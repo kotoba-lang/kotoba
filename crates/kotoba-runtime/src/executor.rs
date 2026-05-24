@@ -3,7 +3,7 @@ use tracing::instrument;
 use wasmtime::component::Func;
 
 use crate::error::RuntimeError;
-use crate::host::{HostState, InferenceFn, KotobaEngine, PendingQuad};
+use crate::host::{HostState, InferenceFn, KotobaEngine, PendingQuad, WitQuad};
 use crate::program::ProgramStore;
 
 /// InvokeContext is CBOR-decoded from the Invoke ChainEntry input field.
@@ -25,6 +25,10 @@ pub struct InvokeResult {
     /// Quads to apply to Arrangement after successful execution
     pub assert_quads: Vec<SerializedQuad>,
     pub retract_quads: Vec<SerializedQuad>,
+    /// kse.publish calls made by the guest — caller routes to KSE Journal
+    pub pending_publishes: Vec<(String, Vec<u8>)>,
+    /// chain.append-infer calls made by the guest — caller appends to SourceChain
+    pub pending_chain_entries: Vec<(String, String, String)>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -80,21 +84,24 @@ impl WasmExecutor {
         Ok(s)
     }
 
-    #[instrument(skip(self, agent_did, wasm_bytes, ctx_cbor), fields(program_cid))]
+    #[instrument(skip(self, agent_did, wasm_bytes, ctx_cbor, quad_snapshot), fields(program_cid))]
     pub fn execute(
         &self,
-        program_cid: &str,
-        wasm_bytes:  &[u8],
-        agent_did:   &str,
-        ctx_cbor:    Vec<u8>,
+        program_cid:   &str,
+        wasm_bytes:    &[u8],
+        agent_did:     &str,
+        ctx_cbor:      Vec<u8>,
+        quad_snapshot: Vec<WitQuad>,
     ) -> Result<InvokeResult, RuntimeError> {
         let component = self.programs
             .get_or_compile(program_cid, wasm_bytes)
             .map_err(RuntimeError::CompileFailed)?;
 
         let state = match &self.inference_engine {
-            Some(e) => HostState::with_inference(agent_did, self.gas_limit, e.clone()),
-            None    => HostState::new(agent_did, self.gas_limit),
+            Some(e) => HostState::with_inference_and_snapshot(
+                agent_did, self.gas_limit, e.clone(), quad_snapshot,
+            ),
+            None => HostState::new(agent_did, self.gas_limit).with_snapshot(quad_snapshot),
         };
         let mut store = self.engine.new_store(state);
 
@@ -161,12 +168,16 @@ impl WasmExecutor {
             .cloned()
             .map(SerializedQuad::from)
             .collect();
+        let pending_publishes     = store.data().pending_publishes.clone();
+        let pending_chain_entries = store.data().pending_chain_entries.clone();
 
         Ok(InvokeResult {
             output_cbor,
             gas_used,
             assert_quads,
             retract_quads,
+            pending_publishes,
+            pending_chain_entries,
         })
     }
 }

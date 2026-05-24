@@ -1,6 +1,6 @@
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
-use kotoba_core::prolly::{ProllyNode, ProllyTree};
+use kotoba_core::prolly::ProllyTree;
 use kotoba_kqe::quad::Quad;
 use kotoba_kqe::delta::Delta;
 use kotoba_kqe::arrangement::Arrangement;
@@ -97,14 +97,8 @@ impl QuadStore {
             }
         };
 
-        // Build a Leaf ProllyNode and flush to BlockStore
-        let root_cid = if entries.is_empty() {
-            KotobaCid::from_bytes(b"empty-tree")
-        } else {
-            let placeholder_cid = KotobaCid::from_bytes(b"leaf");
-            let leaf = ProllyNode::Leaf { entries, cid: placeholder_cid };
-            ProllyTree::put_node(&leaf, &*self.block_store)?
-        };
+        // Build a full ProllyTree (chunked Leaf + Internal levels) and flush to BlockStore
+        let root_cid = ProllyTree::build_tree(entries, &*self.block_store)?;
 
         // Get previous head CID for the DAG chain
         let prev = self.commit_dag.read().await

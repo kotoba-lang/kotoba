@@ -40,6 +40,15 @@ pub struct HostState {
     /// Accumulated output quads (asserted by guest via kqe.assert-quad)
     pub pending_asserts: Vec<PendingQuad>,
     pub pending_retracts: Vec<PendingQuad>,
+    /// Snapshot of the named graph's quads — pre-populated before execution
+    /// so that `kqe.query` can do synchronous predicate-filter lookups.
+    pub quad_snapshot: Vec<WitQuad>,
+    /// kse.publish calls buffered during WASM execution.
+    /// Applied to the KSE Journal by the caller after execute() returns.
+    pub pending_publishes: Vec<(String, Vec<u8>)>,
+    /// chain.append-infer calls buffered during WASM execution.
+    /// Each entry: (model_cid, prompt_cid, output_cid).
+    pub pending_chain_entries: Vec<(String, String, String)>,
     /// WASI preview2 context (required by wasm32-wasip2 components)
     pub wasi_ctx: WasiCtx,
     pub wasi_table: ResourceTable,
@@ -69,10 +78,19 @@ impl HostState {
             gas_remaining: gas_limit,
             pending_asserts: Vec::new(),
             pending_retracts: Vec::new(),
+            quad_snapshot: Vec::new(),
+            pending_publishes: Vec::new(),
+            pending_chain_entries: Vec::new(),
             wasi_ctx,
             wasi_table: ResourceTable::new(),
             inference_engine: None,
         }
+    }
+
+    /// Pre-populate the quad snapshot for `kqe.query` lookups during WASM execution.
+    pub fn with_snapshot(mut self, snapshot: Vec<WitQuad>) -> Self {
+        self.quad_snapshot = snapshot;
+        self
     }
 
     /// Construct a HostState with a pre-loaded local inference engine.
@@ -95,6 +113,17 @@ impl HostState {
     ) -> Self {
         let mut s = Self::new(agent_did, gas_limit);
         s.inference_engine = Some(engine);
+        s
+    }
+
+    pub fn with_inference_and_snapshot(
+        agent_did: impl Into<String>,
+        gas_limit: u64,
+        engine: InferenceFn,
+        snapshot: Vec<WitQuad>,
+    ) -> Self {
+        let mut s = Self::with_inference(agent_did, gas_limit, engine);
+        s.quad_snapshot = snapshot;
         s
     }
 
@@ -204,16 +233,23 @@ fn bind_kqe(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     // query: func(datalog-src: string) -> result<list<quad>, string>
-    // Return type uses WitQuad for the list element.
+    // `datalog_src` is treated as a predicate/relation filter:
+    //   - empty string  → return all quads in the snapshot
+    //   - non-empty     → return quads whose predicate == datalog_src
     inst.func_wrap(
         "query",
         |mut ctx: wasmtime::StoreContextMut<HostState>,
-         (datalog_src,): (String,)|
+         (predicate_filter,): (String,)|
          -> Result<(Result<Vec<WitQuad>, String>,)> {
             ctx.data_mut().charge_gas(100)?;
-            // TODO(Phase 4): delegate to KQE DatalogProgram evaluation
-            let _ = datalog_src;
-            Ok((Ok(vec![]),))
+            let matches: Vec<WitQuad> = ctx
+                .data()
+                .quad_snapshot
+                .iter()
+                .filter(|q| predicate_filter.is_empty() || q.predicate == predicate_filter)
+                .cloned()
+                .collect();
+            Ok((Ok(matches),))
         },
     )?;
 
@@ -253,9 +289,10 @@ fn bind_kse(linker: &mut Linker<HostState>) -> Result<()> {
          (topic, payload): (String, Vec<u8>)|
          -> Result<(Result<String, String>,)> {
             ctx.data_mut().charge_gas(20)?;
-            // TODO(Phase 4): route to KSE Journal
-            let _ = (topic, payload);
-            Ok((Ok("bplaceholder_cid".to_string()),))
+            // Buffer the publish; the caller applies it to the KSE Journal after execute().
+            let synthetic_cid = format!("pending/{}/{}", topic, ctx.data().pending_publishes.len());
+            ctx.data_mut().pending_publishes.push((topic, payload));
+            Ok((Ok(synthetic_cid),))
         },
     )?;
 
@@ -378,11 +415,14 @@ fn bind_chain(linker: &mut Linker<HostState>) -> Result<()> {
     inst.func_wrap(
         "append-infer",
         |mut ctx: wasmtime::StoreContextMut<HostState>,
-         (_model_cid, _prompt_cid, _output_cid): (String, String, String)|
+         (model_cid, prompt_cid, output_cid): (String, String, String)|
          -> Result<(Result<String, String>,)> {
             ctx.data_mut().charge_gas(30)?;
-            // TODO(Phase 4): append Infer ChainEntry to SourceChain
-            Ok((Err("chain append not yet wired".to_string()),))
+            // Buffer the chain entry; caller appends to SourceChain after execute().
+            let idx = ctx.data().pending_chain_entries.len();
+            let synthetic_cid = format!("chain/pending/{idx}");
+            ctx.data_mut().pending_chain_entries.push((model_cid, prompt_cid, output_cid));
+            Ok((Ok(synthetic_cid),))
         },
     )?;
 

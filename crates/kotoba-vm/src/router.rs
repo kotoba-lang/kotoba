@@ -1,7 +1,7 @@
 use anyhow::Result;
 use kotoba_dht::source_chain::ProgramType;
 use kotoba_kqe::{arrangement::Arrangement, datalog::DatalogProgram, delta::Delta};
-use kotoba_runtime::{host::InferenceFn, InvokeResult, UdfExecutor, WasmExecutor};
+use kotoba_runtime::{host::{InferenceFn, WitQuad}, InvokeResult, UdfExecutor, WasmExecutor};
 use thiserror::Error;
 
 use crate::executor::{ExecResult, ExecStatus, KotobaVm};
@@ -86,25 +86,48 @@ impl InvokeRouter {
         input_deltas:   &[Delta],
         max_steps:      u32,
     ) -> Result<DispatchResult, RouterError> {
+        self.dispatch_with_snapshot(
+            program_cid, program_type, agent_did, call_id,
+            program_bytes, ctx_cbor,
+            program, arrangement, input_deltas, max_steps,
+            vec![],
+        )
+    }
+
+    /// Like `dispatch` but supplies a quad snapshot for `kqe.query` in WASM guests.
+    pub fn dispatch_with_snapshot(
+        &self,
+        program_cid:    &str,
+        program_type:   ProgramType,
+        agent_did:      &str,
+        call_id:        u64,
+        program_bytes:  Option<&[u8]>,
+        ctx_cbor:       Vec<u8>,
+        program:        Option<&DatalogProgram>,
+        arrangement:    Option<&Arrangement>,
+        input_deltas:   &[Delta],
+        max_steps:      u32,
+        quad_snapshot:  Vec<WitQuad>,
+    ) -> Result<DispatchResult, RouterError> {
         match program_type {
             ProgramType::WasmNode => {
                 let bytes = program_bytes.ok_or(RouterError::MissingWasmBytes)?;
-                let result = self.wasm.execute(program_cid, bytes, agent_did, ctx_cbor)?;
+                let result = self.wasm.execute(program_cid, bytes, agent_did, ctx_cbor, quad_snapshot)?;
                 Ok(DispatchResult::Wasm(result))
             }
 
             ProgramType::WasmUdf => {
                 let bytes = program_bytes.ok_or(RouterError::MissingWasmBytes)?;
-                // UDF: ctx_cbor treated as a single row; returns list of rows
                 let rows = vec![ctx_cbor];
                 let out_rows = self.udf.eval(program_cid, bytes, rows)?;
-                // Wrap output as a simple InvokeResult
                 let output_cbor = out_rows.into_iter().flatten().collect();
                 Ok(DispatchResult::Wasm(InvokeResult {
                     output_cbor,
                     gas_used: 0,
                     assert_quads: vec![],
                     retract_quads: vec![],
+                    pending_publishes: vec![],
+                    pending_chain_entries: vec![],
                 }))
             }
 

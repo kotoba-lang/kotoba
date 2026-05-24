@@ -49,6 +49,9 @@ pub struct InvokeRunReq {
     pub agent_did:    String,
     pub wasm_b64:     Option<String>,
     pub ctx_b64:      Option<String>,
+    /// Named graph CID (multibase) — when supplied, the graph's Arrangement is
+    /// snapshotted into HostState so WASM guests can call `kqe.query`.
+    pub graph_cid:    Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,6 +181,28 @@ pub async fn invoke_run(
         None => vec![],
     };
 
+    use kotoba_core::cid::KotobaCid;
+    use kotoba_vm::DispatchResult;
+    use kotoba_kqe::quad::{Quad, QuadObject};
+    use kotoba_runtime::host::WitQuad;
+
+    // Build quad snapshot from the named graph's Arrangement for kqe.query in WASM guests.
+    let graph_cid_for_snapshot = req.graph_cid.as_deref()
+        .map(KotobaCid::from_multibase)
+        .and_then(|x| x);
+    let quad_snapshot: Vec<WitQuad> = if let Some(gcid) = &graph_cid_for_snapshot {
+        state.quad_store.arrangement(gcid).await
+            .map(|arr| arr.quads(gcid).into_iter().map(|q| WitQuad {
+                graph:       q.graph.to_multibase(),
+                subject:     q.subject.to_multibase(),
+                predicate:   q.predicate,
+                object_cbor: serde_json::to_vec(&q.object).unwrap_or_default(),
+            }).collect())
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
     // Move owned data into spawn_blocking — dispatch is CPU-bound (Cranelift JIT)
     let program_cid = req.program_cid.clone();
     let agent_did   = req.agent_did.clone();
@@ -186,7 +211,7 @@ pub async fn invoke_run(
 
     let result = tokio::task::spawn_blocking(move || {
         let wasm_ref = wasm_owned.as_deref();
-        router.dispatch(
+        router.dispatch_with_snapshot(
             &program_cid,
             program_type,
             &agent_did,
@@ -197,15 +222,12 @@ pub async fn invoke_run(
             None,
             &[],
             10_000,
+            quad_snapshot,
         )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    use kotoba_core::cid::KotobaCid;
-    use kotoba_vm::DispatchResult;
-    use kotoba_kqe::quad::{Quad, QuadObject};
 
     match result {
         DispatchResult::Wasm(r) => {
@@ -231,12 +253,22 @@ pub async fn invoke_run(
                 };
                 state.journal_retract(&quad).await;
             }
+            // Apply kse.publish calls buffered by guest WASM
+            for (topic, payload) in &r.pending_publishes {
+                use kotoba_kse::Topic;
+                state.journal.publish(
+                    Topic(topic.clone()),
+                    bytes::Bytes::from(payload.clone()),
+                ).await;
+            }
 
             tracing::info!(
                 program_cid = %req.program_cid,
                 gas_used    = r.gas_used,
                 asserts     = r.assert_quads.len(),
                 retracts    = r.retract_quads.len(),
+                kse_publishes = r.pending_publishes.len(),
+                chain_entries = r.pending_chain_entries.len(),
                 "invoke.run → Journal published"
             );
 

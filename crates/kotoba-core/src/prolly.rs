@@ -85,6 +85,93 @@ impl ProllyTree {
         }
         Ok(self.root.clone())
     }
+
+    /// Build a complete ProllyTree from a flat entry list, writing every
+    /// node to `store`.  Returns the root CID.
+    ///
+    /// Algorithm (single-pass bottom-up):
+    ///   1. Sort entries by key.
+    ///   2. Split into Leaf chunks at probabilistic boundaries
+    ///      (`is_boundary` fires ~1/256 of the time with BOUNDARY_MASK=0xFF,
+    ///       giving chunks of ~256 entries on average).
+    ///   3. Persist each Leaf; collect (max_key, leaf_cid) pairs.
+    ///   4. If >1 leaf, recursively build Internal levels until a single root
+    ///      remains — each level applies the same boundary split to child keys.
+    pub fn build_tree(
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        store:   &dyn BlockStore,
+    ) -> anyhow::Result<KotobaCid> {
+        if entries.is_empty() {
+            let leaf = ProllyNode::Leaf { entries: vec![], cid: KotobaCid::default() };
+            return Self::put_node(&leaf, store);
+        }
+
+        let mut sorted = entries;
+        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let leaf_ptrs = Self::build_leaf_level(sorted, store)?;
+        if leaf_ptrs.len() == 1 {
+            return Ok(leaf_ptrs.into_iter().next().unwrap().1);
+        }
+        Self::build_internal_level(leaf_ptrs, store)
+    }
+
+    fn build_leaf_level(
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+        store:   &dyn BlockStore,
+    ) -> anyhow::Result<Vec<(Vec<u8>, KotobaCid)>> {
+        let mut ptrs: Vec<(Vec<u8>, KotobaCid)> = Vec::new();
+        let mut chunk: Vec<(Vec<u8>, Vec<u8>)>   = Vec::new();
+
+        for entry in entries {
+            let at_boundary = ProllyNode::is_boundary(&entry.0);
+            chunk.push(entry);
+            if at_boundary {
+                let max_key = chunk.last().unwrap().0.clone();
+                let leaf    = ProllyNode::Leaf { entries: std::mem::take(&mut chunk), cid: KotobaCid::default() };
+                let cid     = Self::put_node(&leaf, store)?;
+                ptrs.push((max_key, cid));
+            }
+        }
+        if !chunk.is_empty() {
+            let max_key = chunk.last().unwrap().0.clone();
+            let leaf    = ProllyNode::Leaf { entries: chunk, cid: KotobaCid::default() };
+            let cid     = Self::put_node(&leaf, store)?;
+            ptrs.push((max_key, cid));
+        }
+        Ok(ptrs)
+    }
+
+    fn build_internal_level(
+        children: Vec<(Vec<u8>, KotobaCid)>,
+        store:    &dyn BlockStore,
+    ) -> anyhow::Result<KotobaCid> {
+        let mut ptrs: Vec<(Vec<u8>, KotobaCid)>         = Vec::new();
+        let mut chunk: Vec<(Vec<u8>, KotobaCid)> = Vec::new();
+
+        for child in children {
+            let at_boundary = ProllyNode::is_boundary(&child.0);
+            chunk.push(child);
+            if at_boundary {
+                let max_key = chunk.last().unwrap().0.clone();
+                let node    = ProllyNode::Internal { children: std::mem::take(&mut chunk), cid: KotobaCid::default() };
+                let cid     = Self::put_node(&node, store)?;
+                ptrs.push((max_key, cid));
+            }
+        }
+        if !chunk.is_empty() {
+            let max_key = chunk.last().unwrap().0.clone();
+            let node    = ProllyNode::Internal { children: chunk, cid: KotobaCid::default() };
+            let cid     = Self::put_node(&node, store)?;
+            ptrs.push((max_key, cid));
+        }
+
+        if ptrs.len() == 1 {
+            return Ok(ptrs.into_iter().next().unwrap().1);
+        }
+        // Another level needed
+        Self::build_internal_level(ptrs, store)
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,11 @@
 //! `com.atproto.sync.subscribeRepos` firehose client.
 //!
+//! Cursor persistence:
+//!   The last processed `seq` is checkpointed every `CURSOR_PERSIST_INTERVAL` commits
+//!   into the BlockStore under a fixed synthetic CID (`CURSOR_SLOT_CID`).
+//!   On startup, if `KOTOBA_SUBSCRIBE_REPOS_CURSOR` is not set, the persisted value is
+//!   used automatically to resume from where the previous run left off.
+//!
 //! Connects to the AT Protocol relay WebSocket, decodes binary CBOR frames,
 //! parses inline CAR blocks, writes them to the BlockStore under their original
 //! AT CIDs (sha2-256), and asserts a Quad per op into the QuadStore.
@@ -24,6 +30,20 @@
 
 use std::sync::Arc;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Persist cursor every N committed events to avoid excessive BlockStore writes.
+const CURSOR_PERSIST_INTERVAL: u64 = 100;
+
+/// Fixed synthetic CID used as the named slot for cursor persistence.
+/// Not content-addressed — treated as a mutable named register in BlockStore.
+/// Bytes: CIDv1 prefix (4) + ASCII "subscribeRepos/cursor" (21) + padding (11).
+const CURSOR_SLOT_CID: KotobaCid = KotobaCid([
+    0x01, 0x71, 0x1e, 0x20,  // CIDv1 dag-cbor blake3 prefix
+    b's', b'u', b'b', b's', b'c', b'r', b'i', b'b', b'e', b'R', b'e', b'p', b'o', b's',
+    b'/', b'c', b'u', b'r', b's', b'o', b'r',
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
 
 use bytes::Bytes;
 use ciborium::value::Value;
@@ -39,6 +59,24 @@ use kotoba_kse::Journal;
 use crate::atproto::{collection_to_cid, did_to_cid, jetstream_subject_to_topic};
 use crate::quad_store::QuadStore;
 
+// ── Cursor persistence helpers ────────────────────────────────────────────
+
+fn load_cursor(store: &dyn BlockStore) -> Option<u64> {
+    let bytes = store.get(&CURSOR_SLOT_CID).ok()??;
+    if bytes.len() >= 8 {
+        Some(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+    } else {
+        None
+    }
+}
+
+fn save_cursor(store: &dyn BlockStore, seq: u64) {
+    let bytes = seq.to_le_bytes();
+    if let Err(e) = store.put(&CURSOR_SLOT_CID, &bytes) {
+        warn!(err = %e, seq, "failed to persist subscribeRepos cursor");
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────
 
 /// Run the subscribeRepos firehose client loop. Spawn with `tokio::spawn`.
@@ -52,10 +90,15 @@ pub async fn run_subscribe_repos(
             "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos".into()
         );
 
-    let cursor_param = std::env::var("KOTOBA_SUBSCRIBE_REPOS_CURSOR")
-        .ok()
-        .map(|c| format!("?cursor={c}"))
-        .unwrap_or_default();
+    // Prefer env var cursor → then persisted cursor → then no cursor (full replay)
+    let cursor_param = if let Ok(c) = std::env::var("KOTOBA_SUBSCRIBE_REPOS_CURSOR") {
+        format!("?cursor={c}")
+    } else if let Some(persisted) = load_cursor(&*block_store) {
+        info!(cursor = persisted, "subscribeRepos resuming from persisted cursor");
+        format!("?cursor={persisted}")
+    } else {
+        String::new()
+    };
 
     let url = format!("{base}{cursor_param}");
 
@@ -66,7 +109,8 @@ pub async fn run_subscribe_repos(
         .filter(|s| !s.is_empty())
         .collect();
 
-    let mut backoff = 1u64;
+    let mut backoff  = 1u64;
+    let commit_count = Arc::new(AtomicU64::new(0));
 
     loop {
         info!(%url, "subscribeRepos connecting");
@@ -80,13 +124,22 @@ pub async fn run_subscribe_repos(
                 while let Some(msg) = ws.next().await {
                     match msg {
                         Ok(Message::Binary(data)) => {
-                            handle_frame(
+                            let seq = handle_frame(
                                 &data,
                                 &did_filter,
                                 &journal,
                                 &quad_store,
                                 &block_store,
                             ).await;
+
+                            // Persist cursor every CURSOR_PERSIST_INTERVAL commits
+                            if let Some(seq) = seq {
+                                let n = commit_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n % CURSOR_PERSIST_INTERVAL == 0 {
+                                    save_cursor(&*block_store, seq);
+                                    debug!(seq, "subscribeRepos cursor persisted");
+                                }
+                            }
                         }
                         Ok(Message::Close(_)) => {
                             info!("subscribeRepos closed by relay");
@@ -109,53 +162,58 @@ pub async fn run_subscribe_repos(
 
 // ── Frame handling ────────────────────────────────────────────────────────
 
+/// Returns the `seq` of the processed commit frame (for cursor tracking), or None.
 async fn handle_frame(
     data:        &[u8],
     did_filter:  &[String],
     journal:     &Arc<Journal>,
     quad_store:  &Arc<QuadStore>,
     block_store: &Arc<dyn BlockStore + Send + Sync>,
-) {
+) -> Option<u64> {
     // Two CBOR values concatenated: header then body
     let mut cur = Cursor::new(data);
     let header: Value = match ciborium::from_reader(&mut cur) {
         Ok(v) => v,
-        Err(e) => { warn!(err = %e, "bad frame header"); return; }
+        Err(e) => { warn!(err = %e, "bad frame header"); return None; }
     };
     let body: Value = match ciborium::from_reader(&mut cur) {
         Ok(v) => v,
-        Err(e) => { warn!(err = %e, "bad frame body"); return; }
+        Err(e) => { warn!(err = %e, "bad frame body"); return None; }
     };
 
     // op=1 → message; op=-1 → error
     let op = cbor_i64(&header, "op").unwrap_or(0);
-    if op != 1 { return; }
+    if op != 1 { return None; }
 
     match cbor_str(&header, "t").as_deref() {
-        Some("#commit")   => handle_commit(body, did_filter, journal, quad_store, block_store).await,
-        Some("#identity") => handle_identity(body, journal, quad_store).await,
-        Some("#account")  => {}
-        other => debug!(t = ?other, "unhandled frame type"),
+        Some("#commit") => {
+            let seq = handle_commit(body, did_filter, journal, quad_store, block_store).await;
+            seq
+        }
+        Some("#identity") => { handle_identity(body, journal, quad_store).await; None }
+        Some("#account")  => None,
+        other => { debug!(t = ?other, "unhandled frame type"); None }
     }
 }
 
+/// Returns the `seq` of the processed commit for cursor tracking.
 async fn handle_commit(
     body:        Value,
     did_filter:  &[String],
     journal:     &Arc<Journal>,
     quad_store:  &Arc<QuadStore>,
     block_store: &Arc<dyn BlockStore + Send + Sync>,
-) {
+) -> Option<u64> {
     let repo = match cbor_str(&body, "repo") {
         Some(d) => d,
-        None => return,
+        None => return None,
     };
 
     if !did_filter.is_empty() && !did_filter.iter().any(|d| *d == repo) {
-        return;
+        return None;
     }
 
-    let seq     = cbor_i64(&body, "seq").unwrap_or(0);
+    let seq     = cbor_i64(&body, "seq").unwrap_or(0) as u64;
     let too_big = cbor_bool(&body, "tooBig").unwrap_or(false);
 
     // Store CAR blocks in BlockStore (skip if tooBig — blocks absent)
@@ -181,7 +239,7 @@ async fn handle_commit(
     // Build Quads for each op
     let ops = match cbor_get(&body, "ops") {
         Some(Value::Array(arr)) => arr,
-        _ => return,
+        _ => return Some(seq),
     };
 
     let subject_cid = did_to_cid(&repo);
@@ -238,6 +296,8 @@ async fn handle_commit(
         };
         journal.publish(topic, payload).await;
     }
+
+    Some(seq)
 }
 
 async fn handle_identity(

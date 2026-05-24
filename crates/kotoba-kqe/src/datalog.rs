@@ -362,8 +362,10 @@ impl DatalogProgram {
     }
 
     fn resolve_term_str(&self, term: &Term, binding: &Binding) -> Option<String> {
+        // Normalize to CID-multibase so Variable and Constant can be compared
+        // in the same hash space (matches unify_atom's cid_of_str(c) semantics).
         match term {
-            Term::Constant(c) => Some(c.clone()),
+            Term::Constant(c) => Some(cid_of_str(c).to_multibase()),
             Term::Variable(v) => binding.get(v).map(|cid| cid.to_multibase()),
         }
     }
