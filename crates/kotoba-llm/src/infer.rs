@@ -1,5 +1,5 @@
 use kotoba_core::cid::KotobaCid;
-use kotoba_vm::foreign::{ForeignBridge, ForeignCall, ForeignCallType};
+use kotoba_core::foreign::{ForeignBridge, ForeignCall, ForeignCallType};
 use super::kvcache::KvCache;
 
 /// InferenceRequest — maps to Invoke ChainEntry + CALL_FOREIGN(LlmInfer)

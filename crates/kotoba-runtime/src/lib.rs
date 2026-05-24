@@ -181,4 +181,14 @@ mod tests {
         println!("Instantiated OK!");
         Ok(())
     }
+
+    /// Verify that HostState defaults to no inference engine loaded.
+    #[test]
+    fn test_host_state_inference_engine_default_is_none() {
+        let state = crate::host::HostState::new("did:test:000", 10_000_000);
+        assert!(
+            state.inference_engine.is_none(),
+            "HostState::new() must leave inference_engine as None"
+        );
+    }
 }

@@ -1,8 +1,20 @@
 use anyhow::Result;
+use std::sync::Arc;
 use wasmtime::{Config, Engine, Store};
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView, ResourceTable};
 use kotoba_auth::delegation::DelegationChain;
+
+/// Type alias for a synchronous local inference function.
+///
+/// Signature: `(prompt: &str, max_new_tokens: usize) -> Result<String>`
+///
+/// The concrete implementation (e.g. `GemmaRunner::generate`) is provided by
+/// `kotoba-llm --features local-inference` and wired in by `kotoba-server`.
+/// Using a trait object here breaks the circular dependency:
+///   kotoba-llm → kotoba-vm → kotoba-runtime
+/// by removing the direct kotoba-runtime → kotoba-llm edge.
+pub type InferenceFn = Arc<dyn Fn(&str, usize) -> anyhow::Result<String> + Send + Sync>;
 
 /// WIT record type for kotoba:kais/kqe.quad.
 ///
@@ -31,6 +43,14 @@ pub struct HostState {
     /// WASI preview2 context (required by wasm32-wasip2 components)
     pub wasi_ctx: WasiCtx,
     pub wasi_table: ResourceTable,
+    /// Local CPU inference callable.
+    ///
+    /// `None` by default — pass a concrete function via `HostState::with_inference()`
+    /// to wire in real inference (e.g. from `kotoba-llm --features local-inference`).
+    ///
+    /// Type-erased as `InferenceFn` to avoid a direct kotoba-runtime → kotoba-llm
+    /// dependency (which would create a cycle through kotoba-vm).
+    pub inference_engine: Option<InferenceFn>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +71,31 @@ impl HostState {
             pending_retracts: Vec::new(),
             wasi_ctx,
             wasi_table: ResourceTable::new(),
+            inference_engine: None,
         }
+    }
+
+    /// Construct a HostState with a pre-loaded local inference engine.
+    ///
+    /// The caller provides any callable matching `(prompt, max_tokens) → Result<String>`.
+    /// Typically this is a closure wrapping `GemmaRunner::generate` from
+    /// `kotoba-llm --features local-inference`:
+    ///
+    /// ```rust,ignore
+    /// let runner = Arc::new(std::sync::Mutex::new(GemmaRunner::load().await?));
+    /// let engine: InferenceFn = Arc::new(move |prompt, max| {
+    ///     runner.lock().unwrap().generate(prompt, max)
+    /// });
+    /// let state = HostState::with_inference("did:example:1", 10_000_000, engine);
+    /// ```
+    pub fn with_inference(
+        agent_did: impl Into<String>,
+        gas_limit: u64,
+        engine: InferenceFn,
+    ) -> Self {
+        let mut s = Self::new(agent_did, gas_limit);
+        s.inference_engine = Some(engine);
+        s
     }
 
     pub fn charge_gas(&mut self, cost: u64) -> Result<()> {
@@ -278,12 +322,28 @@ fn bind_llm(linker: &mut Linker<HostState>) -> Result<()> {
     inst.func_wrap(
         "infer",
         |mut ctx: wasmtime::StoreContextMut<HostState>,
-         (_model_cid, _prompt_bytes): (String, Vec<u8>)|
+         (_model_cid, prompt_bytes): (String, Vec<u8>)|
          -> Result<(Result<Vec<u8>, String>,)> {
             // CALL_FOREIGN(0xF): gas is high — each token = one Pregel superstep
             ctx.data_mut().charge_gas(1000)?;
-            // TODO(Phase 4): delegate to kotoba-llm InferenceSession via AgentGateway MCP
-            Ok((Err("foreign bridge not yet wired".to_string()),))
+
+            // Clone the Arc so the closure doesn't hold a borrow on ctx.
+            let engine_opt = ctx.data().inference_engine.clone();
+            if let Some(engine_fn) = engine_opt {
+                let prompt = String::from_utf8_lossy(&prompt_bytes).to_string();
+                return match engine_fn(&prompt, 256) {
+                    Ok(text) => Ok((Ok(text.into_bytes()),)),
+                    Err(e)   => Ok((Err(e.to_string()),)),
+                };
+            }
+
+            // No engine loaded at runtime.
+            let _ = prompt_bytes;
+            Ok((Err(
+                "no local inference engine loaded — call HostState::with_inference() \
+                 before executing WASM guests that call llm.infer"
+                .to_string(),
+            ),))
         },
     )?;
 

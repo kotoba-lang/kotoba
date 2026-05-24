@@ -3,9 +3,13 @@ pub mod lora;
 pub mod kvcache;
 pub mod embed;
 pub mod infer;
+pub mod gemma;
 
 pub use weight::{WeightRef, WeightBlob};
 pub use lora::{LoraAdapter, lora_to_delta};
 pub use kvcache::KvCache;
 pub use embed::{Embedding, embed_to_quad};
-pub use infer::{InferenceRequest, InferenceSession};
+pub use infer::{InferenceRequest, InferenceSession, InferError};
+
+#[cfg(feature = "local-inference")]
+pub use gemma::GemmaRunner;

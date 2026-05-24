@@ -1,3 +1,4 @@
+use crate::store::KseStore;
 use crate::topic::Topic;
 use kotoba_core::cid::KotobaCid;
 use bytes::Bytes;
@@ -31,20 +32,29 @@ impl Cursor {
 
 pub struct CursorAck;
 
-/// Journal — ordered persistent log for a set of Topics
+/// Journal — ordered persistent log for a set of Topics.
+///
+/// If built with `with_store()`, each entry is asynchronously persisted to the
+/// backing `KseStore` at key `{seq:020}.json` (fire-and-forget; does not block
+/// `publish()`).  The in-process broadcast channel is always maintained for
+/// low-latency subscribers.
 pub struct Journal {
-    seq:    Arc<RwLock<u64>>,
-    tx:     broadcast::Sender<JournalEntry>,
-    // TODO: segment storage via object_store
+    seq:   Arc<RwLock<u64>>,
+    tx:    broadcast::Sender<JournalEntry>,
+    store: Option<Arc<KseStore>>,
 }
 
 impl Journal {
+    /// In-memory only — no persistence.
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(4096);
-        Self {
-            seq: Arc::new(RwLock::new(0)),
-            tx,
-        }
+        Self { seq: Arc::new(RwLock::new(0)), tx, store: None }
+    }
+
+    /// Persistent — entries are also written to `store`.
+    pub fn with_store(store: Arc<KseStore>) -> Self {
+        let (tx, _) = broadcast::channel(4096);
+        Self { seq: Arc::new(RwLock::new(0)), tx, store: Some(store) }
     }
 
     pub async fn publish(&self, topic: Topic, payload: Bytes) -> JournalEntry {
@@ -62,6 +72,18 @@ impl Journal {
             cid,
         };
         let _ = self.tx.send(entry.clone());
+
+        if let Some(store) = &self.store {
+            let entry_clone = entry.clone();
+            let store_clone = Arc::clone(store);
+            tokio::spawn(async move {
+                let key = format!("{:020}.json", entry_clone.seq);
+                if let Ok(data) = serde_json::to_vec(&entry_clone) {
+                    let _ = store_clone.put(&key, Bytes::from(data)).await;
+                }
+            });
+        }
+
         entry
     }
 
@@ -72,6 +94,10 @@ impl Journal {
             rx: self.tx.subscribe(),
         }
     }
+}
+
+impl Default for Journal {
+    fn default() -> Self { Self::new() }
 }
 
 fn now_ms() -> u64 {
