@@ -3,9 +3,13 @@ use crate::topic::Topic;
 use kotoba_core::cid::KotobaCid;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
+/// Default number of entries kept in the in-process ring buffer.
+/// Enough for a typical agent session window without unbounded growth.
+const DEFAULT_LOG_CAP: usize = 65_536;
 
 /// Journal entry — one ordered record in a Topic's log
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,27 +38,48 @@ pub struct CursorAck;
 
 /// Journal — ordered persistent log for a set of Topics.
 ///
-/// If built with `with_store()`, each entry is asynchronously persisted to the
-/// backing `KseStore` at key `{cid}.cbor` (fire-and-forget; does not block
-/// `publish()`).  The in-process broadcast channel is always maintained for
-/// low-latency subscribers.
+/// Each entry is broadcast to live subscribers AND appended to a bounded
+/// in-process ring buffer (`log`).  Callers can replay history with
+/// [`read_since`] without touching the persistent store.
+///
+/// If built with `with_store()`, entries are also asynchronously persisted to
+/// the backing `KseStore` (fire-and-forget; does not block `publish()`).
 pub struct Journal {
-    seq:   Arc<RwLock<u64>>,
-    tx:    broadcast::Sender<JournalEntry>,
-    store: Option<Arc<KseStore>>,
+    seq:     Arc<RwLock<u64>>,
+    tx:      broadcast::Sender<JournalEntry>,
+    store:   Option<Arc<KseStore>>,
+    /// Bounded in-process ring buffer for selective replay.
+    log:     Arc<RwLock<VecDeque<JournalEntry>>>,
+    log_cap: usize,
 }
 
 impl Journal {
     /// In-memory only — no persistence.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_LOG_CAP)
+    }
+
+    pub fn with_capacity(log_cap: usize) -> Self {
         let (tx, _) = broadcast::channel(4096);
-        Self { seq: Arc::new(RwLock::new(0)), tx, store: None }
+        Self {
+            seq: Arc::new(RwLock::new(0)),
+            tx,
+            store: None,
+            log: Arc::new(RwLock::new(VecDeque::with_capacity(log_cap.min(4096)))),
+            log_cap,
+        }
     }
 
     /// Persistent — entries are also written to `store`.
     pub fn with_store(store: Arc<KseStore>) -> Self {
         let (tx, _) = broadcast::channel(4096);
-        Self { seq: Arc::new(RwLock::new(0)), tx, store: Some(store) }
+        Self {
+            seq: Arc::new(RwLock::new(0)),
+            tx,
+            store: Some(store),
+            log: Arc::new(RwLock::new(VecDeque::with_capacity(4096))),
+            log_cap: DEFAULT_LOG_CAP,
+        }
     }
 
     pub async fn publish(&self, topic: Topic, payload: Bytes) -> JournalEntry {
@@ -72,6 +97,15 @@ impl Journal {
             cid,
         };
         let _ = self.tx.send(entry.clone());
+
+        // Append to ring buffer, evict oldest if over cap
+        {
+            let mut log = self.log.write().await;
+            log.push_back(entry.clone());
+            while log.len() > self.log_cap {
+                log.pop_front();
+            }
+        }
 
         if let Some(store) = &self.store {
             let entry_clone = entry.clone();
@@ -93,6 +127,38 @@ impl Journal {
             id: uuid(),
             position: 0,
             rx: self.tx.subscribe(),
+        }
+    }
+
+    /// Return all entries in the ring buffer with `seq >= since`.
+    ///
+    /// Useful for an agent that knows its last processed sequence and wants
+    /// only the delta — no network or persistent store required.
+    pub async fn read_since(&self, since: u64) -> Vec<JournalEntry> {
+        self.log.read().await
+            .iter()
+            .filter(|e| e.seq >= since)
+            .cloned()
+            .collect()
+    }
+
+    /// Return the current highest sequence number (0 if nothing published yet).
+    pub async fn current_seq(&self) -> u64 {
+        *self.seq.read().await
+    }
+
+    /// Remove ring-buffer entries with `seq < before`.
+    ///
+    /// Frees memory for sessions that no longer need old history.
+    /// Does NOT delete from the persistent store.
+    pub async fn trim_before(&self, before: u64) {
+        let mut log = self.log.write().await;
+        while let Some(front) = log.front() {
+            if front.seq < before {
+                log.pop_front();
+            } else {
+                break;
+            }
         }
     }
 }
@@ -144,7 +210,6 @@ mod tests {
     #[tokio::test]
     async fn subscribe_cursor_receives_published_entry() {
         let journal = Journal::new();
-        // subscribe BEFORE publishing so the broadcast receiver is live
         let mut cursor = journal.subscribe();
         let topic = Topic::new("test/subscribe");
         let payload = Bytes::from_static(b"broadcast me");
@@ -153,6 +218,57 @@ mod tests {
         assert_eq!(received.seq, published.seq);
         assert_eq!(received.cid, published.cid);
         assert_eq!(received.payload, published.payload);
+    }
+
+    #[tokio::test]
+    async fn read_since_returns_only_entries_after_watermark() {
+        let journal = Journal::new();
+        let t = Topic::new("window/test");
+        journal.publish(t.clone(), Bytes::from_static(b"seq1")).await;
+        journal.publish(t.clone(), Bytes::from_static(b"seq2")).await;
+        let anchor = journal.publish(t.clone(), Bytes::from_static(b"seq3")).await;
+        journal.publish(t.clone(), Bytes::from_static(b"seq4")).await;
+        journal.publish(t.clone(), Bytes::from_static(b"seq5")).await;
+
+        let since = anchor.seq; // 3
+        let entries = journal.read_since(since).await;
+        assert_eq!(entries.len(), 3, "should return seq 3, 4, 5");
+        assert!(entries.iter().all(|e| e.seq >= since));
+        assert_eq!(entries[0].seq, 3);
+        assert_eq!(entries[2].seq, 5);
+    }
+
+    #[tokio::test]
+    async fn trim_before_removes_old_entries() {
+        let journal = Journal::new();
+        let t = Topic::new("trim/test");
+        for i in 0..10u8 {
+            journal.publish(t.clone(), Bytes::from(vec![i])).await;
+        }
+        // Before trim: all 10 entries
+        assert_eq!(journal.read_since(1).await.len(), 10);
+
+        journal.trim_before(6).await;
+
+        let remaining = journal.read_since(1).await;
+        assert!(remaining.iter().all(|e| e.seq >= 6),
+            "all remaining entries must have seq >= 6");
+        assert_eq!(remaining.len(), 5, "entries 6..=10 remain");
+    }
+
+    #[tokio::test]
+    async fn ring_buffer_evicts_oldest_when_at_cap() {
+        let journal = Journal::with_capacity(3);
+        let t = Topic::new("cap/test");
+        journal.publish(t.clone(), Bytes::from_static(b"a")).await; // seq 1
+        journal.publish(t.clone(), Bytes::from_static(b"b")).await; // seq 2
+        journal.publish(t.clone(), Bytes::from_static(b"c")).await; // seq 3
+        journal.publish(t.clone(), Bytes::from_static(b"d")).await; // seq 4 — evicts seq 1
+
+        let all = journal.read_since(1).await;
+        assert_eq!(all.len(), 3, "only 3 entries fit in cap-3 buffer");
+        assert_eq!(all[0].seq, 2, "oldest kept entry should be seq 2");
+        assert_eq!(all[2].seq, 4);
     }
 }
 

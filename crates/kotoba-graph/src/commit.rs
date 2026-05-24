@@ -92,6 +92,11 @@ impl CommitDag {
             .and_then(|c| self.commits.get(&c.to_multibase()))
     }
 
+    /// Look up any commit by CID (not just heads).
+    pub fn get(&self, cid: &KotobaCid) -> Option<&Commit> {
+        self.commits.get(&cid.to_multibase())
+    }
+
     /// Return all head commit CIDs as a map from graph multibase → commit multibase.
     /// Used by `kqe.get-head` in WASM guests.
     pub fn heads_as_map(&self) -> std::collections::HashMap<String, String> {

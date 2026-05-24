@@ -73,6 +73,41 @@ impl QuadStore {
         self.commit_dag.read().await.heads_as_map()
     }
 
+    /// Return the ordered list of commits between `since_head` (exclusive) and the
+    /// current head (inclusive), oldest-first.
+    ///
+    /// Used by a syncing agent to fetch only the delta it is missing:
+    /// ```ignore
+    /// let delta = quad_store.commits_since(&graph, window.head_cid.as_ref()).await;
+    /// ```
+    ///
+    /// Returns an empty `Vec` if `since_head` is already the current head, or if
+    /// `graph_cid` has no commits yet.
+    pub async fn commits_since(
+        &self,
+        graph_cid: &KotobaCid,
+        since_head: Option<&KotobaCid>,
+    ) -> Vec<Commit> {
+        let dag = self.commit_dag.read().await;
+        let mut chain: Vec<Commit> = Vec::new();
+        let mut cursor = dag.head(graph_cid).cloned();
+
+        while let Some(commit) = cursor {
+            // Stop if we've reached the caller's known head (exclusive)
+            if let Some(stop) = since_head {
+                if &commit.cid == stop {
+                    break;
+                }
+            }
+            let prev = commit.prev.clone();
+            chain.push(commit);
+            cursor = prev.and_then(|p| dag.get(&p).cloned());
+        }
+
+        chain.reverse(); // oldest first
+        chain
+    }
+
     /// Flush the current Arrangement for `graph_cid` into a ProllyTree Leaf node,
     /// persist it in the BlockStore, create a Commit, and update the CommitDag.
     ///
@@ -161,6 +196,63 @@ mod tests {
         let head = qs.head_commit(&graph).await.unwrap();
         assert_eq!(head.cid, cid);
         assert_eq!(head.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn commits_since_returns_full_chain_for_fresh_agent() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let graph = KotobaCid::from_bytes(b"graph-since");
+
+        qs.assert(make_quad("graph-since", "a", "p", "1")).await;
+        let c1 = qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        qs.assert(make_quad("graph-since", "b", "p", "2")).await;
+        let c2 = qs.commit("did:test", graph.clone(), 2).await.unwrap();
+        qs.assert(make_quad("graph-since", "c", "p", "3")).await;
+        let c3 = qs.commit("did:test", graph.clone(), 3).await.unwrap();
+
+        // Fresh agent (no prior head) should see all three commits oldest-first
+        let delta = qs.commits_since(&graph, None).await;
+        assert_eq!(delta.len(), 3);
+        assert_eq!(delta[0].cid, c1);
+        assert_eq!(delta[1].cid, c2);
+        assert_eq!(delta[2].cid, c3);
+    }
+
+    #[tokio::test]
+    async fn commits_since_returns_only_new_commits() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let graph = KotobaCid::from_bytes(b"graph-partial");
+
+        qs.assert(make_quad("graph-partial", "a", "p", "1")).await;
+        let c1 = qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        qs.assert(make_quad("graph-partial", "b", "p", "2")).await;
+        let c2 = qs.commit("did:test", graph.clone(), 2).await.unwrap();
+        qs.assert(make_quad("graph-partial", "c", "p", "3")).await;
+        let c3 = qs.commit("did:test", graph.clone(), 3).await.unwrap();
+
+        // Agent already has c1, only wants c2 and c3
+        let delta = qs.commits_since(&graph, Some(&c1)).await;
+        assert_eq!(delta.len(), 2);
+        assert_eq!(delta[0].cid, c2);
+        assert_eq!(delta[1].cid, c3);
+    }
+
+    #[tokio::test]
+    async fn commits_since_returns_empty_when_up_to_date() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let graph = KotobaCid::from_bytes(b"graph-uptodate");
+
+        qs.assert(make_quad("graph-uptodate", "a", "p", "1")).await;
+        let head = qs.commit("did:test", graph.clone(), 1).await.unwrap();
+
+        let delta = qs.commits_since(&graph, Some(&head)).await;
+        assert!(delta.is_empty(), "already at head — nothing to sync");
     }
 
     #[tokio::test]
