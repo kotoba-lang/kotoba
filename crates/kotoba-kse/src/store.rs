@@ -68,9 +68,9 @@ mod tests {
         let entry = journal.publish(topic, Bytes::from_static(b"hello")).await;
         // allow the fire-and-forget spawn to complete
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let key = format!("{:020}.json", entry.seq);
+        let key = format!("{}.cbor", entry.cid.to_multibase());
         let data = store.get(&key).await.unwrap();
-        let recovered: JournalEntry = serde_json::from_slice(&data).unwrap();
+        let recovered: JournalEntry = ciborium::from_reader(&data[..]).unwrap();
         assert_eq!(recovered.seq, entry.seq);
     }
 

@@ -1,5 +1,6 @@
 pub mod atproto;
 pub mod commit;
+pub mod jetstream;
 pub mod quad_store;
 pub mod sparql;
 
@@ -10,3 +11,4 @@ pub use atproto::{
 };
 pub use commit::{Commit, CommitDag};
 pub use quad_store::QuadStore;
+pub use jetstream::run_jetstream_client;

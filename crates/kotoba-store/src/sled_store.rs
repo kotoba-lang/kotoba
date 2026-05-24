@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
-use crate::block_store::{BlockStore, StoreError};
+use kotoba_core::store::BlockStore;
+use crate::block_store::StoreError;
 
-/// Sled-backed block store.  The 36-byte CID is used directly as the key.
+/// Sled-backed block store.  The 36-byte CID is used directly as the sled key.
 pub struct SledBlockStore {
     db: sled::Db,
 }
@@ -13,7 +14,6 @@ impl SledBlockStore {
         Ok(Self { db })
     }
 
-    /// In-memory temporary database (useful for tests / ephemeral nodes).
     pub fn temporary() -> Result<Self, StoreError> {
         let db = sled::Config::new().temporary(true).open()?;
         Ok(Self { db })
@@ -21,13 +21,16 @@ impl SledBlockStore {
 }
 
 impl BlockStore for SledBlockStore {
-    fn put(&self, cid: &KotobaCid, data: &[u8]) -> Result<(), StoreError> {
-        self.db.insert(&cid.0, data)?;
-        Ok(())
+    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        self.db.insert(&cid.0, data)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("sled put: {e}"))
     }
 
-    fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>, StoreError> {
-        Ok(self.db.get(&cid.0)?.map(|v| Bytes::copy_from_slice(&v)))
+    fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
+        self.db.get(&cid.0)
+            .map(|opt| opt.map(|v| Bytes::copy_from_slice(&v)))
+            .map_err(|e| anyhow::anyhow!("sled get: {e}"))
     }
 
     fn has(&self, cid: &KotobaCid) -> bool {
@@ -38,13 +41,13 @@ impl BlockStore for SledBlockStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_store::BlockStore;
+    use crate::block_store::put_verified;
 
     #[test]
     fn put_and_get_roundtrip() {
         let store = SledBlockStore::temporary().unwrap();
         let data = b"hello kotoba block";
-        let cid = kotoba_core::cid::KotobaCid::from_bytes(data);
+        let cid = KotobaCid::from_bytes(data);
         store.put(&cid, data).unwrap();
         let retrieved = store.get(&cid).unwrap().unwrap();
         assert_eq!(retrieved.as_ref(), data);
@@ -53,15 +56,15 @@ mod tests {
     #[test]
     fn put_verified_rejects_mismatch() {
         let store = SledBlockStore::temporary().unwrap();
-        let cid = kotoba_core::cid::KotobaCid::from_bytes(b"real data");
-        let result = store.put_verified(&cid, b"wrong data");
+        let cid = KotobaCid::from_bytes(b"real data");
+        let result = put_verified(&store, &cid, b"wrong data");
         assert!(result.is_err());
     }
 
     #[test]
     fn has_returns_false_for_missing() {
         let store = SledBlockStore::temporary().unwrap();
-        let cid = kotoba_core::cid::KotobaCid::from_bytes(b"not stored");
+        let cid = KotobaCid::from_bytes(b"not stored");
         assert!(!store.has(&cid));
     }
 }

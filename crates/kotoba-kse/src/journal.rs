@@ -35,7 +35,7 @@ pub struct CursorAck;
 /// Journal — ordered persistent log for a set of Topics.
 ///
 /// If built with `with_store()`, each entry is asynchronously persisted to the
-/// backing `KseStore` at key `{seq:020}.json` (fire-and-forget; does not block
+/// backing `KseStore` at key `{cid}.cbor` (fire-and-forget; does not block
 /// `publish()`).  The in-process broadcast channel is always maintained for
 /// low-latency subscribers.
 pub struct Journal {
@@ -77,9 +77,10 @@ impl Journal {
             let entry_clone = entry.clone();
             let store_clone = Arc::clone(store);
             tokio::spawn(async move {
-                let key = format!("{:020}.json", entry_clone.seq);
-                if let Ok(data) = serde_json::to_vec(&entry_clone) {
-                    let _ = store_clone.put(&key, Bytes::from(data)).await;
+                let key = format!("{}.cbor", entry_clone.cid.to_multibase());
+                let mut buf = Vec::new();
+                if ciborium::into_writer(&entry_clone, &mut buf).is_ok() {
+                    let _ = store_clone.put(&key, Bytes::from(buf)).await;
                 }
             });
         }

@@ -7,8 +7,11 @@ use kotoba_dht::{
 };
 use kotoba_kse::{store::KseStore, Journal, Shelf, Topic};
 use kotoba_kqe::quad::Quad;
+use kotoba_graph::QuadStore;
+use kotoba_store::IpfsPinClient;
 use kotoba_runtime::{host::InferenceFn, UdfExecutor, WasmExecutor};
 use kotoba_vm::{distributed::DistributedPregelRunner, InvokeRouter};
+use kotoba_core::store::BlockStore;
 
 /// Shared server state — Arc-wrapped and injected into every axum handler.
 pub struct KotobaState {
@@ -33,6 +36,15 @@ pub struct KotobaState {
     // ── Inference ────────────────────────────────────────────────────────
     /// Gemma 4 E2B inference engine, loaded at startup when `KOTOBA_LOAD_GEMMA` is set.
     pub inference_engine: Option<InferenceFn>,
+    // ── BlockStore ───────────────────────────────────────────────────────
+    /// Content-addressed block store (sled-backed or ephemeral).
+    pub block_store: Arc<dyn BlockStore + Send + Sync>,
+    // ── QuadStore ────────────────────────────────────────────────────────────
+    /// Quad write/read with ProllyTree commit + 3-index Journal publish.
+    pub quad_store:  Arc<QuadStore>,
+    // ── IPFS Pinning ─────────────────────────────────────────────────────────
+    /// Optional IPFS Pinning Service client (Pinata/web3.storage/Filebase).
+    pub ipfs_pin: Option<Arc<IpfsPinClient>>,
 }
 
 impl KotobaState {
@@ -75,6 +87,48 @@ impl KotobaState {
         };
         let udf = Arc::new(UdfExecutor::new()?);
 
+        // BlockStore — priority: sled path > B2/S3 > ephemeral sled
+        let block_store: Arc<dyn BlockStore + Send + Sync> =
+            if let Ok(path) = std::env::var("KOTOBA_STORE_PATH") {
+                tracing::info!(path, "BlockStore: sled-backed persistence");
+                Arc::new(
+                    kotoba_store::SledBlockStore::open(&path)
+                        .map_err(|e| anyhow::anyhow!("sled open failed: {e}"))?,
+                )
+            } else if let (Ok(bucket), Ok(key_id), Ok(app_key)) = (
+                std::env::var("KOTOBA_B2_BUCKET"),
+                std::env::var("KOTOBA_B2_KEY_ID"),
+                std::env::var("KOTOBA_B2_APP_KEY"),
+            ) {
+                let endpoint = std::env::var("KOTOBA_B2_ENDPOINT")
+                    .unwrap_or_else(|_| "https://s3.us-west-001.backblazeb2.com".into());
+                use object_store::aws::AmazonS3Builder;
+                let s3 = AmazonS3Builder::new()
+                    .with_bucket_name(&bucket)
+                    .with_access_key_id(&key_id)
+                    .with_secret_access_key(&app_key)
+                    .with_endpoint(&endpoint)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("B2 block store build: {e}"))?;
+                tracing::info!(bucket, "BlockStore: B2/S3-backed (kotoba/blocks/)");
+                Arc::new(kotoba_store::S3BlockStore::new(Arc::new(s3), "kotoba/blocks"))
+            } else {
+                tracing::warn!("BlockStore: ephemeral sled (set KOTOBA_STORE_PATH or KOTOBA_B2_* for persistence)");
+                Arc::new(
+                    kotoba_store::SledBlockStore::temporary()
+                        .map_err(|e| anyhow::anyhow!("sled temporary failed: {e}"))?,
+                )
+            };
+
+        // IPFS Pinning Service client (E) — optional, no daemon required
+        let ipfs_pin = IpfsPinClient::from_env();
+        if ipfs_pin.is_some() {
+            tracing::info!("IPFS pinning enabled (KOTOBA_IPFS_PIN_ENDPOINT)");
+        }
+
+        // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path
+        let quad_store = Arc::new(QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store)));
+
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
             journal,
@@ -87,6 +141,9 @@ impl KotobaState {
             gossip_tx:     None,
             pregel_runner: None,
             inference_engine,
+            block_store,
+            quad_store,
+            ipfs_pin,
         })
     }
 

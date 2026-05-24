@@ -66,6 +66,24 @@ impl Arrangement {
 
     pub fn len(&self) -> usize { self.count }
     pub fn is_empty(&self) -> bool { self.count == 0 }
+
+    /// Reconstruct all Quads from the SPO index, attaching the given graph CID.
+    pub fn quads(&self, graph: &KotobaCid) -> Vec<crate::quad::Quad> {
+        let mut out = Vec::with_capacity(self.count);
+        for (subject, pmap) in &self.spo {
+            for (predicate, objects) in pmap {
+                for object in objects {
+                    out.push(crate::quad::Quad {
+                        graph:     graph.clone(),
+                        subject:   subject.clone(),
+                        predicate: predicate.clone(),
+                        object:    object.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
 }
 
 fn object_key(obj: &QuadObject) -> String {

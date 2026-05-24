@@ -1,31 +1,24 @@
-use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use thiserror::Error;
+
+/// The canonical BlockStore trait lives in kotoba-core to avoid circular deps.
+/// Re-export it here so callers can use `kotoba_store::BlockStore`.
+pub use kotoba_core::store::BlockStore;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sled error: {0}")]
     Sled(#[from] sled::Error),
-    #[error("cid mismatch: expected {expected}, got {actual}")]
-    CidMismatch { expected: String, actual: String },
 }
 
-/// Content-addressed block store.
-/// `put` verifies the CID matches blake3(bytes) before writing.
-/// `get` returns None if the block is not present (no CID verification on get — caller must verify if needed).
-pub trait BlockStore: Send + Sync {
-    fn put(&self, cid: &KotobaCid, data: &[u8]) -> Result<(), StoreError>;
-    fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>, StoreError>;
-    fn has(&self, cid: &KotobaCid) -> bool;
-    /// Verify and put: compute CID from bytes, assert it matches `cid`.
-    fn put_verified(&self, cid: &KotobaCid, data: &[u8]) -> Result<(), StoreError> {
-        let computed = KotobaCid::from_bytes(data);
-        if &computed != cid {
-            return Err(StoreError::CidMismatch {
-                expected: cid.to_multibase(),
-                actual: computed.to_multibase(),
-            });
-        }
-        self.put(cid, data)
-    }
+/// Verify that `blake3(data) == cid`, then put.  Returns `Err` on CID mismatch.
+pub fn put_verified(store: &dyn BlockStore, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+    let computed = KotobaCid::from_bytes(data);
+    anyhow::ensure!(
+        &computed == cid,
+        "cid mismatch: expected {}, got {}",
+        cid.to_multibase(),
+        computed.to_multibase(),
+    );
+    store.put(cid, data)
 }

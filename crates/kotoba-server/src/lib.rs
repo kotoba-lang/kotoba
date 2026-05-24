@@ -7,6 +7,7 @@ use axum::{
     Router,
     routing::{get, post},
 };
+
 use tower_http::trace::TraceLayer;
 use crate::server::KotobaState;
 
@@ -25,6 +26,30 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", xrpc::NSID_NODE_STATUS),
             get(xrpc::node_status),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_BLOCK_PUT),
+            post(xrpc::block_put),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_BLOCK_GET),
+            get(xrpc::block_get),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_COMMIT_GET),
+            get(xrpc::commit_get),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_COMMIT_STORE),
+            post(xrpc::commit_store),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_GRAPH_QUERY),
+            get(xrpc::graph_query),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_WEIGHT_PUT),
+            post(xrpc::weight_put),
         )
         .with_state(state)
         .layer(TraceLayer::new_for_http())

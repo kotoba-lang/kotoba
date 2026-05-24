@@ -20,6 +20,8 @@
 
 use std::collections::HashMap;
 use kotoba_core::cid::KotobaCid;
+use kotoba_core::store::BlockStore;
+use kotoba_core::prolly::{ProllyTree, ProllyNode};
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -137,11 +139,26 @@ impl PregelGraph {
             }
         }
 
+        // Sort each inbox deterministically: (src_cid_multibase, payload).
+        // Gossip delivery order varies across nodes; sorting here ensures that
+        // every node with the same message set produces identical compute inputs.
+        // The next superstep re-sorts its own inboxes, so pending queue order
+        // after Phase 3 does not affect determinism.
+        for inbox in inboxes.values_mut() {
+            inbox.sort_by(|a, b| {
+                a.src.cid().to_multibase()
+                    .cmp(&b.src.cid().to_multibase())
+                    .then_with(|| a.payload.cmp(&b.payload))
+            });
+        }
+
         // --- Phase 2: Compute ---
-        let active_ids: Vec<VertexId> = self.vertices.values()
+        // Sort active vertex IDs so all nodes iterate in the same order.
+        let mut active_ids: Vec<VertexId> = self.vertices.values()
             .filter(|v| v.active)
             .map(|v| v.id.clone())
             .collect();
+        active_ids.sort_by_key(|id| id.cid().to_multibase());
         let active_count = active_ids.len();
         let mut all_out_messages: Vec<Message> = Vec::new();
 
@@ -196,6 +213,23 @@ impl PregelGraph {
 
     pub fn vertex_count(&self) -> usize { self.vertices.len() }
     pub fn current_superstep(&self) -> u32 { self.superstep }
+
+    /// Snapshot all vertex states into a content-addressed ProllyTree leaf node
+    /// and return the root CID — the Merkle proof for this superstep's state.
+    ///
+    /// Entries are sorted by vertex CID for deterministic output regardless of
+    /// HashMap iteration order.  Calling this after each superstep gives one
+    /// root CID per BSP step, satisfying the "Merkle root per superstep" invariant.
+    pub fn checkpoint(&self, store: &dyn BlockStore) -> anyhow::Result<KotobaCid> {
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = self.vertices.values()
+            .map(|v| (v.id.cid().0.to_vec(), v.state.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let placeholder = KotobaCid::from_bytes(b"superstep-checkpoint");
+        let leaf = ProllyNode::Leaf { entries, cid: placeholder };
+        ProllyTree::put_node(&leaf, store)
+    }
 }
 
 impl Default for PregelGraph { fn default() -> Self { Self::new() } }
@@ -405,6 +439,70 @@ mod tests {
         assert_eq!(r.active_count, 1);
         let v = graph.vertex(&VertexId::from_str("new-vertex")).unwrap();
         assert_eq!(v.state, b"created");
+    }
+
+    #[test]
+    fn test_inbox_sort_is_deterministic() {
+        // Two graphs receive the same three messages in different injection orders.
+        // A compute function that concatenates payload bytes into vertex state
+        // will produce identical output only if inboxes are sorted before compute.
+        let compute: ComputeFn = Box::new(|_v, inbox| {
+            // Concatenate payloads in inbox order — sensitive to ordering
+            let new_state: Vec<u8> = inbox.iter().flat_map(|m| m.payload.iter().copied()).collect();
+            ComputeOutput { new_state, messages: vec![], vote_halt: true }
+        });
+
+        let dst = VertexId::from_str("target");
+
+        // Graph A: inject in order alpha, beta, gamma
+        let mut graph_a = PregelGraph::new();
+        graph_a.add_vertex(dst.clone(), Vec::new());
+        graph_a.inject_message(make_msg("src-alpha", "target", b"A"));
+        graph_a.inject_message(make_msg("src-beta",  "target", b"B"));
+        graph_a.inject_message(make_msg("src-gamma", "target", b"C"));
+
+        // Graph B: inject in reverse order
+        let mut graph_b = PregelGraph::new();
+        graph_b.add_vertex(dst.clone(), Vec::new());
+        graph_b.inject_message(make_msg("src-gamma", "target", b"C"));
+        graph_b.inject_message(make_msg("src-beta",  "target", b"B"));
+        graph_b.inject_message(make_msg("src-alpha", "target", b"A"));
+
+        graph_a.superstep(&compute);
+        graph_b.superstep(&compute);
+
+        let state_a = graph_a.vertex(&dst).unwrap().state.clone();
+        let state_b = graph_b.vertex(&dst).unwrap().state.clone();
+        assert_eq!(state_a, state_b, "inbox sort must produce identical state regardless of injection order");
+    }
+
+    #[test]
+    fn test_active_vertex_iteration_is_deterministic() {
+        // Three vertices all receive a message; compute records the vertex CID
+        // into a shared vec. After sorting active_ids, the execution order is
+        // lexicographic by CID multibase — independent of HashMap iteration order.
+        use std::sync::{Arc, Mutex};
+
+        let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let order_clone = Arc::clone(&order);
+
+        let compute: ComputeFn = Box::new(move |v, _inbox| {
+            order_clone.lock().unwrap().push(v.id.cid().to_multibase());
+            ComputeOutput { new_state: vec![], messages: vec![], vote_halt: true }
+        });
+
+        let mut graph = PregelGraph::new();
+        for name in &["vc", "va", "vb"] {
+            let vid = VertexId::from_str(name);
+            graph.add_vertex(vid.clone(), Vec::new());
+            graph.inject_message(make_msg("seed", name, b"go"));
+        }
+        graph.superstep(&compute);
+
+        let recorded = order.lock().unwrap().clone();
+        let mut sorted = recorded.clone();
+        sorted.sort();
+        assert_eq!(recorded, sorted, "vertices must be computed in sorted CID order");
     }
 
     #[test]

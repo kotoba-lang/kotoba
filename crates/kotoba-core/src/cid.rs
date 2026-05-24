@@ -3,7 +3,11 @@ use thiserror::Error;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct KotobaCid(pub [u8; 36]); // version(1) + codec(1) + multihash(34)
+pub struct KotobaCid(pub [u8; 36]);
+
+impl Default for KotobaCid {
+    fn default() -> Self { Self([0u8; 36]) }
+} // version(1) + codec(1) + multihash(34)
 
 // Manual Serialize/Deserialize for [u8; 36] (fixed arrays need special handling in serde)
 impl Serialize for KotobaCid {
@@ -75,6 +79,19 @@ impl KotobaCid {
         // base32lower (multibase 'b')
         let encoded = data_encoding::BASE32_NOPAD.encode(&self.0);
         format!("b{}", encoded.to_lowercase())
+    }
+
+    /// Parse a multibase-encoded CID (base32lower, 'b' prefix).
+    /// Returns `None` if the string is malformed or decodes to != 36 bytes.
+    pub fn from_multibase(s: &str) -> Option<Self> {
+        let hex = s.strip_prefix('b')?;
+        let bytes = data_encoding::BASE32_NOPAD
+            .decode(hex.to_uppercase().as_bytes())
+            .ok()?;
+        if bytes.len() != 36 { return None; }
+        let mut arr = [0u8; 36];
+        arr.copy_from_slice(&bytes);
+        Some(Self(arr))
     }
 }
 

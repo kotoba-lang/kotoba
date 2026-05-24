@@ -11,6 +11,9 @@ pub const NSID_WEIGHT_PUT:   &str = "ai.gftd.apps.kotoba.weight.put";
 pub const NSID_LORA_APPLY:   &str = "ai.gftd.apps.kotoba.lora.apply";
 pub const NSID_EMBED_CREATE: &str = "ai.gftd.apps.kotoba.embed.create";
 pub const NSID_NODE_STATUS:  &str = "ai.gftd.apps.kotoba.node.status";
+pub const NSID_BLOCK_PUT:    &str = "ai.gftd.apps.kotoba.block.put";
+pub const NSID_BLOCK_GET:    &str = "ai.gftd.apps.kotoba.block.get";
+pub const NSID_COMMIT_STORE: &str = "ai.gftd.apps.kotoba.commit.store";
 
 use std::sync::Arc;
 use axum::{
@@ -120,14 +123,16 @@ pub async fn quad_create(
         object:    QuadObject::Text(req.object.clone()),
     };
 
+    // Journal (B2 persistence + GossipSub) AND QuadStore (Arrangement + ProllyTree)
     let journal_cid = state.journal_assert(&quad).await;
+    state.quad_store.assert(quad).await;
 
     tracing::info!(
-        graph    = %req.graph,
-        subject  = %req.subject,
+        graph     = %req.graph,
+        subject   = %req.subject,
         predicate = %req.predicate,
-        cid      = %journal_cid,
-        "quad.create → KSE Journal"
+        cid       = %journal_cid,
+        "quad.create → Journal + QuadStore"
     );
 
     (StatusCode::OK, Json(QuadCreateResp { status: "ok", journal_cid }))
@@ -256,4 +261,287 @@ pub async fn invoke_run(
             }))
         }
     }
+}
+
+// ── Block store endpoints ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct BlockPutReq {
+    /// base64-encoded raw block bytes
+    pub data_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockPutResp {
+    pub cid: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BlockGetReq {
+    pub cid: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockGetResp {
+    pub cid:      String,
+    pub data_b64: String,
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.block.put
+/// Write raw bytes into the block store, returning the CID.
+pub async fn block_put(
+    State(state): State<Arc<KotobaState>>,
+    Json(req):    Json<BlockPutReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use kotoba_core::cid::KotobaCid;
+
+    let bytes = B64.decode(&req.data_b64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let cid = KotobaCid::from_bytes(&bytes);
+    state.block_store.put(&cid, &bytes)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Fire-and-forget IPFS pin (E) — no-op if KOTOBA_IPFS_PIN_ENDPOINT not set
+    if let Some(pin) = &state.ipfs_pin {
+        let pin  = std::sync::Arc::clone(pin);
+        let cid_str = cid.to_multibase();
+        tokio::spawn(async move { pin.pin(&cid_str).await });
+    }
+
+    Ok(Json(BlockPutResp { cid: cid.to_multibase() }))
+}
+
+/// GET /xrpc/ai.gftd.apps.kotoba.block.get?cid=<multibase>
+pub async fn block_get(
+    State(state): State<Arc<KotobaState>>,
+    axum::extract::Query(req): axum::extract::Query<BlockGetReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use kotoba_core::cid::KotobaCid;
+
+    let cid = KotobaCid::from_multibase(&req.cid)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid CID".into()))?;
+    match state.block_store.get(&cid)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        None => Err((StatusCode::NOT_FOUND, "block not found".into())),
+        Some(bytes) => Ok(Json(BlockGetResp {
+            cid:      req.cid.clone(),
+            data_b64: B64.encode(&bytes),
+        })),
+    }
+}
+
+// ── Commit endpoints ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CommitGetReq {
+    pub graph: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitGetResp {
+    pub cid:    String,
+    pub graph:  String,
+    pub root:   String,
+    pub prev:   Option<String>,
+    pub author: String,
+    pub seq:    u64,
+    pub ts:     u64,
+}
+
+/// GET /xrpc/ai.gftd.apps.kotoba.commit.get?graph=<multibase>
+pub async fn commit_get(
+    State(state): State<Arc<KotobaState>>,
+    axum::extract::Query(req): axum::extract::Query<CommitGetReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kotoba_core::cid::KotobaCid;
+
+    let graph_cid = KotobaCid::from_multibase(&req.graph)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph CID".into()))?;
+    match state.quad_store.head_commit(&graph_cid).await {
+        None => Err((StatusCode::NOT_FOUND, "no commit for graph".into())),
+        Some(c) => Ok(Json(CommitGetResp {
+            cid:    c.cid.to_multibase(),
+            graph:  c.graph.to_multibase(),
+            root:   c.root.to_multibase(),
+            prev:   c.prev.map(|p| p.to_multibase()),
+            author: c.author,
+            seq:    c.seq,
+            ts:     c.ts,
+        })),
+    }
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.commit.store
+/// Flush current Arrangement for the given graph into BlockStore and create a Commit.
+#[derive(Debug, Deserialize)]
+pub struct CommitStoreReq {
+    pub graph:  String,
+    pub author: String,
+    pub seq:    u64,
+}
+
+pub async fn commit_store(
+    State(state): State<Arc<KotobaState>>,
+    Json(req):    Json<CommitStoreReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kotoba_core::cid::KotobaCid;
+
+    let graph_cid = KotobaCid::from_multibase(&req.graph)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph CID".into()))?;
+    let cid = state.quad_store
+        .commit(&req.author, graph_cid, req.seq)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "cid": cid.to_multibase() })))
+}
+
+// ── Graph query (B) ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct GraphQueryReq {
+    /// Named graph CID (multibase base32lower)
+    pub graph:     String,
+    /// Optional subject CID filter (multibase or raw string)
+    pub subject:   Option<String>,
+    /// Optional predicate filter (exact string match)
+    pub predicate: Option<String>,
+    /// Datalog rules reserved for invoke.run; graph.query returns SPO matches only
+    pub rules:     Option<String>,
+}
+
+/// GET /xrpc/ai.gftd.apps.kotoba.graph.query
+/// SPO pattern query over the in-memory Arrangement.
+/// Full Datalog evaluation: use invoke.run with program_type=datalog.
+pub async fn graph_query(
+    State(state): State<Arc<KotobaState>>,
+    axum::extract::Query(req): axum::extract::Query<GraphQueryReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kotoba_core::cid::KotobaCid;
+
+    let graph_cid = KotobaCid::from_multibase(&req.graph)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph CID".into()))?;
+
+    let arrangement = match state.quad_store.arrangement(&graph_cid).await {
+        None => {
+            return Ok(Json(serde_json::json!({ "graph": req.graph, "count": 0, "quads": [] })));
+        }
+        Some(a) => a,
+    };
+
+    let mut quads = arrangement.quads(&graph_cid);
+
+    // Subject filter (accept multibase CID or raw string → hash to CID)
+    if let Some(s) = &req.subject {
+        let s_cid = KotobaCid::from_multibase(s)
+            .unwrap_or_else(|| KotobaCid::from_bytes(s.as_bytes()));
+        quads.retain(|q| q.subject == s_cid);
+    }
+
+    // Predicate filter
+    if let Some(p) = &req.predicate {
+        quads.retain(|q| &q.predicate == p);
+    }
+
+    Ok(Json(serde_json::json!({
+        "graph": req.graph,
+        "count": quads.len(),
+        "quads": quads,
+        "note":  if req.rules.is_some() { "use invoke.run for Datalog evaluation" } else { "" },
+    })))
+}
+
+// ── Weight put (C) ────────────────────────────────────────────────────────
+
+pub const NSID_WEIGHT_GET:  &str = "ai.gftd.apps.kotoba.weight.get";
+
+#[derive(Debug, Deserialize)]
+pub struct WeightPutReq {
+    /// model CID (multibase) — identifies the model this weight belongs to
+    pub model_cid: String,
+    /// layer index
+    pub layer:     u32,
+    /// raw FP8 tensor bytes, base64-encoded
+    pub data_b64:  String,
+    /// tensor shape e.g. [4096, 4096]
+    pub shape:     Vec<u32>,
+    /// dtype string: "fp8e4m3" | "fp8e5m2" | "fp16" | "bf16" | "f32"
+    pub dtype:     String,
+    /// named graph CID (multibase) to index this weight in
+    pub graph:     String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WeightPutResp {
+    pub blob_cid:    String,
+    pub quad_cid:    String,
+    pub layer:       u32,
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.weight.put
+pub async fn weight_put(
+    State(state): State<Arc<KotobaState>>,
+    Json(req):    Json<WeightPutReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use kotoba_core::cid::KotobaCid;
+    use kotoba_kqe::quad::{Quad, QuadObject, TensorDtype};
+
+    let bytes = B64.decode(&req.data_b64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // 1. Store raw tensor bytes in BlockStore (content-addressed)
+    let blob_cid = KotobaCid::from_bytes(&bytes);
+    state.block_store.put(&blob_cid, &bytes)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // 2. IPFS pin the tensor blob
+    if let Some(pin) = &state.ipfs_pin {
+        let pin  = std::sync::Arc::clone(pin);
+        let cs   = blob_cid.to_multibase();
+        tokio::spawn(async move { pin.pin(&cs).await });
+    }
+
+    // 3. Parse CIDs
+    let model_cid = KotobaCid::from_multibase(&req.model_cid)
+        .unwrap_or_else(|| KotobaCid::from_bytes(req.model_cid.as_bytes()));
+    let graph_cid = KotobaCid::from_multibase(&req.graph)
+        .unwrap_or_else(|| KotobaCid::from_bytes(req.graph.as_bytes()));
+
+    let dtype = match req.dtype.as_str() {
+        "fp8e4m3" | "f8e4m3" => TensorDtype::F8E4M3,
+        "fp8e5m2" | "f8e5m2" => TensorDtype::F8E5M2,
+        "fp16"    | "f16"    => TensorDtype::F16,
+        "bf16"               => TensorDtype::BF16,
+        _                    => TensorDtype::F32,
+    };
+
+    // 4. Assert WeightRef Quad: (graph, model_cid) --weight/layer/N--> blob_cid
+    let quad = Quad {
+        graph:     graph_cid,
+        subject:   model_cid,
+        predicate: format!("weight/layer/{}", req.layer),
+        object:    QuadObject::TensorCid {
+            cid:   blob_cid.clone(),
+            shape: req.shape.clone(),
+            dtype,
+        },
+    };
+    let quad_cid = state.journal_assert(&quad).await;
+    state.quad_store.assert(quad).await;
+
+    tracing::info!(
+        blob_cid = %blob_cid.to_multibase(),
+        layer    = req.layer,
+        bytes    = bytes.len(),
+        "weight.put stored"
+    );
+
+    Ok(Json(WeightPutResp {
+        blob_cid: blob_cid.to_multibase(),
+        quad_cid,
+        layer:    req.layer,
+    }))
 }

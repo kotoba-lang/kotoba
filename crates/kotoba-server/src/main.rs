@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 use kotoba_server::{build_router, server::KotobaState};
 use kotoba_net::{KotobaNetEvent, KotobaSwarm, PREGEL_GOSSIP_TOPIC};
 use kotoba_vm::distributed::{DistributedMessage, DistributedPregelRunner};
+use kotoba_core::store::BlockStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -109,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
                     tokio::sync::mpsc::channel::<(String, Vec<u8>)>(1024);
 
                 let journal_arc = Arc::clone(&state.journal);
+                let block_store_arc = Arc::clone(&state.block_store);
 
                 tokio::spawn(swarm_actor(
                     swarm,
@@ -116,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
                     journal_arc,
                     pregel_inbound_tx,
                     pregel_outbound_rx,
+                    block_store_arc,
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");
@@ -130,6 +133,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("KOTOBA_NO_SWARM set — skipping p2p swarm");
         state
     };
+
+    // ── 5. Jetstream AT Protocol firehose (optional) ──────────────────────────
+    if std::env::var("KOTOBA_JETSTREAM").is_ok() {
+        let journal_arc     = Arc::clone(&state.journal);
+        let quad_store_arc  = Arc::clone(&state.quad_store);
+        tokio::spawn(kotoba_graph::run_jetstream_client(journal_arc, quad_store_arc));
+        tracing::info!("Jetstream client started (Journal + QuadStore)");
+    }
 
     let state = Arc::new(state);
 
@@ -149,10 +160,10 @@ async fn main() -> anyhow::Result<()> {
 
 /// Swarm actor task.
 ///
-/// Three-way fan-out via `tokio::select!`:
-///   1. `publish_rx`       — KSE outbound → `swarm.publish`
+/// Four-way fan-out via `tokio::select!`:
+///   1. `publish_rx`         — KSE outbound → `swarm.publish`
 ///   2. `pregel_outbound_rx` — Pregel runner outbound → `swarm.send_pregel_message`
-///   3. `swarm.next_event` — inbound gossip → route to KSE Journal or Pregel inbound channel
+///   3. `swarm.next_event`   — inbound events → Bitswap serving, KSE Journal, or Pregel channel
 ///
 /// GossipSub topics managed here:
 ///   "kotoba/quad/assert"  / "kotoba/quad/retract" — KSE quad propagation
@@ -163,6 +174,7 @@ async fn swarm_actor(
     journal:             Arc<kotoba_kse::Journal>,
     pregel_inbound_tx:   tokio::sync::mpsc::Sender<DistributedMessage>,
     mut pregel_out_rx:   tokio::sync::mpsc::Receiver<DistributedMessage>,
+    block_store:         Arc<dyn BlockStore + Send + Sync>,
 ) {
     swarm.subscribe("quad/assert").ok();
     swarm.subscribe("quad/retract").ok();
@@ -187,36 +199,64 @@ async fn swarm_actor(
                     .ok();
             }
 
-            // ── Inbound: peer gossip → KSE Journal or Pregel channel ────
+            // ── Inbound: peer events → Bitswap / KSE Journal / Pregel ───
             event = swarm.next_event() => {
                 let Some(event) = event else { break };
-                if let KotobaNetEvent::GossipMessage { topic, data, .. } = event {
-                    if topic == pregel_full_topic
-                        || topic.ends_with(PREGEL_GOSSIP_TOPIC)
-                    {
-                        // Decode Pregel gossip message and forward to runner
-                        if let Ok(pnet) =
-                            serde_json::from_slice::<kotoba_net::PregelNetMessage>(&data)
-                        {
-                            use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-                            let payload = B64.decode(&pnet.payload_b64).unwrap_or_default();
-                            pregel_inbound_tx
-                                .try_send(DistributedMessage {
-                                    src: pnet.src,
-                                    dst: pnet.dst,
-                                    payload,
-                                })
-                                .ok();
+                match event {
+                    KotobaNetEvent::BitswapRequest { peer: _, request, channel } => {
+                        let mut have      = Vec::new();
+                        let mut dont_have = Vec::new();
+                        let mut blocks    = Vec::new();
+
+                        for raw in &request.want_have {
+                            let cid = kotoba_core::cid::KotobaCid(*raw);
+                            if block_store.has(&cid) {
+                                have.push(*raw);
+                            } else {
+                                dont_have.push(*raw);
+                            }
                         }
-                    } else {
-                        // KSE journal ingest — strip "kotoba/" prefix
-                        let kse_name = topic
-                            .strip_prefix("kotoba/")
-                            .unwrap_or(&topic)
-                            .to_string();
-                        let kse_topic = kotoba_kse::Topic(kse_name);
-                        journal.publish(kse_topic, bytes::Bytes::from(data)).await;
+                        for raw in &request.want_block {
+                            let cid = kotoba_core::cid::KotobaCid(*raw);
+                            match block_store.get(&cid) {
+                                Ok(Some(bytes)) => blocks.push((*raw, bytes.to_vec())),
+                                _               => dont_have.push(*raw),
+                            }
+                        }
+
+                        swarm.swarm.behaviour_mut().bitswap
+                            .send_response(channel, kotoba_net::BitswapResponse { have, dont_have, blocks })
+                            .ok();
                     }
+                    KotobaNetEvent::GossipMessage { topic, data, .. } => {
+                        if topic == pregel_full_topic
+                            || topic.ends_with(PREGEL_GOSSIP_TOPIC)
+                        {
+                            // Decode Pregel gossip message and forward to runner
+                            if let Ok(pnet) =
+                                serde_json::from_slice::<kotoba_net::PregelNetMessage>(&data)
+                            {
+                                use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+                                let payload = B64.decode(&pnet.payload_b64).unwrap_or_default();
+                                pregel_inbound_tx
+                                    .try_send(DistributedMessage {
+                                        src: pnet.src,
+                                        dst: pnet.dst,
+                                        payload,
+                                    })
+                                    .ok();
+                            }
+                        } else {
+                            // KSE journal ingest — strip "kotoba/" prefix
+                            let kse_name = topic
+                                .strip_prefix("kotoba/")
+                                .unwrap_or(&topic)
+                                .to_string();
+                            let kse_topic = kotoba_kse::Topic(kse_name);
+                            journal.publish(kse_topic, bytes::Bytes::from(data)).await;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
