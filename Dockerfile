@@ -28,7 +28,6 @@ RUN mkdir -p /data/sled && chown kotoba:kotoba /data/sled
 USER kotoba
 
 ENV KOTOBA_PORT=8080 \
-    KOTOBA_STORE_PATH=/data/sled \
     RUST_LOG=info
 
 EXPOSE 8080
