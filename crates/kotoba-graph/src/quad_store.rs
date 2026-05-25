@@ -1,6 +1,7 @@
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_core::prolly::ProllyTree;
+use kotoba_store::{CapturingBlockStore, CarBundleWriter};
 use kotoba_kqe::quad::Quad;
 use kotoba_kqe::delta::Delta;
 use kotoba_kqe::arrangement::Arrangement;
@@ -332,27 +333,45 @@ impl QuadStore {
             }
         };
 
-        // Build 4 ProllyTrees on a dedicated 64 MB stack thread.
-        // tokio::task::spawn_blocking uses the blocking thread pool (default 8 MB stack),
-        // which overflows at 1M+ entry scale.  A manual thread + oneshot channel avoids that.
+        // Build 4 ProllyTrees in parallel, each on a dedicated 64 MB stack thread.
+        // Each thread gets a CapturingBlockStore that writes through to the shared hot store
+        // and simultaneously records every block written — used below for CAR bundling.
         let bs = Arc::clone(&self.block_store);
-        let (tx, rx) = tokio::sync::oneshot::channel::<anyhow::Result<_>>();
-        std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .name("kotoba-prolly-build".to_string())
-            .spawn(move || {
-                let result = (|| -> anyhow::Result<_> {
-                    let re = ProllyTree::build_tree(eavt_entries, &*bs)?;
-                    let ra = ProllyTree::build_tree(aevt_entries, &*bs)?;
-                    let rv = ProllyTree::build_tree(avet_entries, &*bs)?;
-                    let rw = ProllyTree::build_tree(vaet_entries, &*bs)?;
-                    Ok((re, ra, rv, rw))
-                })();
-                let _ = tx.send(result);
-            })
-            .map_err(|e| anyhow::anyhow!("failed to spawn prolly-build thread: {e}"))?;
-        let (root_eavt, root_aevt, root_avet, root_vaet) = rx.await
-            .map_err(|_| anyhow::anyhow!("prolly-build thread dropped sender"))??;
+        let tree_inputs: Vec<(&'static str, Vec<(Vec<u8>, Vec<u8>)>)> = vec![
+            ("eavt", eavt_entries),
+            ("aevt", aevt_entries),
+            ("avet", avet_entries),
+            ("vaet", vaet_entries),
+        ];
+
+        let mut handles = Vec::with_capacity(4);
+        for (name, entries) in tree_inputs {
+            let inner = Arc::clone(&bs);
+            let handle = std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .name(format!("kotoba-prolly-{name}"))
+                .spawn(move || -> anyhow::Result<(KotobaCid, Vec<(KotobaCid, Vec<u8>)>)> {
+                    let cap = Arc::new(CapturingBlockStore::new(inner));
+                    let root = ProllyTree::build_tree(entries, &*cap)?;
+                    let blocks = cap.drain();
+                    Ok((root, blocks))
+                })
+                .map_err(|e| anyhow::anyhow!("failed to spawn prolly-{name} thread: {e}"))?;
+            handles.push(handle);
+        }
+
+        let mut roots: Vec<KotobaCid> = Vec::with_capacity(4);
+        let mut all_blocks: Vec<(KotobaCid, Vec<u8>)> = Vec::new();
+        for h in handles {
+            let (root, blocks) = h.join()
+                .map_err(|_| anyhow::anyhow!("prolly-build thread panicked"))??;
+            roots.push(root);
+            all_blocks.extend(blocks);
+        }
+        let root_vaet = roots.remove(3);
+        let root_avet = roots.remove(2);
+        let root_aevt = roots.remove(1);
+        let root_eavt = roots.remove(0);
 
         let mut index_roots = std::collections::HashMap::new();
         index_roots.insert("aevt".to_string(), root_aevt);
@@ -367,6 +386,24 @@ impl QuadStore {
         // Seal + persist Commit (root = EAVT for backward compat)
         let commit = Commit::seal(graph_cid.clone(), root_eavt, prev, author.to_string(), seq, index_roots);
         let cid    = commit.persist(&*self.block_store)?;
+
+        // Pack all tree blocks + commit block into a single CAR bundle.
+        // The CAR is stored in the block store under the commit CID so the cold tier
+        // can upload it as one batched PUT instead of N individual PUTs.
+        {
+            let mut writer = CarBundleWriter::new(cid.clone());
+            for (bcid, data) in &all_blocks {
+                writer.append(bcid, data);
+            }
+            let (car_bytes, _idx) = writer.finish();
+            let car_cid = KotobaCid::from_bytes(&car_bytes);
+            if let Err(e) = self.block_store.put(&car_cid, &car_bytes) {
+                tracing::warn!(%cid, car_blocks = all_blocks.len(), "CAR bundle write failed: {e}");
+            } else {
+                tracing::debug!(%cid, car_blocks = all_blocks.len(),
+                    car_bytes = car_bytes.len(), "CAR bundle stored");
+            }
+        }
 
         // Update in-memory CommitDag
         self.commit_dag.write().await.add(commit);
