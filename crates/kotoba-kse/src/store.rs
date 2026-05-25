@@ -36,6 +36,28 @@ impl KseStore {
     pub async fn exists(&self, key: &str) -> bool {
         self.inner.head(&self.path(key)).await.is_ok()
     }
+
+    /// List all keys under `{prefix}{sub_prefix}`, returning them relative to `self.prefix`.
+    ///
+    /// E.g. with `self.prefix = "journal/"` and `sub_prefix = "seq/"`, returns strings like
+    /// `"seq/00000000000000000001"`.
+    pub async fn list_prefix(&self, sub_prefix: &str) -> Vec<String> {
+        use tokio_stream::StreamExt as _;
+        let full_prefix = format!("{}{}", self.prefix, sub_prefix);
+        let prefix_path = Path::from(full_prefix.as_str());
+        let mut stream = self.inner.list(Some(&prefix_path));
+        let store_prefix = self.prefix.as_str();
+        let mut keys = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(meta) = item {
+                let location = meta.location.to_string();
+                if let Some(relative) = location.strip_prefix(store_prefix) {
+                    keys.push(relative.to_string());
+                }
+            }
+        }
+        keys
+    }
 }
 
 #[cfg(test)]

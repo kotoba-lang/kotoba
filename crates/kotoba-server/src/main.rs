@@ -4,6 +4,7 @@ use kotoba_server::{build_router, server::KotobaState};
 use kotoba_net::{KotobaNetEvent, KotobaSwarm, PREGEL_GOSSIP_TOPIC};
 use kotoba_vm::distributed::{DistributedMessage, DistributedPregelRunner};
 use kotoba_core::store::BlockStore;
+use kotoba_graph::QuadStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,18 +18,34 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ── 1. Inference engine (optional) ────────────────────────────────────────
+    //
+    // Priority:
+    //   1. KOTOBA_INFERENCE_URL  — HTTP (OpenAI-compat: Ollama, vLLM, Vultr A16)
+    //   2. KOTOBA_LOAD_GEMMA     — local candle inference (requires --features local-inference)
     let inference_engine: Option<kotoba_runtime::host::InferenceFn> =
-        if std::env::var("KOTOBA_LOAD_GEMMA").is_ok() {
+        if let Ok(_url) = std::env::var("KOTOBA_INFERENCE_URL") {
+            let model = std::env::var("KOTOBA_INFERENCE_MODEL")
+                .unwrap_or_else(|_| "gemma4:e4b".to_string());
+            tracing::info!(_url, model, "HTTP inference engine active");
+            let engine = kotoba_llm::HttpInferEngine::from_env()
+                .map_err(|e| anyhow::anyhow!("HttpInferEngine init failed: {e}"))?;
+            let engine = Arc::new(engine);
+            let fn_: kotoba_runtime::host::InferenceFn =
+                Arc::new(move |prompt: &str, max_tokens: usize| {
+                    engine.generate(prompt, max_tokens)
+                });
+            Some(fn_)
+        } else if std::env::var("KOTOBA_LOAD_GEMMA").is_ok() {
             #[cfg(feature = "local-inference")]
             {
                 use kotoba_llm::GemmaRunner;
-                tracing::info!("loading Gemma 4 E2B from HuggingFace Hub (first run downloads ~4 GB)...");
+                tracing::info!("loading Gemma 2 2B IT from HuggingFace Hub (first run downloads ~5 GB)...");
                 let runner = Arc::new(std::sync::Mutex::new(
                     GemmaRunner::load()
                         .await
                         .map_err(|e| anyhow::anyhow!("Gemma load failed: {e}"))?,
                 ));
-                tracing::info!("Gemma 4 E2B loaded");
+                tracing::info!("Gemma 2 2B IT loaded");
                 let engine: kotoba_runtime::host::InferenceFn =
                     Arc::new(move |prompt: &str, max_tokens: usize| {
                         runner.lock().unwrap().generate(prompt, max_tokens)
@@ -109,8 +126,9 @@ async fn main() -> anyhow::Result<()> {
                 let (publish_tx, publish_rx) =
                     tokio::sync::mpsc::channel::<(String, Vec<u8>)>(1024);
 
-                let journal_arc = Arc::clone(&state.journal);
+                let journal_arc     = Arc::clone(&state.journal);
                 let block_store_arc = Arc::clone(&state.block_store);
+                let quad_store_arc  = Arc::clone(&state.quad_store);
 
                 tokio::spawn(swarm_actor(
                     swarm,
@@ -119,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
                     pregel_inbound_tx,
                     pregel_outbound_rx,
                     block_store_arc,
+                    quad_store_arc,
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");
@@ -184,6 +203,7 @@ async fn swarm_actor(
     pregel_inbound_tx:   tokio::sync::mpsc::Sender<DistributedMessage>,
     mut pregel_out_rx:   tokio::sync::mpsc::Receiver<DistributedMessage>,
     block_store:         Arc<dyn BlockStore + Send + Sync>,
+    quad_store:          Arc<QuadStore>,
 ) {
     swarm.subscribe("quad/assert").ok();
     swarm.subscribe("quad/retract").ok();
@@ -213,9 +233,10 @@ async fn swarm_actor(
                 let Some(event) = event else { break };
                 match event {
                     KotobaNetEvent::BitswapRequest { peer: _, request, channel } => {
-                        let mut have      = Vec::new();
-                        let mut dont_have = Vec::new();
-                        let mut blocks    = Vec::new();
+                        let mut have          = Vec::new();
+                        let mut dont_have     = Vec::new();
+                        let mut blocks        = Vec::new();
+                        let mut delta_commits = Vec::new();
 
                         for raw in &request.want_have {
                             let cid = kotoba_core::cid::KotobaCid(*raw);
@@ -232,9 +253,24 @@ async fn swarm_actor(
                                 _               => dont_have.push(*raw),
                             }
                         }
+                        // Selective-sync delta: CBOR-serialise Commit chain oldest-first
+                        for ws in &request.want_since {
+                            let graph_cid = kotoba_core::cid::KotobaCid(ws.graph_cid);
+                            let head      = ws.head_cid.map(kotoba_core::cid::KotobaCid);
+                            let commits   = quad_store.commits_since(&graph_cid, head.as_ref()).await;
+                            for commit in commits {
+                                let cid_raw = commit.cid.0;
+                                let mut buf = Vec::new();
+                                if ciborium::into_writer(&commit, &mut buf).is_ok() {
+                                    delta_commits.push((cid_raw, buf));
+                                }
+                            }
+                        }
 
                         swarm.swarm.behaviour_mut().bitswap
-                            .send_response(channel, kotoba_net::BitswapResponse { have, dont_have, blocks })
+                            .send_response(channel, kotoba_net::BitswapResponse {
+                                have, dont_have, blocks, delta_commits,
+                            })
                             .ok();
                     }
                     KotobaNetEvent::GossipMessage { topic, data, .. } => {

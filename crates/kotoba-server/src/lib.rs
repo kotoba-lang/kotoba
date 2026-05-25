@@ -33,6 +33,9 @@ mod tests {
         NSID_BLOCK_PUT,
         NSID_BLOCK_GET,
         NSID_AGENT_RUN,
+        NSID_AGENT_SYNC_OPEN,
+        NSID_AGENT_SYNC_ADV,
+        NSID_AGENT_SYNC_CLOSE,
     ];
 
     #[test]
@@ -136,6 +139,18 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", xrpc::NSID_AGENT_RUN),
             post(xrpc::agent_run),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_AGENT_SYNC_OPEN),
+            post(xrpc::agent_sync_open),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_AGENT_SYNC_ADV),
+            post(xrpc::agent_sync_advance),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_AGENT_SYNC_CLOSE),
+            post(xrpc::agent_sync_close),
         )
         .route("/mcp", post(mcp::mcp_handler))
         .with_state(state)

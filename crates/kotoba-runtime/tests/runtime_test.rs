@@ -6,9 +6,11 @@
 ///   - ProgramStore cache
 ///   - HostState gas accounting
 ///
-/// Phase 2 (TODO): end-to-end WASM execution
-///   - requires a compiled kotoba-node component (wit-bindgen + wasm32-wasip2)
-///   - deferred until kotoba-runtime reaches beta
+/// Phase 2: end-to-end WASM execution via kotoba-guest component
+///   - `build_guest_component()` compiles kotoba-guest to wasm32-wasip2
+///   - `guest_wasm_executes_assert_quad_and_publish` runs the full kqe+kse host ABI
+///   - `guest_wasm_gas_exhaustion_errors` verifies gas accounting traps
+///   - Skips gracefully when cargo-component or wasm32-wasip2 target is unavailable
 
 use kotoba_runtime::{
     HostState, KotobaEngine, UdfExecutor, WasmExecutor,

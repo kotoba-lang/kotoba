@@ -8,7 +8,7 @@ use libp2p::{
 };
 
 use crate::behaviour::{KotobaBehaviour, KotobaBehaviourEvent};
-use crate::bitswap::{BitswapRequest, BitswapResponse, BITSWAP_PROTOCOL};
+use crate::bitswap::{BitswapRequest, BitswapResponse, WantSince, BITSWAP_PROTOCOL};
 use crate::protocol::KOTOBA_SYNC_PROTOCOL;
 
 pub type KotobaSwarmType = Swarm<KotobaBehaviour>;
@@ -133,6 +133,7 @@ impl KotobaSwarm {
         self.swarm.behaviour_mut().bitswap.send_request(&peer, BitswapRequest {
             want_have:  vec![],
             want_block: vec![cid],
+            want_since: vec![],
         })
     }
 
@@ -141,6 +142,23 @@ impl KotobaSwarm {
         self.swarm.behaviour_mut().bitswap.send_request(&peer, BitswapRequest {
             want_have:  vec![cid],
             want_block: vec![],
+            want_since: vec![],
+        })
+    }
+
+    /// Request a selective-sync delta: all commits in `graph_cid` since `head_cid`.
+    /// `head_cid = None` means fresh agent — peer should return the full commit chain.
+    pub fn want_since(
+        &mut self,
+        peer:      PeerId,
+        graph_cid: [u8; 36],
+        since_seq: u64,
+        head_cid:  Option<[u8; 36]>,
+    ) -> request_response::OutboundRequestId {
+        self.swarm.behaviour_mut().bitswap.send_request(&peer, BitswapRequest {
+            want_have:  vec![],
+            want_block: vec![],
+            want_since: vec![WantSince { graph_cid, since_seq, head_cid }],
         })
     }
 

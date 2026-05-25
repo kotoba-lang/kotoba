@@ -14,7 +14,10 @@ pub const NSID_NODE_STATUS:  &str = "ai.gftd.apps.kotoba.node.status";
 pub const NSID_BLOCK_PUT:    &str = "ai.gftd.apps.kotoba.block.put";
 pub const NSID_BLOCK_GET:    &str = "ai.gftd.apps.kotoba.block.get";
 pub const NSID_COMMIT_STORE: &str = "ai.gftd.apps.kotoba.commit.store";
-pub const NSID_AGENT_RUN:   &str = "ai.gftd.apps.kotoba.agent.run";
+pub const NSID_AGENT_RUN:        &str = "ai.gftd.apps.kotoba.agent.run";
+pub const NSID_AGENT_SYNC_OPEN:  &str = "ai.gftd.apps.kotoba.agent.syncopen";
+pub const NSID_AGENT_SYNC_ADV:   &str = "ai.gftd.apps.kotoba.agent.syncadvance";
+pub const NSID_AGENT_SYNC_CLOSE: &str = "ai.gftd.apps.kotoba.agent.syncclose";
 
 use std::sync::Arc;
 use axum::{
@@ -948,4 +951,137 @@ pub async fn agent_run(
         supersteps,
         commit_cid,
     }))
+}
+
+// ── Agent SyncWindow session management (C) ───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct AgentSyncOpenReq {
+    /// Caller-assigned session identifier (UUIDv4 recommended).
+    pub session_id: String,
+    /// Named graph CID to sync (multibase).
+    pub graph_cid:  String,
+    /// Journal sequence watermark — the agent has already processed all entries before this.
+    pub since_seq:  u64,
+    /// Last commit head the agent has processed. `None` = fresh agent.
+    pub head_cid:   Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentSyncOpenResp {
+    pub status:     &'static str,
+    pub session_id: String,
+    pub since_seq:  u64,
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.agent.syncopen
+///
+/// Opens a SyncWindow session.  The graph and head CIDs are pinned in the
+/// BudgetedBlockStore so they survive eviction for the duration of the session.
+pub async fn agent_sync_open(
+    State(state): State<Arc<KotobaState>>,
+    Json(req):    Json<AgentSyncOpenReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kotoba_core::cid::KotobaCid;
+    use kotoba_kse::sync_window::SyncWindow;
+
+    let graph_cid = KotobaCid::from_multibase(&req.graph_cid)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph_cid".into()))?;
+    let head_cid = req.head_cid.as_deref()
+        .map(|s| KotobaCid::from_multibase(s)
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid head_cid".into())))
+        .transpose()?;
+
+    let window = SyncWindow::new(graph_cid.clone(), req.since_seq, head_cid.clone());
+
+    // Pin anchors directly (avoids dyn-coercion issues)
+    state.block_store.pin(&graph_cid);
+    if let Some(h) = &head_cid {
+        state.block_store.pin(h);
+    }
+
+    let since_seq = window.since_seq;
+    state.agent_sessions.write().await.insert(req.session_id.clone(), window);
+
+    tracing::info!(session_id = %req.session_id, since_seq, "agent.syncopen");
+
+    Ok(Json(AgentSyncOpenResp { status: "ok", session_id: req.session_id, since_seq }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentSyncAdvReq {
+    pub session_id:   String,
+    /// New commit head CID (multibase) the agent has processed.
+    pub new_head_cid: String,
+    /// Updated journal watermark.
+    pub new_seq:      u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentSyncAdvResp {
+    pub status:     &'static str,
+    pub session_id: String,
+    pub since_seq:  u64,
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.agent.syncadvance
+///
+/// Advance the SyncWindow: unpin the old head, pin the new head.
+pub async fn agent_sync_advance(
+    State(state): State<Arc<KotobaState>>,
+    Json(req):    Json<AgentSyncAdvReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kotoba_core::cid::KotobaCid;
+
+    let new_head = KotobaCid::from_multibase(&req.new_head_cid)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid new_head_cid".into()))?;
+
+    let mut sessions = state.agent_sessions.write().await;
+    let window = sessions.get_mut(&req.session_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("session not found: {}", req.session_id)))?;
+
+    // Unpin old head, pin new head
+    if let Some(old) = &window.head_cid {
+        state.block_store.unpin(old);
+    }
+    state.block_store.pin(&new_head);
+    window.head_cid  = Some(new_head);
+    window.since_seq = req.new_seq;
+
+    let since_seq = window.since_seq;
+    tracing::info!(session_id = %req.session_id, since_seq, "agent.syncadvance");
+
+    Ok(Json(AgentSyncAdvResp { status: "ok", session_id: req.session_id, since_seq }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentSyncCloseReq {
+    pub session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentSyncCloseResp {
+    pub status:     &'static str,
+    pub session_id: String,
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.agent.syncclose
+///
+/// Close the SyncWindow session, unpinning all anchors.
+pub async fn agent_sync_close(
+    State(state): State<Arc<KotobaState>>,
+    Json(req):    Json<AgentSyncCloseReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let mut sessions = state.agent_sessions.write().await;
+    let window = sessions.remove(&req.session_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("session not found: {}", req.session_id)))?;
+
+    state.block_store.unpin(&window.graph_cid);
+    if let Some(h) = &window.head_cid {
+        state.block_store.unpin(h);
+    }
+
+    tracing::info!(session_id = %req.session_id, "agent.syncclose");
+
+    Ok(Json(AgentSyncCloseResp { status: "ok", session_id: req.session_id }))
 }

@@ -123,21 +123,46 @@ mod idb_impl {
 
         /// Helper: resolve an IdbRequest to its result as a JsValue.
         async fn await_request(req: &web_sys::IdbRequest) -> Result<JsValue> {
+            // Clone before the closure so `req` stays available for set_onsuccess.
+            let req_outer = req.clone();
             JsFuture::from(js_sys::Promise::new(&mut |resolve, reject| {
-                let req = req.clone();
+                let req_inner = req_outer.clone(); // captured by res_cb move closure
                 let res_cb: Closure<dyn FnMut()> = Closure::new(move || {
-                    resolve.call1(&JsValue::undefined(), &req.result().unwrap_or(JsValue::undefined())).unwrap();
+                    resolve.call1(&JsValue::undefined(), &req_inner.result().unwrap_or(JsValue::undefined())).unwrap();
                 });
                 let rej_cb: Closure<dyn FnMut(JsValue)> = Closure::new(move |e: JsValue| {
                     reject.call1(&JsValue::undefined(), &e).unwrap();
                 });
-                req.set_onsuccess(Some(res_cb.as_ref().unchecked_ref()));
-                req.set_onerror(Some(rej_cb.as_ref().unchecked_ref()));
+                req_outer.set_onsuccess(Some(res_cb.as_ref().unchecked_ref()));
+                req_outer.set_onerror(Some(rej_cb.as_ref().unchecked_ref()));
                 res_cb.forget();
                 rej_cb.forget();
             }))
             .await
             .map_err(|e| anyhow!("IDB request: {e:?}"))
+        }
+
+        /// Await an IDBTransaction `oncomplete` event.
+        ///
+        /// `IdbTransaction::commit()` in web-sys 0.3.99 returns `()` (not a Promise).
+        /// We wrap the `oncomplete` DOM event in a Promise so callers can `await` durability.
+        async fn tx_complete(tx: web_sys::IdbTransaction) -> Result<()> {
+            JsFuture::from(js_sys::Promise::new(&mut |resolve, reject| {
+                let tx_clone = tx.clone();
+                let res_cb: Closure<dyn FnMut()> = Closure::new(move || {
+                    resolve.call0(&JsValue::undefined()).unwrap();
+                });
+                let rej_cb: Closure<dyn FnMut(JsValue)> = Closure::new(move |e: JsValue| {
+                    reject.call1(&JsValue::undefined(), &e).unwrap();
+                });
+                tx_clone.set_oncomplete(Some(res_cb.as_ref().unchecked_ref()));
+                tx_clone.set_onerror(Some(rej_cb.as_ref().unchecked_ref()));
+                res_cb.forget();
+                rej_cb.forget();
+            }))
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow!("tx complete: {e:?}"))
         }
 
         /// Build a meta object `{pinned, last_used, size}`.
@@ -177,9 +202,7 @@ mod idb_impl {
             meta.put_with_key(&Self::meta_obj(pinned, Self::now_ms(), size), &key)
                 .map_err(|e| anyhow!("{e:?}"))?;
 
-            JsFuture::from(tx.commit().map_err(|e| anyhow!("{e:?}"))?)
-                .await
-                .map_err(|e| anyhow!("tx commit: {e:?}"))?;
+            Self::tx_complete(tx).await?;
 
             // Auto-evict if over budget
             if let Some(max) = self.max_bytes {
@@ -224,9 +247,7 @@ mod idb_impl {
                 meta.put_with_key(&Self::meta_obj(pinned, Self::now_ms(), size), &key)
                     .map_err(|e| anyhow!("{e:?}"))?;
             }
-            JsFuture::from(tx.commit().map_err(|e| anyhow!("{e:?}"))?)
-                .await
-                .map_err(|e| anyhow!("tx commit: {e:?}"))?;
+            Self::tx_complete(tx).await?;
 
             let arr: Uint8Array = val.dyn_into().map_err(|_| anyhow!("not Uint8Array"))?;
             Ok(Some(Bytes::from(arr.to_vec())))
@@ -255,9 +276,7 @@ mod idb_impl {
                 .map_err(|e| anyhow!("{e:?}"))?;
             tx.object_store(STORE_BLOCKS).map_err(|e| anyhow!("{e:?}"))?.delete(&key).map_err(|e| anyhow!("{e:?}"))?;
             tx.object_store(STORE_META).map_err(|e| anyhow!("{e:?}"))?.delete(&key).map_err(|e| anyhow!("{e:?}"))?;
-            JsFuture::from(tx.commit().map_err(|e| anyhow!("{e:?}"))?)
-                .await
-                .map_err(|e| anyhow!("tx commit: {e:?}"))?;
+            Self::tx_complete(tx).await?;
             Ok(())
         }
 
@@ -326,7 +345,7 @@ mod idb_impl {
                 freed += size;
             }
 
-            let _ = JsFuture::from(tx.commit().unwrap_or_else(|_| js_sys::Promise::resolve(&JsValue::undefined()))).await;
+            let _ = Self::tx_complete(tx).await;
             freed
         }
     }

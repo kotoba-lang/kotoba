@@ -4,6 +4,7 @@ pub mod kvcache;
 pub mod embed;
 pub mod infer;
 pub mod gemma;
+pub mod http_infer;
 
 pub use weight::{WeightRef, WeightBlob};
 pub use lora::{LoraAdapter, lora_to_delta};
@@ -13,6 +14,9 @@ pub use infer::{InferenceRequest, InferenceSession, InferError};
 
 #[cfg(feature = "local-inference")]
 pub use gemma::GemmaRunner;
+
+#[cfg(feature = "http-inference")]
+pub use http_infer::HttpInferEngine;
 
 #[cfg(test)]
 mod tests {

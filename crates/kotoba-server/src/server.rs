@@ -1,14 +1,15 @@
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use bytes::Bytes;
 use kotoba_dht::{
     neighborhood::Neighborhood,
     node_id::NodeId,
 };
-use kotoba_kse::{store::KseStore, Journal, Shelf, Topic};
+use kotoba_kse::{store::KseStore, sync_window::SyncWindow, Journal, Shelf, Topic};
 use kotoba_kqe::quad::Quad;
 use kotoba_graph::QuadStore;
-use kotoba_store::IpfsPinClient;
+use kotoba_store::{BudgetedBlockStore, IpfsPinClient};
 use kotoba_runtime::{host::InferenceFn, UdfExecutor, WasmExecutor};
 use kotoba_vm::{distributed::DistributedPregelRunner, InvokeRouter};
 use kotoba_core::store::BlockStore;
@@ -45,6 +46,9 @@ pub struct KotobaState {
     // ── IPFS Pinning ─────────────────────────────────────────────────────────
     /// Optional IPFS Pinning Service client (Pinata/web3.storage/Filebase).
     pub ipfs_pin: Option<Arc<IpfsPinClient>>,
+    // ── Agent Sessions ───────────────────────────────────────────────────────
+    /// Active SyncWindow sessions keyed by session_id.
+    pub agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, SyncWindow>>>,
 }
 
 impl KotobaState {
@@ -88,13 +92,17 @@ impl KotobaState {
         let udf = Arc::new(UdfExecutor::new()?);
 
         // BlockStore — priority: sled path > B2/S3 > ephemeral sled
+        // Optionally wrapped in BudgetedBlockStore when KOTOBA_STORAGE_BUDGET_BYTES is set.
+        let budget_bytes: Option<usize> = std::env::var("KOTOBA_STORAGE_BUDGET_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
         let block_store: Arc<dyn BlockStore + Send + Sync> =
             if let Ok(path) = std::env::var("KOTOBA_STORE_PATH") {
                 tracing::info!(path, "BlockStore: sled-backed persistence");
-                Arc::new(
-                    kotoba_store::SledBlockStore::open(&path)
-                        .map_err(|e| anyhow::anyhow!("sled open failed: {e}"))?,
-                )
+                let inner = kotoba_store::SledBlockStore::open(&path)
+                    .map_err(|e| anyhow::anyhow!("sled open failed: {e}"))?;
+                maybe_wrap(inner, budget_bytes)
             } else if let (Ok(bucket), Ok(key_id), Ok(app_key)) = (
                 std::env::var("KOTOBA_B2_BUCKET"),
                 std::env::var("KOTOBA_B2_KEY_ID"),
@@ -111,13 +119,13 @@ impl KotobaState {
                     .build()
                     .map_err(|e| anyhow::anyhow!("B2 block store build: {e}"))?;
                 tracing::info!(bucket, "BlockStore: B2/S3-backed (kotoba/blocks/)");
-                Arc::new(kotoba_store::S3BlockStore::new(Arc::new(s3), "kotoba/blocks"))
+                let inner = kotoba_store::S3BlockStore::new(Arc::new(s3), "kotoba/blocks");
+                maybe_wrap(inner, budget_bytes)
             } else {
                 tracing::warn!("BlockStore: ephemeral sled (set KOTOBA_STORE_PATH or KOTOBA_B2_* for persistence)");
-                Arc::new(
-                    kotoba_store::SledBlockStore::temporary()
-                        .map_err(|e| anyhow::anyhow!("sled temporary failed: {e}"))?,
-                )
+                let inner = kotoba_store::SledBlockStore::temporary()
+                    .map_err(|e| anyhow::anyhow!("sled temporary failed: {e}"))?;
+                maybe_wrap(inner, budget_bytes)
             };
 
         // IPFS Pinning Service client (E) — optional, no daemon required
@@ -138,12 +146,13 @@ impl KotobaState {
             executor,
             udf,
             router,
-            gossip_tx:     None,
-            pregel_runner: None,
+            gossip_tx:      None,
+            pregel_runner:  None,
             inference_engine,
             block_store,
             quad_store,
             ipfs_pin,
+            agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -197,6 +206,23 @@ impl KotobaState {
 
         let entry = self.journal.publish(topic, Bytes::from(payload)).await;
         entry.cid.to_multibase()
+    }
+}
+
+/// Optionally wrap a concrete `BlockStore` in a `BudgetedBlockStore`, then box it.
+///
+/// Accepts the concrete value (not `Arc<S>`) because `BudgetedBlockStore<S>`
+/// requires `S: BlockStore + Sized` — it cannot wrap a `dyn` or `Arc<dyn>`.
+fn maybe_wrap<S: BlockStore + Send + Sync + 'static>(
+    inner:  S,
+    budget: Option<usize>,
+) -> Arc<dyn BlockStore + Send + Sync> {
+    match budget {
+        Some(b) if b > 0 => {
+            tracing::info!(budget_bytes = b, "BlockStore: BudgetedBlockStore LRU eviction enabled");
+            Arc::new(BudgetedBlockStore::new(inner, b))
+        }
+        _ => Arc::new(inner),
     }
 }
 

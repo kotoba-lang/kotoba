@@ -29,20 +29,97 @@ pub struct ForeignCall {
     pub ucan_cid:  KotobaCid, // CACAO authorization
 }
 
-/// ForeignBridge — delegates CALL_FOREIGN to AgentGateway MCP
-/// Full implementation: HTTP to AgentGateway → LangServer pod → Vultr A16
+/// ForeignBridge — delegates CALL_FOREIGN to AgentGateway MCP via JSON-RPC 2.0.
+///
+/// Wire: POST {gateway_url}/mcp  (JSON-RPC 2.0 tools/call)
+/// Auth: UCAN CID passed as `Authorization: Bearer {ucan_cid}`
+///
+/// Tool mapping:
+///   LlmInfer   → tool `kotoba_infer_run`
+///   Embed      → tool `kotoba_embed_create`
+///   WeightLoad → tool `kotoba_weight_get`
 pub struct ForeignBridge {
     pub gateway_url: String,
+    client:          reqwest::Client,
 }
 
 impl ForeignBridge {
     pub fn new(gateway_url: impl Into<String>) -> Self {
-        Self { gateway_url: gateway_url.into() }
+        Self {
+            gateway_url: gateway_url.into(),
+            client:      reqwest::Client::new(),
+        }
     }
 
-    pub async fn call(&self, _call: ForeignCall) -> Result<Vec<u8>, ForeignError> {
-        // Phase 6 implementation: HTTP POST to AgentGateway
-        Err(ForeignError::NotImplemented)
+    pub async fn call(&self, call: ForeignCall) -> Result<Vec<u8>, ForeignError> {
+        let ucan = call.ucan_cid.to_multibase();
+
+        let (tool, arguments) = match call.call_type {
+            ForeignCallType::LlmInfer { model_cid, adapter_cid: _, session_cid: _, max_tokens } => {
+                let args = serde_json::json!({
+                    "model_cid":      model_cid.to_multibase(),
+                    "max_new_tokens": max_tokens,
+                    "prompt":         "",
+                });
+                ("kotoba_infer_run", args)
+            }
+            ForeignCallType::Embed { model_cid, text } => {
+                let args = serde_json::json!({
+                    "text":      text,
+                    "model_cid": model_cid.to_multibase(),
+                    "doc_cid":   KotobaCid::from_bytes(text.as_bytes()).to_multibase(),
+                    "graph":     "foreign/embed",
+                });
+                ("kotoba_embed_create", args)
+            }
+            ForeignCallType::WeightLoad { blob_cid, shape: _ } => {
+                let args = serde_json::json!({
+                    "cid": blob_cid.to_multibase(),
+                });
+                ("kotoba_weight_get", args)
+            }
+        };
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id":      call.call_id,
+            "method":  "tools/call",
+            "params": {
+                "name":      tool,
+                "arguments": arguments,
+            }
+        });
+
+        let url = format!("{}/mcp", self.gateway_url.trim_end_matches('/'));
+        let resp = self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {ucan}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ForeignError::Gateway(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ForeignError::Gateway(format!("HTTP {status}: {text}")));
+        }
+
+        let rpc: serde_json::Value = resp.json()
+            .await
+            .map_err(|e| ForeignError::Gateway(e.to_string()))?;
+
+        if let Some(err) = rpc.get("error") {
+            return Err(ForeignError::Gateway(err.to_string()));
+        }
+
+        // Result bytes: serialize the result JSON as UTF-8
+        let result = rpc.get("result").unwrap_or(&serde_json::Value::Null);
+        let bytes = serde_json::to_vec(result)
+            .map_err(|e| ForeignError::Gateway(e.to_string()))?;
+
+        Ok(bytes)
     }
 }
 
@@ -54,4 +131,78 @@ pub enum ForeignError {
     Gateway(String),
     #[error("unauthorized")]
     Unauthorized,
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_cid(seed: &[u8]) -> KotobaCid {
+        KotobaCid::from_bytes(seed)
+    }
+
+    #[test]
+    fn foreign_bridge_new_ok() {
+        let bridge = ForeignBridge::new("http://localhost:9000");
+        assert!(bridge.gateway_url.contains("9000"));
+    }
+
+    #[test]
+    fn foreign_call_type_llm_infer_fields() {
+        let call = ForeignCall {
+            call_id:   1,
+            call_type: ForeignCallType::LlmInfer {
+                model_cid:   dummy_cid(b"model"),
+                adapter_cid: None,
+                session_cid: None,
+                max_tokens:  256,
+            },
+            ucan_cid: dummy_cid(b"ucan"),
+        };
+        assert_eq!(call.call_id, 1);
+    }
+
+    #[test]
+    fn foreign_call_type_embed_fields() {
+        let call = ForeignCall {
+            call_id:   2,
+            call_type: ForeignCallType::Embed {
+                model_cid: dummy_cid(b"embed-model"),
+                text:      "hello world".into(),
+            },
+            ucan_cid: dummy_cid(b"ucan"),
+        };
+        if let ForeignCallType::Embed { text, .. } = &call.call_type {
+            assert_eq!(text, "hello world");
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn foreign_call_type_weight_load_fields() {
+        let call = ForeignCall {
+            call_id:   3,
+            call_type: ForeignCallType::WeightLoad {
+                blob_cid: dummy_cid(b"blob"),
+                shape:    vec![4096, 4096],
+            },
+            ucan_cid: dummy_cid(b"ucan"),
+        };
+        if let ForeignCallType::WeightLoad { shape, .. } = &call.call_type {
+            assert_eq!(shape, &[4096, 4096]);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn foreign_error_display() {
+        let e = ForeignError::Gateway("timeout".into());
+        assert!(e.to_string().contains("timeout"));
+        assert!(ForeignError::NotImplemented.to_string().contains("not implemented"));
+        assert!(ForeignError::Unauthorized.to_string().contains("unauthorized"));
+    }
 }

@@ -24,6 +24,8 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 | kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference |
 | kotoba-runtime | WASM Component Model host: WasmExecutor + UdfExecutor + WIT bindings |
 | kotoba-server | XRPC / MCP endpoints |
+| kotoba-store | BlockStore implementations: Memory, Sled, S3; BudgetedBlockStore<S> LRU eviction |
+| kotoba-store-web | Browser IndexedDB block store (wasm32), AsyncBlockStore trait |
 
 ## 実装順序
 
@@ -44,6 +46,101 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 - KV-cache = ephemeral Arrangement per session_cid
 - Inference = Invoke ChainEntry {program_cid: inference_datalog}
 - FP8 tensor = Vault blob (dim > 1024 はオフロード)
+
+## Selective Sync + Storage Budget 設計
+
+### SyncWindow (kotoba-kse)
+- エージェントが必要な履歴窓を宣言: `SyncWindow { graph_cid, since_seq, head_cid }`
+- `pin_into(store)` → anchor CID を BudgetedBlockStore の eviction から保護
+- `advance(new_head, seq, store)` → 旧 head アンピン → 新 head ピン
+- `unpin_from(store)` → セッション終了時に解放
+
+### Journal Selective Replay (persistent fallback 含む)
+- `Journal::read_since(seq)` → ring buffer から `seq` 以降を返す。`seq < oldest_ring_seq` かつ store が Some なら `seq/{seq:020}` seq-index で persistent fallback
+- `Journal::trim_before(seq)` → ring buffer の古いエントリを解放
+- `Journal::with_capacity(n)` → ring buffer サイズをカスタマイズ (デフォルト 65,536)
+- `Journal::publish()` は `{cid}.cbor` に加えて `seq/{seq:020}` → CID multibase の seq-index も書く
+- `KseStore::list_prefix(sub_prefix)` → `object_store::list()` を `tokio_stream::StreamExt` でストリーム処理
+
+### QuadStore Delta Sync
+- `QuadStore::commits_since(graph_cid, since_head)` → head から `since_head` まで DAG を遡り oldest-first で返す
+- fresh agent: `since_head = None` → 全履歴
+- 再開 agent: `since_head = Some(last_known_cid)` → delta のみ
+
+### BudgetedBlockStore (kotoba-store)
+- `BudgetedBlockStore::new(inner, max_bytes)` → LRU + pin-aware eviction wrapper
+- `evict_cold()` → 予算超過時に unpinned cold blocks を `inner.delete()` で削除、target = 80%
+- `pin/unpin/is_pinned` → SyncWindow が anchor CID を保護するために使用
+
+### AsyncBlockStore + IdbBlockStore (kotoba-store-web)
+- `AsyncBlockStore` trait: `put/get/has/delete/pin/unpin/evict_cold` の async 版 (wasm32: `?Send`)
+- `IdbBlockStore` (wasm32 only): IndexedDB `"blocks"` + `"meta"` 2 store
+- `evict_cold_async(max_bytes)` → meta の `last_used` 昇順で unpinned entries を削除
+- ブラウザはキャッシュのみ。Pregel / WASM 実行はサーバーサイド
+
+### Bitswap WantSince delta wire format (kotoba-net)
+- `WantSince { graph_cid, since_seq, head_cid: Option<_> }` — `BitswapRequest.want_since` フィールド (`#[serde(default)]`)
+- `BitswapResponse.delta_commits` — CBOR-serialised `Commit` のリスト (oldest-first)
+- `KotobaSwarm::want_since(peer, graph_cid, since_seq, head_cid)` でリクエスト送信
+
+### kotoba-server SyncWindow integration
+- `maybe_wrap<S: BlockStore + Send + Sync + 'static>(inner: S, budget: Option<usize>) -> Arc<dyn BlockStore + Send + Sync>` — `BudgetedBlockStore<S>` は `S: Sized` バインドのため concrete type で適用してから `Arc<dyn>` にキャスト
+- `KOTOBA_STORAGE_BUDGET_BYTES` 環境変数で `BudgetedBlockStore` を有効化
+- `KotobaState.agent_sessions: Arc<RwLock<HashMap<String, SyncWindow>>>` — セッション管理
+- XRPC: `agent.syncopen` / `agent.syncadvance` / `agent.syncclose`
+
+### 禁止
+- `BudgetedBlockStore` 生成時に `max_bytes = 0` (全ブロックが即時 evict される)
+- ピンなしで `SyncWindow::advance()` を呼ぶ (store が None でも呼び出せるが古い head が unpin されない)
+- `IdbBlockStore` をサーバーサイドで使用 (wasm32 cfg で ガード済み)
+- `BudgetedBlockStore<Arc<S>>` の構築 (`Arc<S>: BlockStore` は未実装 → E0277。`maybe_wrap(concrete, budget)` を使う)
+
+## StateGraph 設計 (ADR-2605250002)
+
+SSoT: `90-docs/adr/2605250002-kotoba-state-graph-langgraph-api.md`
+
+### API
+
+```rust
+// builder
+StateGraph::new(schema)
+  .add_node("name", NodeKind::Fn(fn))   // or NodeKind::ToolNode
+  .add_edge("from", EdgeTarget::Node("to"))
+  .add_conditional_edges("from", router_fn)
+  .set_entry_point("name")
+  .compile()                             // → CompiledGraph { graph_def_cid, .. }
+
+// run
+let thread = compiled.run(thread)?;
+```
+
+### Reducer セマンティクス
+- `Reducer::Override` — last-write-wins
+- `Reducer::Append` — extend semantics: update が Array → `arr.extend(new_items)` (spread); scalar → `arr.push(scalar)`。LangGraph `add_messages` と同一。**push ではなく extend** — ネスト禁止
+
+### graph_def_cid 導出ルール
+- 入力: sorted channel 宣言 + sorted node 名 + sorted edge 文字列 + entry point
+- Rust クロージャは含めない (シリアライズ不可)
+- 同一トポロジーは常に同一 CID → キャッシュ・分散複製に安全
+
+### ToolNode
+- `state["tool_calls"]` (Array of `{name, arguments}`) を読み `ToolRegistry` に dispatch
+- 結果を `state["messages"]` に append
+- ToolNode を使う graph は `messages: Append` + `tool_calls: Override` が必須
+
+### definition_datoms()
+- `lgraph/node/{name}` / `lgraph/edge/{from}` / `lgraph/entry` / `lgraph/channel/{name}` Quad を返す
+- KQE Datalog でグラフ構造を introspect 可能
+
+### Thread 実行モデル
+- Thread ごとに 1 Pregel vertex; 全ノードが 1 BSP superstep 内で順次実行
+- KQE Arrangement backing (Phase 1 target): `subject=thread_cid / predicate=channel_name / object=JSON`
+- Time-travel: Arrangement Delta から過去の Thread 状態を再構築
+
+### 禁止
+- `Reducer::Append` で update value (Array) を `push` する (extend が正)
+- `graph_def_cid` にクロージャを含める (shape のみ)
+- StateGraph Thread を `DistributedPregelRunner` に渡す (分散実行は未対応)
 
 ## WASM Runtime 設計
 

@@ -111,10 +111,15 @@ impl Journal {
             let entry_clone = entry.clone();
             let store_clone = Arc::clone(store);
             tokio::spawn(async move {
-                let key = format!("{}.cbor", entry_clone.cid.to_multibase());
+                let cid_mb = entry_clone.cid.to_multibase();
+                // seq index: cheap pointer used by persistent read_since fallback
+                let seq_key = format!("seq/{:020}", entry_clone.seq);
+                let _ = store_clone.put(&seq_key, Bytes::from(cid_mb.clone().into_bytes())).await;
+                // full entry CBOR
+                let entry_key = format!("{}.cbor", cid_mb);
                 let mut buf = Vec::new();
                 if ciborium::into_writer(&entry_clone, &mut buf).is_ok() {
-                    let _ = store_clone.put(&key, Bytes::from(buf)).await;
+                    let _ = store_clone.put(&entry_key, Bytes::from(buf)).await;
                 }
             });
         }
@@ -130,16 +135,58 @@ impl Journal {
         }
     }
 
-    /// Return all entries in the ring buffer with `seq >= since`.
+    /// Return all entries with `seq >= since`.
     ///
-    /// Useful for an agent that knows its last processed sequence and wants
-    /// only the delta — no network or persistent store required.
+    /// Scans the ring buffer first.  When `since` predates the oldest entry in
+    /// the ring buffer AND a persistent store is configured, fetches the gap
+    /// from the seq-index written by `publish()`.
     pub async fn read_since(&self, since: u64) -> Vec<JournalEntry> {
-        self.log.read().await
-            .iter()
+        let log = self.log.read().await;
+        let oldest_ring_seq = log.front().map(|e| e.seq);
+        let ring_entries: Vec<JournalEntry> = log.iter()
             .filter(|e| e.seq >= since)
             .cloned()
-            .collect()
+            .collect();
+        drop(log);
+
+        let needs_persistent = self.store.is_some() && match oldest_ring_seq {
+            None => true,
+            Some(oldest) => since < oldest,
+        };
+
+        if needs_persistent {
+            if let Some(store) = &self.store {
+                let until = oldest_ring_seq.unwrap_or(u64::MAX);
+                let mut entries = Self::fetch_seq_range_from_store(store, since, until).await;
+                entries.extend(ring_entries);
+                return entries;
+            }
+        }
+        ring_entries
+    }
+
+    /// Fetch entries from the persistent seq-index in the range `[since, before)`.
+    async fn fetch_seq_range_from_store(
+        store: &Arc<KseStore>,
+        since: u64,
+        before: u64,
+    ) -> Vec<JournalEntry> {
+        let keys = store.list_prefix("seq/").await;
+        let mut entries = Vec::new();
+        for key in keys {
+            let Some(seq_str) = key.strip_prefix("seq/") else { continue };
+            let Ok(seq) = seq_str.trim().parse::<u64>() else { continue };
+            if seq < since || seq >= before { continue; }
+            let Ok(cid_bytes) = store.get(&key).await else { continue };
+            let cid_mb = String::from_utf8_lossy(&cid_bytes).into_owned();
+            let entry_key = format!("{}.cbor", cid_mb);
+            let Ok(data) = store.get(&entry_key).await else { continue };
+            if let Ok(entry) = ciborium::from_reader::<JournalEntry, _>(&data[..]) {
+                entries.push(entry);
+            }
+        }
+        entries.sort_unstable_by_key(|e| e.seq);
+        entries
     }
 
     /// Return the current highest sequence number (0 if nothing published yet).
@@ -254,6 +301,45 @@ mod tests {
         assert!(remaining.iter().all(|e| e.seq >= 6),
             "all remaining entries must have seq >= 6");
         assert_eq!(remaining.len(), 5, "entries 6..=10 remain");
+    }
+
+    #[tokio::test]
+    async fn read_since_falls_back_to_persistent_store() {
+        use object_store::local::LocalFileSystem;
+        use crate::store::KseStore;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("kotoba-journal-persist-{}", nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = Arc::new(KseStore::new(fs, "journal/"));
+        // Ring cap = 3; publish 5 entries so seq 1,2 fall out of ring
+        let journal = {
+            let (tx, _) = tokio::sync::broadcast::channel(4096);
+            Journal {
+                seq: Arc::new(RwLock::new(0)),
+                tx,
+                store: Some(Arc::clone(&store)),
+                log: Arc::new(RwLock::new(VecDeque::with_capacity(3))),
+                log_cap: 3,
+            }
+        };
+
+        let t = Topic::new("persist/test");
+        for i in 0..5u8 {
+            journal.publish(t.clone(), Bytes::from(vec![i])).await;
+        }
+        // Let fire-and-forget persist tasks complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Ring now holds seq 3,4,5; seq 1,2 are in persistent store only
+        let all = journal.read_since(1).await;
+        let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "persistent fallback must fill the gap");
     }
 
     #[tokio::test]
