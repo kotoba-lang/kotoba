@@ -5,18 +5,27 @@ pub mod embed;
 pub mod infer;
 pub mod gemma;
 pub mod http_infer;
+pub mod train;
+
+#[cfg(feature = "webgpu-train")]
+pub mod train_gpu;
 
 pub use weight::{WeightRef, WeightBlob};
 pub use lora::{LoraAdapter, lora_to_delta};
 pub use kvcache::KvCache;
 pub use embed::{Embedding, embed_to_quad};
 pub use infer::{InferenceRequest, InferenceSession, InferError};
+pub use train::{TrainBatch, GradientRef, AdamMoments, OptimizerStep};
 
 #[cfg(feature = "local-inference")]
 pub use gemma::GemmaRunner;
 
 #[cfg(feature = "http-inference")]
 pub use http_infer::HttpInferEngine;
+
+#[cfg(feature = "webgpu-train")]
+pub use train_gpu::{WebGpuTrainer, AdamConfig, TrainStepResult,
+                    dequantize_fp8_e4m3, quantize_f32_to_fp8_e4m3, wgsl_shaders};
 
 #[cfg(test)]
 mod tests {
