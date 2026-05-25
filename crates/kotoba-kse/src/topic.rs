@@ -34,6 +34,11 @@ impl Topic {
         Self(format!("/kotoba/pos/{graph}/{predicate}/{object}/{subject}"))
     }
 
+    /// PSO index topic: /kotoba/pso/{graph}/{predicate}/{subject}/{object}  (AEVT pub/sub)
+    pub fn quad_pso(graph: &str, predicate: &str, subject: &str, object: &str) -> Self {
+        Self(format!("/kotoba/pso/{graph}/{predicate}/{subject}/{object}"))
+    }
+
     /// OSP index topic: /kotoba/osp/{graph}/{object}/{subject}/{predicate}
     pub fn quad_osp(graph: &str, object: &str, subject: &str, predicate: &str) -> Self {
         Self(format!("/kotoba/osp/{graph}/{object}/{subject}/{predicate}"))

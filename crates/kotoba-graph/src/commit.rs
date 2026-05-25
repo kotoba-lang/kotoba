@@ -3,38 +3,50 @@ use kotoba_core::store::BlockStore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Commit — Prolly Tree root snapshot per named graph (≅ AT Protocol Repo Commit)
-/// T in KOTOBA's Datom model: content-addressed, not integer
+/// Commit — 4-ProllyTree root snapshot per named graph (≅ AT Protocol Repo Commit)
+/// T in KOTOBA's Datom model: content-addressed, not integer.
+///
+/// `root` = EAVT (SPO) tree root — kept for backward compatibility.
+/// `index_roots` = the other 3 covering-index roots: "aevt", "avet", "vaet".
 ///
 /// The `cid` field is NOT included in the CBOR serialization — it is derived as
 /// `blake3(CBOR(rest_of_fields))` and restored on load from the block-store key.
+/// Old commits (without `index_roots`) load with an empty map (field defaults to `{}`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
     #[serde(skip)]
-    pub cid:    KotobaCid,          // derived; not stored in block bytes
-    pub graph:  KotobaCid,          // named graph
-    pub root:   KotobaCid,          // Prolly Tree root CID
-    pub prev:   Option<KotobaCid>,  // parent commit (DAG)
-    pub author: String,             // DID
-    pub seq:    u64,                // monotonic (≅ AT Protocol rev)
-    pub ts:     u64,                // unix seconds
+    pub cid:         KotobaCid,                    // derived; not stored in block bytes
+    pub graph:       KotobaCid,                    // named graph
+    pub root:        KotobaCid,                    // EAVT (SPO) ProllyTree root CID
+    pub prev:        Option<KotobaCid>,            // parent commit (DAG)
+    pub author:      String,                       // DID
+    pub seq:         u64,                          // monotonic (≅ AT Protocol rev)
+    pub ts:          u64,                          // unix seconds
+    /// Additional covering-index roots: "aevt" / "avet" / "vaet".
+    /// Omitted from CBOR when empty (old-format commits remain CID-stable on read).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub index_roots: HashMap<String, KotobaCid>,
 }
 
 impl Commit {
     /// Build a new commit, computing its CID from the CBOR of the payload fields.
     pub fn seal(
-        graph:  KotobaCid,
-        root:   KotobaCid,
-        prev:   Option<KotobaCid>,
-        author: String,
-        seq:    u64,
+        graph:       KotobaCid,
+        root:        KotobaCid,
+        prev:        Option<KotobaCid>,
+        author:      String,
+        seq:         u64,
+        index_roots: HashMap<String, KotobaCid>,
     ) -> Self {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let mut c = Self { cid: KotobaCid([0u8; 36]), graph, root, prev, author, seq, ts };
+        let mut c = Self {
+            cid: KotobaCid([0u8; 36]),
+            graph, root, prev, author, seq, ts, index_roots,
+        };
 
         // Compute CID from CBOR of payload (cid field is skipped by serde)
         let mut buf = Vec::new();
@@ -128,7 +140,7 @@ mod tests {
         let store = MemoryBlockStore::new();
         let graph  = KotobaCid::from_bytes(b"graph");
         let root   = KotobaCid::from_bytes(b"root");
-        let commit = Commit::seal(graph.clone(), root.clone(), None, "did:test".into(), 1);
+        let commit = Commit::seal(graph.clone(), root.clone(), None, "did:test".into(), 1, HashMap::new());
         let cid    = commit.persist(&store).unwrap();
         let loaded = Commit::load(&cid, &store).unwrap().unwrap();
         assert_eq!(loaded.author, "did:test");
@@ -137,11 +149,27 @@ mod tests {
     }
 
     #[test]
+    fn commit_with_index_roots_roundtrip() {
+        let store  = MemoryBlockStore::new();
+        let graph  = KotobaCid::from_bytes(b"graph-idx");
+        let root   = KotobaCid::from_bytes(b"eavt-root");
+        let mut idx = HashMap::new();
+        idx.insert("aevt".to_string(), KotobaCid::from_bytes(b"aevt-root"));
+        idx.insert("avet".to_string(), KotobaCid::from_bytes(b"avet-root"));
+        idx.insert("vaet".to_string(), KotobaCid::from_bytes(b"vaet-root"));
+        let commit = Commit::seal(graph.clone(), root.clone(), None, "did:test".into(), 2, idx.clone());
+        let cid    = commit.persist(&store).unwrap();
+        let loaded = Commit::load(&cid, &store).unwrap().unwrap();
+        assert_eq!(loaded.index_roots.get("aevt"), idx.get("aevt"));
+        assert_eq!(loaded.index_roots.len(), 3);
+    }
+
+    #[test]
     fn commit_dag_head_roundtrip() {
         let store  = MemoryBlockStore::new();
         let graph  = KotobaCid::from_bytes(b"graph1");
         let root   = KotobaCid::from_bytes(b"root1");
-        let commit = Commit::seal(graph.clone(), root.clone(), None, "did:x".into(), 0);
+        let commit = Commit::seal(graph.clone(), root.clone(), None, "did:x".into(), 0, HashMap::new());
 
         let mut dag = CommitDag::new();
         dag.add(commit);

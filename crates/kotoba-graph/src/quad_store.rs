@@ -30,20 +30,21 @@ impl QuadStore {
         }
     }
 
-    /// Write quad: publish to SPO/POS/OSP Topics + update in-memory Arrangement
+    /// Write quad: publish to 4-index Topics (SPO/PSO/POS/OSP) + update Arrangement.
     pub async fn assert(&self, quad: Quad) -> Delta {
         let g = quad.graph.to_multibase();
         let s = quad.subject.to_multibase();
-        let p = &quad.predicate.clone();
+        let p = quad.predicate.clone();
         let o = {
             let obj_bytes = serde_json::to_vec(&quad.object).unwrap_or_default();
             kotoba_core::cid::KotobaCid::from_bytes(&obj_bytes).to_multibase()
         };
 
         let payload = serde_json::to_vec(&quad).unwrap_or_default().into();
-        self.journal.publish(Topic::quad_spo(&g, &s, p, &o), bytes::Bytes::clone(&payload)).await;
-        self.journal.publish(Topic::quad_pos(&g, p, &o, &s), bytes::Bytes::clone(&payload)).await;
-        self.journal.publish(Topic::quad_osp(&g, &o, &s, p), payload).await;
+        self.journal.publish(Topic::quad_spo(&g, &s, &p, &o), bytes::Bytes::clone(&payload)).await;
+        self.journal.publish(Topic::quad_pso(&g, &p, &s, &o), bytes::Bytes::clone(&payload)).await;
+        self.journal.publish(Topic::quad_pos(&g, &p, &o, &s), bytes::Bytes::clone(&payload)).await;
+        self.journal.publish(Topic::quad_osp(&g, &o, &s, &p), payload).await;
 
         let delta = Delta::assert(quad.clone());
         let mut arrs = self.arrangements.write().await;
@@ -243,8 +244,9 @@ impl QuadStore {
         chain
     }
 
-    /// Flush the current Arrangement for `graph_cid` into a ProllyTree Leaf node,
-    /// persist it in the BlockStore, create a Commit, and update the CommitDag.
+    /// Flush the current Arrangement for `graph_cid` into 4 covering ProllyTrees
+    /// (EAVT/AEVT/AVET/VAET), persist all roots in the BlockStore, create a Commit,
+    /// and update the CommitDag.
     ///
     /// Returns the new commit CID.
     pub async fn commit(
@@ -253,45 +255,88 @@ impl QuadStore {
         graph_cid: KotobaCid,
         seq:       u64,
     ) -> anyhow::Result<KotobaCid> {
-        // Build sorted (key, value) entries from the Arrangement
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = {
+        let (eavt_entries, aevt_entries, avet_entries, vaet_entries) = {
             let arrs = self.arrangements.read().await;
             match arrs.get(&graph_cid.to_multibase()) {
-                None => vec![],
-                Some(arr) => arr.quads(&graph_cid).into_iter()
-                    .map(|quad| {
-                        // key  = CBOR(graph || subject || predicate)
-                        // value = CBOR(object)
-                        let key = {
+                None => (vec![], vec![], vec![], vec![]),
+                Some(arr) => {
+                    // EAVT (SPO): key = subject || predicate, value = object bytes
+                    let eavt: Vec<(Vec<u8>, Vec<u8>)> = arr.quads(&graph_cid).into_iter()
+                        .map(|q| {
                             let mut k = Vec::new();
-                            k.extend_from_slice(&quad.graph.0);
-                            k.extend_from_slice(&quad.subject.0);
-                            k.extend_from_slice(quad.predicate.as_bytes());
-                            k
-                        };
-                        let val = serde_json::to_vec(&quad.object).unwrap_or_default();
-                        (key, val)
-                    })
-                    .collect(),
+                            k.extend_from_slice(&q.subject.0);
+                            k.extend_from_slice(q.predicate.as_bytes());
+                            let v = serde_json::to_vec(&q.object).unwrap_or_default();
+                            (k, v)
+                        })
+                        .collect();
+
+                    // AEVT (PSO): key = predicate || subject bytes, value = object bytes
+                    let aevt: Vec<(Vec<u8>, Vec<u8>)> = arr.aevt_entries().into_iter()
+                        .flat_map(|(pred, subj, objs)| {
+                            objs.into_iter().map(move |obj| {
+                                let mut k = Vec::new();
+                                k.extend_from_slice(pred.as_bytes());
+                                k.extend_from_slice(&subj.0);
+                                let v = serde_json::to_vec(&obj).unwrap_or_default();
+                                (k, v)
+                            })
+                        })
+                        .collect();
+
+                    // AVET (POS): key = predicate || object_key bytes, value = subject bytes
+                    let avet: Vec<(Vec<u8>, Vec<u8>)> = arr.avet_entries().into_iter()
+                        .flat_map(|(pred, okey, subs)| {
+                            subs.into_iter().map(move |s| {
+                                let mut k = Vec::new();
+                                k.extend_from_slice(pred.as_bytes());
+                                k.extend_from_slice(okey.as_bytes());
+                                (k, s.0.to_vec())
+                            })
+                        })
+                        .collect();
+
+                    // VAET (OCP): key = object_cid || predicate, value = subject bytes  (ref-only)
+                    let vaet: Vec<(Vec<u8>, Vec<u8>)> = arr.vaet_entries().into_iter()
+                        .flat_map(|(ocid, pred, subs)| {
+                            subs.into_iter().map(move |s| {
+                                let mut k = Vec::new();
+                                k.extend_from_slice(&ocid.0);
+                                k.extend_from_slice(pred.as_bytes());
+                                (k, s.0.to_vec())
+                            })
+                        })
+                        .collect();
+
+                    (eavt, aevt, avet, vaet)
+                }
             }
         };
 
-        // Build a full ProllyTree (chunked Leaf + Internal levels) and flush to BlockStore
-        let root_cid = ProllyTree::build_tree(entries, &*self.block_store)?;
+        // Build and persist 4 ProllyTrees
+        let root_eavt = ProllyTree::build_tree(eavt_entries, &*self.block_store)?;
+        let root_aevt = ProllyTree::build_tree(aevt_entries, &*self.block_store)?;
+        let root_avet = ProllyTree::build_tree(avet_entries, &*self.block_store)?;
+        let root_vaet = ProllyTree::build_tree(vaet_entries, &*self.block_store)?;
+
+        let mut index_roots = std::collections::HashMap::new();
+        index_roots.insert("aevt".to_string(), root_aevt);
+        index_roots.insert("avet".to_string(), root_avet);
+        index_roots.insert("vaet".to_string(), root_vaet);
 
         // Get previous head CID for the DAG chain
         let prev = self.commit_dag.read().await
             .head(&graph_cid)
             .map(|c| c.cid.clone());
 
-        // Seal + persist Commit
-        let commit = Commit::seal(graph_cid.clone(), root_cid, prev, author.to_string(), seq);
+        // Seal + persist Commit (root = EAVT for backward compat)
+        let commit = Commit::seal(graph_cid.clone(), root_eavt, prev, author.to_string(), seq, index_roots);
         let cid    = commit.persist(&*self.block_store)?;
 
         // Update in-memory CommitDag
         self.commit_dag.write().await.add(commit);
 
-        tracing::info!(%cid, author, seq, "QuadStore committed");
+        tracing::info!(%cid, author, seq, "QuadStore committed (4-index)");
         Ok(cid)
     }
 }

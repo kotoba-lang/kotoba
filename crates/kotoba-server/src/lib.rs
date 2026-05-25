@@ -1,3 +1,5 @@
+pub mod attestation;
+pub mod fingerprint;
 pub mod kg;
 pub mod mcp;
 pub mod net_actor;
@@ -8,6 +10,7 @@ pub mod xrpc;
 use std::sync::Arc;
 use axum::{
     Router,
+    middleware,
     routing::{get, post},
 };
 
@@ -41,6 +44,11 @@ mod tests {
         NSID_AGENT_SYNC_CLOSE,
         NSID_VAULT_PUT,
         NSID_VAULT_GET,
+        // attestation
+        super::attestation::NSID_ATTEST_CLAIM,
+        super::attestation::NSID_ATTEST_CHALLENGE,
+        super::attestation::NSID_ATTEST_QUERY,
+        super::attestation::NSID_REQUEST_LOG,
     ];
 
     #[test]
@@ -215,6 +223,27 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY),
             post(signal_xrpc::distribute_sender_key),
         )
+        // ── Attestation ────────────────────────────────────────────────────
+        .route(
+            &format!("/xrpc/{}", attestation::NSID_ATTEST_CLAIM),
+            post(attestation::attest_claim),
+        )
+        .route(
+            &format!("/xrpc/{}", attestation::NSID_ATTEST_CHALLENGE),
+            post(attestation::attest_challenge),
+        )
+        .route(
+            &format!("/xrpc/{}", attestation::NSID_ATTEST_QUERY),
+            get(attestation::attest_query),
+        )
+        .route(
+            &format!("/xrpc/{}", attestation::NSID_REQUEST_LOG),
+            get(attestation::request_log_query),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            fingerprint::fingerprint_middleware,
+        ))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

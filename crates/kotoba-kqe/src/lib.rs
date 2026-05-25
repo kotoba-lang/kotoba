@@ -5,6 +5,7 @@ pub mod datalog;
 pub mod mv;
 pub mod sql;
 pub mod cypher;
+pub mod citation;
 
 pub use quad::{Quad, QuadObject};
 pub use delta::{Delta, Multiplicity};
