@@ -23,7 +23,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -75,9 +75,8 @@ impl JsonRpcResponse {
 
 // ── JSON-RPC error codes ──────────────────────────────────────────────────────
 
-const ERR_PARSE:       i32 = -32700;
-const ERR_INVALID_REQ: i32 = -32600;
-const ERR_NOT_FOUND:   i32 = -32601;
+const ERR_PARSE:          i32 = -32700;
+const ERR_NOT_FOUND:      i32 = -32601;
 const ERR_INVALID_PARAMS: i32 = -32602;
 const ERR_INTERNAL:    i32 = -32603;
 const ERR_AUTH:        i32 = -32001;   // kotoba extension
@@ -176,7 +175,7 @@ fn tools_list() -> Value {
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
-fn is_mutating(method: &str, tool: Option<&str>) -> bool {
+fn is_mutating(method: &str, _tool: Option<&str>) -> bool {
     if method == "tools/call" {
         return true;
     }

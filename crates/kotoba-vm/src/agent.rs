@@ -425,9 +425,31 @@ impl AgentSnapshot {
 
 fn build_prompt(task: &str, steps: &[ReActStep], registry: &ToolRegistry) -> String {
     let mut p = String::new();
-    let _ = writeln!(p, "You are a KOTOBA agent. Use ReAct to answer the task.");
-    let _ = writeln!(p, "Tools: {}", registry.tool_descriptions());
-    let _ = writeln!(p, "\nTask: {task}\n");
+    let _ = writeln!(p, "You are a KOTOBA reasoning agent. Solve tasks step-by-step using ReAct.");
+    let _ = writeln!(p);
+    let _ = writeln!(p, "TOOLS:");
+    let mut names: Vec<&str> = registry.tools.keys().map(|s| s.as_str()).collect();
+    names.sort_unstable();
+    for name in &names {
+        let _ = writeln!(p, "  {name} — {}", registry.tools[*name].description);
+    }
+    let _ = writeln!(p);
+    let _ = writeln!(p, "RULES:");
+    let _ = writeln!(p, "  - Each response MUST contain exactly these two lines (nothing else):");
+    let _ = writeln!(p, "      Thought: <your reasoning>");
+    let _ = writeln!(p, "      Action: <tool_name>(<input>)");
+    let _ = writeln!(p, "  - Call finish when you have the answer: Action: finish(<answer>)");
+    let _ = writeln!(p);
+    let _ = writeln!(p, "EXAMPLE:");
+    let _ = writeln!(p, "Thought: I should check what facts I have.");
+    let _ = writeln!(p, "Action: kqe.query(*)");
+    let _ = writeln!(p, "Observation: quad log is empty");
+    let _ = writeln!(p, "Thought: No prior facts. I will answer from my knowledge.");
+    let _ = writeln!(p, "Action: finish(The capital of France is Paris.)");
+    let _ = writeln!(p);
+    let _ = writeln!(p, "--- TASK ---");
+    let _ = writeln!(p, "Task: {task}");
+    let _ = writeln!(p);
     for step in steps {
         match step {
             ReActStep::Thought     { text }        => { let _ = writeln!(p, "Thought: {text}"); }
@@ -440,18 +462,43 @@ fn build_prompt(task: &str, steps: &[ReActStep], registry: &ToolRegistry) -> Str
     p
 }
 
+/// Try to parse `tool(input)` from a single trimmed string.
+/// Returns `None` if the string does not match the pattern or has an invalid tool name.
+fn try_parse_tool_call(s: &str) -> Option<(String, String)> {
+    let paren = s.find('(')?;
+    let tool  = s[..paren].trim();
+    // Tool names are alphanumeric + dots + underscores only.
+    if tool.is_empty() || !tool.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '_') {
+        return None;
+    }
+    let rest  = &s[paren + 1..];
+    let input = rest.strip_suffix(')').unwrap_or(rest).trim().to_string();
+    Some((tool.to_string(), input))
+}
+
+/// Extract the `(tool, input)` pair from LLM output.
+///
+/// Scan strategy (in order):
+///  1. Any line that starts with "Action:" — parse `tool(input)` from it.
+///  2. Fallback: parse the first line directly as `tool(input)` (bare format).
+///  3. No parseable action: treat the entire text as a `finish` answer.
 fn parse_action(text: &str) -> (String, String) {
-    let line = text.lines().next().unwrap_or(text).trim();
-    let line = line.strip_prefix("Action:").unwrap_or(line).trim();
-    if let Some(paren) = line.find('(') {
-        let tool  = line[..paren].trim().to_string();
-        let rest  = &line[paren + 1..];
-        let input = rest.strip_suffix(')').unwrap_or(rest).trim().to_string();
-        if !tool.is_empty() {
-            return (tool, input);
+    // Pass 1: look for an explicit "Action: tool(input)" line.
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(candidate) = line.strip_prefix("Action:") {
+            if let Some(pair) = try_parse_tool_call(candidate.trim()) {
+                return pair;
+            }
         }
     }
-    ("finish".to_string(), line.to_string())
+    // Pass 2: bare `tool(input)` on the first line (test engines / simple models).
+    let first = text.lines().next().unwrap_or(text).trim();
+    if let Some(pair) = try_parse_tool_call(first) {
+        return pair;
+    }
+    // Pass 3: no structured action — surface the full text as a finish answer.
+    ("finish".to_string(), text.trim().to_string())
 }
 
 // Reconstruct an `Arrangement` from the flat quad tuples stored in a snapshot.
@@ -561,7 +608,7 @@ impl PregelReActRunner {
         use crate::pregel::{PregelGraph, VertexId, Message, ComputeOutput, ComputeFn};
 
         let vid       = VertexId(session.session_cid.clone());
-        let graph_cid = session.graph_cid.clone();
+        let _graph_cid = session.graph_cid.clone();
         let max_steps = session.max_steps;
         let registry  = Arc::clone(&session.registry);
 

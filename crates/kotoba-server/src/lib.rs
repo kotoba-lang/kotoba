@@ -1,5 +1,8 @@
+pub mod kg;
 pub mod mcp;
+pub mod net_actor;
 pub mod server;
+pub mod signal_xrpc;
 pub mod xrpc;
 
 use std::sync::Arc;
@@ -36,6 +39,8 @@ mod tests {
         NSID_AGENT_SYNC_OPEN,
         NSID_AGENT_SYNC_ADV,
         NSID_AGENT_SYNC_CLOSE,
+        NSID_VAULT_PUT,
+        NSID_VAULT_GET,
     ];
 
     #[test]
@@ -152,7 +157,60 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", xrpc::NSID_AGENT_SYNC_CLOSE),
             post(xrpc::agent_sync_close),
         )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_PUT),
+            post(xrpc::vault_put),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_GET),
+            get(xrpc::vault_get),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_ENTITY),
+            get(kg::kg_entity),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_CATALOG),
+            get(kg::kg_catalog),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_EMBED),
+            post(kg::kg_embed),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_SEARCH),
+            get(kg::kg_search),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_QUERY),
+            post(kg::kg_query),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_INGEST),
+            post(kg::kg_ingest),
+        )
         .route("/mcp", post(mcp::mcp_handler))
+        // ── Signal Protocol E2E (ai.gftd.signal.*) ─────────────────────────
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS),
+            post(signal_xrpc::register_prekeys),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_GET_PREKEY_BUNDLE),
+            get(signal_xrpc::get_prekey_bundle),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_SEND_MESSAGE),
+            post(signal_xrpc::send_message),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_SEND_GROUP_MESSAGE),
+            post(signal_xrpc::send_group_message),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY),
+            post(signal_xrpc::distribute_sender_key),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

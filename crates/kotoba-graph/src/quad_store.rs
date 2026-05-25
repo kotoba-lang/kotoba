@@ -62,6 +62,86 @@ impl QuadStore {
         self.arrangements.read().await.get(&graph_cid.to_multibase()).cloned()
     }
 
+    /// Return all Quads whose subject matches `subject`, optionally restricted to `graph_cid`.
+    /// When `graph_cid` is None, scans every named graph in memory.
+    pub async fn get_entity_quads(
+        &self,
+        graph_cid: Option<&KotobaCid>,
+        subject: &KotobaCid,
+    ) -> Vec<Quad> {
+        let arrs = self.arrangements.read().await;
+        if let Some(gcid) = graph_cid {
+            return arrs.get(&gcid.to_multibase())
+                .map(|arr| arr.get_subject_quads(gcid, subject))
+                .unwrap_or_default();
+        }
+        let mut out = vec![];
+        for (g_mb, arr) in arrs.iter() {
+            let gcid = KotobaCid::from_multibase(g_mb)
+                .unwrap_or_else(|| KotobaCid::from_bytes(g_mb.as_bytes()));
+            out.extend(arr.get_subject_quads(&gcid, subject));
+        }
+        out
+    }
+
+    /// Quads whose predicate starts with `prefix`, optionally within a named graph.
+    pub async fn quads_by_predicate_prefix(
+        &self,
+        graph_cid: Option<&KotobaCid>,
+        prefix: &str,
+    ) -> Vec<Quad> {
+        let arrs = self.arrangements.read().await;
+        if let Some(gcid) = graph_cid {
+            return arrs.get(&gcid.to_multibase())
+                .map(|arr| arr.quads_with_predicate_prefix(gcid, prefix))
+                .unwrap_or_default();
+        }
+        let mut out = vec![];
+        for (g_mb, arr) in arrs.iter() {
+            let gcid = KotobaCid::from_multibase(g_mb)
+                .unwrap_or_else(|| KotobaCid::from_bytes(g_mb.as_bytes()));
+            out.extend(arr.quads_with_predicate_prefix(&gcid, prefix));
+        }
+        out
+    }
+
+    /// Snapshot all quads in the named graph as Assert Deltas (Datalog seed).
+    pub async fn snapshot_deltas(&self, graph_cid: &KotobaCid) -> Vec<Delta> {
+        self.arrangements.read().await
+            .get(&graph_cid.to_multibase())
+            .map(|arr| arr.to_deltas(graph_cid))
+            .unwrap_or_default()
+    }
+
+    /// Count quads whose predicate starts with `prefix` within the named graph.
+    pub async fn count_by_predicate_prefix(&self, graph_cid: &KotobaCid, prefix: &str) -> usize {
+        self.arrangements.read().await
+            .get(&graph_cid.to_multibase())
+            .map(|arr| arr.count_by_predicate_prefix(prefix))
+            .unwrap_or(0)
+    }
+
+    /// Find subject CIDs where predicate = `predicate` and object_key = `object_key`,
+    /// optionally within a named graph.
+    pub async fn lookup_subject_by_po(
+        &self,
+        graph_cid: Option<&KotobaCid>,
+        predicate: &str,
+        object_key: &str,
+    ) -> Vec<KotobaCid> {
+        let arrs = self.arrangements.read().await;
+        if let Some(gcid) = graph_cid {
+            return arrs.get(&gcid.to_multibase())
+                .map(|arr| arr.get_subjects_by_predicate_object(predicate, object_key))
+                .unwrap_or_default();
+        }
+        let mut out = vec![];
+        for arr in arrs.values() {
+            out.extend(arr.get_subjects_by_predicate_object(predicate, object_key));
+        }
+        out
+    }
+
     /// Return the head Commit for `graph_cid` (if any).
     pub async fn head_commit(&self, graph_cid: &KotobaCid) -> Option<Commit> {
         self.commit_dag.read().await.head(graph_cid).cloned()

@@ -67,6 +67,79 @@ impl Arrangement {
     pub fn len(&self) -> usize { self.count }
     pub fn is_empty(&self) -> bool { self.count == 0 }
 
+    /// All quads for a specific subject (SPO row scan).
+    pub fn get_subject_quads(&self, graph: &KotobaCid, subject: &KotobaCid) -> Vec<crate::quad::Quad> {
+        let mut out = vec![];
+        if let Some(pmap) = self.spo.get(subject) {
+            for (predicate, objects) in pmap {
+                for object in objects {
+                    out.push(crate::quad::Quad {
+                        graph:     graph.clone(),
+                        subject:   subject.clone(),
+                        predicate: predicate.clone(),
+                        object:    object.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// POS lookup: subjects that have (predicate, object_key).
+    /// `object_key` matches Text values directly and CID multibase strings.
+    pub fn get_subjects_by_predicate_object(
+        &self,
+        predicate: &str,
+        object_key: &str,
+    ) -> Vec<KotobaCid> {
+        self.pos
+            .get(predicate)
+            .and_then(|omap| omap.get(object_key))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Quads whose predicate starts with `prefix` (BTreeMap range scan on POS).
+    /// Uses SPO index to recover the full object value for each matching subject.
+    pub fn quads_with_predicate_prefix(&self, graph: &KotobaCid, prefix: &str) -> Vec<crate::quad::Quad> {
+        let mut out = vec![];
+        for (predicate, omap) in self.pos.range(prefix.to_string()..) {
+            if !predicate.starts_with(prefix) { break; }
+            for subjects in omap.values() {
+                for subject in subjects {
+                    if let Some(pmap) = self.spo.get(subject) {
+                        if let Some(objects) = pmap.get(predicate) {
+                            for object in objects {
+                                out.push(crate::quad::Quad {
+                                    graph:     graph.clone(),
+                                    subject:   subject.clone(),
+                                    predicate: predicate.clone(),
+                                    object:    object.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Count quads whose predicate starts with `prefix`.
+    pub fn count_by_predicate_prefix(&self, prefix: &str) -> usize {
+        let mut n = 0usize;
+        for (predicate, omap) in self.pos.range(prefix.to_string()..) {
+            if !predicate.starts_with(prefix) { break; }
+            n += omap.values().map(|v| v.len()).sum::<usize>();
+        }
+        n
+    }
+
+    /// Snapshot all quads as Assert Deltas (seed for Datalog evaluation).
+    pub fn to_deltas(&self, graph: &KotobaCid) -> Vec<Delta> {
+        self.quads(graph).into_iter().map(Delta::assert).collect()
+    }
+
     /// Reconstruct all Quads from the SPO index, attaching the given graph CID.
     pub fn quads(&self, graph: &KotobaCid) -> Vec<crate::quad::Quad> {
         let mut out = Vec::with_capacity(self.count);

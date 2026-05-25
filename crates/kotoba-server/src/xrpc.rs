@@ -18,6 +18,8 @@ pub const NSID_AGENT_RUN:        &str = "ai.gftd.apps.kotoba.agent.run";
 pub const NSID_AGENT_SYNC_OPEN:  &str = "ai.gftd.apps.kotoba.agent.syncopen";
 pub const NSID_AGENT_SYNC_ADV:   &str = "ai.gftd.apps.kotoba.agent.syncadvance";
 pub const NSID_AGENT_SYNC_CLOSE: &str = "ai.gftd.apps.kotoba.agent.syncclose";
+pub const NSID_VAULT_PUT:        &str = "ai.gftd.apps.kotoba.vault.put";
+pub const NSID_VAULT_GET:        &str = "ai.gftd.apps.kotoba.vault.get";
 
 use std::sync::Arc;
 use axum::{
@@ -37,6 +39,28 @@ pub struct QuadCreateReq {
     pub subject:   String,
     pub predicate: String,
     pub object:    String,
+    /// Optional CACAO warrant (DAG-CBOR, base64-standard encoded).
+    /// When present: verified before write; `cacao.p.graph_cid()` must match `graph`.
+    /// Issuer DID becomes the authoritative namespace for this write.
+    pub cacao_b64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VaultPutReq {
+    /// Raw blob encoded as standard base64.
+    pub data_b64: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VaultPutResp {
+    pub cid:  String,
+    pub size: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VaultGetResp {
+    pub cid:      String,
+    pub data_b64: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,12 +140,41 @@ pub async fn health(State(state): State<Arc<KotobaState>>) -> impl IntoResponse 
 
 /// POST /xrpc/ai.gftd.apps.kotoba.quad.create
 /// Publish a Quad assert to the KSE Journal (SPO topic).
+///
+/// When `cacao_b64` is present, the CACAO is verified before the write.
+/// The CACAO's `graph_cid` resource must match the requested `graph` field,
+/// and the signature must recover to the declared issuer DID.
 pub async fn quad_create(
     State(state): State<Arc<KotobaState>>,
     Json(req):    Json<QuadCreateReq>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     use kotoba_core::cid::KotobaCid;
     use kotoba_kqe::quad::{Quad, QuadObject};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
+    // ── CACAO verification (when warrant is present) ──────────────────────
+    if let Some(b64) = &req.cacao_b64 {
+        let cbor = B64.decode(b64)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao_b64 decode: {e}")))?;
+        let cacao = kotoba_auth::Cacao::from_cbor(&cbor)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao parse: {e}")))?;
+
+        // Signature must be valid
+        let issuer_did = cacao.verify_signature()
+            .map_err(|e| (StatusCode::UNAUTHORIZED, format!("cacao sig: {e}")))?;
+
+        // The CACAO's graph resource must match the requested graph
+        if let Some(cacao_graph) = cacao.p.graph_cid() {
+            if cacao_graph != req.graph {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    format!("cacao graph mismatch: warrant covers {cacao_graph}, request targets {}", req.graph),
+                ));
+            }
+        }
+
+        tracing::info!(issuer = %issuer_did, graph = %req.graph, "quad.create: CACAO verified");
+    }
 
     let quad = Quad {
         graph:     KotobaCid::from_bytes(req.graph.as_bytes()),
@@ -142,7 +195,53 @@ pub async fn quad_create(
         "quad.create → Journal + QuadStore"
     );
 
-    (StatusCode::OK, Json(QuadCreateResp { status: "ok", journal_cid }))
+    Ok((StatusCode::OK, Json(QuadCreateResp { status: "ok", journal_cid })))
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.vault.put
+/// Store an opaque blob in the private Vault.  Returns a CID (multibase blake3).
+/// No GossipSub propagation — vault blobs stay local (or in B2 when configured).
+pub async fn vault_put(
+    State(state): State<Arc<KotobaState>>,
+    Json(req):    Json<VaultPutReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use bytes::Bytes;
+
+    let data = B64.decode(&req.data_b64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("data_b64 decode: {e}")))?;
+
+    let blob_ref = state.vault.put(Bytes::from(data)).await;
+    tracing::info!(cid = %blob_ref.cid.to_multibase(), size = blob_ref.size, "vault.put");
+
+    Ok((StatusCode::OK, Json(VaultPutResp {
+        cid:  blob_ref.cid.to_multibase(),
+        size: blob_ref.size,
+    })))
+}
+
+/// GET /xrpc/ai.gftd.apps.kotoba.vault.get?cid=<multibase>
+/// Retrieve a blob from the Vault by CID.  Returns 404 if not found.
+pub async fn vault_get(
+    State(state): State<Arc<KotobaState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use kotoba_core::cid::KotobaCid;
+
+    let cid_str = params.get("cid")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing `cid` query param".to_string()))?;
+
+    let cid = KotobaCid::from_multibase(cid_str)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("invalid CID: {cid_str}")))?;
+
+    let data = state.vault.get(&cid).await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("vault: CID not found: {cid_str}")))?;
+
+    Ok((StatusCode::OK, Json(VaultGetResp {
+        cid:      cid_str.to_string(),
+        data_b64: B64.encode(&data),
+    })))
 }
 
 /// GET /xrpc/ai.gftd.apps.kotoba.node.status
@@ -903,12 +1002,39 @@ pub async fn agent_run(
     let task       = req.task.clone();
     let graph_cid2 = graph_cid.clone();
     let qs         = Arc::clone(&state.quad_store);
+    let journal    = Arc::clone(&state.journal);
 
     // Run the Pregel ReAct loop in a blocking thread (LLM is sync).
     // Each BSP superstep = one Thought+Action+Observation cycle.
     let (session, superstep_results) = tokio::task::spawn_blocking(move || {
+        use kotoba_vm::agent::{Tool, ToolOutput};
+
+        // Override the default no-op kse.publish with a real Journal write.
+        let journal2 = Arc::clone(&journal);
+        let kse_publish_tool = Tool::from_fn(
+            "kse.publish",
+            "Publish a KSE event — kse.publish(topic,message)",
+            move |input, _snap| {
+                let (topic_str, msg) = input.split_once(',')
+                    .map(|(t, m)| (t.trim().to_string(), m.trim().to_string()))
+                    .unwrap_or_else(|| ("agent".to_string(), input.trim().to_string()));
+                let j = Arc::clone(&journal2);
+                let topic_str2 = topic_str.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        j.publish(
+                            kotoba_kse::Topic(topic_str2),
+                            bytes::Bytes::from(msg),
+                        ).await;
+                    });
+                });
+                ToolOutput { observation: format!("published to '{topic_str}'"), done: false, route: None }
+            },
+        );
+
         let runner  = PregelReActRunner::new(engine, max_tokens);
-        let session = AgentSession::new(task, graph_cid2, max_steps);
+        let session = AgentSession::new(task, graph_cid2, max_steps)
+            .with_tool(kse_publish_tool);
         runner.run(session)
     })
     .await

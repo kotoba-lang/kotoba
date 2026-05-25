@@ -454,7 +454,7 @@ fn read_relation_type(chars: &mut std::iter::Peekable<std::str::Chars>) -> Strin
 /// Parse a string literal enclosed in `"` or `'`. Returns the content without quotes.
 fn parse_string_literal(s: &str) -> Option<String> {
     let s = s.trim();
-    let (open, close) = if s.starts_with('"') {
+    let (_open, close) = if s.starts_with('"') {
         ('"', '"')
     } else if s.starts_with('\'') {
         ('\'', '\'')

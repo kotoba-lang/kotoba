@@ -569,7 +569,7 @@ enum InternalNode {
 /// Execute `NodeKind::ToolNode`: read `tool_calls` from state, dispatch via
 /// `ToolRegistry`, append tool results to `messages`.
 fn run_tool_node(state: &State, registry: &ToolRegistry) -> HashMap<String, Value> {
-    use crate::agent::{AgentSnapshot, ChannelMode};
+    use crate::agent::AgentSnapshot;
 
     let calls = match state.get("tool_calls") {
         Some(Value::Array(arr)) => arr.clone(),

@@ -6,7 +6,7 @@ use kotoba_dht::{
     neighborhood::Neighborhood,
     node_id::NodeId,
 };
-use kotoba_kse::{store::KseStore, sync_window::SyncWindow, Journal, Shelf, Topic};
+use kotoba_kse::{store::KseStore, sync_window::SyncWindow, Journal, Shelf, Topic, Vault};
 use kotoba_kqe::quad::Quad;
 use kotoba_graph::QuadStore;
 use kotoba_store::{BudgetedBlockStore, IpfsPinClient};
@@ -20,6 +20,8 @@ pub struct KotobaState {
     // ── KSE ──────────────────────────────────────────────────────────────
     pub journal:       Arc<Journal>,
     pub shelf:         Arc<Shelf>,
+    /// Content-addressed private blob vault (no GossipSub, no CACAO required).
+    pub vault:         Arc<Vault>,
     // ── KDHT ─────────────────────────────────────────────────────────────
     pub neighborhood:  Arc<tokio::sync::RwLock<Neighborhood>>,
     pub local_node_id: NodeId,
@@ -137,10 +139,23 @@ impl KotobaState {
         // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path
         let quad_store = Arc::new(QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store)));
 
+        // Vault — content-addressed private blob store; persisted to B2 when available
+        let vault = Arc::new(match build_kse_store("kotoba/vault/") {
+            Some(store) => {
+                tracing::info!("Vault: B2 persistence enabled");
+                Vault::with_store(store)
+            }
+            None => {
+                tracing::info!("Vault: in-memory only");
+                Vault::new()
+            }
+        });
+
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
             journal,
             shelf,
+            vault,
             neighborhood,
             local_node_id,
             executor,

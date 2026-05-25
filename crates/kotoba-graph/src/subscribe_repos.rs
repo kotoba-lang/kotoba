@@ -80,10 +80,14 @@ fn save_cursor(store: &dyn BlockStore, seq: u64) {
 // ── Public entry point ────────────────────────────────────────────────────
 
 /// Run the subscribeRepos firehose client loop. Spawn with `tokio::spawn`.
+///
+/// When `gossip_tx` is `Some`, each asserted quad is also forwarded to the GossipSub
+/// swarm actor on the `"quad/assert"` topic so remote peers receive AT Protocol events.
 pub async fn run_subscribe_repos(
     journal:     Arc<Journal>,
     quad_store:  Arc<QuadStore>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
+    gossip_tx:   Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
 ) {
     let base = std::env::var("KOTOBA_SUBSCRIBE_REPOS_URL")
         .unwrap_or_else(|_|
@@ -130,6 +134,7 @@ pub async fn run_subscribe_repos(
                                 &journal,
                                 &quad_store,
                                 &block_store,
+                                &gossip_tx,
                             ).await;
 
                             // Persist cursor every CURSOR_PERSIST_INTERVAL commits
@@ -169,6 +174,7 @@ async fn handle_frame(
     journal:     &Arc<Journal>,
     quad_store:  &Arc<QuadStore>,
     block_store: &Arc<dyn BlockStore + Send + Sync>,
+    gossip_tx:   &Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
 ) -> Option<u64> {
     // Two CBOR values concatenated: header then body
     let mut cur = Cursor::new(data);
@@ -187,8 +193,7 @@ async fn handle_frame(
 
     match cbor_str(&header, "t").as_deref() {
         Some("#commit") => {
-            let seq = handle_commit(body, did_filter, journal, quad_store, block_store).await;
-            seq
+            handle_commit(body, did_filter, journal, quad_store, block_store, gossip_tx).await
         }
         Some("#identity") => { handle_identity(body, journal, quad_store).await; None }
         Some("#account")  => None,
@@ -203,6 +208,7 @@ async fn handle_commit(
     journal:     &Arc<Journal>,
     quad_store:  &Arc<QuadStore>,
     block_store: &Arc<dyn BlockStore + Send + Sync>,
+    gossip_tx:   &Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
 ) -> Option<u64> {
     let repo = match cbor_str(&body, "repo") {
         Some(d) => d,
@@ -294,6 +300,10 @@ async fn handle_commit(
             Ok(v) => Bytes::from(v),
             Err(_) => continue,
         };
+        // Propagate to GossipSub peers so remote kotoba nodes receive AT Protocol events
+        if let Some(tx) = gossip_tx {
+            tx.try_send(("quad/assert".to_string(), payload.to_vec())).ok();
+        }
         journal.publish(topic, payload).await;
     }
 
