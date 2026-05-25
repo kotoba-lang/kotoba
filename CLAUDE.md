@@ -167,7 +167,8 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
 
 - VAET は `QuadObject::Cid` のみインデックス — Text/Integer/Float 禁止
 - `CommitDag::Commit` に `index_roots: HashMap<String, KotobaCid>` 追加 (`serde(default, skip_serializing_if)` で旧 commit CID 安定)
-- `QuadStore::commit()` は EAVT/AEVT/AVET/VAET を **4 並列 64MB スタックスレッド** で同時ビルド (各スレッドは `CapturingBlockStore` でブロックを記録); 完了後 `CarBundleWriter` で全ブロックを単一 CAR ファイルにパック → ブロックストアに 1 PUT。期待スピードアップ: ~4.7s → ~1.5–2s
+- `QuadStore::commit()` は EAVT/AEVT/AVET/VAET を **4 並列 64MB スタックスレッド** で同時ビルド (各スレッドは `CapturingBlockStore` でブロックを記録); 完了後 `CarBundleWriter` で全ブロックを単一 CAR ファイルにパック → ブロックストアに 1 PUT。実測: 3.1–3.8s/1Mquad commit (serial 4.7s → **28% 高速化**; MemoryBlockStore, M4 Mac)
+- `QuadStore::get_entity_quads_cold()`: hot Arrangement clear 後の cold 読み取り。ProllyTree `scan_prefix(subject_bytes)` → EAVT エントリ再構成。実測コスト: iroh LAN (1ms/GET) 3.1ms / iroh WAN (80ms/GET) 169ms / S3 same-AZ (2ms/GET) 5.9ms (1K entries, 2 tree levels)
 - Journal: 4 トピック SPO + PSO + POS + OSP に publish
 
 ## TieredBlockStore / IrohBlockStore

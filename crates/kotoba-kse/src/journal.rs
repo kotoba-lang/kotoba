@@ -209,10 +209,11 @@ impl Journal {
         }
     }
 
-    /// Delete seq-index keys (`seq/{seq:020}`) for all entries with `seq < before`
-    /// from the persistent store.  The associated `{cid}.cbor` blobs are left for
-    /// a future GC pass — only the seq-index is pruned here, which is sufficient to
-    /// prevent `read_since(1)` from loading stale data on the next startup.
+    /// Delete seq-index keys (`seq/{seq:020}`) **and** the associated `{cid_mb}.cbor` blob
+    /// entries for all entries with `seq < before` from the persistent store.
+    ///
+    /// Both deletes are best-effort (errors are silently ignored).  Total count of
+    /// deleted keys (seq-index + cbor blobs) is logged at debug level.
     ///
     /// Runs to completion; callers should `tokio::spawn` if fire-and-forget is preferred.
     pub async fn trim_persistent_before(&self, before: u64) {
@@ -226,13 +227,21 @@ impl Journal {
             let Some(seq_str) = key.strip_prefix("seq/") else { continue };
             let Ok(seq) = seq_str.trim().parse::<u64>() else { continue };
             if seq < before {
-                if store.delete_key(&key).await.is_ok() {
+                // Read the seq key value to obtain the CID multibase string.
+                if let Ok(cid_bytes) = store.get(&key).await {
+                    let cid_mb = String::from_utf8_lossy(&cid_bytes).into_owned();
+                    // Best-effort: delete the {cid_mb}.cbor blob.
+                    let blob_key = format!("{}.cbor", cid_mb);
+                    let _ = store.delete_key(&blob_key).await;
                     deleted += 1;
                 }
+                // Best-effort: delete the seq/{N} key.
+                let _ = store.delete_key(&key).await;
+                deleted += 1;
             }
         }
         if deleted > 0 {
-            tracing::debug!(deleted, before, "Journal: trimmed persistent seq-index entries");
+            tracing::debug!(deleted, before, "Journal: trimmed persistent seq-index and cbor blob entries");
         }
     }
 

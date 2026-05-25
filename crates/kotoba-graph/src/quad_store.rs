@@ -100,14 +100,48 @@ impl QuadStore {
     ///
     /// First-run (no checkpoint): falls back to replaying from seq=1.
     pub async fn replay_from_journal(&self) {
-        // Load checkpoint; extract committed_seq.
+        // Load checkpoint; extract committed_seq and restore CommitDag heads.
         let committed = if let Some(raw) = self.journal.read_checkpoint().await {
-            let seq = serde_json::from_slice::<serde_json::Value>(&raw)
-                .ok()
+            let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+            let seq = value.as_ref()
                 .and_then(|v| v["committed_seq"].as_u64())
                 .unwrap_or(0);
             *self.committed_seq.write().await = seq;
             tracing::info!(committed_seq = seq, "QuadStore: checkpoint found, replaying delta only");
+
+            // Restore CommitDag from checkpoint heads map.
+            if let Some(heads) = value
+                .as_ref()
+                .and_then(|v| v["heads"].as_object())
+            {
+                let mut restored = 0usize;
+                for (_graph_mb, commit_mb) in heads {
+                    if let Some(commit_mb_str) = commit_mb.as_str() {
+                        if let Some(commit_cid) = KotobaCid::from_multibase(commit_mb_str) {
+                            match crate::commit::Commit::load(&commit_cid, &*self.block_store) {
+                                Ok(Some(commit)) => {
+                                    self.commit_dag.write().await.add(commit);
+                                    restored += 1;
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        commit_cid = %commit_cid,
+                                        "CommitDag restore: commit block not found in BlockStore"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        commit_cid = %commit_cid,
+                                        "CommitDag restore: failed to load commit: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                tracing::info!(graphs = restored, "CommitDag restored from checkpoint");
+            }
+
             seq
         } else {
             tracing::info!("QuadStore: no checkpoint, full WAL replay (first run)");
@@ -232,6 +266,67 @@ impl QuadStore {
             out.extend(arr.get_subjects_by_predicate_object(predicate, object_key));
         }
         out
+    }
+
+    /// Return quads for `subject` in `graph_cid`, searching committed ProllyTree data.
+    ///
+    /// Hot path: if the Arrangement still holds the graph, returns immediately
+    /// (identical to `get_entity_quads`).
+    ///
+    /// Cold path: when the Arrangement has been cleared after `commit()`, decodes
+    /// quads from the EAVT ProllyTree via `scan_prefix(subject_bytes)`.  Each tree
+    /// level = 1 BlockStore GET (1–6 RTTs for 1K–1B quads).
+    pub async fn get_entity_quads_cold(
+        &self,
+        graph_cid: &KotobaCid,
+        subject:   &KotobaCid,
+    ) -> anyhow::Result<Vec<Quad>> {
+        // ── Hot path ──────────────────────────────────────────────────────────
+        {
+            let arrs = self.arrangements.read().await;
+            if let Some(arr) = arrs.get(&graph_cid.to_multibase()) {
+                if !arr.is_empty() {
+                    return Ok(arr.get_subject_quads(graph_cid, subject));
+                }
+            }
+        }
+
+        // ── Cold path: EAVT ProllyTree scan ───────────────────────────────────
+        let head = self.commit_dag.read().await.head(graph_cid).cloned();
+        let Some(commit) = head else {
+            return Ok(vec![]); // no commit yet
+        };
+
+        let root_eavt = commit.root.clone(); // EAVT root (backward-compat field)
+        let prefix    = &subject.0[..];      // subject bytes = EAVT key prefix
+
+        let bs = Arc::clone(&self.block_store);
+        let prefix_vec = prefix.to_vec();
+        let entries = tokio::task::spawn_blocking(move || {
+            ProllyTree::scan_prefix(&root_eavt, &prefix_vec, &*bs)
+        }).await
+          .map_err(|e| anyhow::anyhow!("spawn_blocking panic: {e}"))??;
+
+        // Each EAVT entry: key = subject||predicate bytes, value = object JSON.
+        // Decode the predicate (the bytes after the fixed subject prefix length).
+        let subject_len = subject.0.len();
+        let mut quads = Vec::new();
+        for (key, val) in entries {
+            if key.len() <= subject_len { continue; }
+            let predicate = match std::str::from_utf8(&key[subject_len..]) {
+                Ok(p)  => p.to_string(),
+                Err(_) => continue,
+            };
+            let object: kotoba_kqe::quad::QuadObject =
+                serde_json::from_slice(&val).unwrap_or(kotoba_kqe::quad::QuadObject::Text(String::new()));
+            quads.push(Quad {
+                graph:    graph_cid.clone(),
+                subject:  subject.clone(),
+                predicate,
+                object,
+            });
+        }
+        Ok(quads)
     }
 
     /// Clear the in-memory Arrangement for `graph_cid`, reclaiming RAM.
@@ -567,5 +662,32 @@ mod tests {
         let head = qs.head_commit(&graph).await.unwrap();
         assert_eq!(head.prev, Some(cid1));
         assert_eq!(head.cid, cid2);
+    }
+
+    /// P2: After commit + reset_arrangement, get_entity_quads_cold must reconstruct
+    /// quads for a specific subject from the committed EAVT ProllyTree.
+    #[tokio::test]
+    async fn cold_fallback_returns_committed_quads_after_arrangement_clear() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+
+        let graph   = KotobaCid::from_bytes(b"cold-graph");
+        let subject = KotobaCid::from_bytes(b"alice");
+
+        // Assert two quads for alice and one for bob
+        qs.assert(make_quad("cold-graph", "alice", "name",  "Alice")).await;
+        qs.assert(make_quad("cold-graph", "alice", "knows", "Bob")).await;
+        qs.assert(make_quad("cold-graph", "bob",   "name",  "Bob")).await;
+
+        qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        qs.reset_arrangement(&graph).await; // evict hot Arrangement
+
+        let quads = qs.get_entity_quads_cold(&graph, &subject).await.unwrap();
+        assert_eq!(quads.len(), 2, "should find 2 quads for alice from cold ProllyTree");
+        let predicates: std::collections::HashSet<&str> =
+            quads.iter().map(|q| q.predicate.as_str()).collect();
+        assert!(predicates.contains("name"),  "name predicate expected");
+        assert!(predicates.contains("knows"), "knows predicate expected");
     }
 }
