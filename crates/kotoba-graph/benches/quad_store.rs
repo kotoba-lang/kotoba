@@ -1,17 +1,39 @@
-/// QuadStore insert benchmarks — per-quad async vs. batch insert.
+/// QuadStore insert + query benchmarks.
 ///
-/// Measures wall-clock throughput (quads/s) for the full QuadStore insert path
-/// including RwLock acquisition, so the batch speedup shows clearly.
+/// ## Scope
+///
+/// All insert and hot-path query benchmarks use `MemoryBlockStore` — they measure
+/// the **in-memory Arrangement path only** (no BlockStore I/O during query).
+///
+/// The cold-path query group (`query_cold_prolly_*`) measures the **committed data
+/// read path**: ProllyTree node traversal through a `SimulatedLatencyBlockStore`.
+/// This simulates what happens when quads have been committed and the Arrangement
+/// is no longer hot:
+///   - iroh LAN  (1 ms GET)  → one ProllyTree level = 1 ms overhead
+///   - iroh WAN  (80 ms GET) → each node = 80 ms; multi-level = additive
+///   - S3 same-AZ (2 ms GET) → comparable to iroh LAN
+///
+/// ## Key result interpretation
+///
+/// | benchmark group            | includes IPFS/S3 I/O? |
+/// |----------------------------|-----------------------|
+/// | insert_per_quad            | no  (hot Arrangement) |
+/// | insert_batch               | no  (hot Arrangement) |
+/// | insert_batch_chunked       | no  (hot Arrangement) |
+/// | query_hot_arrangement      | no  (in-memory only)  |
+/// | query_cold_prolly_commit   | YES (simulated RTT)   |
 ///
 /// Run:
 ///   cargo bench -p kotoba-graph --bench quad_store
+use std::{sync::Arc, time::Duration};
+use anyhow::Result;
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use kotoba_core::cid::KotobaCid;
+use kotoba_core::{cid::KotobaCid, prolly::ProllyTree, store::BlockStore};
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_kqe::quad::{Quad, QuadObject};
 use kotoba_kse::journal::Journal;
 use kotoba_store::MemoryBlockStore;
-use std::sync::Arc;
 
 fn make_cid(n: u64) -> KotobaCid {
     KotobaCid::from_bytes(&n.to_le_bytes())
@@ -46,9 +68,10 @@ fn bench_insert_per_quad(c: &mut Criterion) {
         .unwrap();
 
     let mut group = c.benchmark_group("quad_store/insert_per_quad");
-    for n in [1_000u64, 10_000, 100_000] {
+    for &(n, samples) in &[(1_000u64, 100), (10_000, 20), (100_000, 10)] {
         let quads = make_quads(n);
         group.throughput(Throughput::Elements(n * 2)); // 2 quads per entity
+        group.sample_size(samples);
         group.bench_with_input(BenchmarkId::from_parameter(n), &quads, |b, quads| {
             b.to_async(&rt).iter(|| async {
                 let qs = make_store();
@@ -110,10 +133,114 @@ fn bench_insert_batch_chunked(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── Hot-path query bench ─────────────────────────────────────────────────────
+
+/// Query benchmarks against the hot in-memory Arrangement (no BlockStore I/O).
+fn bench_query_hot(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let qs = rt.block_on(async {
+        let store = make_store();
+        let n = 100_000u64;
+        for chunk in make_quads(n).chunks(50_000) {
+            store.assert_batch_silent(chunk.to_vec()).await;
+        }
+        store
+    });
+    let graph = make_cid(1);
+    let subject = make_cid(42);
+
+    let mut group = c.benchmark_group("quad_store/query_hot");
+    group.bench_function("get_entity_quads_eavt", |b| {
+        b.to_async(&rt).iter(|| async {
+            qs.get_entity_quads(Some(&graph), &subject).await
+        });
+    });
+    group.bench_function("lookup_by_predicate_object_avet", |b| {
+        b.to_async(&rt).iter(|| async {
+            qs.lookup_subject_by_po(Some(&graph), "name", "Alice").await
+        });
+    });
+    group.bench_function("quads_by_predicate_prefix_avet", |b| {
+        b.to_async(&rt).iter(|| async {
+            qs.quads_by_predicate_prefix(Some(&graph), "name").await
+        });
+    });
+    group.finish();
+}
+
+// ─── Cold-path: ProllyTree commit + re-read with simulated IPFS/S3 RTT ────────
+
+/// Wraps MemoryBlockStore with a fixed sleep per get/put to simulate network RTT.
+struct SimulatedLatencyBlockStore {
+    inner:   MemoryBlockStore,
+    get_rtt: Duration,
+    put_rtt: Duration,
+}
+impl SimulatedLatencyBlockStore {
+    fn iroh_lan()       -> Self { Self { inner: MemoryBlockStore::new(), get_rtt: ms(1),  put_rtt: ms(2)  } }
+    fn iroh_wan()       -> Self { Self { inner: MemoryBlockStore::new(), get_rtt: ms(80), put_rtt: ms(100) } }
+    fn s3_same_az()     -> Self { Self { inner: MemoryBlockStore::new(), get_rtt: ms(2),  put_rtt: ms(10) } }
+}
+fn ms(n: u64) -> Duration { Duration::from_millis(n) }
+
+impl BlockStore for SimulatedLatencyBlockStore {
+    fn put(&self, cid: &KotobaCid, data: &[u8]) -> Result<()> {
+        std::thread::sleep(self.put_rtt);
+        self.inner.put(cid, data)
+    }
+    fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>> {
+        std::thread::sleep(self.get_rtt);
+        self.inner.get(cid)
+    }
+    fn has(&self, cid: &KotobaCid) -> bool { self.inner.has(cid) }
+    fn delete(&self, cid: &KotobaCid) -> Result<()> { self.inner.delete(cid) }
+    fn pin(&self, cid: &KotobaCid) { self.inner.pin(cid) }
+    fn unpin(&self, cid: &KotobaCid) { self.inner.unpin(cid) }
+    fn is_pinned(&self, cid: &KotobaCid) -> bool { self.inner.is_pinned(cid) }
+}
+
+/// Build a small ProllyTree (1K entries) with a simulated-latency store, then
+/// do a single-key lookup.  Each ProllyTree level = 1 BlockStore.get() call.
+/// With a branching factor of ~128 entries/node, 1K entries = 2-3 levels.
+///
+/// This measures: commit (PUT per node) + point-query (GET per level traversal).
+fn bench_query_cold_prolly(c: &mut Criterion) {
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = (0u64..1_000)
+        .map(|i| (i.to_le_bytes().to_vec(), format!("v{i}").into_bytes()))
+        .collect();
+    let lookup_key = 500u64.to_le_bytes().to_vec();
+
+    let scenarios: &[(&str, fn() -> SimulatedLatencyBlockStore)] = &[
+        ("iroh_lan_1ms_get",   SimulatedLatencyBlockStore::iroh_lan),
+        ("iroh_wan_80ms_get",  SimulatedLatencyBlockStore::iroh_wan),
+        ("s3_same_az_2ms_get", SimulatedLatencyBlockStore::s3_same_az),
+    ];
+
+    let mut group = c.benchmark_group("quad_store/query_cold_prolly_1k");
+    group.sample_size(10);
+
+    for (name, make_store) in scenarios {
+        let store = Arc::new(make_store());
+        // commit once into the simulated store (PUT cost)
+        let root = ProllyTree::build_tree(entries.clone(), &*store).unwrap();
+
+        group.bench_function(*name, |b| {
+            b.iter(|| ProllyTree::get(&root, &lookup_key, &*store));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_per_quad,
     bench_insert_batch,
     bench_insert_batch_chunked,
+    bench_query_hot,
+    bench_query_cold_prolly,
 );
 criterion_main!(benches);

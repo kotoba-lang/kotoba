@@ -183,8 +183,83 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
 
 ## criterion ベンチマーク
 
-- `kotoba-kqe/benches/arrangement.rs`: insert (1k/10k/100k), SPO/PSO/POS/OCP lookup, prefix scan
-- `kotoba-store/benches/tiered_store.rs`: hot put/get, cold-promote, budgeted eviction
+### ベンチ一覧
+
+| ファイル | グループ | 内容 |
+|---|---|---|
+| `kotoba-kqe/benches/arrangement.rs` | `arrangement/insert` | Arrangement insert 1K/10K/100K |
+| | `arrangement/spo_lookup_eavt` | EAVT 点引き |
+| | `arrangement/pso_*_aevt` | AEVT subjects / by_predicate |
+| | `arrangement/pos_lookup_avet` | AVET 値引き |
+| | `arrangement/ocp_reverse_ref_vaet` | VAET 逆参照 |
+| | `arrangement/prefix_scan_avet_weight` | 述語プレフィックス scan |
+| | `arrangement/multi_hop_2hop_vaet_eavt` | 2-hop 経路探索 |
+| | `arrangement/multi_hop_3hop_vaet` | 3-hop 経路探索 |
+| | `arrangement/join_avet_status_active_and_role_admin` | 2-属性 AVET 交差 join |
+| | `arrangement/population_count_by_status_aevt` | AEVT 集計 (GROUP BY 相当) |
+| | `arrangement/star_pattern_eavt_20pred` | EAVT star pattern (全述語取得) |
+| | `arrangement/reverse_fanin_vaet_5k_to_hub` | VAET fan-in (5K→hub) |
+| `kotoba-graph/benches/quad_store.rs` | `quad_store/insert_per_quad` | assert_silent × N (1ロック/quad) |
+| | `quad_store/insert_batch` | assert_batch_silent (1ロック/全quads) |
+| | `quad_store/insert_batch_chunked` | 50K chunk バッチ (loadtest 同等) |
+| | `quad_store/query_hot` | Arrangement hot-path クエリ |
+| | `quad_store/query_cold_prolly_1k` | ProllyTree 点引き + 模擬RTT |
+| `kotoba-store/benches/tiered_store.rs` | `tiered_store/*` | hot put/get, cold-promote, 予算 eviction |
+
+### ベンチの IPFS/S3 I/O スコープ
+
+**重要**: 現在のクエリベンチは2種類ある。
+
+| ベンチグループ | BlockStore I/O を含む? | 説明 |
+|---|---|---|
+| `arrangement/*` | **含まない** | 純インメモリ Arrangement |
+| `quad_store/insert_*` | **含まない** | MemoryBlockStore、Arrangement のみ |
+| `quad_store/query_hot` | **含まない** | hot Arrangement (commit 後も in-memory) |
+| `quad_store/query_cold_prolly_1k` | **含む (模擬)** | ProllyTree 点引き、RTT = iroh LAN 1ms / iroh WAN 80ms / S3 same-AZ 2ms |
+| `tiered_store/*` | **含む (模擬)** | TieredBlockStore hot/cold 経路 |
+
+**cold-path クエリ (IPFS/S3) の特性**:  
+- ProllyTree の1レベル = 1 BlockStore.get() = 1 RTT  
+- ~256 entries/node なので深さ = ceil(log256(N)): 1K → 1-2 RTT、1M → 3-4 RTT、1B → 5-6 RTT  
+- iroh LAN 1ms × 3 レベル = **~3ms**  
+- iroh WAN 80ms × 3 レベル = **~240ms**  
+- S3 same-AZ 2ms × 3 レベル = **~6ms**  
+- TieredBlockStore(hot=sled, cold=iroh): hot ヒット時は **µs オーダー**
+
+### 実測値 (2026-05-25, macOS aarch64, release build)
+
+#### Arrangement hot-path (インメモリ)
+
+| ベンチ | p50 |
+|---|---|
+| insert 1K quads | 3.4µs/quad (290K quad/s) |
+| EAVT 点引き | ~180ns |
+| AEVT 逆引き | ~8µs |
+| AVET 値引き | ~18µs |
+| VAET 逆参照 | ~83µs |
+
+#### QuadStore insert (criterion bench, macOS aarch64, 2026-05-25)
+
+entities × 2 quads = 要素数 (throughput = quad/s)
+
+| パス | 1K entities (2K q) | 10K entities (20K q) | 100K entities (200K q) | 1M entities (2M q) |
+|---|---|---|---|---|
+| `insert_per_quad` (1ロック/quad) | 13.7ms **146K/s** | 138ms **145K/s** | 1.54s **130K/s** | — |
+| `insert_batch` (1ロック/全quads) | 5.1ms **390K/s** (2.7×) | 79ms **252K/s** (1.7×) | 1.11s **180K/s** (1.4×) | — |
+| `insert_batch_chunked` (50K chunk) | — | — | 1.33s **150K/s** | 38.6s **52K/s** ¹ |
+
+¹ 1M entities (2M quads) の bench は HashMap/BTreeMap 成長コストを含む。実運用 (batch commit cycle で reset_arrangement) は loadtest 測定値を参照。
+
+#### loadtest Phase 1 (純 Arrangement, 2026-05-25)
+
+| quads | insert | MB_rss | p50 | p95 | p99 | quad/s | MB/Mquad |
+|---|---|---|---|---|---|---|---|
+| 1M | 3.45s | 840 MB | 68µs | 7.4ms | 14ms | 290K | 840 |
+| 10M | 75.9s | 1570 MB | 829µs | 87ms | 136ms | 132K | 157 |
+
+Run: `cargo bench -p kotoba-kqe --bench arrangement`  
+Run: `cargo bench -p kotoba-graph --bench quad_store`  
+Run: `cargo bench -p kotoba-store --bench tiered_store`
 
 ## Selective Sync + Storage Budget 設計
 

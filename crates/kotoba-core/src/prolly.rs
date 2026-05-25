@@ -142,6 +142,42 @@ impl ProllyTree {
         Ok(ptrs)
     }
 
+    /// Point-query: look up `key` in the ProllyTree rooted at `root_cid`.
+    ///
+    /// Each tree level requires one `store.get()` call — on a cold BlockStore
+    /// (IPFS / S3) this multiplies the network RTT by the tree depth.
+    /// With ~256-entry leaves, depth = ceil(log256(N)):
+    ///   - 1K entries  → 1–2 levels → 1–2 RTTs
+    ///   - 1M entries  → 3–4 levels → 3–4 RTTs
+    ///   - 1B entries  → 5–6 levels → 5–6 RTTs
+    ///
+    /// Returns `None` if the key is not found.
+    pub fn get(
+        root: &KotobaCid,
+        key:  &[u8],
+        store: &dyn BlockStore,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(node) = Self::load_node(root, store)? else {
+            return Ok(None);
+        };
+        match node {
+            ProllyNode::Leaf { entries, .. } => {
+                Ok(entries.into_iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| v))
+            }
+            ProllyNode::Internal { children, .. } => {
+                // Find the first child whose max_key >= key, then recurse.
+                let child_cid = children
+                    .into_iter()
+                    .find(|(max_key, _)| max_key.as_slice() >= key)
+                    .map(|(_, cid)| cid);
+                match child_cid {
+                    Some(cid) => Self::get(&cid, key, store),
+                    None      => Ok(None),
+                }
+            }
+        }
+    }
+
     fn build_internal_level(
         children: Vec<(Vec<u8>, KotobaCid)>,
         store:    &dyn BlockStore,

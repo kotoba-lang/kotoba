@@ -109,6 +109,149 @@ fn bench_predicate_prefix_scan(c: &mut Criterion) {
     });
 }
 
+// ─── Complex / join queries ───────────────────────────────────────────────────
+
+/// 2-hop traversal: for each entity e, follow `knows` once (VAET lookup),
+/// then for each neighbour follow `knows` again → set of 2nd-hop subjects.
+/// Models "who knows someone who knows Alice?"
+fn bench_multi_hop_traversal(c: &mut Criterion) {
+    let mut arr = Arrangement::new();
+    let n = 10_000u64;
+    for i in 0..n {
+        // ring: i → knows → (i+1)%n
+        arr.insert(&make_ref_quad(i, "knows", (i + 1) % n));
+        arr.insert(&make_text_quad(i, "name", "Alice"));
+    }
+
+    let seed = make_cid(0); // start node for traversal
+
+    c.bench_function("arrangement/multi_hop_2hop_vaet_eavt", |b| {
+        b.iter(|| {
+            // hop1: VAET — who references seed via "knows"?
+            let hop1: Vec<KotobaCid> = arr.get_referencing_subjects_by_predicate(&seed, "knows");
+            // hop2: for each, follow "knows" again (VAET)
+            let mut hop2: Vec<KotobaCid> = Vec::new();
+            for h in &hop1 {
+                hop2.extend(arr.get_referencing_subjects_by_predicate(h, "knows"));
+            }
+            hop2
+        });
+    });
+
+    c.bench_function("arrangement/multi_hop_3hop_vaet", |b| {
+        b.iter(|| {
+            let hop1 = arr.get_referencing_subjects_by_predicate(&seed, "knows");
+            let mut hop2: Vec<KotobaCid> = hop1.iter()
+                .flat_map(|h| arr.get_referencing_subjects_by_predicate(h, "knows"))
+                .collect();
+            hop2.dedup();
+            let hop3: Vec<KotobaCid> = hop2.iter()
+                .flat_map(|h| arr.get_referencing_subjects_by_predicate(h, "knows"))
+                .collect();
+            hop3
+        });
+    });
+}
+
+/// Join query: AVET ∩ AVET — find all subjects where `status=active` AND `role=admin`.
+/// Models a two-attribute filter (SQL: WHERE status='active' AND role='admin').
+fn bench_join_avet_intersection(c: &mut Criterion) {
+    let mut arr = Arrangement::new();
+    let n = 10_000u64;
+    for i in 0..n {
+        arr.insert(&make_text_quad(i, "status", if i % 3 == 0 { "active" } else { "inactive" }));
+        arr.insert(&make_text_quad(i, "role", if i % 7 == 0 { "admin" } else { "viewer" }));
+    }
+
+    c.bench_function("arrangement/join_avet_status_active_and_role_admin", |b| {
+        b.iter(|| {
+            let active: std::collections::HashSet<_> =
+                arr.get_subjects_by_predicate_object("status", "active").into_iter().collect();
+            let admins = arr.get_subjects_by_predicate_object("role", "admin");
+            // intersection
+            admins.iter().filter(|s| active.contains(s)).cloned().collect::<Vec<_>>()
+        });
+    });
+}
+
+/// Population count: count distinct subjects per predicate value (GROUP BY equivalent).
+/// Models "how many entities have each status value?"
+fn bench_population_count_aevt(c: &mut Criterion) {
+    let mut arr = Arrangement::new();
+    let n = 50_000u64;
+    for i in 0..n {
+        let status = match i % 4 {
+            0 => "active", 1 => "inactive", 2 => "pending", _ => "archived",
+        };
+        arr.insert(&make_text_quad(i, "status", status));
+    }
+
+    c.bench_function("arrangement/population_count_by_status_aevt", |b| {
+        b.iter(|| {
+            // AEVT scan: all subjects per predicate
+            let all = arr.get_by_predicate("status");
+            // count unique subjects per object value
+            let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for (_, objs) in &all {
+                for obj in objs {
+                    if let kotoba_kqe::quad::QuadObject::Text(v) = obj {
+                        *counts.entry(v.clone()).or_default() += 1;
+                    }
+                }
+            }
+            counts
+        });
+    });
+}
+
+/// Star pattern: fetch all triples for a single entity (EAVT full entity).
+/// Models "give me everything about entity X".
+fn bench_star_pattern_eavt(c: &mut Criterion) {
+    let mut arr = Arrangement::new();
+    let g = make_cid(0);
+    let target = make_cid(42);
+    // Add 20 predicates to the target entity
+    let preds = ["name", "email", "role", "status", "country", "city",
+                 "org", "dept", "level", "score", "created", "updated",
+                 "weight/embed", "weight/lm_head", "knows", "manages",
+                 "reports_to", "member_of", "owner", "lang"];
+    for p in &preds {
+        arr.insert(&make_text_quad(42, p, "value"));
+    }
+    // Add noise entities
+    for i in 0..10_000u64 {
+        arr.insert(&make_text_quad(i % 1000 + 100, "name", "noise"));
+    }
+
+    c.bench_function("arrangement/star_pattern_eavt_20pred", |b| {
+        b.iter(|| arr.get_subject_quads(&g, &target));
+    });
+}
+
+/// Reverse graph: find all entities that transitively point to a target via "knows".
+/// Models "give me all ancestors of X in the social graph" (fan-in traversal).
+fn bench_reverse_fanin_vaet(c: &mut Criterion) {
+    let mut arr = Arrangement::new();
+    let n = 5_000u64;
+    let hub = make_cid(0);
+    // Star topology: 5000 entities all point to hub
+    for i in 1..=n {
+        arr.insert(&make_ref_quad(i, "knows", 0));
+    }
+    // Add chain: 100 others form a chain pointing at hub
+    for i in 0..100u64 {
+        arr.insert(&make_ref_quad(n + i + 1, "follows", 0));
+    }
+
+    c.bench_function("arrangement/reverse_fanin_vaet_5k_to_hub", |b| {
+        b.iter(|| arr.get_referencing_subjects(&hub));
+    });
+
+    c.bench_function("arrangement/reverse_fanin_by_pred_vaet", |b| {
+        b.iter(|| arr.get_referencing_subjects_by_predicate(&hub, "knows"));
+    });
+}
+
 criterion_group!(
     benches,
     bench_insert,
@@ -117,5 +260,10 @@ criterion_group!(
     bench_pos_lookup,
     bench_ocp_lookup,
     bench_predicate_prefix_scan,
+    bench_multi_hop_traversal,
+    bench_join_avet_intersection,
+    bench_population_count_aevt,
+    bench_star_pattern_eavt,
+    bench_reverse_fanin_vaet,
 );
 criterion_main!(benches);
