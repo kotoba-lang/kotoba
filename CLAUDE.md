@@ -21,7 +21,7 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 | kotoba-auth | CACAO chain verification, DID Document |
 | kotoba-graph | Quad API, SPARQL→Datalog, Commit DAG |
 | kotoba-vm | Invoke/Result ChainEntry, CALL_FOREIGN bridge (KVM) |
-| kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference |
+| kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference, WebGPU training (embedding + LM head) |
 | kotoba-runtime | WASM Component Model host: WasmExecutor + UdfExecutor + WIT bindings |
 | kotoba-server | XRPC / MCP endpoints |
 | kotoba-store | BlockStore implementations: Memory, Sled, S3; BudgetedBlockStore<S> LRU eviction |
@@ -35,7 +35,7 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 4. kotoba-kqe (Datalog + Arrangement + Delta)
 5. kotoba-dht (Source Chain + Warrant + Neighborhood)
 6. kotoba-vm (Invoke/Result + CALL_FOREIGN)
-7. kotoba-llm (weight, LoRA, KV-cache, inference)
+7. kotoba-llm (weight, LoRA, KV-cache, inference, WebGPU training)
 8. kotoba-runtime (WasmExecutor + UdfExecutor + WIT host bindings)
 9. kotoba-server (XRPC / MCP)
 
@@ -46,6 +46,54 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 - KV-cache = ephemeral Arrangement per session_cid
 - Inference = Invoke ChainEntry {program_cid: inference_datalog}
 - FP8 tensor = Vault blob (dim > 1024 はオフロード)
+
+## WebGPU Training 設計 (ADR-2605250004)
+
+SSoT: `90-docs/adr/2605250004-kotoba-webgpu-training.md`
+
+### dtype 境界
+
+```
+Vault FP8 ──dequantize──▶ f32 GPU buffer ──train──▶ quantize ──▶ Vault FP8
+```
+
+- WebGPU は f32 のみ。FP8 は Vault read/write 時のみ変換
+- `dequantize_fp8_e4m3` / `quantize_f32_to_fp8_e4m3` (CPU-side, E4M3FN: NaN = S_1111_111 のみ)
+
+### Fine-tuning スコープ (Phase 1)
+
+| layer | predicate | shape |
+|---|---|---|
+| 0 Embedding | `weight/layer/0` | `[vocab × H]` |
+| 1 LM head | `weight/layer/1` | `[H × vocab]` |
+
+中間 Transformer 層は凍結。
+
+### Datom エンコーディング
+
+- Gradient (ephemeral): `Quad(model_cid, "grad/layer/{N}/step/{M}", TensorCid{F32})` — optimizer step 後に `Delta::retract`
+- AdamW m1: `Quad(model_cid, "train/adam/m1/layer/{N}", TensorCid{F32})` — 永続
+- AdamW m2: `Quad(model_cid, "train/adam/m2/layer/{N}", TensorCid{F32})` — 永続
+- 重み更新: `[Delta::retract(old), Delta::assert(new)]` — 原子的ペア
+
+### WGSL シェーダー
+
+`MATMUL_WGSL` (forward) / `MATMUL_AT_WGSL` (backward) / `CE_LOSS_WGSL` (quality-scaled loss) / `ADAMW_WGSL` (optimizer)
+
+### Feature ゲート
+
+```toml
+# kotoba-llm: feature = "webgpu-train"
+wgpu     = { version = "24", optional = true }  # kami-engine と同一バージョン
+bytemuck = { version = "1",  features = ["derive"], optional = true }
+```
+
+### 禁止
+
+- GPU 上で FP8 計算
+- `Delta::retract` なしで旧 WeightRef を放置 (二重 Datom)
+- `quality_scale = NaN / Inf`
+- optimizer step 後に grad テンソルを Arrangement に残す
 
 ## Selective Sync + Storage Budget 設計
 
