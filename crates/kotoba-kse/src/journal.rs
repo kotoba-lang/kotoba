@@ -208,6 +208,50 @@ impl Journal {
             }
         }
     }
+
+    /// Delete seq-index keys (`seq/{seq:020}`) for all entries with `seq < before`
+    /// from the persistent store.  The associated `{cid}.cbor` blobs are left for
+    /// a future GC pass — only the seq-index is pruned here, which is sufficient to
+    /// prevent `read_since(1)` from loading stale data on the next startup.
+    ///
+    /// Runs to completion; callers should `tokio::spawn` if fire-and-forget is preferred.
+    pub async fn trim_persistent_before(&self, before: u64) {
+        let store = match &self.store {
+            Some(s) => Arc::clone(s),
+            None    => return,
+        };
+        let keys = store.list_prefix("seq/").await;
+        let mut deleted = 0usize;
+        for key in keys {
+            let Some(seq_str) = key.strip_prefix("seq/") else { continue };
+            let Ok(seq) = seq_str.trim().parse::<u64>() else { continue };
+            if seq < before {
+                if store.delete_key(&key).await.is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+        if deleted > 0 {
+            tracing::debug!(deleted, before, "Journal: trimmed persistent seq-index entries");
+        }
+    }
+
+    /// Persist a checkpoint blob at `checkpoint/heads` in the backing store.
+    /// Overwrites any previous checkpoint (latest wins).
+    pub async fn write_checkpoint(&self, data: bytes::Bytes) {
+        if let Some(store) = &self.store {
+            if let Err(e) = store.put("checkpoint/heads", data).await {
+                tracing::warn!("Journal: checkpoint write failed: {e}");
+            }
+        }
+    }
+
+    /// Read the latest checkpoint blob from `checkpoint/heads`.
+    /// Returns `None` if the backing store is absent or the key does not exist.
+    pub async fn read_checkpoint(&self) -> Option<bytes::Bytes> {
+        let store = self.store.as_ref()?;
+        store.get("checkpoint/heads").await.ok()
+    }
 }
 
 impl Default for Journal {

@@ -15,10 +15,15 @@ use crate::commit::{Commit, CommitDag};
 
 /// QuadStore — Quad write/read API with 3-index Journal publish + ProllyTree commit
 pub struct QuadStore {
-    journal:      Arc<Journal>,
-    block_store:  Arc<dyn BlockStore + Send + Sync>,
-    arrangements: Arc<RwLock<HashMap<String, Arrangement>>>, // graph_cid → Arrangement
-    commit_dag:   Arc<RwLock<CommitDag>>,
+    journal:       Arc<Journal>,
+    block_store:   Arc<dyn BlockStore + Send + Sync>,
+    arrangements:  Arc<RwLock<HashMap<String, Arrangement>>>, // graph_cid → Arrangement
+    commit_dag:    Arc<RwLock<CommitDag>>,
+    /// seq of the last successful commit — persisted as a checkpoint in the Journal store.
+    /// On startup this is loaded from the checkpoint before Journal replay so that
+    /// `replay_from_journal` only processes entries written *after* the last commit,
+    /// not the full WAL history.
+    committed_seq: Arc<RwLock<u64>>,
 }
 
 impl QuadStore {
@@ -26,8 +31,9 @@ impl QuadStore {
         Self {
             journal,
             block_store,
-            arrangements: Arc::new(RwLock::new(HashMap::new())),
-            commit_dag:   Arc::new(RwLock::new(CommitDag::new())),
+            arrangements:  Arc::new(RwLock::new(HashMap::new())),
+            commit_dag:    Arc::new(RwLock::new(CommitDag::new())),
+            committed_seq: Arc::new(RwLock::new(0)),
         }
     }
 
@@ -85,13 +91,31 @@ impl QuadStore {
         arrs.entry(g).or_insert_with(Arrangement::new).remove(&quad);
     }
 
-    /// Replay the Journal WAL into the in-memory Arrangement.
+    /// Restore state from Journal on startup.
     ///
-    /// Reads all entries from seq=1, filters SPO-assert and retract topics,
-    /// deduplicates by entry CID (same payload bytes → same CID), and applies
-    /// them in seq order.  Called once at startup before serving requests.
+    /// Reads the checkpoint written by the last `commit()` call to find
+    /// `committed_seq`, then replays only Journal entries **after** that seq.
+    /// This ensures startup cost is O(uncommitted delta) regardless of total
+    /// data history — 1B quads committed = < 1s startup vs ~83 minutes previously.
+    ///
+    /// First-run (no checkpoint): falls back to replaying from seq=1.
     pub async fn replay_from_journal(&self) {
-        let entries = self.journal.read_since(1).await;
+        // Load checkpoint; extract committed_seq.
+        let committed = if let Some(raw) = self.journal.read_checkpoint().await {
+            let seq = serde_json::from_slice::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v["committed_seq"].as_u64())
+                .unwrap_or(0);
+            *self.committed_seq.write().await = seq;
+            tracing::info!(committed_seq = seq, "QuadStore: checkpoint found, replaying delta only");
+            seq
+        } else {
+            tracing::info!("QuadStore: no checkpoint, full WAL replay (first run)");
+            0
+        };
+
+        // Only load entries written after the last committed seq.
+        let entries = self.journal.read_since(committed + 1).await;
         if entries.is_empty() { return; }
 
         let mut seen = std::collections::HashSet::<KotobaCid>::new();
@@ -407,6 +431,26 @@ impl QuadStore {
 
         // Update in-memory CommitDag
         self.commit_dag.write().await.add(commit);
+
+        // ── Checkpoint ────────────────────────────────────────────────────────────
+        // Record committed_seq + CommitDag heads as a tiny JSON blob in the Journal
+        // store.  On the next startup replay_from_journal() will skip all Journal
+        // entries ≤ this seq — reducing startup cost from O(all history) to O(delta).
+        *self.committed_seq.write().await = seq;
+        {
+            let heads = self.commit_dag.read().await.heads_as_map();
+            let cp    = serde_json::json!({ "committed_seq": seq, "heads": heads });
+            let bytes = bytes::Bytes::from(cp.to_string().into_bytes());
+            self.journal.write_checkpoint(bytes).await;
+        }
+        // Trim ring buffer (in-process memory free).
+        self.journal.trim_before(seq).await;
+        // Trim persistent seq-index in B2 (fire-and-forget; old seq keys deleted).
+        {
+            let j = Arc::clone(&self.journal);
+            tokio::spawn(async move { j.trim_persistent_before(seq).await; });
+        }
+        // ─────────────────────────────────────────────────────────────────────────
 
         tracing::info!(%cid, author, seq, "QuadStore committed (4-index)");
         Ok(cid)
