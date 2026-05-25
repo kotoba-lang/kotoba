@@ -1,0 +1,442 @@
+//! `com.atproto.sync.subscribeRepos` firehose client.
+//!
+//! Cursor persistence:
+//!   The last processed `seq` is checkpointed every `CURSOR_PERSIST_INTERVAL` commits
+//!   into the BlockStore under a fixed synthetic CID (`CURSOR_SLOT_CID`).
+//!   On startup, if `KOTOBA_SUBSCRIBE_REPOS_CURSOR` is not set, the persisted value is
+//!   used automatically to resume from where the previous run left off.
+//!
+//! Connects to the AT Protocol relay WebSocket, decodes binary CBOR frames,
+//! parses inline CAR blocks, writes them to the BlockStore under their original
+//! AT CIDs (sha2-256), and asserts a Quad per op into the QuadStore.
+//!
+//! Wire format (Event Stream Frames):
+//!   Binary WebSocket msg = CBOR(header) || CBOR(body)
+//!   header = { "op": 1 (msg) | -1 (error), "t": "#commit" | "#identity" | … }
+//!   body   = type-specific CBOR map
+//!
+//! CBOR CIDs: tag 42 with bytes `\x00<raw_cid_bytes>` (multibase identity prefix).
+//!
+//! CIDv1 sha2-256 dag-cbor (AT Protocol standard) = 36 bytes:
+//!   [0x01, 0x71, 0x12, 0x20, ...32 sha2-256 bytes...]
+//!   (byte 2 is 0x12=sha2-256; KotobaCid uses 0x1e=blake3 at same position)
+//! We store blocks under their original AT CIDs for round-trip AT compatibility.
+//!
+//! Env vars:
+//!   KOTOBA_SUBSCRIBE_REPOS         — set to any value to enable
+//!   KOTOBA_SUBSCRIBE_REPOS_URL     — default: wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos
+//!   KOTOBA_SUBSCRIBE_REPOS_CURSOR  — resume from seq number (u64)
+//!   KOTOBA_SUBSCRIBE_REPOS_DIDS    — comma-sep DID allowlist (empty = all)
+
+use std::sync::Arc;
+use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Persist cursor every N committed events to avoid excessive BlockStore writes.
+const CURSOR_PERSIST_INTERVAL: u64 = 100;
+
+/// Fixed synthetic CID used as the named slot for cursor persistence.
+/// Not content-addressed — treated as a mutable named register in BlockStore.
+/// Bytes: CIDv1 prefix (4) + ASCII "subscribeRepos/cursor" (21) + padding (11).
+const CURSOR_SLOT_CID: KotobaCid = KotobaCid([
+    0x01, 0x71, 0x1e, 0x20,  // CIDv1 dag-cbor blake3 prefix
+    b's', b'u', b'b', b's', b'c', b'r', b'i', b'b', b'e', b'R', b'e', b'p', b'o', b's',
+    b'/', b'c', b'u', b'r', b's', b'o', b'r',
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+]);
+
+use bytes::Bytes;
+use ciborium::value::Value;
+use futures::StreamExt;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{debug, info, warn};
+
+use kotoba_core::cid::KotobaCid;
+use kotoba_core::store::BlockStore;
+use kotoba_kqe::quad::{Quad, QuadObject};
+use kotoba_kse::Journal;
+
+use crate::atproto::{collection_to_cid, did_to_cid, jetstream_subject_to_topic};
+use crate::quad_store::QuadStore;
+
+// ── Cursor persistence helpers ────────────────────────────────────────────
+
+fn load_cursor(store: &dyn BlockStore) -> Option<u64> {
+    let bytes = store.get(&CURSOR_SLOT_CID).ok()??;
+    if bytes.len() >= 8 {
+        Some(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+    } else {
+        None
+    }
+}
+
+fn save_cursor(store: &dyn BlockStore, seq: u64) {
+    let bytes = seq.to_le_bytes();
+    if let Err(e) = store.put(&CURSOR_SLOT_CID, &bytes) {
+        warn!(err = %e, seq, "failed to persist subscribeRepos cursor");
+    }
+}
+
+// ── Public entry point ────────────────────────────────────────────────────
+
+/// Run the subscribeRepos firehose client loop. Spawn with `tokio::spawn`.
+///
+/// When `gossip_tx` is `Some`, each asserted quad is also forwarded to the GossipSub
+/// swarm actor on the `"quad/assert"` topic so remote peers receive AT Protocol events.
+pub async fn run_subscribe_repos(
+    journal:     Arc<Journal>,
+    quad_store:  Arc<QuadStore>,
+    block_store: Arc<dyn BlockStore + Send + Sync>,
+    gossip_tx:   Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
+) {
+    let base = std::env::var("KOTOBA_SUBSCRIBE_REPOS_URL")
+        .unwrap_or_else(|_|
+            "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos".into()
+        );
+
+    // Prefer env var cursor → then persisted cursor → then no cursor (full replay)
+    let cursor_param = if let Ok(c) = std::env::var("KOTOBA_SUBSCRIBE_REPOS_CURSOR") {
+        format!("?cursor={c}")
+    } else if let Some(persisted) = load_cursor(&*block_store) {
+        info!(cursor = persisted, "subscribeRepos resuming from persisted cursor");
+        format!("?cursor={persisted}")
+    } else {
+        String::new()
+    };
+
+    let url = format!("{base}{cursor_param}");
+
+    let did_filter: Vec<String> = std::env::var("KOTOBA_SUBSCRIBE_REPOS_DIDS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut backoff  = 1u64;
+    let commit_count = Arc::new(AtomicU64::new(0));
+
+    loop {
+        info!(%url, "subscribeRepos connecting");
+
+        match connect_async(&url).await {
+            Err(e) => warn!(err = %e, backoff, "subscribeRepos connect failed"),
+            Ok((mut ws, _)) => {
+                info!("subscribeRepos connected");
+                backoff = 1;
+
+                while let Some(msg) = ws.next().await {
+                    match msg {
+                        Ok(Message::Binary(data)) => {
+                            let seq = handle_frame(
+                                &data,
+                                &did_filter,
+                                &journal,
+                                &quad_store,
+                                &block_store,
+                                &gossip_tx,
+                            ).await;
+
+                            // Persist cursor every CURSOR_PERSIST_INTERVAL commits
+                            if let Some(seq) = seq {
+                                let n = commit_count.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n % CURSOR_PERSIST_INTERVAL == 0 {
+                                    save_cursor(&*block_store, seq);
+                                    debug!(seq, "subscribeRepos cursor persisted");
+                                }
+                            }
+                        }
+                        Ok(Message::Close(_)) => {
+                            info!("subscribeRepos closed by relay");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(err = %e, "subscribeRepos read error");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(60);
+    }
+}
+
+// ── Frame handling ────────────────────────────────────────────────────────
+
+/// Returns the `seq` of the processed commit frame (for cursor tracking), or None.
+async fn handle_frame(
+    data:        &[u8],
+    did_filter:  &[String],
+    journal:     &Arc<Journal>,
+    quad_store:  &Arc<QuadStore>,
+    block_store: &Arc<dyn BlockStore + Send + Sync>,
+    gossip_tx:   &Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
+) -> Option<u64> {
+    // Two CBOR values concatenated: header then body
+    let mut cur = Cursor::new(data);
+    let header: Value = match ciborium::from_reader(&mut cur) {
+        Ok(v) => v,
+        Err(e) => { warn!(err = %e, "bad frame header"); return None; }
+    };
+    let body: Value = match ciborium::from_reader(&mut cur) {
+        Ok(v) => v,
+        Err(e) => { warn!(err = %e, "bad frame body"); return None; }
+    };
+
+    // op=1 → message; op=-1 → error
+    let op = cbor_i64(&header, "op").unwrap_or(0);
+    if op != 1 { return None; }
+
+    match cbor_str(&header, "t").as_deref() {
+        Some("#commit") => {
+            handle_commit(body, did_filter, journal, quad_store, block_store, gossip_tx).await
+        }
+        Some("#identity") => { handle_identity(body, journal, quad_store).await; None }
+        Some("#account")  => None,
+        other => { debug!(t = ?other, "unhandled frame type"); None }
+    }
+}
+
+/// Returns the `seq` of the processed commit for cursor tracking.
+async fn handle_commit(
+    body:        Value,
+    did_filter:  &[String],
+    journal:     &Arc<Journal>,
+    quad_store:  &Arc<QuadStore>,
+    block_store: &Arc<dyn BlockStore + Send + Sync>,
+    gossip_tx:   &Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
+) -> Option<u64> {
+    let repo = match cbor_str(&body, "repo") {
+        Some(d) => d,
+        None => return None,
+    };
+
+    if !did_filter.is_empty() && !did_filter.iter().any(|d| *d == repo) {
+        return None;
+    }
+
+    let seq     = cbor_i64(&body, "seq").unwrap_or(0) as u64;
+    let too_big = cbor_bool(&body, "tooBig").unwrap_or(false);
+
+    // Store CAR blocks in BlockStore (skip if tooBig — blocks absent)
+    if !too_big {
+        if let Some(Value::Bytes(car_bytes)) = cbor_get(&body, "blocks") {
+            let blocks = parse_car(car_bytes);
+            let stored = blocks.len();
+            for (cid_bytes, block_data) in &blocks {
+                if cid_bytes.len() == 36 {
+                    let mut arr = [0u8; 36];
+                    arr.copy_from_slice(cid_bytes);
+                    let cid = KotobaCid(arr);
+                    // Store under original AT CID (sha2-256) for AT compatibility
+                    if let Err(e) = block_store.put(&cid, block_data) {
+                        warn!(err = %e, "block store put failed");
+                    }
+                }
+            }
+            debug!(repo = %repo, seq, stored, "CAR blocks stored");
+        }
+    }
+
+    // Build Quads for each op
+    let ops = match cbor_get(&body, "ops") {
+        Some(Value::Array(arr)) => arr,
+        _ => return Some(seq),
+    };
+
+    let subject_cid = did_to_cid(&repo);
+
+    for op in ops {
+        let action = match cbor_str(op, "action").as_deref() {
+            Some("create") | Some("update") => true,
+            Some("delete") => false,
+            _ => continue,
+        };
+
+        let path = match cbor_str(op, "path") {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // path = "collection/rkey"
+        let (collection, rkey) = match path.split_once('/') {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let graph_cid = collection_to_cid(collection);
+        let topic     = jetstream_subject_to_topic(collection);
+
+        let object = if action {
+            // Create/update: object is the record CID (tag 42) or Text("delete")
+            match cbor_get(op, "cid") {
+                Some(v) => {
+                    if let Some(arr) = cbor_cid_bytes(v) {
+                        QuadObject::Cid(KotobaCid(arr))
+                    } else {
+                        QuadObject::Text("unknown".into())
+                    }
+                }
+                None => QuadObject::Text("unknown".into()),
+            }
+        } else {
+            QuadObject::Text("delete".into())
+        };
+
+        let quad = Quad {
+            graph:     graph_cid,
+            subject:   subject_cid.clone(),
+            predicate: rkey.to_string(),
+            object,
+        };
+
+        // Assert into QuadStore + Journal
+        quad_store.assert(quad.clone()).await;
+        let payload = match serde_json::to_vec(&quad) {
+            Ok(v) => Bytes::from(v),
+            Err(_) => continue,
+        };
+        // Propagate to GossipSub peers so remote kotoba nodes receive AT Protocol events
+        if let Some(tx) = gossip_tx {
+            tx.try_send(("quad/assert".to_string(), payload.to_vec())).ok();
+        }
+        journal.publish(topic, payload).await;
+    }
+
+    Some(seq)
+}
+
+async fn handle_identity(
+    body:       Value,
+    journal:    &Arc<Journal>,
+    quad_store: &Arc<QuadStore>,
+) {
+    let did    = match cbor_str(&body, "did")    { Some(d) => d, None => return };
+    let handle = match cbor_str(&body, "handle") { Some(h) => h, None => return };
+
+    let graph_cid   = collection_to_cid("com.atproto.identity.handle");
+    let subject_cid = did_to_cid(&did);
+    let topic       = jetstream_subject_to_topic("com.atproto.identity.handle");
+
+    let quad = Quad {
+        graph:     graph_cid,
+        subject:   subject_cid,
+        predicate: "handle".into(),
+        object:    QuadObject::Text(handle.clone()),
+    };
+
+    quad_store.assert(quad.clone()).await;
+    let payload = serde_json::to_vec(&quad).unwrap_or_default().into();
+    journal.publish(topic, payload).await;
+
+    debug!(did = %did, handle = %handle, "identity asserted");
+}
+
+// ── CAR v1 parser (no external crate) ────────────────────────────────────
+
+fn read_uvarint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut v = 0u64;
+    let mut shift = 0u32;
+    for (i, &b) in buf.iter().enumerate().take(10) {
+        v |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 { return Some((v, i + 1)); }
+        shift += 7;
+    }
+    None
+}
+
+/// Parse a CIDv1 from a byte slice.  Returns (raw_cid_bytes, bytes_consumed).
+fn read_cid_v1(buf: &[u8]) -> Option<(&[u8], usize)> {
+    let mut pos = 0;
+    let (ver, n) = read_uvarint(&buf[pos..])?;
+    pos += n;
+    if ver != 1 { return None; }
+    let (_, n) = read_uvarint(&buf[pos..])?; // codec
+    pos += n;
+    let (_, n) = read_uvarint(&buf[pos..])?; // hash function code
+    pos += n;
+    let (dlen, n) = read_uvarint(&buf[pos..])?; // digest length
+    pos += n + dlen as usize;
+    if buf.len() < pos { return None; }
+    Some((&buf[..pos], pos))
+}
+
+/// Parse a CAR v1 payload into `(cid_bytes, block_bytes)` pairs.
+fn parse_car(data: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+
+    // Skip CAR header: uvarint(len) + CBOR header map
+    let Some((hlen, n)) = read_uvarint(&data[pos..]) else { return result };
+    pos += n + hlen as usize;
+
+    while pos < data.len() {
+        let Some((section_len, n)) = read_uvarint(&data[pos..]) else { break };
+        pos += n;
+        if section_len == 0 { break; }
+        let section_end = pos + section_len as usize;
+        if section_end > data.len() { break; }
+
+        let Some((cid_bytes, cid_len)) = read_cid_v1(&data[pos..section_end]) else { break };
+        let block = data[pos + cid_len..section_end].to_vec();
+        result.push((cid_bytes.to_vec(), block));
+        pos = section_end;
+    }
+
+    result
+}
+
+// ── CBOR helpers ──────────────────────────────────────────────────────────
+
+fn cbor_get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    if let Value::Map(m) = v {
+        for (k, val) in m {
+            if matches!(k, Value::Text(s) if s == key) { return Some(val); }
+        }
+    }
+    None
+}
+
+fn cbor_str(v: &Value, key: &str) -> Option<String> {
+    match cbor_get(v, key)? {
+        Value::Text(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn cbor_i64(v: &Value, key: &str) -> Option<i64> {
+    match cbor_get(v, key)? {
+        Value::Integer(i) => Some(i128::from(*i) as i64),
+        _ => None,
+    }
+}
+
+fn cbor_bool(v: &Value, key: &str) -> Option<bool> {
+    match cbor_get(v, key)? {
+        Value::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Extract raw CID bytes from a CBOR tag-42 value (`\x00<cid_bytes>`).
+fn cbor_cid_bytes(v: &Value) -> Option<[u8; 36]> {
+    match v {
+        Value::Tag(42, inner) => {
+            if let Value::Bytes(b) = inner.as_ref() {
+                // Strip leading multibase identity prefix byte 0x00
+                let raw = if b.first() == Some(&0) { &b[1..] } else { b.as_slice() };
+                if raw.len() == 36 {
+                    let mut arr = [0u8; 36];
+                    arr.copy_from_slice(raw);
+                    return Some(arr);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
