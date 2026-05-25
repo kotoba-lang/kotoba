@@ -228,15 +228,21 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
 
 ### 実測値 (2026-05-25, macOS aarch64, release build)
 
-#### Arrangement hot-path (インメモリ)
+#### Arrangement hot-path (インメモリ, criterion 実測値 2026-05-25)
 
-| ベンチ | p50 |
-|---|---|
-| insert 1K quads | 3.4µs/quad (290K quad/s) |
-| EAVT 点引き | ~180ns |
-| AEVT 逆引き | ~8µs |
-| AVET 値引き | ~18µs |
-| VAET 逆参照 | ~83µs |
+| ベンチ | p50 | 備考 |
+|---|---|---|
+| EAVT 点引き (SPO) | ~180 ns | 1 HashMap lookup |
+| AEVT 逆引き subjects | ~8 µs | BTreeMap range |
+| AVET 値引き (P+O→S) | ~18 µs | BTreeMap range |
+| VAET 逆参照 (全述語) | ~83–147 µs | 10K entity |
+| **2-hop 経路探索** (VAET×2) | **748 ns** | 10K ring graph |
+| **3-hop 経路探索** (VAET×3+dedup) | **1.16 µs** | 10K ring graph |
+| **join AVET×2** (status=active AND role=admin) | **783 µs** | HashSet intersection、10K |
+| **population count** (GROUP BY status, AEVT) | **47 ms** | 50K entity 全スキャン |
+| **star pattern** (EAVT 全述語, 20 pred) | **6.4 µs** | 10K noise |
+| **reverse fan-in** (VAET, 5K→hub) | **76 µs** | star topology |
+| **reverse fan-in by pred** (VAET+P) | **21 µs** | pred=knows フィルタ |
 
 #### QuadStore insert (criterion bench, macOS aarch64, 2026-05-25)
 
