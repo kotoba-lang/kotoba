@@ -1,4 +1,5 @@
 pub mod attestation;
+pub mod email_xrpc;
 pub mod fingerprint;
 pub mod kg;
 pub mod mcp;
@@ -44,6 +45,10 @@ mod tests {
         NSID_AGENT_SYNC_CLOSE,
         NSID_VAULT_PUT,
         NSID_VAULT_GET,
+        // email
+        super::email_xrpc::NSID_EMAIL_LIST,
+        super::email_xrpc::NSID_EMAIL_READ,
+        super::email_xrpc::NSID_EMAIL_INGEST,
         // attestation
         super::attestation::NSID_ATTEST_CLAIM,
         super::attestation::NSID_ATTEST_CHALLENGE,
@@ -202,6 +207,19 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             post(kg::kg_delete),
         )
         .route("/mcp", post(mcp::mcp_handler))
+        // ── Email E2E XRPC ──────────────────────────────────────────────────
+        .route(
+            &format!("/xrpc/{}", email_xrpc::NSID_EMAIL_LIST),
+            get(email_xrpc::email_list),
+        )
+        .route(
+            &format!("/xrpc/{}", email_xrpc::NSID_EMAIL_READ),
+            get(email_xrpc::email_read),
+        )
+        .route(
+            &format!("/xrpc/{}", email_xrpc::NSID_EMAIL_INGEST),
+            post(email_xrpc::email_ingest),
+        )
         // ── Signal Protocol E2E (ai.gftd.signal.*) ─────────────────────────
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS),

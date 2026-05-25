@@ -36,15 +36,23 @@ impl<H: BlockStore + 'static, C: BlockStore + 'static> BlockStore for TieredBloc
     fn put(&self, cid: &KotobaCid, data: &[u8]) -> Result<()> {
         // Synchronous hot write
         self.hot.put(cid, data)?;
-        // Async cold write — fire-and-forget; failure is logged but non-fatal
+        // Async cold write — fire-and-forget when a tokio runtime is available.
+        // Falls back to a synchronous write (used in tests and bench contexts).
         let cold  = Arc::clone(&self.cold);
         let cid2  = cid.clone();
         let buf   = data.to_vec();
-        tokio::spawn(async move {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = cold.put(&cid2, &buf) {
+                    tracing::warn!(cid = %cid2, err = %e, "tiered cold-put failed");
+                }
+            });
+        } else {
+            // No async runtime (e.g. benchmark or sync test context): write inline
             if let Err(e) = cold.put(&cid2, &buf) {
-                tracing::warn!(cid = %cid2, err = %e, "tiered cold-put failed");
+                tracing::warn!(cid = %cid2, err = %e, "tiered cold-put (sync) failed");
             }
-        });
+        }
         Ok(())
     }
 

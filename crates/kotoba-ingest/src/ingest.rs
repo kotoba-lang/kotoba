@@ -152,8 +152,9 @@ mod tests {
 
     fn make_ingestor() -> EmailIngestor {
         let journal     = Arc::new(Journal::new());
-        let block_store = Arc::new(SledBlockStore::temporary().expect("sled temp"));
-        let quad_store  = Arc::new(QuadStore::new(journal, Arc::new(block_store) as _));
+        let block_store: Arc<dyn kotoba_graph::BlockStore + Send + Sync> =
+            Arc::new(SledBlockStore::temporary().expect("sled temp"));
+        let quad_store  = Arc::new(QuadStore::new(journal, block_store));
         let vault       = SecureVault::new();
         EmailIngestor::new(
             Arc::new(vault),
@@ -191,9 +192,10 @@ mod tests {
         use kotoba_kse::SecureVault;
         let vault = Arc::new(SecureVault::new());
         let key   = test_key();
-        let journal    = Arc::new(Journal::new());
-        let block_store = Arc::new(SledBlockStore::temporary().expect("sled temp"));
-        let quad_store = Arc::new(QuadStore::new(journal, Arc::new(block_store) as _));
+        let journal     = Arc::new(Journal::new());
+        let block_store: Arc<dyn kotoba_graph::BlockStore + Send + Sync> =
+            Arc::new(SledBlockStore::temporary().expect("sled temp"));
+        let quad_store  = Arc::new(QuadStore::new(journal, block_store));
         let ing = EmailIngestor::new(
             Arc::clone(&vault), quad_store, key, "did:plc:test2".to_string()
         );

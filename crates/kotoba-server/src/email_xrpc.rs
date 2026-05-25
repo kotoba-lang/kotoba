@@ -59,18 +59,13 @@ pub async fn email_list(
     let offset = q.offset.unwrap_or(0);
     let limit  = q.limit.unwrap_or(50).min(200);
 
-    let page: Vec<Value> = entries.into_iter().skip(offset).take(limit).map(|(cid, date)| {
-        // Attach plaintext message_id and encrypted from/subject (caller decrypts if needed)
-        let message_id = arrangement.get_objects(
-            &KotobaCid::from_bytes(
-                cid.as_bytes()  // reconstruct from multibase (lossy but consistent)
-            ),
-            "email/message_id",
-        ).into_iter().find_map(|o| {
-            if let QuadObject::Text(t) = o { Some(t.clone()) } else { None }
+    let page: Vec<Value> = entries.into_iter().skip(offset).take(limit).map(|(cid_mb, date)| {
+        let message_id = KotobaCid::from_multibase(&cid_mb).map(|cid| {
+            arrangement.get_objects(&cid, "email/message_id")
+                .into_iter().find_map(|o| if let QuadObject::Text(t) = o { Some(t.clone()) } else { None })
+                .unwrap_or_default()
         }).unwrap_or_default();
-
-        json!({ "cid": cid, "date": date, "message_id": message_id })
+        json!({ "cid": cid_mb, "date": date, "message_id": message_id })
     }).collect();
 
     Json(json!({ "emails": page, "total": total, "offset": offset, "limit": limit }))

@@ -162,7 +162,19 @@ async fn main() -> anyhow::Result<()> {
         state
     };
 
-    // ── 5. Jetstream AT Protocol firehose (optional) ──────────────────────────
+    // ── 5. Gmail polling loop (optional) ─────────────────────────────────────
+    if let Some(vault_key) = state.vault_key {
+        if std::env::var("KOTOBA_GMAIL_CLIENT_ID").is_ok() {
+            tracing::info!("Gmail poll loop enabled");
+            let sv = Arc::clone(&state.secure_vault);
+            let qs = Arc::clone(&state.quad_store);
+            tokio::spawn(kotoba_ingest::gmail_poll_loop(vault_key, sv, qs));
+        } else {
+            tracing::info!("Gmail poll loop disabled (set KOTOBA_GMAIL_CLIENT_ID to enable)");
+        }
+    }
+
+    // ── 6. Jetstream AT Protocol firehose (optional) ──────────────────────────
     if std::env::var("KOTOBA_JETSTREAM").is_ok() {
         let journal_arc     = Arc::clone(&state.journal);
         let quad_store_arc  = Arc::clone(&state.quad_store);

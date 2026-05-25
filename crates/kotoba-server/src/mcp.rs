@@ -4,13 +4,15 @@
 /// Auth:  initialize / tools/list / ping → public
 ///        tools/call → requires `Authorization: Bearer <AT-session-JWT>`
 ///
-/// Tools exposed (6):
+/// Tools exposed (8):
 ///   kotoba_quad_create   — assert a quad into the graph
 ///   kotoba_graph_query   — SPO pattern query
 ///   kotoba_infer_run     — run inference via inference engine
 ///   kotoba_embed_create  — create and store a text embedding
 ///   kotoba_weight_put    — store an FP8 tensor weight blob
 ///   kotoba_lora_apply    — register a LoRA adapter delta
+///   kotoba_email_list    — list encrypted emails for an owner DID
+///   kotoba_email_read    — decrypt and return one email body + metadata
 
 pub const MCP_TOOL_QUAD_CREATE:  &str = "kotoba_quad_create";
 pub const MCP_TOOL_GRAPH_QUERY:  &str = "kotoba_graph_query";
@@ -434,6 +436,117 @@ async fn call_tool(
                 "status":      "ok",
                 "adapter_cid": adapter_cid.to_multibase(),
                 "quad_cid":    quad_cid,
+            }))
+        }
+
+        // ── kotoba_email_list ────────────────────────────────────────────────
+        MCP_TOOL_EMAIL_LIST => {
+            use kotoba_ingest::graph_cid_for;
+            use kotoba_kqe::quad::QuadObject;
+
+            let owner_did = get_str("owner_did")?;
+            let limit  = args.get("limit").and_then(Value::as_u64).unwrap_or(50).min(200) as usize;
+            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+
+            let graph_cid = graph_cid_for(&owner_did);
+            let arrangement = match state.quad_store.arrangement(&graph_cid).await {
+                None => return Ok(json!({ "emails": [], "total": 0 })),
+                Some(a) => a,
+            };
+
+            let mut entries: Vec<(String, String)> = arrangement
+                .get_by_predicate("email/date")
+                .into_iter()
+                .filter_map(|(subject_cid, objs)| {
+                    let date = objs.into_iter().find_map(|o| {
+                        if let QuadObject::Text(t) = o { Some(t) } else { None }
+                    })?;
+                    Some((subject_cid.to_multibase(), date))
+                })
+                .collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            let total = entries.len();
+
+            let vault_key = state.vault_key;
+            let emails: Vec<Value> = entries.into_iter().skip(offset).take(limit).map(|(cid_mb, date)| {
+                let email_cid = kotoba_core::cid::KotobaCid::from_bytes(cid_mb.as_bytes());
+                let message_id = arrangement.get_objects(&email_cid, "email/message_id")
+                    .into_iter().find_map(|o| if let QuadObject::Text(t) = o { Some(t) } else { None })
+                    .unwrap_or_default();
+                let subject_enc = arrangement.get_objects(&email_cid, "email/subject")
+                    .into_iter().find_map(|o| if let QuadObject::Text(t) = o { Some(t) } else { None })
+                    .unwrap_or_default();
+                let from_enc = arrangement.get_objects(&email_cid, "email/from")
+                    .into_iter().find_map(|o| if let QuadObject::Text(t) = o { Some(t) } else { None })
+                    .unwrap_or_default();
+
+                let subject = vault_key.as_ref()
+                    .and_then(|k| kotoba_crypto::envelope::decrypt_field(k, &subject_enc).ok())
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or(subject_enc);
+                let from = vault_key.as_ref()
+                    .and_then(|k| kotoba_crypto::envelope::decrypt_field(k, &from_enc).ok())
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or(from_enc);
+
+                json!({ "cid": cid_mb, "date": date, "message_id": message_id, "subject": subject, "from": from })
+            }).collect();
+
+            Ok(json!({ "emails": emails, "total": total, "offset": offset, "limit": limit }))
+        }
+
+        // ── kotoba_email_read ────────────────────────────────────────────────
+        MCP_TOOL_EMAIL_READ => {
+            use kotoba_ingest::graph_cid_for;
+            use kotoba_kqe::quad::QuadObject;
+
+            let email_cid_str = get_str("email_cid")?;
+            let owner_did     = get_str("owner_did")?;
+
+            let vault_key = state.vault_key.ok_or_else(|| {
+                (ERR_INTERNAL, "vault_key not configured (set KOTOBA_VAULT_KEY)".to_string())
+            })?;
+
+            let graph_cid = graph_cid_for(&owner_did);
+            let arrangement = state.quad_store.arrangement(&graph_cid).await
+                .ok_or_else(|| (ERR_NOT_FOUND, "no emails found for owner_did".to_string()))?;
+
+            let email_cid = kotoba_core::cid::KotobaCid::from_bytes(email_cid_str.as_bytes());
+
+            // body_cid → SecureVault decrypt
+            let body_cid_str = arrangement.get_objects(&email_cid, "email/body_cid")
+                .into_iter().find_map(|o| if let QuadObject::Text(t) = o { Some(t) } else { None })
+                .ok_or_else(|| (ERR_NOT_FOUND, "email/body_cid not found".to_string()))?;
+
+            let blob_cid  = kotoba_core::cid::KotobaCid::from_bytes(body_cid_str.as_bytes());
+            let blob_ref  = kotoba_kse::BlobRef { cid: blob_cid, size: 0 };
+            let body_bytes = state.secure_vault.get(&vault_key, &blob_ref).await
+                .map_err(|e| (ERR_INTERNAL, format!("vault decrypt: {e}")))?
+                .ok_or_else(|| (ERR_NOT_FOUND, "body blob not found in vault".to_string()))?;
+            let body = String::from_utf8_lossy(&body_bytes).into_owned();
+
+            let dec = |pred: &str| -> String {
+                let enc = arrangement.get_objects(&email_cid, pred)
+                    .into_iter().find_map(|o| if let QuadObject::Text(t) = o { Some(t) } else { None })
+                    .unwrap_or_default();
+                kotoba_crypto::envelope::decrypt_field(&vault_key, &enc)
+                    .ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or(enc)
+            };
+            let plain = |pred: &str| -> String {
+                arrangement.get_objects(&email_cid, pred)
+                    .into_iter().find_map(|o| if let QuadObject::Text(t) = o { Some(t) } else { None })
+                    .unwrap_or_default()
+            };
+
+            Ok(json!({
+                "email_cid":  email_cid_str,
+                "message_id": plain("email/message_id"),
+                "from":       dec("email/from"),
+                "to":         dec("email/to"),
+                "subject":    dec("email/subject"),
+                "date":       plain("email/date"),
+                "thread_id":  plain("email/thread_id"),
+                "body":       body,
             }))
         }
 
