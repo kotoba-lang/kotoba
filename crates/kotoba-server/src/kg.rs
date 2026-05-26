@@ -720,6 +720,8 @@ pub struct KgQueryReq {
     pub query: String,
     /// CACAO delegation chain for private graphs (DAG-CBOR, base64-standard encoded).
     pub cacao_b64: Option<String>,
+    /// Maximum results to return (1–10000; default 1000).
+    pub limit: Option<usize>,
 }
 
 /// POST /xrpc/ai.gftd.apps.yata.kg.query
@@ -739,6 +741,12 @@ pub async fn kg_query(
     use kotoba_kqe::cypher::CypherCompiler;
     use kotoba_graph::sparql::SparqlCompiler;
 
+    const MAX_KG_LANG_LEN: usize = 16;
+    const MAX_KG_QUERY_RESULT_LIMIT: usize = 10_000;
+    if req.lang.len() > MAX_KG_LANG_LEN {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("lang field too long ({} bytes, limit {MAX_KG_LANG_LEN})", req.lang.len())));
+    }
     if req.query.is_empty() || req.query.len() > MAX_KG_QUERY_PROG_LEN {
         return Err((StatusCode::BAD_REQUEST,
             format!("query must be 1–{MAX_KG_QUERY_PROG_LEN} bytes")));
@@ -747,6 +755,7 @@ pub async fn kg_query(
         return Err((StatusCode::BAD_REQUEST,
             "lang must be 'sparql' or 'cypher'".to_string()));
     }
+    let result_limit = req.limit.unwrap_or(MAX_KG_LIMIT).min(MAX_KG_QUERY_RESULT_LIMIT);
 
     let t0        = Instant::now();
     let graph_cid = kg_graph_cid();
@@ -777,9 +786,10 @@ pub async fn kg_query(
     // Evaluate Datalog rules against the fact base
     let derived = program.evaluate_delta(&deltas);
 
-    // Collect derived facts for the output_relation
+    // Collect derived facts for the output_relation, bounded by result_limit.
     let results: Vec<serde_json::Value> = derived.iter()
         .filter(|d| d.quad.predicate == output_relation && d.is_assert())
+        .take(result_limit)
         .map(|d| serde_json::json!({
             "a": d.quad.subject.to_multibase(),
             "b": match &d.quad.object {

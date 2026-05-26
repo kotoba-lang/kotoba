@@ -514,7 +514,16 @@ pub async fn handle_pin_create(
     let resolved_cid = if let Some(c) = req.cid.as_deref() {
         c.to_string()
     } else {
-        let qi      = req.quads.as_ref().expect("quads present: validated above by cid.is_none() == quads.is_none()");
+        // Invariant: exactly one of cid/quads is Some (enforced by the check above).
+        // Use a graceful 500 instead of panic so a refactor cannot silently break this.
+        let qi = match req.quads.as_ref() {
+            Some(q) => q,
+            None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(PinCreateResp {
+                ok: false, pin_id: String::new(), cid: String::new(),
+                status: "failed".into(), size_bytes: 0,
+                error: Some("internal: quads field unexpectedly absent".into()),
+            })),
+        };
         let graph   = format!("{}/{}", req.tenant_did, qi.graph);
         let mut quads = Vec::new();
         for t in qi.triples.as_deref().unwrap_or(&[]) {
