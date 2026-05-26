@@ -6,7 +6,7 @@ use kotoba_dht::{
     neighborhood::Neighborhood,
     node_id::NodeId,
 };
-use kotoba_kse::{sync_window::SyncWindow, Journal, KseStore, Shelf, Topic, Vault};
+use kotoba_kse::{sync_window::SyncWindow, Journal, KseStore, PreKeyRegistry, Shelf, Topic, Vault};
 use kotoba_kqe::quad::Quad;
 use kotoba_graph::QuadStore;
 use kotoba_kse::SecureVault;
@@ -67,6 +67,10 @@ pub struct KotobaState {
     // ── CC Vector Search ─────────────────────────────────────────────────────
     /// Optional embed client for CC vector search (KOTOBA_EMBED_URL).
     pub cc_embed_client: Option<Arc<dyn EmbedClient>>,
+    // ── PRE Key Registry ─────────────────────────────────────────────────────
+    /// Maps (owner_did, accessor_did) → wrapped re-encryption key.
+    /// `None` until `attach_pre_key_registry()` is called.
+    pub pre_key_registry: Option<Arc<PreKeyRegistry>>,
 }
 
 impl KotobaState {
@@ -191,17 +195,18 @@ impl KotobaState {
             executor,
             udf,
             router,
-            gossip_tx:      None,
-            pregel_runner:  None,
+            gossip_tx:        None,
+            pregel_runner:    None,
             inference_engine,
             block_store,
             quad_store,
             ipfs_pin,
             secure_vault,
-            crypto:          None,
+            crypto:            None,
             kse_store,
-            agent_sessions:  Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            agent_sessions:    Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             cc_embed_client,
+            pre_key_registry:  None,
         })
     }
 
@@ -254,6 +259,12 @@ impl KotobaState {
     /// Attach the distributed Pregel runner after swarm setup.
     pub fn attach_pregel(mut self, runner: DistributedPregelRunner) -> Self {
         self.pregel_runner = Some(Arc::new(tokio::sync::Mutex::new(runner)));
+        self
+    }
+
+    /// Attach a PRE key registry for actor-level content encryption grants.
+    pub fn attach_pre_key_registry(mut self, registry: Arc<PreKeyRegistry>) -> Self {
+        self.pre_key_registry = Some(registry);
         self
     }
 

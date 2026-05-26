@@ -55,6 +55,10 @@ pub struct ChainEntry {
     pub content: ChainContent,
     pub ts:      u64,
     pub sig:     Vec<u8>,        // Ed25519 signature over signing_bytes()
+    /// Access policy for this entry.  `Open` entries gossip as plaintext;
+    /// `Encrypted` entries gossip only the `ct_cid` — PRE re-encryption on demand.
+    #[serde(default, skip_serializing_if = "kotoba_core::DataPolicy::is_open")]
+    pub policy:  kotoba_core::DataPolicy,
 }
 
 /// Subset of ChainEntry fields that are covered by the Ed25519 signature.
@@ -76,11 +80,21 @@ impl ChainEntry {
         content: ChainContent,
         sig: Vec<u8>,
     ) -> Self {
+        Self::new_with_policy(prev, agent, seq, content, sig, kotoba_core::DataPolicy::Open)
+    }
+
+    pub fn new_with_policy(
+        prev: Option<KotobaCid>,
+        agent: String,
+        seq: u64,
+        content: ChainContent,
+        sig: Vec<u8>,
+        policy: kotoba_core::DataPolicy,
+    ) -> Self {
         let ts = now_ms();
-        // CID computed from content (excluding cid field itself)
         let payload = format!("{:?}{:?}{}{}", prev, content, seq, ts);
         let cid = KotobaCid::from_bytes(payload.as_bytes());
-        Self { cid, prev, agent, seq, content, ts, sig }
+        Self { cid, prev, agent, seq, content, ts, sig, policy }
     }
 
     /// Canonical CBOR bytes that the agent signs.

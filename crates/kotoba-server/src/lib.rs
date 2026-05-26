@@ -6,6 +6,7 @@ pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
 pub mod net_actor;
+pub mod pre_proxy;
 pub mod server;
 pub mod signal_xrpc;
 pub mod xrpc;

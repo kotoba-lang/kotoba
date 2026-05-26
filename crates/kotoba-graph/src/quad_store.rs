@@ -7,11 +7,19 @@ use kotoba_kqe::delta::Delta;
 use kotoba_kqe::arrangement::Arrangement;
 use kotoba_kse::journal::Journal;
 use kotoba_kse::topic::Topic;
+use kotoba_auth::delegation::{DelegationChain, DelegationError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::commit::{Commit, CommitDag};
+
+/// Error returned when a CACAO-gated quad write fails.
+#[derive(Debug, thiserror::Error)]
+pub enum AccessError {
+    #[error("delegation: {0}")]
+    Delegation(#[from] DelegationError),
+}
 
 /// QuadStore — Quad write/read API with 3-index Journal publish + ProllyTree commit
 pub struct QuadStore {
@@ -57,6 +65,21 @@ impl QuadStore {
         let mut arrs = self.arrangements.write().await;
         arrs.entry(g).or_insert_with(Arrangement::new).insert(&quad);
         delta
+    }
+
+    /// CACAO-gated quad assert.
+    ///
+    /// Verifies that `chain` grants `"quad:write"` on the quad's subject CID before
+    /// delegating to `assert()`. Compute functions should call this instead of `assert()`
+    /// whenever the write originates from an actor rather than the server itself.
+    pub async fn assert_authed(
+        &self,
+        quad: Quad,
+        chain: &DelegationChain,
+    ) -> Result<Delta, AccessError> {
+        let subject_mb = quad.subject.to_multibase();
+        chain.verify(&subject_mb, "quad:write")?;
+        Ok(self.assert(quad).await)
     }
 
     pub async fn retract(&self, quad: Quad) -> Delta {
