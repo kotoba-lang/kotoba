@@ -94,9 +94,21 @@ impl SignalStore {
     /// Derive a convo-scoped AES-256-GCM key.
     /// HKDF-SHA256(ikm = ik_dh_pub, info = "kotoba-field\x00{did}\x00{convo_id}")
     ///
-    /// NUL is used as separator because DIDs and convo IDs never contain NUL,
+    /// NUL is used as separator because DIDs and convo IDs must not contain NUL,
     /// preventing key-confusion between ("x", "y:z") and ("x:y", "z").
+    ///
+    /// # Panics
+    /// Panics in debug builds if `peer_did` or `convo_id` contains a NUL byte,
+    /// which would violate the separator invariant.
     pub fn derive_field_key(&self, peer_did: &str, convo_id: &str) -> [u8; 32] {
+        debug_assert!(
+            !peer_did.contains('\0'),
+            "peer_did must not contain NUL bytes (got {peer_did:?})"
+        );
+        debug_assert!(
+            !convo_id.contains('\0'),
+            "convo_id must not contain NUL bytes (got {convo_id:?})"
+        );
         let ik_dh_pub = x25519_dalek::PublicKey::from(&self.identity.dh).to_bytes();
         let mut info = b"kotoba-field\x00".to_vec();
         info.extend_from_slice(peer_did.as_bytes());
@@ -155,6 +167,22 @@ mod tests {
         let k1 = store.derive_field_key("did:plc:a", "b:c");
         let k2 = store.derive_field_key("did:plc:a:b", "c");
         assert_ne!(k1, k2, "HKDF key-confusion: different splits must yield different keys");
+    }
+
+    #[test]
+    fn derive_field_key_same_inputs_are_deterministic() {
+        let store = SignalStore::new("did:plc:owner", "dev-1");
+        let k1 = store.derive_field_key("did:plc:peer", "convo-abc");
+        let k2 = store.derive_field_key("did:plc:peer", "convo-abc");
+        assert_eq!(k1, k2, "same inputs must produce same key");
+    }
+
+    #[test]
+    fn derive_field_key_different_convo_ids_produce_distinct_keys() {
+        let store = SignalStore::new("did:plc:owner", "dev-1");
+        let k1 = store.derive_field_key("did:plc:peer", "convo-1");
+        let k2 = store.derive_field_key("did:plc:peer", "convo-2");
+        assert_ne!(k1, k2, "different convo_id must yield different keys");
     }
 
     #[tokio::test]
