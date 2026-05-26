@@ -211,6 +211,8 @@ async fn resolve_and_verify_did_web(
         format!("https://{}/.well-known/did.json", suffix)
     };
 
+    const MAX_DID_DOC_BYTES: usize = 65_536; // 64 KiB — guard against response-bombing
+
     let resp = client.get(&url).send().await
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("did:web fetch {url}: {e}")))?;
     if !resp.status().is_success() {
@@ -219,7 +221,15 @@ async fn resolve_and_verify_did_web(
             format!("did:web fetch {url}: HTTP {}", resp.status()),
         ));
     }
-    let doc: DidDocument = resp.json().await
+    let body_bytes = resp.bytes().await
+        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("did:web read body: {e}")))?;
+    if body_bytes.len() > MAX_DID_DOC_BYTES {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("did:web document exceeds {MAX_DID_DOC_BYTES} byte limit"),
+        ));
+    }
+    let doc: DidDocument = serde_json::from_slice(&body_bytes)
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("did:web document parse: {e}")))?;
 
     let pubkey = doc.ed25519_public_key()
@@ -683,7 +693,7 @@ pub async fn graph_query(
 
     // ── Read-access gate ─────────────────────────────────────────────────────
     let visibility = state.graph_visibility(&graph_cid).await;
-    check_read_access(&visibility, &headers, req.cacao_b64.as_deref())
+    check_read_access(&visibility, &headers, req.cacao_b64.as_deref(), Some(state.operator_did.as_str()))
         .map_err(AccessDenied::into_response)?;
 
     let arrangement = match state.quad_store.arrangement(&graph_cid).await {

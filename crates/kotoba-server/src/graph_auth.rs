@@ -32,6 +32,8 @@ pub enum AccessDenied {
     DelegationError(String),
     /// Private tier: CACAO was issued by a DID other than the graph owner.
     IssuerMismatch { expected: String, got: String },
+    /// Private tier: CACAO `aud` field does not match this node's DID.
+    AudienceMismatch { expected: String, got: String },
 }
 
 impl AccessDenied {
@@ -66,6 +68,10 @@ impl AccessDenied {
             AccessDenied::IssuerMismatch { expected, got } => (
                 StatusCode::UNAUTHORIZED,
                 format!("cacao issuer mismatch: expected {expected}, got {got}"),
+            ),
+            AccessDenied::AudienceMismatch { expected, got } => (
+                StatusCode::UNAUTHORIZED,
+                format!("cacao audience mismatch: expected {expected}, got {got}"),
             ),
         }
     }
@@ -113,10 +119,12 @@ fn jwt_exp_elapsed(token: &str) -> bool {
 ///     2. graph scope `kotoba://graph/private/{owner_did}` (or absent = all graphs)
 ///     3. valid cryptographic signature
 ///     4. issuer DID == `owner_did`
+///     5. `aud` field matches `expected_aud` when provided (CAIP-74 audience check)
 pub fn check_read_access(
     visibility: &GraphVisibility,
     headers: &HeaderMap,
     cacao_b64: Option<&str>,
+    expected_aud: Option<&str>,
 ) -> Result<(), AccessDenied> {
     match visibility {
         GraphVisibility::Public => Ok(()),
@@ -162,9 +170,19 @@ pub fn check_read_access(
             // private graph "kotoba://graph/private/{did}" becomes "private/{did}".
             let graph_scope = format!("private/{}", owner_did);
             let chain = DelegationChain::new(cacao);
-            let issuer_did = chain
-                .verify(&graph_scope, "quad:read")
-                .map_err(|e| AccessDenied::DelegationError(e.to_string()))?;
+            let issuer_did = if let Some(aud) = expected_aud {
+                chain
+                    .verify_with_aud(&graph_scope, "quad:read", aud)
+                    .map_err(|e| match e {
+                        kotoba_auth::DelegationError::AudienceMismatch { expected, got } =>
+                            AccessDenied::AudienceMismatch { expected, got },
+                        other => AccessDenied::DelegationError(other.to_string()),
+                    })?
+            } else {
+                chain
+                    .verify(&graph_scope, "quad:read")
+                    .map_err(|e| AccessDenied::DelegationError(e.to_string()))?
+            };
 
             // 4. The recovered issuer must be the graph owner (security invariant:
             //    only the owner themselves may delegate read access to a private graph).
@@ -177,5 +195,83 @@ pub fn check_read_access(
 
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    fn jwt_with_exp(exp: u64) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let header  = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"did:key:z6Mk","exp":{exp}}}"#));
+        format!("{header}.{payload}.fakesig")
+    }
+
+    #[test]
+    fn public_graph_always_allowed() {
+        let vis = GraphVisibility::Public;
+        assert!(check_read_access(&vis, &HeaderMap::new(), None, None).is_ok());
+    }
+
+    #[test]
+    fn authenticated_accepts_valid_bearer() {
+        let vis = GraphVisibility::Authenticated;
+        // A non-JWT opaque token (no `exp` claim) — should pass (no exp to check)
+        let h = bearer_headers("opaque-session-token");
+        assert!(check_read_access(&vis, &h, None, None).is_ok());
+    }
+
+    #[test]
+    fn authenticated_rejects_missing_bearer() {
+        let vis = GraphVisibility::Authenticated;
+        let err = check_read_access(&vis, &HeaderMap::new(), None, None).unwrap_err();
+        assert!(matches!(err, AccessDenied::MissingBearer));
+    }
+
+    #[test]
+    fn authenticated_rejects_expired_jwt() {
+        let vis = GraphVisibility::Authenticated;
+        // exp = 1 (far in the past)
+        let token = jwt_with_exp(1);
+        let h = bearer_headers(&token);
+        let err = check_read_access(&vis, &h, None, None).unwrap_err();
+        assert!(matches!(err, AccessDenied::TokenExpired), "expected TokenExpired, got {err:?}");
+    }
+
+    #[test]
+    fn authenticated_accepts_future_jwt() {
+        let vis = GraphVisibility::Authenticated;
+        // exp = year 2099 in unix secs
+        let far_future: u64 = 4_102_444_800;
+        let token = jwt_with_exp(far_future);
+        let h = bearer_headers(&token);
+        assert!(check_read_access(&vis, &h, None, None).is_ok());
+    }
+
+    #[test]
+    fn jwt_exp_elapsed_no_payload_returns_false() {
+        assert!(!jwt_exp_elapsed("not.a.jwt"));
+        assert!(!jwt_exp_elapsed("onlyone"));
+    }
+
+    #[test]
+    fn jwt_exp_elapsed_missing_exp_returns_false() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let header  = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"sub":"alice"}"#);
+        let token   = format!("{header}.{payload}.sig");
+        assert!(!jwt_exp_elapsed(&token));
     }
 }

@@ -215,4 +215,29 @@ pub enum DelegationError {
     RootMismatch,
     #[error("graph scope mismatch: expected '{expected}', got '{got}'")]
     GraphMismatch { expected: String, got: String },
+    #[error("audience mismatch: CACAO aud '{got}' does not match expected '{expected}'")]
+    AudienceMismatch { expected: String, got: String },
+}
+
+impl DelegationChain {
+    /// Like [`verify`] but also validates that `cacao.p.aud` matches `expected_aud`.
+    ///
+    /// CAIP-74 requires the audience field to equal the verifier's own identifier so
+    /// a CACAO intended for service A cannot be replayed against service B.
+    pub fn verify_with_aud(
+        &self,
+        graph_cid:    &str,
+        required_cap: &str,
+        expected_aud: &str,
+    ) -> Result<String, DelegationError> {
+        // Audience check before signature to fail fast on misrouted tokens.
+        let cacao = self.chain.first().ok_or(DelegationError::EmptyChain)?;
+        if !cacao.p.aud.is_empty() && cacao.p.aud != expected_aud {
+            return Err(DelegationError::AudienceMismatch {
+                expected: expected_aud.to_string(),
+                got:      cacao.p.aud.clone(),
+            });
+        }
+        self.verify(graph_cid, required_cap)
+    }
 }

@@ -450,7 +450,7 @@ pub async fn handle_pin_create(
     let resolved_cid = if let Some(c) = req.cid.as_deref() {
         c.to_string()
     } else {
-        let qi      = req.quads.as_ref().unwrap();
+        let qi      = req.quads.as_ref().expect("quads present: validated above by cid.is_none() == quads.is_none()");
         let graph   = format!("{}/{}", req.tenant_did, qi.graph);
         let mut quads = Vec::new();
         for t in qi.triples.as_deref().unwrap_or(&[]) {

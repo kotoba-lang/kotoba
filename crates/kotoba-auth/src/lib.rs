@@ -383,6 +383,44 @@ mod tests {
             "expected InvalidExpiry, got {err:?}");
     }
 
+    #[test]
+    fn delegation_verify_with_aud_wrong_audience_returns_mismatch() {
+        let p = test_payload(vec![]);
+        // test_payload sets aud = "kotoba://test"
+        let cacao = Cacao {
+            h: CacaoHeader { t: "eip4361".into() },
+            p,
+            s: CacaoSig { t: "eip191".into(), s: "00".into() },
+        };
+        let chain = delegation::DelegationChain::new(cacao);
+        let err = chain.verify_with_aud("graph_cid", "quad:read", "kotoba://different-node").unwrap_err();
+        assert!(
+            matches!(err, DelegationError::AudienceMismatch { .. }),
+            "expected AudienceMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn delegation_verify_with_aud_matching_audience_proceeds_to_verify() {
+        // With matching aud the audience gate passes and verify() is called next.
+        // The CACAO will fail expiry (iat = 2026-05-25 > 7 days ago as of test time
+        // is still valid, but the sig is fake "00" so it fails at sig verification).
+        // We just assert we get past AudienceMismatch into a different error.
+        let mut p = test_payload(vec![]);
+        p.expiry = Some("2099-12-31T23:59:59Z".into()); // far future
+        let cacao = Cacao {
+            h: CacaoHeader { t: "eip4361".into() },
+            p,
+            s: CacaoSig { t: "eip191".into(), s: "00".into() },
+        };
+        let chain = delegation::DelegationChain::new(cacao);
+        let err = chain.verify_with_aud("graph_cid", "quad:read", "kotoba://test").unwrap_err();
+        assert!(
+            !matches!(err, DelegationError::AudienceMismatch { .. }),
+            "should have passed audience gate; got {err:?}"
+        );
+    }
+
     // ── DidDocument ────────────────────────────────────────────────────────
 
     fn test_did_doc() -> DidDocument {
