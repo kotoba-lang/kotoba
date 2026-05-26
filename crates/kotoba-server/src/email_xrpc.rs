@@ -282,6 +282,26 @@ fn get_text_field(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nsid_constants_have_correct_prefix() {
+        let prefix = "ai.gftd.apps.kotoba.email.";
+        assert!(NSID_EMAIL_LIST.starts_with(prefix));
+        assert!(NSID_EMAIL_READ.starts_with(prefix));
+        assert!(NSID_EMAIL_INGEST.starts_with(prefix));
+    }
+
+    #[test]
+    fn size_limits_are_sane() {
+        assert!(MAX_OWNER_DID_LEN >= 64);
+        assert!(MAX_EMAIL_CID_LEN >= 32);
+        assert!(MAX_RAW_B64_LEN >= 1024);
+    }
+}
+
 /// Open a `signal:v1:` envelope using AgentCrypto; returns ciphertext on failure
 /// (same fallback as the old decrypt_text_field).
 async fn open_field_safe(
