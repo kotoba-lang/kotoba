@@ -448,7 +448,9 @@ impl KotobaState {
             &quad.predicate,
             &object_str,
         );
-        let payload = serde_json::to_vec(quad).unwrap_or_default();
+        // Quad is serde-derived with primitive types — serialization cannot fail.
+        let payload = serde_json::to_vec(quad)
+            .expect("Quad serialization is infallible");
 
         // Gossip on a coarse topic so peers can subscribe once and receive all asserts.
         // Channel carries raw KSE names (no "kotoba/" prefix); KotobaSwarm::publish adds it.
@@ -463,7 +465,9 @@ impl KotobaState {
     /// Publish a Quad retract to the KSE Journal.
     pub async fn journal_retract(&self, quad: &Quad) -> String {
         let topic   = Topic(format!("kotoba/retract/{}/{}/{}", quad.graph, quad.subject, quad.predicate));
-        let payload = serde_json::to_vec(quad).unwrap_or_default();
+        // Quad is serde-derived with primitive types — serialization cannot fail.
+        let payload = serde_json::to_vec(quad)
+            .expect("Quad serialization is infallible");
 
         // Gossip retract events on a coarse topic as well.
         if let Some(tx) = &self.gossip_tx {
