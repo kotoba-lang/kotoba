@@ -484,8 +484,25 @@ pub async fn invoke_run(
     Json(req):    Json<InvokeRunReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    const MAX_AGENT_DID_LEN: usize = 512;
+    const MAX_AGENT_DID_LEN:    usize = 512;
+    const MAX_PROGRAM_CID_LEN:  usize = 512;
+    const MAX_GRAPH_CID_LEN:    usize = 512;
+    const MAX_PROGRAM_TYPE_LEN: usize = 16;
     crate::graph_auth::validate_did(&req.agent_did, "agent_did", MAX_AGENT_DID_LEN)?;
+    if req.program_cid.len() > MAX_PROGRAM_CID_LEN {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("program_cid too long ({} bytes, limit {MAX_PROGRAM_CID_LEN})", req.program_cid.len())));
+    }
+    if req.program_type.len() > MAX_PROGRAM_TYPE_LEN {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("program_type too long ({} bytes, limit {MAX_PROGRAM_TYPE_LEN})", req.program_type.len())));
+    }
+    if let Some(gcid) = &req.graph_cid {
+        if gcid.len() > MAX_GRAPH_CID_LEN {
+            return Err((StatusCode::BAD_REQUEST,
+                format!("graph_cid too long ({} bytes, limit {MAX_GRAPH_CID_LEN})", gcid.len())));
+        }
+    }
 
     use kotoba_dht::source_chain::ProgramType;
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
