@@ -3457,3 +3457,66 @@ async fn email_read_without_crypto_returns_503() {
     assert_eq!(status, 503, "{body}");
     assert!(body["error"].as_str().is_some(), "expected error field: {body}");
 }
+
+// ── New input-guard e2e tests (guards added 2026-05-27) ──────────────────────
+
+#[tokio::test]
+async fn block_get_oversized_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let oversized_cid = "b".repeat(513); // exceeds MAX_CID_LEN=512
+    let (status, body) = s
+        .get(&format!("/xrpc/ai.gftd.apps.kotoba.block.get?cid={oversized_cid}"))
+        .await;
+    assert_eq!(status, 400, "oversized cid must be rejected: {body}");
+}
+
+#[tokio::test]
+async fn weight_get_oversized_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let oversized_cid = "w".repeat(513);
+    let (status, body) = s
+        .get(&format!("/xrpc/ai.gftd.apps.kotoba.weight.get?cid={oversized_cid}"))
+        .await;
+    assert_eq!(status, 400, "oversized cid must be rejected: {body}");
+}
+
+#[tokio::test]
+async fn commit_get_oversized_graph_returns_400() {
+    let s = TestServer::start(false).await;
+    let oversized_graph = "g".repeat(513);
+    let (status, body) = s
+        .get(&format!("/xrpc/ai.gftd.apps.kotoba.commit.get?graph={oversized_graph}"))
+        .await;
+    assert_eq!(status, 400, "oversized graph must be rejected: {body}");
+}
+
+#[tokio::test]
+async fn kg_query_oversized_lang_returns_400() {
+    let s = TestServer::start(false).await;
+    let oversized_lang = "x".repeat(17); // exceeds MAX_KG_LANG_LEN=16
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.yata.kg.query",
+            json!({ "lang": oversized_lang, "query": "SELECT ?s ?o WHERE {}" }),
+            "test-token",
+        )
+        .await;
+    assert_eq!(status, 400, "oversized lang must be rejected: {body}");
+}
+
+#[tokio::test]
+async fn commit_store_oversized_graph_returns_400() {
+    let s = TestServer::start(false).await;
+    let oversized_graph = "g".repeat(513); // exceeds MAX_GRAPH_LEN=512
+    let (_, cacao_b64) = build_ed25519_cacao("irrelevant-graph");
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.commit.store",
+        json!({
+            "graph":     oversized_graph,
+            "author":    "did:key:zAuthor",
+            "seq":       0u64,
+            "cacao_b64": cacao_b64,
+        }),
+    ).await;
+    assert_eq!(status, 400, "oversized graph must be rejected before CACAO: {body}");
+}
