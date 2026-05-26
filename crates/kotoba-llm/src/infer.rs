@@ -54,3 +54,56 @@ pub enum InferError {
     #[error("context length exceeded")]
     ContextExceeded,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kotoba_core::cid::KotobaCid;
+
+    fn make_request() -> InferenceRequest {
+        InferenceRequest {
+            model_cid:    KotobaCid::from_bytes(b"model"),
+            adapter_cid:  None,
+            input_tokens: vec![1, 2, 3],
+            max_tokens:   64,
+            call_id:      42,
+            ucan_cid:     KotobaCid::from_bytes(b"ucan"),
+        }
+    }
+
+    #[test]
+    fn new_session_output_is_empty() {
+        let session_cid = KotobaCid::from_bytes(b"session");
+        let session = InferenceSession::new(make_request(), session_cid);
+        assert!(session.output.is_empty());
+    }
+
+    #[test]
+    fn new_session_kvcache_has_correct_cid() {
+        let session_cid = KotobaCid::from_bytes(b"my-session");
+        let session = InferenceSession::new(make_request(), session_cid.clone());
+        assert_eq!(session.kv_cache.session_cid, session_cid);
+    }
+
+    #[test]
+    fn new_session_preserves_request_fields() {
+        let session_cid = KotobaCid::from_bytes(b"sess");
+        let session = InferenceSession::new(make_request(), session_cid);
+        assert_eq!(session.request.call_id, 42);
+        assert_eq!(session.request.max_tokens, 64);
+        assert_eq!(session.request.input_tokens, vec![1, 2, 3]);
+        assert!(session.request.adapter_cid.is_none());
+    }
+
+    #[test]
+    fn infer_error_bridge_display() {
+        let e = InferError::Bridge("timeout".to_string());
+        assert_eq!(e.to_string(), "bridge error: timeout");
+    }
+
+    #[test]
+    fn infer_error_context_exceeded_display() {
+        let e = InferError::ContextExceeded;
+        assert_eq!(e.to_string(), "context length exceeded");
+    }
+}
