@@ -29,8 +29,13 @@ impl DelegationChain {
     ///
     /// Returns the issuer DID (ERC-725) on success.
     pub fn verify(&self, graph_cid: &str, required_cap: &str) -> Result<String, DelegationError> {
-        if self.chain.is_empty() {
-            return Err(DelegationError::EmptyChain);
+        match self.chain.len() {
+            0 => return Err(DelegationError::EmptyChain),
+            // Multi-link delegation is not implemented; extra links would be silently
+            // ignored, which could allow an attacker to bypass capability checks by
+            // appending forged sub-delegations.  Hard-reject until it is designed.
+            n if n > 1 => return Err(DelegationError::ChainDepthExceeded(n)),
+            _ => {}
         }
         let cacao = &self.chain[0];
 
@@ -119,6 +124,8 @@ fn is_leap(y: u64) -> bool {
 pub enum DelegationError {
     #[error("empty delegation chain")]
     EmptyChain,
+    #[error("chain depth {0} exceeds maximum (1); multi-link delegation not implemented")]
+    ChainDepthExceeded(usize),
     #[error("cacao error: {0}")]
     Cacao(#[from] CacaoError),
     #[error("capability not granted: {0}")]

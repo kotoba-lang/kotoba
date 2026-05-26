@@ -14,6 +14,7 @@ use kotoba_auth::resolver::{DidDocumentResolver, DidResolverError};
 use kotoba_crypto::aead::CryptoError;
 use kotoba_crypto::hpke::hpke_seal;
 use kotoba_kse::{PreKeyError, PreKeyRegistry};
+use subtle::ConstantTimeEq;
 use x25519_dalek::PublicKey;
 
 #[derive(Debug, thiserror::Error)]
@@ -58,8 +59,9 @@ impl PreProxy {
         requester_pk: &[u8; 32],
     ) -> Result<Vec<u8>, PreProxyError> {
         // Fix #4: validate requester_pk against accessor_did's DID Document.
+        // Use constant-time comparison to avoid timing side-channels on key material.
         let registered_pk = self.resolver.x25519_key(accessor_did)?;
-        if registered_pk != *requester_pk {
+        if registered_pk.ct_eq(requester_pk).unwrap_u8() == 0 {
             return Err(PreProxyError::PkMismatch);
         }
 
