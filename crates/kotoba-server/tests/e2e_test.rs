@@ -1999,3 +1999,40 @@ async fn kotobase_pin_list_offset_pagination() {
     assert_eq!(body["offset"], 2, "{body}");
     assert_eq!(body["pins"].as_array().map(|a| a.len()).unwrap_or(0), 1, "{body}");
 }
+
+// ── cc.search / cc.rag / cc.ingest smoke tests ───────────────────────────────
+
+#[tokio::test]
+async fn cc_search_without_real_embed_endpoint_returns_error() {
+    let s = TestServer::start(false).await;
+    // The embed client initializes with default localhost:11434 but no server is running.
+    // The request should return an error response (500 or 503) — not 200 with data.
+    let (status, body) = s.get("/xrpc/ai.gftd.apps.kotoba.cc.search?q=test").await;
+    assert!(status == 500 || status == 503, "expected 500 or 503, got {status}: {body}");
+    assert!(body["error"].as_str().is_some(), "expected error field: {body}");
+}
+
+#[tokio::test]
+async fn cc_rag_without_real_embed_endpoint_returns_error() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.cc.rag",
+        json!({ "query": "what is Rust?" }),
+    ).await;
+    assert!(status == 500 || status == 503, "expected 500 or 503, got {status}: {body}");
+    assert!(body["error"].as_str().is_some(), "expected error field: {body}");
+}
+
+#[tokio::test]
+async fn cc_ingest_trigger_returns_started_job_id() {
+    let s = TestServer::start(false).await;
+    // Even with a non-existent parquet_dir, the ingest endpoint accepts the request
+    // and spawns the job asynchronously; the response must include job_id + status=started
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.cc.ingest",
+        json!({ "parquetDir": "/tmp/no-such-dir", "mode": "chunks" }),
+    ).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["job_id"].as_str().is_some(), "job_id missing: {body}");
+    assert_eq!(body["status"], "started", "{body}");
+}
