@@ -459,14 +459,21 @@ pub async fn vault_get(
 }
 
 /// GET /xrpc/ai.gftd.apps.kotoba.node.status
-pub async fn node_status(State(state): State<Arc<KotobaState>>) -> impl IntoResponse {
+/// Operator-only: exposes peer topology that aids targeted DHT attacks.
+pub async fn node_status(
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if let Err((code, msg)) = crate::graph_auth::require_operator_auth(&headers, &state.operator_did) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
     let nb = state.neighborhood.read().await;
     Json(serde_json::json!({
         "node_id":    hex::encode(state.local_node_id.0),
         "peer_count": nb.peers.len(),
         "peers":      nb.peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>(),
         "k":          kotoba_dht::neighborhood::K,
-    }))
+    })).into_response()
 }
 
 /// POST /xrpc/ai.gftd.apps.kotoba.invoke.run

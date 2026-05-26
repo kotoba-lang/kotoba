@@ -165,10 +165,26 @@ async fn app_meta_returns_ok() {
 
 #[tokio::test]
 async fn node_status_returns_node_id() {
-    let s = TestServer::start(false).await;
-    let (status, body) = s.get("/xrpc/ai.gftd.apps.kotoba.node.status").await;
+    let s   = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let (status, body) = s.get_with_auth("/xrpc/ai.gftd.apps.kotoba.node.status", &tok).await;
     assert_eq!(status, 200);
     assert!(body["node_id"].as_str().is_some(), "node_id missing: {body}");
+}
+
+#[tokio::test]
+async fn node_status_without_auth_returns_401() {
+    let s = TestServer::start(false).await;
+    let (status, _) = s.get("/xrpc/ai.gftd.apps.kotoba.node.status").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn node_status_non_operator_returns_401() {
+    let s   = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zNonOperator");
+    let (status, body) = s.get_with_auth("/xrpc/ai.gftd.apps.kotoba.node.status", &tok).await;
+    assert_eq!(status, 401, "{body}");
 }
 
 #[tokio::test]
