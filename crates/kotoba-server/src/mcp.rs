@@ -318,13 +318,42 @@ fn check_auth(headers: &HeaderMap) -> bool {
     !crate::graph_auth::jwt_exp_elapsed(token)
 }
 
+/// Extract the `sub` claim from the Bearer JWT, if present and non-expired.
+fn caller_sub(headers: &HeaderMap) -> Option<String> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))?;
+    if crate::graph_auth::jwt_exp_elapsed(token) {
+        return None;
+    }
+    crate::graph_auth::jwt_sub(token)
+}
+
+/// Administrative tools that modify storage structure (not data content) must
+/// be restricted to the operator to prevent accidental or malicious data loss.
+const ADMIN_ONLY_TOOLS: &[&str] = &[MCP_TOOL_GRAPH_GC, MCP_TOOL_COMMIT_PRUNE, MCP_TOOL_NODE_REGISTER];
+
 // ── Dispatch to state methods ────────────────────────────────────────────────
 
 async fn call_tool(
     tool: &str,
     args: &Value,
     state: &Arc<KotobaState>,
+    caller: Option<&str>,
 ) -> Result<Value, (i32, String)> {
+    if ADMIN_ONLY_TOOLS.contains(&tool) {
+        match caller {
+            Some(sub) if sub == state.operator_did => {}
+            Some(sub) => {
+                tracing::warn!(tool, sub, "mcp: admin-only tool called by non-operator");
+                return Err((ERR_AUTH, format!("tool {tool:?} requires operator credentials")));
+            }
+            None => {
+                return Err((ERR_AUTH, format!("tool {tool:?} requires operator credentials")));
+            }
+        }
+    }
     let get_str = |key: &str| -> Result<String, (i32, String)> {
         args.get(key)
             .and_then(Value::as_str)
@@ -1097,8 +1126,9 @@ pub async fn mcp_handler(
                 )),
             };
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            let caller = caller_sub(&headers);
 
-            match call_tool(&tool_name, &args, &state).await {
+            match call_tool(&tool_name, &args, &state, caller.as_deref()).await {
                 Ok(content) => json!({
                     "content": [{ "type": "text", "text": content.to_string() }],
                     "isError": false,
@@ -1237,7 +1267,7 @@ mod tests {
         let state = Arc::new(
             crate::server::KotobaState::new(None).expect("state")
         );
-        let result = call_tool("nonexistent_tool", &json!({}), &state).await;
+        let result = call_tool("nonexistent_tool", &json!({}), &state, None).await;
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ERR_NOT_FOUND);
     }
@@ -1252,7 +1282,7 @@ mod tests {
             "subject":   "alice",
             "predicate": "knows",
             "object":    "bob"
-        }), &state).await;
+        }), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.unwrap()["status"], "ok");
     }
@@ -1266,7 +1296,7 @@ mod tests {
             "graph": "g",
             "subject": "s"
             // predicate and object missing
-        }), &state).await;
+        }), &state, None).await;
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
     }
@@ -1282,7 +1312,7 @@ mod tests {
             "subject":   big,
             "predicate": "p",
             "object":    "o"
-        }), &state).await;
+        }), &state, None).await;
         let (code, msg) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
         assert!(msg.contains("too large"), "expected 'too large' in: {msg}");
@@ -1295,7 +1325,7 @@ mod tests {
         );
         let result = call_tool(MCP_TOOL_GRAPH_QUERY, &json!({
             "graph": "nonexistent_graph_xyz"
-        }), &state).await;
+        }), &state, None).await;
         assert!(result.is_ok());
         let v = result.unwrap();
         assert_eq!(v["count"], 0);
@@ -1310,13 +1340,13 @@ mod tests {
         for (pred, obj) in [("weight/layer/0", "val0"), ("weight/layer/1", "val1"), ("other", "x")] {
             call_tool(MCP_TOOL_QUAD_CREATE, &json!({
                 "graph": "g", "subject": "model", "predicate": pred, "object": obj
-            }), &state).await.unwrap();
+            }), &state, None).await.unwrap();
         }
         // AVET prefix scan should return only the two weight quads
         let v = call_tool(MCP_TOOL_GRAPH_QUERY, &json!({
             "graph": "g",
             "predicate_prefix": "weight/"
-        }), &state).await.unwrap();
+        }), &state, None).await.unwrap();
         assert_eq!(v["count"], 2, "prefix scan should return 2 weight quads, got {v}");
     }
 
@@ -1329,15 +1359,35 @@ mod tests {
         for (s, o) in [("alice", "bob"), ("carol", "bob"), ("dave", "eve")] {
             call_tool(MCP_TOOL_QUAD_CREATE, &json!({
                 "graph": "g2", "subject": s, "predicate": "knows", "object": o
-            }), &state).await.unwrap();
+            }), &state, None).await.unwrap();
         }
         // AVET P+O→S: who knows bob?
         let v = call_tool(MCP_TOOL_GRAPH_QUERY, &json!({
             "graph": "g2",
             "predicate": "knows",
             "object": "bob"
-        }), &state).await.unwrap();
+        }), &state, None).await.unwrap();
         assert_eq!(v["count"], 2, "should find alice and carol, got {v}");
+    }
+
+    #[tokio::test]
+    async fn admin_tools_reject_non_operator() {
+        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        // Any DID other than operator_did must be rejected with ERR_AUTH.
+        for tool in ADMIN_ONLY_TOOLS {
+            let args = if *tool == MCP_TOOL_COMMIT_PRUNE {
+                json!({ "before_seq": 0 })
+            } else {
+                json!({})
+            };
+            let err = call_tool(tool, &args, &state, Some("did:key:zNotTheOperator")).await
+                .expect_err(&format!("{tool} should reject non-operator"));
+            assert_eq!(err.0, ERR_AUTH, "{tool}: expected ERR_AUTH, got {err:?}");
+
+            let err_none = call_tool(tool, &args, &state, None).await
+                .expect_err(&format!("{tool} should reject missing caller"));
+            assert_eq!(err_none.0, ERR_AUTH, "{tool}: no-caller should give ERR_AUTH");
+        }
     }
 
     #[tokio::test]
@@ -1346,7 +1396,7 @@ mod tests {
             crate::server::KotobaState::new(None).expect("state")
         );
         // Fresh store has no committed blocks — GC should delete 0 and succeed.
-        let v = call_tool(MCP_TOOL_GRAPH_GC, &json!({}), &state).await.unwrap();
+        let v = call_tool(MCP_TOOL_GRAPH_GC, &json!({}), &state, Some(state.operator_did.as_str())).await.unwrap();
         assert_eq!(v["status"], "ok");
         assert!(v["deleted_blocks"].as_u64().is_some(), "deleted_blocks must be a number");
     }
@@ -1357,7 +1407,8 @@ mod tests {
             crate::server::KotobaState::new(None).expect("state")
         );
         // Fresh store — no commits yet; prune with before_seq=0 removes nothing.
-        let v = call_tool(MCP_TOOL_COMMIT_PRUNE, &json!({ "before_seq": 0 }), &state)
+        let v = call_tool(MCP_TOOL_COMMIT_PRUNE, &json!({ "before_seq": 0 }), &state,
+            Some(state.operator_did.as_str()))
             .await
             .unwrap();
         assert_eq!(v["status"], "ok");
@@ -1370,7 +1421,7 @@ mod tests {
         let state = Arc::new(
             crate::server::KotobaState::new(None).expect("state")
         );
-        let result = call_tool(MCP_TOOL_COMMIT_PRUNE, &json!({}), &state).await;
+        let result = call_tool(MCP_TOOL_COMMIT_PRUNE, &json!({}), &state, Some(state.operator_did.as_str())).await;
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
     }
@@ -1387,7 +1438,7 @@ mod tests {
             "doc_cid":   "doc1",
             "model_cid": "model1",
             "graph":     "graph1"
-        }), &state).await;
+        }), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");
@@ -1405,7 +1456,7 @@ mod tests {
             "doc_cid":   "doc1",
             "model_cid": "model1",
             "graph":     "graph1"
-        }), &state).await;
+        }), &state, None).await;
         let (code, msg) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
         assert!(msg.contains("empty"), "expected 'empty' in: {msg}");
@@ -1420,7 +1471,7 @@ mod tests {
             "doc_cid":   "doc1",
             "model_cid": "model1",
             "graph":     "graph1"
-        }), &state).await;
+        }), &state, None).await;
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
     }
@@ -1435,7 +1486,7 @@ mod tests {
         // No inference engine loaded → must fail
         let result = call_tool(MCP_TOOL_INFER_RUN, &json!({
             "prompt": "hello"
-        }), &state).await;
+        }), &state, None).await;
         assert!(result.is_err(), "expected error when no engine");
         let (code, msg) = result.unwrap_err();
         assert_eq!(code, ERR_INTERNAL);
@@ -1449,7 +1500,7 @@ mod tests {
         );
         // Engine check precedes prompt validation — either ERR_INTERNAL (no engine)
         // or ERR_INVALID_PARAMS (missing prompt) are both acceptable errors.
-        let result = call_tool(MCP_TOOL_INFER_RUN, &json!({}), &state).await;
+        let result = call_tool(MCP_TOOL_INFER_RUN, &json!({}), &state, None).await;
         assert!(result.is_err(), "expected error for missing prompt");
     }
 
@@ -1460,7 +1511,7 @@ mod tests {
         let state = Arc::new(
             crate::server::KotobaState::new(None).expect("state")
         );
-        let result = call_tool(MCP_TOOL_NODE_INFO, &json!({}), &state).await;
+        let result = call_tool(MCP_TOOL_NODE_INFO, &json!({}), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
         assert!(v["did"].is_string(),        "did must be a string");
@@ -1477,7 +1528,7 @@ mod tests {
         let state = Arc::new(
             crate::server::KotobaState::new(None).expect("state")
         );
-        let result = call_tool(MCP_TOOL_NODE_REGISTER, &json!({}), &state).await;
+        let result = call_tool(MCP_TOOL_NODE_REGISTER, &json!({}), &state, Some(state.operator_did.as_str())).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");
@@ -1491,7 +1542,7 @@ mod tests {
         let state = Arc::new(
             crate::server::KotobaState::new(None).expect("state")
         );
-        let result = call_tool(MCP_TOOL_NETWORK_PEERS, &json!({}), &state).await;
+        let result = call_tool(MCP_TOOL_NETWORK_PEERS, &json!({}), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
         assert!(v["local_node_id_hex"].is_string(), "local_node_id_hex must be a string");
@@ -1511,7 +1562,7 @@ mod tests {
         let result = call_tool(MCP_TOOL_WASM_RUN, &json!({
             "agent_did":    "did:plc:test",
             "ctx_cbor_b64": ""
-        }), &state).await;
+        }), &state, None).await;
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
     }
@@ -1525,7 +1576,7 @@ mod tests {
             "wasm_b64":     "not-valid-base64!!!",
             "agent_did":    "did:plc:test",
             "ctx_cbor_b64": "AA=="
-        }), &state).await;
+        }), &state, None).await;
         let (code, msg) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
         assert!(msg.contains("wasm_b64"), "expected 'wasm_b64' in: {msg}");
@@ -1540,7 +1591,7 @@ mod tests {
         );
         let result = call_tool(MCP_TOOL_DATALOG_RUN, &json!({
             "graph": "test_graph"
-        }), &state).await;
+        }), &state, None).await;
         let (code, msg) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
         assert!(msg.contains("rules"), "expected 'rules' in: {msg}");
@@ -1555,7 +1606,7 @@ mod tests {
         let result = call_tool(MCP_TOOL_DATALOG_RUN, &json!({
             "graph": "nonexistent_graph_for_datalog_test",
             "rules": []
-        }), &state).await;
+        }), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
         // Empty graph returns early with derived=[], citations=0, royalty_quads=0
@@ -1578,7 +1629,7 @@ mod tests {
             "graph":     "graph1",
             "dtype":     "fp16"
             // layer missing
-        }), &state).await;
+        }), &state, None).await;
         let (code, msg) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
         assert!(msg.contains("layer"), "expected 'layer' in: {msg}");
@@ -1597,7 +1648,7 @@ mod tests {
             "graph":     "graph1",
             "dtype":     "bf16",
             "layer":     0
-        }), &state).await;
+        }), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");
@@ -1620,7 +1671,7 @@ mod tests {
             "model_cid":   "model1",
             "graph":       "graph1"
             // rank missing
-        }), &state).await;
+        }), &state, None).await;
         let (code, msg) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
         assert!(msg.contains("rank"), "expected 'rank' in: {msg}");
@@ -1638,7 +1689,7 @@ mod tests {
             "model_cid":   "model1",
             "graph":       "graph1",
             "rank":        8
-        }), &state).await;
+        }), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
         assert_eq!(v["status"], "ok");
