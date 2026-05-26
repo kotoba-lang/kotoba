@@ -980,7 +980,8 @@ async fn quad_create_with_valid_ed25519_cacao_stores_author_did() {
     let author_quad = quads.iter()
         .find(|q| q["predicate"] == "meta/author")
         .expect("meta/author quad not found");
-    assert_eq!(author_quad["object"], issuer_did, "author DID must match CACAO issuer");
+    // QuadObject::Text serializes as {"Text": "<value>"}
+    assert_eq!(author_quad["object"]["Text"], issuer_did, "author DID must match CACAO issuer");
 }
 
 #[tokio::test]
