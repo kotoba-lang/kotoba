@@ -108,4 +108,47 @@ mod tests {
         assert!(ct.len() > pt.len());
         assert_eq!(ct.len(), NONCE_LEN + pt.len() + TAG_LEN);
     }
+
+    #[test]
+    fn seal_open_empty_plaintext() {
+        // AES-256-GCM must handle zero-length plaintext (auth-only mode).
+        let key = random_key();
+        let ct = seal(&key, b"").unwrap();
+        assert_eq!(ct.len(), NONCE_LEN + TAG_LEN, "empty pt: only nonce+tag");
+        let pt = open(&key, &ct).unwrap();
+        assert_eq!(pt.as_slice(), b"");
+    }
+
+    #[test]
+    fn open_data_too_short_returns_error() {
+        let key = random_key();
+        // 27 bytes < NONCE_LEN(12) + TAG_LEN(16) = 28
+        let short = vec![0u8; NONCE_LEN + TAG_LEN - 1];
+        assert!(open(&key, &short).is_err());
+        // Empty data
+        assert!(open(&key, &[]).is_err());
+    }
+
+    #[test]
+    fn successive_seals_use_distinct_nonces() {
+        // Each `seal` call must generate a unique 96-bit nonce via OsRng.
+        // Two seals of the same plaintext must produce distinct ciphertexts.
+        let key = random_key();
+        let ct1 = seal(&key, b"same plaintext").unwrap();
+        let ct2 = seal(&key, b"same plaintext").unwrap();
+        // nonces (first 12 bytes) must differ with overwhelming probability.
+        assert_ne!(
+            &ct1[..NONCE_LEN], &ct2[..NONCE_LEN],
+            "nonce reuse detected — OsRng should produce distinct nonces"
+        );
+    }
+
+    #[test]
+    fn truncated_tag_is_rejected() {
+        let key = random_key();
+        let mut ct = seal(&key, b"important").unwrap();
+        // Remove last byte of the auth tag.
+        ct.pop();
+        assert!(open(&key, &ct).is_err(), "truncated tag must be rejected");
+    }
 }
