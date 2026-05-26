@@ -255,6 +255,12 @@ class CompiledGraph:
             node = edge(state) if callable(edge) else edge
             steps += 1
 
+        if self._checkpointer is not None:
+            try:
+                self._checkpointer.save(thread_id, state)
+            except Exception:
+                pass
+
 
 # ── MessagesState convenience ────────────────────────────────────────────────
 

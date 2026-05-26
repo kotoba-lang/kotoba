@@ -212,6 +212,53 @@ class TestStream:
 
 # ── MessagesState convenience ─────────────────────────────────────────────────
 
+class TestStreamCheckpointer:
+    """stream() must persist state to checkpointer after exhaustion."""
+
+    def test_stream_saves_to_checkpointer(self):
+        from kotoba_langgraph.checkpointer import KotobaCheckpointer
+
+        ckpt = KotobaCheckpointer()
+
+        def inc(s): return {"count": s["count"] + 1}
+
+        g = StateGraph(CountState)
+        g.add_node("a", inc)
+        g.add_edge(START, "a")
+        g.add_edge("a", END)
+        compiled = g.compile(checkpointer=ckpt)
+
+        cfg = {"configurable": {"thread_id": "stream-t1"}}
+        list(compiled.stream({"count": 0}, config=cfg))  # exhaust
+
+        saved = ckpt.load("stream-t1")
+        assert saved is not None and saved["count"] == 1
+
+    def test_stream_multi_turn_accumulates(self):
+        from kotoba_langgraph.checkpointer import KotobaCheckpointer
+        from kotoba_langgraph.messages import add_messages, human_message, ai_message
+
+        ckpt = KotobaCheckpointer()
+
+        class MS(TypedDict):
+            messages: Annotated[list, add_messages]
+
+        def respond(state):
+            return {"messages": [ai_message("pong")]}
+
+        g = StateGraph(MS)
+        g.add_node("bot", respond)
+        g.add_edge(START, "bot")
+        g.add_edge("bot", END)
+        compiled = g.compile(checkpointer=ckpt)
+
+        cfg = {"configurable": {"thread_id": "stream-t2"}}
+        list(compiled.stream({"messages": [human_message("ping")]}, config=cfg))
+        snapshots = list(compiled.stream({"messages": [human_message("ping2")]}, config=cfg))
+        # After second stream: 2 from turn1 + 1 human + 1 ai = 4
+        assert len(snapshots[-1]["messages"]) == 4
+
+
 class TestMessagesState:
     def test_messages_state_reducer(self):
         def respond(s):
