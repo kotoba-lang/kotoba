@@ -27,6 +27,12 @@ pub enum RouterError {
     #[error("program bytes not provided for wasm program_type")]
     MissingWasmBytes,
 
+    #[error("datalog program not provided for datalog program_type")]
+    MissingDatalogProgram,
+
+    #[error("arrangement not provided for datalog program_type")]
+    MissingArrangement,
+
     #[error("datalog execution exceeded step limit")]
     StepsExceeded,
 
@@ -137,8 +143,8 @@ impl InvokeRouter {
             }
 
             ProgramType::Datalog => {
-                let prog = program.expect("Datalog dispatch requires program");
-                let arr  = arrangement.expect("Datalog dispatch requires arrangement");
+                let prog = program.ok_or(RouterError::MissingDatalogProgram)?;
+                let arr  = arrangement.ok_or(RouterError::MissingArrangement)?;
                 use kotoba_core::cid::KotobaCid;
                 let cid = KotobaCid::from_bytes(program_cid.as_bytes());
                 let result = KotobaVm::execute(&cid, prog, arr, input_deltas, max_steps, call_id, None);
@@ -239,5 +245,27 @@ mod tests {
         // WasmExecutor::new requires gas_limit > 0; passing 0 should fail
         let result = InvokeRouter::new(0, "http://localhost:9999");
         assert!(result.is_err(), "gas_limit=0 should fail InvokeRouter::new");
+    }
+
+    #[test]
+    fn datalog_without_program_returns_missing_program_error() {
+        let r   = router();
+        let arr = Arrangement::default();
+        let result = r.dispatch(
+            "prog-cid", ProgramType::Datalog, "did:test:agent",
+            1, None, vec![], None, Some(&arr), &[], 100,
+        );
+        assert!(matches!(result, Err(RouterError::MissingDatalogProgram)));
+    }
+
+    #[test]
+    fn datalog_without_arrangement_returns_missing_arrangement_error() {
+        let r    = router();
+        let prog = DatalogProgram::new();
+        let result = r.dispatch(
+            "prog-cid", ProgramType::Datalog, "did:test:agent",
+            1, None, vec![], Some(&prog), None, &[], 100,
+        );
+        assert!(matches!(result, Err(RouterError::MissingArrangement)));
     }
 }
