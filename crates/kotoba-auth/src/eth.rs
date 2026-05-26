@@ -74,3 +74,116 @@ pub fn parse_eth_address_from_did(iss: &str) -> Result<[u8; 20], EthError> {
 pub fn eth_address_to_erc725_did(addr: &[u8; 20]) -> String {
     format!("did:erc725:gftd:260425:0x{}", hex::encode(addr))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── eth_address_to_erc725_did ─────────────────────────────────────────────
+
+    #[test]
+    fn erc725_did_format() {
+        let addr = [0x00u8; 20];
+        let did  = eth_address_to_erc725_did(&addr);
+        assert!(did.starts_with("did:erc725:gftd:260425:0x"));
+        assert_eq!(did.len(), "did:erc725:gftd:260425:0x".len() + 40);
+    }
+
+    #[test]
+    fn erc725_did_known_address() {
+        let mut addr = [0u8; 20];
+        addr[19] = 0xAB;
+        let did = eth_address_to_erc725_did(&addr);
+        assert!(did.ends_with("ab"), "last byte 0xAB → hex 'ab': {did}");
+    }
+
+    // ── parse_eth_address_from_did ────────────────────────────────────────────
+
+    #[test]
+    fn parse_pkh_did() {
+        let did = "did:pkh:eip155:1:0xabcdef1234567890abcdef1234567890abcdef12";
+        let addr = parse_eth_address_from_did(did).unwrap();
+        assert_eq!(addr[0], 0xab);
+        assert_eq!(addr[19], 0x12);
+    }
+
+    #[test]
+    fn parse_erc725_did() {
+        let did = "did:erc725:gftd:260425:0xabcdef1234567890abcdef1234567890abcdef12";
+        let addr = parse_eth_address_from_did(did).unwrap();
+        assert_eq!(addr[0], 0xab);
+    }
+
+    #[test]
+    fn parse_did_rejects_wrong_length() {
+        // 19 bytes hex = 38 hex chars
+        let did = "did:pkh:eip155:1:0xabcdef1234567890abcdef1234567890abcdef";
+        let result = parse_eth_address_from_did(did);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_did_rejects_invalid_hex() {
+        let did = "did:pkh:eip155:1:0xGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+        let result = parse_eth_address_from_did(did);
+        assert!(result.is_err());
+    }
+
+    // ── personal_sign_hash ────────────────────────────────────────────────────
+
+    #[test]
+    fn personal_sign_hash_deterministic() {
+        let h1 = personal_sign_hash(b"hello");
+        let h2 = personal_sign_hash(b"hello");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn personal_sign_hash_different_messages_differ() {
+        let h1 = personal_sign_hash(b"hello");
+        let h2 = personal_sign_hash(b"world");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn personal_sign_hash_is_32_bytes() {
+        let h = personal_sign_hash(b"test");
+        assert_eq!(h.len(), 32);
+    }
+
+    // ── recover_eth_address ───────────────────────────────────────────────────
+
+    #[test]
+    fn recover_rejects_wrong_length_sig() {
+        let hash = [0u8; 32];
+        let sig  = [0u8; 64]; // 64 bytes, not 65
+        let result = recover_eth_address(&hash, &sig);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("65"), "error should mention 65 bytes: {msg}");
+    }
+
+    // ── EthError display ──────────────────────────────────────────────────────
+
+    #[test]
+    fn eth_error_display_sig() {
+        let e = EthError::Sig("bad sig".to_string());
+        assert!(e.to_string().contains("bad sig"));
+    }
+
+    #[test]
+    fn eth_error_display_did() {
+        let e = EthError::Did("bad did".to_string());
+        assert!(e.to_string().contains("bad did"));
+    }
+
+    // ── roundtrip: parse DID → encode back ───────────────────────────────────
+
+    #[test]
+    fn roundtrip_address_via_erc725_did() {
+        let original = [0x11u8; 20];
+        let did      = eth_address_to_erc725_did(&original);
+        let parsed   = parse_eth_address_from_did(&did).unwrap();
+        assert_eq!(original, parsed);
+    }
+}

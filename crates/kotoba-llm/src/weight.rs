@@ -101,3 +101,102 @@ impl WeightBlob {
         Self { blob_cid: blob_ref.cid, bytes, shape, dtype }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── WeightKind::path ──────────────────────────────────────────────────────
+
+    #[test]
+    fn path_embed()      { assert_eq!(WeightKind::Embed.path(),          "embed"); }
+    #[test]
+    fn path_lm_head()    { assert_eq!(WeightKind::LmHead.path(),         "lm_head"); }
+    #[test]
+    fn path_final_norm() { assert_eq!(WeightKind::FinalNorm.path(),      "norm/final"); }
+
+    #[test]
+    fn path_block_attn_q() {
+        assert_eq!(WeightKind::BlockAttnQ(3).path(),   "block/3/attn/q");
+        assert_eq!(WeightKind::BlockAttnK(7).path(),   "block/7/attn/k");
+        assert_eq!(WeightKind::BlockAttnV(0).path(),   "block/0/attn/v");
+        assert_eq!(WeightKind::BlockAttnO(25).path(),  "block/25/attn/o");
+    }
+
+    #[test]
+    fn path_block_ffn() {
+        assert_eq!(WeightKind::BlockFfnGate(1).path(), "block/1/ffn/gate");
+        assert_eq!(WeightKind::BlockFfnUp(2).path(),   "block/2/ffn/up");
+        assert_eq!(WeightKind::BlockFfnDown(3).path(), "block/3/ffn/down");
+    }
+
+    #[test]
+    fn path_block_norm() {
+        assert_eq!(WeightKind::BlockNormAttn(4).path(), "block/4/norm/attn");
+        assert_eq!(WeightKind::BlockNormFfn(5).path(),  "block/5/norm/ffn");
+    }
+
+    // ── WeightKind::predicate ─────────────────────────────────────────────────
+
+    #[test]
+    fn predicate_has_weight_prefix() {
+        for kind in [
+            WeightKind::Embed,
+            WeightKind::LmHead,
+            WeightKind::FinalNorm,
+            WeightKind::BlockAttnQ(0),
+            WeightKind::BlockFfnDown(0),
+        ] {
+            let pred = kind.predicate();
+            assert!(pred.starts_with("weight/"), "predicate missing 'weight/': {pred}");
+        }
+    }
+
+    #[test]
+    fn predicate_equals_weight_slash_path() {
+        let kind = WeightKind::BlockAttnQ(7);
+        assert_eq!(kind.predicate(), format!("weight/{}", kind.path()));
+    }
+
+    // ── WeightRef::to_quad ────────────────────────────────────────────────────
+
+    #[test]
+    fn to_quad_predicate_matches_kind() {
+        let model_cid = KotobaCid::from_bytes(b"model");
+        let blob_cid  = KotobaCid::from_bytes(b"blob");
+        let kind      = WeightKind::BlockAttnQ(3);
+        let wr = WeightRef {
+            model_cid: model_cid.clone(),
+            kind:      kind.clone(),
+            blob_cid:  blob_cid.clone(),
+            shape:     vec![2048, 256],
+            dtype:     TensorDtype::F32,
+        };
+        let graph_cid = KotobaCid::from_bytes(b"graph");
+        let quad = wr.to_quad(graph_cid.clone());
+        assert_eq!(quad.predicate, kind.predicate());
+        assert_eq!(quad.subject, model_cid);
+        assert_eq!(quad.graph,   graph_cid);
+    }
+
+    #[test]
+    fn to_quad_object_is_tensor_cid() {
+        let model_cid = KotobaCid::from_bytes(b"m");
+        let blob_cid  = KotobaCid::from_bytes(b"b");
+        let wr = WeightRef {
+            model_cid,
+            kind:  WeightKind::Embed,
+            blob_cid: blob_cid.clone(),
+            shape: vec![32000, 2048],
+            dtype: TensorDtype::F8E4M3,
+        };
+        let quad = wr.to_quad(KotobaCid::from_bytes(b"g"));
+        if let QuadObject::TensorCid { cid, shape, dtype } = quad.object {
+            assert_eq!(cid,   blob_cid);
+            assert_eq!(shape, vec![32000, 2048]);
+            assert_eq!(dtype, TensorDtype::F8E4M3);
+        } else {
+            panic!("expected TensorCid object, got {:?}", quad.object);
+        }
+    }
+}

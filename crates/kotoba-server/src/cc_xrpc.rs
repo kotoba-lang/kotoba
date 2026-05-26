@@ -405,3 +405,121 @@ pub async fn cc_status(
         "pages_graph_cid":  pages_graph.to_multibase(),
     })).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── cosine_score ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn cosine_score_identity() {
+        let v = vec![1.0f32, 2.0, 3.0];
+        let s = cosine_score(&v, &v);
+        assert!((s - 1.0).abs() < 1e-6, "same vector → 1.0, got {s}");
+    }
+
+    #[test]
+    fn cosine_score_orthogonal() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![0.0f32, 1.0];
+        let s = cosine_score(&a, &b);
+        assert!(s.abs() < 1e-6, "orthogonal → ~0.0, got {s}");
+    }
+
+    #[test]
+    fn cosine_score_opposite() {
+        let a = vec![1.0f32, 0.0];
+        let b = vec![-1.0f32, 0.0];
+        let s = cosine_score(&a, &b);
+        assert!((s + 1.0).abs() < 1e-6, "opposite → -1.0, got {s}");
+    }
+
+    #[test]
+    fn cosine_score_zero_vector_no_nan() {
+        // norm guard: .max(1e-9) ensures no NaN; dot=0 → result=0
+        let a = vec![0.0f32, 0.0];
+        let b = vec![1.0f32, 0.0];
+        let s = cosine_score(&a, &b);
+        assert!(!s.is_nan(), "must not be NaN");
+        assert!(s.abs() < 1e-3, "zero-vector dot=0 → ~0.0, got {s}");
+    }
+
+    #[test]
+    fn cosine_score_mismatched_lengths_uses_zip() {
+        // zip truncates to shorter; na uses full a, nb uses full b
+        // a=[1,0,0], b=[1,0]  dot=1  na=1  nb=1 → 1.0
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![1.0f32, 0.0];
+        let s = cosine_score(&a, &b);
+        assert!((s - 1.0).abs() < 1e-5, "zip-truncated overlap identical → 1.0, got {s}");
+    }
+
+    // ── brute_force_cosine ───────────────────────────────────────────────────
+
+    #[test]
+    fn brute_force_cosine_empty_embeddings() {
+        let q = vec![1.0f32, 0.0];
+        let result = brute_force_cosine(&q, &[], 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn brute_force_cosine_top_k_zero() {
+        let q = vec![1.0f32, 0.0];
+        let cid = KotobaCid::from_bytes(b"x");
+        let emb = vec![(cid, vec![1.0f32, 0.0])];
+        let result = brute_force_cosine(&q, &emb, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn brute_force_cosine_sorted_descending() {
+        let q    = vec![1.0f32, 0.0];
+        let cid0 = KotobaCid::from_bytes(b"a");
+        let cid1 = KotobaCid::from_bytes(b"b");
+        let cid2 = KotobaCid::from_bytes(b"c");
+        let embs = vec![
+            (cid0, vec![0.0f32, 1.0]),  // orthogonal → ~0
+            (cid1, vec![-1.0f32, 0.0]), // opposite   → -1
+            (cid2, vec![1.0f32, 0.0]),  // identical  → 1
+        ];
+        let result = brute_force_cosine(&q, &embs, 3);
+        assert_eq!(result.len(), 3);
+        // scores must be non-increasing
+        for w in result.windows(2) {
+            assert!(w[0].0 >= w[1].0, "not sorted descending: {:?}", result);
+        }
+        // best match is cid2 (index 2)
+        assert_eq!(result[0].1, 2);
+    }
+
+    #[test]
+    fn brute_force_cosine_truncates_to_top_k() {
+        let q  = vec![1.0f32, 0.0];
+        let embs: Vec<(KotobaCid, Vec<f32>)> = (0u8..10)
+            .map(|i| (KotobaCid::from_bytes(&[i]), vec![i as f32, 0.0]))
+            .collect();
+        let result = brute_force_cosine(&q, &embs, 3);
+        assert_eq!(result.len(), 3);
+    }
+
+    // ── constants ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nsid_constants_have_correct_prefix() {
+        let prefix = "ai.gftd.apps.kotoba.cc.";
+        assert!(NSID_CC_SEARCH.starts_with(prefix));
+        assert!(NSID_CC_RAG.starts_with(prefix));
+        assert!(NSID_CC_INGEST.starts_with(prefix));
+        assert!(NSID_CC_STATUS.starts_with(prefix));
+    }
+
+    #[test]
+    fn limits_are_sane() {
+        assert!(MAX_QUERY_LEN  >= 1_024);
+        assert!(MAX_TOP_K      >=   10);
+        assert!(MAX_CONTEXT_K  <=   MAX_TOP_K);
+        assert!(MAX_PARQUET_DIR >= 10);
+    }
+}
