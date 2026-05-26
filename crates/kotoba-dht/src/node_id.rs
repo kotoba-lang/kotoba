@@ -33,3 +33,64 @@ impl std::fmt::Display for NodeId {
         write!(f, "{}", hex::encode(self.0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_pubkey_is_deterministic() {
+        let a = NodeId::from_pubkey(b"peer-key");
+        let b = NodeId::from_pubkey(b"peer-key");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn from_pubkey_differs_for_different_keys() {
+        let a = NodeId::from_pubkey(b"alice");
+        let b = NodeId::from_pubkey(b"bob");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn xor_distance_self_is_zero() {
+        let n = NodeId::from_pubkey(b"self");
+        assert_eq!(n.xor_distance(&n), [0u8; 32]);
+    }
+
+    #[test]
+    fn xor_distance_is_symmetric() {
+        let a = NodeId::from_pubkey(b"a");
+        let b = NodeId::from_pubkey(b"b");
+        assert_eq!(a.xor_distance(&b), b.xor_distance(&a));
+    }
+
+    #[test]
+    fn k_nearest_returns_at_most_k() {
+        let target = NodeId::from_pubkey(b"target");
+        let candidates: Vec<NodeId> = (0..10u8).map(|i| NodeId::from_pubkey(&[i])).collect();
+        let nearest = NodeId::k_nearest(&target, &candidates, 3);
+        assert_eq!(nearest.len(), 3);
+    }
+
+    #[test]
+    fn k_nearest_empty_candidates() {
+        let target = NodeId::from_pubkey(b"t");
+        assert!(NodeId::k_nearest(&target, &[], 5).is_empty());
+    }
+
+    #[test]
+    fn k_nearest_fewer_than_k() {
+        let target = NodeId::from_pubkey(b"t");
+        let candidates = vec![NodeId::from_pubkey(b"x")];
+        assert_eq!(NodeId::k_nearest(&target, &candidates, 5).len(), 1);
+    }
+
+    #[test]
+    fn display_is_64_hex_chars() {
+        let n = NodeId::from_pubkey(b"display-test");
+        let s = format!("{n}");
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}

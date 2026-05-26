@@ -60,3 +60,73 @@ impl TopicPattern {
         Self::new(format!("/kotoba/quad/{graph}/>"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(s: &str) -> Topic { Topic::new(s) }
+    fn p(s: &str) -> TopicPattern { TopicPattern::new(s) }
+
+    #[test]
+    fn exact_match() {
+        assert!(t("a/b/c").matches(&p("a/b/c")));
+    }
+
+    #[test]
+    fn exact_mismatch() {
+        assert!(!t("a/b/c").matches(&p("a/b/x")));
+    }
+
+    #[test]
+    fn single_wildcard_matches_one_segment() {
+        assert!(t("a/b/c").matches(&p("a/*/c")));
+        assert!(!t("a/b/c/d").matches(&p("a/*/c")));
+    }
+
+    #[test]
+    fn rest_wildcard_matches_any_suffix() {
+        assert!(t("a/b/c/d").matches(&p("a/>")));
+        assert!(t("a/b").matches(&p("a/>")));
+    }
+
+    #[test]
+    fn all_quads_pattern_matches_quad_topic() {
+        let graph = "g1";
+        let topic = Topic::quad_spo(graph, "s", "pred", "obj");
+        let pat   = TopicPattern::all_quads(graph);
+        assert!(topic.matches(&pat));
+    }
+
+    #[test]
+    fn all_quads_pattern_does_not_match_other_graph() {
+        let topic = Topic::quad_spo("g1", "s", "pred", "obj");
+        let pat   = TopicPattern::all_quads("g2");
+        assert!(!topic.matches(&pat));
+    }
+
+    #[test]
+    fn segments_filters_empty() {
+        let topic = Topic::new("/a//b/");
+        let segs = topic.segments();
+        assert_eq!(segs, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn commit_topic_format() {
+        let t = Topic::commit("mygraph");
+        assert_eq!(t.0, "/kotoba/commit/mygraph");
+    }
+
+    #[test]
+    fn quad_index_topics_differ() {
+        let spo = Topic::quad_spo("g", "s", "p", "o");
+        let pos = Topic::quad_pos("g", "p", "o", "s");
+        let pso = Topic::quad_pso("g", "p", "s", "o");
+        let osp = Topic::quad_osp("g", "o", "s", "p");
+        // All four are distinct
+        assert_ne!(spo.0, pos.0);
+        assert_ne!(spo.0, pso.0);
+        assert_ne!(spo.0, osp.0);
+    }
+}
