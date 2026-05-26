@@ -181,7 +181,8 @@ mod tests {
     async fn kse_store_prefix_isolation() {
         // Two stores with different prefixes must not see each other's keys
         let dir = tmp_dir("kse-prefix-isolation");
-        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let fs: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
         let store_a = KseStore::new(Arc::clone(&fs), "ns-a/");
         let store_b = KseStore::new(Arc::clone(&fs), "ns-b/");
 

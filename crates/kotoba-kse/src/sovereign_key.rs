@@ -367,4 +367,88 @@ mod tests {
         // New ciphertext is NOT the same bytes as old (different key)
         assert_ne!(new_ct, old_ct);
     }
+
+    #[tokio::test]
+    async fn different_scopes_produce_different_ciphertexts() {
+        let dir = tmp_dir("scopes");
+        let (kse, blk) = make_stores(&dir);
+        let id = AgentIdentity::generate_ephemeral();
+        let crypto = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await.unwrap();
+
+        let ct1 = crypto.encrypt(b"scope-a", b"hello").await.unwrap();
+        let ct2 = crypto.encrypt(b"scope-b", b"hello").await.unwrap();
+        // Different scopes → different AEAD AD → different ciphertexts
+        assert_ne!(ct1, ct2);
+        // Wrong scope decryption fails
+        assert!(crypto.decrypt(b"scope-a", &ct2).await.is_err());
+        assert!(crypto.decrypt(b"scope-b", &ct1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypt_same_plaintext_twice_gives_different_ciphertexts() {
+        let dir = tmp_dir("nonce");
+        let (kse, blk) = make_stores(&dir);
+        let id = AgentIdentity::generate_ephemeral();
+        let crypto = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await.unwrap();
+
+        // Random nonce → different ciphertexts for same plaintext
+        let ct1 = crypto.encrypt(b"scope", b"repeat").await.unwrap();
+        let ct2 = crypto.encrypt(b"scope", b"repeat").await.unwrap();
+        assert_ne!(ct1, ct2, "nonce must differ between calls");
+
+        // Both should decrypt to the same plaintext
+        let pt1 = crypto.decrypt(b"scope", &ct1).await.unwrap();
+        let pt2 = crypto.decrypt(b"scope", &ct2).await.unwrap();
+        assert_eq!(pt1.as_slice(), b"repeat");
+        assert_eq!(pt2.as_slice(), b"repeat");
+    }
+
+    #[tokio::test]
+    async fn multiple_rotations_increment_version() {
+        let dir = tmp_dir("multi-rotate");
+        let (kse, blk) = make_stores(&dir);
+        let id = AgentIdentity::generate_ephemeral();
+
+        let c1 = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await.unwrap();
+        let c2 = c1.rotate(&id, &kse, &blk).await.unwrap();
+        let _c3 = c2.rotate(&id, &kse, &blk).await.unwrap();
+
+        let slug = id.did_slug();
+        let data = kse.get(&format!("agent/crypto/{slug}/current.json")).await.unwrap();
+        let key_ref: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        assert_eq!(key_ref["version"], 3, "three rotations should yield version 3");
+    }
+
+    #[tokio::test]
+    async fn two_independent_identities_have_isolated_keys() {
+        let dir1 = tmp_dir("iso-1");
+        let dir2 = tmp_dir("iso-2");
+        let (kse1, blk1) = make_stores(&dir1);
+        let (kse2, blk2) = make_stores(&dir2);
+
+        let id1 = AgentIdentity::generate_ephemeral();
+        let id2 = AgentIdentity::generate_ephemeral();
+
+        let c1 = SovereignCrypto::load_or_genesis(&id1, &kse1, &blk1).await.unwrap();
+        let c2 = SovereignCrypto::load_or_genesis(&id2, &kse2, &blk2).await.unwrap();
+
+        let ct = c1.encrypt(b"s", b"data").await.unwrap();
+        // id2 should not be able to decrypt id1's ciphertext
+        assert!(
+            c2.decrypt(b"s", &ct).await.is_err(),
+            "different identity keys must not decrypt each other's ciphertext"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_plaintext_roundtrip() {
+        let dir = tmp_dir("empty-pt");
+        let (kse, blk) = make_stores(&dir);
+        let id = AgentIdentity::generate_ephemeral();
+        let crypto = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await.unwrap();
+
+        let ct = crypto.encrypt(b"s", b"").await.unwrap();
+        let pt = crypto.decrypt(b"s", &ct).await.unwrap();
+        assert_eq!(pt.as_slice(), b"", "empty plaintext must round-trip correctly");
+    }
 }
