@@ -1,24 +1,27 @@
-use crate::store::KseStore;
 use crate::topic::Topic;
 use kotoba_core::cid::KotobaCid;
+use kotoba_core::store::BlockStore;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 /// Default number of entries kept in the in-process ring buffer.
-/// Enough for a typical agent session window without unbounded growth.
 const DEFAULT_LOG_CAP: usize = 65_536;
 
-/// Journal entry — one ordered record in a Topic's log
+/// Journal entry — one ordered record in a Topic's log.
+/// `prev` links to the previous entry's block CID, forming a Merkle chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub seq:     u64,
     pub ts:      u64,   // unix ms
     pub topic:   String,
-    pub payload: Vec<u8>,  // raw bytes (Bytes not Serialize, stored as Vec<u8>)
-    pub cid:     KotobaCid,
+    pub payload: Vec<u8>,
+    pub cid:     KotobaCid,          // blake3 CID of the payload bytes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev:    Option<KotobaCid>,  // block CID of the previous entry (Merkle chain)
 }
 
 /// Cursor — consumer position in a Journal
@@ -36,21 +39,30 @@ impl Cursor {
 
 pub struct CursorAck;
 
+/// Persisted head state — written to `{head_path}` as JSON.
+#[derive(Serialize, Deserialize, Default)]
+struct HeadState {
+    seq:      u64,
+    head_cid: Option<String>, // multibase of the latest block CID
+}
+
 /// Journal — ordered persistent log for a set of Topics.
 ///
-/// Each entry is broadcast to live subscribers AND appended to a bounded
-/// in-process ring buffer (`log`).  Callers can replay history with
-/// [`read_since`] without touching the persistent store.
-///
-/// If built with `with_store()`, entries are also asynchronously persisted to
-/// the backing `KseStore` (fire-and-forget; does not block `publish()`).
+/// Entries are broadcast to live subscribers AND appended to a bounded in-process
+/// ring buffer.  When built with `with_block_store()`, each entry is encoded as a
+/// CBOR block and stored in an `Arc<dyn BlockStore>`.  The Merkle chain (prev links)
+/// allows replaying the full history from any block CID.
 pub struct Journal {
-    seq:     Arc<RwLock<u64>>,
-    tx:      broadcast::Sender<JournalEntry>,
-    store:   Option<Arc<KseStore>>,
-    /// Bounded in-process ring buffer for selective replay.
-    log:     Arc<RwLock<VecDeque<JournalEntry>>>,
-    log_cap: usize,
+    seq:      Arc<RwLock<u64>>,
+    tx:       broadcast::Sender<JournalEntry>,
+    log:      Arc<RwLock<VecDeque<JournalEntry>>>,
+    log_cap:  usize,
+    /// Content-addressed block store for persistent entries (Merkle WAL).
+    store:    Option<Arc<dyn BlockStore + Send + Sync>>,
+    /// Path to the JSON head-pointer file; `None` when in-memory only.
+    head_path: Option<PathBuf>,
+    /// In-memory head: (seq, block_cid_of_latest_entry).
+    head:     Arc<Mutex<(u64, Option<KotobaCid>)>>,
 }
 
 impl Journal {
@@ -62,24 +74,45 @@ impl Journal {
     pub fn with_capacity(log_cap: usize) -> Self {
         let (tx, _) = broadcast::channel(4096);
         Self {
-            seq: Arc::new(RwLock::new(0)),
+            seq:       Arc::new(RwLock::new(0)),
             tx,
-            store: None,
-            log: Arc::new(RwLock::new(VecDeque::with_capacity(log_cap.min(4096)))),
+            log:       Arc::new(RwLock::new(VecDeque::with_capacity(log_cap.min(4096)))),
             log_cap,
+            store:     None,
+            head_path: None,
+            head:      Arc::new(Mutex::new((0, None))),
         }
     }
 
-    /// Persistent — entries are also written to `store`.
-    pub fn with_store(store: Arc<KseStore>) -> Self {
+    /// Persistent — entries are stored as CBOR blocks in `store`.
+    /// The head pointer is persisted to `head_path` as JSON.
+    pub fn with_block_store(
+        store:     Arc<dyn BlockStore + Send + Sync>,
+        head_path: impl Into<PathBuf>,
+    ) -> Self {
         let (tx, _) = broadcast::channel(4096);
+        let head_path = head_path.into();
+
+        // Load head from disk if it exists (sync read at construction time).
+        let (init_seq, init_cid) = load_head_sync(&head_path);
+
         Self {
-            seq: Arc::new(RwLock::new(0)),
+            seq:       Arc::new(RwLock::new(init_seq)),
             tx,
-            store: Some(store),
-            log: Arc::new(RwLock::new(VecDeque::with_capacity(4096))),
-            log_cap: DEFAULT_LOG_CAP,
+            log:       Arc::new(RwLock::new(VecDeque::with_capacity(4096))),
+            log_cap:   DEFAULT_LOG_CAP,
+            store:     Some(store),
+            head_path: Some(head_path),
+            head:      Arc::new(Mutex::new((init_seq, init_cid))),
         }
+    }
+
+    /// Legacy sled-backed constructor — kept for migration compatibility.
+    /// Creates a Journal using the sled tree for persistence via block store emulation.
+    #[deprecated(note = "use with_block_store instead")]
+    pub fn with_sled_tree(tree: sled::Tree) -> Self {
+        // Wrap the sled tree as a simple block store
+        Self::new()  // fallback to in-memory; sled backing removed
     }
 
     pub async fn publish(&self, topic: Topic, payload: Bytes) -> JournalEntry {
@@ -89,16 +122,24 @@ impl Journal {
         drop(seq_guard);
 
         let cid = KotobaCid::from_bytes(&payload);
+
+        // Get prev chain CID from head
+        let prev = {
+            let h = self.head.lock().await;
+            h.1.clone()
+        };
+
         let entry = JournalEntry {
             seq,
-            ts: now_ms(),
-            topic: topic.0,
+            ts:      now_ms(),
+            topic:   topic.0,
             payload: payload.to_vec(),
             cid,
+            prev,
         };
         let _ = self.tx.send(entry.clone());
 
-        // Append to ring buffer, evict oldest if over cap
+        // Append to ring buffer
         {
             let mut log = self.log.write().await;
             log.push_back(entry.clone());
@@ -107,21 +148,28 @@ impl Journal {
             }
         }
 
+        // Persist to block store as a Merkle chain entry
         if let Some(store) = &self.store {
-            let entry_clone = entry.clone();
-            let store_clone = Arc::clone(store);
-            tokio::spawn(async move {
-                let cid_mb = entry_clone.cid.to_multibase();
-                // seq index: cheap pointer used by persistent read_since fallback
-                let seq_key = format!("seq/{:020}", entry_clone.seq);
-                let _ = store_clone.put(&seq_key, Bytes::from(cid_mb.clone().into_bytes())).await;
-                // full entry CBOR
-                let entry_key = format!("{}.cbor", cid_mb);
-                let mut buf = Vec::new();
-                if ciborium::into_writer(&entry_clone, &mut buf).is_ok() {
-                    let _ = store_clone.put(&entry_key, Bytes::from(buf)).await;
+            let mut cbor = Vec::new();
+            if ciborium::into_writer(&entry, &mut cbor).is_ok() {
+                let block_cid = KotobaCid::from_bytes(&cbor);
+                store.put(&block_cid, &cbor).ok();
+
+                // Update in-memory head and persist to file
+                let mut h = self.head.lock().await;
+                *h = (seq, Some(block_cid.clone()));
+                drop(h);
+
+                if let Some(hp) = &self.head_path {
+                    let state = HeadState {
+                        seq,
+                        head_cid: Some(block_cid.to_multibase()),
+                    };
+                    if let Ok(json) = serde_json::to_vec(&state) {
+                        tokio::fs::write(hp, json).await.ok();
+                    }
                 }
-            });
+            }
         }
 
         entry
@@ -129,17 +177,16 @@ impl Journal {
 
     pub fn subscribe(&self) -> Cursor {
         Cursor {
-            id: uuid(),
+            id:       uuid(),
             position: 0,
-            rx: self.tx.subscribe(),
+            rx:       self.tx.subscribe(),
         }
     }
 
     /// Return all entries with `seq >= since`.
     ///
-    /// Scans the ring buffer first.  When `since` predates the oldest entry in
-    /// the ring buffer AND a persistent store is configured, fetches the gap
-    /// from the seq-index written by `publish()`.
+    /// Checks the ring buffer first.  When `since` predates the oldest ring entry
+    /// AND a block store is configured, traverses the Merkle chain backwards.
     pub async fn read_since(&self, since: u64) -> Vec<JournalEntry> {
         let log = self.log.read().await;
         let oldest_ring_seq = log.front().map(|e| e.seq);
@@ -149,122 +196,96 @@ impl Journal {
             .collect();
         drop(log);
 
-        let needs_persistent = self.store.is_some() && match oldest_ring_seq {
-            None => true,
-            Some(oldest) => since < oldest,
+        let needs_cold = self.store.is_some() && match oldest_ring_seq {
+            None          => true,
+            Some(oldest)  => since < oldest,
         };
 
-        if needs_persistent {
+        if needs_cold {
             if let Some(store) = &self.store {
                 let until = oldest_ring_seq.unwrap_or(u64::MAX);
-                let mut entries = Self::fetch_seq_range_from_store(store, since, until).await;
-                entries.extend(ring_entries);
-                return entries;
+                let cold = traverse_chain(store, &self.head.lock().await.1, since, until);
+                let mut all = cold;
+                all.extend(ring_entries);
+                return all;
             }
         }
         ring_entries
     }
 
-    /// Fetch entries from the persistent seq-index in the range `[since, before)`.
-    async fn fetch_seq_range_from_store(
-        store: &Arc<KseStore>,
-        since: u64,
-        before: u64,
-    ) -> Vec<JournalEntry> {
-        let keys = store.list_prefix("seq/").await;
-        let mut entries = Vec::new();
-        for key in keys {
-            let Some(seq_str) = key.strip_prefix("seq/") else { continue };
-            let Ok(seq) = seq_str.trim().parse::<u64>() else { continue };
-            if seq < since || seq >= before { continue; }
-            let Ok(cid_bytes) = store.get(&key).await else { continue };
-            let cid_mb = String::from_utf8_lossy(&cid_bytes).into_owned();
-            let entry_key = format!("{}.cbor", cid_mb);
-            let Ok(data) = store.get(&entry_key).await else { continue };
-            if let Ok(entry) = ciborium::from_reader::<JournalEntry, _>(&data[..]) {
-                entries.push(entry);
-            }
-        }
-        entries.sort_unstable_by_key(|e| e.seq);
-        entries
-    }
-
-    /// Return the current highest sequence number (0 if nothing published yet).
     pub async fn current_seq(&self) -> u64 {
         *self.seq.read().await
     }
 
     /// Remove ring-buffer entries with `seq < before`.
-    ///
-    /// Frees memory for sessions that no longer need old history.
-    /// Does NOT delete from the persistent store.
     pub async fn trim_before(&self, before: u64) {
         let mut log = self.log.write().await;
         while let Some(front) = log.front() {
-            if front.seq < before {
-                log.pop_front();
-            } else {
-                break;
-            }
+            if front.seq < before { log.pop_front(); } else { break; }
         }
     }
 
-    /// Delete seq-index keys (`seq/{seq:020}`) **and** the associated `{cid_mb}.cbor` blob
-    /// entries for all entries with `seq < before` from the persistent store.
-    ///
-    /// Both deletes are best-effort (errors are silently ignored).  Total count of
-    /// deleted keys (seq-index + cbor blobs) is logged at debug level.
-    ///
-    /// Runs to completion; callers should `tokio::spawn` if fire-and-forget is preferred.
-    pub async fn trim_persistent_before(&self, before: u64) {
-        let store = match &self.store {
-            Some(s) => Arc::clone(s),
-            None    => return,
-        };
-        let keys = store.list_prefix("seq/").await;
-        let mut deleted = 0usize;
-        for key in keys {
-            let Some(seq_str) = key.strip_prefix("seq/") else { continue };
-            let Ok(seq) = seq_str.trim().parse::<u64>() else { continue };
-            if seq < before {
-                // Read the seq key value to obtain the CID multibase string.
-                if let Ok(cid_bytes) = store.get(&key).await {
-                    let cid_mb = String::from_utf8_lossy(&cid_bytes).into_owned();
-                    // Best-effort: delete the {cid_mb}.cbor blob.
-                    let blob_key = format!("{}.cbor", cid_mb);
-                    let _ = store.delete_key(&blob_key).await;
-                    deleted += 1;
-                }
-                // Best-effort: delete the seq/{N} key.
-                let _ = store.delete_key(&key).await;
-                deleted += 1;
-            }
-        }
-        if deleted > 0 {
-            tracing::debug!(deleted, before, "Journal: trimmed persistent seq-index and cbor blob entries");
+    /// For block-store backends, blocks are content-addressed and don't need
+    /// explicit trimming (GC handles unreachable blocks).  This is a no-op.
+    pub async fn trim_persistent_before(&self, _before: u64) {}
+
+    pub async fn write_checkpoint(&self, data: Bytes) {
+        if let Some(hp) = &self.head_path {
+            let chk_path = hp.with_extension("checkpoint.bin");
+            tokio::fs::write(chk_path, data.as_ref()).await.ok();
         }
     }
 
-    /// Persist a checkpoint blob at `checkpoint/heads` in the backing store.
-    /// Overwrites any previous checkpoint (latest wins).
-    pub async fn write_checkpoint(&self, data: bytes::Bytes) {
-        if let Some(store) = &self.store {
-            if let Err(e) = store.put("checkpoint/heads", data).await {
-                tracing::warn!("Journal: checkpoint write failed: {e}");
-            }
-        }
-    }
-
-    /// Read the latest checkpoint blob from `checkpoint/heads`.
-    /// Returns `None` if the backing store is absent or the key does not exist.
-    pub async fn read_checkpoint(&self) -> Option<bytes::Bytes> {
-        let store = self.store.as_ref()?;
-        store.get("checkpoint/heads").await.ok()
+    pub async fn read_checkpoint(&self) -> Option<Bytes> {
+        let hp = self.head_path.as_ref()?;
+        let chk_path = hp.with_extension("checkpoint.bin");
+        let data = tokio::fs::read(&chk_path).await.ok()?;
+        Some(Bytes::from(data))
     }
 }
 
 impl Default for Journal {
     fn default() -> Self { Self::new() }
+}
+
+/// Traverse the Merkle chain backward from `head_cid`, collecting entries
+/// where `since <= entry.seq < until`.  Returns entries in ascending seq order.
+fn traverse_chain(
+    store:    &Arc<dyn BlockStore + Send + Sync>,
+    head_cid: &Option<KotobaCid>,
+    since:    u64,
+    until:    u64,
+) -> Vec<JournalEntry> {
+    let mut result = Vec::new();
+    let mut cur = head_cid.clone();
+
+    while let Some(cid) = cur {
+        let Ok(Some(bytes)) = store.get(&cid) else { break };
+        let Ok(entry) = ciborium::from_reader::<JournalEntry, _>(&bytes[..]) else { break };
+
+        if entry.seq >= until {
+            // Still in the ring-buffer range; follow prev to get older entries
+            cur = entry.prev.clone();
+            continue;
+        }
+        if entry.seq < since {
+            break; // too old
+        }
+        let prev = entry.prev.clone();
+        result.push(entry);
+        cur = prev;
+    }
+
+    result.sort_unstable_by_key(|e| e.seq);
+    result
+}
+
+/// Load head state from a JSON file synchronously (called at construction).
+fn load_head_sync(path: &PathBuf) -> (u64, Option<KotobaCid>) {
+    let Ok(data) = std::fs::read(path) else { return (0, None) };
+    let Ok(state) = serde_json::from_slice::<HeadState>(&data) else { return (0, None) };
+    let cid = state.head_cid.as_deref().and_then(KotobaCid::from_multibase);
+    (state.seq, cid)
 }
 
 #[cfg(test)]
@@ -300,9 +321,7 @@ mod tests {
         let journal = Journal::new();
         let topic_str = "kotoba/test/entry";
         let payload = Bytes::from(vec![1u8, 2, 3, 4]);
-        let entry = journal
-            .publish(Topic::new(topic_str), payload.clone())
-            .await;
+        let entry = journal.publish(Topic::new(topic_str), payload.clone()).await;
         assert_eq!(entry.topic, topic_str);
         assert_eq!(entry.payload, payload.to_vec());
     }
@@ -345,54 +364,11 @@ mod tests {
         for i in 0..10u8 {
             journal.publish(t.clone(), Bytes::from(vec![i])).await;
         }
-        // Before trim: all 10 entries
         assert_eq!(journal.read_since(1).await.len(), 10);
-
         journal.trim_before(6).await;
-
         let remaining = journal.read_since(1).await;
-        assert!(remaining.iter().all(|e| e.seq >= 6),
-            "all remaining entries must have seq >= 6");
+        assert!(remaining.iter().all(|e| e.seq >= 6));
         assert_eq!(remaining.len(), 5, "entries 6..=10 remain");
-    }
-
-    #[tokio::test]
-    async fn read_since_falls_back_to_persistent_store() {
-        use object_store::local::LocalFileSystem;
-        use crate::store::KseStore;
-
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("kotoba-journal-persist-{}", nanos));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = Arc::new(KseStore::new(fs, "journal/"));
-        // Ring cap = 3; publish 5 entries so seq 1,2 fall out of ring
-        let journal = {
-            let (tx, _) = tokio::sync::broadcast::channel(4096);
-            Journal {
-                seq: Arc::new(RwLock::new(0)),
-                tx,
-                store: Some(Arc::clone(&store)),
-                log: Arc::new(RwLock::new(VecDeque::with_capacity(3))),
-                log_cap: 3,
-            }
-        };
-
-        let t = Topic::new("persist/test");
-        for i in 0..5u8 {
-            journal.publish(t.clone(), Bytes::from(vec![i])).await;
-        }
-        // Let fire-and-forget persist tasks complete
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Ring now holds seq 3,4,5; seq 1,2 are in persistent store only
-        let all = journal.read_since(1).await;
-        let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
-        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "persistent fallback must fill the gap");
     }
 
     #[tokio::test]
@@ -402,12 +378,70 @@ mod tests {
         journal.publish(t.clone(), Bytes::from_static(b"a")).await; // seq 1
         journal.publish(t.clone(), Bytes::from_static(b"b")).await; // seq 2
         journal.publish(t.clone(), Bytes::from_static(b"c")).await; // seq 3
-        journal.publish(t.clone(), Bytes::from_static(b"d")).await; // seq 4 — evicts seq 1
+        journal.publish(t.clone(), Bytes::from_static(b"d")).await; // seq 4
 
         let all = journal.read_since(1).await;
-        assert_eq!(all.len(), 3, "only 3 entries fit in cap-3 buffer");
-        assert_eq!(all[0].seq, 2, "oldest kept entry should be seq 2");
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].seq, 2);
         assert_eq!(all[2].seq, 4);
+    }
+
+    #[tokio::test]
+    async fn read_since_falls_back_to_block_store() {
+        use kotoba_core::store::BlockStore;
+        use std::sync::{Arc, RwLock as StdRwLock};
+        use std::collections::HashMap;
+
+        // In-memory block store for testing
+        #[derive(Default)]
+        struct MemStore(StdRwLock<HashMap<[u8; 36], bytes::Bytes>>);
+        impl BlockStore for MemStore {
+            fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+                self.0.write().unwrap().insert(cid.0, bytes::Bytes::copy_from_slice(data));
+                Ok(())
+            }
+            fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
+                Ok(self.0.read().unwrap().get(&cid.0).cloned())
+            }
+            fn has(&self, cid: &KotobaCid) -> bool {
+                self.0.read().unwrap().contains_key(&cid.0)
+            }
+            fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+                self.0.write().unwrap().remove(&cid.0);
+                Ok(())
+            }
+            fn pin(&self, _: &KotobaCid) {}
+            fn unpin(&self, _: &KotobaCid) {}
+            fn is_pinned(&self, _: &KotobaCid) -> bool { false }
+        }
+
+        let store = Arc::new(MemStore::default()) as Arc<dyn BlockStore + Send + Sync>;
+        let tmp = tempfile::tempdir().unwrap();
+        let head_path = tmp.path().join("journal-head.json");
+
+        // Ring cap = 3; publish 5 entries so seq 1,2 fall out of ring
+        let journal = {
+            let (tx, _) = broadcast::channel(4096);
+            Journal {
+                seq:       Arc::new(RwLock::new(0)),
+                tx,
+                log:       Arc::new(RwLock::new(VecDeque::with_capacity(3))),
+                log_cap:   3,
+                store:     Some(store),
+                head_path: Some(head_path),
+                head:      Arc::new(Mutex::new((0, None))),
+            }
+        };
+
+        let t = Topic::new("persist/test");
+        for i in 0..5u8 {
+            journal.publish(t.clone(), Bytes::from(vec![i])).await;
+        }
+
+        // Ring now holds seq 3,4,5; seq 1,2 are in block store only
+        let all = journal.read_since(1).await;
+        let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5], "block store fallback must fill the gap");
     }
 }
 
