@@ -154,7 +154,7 @@ pub async fn cc_search(
         return Json(json!({ "results": [], "total": 0, "note": "no embeddings found" })).into_response();
     }
 
-    let top_k = q.top_k.min(100);
+    let top_k = q.top_k.min(MAX_TOP_K);
 
     // Use IVF if centroids were persisted, else brute-force
     let ivf_quads = arrangement.quads_with_predicate_prefix(&graph_cid, "cc/ivf/");

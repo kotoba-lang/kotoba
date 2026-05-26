@@ -241,6 +241,38 @@ async fn quad_retract_cacao_graph_mismatch_returns_401() {
 }
 
 #[tokio::test]
+async fn block_get_invalid_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s.get("/xrpc/ai.gftd.apps.kotoba.block.get?cid=not-a-valid-cid").await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn block_get_unknown_cid_returns_404() {
+    use kotoba_core::cid::KotobaCid;
+    let s = TestServer::start(false).await;
+    let cid = KotobaCid::from_bytes(b"block-does-not-exist-xyz").to_multibase();
+    let (status, body) = s.get(&format!("/xrpc/ai.gftd.apps.kotoba.block.get?cid={cid}")).await;
+    assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test]
+async fn commit_get_invalid_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s.get("/xrpc/ai.gftd.apps.kotoba.commit.get?graph=not-a-cid").await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn commit_get_unknown_graph_returns_404() {
+    use kotoba_core::cid::KotobaCid;
+    let s = TestServer::start(false).await;
+    let cid = KotobaCid::from_bytes(b"graph-commit-does-not-exist").to_multibase();
+    let (status, body) = s.get(&format!("/xrpc/ai.gftd.apps.kotoba.commit.get?graph={cid}")).await;
+    assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test]
 async fn block_put_and_get_roundtrip() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let s = TestServer::start(false).await;
@@ -316,6 +348,18 @@ async fn embed_create_returns_quad_cid() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "ok");
     assert!(body["dims"].as_u64().unwrap_or(0) > 0);
+}
+
+#[tokio::test]
+async fn embed_create_empty_text_returns_400() {
+    use kotoba_core::cid::KotobaCid;
+    let s = TestServer::start(false).await;
+    let graph_cid = KotobaCid::from_bytes(b"embed-empty").to_multibase();
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.embed.create",
+        json!({ "text": "", "doc_cid": "doc-empty", "model_cid": "model1", "graph": graph_cid }),
+    ).await;
+    assert_eq!(status, 400, "{body}");
 }
 
 #[tokio::test]
@@ -2151,8 +2195,7 @@ async fn agent_sync_open_non_ascii_session_id_returns_400() {
 async fn agent_sync_advance_unknown_session_returns_404() {
     let s = TestServer::start(false).await;
     use kotoba_core::cid::KotobaCid;
-    let graph_cid = KotobaCid::from_bytes(b"adv-graph").to_multibase();
-    let head_cid  = KotobaCid::from_bytes(b"head-adv").to_multibase();
+    let head_cid = KotobaCid::from_bytes(b"head-adv").to_multibase();
     let (status, body) = s.post("/xrpc/ai.gftd.apps.kotoba.agent.syncadvance", json!({
         "session_id":   "no-such-session",
         "new_head_cid": head_cid,
