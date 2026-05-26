@@ -68,11 +68,6 @@ impl KseStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        journal::{Journal, JournalEntry},
-        topic::Topic,
-        vault::Vault,
-    };
     use object_store::local::LocalFileSystem;
 
     fn tmp_dir(prefix: &str) -> std::path::PathBuf {
@@ -86,34 +81,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn journal_persists_to_local_fs() {
-        let dir = tmp_dir("journal");
+    async fn kse_store_put_get_roundtrip() {
+        let dir = tmp_dir("kse");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = Arc::new(KseStore::new(fs, "journal/"));
-        let journal = Journal::with_store(Arc::clone(&store));
-        let topic = Topic::new("test/topic");
-        let entry = journal.publish(topic, Bytes::from_static(b"hello")).await;
-        // allow the fire-and-forget spawn to complete
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let key = format!("{}.cbor", entry.cid.to_multibase());
-        let data = store.get(&key).await.unwrap();
-        let recovered: JournalEntry = ciborium::from_reader(&data[..]).unwrap();
-        assert_eq!(recovered.seq, entry.seq);
+        let store = KseStore::new(fs, "test/");
+        store.put("hello", Bytes::from_static(b"world")).await.unwrap();
+        let got = store.get("hello").await.unwrap();
+        assert_eq!(got.as_ref(), b"world");
     }
 
     #[tokio::test]
-    async fn vault_persists_and_retrieves() {
-        let dir = tmp_dir("vault");
+    async fn kse_store_exists_and_delete() {
+        let dir = tmp_dir("kse-del");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = Arc::new(KseStore::new(fs, "vault/"));
-        let vault = Vault::with_store(Arc::clone(&store));
-        let data = Bytes::from_static(b"binary blob content");
-        let blob_ref = vault.put(data.clone()).await;
-        // allow the fire-and-forget spawn to complete
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // new vault instance — empty memory cache, must read from store
-        let vault2 = Vault::with_store(Arc::clone(&store));
-        let retrieved = vault2.get(&blob_ref.cid).await.unwrap();
-        assert_eq!(retrieved, data);
+        let store = KseStore::new(fs, "test/");
+        assert!(!store.exists("key").await);
+        store.put("key", Bytes::from_static(b"val")).await.unwrap();
+        assert!(store.exists("key").await);
+        store.delete_key("key").await.unwrap();
+        assert!(!store.exists("key").await);
     }
 }

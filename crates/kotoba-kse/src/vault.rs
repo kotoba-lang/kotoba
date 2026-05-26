@@ -1,5 +1,5 @@
-use crate::store::KseStore;
 use kotoba_core::cid::KotobaCid;
+use kotoba_core::store::BlockStore;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,15 +12,14 @@ pub struct BlobRef {
     pub size: usize,
 }
 
-/// Vault — chunked binary blob store (clean room, inspired by NATS Object Store)
-/// Large tensors (FP8 weights, embeddings) stored here.
+/// Vault — chunked binary blob store.
 ///
-/// If built with `with_store()`, every `put()` is also persisted to the backing
-/// `KseStore` (fire-and-forget).  `get()` checks the in-memory cache first and
-/// falls back to the store on a miss, populating the cache on retrieval.
+/// If built with `with_block_store()`, every `put()` is persisted to the
+/// given `BlockStore`.  `get()` checks the in-memory cache first and falls
+/// back to the block store on a miss, populating the cache on retrieval.
 pub struct Vault {
     blobs: Arc<RwLock<HashMap<String, Bytes>>>,
-    store: Option<Arc<KseStore>>,
+    store: Option<Arc<dyn BlockStore + Send + Sync>>,
 }
 
 impl Vault {
@@ -29,22 +28,25 @@ impl Vault {
         Self { blobs: Arc::new(RwLock::new(HashMap::new())), store: None }
     }
 
-    /// Persistent — blobs are also written to / read from `store`.
-    pub fn with_store(store: Arc<KseStore>) -> Self {
+    /// Persistent — blobs are written to / read from the given block store.
+    pub fn with_block_store(store: Arc<dyn BlockStore + Send + Sync>) -> Self {
         Self { blobs: Arc::new(RwLock::new(HashMap::new())), store: Some(store) }
+    }
+
+    /// Legacy sled-backed constructor — kept for migration compatibility.
+    #[deprecated(note = "use with_block_store instead")]
+    pub fn with_sled_tree(_tree: sled::Tree) -> Self {
+        Self::new()
     }
 
     pub async fn put(&self, data: Bytes) -> BlobRef {
         let cid = KotobaCid::from_bytes(&data);
         let key = cid.to_multibase();
         let size = data.len();
-        self.blobs.write().await.insert(key.clone(), data.clone());
+        self.blobs.write().await.insert(key, data.clone());
 
         if let Some(store) = &self.store {
-            let store_clone = Arc::clone(store);
-            tokio::spawn(async move {
-                let _ = store_clone.put(&key, data).await;
-            });
+            store.put(&cid, &data).ok();
         }
 
         BlobRef { cid, size }
@@ -58,11 +60,11 @@ impl Vault {
             return Some(blob);
         }
 
-        // fallback: object_store
+        // fallback: block store
         if let Some(store) = &self.store {
-            if let Ok(data) = store.get(&key).await {
-                self.blobs.write().await.insert(key, data.clone());
-                return Some(data);
+            if let Ok(Some(bytes)) = store.get(cid) {
+                self.blobs.write().await.insert(key, bytes.clone());
+                return Some(bytes);
             }
         }
 
@@ -75,7 +77,7 @@ impl Vault {
             return true;
         }
         if let Some(store) = &self.store {
-            return store.exists(&key).await;
+            return store.has(cid);
         }
         false
     }
@@ -88,6 +90,31 @@ impl Default for Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kotoba_core::store::BlockStore;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock as StdRwLock};
+
+    #[derive(Default)]
+    struct MemStore(StdRwLock<HashMap<[u8; 36], Bytes>>);
+    impl BlockStore for MemStore {
+        fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+            self.0.write().unwrap().insert(cid.0, Bytes::copy_from_slice(data));
+            Ok(())
+        }
+        fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
+            Ok(self.0.read().unwrap().get(&cid.0).cloned())
+        }
+        fn has(&self, cid: &KotobaCid) -> bool {
+            self.0.read().unwrap().contains_key(&cid.0)
+        }
+        fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+            self.0.write().unwrap().remove(&cid.0);
+            Ok(())
+        }
+        fn pin(&self, _: &KotobaCid) {}
+        fn unpin(&self, _: &KotobaCid) {}
+        fn is_pinned(&self, _: &KotobaCid) -> bool { false }
+    }
 
     #[tokio::test]
     async fn put_returns_blob_ref_with_correct_size() {
@@ -118,9 +145,9 @@ mod tests {
         let vault = Vault::new();
         let data = Bytes::from_static(b"contains check");
         let cid = KotobaCid::from_bytes(&data);
-        assert!(!vault.contains(&cid).await, "should not contain before put");
+        assert!(!vault.contains(&cid).await);
         vault.put(data).await;
-        assert!(vault.contains(&cid).await, "should contain after put");
+        assert!(vault.contains(&cid).await);
     }
 
     #[tokio::test]
@@ -128,6 +155,20 @@ mod tests {
         let vault = Vault::new();
         let ref_a = vault.put(Bytes::from_static(b"content alpha")).await;
         let ref_b = vault.put(Bytes::from_static(b"content beta")).await;
-        assert_ne!(ref_a.cid, ref_b.cid, "distinct content must produce distinct CIDs");
+        assert_ne!(ref_a.cid, ref_b.cid);
+    }
+
+    #[tokio::test]
+    async fn block_store_vault_survives_cache_eviction() {
+        let store = Arc::new(MemStore::default()) as Arc<dyn BlockStore + Send + Sync>;
+        let vault = Vault::with_block_store(store.clone());
+
+        let data = Bytes::from_static(b"persistent blob");
+        let blob_ref = vault.put(data.clone()).await;
+
+        // Fresh vault sharing the same block store (empty in-memory cache)
+        let vault2 = Vault::with_block_store(store);
+        let retrieved = vault2.get(&blob_ref.cid).await;
+        assert_eq!(retrieved, Some(data));
     }
 }

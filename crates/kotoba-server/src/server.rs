@@ -6,7 +6,7 @@ use kotoba_dht::{
     neighborhood::Neighborhood,
     node_id::NodeId,
 };
-use kotoba_kse::{store::KseStore, sync_window::SyncWindow, Journal, Shelf, Topic, Vault};
+use kotoba_kse::{sync_window::SyncWindow, Journal, Shelf, Topic, Vault};
 use kotoba_kqe::quad::Quad;
 use kotoba_graph::QuadStore;
 use kotoba_kse::SecureVault;
@@ -65,18 +65,47 @@ pub struct KotobaState {
 
 impl KotobaState {
     pub fn new(inference_engine: Option<InferenceFn>) -> anyhow::Result<Self> {
-        // KSE — wire B2 persistence when env vars are present
-        let journal = Arc::new(match build_kse_store("kotoba/journal/") {
-            Some(store) => {
-                tracing::info!("KSE Journal: B2 persistence enabled");
-                Journal::with_store(store)
+        // BlockStore — sled-backed when KOTOBA_STORE_PATH is set, ephemeral otherwise.
+        // All KSE components (Journal, Vault, SecureVault) share the same store.
+        let store_path: Option<String> = std::env::var("KOTOBA_STORE_PATH").ok();
+        let sled_db: Option<sled::Db> = store_path.as_ref().map(|path| {
+            sled::open(path)
+                .map_err(|e| anyhow::anyhow!("sled open failed: {e}"))
+                .expect("sled open")
+        });
+
+        let budget_bytes: Option<usize> = std::env::var("KOTOBA_STORAGE_BUDGET_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
+        let block_store: Arc<dyn BlockStore + Send + Sync> = match &sled_db {
+            Some(db) => {
+                tracing::info!("BlockStore: sled-backed persistence");
+                let inner = kotoba_store::SledBlockStore::from_db(db)
+                    .map_err(|e| anyhow::anyhow!("sled blocks tree: {e}"))?;
+                maybe_wrap(inner, budget_bytes)
             }
             None => {
-                tracing::info!("KSE Journal: in-memory only (set KOTOBA_B2_* for persistence)");
+                tracing::warn!("BlockStore: ephemeral (set KOTOBA_STORE_PATH for persistence)");
+                let inner = kotoba_store::SledBlockStore::temporary()
+                    .map_err(|e| anyhow::anyhow!("sled temporary failed: {e}"))?;
+                maybe_wrap(inner, budget_bytes)
+            }
+        };
+
+        // Journal — Merkle WAL backed by block_store; head pointer in a sibling JSON file.
+        let journal = Arc::new(match &store_path {
+            Some(path) => {
+                let head_path = format!("{path}.journal-head.json");
+                tracing::info!("KSE Journal: block-store persistence enabled");
+                Journal::with_block_store(Arc::clone(&block_store), head_path)
+            }
+            None => {
+                tracing::info!("KSE Journal: in-memory only (set KOTOBA_STORE_PATH for persistence)");
                 Journal::new()
             }
         });
-        let shelf   = Arc::new(Shelf::new());
+        let shelf = Arc::new(Shelf::new());
 
         // KDHT — generate ephemeral NodeId (dev mode; prod uses persisted Ed25519 key)
         let local_node_id = {
@@ -103,72 +132,6 @@ impl KotobaState {
         };
         let udf = Arc::new(UdfExecutor::new()?);
 
-        // BlockStore — priority: sled path > B2/S3 > ephemeral sled
-        // Optionally wrapped in BudgetedBlockStore when KOTOBA_STORAGE_BUDGET_BYTES is set.
-        let budget_bytes: Option<usize> = std::env::var("KOTOBA_STORAGE_BUDGET_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok());
-
-        let b2_creds = match (
-            std::env::var("KOTOBA_B2_BUCKET"),
-            std::env::var("KOTOBA_B2_KEY_ID"),
-            std::env::var("KOTOBA_B2_APP_KEY"),
-        ) {
-            (Ok(bucket), Ok(key_id), Ok(app_key)) => Some((bucket, key_id, app_key)),
-            _ => None,
-        };
-
-        let block_store: Arc<dyn BlockStore + Send + Sync> =
-            match (std::env::var("KOTOBA_STORE_PATH"), b2_creds) {
-                (Ok(path), Some((bucket, key_id, app_key))) => {
-                    let endpoint = std::env::var("KOTOBA_B2_ENDPOINT")
-                        .unwrap_or_else(|_| "https://s3.us-west-001.backblazeb2.com".into());
-                    use object_store::aws::AmazonS3Builder;
-                    let s3 = AmazonS3Builder::new()
-                        .with_bucket_name(&bucket)
-                        .with_access_key_id(&key_id)
-                        .with_secret_access_key(&app_key)
-                        .with_endpoint(&endpoint)
-                        .build()
-                        .map_err(|e| anyhow::anyhow!("B2 block store build: {e}"))?;
-                    let sled = kotoba_store::SledBlockStore::open(&path)
-                        .map_err(|e| anyhow::anyhow!("sled open failed: {e}"))?;
-                    tracing::info!(path, bucket, "BlockStore: LayeredBlockStore (sled primary + B2 backup)");
-                    let inner = LayeredBlockStore::new(
-                        Arc::new(sled),
-                        Arc::new(kotoba_store::S3BlockStore::new(Arc::new(s3), "kotoba/blocks")),
-                    );
-                    maybe_wrap(inner, budget_bytes)
-                }
-                (Ok(path), None) => {
-                    tracing::info!(path, "BlockStore: sled-backed persistence (no B2 backup)");
-                    let inner = kotoba_store::SledBlockStore::open(&path)
-                        .map_err(|e| anyhow::anyhow!("sled open failed: {e}"))?;
-                    maybe_wrap(inner, budget_bytes)
-                }
-                (Err(_), Some((bucket, key_id, app_key))) => {
-                    let endpoint = std::env::var("KOTOBA_B2_ENDPOINT")
-                        .unwrap_or_else(|_| "https://s3.us-west-001.backblazeb2.com".into());
-                    use object_store::aws::AmazonS3Builder;
-                    let s3 = AmazonS3Builder::new()
-                        .with_bucket_name(&bucket)
-                        .with_access_key_id(&key_id)
-                        .with_secret_access_key(&app_key)
-                        .with_endpoint(&endpoint)
-                        .build()
-                        .map_err(|e| anyhow::anyhow!("B2 block store build: {e}"))?;
-                    tracing::info!(bucket, "BlockStore: B2/S3-backed (kotoba/blocks/)");
-                    let inner = kotoba_store::S3BlockStore::new(Arc::new(s3), "kotoba/blocks");
-                    maybe_wrap(inner, budget_bytes)
-                }
-                (Err(_), None) => {
-                    tracing::warn!("BlockStore: ephemeral sled (set KOTOBA_STORE_PATH or KOTOBA_B2_* for persistence)");
-                    let inner = kotoba_store::SledBlockStore::temporary()
-                        .map_err(|e| anyhow::anyhow!("sled temporary failed: {e}"))?;
-                    maybe_wrap(inner, budget_bytes)
-                }
-            };
-
         // IPFS Pinning Service client (E) — optional, no daemon required
         let ipfs_pin = IpfsPinClient::from_env();
         if ipfs_pin.is_some() {
@@ -178,25 +141,21 @@ impl KotobaState {
         // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path
         let quad_store = Arc::new(QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store)));
 
-        // Vault — content-addressed private blob store; persisted to B2 when available
-        let vault = Arc::new(match build_kse_store("kotoba/vault/") {
-            Some(store) => {
-                tracing::info!("Vault: B2 persistence enabled");
-                Vault::with_store(store)
-            }
-            None => {
-                tracing::info!("Vault: in-memory only");
-                Vault::new()
-            }
+        // Vault — content-addressed private blob store; backed by block_store.
+        let vault = Arc::new(if store_path.is_some() {
+            tracing::info!("Vault: block-store persistence enabled");
+            Vault::with_block_store(Arc::clone(&block_store))
+        } else {
+            tracing::info!("Vault: in-memory only");
+            Vault::new()
         });
 
-        // SecureVault — E2E encrypted blob store for email bodies
-        let secure_vault = Arc::new(match build_kse_store("kotoba/email-vault/") {
-            Some(store) => {
-                tracing::info!("SecureVault: B2 persistence enabled (kotoba/email-vault/)");
-                SecureVault::with_vault(Vault::with_store(store))
-            }
-            None => SecureVault::new(),
+        // SecureVault — E2E encrypted blob store for email bodies; shares block_store.
+        let secure_vault = Arc::new(if store_path.is_some() {
+            tracing::info!("SecureVault: block-store persistence enabled");
+            SecureVault::with_vault(Vault::with_block_store(Arc::clone(&block_store)))
+        } else {
+            SecureVault::new()
         });
 
         // Vault key — 32 bytes from KOTOBA_VAULT_KEY (64 hex chars)
@@ -322,31 +281,6 @@ fn maybe_wrap<S: BlockStore + Send + Sync + 'static>(
         }
         _ => Arc::new(inner),
     }
-}
-
-/// Build a `KseStore` backed by Backblaze B2 (S3-compatible) when the
-/// required env vars are present.
-///
-/// Required: `KOTOBA_B2_BUCKET`, `KOTOBA_B2_KEY_ID`, `KOTOBA_B2_APP_KEY`
-/// Optional: `KOTOBA_B2_ENDPOINT` (default: `https://s3.us-west-001.backblazeb2.com`)
-fn build_kse_store(prefix: &str) -> Option<Arc<KseStore>> {
-    let bucket   = std::env::var("KOTOBA_B2_BUCKET").ok()?;
-    let key_id   = std::env::var("KOTOBA_B2_KEY_ID").ok()?;
-    let app_key  = std::env::var("KOTOBA_B2_APP_KEY").ok()?;
-    let endpoint = std::env::var("KOTOBA_B2_ENDPOINT")
-        .unwrap_or_else(|_| "https://s3.us-west-001.backblazeb2.com".into());
-
-    use object_store::aws::AmazonS3Builder;
-    let s3 = AmazonS3Builder::new()
-        .with_bucket_name(&bucket)
-        .with_access_key_id(&key_id)
-        .with_secret_access_key(&app_key)
-        .with_endpoint(&endpoint)
-        .build()
-        .map_err(|e| tracing::warn!("B2 store build failed: {e}"))
-        .ok()?;
-
-    Some(Arc::new(KseStore::new(Arc::new(s3), prefix)))
 }
 
 /// Generate a deterministic-ish seed for the ephemeral dev NodeId.

@@ -9,40 +9,75 @@ use std::sync::{Arc, RwLock};
 /// Pins are kept in-memory (not persisted across restarts); agents re-pin on startup.
 pub struct SledBlockStore {
     db:     sled::Db,
+    /// Named tree used for block storage ("blocks" when opened via `from_db`).
+    tree:   Option<sled::Tree>,
     pinned: Arc<RwLock<HashSet<[u8; 36]>>>,
 }
 
 impl SledBlockStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StoreError> {
         let db = sled::open(path)?;
-        Ok(Self { db, pinned: Arc::new(RwLock::new(HashSet::new())) })
+        Ok(Self { db, tree: None, pinned: Arc::new(RwLock::new(HashSet::new())) })
     }
 
     pub fn temporary() -> Result<Self, StoreError> {
         let db = sled::Config::new().temporary(true).open()?;
-        Ok(Self { db, pinned: Arc::new(RwLock::new(HashSet::new())) })
+        Ok(Self { db, tree: None, pinned: Arc::new(RwLock::new(HashSet::new())) })
+    }
+
+    /// Build from a shared sled::Db, using the "blocks" named tree.
+    /// Allows server.rs to share one Sled DB across blocks / journal / vault.
+    pub fn from_db(db: &sled::Db) -> sled::Result<Self> {
+        let tree = db.open_tree("blocks")?;
+        Ok(Self {
+            db:     db.clone(),
+            tree:   Some(tree),
+            pinned: Arc::new(RwLock::new(HashSet::new())),
+        })
+    }
+
+    /// Open a named tree within the same Sled DB.
+    pub fn open_tree(&self, name: &str) -> sled::Result<sled::Tree> {
+        self.db.open_tree(name)
+    }
+
+    #[inline]
+    fn tree_insert(&self, key: &[u8], val: &[u8]) -> sled::Result<Option<sled::IVec>> {
+        if let Some(t) = &self.tree { t.insert(key, val) } else { self.db.insert(key, val) }
+    }
+    #[inline]
+    fn tree_get(&self, key: &[u8]) -> sled::Result<Option<sled::IVec>> {
+        if let Some(t) = &self.tree { t.get(key) } else { self.db.get(key) }
+    }
+    #[inline]
+    fn tree_contains(&self, key: &[u8]) -> sled::Result<bool> {
+        if let Some(t) = &self.tree { t.contains_key(key) } else { self.db.contains_key(key) }
+    }
+    #[inline]
+    fn tree_remove(&self, key: &[u8]) -> sled::Result<Option<sled::IVec>> {
+        if let Some(t) = &self.tree { t.remove(key) } else { self.db.remove(key) }
     }
 }
 
 impl BlockStore for SledBlockStore {
     fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-        self.db.insert(&cid.0, data)
+        self.tree_insert(&cid.0, data)
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("sled put: {e}"))
     }
 
     fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
-        self.db.get(&cid.0)
+        self.tree_get(&cid.0)
             .map(|opt| opt.map(|v| Bytes::copy_from_slice(&v)))
             .map_err(|e| anyhow::anyhow!("sled get: {e}"))
     }
 
     fn has(&self, cid: &KotobaCid) -> bool {
-        self.db.contains_key(&cid.0).unwrap_or(false)
+        self.tree_contains(&cid.0).unwrap_or(false)
     }
 
     fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
-        self.db.remove(&cid.0)
+        self.tree_remove(&cid.0)
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("sled delete: {e}"))
     }
