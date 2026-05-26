@@ -1176,6 +1176,64 @@ async fn quad_create_cacao_cbor_parse_error_returns_400() {
     assert_eq!(status, 400);
 }
 
+// ── quad.create / quad.retract field-length caps (security bounds) ────────────
+
+#[tokio::test]
+async fn quad_create_oversized_graph_returns_400() {
+    let s = TestServer::start(false).await;
+    // Build CACAO for the oversized graph so auth succeeds; size cap fires after.
+    let oversized_graph = "g".repeat(513);
+    let (_, cacao_b64) = build_ed25519_cacao(&oversized_graph);
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.quad.create",
+        json!({
+            "graph":     oversized_graph,
+            "subject":   "s",
+            "predicate": "p",
+            "object":    "o",
+            "cacao_b64": cacao_b64,
+        }),
+    ).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn quad_create_oversized_object_returns_400() {
+    let s = TestServer::start(false).await;
+    let (_, cacao_b64) = build_ed25519_cacao("e2e");
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.quad.create",
+        json!({
+            "graph":     "e2e",
+            "subject":   "s",
+            "predicate": "p",
+            "object":    "x".repeat(8 * 1024 + 1), // > 8 KiB limit
+            "cacao_b64": cacao_b64,
+        }),
+    ).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn mcp_quad_create_oversized_field_returns_error() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s.post_auth("/mcp", json!({
+        "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+        "params": {
+            "name": "kotoba_quad_create",
+            "arguments": {
+                "graph":     "g",
+                "subject":   "s",
+                "predicate": "p",
+                "object":    "x".repeat(4097), // > 4096 byte MCP limit
+            }
+        }
+    }), "test-token").await;
+    assert_eq!(status, 200, "{body}");
+    // MCP tools return errors as JSON-RPC error objects, not HTTP 4xx
+    assert!(body.get("error").is_some(), "expected error for oversized field: {body}");
+}
+
 // ── kotobase input validation tests ──────────────────────────────────────────
 
 const KOTOBASE_ACCOUNT_CREATE:  &str = "/xrpc/ai.gftd.apps.kotobase.accountCreate";
@@ -1457,4 +1515,94 @@ async fn email_list_xrpc_unknown_owner_returns_empty() {
         body["emails"].as_array().map(|a| a.is_empty()).unwrap_or(false),
         "{body}"
     );
+}
+
+// ── weight.put CACAO auth tests ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn weight_put_with_valid_cacao_returns_blob_cid() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    let s = TestServer::start(false).await;
+    let graph = "weight-test-graph";
+    let (_, cacao_b64) = build_ed25519_cacao(graph);
+
+    // Minimal 1-element FP8 tensor
+    let data = vec![0x3cu8];
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.weight.put",
+        json!({
+            "model_cid":  "bafkreiabcdef",
+            "layer":      0,
+            "data_b64":   B64.encode(&data),
+            "shape":      [1u32],
+            "dtype":      "fp8e4m3",
+            "graph":      graph,
+            "cacao_b64":  cacao_b64,
+        }),
+    ).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["blob_cid"].as_str().is_some(), "blob_cid missing: {body}");
+    assert!(body["quad_cid"].as_str().is_some(), "quad_cid missing: {body}");
+    assert_eq!(body["layer"], 0u64, "layer mismatch: {body}");
+}
+
+#[tokio::test]
+async fn weight_put_without_cacao_returns_401() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    let s = TestServer::start(false).await;
+    let data = vec![0x3cu8];
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.weight.put",
+        json!({
+            "model_cid": "bafkreiabcdef",
+            "layer":     0,
+            "data_b64":  B64.encode(&data),
+            "shape":     [1u32],
+            "dtype":     "fp8e4m3",
+            "graph":     "weight-test-graph",
+        }),
+    ).await;
+    assert_eq!(status, 401, "{body}");
+}
+
+// ── lora.apply CACAO auth tests ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn lora_apply_with_valid_cacao_returns_adapter_cid() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    let s = TestServer::start(false).await;
+    let graph = "lora-test-graph";
+    let (_, cacao_b64) = build_ed25519_cacao(graph);
+
+    let adapter = vec![0x01u8, 0x02u8, 0x03u8];
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.lora.apply",
+        json!({
+            "model_cid":   "bafkreiabcdef",
+            "rank":        4u32,
+            "graph":       graph,
+            "adapter_b64": B64.encode(&adapter),
+            "cacao_b64":   cacao_b64,
+        }),
+    ).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["adapter_cid"].as_str().is_some(), "adapter_cid missing: {body}");
+    assert!(body["quad_cid"].as_str().is_some(), "quad_cid missing: {body}");
+}
+
+#[tokio::test]
+async fn lora_apply_without_cacao_returns_401() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    let s = TestServer::start(false).await;
+    let adapter = vec![0x01u8, 0x02u8, 0x03u8];
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.lora.apply",
+        json!({
+            "model_cid":   "bafkreiabcdef",
+            "rank":        4u32,
+            "graph":       "lora-test-graph",
+            "adapter_b64": B64.encode(&adapter),
+        }),
+    ).await;
+    assert_eq!(status, 401, "{body}");
 }

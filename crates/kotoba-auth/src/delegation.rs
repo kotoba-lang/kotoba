@@ -232,7 +232,11 @@ impl DelegationChain {
     ) -> Result<String, DelegationError> {
         // Audience check before signature to fail fast on misrouted tokens.
         let cacao = self.chain.first().ok_or(DelegationError::EmptyChain)?;
-        if !cacao.p.aud.is_empty() && cacao.p.aud != expected_aud {
+        // A CACAO with an empty (absent) `aud` field has no audience binding.
+        // When the caller explicitly requests audience enforcement, an unbound
+        // CACAO is treated as a mismatch — otherwise a bearer token issued without
+        // `aud` would bypass replay protection entirely.
+        if cacao.p.aud.is_empty() || cacao.p.aud != expected_aud {
             return Err(DelegationError::AudienceMismatch {
                 expected: expected_aud.to_string(),
                 got:      cacao.p.aud.clone(),

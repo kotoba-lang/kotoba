@@ -421,6 +421,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delegation_verify_with_aud_empty_aud_is_rejected() {
+        // A CACAO with no audience binding must be rejected by verify_with_aud.
+        // Accepting an empty aud would let bearer tokens bypass replay protection.
+        let mut p = test_payload(vec![]);
+        p.aud = String::new(); // no audience binding
+        let cacao = Cacao {
+            h: CacaoHeader { t: "eip4361".into() },
+            p,
+            s: CacaoSig { t: "eip191".into(), s: "00".into() },
+        };
+        let chain = delegation::DelegationChain::new(cacao);
+        let err = chain.verify_with_aud("graph_cid", "quad:read", "kotoba://test").unwrap_err();
+        assert!(
+            matches!(err, DelegationError::AudienceMismatch { .. }),
+            "expected AudienceMismatch for empty aud, got {err:?}"
+        );
+    }
+
     // ── DidDocument ────────────────────────────────────────────────────────
 
     fn test_did_doc() -> DidDocument {

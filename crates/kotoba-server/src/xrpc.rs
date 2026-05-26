@@ -829,6 +829,8 @@ pub struct WeightPutReq {
     pub dtype:     String,
     /// named graph CID (multibase) to index this weight in
     pub graph:     String,
+    /// CACAO delegation proof (CBOR, base64) — required; must carry `quad:write` capability
+    pub cacao_b64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -839,6 +841,10 @@ pub struct WeightPutResp {
 }
 
 /// POST /xrpc/ai.gftd.apps.kotoba.weight.put
+///
+/// `cacao_b64` is required. The CACAO is verified before the write:
+/// - did:web issuer → HTTP resolution + expiry check
+/// - everything else → DelegationChain verifies expiry + `quad:write` capability + graph + sig
 pub async fn weight_put(
     State(state): State<Arc<KotobaState>>,
     Json(req):    Json<WeightPutReq>,
@@ -846,6 +852,27 @@ pub async fn weight_put(
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use kotoba_core::cid::KotobaCid;
     use kotoba_kqe::quad::{Quad, QuadObject, TensorDtype};
+
+    // ── CACAO auth ────────────────────────────────────────────────────────
+    let b64 = req.cacao_b64.as_deref()
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "cacao_b64 is required for weight.put".to_string()))?;
+    const MAX_CACAO_B64_LEN: usize = 8 * 1024;
+    if b64.len() > MAX_CACAO_B64_LEN {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("cacao_b64 too large ({} bytes, limit {MAX_CACAO_B64_LEN})", b64.len())));
+    }
+    let cbor = B64.decode(b64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao_b64 decode: {e}")))?;
+    let cacao = kotoba_auth::Cacao::from_cbor(&cbor)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao parse: {e}")))?;
+    let issuer_did = if cacao.p.iss.starts_with("did:web:") {
+        resolve_and_verify_did_web(&cacao, &req.graph, &state.http_client).await?
+    } else {
+        kotoba_auth::DelegationChain::new(cacao)
+            .verify(&req.graph, "quad:write")
+            .map_err(map_delegation_error)?
+    };
+    tracing::info!(issuer = %issuer_did, graph = %req.graph, "weight.put: CACAO verified");
 
     let bytes = B64.decode(&req.data_b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -1049,6 +1076,8 @@ pub struct LoraApplyReq {
     pub graph:       String,
     /// Raw LoRA adapter bytes, base64-encoded
     pub adapter_b64: String,
+    /// CACAO delegation proof (CBOR, base64) — required; must carry `quad:write` capability
+    pub cacao_b64:   Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1058,6 +1087,10 @@ pub struct LoraApplyResp {
 }
 
 /// POST /xrpc/ai.gftd.apps.kotoba.lora.apply
+///
+/// `cacao_b64` is required. The CACAO is verified before the write:
+/// - did:web issuer → HTTP resolution + expiry check
+/// - everything else → DelegationChain verifies expiry + `quad:write` capability + graph + sig
 pub async fn lora_apply(
     State(state): State<Arc<KotobaState>>,
     Json(req):    Json<LoraApplyReq>,
@@ -1065,6 +1098,27 @@ pub async fn lora_apply(
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use kotoba_core::cid::KotobaCid;
     use kotoba_kqe::quad::{Quad, QuadObject, TensorDtype};
+
+    // ── CACAO auth ────────────────────────────────────────────────────────
+    let b64 = req.cacao_b64.as_deref()
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "cacao_b64 is required for lora.apply".to_string()))?;
+    const MAX_CACAO_B64_LEN: usize = 8 * 1024;
+    if b64.len() > MAX_CACAO_B64_LEN {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("cacao_b64 too large ({} bytes, limit {MAX_CACAO_B64_LEN})", b64.len())));
+    }
+    let cbor = B64.decode(b64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao_b64 decode: {e}")))?;
+    let cacao = kotoba_auth::Cacao::from_cbor(&cbor)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao parse: {e}")))?;
+    let issuer_did = if cacao.p.iss.starts_with("did:web:") {
+        resolve_and_verify_did_web(&cacao, &req.graph, &state.http_client).await?
+    } else {
+        kotoba_auth::DelegationChain::new(cacao)
+            .verify(&req.graph, "quad:write")
+            .map_err(map_delegation_error)?
+    };
+    tracing::info!(issuer = %issuer_did, graph = %req.graph, "lora.apply: CACAO verified");
 
     let bytes = B64.decode(&req.adapter_b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
