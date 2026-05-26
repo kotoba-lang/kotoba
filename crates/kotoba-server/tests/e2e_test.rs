@@ -315,7 +315,7 @@ async fn mcp_tools_list_returns_eight_tools() {
     ).await;
     assert_eq!(status, 200);
     let tools = body["result"]["tools"].as_array().expect("tools");
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 10);
 }
 
 #[tokio::test]

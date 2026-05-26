@@ -510,7 +510,7 @@ let thread = compiled.run(thread)?;
 | 実行バックエンド | crate | 用途 | サーバ接続 |
 |---|---|---|---|
 | `WasmExecutor` | kotoba-runtime | WASM Component Model host; gas_limit=10M | ✓ `KotobaState.executor` |
-| `WasmPregelRunner` | kotoba-vm | WASM を Pregel BSP に乗せる (単頂点 self-loop) | — (server 未接続) |
+| `WasmPregelRunner` | kotoba-vm | WASM を Pregel BSP に乗せる (単頂点 self-loop) | ✓ MCP tool `kotoba_wasm_run` (2026-05-26) |
 | `KotobaVm::execute()` | kotoba-vm | Datalog を Pregel BSP で実行; 各 superstep を BlockStore に checkpoint | partial `InvokeRouter` |
 | `ReActRunner` | kotoba-vm | sync ReAct ループ (embedded/test) | — |
 | `PregelReActRunner` | kotoba-vm | ReAct を Pregel superstep にマッピング | ✓ `xrpc.rs agent.run` |
@@ -522,21 +522,22 @@ let thread = compiled.run(thread)?;
 - **Checkpoint**: `PregelGraph::checkpoint()` → ProllyTree leaf (BlockStore, CAS); `checkpoint_chained()` → `CID=blake3(root||prev)` で Merkle chain 形成
 - **分散**: `DistributedPregelRunner` が local / remote vertex を分離; remote メッセージは `outbound_tx` → `KotobaSwarm::send_pregel_message` (Phase 6 full-mesh replication; Phase 8 shard)
 
-### Economy system — 実装状況と gap
+### Economy system — 実装状況 (2026-05-26)
 
 **実装済み (接続あり)**:
 - Attestation staking: 自己認証 1,000 KOTO / 検証済み 5,000 KOTO → Quad `attest/stake_mkoto` に永続化
 - `WasmExecutor::execute()` → `InvokeResult::gas_used` を返す
 - `KotobaVm::execute()` → `ExecResult::gas_used` + `checkpoint_cids` を返す
+- **[gap 1, 2026-05-26]** `DatalogProgram::evaluate_delta_cited(&deltas, &mut CitationLedger)` — join hit 時に `CitationLedger::cite()` を呼ぶ; `evaluate_delta()` は backward compat で ledger なし版を維持
+- **[gap 2, 2026-05-26]** MCP tool `kotoba_wasm_run` → `WasmPregelRunner` → `WasmRunResult::total_gas_used` → Quad `gas/consumed_mkoto` per agent DID
+- **[gap 3, 2026-05-26]** MCP tool `kotoba_datalog_run` → `evaluate_delta_cited` → `flush_epoch()` → `royalty_quads()` → `QuadStore::assert()` per epoch
 
-**実装済み (未接続)**:
-- `CitationLedger` (kotoba-kqe): Datom 引用カウント + mKOTO royalty 分配 (`flush_epoch()` → `royalty_quads()`)
+**未実装 (etzhayyim-exclusive)**:
+4. on-chain settlement: ERC-4337 / Base L2 への mKOTO royalty 送金ブリッジ (ADR-2605260004)
 
-**未実装 (gap)**:
-1. `DatalogProgram::evaluate_delta()` の join hit 時に `CitationLedger::cite()` を呼ばない
-2. `gas_used` → mKOTO billing pipeline (gas cost × KOTO/gas レート → QuadStore write)
-3. `CitationLedger::flush_epoch()` → `royalty_quads()` → `QuadStore::assert_batch()` の自動発火
-4. on-chain settlement: ERC-4337 / Base L2 への mKOTO royalty 送金ブリッジ
+**Browser / Edge WASM (Phase N)**:
+- `wasmtime` は native-only (wasm32 にコンパイル不可)
+- ブラウザ実行は `kotoba-runtime-web` crate が必要 (browser native WebAssembly + IdbBlockStore + metered interpreter)
 
 ## 禁止
 
