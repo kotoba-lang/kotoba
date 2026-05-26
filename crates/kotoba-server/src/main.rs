@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Gemma 2 2B IT loaded");
                 let engine: kotoba_runtime::host::InferenceFn =
                     Arc::new(move |prompt: &str, max_tokens: usize| {
-                        runner.lock().unwrap().generate(prompt, max_tokens)
+                        runner.lock().unwrap_or_else(|e| e.into_inner()).generate(prompt, max_tokens)
                     });
                 Some(engine)
             }
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Jetstream client started (Journal + QuadStore)");
     }
 
-    // ── 6. subscribeRepos binary firehose (optional) ──────────────────────────
+    // ── 7. subscribeRepos binary firehose (optional) ──────────────────────────
     if std::env::var("KOTOBA_SUBSCRIBE_REPOS").is_ok() {
         let journal_arc     = Arc::clone(&state.journal);
         let quad_store_arc  = Arc::clone(&state.quad_store);

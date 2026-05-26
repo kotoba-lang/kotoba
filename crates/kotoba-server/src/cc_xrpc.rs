@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,7 @@ const MAX_QUERY_LEN:   usize = 8_192;  // 8 KiB — prevents embed-client DoS
 const MAX_LANG_LEN:    usize =   16;
 const MAX_SYSTEM_LEN:  usize = 4_096;
 const MAX_TOP_K:       usize =  100;
+const MAX_CONTEXT_K:   usize =   20;   // cap RAG context chunks before LLM prompt construction
 const MAX_PARQUET_DIR: usize = 1_024;
 
 #[derive(Serialize)]
@@ -245,7 +246,7 @@ pub async fn cc_rag(
     };
 
     let chunk_embeddings = collect_chunk_embeddings(&arrangement, &graph_cid);
-    let ranked = brute_force_cosine(query_vec, &chunk_embeddings, body.context_k);
+    let ranked = brute_force_cosine(query_vec, &chunk_embeddings, body.context_k.min(MAX_CONTEXT_K));
 
     let mut context_texts: Vec<String> = Vec::new();
     let mut context_meta:  Vec<Value>  = Vec::new();
@@ -304,10 +305,15 @@ fn default_owner_did()   -> String { "did:plc:unknown".to_string() }
 
 pub async fn cc_ingest(
     State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
     Json(body): Json<CcIngestBody>,
 ) -> impl IntoResponse {
     use kotoba_ingest::cc::{CcPageIngestor, CcChunkIngestor};
     use kotoba_ingest::embed_client::Blake3EmbedClient;
+
+    if let Err((code, msg)) = crate::graph_auth::require_operator_auth(&headers, &state.operator_did) {
+        return (code, Json(json!({"error": msg}))).into_response();
+    }
 
     if body.parquet_dir.is_empty() || body.parquet_dir.len() > MAX_PARQUET_DIR {
         return (StatusCode::BAD_REQUEST,

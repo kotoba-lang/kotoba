@@ -461,6 +461,9 @@ async fn call_tool(
             let model_cid = get_str("model_cid")?;
             let graph     = get_str("graph")?;
 
+            if text.is_empty() {
+                return Err((ERR_INVALID_PARAMS, "text must not be empty".into()));
+            }
             const MAX_EMBED_TEXT_LEN: usize = 64 * 1024;
             if text.len() > MAX_EMBED_TEXT_LEN {
                 return Err((ERR_INVALID_PARAMS,
@@ -1293,5 +1296,276 @@ mod tests {
         let result = call_tool(MCP_TOOL_COMMIT_PRUNE, &json!({}), &state).await;
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ERR_INVALID_PARAMS);
+    }
+
+    // ── kotoba_embed_create ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_embed_create_ok_blake3_fallback() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_EMBED_CREATE, &json!({
+            "text":      "hello kotoba",
+            "doc_cid":   "doc1",
+            "model_cid": "model1",
+            "graph":     "graph1"
+        }), &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let v = result.unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(v["dims"].as_u64().unwrap_or(0) > 0, "dims must be > 0");
+        assert!(v["quad_cid"].is_string(), "quad_cid must be a string");
+    }
+
+    #[tokio::test]
+    async fn call_tool_embed_create_empty_text_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_EMBED_CREATE, &json!({
+            "text":      "",
+            "doc_cid":   "doc1",
+            "model_cid": "model1",
+            "graph":     "graph1"
+        }), &state).await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+        assert!(msg.contains("empty"), "expected 'empty' in: {msg}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_embed_create_missing_text_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_EMBED_CREATE, &json!({
+            "doc_cid":   "doc1",
+            "model_cid": "model1",
+            "graph":     "graph1"
+        }), &state).await;
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+    }
+
+    // ── kotoba_infer_run ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_infer_run_without_engine_returns_error() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        // No inference engine loaded → must fail
+        let result = call_tool(MCP_TOOL_INFER_RUN, &json!({
+            "prompt": "hello"
+        }), &state).await;
+        assert!(result.is_err(), "expected error when no engine");
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(msg.contains("inference engine"), "expected 'inference engine' in: {msg}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_infer_run_missing_prompt_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        // Engine check precedes prompt validation — either ERR_INTERNAL (no engine)
+        // or ERR_INVALID_PARAMS (missing prompt) are both acceptable errors.
+        let result = call_tool(MCP_TOOL_INFER_RUN, &json!({}), &state).await;
+        assert!(result.is_err(), "expected error for missing prompt");
+    }
+
+    // ── kotoba_node_info ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_node_info_returns_node_fields() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_NODE_INFO, &json!({}), &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let v = result.unwrap();
+        assert!(v["did"].is_string(),        "did must be a string");
+        assert!(v["node_id_hex"].is_string(), "node_id_hex must be a string");
+        assert!(v["version"].is_string(),     "version must be a string");
+        assert!(v["roles"].is_array(),        "roles must be an array");
+        assert!(v["peer_count"].as_u64().is_some(), "peer_count must be a number");
+    }
+
+    // ── kotoba_node_register ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_node_register_returns_ok() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_NODE_REGISTER, &json!({}), &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let v = result.unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(v["operator_did"].is_string(), "operator_did must be a string");
+    }
+
+    // ── kotoba_network_peers ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_network_peers_returns_peer_list() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_NETWORK_PEERS, &json!({}), &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let v = result.unwrap();
+        assert!(v["local_node_id_hex"].is_string(), "local_node_id_hex must be a string");
+        assert!(v["peer_count"].as_u64().is_some(),  "peer_count must be a number");
+        assert!(v["peers"].is_array(),               "peers must be an array");
+        // Fresh state has no peers
+        assert_eq!(v["peer_count"].as_u64().unwrap(), 0);
+    }
+
+    // ── kotoba_wasm_run ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_wasm_run_missing_wasm_b64_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_WASM_RUN, &json!({
+            "agent_did":    "did:plc:test",
+            "ctx_cbor_b64": ""
+        }), &state).await;
+        let (code, _) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn call_tool_wasm_run_invalid_base64_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_WASM_RUN, &json!({
+            "wasm_b64":     "not-valid-base64!!!",
+            "agent_did":    "did:plc:test",
+            "ctx_cbor_b64": "AA=="
+        }), &state).await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+        assert!(msg.contains("wasm_b64"), "expected 'wasm_b64' in: {msg}");
+    }
+
+    // ── kotoba_datalog_run ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_datalog_run_missing_rules_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        let result = call_tool(MCP_TOOL_DATALOG_RUN, &json!({
+            "graph": "test_graph"
+        }), &state).await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+        assert!(msg.contains("rules"), "expected 'rules' in: {msg}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_datalog_run_empty_graph_returns_empty_derived() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        // Empty graph with no rules — should succeed with 0 derived facts
+        let result = call_tool(MCP_TOOL_DATALOG_RUN, &json!({
+            "graph": "nonexistent_graph_for_datalog_test",
+            "rules": []
+        }), &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let v = result.unwrap();
+        // Empty graph returns early with derived=[], citations=0, royalty_quads=0
+        assert_eq!(v["derived"], json!([]));
+        assert_eq!(v["citations"].as_u64().unwrap_or(1), 0);
+    }
+
+    // ── kotoba_weight_put ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_weight_put_missing_layer_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let data = B64.encode(b"fake-weight-data");
+        let result = call_tool(MCP_TOOL_WEIGHT_PUT, &json!({
+            "data_b64":  data,
+            "model_cid": "model1",
+            "graph":     "graph1",
+            "dtype":     "fp16"
+            // layer missing
+        }), &state).await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+        assert!(msg.contains("layer"), "expected 'layer' in: {msg}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_weight_put_ok() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let data = B64.encode(b"fake-weight-bytes");
+        let result = call_tool(MCP_TOOL_WEIGHT_PUT, &json!({
+            "data_b64":  data,
+            "model_cid": "model1",
+            "graph":     "graph1",
+            "dtype":     "bf16",
+            "layer":     0
+        }), &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let v = result.unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["layer"].as_u64().unwrap(), 0);
+        assert!(v["blob_cid"].is_string());
+        assert!(v["quad_cid"].is_string());
+    }
+
+    // ── kotoba_lora_apply ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_lora_apply_missing_rank_errors() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let adapter = B64.encode(b"fake-lora-adapter");
+        let result = call_tool(MCP_TOOL_LORA_APPLY, &json!({
+            "adapter_b64": adapter,
+            "model_cid":   "model1",
+            "graph":       "graph1"
+            // rank missing
+        }), &state).await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+        assert!(msg.contains("rank"), "expected 'rank' in: {msg}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_lora_apply_ok() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let adapter = B64.encode(b"fake-lora-adapter-bytes");
+        let result = call_tool(MCP_TOOL_LORA_APPLY, &json!({
+            "adapter_b64": adapter,
+            "model_cid":   "model1",
+            "graph":       "graph1",
+            "rank":        8
+        }), &state).await;
+        assert!(result.is_ok(), "{result:?}");
+        let v = result.unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(v["adapter_cid"].is_string());
+        assert!(v["quad_cid"].is_string());
     }
 }

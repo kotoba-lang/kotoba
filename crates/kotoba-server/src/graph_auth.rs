@@ -100,7 +100,7 @@ pub(crate) fn jwt_sub(token: &str) -> Option<String> {
 /// This is a defense-in-depth check only — the JWT signature is NOT verified here.
 /// The edge BFF (AT Protocol PDS / CF Worker) is the trust boundary for signatures.
 /// Returns `false` for any token that cannot be decoded or has no `exp` claim.
-fn jwt_exp_elapsed(token: &str) -> bool {
+pub(crate) fn jwt_exp_elapsed(token: &str) -> bool {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     // A JWT has three dot-separated segments: header.payload.signature
@@ -126,6 +126,36 @@ fn jwt_exp_elapsed(token: &str) -> bool {
         .unwrap_or_default()
         .as_secs();
     now > exp
+}
+
+/// Require that the request carries a Bearer JWT whose `sub` matches `operator_did`.
+///
+/// Used by unauthenticated-write endpoints (`kg_ingest`, `kg_delete`, `kg_embed`,
+/// `embed_create`, `agent_run`, `block_put`, `vault_put`) to prevent storage/compute abuse.
+/// JWT signature is NOT re-verified — the edge BFF is the trust boundary; we only check
+/// that the token is not expired and that the `sub` claim names the operator.
+pub fn require_operator_auth(
+    headers: &HeaderMap,
+    operator_did: &str,
+) -> Result<(), (StatusCode, String)> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED,
+            "Authorization: Bearer <token> required".to_string()))?;
+    if jwt_exp_elapsed(token) {
+        return Err((StatusCode::UNAUTHORIZED, "Bearer token has expired".to_string()));
+    }
+    let sub = jwt_sub(token)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED,
+            "Bearer token missing sub claim".to_string()))?;
+    if sub == operator_did {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED,
+            format!("Bearer sub {sub:?} is not the operator DID")))
+    }
 }
 
 /// Check read access for a named graph.
@@ -365,6 +395,50 @@ mod tests {
             .as_secs() + 3600;
         assert!(store.check_and_register(nonce, far_future), "first empty-nonce accepted");
         assert!(!store.check_and_register(nonce, far_future), "second empty-nonce blocked (all nonce-less CACAOs)");
+    }
+
+    #[test]
+    fn require_operator_auth_accepts_matching_sub() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let far_future: u64 = 4_102_444_800;
+        let header  = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            format!(r#"{{"sub":"did:key:zOperator","exp":{far_future}}}"#));
+        let token = format!("{header}.{payload}.fakesig");
+        let h = bearer_headers(&token);
+        assert!(require_operator_auth(&h, "did:key:zOperator").is_ok());
+    }
+
+    #[test]
+    fn require_operator_auth_rejects_wrong_sub() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let far_future: u64 = 4_102_444_800;
+        let header  = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            format!(r#"{{"sub":"did:key:zOther","exp":{far_future}}}"#));
+        let token = format!("{header}.{payload}.fakesig");
+        let h = bearer_headers(&token);
+        let err = require_operator_auth(&h, "did:key:zOperator");
+        assert!(err.is_err());
+        let (code, _) = err.unwrap_err();
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_operator_auth_rejects_missing_bearer() {
+        let err = require_operator_auth(&HeaderMap::new(), "did:key:zOperator");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn require_operator_auth_rejects_expired_token() {
+        let token = jwt_with_exp(1); // expired in 1970
+        let h = bearer_headers(&token);
+        let err = require_operator_auth(&h, "did:key:zOperator");
+        assert!(err.is_err());
+        let (code, msg) = err.unwrap_err();
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert!(msg.contains("expired"), "expected 'expired' in: {msg}");
     }
 
     #[test]

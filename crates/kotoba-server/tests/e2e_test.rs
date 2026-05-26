@@ -291,11 +291,13 @@ async fn commit_get_unknown_graph_returns_404() {
 async fn block_put_and_get_roundtrip() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
 
     let payload = b"kotoba e2e block";
-    let (status, put) = s.post(
+    let (status, put) = s.post_auth(
         "/xrpc/ai.gftd.apps.kotoba.block.put",
         json!({ "data_b64": B64.encode(payload) }),
+        &tok,
     ).await;
     assert_eq!(status, 200, "{put}");
     let cid = put["cid"].as_str().expect("cid");
@@ -350,8 +352,9 @@ async fn commit_store_without_cacao_returns_401() {
 async fn embed_create_returns_quad_cid() {
     use kotoba_core::cid::KotobaCid;
     let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
     let graph_cid = KotobaCid::from_bytes(b"embed-e2e").to_multibase();
-    let (status, body) = s.post(
+    let (status, body) = s.post_auth(
         "/xrpc/ai.gftd.apps.kotoba.embed.create",
         json!({
             "text": "hello kotoba",
@@ -359,6 +362,7 @@ async fn embed_create_returns_quad_cid() {
             "model_cid": "model1",
             "graph": graph_cid
         }),
+        &tok,
     ).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "ok");
@@ -369,10 +373,12 @@ async fn embed_create_returns_quad_cid() {
 async fn embed_create_empty_text_returns_400() {
     use kotoba_core::cid::KotobaCid;
     let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
     let graph_cid = KotobaCid::from_bytes(b"embed-empty").to_multibase();
-    let (status, body) = s.post(
+    let (status, body) = s.post_auth(
         "/xrpc/ai.gftd.apps.kotoba.embed.create",
         json!({ "text": "", "doc_cid": "doc-empty", "model_cid": "model1", "graph": graph_cid }),
+        &tok,
     ).await;
     assert_eq!(status, 400, "{body}");
 }
@@ -402,9 +408,11 @@ async fn infer_run_without_engine_returns_503() {
 #[tokio::test]
 async fn agent_run_with_stub_engine_completes() {
     let s = TestServer::start(true).await;
-    let (status, body) = s.post(
+    let tok = tenant_jwt(&s.operator_did);
+    let (status, body) = s.post_auth(
         "/xrpc/ai.gftd.apps.kotoba.agent.run",
         json!({ "task": "test: 2+2?", "max_steps": 3, "max_tokens": 64 }),
+        &tok,
     ).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "ok");
@@ -415,9 +423,11 @@ async fn agent_run_with_stub_engine_completes() {
 #[tokio::test]
 async fn agent_run_without_engine_returns_503() {
     let s = TestServer::start(false).await;
-    let (status, _) = s.post(
+    let tok = tenant_jwt(&s.operator_did);
+    let (status, _) = s.post_auth(
         "/xrpc/ai.gftd.apps.kotoba.agent.run",
         json!({ "task": "x" }),
+        &tok,
     ).await;
     assert_eq!(status, 503);
 }
@@ -971,10 +981,12 @@ fn build_guest_component() -> Option<Vec<u8>> {
 async fn vault_put_returns_cid_and_size() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
     let data = b"hello vault";
-    let (status, body) = s.post(
+    let (status, body) = s.post_auth(
         "/xrpc/ai.gftd.apps.kotoba.vault.put",
         json!({ "data_b64": B64.encode(data) }),
+        &tok,
     ).await;
     assert_eq!(status, 200, "{body}");
     assert!(body["cid"].as_str().is_some(), "cid missing: {body}");
@@ -985,12 +997,14 @@ async fn vault_put_returns_cid_and_size() {
 async fn vault_put_then_get_roundtrip() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
     let data = b"roundtrip blob content";
     let data_b64 = B64.encode(data);
 
-    let (status, put_body) = s.post(
+    let (status, put_body) = s.post_auth(
         "/xrpc/ai.gftd.apps.kotoba.vault.put",
         json!({ "data_b64": data_b64 }),
+        &tok,
     ).await;
     assert_eq!(status, 200, "{put_body}");
     let cid = put_body["cid"].as_str().expect("cid");
@@ -2254,7 +2268,7 @@ async fn cc_ingest_without_auth_returns_401() {
 }
 
 #[tokio::test]
-async fn cc_ingest_with_non_operator_did_returns_403() {
+async fn cc_ingest_with_non_operator_did_returns_401() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt("did:key:zNotTheOperator");
     let (status, body) = s.post_auth(
@@ -2262,7 +2276,7 @@ async fn cc_ingest_with_non_operator_did_returns_403() {
         json!({ "parquetDir": "/tmp/test", "mode": "chunks" }),
         &tok,
     ).await;
-    assert_eq!(status, 403, "{body}");
+    assert_eq!(status, 401, "{body}");
     assert!(body["error"].as_str().is_some(), "{body}");
 }
 

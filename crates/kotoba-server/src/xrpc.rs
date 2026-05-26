@@ -382,8 +382,10 @@ pub async fn quad_create(
 /// No GossipSub propagation — vault blobs stay local (or in B2 when configured).
 pub async fn vault_put(
     State(state): State<Arc<KotobaState>>,
+    headers:      axum::http::HeaderMap,
     Json(req):    Json<VaultPutReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use bytes::Bytes;
 
@@ -643,8 +645,10 @@ pub struct BlockGetResp {
 /// Write raw bytes into the block store, returning the CID.
 pub async fn block_put(
     State(state): State<Arc<KotobaState>>,
+    headers:      axum::http::HeaderMap,
     Json(req):    Json<BlockPutReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use kotoba_core::cid::KotobaCid;
 
@@ -1251,8 +1255,10 @@ pub struct EmbedCreateResp {
 /// POST /xrpc/ai.gftd.apps.kotoba.embed.create
 pub async fn embed_create(
     State(state): State<Arc<KotobaState>>,
+    headers:      axum::http::HeaderMap,
     Json(req):    Json<EmbedCreateReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     use kotoba_core::cid::KotobaCid;
     use kotoba_llm::embed::{Embedding, embed_to_quad};
 
@@ -1396,8 +1402,10 @@ pub struct AgentRunResp {
 /// Requires `KOTOBA_LOAD_GEMMA` (or another inference engine) to be loaded.
 pub async fn agent_run(
     State(state): State<Arc<KotobaState>>,
+    headers:      axum::http::HeaderMap,
     Json(req):    Json<AgentRunReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     use kotoba_core::cid::KotobaCid;
     use kotoba_vm::{AgentSession, PregelReActRunner, ReActStep, session_to_quads};
 
@@ -1601,6 +1609,14 @@ pub async fn agent_sync_advance(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use kotoba_core::cid::KotobaCid;
 
+    const MAX_SESSION_ID_LEN: usize = 256;
+    if req.session_id.is_empty() || req.session_id.len() > MAX_SESSION_ID_LEN
+        || !req.session_id.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err((StatusCode::BAD_REQUEST,
+            "session_id must be 1–256 printable ASCII characters".into()));
+    }
+
     let new_head = KotobaCid::from_multibase(&req.new_head_cid)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid new_head_cid".into()))?;
 
@@ -1640,6 +1656,14 @@ pub async fn agent_sync_close(
     State(state): State<Arc<KotobaState>>,
     Json(req):    Json<AgentSyncCloseReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    const MAX_SESSION_ID_LEN: usize = 256;
+    if req.session_id.is_empty() || req.session_id.len() > MAX_SESSION_ID_LEN
+        || !req.session_id.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err((StatusCode::BAD_REQUEST,
+            "session_id must be 1–256 printable ASCII characters".into()));
+    }
+
     let mut sessions = state.agent_sessions.write().await;
     let window = sessions.remove(&req.session_id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("session not found: {}", req.session_id)))?;
