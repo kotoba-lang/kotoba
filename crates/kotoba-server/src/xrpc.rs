@@ -1558,16 +1558,6 @@ pub async fn agent_sync_open(
 
     crate::graph_auth::require_any_bearer_auth(&headers, "agent.syncopen")?;
 
-    // Cap total concurrent sessions to prevent HashMap memory exhaustion.
-    const MAX_CONCURRENT_SESSIONS: usize = 1_000;
-    {
-        let sessions = state.agent_sessions.read().await;
-        if sessions.len() >= MAX_CONCURRENT_SESSIONS {
-            return Err((StatusCode::TOO_MANY_REQUESTS,
-                format!("too many open sessions (limit {MAX_CONCURRENT_SESSIONS})")));
-        }
-    }
-
     let graph_cid = KotobaCid::from_multibase(&req.graph_cid)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph_cid".into()))?;
     let head_cid = req.head_cid.as_deref()
@@ -1583,8 +1573,22 @@ pub async fn agent_sync_open(
         state.block_store.pin(h);
     }
 
-    let since_seq = window.since_seq;
-    state.agent_sessions.write().await.insert(req.session_id.clone(), window);
+    // Cap total concurrent sessions under a single write lock to close the
+    // TOCTOU window between capacity check and insert.
+    const MAX_CONCURRENT_SESSIONS: usize = 1_000;
+    let since_seq = {
+        let mut sessions = state.agent_sessions.write().await;
+        if sessions.len() >= MAX_CONCURRENT_SESSIONS {
+            // Unpin the anchors we just pinned since we're rejecting the request.
+            state.block_store.unpin(&graph_cid);
+            if let Some(h) = &head_cid { state.block_store.unpin(h); }
+            return Err((StatusCode::TOO_MANY_REQUESTS,
+                format!("too many open sessions (limit {MAX_CONCURRENT_SESSIONS})")));
+        }
+        let seq = window.since_seq;
+        sessions.insert(req.session_id.clone(), window);
+        seq
+    };
 
     tracing::info!(session_id = %req.session_id, since_seq, "agent.syncopen");
 

@@ -80,7 +80,7 @@ impl Cacao {
     pub fn siwe_message(&self) -> String {
         let p = &self.p;
         // Extract address from iss (last colon-separated segment)
-        let address = p.iss.split(':').last().unwrap_or(&p.iss);
+        let address = p.iss.split(':').next_back().unwrap_or(&p.iss);
         // Extract chain id: did:pkh:eip155:N:0x... → "N"; did:key → "1" (CAIP-122 default)
         let chain_id = if p.iss.starts_with("did:key:") {
             "1"
@@ -253,7 +253,7 @@ fn parse_strict_utc_iso8601(s: &str) -> Option<u64> {
         [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
     if day > mdays[(month - 1) as usize] { return None; }
-    for m in 0..(month - 1) as usize { days += mdays[m]; }
+    for d in mdays.iter().take((month - 1) as usize) { days += d; }
     days += day - 1;
     Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
 }
@@ -304,7 +304,7 @@ fn unix_days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 }
 
 fn unix_is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 /// Decode a signature string — tries base64url (no-pad) first, then hex.
