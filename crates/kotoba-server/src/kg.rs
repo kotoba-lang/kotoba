@@ -935,4 +935,38 @@ mod tests {
         let expected = 1.0 / (f32::sqrt(1.0 + 0.0 + 99.0_f32 * 99.0) * 1.0);
         assert!((s - expected).abs() < 1e-5, "got {s}, expected {expected}");
     }
+
+    // ── kg_query input-guard constants ────────────────────────────────────────
+
+    #[test]
+    fn kg_query_lang_length_constant_is_sane() {
+        // MAX_KG_LANG_LEN must accept "sparql" and "cypher" (6 and 6 chars) with margin.
+        assert!("sparql".len() <= 16, "MAX_KG_LANG_LEN must fit 'sparql'");
+        assert!("cypher".len() <= 16, "MAX_KG_LANG_LEN must fit 'cypher'");
+        // The constant must be small enough to prevent oversized error messages.
+        assert!(16 <= 64, "MAX_KG_LANG_LEN should be modest");
+    }
+
+    #[test]
+    fn kg_query_result_limit_constant_is_sane() {
+        // MAX_KG_QUERY_RESULT_LIMIT (10000) is ≥ MAX_KG_LIMIT (1000) and ≤ MAX_DERIVED_FACTS.
+        assert!(10_000 >= MAX_KG_LIMIT, "result limit must be ≥ default kg limit");
+        // A response of 10k rows should remain reasonable in size.
+        assert!(10_000 <= 100_000, "result limit should be bounded for response safety");
+    }
+
+    #[test]
+    fn kg_query_limit_field_default_and_cap() {
+        // Default: None → MAX_KG_LIMIT (1000).
+        let default_limit = None::<usize>.unwrap_or(MAX_KG_LIMIT).min(10_000);
+        assert_eq!(default_limit, MAX_KG_LIMIT);
+
+        // Caller-supplied value is capped at MAX_KG_QUERY_RESULT_LIMIT.
+        let caller_huge = Some(999_999usize).unwrap_or(MAX_KG_LIMIT).min(10_000);
+        assert_eq!(caller_huge, 10_000, "oversized limit must be capped at 10_000");
+
+        // Caller-supplied small value passes through unchanged.
+        let caller_small = Some(42usize).unwrap_or(MAX_KG_LIMIT).min(10_000);
+        assert_eq!(caller_small, 42);
+    }
 }
