@@ -1399,10 +1399,10 @@ async fn kotobase_account_and_pin_lifecycle() {
     assert!(body["ok"].as_bool().unwrap_or(false), "{body}");
     assert!(!body["pin_id"].as_str().unwrap_or("").is_empty(), "{body}");
 
-    // Check usage (read-only, no auth required)
-    let (status, body) = s.post(KOTOBASE_USAGE_GET, json!({
+    // Check usage
+    let (status, body) = s.post_auth(KOTOBASE_USAGE_GET, json!({
         "tenant_did": did,
-    })).await;
+    }), &tok).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["pin_count"], 1, "{body}");
 }
@@ -1417,8 +1417,7 @@ async fn kotobase_account_status_returns_tier_and_quota() {
     let (status, _) = s.post_auth(KOTOBASE_ACCOUNT_CREATE, json!({ "tenant_did": did }), &tok).await;
     assert_eq!(status, 200);
 
-    // account_status is read-only — no auth required
-    let (status, body) = s.post(KOTOBASE_ACCOUNT_STATUS, json!({ "tenant_did": did })).await;
+    let (status, body) = s.post_auth(KOTOBASE_ACCOUNT_STATUS, json!({ "tenant_did": did }), &tok).await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false), "{body}");
     assert_eq!(body["tenant_did"], did, "{body}");
@@ -1457,8 +1456,8 @@ async fn kotobase_pin_delete_removes_pin() {
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false), "{body}");
 
-    // list should now be empty (read-only, no auth required)
-    let (status, body) = s.post(KOTOBASE_PIN_LIST, json!({ "tenant_did": did })).await;
+    // list should now be empty
+    let (status, body) = s.post_auth(KOTOBASE_PIN_LIST, json!({ "tenant_did": did }), &tok).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["total"], 0, "expected 0 pins after delete: {body}");
 }
@@ -1852,7 +1851,7 @@ async fn kg_search_after_ingest_returns_entity() {
     assert_eq!(status, 200, "{body}");
     assert!(body["results"].is_array(), "{body}");
     // At minimum the field must be present; exact match depends on vector similarity
-    assert!(body["latency_ms"].is_number(), "latency_ms missing: {body}");
+    assert!(body["elapsedMs"].is_number(), "elapsedMs missing: {body}");
 }
 
 #[tokio::test]
@@ -1930,4 +1929,73 @@ async fn kg_ingest_then_delete_removes_entity() {
     ).await;
     assert_eq!(status, 200, "{body}");
     assert!(!body["ok"].as_bool().unwrap_or(true), "entity still found after delete: {body}");
+}
+
+// ── kotobase read-endpoint auth tests ────────────────────────────────────────
+
+#[tokio::test]
+async fn kotobase_account_status_without_auth_returns_401() {
+    let s = TestServer::start(false).await;
+    let (status, _) = s.post(KOTOBASE_ACCOUNT_STATUS, json!({
+        "tenant_did": "did:key:zStatusNoAuth1",
+    })).await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn kotobase_pin_list_without_auth_returns_401() {
+    let s = TestServer::start(false).await;
+    let (status, _) = s.post(KOTOBASE_PIN_LIST, json!({
+        "tenant_did": "did:key:zPinListNoAuth1",
+    })).await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn kotobase_usage_get_without_auth_returns_401() {
+    let s = TestServer::start(false).await;
+    let (status, _) = s.post(KOTOBASE_USAGE_GET, json!({
+        "tenant_did": "did:key:zUsageNoAuth1",
+    })).await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn kotobase_pin_list_offset_pagination() {
+    let s   = TestServer::start(false).await;
+    let did = "did:key:zPaginate1";
+    let tok = tenant_jwt(did);
+
+    let (status, _) = s.post_auth(KOTOBASE_ACCOUNT_CREATE, json!({
+        "tenant_did": did, "tier": "starter",
+    }), &tok).await;
+    assert_eq!(status, 200);
+
+    // Create 3 pins
+    for name in &["pin-a", "pin-b", "pin-c"] {
+        let (status, body) = s.post_auth(KOTOBASE_PIN_CREATE, json!({
+            "tenant_did": did, "name": name,
+            "cid": format!("bafytest{name}"),
+        }), &tok).await;
+        assert_eq!(status, 200, "create {name}: {body}");
+    }
+
+    // Page 1: offset=0, limit=2
+    let (status, body) = s.post_auth(KOTOBASE_PIN_LIST, json!({
+        "tenant_did": did, "limit": 2, "offset": 0,
+    }), &tok).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 3, "total should be 3: {body}");
+    assert_eq!(body["offset"], 0, "{body}");
+    assert_eq!(body["limit"],  2, "{body}");
+    assert_eq!(body["pins"].as_array().map(|a| a.len()).unwrap_or(0), 2, "{body}");
+
+    // Page 2: offset=2, limit=2
+    let (status, body) = s.post_auth(KOTOBASE_PIN_LIST, json!({
+        "tenant_did": did, "limit": 2, "offset": 2,
+    }), &tok).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["total"], 3, "total still 3: {body}");
+    assert_eq!(body["offset"], 2, "{body}");
+    assert_eq!(body["pins"].as_array().map(|a| a.len()).unwrap_or(0), 1, "{body}");
 }
