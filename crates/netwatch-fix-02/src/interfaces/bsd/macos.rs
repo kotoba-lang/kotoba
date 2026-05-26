@@ -84,3 +84,40 @@ pub(super) fn probe_routing_stack() -> RoutingStack {
         kernel_align: 4,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sockaddr_inet_is_16_bytes() {
+        assert_eq!(SIZEOF_SOCKADDR_INET, 16);
+    }
+
+    #[test]
+    fn sockaddr_inet6_is_28_bytes() {
+        assert_eq!(SIZEOF_SOCKADDR_INET6, 28);
+    }
+
+    #[test]
+    fn rt_msghdr_size_matches_darwin15() {
+        assert_eq!(SIZEOF_RT_MSGHDR_DARWIN15, 0x5c);
+    }
+
+    #[test]
+    fn if_msghdr2_larger_than_if_msghdr() {
+        assert!(SIZEOF_IF_MSGHDR2_DARWIN15 > SIZEOF_IF_MSGHDR_DARWIN15);
+    }
+
+    #[test]
+    fn probe_routing_stack_has_17_wire_formats() {
+        let rs = probe_routing_stack();
+        assert_eq!(rs.wire_formats.len(), 17);
+    }
+
+    #[test]
+    fn probe_routing_stack_kernel_align_is_4() {
+        let rs = probe_routing_stack();
+        assert_eq!(rs.kernel_align, 4);
+    }
+}

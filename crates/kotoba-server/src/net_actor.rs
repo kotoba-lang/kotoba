@@ -180,3 +180,39 @@ pub async fn run(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_want_have_is_1000() {
+        assert_eq!(MAX_WANT_HAVE, 1_000);
+    }
+
+    #[test]
+    fn max_want_block_is_100() {
+        assert_eq!(MAX_WANT_BLOCK, 100);
+    }
+
+    #[test]
+    fn max_want_since_is_16() {
+        assert_eq!(MAX_WANT_SINCE, 16);
+    }
+
+    #[test]
+    fn max_delta_commits_per_graph_is_1000() {
+        assert_eq!(MAX_DELTA_COMMITS_PER_GRAPH, 1_000);
+    }
+
+    #[test]
+    fn max_delta_commits_total_bytes_is_8mib() {
+        assert_eq!(MAX_DELTA_COMMITS_TOTAL_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn want_block_is_fraction_of_want_have() {
+        assert!(MAX_WANT_BLOCK < MAX_WANT_HAVE,
+            "want_block limit should be smaller than want_have");
+    }
+}
