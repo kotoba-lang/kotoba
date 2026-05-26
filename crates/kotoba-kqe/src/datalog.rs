@@ -356,7 +356,11 @@ impl DatalogProgram {
         obj:     &KotobaCid,
         binding: &Binding,
     ) -> Option<Binding> {
-        assert_eq!(atom.args.len(), 2, "Datalog atom must be binary (Quad arity)");
+        // Quad arity is fixed at 2; reject malformed user-supplied rules gracefully.
+        if atom.args.len() != 2 {
+            tracing::warn!(arity = atom.args.len(), relation = %atom.relation, "Datalog atom has wrong arity; skipping");
+            return None;
+        }
         let mut b = binding.clone();
 
         let vals = [subj, obj];
@@ -383,7 +387,10 @@ impl DatalogProgram {
         head:    &Atom,
         binding: &Binding,
     ) -> Option<(KotobaCid, KotobaCid)> {
-        assert_eq!(head.args.len(), 2, "Datalog head must be binary");
+        if head.args.len() != 2 {
+            tracing::warn!(arity = head.args.len(), relation = %head.relation, "Datalog head has wrong arity; skipping");
+            return None;
+        }
         let s = self.resolve_term_cid(&head.args[0], binding)?;
         let o = self.resolve_term_cid(&head.args[1], binding)?;
         Some((s, o))
@@ -686,5 +693,69 @@ mod tests {
         assert!(MAX_DATALOG_ITERATIONS <= 100_000, "iteration limit should not be excessively high");
         assert!(MAX_DERIVED_FACTS >= 10_000, "derived fact cap must allow reasonable programs");
         assert!(MAX_DERIVED_FACTS <= 100_000_000, "derived fact cap should not be excessively high");
+    }
+
+    // ── Arity guards (reject malformed user-supplied rules gracefully) ─────────
+
+    #[test]
+    fn wrong_arity_body_atom_produces_no_derivations() {
+        // A rule whose body atom has 3 args instead of 2 should be silently skipped,
+        // not panic. This guards against malformed user-supplied DatalogRule objects
+        // arriving via the MCP tool interface or WASM host.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: Atom {
+                relation: "out".to_string(),
+                args: vec![Term::Variable("X".to_string()), Term::Variable("Y".to_string())],
+            },
+            body: vec![BodyLiteral::Positive(Atom {
+                relation: "edge".to_string(),
+                // 3 args — violates binary arity invariant
+                args: vec![
+                    Term::Variable("X".to_string()),
+                    Term::Variable("Y".to_string()),
+                    Term::Variable("Z".to_string()),
+                ],
+            })],
+        });
+        let input = vec![fact("edge", &["a", "b"])];
+        // Must not panic; rule with wrong arity is skipped → no derived facts.
+        let derived = prog.evaluate_delta(&input);
+        assert!(derived.is_empty(), "malformed body atom (arity 3) must produce no derivations");
+    }
+
+    #[test]
+    fn wrong_arity_head_atom_produces_no_derivations() {
+        // A rule whose head atom has 1 arg instead of 2 should be silently skipped.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: Atom {
+                relation: "out".to_string(),
+                args: vec![Term::Variable("X".to_string())], // 1 arg — wrong
+            },
+            body: vec![BodyLiteral::Positive(Atom {
+                relation: "edge".to_string(),
+                args: vec![Term::Variable("X".to_string()), Term::Variable("Y".to_string())],
+            })],
+        });
+        let input = vec![fact("edge", &["a", "b"])];
+        let derived = prog.evaluate_delta(&input);
+        assert!(derived.is_empty(), "malformed head atom (arity 1) must produce no derivations");
+    }
+
+    #[test]
+    fn zero_arity_atom_produces_no_derivations() {
+        // Edge case: completely empty args list must not panic.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: Atom { relation: "out".to_string(), args: vec![] },
+            body: vec![BodyLiteral::Positive(Atom {
+                relation: "edge".to_string(),
+                args: vec![],
+            })],
+        });
+        let input = vec![fact("edge", &["a", "b"])];
+        let derived = prog.evaluate_delta(&input);
+        assert!(derived.is_empty(), "zero-arity atoms must produce no derivations");
     }
 }
