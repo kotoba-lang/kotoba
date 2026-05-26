@@ -2423,3 +2423,71 @@ async fn signal_send_group_message_empty_group_returns_400() {
     })).await;
     assert_eq!(status, 400, "{body}");
 }
+
+// ── attestation endpoint security tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn attest_claim_without_auth_returns_401() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s.post("/xrpc/ai.gftd.apps.kotoba.attest.claim", json!({
+        "entity_did":   "did:key:zEntity1",
+        "attester_did": "did:key:zAttester1",
+        "claim_type":   "self",
+        "stake_mkoto":  1_000_000_000u64,
+    })).await;
+    assert_eq!(status, 401, "{body}");
+}
+
+#[tokio::test]
+async fn attest_claim_invalid_claim_type_returns_400() {
+    let s   = TestServer::start(false).await;
+    let did = "did:key:zAttester2";
+    let tok = tenant_jwt(did);
+    let (status, body) = s.post_auth("/xrpc/ai.gftd.apps.kotoba.attest.claim", json!({
+        "entity_did":   "did:key:zEntity2",
+        "attester_did": did,
+        "claim_type":   "unknown_type",
+        "stake_mkoto":  1_000_000_000u64,
+    }), &tok).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn attest_claim_roundtrip() {
+    let s   = TestServer::start(false).await;
+    let did = "did:key:zAttester3";
+    let tok = tenant_jwt(did);
+    let (status, body) = s.post_auth("/xrpc/ai.gftd.apps.kotoba.attest.claim", json!({
+        "entity_did":   "did:key:zEntity3",
+        "attester_did": did,
+        "claim_type":   "self",
+        "stake_mkoto":  1_000_000_000u64,
+    }), &tok).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["status"], "attested", "{body}");
+    assert!(body["claim_cid"].as_str().is_some(), "{body}");
+}
+
+#[tokio::test]
+async fn attest_challenge_without_auth_returns_401() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s.post("/xrpc/ai.gftd.apps.kotoba.attest.challenge", json!({
+        "claim_cid":      "bafybeifake000000000000000000000000000",
+        "challenger_did": "did:key:zChallenger1",
+        "reason":         "fabricated evidence",
+    })).await;
+    assert_eq!(status, 401, "{body}");
+}
+
+#[tokio::test]
+async fn attest_challenge_empty_reason_returns_400() {
+    let s   = TestServer::start(false).await;
+    let did = "did:key:zChallenger2";
+    let tok = tenant_jwt(did);
+    let (status, body) = s.post_auth("/xrpc/ai.gftd.apps.kotoba.attest.challenge", json!({
+        "claim_cid":      "bafybeifake000000000000000000000000000",
+        "challenger_did": did,
+        "reason":         "",
+    }), &tok).await;
+    assert_eq!(status, 400, "{body}");
+}

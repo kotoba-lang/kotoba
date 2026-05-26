@@ -152,8 +152,14 @@ impl WasmPregelRunner {
             let invoke: InvokeResult = match result {
                 Ok(r)  => r,
                 Err(e) => {
-                    // On error: store an error status and vote halt
-                    state.final_output_cbor = format!("{{\"status\":\"error\",\"msg\":\"{e:?}\"}}").into_bytes();
+                    // On error: encode {"err": "..."} as CBOR (matches Python handle_invoke format)
+                    let err_cbor = ciborium::Value::Map(vec![(
+                        ciborium::Value::Text("err".into()),
+                        ciborium::Value::Text(format!("{e:?}")),
+                    )]);
+                    let mut err_buf = Vec::new();
+                    let _ = ciborium::into_writer(&err_cbor, &mut err_buf);
+                    state.final_output_cbor = err_buf;
                     let mut buf = Vec::new();
                     let _ = ciborium::into_writer(&state, &mut buf);
                     return ComputeOutput { new_state: buf, messages: vec![], vote_halt: true };

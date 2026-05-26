@@ -16,6 +16,7 @@ pub mod xrpc;
 use std::sync::Arc;
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
 };
@@ -236,7 +237,8 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", kg::NSID_KG_DELETE),
             post(kg::kg_delete),
         )
-        .route("/mcp", post(mcp::mcp_handler))
+        // MCP body limit: 50 MB to allow kotoba_wasm_run with large WASM payloads
+        .route("/mcp", post(mcp::mcp_handler).layer(DefaultBodyLimit::max(50 * 1024 * 1024)))
         // ── kotobase multi-tenant pinning service (ADR-2605260001) ──────────
         .route(
             &format!("/xrpc/{}", kotobase_xrpc::NSID_ACCOUNT_CREATE),

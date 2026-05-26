@@ -45,22 +45,30 @@ fn request_cid(method: &str, path: &str, ts: u64, node_id: &[u8; 32]) -> KotobaC
     KotobaCid::from_bytes(&buf)
 }
 
+/// Maximum length for a stored IP string (IPv6 max is 39 chars; 64 is generous).
+const MAX_AUDIT_IP_LEN: usize = 64;
+
 /// Extract client IP from `X-Forwarded-For` or `X-Real-IP` headers.
 fn extract_ip(req: &Request<Body>) -> Option<String> {
     let headers = req.headers();
     if let Some(xff) = headers.get("x-forwarded-for") {
         if let Ok(s) = xff.to_str() {
             // Take the first (leftmost) address — the original client.
-            return Some(s.split(',').next().unwrap_or(s).trim().to_string());
+            let ip = s.split(',').next().unwrap_or(s).trim();
+            return Some(ip.chars().take(MAX_AUDIT_IP_LEN).collect());
         }
     }
     if let Some(rip) = headers.get("x-real-ip") {
         if let Ok(s) = rip.to_str() {
-            return Some(s.trim().to_string());
+            return Some(s.trim().chars().take(MAX_AUDIT_IP_LEN).collect());
         }
     }
     None
 }
+
+/// Maximum path length stored in audit Quads.  Paths longer than this are
+/// truncated to prevent unbounded Quad object growth from crafted URLs.
+const MAX_AUDIT_PATH_LEN: usize = 512;
 
 /// Axum middleware: fingerprint every request and store Datoms asynchronously.
 ///
@@ -71,8 +79,13 @@ pub async fn fingerprint_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let method   = req.method().as_str().to_string();
-    let path     = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
+    let raw    = req.uri().path();
+    let path   = if raw.len() > MAX_AUDIT_PATH_LEN {
+        format!("{}…", &raw[..MAX_AUDIT_PATH_LEN])
+    } else {
+        raw.to_string()
+    };
     let peer_ip  = extract_ip(&req);
 
     let ts = SystemTime::now()

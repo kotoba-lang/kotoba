@@ -188,8 +188,9 @@ impl KotobaState {
             "node identity + roles initialised"
         );
 
-        // KDHT — NodeId = Ed25519 signing key seed (deterministic when env vars are set).
-        let local_node_id = NodeId(identity.signing_key.to_bytes());
+        // KDHT — NodeId = blake3(Ed25519 verifying key) — safe to expose publicly.
+        // MUST NOT use signing_key.to_bytes() (private key seed) here.
+        let local_node_id = NodeId::from_pubkey(&identity.verifying_key().to_bytes());
         let neighborhood  = Arc::new(tokio::sync::RwLock::new(
             Neighborhood::new(local_node_id.clone()),
         ));
@@ -572,8 +573,8 @@ mod tests {
 
     #[test]
     fn node_id_matches_operator_did_signing_key() {
-        // NodeId is derived from signing_key.to_bytes() — same identity used for
-        // both operator_did and node_id_hex (prevents the double-generation bug).
+        // NodeId is blake3(verifying_key) — derived from the same identity used for
+        // operator_did (prevents the double-generation bug; never exposes private key).
         std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_DID");

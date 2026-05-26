@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
     Json,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,34 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::quad::{Quad, QuadObject};
 
 use crate::server::KotobaState;
+
+const MAX_ATTEST_DID_LEN:      usize = 512;
+const MAX_ATTEST_CLAIM_TYPE:   usize =  64;
+const MAX_ATTEST_EVIDENCE_LEN: usize = 2_048;
+const MAX_ATTEST_REASON_LEN:   usize = 4_096;
+const MAX_ATTEST_CID_LEN:      usize =  256;
+
+fn require_attester_auth(
+    headers: &HeaderMap,
+    attester_did: &str,
+    operator_did: &str,
+) -> Result<(), (StatusCode, String)> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED,
+            "Authorization: Bearer <token> required".to_string()))?;
+    let sub = crate::graph_auth::jwt_sub(token)
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED,
+            "Bearer token missing sub claim".to_string()))?;
+    if sub == attester_did || sub == operator_did {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED,
+            format!("Bearer sub does not match attester_did {attester_did:?}")))
+    }
+}
 
 // ── NSID constants ────────────────────────────────────────────────────────────
 
@@ -153,8 +181,35 @@ pub struct RequestLogEntry {
 /// Validates stake thresholds and writes the attestation as Datoms.
 pub async fn attest_claim(
     State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
     Json(req): Json<AttestClaimReq>,
 ) -> impl IntoResponse {
+    if req.entity_did.is_empty() || req.entity_did.len() > MAX_ATTEST_DID_LEN {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("entity_did must be 1–{MAX_ATTEST_DID_LEN} bytes") }))).into_response();
+    }
+    if req.attester_did.is_empty() || req.attester_did.len() > MAX_ATTEST_DID_LEN {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("attester_did must be 1–{MAX_ATTEST_DID_LEN} bytes") }))).into_response();
+    }
+    if req.claim_type.is_empty() || req.claim_type.len() > MAX_ATTEST_CLAIM_TYPE {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "claim_type must be 'self', 'verified_entity', or 'delegation'" }))).into_response();
+    }
+    if !matches!(req.claim_type.as_str(), "self" | "verified_entity" | "delegation") {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "claim_type must be 'self', 'verified_entity', or 'delegation'" }))).into_response();
+    }
+    if let Some(ev) = &req.evidence {
+        if ev.len() > MAX_ATTEST_EVIDENCE_LEN {
+            return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("evidence exceeds {MAX_ATTEST_EVIDENCE_LEN} bytes") }))).into_response();
+        }
+    }
+    if let Err((code, msg)) = require_attester_auth(&headers, &req.attester_did, &state.operator_did) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
+
     // Enforce stake threshold based on claim type.
     let min_stake = match req.claim_type.as_str() {
         "verified_entity" | "delegation" => MIN_STAKE_VERIFIED_ENTITY,
@@ -254,8 +309,25 @@ pub async fn attest_claim(
 /// Records a challenge against an existing attestation claim.
 pub async fn attest_challenge(
     State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
     Json(req): Json<AttestChallengeReq>,
 ) -> impl IntoResponse {
+    if req.claim_cid.is_empty() || req.claim_cid.len() > MAX_ATTEST_CID_LEN {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("claim_cid must be 1–{MAX_ATTEST_CID_LEN} bytes") }))).into_response();
+    }
+    if req.challenger_did.is_empty() || req.challenger_did.len() > MAX_ATTEST_DID_LEN {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("challenger_did must be 1–{MAX_ATTEST_DID_LEN} bytes") }))).into_response();
+    }
+    if req.reason.is_empty() || req.reason.len() > MAX_ATTEST_REASON_LEN {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("reason must be 1–{MAX_ATTEST_REASON_LEN} bytes") }))).into_response();
+    }
+    if let Err((code, msg)) = require_attester_auth(&headers, &req.challenger_did, &state.operator_did) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
+
     // Decode the claim CID from multibase (base32lower 'b' prefix).
     let claim_cid = match KotobaCid::from_multibase(&req.claim_cid) {
         Some(c) => c,
@@ -331,6 +403,14 @@ pub async fn attest_query(
     State(_state): State<Arc<KotobaState>>,
     Query(params): Query<AttestQueryParams>,
 ) -> impl IntoResponse {
+    if params.entity_did.as_deref().map(|s| s.len() > MAX_ATTEST_DID_LEN).unwrap_or(false) {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("entity_did exceeds {MAX_ATTEST_DID_LEN} bytes") }))).into_response();
+    }
+    if params.attester_did.as_deref().map(|s| s.len() > MAX_ATTEST_DID_LEN).unwrap_or(false) {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("attester_did exceeds {MAX_ATTEST_DID_LEN} bytes") }))).into_response();
+    }
     let limit = params.limit.unwrap_or(20).min(100);
 
     tracing::debug!(
@@ -344,7 +424,7 @@ pub async fn attest_query(
     Json(AttestQueryResp {
         claims: Vec::new(),
         total: 0,
-    })
+    }).into_response()
 }
 
 /// GET `ai.gftd.apps.kotoba.request.log`

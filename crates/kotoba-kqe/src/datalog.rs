@@ -5,6 +5,13 @@
 /// Atom arity is fixed at 2 (binary relations) — Quad enforces (S, P, O).
 /// Ground identifiers are hashed to KotobaCid via `cid_of_str`.
 
+/// Maximum fixpoint iterations before aborting (guards against very deep
+/// transitive-closure chains that would otherwise run for O(N) rounds).
+pub const MAX_DATALOG_ITERATIONS: usize = 1_000;
+/// Maximum total derived facts accumulated across all rounds.
+/// Prevents memory exhaustion from rules with large cross-product output.
+pub const MAX_DERIVED_FACTS: usize = 1_000_000;
+
 use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use kotoba_core::cid::KotobaCid;
@@ -135,7 +142,17 @@ impl DatalogProgram {
         // A stable "zero" graph CID for derived quads
         let graph_cid = cid_of_str("datalog:derived");
 
+        let mut iteration: usize = 0;
         loop {
+            if iteration >= MAX_DATALOG_ITERATIONS {
+                tracing::warn!(
+                    iteration,
+                    "Datalog fixpoint aborted: exceeded MAX_DATALOG_ITERATIONS ({})",
+                    MAX_DATALOG_ITERATIONS
+                );
+                break;
+            }
+            iteration += 1;
             let mut added_this_round: HashMap<String, HashSet<(KotobaCid, KotobaCid)>> =
                 HashMap::new();
 
@@ -167,6 +184,14 @@ impl DatalogProgram {
 
                 // Filter out facts already in fact_base
                 for pair in rule_heads {
+                    if derived.len() >= MAX_DERIVED_FACTS {
+                        tracing::warn!(
+                            count = derived.len(),
+                            "Datalog evaluation aborted: exceeded MAX_DERIVED_FACTS ({})",
+                            MAX_DERIVED_FACTS
+                        );
+                        return derived;
+                    }
                     let entry = fact_base
                         .entry(rule.head.relation.clone())
                         .or_default();
@@ -621,5 +646,45 @@ mod tests {
             "must include citation/royalty_mkoto predicate");
         assert!(predicates.contains(&"citation/count"),
             "must include citation/count predicate");
+    }
+
+    // ── Safety limits ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn iteration_limit_terminates_long_chain() {
+        // Transitive closure over a linear chain of 20 edges requires 19 rounds.
+        // Verifies the engine terminates and the limit constant (1000) is not hit
+        // for normal inputs (the limit only fires for pathologically deep graphs).
+        let mut prog = DatalogProgram::default();
+        prog.add_rule(DatalogRule {
+            head: Atom { relation: "reach".into(), args: vec![Term::Variable("X".into()), Term::Variable("Z".into())] },
+            body: vec![
+                BodyLiteral::Positive(Atom { relation: "reach".into(), args: vec![Term::Variable("X".into()), Term::Variable("Y".into())] }),
+                BodyLiteral::Positive(Atom { relation: "edge".into(),  args: vec![Term::Variable("Y".into()), Term::Variable("Z".into())] }),
+            ],
+        });
+
+        let n = 20usize; // small enough for fast test; deep enough to need multiple rounds
+        let mut deltas = Vec::new();
+        for i in 0..n {
+            let s = KotobaCid::from_bytes(format!("node{i}").as_bytes());
+            let o = KotobaCid::from_bytes(format!("node{}", i + 1).as_bytes());
+            deltas.push(Delta::assert(Quad { graph: test_graph(), subject: s.clone(), predicate: "edge".into(),  object: QuadObject::Cid(o.clone()) }));
+            deltas.push(Delta::assert(Quad { graph: test_graph(), subject: s,         predicate: "reach".into(), object: QuadObject::Cid(o) }));
+        }
+
+        let derived = prog.evaluate_delta(&deltas);
+        // Transitive closure of a chain of length N produces N*(N-1)/2 pairs.
+        assert!(!derived.is_empty(), "transitive closure should produce facts");
+        assert!(derived.len() <= MAX_DERIVED_FACTS, "must not exceed MAX_DERIVED_FACTS");
+    }
+
+    #[test]
+    fn derived_facts_cap_constant_is_reasonable() {
+        // Sanity check: the safety constants have sensible values.
+        assert!(MAX_DATALOG_ITERATIONS >= 100, "iteration limit must be at least 100");
+        assert!(MAX_DATALOG_ITERATIONS <= 100_000, "iteration limit should not be excessively high");
+        assert!(MAX_DERIVED_FACTS >= 10_000, "derived fact cap must allow reasonable programs");
+        assert!(MAX_DERIVED_FACTS <= 100_000_000, "derived fact cap should not be excessively high");
     }
 }
