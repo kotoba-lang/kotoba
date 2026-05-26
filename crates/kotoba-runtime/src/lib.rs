@@ -223,4 +223,64 @@ mod tests {
         let state = crate::host::HostState::new("did:plc:test", 99_999);
         assert_eq!(state.gas_remaining, 99_999);
     }
+
+    #[test]
+    fn host_state_pending_asserts_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.pending_asserts.is_empty());
+    }
+
+    #[test]
+    fn host_state_pending_retracts_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.pending_retracts.is_empty());
+    }
+
+    #[test]
+    fn host_state_quad_snapshot_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.quad_snapshot.is_empty());
+    }
+
+    #[test]
+    fn host_state_pending_publishes_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.pending_publishes.is_empty());
+    }
+
+    #[test]
+    fn host_state_pending_chain_entries_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.pending_chain_entries.is_empty());
+    }
+
+    #[test]
+    fn host_state_pending_lora_loads_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.pending_lora_loads.is_empty());
+    }
+
+    #[test]
+    fn host_state_head_commits_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.head_commits.is_empty());
+    }
+
+    #[test]
+    fn host_state_kse_inbox_empty_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.kse_inbox.is_empty());
+    }
+
+    #[test]
+    fn host_state_source_chain_head_none_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.source_chain_head.is_none());
+    }
+
+    #[test]
+    fn host_state_embed_fn_none_on_new() {
+        let state = crate::host::HostState::new("did:plc:test", 1_000);
+        assert!(state.embed_fn.is_none());
+    }
 }

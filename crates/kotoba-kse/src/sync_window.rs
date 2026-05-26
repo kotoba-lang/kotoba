@@ -145,4 +145,68 @@ mod tests {
         win.pin_into(&store);
         assert!(store.is_pinned(&g));
     }
+
+    #[test]
+    fn new_stores_all_fields() {
+        let g = cid("g");
+        let h = cid("h");
+        let win = SyncWindow::new(g.clone(), 77, Some(h.clone()));
+        assert_eq!(win.graph_cid, g);
+        assert_eq!(win.since_seq, 77);
+        assert_eq!(win.head_cid, Some(h));
+    }
+
+    #[test]
+    fn advance_with_no_prior_head_pins_new_head() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h = cid("new_head");
+        let mut win = SyncWindow::head_only(g.clone(), 0);
+        win.pin_into(&store);
+        win.advance(h.clone(), 10, &store);
+        assert!(store.is_pinned(&h));
+        assert_eq!(win.since_seq, 10);
+    }
+
+    #[test]
+    fn advance_multiple_times_only_last_pinned() {
+        let store = PinStore::default();
+        let g  = cid("g");
+        let h1 = cid("h1");
+        let h2 = cid("h2");
+        let h3 = cid("h3");
+
+        let mut win = SyncWindow::new(g.clone(), 0, Some(h1.clone()));
+        win.pin_into(&store);
+
+        win.advance(h2.clone(), 1, &store);
+        win.advance(h3.clone(), 2, &store);
+
+        assert!(!store.is_pinned(&h1));
+        assert!(!store.is_pinned(&h2));
+        assert!(store.is_pinned(&h3));
+        assert_eq!(win.since_seq, 2);
+    }
+
+    #[test]
+    fn unpin_when_no_head_only_unpins_graph() {
+        let store = PinStore::default();
+        let g = cid("g");
+        let win = SyncWindow::head_only(g.clone(), 5);
+        win.pin_into(&store);
+        assert!(store.is_pinned(&g));
+        win.unpin_from(&store);
+        assert!(!store.is_pinned(&g));
+    }
+
+    #[test]
+    fn sync_window_clone_is_equal() {
+        let g = cid("g");
+        let h = cid("h");
+        let win = SyncWindow::new(g.clone(), 42, Some(h.clone()));
+        let cloned = win.clone();
+        assert_eq!(cloned.graph_cid, win.graph_cid);
+        assert_eq!(cloned.since_seq, win.since_seq);
+        assert_eq!(cloned.head_cid, win.head_cid);
+    }
 }

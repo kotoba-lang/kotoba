@@ -104,4 +104,51 @@ mod tests {
             panic!("expected TensorCid");
         }
     }
+
+    #[test]
+    fn embed_to_quad_empty_vector_is_inline() {
+        let emb = Embedding {
+            doc_cid:   cid(b"doc"),
+            model_cid: cid(b"model"),
+            vector:    vec![],
+        };
+        let d = embed_to_quad(&emb, cid(b"g"));
+        assert!(matches!(d.quad.object, QuadObject::VectorF32(_)),
+            "empty vector (size 0 <= 1024) should be VectorF32");
+    }
+
+    #[test]
+    fn embed_to_quad_size_1023_is_inline() {
+        let d = embed_to_quad(&embedding(1023), cid(b"g"));
+        assert!(matches!(d.quad.object, QuadObject::VectorF32(_)),
+            "1023 dims should be inline VectorF32");
+    }
+
+    #[test]
+    fn embed_to_quad_graph_cid_stored_in_quad() {
+        let graph = cid(b"my-graph");
+        let d = embed_to_quad(&embedding(4), graph.clone());
+        assert_eq!(d.quad.graph, graph,
+            "graph_cid should be stored in quad.graph");
+    }
+
+    #[test]
+    fn embed_to_quad_different_model_cids_different_predicates() {
+        let emb1 = Embedding { doc_cid: cid(b"doc"), model_cid: cid(b"modelA"), vector: vec![1.0; 4] };
+        let emb2 = Embedding { doc_cid: cid(b"doc"), model_cid: cid(b"modelB"), vector: vec![1.0; 4] };
+        let d1 = embed_to_quad(&emb1, cid(b"g"));
+        let d2 = embed_to_quad(&emb2, cid(b"g"));
+        assert_ne!(d1.quad.predicate, d2.quad.predicate,
+            "different model_cids must produce different predicates");
+    }
+
+    #[test]
+    fn embed_to_quad_large_tensor_dtype_is_f32() {
+        let d = embed_to_quad(&embedding(1025), cid(b"g"));
+        if let QuadObject::TensorCid { dtype, .. } = d.quad.object {
+            assert_eq!(dtype, kotoba_kqe::quad::TensorDtype::F32);
+        } else {
+            panic!("expected TensorCid");
+        }
+    }
 }

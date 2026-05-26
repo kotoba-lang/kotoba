@@ -699,4 +699,79 @@ mod tests {
         assert_eq!(cfg.n_layers, 34);
         assert!(cfg.n_heads % cfg.n_kv_heads == 0);
     }
+
+    #[test]
+    fn cpu_matvec_identity_matrix() {
+        // 2×2 identity
+        let a = vec![1.0f32, 0.0, 0.0, 1.0];
+        let x = vec![3.0f32, 7.0];
+        let out = cpu_matvec(&a, &x, 2, 2);
+        assert!((out[0] - 3.0).abs() < 1e-6);
+        assert!((out[1] - 7.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_matvec_zero_input_gives_zero_output() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let x = vec![0.0f32, 0.0];
+        let out = cpu_matvec(&a, &x, 2, 2);
+        assert!((out[0]).abs() < 1e-6);
+        assert!((out[1]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cpu_argmax_single_element() {
+        let logits = vec![42.0f32];
+        assert_eq!(cpu_argmax(&logits), 0);
+    }
+
+    #[test]
+    fn cpu_argmax_last_element_is_max() {
+        let logits = vec![0.1f32, 0.2, 0.3, 99.0];
+        assert_eq!(cpu_argmax(&logits), 3);
+    }
+
+    #[test]
+    fn cpu_rope_nonzero_pos_rotates() {
+        // At pos=1 the first pair should be rotated — not identical to input
+        let x = vec![1.0f32, 0.0, 0.0, 1.0]; // 1 head × head_dim=4
+        let y = cpu_rope(&x, 1, 1, 4, 10_000.0);
+        // The output should differ from input (rotation applied)
+        let changed = x.iter().zip(y.iter()).any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(changed, "cpu_rope at pos>0 must rotate the vector");
+    }
+
+    #[test]
+    fn cpu_swiglu_zero_input_gives_zero_output() {
+        let x       = vec![0.0f32; 4];
+        let gate_w  = vec![1.0f32; 2 * 4]; // ffn_dim=2, hidden=4
+        let up_w    = vec![1.0f32; 2 * 4];
+        let down_w  = vec![1.0f32; 4 * 2];
+        let out = cpu_swiglu(&x, &gate_w, &up_w, &down_w, 4, 2);
+        for &v in &out {
+            assert!(v.abs() < 1e-6, "zero input → zero output, got {v}");
+        }
+    }
+
+    #[test]
+    fn wgsl_shaders_returns_six_entries() {
+        let shaders = wgsl_shaders();
+        assert_eq!(shaders.len(), 6);
+    }
+
+    #[test]
+    fn wgsl_shaders_names_are_unique() {
+        let shaders = wgsl_shaders();
+        let names: std::collections::HashSet<&str> = shaders.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names.len(), 6, "all shader names must be unique");
+    }
+
+    #[test]
+    fn webgpu_infer_config_clone() {
+        let orig  = WebGpuInferConfig::gemma4_e2b();
+        let cloned = orig.clone();
+        assert_eq!(cloned.n_layers,   orig.n_layers);
+        assert_eq!(cloned.hidden_dim, orig.hidden_dim);
+        assert_eq!(cloned.vocab_size, orig.vocab_size);
+    }
 }

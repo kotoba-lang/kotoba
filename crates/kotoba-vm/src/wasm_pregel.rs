@@ -420,4 +420,120 @@ mod tests {
         ciborium::into_writer(&map, &mut buf).expect("cbor encode");
         buf
     }
+
+    // ── Additional pure-logic tests ────────────────────────────────────────
+
+    #[test]
+    fn decode_status_continue_no_status_key_is_false() {
+        let mut buf = Vec::new();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("other", ciborium::Value::Text("continue".into()));
+        ciborium::into_writer(&map, &mut buf).unwrap();
+        assert!(!decode_status_continue(&buf));
+    }
+
+    #[test]
+    fn decode_status_continue_non_text_value_is_false() {
+        let val = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("status".into()),
+            ciborium::Value::Integer(0u8.into()),
+        )]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&val, &mut buf).unwrap();
+        assert!(!decode_status_continue(&buf));
+    }
+
+    #[test]
+    fn decode_status_continue_empty_string_is_false() {
+        let mut buf = Vec::new();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("status", ciborium::Value::Text(String::new()));
+        ciborium::into_writer(&map, &mut buf).unwrap();
+        assert!(!decode_status_continue(&buf));
+    }
+
+    #[test]
+    fn decode_status_continue_uppercase_continue_is_false() {
+        let mut buf = Vec::new();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("status", ciborium::Value::Text("CONTINUE".into()));
+        ciborium::into_writer(&map, &mut buf).unwrap();
+        assert!(!decode_status_continue(&buf));
+    }
+
+    #[test]
+    fn decode_status_continue_cbor_array_is_false() {
+        let val = ciborium::Value::Array(vec![
+            ciborium::Value::Text("status".into()),
+            ciborium::Value::Text("continue".into()),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&val, &mut buf).unwrap();
+        assert!(!decode_status_continue(&buf));
+    }
+
+    #[test]
+    fn serialized_quad_owned_from_serialized_quad_roundtrip() {
+        use kotoba_runtime::executor::SerializedQuad;
+        let sq = SerializedQuad {
+            graph:       "g".to_string(),
+            subject:     "s".to_string(),
+            predicate:   "p".to_string(),
+            object_cbor: vec![1, 2, 3],
+        };
+        let owned: SerializedQuadOwned = sq.into();
+        assert_eq!(owned.graph,       "g");
+        assert_eq!(owned.subject,     "s");
+        assert_eq!(owned.predicate,   "p");
+        assert_eq!(owned.object_cbor, vec![1, 2, 3]);
+
+        let back: SerializedQuad = owned.into();
+        assert_eq!(back.graph,       "g");
+        assert_eq!(back.subject,     "s");
+        assert_eq!(back.predicate,   "p");
+        assert_eq!(back.object_cbor, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn wasm_run_result_fields_accessible() {
+        use kotoba_runtime::executor::SerializedQuad;
+        let result = WasmRunResult {
+            superstep_results: vec![],
+            assert_quads: vec![SerializedQuad {
+                graph: "g".into(), subject: "s".into(), predicate: "p".into(), object_cbor: vec![],
+            }],
+            retract_quads:     vec![],
+            pending_publishes: vec![("topic".into(), vec![0x42])],
+            final_output_cbor: vec![0xF6],
+            total_gas_used:    1234,
+            supersteps_run:    3,
+        };
+        assert_eq!(result.supersteps_run, 3);
+        assert_eq!(result.total_gas_used, 1234);
+        assert_eq!(result.assert_quads.len(), 1);
+        assert_eq!(result.pending_publishes.len(), 1);
+        assert_eq!(result.pending_publishes[0].0, "topic");
+    }
+
+    #[test]
+    fn wasm_vertex_state_default_is_empty() {
+        let state = WasmVertexState::default();
+        assert!(state.accumulated_quads.is_empty());
+        assert!(state.accumulated_retracts.is_empty());
+        assert!(state.accumulated_publishes.is_empty());
+        assert_eq!(state.total_gas_used, 0);
+        assert!(state.final_output_cbor.is_empty());
+    }
+
+    #[test]
+    fn wasm_vertex_state_cbor_roundtrip() {
+        let mut state = WasmVertexState::default();
+        state.total_gas_used = 42;
+        state.final_output_cbor = b"hello".to_vec();
+        let mut buf = Vec::new();
+        ciborium::into_writer(&state, &mut buf).unwrap();
+        let back: WasmVertexState = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back.total_gas_used, 42);
+        assert_eq!(back.final_output_cbor, b"hello");
+    }
 }

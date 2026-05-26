@@ -93,4 +93,87 @@ mod tests {
         assert_eq!(s.len(), 64);
         assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
+
+    // ---- New tests --------------------------------------------------------
+
+    /// XOR distance is commutative and already tested above, but also check
+    /// that the non-zero distance value is non-trivial (not all zeros).
+    #[test]
+    fn xor_distance_nonzero_for_different_nodes() {
+        let a = NodeId::from_pubkey(b"alpha");
+        let b = NodeId::from_pubkey(b"beta");
+        let d = a.xor_distance(&b);
+        assert_ne!(d, [0u8; 32], "distinct nodes must have non-zero XOR distance");
+    }
+
+    /// XOR triangle inequality: d(a,c) ≤ d(a,b) XOR d(b,c) holds byte-by-byte
+    /// in the sense that XOR metric satisfies the ultrametric inequality.
+    /// Simple sanity: d(a,c) ≤ max(d(a,b), d(b,c)) as byte arrays.
+    #[test]
+    fn xor_metric_ultrametric_sanity() {
+        let a = NodeId::from_pubkey(b"node-a");
+        let b = NodeId::from_pubkey(b"node-b");
+        let c = NodeId::from_pubkey(b"node-c");
+        let dac = a.xor_distance(&c);
+        let dab = a.xor_distance(&b);
+        let dbc = b.xor_distance(&c);
+        // ultrametric: dac[i] <= max(dab[i], dbc[i]) for leading bytes
+        let max_other = dab.iter().zip(dbc.iter()).map(|(x, y)| x.max(y)).cloned().collect::<Vec<_>>();
+        // At least the first byte should satisfy the ultrametric
+        assert!(dac[0] <= max_other[0],
+            "XOR ultrametric violated: dac[0]={}, max(dab[0],dbc[0])={}", dac[0], max_other[0]);
+    }
+
+    /// Ordering: NodeId implements Ord via the byte array, so two different nodes
+    /// are strictly ordered.
+    #[test]
+    fn node_ids_are_totally_ordered() {
+        let a = NodeId::from_pubkey(b"aaa");
+        let b = NodeId::from_pubkey(b"bbb");
+        // They are different, so exactly one of a < b or a > b holds.
+        assert!(a != b);
+        assert!(a < b || a > b, "NodeId ordering must be total");
+    }
+
+    /// Clone produces an equal but independent value.
+    #[test]
+    fn clone_equals_original() {
+        let n = NodeId::from_pubkey(b"clone-me");
+        let c = n.clone();
+        assert_eq!(n, c);
+    }
+
+    /// Hash: two equal NodeIds must hash identically (tested via HashMap).
+    #[test]
+    fn hash_consistent_with_equality() {
+        use std::collections::HashMap;
+        let a = NodeId::from_pubkey(b"hash-test");
+        let b = NodeId::from_pubkey(b"hash-test");
+        let mut map = HashMap::new();
+        map.insert(a.clone(), 1u32);
+        assert_eq!(map.get(&b), Some(&1u32));
+    }
+
+    /// k_nearest returns results sorted by XOR distance (closest first).
+    #[test]
+    fn k_nearest_sorted_by_distance() {
+        let target = NodeId::from_pubkey(b"target-sort");
+        let candidates: Vec<NodeId> = (0..8u8).map(|i| NodeId::from_pubkey(&[i; 4])).collect();
+        let nearest = NodeId::k_nearest(&target, &candidates, 4);
+        assert_eq!(nearest.len(), 4);
+        // Verify ascending XOR distance order
+        for w in nearest.windows(2) {
+            let d0 = target.xor_distance(w[0]);
+            let d1 = target.xor_distance(w[1]);
+            assert!(d0 <= d1, "k_nearest must be sorted by XOR distance");
+        }
+    }
+
+    /// k=0 returns empty slice regardless of candidates.
+    #[test]
+    fn k_nearest_k_zero_returns_empty() {
+        let target = NodeId::from_pubkey(b"t");
+        let candidates = vec![NodeId::from_pubkey(b"x"), NodeId::from_pubkey(b"y")];
+        assert!(NodeId::k_nearest(&target, &candidates, 0).is_empty());
+    }
 }

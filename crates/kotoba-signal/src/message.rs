@@ -254,4 +254,22 @@ mod tests {
         assert_eq!(cloned.message_type, MessageType::Receipt);
         assert_eq!(cloned.sender_did, msg.sender_did);
     }
+
+    #[test]
+    fn delivery_receipt_read_status_json() {
+        let r = DeliveryReceipt {
+            message_ids: vec!["id-1".to_string()],
+            status:      ReceiptStatus::Read,
+            timestamp:   "2026-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"read\""), "status should serialize as 'read'");
+    }
+
+    #[test]
+    fn message_type_clone() {
+        let t = MessageType::GroupMessage;
+        let c = t.clone();
+        assert_eq!(t, c);
+    }
 }
