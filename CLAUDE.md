@@ -503,6 +503,41 @@ let thread = compiled.run(thread)?;
 - program_cid = WASM bytes の CIDv1 blake3 → Vault/Shelf["KOTOBA_PROGRAMS"] に保存
 - ProgramStore: Cranelift JIT 済み Component を DashMap でキャッシュ (再コンパイル不要)
 
+## 実行 Host アーキテクチャ (2026-05-26)
+
+### 実行パス一覧
+
+| 実行バックエンド | crate | 用途 | サーバ接続 |
+|---|---|---|---|
+| `WasmExecutor` | kotoba-runtime | WASM Component Model host; gas_limit=10M | ✓ `KotobaState.executor` |
+| `WasmPregelRunner` | kotoba-vm | WASM を Pregel BSP に乗せる (単頂点 self-loop) | — (server 未接続) |
+| `KotobaVm::execute()` | kotoba-vm | Datalog を Pregel BSP で実行; 各 superstep を BlockStore に checkpoint | partial `InvokeRouter` |
+| `ReActRunner` | kotoba-vm | sync ReAct ループ (embedded/test) | — |
+| `PregelReActRunner` | kotoba-vm | ReAct を Pregel superstep にマッピング | ✓ `xrpc.rs agent.run` |
+| `DistributedPregelRunner` | kotoba-vm | cross-node BSP; KotobaSwarm GossipSub 経由 | ✓ `main.rs channel_pair(1024)` |
+
+### Pregel BSP host の設計特性
+
+- **決定論**: inbox sort (src CID multibase) + active vertex sort → 同一メッセージセットで全ノードが同一 compute 入力
+- **Checkpoint**: `PregelGraph::checkpoint()` → ProllyTree leaf (BlockStore, CAS); `checkpoint_chained()` → `CID=blake3(root||prev)` で Merkle chain 形成
+- **分散**: `DistributedPregelRunner` が local / remote vertex を分離; remote メッセージは `outbound_tx` → `KotobaSwarm::send_pregel_message` (Phase 6 full-mesh replication; Phase 8 shard)
+
+### Economy system — 実装状況と gap
+
+**実装済み (接続あり)**:
+- Attestation staking: 自己認証 1,000 KOTO / 検証済み 5,000 KOTO → Quad `attest/stake_mkoto` に永続化
+- `WasmExecutor::execute()` → `InvokeResult::gas_used` を返す
+- `KotobaVm::execute()` → `ExecResult::gas_used` + `checkpoint_cids` を返す
+
+**実装済み (未接続)**:
+- `CitationLedger` (kotoba-kqe): Datom 引用カウント + mKOTO royalty 分配 (`flush_epoch()` → `royalty_quads()`)
+
+**未実装 (gap)**:
+1. `DatalogProgram::evaluate_delta()` の join hit 時に `CitationLedger::cite()` を呼ばない
+2. `gas_used` → mKOTO billing pipeline (gas cost × KOTO/gas レート → QuadStore write)
+3. `CitationLedger::flush_epoch()` → `royalty_quads()` → `QuadStore::assert_batch()` の自動発火
+4. on-chain settlement: ERC-4337 / Base L2 への mKOTO royalty 送金ブリッジ
+
 ## 禁止
 
 - 中央マスターノード (DHT 分散)
