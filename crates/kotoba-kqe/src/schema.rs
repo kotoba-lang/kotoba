@@ -165,4 +165,85 @@ mod tests {
     fn predicate_name() {
         assert_eq!(SchemaMap::predicate("orders", "status"), "orders/status");
     }
+
+    #[test]
+    fn is_entity_col_true_for_entity_col() {
+        let schema = TableSchema::new("id");
+        assert!(schema.is_entity_col("id"));
+    }
+
+    #[test]
+    fn is_entity_col_false_for_other_col() {
+        let schema = TableSchema::new("id");
+        assert!(!schema.is_entity_col("amount"));
+    }
+
+    #[test]
+    fn with_predicate_overrides_default() {
+        let attr = AttrDef::scalar("status", "orders").with_predicate("custom/predicate");
+        assert_eq!(attr.predicate, "custom/predicate");
+        assert_eq!(attr.col, "status");
+    }
+
+    #[test]
+    fn is_registered_true_after_add() {
+        let mut m = SchemaMap::new();
+        m.add("invoices", TableSchema::new("invoice_id"));
+        assert!(m.is_registered("invoices"));
+    }
+
+    #[test]
+    fn is_registered_false_for_unknown_table() {
+        let m = SchemaMap::new();
+        assert!(!m.is_registered("nonexistent"));
+    }
+
+    #[test]
+    fn add_overwrites_existing_schema() {
+        let mut m = SchemaMap::new();
+        m.add("t", TableSchema::new("old_pk"));
+        m.add("t", TableSchema::new("new_pk"));
+        assert_eq!(m.get("t").unwrap().entity_col, "new_pk");
+    }
+
+    #[test]
+    fn attr_returns_none_for_missing_col() {
+        let schema = TableSchema::new("id")
+            .with_attr(AttrDef::numeric("amount", "orders"));
+        assert!(schema.attr("nonexistent_col").is_none());
+    }
+
+    #[test]
+    fn attr_kind_temporal_sets_kind() {
+        let attr = AttrDef::temporal("created_at", "orders");
+        assert_eq!(attr.kind, AttrKind::Temporal);
+        assert_eq!(attr.predicate, "orders/created_at");
+    }
+
+    #[test]
+    fn effective_returns_borrowed_for_registered_table() {
+        let mut m = SchemaMap::new();
+        m.add("products", TableSchema::new("product_id"));
+        let cow = m.effective("products");
+        // Borrowed variant means it references the registered schema
+        assert_eq!(cow.entity_col, "product_id");
+    }
+
+    #[test]
+    fn effective_fallback_has_scalar_attr_o() {
+        let m = SchemaMap::new();
+        let cow = m.effective("mystery_table");
+        let attr = cow.attr("o").expect("fallback must have 'o' attr");
+        assert_eq!(attr.kind, AttrKind::Scalar);
+    }
+
+    #[test]
+    fn attr_kind_entity_and_numeric_constructors() {
+        let e = AttrDef::entity("fk_col", "tbl");
+        let n = AttrDef::numeric("qty", "tbl");
+        assert_eq!(e.kind, AttrKind::Entity);
+        assert_eq!(n.kind, AttrKind::Numeric);
+        assert_eq!(e.predicate, "tbl/fk_col");
+        assert_eq!(n.predicate, "tbl/qty");
+    }
 }

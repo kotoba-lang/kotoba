@@ -222,4 +222,83 @@ mod tests {
         let back: DidDocument = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, doc.id);
     }
+
+    // ── x25519 key extraction ─────────────────────────────────────────────────
+
+    #[test]
+    fn x25519_public_key_extracted_correctly() {
+        let raw_key = [0xABu8; 32];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_key);
+        let mut doc = base_doc("did:key:zX25519");
+        doc.verification_method.push(VerificationMethod {
+            id:                   "did:key:zX25519#key-x25519".to_string(),
+            key_type:             X25519_KEY_TYPE.to_string(),
+            controller:           "did:key:zX25519".to_string(),
+            public_key_multibase: encoded,
+        });
+        let extracted = doc.x25519_public_key().unwrap();
+        assert_eq!(extracted, raw_key);
+    }
+
+    #[test]
+    fn x25519_wrong_length_returns_none() {
+        // Encode only 16 bytes — should fail the 32-byte length check
+        let short_key = [0x01u8; 16];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &short_key);
+        let mut doc = base_doc("did:key:zShort");
+        doc.verification_method.push(VerificationMethod {
+            id:                   "did:key:zShort#key-1".to_string(),
+            key_type:             X25519_KEY_TYPE.to_string(),
+            controller:           "did:key:zShort".to_string(),
+            public_key_multibase: encoded,
+        });
+        assert!(doc.x25519_public_key().is_none());
+    }
+
+    // ── Ed25519 2018 type ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ed25519_2018_type_is_recognised() {
+        let raw_key = [0x55u8; 32];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_key);
+        let mut doc = base_doc("did:key:z2018");
+        doc.verification_method.push(VerificationMethod {
+            id:                   "did:key:z2018#key-1".to_string(),
+            key_type:             ED25519_KEY_TYPE_2018.to_string(),
+            controller:           "did:key:z2018".to_string(),
+            public_key_multibase: encoded,
+        });
+        let extracted = doc.ed25519_public_key().unwrap();
+        assert_eq!(extracted, raw_key);
+    }
+
+    // ── kotoba_endpoint ignores non-KotobaNode services ───────────────────────
+
+    #[test]
+    fn kotoba_endpoint_ignores_non_kotoba_node_service() {
+        let mut doc = with_service(
+            base_doc("did:key:zMulti"),
+            "OtherService",
+            ServiceEndpointValue::Single("https://other.example.com".to_string()),
+        );
+        doc.service.push(ServiceEndpoint {
+            id:           "did:key:zMulti#kotoba".to_string(),
+            service_type: "KotobaNode".to_string(),
+            endpoint:     ServiceEndpointValue::Single("/ip4/10.0.0.1/tcp/4001".to_string()),
+        });
+        assert_eq!(doc.kotoba_endpoint(), Some("/ip4/10.0.0.1/tcp/4001"));
+    }
+
+    // ── graph_memberships with Single endpoint → empty ────────────────────────
+
+    #[test]
+    fn graph_memberships_single_endpoint_returns_empty() {
+        let doc = with_service(
+            base_doc("did:key:zSingle"),
+            "KotobaGraphMembership",
+            ServiceEndpointValue::Single("only-one".to_string()),
+        );
+        // Single variant is not Multiple, so memberships should be empty
+        assert!(doc.graph_memberships().is_empty());
+    }
 }

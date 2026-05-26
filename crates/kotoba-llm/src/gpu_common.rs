@@ -124,4 +124,91 @@ mod tests {
         cpu_matmul(&a, &b, &mut c, 2, 2, 2);
         assert_eq!(c, vec![1.0, 2.0, 3.0, 4.0]);
     }
+
+    // ── FP8 NaN sentinel ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fp8_nan_sentinel_decodes_to_nan() {
+        // Byte 0x7F = sign=0, exp=0x0F, man=0x07 → NaN sentinel
+        let result = dequantize_fp8_e4m3(&[0x7F]);
+        assert!(result[0].is_nan(), "0x7F must decode to NaN");
+    }
+
+    #[test]
+    fn fp8_nan_input_quantizes_to_sentinel() {
+        let enc = quantize_f32_to_fp8_e4m3(&[f32::NAN]);
+        assert_eq!(enc[0], 0x7F, "NaN must quantize to 0x7F sentinel");
+    }
+
+    // ── FP8 subnormal ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn fp8_subnormal_decode_exp_zero() {
+        // exp_bits=0, man_bits=4 → 4/64 = 0.0625
+        let byte: u8 = 0x04; // sign=0, exp=0, man=4
+        let result = dequantize_fp8_e4m3(&[byte]);
+        let expected = 4.0f32 / 64.0;
+        assert!(
+            (result[0] - expected).abs() < 1e-6,
+            "subnormal decode: got {}, expected {expected}", result[0]
+        );
+    }
+
+    // ── FP8 saturation ────────────────────────────────────────────────────────
+
+    #[test]
+    fn fp8_saturation_clamps_large_value() {
+        // 1000.0 > 448.0 should saturate
+        let enc = quantize_f32_to_fp8_e4m3(&[1000.0f32]);
+        let dec = dequantize_fp8_e4m3(&enc);
+        assert!(
+            dec[0] <= 448.0 + 1.0,
+            "saturation: decoded {}, expected ≤ 449", dec[0]
+        );
+    }
+
+    // ── FP8 zero ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fp8_zero_encodes_and_decodes() {
+        let enc = quantize_f32_to_fp8_e4m3(&[0.0f32]);
+        let dec = dequantize_fp8_e4m3(&enc);
+        assert_eq!(dec[0], 0.0, "zero must round-trip exactly");
+    }
+
+    // ── f32/bytes helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn f32_slice_bytes_roundtrip() {
+        let vals = vec![1.5f32, -2.25, 0.0, f32::MAX];
+        let bytes = f32_slice_to_bytes(&vals);
+        let back = bytes_to_f32_slice(&bytes);
+        assert_eq!(back.len(), vals.len());
+        for (a, b) in vals.iter().zip(back.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "f32 roundtrip failed: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn bytes_to_f32_ignores_trailing_partial_chunk() {
+        // 9 bytes → 2 complete f32s (8 bytes) + 1 ignored byte
+        let bytes = vec![0u8; 9];
+        let result = bytes_to_f32_slice(&bytes);
+        assert_eq!(result.len(), 2);
+    }
+
+    // ── non-square matmul ─────────────────────────────────────────────────────
+
+    #[test]
+    fn matmul_non_square() {
+        // A[2,3] × B[3,1] = C[2,1]
+        // A = [[1,2,3],[4,5,6]], B = [[1],[1],[1]]
+        // C = [[6],[15]]
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![1.0f32, 1.0, 1.0];
+        let mut c = vec![0.0f32; 2];
+        cpu_matmul(&a, &b, &mut c, 2, 3, 1);
+        assert!((c[0] - 6.0).abs() < 1e-5, "c[0] = {}", c[0]);
+        assert!((c[1] - 15.0).abs() < 1e-5, "c[1] = {}", c[1]);
+    }
 }

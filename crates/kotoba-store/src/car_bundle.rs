@@ -260,4 +260,124 @@ mod tests {
         // First block should be at HEADER_LEN offset
         assert_eq!(&car[HEADER_LEN..HEADER_LEN + 1], b"x");
     }
+
+    // ── empty writer ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_writer_block_count_and_bytes() {
+        let w = CarBundleWriter::new(fake_cid(0));
+        assert_eq!(w.block_count(), 0);
+        assert_eq!(w.blocks_bytes(), 0);
+    }
+
+    #[test]
+    fn empty_writer_produces_valid_header_only_car() {
+        let root = fake_cid(42);
+        let w = CarBundleWriter::new(root.clone());
+        let (car, idx) = w.finish();
+        assert_eq!(car.len(), HEADER_LEN);
+        assert!(idx.is_empty());
+        let (parsed_root, parsed_idx) = parse_index(&car).unwrap();
+        assert_eq!(parsed_root, root);
+        assert_eq!(parsed_idx.len(), 0);
+    }
+
+    // ── block_count and blocks_bytes ──────────────────────────────────────────
+
+    #[test]
+    fn block_count_and_blocks_bytes_track_appends() {
+        let mut w = CarBundleWriter::new(fake_cid(0));
+        w.append(&fake_cid(1), &[0u8; 100]);
+        w.append(&fake_cid(2), &[0u8; 200]);
+        assert_eq!(w.block_count(), 2);
+        assert_eq!(w.blocks_bytes(), 300);
+    }
+
+    // ── parse_index error paths ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_index_rejects_too_short() {
+        let result = parse_index(&[0u8; 10]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too short"));
+    }
+
+    #[test]
+    fn parse_index_rejects_wrong_magic() {
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(b"XXXX");
+        let result = parse_index(&car);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("magic"));
+    }
+
+    #[test]
+    fn parse_index_rejects_wrong_version() {
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(b"KCAR");
+        car[4..8].copy_from_slice(&2u32.to_le_bytes()); // version 2
+        let result = parse_index(&car);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("version"));
+    }
+
+    #[test]
+    fn parse_index_rejects_truncated_index_section() {
+        // Build a valid 1-block CAR, then truncate it
+        let mut w = CarBundleWriter::new(fake_cid(0));
+        w.append(&fake_cid(1), b"data");
+        let (car, _) = w.finish();
+        // Remove last byte (truncates the index section)
+        let truncated = &car[..car.len() - 1];
+        let result = parse_index(truncated);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
+
+    // ── extract_block out-of-range ────────────────────────────────────────────
+
+    #[test]
+    fn extract_block_rejects_out_of_range() {
+        let car = vec![0u8; 100];
+        let result = extract_block(&car, 90, 20); // 90+20=110 > 100
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out of range"));
+    }
+
+    // ── CarBlockIndex ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn car_block_index_is_empty_initially() {
+        let idx = CarBlockIndex::new();
+        assert!(idx.is_empty());
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn car_block_index_get_miss_returns_none() {
+        let idx = CarBlockIndex::new();
+        assert!(idx.get(&fake_cid(99)).is_none());
+    }
+
+    #[test]
+    fn car_block_index_insert_multiple_cars() {
+        let mut index = CarBlockIndex::new();
+
+        // First CAR: 3 blocks
+        let mut w1 = CarBundleWriter::new(fake_cid(0));
+        for i in 0u64..3 { w1.append(&fake_cid(i), &fake_data(i, 32)); }
+        let (_, idx1) = w1.finish();
+        index.insert_car("car-A", &idx1);
+
+        // Second CAR: 2 blocks (different CIDs)
+        let mut w2 = CarBundleWriter::new(fake_cid(10));
+        for i in 10u64..12 { w2.append(&fake_cid(i), &fake_data(i, 16)); }
+        let (_, idx2) = w2.finish();
+        index.insert_car("car-B", &idx2);
+
+        assert_eq!(index.len(), 5);
+        assert_eq!(index.get(&fake_cid(0)).unwrap().0, "car-A");
+        assert_eq!(index.get(&fake_cid(10)).unwrap().0, "car-B");
+        assert_eq!(index.get(&fake_cid(11)).unwrap().2, 16);
+    }
 }
