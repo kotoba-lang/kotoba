@@ -152,7 +152,16 @@ pub fn check_read_access(
         GraphVisibility::Private { owner_did } => {
             let b64 = cacao_b64.ok_or(AccessDenied::MissingCacao)?;
 
-            // 1. Decode base64
+            // 1. Guard: reject oversized cacao_b64 before decoding.
+            // Legitimate CACAOs are ~400-800 base64 chars. 8 KiB is generous.
+            const MAX_CACAO_B64_LEN: usize = 8 * 1024;
+            if b64.len() > MAX_CACAO_B64_LEN {
+                return Err(AccessDenied::CacaoDecodeError(
+                    format!("cacao_b64 too large ({} bytes, limit {MAX_CACAO_B64_LEN})", b64.len())
+                ));
+            }
+
+            // 2. Decode base64
             let cbor = B64.decode(b64)
                 .map_err(|e| AccessDenied::CacaoDecodeError(e.to_string()))?;
 

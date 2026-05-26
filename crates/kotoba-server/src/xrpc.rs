@@ -261,6 +261,12 @@ pub async fn quad_create(
     let b64 = req.cacao_b64.as_deref()
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "cacao_b64 is required for quad.create".to_string()))?;
 
+    const MAX_CACAO_B64_LEN: usize = 8 * 1024;
+    if b64.len() > MAX_CACAO_B64_LEN {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("cacao_b64 too large ({} bytes, limit {MAX_CACAO_B64_LEN})", b64.len())));
+    }
+
     let cbor = B64.decode(b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao_b64 decode: {e}")))?;
     let cacao = kotoba_auth::Cacao::from_cbor(&cbor)
