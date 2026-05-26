@@ -558,12 +558,16 @@ async fn call_tool(
             let model_str = get_str("model_cid")?;
             let graph_str = get_str("graph")?;
             let dtype_str = get_str("dtype")?;
-            let layer = args.get("layer")
+            let layer_u64 = args.get("layer")
                 .and_then(Value::as_u64)
-                .ok_or_else(|| (ERR_INVALID_PARAMS, "missing required field: layer".into()))? as u32;
+                .ok_or_else(|| (ERR_INVALID_PARAMS, "missing required field: layer".into()))?;
+            let layer = u32::try_from(layer_u64)
+                .map_err(|_| (ERR_INVALID_PARAMS, format!("layer {layer_u64} exceeds u32::MAX")))?;
             let shape: Vec<u32> = args.get("shape")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+                .map(|a| a.iter().filter_map(|v| {
+                    v.as_u64().and_then(|n| u32::try_from(n).ok())
+                }).collect())
                 .unwrap_or_default();
 
             const MAX_WEIGHT_B64_LEN: usize = 512 * 1024 * 1024;
@@ -615,9 +619,11 @@ async fn call_tool(
             let adapter_b64 = get_str("adapter_b64")?;
             let model_str   = get_str("model_cid")?;
             let graph_str   = get_str("graph")?;
-            let rank = args.get("rank")
+            let rank_u64 = args.get("rank")
                 .and_then(Value::as_u64)
-                .ok_or_else(|| (ERR_INVALID_PARAMS, "missing required field: rank".into()))? as u32;
+                .ok_or_else(|| (ERR_INVALID_PARAMS, "missing required field: rank".into()))?;
+            let rank = u32::try_from(rank_u64)
+                .map_err(|_| (ERR_INVALID_PARAMS, format!("rank {rank_u64} exceeds u32::MAX")))?;
 
             const MAX_ADAPTER_B64_LEN: usize = 128 * 1024 * 1024;
             if adapter_b64.len() > MAX_ADAPTER_B64_LEN {
@@ -1711,5 +1717,54 @@ mod tests {
         assert_eq!(v["status"], "ok");
         assert!(v["adapter_cid"].is_string());
         assert!(v["quad_cid"].is_string());
+    }
+
+    // ── u64→u32 truncation guards ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn weight_store_layer_overflow_u32_is_rejected() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let data = B64.encode(b"fake-weight-bytes");
+        let overflow_layer: u64 = u32::MAX as u64 + 1;
+        let result = call_tool(MCP_TOOL_WEIGHT_PUT, &json!({
+            "data_b64":  data,
+            "model_cid": "model1",
+            "graph":     "graph1",
+            "dtype":     "f32",
+            "layer":     overflow_layer,
+            "shape":     [4, 4]
+        }), &state, None).await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS, "overflow layer must return INVALID_PARAMS");
+        assert!(msg.contains("u32"), "error must mention u32 boundary, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn lora_apply_rank_overflow_u32_is_rejected() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None).expect("state")
+        );
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        let adapter = B64.encode(b"fake-lora");
+        let overflow_rank: u64 = u32::MAX as u64 + 1;
+        let result = call_tool(MCP_TOOL_LORA_APPLY, &json!({
+            "adapter_b64": adapter,
+            "model_cid":   "model1",
+            "graph":       "graph1",
+            "rank":        overflow_rank
+        }), &state, None).await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS, "overflow rank must return INVALID_PARAMS");
+        assert!(msg.contains("u32"), "error must mention u32 boundary, got: {msg}");
+    }
+
+    #[test]
+    fn u32_max_is_safe_layer_boundary() {
+        // u32::MAX is accepted by try_from; u32::MAX + 1 is not
+        assert!(u32::try_from(u32::MAX as u64).is_ok());
+        assert!(u32::try_from(u32::MAX as u64 + 1).is_err());
     }
 }
