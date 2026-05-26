@@ -804,10 +804,16 @@ async fn call_tool(
                 state.quad_store.assert(provider_quad).await;
             }
 
-            // Write WASM-asserted quads into the store
+            // Write WASM-asserted quads into the store (capped to prevent runaway writes).
             {
                 use kotoba_core::cid::KotobaCid;
                 use kotoba_kqe::quad::{Quad, QuadObject};
+                const MAX_ASSERT_QUADS: usize = 10_000;
+                if result.assert_quads.len() > MAX_ASSERT_QUADS {
+                    return Err((ERR_INVALID_PARAMS,
+                        format!("WASM produced {} assert quads (MCP limit {MAX_ASSERT_QUADS})",
+                            result.assert_quads.len())));
+                }
                 for sq in &result.assert_quads {
                     let quad = Quad {
                         graph:     KotobaCid::from_bytes(sq.graph.as_bytes()),
@@ -841,12 +847,17 @@ async fn call_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(1_000_000); // default 1 KOTO
 
-            // Deserialize rules array
+            // Deserialize rules array (cap prevents combinatorial-explosion DoS).
+            const MAX_DATALOG_RULES: usize = 256;
             let rules: Vec<DatalogRule> = match args.get("rules") {
                 Some(r) => serde_json::from_value(r.clone())
                     .map_err(|e| (ERR_INVALID_PARAMS, format!("invalid rules: {e}")))?,
                 None => return Err((ERR_INVALID_PARAMS, "missing required field: rules".into())),
             };
+            if rules.len() > MAX_DATALOG_RULES {
+                return Err((ERR_INVALID_PARAMS,
+                    format!("rules array has {} items (limit {MAX_DATALOG_RULES})", rules.len())));
+            }
 
             let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
 
