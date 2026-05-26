@@ -129,4 +129,40 @@ mod tests {
         assert_ne!(spo.0, pso.0);
         assert_ne!(spo.0, osp.0);
     }
+
+    #[test]
+    fn bare_rest_wildcard_matches_any_topic() {
+        // Pattern ">" alone (single segment) should match anything due to early return
+        assert!(t("a").matches(&p(">")));
+        assert!(t("a/b/c/d/e").matches(&p(">")));
+    }
+
+    #[test]
+    fn pattern_longer_than_topic_does_not_match() {
+        // topic has 2 segments, pattern has 3 — can't match
+        assert!(!t("a/b").matches(&p("a/b/c")));
+    }
+
+    #[test]
+    fn topic_shorter_than_pattern_does_not_match() {
+        // topic has 3 segments, pattern has 4
+        assert!(!t("a/b/c").matches(&p("a/b/c/d")));
+    }
+
+    #[test]
+    fn single_wildcard_does_not_match_multiple_segments() {
+        // * matches exactly one segment, not two
+        assert!(!t("a/b/c").matches(&p("a/*")));
+    }
+
+    #[test]
+    fn rest_wildcard_at_start_matches_everything() {
+        assert!(t("x/y/z").matches(&p(">")));
+    }
+
+    #[test]
+    fn exact_single_segment_match() {
+        assert!(t("hello").matches(&p("hello")));
+        assert!(!t("hello").matches(&p("world")));
+    }
 }

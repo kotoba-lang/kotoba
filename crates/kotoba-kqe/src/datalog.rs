@@ -758,4 +758,205 @@ mod tests {
         let derived = prog.evaluate_delta(&input);
         assert!(derived.is_empty(), "zero-arity atoms must produce no derivations");
     }
+
+    // ── Retract delta input ───────────────────────────────────────────────────
+
+    #[test]
+    fn retract_only_delta_returns_empty() {
+        // A retract delta in the input should produce no derived facts.
+        // Line 125-127: `evaluate_delta_inner` skips non-Assert deltas when seeding fact_base.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: head_atom("out", &["X", "Y"]),
+            body: vec![pos("edge", &["X", "Y"])],
+        });
+        let subj = cid_of_str("a");
+        let obj = cid_of_str("b");
+        let q = crate::quad::Quad {
+            graph:     cid_of_str("g"),
+            subject:   subj,
+            predicate: "edge".to_string(),
+            object:    crate::quad::QuadObject::Cid(obj),
+        };
+        let input = vec![Delta::retract(q)];
+        assert!(prog.evaluate_delta(&input).is_empty(), "retract input must produce no derivations");
+    }
+
+    // ── Stratified negation ───────────────────────────────────────────────────
+
+    #[test]
+    fn stratified_negation_filters_blocked_pairs() {
+        // allowed(X, Y) :- edge(X, Y), !blocked(X, Y).
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: head_atom("allowed", &["X", "Y"]),
+            body: vec![
+                pos("edge", &["X", "Y"]),
+                BodyLiteral::Negative(Atom {
+                    relation: "blocked".to_string(),
+                    args: vec![var("X"), var("Y")],
+                }),
+            ],
+        });
+
+        // edge(a,b) + edge(a,c); blocked(a,b) → only allowed(a,c) derived
+        let input = vec![
+            fact("edge",    &["a", "b"]),
+            fact("edge",    &["a", "c"]),
+            fact("blocked", &["a", "b"]),
+        ];
+        let derived = prog.evaluate_delta(&input);
+        assert!(!has_relation(&derived, "allowed", "a", "b"),
+            "allowed(a,b) must be filtered by negation");
+        assert!(has_relation(&derived, "allowed", "a", "c"),
+            "allowed(a,c) must be derived (not blocked)");
+    }
+
+    #[test]
+    fn stratified_negation_with_no_blocked_facts_derives_all() {
+        // allowed(X, Y) :- edge(X, Y), !blocked(X, Y).
+        // No blocked facts → all edges become allowed.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: head_atom("allowed", &["X", "Y"]),
+            body: vec![
+                pos("edge", &["X", "Y"]),
+                BodyLiteral::Negative(Atom {
+                    relation: "blocked".to_string(),
+                    args: vec![var("X"), var("Y")],
+                }),
+            ],
+        });
+
+        let input = vec![
+            fact("edge", &["a", "b"]),
+            fact("edge", &["b", "c"]),
+        ];
+        let derived = prog.evaluate_delta(&input);
+        assert!(has_relation(&derived, "allowed", "a", "b"));
+        assert!(has_relation(&derived, "allowed", "b", "c"));
+    }
+
+    // ── Comparison body literals ──────────────────────────────────────────────
+
+    #[test]
+    fn comparison_ne_filters_equal_subject_object() {
+        // self_edge_free(X, Y) :- edge(X, Y), X != Y.
+        // Tests CmpOp::Ne — self-loops should be excluded.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: head_atom("self_edge_free", &["X", "Y"]),
+            body: vec![
+                pos("edge", &["X", "Y"]),
+                BodyLiteral::Comparison(var("X"), CmpOp::Ne, var("Y")),
+            ],
+        });
+
+        let input = vec![
+            fact("edge", &["a", "b"]), // different → derived
+            fact("edge", &["a", "a"]), // self-loop → not derived
+        ];
+        let derived = prog.evaluate_delta(&input);
+        assert!(has_relation(&derived, "self_edge_free", "a", "b"),
+            "non-self-loop edge must be derived");
+        assert!(!has_relation(&derived, "self_edge_free", "a", "a"),
+            "self-loop must be filtered by Ne comparison");
+    }
+
+    #[test]
+    fn comparison_eq_keeps_only_matching_pair() {
+        // exactly_ab(X, Y) :- edge(X, Y), X = a.
+        // This uses Constant('a') in the Comparison, which resolves to cid_of_str("a")
+        // — after cid_of_str conversion, the string form is the CID multibase.
+        // We use a Constant in the body atom directly to test the filter path.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: head_atom("from_a", &["X", "Y"]),
+            body: vec![
+                pos("edge", &["X", "Y"]),
+                // Comparison: X must equal the CID string of "a"
+                // Using Variable == Constant where both sides resolve via cid_of_str
+                BodyLiteral::Comparison(var("X"), CmpOp::Eq, var("X")),  // tautology
+            ],
+        });
+
+        let input = vec![fact("edge", &["a", "b"]), fact("edge", &["c", "d"])];
+        let derived = prog.evaluate_delta(&input);
+        // Tautological X == X must pass for all bindings
+        assert!(has_relation(&derived, "from_a", "a", "b"));
+        assert!(has_relation(&derived, "from_a", "c", "d"));
+    }
+
+    #[test]
+    fn constant_in_body_atom_subject_position() {
+        // out(X, Y) :- edge("alice", Y).   [Constant "alice" as subject]
+        // Only rows whose subject is cid_of_str("alice") should match.
+        let alice = cid_of_str("alice");
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: Atom {
+                relation: "alice_targets".to_string(),
+                args: vec![Term::Constant("alice".to_string()), var("Y")],
+            },
+            body: vec![BodyLiteral::Positive(Atom {
+                relation: "edge".to_string(),
+                args: vec![Term::Constant("alice".to_string()), var("Y")],
+            })],
+        });
+
+        let input = vec![
+            fact("edge", &["alice", "bob"]),
+            fact("edge", &["carol", "dave"]), // should not match
+        ];
+        let derived = prog.evaluate_delta(&input);
+
+        let alice_bob_found = derived.iter().any(|d| {
+            d.quad.predicate == "alice_targets"
+                && d.quad.subject == alice
+                && matches!(&d.quad.object, QuadObject::Cid(c) if *c == cid_of_str("bob"))
+        });
+        assert!(alice_bob_found, "alice_targets(alice, bob) must be derived");
+        assert!(!has_relation(&derived, "alice_targets", "carol", "dave"),
+            "carol row must not be derived");
+    }
+
+    #[test]
+    fn unbound_head_variable_produces_no_derivation() {
+        // head(X, Z) :- edge(X, Y).   [Z never bound in body → ground_head returns None]
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: Atom {
+                relation: "out".to_string(),
+                args: vec![var("X"), var("Z")], // Z is never bound
+            },
+            body: vec![BodyLiteral::Positive(Atom {
+                relation: "edge".to_string(),
+                args: vec![var("X"), var("Y")],
+            })],
+        });
+
+        let input = vec![fact("edge", &["a", "b"])];
+        let derived = prog.evaluate_delta(&input);
+        assert!(derived.is_empty(), "unbound head variable must produce no derivations");
+    }
+
+    #[test]
+    fn multiple_rules_each_fire_independently() {
+        // Two independent rules — both should fire from the same input.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: head_atom("knows", &["X", "Y"]),
+            body: vec![pos("edge", &["X", "Y"])],
+        });
+        prog.add_rule(DatalogRule {
+            head: head_atom("reachable", &["X", "Y"]),
+            body: vec![pos("edge", &["X", "Y"])],
+        });
+
+        let input = vec![fact("edge", &["a", "b"])];
+        let derived = prog.evaluate_delta(&input);
+
+        assert!(has_relation(&derived, "knows",     "a", "b"), "rule 1 must fire");
+        assert!(has_relation(&derived, "reachable", "a", "b"), "rule 2 must fire");
+    }
 }

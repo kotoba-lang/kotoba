@@ -439,4 +439,49 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn parse_error_returns_err() {
+        let sparql = "this is not valid sparql @@@";
+        assert!(SparqlCompiler::compile(sparql, "out").is_err());
+    }
+
+    #[test]
+    fn filter_equality_literal_on_left_side() {
+        // FILTER("alice" = ?s) — operand order reversed (literal on left)
+        let sparql = format!(
+            r#"PREFIX k: <urn:k:> SELECT ?s ?o WHERE {{ ?s k:knows ?o FILTER("alice" = ?s) }}"#
+        );
+        let mv = SparqlCompiler::compile(&sparql, "out").unwrap();
+        let input = vec![
+            fact(KNOWS, "alice", "bob"),
+            fact(KNOWS, "carol", "dave"),
+        ];
+        let derived = mv.program.evaluate_delta(&input);
+        assert!( has(&derived, "out", "alice", "bob"),  "alice should pass");
+        assert!(!has(&derived, "out", "carol", "dave"), "carol should be filtered");
+    }
+
+    #[test]
+    fn filter_inequality_object_variable() {
+        // Filter on the object variable, not subject
+        let sparql = format!(
+            r#"PREFIX k: <urn:k:> SELECT ?s ?o WHERE {{ ?s k:knows ?o FILTER(?o != "dave") }}"#
+        );
+        let mv = SparqlCompiler::compile(&sparql, "not_dave_target").unwrap();
+        let input = vec![
+            fact(KNOWS, "alice", "bob"),
+            fact(KNOWS, "carol", "dave"),
+        ];
+        let derived = mv.program.evaluate_delta(&input);
+        assert!( has(&derived, "not_dave_target", "alice", "bob"));
+        assert!(!has(&derived, "not_dave_target", "carol", "dave"));
+    }
+
+    #[test]
+    fn output_relation_name_is_preserved() {
+        let sparql = "PREFIX k: <urn:k:> SELECT ?s ?o WHERE { ?s k:knows ?o }";
+        let mv = SparqlCompiler::compile(sparql, "my_custom_relation").unwrap();
+        assert_eq!(mv.output_relation, "my_custom_relation");
+    }
 }

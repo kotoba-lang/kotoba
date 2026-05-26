@@ -416,4 +416,152 @@ mod tests {
         let follows_bob = arr.get_referencing_subjects_by_predicate(&cid("bob"), "follows");
         assert_eq!(follows_bob.len(), 1);
     }
+
+    #[test]
+    fn apply_mixed_assert_retract_batch() {
+        let mut arr = Arrangement::new();
+        let q1 = quad("alice", "name", "Alice");
+        let q2 = quad("bob", "name", "Bob");
+        let deltas = vec![
+            Delta::assert(q1.clone()),
+            Delta::assert(q2.clone()),
+            Delta::retract(q1.clone()),
+        ];
+        arr.apply(&deltas);
+        assert_eq!(arr.len(), 1);
+        assert!(arr.get_objects(&cid("alice"), "name").is_empty());
+        assert_eq!(arr.get_objects(&cid("bob"), "name").len(), 1);
+    }
+
+    #[test]
+    fn clear_resets_count_and_all_indexes() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "name", "Alice"));
+        arr.insert(&ref_quad("alice", "knows", "bob"));
+        assert_eq!(arr.len(), 2);
+        assert!(!arr.is_empty());
+
+        arr.clear();
+        assert_eq!(arr.len(), 0);
+        assert!(arr.is_empty());
+        assert!(arr.get_objects(&cid("alice"), "name").is_empty());
+        assert!(arr.get_subjects_by_predicate("name").is_empty());
+        assert!(arr.get_referencing_subjects(&cid("bob")).is_empty());
+    }
+
+    #[test]
+    fn to_deltas_and_quads_roundtrip() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "name", "Alice"));
+        arr.insert(&quad("bob", "name", "Bob"));
+
+        let g = cid("g");
+        let all_quads = arr.quads(&g);
+        assert_eq!(all_quads.len(), 2);
+
+        let deltas = arr.to_deltas(&g);
+        assert_eq!(deltas.len(), 2);
+        assert!(deltas.iter().all(|d| d.mult == Multiplicity::Assert));
+    }
+
+    #[test]
+    fn aevt_entries_returns_all_predicate_subject_pairs() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "name", "Alice"));
+        arr.insert(&quad("bob", "name", "Bob"));
+        arr.insert(&quad("alice", "age", "30"));
+
+        let entries = arr.aevt_entries();
+        // 3 (pred, subj) pairs: (name, alice), (name, bob), (age, alice)
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn avet_entries_returns_all_predicate_objectkey_subject_triples() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "name", "Alice"));
+        arr.insert(&quad("bob", "name", "Bob"));
+
+        let entries = arr.avet_entries();
+        assert_eq!(entries.len(), 2); // (name, Alice, [alice]), (name, Bob, [bob])
+    }
+
+    #[test]
+    fn vaet_entries_only_for_cid_objects() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "name", "Alice")); // Text — no VAET
+        arr.insert(&ref_quad("alice", "knows", "bob")); // Cid — VAET
+        arr.insert(&ref_quad("carol", "knows", "bob")); // second ref to same cid
+
+        let entries = arr.vaet_entries();
+        // (bob_cid, "knows", [alice, carol])
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, cid("bob"));
+        assert_eq!(entries[0].1, "knows");
+        assert_eq!(entries[0].2.len(), 2);
+    }
+
+    #[test]
+    fn count_by_predicate_prefix_sums_correct_count() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "rel/friend", "Bob"));
+        arr.insert(&quad("alice", "rel/colleague", "Carol"));
+        arr.insert(&quad("alice", "meta/created", "2024"));
+
+        assert_eq!(arr.count_by_predicate_prefix("rel/"), 2);
+        assert_eq!(arr.count_by_predicate_prefix("meta/"), 1);
+        assert_eq!(arr.count_by_predicate_prefix("nonexistent/"), 0);
+    }
+
+    #[test]
+    fn remove_nonexistent_quad_does_not_panic_or_alter_count() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "name", "Alice"));
+        assert_eq!(arr.len(), 1);
+
+        // Remove a quad that was never inserted
+        arr.remove(&quad("bob", "name", "Bob"));
+        assert_eq!(arr.len(), 1); // count unchanged
+    }
+
+    #[test]
+    fn get_subject_quads_returns_all_predicates_for_subject() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "name", "Alice"));
+        arr.insert(&quad("alice", "age", "30"));
+        arr.insert(&quad("bob", "name", "Bob"));
+
+        let g = cid("g");
+        let alice_quads = arr.get_subject_quads(&g, &cid("alice"));
+        assert_eq!(alice_quads.len(), 2);
+        assert!(alice_quads.iter().all(|q| q.subject == cid("alice")));
+
+        let bob_quads = arr.get_subject_quads(&g, &cid("bob"));
+        assert_eq!(bob_quads.len(), 1);
+    }
+
+    #[test]
+    fn get_by_predicate_returns_all_subject_object_pairs() {
+        let mut arr = Arrangement::new();
+        arr.insert(&quad("alice", "knows", "Bob"));
+        arr.insert(&quad("carol", "knows", "Dave"));
+        arr.insert(&quad("alice", "likes", "music"));
+
+        let pairs = arr.get_by_predicate("knows");
+        assert_eq!(pairs.len(), 2);
+
+        let empty = arr.get_by_predicate("nonexistent");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn new_arrangement_is_empty() {
+        let arr = Arrangement::new();
+        assert_eq!(arr.len(), 0);
+        assert!(arr.is_empty());
+        assert!(arr.quads(&cid("g")).is_empty());
+        assert!(arr.aevt_entries().is_empty());
+        assert!(arr.avet_entries().is_empty());
+        assert!(arr.vaet_entries().is_empty());
+    }
 }

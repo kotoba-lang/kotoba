@@ -168,4 +168,37 @@ mod tests {
         assert!(!derived_subjects.contains(&cid("carol")),
             "carol should be filtered out");
     }
+
+    // ── Apply: empty delta slice ──────────────────────────────────────────
+
+    #[test]
+    fn apply_empty_deltas_returns_empty_and_leaves_state_unchanged() {
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(make_rule("reachable", "edge"));
+        let mut mv = MaterializedView::new("reachable", prog);
+
+        let out = mv.apply(&[]);
+        assert!(out.is_empty(), "empty delta input must produce no derived deltas");
+        assert!(mv.state.is_empty(), "state must remain empty after empty apply");
+    }
+
+    // ── Apply: program with no rules ─────────────────────────────────────
+
+    #[test]
+    fn apply_with_no_rules_accumulates_state_but_derives_nothing() {
+        let prog = DatalogProgram::new(); // no rules
+        let mut mv = MaterializedView::new("noop", prog);
+
+        let out = mv.apply(&[Delta::assert(edge_quad("a", "b"))]);
+        assert!(out.is_empty(), "no rules → no derived deltas");
+        assert_eq!(mv.state.len(), 1, "raw input delta still applied to state");
+    }
+
+    // ── Name round-trip ───────────────────────────────────────────────────
+
+    #[test]
+    fn name_preserved() {
+        let mv = MaterializedView::new("my-view", DatalogProgram::new());
+        assert_eq!(mv.name, "my-view");
+    }
 }

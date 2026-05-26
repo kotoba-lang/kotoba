@@ -301,4 +301,40 @@ mod tests {
         // Single variant is not Multiple, so memberships should be empty
         assert!(doc.graph_memberships().is_empty());
     }
+
+    // ── malformed JSON deserialization ────────────────────────────────────────
+
+    #[test]
+    fn malformed_json_returns_error() {
+        let bad_json = r#"{"id": "did:key:z", "broken json: }"#;
+        let result: Result<DidDocument, _> = serde_json::from_str(bad_json);
+        assert!(result.is_err(), "malformed JSON must fail to deserialize");
+    }
+
+    // ── both key types present ─────────────────────────────────────────────────
+
+    #[test]
+    fn both_key_types_present_each_extracted_independently() {
+        let raw_ed  = [0x11u8; 32];
+        let raw_x25 = [0x22u8; 32];
+        let enc_ed  = multibase::encode(multibase::Base::Base58Btc, &raw_ed);
+        let enc_x25 = multibase::encode(multibase::Base::Base58Btc, &raw_x25);
+
+        let mut doc = base_doc("did:key:zBoth");
+        doc.verification_method.push(VerificationMethod {
+            id:                   "did:key:zBoth#ed".to_string(),
+            key_type:             ED25519_KEY_TYPE_2020.to_string(),
+            controller:           "did:key:zBoth".to_string(),
+            public_key_multibase: enc_ed,
+        });
+        doc.verification_method.push(VerificationMethod {
+            id:                   "did:key:zBoth#x25519".to_string(),
+            key_type:             X25519_KEY_TYPE.to_string(),
+            controller:           "did:key:zBoth".to_string(),
+            public_key_multibase: enc_x25,
+        });
+
+        assert_eq!(doc.ed25519_public_key().unwrap(), raw_ed);
+        assert_eq!(doc.x25519_public_key().unwrap(), raw_x25);
+    }
 }

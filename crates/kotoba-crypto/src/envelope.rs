@@ -66,4 +66,63 @@ mod tests {
         let dec = decode_envelope(&enc).unwrap();
         assert_eq!(dec, data);
     }
+
+    #[test]
+    fn signal_val_prefix_constant_value() {
+        assert_eq!(SIGNAL_VAL_PREFIX, "signal:v1:");
+    }
+
+    #[test]
+    fn empty_plaintext_roundtrip() {
+        let key = random_key();
+        let enc = encrypt_field(&key, b"").unwrap();
+        assert!(enc.starts_with(SIGNAL_VAL_PREFIX));
+        let dec = decrypt_field(&key, &enc).unwrap();
+        assert!(dec.is_empty());
+    }
+
+    #[test]
+    fn wrong_key_returns_decrypt_error() {
+        let key1 = random_key();
+        let key2 = random_key();
+        // Ensure keys differ (astronomically likely)
+        let enc = encrypt_field(&key1, b"secret").unwrap();
+        let result = decrypt_field(&key2, &enc);
+        assert!(result.is_err(), "decryption with wrong key must fail");
+    }
+
+    #[test]
+    fn same_plaintext_produces_different_ciphertexts() {
+        let key = random_key();
+        let msg = b"determinism check";
+        let enc1 = encrypt_field(&key, msg).unwrap();
+        let enc2 = encrypt_field(&key, msg).unwrap();
+        // Due to random nonce, envelopes must differ
+        assert_ne!(enc1, enc2, "nonces must be random — same plaintext must yield different envelopes");
+    }
+
+    #[test]
+    fn invalid_base64_after_prefix_returns_error() {
+        let bad = format!("{}not!!valid==base64", SIGNAL_VAL_PREFIX);
+        let result = decode_envelope(&bad);
+        assert!(result.is_err(), "invalid base64 must be rejected");
+    }
+
+    #[test]
+    fn truncated_payload_decrypt_fails() {
+        let key = random_key();
+        // A valid-looking envelope but with too few bytes after decoding (no nonce/tag)
+        let truncated = format!("{}dG9vc2hvcnQ", SIGNAL_VAL_PREFIX); // "tooshort" base64url
+        let result = decrypt_field(&key, &truncated);
+        assert!(result.is_err(), "truncated ciphertext must fail to decrypt");
+    }
+
+    #[test]
+    fn encode_envelope_produces_signal_prefix() {
+        let data = vec![0u8, 1, 2, 255];
+        let enc = encode_envelope(&data);
+        assert!(enc.starts_with("signal:v1:"));
+        // No padding characters in URL_SAFE_NO_PAD
+        assert!(!enc.contains('='));
+    }
 }

@@ -87,4 +87,34 @@ mod tests {
         sorted.sort();
         assert_eq!(dists, sorted);
     }
+
+    #[test]
+    fn new_neighborhood_has_empty_peers() {
+        let nb = Neighborhood::new(nid(b"solo"));
+        assert!(nb.peers.is_empty());
+    }
+
+    #[test]
+    fn responsible_for_empty_peers_returns_empty() {
+        let nb = Neighborhood::new(nid(b"loner"));
+        let resp = nb.responsible_for(&nid(b"target"));
+        assert!(resp.is_empty(), "no peers → responsible_for should return empty vec");
+    }
+
+    #[test]
+    fn is_responsible_with_no_peers_is_true() {
+        let nb = Neighborhood::new(nid(b"loner"));
+        // nearest.len() < K always when peers is empty
+        assert!(nb.is_responsible(&nid(b"anything")));
+    }
+
+    #[test]
+    fn add_peer_maintains_exactly_k_times_8_limit() {
+        let mut nb = Neighborhood::new(nid(b"local"));
+        let limit = K * 8;
+        for i in 0..=limit + 5 {
+            nb.add_peer(nid(&(i as u64).to_le_bytes()));
+        }
+        assert!(nb.peers.len() <= limit);
+    }
 }

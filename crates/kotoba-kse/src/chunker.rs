@@ -284,4 +284,64 @@ mod tests {
         assert_eq!(strategy_for("application/cbor", big), ChunkStrategy::CodecAware);
         assert_eq!(strategy_for("application/vnd.ipld.dag-cbor", big), ChunkStrategy::CodecAware);
     }
+
+    #[test]
+    fn split_empty_data_single_strategy_returns_one_empty_chunk() {
+        let chunks = split(&[], &ChunkStrategy::Single);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_empty());
+    }
+
+    #[test]
+    fn split_empty_data_fixed_len_returns_no_chunks() {
+        // data.chunks(n) on empty slice yields nothing
+        let chunks = split(&[], &ChunkStrategy::FixedLen(512));
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn split_empty_data_cdc_returns_no_chunks() {
+        let chunks = split(&[], &ChunkStrategy::ContentDefined);
+        assert_eq!(chunks.len(), 0);
+    }
+
+    #[test]
+    fn malformed_cbor_falls_back_to_cdc() {
+        // 2 MB of bytes that are not valid CBOR
+        let data = vec![0xFFu8; SINGLE_THRESHOLD + 1];
+        let strat = ChunkStrategy::CodecAware;
+        // Should not panic; falls back to CDC
+        let chunks = split(&data, &strat);
+        assert!(!chunks.is_empty());
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, data.len());
+    }
+
+    #[test]
+    fn exactly_at_threshold_uses_single() {
+        let data = vec![0u8; SINGLE_THRESHOLD - 1];
+        let strat = strategy_for("text/plain", data.len());
+        assert_eq!(strat, ChunkStrategy::Single);
+    }
+
+    #[test]
+    fn one_byte_above_threshold_uses_content_defined() {
+        let data = vec![0u8; SINGLE_THRESHOLD];
+        let strat = strategy_for("text/plain", data.len());
+        assert_eq!(strat, ChunkStrategy::ContentDefined);
+    }
+
+    #[test]
+    fn fixed_chunk_bytes_constant_value() {
+        assert_eq!(FIXED_CHUNK_BYTES, 512 * 1024);
+    }
+
+    #[test]
+    fn all_chunks_reassemble_to_original_fixed_len() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1_300_000).collect();
+        let strat = ChunkStrategy::FixedLen(FIXED_CHUNK_BYTES);
+        let chunks = split(&data, &strat);
+        let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.iter().cloned()).collect();
+        assert_eq!(reassembled, data);
+    }
 }
