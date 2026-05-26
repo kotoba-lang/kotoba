@@ -308,10 +308,14 @@ fn is_mutating(method: &str, _tool: Option<&str>) -> bool {
 }
 
 fn check_auth(headers: &HeaderMap) -> bool {
-    headers.get("authorization")
+    let Some(token) = headers
+        .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.starts_with("Bearer "))
-        .unwrap_or(false)
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    !crate::graph_auth::jwt_exp_elapsed(token)
 }
 
 // ── Dispatch to state methods ────────────────────────────────────────────────
@@ -1132,8 +1136,10 @@ mod tests {
 
     #[test]
     fn check_auth_requires_bearer() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         let mut h = HeaderMap::new();
         assert!(!check_auth(&h));
+        // Opaque (non-JWT) token — no exp to check, passes
         h.insert(
             axum::http::header::AUTHORIZATION,
             "Bearer tok123".parse().unwrap(),
@@ -1145,6 +1151,34 @@ mod tests {
             "Basic abc".parse().unwrap(),
         );
         assert!(!check_auth(&h2));
+    }
+
+    #[test]
+    fn check_auth_rejects_expired_jwt() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let header  = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"sub":"did:key:z6Mk","exp":1}"#); // exp=1 → 1970
+        let expired_tok = format!("{header}.{payload}.fakesig");
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {expired_tok}").parse().unwrap(),
+        );
+        assert!(!check_auth(&h), "expired JWT must be rejected by check_auth");
+    }
+
+    #[test]
+    fn check_auth_accepts_future_jwt() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let header  = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"sub":"did:key:z6Mk","exp":9999999999}"#);
+        let tok = format!("{header}.{payload}.fakesig");
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {tok}").parse().unwrap(),
+        );
+        assert!(check_auth(&h), "future JWT must be accepted by check_auth");
     }
 
     #[test]

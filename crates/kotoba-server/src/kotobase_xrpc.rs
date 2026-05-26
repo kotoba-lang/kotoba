@@ -35,6 +35,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 ///
 /// Returns `Err(401)` when:
 /// - No `Authorization: Bearer <token>` header is present.
+/// - The token `exp` claim is in the past.
 /// - The token has no `sub` claim.
 /// - `sub` is neither `tenant_did` nor `operator_did`.
 ///
@@ -45,14 +46,23 @@ fn require_did_ownership(
     operator_did: &str,
 ) -> Result<(), (StatusCode, String)> {
     let token = bearer_token(headers)
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED,
-            "Authorization: Bearer <token> required".to_string()))?;
+        .ok_or_else(|| {
+            tracing::warn!("kotobase auth: missing Bearer token");
+            (StatusCode::UNAUTHORIZED, "Authorization: Bearer <token> required".to_string())
+        })?;
+    if crate::graph_auth::jwt_exp_elapsed(token) {
+        tracing::warn!("kotobase auth: expired JWT");
+        return Err((StatusCode::UNAUTHORIZED, "Bearer token has expired".to_string()));
+    }
     let sub = crate::graph_auth::jwt_sub(token)
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED,
-            "Bearer token missing sub claim".to_string()))?;
+        .ok_or_else(|| {
+            tracing::warn!("kotobase auth: JWT missing sub claim");
+            (StatusCode::UNAUTHORIZED, "Bearer token missing sub claim".to_string())
+        })?;
     if sub == tenant_did || sub == operator_did {
         Ok(())
     } else {
+        tracing::warn!(sub = %sub, tenant_did = %tenant_did, "kotobase auth: sub mismatch");
         Err((StatusCode::UNAUTHORIZED,
             format!("Bearer sub {sub:?} does not match tenant_did {tenant_did:?}")))
     }
