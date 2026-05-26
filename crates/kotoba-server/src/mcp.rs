@@ -1,25 +1,25 @@
-/// MCP JSON-RPC 2.0 handler — kotoba MCP facade (ADR-2605091400)
-///
-/// Wire:  POST /mcp  (JSON-RPC 2.0)
-/// Auth:  initialize / tools/list / ping → public
-///        tools/call → requires `Authorization: Bearer <AT-session-JWT>`
-///
-/// Tools exposed (14):
-///   kotoba_quad_create      — assert a quad into the graph
-///   kotoba_graph_query      — SPO pattern query
-///   kotoba_infer_run        — run inference via inference engine
-///   kotoba_embed_create     — create and store a text embedding
-///   kotoba_weight_put       — store an FP8 tensor weight blob
-///   kotoba_lora_apply       — register a LoRA adapter delta
-///   kotoba_email_list       — list encrypted emails for an owner DID
-///   kotoba_email_read       — decrypt and return one email body + metadata
-///   kotoba_wasm_run         — run a WASM Component Model program via Pregel BSP
-///   kotoba_datalog_run      — evaluate Datalog with citation tracking + royalty flush
-///   kotoba_node_info        — return this node's DID, roles, NodeId, peer count
-///   kotoba_node_register    — write/refresh node registration Quads
-///   kotoba_network_peers    — list KDHT neighborhood peers
-///   kotoba_graph_gc         — mark-sweep GC: delete unreachable blocks from the block store
-///   kotoba_commit_prune     — prune historical non-HEAD commit entries from CommitDag (15)
+//! MCP JSON-RPC 2.0 handler — kotoba MCP facade (ADR-2605091400)
+//!
+//! Wire:  POST /mcp  (JSON-RPC 2.0)
+//! Auth:  initialize / tools/list / ping → public
+//!        tools/call → requires `Authorization: Bearer <AT-session-JWT>`
+//!
+//! Tools exposed (14):
+//!   kotoba_quad_create      — assert a quad into the graph
+//!   kotoba_graph_query      — SPO pattern query
+//!   kotoba_infer_run        — run inference via inference engine
+//!   kotoba_embed_create     — create and store a text embedding
+//!   kotoba_weight_put       — store an FP8 tensor weight blob
+//!   kotoba_lora_apply       — register a LoRA adapter delta
+//!   kotoba_email_list       — list encrypted emails for an owner DID
+//!   kotoba_email_read       — decrypt and return one email body + metadata
+//!   kotoba_wasm_run         — run a WASM Component Model program via Pregel BSP
+//!   kotoba_datalog_run      — evaluate Datalog with citation tracking + royalty flush
+//!   kotoba_node_info        — return this node's DID, roles, NodeId, peer count
+//!   kotoba_node_register    — write/refresh node registration Quads
+//!   kotoba_network_peers    — list KDHT neighborhood peers
+//!   kotoba_graph_gc         — mark-sweep GC: delete unreachable blocks from the block store
+//!   kotoba_commit_prune     — prune historical non-HEAD commit entries from CommitDag (15)
 
 pub const MCP_TOOL_QUAD_CREATE:   &str = "kotoba_quad_create";
 pub const MCP_TOOL_GRAPH_QUERY:   &str = "kotoba_graph_query";

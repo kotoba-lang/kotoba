@@ -1,7 +1,7 @@
-/// Shared GPU utilities: FP8 codec, MATMUL WGSL, CPU matmul helper.
-///
-/// Used by both `train_gpu` (feature=webgpu-train) and `infer_gpu` (feature=webgpu-infer).
-/// No feature gate — always compiled.
+//! Shared GPU utilities: FP8 codec, MATMUL WGSL, CPU matmul helper.
+//!
+//! Used by both `train_gpu` (feature=webgpu-train) and `infer_gpu` (feature=webgpu-infer).
+//! No feature gate — always compiled.
 
 // ── WGSL shared shaders ───────────────────────────────────────────────────────
 

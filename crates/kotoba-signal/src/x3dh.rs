@@ -1,15 +1,15 @@
-/// X3DH Extended Triple Diffie-Hellman key agreement.
-///
-/// Sender computes:
-///   DH1 = DH(IK_A,  SPK_B)
-///   DH2 = DH(EK_A,  IK_B)
-///   DH3 = DH(EK_A,  SPK_B)
-///   DH4 = DH(EK_A,  OPK_B)  (optional)
-///   SK  = HKDF(0xFF*32 || DH1 || DH2 || DH3 [|| DH4])
-///
-/// Receiver computes the symmetric counterpart.
-///
-/// Reference: Signal specification https://signal.org/docs/specifications/x3dh/
+//! X3DH Extended Triple Diffie-Hellman key agreement.
+//!
+//! Sender computes:
+//!   DH1 = DH(IK_A,  SPK_B)
+//!   DH2 = DH(EK_A,  IK_B)
+//!   DH3 = DH(EK_A,  SPK_B)
+//!   DH4 = DH(EK_A,  OPK_B)  (optional)
+//!   SK  = HKDF(0xFF*32 || DH1 || DH2 || DH3 [|| DH4])
+//!
+//! Receiver computes the symmetric counterpart.
+//!
+//! Reference: Signal specification https://signal.org/docs/specifications/x3dh/
 
 use x25519_dalek::{StaticSecret, PublicKey as X25519Public};
 use rand::rngs::OsRng;

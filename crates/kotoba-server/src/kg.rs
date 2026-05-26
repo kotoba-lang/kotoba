@@ -1,23 +1,23 @@
-/// yatabase KG entity lookup endpoint backed by kotoba QuadStore.
-///
-/// NSID: ai.gftd.apps.yata.kg.entity
-/// All KG quads live in the named graph `yatabase-kg-v1`.
-///
-/// Predicate conventions (written by seed_kotoba.py):
-///   kg/id           — nanoid primary key
-///   kg/qid          — Wikidata QID (e.g. "Q42")
-///   kg/type         — entity type string
-///   kg/label/ja     — Japanese label
-///   kg/label/en     — English label
-///   kg/confidence   — float string
-///   kg/license      — license SPDX
-///   kg/extractor    — extractor identifier
-///   kg/valid_from   — ISO-8601 date
-///   kg/valid_to     — ISO-8601 date
-///   kg/ingested_at  — ISO-8601 datetime
-///   kg/source_id    — source nanoid
-///   kg/claim/<pred> — property claim (Text / Float / Bool)
-///   kg/relation/<pred> — edge to another entity (Cid object = subject CID of dst)
+//! yatabase KG entity lookup endpoint backed by kotoba QuadStore.
+//!
+//! NSID: ai.gftd.apps.yata.kg.entity
+//! All KG quads live in the named graph `yatabase-kg-v1`.
+//!
+//! Predicate conventions (written by seed_kotoba.py):
+//!   kg/id           — nanoid primary key
+//!   kg/qid          — Wikidata QID (e.g. "Q42")
+//!   kg/type         — entity type string
+//!   kg/label/ja     — Japanese label
+//!   kg/label/en     — English label
+//!   kg/confidence   — float string
+//!   kg/license      — license SPDX
+//!   kg/extractor    — extractor identifier
+//!   kg/valid_from   — ISO-8601 date
+//!   kg/valid_to     — ISO-8601 date
+//!   kg/ingested_at  — ISO-8601 datetime
+//!   kg/source_id    — source nanoid
+//!   kg/claim/<pred> — property claim (Text / Float / Bool)
+//!   kg/relation/<pred> — edge to another entity (Cid object = subject CID of dst)
 
 use std::sync::Arc;
 use axum::{

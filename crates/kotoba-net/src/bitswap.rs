@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+type CidBytes = [u8; 36];
+type BlockEntry = (CidBytes, Vec<u8>);
 #[allow(unused_imports)]
 use serde::ser::SerializeSeq as _;
 
@@ -58,7 +61,7 @@ mod cid_serde {
     }
 
     pub fn serialize_block_vec<S: Serializer>(
-        blocks: &Vec<([u8; 36], Vec<u8>)>, s: S,
+        blocks: &Vec<BlockEntry>, s: S,
     ) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
         let mut seq = s.serialize_seq(Some(blocks.len()))?;
@@ -70,14 +73,14 @@ mod cid_serde {
 
     pub fn deserialize_block_vec<'de, D: Deserializer<'de>>(
         d: D,
-    ) -> Result<Vec<([u8; 36], Vec<u8>)>, D::Error> {
+    ) -> Result<Vec<BlockEntry>, D::Error> {
         struct BlockVecV;
         impl<'de> serde::de::Visitor<'de> for BlockVecV {
-            type Value = Vec<([u8; 36], Vec<u8>)>;
+            type Value = Vec<BlockEntry>;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 write!(f, "sequence of (CID, bytes) tuples")
             }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<([u8; 36], Vec<u8>)>, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<BlockEntry>, A::Error> {
                 let mut out = Vec::new();
                 while let Some((cid_buf, data_buf)) =
                     seq.next_element::<(serde_bytes::ByteBuf, serde_bytes::ByteBuf)>()?
@@ -182,14 +185,14 @@ pub struct BitswapResponse {
     #[serde(serialize_with = "cid_serde::serialize_cid_vec", deserialize_with = "cid_serde::deserialize_cid_vec")]
     pub dont_have: Vec<[u8; 36]>,  // CIDs this peer does not have
     #[serde(serialize_with = "cid_serde::serialize_block_vec", deserialize_with = "cid_serde::deserialize_block_vec")]
-    pub blocks: Vec<([u8; 36], Vec<u8>)>, // (CID, bytes) for want_block requests
+    pub blocks: Vec<BlockEntry>, // (CID, bytes) for want_block requests
     /// CBOR-serialised Commit structs, oldest-first, for want_since delta responses
     #[serde(
         default,
         serialize_with = "cid_serde::serialize_block_vec",
         deserialize_with = "cid_serde::deserialize_block_vec"
     )]
-    pub delta_commits: Vec<([u8; 36], Vec<u8>)>,
+    pub delta_commits: Vec<BlockEntry>,
 }
 
 #[derive(Clone, Default)]

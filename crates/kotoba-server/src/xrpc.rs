@@ -1,5 +1,5 @@
-/// XRPC endpoint declarations and handlers for Kotoba
-/// NSIDs follow ai.gftd.apps.kotoba.* namespace
+//! XRPC endpoint declarations and handlers for Kotoba
+//! NSIDs follow ai.gftd.apps.kotoba.* namespace
 
 pub const NSID_QUAD_CREATE:  &str = "ai.gftd.apps.kotoba.quad.create";
 pub const NSID_QUAD_RETRACT: &str = "ai.gftd.apps.kotoba.quad.retract";
@@ -782,6 +782,13 @@ pub async fn commit_store(
     };
     tracing::info!(issuer = %issuer_did, graph = %req.graph, "commit.store: CACAO verified");
 
+    // author is stored verbatim in commit metadata — bound it to prevent oversized records.
+    const MAX_AUTHOR_LEN: usize = 512;
+    if req.author.len() > MAX_AUTHOR_LEN {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("author too long ({} bytes, limit {MAX_AUTHOR_LEN})", req.author.len())));
+    }
+
     let graph_cid = KotobaCid::from_multibase(&req.graph)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph CID".into()))?;
     let cid = state.quad_store
@@ -940,6 +947,12 @@ pub async fn weight_put(
     if req.data_b64.len() > MAX_WEIGHT_B64_LEN {
         return Err((StatusCode::PAYLOAD_TOO_LARGE,
             format!("data_b64 too large ({} bytes, limit {MAX_WEIGHT_B64_LEN})", req.data_b64.len())));
+    }
+    // Shape has at most 8 dimensions (tensors beyond rank-8 are not supported).
+    const MAX_SHAPE_DIMS: usize = 8;
+    if req.shape.len() > MAX_SHAPE_DIMS {
+        return Err((StatusCode::BAD_REQUEST,
+            format!("shape has {} dimensions; limit is {MAX_SHAPE_DIMS}", req.shape.len())));
     }
 
     let bytes = B64.decode(&req.data_b64)

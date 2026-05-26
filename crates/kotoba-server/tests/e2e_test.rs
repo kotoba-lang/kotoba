@@ -2985,3 +2985,49 @@ async fn attest_challenge_invalid_challenger_did_prefix_returns_400() {
     }), &tok).await;
     assert_eq!(status, 400, "{body}");
 }
+
+// ── commit.store / weight.put field-bound tests ───────────────────────────────
+
+#[tokio::test]
+async fn commit_store_oversized_author_returns_400() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    let s = TestServer::start(false).await;
+    let graph = "commit-author-bound-graph";
+    let (_, cacao_b64) = build_ed25519_cacao(graph);
+    // 513-byte author (limit is 512)
+    let long_author = "a".repeat(513);
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.commit.store",
+        json!({
+            "graph":     graph,
+            "author":    long_author,
+            "seq":       1u64,
+            "cacao_b64": cacao_b64,
+        }),
+    ).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn weight_put_oversized_shape_returns_400() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    let s = TestServer::start(false).await;
+    let graph = "weight-shape-bound-graph";
+    let (_, cacao_b64) = build_ed25519_cacao(graph);
+    let data = vec![0x3cu8];
+    // 9-element shape (limit is 8)
+    let bad_shape: Vec<u32> = vec![1; 9];
+    let (status, body) = s.post(
+        "/xrpc/ai.gftd.apps.kotoba.weight.put",
+        json!({
+            "model_cid": "bafkreiabcdef",
+            "layer":     0,
+            "data_b64":  B64.encode(&data),
+            "shape":     bad_shape,
+            "dtype":     "fp8e4m3",
+            "graph":     graph,
+            "cacao_b64": cacao_b64,
+        }),
+    ).await;
+    assert_eq!(status, 400, "{body}");
+}

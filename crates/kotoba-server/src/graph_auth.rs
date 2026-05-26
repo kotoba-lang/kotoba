@@ -1,11 +1,11 @@
-/// Graph read-access control.
-///
-/// Three visibility tiers (see `kotoba_core::named_graph::GraphVisibility`):
-///   - `Public`         — no auth required
-///   - `Authenticated`  — `Authorization: Bearer <any-non-empty-token>` required
-///   - `Private`        — CACAO delegation chain (DAG-CBOR, base64-standard encoded)
-///                        in the `cacao_b64` query param, verified with `quad:read`
-///                        capability and issuer == owner_did
+//! Graph read-access control.
+//!
+//! Three visibility tiers (see `kotoba_core::named_graph::GraphVisibility`):
+//! - `Public`         — no auth required
+//! - `Authenticated`  — `Authorization: Bearer <any-non-empty-token>` required
+//! - `Private`        — CACAO delegation chain (DAG-CBOR, base64-standard encoded)
+//!   in the `cacao_b64` query param, verified with `quad:read`
+//!   capability and issuer == owner_did
 
 use axum::http::{HeaderMap, StatusCode};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};

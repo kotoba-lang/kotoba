@@ -97,4 +97,25 @@ mod tests {
             assert!(store.check_and_register(&format!("nonce-{i}"), exp));
         }
     }
+
+    #[test]
+    fn capacity_eviction_purges_expired_and_accepts_new() {
+        let store = NonceStore::new();
+        // Fill to MAX_NONCES with already-expired entries (exp = 1 = 1970-01-01).
+        for i in 0..MAX_NONCES {
+            store.check_and_register(&format!("old-{i}"), 1);
+        }
+        // The map is now at capacity. A fresh nonce with a future expiry should still
+        // be accepted: the overflow path purges all expired entries before inserting.
+        let future = now_secs() + 3600;
+        assert!(
+            store.check_and_register("brand-new-nonce", future),
+            "new nonce must be accepted after expired entries are evicted"
+        );
+        // The new nonce must be tracked — a second presentation is a replay.
+        assert!(
+            !store.check_and_register("brand-new-nonce", future),
+            "replay of just-registered nonce must be rejected"
+        );
+    }
 }

@@ -1,15 +1,15 @@
-/// kotobase XRPC handlers — multi-tenant pinning service (ADR-2605260001)
-///
-/// NSIDs: ai.gftd.apps.kotobase.*
-///
-/// Tenant data lives in kotoba's own QuadStore under namespaced graphs:
-///   kotobase/accounts/{tenant_did}  — tier + metadata
-///   kotobase/pins/{tenant_did}      — per-pin records
-///
-/// Quota tiers:
-///   free:    3 pins,  100 MB
-///   starter: 50 pins,   5 GB  ($9/mo — Stripe stub)
-///   pro:    500 pins,  50 GB  ($49/mo — Stripe stub)
+//! kotobase XRPC handlers — multi-tenant pinning service (ADR-2605260001)
+//!
+//! NSIDs: ai.gftd.apps.kotobase.*
+//!
+//! Tenant data lives in kotoba's own QuadStore under namespaced graphs:
+//!   kotobase/accounts/{tenant_did}  — tier + metadata
+//!   kotobase/pins/{tenant_did}      — per-pin records
+//!
+//! Quota tiers:
+//!   free:    3 pins,  100 MB
+//!   starter: 50 pins,   5 GB  ($9/mo — Stripe stub)
+//!   pro:    500 pins,  50 GB  ($49/mo — Stripe stub)
 
 pub const NSID_ACCOUNT_CREATE: &str = "ai.gftd.apps.kotobase.accountCreate";
 pub const NSID_ACCOUNT_STATUS: &str = "ai.gftd.apps.kotobase.accountStatus";

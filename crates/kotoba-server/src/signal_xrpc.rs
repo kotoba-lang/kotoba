@@ -1,8 +1,8 @@
-/// Signal Protocol XRPC endpoints.
-/// NSIDs: ai.gftd.signal.{register.prekeys, get.prekey.bundle, send.message, send.group.message}
-///
-/// These endpoints make kotoba-server the SSoT for Signal Protocol E2E,
-/// superseding `@gftd/signal` (`10-protocol/signal/`).
+//! Signal Protocol XRPC endpoints.
+//! NSIDs: ai.gftd.signal.{register.prekeys, get.prekey.bundle, send.message, send.group.message}
+//!
+//! These endpoints make kotoba-server the SSoT for Signal Protocol E2E,
+//! superseding `@gftd/signal` (`10-protocol/signal/`).
 
 pub const NSID_SIGNAL_REGISTER_PREKEYS:      &str = "ai.gftd.signal.register.prekeys";
 pub const NSID_SIGNAL_GET_PREKEY_BUNDLE:     &str = "ai.gftd.signal.get.prekey.bundle";

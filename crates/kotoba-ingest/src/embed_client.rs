@@ -16,6 +16,8 @@ use std::pin::Pin;
 use anyhow::Result;
 use serde_json::json;
 
+type EmbedFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
+
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -28,7 +30,7 @@ pub trait EmbedClient: Send + Sync {
     fn embed_batch<'a>(
         &'a self,
         texts: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
+    ) -> EmbedFuture<'a>;
 
     fn dim(&self) -> usize;
     fn model_id(&self) -> &str;
@@ -119,7 +121,7 @@ impl EmbedClient for HttpEmbedClient {
     fn embed_batch<'a>(
         &'a self,
         texts: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>> {
+    ) -> EmbedFuture<'a> {
         Box::pin(async move {
             let mut all: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
@@ -171,7 +173,7 @@ impl EmbedClient for Blake3EmbedClient {
     fn embed_batch<'a>(
         &'a self,
         texts: &'a [&'a str],
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>> {
+    ) -> EmbedFuture<'a> {
         Box::pin(async move {
             Ok(texts.iter().map(|t| self.pseudo_vector(t)).collect())
         })
