@@ -529,7 +529,7 @@ pub async fn request_log_query(
     let mut entries: Vec<RequestLogEntry> = map.into_values()
         .filter(|e| {
             params.path_prefix.as_deref()
-                .map_or(true, |pfx| e.path.starts_with(pfx))
+                .is_none_or(|pfx| e.path.starts_with(pfx))
         })
         .collect();
     entries.sort_by(|a, b| b.ts_unix.cmp(&a.ts_unix));
