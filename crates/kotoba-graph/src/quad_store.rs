@@ -836,4 +836,61 @@ mod tests {
         let dag = qs.commit_dag.read().await;
         assert!(dag.head(&graph).is_some(), "HEAD must survive prune");
     }
+
+    // ── additional gap tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn arrangement_unknown_graph_returns_none() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let unknown     = KotobaCid::from_bytes(b"never-asserted");
+        assert!(qs.arrangement(&unknown).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn head_commit_unknown_graph_returns_none() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let unknown     = KotobaCid::from_bytes(b"no-commits-here");
+        assert!(qs.head_commit(&unknown).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_dag_size_is_zero_initially() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        assert_eq!(qs.commit_dag_size().await, 0);
+    }
+
+    #[tokio::test]
+    async fn count_by_predicate_prefix_unknown_graph_returns_zero() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let unknown     = KotobaCid::from_bytes(b"no-graph");
+        assert_eq!(qs.count_by_predicate_prefix(&unknown, "ai.gftd/").await, 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_deltas_unknown_graph_returns_empty() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let unknown     = KotobaCid::from_bytes(b"empty-graph");
+        let deltas      = qs.snapshot_deltas(&unknown).await;
+        assert!(deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commits_since_empty_when_no_commits() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let graph       = KotobaCid::from_bytes(b"empty-dag-graph");
+        let result      = qs.commits_since(&graph, None).await;
+        assert!(result.is_empty(), "no commits → commits_since must return empty");
+    }
 }

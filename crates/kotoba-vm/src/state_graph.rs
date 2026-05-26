@@ -816,4 +816,94 @@ mod tests {
         let t2 = compiled.invoke(State::new(Arc::new(schema())), Some(fixed_tid.clone()));
         assert_eq!(t1.thread_id, t2.thread_id);
     }
+
+    // ── additional gap tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn state_from_messages_stores_messages_channel() {
+        let schema = Arc::new(schema());
+        let msgs = vec![json!({"role":"user","content":"hi"})];
+        let s = State::from_messages(msgs.clone(), schema);
+        assert_eq!(s.messages(), msgs);
+    }
+
+    #[test]
+    fn state_schema_channel_names_sorted() {
+        let schema = StateSchema::new()
+            .channel("zebra",    Reducer::Override)
+            .channel("alpha",    Reducer::Append)
+            .channel("messages", Reducer::Append);
+        let names = schema.channel_names_sorted();
+        assert_eq!(names, vec!["alpha", "messages", "zebra"]);
+    }
+
+    #[test]
+    fn node_output_set_and_extend() {
+        let mut extra = HashMap::new();
+        extra.insert("count".to_string(), json!(3));
+        extra.insert("ready".to_string(), json!(true));
+
+        let out = NodeOutput::new()
+            .set("score", json!(10))
+            .extend(extra);
+
+        assert_eq!(out.updates.get("score"), Some(&json!(10)));
+        assert_eq!(out.updates.get("count"), Some(&json!(3)));
+        assert_eq!(out.updates.get("ready"), Some(&json!(true)));
+        assert_eq!(out.updates.len(), 3);
+    }
+
+    #[test]
+    fn append_array_extends_existing_array() {
+        let mut s = State::new(Arc::new(schema()));
+        s.update("messages", json!("first"));
+        s.update("messages", json!(["second", "third"])); // array extends
+        let msgs = s.messages();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], json!("first"));
+        assert_eq!(msgs[1], json!("second"));
+        assert_eq!(msgs[2], json!("third"));
+    }
+
+    #[test]
+    fn definition_datoms_count_increases_with_channels_and_nodes() {
+        let compiled_1 = StateGraph::new(
+            StateSchema::new().channel("x", Reducer::Override)
+        )
+            .add_node("n1", NodeKind::Fn(Arc::new(|_| NodeOutput::new())))
+            .set_entry_point("n1")
+            .compile();
+
+        let compiled_2 = StateGraph::new(
+            StateSchema::new()
+                .channel("x", Reducer::Override)
+                .channel("y", Reducer::Append)
+        )
+            .add_node("n1", NodeKind::Fn(Arc::new(|_| NodeOutput::new())))
+            .add_node("n2", NodeKind::Fn(Arc::new(|_| NodeOutput::new())))
+            .set_entry_point("n1")
+            .compile();
+
+        let d1 = compiled_1.definition_datoms().len();
+        let d2 = compiled_2.definition_datoms().len();
+        assert!(d2 > d1, "more channels + nodes → more datoms");
+    }
+
+    #[test]
+    fn thread_get_returns_channel_value() {
+        let compiled = StateGraph::new(schema())
+            .add_node("a", NodeKind::Fn(Arc::new(|_| {
+                NodeOutput::new()
+                    .set("score",    json!(77))
+                    .set("messages", json!("hello"))
+            })))
+            .add_end_edge("a")
+            .set_entry_point("a")
+            .compile();
+
+        let thread = compiled.invoke(State::new(Arc::new(schema())), None);
+        assert_eq!(thread.get("score"), Some(&json!(77)));
+        // messages was Append so it should be an array
+        assert!(thread.get("messages").is_some());
+    }
 }

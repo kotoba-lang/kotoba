@@ -63,4 +63,35 @@ mod tests {
         let d = Delta::assert(make_quad());
         assert!(d.ts > 0);
     }
+
+    #[test]
+    fn multiplicity_discriminant_values() {
+        assert_eq!(Multiplicity::Assert  as i32,  1);
+        assert_eq!(Multiplicity::Retract as i32, -1);
+    }
+
+    #[test]
+    fn multiplicity_copy_and_clone() {
+        let m = Multiplicity::Assert;
+        let m2 = m;          // Copy
+        let m3 = m.clone();  // Clone
+        assert_eq!(m2, Multiplicity::Assert);
+        assert_eq!(m3, Multiplicity::Assert);
+    }
+
+    #[test]
+    fn delta_clone_preserves_fields() {
+        let d = Delta::assert(make_quad());
+        let d2 = d.clone();
+        assert_eq!(d2.mult, Multiplicity::Assert);
+        assert_eq!(d2.quad, d.quad);
+        assert_eq!(d2.ts,   d.ts);
+    }
+
+    #[test]
+    fn retract_is_not_assert() {
+        let d = Delta::retract(make_quad());
+        assert!(!d.is_assert());
+        assert_eq!(d.mult, Multiplicity::Retract);
+    }
 }

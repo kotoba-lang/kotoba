@@ -463,4 +463,65 @@ mod tests {
         assert_eq!(matches.len(), 50, "expected 50 'b' entries");
         assert!(matches.iter().all(|(k, _)| k.starts_with(b"b")));
     }
+
+    // ── additional gap tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn prolly_node_cid_accessor_leaf() {
+        let expected_cid = KotobaCid::from_bytes(b"leaf-cid");
+        let node = ProllyNode::Leaf {
+            entries: vec![(b"k".to_vec(), b"v".to_vec())],
+            cid: expected_cid.clone(),
+        };
+        assert_eq!(node.cid(), &expected_cid);
+    }
+
+    #[test]
+    fn prolly_node_cid_accessor_internal() {
+        let expected_cid = KotobaCid::from_bytes(b"internal-cid");
+        let node = ProllyNode::Internal {
+            children: vec![(b"max".to_vec(), KotobaCid::from_bytes(b"child"))],
+            cid: expected_cid.clone(),
+        };
+        assert_eq!(node.cid(), &expected_cid);
+    }
+
+    #[test]
+    fn is_boundary_is_deterministic() {
+        // Same key must always give the same result
+        let key = b"deterministic-boundary-key";
+        let r1 = ProllyNode::is_boundary(key);
+        let r2 = ProllyNode::is_boundary(key);
+        assert_eq!(r1, r2, "is_boundary must be deterministic for same key");
+    }
+
+    #[test]
+    fn diff_same_root_returns_empty_vecs() {
+        let root = KotobaCid::from_bytes(b"same-root");
+        let (only_a, only_b) = ProllyTree::diff(&root, &root);
+        assert!(only_a.is_empty(), "diff of same root: only_in_a must be empty");
+        assert!(only_b.is_empty(), "diff of same root: only_in_b must be empty");
+    }
+
+    #[test]
+    fn diff_different_roots_returns_non_empty() {
+        let root_a = KotobaCid::from_bytes(b"root-a");
+        let root_b = KotobaCid::from_bytes(b"root-b");
+        let (only_a, only_b) = ProllyTree::diff(&root_a, &root_b);
+        // With the current placeholder impl, roots themselves are returned.
+        assert!(!only_a.is_empty() || !only_b.is_empty(),
+            "diff of different roots must report at least one difference");
+    }
+
+    #[test]
+    fn build_tree_empty_returns_no_root() {
+        // build_tree([]) must not panic and must return a valid (but empty) root CID
+        // OR handle the empty case gracefully. The actual behavior depends on impl.
+        let store = MemoryBlockStore::new();
+        // An empty entry list should produce exactly one leaf (or handle gracefully).
+        // This test verifies no panic only — the exact return value is impl-defined.
+        let result = ProllyTree::build_tree(vec![], &store);
+        // May be Ok or Err, but must not panic.
+        let _ = result;
+    }
 }

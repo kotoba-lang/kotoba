@@ -105,4 +105,183 @@ mod tests {
         let key = q.spo_key();
         assert_eq!(&key[36 + "enc/field".len()..], &ct.0);
     }
+
+    // ── spo_key for remaining scalar variants ────────────────────────────────
+
+    #[test]
+    fn spo_key_bool_not_appended() {
+        let k = quad("p", QuadObject::Bool(true)).spo_key();
+        assert_eq!(k.len(), 36 + "p".len());
+    }
+
+    #[test]
+    fn spo_key_float_not_appended() {
+        let k = quad("p", QuadObject::Float(3.14)).spo_key();
+        assert_eq!(k.len(), 36 + "p".len());
+    }
+
+    #[test]
+    fn spo_key_bytes_not_appended() {
+        let k = quad("p", QuadObject::Bytes(vec![1, 2, 3])).spo_key();
+        assert_eq!(k.len(), 36 + "p".len());
+    }
+
+    #[test]
+    fn spo_key_vector_f32_not_appended() {
+        let k = quad("p", QuadObject::VectorF32(vec![0.1, 0.2])).spo_key();
+        assert_eq!(k.len(), 36 + "p".len());
+    }
+
+    #[test]
+    fn spo_key_tensor_cid_not_appended() {
+        let k = quad("p", QuadObject::TensorCid {
+            cid: cid(b"t"),
+            shape: vec![4, 4],
+            dtype: TensorDtype::F32,
+        }).spo_key();
+        assert_eq!(k.len(), 36 + "p".len());
+    }
+
+    // ── TensorDtype: all 5 variants ───────────────────────────────────────────
+
+    #[test]
+    fn tensor_dtype_equality_all_variants() {
+        assert_eq!(TensorDtype::F32,   TensorDtype::F32);
+        assert_eq!(TensorDtype::F16,   TensorDtype::F16);
+        assert_eq!(TensorDtype::BF16,  TensorDtype::BF16);
+        assert_eq!(TensorDtype::F8E4M3, TensorDtype::F8E4M3);
+        assert_eq!(TensorDtype::F8E5M2, TensorDtype::F8E5M2);
+        assert_ne!(TensorDtype::F32,   TensorDtype::F16);
+        assert_ne!(TensorDtype::F8E4M3, TensorDtype::F8E5M2);
+    }
+
+    #[test]
+    fn tensor_dtype_clone() {
+        let d = TensorDtype::BF16;
+        assert_eq!(d.clone(), TensorDtype::BF16);
+    }
+
+    // ── QuadObject PartialEq ─────────────────────────────────────────────────
+
+    #[test]
+    fn quad_object_partial_eq_same_variant() {
+        assert_eq!(QuadObject::Integer(7), QuadObject::Integer(7));
+        assert_ne!(QuadObject::Integer(7), QuadObject::Integer(8));
+        assert_eq!(QuadObject::Bool(false), QuadObject::Bool(false));
+        assert_ne!(QuadObject::Bool(true), QuadObject::Bool(false));
+        assert_eq!(QuadObject::Text("hi".to_string()), QuadObject::Text("hi".to_string()));
+    }
+
+    #[test]
+    fn quad_object_partial_eq_cid_variant() {
+        let a = QuadObject::Cid(cid(b"a"));
+        let b = QuadObject::Cid(cid(b"b"));
+        assert_eq!(a.clone(), a.clone());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn quad_object_partial_eq_encrypted_variant() {
+        let enc1 = QuadObject::Encrypted { ct_cid: cid(b"ct1"), policy_cid: cid(b"pol") };
+        let enc2 = QuadObject::Encrypted { ct_cid: cid(b"ct2"), policy_cid: cid(b"pol") };
+        assert_eq!(enc1.clone(), enc1.clone());
+        assert_ne!(enc1, enc2);
+    }
+
+    // ── Quad PartialEq ───────────────────────────────────────────────────────
+
+    #[test]
+    fn quad_partial_eq_same_fields() {
+        let q1 = quad("ns/pred", QuadObject::Integer(1));
+        let q2 = quad("ns/pred", QuadObject::Integer(1));
+        assert_eq!(q1, q2);
+    }
+
+    #[test]
+    fn quad_partial_eq_differs_by_object() {
+        let q1 = quad("ns/pred", QuadObject::Integer(1));
+        let q2 = quad("ns/pred", QuadObject::Integer(2));
+        assert_ne!(q1, q2);
+    }
+
+    // ── Serde JSON roundtrip per QuadObject variant ──────────────────────────
+
+    fn roundtrip(obj: QuadObject) -> QuadObject {
+        let json = serde_json::to_string(&obj).expect("serialize");
+        serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn serde_quad_object_cid() {
+        let obj = QuadObject::Cid(cid(b"serde-test"));
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_integer() {
+        let obj = QuadObject::Integer(-42);
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_float() {
+        let obj = QuadObject::Float(2.718281828);
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_text() {
+        let obj = QuadObject::Text("hello kotoba".to_string());
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_bool() {
+        assert_eq!(roundtrip(QuadObject::Bool(true)),  QuadObject::Bool(true));
+        assert_eq!(roundtrip(QuadObject::Bool(false)), QuadObject::Bool(false));
+    }
+
+    #[test]
+    fn serde_quad_object_bytes() {
+        let obj = QuadObject::Bytes(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_vector_f32() {
+        let obj = QuadObject::VectorF32(vec![1.0, 2.0, 3.0]);
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_tensor_cid() {
+        let obj = QuadObject::TensorCid {
+            cid: cid(b"tensor"),
+            shape: vec![768, 1],
+            dtype: TensorDtype::F8E4M3,
+        };
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_encrypted() {
+        let obj = QuadObject::Encrypted {
+            ct_cid:     cid(b"ct"),
+            policy_cid: cid(b"policy"),
+        };
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_full_roundtrip() {
+        let q = Quad {
+            graph:     cid(b"graph"),
+            subject:   cid(b"subj"),
+            predicate: "ai.gftd.test/attr".to_string(),
+            object:    QuadObject::Text("value".to_string()),
+        };
+        let json = serde_json::to_string(&q).expect("serialize");
+        let q2: Quad = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(q, q2);
+    }
 }

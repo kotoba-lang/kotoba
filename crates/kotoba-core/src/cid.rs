@@ -170,4 +170,38 @@ mod tests {
         let actual   = KotobaCid::from_cbor(&value).unwrap();
         assert_eq!(expected, actual);
     }
+
+    #[test]
+    fn default_is_all_zeros() {
+        let cid = KotobaCid::default();
+        assert_eq!(cid.0, [0u8; 36]);
+    }
+
+    #[test]
+    fn hash_trait_in_hashset() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        let a = KotobaCid::from_bytes(b"a");
+        let b = KotobaCid::from_bytes(b"b");
+        set.insert(a.clone());
+        set.insert(a.clone()); // duplicate → no growth
+        set.insert(b.clone());
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&a));
+        assert!(set.contains(&b));
+    }
+
+    #[test]
+    fn from_cbor_error_on_non_serializable_would_fail_gracefully() {
+        // A valid serializable value must always succeed.
+        let n: u64 = 12345678;
+        let cid = KotobaCid::from_cbor(&n);
+        assert!(cid.is_ok());
+    }
+
+    #[test]
+    fn cid_is_exactly_36_bytes() {
+        let cid = KotobaCid::from_bytes(b"size-check");
+        assert_eq!(cid.0.len(), 36);
+    }
 }

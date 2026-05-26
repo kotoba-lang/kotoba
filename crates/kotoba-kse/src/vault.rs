@@ -319,4 +319,48 @@ mod tests {
         assert!(car.is_some());
         assert!(car.unwrap().len() > 16); // CAR header + at least one block
     }
+
+    // ── additional gap tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn vault_default_is_functional() {
+        let vault = Vault::default();
+        let blob_ref = vault.put(Bytes::from_static(b"default vault test")).await;
+        assert!(vault.contains(&blob_ref.cid).await);
+    }
+
+    #[tokio::test]
+    async fn flush_as_car_without_store_returns_none() {
+        let vault = Vault::new(); // no block store
+        let blob_ref = vault.put(Bytes::from_static(b"no-store")).await;
+        let car = vault.flush_as_car(&blob_ref.cid, &[blob_ref.cid.clone()]).await;
+        assert!(car.is_none(), "flush_as_car without a block store must return None");
+    }
+
+    #[test]
+    fn blob_manifest_cbor_roundtrip() {
+        let cid1 = KotobaCid::from_bytes(b"chunk1");
+        let cid2 = KotobaCid::from_bytes(b"chunk2");
+        let manifest = BlobManifest {
+            mime_type:  "video/mp4".to_string(),
+            total_size: 1_048_576,
+            chunks:     vec![cid1.clone(), cid2.clone()],
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&manifest, &mut cbor).expect("serialize BlobManifest");
+        let recovered: BlobManifest =
+            ciborium::from_reader(&cbor[..]).expect("deserialize BlobManifest");
+        assert_eq!(recovered.mime_type,  manifest.mime_type);
+        assert_eq!(recovered.total_size, manifest.total_size);
+        assert_eq!(recovered.chunks.len(), 2);
+        assert_eq!(recovered.chunks[0], cid1);
+        assert_eq!(recovered.chunks[1], cid2);
+    }
+
+    #[tokio::test]
+    async fn get_unknown_cid_returns_none() {
+        let vault = Vault::new();
+        let unknown = KotobaCid::from_bytes(b"not-stored");
+        assert!(vault.get(&unknown).await.is_none());
+    }
 }

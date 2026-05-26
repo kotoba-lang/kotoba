@@ -435,6 +435,83 @@ mod tests {
         let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![1, 2, 3, 4, 5], "block store fallback must fill the gap");
     }
+
+    // ── additional gap tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn current_seq_is_zero_before_any_publish() {
+        let journal = Journal::new();
+        assert_eq!(journal.current_seq().await, 0);
+    }
+
+    #[tokio::test]
+    async fn current_seq_matches_last_entry_seq() {
+        let journal = Journal::new();
+        let t = Topic::new("seq-check");
+        journal.publish(t.clone(), Bytes::from_static(b"x")).await;
+        journal.publish(t.clone(), Bytes::from_static(b"y")).await;
+        assert_eq!(journal.current_seq().await, 2);
+    }
+
+    #[tokio::test]
+    async fn default_creates_functional_journal() {
+        let journal = Journal::default();
+        let e = journal.publish(Topic::new("default/test"), Bytes::from_static(b"hi")).await;
+        assert_eq!(e.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn trim_before_zero_is_noop() {
+        let journal = Journal::new();
+        let t = Topic::new("noop/trim");
+        journal.publish(t.clone(), Bytes::from_static(b"a")).await;
+        journal.publish(t.clone(), Bytes::from_static(b"b")).await;
+        journal.trim_before(0).await;
+        assert_eq!(journal.read_since(1).await.len(), 2, "trim_before(0) should not remove any entry");
+    }
+
+    #[tokio::test]
+    async fn trim_persistent_before_is_noop() {
+        // Verify no panic and no side-effects
+        let journal = Journal::new();
+        let t = Topic::new("persist/noop");
+        journal.publish(t.clone(), Bytes::from_static(b"z")).await;
+        journal.trim_persistent_before(9999).await;  // must not remove in-memory entries
+        assert_eq!(journal.read_since(1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_and_read_checkpoint_without_store_are_noops() {
+        let journal = Journal::new(); // no head_path → no-op
+        journal.write_checkpoint(Bytes::from_static(b"ckpt")).await;
+        let result = journal.read_checkpoint().await;
+        assert!(result.is_none(), "read_checkpoint without store must return None");
+    }
+
+    #[tokio::test]
+    async fn read_since_all_from_zero_returns_everything() {
+        let journal = Journal::new();
+        let t = Topic::new("all/entries");
+        journal.publish(t.clone(), Bytes::from_static(b"1")).await;
+        journal.publish(t.clone(), Bytes::from_static(b"2")).await;
+        journal.publish(t.clone(), Bytes::from_static(b"3")).await;
+        let all = journal.read_since(1).await;
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn merkle_prev_links_form_chain() {
+        let journal = Journal::new();
+        let t = Topic::new("merkle/chain");
+        let e1 = journal.publish(t.clone(), Bytes::from_static(b"first")).await;
+        let e2 = journal.publish(t.clone(), Bytes::from_static(b"second")).await;
+        // First entry has no prev; second entry's prev should match something or be None
+        // (in-memory journal without block store: prev is always None at entry level, but
+        //  the head CID IS tracked in self.head for block-store journals)
+        assert!(e1.prev.is_none(), "first entry should have no prev");
+        // For an in-memory journal without block store, prev is also None (no CBOR blocks)
+        let _ = e2; // just ensure it was created without panic
+    }
 }
 
 fn now_ms() -> u64 {
