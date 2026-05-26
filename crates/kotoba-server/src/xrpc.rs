@@ -874,6 +874,14 @@ pub async fn weight_put(
     };
     tracing::info!(issuer = %issuer_did, graph = %req.graph, "weight.put: CACAO verified");
 
+    // Tensor blobs can legitimately be large (embedding tables ~512 MiB raw).
+    // Cap at 512 MiB base64 (≈384 MiB raw) to prevent runaway OOM.
+    const MAX_WEIGHT_B64_LEN: usize = 512 * 1024 * 1024;
+    if req.data_b64.len() > MAX_WEIGHT_B64_LEN {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE,
+            format!("data_b64 too large ({} bytes, limit {MAX_WEIGHT_B64_LEN})", req.data_b64.len())));
+    }
+
     let bytes = B64.decode(&req.data_b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
