@@ -43,3 +43,64 @@ pub fn lora_retract_delta(adapter: &LoraAdapter, graph_cid: KotobaCid) -> Delta 
     };
     Delta::retract(quad)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kotoba_kqe::delta::Multiplicity;
+
+    fn adapter() -> LoraAdapter {
+        LoraAdapter {
+            base_cid:    KotobaCid::from_bytes(b"base"),
+            adapter_cid: KotobaCid::from_bytes(b"adapter"),
+            scale:       0.5,
+            rank:        16,
+        }
+    }
+
+    #[test]
+    fn lora_to_delta_is_assert() {
+        let d = lora_to_delta(&adapter(), KotobaCid::from_bytes(b"g"));
+        assert_eq!(d.mult, Multiplicity::Assert);
+    }
+
+    #[test]
+    fn lora_to_delta_predicate() {
+        let d = lora_to_delta(&adapter(), KotobaCid::from_bytes(b"g"));
+        assert_eq!(d.quad.predicate, "lora/adapter");
+    }
+
+    #[test]
+    fn lora_to_delta_subject_is_base_cid() {
+        let a = adapter();
+        let d = lora_to_delta(&a, KotobaCid::from_bytes(b"g"));
+        assert_eq!(d.quad.subject, a.base_cid);
+    }
+
+    #[test]
+    fn lora_to_delta_shape_is_rank() {
+        let a = adapter();
+        let d = lora_to_delta(&a, KotobaCid::from_bytes(b"g"));
+        if let QuadObject::TensorCid { shape, .. } = d.quad.object {
+            assert_eq!(shape, vec![a.rank]);
+        } else {
+            panic!("expected TensorCid");
+        }
+    }
+
+    #[test]
+    fn lora_retract_delta_is_retract() {
+        let d = lora_retract_delta(&adapter(), KotobaCid::from_bytes(b"g"));
+        assert_eq!(d.mult, Multiplicity::Retract);
+    }
+
+    #[test]
+    fn assert_and_retract_have_matching_quads() {
+        let a = adapter();
+        let g = KotobaCid::from_bytes(b"g");
+        let da = lora_to_delta(&a, g.clone());
+        let dr = lora_retract_delta(&a, g);
+        assert_eq!(da.quad.subject,   dr.quad.subject);
+        assert_eq!(da.quad.predicate, dr.quad.predicate);
+    }
+}
