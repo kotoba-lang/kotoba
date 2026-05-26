@@ -505,9 +505,6 @@ let thread = compiled.run(thread)?;
 
 ## 禁止
 
-- IPFS daemon 依存 (CID のみ、Kubo 不使用)
-- PostgreSQL wire 互換 (意図的に RisingWave 非互換)
-- EVM 実行 (CALL_FOREIGN でブリッジ)
 - 中央マスターノード (DHT 分散)
 - `wit-bindgen` macro を kotoba-runtime の **host 側** で使用 (host は dynamic Val dispatch)
 - guest WASM を kotoba-runtime crate 内に同梱 (guest は別 crate / 別ビルドターゲット)
