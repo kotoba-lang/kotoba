@@ -2990,7 +2990,6 @@ async fn attest_challenge_invalid_challenger_did_prefix_returns_400() {
 
 #[tokio::test]
 async fn commit_store_oversized_author_returns_400() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     let s = TestServer::start(false).await;
     let graph = "commit-author-bound-graph";
     let (_, cacao_b64) = build_ed25519_cacao(graph);
