@@ -701,3 +701,129 @@ pub const ALL_NSIDS: &[&str] = &[
     NSID_PIN_DELETE,
     NSID_USAGE_GET,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── quota_for_tier ────────────────────────────────────────────────────────
+
+    #[test]
+    fn quota_free_tier() {
+        let (pins, bytes) = quota_for_tier("free");
+        assert_eq!(pins,  QUOTA_FREE_PINS);
+        assert_eq!(bytes, QUOTA_FREE_BYTES);
+    }
+
+    #[test]
+    fn quota_starter_tier() {
+        let (pins, bytes) = quota_for_tier("starter");
+        assert_eq!(pins,  QUOTA_STARTER_PINS);
+        assert_eq!(bytes, QUOTA_STARTER_BYTES);
+    }
+
+    #[test]
+    fn quota_pro_tier() {
+        let (pins, bytes) = quota_for_tier("pro");
+        assert_eq!(pins,  QUOTA_PRO_PINS);
+        assert_eq!(bytes, QUOTA_PRO_BYTES);
+    }
+
+    #[test]
+    fn quota_unknown_tier_falls_back_to_free() {
+        let (pins, bytes) = quota_for_tier("enterprise");
+        assert_eq!(pins,  QUOTA_FREE_PINS);
+        assert_eq!(bytes, QUOTA_FREE_BYTES);
+    }
+
+    // ── validate_name ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_name_accepts_empty_string() {
+        assert!(validate_name("").is_ok());
+    }
+
+    #[test]
+    fn validate_name_accepts_max_len() {
+        let name = "a".repeat(MAX_NAME_LEN);
+        assert!(validate_name(&name).is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_over_max() {
+        let name = "a".repeat(MAX_NAME_LEN + 1);
+        assert!(validate_name(&name).is_err());
+    }
+
+    // ── validate_triple ───────────────────────────────────────────────────────
+
+    fn triple(s: &str, p: &str, o: &str) -> TripleInput {
+        TripleInput { subject: s.to_string(), predicate: p.to_string(), object: o.to_string() }
+    }
+
+    #[test]
+    fn validate_triple_accepts_valid_input() {
+        assert!(validate_triple(&triple("subj", "pred/foo", "value")).is_ok());
+    }
+
+    #[test]
+    fn validate_triple_rejects_empty_subject() {
+        assert!(validate_triple(&triple("", "pred", "val")).is_err());
+    }
+
+    #[test]
+    fn validate_triple_rejects_empty_predicate() {
+        assert!(validate_triple(&triple("subj", "", "val")).is_err());
+    }
+
+    #[test]
+    fn validate_triple_rejects_oversized_subject() {
+        let long = "s".repeat(MAX_SUBJECT_LEN + 1);
+        assert!(validate_triple(&triple(&long, "pred", "val")).is_err());
+    }
+
+    #[test]
+    fn validate_triple_rejects_oversized_object() {
+        let long = "o".repeat(MAX_OBJECT_LEN + 1);
+        assert!(validate_triple(&triple("subj", "pred", &long)).is_err());
+    }
+
+    // ── new_pin_id ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_pin_id_has_pin_prefix() {
+        let id = new_pin_id();
+        assert!(id.starts_with("pin_"), "expected pin_ prefix, got {id}");
+    }
+
+    #[test]
+    fn new_pin_id_is_unique() {
+        let a = new_pin_id();
+        let b = new_pin_id();
+        assert_ne!(a, b);
+    }
+
+    // ── now_unix_str ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn now_unix_str_is_numeric() {
+        let s = now_unix_str();
+        assert!(s.parse::<u64>().is_ok(), "expected numeric unix timestamp, got {s}");
+    }
+
+    #[test]
+    fn now_unix_str_is_reasonable_epoch() {
+        let secs: u64 = now_unix_str().parse().unwrap();
+        // After 2026-01-01 epoch
+        assert!(secs > 1_750_000_000, "unix time looks too old: {secs}");
+    }
+
+    // ── ALL_NSIDS ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn all_nsids_have_correct_prefix() {
+        for nsid in ALL_NSIDS {
+            assert!(nsid.starts_with("ai.gftd.apps.kotobase."), "bad nsid: {nsid}");
+        }
+    }
+}
