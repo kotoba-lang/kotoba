@@ -25,3 +25,50 @@ impl DataPolicy {
     #[inline] pub fn is_open(&self) -> bool { matches!(self, DataPolicy::Open) }
     #[inline] pub fn is_encrypted(&self) -> bool { !self.is_open() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_policy_is_open() {
+        let p = DataPolicy::Open;
+        assert!(p.is_open());
+        assert!(!p.is_encrypted());
+    }
+
+    #[test]
+    fn encrypted_policy_is_encrypted() {
+        let cid = KotobaCid::from_bytes(b"ct");
+        let pol = KotobaCid::from_bytes(b"policy");
+        let p   = DataPolicy::Encrypted { ct_cid: cid, policy_cid: pol };
+        assert!(p.is_encrypted());
+        assert!(!p.is_open());
+    }
+
+    #[test]
+    fn default_policy_is_open() {
+        let p = DataPolicy::default();
+        assert!(p.is_open());
+    }
+
+    #[test]
+    fn cbor_roundtrip_open() {
+        let p = DataPolicy::Open;
+        let mut buf = Vec::new();
+        ciborium::into_writer(&p, &mut buf).unwrap();
+        let back: DataPolicy = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, DataPolicy::Open);
+    }
+
+    #[test]
+    fn cbor_roundtrip_encrypted() {
+        let ct  = KotobaCid::from_bytes(b"ct-data");
+        let pol = KotobaCid::from_bytes(b"policy-data");
+        let p   = DataPolicy::Encrypted { ct_cid: ct.clone(), policy_cid: pol.clone() };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&p, &mut buf).unwrap();
+        let back: DataPolicy = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, p);
+    }
+}

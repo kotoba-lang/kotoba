@@ -22,3 +22,37 @@ pub fn put_verified(store: &dyn BlockStore, cid: &KotobaCid, data: &[u8]) -> any
     );
     store.put(cid, data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryBlockStore;
+    use std::sync::Arc;
+
+    #[test]
+    fn put_verified_succeeds_with_correct_cid() {
+        let store = Arc::new(MemoryBlockStore::new());
+        let data  = b"hello kotoba";
+        let cid   = KotobaCid::from_bytes(data);
+        put_verified(&*store, &cid, data).unwrap();
+        assert!(store.has(&cid));
+    }
+
+    #[test]
+    fn put_verified_fails_with_wrong_cid() {
+        let store    = Arc::new(MemoryBlockStore::new());
+        let data     = b"real data";
+        let bad_cid  = KotobaCid::from_bytes(b"different data");
+        let result   = put_verified(&*store, &bad_cid, data);
+        assert!(result.is_err(), "must reject CID mismatch");
+        // Block must NOT have been written
+        assert!(!store.has(&bad_cid));
+    }
+
+    #[test]
+    fn store_error_is_displayable() {
+        let err = StoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, "disk full"));
+        let msg = err.to_string();
+        assert!(msg.contains("io error") || msg.contains("disk full"), "got: {msg}");
+    }
+}
