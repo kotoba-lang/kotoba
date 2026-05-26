@@ -141,7 +141,13 @@ impl PreKeyRegistry {
         accessor_did: &str,
         owner_enc_key: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, PreKeyError> {
-        chain.verify(owner_did, "quad:read")?;
+        // verify() returns the issuer DID extracted from the verified CACAO.
+        // We must check it matches accessor_did — otherwise a valid CACAO from
+        // a different accessor could be used to look up an unrelated re-key.
+        let issuer_did = chain.verify(owner_did, "quad:read")?;
+        if issuer_did != accessor_did {
+            return Err(PreKeyError::Access(DelegationError::RootMismatch));
+        }
         // Check revocation set (fast path before touching BlockStore).
         if self.revoked.read().await
             .contains(&(owner_did.to_string(), accessor_did.to_string()))
@@ -430,5 +436,65 @@ mod tests {
         // Node B should now have the pair revoked.
         assert!(node_b.revoked.read().await
             .contains(&("did:alice".to_string(), "did:bob".to_string())));
+    }
+
+    /// CACAO signed by accessor-A cannot be used to fetch accessor-B's re-key.
+    ///
+    /// This guards against a cross-accessor substitution attack where an attacker
+    /// holds a valid delegation for their own DID and passes a different accessor_did
+    /// to `get_rekey_authed()` to retrieve an unrelated re-key entry.
+    #[tokio::test]
+    async fn issuer_mismatch_rejected_by_get_rekey_authed() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use kotoba_auth::{Cacao, CacaoHeader, CacaoPayload, CacaoSig, DelegationChain};
+        use kotoba_auth::ed25519_pubkey_to_did_key;
+
+        // accessor-A: has a valid grant and provides a valid signed CACAO.
+        let sk_a = SigningKey::from_bytes(&[11u8; 32]);
+        let accessor_a_did = ed25519_pubkey_to_did_key(sk_a.verifying_key().as_bytes());
+
+        // accessor-B: also has a grant; attacker wants accessor-B's re-key.
+        let accessor_b_did = "did:key:zAttackerWantsThis";
+
+        let owner_did = "did:key:zOwner";
+        let enc_key   = rand_key();
+        let re_key_b  = rand_key();
+
+        let reg = PreKeyRegistry::new(store());
+        reg.grant(owner_did, &accessor_a_did, &rand_key(), &enc_key).await.unwrap();
+        reg.grant(owner_did, accessor_b_did, &re_key_b, &enc_key).await.unwrap();
+
+        // Build a valid CACAO signed by accessor-A.
+        let payload = CacaoPayload {
+            iss:       accessor_a_did.clone(),
+            aud:       "kotoba://test".into(),
+            issued_at: "2026-05-26T00:00:00Z".into(),
+            expiry:    None,
+            nonce:     "issuer-mismatch-nonce".into(),
+            domain:    "kotoba.test".into(),
+            statement: None,
+            version:   "1".into(),
+            resources: vec![],
+        };
+        let mut cacao = Cacao {
+            h: CacaoHeader { t: "caip122".into() },
+            p: payload,
+            s: CacaoSig { t: "EdDSA".into(), s: String::new() },
+        };
+        let sig = sk_a.sign(cacao.siwe_message().as_bytes());
+        cacao.s.s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        let chain = DelegationChain::new(cacao);
+
+        // Attempt to use accessor-A's CACAO to fetch accessor-B's re-key.
+        let err = reg
+            .get_rekey_authed(&chain, owner_did, accessor_b_did, &enc_key)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, PreKeyError::Access(DelegationError::RootMismatch)),
+            "expected RootMismatch, got {err:?}"
+        );
     }
 }
