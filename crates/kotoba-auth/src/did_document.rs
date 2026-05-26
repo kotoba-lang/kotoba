@@ -109,3 +109,117 @@ impl DidDocument {
         Some(key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_doc(id: &str) -> DidDocument {
+        DidDocument {
+            context:                vec!["https://www.w3.org/ns/did/v1".to_string()],
+            id:                     id.to_string(),
+            verification_method:    vec![],
+            authentication:         vec![],
+            assertion_method:       vec![],
+            capability_invocation:  vec![],
+            capability_delegation:  vec![],
+            service:                vec![],
+        }
+    }
+
+    fn with_service(mut doc: DidDocument, stype: &str, endpoint: ServiceEndpointValue) -> DidDocument {
+        doc.service.push(ServiceEndpoint {
+            id:           format!("{}#{}", doc.id, stype),
+            service_type: stype.to_string(),
+            endpoint,
+        });
+        doc
+    }
+
+    // ── kotoba_endpoint ───────────────────────────────────────────────────────
+
+    #[test]
+    fn kotoba_endpoint_returns_none_when_absent() {
+        let doc = base_doc("did:key:zTest");
+        assert!(doc.kotoba_endpoint().is_none());
+    }
+
+    #[test]
+    fn kotoba_endpoint_returns_single_url() {
+        let doc = with_service(
+            base_doc("did:key:zTest"),
+            "KotobaNode",
+            ServiceEndpointValue::Single("/ip4/127.0.0.1/tcp/4001".to_string()),
+        );
+        assert_eq!(doc.kotoba_endpoint(), Some("/ip4/127.0.0.1/tcp/4001"));
+    }
+
+    #[test]
+    fn kotoba_endpoint_returns_none_for_multiple_value() {
+        let doc = with_service(
+            base_doc("did:key:zTest"),
+            "KotobaNode",
+            ServiceEndpointValue::Multiple(vec!["/ip4/1.2.3.4/tcp/4001".to_string()]),
+        );
+        assert!(doc.kotoba_endpoint().is_none());
+    }
+
+    // ── graph_memberships ─────────────────────────────────────────────────────
+
+    #[test]
+    fn graph_memberships_returns_empty_when_absent() {
+        assert!(base_doc("did:key:z").graph_memberships().is_empty());
+    }
+
+    #[test]
+    fn graph_memberships_returns_list() {
+        let doc = with_service(
+            base_doc("did:key:z"),
+            "KotobaGraphMembership",
+            ServiceEndpointValue::Multiple(vec![
+                "graph-cid-1".to_string(),
+                "graph-cid-2".to_string(),
+            ]),
+        );
+        let memberships = doc.graph_memberships();
+        assert_eq!(memberships.len(), 2);
+        assert!(memberships.contains(&"graph-cid-1"));
+    }
+
+    // ── key extraction ────────────────────────────────────────────────────────
+
+    #[test]
+    fn ed25519_public_key_returns_none_when_absent() {
+        assert!(base_doc("did:key:z").ed25519_public_key().is_none());
+    }
+
+    #[test]
+    fn x25519_public_key_returns_none_when_absent() {
+        assert!(base_doc("did:key:z").x25519_public_key().is_none());
+    }
+
+    #[test]
+    fn ed25519_public_key_extracted_correctly() {
+        let raw_key = [0x42u8; 32];
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &raw_key);
+        let mut doc = base_doc("did:key:z");
+        doc.verification_method.push(VerificationMethod {
+            id:                   "did:key:z#key-1".to_string(),
+            key_type:             "Ed25519VerificationKey2020".to_string(),
+            controller:           "did:key:z".to_string(),
+            public_key_multibase: encoded,
+        });
+        let extracted = doc.ed25519_public_key().unwrap();
+        assert_eq!(extracted, raw_key);
+    }
+
+    // ── JSON roundtrip ────────────────────────────────────────────────────────
+
+    #[test]
+    fn did_document_json_roundtrip() {
+        let doc   = base_doc("did:key:zTestRoundtrip");
+        let json  = serde_json::to_string(&doc).unwrap();
+        let back: DidDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, doc.id);
+    }
+}
