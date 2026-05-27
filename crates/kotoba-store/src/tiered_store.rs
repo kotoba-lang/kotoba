@@ -4,11 +4,12 @@
 /// Hot misses fall through to cold and promote the block back to hot.
 ///
 /// Design:
-///   hot: small + fast (e.g., BudgetedBlockStore<SledBlockStore>)
-///   cold: large + slow (e.g., IrohBlockStore)
+///   hot: small + fast (BudgetedBlockStore<MemoryBlockStore>)
+///   cold: large + persistent (IrohBlockStore — iroh-blobs fs::Store)
 ///
-/// The split ensures each node only keeps its working set in hot memory/disk while
-/// the full dataset is addressed and replicated in cold (iroh/IPFS-pin style).
+/// Each node keeps its working set in hot memory while the full dataset is
+/// stored persistently in the iroh cold tier.  Remote durability is handled by
+/// kotobase.gftd.ai via KotobasePinClient (fire-and-forget after put).
 use std::sync::Arc;
 use bytes::Bytes;
 use anyhow::Result;

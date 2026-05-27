@@ -548,7 +548,7 @@ pub async fn handle_pin_create(
     state.quad_store.assert_batch_silent(pin_quads).await;
 
     // Fire-and-forget IPFS pin
-    if let Some(ipfs) = &state.ipfs_pin {
+    if let Some(ipfs) = &state.kotobase_pin {
         let ipfs_c    = Arc::clone(ipfs);
         let cid_c     = resolved_cid.clone();
         let state_c   = Arc::clone(&state);
@@ -572,7 +572,7 @@ pub async fn handle_pin_create(
         ok:     true,
         pin_id,
         cid:    resolved_cid,
-        status: if state.ipfs_pin.is_some() { "pinning" } else { "pinned" }.into(),
+        status: if state.kotobase_pin.is_some() { "pinning" } else { "pinned" }.into(),
         size_bytes: size,
         error:  None,
     }))

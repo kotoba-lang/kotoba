@@ -12,7 +12,7 @@ use kotoba_kse::{sync_window::SyncWindow, AgentIdentity, Journal, KseStore, PreK
 use kotoba_kqe::quad::Quad;
 use kotoba_graph::QuadStore;
 use kotoba_kse::SecureVault;
-use kotoba_store::IpfsPinClient;
+use kotoba_store::KotobasePinClient;
 use kotoba_runtime::{host::InferenceFn, UdfExecutor, WasmExecutor};
 use kotoba_ingest::embed_client::{EmbedClient, HttpEmbedClient};
 use kotoba_vm::{distributed::DistributedPregelRunner, InvokeRouter};
@@ -95,9 +95,9 @@ pub struct KotobaState {
     // ── QuadStore ────────────────────────────────────────────────────────────
     /// Quad write/read with ProllyTree commit + 3-index Journal publish.
     pub quad_store:  Arc<QuadStore>,
-    // ── IPFS Pinning ─────────────────────────────────────────────────────────
-    /// Optional IPFS Pinning Service client (Pinata/web3.storage/Filebase).
-    pub ipfs_pin: Option<Arc<IpfsPinClient>>,
+    // ── kotobase Pinning ─────────────────────────────────────────────────────────
+    /// Optional kotobase.gftd.ai XRPC pin client (KOTOBA_PIN_TOKEN).
+    pub kotobase_pin: Option<Arc<KotobasePinClient>>,
     // ── Email E2E Storage ────────────────────────────────────────────────────
     /// AES-256-GCM encrypted vault for email body blobs (legacy; kept for compat).
     pub secure_vault: Arc<SecureVault>,
@@ -138,7 +138,7 @@ impl KotobaState {
         // Hot block cache — BudgetedBlockStore<MemoryBlockStore>.
         // Capacity: KOTOBA_HOT_CACHE_BYTES (default 256 MiB) or
         //           KOTOBA_STORAGE_BUDGET_BYTES (legacy alias, same meaning).
-        // Persistence: B2/S3 cold tier (LayeredBlockStore) if KOTOBA_B2_* env vars are set.
+        // Persistence: iroh cold tier (IrohBlockStore) if KOTOBA_STORE_PATH is set; remote pin via kotobase.
         // All KSE components (Journal, Vault, SecureVault) share the same store.
         let store_path: Option<String> = std::env::var("KOTOBA_STORE_PATH").ok();
 
@@ -154,11 +154,33 @@ impl KotobaState {
                 kotoba_store::MemoryBlockStore::new(),
                 hot_cache_bytes,
             );
-            tracing::info!(
-                hot_cache_mib = hot_cache_bytes / (1024 * 1024),
-                "BlockStore: BudgetedBlockStore<MemoryBlockStore> hot cache"
-            );
-            Arc::new(hot)
+            if let Some(ref path) = store_path {
+                let iroh_path = format!("{path}-iroh");
+                match kotoba_store::IrohBlockStore::open(&iroh_path) {
+                    Ok(cold) => {
+                        tracing::info!(
+                            hot_cache_mib = hot_cache_bytes / (1024 * 1024),
+                            iroh_path = %iroh_path,
+                            "BlockStore: TieredBlockStore<BudgetedMemory, IrohFs> — IPFS persistence enabled"
+                        );
+                        Arc::new(kotoba_store::TieredBlockStore::new(hot, cold))
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, iroh_path = %iroh_path, "IrohBlockStore::open failed — falling back to memory-only hot cache");
+                        tracing::info!(
+                            hot_cache_mib = hot_cache_bytes / (1024 * 1024),
+                            "BlockStore: BudgetedBlockStore<MemoryBlockStore> hot cache (fallback)"
+                        );
+                        Arc::new(hot)
+                    }
+                }
+            } else {
+                tracing::info!(
+                    hot_cache_mib = hot_cache_bytes / (1024 * 1024),
+                    "BlockStore: BudgetedBlockStore<MemoryBlockStore> hot cache (no KOTOBA_STORE_PATH)"
+                );
+                Arc::new(hot)
+            }
         };
 
         // Journal — Merkle WAL backed by block_store; head pointer in a sibling JSON file.
@@ -211,10 +233,10 @@ impl KotobaState {
         };
         let udf = Arc::new(UdfExecutor::new()?);
 
-        // IPFS Pinning Service client (E) — optional, no daemon required
-        let ipfs_pin = IpfsPinClient::from_env();
-        if ipfs_pin.is_some() {
-            tracing::info!("IPFS pinning enabled (KOTOBA_IPFS_PIN_ENDPOINT)");
+        // kotobase.gftd.ai pin client — optional; requires KOTOBA_PIN_TOKEN
+        let kotobase_pin = KotobasePinClient::from_env();
+        if kotobase_pin.is_some() {
+            tracing::info!("kotobase pinning enabled (KOTOBA_PIN_TOKEN)");
         }
 
         // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path
@@ -284,7 +306,7 @@ impl KotobaState {
             inference_engine,
             block_store,
             quad_store,
-            ipfs_pin,
+            kotobase_pin,
             secure_vault,
             crypto:            None,
             kse_store,

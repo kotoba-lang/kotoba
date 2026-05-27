@@ -170,9 +170,7 @@ pub fn extract_block(car: &[u8], abs_offset: u64, data_len: u32) -> Result<Bytes
 // ─── CarBlockIndex ────────────────────────────────────────────────────────────
 
 /// In-memory index: maps CID → (car_key, abs_offset, data_len).
-/// `car_key` is the S3/B2 object key for the CAR file (= commit CID multibase).
-///
-/// In production this would be backed by sled for persistence across restarts.
+/// `car_key` is the kotobase/IPFS CAR object key (= commit CID multibase).
 #[derive(Default)]
 pub struct CarBlockIndex {
     entries: HashMap<KotobaCid, (String, u64, u32)>,

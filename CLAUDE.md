@@ -25,7 +25,7 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 | kotoba-runtime | WASM Component Model host: WasmExecutor + UdfExecutor + WIT bindings |
 | kotoba-ingest | Gmail OAuth2 poll + RFC 2822 parse + E2E encrypt → QuadStore (ADR-2605252400); **EmailIngestor** now uses `Arc<dyn AgentCrypto>` + `Arc<Vault>` (raw vault_key removed 2026-05-26) |
 | kotoba-server | XRPC / MCP endpoints |
-| kotoba-store | BlockStore implementations: Memory, Sled, S3; BudgetedBlockStore<S> LRU eviction; TieredBlockStore<H,C> hot/cold tiering; IrohBlockStore (feature=iroh-cold, iroh-blobs 0.30); **CapturingBlockStore** (pass-through + recorder for CAR bundling); **CarBundleWriter / CarBlockIndex** (Hummock SST 相当: N blocks → single S3 PUT, 3.8 GiB/s serialize) |
+| kotoba-store | BlockStore implementations: Memory (hot); IrohBlockStore (iroh-blobs 0.30, sole cold tier); BudgetedBlockStore<S> LRU eviction; TieredBlockStore<H,C> hot/cold tiering; **CapturingBlockStore** (pass-through + recorder for CAR bundling); **CarBundleWriter / CarBlockIndex** (CARv1 format: 72B header + blocks + 48B/entry index, 3.8 GiB/s serialize); **KotobasePinClient** (kotobase.gftd.ai XRPC pin client). S3BlockStore + LayeredBlockStore removed 2026-05-27. |
 | kotoba-store-web | Browser IndexedDB block store (wasm32), AsyncBlockStore trait |
 
 ## 実装順序
@@ -173,14 +173,19 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
 
 ## TieredBlockStore / IrohBlockStore
 
-- `TieredBlockStore<H, C>`: hot (Sled/Budgeted) + cold (iroh/S3) の 2 層
+- `TieredBlockStore<H, C>`: hot (BudgetedBlockStore<MemoryBlockStore>) + cold (IrohBlockStore) の 2 層
   - put: hot に即時書き込み + cold に `tokio::spawn` fire-and-forget
   - get: hot ヒット → 即返却; hot miss → cold fetch + hot promote
   - pin/unpin: hot 層に委譲 (SyncWindow compatible)
-- `IrohBlockStore` (feature=`iroh-cold`): iroh-blobs 0.30 の in-process store
+- `IrohBlockStore`: iroh-blobs 0.30 の in-process store (常時コンパイル、feature gate 廃止)
   - `blake3 CIDv1 hash = cid.0[4..36]` → `iroh_blobs::Hash`
-  - daemon 不要、Kubo 不使用
+  - daemon 不要、Kubo 不使用; `open(path)` で FsStore (永続), `new()` で MemStore (テスト)
   - sync BlockStore は `tokio::task::block_in_place` でブリッジ
+- `KotobasePinClient`: kotobase.gftd.ai XRPC pin client
+  - `KOTOBA_PIN_TOKEN` (Bearer JWT) + `KOTOBA_PIN_ENDPOINT` (default `https://kotobase.gftd.ai`)
+  - `pin(cid)` → `POST /xrpc/ai.gftd.apps.kotobase.pin.create` (fire-and-forget)
+  - `status(cid)` → `GET /xrpc/ai.gftd.apps.kotobase.pin.list?cid=...`
+  - `unpin(cid)` → `POST /xrpc/ai.gftd.apps.kotobase.pin.delete`
 
 ## criterion ベンチマーク
 

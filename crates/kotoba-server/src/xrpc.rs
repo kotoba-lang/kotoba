@@ -721,7 +721,7 @@ pub async fn block_put(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Fire-and-forget IPFS pin (E) — no-op if KOTOBA_IPFS_PIN_ENDPOINT not set
-    if let Some(pin) = &state.ipfs_pin {
+    if let Some(pin) = &state.kotobase_pin {
         let pin  = std::sync::Arc::clone(pin);
         let cid_str = cid.to_multibase();
         tokio::spawn(async move { pin.pin(&cid_str).await });
@@ -861,7 +861,7 @@ pub async fn commit_store(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if let Some(pin) = state.ipfs_pin.clone() {
+    if let Some(pin) = state.kotobase_pin.clone() {
         let cid_str = cid.to_multibase();
         tokio::spawn(async move { pin.pin(&cid_str).await });
     }
@@ -1061,7 +1061,7 @@ pub async fn weight_put(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // 2. IPFS pin the tensor blob
-    if let Some(pin) = &state.ipfs_pin {
+    if let Some(pin) = &state.kotobase_pin {
         let pin  = std::sync::Arc::clone(pin);
         let cs   = blob_cid.to_multibase();
         tokio::spawn(async move { pin.pin(&cs).await });
@@ -1625,7 +1625,7 @@ pub async fn agent_run(
         .map(|c| c.to_multibase());
 
     // If IPFS pinning is enabled, pin the commit block in the background
-    if let (Some(cid_str), Some(pin)) = (commit_cid.clone(), state.ipfs_pin.clone()) {
+    if let (Some(cid_str), Some(pin)) = (commit_cid.clone(), state.kotobase_pin.clone()) {
         tokio::spawn(async move { pin.pin(&cid_str).await });
     }
 

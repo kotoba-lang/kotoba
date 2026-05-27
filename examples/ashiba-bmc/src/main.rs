@@ -3,7 +3,7 @@
 //! This example encodes the ashiba Lean BMC as kotoba Quads, then runs
 //! a DatalogProgram to compute coverage % and per-block maturity scores.
 //!
-//! Data source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v1.toml`
+//! Data source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v3.toml`
 //! Rules source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/coverage.dl`
 
 use anyhow::Result;
@@ -21,15 +21,15 @@ use std::sync::Arc;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BMC_BLOCKS: &[(&str, i64)] = &[
-    ("problem",           2),
-    ("customer_segments", 2),
-    ("uvp",               2),
-    ("solution",          2),
-    ("channels",          2),
-    ("revenue",           3),
-    ("cost_structure",    2),
-    ("key_metrics",       3),
-    ("unfair_advantage",  1),
+    ("problem",           4),
+    ("customer_segments", 4),
+    ("uvp",               4),
+    ("solution",          4),
+    ("channels",          4),
+    ("revenue",           4),
+    ("cost_structure",    4),
+    ("key_metrics",       4),
+    ("unfair_advantage",  4),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
 
 fn cid(s: &str) -> KotobaCid { KotobaCid::from_bytes(s.as_bytes()) }
 
-fn graph_cid() -> KotobaCid { cid("bmc:ashiba:v1") }
+fn graph_cid() -> KotobaCid { cid("bmc:ashiba:v3") }
 
 fn quad(subject: &str, predicate: &str, object: QuadObject) -> Quad {
     Quad { graph: graph_cid(), subject: cid(subject), predicate: predicate.to_string(), object }
@@ -67,7 +67,7 @@ fn build_bmc_facts() -> Vec<Delta> {
 
     // bmc root
     deltas.push(Delta::assert(quad(
-        "bmc:ashiba", "bmc/version", QuadObject::Text("v1".into()),
+        "bmc:ashiba", "bmc/version", QuadObject::Text("v3".into()),
     )));
     deltas.push(Delta::assert(quad(
         "bmc:ashiba", "bmc/product", QuadObject::Text("ashiba.gftd.ai".into()),
@@ -212,7 +212,7 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║     ashiba.gftd.ai Lean BMC — kotoba Scoring Report      ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Iteration : 1  (2026-05-27)                             ║");
+    println!("║  Iteration : 3  (2026-05-27)                             ║");
     println!("║  Model     : Lean Canvas Hybrid (9 blocks)               ║");
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Coverage  : {derived_covered}/{total} blocks = {coverage_pct}%                       ║");
@@ -237,11 +237,11 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     println!("║    2. 問題の深刻度 (3日超調達率 > 60%)                   ║");
     println!("║    3. Take rate 受容性 (6% @ both sides)                 ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Next Iteration (iter-2) Goals: maturity → 3.0           ║");
-    println!("║    · 供給側 20社インタビュー → 遊休在庫率データ          ║");
-    println!("║    · 需要側 20社インタビュー → 調達リードタイム          ║");
-    println!("║    · LP 3パターン A/Bテスト → UVP バリデーション         ║");
-    println!("║    · 仮設工業会 勉強会登壇申込                           ║");
+    println!("║  Next Iteration (iter-4) Goals: maturity → 5.0           ║");
+    println!("║    · 需要側 20社インタビュー全完了 → p1 統計確定         ║");
+    println!("║    · LP A/B n=500達成 → 勝者 variant 確定               ║");
+    println!("║    · Concierge MVP 月20件達成 → NPS >= 8 validated       ║");
+    println!("║    · 供給側 pre-commitment 10社達成 → cold-start 解消    ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 }
 
