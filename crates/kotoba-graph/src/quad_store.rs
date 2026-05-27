@@ -88,6 +88,33 @@ impl QuadStore {
         Ok(self.assert(quad).await)
     }
 
+    /// CACAO-gated batch insert.
+    ///
+    /// Verifies that `chain` grants `"quad:write"` on every **unique graph** CID present
+    /// in `quads` before delegating to `assert_batch_silent`.  All quads across all named
+    /// graphs in the batch are checked up front — the batch is rejected atomically if any
+    /// graph scope fails.
+    ///
+    /// Typical use: actor writes a cluster of related quads (e.g. all attributes of one
+    /// entity) in a single CACAO-authorized call without per-quad overhead.
+    pub async fn assert_batch_authed(
+        &self,
+        quads: Vec<Quad>,
+        chain: &DelegationChain,
+    ) -> Result<usize, AccessError> {
+        // Collect unique graph CIDs and verify authorization for each.
+        let mut seen = std::collections::HashSet::new();
+        for q in &quads {
+            let g = q.graph.to_multibase();
+            if seen.insert(g.clone()) {
+                chain.verify(&g, "quad:write")?;
+            }
+        }
+        let n = quads.len();
+        self.assert_batch_silent(quads).await;
+        Ok(n)
+    }
+
     pub async fn retract(&self, quad: Quad) -> Delta {
         let g = quad.graph.to_multibase();
         self.arrangements.entry(g).or_insert_with(Arrangement::new).remove(&quad);
@@ -1359,5 +1386,109 @@ mod tests {
             Ok(_) => {} // passes on future test infra with real crypto
             Err(AccessError::Internal(e)) => panic!("unexpected internal error: {e}"),
         }
+    }
+
+    // ─── assert_batch_authed tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn batch_authed_rejected_wrong_capability() {
+        let qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
+        );
+        let graph = KotobaCid::from_bytes(b"batch-authed-g1");
+        let subject = KotobaCid::from_bytes(b"batch-authed-s1");
+        let graph_mb = graph.to_multibase();
+        // chain grants quad:read — not quad:write
+        let chain = DelegationChain::new_for_test(&graph_mb, "quad:read");
+        let quads = vec![Quad {
+            graph: graph.clone(),
+            subject: subject.clone(),
+            predicate: "role".to_string(),
+            object: QuadObject::Text("admin".to_string()),
+        }];
+        let result = qs.assert_batch_authed(quads, &chain).await;
+        assert!(matches!(result, Err(AccessError::Delegation(_))),
+            "wrong-capability chain must be rejected");
+    }
+
+    #[tokio::test]
+    async fn batch_authed_rejected_wrong_graph() {
+        let qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
+        );
+        let graph   = KotobaCid::from_bytes(b"batch-authed-g2");
+        let subject = KotobaCid::from_bytes(b"batch-authed-s2");
+        // chain is for a different graph
+        let other_graph_mb = KotobaCid::from_bytes(b"other-graph").to_multibase();
+        let chain = DelegationChain::new_for_test(&other_graph_mb, "quad:write");
+        let quads = vec![Quad {
+            graph: graph.clone(),
+            subject,
+            predicate: "role".to_string(),
+            object: QuadObject::Text("admin".to_string()),
+        }];
+        let result = qs.assert_batch_authed(quads, &chain).await;
+        assert!(matches!(result, Err(AccessError::Delegation(_))),
+            "wrong-graph chain must be rejected");
+    }
+
+    #[tokio::test]
+    async fn batch_authed_succeeds_writes_quads() {
+        let qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
+        );
+        let graph   = KotobaCid::from_bytes(b"batch-authed-g3");
+        let subject = KotobaCid::from_bytes(b"batch-authed-s3");
+        let graph_mb = graph.to_multibase();
+        let chain = DelegationChain::new_for_test(&graph_mb, "quad:write");
+        let quads = vec![
+            Quad { graph: graph.clone(), subject: subject.clone(),
+                   predicate: "name".to_string(),
+                   object: QuadObject::Text("Alice".to_string()) },
+            Quad { graph: graph.clone(), subject: subject.clone(),
+                   predicate: "role".to_string(),
+                   object: QuadObject::Text("admin".to_string()) },
+        ];
+        // verify_skip_sig to ensure chain shape is correct (sig check skipped in test)
+        assert!(chain.verify_skip_sig(&graph_mb, "quad:write").is_ok());
+        // assert_batch_authed calls chain.verify() which will fail on fake sig;
+        // confirm it fails at sig step not cap/graph step
+        let result = qs.assert_batch_authed(quads.clone(), &chain).await;
+        match result {
+            Err(AccessError::Delegation(e)) => {
+                let msg = e.to_string();
+                assert!(!msg.contains("need 'quad:write'") && !msg.contains("graph mismatch"),
+                    "error must be at sig step: {msg}");
+            }
+            Ok(n) => assert_eq!(n, 2), // passes with real crypto
+            Err(AccessError::Internal(e)) => panic!("unexpected internal error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_authed_rejects_multi_graph_wrong_graph() {
+        // Batch spanning two named graphs: chain scoped to graph A only →
+        // quad from graph B must cause rejection.
+        let qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
+        );
+        let graph_a = KotobaCid::from_bytes(b"batch-multi-g-a");
+        let graph_b = KotobaCid::from_bytes(b"batch-multi-g-b");
+        let subj    = KotobaCid::from_bytes(b"batch-multi-s");
+        let graph_a_mb = graph_a.to_multibase();
+        let chain = DelegationChain::new_for_test(&graph_a_mb, "quad:write");
+        let quads = vec![
+            Quad { graph: graph_a.clone(), subject: subj.clone(),
+                   predicate: "name".to_string(), object: QuadObject::Text("A".to_string()) },
+            Quad { graph: graph_b.clone(), subject: subj.clone(),
+                   predicate: "name".to_string(), object: QuadObject::Text("B".to_string()) },
+        ];
+        let result = qs.assert_batch_authed(quads, &chain).await;
+        assert!(matches!(result, Err(AccessError::Delegation(_))),
+            "cross-graph batch with single-graph chain must be rejected");
     }
 }

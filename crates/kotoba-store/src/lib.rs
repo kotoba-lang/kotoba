@@ -6,6 +6,7 @@ pub mod ipfs_pin;
 pub mod budgeted_store;
 pub mod tiered_store;
 pub mod kubo_store;
+pub mod distributed_store;
 
 pub use block_store::{BlockStore, StoreError, put_verified};
 pub use capturing_store::CapturingBlockStore;
@@ -14,4 +15,5 @@ pub use ipfs_pin::IpfsPinClient;
 pub use budgeted_store::BudgetedBlockStore;
 pub use tiered_store::TieredBlockStore;
 pub use kubo_store::KuboBlockStore;
+pub use distributed_store::DistributedBlockStore;
 pub use car_bundle::{CarBundleWriter, CarBlockIndex, parse_index, extract_block};
