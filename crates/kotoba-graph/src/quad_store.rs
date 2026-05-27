@@ -703,6 +703,117 @@ impl QuadStore {
                 Ok(results)
             }
 
+            // ── Extend (aggregate variable rename: internal UUID → user var name) ──
+            // GROUP BY aggregates use an internal UUID variable; Extend maps it to the
+            // user-declared name.  We execute the inner pattern then rename predicates.
+            GraphPattern::Extend { inner, variable, expression } => {
+                let quads = Box::pin(self.execute_sparql_graph_pattern(graph_cid, inner)).await?;
+                let from_name = if let spargebra::algebra::Expression::Variable(v) = expression {
+                    v.as_str().to_string()
+                } else {
+                    return Ok(quads);
+                };
+                let to_name = variable.as_str().to_string();
+                Ok(quads.into_iter().map(|mut q| {
+                    if q.predicate == from_name { q.predicate = to_name.clone(); }
+                    q
+                }).collect())
+            }
+
+            // ── Join (inner join by shared subject) ─────────────────────────────
+            // Execute both sub-patterns (stripping any Project wrapper), then keep
+            // quads whose subject appears in both result sets.
+            GraphPattern::Join { left, right } => {
+                let left_inner  = unwrap_bgp_pattern(*left.clone());
+                let right_inner = unwrap_bgp_pattern(*right.clone());
+                let left_quads  = Box::pin(self.execute_sparql_graph_pattern(graph_cid, &left_inner)).await?;
+                let right_quads = Box::pin(self.execute_sparql_graph_pattern(graph_cid, &right_inner)).await?;
+                let left_subjects: std::collections::HashSet<String> =
+                    left_quads.iter().map(|q| q.subject.to_multibase()).collect();
+                let right_subjects: std::collections::HashSet<String> =
+                    right_quads.iter().map(|q| q.subject.to_multibase()).collect();
+                // Inner join: both sides must have the subject
+                let shared: std::collections::HashSet<&String> =
+                    left_subjects.intersection(&right_subjects).collect();
+                let mut results = Vec::new();
+                for q in left_quads.into_iter().chain(right_quads) {
+                    if shared.contains(&q.subject.to_multibase())
+                        && !results.iter().any(|r| quad_eq(r, &q))
+                    {
+                        results.push(q);
+                    }
+                }
+                Ok(results)
+            }
+
+            // ── GROUP BY + COUNT aggregate ────────────────────────────────────────
+            // Execute inner pattern; group quads by their object text value
+            // (or into one global group when GROUP BY has no variables);
+            // return one synthetic Quad per group:
+            //   subject = CID(group_key_bytes), predicate = agg_var_name, object = Text(count)
+            GraphPattern::Group { inner, variables, aggregates } => {
+                let quads = Box::pin(self.execute_sparql_graph_pattern(graph_cid, inner)).await?;
+                let agg_var = aggregates.first().map(|(v, _)| v.as_str()).unwrap_or("count");
+                let agg_expr = aggregates.first().map(|(_, e)| e);
+
+                // When GROUP BY has no variables, all rows form one global group
+                let mut groups: std::collections::HashMap<String, Vec<&Quad>> =
+                    std::collections::HashMap::new();
+                let global_group = variables.is_empty();
+                for q in &quads {
+                    let key = if global_group {
+                        "*".to_string()
+                    } else { match &q.object {
+                        kotoba_kqe::quad::QuadObject::Text(t)    => t.clone(),
+                        kotoba_kqe::quad::QuadObject::Cid(c)     => c.to_multibase(),
+                        kotoba_kqe::quad::QuadObject::Integer(i) => i.to_string(),
+                        kotoba_kqe::quad::QuadObject::Float(f)   => format!("{f}"),
+                        kotoba_kqe::quad::QuadObject::Bool(b)    => b.to_string(),
+                        kotoba_kqe::quad::QuadObject::Bytes(v)       => format!("bytes:{}", v.len()),
+                        kotoba_kqe::quad::QuadObject::VectorF32(v)           => format!("vec:{}", v.len()),
+                        kotoba_kqe::quad::QuadObject::TensorCid { cid, .. }  => cid.to_multibase(),
+                        kotoba_kqe::quad::QuadObject::Encrypted { ct_cid, .. } => ct_cid.to_multibase(),
+                    } };
+                    groups.entry(key).or_default().push(q);
+                }
+
+                let mut results = Vec::new();
+                for (key, members) in groups {
+                    use spargebra::algebra::{AggregateExpression, AggregateFunction};
+                    let agg_val = match agg_expr {
+                        Some(AggregateExpression::CountSolutions { .. }) => members.len() as u64,
+                        Some(AggregateExpression::FunctionCall {
+                            name: AggregateFunction::Count, ..
+                        }) => members.len() as u64,
+                        Some(AggregateExpression::FunctionCall {
+                            name: AggregateFunction::Sum, expr, ..
+                        }) => {
+                            let var_name = extract_var_name_from_expr(expr);
+                            members.iter().filter_map(|q| {
+                                let _ = &var_name;
+                                if let kotoba_kqe::quad::QuadObject::Text(t) = &q.object {
+                                    t.parse::<u64>().ok()
+                                } else { None }
+                            }).sum()
+                        }
+                        _ => members.len() as u64,
+                    };
+                    results.push(Quad {
+                        graph:     graph_cid.clone(),
+                        subject:   KotobaCid::from_bytes(key.as_bytes()),
+                        predicate: agg_var.to_string(),
+                        object:    kotoba_kqe::quad::QuadObject::Text(agg_val.to_string()),
+                    });
+                }
+                // Sort by count descending for stable output
+                results.sort_by(|a, b| {
+                    let va = if let kotoba_kqe::quad::QuadObject::Text(t) = &a.object { t.parse::<u64>().unwrap_or(0) } else { 0 };
+                    let vb = if let kotoba_kqe::quad::QuadObject::Text(t) = &b.object { t.parse::<u64>().unwrap_or(0) } else { 0 };
+                    vb.cmp(&va)
+                });
+                Ok(results)
+            }
+
             // ── Property Path (pred+, pred*, pred/pred2) ─────────────────────────
             // ?s <pred>+ ?o  → BFS: collect all CID objects reachable via <pred>
             // ?s <pred>* ?o  → BFS including ?s itself (ZeroOrMore)
@@ -1332,6 +1443,7 @@ fn unwrap_bgp_pattern(pattern: spargebra::algebra::GraphPattern) -> spargebra::a
         GraphPattern::Project { inner, .. }  => unwrap_bgp_pattern(*inner),
         GraphPattern::Distinct { inner }     => unwrap_bgp_pattern(*inner),
         GraphPattern::Reduced  { inner }     => unwrap_bgp_pattern(*inner),
+        // Preserve Extend so execute_sparql_graph_pattern can rename aggregate vars
         other => other,
     }
 }
@@ -1445,8 +1557,9 @@ fn sparql_pattern_name(pattern: &spargebra::algebra::GraphPattern) -> &'static s
         GraphPattern::LeftJoin { .. }  => "LeftJoin",
         GraphPattern::Filter { .. }    => "Filter",
         GraphPattern::Union { .. }     => "Union",
-        GraphPattern::Graph { .. }     => "Graph",
+        GraphPattern::Group { .. }     => "Group",
         GraphPattern::Extend { .. }    => "Extend",
+        GraphPattern::Graph { .. }     => "Graph",
         GraphPattern::Minus { .. }     => "Minus",
         GraphPattern::Values { .. }    => "Values",
         GraphPattern::OrderBy { .. }   => "OrderBy",
@@ -1454,8 +1567,17 @@ fn sparql_pattern_name(pattern: &spargebra::algebra::GraphPattern) -> &'static s
         GraphPattern::Distinct { .. }  => "Distinct",
         GraphPattern::Reduced { .. }   => "Reduced",
         GraphPattern::Slice { .. }     => "Slice",
-        GraphPattern::Group { .. }     => "Group",
+        GraphPattern::Path { .. }      => "Path",
         _ => "Unknown",
+    }
+}
+
+/// Extract a variable name string from an aggregate `expr` argument.
+fn extract_var_name_from_expr(expr: &spargebra::algebra::Expression) -> Option<&str> {
+    if let spargebra::algebra::Expression::Variable(v) = expr {
+        Some(v.as_str())
+    } else {
+        None
     }
 }
 
@@ -2267,6 +2389,64 @@ mod tests {
         let quads = result.unwrap();
         // Alice has name + role + knows = 3 quads
         assert!(!quads.is_empty(), "Alice's quads must be returned");
+    }
+
+    // ─── SPARQL JOIN ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sparql_bgp_explicit_join_subquery() {
+        // spargebra emits a Join node when two subqueries are combined.
+        // { SELECT ?s WHERE { ?s <name> ?n } } JOIN { SELECT ?s WHERE { ?s <role> "admin" } }
+        // → subjects in both = Alice + Carol; Bob appears only in role(user), not in admin
+        let (qs, graph) = setup_sparql_qs().await;
+        let quads = qs.cold_query_sparql_bgp(
+            &graph,
+            r#"SELECT * WHERE { { SELECT ?s WHERE { ?s <name> ?n } } { SELECT ?s WHERE { ?s <role> "admin" } } }"#,
+        ).await.unwrap();
+        // Inner join: subjects must appear on both sides (Alice + Carol = admins with names)
+        // Left: name quads for Alice + Carol + Bob (3); Right: role=admin for Alice+Carol (2)
+        // Shared subjects: Alice + Carol → left(Alice-name + Carol-name) + right(Alice-role + Carol-role) = 4 quads
+        let subjects: std::collections::HashSet<String> =
+            quads.iter().map(|q| q.subject.to_multibase()).collect();
+        let bob_mb = KotobaCid::from_bytes(b"bob").to_multibase();
+        assert!(!subjects.contains(&bob_mb), "Bob is not admin — excluded by inner join");
+        assert!(subjects.len() == 2, "Alice and Carol are the only shared subjects");
+    }
+
+    #[tokio::test]
+    async fn sparql_aggregate_count_by_role() {
+        // SELECT ?r (COUNT(*) AS ?n) WHERE { ?s <role> ?r } GROUP BY ?r
+        // Expects: admin→2, user→1
+        let (qs, graph) = setup_sparql_qs().await;
+        let quads = qs.cold_query_sparql_bgp(
+            &graph,
+            "SELECT ?r (COUNT(*) AS ?n) WHERE { ?s <role> ?r } GROUP BY ?r",
+        ).await.unwrap();
+        assert_eq!(quads.len(), 2, "two distinct role groups expected, got {}", quads.len());
+        // Sorted descending by count: admin (2) first, user (1) second
+        let counts: Vec<String> = quads.iter().filter_map(|q| {
+            if let QuadObject::Text(t) = &q.object { Some(t.clone()) } else { None }
+        }).collect();
+        assert_eq!(counts[0], "2", "admin group has 2 members");
+        assert_eq!(counts[1], "1", "user group has 1 member");
+        // Predicate is the aggregate variable name
+        assert!(quads.iter().all(|q| q.predicate == "n"), "predicate = agg var 'n'");
+    }
+
+    #[tokio::test]
+    async fn sparql_aggregate_count_all() {
+        // SELECT (COUNT(*) AS ?total) WHERE { ?s <role> ?r }
+        // Expects: one group with count=3 (no GROUP BY = single global aggregate)
+        let (qs, graph) = setup_sparql_qs().await;
+        let quads = qs.cold_query_sparql_bgp(
+            &graph,
+            "SELECT (COUNT(*) AS ?total) WHERE { ?s <role> ?r }",
+        ).await.unwrap();
+        // Without GROUP BY spargebra emits a single empty-variables Group
+        // All 3 role quads go into one group → count = 3
+        assert_eq!(quads.len(), 1, "one global aggregate row expected, got {}", quads.len());
+        let count_val = if let QuadObject::Text(t) = &quads[0].object { t.clone() } else { "?".into() };
+        assert_eq!(count_val, "3", "3 role quads total");
     }
 
     // ─── SPARQL FILTER / UNION / OPTIONAL ────────────────────────────────────
