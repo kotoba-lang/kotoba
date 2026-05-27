@@ -3,7 +3,7 @@
 //! This example encodes the ashiba Lean BMC as kotoba Quads, then runs
 //! a DatalogProgram to compute coverage % and per-block maturity scores.
 //!
-//! Data source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v9.toml`
+//! Data source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v13.toml`
 //! Rules source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/coverage.dl`
 
 use anyhow::Result;
@@ -22,12 +22,12 @@ use std::sync::Arc;
 
 const BMC_BLOCKS: &[(&str, i64)] = &[
     ("problem",           5),
-    ("customer_segments", 4),
+    ("customer_segments", 5),
     ("uvp",               5),
     ("solution",          4),
-    ("channels",          5),
-    ("revenue",           5),
-    ("cost_structure",    4),
+    ("channels",          4),
+    ("revenue",           4),
+    ("cost_structure",    3),
     ("key_metrics",       4),
     ("unfair_advantage",  5),
 ];
@@ -37,23 +37,46 @@ const BMC_BLOCKS: &[(&str, i64)] = &[
 // ─────────────────────────────────────────────────────────────────────────────
 
 const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
-    ("p_national",    "problem",           "全国ペイン普遍的 (stable)", true),
-    ("cs_scale1",     "customer_segments", "全国 供給 500社 (174社達成中)", false),
-    ("cs_enterprise", "customer_segments", "ゼネコン POC 2社 kick-off", false),
-    ("uvp_v2_ai",     "uvp",               "v2 AI beta 成約率 94.1% (A/B validated)", true),
-    ("uvp_network",   "uvp",               "全国最大在庫 174社 = 競合 6.2倍", true),
-    ("sol_v2_dev",    "solution",          "v2 本番 rollout 2026-08-01 (実装 80%)", false),
-    ("sol_enterprise","solution",          "Enterprise API 竹中 POC 稼働中", false),
-    ("ch_national",   "channels",          "全国 3拠点 launch 71社 CAC ¥5,800", true),
-    ("ch_seo_scale",  "channels",          "SEO organic 2,000+/月 (Month 9)", false),
-    ("r_gmv_scale",   "revenue",           "GMV ¥28M (+76% MoM) → ¥50M 軌道", false),
-    ("r_enterprise",  "revenue",           "Enterprise ¥80K/月 竹中見積提出中", false),
-    ("cs_series_a",   "cost_structure",    "Series A deck 完成 / VC 3社 pitch scheduled", false),
-    ("cs_team",       "cost_structure",    "エンジニア 4名採用完了 / BizDev 2名内定", false),
-    ("km_nrr",        "key_metrics",       "NRR 118% (目標 120% まで +2pt)", false),
-    ("km_d180",       "key_metrics",       "D120 38.4% → D180 > 35% 外挿 on-track", false),
-    ("ua_did_moat",   "unfair_advantage",  "DID 2,341件 相関 0.77 蓄積加速", true),
-    ("ua_association","unfair_advantage",  "工業会正式認定 + 安全点検 API 独占", true),
+    // problem
+    ("p_domestic",       "problem",           "国内ペイン普遍的 (stable)", true),
+    ("p_korea_taiwan",   "problem",           "韓国+台湾 同一ペイン 91% (n=30社) stable", true),
+    ("p_sea_survey",     "problem",           "東南アジア 同一ペイン調査 → IPO TAM 拡張", false),
+    // customer_segments
+    ("cs_enterprise5",   "customer_segments", "ゼネコン 5社 Enterprise ARR ¥5.4M stable", true),
+    ("cs_korea_pilot",   "customer_segments", "韓국 22社 pilot 2027-03-01 正式開始", true),
+    ("cs_taiwan_pipe",   "customer_segments", "台湾 10社 pipeline → 2027-Q3 pilot", false),
+    // uvp
+    ("uvp_v3_live",      "uvp",               "v3 AI 本番稼働 2027-02-01 精度 88.3%", true),
+    ("uvp_jis_mandatory","uvp",               "JIS A 8951:2026 義務化 仕様権保有 stable", true),
+    ("uvp_korea_std",    "uvp",               "韓国 KS F 改訂 → ashiba API 義務化仮説", false),
+    // solution
+    ("sol_v3_live",      "solution",          "v3 AI 本番稼働 + 成約率 97.8%", true),
+    ("sol_korea_stable", "solution",          "韓국 API 本番 SLA 99.7% 安定稼働", true),
+    ("sol_taiwan_api",   "solution",          "台湾版 API TWD 決済 設計中", false),
+    ("sol_v4_video",     "solution",          "v4 AI 動画 → 施工品質 audit PoC", false),
+    // channels
+    ("ch_korea_full",    "channels",          "韓国 현대건설 full expansion 22→100社 2027-Q4", true),
+    ("ch_seo_2000",      "channels",          "SEO organic 2,047/月 Month 9 達成", true),
+    ("ch_taiwan_partner","channels",          "台湾 BizDev パートナー 1社 2027-Q3", false),
+    ("ch_sea_explore",   "channels",          "タイ BizDev 初期探索 (IPO TAM 用)", false),
+    // revenue
+    ("r_gmv_100m",       "revenue",           "GMV ¥100M/月 Month 12 (2027-Q1) 達成仮説", false),
+    ("r_enterprise_756", "revenue",           "Enterprise ARR ¥7.56M stable", true),
+    ("r_korea_gmv",      "revenue",           "韓国 pilot GMV ¥8M/月 2027-Q2 寄与仮説", false),
+    ("r_enterprise_12m", "revenue",           "Enterprise ARR ¥12M (8社, 2027-Q4)", false),
+    // cost_structure
+    ("cs_korea_stable",  "cost_structure",    "주식회사 아시바코리아 5名 安定稼働", true),
+    ("cs_auditor",       "cost_structure",    "IPO 監査法人 Big4 契約 2027-Q4", false),
+    ("cs_underwriter",   "cost_structure",    "IPO 主幹事証券 選定 2027-Q4", false),
+    ("cs_team_45",       "cost_structure",    "45名体制 + 台湾 5名 runway 24ヶ月", false),
+    // key_metrics
+    ("km_nrr_128",       "key_metrics",       "NRR 128% stable", true),
+    ("km_d365",          "key_metrics",       "D365 実測 > 30% (2027-05-01)", false),
+    ("km_ipo_kpi",       "key_metrics",       "IPO KPI ダッシュボード 監査法人 承認", false),
+    // unfair_advantage
+    ("ua_jis_mandatory", "unfair_advantage",  "JIS 義務化 仕様権保有 参入コスト ∞ stable", true),
+    ("ua_did_4800",      "unfair_advantage",  "DID 4,800件 相関 0.81 + 韓국 DID 加速", true),
+    ("ua_v3_ip",         "unfair_advantage",  "v3 AI 特許出願 日本+韓国+PCT 2027-Q2", false),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,7 +85,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
 
 fn cid(s: &str) -> KotobaCid { KotobaCid::from_bytes(s.as_bytes()) }
 
-fn graph_cid() -> KotobaCid { cid("bmc:ashiba:v9") }
+fn graph_cid() -> KotobaCid { cid("bmc:ashiba:v13") }
 
 fn quad(subject: &str, predicate: &str, object: QuadObject) -> Quad {
     Quad { graph: graph_cid(), subject: cid(subject), predicate: predicate.to_string(), object }
@@ -77,7 +100,7 @@ fn build_bmc_facts() -> Vec<Delta> {
 
     // bmc root
     deltas.push(Delta::assert(quad(
-        "bmc:ashiba", "bmc/version", QuadObject::Text("v9".into()),
+        "bmc:ashiba", "bmc/version", QuadObject::Text("v13".into()),
     )));
     deltas.push(Delta::assert(quad(
         "bmc:ashiba", "bmc/product", QuadObject::Text("ashiba.gftd.ai".into()),
@@ -222,7 +245,7 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║     ashiba.gftd.ai Lean BMC — kotoba Scoring Report      ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Iteration : 9  (2026-05-27) [Series A Phase — Month 2]  ║");
+    println!("║  Iteration : 13 (2026-05-27) [IPO 準備フェーズ Month 1] ║");
     println!("║  Model     : Lean Canvas Hybrid (9 blocks)               ║");
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Coverage  : {derived_covered}/{total} blocks = {coverage_pct}%                       ║");
@@ -243,18 +266,18 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     }
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Riskiest Assumptions (prioritised)                      ║");
-    println!("║    1. Series A close — グロービス/WiL/DCM term sheet     ║");
-    println!("║    2. NRR 120% — upsell 速度 vs churn (現 118%)          ║");
-    println!("║    3. ゼネコン Enterprise ¥80K — 稟議 3-6ヶ月            ║");
+    println!("║    1. GMV ¥100M/月 Month 12 — 韓국 pilot GMV 寄与が鍵   ║");
+    println!("║    2. 監査法人 + 主幹事 選定 (2027-Q4) — Big4 受諾確度  ║");
+    println!("║    3. D365 実測 > 30% (2027-05-01) — 初回実計測          ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  GMV ¥28M (+76%) / v2 AI 94.1% / DID 2,341件 / NRR 118% ║");
-    println!("║  全国 174社 / 3拠点 launch / Series A pitch 2026-07       ║");
+    println!("║  v3 live 88.3% / GMV ¥75M→¥100M / DID 4,800件 / NRR128%║");
+    println!("║  韓국 pilot 2027-03-01 / JIS 義務化 / ARR ¥7.56M→¥12M  ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Next (iter-10) → avg 5.0 (Series A VALIDATED)           ║");
-    println!("║    · Series A term sheet 1社以上取得                     ║");
-    println!("║    · v2 AI 本番 rollout (2026-08-01)                     ║");
-    println!("║    · NRR 120%+ 確認                                      ║");
-    println!("║    · ゼネコン Enterprise 1社契約 / GMV ¥40M 軌道         ║");
+    println!("║  IPO 準備フェーズ — 2028 上場 target                     ║");
+    println!("║    · GMV ¥100M/月 (Month 12 / 2027-Q1) 確認             ║");
+    println!("║    · 韓국 pilot → 本格展開 100社 (2027-Q4)              ║");
+    println!("║    · 台湾 pilot 開始 (2027-Q3)                          ║");
+    println!("║    · 監査法人 + 主幹事 選定 + IPO KPI 承認 (2027-Q4)    ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 }
 
