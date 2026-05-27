@@ -1235,6 +1235,49 @@ impl QuadStore {
                 Box::pin(self.execute_sparql_graph_pattern(graph_cid, inner)).await
             }
 
+            // ── SERVICE <iri> { … } — SPARQL 1.1 federated query ──────────────
+            //
+            // Service IRI forms recognised:
+            //   `<cid:mb>`              — graph CID, multibase-encoded
+            //   `kotoba://graph/<mb>`   — fully qualified graph URI
+            //   `kotoba://node/<did>`   — peer DID (not yet routed)
+            //
+            // The federation effect is implicit: blocks for the target graph
+            // CID are loaded via the configured BlockStore, which may itself be
+            // a DistributedBlockStore that pulls from remote IPFS peers.
+            //
+            // `silent=true` per SPARQL 1.1 spec swallows errors → returns empty.
+            GraphPattern::Service { name, inner, silent } => {
+                use spargebra::term::NamedNodePattern;
+                let iri = match name {
+                    NamedNodePattern::NamedNode(nn) => nn.as_str().to_string(),
+                    NamedNodePattern::Variable(_) => {
+                        if *silent { return Ok(Vec::new()); }
+                        anyhow::bail!("SERVICE ?var: variable service endpoint not supported");
+                    }
+                };
+                let stripped = iri.strip_prefix(SPARQL_BGP_BASE_IRI).unwrap_or(&iri);
+                let mb_opt: Option<String> = if let Some(rest) = stripped.strip_prefix("kotoba://graph/") {
+                    Some(rest.to_string())
+                } else if stripped.starts_with("kotoba://node/") {
+                    if *silent { return Ok(Vec::new()); }
+                    anyhow::bail!("SERVICE kotoba://node/<did>: peer-DID routing not yet implemented");
+                } else if let Some(rest) = stripped.strip_prefix("cid:") {
+                    Some(rest.to_string())
+                } else {
+                    Some(stripped.to_string())
+                };
+                match mb_opt.and_then(|mb| KotobaCid::from_multibase(&mb)) {
+                    Some(target_graph) => {
+                        Box::pin(self.execute_sparql_graph_pattern(&target_graph, inner)).await
+                    }
+                    None => {
+                        if *silent { Ok(Vec::new()) }
+                        else { anyhow::bail!("SERVICE: unrecognised service IRI: {iri}") }
+                    }
+                }
+            }
+
             other => anyhow::bail!(
                 "unsupported SPARQL pattern type: {}",
                 sparql_pattern_name(other)
@@ -2376,6 +2419,7 @@ fn sparql_pattern_name(pattern: &spargebra::algebra::GraphPattern) -> &'static s
         GraphPattern::Reduced { .. }   => "Reduced",
         GraphPattern::Slice { .. }     => "Slice",
         GraphPattern::Path { .. }      => "Path",
+        GraphPattern::Service { .. }   => "Service",
         _ => "Unknown",
     }
 }
@@ -4684,5 +4728,97 @@ mod tests {
             &chain,
         ).await;
         assert!(matches!(result, Err(AccessError::Delegation(_))), "wrong graph must be denied");
+    }
+
+    // ─── SPARQL SERVICE (federated query) ──────────────────────────────────────
+
+    async fn setup_two_graph_qs() -> (QuadStore, KotobaCid, KotobaCid) {
+        // Two graphs, each with role triples; SERVICE federates from one to the other.
+        let qs    = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
+        );
+        let g1 = KotobaCid::from_bytes(b"svc-graph-1");
+        let g2 = KotobaCid::from_bytes(b"svc-graph-2");
+        let alice = KotobaCid::from_bytes(b"svc-alice");
+        let bob   = KotobaCid::from_bytes(b"svc-bob");
+
+        qs.assert(Quad { graph: g1.clone(), subject: alice.clone(),
+            predicate: "role".into(), object: QuadObject::Text("admin".into()) }).await;
+        qs.assert(Quad { graph: g2.clone(), subject: bob.clone(),
+            predicate: "role".into(), object: QuadObject::Text("user".into()) }).await;
+        qs.assert(Quad { graph: g2.clone(), subject: alice.clone(),
+            predicate: "role".into(), object: QuadObject::Text("viewer".into()) }).await;
+
+        qs.commit("did:test", g1.clone(), 1).await.unwrap();
+        qs.commit("did:test", g2.clone(), 2).await.unwrap();
+        qs.reset_arrangement(&g1).await;
+        qs.reset_arrangement(&g2).await;
+        (qs, g1, g2)
+    }
+
+    #[tokio::test]
+    async fn sparql_service_cid_iri_federates_to_remote_graph() {
+        // SERVICE <cid:g2> { ?s <role> ?r } from g1 context → returns g2 quads
+        let (qs, g1, g2) = setup_two_graph_qs().await;
+        let g2_mb = g2.to_multibase();
+        let quads = qs.cold_query_sparql_bgp(
+            &g1,
+            &format!("SELECT * WHERE {{ SERVICE <cid:{g2_mb}> {{ ?s <role> ?r }} }}"),
+        ).await.unwrap();
+        assert_eq!(quads.len(), 2, "g2 has 2 role quads (bob=user, alice=viewer), got {}", quads.len());
+        assert!(quads.iter().all(|q| q.graph == g2),
+            "all returned quads must be from g2");
+    }
+
+    #[tokio::test]
+    async fn sparql_service_kotoba_graph_uri_form() {
+        // SERVICE <kotoba://graph/<mb>> { ... } long URI form
+        let (qs, g1, g2) = setup_two_graph_qs().await;
+        let g2_mb = g2.to_multibase();
+        let quads = qs.cold_query_sparql_bgp(
+            &g1,
+            &format!("SELECT * WHERE {{ SERVICE <kotoba://graph/{g2_mb}> {{ ?s <role> ?r }} }}"),
+        ).await.unwrap();
+        assert_eq!(quads.len(), 2, "kotoba://graph/ form must work, got {}", quads.len());
+    }
+
+    #[tokio::test]
+    async fn sparql_service_silent_returns_empty_on_unknown_iri() {
+        // SERVICE SILENT <cid:nonexistent> { ... } → empty (no error)
+        let (qs, g1, _g2) = setup_two_graph_qs().await;
+        let quads = qs.cold_query_sparql_bgp(
+            &g1,
+            "SELECT * WHERE { SERVICE SILENT <kotoba://node/did:does-not-exist> { ?s <role> ?r } }",
+        ).await.unwrap();
+        assert!(quads.is_empty(), "SILENT must swallow unknown service and return empty");
+    }
+
+    #[tokio::test]
+    async fn sparql_service_non_silent_errors_on_unrouted_node() {
+        // SERVICE <kotoba://node/did:foo> { ... } without SILENT → error
+        let (qs, g1, _g2) = setup_two_graph_qs().await;
+        let result = qs.cold_query_sparql_bgp(
+            &g1,
+            "SELECT * WHERE { SERVICE <kotoba://node/did:foo> { ?s <role> ?r } }",
+        ).await;
+        assert!(result.is_err(), "non-silent unrouted SERVICE must error");
+    }
+
+    #[tokio::test]
+    async fn sparql_service_with_filter_inner() {
+        // SERVICE wraps a FILTER pattern — filter applies on remote graph
+        let (qs, g1, g2) = setup_two_graph_qs().await;
+        let g2_mb = g2.to_multibase();
+        let quads = qs.cold_query_sparql_bgp(
+            &g1,
+            &format!(r#"SELECT * WHERE {{ SERVICE <cid:{g2_mb}> {{ ?s <role> ?r FILTER(?r = "user") }} }}"#),
+        ).await.unwrap();
+        assert_eq!(quads.len(), 1, "only bob=user matches inside SERVICE FILTER, got {}", quads.len());
+        let obj = match &quads[0].object {
+            QuadObject::Text(t) => t.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(obj, "user");
     }
 }
