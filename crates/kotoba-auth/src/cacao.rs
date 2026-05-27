@@ -579,4 +579,103 @@ mod tests {
         assert_eq!(back.p.iss, c.p.iss);
         assert_eq!(back.s.t,   c.s.t);
     }
+
+    // ── EdDSA CACAO full E2E (real Ed25519 keypair + signature) ──────────────
+
+    /// Build a signed CACAO using a deterministic Ed25519 keypair.
+    /// Returns (cacao, did_key_string, signing_key).
+    fn make_signed_eddsa_cacao(
+        graph_cid: &str,
+        capability: &str,
+        expiry: Option<&str>,
+    ) -> Cacao {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use ed25519_dalek::{SigningKey, Signer};
+        use crate::did_key::ed25519_pubkey_to_did_key;
+
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let pk = sk.verifying_key();
+        let did = ed25519_pubkey_to_did_key(pk.as_bytes());
+
+        let cacao = Cacao {
+            h: CacaoHeader { t: "eip4361".to_string() },
+            p: CacaoPayload {
+                iss:       did.clone(),
+                aud:       "https://kotoba.test".to_string(),
+                issued_at: "2026-01-01T00:00:00Z".to_string(),
+                expiry:    expiry.map(str::to_string),
+                nonce:     "e2e-test-nonce".to_string(),
+                domain:    "kotoba.test".to_string(),
+                statement: None,
+                version:   "1".to_string(),
+                resources: vec![
+                    format!("kotoba://can/{capability}"),
+                    format!("kotoba://graph/{graph_cid}"),
+                ],
+            },
+            s: CacaoSig { t: "EdDSA".to_string(), s: String::new() },
+        };
+
+        // Sign the SIWE message and embed the real signature.
+        let msg = cacao.siwe_message();
+        let sig = sk.sign(msg.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        Cacao { s: CacaoSig { t: "EdDSA".to_string(), s: sig_b64 }, ..cacao }
+    }
+
+    #[test]
+    fn eddsa_cacao_verify_signature_succeeds() {
+        let graph_cid = "bafy2bzaced-test-graph";
+        let cacao = make_signed_eddsa_cacao(graph_cid, "quad:read", Some("2099-01-01T00:00:00Z"));
+        let result = cacao.verify_signature();
+        assert!(result.is_ok(), "real EdDSA sig must verify: {:?}", result.err());
+        assert!(result.unwrap().starts_with("did:key:z6Mk"),
+            "issuer must be did:key:z6Mk...");
+    }
+
+    #[test]
+    fn eddsa_cacao_wrong_sig_fails() {
+        let cacao = make_signed_eddsa_cacao("graph-x", "quad:read", Some("2099-01-01T00:00:00Z"));
+        // Corrupt the sig: flip the last byte.
+        let bad_sig = {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            let mut bytes = URL_SAFE_NO_PAD.decode(&cacao.s.s).unwrap();
+            *bytes.last_mut().unwrap() ^= 0xff;
+            URL_SAFE_NO_PAD.encode(&bytes)
+        };
+        let bad = Cacao {
+            s: CacaoSig { t: "EdDSA".to_string(), s: bad_sig },
+            ..cacao
+        };
+        assert!(bad.verify_signature().is_err(), "corrupted sig must fail");
+    }
+
+    #[test]
+    fn eddsa_cacao_delegation_chain_verify_succeeds() {
+        use crate::delegation::DelegationChain;
+        let graph_cid = "bafy2bzaced-chain-test";
+        let cacao = make_signed_eddsa_cacao(graph_cid, "quad:read", Some("2099-01-01T00:00:00Z"));
+        let chain = DelegationChain::new(cacao);
+        let result = chain.verify(graph_cid, "quad:read");
+        assert!(result.is_ok(),
+            "DelegationChain::verify with real EdDSA sig must succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn eddsa_cacao_delegation_chain_wrong_graph_fails() {
+        use crate::delegation::DelegationChain;
+        let cacao = make_signed_eddsa_cacao("graph-a", "quad:read", Some("2099-01-01T00:00:00Z"));
+        let chain = DelegationChain::new(cacao);
+        let result = chain.verify("graph-b", "quad:read");
+        assert!(result.is_err(), "wrong graph CID must be rejected");
+    }
+
+    #[test]
+    fn eddsa_cacao_delegation_chain_wrong_capability_fails() {
+        use crate::delegation::DelegationChain;
+        let cacao = make_signed_eddsa_cacao("g", "quad:read", Some("2099-01-01T00:00:00Z"));
+        let chain = DelegationChain::new(cacao);
+        let result = chain.verify("g", "quad:write");
+        assert!(result.is_err(), "wrong capability must be rejected");
+    }
 }

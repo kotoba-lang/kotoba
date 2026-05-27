@@ -1874,6 +1874,75 @@ mod tests {
         assert!(matches!(result, Err(AccessError::Delegation(_))));
     }
 
+    // ─── CACAO EdDSA E2E: real signature, real cold-path authed query ─────────
+
+    /// Build a Cacao with a real Ed25519 signature that grants `capability` on `graph_cid`.
+    fn make_real_eddsa_cacao(graph_mb: &str, capability: &str) -> DelegationChain {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use ed25519_dalek::{SigningKey, Signer};
+        use kotoba_auth::cacao::{Cacao, CacaoHeader, CacaoPayload, CacaoSig};
+        use kotoba_auth::did_key::ed25519_pubkey_to_did_key;
+
+        let sk  = SigningKey::from_bytes(&[13u8; 32]);
+        let pk  = sk.verifying_key();
+        let did = ed25519_pubkey_to_did_key(pk.as_bytes());
+
+        let template = Cacao {
+            h: CacaoHeader { t: "eip4361".to_string() },
+            p: CacaoPayload {
+                iss:       did,
+                aud:       "https://kotoba.test".to_string(),
+                issued_at: "2026-01-01T00:00:00Z".to_string(),
+                expiry:    Some("2099-01-01T00:00:00Z".to_string()),
+                nonce:     "real-sig-e2e".to_string(),
+                domain:    "kotoba.test".to_string(),
+                statement: None,
+                version:   "1".to_string(),
+                resources: vec![
+                    format!("kotoba://can/{capability}"),
+                    format!("kotoba://graph/{graph_mb}"),
+                ],
+            },
+            s: CacaoSig { t: "EdDSA".to_string(), s: String::new() },
+        };
+        let msg     = template.siwe_message();
+        let sig     = sk.sign(msg.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        let cacao   = Cacao { s: CacaoSig { t: "EdDSA".to_string(), s: sig_b64 }, ..template };
+        DelegationChain::new(cacao)
+    }
+
+    #[tokio::test]
+    async fn sparql_bgp_authed_real_sig_succeeds() {
+        let (qs, graph) = setup_sparql_qs().await;
+        let graph_mb = graph.to_multibase();
+        let chain = make_real_eddsa_cacao(&graph_mb, "quad:read");
+
+        // Real Ed25519 verify + cold-path SPARQL query must succeed.
+        let result = qs.cold_query_sparql_bgp_authed(
+            &graph,
+            r#"SELECT * WHERE { ?s <role> "admin" }"#,
+            &chain,
+        ).await;
+        assert!(result.is_ok(), "real EdDSA CACAO chain must pass: {:?}", result.err());
+        let quads = result.unwrap();
+        assert_eq!(quads.len(), 2, "Alice + Carol have role=admin");
+    }
+
+    #[tokio::test]
+    async fn get_entity_quads_cold_authed_real_sig_succeeds() {
+        let (qs, graph) = setup_sparql_qs().await;
+        let graph_mb = graph.to_multibase();
+        let chain    = make_real_eddsa_cacao(&graph_mb, "quad:read");
+        let alice    = KotobaCid::from_bytes(b"alice");
+
+        let result = qs.get_entity_quads_cold_authed(&graph, &alice, &chain).await;
+        assert!(result.is_ok(), "real EdDSA get_entity cold authed: {:?}", result.err());
+        let quads = result.unwrap();
+        // Alice has name + role + knows = 3 quads
+        assert!(!quads.is_empty(), "Alice's quads must be returned");
+    }
+
     // ─── import_commit tests ──────────────────────────────────────────────────
 
     #[tokio::test]

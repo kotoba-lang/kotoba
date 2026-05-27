@@ -328,6 +328,7 @@ MemoryBlockStore、10K entities × 4 quads (name/role/status/knows)。reset_arra
 | CACAO verify_skip_sig overhead | **<1µs** | — | pure auth check |
 
 - CACAO auth overhead <1µs; production EdDSA verify adds ~0.1ms → dominates only sub-ms hot queries
+- **EdDSA CACAO E2E verified (2026-05-27)**: real `SigningKey::from_bytes` + `Signer::sign(siwe_message)` + `DelegationChain::new(cacao).verify()` succeeds; `cold_query_sparql_bgp_authed` and `get_entity_quads_cold_authed` both return correct results with real-sig chains; 5 cacao.rs tests + 2 quad_store.rs tests pass
 - `cold_query_sparql_bgp` bug fix: cold methods require **original graph CID** (not the commit CID returned by `commit()`)
 
 #### Distributed E2E — import_commit() (2026-05-27)
