@@ -830,6 +830,25 @@ impl QuadStore {
         }
     }
 
+    /// Import a commit from the local BlockStore into the CommitDag.
+    ///
+    /// Used during distributed sync: after a peer's blocks are replicated into this
+    /// node's BlockStore (via block-copy or bitswap), call this with the known commit
+    /// CID to make the graph queryable via cold-path reads.  The commit block must
+    /// already exist in `self.block_store`.
+    ///
+    /// Returns `true` if the commit was found and imported, `false` if the block was
+    /// not present in the store.
+    pub async fn import_commit(&self, commit_cid: &KotobaCid) -> anyhow::Result<bool> {
+        match Commit::load(commit_cid, &*self.block_store)? {
+            None => Ok(false),
+            Some(commit) => {
+                self.commit_dag.write().await.add(commit);
+                Ok(true)
+            }
+        }
+    }
+
     /// Return the head Commit for `graph_cid` (if any).
     pub async fn head_commit(&self, graph_cid: &KotobaCid) -> Option<Commit> {
         self.commit_dag.read().await.head(graph_cid).cloned()
@@ -1853,5 +1872,78 @@ mod tests {
             &chain,
         ).await;
         assert!(matches!(result, Err(AccessError::Delegation(_))));
+    }
+
+    // ─── import_commit tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn import_commit_makes_graph_queryable() {
+        // Node A (peer): commits quads to its own MemoryBlockStore.
+        let peer_bs = Arc::new(MemoryBlockStore::new());
+        let peer_qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::clone(&peer_bs) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
+        );
+        let graph   = make_cid_from("import-g");
+        let subject = make_cid_from("import-s1");
+        peer_qs.assert(Quad {
+            graph:    graph.clone(),
+            subject:  subject.clone(),
+            predicate: "name".into(),
+            object:   QuadObject::Text("ImportEntity".into()),
+        }).await;
+        let commit_cid = peer_qs.commit("did:peer", graph.clone(), 1).await.unwrap();
+        peer_qs.reset_arrangement(&graph).await;
+
+        // Replicate peer's blocks into node B's store.
+        let local_b = Arc::new(MemoryBlockStore::new());
+        for cid in peer_bs.all_cids() {
+            if let Ok(Some(data)) = peer_bs.get(&cid) {
+                local_b.put(&cid, &data).unwrap();
+            }
+        }
+
+        // Node B: no quads, no commit — only the replicated blocks.
+        let qs_b = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::clone(&local_b) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
+        );
+        assert!(qs_b.head_commit(&graph).await.is_none(), "before import: no head");
+
+        // import_commit() populates the CommitDag from the replicated block store.
+        let imported = qs_b.import_commit(&commit_cid).await.unwrap();
+        assert!(imported, "commit block must be found in local_b after replication");
+        assert!(qs_b.head_commit(&graph).await.is_some(), "after import: head exists");
+
+        // Cold query must succeed via ProllyTree blocks in local_b.
+        let result = qs_b.get_entity_quads_cold(&graph, &subject).await.unwrap();
+        assert!(!result.is_empty(), "replicated entity quads readable after import_commit");
+    }
+
+    #[tokio::test]
+    async fn import_commit_missing_block_returns_false() {
+        // Get a real commit CID from a peer.
+        let peer_bs = Arc::new(MemoryBlockStore::new());
+        let peer_qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::clone(&peer_bs) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
+        );
+        let graph = make_cid_from("import-miss-g");
+        peer_qs.assert(Quad {
+            graph: graph.clone(),
+            subject: make_cid_from("s"),
+            predicate: "p".into(),
+            object: QuadObject::Text("v".into()),
+        }).await;
+        let commit_cid = peer_qs.commit("did:peer", graph.clone(), 1).await.unwrap();
+
+        // Node B has an empty store — commit block not present.
+        let qs_b = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
+        );
+        let imported = qs_b.import_commit(&commit_cid).await.unwrap();
+        assert!(!imported, "commit not in store → import returns false");
+        assert!(qs_b.head_commit(&graph).await.is_none());
     }
 }

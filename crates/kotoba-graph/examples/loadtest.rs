@@ -271,17 +271,7 @@ async fn phase4_distributed_fetch() {
         DistributedBlockStore::new(Arc::clone(&local_a), vec![] /* no HTTP peers in sim */)
     ) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
 
-    // We can't do real HTTP bitswap in-process, so we demonstrate the local-only
-    // path and then manually pre-populate local_a with blocks from peer_store to
-    // simulate a successful peer fetch (the DistributedBlockStore promotes on hit).
-    //
-    // For a true E2E test we'd need two kotoba-server instances with Kubo.
-    // Here we measure: (1) local-only miss time, (2) post-promote hit time.
-
-    let _qs_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&dist_store));
-
-    // Manually replicate node B's blocks into local_a (simulates peer fetch success)
-    // This requires copying all blocks from peer_store to local_a via peer_store.all_cids()
+    // Manually replicate node B's blocks into local_a (simulates bitswap / block-copy).
     let peer_cids = peer_store.all_cids();
     let mut blocks_copied = 0usize;
     for pcid in peer_cids {
@@ -291,13 +281,20 @@ async fn phase4_distributed_fetch() {
         }
     }
 
-    // Now cold query from qs_a (all blocks are in local_a after simulated fetch)
+    // Node A: create QuadStore backed by dist_store (local_a already has all blocks).
+    // Import the commit CID so the CommitDag knows the graph → ProllyTree roots mapping.
+    let qs_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&dist_store));
+    let imported = qs_a.import_commit(&_commit_cid_b).await.unwrap();
+    assert!(imported, "commit block must be present after block replication");
+
+    // First cold-path: qs_a queries from its own store (blocks promoted from local_a).
+    // Second cold-path: same query again — blocks are already hot in MemoryBlockStore.
     let mut first_times: Vec<Duration> = Vec::with_capacity(ITERS);
     let mut promoted_times: Vec<Duration> = Vec::with_capacity(ITERS);
     for i in 0..ITERS {
         let s = cid(200 + (i as u64 * 7919) % n);
-        let t = Instant::now(); let _ = qs_b.get_entity_quads_cold(&graph, &s).await; first_times.push(t.elapsed());
-        let t = Instant::now(); let _ = qs_b.get_entity_quads_cold(&graph, &s).await; promoted_times.push(t.elapsed());
+        let t = Instant::now(); let _ = qs_a.get_entity_quads_cold(&graph, &s).await; first_times.push(t.elapsed());
+        let t = Instant::now(); let _ = qs_a.get_entity_quads_cold(&graph, &s).await; promoted_times.push(t.elapsed());
     }
     first_times.sort_unstable();
     promoted_times.sort_unstable();
@@ -305,13 +302,14 @@ async fn phase4_distributed_fetch() {
     let pr_p50 = promoted_times[ITERS / 2].as_micros();
 
     println!("{:<35}  {:>10.3}  {:>12}  {:>10}",
-        "EAVT cold (post-block-replicate)",
+        "EAVT cold (post-import_commit)",
         f_p50, format!("{pr_p50}µs"),
         format!("{blocks_copied} blocks copied"));
 
-    println!("\n  Simulation note: real distributed fetch replaces block-copy step with");
+    println!("\n  import_commit(): loads Commit block from BlockStore → CommitDag.add().");
+    println!("  In production: blocks arrive via bitswap; import_commit() is called once");
+    println!("  per replicated graph to make it queryable without re-running commit().");
     println!("  DistributedBlockStore → peer Kubo HTTP /api/v0/block/get; RTT adds per-block latency.");
-    println!("  With 0 peers: local-only; set KOTOBA_PEERS to enable live peer fetch.");
 }
 
 // ─── Phase 3: cold-path query latency (EAVT / AEVT / AVET / VAET / multi-hop) ──

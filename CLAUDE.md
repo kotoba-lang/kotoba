@@ -330,6 +330,20 @@ MemoryBlockStore、10K entities × 4 quads (name/role/status/knows)。reset_arra
 - CACAO auth overhead <1µs; production EdDSA verify adds ~0.1ms → dominates only sub-ms hot queries
 - `cold_query_sparql_bgp` bug fix: cold methods require **original graph CID** (not the commit CID returned by `commit()`)
 
+#### Distributed E2E — import_commit() (2026-05-27)
+
+`QuadStore::import_commit(commit_cid)`: loads a Commit block from the node's own BlockStore into the CommitDag. Enables distributed sync without re-running `commit()`:
+
+```
+Node B: commit() → block store has Commit + ProllyTree blocks
+Block replication (bitswap/copy): B.block_store → A.block_store
+Node A: import_commit(&commit_cid) → CommitDag.add(commit)
+Node A: get_entity_quads_cold(&graph, &subject) → reads via ProllyTree
+```
+
+loadtest Phase 4 (10K entities, MemoryBlockStore, 293 blocks replicated):
+- EAVT cold (post-import_commit) first: ~1.9ms, promoted: ~1.8ms
+
 Run: `cargo bench -p kotoba-kqe --bench arrangement`  
 Run: `cargo bench -p kotoba-graph --bench quad_store`  
 Run: `cargo bench -p kotoba-store --bench tiered_store`  
