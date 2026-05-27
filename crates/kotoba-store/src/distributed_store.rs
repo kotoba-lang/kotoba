@@ -28,6 +28,7 @@ use bytes::Bytes;
 use anyhow::Result;
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
+#[cfg(test)]
 use crate::MemoryBlockStore;
 
 /// A block store that reads from `local` first, then fans out to `peers` on miss.
