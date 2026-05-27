@@ -415,3 +415,187 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
+
+/// Start the kotoba server, blocking until shutdown.
+/// All configuration is read from environment variables (same as the binary).
+pub async fn run() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use kotoba_net::KotobaSwarm;
+    use kotoba_vm::distributed::DistributedPregelRunner;
+
+    tracing::info!(
+        definition = "Datom[CID/T] × EAVT × Pregel[BSP] × Datalog[Δ] × LLM × WASM/WIT",
+        "kotoba starting"
+    );
+
+    let inference_engine: Option<kotoba_runtime::host::InferenceFn> =
+        if let Ok(_url) = std::env::var("KOTOBA_INFERENCE_URL") {
+            let model = std::env::var("KOTOBA_INFERENCE_MODEL")
+                .unwrap_or_else(|_| "gemma4:e4b".to_string());
+            tracing::info!(_url, model, "HTTP inference engine active");
+            let engine = kotoba_llm::HttpInferEngine::from_env()
+                .map_err(|e| anyhow::anyhow!("HttpInferEngine init failed: {e}"))?;
+            let engine = Arc::new(engine);
+            let fn_: kotoba_runtime::host::InferenceFn =
+                Arc::new(move |prompt: &str, max_tokens: usize| {
+                    engine.generate(prompt, max_tokens)
+                });
+            Some(fn_)
+        } else if std::env::var("KOTOBA_LOAD_GEMMA").is_ok() {
+            #[cfg(feature = "local-inference")]
+            {
+                use kotoba_llm::GemmaRunner;
+                tracing::info!("loading Gemma 2 2B IT from HuggingFace Hub (first run downloads ~5 GB)...");
+                let runner = Arc::new(std::sync::Mutex::new(
+                    GemmaRunner::load()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Gemma load failed: {e}"))?,
+                ));
+                tracing::info!("Gemma 2 2B IT loaded");
+                let engine: kotoba_runtime::host::InferenceFn =
+                    Arc::new(move |prompt: &str, max_tokens: usize| {
+                        runner.lock().unwrap_or_else(|e| e.into_inner()).generate(prompt, max_tokens)
+                    });
+                Some(engine)
+            }
+            #[cfg(not(feature = "local-inference"))]
+            {
+                tracing::warn!(
+                    "KOTOBA_LOAD_GEMMA is set but the `local-inference` feature is not enabled.\n\
+                     Rebuild with: cargo build -p kotoba-server --features local-inference"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+    let state = server::KotobaState::new(inference_engine)?;
+    let state = state.init_crypto().await?;
+
+    tracing::info!(
+        version  = state.version,
+        node_id  = %hex::encode(state.local_node_id.0),
+        did      = %state.operator_did,
+        "KSE Journal + Shelf + KDHT Neighborhood ready"
+    );
+
+    state.register_node().await;
+
+    {
+        let quad_store = Arc::clone(&state.quad_store);
+        tokio::spawn(async move {
+            quad_store.replay_from_journal().await;
+        });
+    }
+
+    let (pregel_inbound_tx, pregel_outbound_rx, pregel_runner) =
+        DistributedPregelRunner::channel_pair(1024);
+    let state = state.attach_pregel(pregel_runner);
+
+    let state = if std::env::var("KOTOBA_NO_SWARM").is_err() {
+        let listen_port: u16 = std::env::var("KOTOBA_P2P_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
+        let listen_addr = kotoba_net::quic_addr(listen_port);
+
+        match KotobaSwarm::new(listen_addr).await {
+            Ok(mut swarm) => {
+                if let Ok(peers_str) = std::env::var("KOTOBA_BOOTSTRAP_PEERS") {
+                    let mut bootstrapped = false;
+                    for entry in peers_str.split(',') {
+                        let entry = entry.trim();
+                        if entry.is_empty() { continue; }
+                        if let Some((pid_str, addr_str)) = entry.split_once('@') {
+                            match (
+                                pid_str.trim().parse::<kotoba_net::PeerId>(),
+                                addr_str.trim().parse::<kotoba_net::Multiaddr>(),
+                            ) {
+                                (Ok(peer_id), Ok(addr)) => {
+                                    swarm.add_peer(peer_id, addr.clone());
+                                    tracing::info!(%peer_id, %addr, "added bootstrap peer");
+                                    bootstrapped = true;
+                                }
+                                (Err(e), _) => tracing::warn!("invalid peer_id: {e}"),
+                                (_, Err(e)) => tracing::warn!("invalid multiaddr: {e}"),
+                            }
+                        }
+                    }
+                    if bootstrapped {
+                        swarm.bootstrap().ok();
+                        tracing::info!("Kademlia bootstrap triggered");
+                    }
+                }
+
+                let (publish_tx, publish_rx) =
+                    tokio::sync::mpsc::channel::<(String, Vec<u8>)>(1024);
+
+                let journal_arc     = Arc::clone(&state.journal);
+                let block_store_arc = Arc::clone(&state.block_store);
+                let quad_store_arc  = Arc::clone(&state.quad_store);
+
+                tokio::spawn(net_actor::run(
+                    swarm,
+                    publish_rx,
+                    journal_arc,
+                    pregel_inbound_tx,
+                    pregel_outbound_rx,
+                    block_store_arc,
+                    quad_store_arc,
+                ));
+
+                tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");
+                state.attach_gossip(publish_tx)
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "swarm init failed — running without p2p");
+                state
+            }
+        }
+    } else {
+        tracing::info!("KOTOBA_NO_SWARM set — skipping p2p swarm");
+        state
+    };
+
+    if std::env::var("KOTOBA_GMAIL_CLIENT_ID").is_ok() {
+        if let Some(ref crypto) = state.crypto {
+            let cr = Arc::clone(crypto);
+            let vt = Arc::clone(&state.vault);
+            let qs = Arc::clone(&state.quad_store);
+            tokio::spawn(kotoba_ingest::gmail_poll_loop(cr, vt, qs));
+        }
+    }
+
+    if std::env::var("KOTOBA_JETSTREAM").is_ok() {
+        let journal_arc    = Arc::clone(&state.journal);
+        let quad_store_arc = Arc::clone(&state.quad_store);
+        tokio::spawn(kotoba_graph::run_jetstream_client(journal_arc, quad_store_arc));
+        tracing::info!("Jetstream client started");
+    }
+
+    if std::env::var("KOTOBA_SUBSCRIBE_REPOS").is_ok() {
+        let journal_arc     = Arc::clone(&state.journal);
+        let quad_store_arc  = Arc::clone(&state.quad_store);
+        let block_store_arc = Arc::clone(&state.block_store);
+        let gossip_tx       = state.gossip_tx.clone();
+        tokio::spawn(kotoba_graph::run_subscribe_repos(
+            journal_arc, quad_store_arc, block_store_arc, gossip_tx,
+        ));
+        tracing::info!("subscribeRepos firehose client started");
+    }
+
+    let state = Arc::new(state);
+    let app = build_router(Arc::clone(&state));
+
+    let port = std::env::var("KOTOBA_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+
+    tracing::info!(%addr, "kotoba listening");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
