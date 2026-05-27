@@ -21,6 +21,72 @@ impl DelegationChain {
         Self { chain: vec![invocation] }
     }
 
+    /// Test-only constructor that verifies capability and graph scope but skips
+    /// the cryptographic signature check.  Available via the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_for_test(graph_cid: &str, capability: &str) -> Self {
+        use super::cacao::{CacaoHeader, CacaoPayload, CacaoSig};
+        // Use a far-future fixed expiry so temporal check passes.
+        let cacao = Cacao {
+            h: CacaoHeader { t: "eip4361".into() },
+            p: CacaoPayload {
+                iss:       "did:test:issuer".into(),
+                aud:       "did:test:aud".into(),
+                issued_at: "2026-01-01T00:00:00Z".into(),
+                expiry:    Some("2099-01-01T00:00:00Z".into()),
+                nonce:     "test-nonce".into(),
+                domain:    "kotoba.test".into(),
+                statement: None,
+                version:   "1".into(),
+                resources: vec![
+                    format!("kotoba://can/{capability}"),
+                    format!("kotoba://graph/{graph_cid}"),
+                ],
+            },
+            s: CacaoSig { t: "test-bypass".into(), s: "00".into() },
+        };
+        Self { chain: vec![cacao] }
+    }
+
+    /// Like `verify()` but skips the cryptographic signature step.  Available via `test-utils`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn verify_skip_sig(&self, graph_cid: &str, required_cap: &str) -> Result<String, DelegationError> {
+        if self.chain.is_empty() { return Err(DelegationError::EmptyChain); }
+        if self.chain.len() > 1  { return Err(DelegationError::ChainDepthExceeded(self.chain.len())); }
+        let cacao = &self.chain[0];
+
+        // 1. Temporal validity
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if let Some(exp) = &cacao.p.expiry {
+            if !is_utc_iso8601(exp) { return Err(DelegationError::InvalidExpiry(exp.clone())); }
+            let now_iso = format_iso8601(now_secs);
+            if now_iso > *exp { return Err(DelegationError::Expired); }
+        }
+
+        // 2. Capability check
+        if let Some(granted_cap) = cacao.p.capability() {
+            if granted_cap != required_cap {
+                return Err(DelegationError::CapabilityDenied(
+                    format!("need '{required_cap}', CACAO grants '{granted_cap}'"),
+                ));
+            }
+        }
+
+        // 3. Graph-CID scope check
+        if let Some(granted_graph) = cacao.p.graph_cid() {
+            if granted_graph != graph_cid {
+                return Err(DelegationError::GraphMismatch {
+                    expected: granted_graph.to_string(),
+                    got:      graph_cid.to_string(),
+                });
+            }
+        }
+
+        // 4. Signature SKIPPED in test mode
+        Ok(cacao.p.iss.clone())
+    }
+
     /// Verify the delegation chain.
     ///
     /// Checks (in order):

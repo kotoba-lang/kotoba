@@ -1,9 +1,14 @@
-/// Load test: Arrangement 4-index + QuadStore commit cycle at 1M / 10M / 100M quads.
+/// Load test: Arrangement 4-index + QuadStore commit cycle + cold-path queries.
 ///
 /// Usage:
 ///   cargo run --release --example loadtest -p kotoba-graph
 ///   LOADTEST_MAX=100M cargo run --release --example loadtest -p kotoba-graph
 ///   LOADTEST_MEM_LIMIT_MB=8192 cargo run --release --example loadtest -p kotoba-graph
+///
+/// Phases:
+///   Phase 1: in-memory Arrangement insert + hot-path query latency
+///   Phase 2: QuadStore commit cycle (batch 1M, repeat up to max)
+///   Phase 3: cold-path query latency (EAVT/AEVT/AVET/VAET/multi-hop post-commit)
 ///
 /// Output format: TSV lines → easy to paste into a spreadsheet.
 use std::{
@@ -207,6 +212,92 @@ async fn async_main() {
     if max >= 1_000_000 {
         phase2(max, mem_limit_mb).await;
     }
+
+    // Phase 3: cold-path query latency (always runs)
+    phase3_cold_queries().await;
+}
+
+// ─── Phase 3: cold-path query latency (EAVT / AEVT / AVET / VAET / multi-hop) ──
+
+async fn phase3_cold_queries() {
+    const N_ENTITIES: u64 = 100_000;
+    const ITERS: usize = 50;
+
+    println!("\n=== Phase 3: cold-path query latency (MemoryBlockStore, {} entities) ===", fmt_n(N_ENTITIES));
+    println!("{:<30}  {:>10}  {:>10}  {:>10}",
+        "query", "p50_ms", "p95_ms", "p99_ms");
+
+    let journal     = Arc::new(Journal::new());
+    let block_store = Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
+    let qs          = QuadStore::new(journal, block_store);
+    let graph       = cid(1);
+
+    // Insert N_ENTITIES × 2 quads and commit
+    const CHUNK: u64 = 50_000;
+    let n = N_ENTITIES;
+    for chunk_start in (0..n).step_by(CHUNK as usize / 2) {
+        let chunk_end = (chunk_start + CHUNK / 2).min(n);
+        let mut quads = Vec::with_capacity(((chunk_end - chunk_start) * 2) as usize);
+        for i in chunk_start..chunk_end {
+            quads.push(text_quad(1, i + 100, "name", &format!("entity-{i}")));
+            quads.push(ref_quad (1, i + 100, "knows", ((i + 1) % n) + 100));
+        }
+        qs.assert_batch_silent(quads).await;
+    }
+    let graph_cid = qs.commit("did:loadtest", graph, 1).await.unwrap();
+    qs.reset_arrangement(&graph_cid).await;
+
+    let mid_subject = cid(100 + n / 2);
+    let mid_object  = cid(100 + n / 3);
+
+    // Helper to run a cold query ITERS times and return sorted durations
+    macro_rules! bench_query {
+        ($label:expr, $body:expr) => {{
+            let mut times: Vec<Duration> = Vec::with_capacity(ITERS);
+            for _ in 0..ITERS {
+                let t = Instant::now();
+                let _ = $body;
+                times.push(t.elapsed());
+            }
+            times.sort_unstable();
+            let p50 = times[ITERS / 2].as_secs_f64() * 1000.0;
+            let p95 = times[(ITERS * 95 / 100).min(ITERS - 1)].as_secs_f64() * 1000.0;
+            let p99 = times[(ITERS * 99 / 100).min(ITERS - 1)].as_secs_f64() * 1000.0;
+            println!("{:<30}  {:>10.3}  {:>10.3}  {:>10.3}", $label, p50, p95, p99);
+        }};
+    }
+
+    // EAVT: get all quads for one subject
+    bench_query!("EAVT get_entity_quads_cold",
+        qs.get_entity_quads_cold(&graph_cid, &mid_subject).await.unwrap());
+
+    // AEVT: scan all quads with predicate prefix "name"
+    bench_query!("AEVT quads_by_predicate_prefix_cold",
+        qs.quads_by_predicate_prefix_cold(&graph_cid, "name").await.unwrap());
+
+    // AVET: lookup subjects by predicate+object value
+    bench_query!("AVET lookup_subject_by_po_cold",
+        qs.lookup_subject_by_po_cold(&graph_cid, "name", "entity-100").await.unwrap());
+
+    // VAET: reverse lookup (all subjects referencing an object CID)
+    bench_query!("VAET reverse_lookup_cold",
+        qs.reverse_lookup_cold(&graph_cid, &mid_object).await.unwrap());
+
+    // Multi-hop: BFS 2 hops from start
+    bench_query!("multi_hop_cold 2-hop",
+        qs.multi_hop_cold(&graph_cid, &mid_subject, 2).await.unwrap());
+
+    // Multi-hop: BFS 3 hops from start
+    bench_query!("multi_hop_cold 3-hop",
+        qs.multi_hop_cold(&graph_cid, &mid_subject, 3).await.unwrap());
+
+    // AVET × AVET join: subjects where name=entity-100 AND knows=cid(mid)
+    bench_query!("join_by_two_predicates_cold",
+        qs.join_by_two_predicates_cold(
+            &graph_cid,
+            "name", "entity-100",
+            "name", "entity-200",
+        ).await.unwrap());
 }
 
 async fn phase2(total: u64, mem_limit_mb: f64) {

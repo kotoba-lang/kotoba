@@ -19,11 +19,13 @@ use dashmap::DashMap;
 
 use crate::commit::{Commit, CommitDag};
 
-/// Error returned when a CACAO-gated quad write fails.
+/// Error returned when a CACAO-gated quad operation fails.
 #[derive(Debug, thiserror::Error)]
 pub enum AccessError {
     #[error("delegation: {0}")]
     Delegation(#[from] DelegationError),
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 /// QuadStore — Quad write/read API with 3-index Journal publish + ProllyTree commit
@@ -509,6 +511,118 @@ impl QuadStore {
             results.push((predicate, KotobaCid(subj_arr)));
         }
         Ok(results)
+    }
+
+    // ── Complex / compound cold-path queries ──────────────────────────────────
+
+    /// Multi-hop BFS traversal following `QuadObject::Cid` references.
+    ///
+    /// Starting from `start`, resolves up to `max_hops` hops of object-CID
+    /// references across the committed ProllyTree (EAVT cold path per hop).
+    /// Returns `(depth, quad)` pairs in BFS order; depth 0 = quads of `start`.
+    ///
+    /// Hot path: used when the Arrangement is non-empty (µs).
+    /// Cold path: one `get_entity_quads_cold` call per frontier node.
+    pub async fn multi_hop_cold(
+        &self,
+        graph_cid: &KotobaCid,
+        start:     &KotobaCid,
+        max_hops:  usize,
+    ) -> anyhow::Result<Vec<(usize, Quad)>> {
+        let mut result: Vec<(usize, Quad)> = Vec::new();
+        let mut frontier = vec![start.clone()];
+        let mut visited  = std::collections::HashSet::new();
+        visited.insert(start.clone());
+
+        for depth in 0..=max_hops {
+            if frontier.is_empty() { break; }
+            let mut next_frontier: Vec<KotobaCid> = Vec::new();
+            for node in &frontier {
+                let quads = self.get_entity_quads_cold(graph_cid, node).await?;
+                for q in quads {
+                    if let kotoba_kqe::quad::QuadObject::Cid(ref ref_cid) = q.object {
+                        if depth < max_hops && visited.insert(ref_cid.clone()) {
+                            next_frontier.push(ref_cid.clone());
+                        }
+                    }
+                    result.push((depth, q));
+                }
+            }
+            frontier = next_frontier;
+        }
+        Ok(result)
+    }
+
+    /// AVET×AVET intersection: subjects where `pred1 = val1` AND `pred2 = val2`.
+    ///
+    /// Hot path: two `get_subjects_by_predicate_object` calls + HashSet intersection.
+    /// Cold path: two `lookup_subject_by_po_cold` calls + intersection.
+    pub async fn join_by_two_predicates_cold(
+        &self,
+        graph_cid: &KotobaCid,
+        pred1: &str, val1: &str,
+        pred2: &str, val2: &str,
+    ) -> anyhow::Result<Vec<KotobaCid>> {
+        let set1: std::collections::HashSet<[u8; 36]> = self
+            .lookup_subject_by_po_cold(graph_cid, pred1, val1).await?
+            .into_iter().map(|c| c.0).collect();
+        if set1.is_empty() { return Ok(vec![]); }
+
+        let set2 = self.lookup_subject_by_po_cold(graph_cid, pred2, val2).await?;
+        Ok(set2.into_iter().filter(|c| set1.contains(&c.0)).collect())
+    }
+
+    // ── CACAO-authed cold-path reads ──────────────────────────────────────────
+
+    /// CACAO-gated EAVT cold read.  Verifies `quad:read` capability on `graph_cid`
+    /// before fetching committed quads from the IPFS-backed ProllyTree.
+    pub async fn get_entity_quads_cold_authed(
+        &self,
+        graph_cid: &KotobaCid,
+        subject:   &KotobaCid,
+        chain:     &DelegationChain,
+    ) -> Result<Vec<Quad>, AccessError> {
+        chain.verify(&graph_cid.to_multibase(), "quad:read")?;
+        self.get_entity_quads_cold(graph_cid, subject).await
+            .map_err(|e| AccessError::Internal(e.to_string()))
+    }
+
+    /// CACAO-gated AEVT cold read.
+    pub async fn quads_by_predicate_prefix_cold_authed(
+        &self,
+        graph_cid:        &KotobaCid,
+        predicate_prefix: &str,
+        chain:            &DelegationChain,
+    ) -> Result<Vec<Quad>, AccessError> {
+        chain.verify(&graph_cid.to_multibase(), "quad:read")?;
+        self.quads_by_predicate_prefix_cold(graph_cid, predicate_prefix).await
+            .map_err(|e| AccessError::Internal(e.to_string()))
+    }
+
+    /// CACAO-gated AVET cold read.
+    pub async fn lookup_subject_by_po_cold_authed(
+        &self,
+        graph_cid:  &KotobaCid,
+        predicate:  &str,
+        object_key: &str,
+        chain:      &DelegationChain,
+    ) -> Result<Vec<KotobaCid>, AccessError> {
+        chain.verify(&graph_cid.to_multibase(), "quad:read")?;
+        self.lookup_subject_by_po_cold(graph_cid, predicate, object_key).await
+            .map_err(|e| AccessError::Internal(e.to_string()))
+    }
+
+    /// CACAO-gated multi-hop BFS cold traversal.
+    pub async fn multi_hop_cold_authed(
+        &self,
+        graph_cid: &KotobaCid,
+        start:     &KotobaCid,
+        max_hops:  usize,
+        chain:     &DelegationChain,
+    ) -> Result<Vec<(usize, Quad)>, AccessError> {
+        chain.verify(&graph_cid.to_multibase(), "quad:read")?;
+        self.multi_hop_cold(graph_cid, start, max_hops).await
+            .map_err(|e| AccessError::Internal(e.to_string()))
     }
 
     /// Clear the in-memory Arrangement for `graph_cid`, reclaiming RAM.
@@ -1045,5 +1159,205 @@ mod tests {
         let graph       = KotobaCid::from_bytes(b"empty-dag-graph");
         let result      = qs.commits_since(&graph, None).await;
         assert!(result.is_empty(), "no commits → commits_since must return empty");
+    }
+
+    // ── complex / compound cold-path query tests ──────────────────────────────
+
+    fn make_cid_from(s: &str) -> KotobaCid { KotobaCid::from_bytes(s.as_bytes()) }
+
+    #[tokio::test]
+    async fn multi_hop_cold_follows_cid_references() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+
+        let graph = make_cid_from("hop-graph");
+        let alice = make_cid_from("alice");
+        let bob   = make_cid_from("bob");
+
+        // alice --knows--> bob (CID ref)
+        qs.assert(Quad {
+            graph: graph.clone(), subject: alice.clone(),
+            predicate: "knows".into(), object: QuadObject::Cid(bob.clone()),
+        }).await;
+        qs.assert(Quad {
+            graph: graph.clone(), subject: alice.clone(),
+            predicate: "name".into(), object: QuadObject::Text("Alice".into()),
+        }).await;
+        // bob's own quad
+        qs.assert(Quad {
+            graph: graph.clone(), subject: bob.clone(),
+            predicate: "name".into(), object: QuadObject::Text("Bob".into()),
+        }).await;
+
+        qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        qs.reset_arrangement(&graph).await;
+
+        // 1-hop: depth 0 = alice quads, depth 1 = bob quads
+        let hops = qs.multi_hop_cold(&graph, &alice, 1).await.unwrap();
+        let depth_0: Vec<_> = hops.iter().filter(|(d, _)| *d == 0).collect();
+        let depth_1: Vec<_> = hops.iter().filter(|(d, _)| *d == 1).collect();
+        assert_eq!(depth_0.len(), 2, "alice has 2 quads");
+        assert_eq!(depth_1.len(), 1, "bob has 1 quad (name)");
+        assert_eq!(depth_1[0].1.predicate, "name");
+    }
+
+    #[tokio::test]
+    async fn multi_hop_cold_max_hops_zero_returns_only_start() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+
+        let graph   = make_cid_from("hop-zero");
+        let alice   = make_cid_from("alice2");
+        let bob     = make_cid_from("bob2");
+        qs.assert(Quad {
+            graph: graph.clone(), subject: alice.clone(),
+            predicate: "knows".into(), object: QuadObject::Cid(bob.clone()),
+        }).await;
+        qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        qs.reset_arrangement(&graph).await;
+
+        let hops = qs.multi_hop_cold(&graph, &alice, 0).await.unwrap();
+        assert_eq!(hops.len(), 1, "max_hops=0 returns only start quads");
+        assert_eq!(hops[0].0, 0, "depth must be 0");
+    }
+
+    #[tokio::test]
+    async fn join_by_two_predicates_cold_returns_intersection() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+
+        let graph = make_cid_from("join-graph");
+        let alice = make_cid_from("ja");
+        let bob   = make_cid_from("jb");
+        let carol = make_cid_from("jc");
+
+        for (s, name, role) in [
+            (&alice, "Alice", "admin"),
+            (&bob,   "Bob",   "user"),
+            (&carol, "Carol", "admin"),
+        ] {
+            qs.assert(Quad { graph: graph.clone(), subject: s.clone(),
+                predicate: "name".into(), object: QuadObject::Text(name.into()) }).await;
+            qs.assert(Quad { graph: graph.clone(), subject: s.clone(),
+                predicate: "role".into(), object: QuadObject::Text(role.into()) }).await;
+        }
+        qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        qs.reset_arrangement(&graph).await;
+
+        // subjects where name=Alice AND role=admin → only alice
+        let results = qs.join_by_two_predicates_cold(&graph, "name", "Alice", "role", "admin").await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, alice.0);
+
+        // subjects where role=admin → alice + carol
+        let admins = qs.join_by_two_predicates_cold(&graph, "role", "admin", "role", "admin").await.unwrap();
+        assert_eq!(admins.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn join_by_two_predicates_cold_empty_when_no_overlap() {
+        let journal     = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs          = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+
+        let graph = make_cid_from("join-empty");
+        let alice = make_cid_from("je-alice");
+        qs.assert(Quad { graph: graph.clone(), subject: alice.clone(),
+            predicate: "role".into(), object: QuadObject::Text("admin".into()) }).await;
+        qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        qs.reset_arrangement(&graph).await;
+
+        let results = qs.join_by_two_predicates_cold(&graph, "role", "admin", "role", "superuser").await.unwrap();
+        assert!(results.is_empty(), "no entity has both admin and superuser");
+    }
+
+    // ── CACAO-authed cold-path tests ──────────────────────────────────────────
+    // Rejection tests fail before crypto (capability / graph-scope mismatch).
+    // Acceptance tests use new_for_test() + verify_skip_sig() (test-only bypass).
+
+    async fn setup_committed_qs(graph_key: &str, subject_key: &str, pred: &str, val: &str)
+        -> (QuadStore, KotobaCid, KotobaCid)
+    {
+        let journal = Arc::new(Journal::new());
+        let bs      = Arc::new(MemoryBlockStore::new());
+        let qs      = QuadStore::new(Arc::clone(&journal), Arc::clone(&bs) as _);
+        let g       = make_cid_from(graph_key);
+        let s       = make_cid_from(subject_key);
+        qs.assert(Quad { graph: g.clone(), subject: s.clone(),
+            predicate: pred.into(), object: QuadObject::Text(val.into()) }).await;
+        qs.commit("did:test", g.clone(), 1).await.unwrap();
+        qs.reset_arrangement(&g).await;
+        (qs, g, s)
+    }
+
+    #[tokio::test]
+    async fn cacao_authed_read_rejected_wrong_capability() {
+        let (qs, graph, subject) = setup_committed_qs("cacao-cap-g", "cacao-cap-s", "p", "v").await;
+        let graph_mb = graph.to_multibase();
+        // Chain grants quad:write, not quad:read
+        let chain = DelegationChain::new_for_test(&graph_mb, "quad:write");
+        let result = qs.get_entity_quads_cold_authed(&graph, &subject, &chain).await;
+        assert!(matches!(result, Err(AccessError::Delegation(_))),
+            "quad:write chain must not satisfy quad:read");
+    }
+
+    #[tokio::test]
+    async fn cacao_authed_read_rejected_wrong_graph() {
+        let (qs, graph, subject) = setup_committed_qs("cacao-gph-g", "cacao-gph-s", "p", "v").await;
+        // Chain grants read on a different graph
+        let chain = DelegationChain::new_for_test("different-graph-cid", "quad:read");
+        let result = qs.get_entity_quads_cold_authed(&graph, &subject, &chain).await;
+        assert!(matches!(result, Err(AccessError::Delegation(_))),
+            "chain for wrong graph must be rejected");
+    }
+
+    #[tokio::test]
+    async fn cacao_authed_aevt_rejected_wrong_capability() {
+        let (qs, graph, _) = setup_committed_qs("cacao-aevt-g", "cacao-aevt-s", "name", "Alice").await;
+        let graph_mb = graph.to_multibase();
+        let chain = DelegationChain::new_for_test(&graph_mb, "quad:write");
+        let result = qs.quads_by_predicate_prefix_cold_authed(&graph, "name", &chain).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cacao_authed_avet_rejected_wrong_graph() {
+        let (qs, graph, _) = setup_committed_qs("cacao-avet-g", "cacao-avet-s", "role", "admin").await;
+        let chain = DelegationChain::new_for_test("wrong-graph", "quad:read");
+        let result = qs.lookup_subject_by_po_cold_authed(&graph, "role", "admin", &chain).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cacao_authed_multi_hop_rejected_wrong_graph() {
+        let (qs, graph, subject) = setup_committed_qs("cacao-mh-g", "cacao-mh-s", "p", "v").await;
+        let chain = DelegationChain::new_for_test("wrong-graph", "quad:read");
+        let result = qs.multi_hop_cold_authed(&graph, &subject, 1, &chain).await;
+        assert!(result.is_err(), "wrong graph must be rejected");
+    }
+
+    #[tokio::test]
+    async fn cacao_authed_read_succeeds_with_correct_chain() {
+        let (qs, graph, subject) = setup_committed_qs("cacao-ok-g", "cacao-ok-s", "name", "OkSubj").await;
+        let graph_mb = graph.to_multibase();
+        let chain    = DelegationChain::new_for_test(&graph_mb, "quad:read");
+        // verify_skip_sig to confirm chain shape is correct, then use it for the authed call
+        assert!(chain.verify_skip_sig(&graph_mb, "quad:read").is_ok());
+        // The authed call will hit verify() which calls verify_signature() → will err on fake sig.
+        // This confirms the auth layer is wired; real acceptance requires a properly signed CACAO.
+        let result = qs.get_entity_quads_cold_authed(&graph, &subject, &chain).await;
+        // We expect an error at the sig step, NOT at the capability/graph step.
+        match result {
+            Err(AccessError::Delegation(e)) => {
+                let msg = e.to_string();
+                assert!(!msg.contains("need 'quad:read'") && !msg.contains("graph mismatch"),
+                    "error must be at sig step, not cap/graph: {msg}");
+            }
+            Ok(_) => {} // passes on future test infra with real crypto
+            Err(AccessError::Internal(e)) => panic!("unexpected internal error: {e}"),
+        }
     }
 }

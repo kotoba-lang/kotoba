@@ -234,6 +234,172 @@ fn bench_query_cold_prolly(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── Cold-path: QuadStore committed reads (EAVT / AEVT / AVET / VAET / multi-hop) ──
+
+/// Build a committed QuadStore backed by SimulatedLatencyBlockStore.
+/// Returns (qs, graph_cid, representative_subject_cid).
+async fn make_committed_qs_latency(
+    get_rtt: Duration,
+    put_rtt: Duration,
+    n_entities: u64,
+) -> (QuadStore, KotobaCid, KotobaCid) {
+    let inner = SimulatedLatencyBlockStore {
+        inner: MemoryBlockStore::new(),
+        get_rtt,
+        put_rtt,
+    };
+    let store = Arc::new(inner) as Arc<dyn BlockStore + Send + Sync>;
+    let qs = QuadStore::new(Arc::new(Journal::new()), store);
+    let graph = make_cid(1);
+    let quads: Vec<Quad> = (0..n_entities).flat_map(|i| {
+        let s = make_cid(i + 100);
+        [
+            Quad { graph: graph.clone(), subject: s.clone(),
+                   predicate: "name".to_string(),
+                   object: QuadObject::Text(format!("entity-{i}")) },
+            Quad { graph: graph.clone(), subject: s.clone(),
+                   predicate: "knows".to_string(),
+                   object: QuadObject::Cid(make_cid((i + 1) % n_entities + 100)) },
+        ]
+    }).collect();
+    qs.assert_batch_silent(quads).await;
+    let graph_cid = qs.commit("did:bench", graph.clone(), 1).await.unwrap();
+    qs.reset_arrangement(&graph_cid).await;
+    let subject = make_cid(100 + n_entities / 2);
+    (qs, graph_cid, subject)
+}
+
+/// Cold EAVT: `get_entity_quads_cold` — one subject's full attribute set.
+fn bench_cold_eavt(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("quad_store/cold_eavt");
+    group.sample_size(10);
+
+    for (name, get_rtt, put_rtt) in [
+        ("kubo_lan_1ms",   ms(1),  ms(2)),
+        ("kubo_wan_80ms",  ms(80), ms(100)),
+        ("s3_same_az_2ms", ms(2),  ms(10)),
+    ] {
+        let (qs, graph_cid, subject) = rt.block_on(
+            make_committed_qs_latency(get_rtt, put_rtt, 1_000));
+        group.bench_function(name, |b| {
+            b.to_async(&rt).iter(|| async {
+                qs.get_entity_quads_cold(&graph_cid, &subject).await.unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Cold AEVT: `quads_by_predicate_prefix_cold` — all quads with predicate "name".
+fn bench_cold_aevt(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("quad_store/cold_aevt");
+    group.sample_size(10);
+
+    for (name, get_rtt, put_rtt) in [
+        ("kubo_lan_1ms",   ms(1),  ms(2)),
+        ("kubo_wan_80ms",  ms(80), ms(100)),
+        ("s3_same_az_2ms", ms(2),  ms(10)),
+    ] {
+        let (qs, graph_cid, _) = rt.block_on(
+            make_committed_qs_latency(get_rtt, put_rtt, 1_000));
+        group.bench_function(name, |b| {
+            b.to_async(&rt).iter(|| async {
+                qs.quads_by_predicate_prefix_cold(&graph_cid, "name").await.unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Cold AVET: `lookup_subject_by_po_cold` — subjects where predicate=name, object="entity-100".
+fn bench_cold_avet(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("quad_store/cold_avet");
+    group.sample_size(10);
+
+    for (name, get_rtt, put_rtt) in [
+        ("kubo_lan_1ms",   ms(1),  ms(2)),
+        ("kubo_wan_80ms",  ms(80), ms(100)),
+        ("s3_same_az_2ms", ms(2),  ms(10)),
+    ] {
+        let (qs, graph_cid, _) = rt.block_on(
+            make_committed_qs_latency(get_rtt, put_rtt, 1_000));
+        group.bench_function(name, |b| {
+            b.to_async(&rt).iter(|| async {
+                qs.lookup_subject_by_po_cold(&graph_cid, "name", "entity-100").await.unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Cold VAET: `reverse_lookup_cold` — all subjects that reference a given object CID.
+fn bench_cold_vaet(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("quad_store/cold_vaet");
+    group.sample_size(10);
+
+    for (name, get_rtt, put_rtt) in [
+        ("kubo_lan_1ms",   ms(1),  ms(2)),
+        ("kubo_wan_80ms",  ms(80), ms(100)),
+        ("s3_same_az_2ms", ms(2),  ms(10)),
+    ] {
+        // entity-100 is referenced by entity-99 via "knows"
+        let object_cid = make_cid(100 + 500);
+        let (qs, graph_cid, _) = rt.block_on(
+            make_committed_qs_latency(get_rtt, put_rtt, 1_000));
+        group.bench_function(name, |b| {
+            b.to_async(&rt).iter(|| async {
+                qs.reverse_lookup_cold(&graph_cid, &object_cid).await.unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Cold multi-hop: BFS traversal 2 hops from start entity.
+fn bench_cold_multi_hop(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("quad_store/cold_multi_hop");
+    group.sample_size(10);
+
+    for (name, get_rtt, put_rtt) in [
+        ("kubo_lan_1ms",   ms(1),  ms(2)),
+        ("s3_same_az_2ms", ms(2),  ms(10)),
+    ] {
+        let (qs, graph_cid, start) = rt.block_on(
+            make_committed_qs_latency(get_rtt, put_rtt, 200));
+        group.bench_function(name, |b| {
+            b.to_async(&rt).iter(|| async {
+                qs.multi_hop_cold(&graph_cid, &start, 2).await.unwrap()
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_per_quad,
@@ -241,5 +407,10 @@ criterion_group!(
     bench_insert_batch_chunked,
     bench_query_hot,
     bench_query_cold_prolly,
+    bench_cold_eavt,
+    bench_cold_aevt,
+    bench_cold_avet,
+    bench_cold_vaet,
+    bench_cold_multi_hop,
 );
 criterion_main!(benches);
