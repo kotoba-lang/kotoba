@@ -3,7 +3,7 @@
 //! This example encodes the ashiba Lean BMC as kotoba Quads, then runs
 //! a DatalogProgram to compute coverage % and per-block maturity scores.
 //!
-//! Data source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v3.toml`
+//! Data source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v9.toml`
 //! Rules source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/coverage.dl`
 
 use anyhow::Result;
@@ -21,15 +21,15 @@ use std::sync::Arc;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const BMC_BLOCKS: &[(&str, i64)] = &[
-    ("problem",           4),
+    ("problem",           5),
     ("customer_segments", 4),
-    ("uvp",               4),
+    ("uvp",               5),
     ("solution",          4),
-    ("channels",          4),
-    ("revenue",           4),
+    ("channels",          5),
+    ("revenue",           5),
     ("cost_structure",    4),
     ("key_metrics",       4),
-    ("unfair_advantage",  4),
+    ("unfair_advantage",  5),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,13 +37,23 @@ const BMC_BLOCKS: &[(&str, i64)] = &[
 // ─────────────────────────────────────────────────────────────────────────────
 
 const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
-    ("p1", "problem", "工務店の60%以上が足場確保に3日以上かけている", false),
-    ("p2", "problem", "中小足場業者の遊休在庫率は30%超", false),
-    ("p3", "problem", "工務店の80%は相見積もりを3社以上から取れていない", false),
-    ("cs1_cold_start", "customer_segments", "供給側50社pre-commitmentでコールドスタート解消", false),
-    ("uvp1", "uvp", "「5分で足場を見つける」コピーCTR > 5%", false),
-    ("r1", "revenue", "6% take rateで双方継続利用", false),
-    ("ua1", "unfair_advantage", "安全チェック自動化が競合との差別化になる", false),
+    ("p_national",    "problem",           "全国ペイン普遍的 (stable)", true),
+    ("cs_scale1",     "customer_segments", "全国 供給 500社 (174社達成中)", false),
+    ("cs_enterprise", "customer_segments", "ゼネコン POC 2社 kick-off", false),
+    ("uvp_v2_ai",     "uvp",               "v2 AI beta 成約率 94.1% (A/B validated)", true),
+    ("uvp_network",   "uvp",               "全国最大在庫 174社 = 競合 6.2倍", true),
+    ("sol_v2_dev",    "solution",          "v2 本番 rollout 2026-08-01 (実装 80%)", false),
+    ("sol_enterprise","solution",          "Enterprise API 竹中 POC 稼働中", false),
+    ("ch_national",   "channels",          "全国 3拠点 launch 71社 CAC ¥5,800", true),
+    ("ch_seo_scale",  "channels",          "SEO organic 2,000+/月 (Month 9)", false),
+    ("r_gmv_scale",   "revenue",           "GMV ¥28M (+76% MoM) → ¥50M 軌道", false),
+    ("r_enterprise",  "revenue",           "Enterprise ¥80K/月 竹中見積提出中", false),
+    ("cs_series_a",   "cost_structure",    "Series A deck 完成 / VC 3社 pitch scheduled", false),
+    ("cs_team",       "cost_structure",    "エンジニア 4名採用完了 / BizDev 2名内定", false),
+    ("km_nrr",        "key_metrics",       "NRR 118% (目標 120% まで +2pt)", false),
+    ("km_d180",       "key_metrics",       "D120 38.4% → D180 > 35% 外挿 on-track", false),
+    ("ua_did_moat",   "unfair_advantage",  "DID 2,341件 相関 0.77 蓄積加速", true),
+    ("ua_association","unfair_advantage",  "工業会正式認定 + 安全点検 API 独占", true),
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,7 +62,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
 
 fn cid(s: &str) -> KotobaCid { KotobaCid::from_bytes(s.as_bytes()) }
 
-fn graph_cid() -> KotobaCid { cid("bmc:ashiba:v3") }
+fn graph_cid() -> KotobaCid { cid("bmc:ashiba:v9") }
 
 fn quad(subject: &str, predicate: &str, object: QuadObject) -> Quad {
     Quad { graph: graph_cid(), subject: cid(subject), predicate: predicate.to_string(), object }
@@ -67,7 +77,7 @@ fn build_bmc_facts() -> Vec<Delta> {
 
     // bmc root
     deltas.push(Delta::assert(quad(
-        "bmc:ashiba", "bmc/version", QuadObject::Text("v3".into()),
+        "bmc:ashiba", "bmc/version", QuadObject::Text("v9".into()),
     )));
     deltas.push(Delta::assert(quad(
         "bmc:ashiba", "bmc/product", QuadObject::Text("ashiba.gftd.ai".into()),
@@ -212,7 +222,7 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║     ashiba.gftd.ai Lean BMC — kotoba Scoring Report      ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Iteration : 3  (2026-05-27)                             ║");
+    println!("║  Iteration : 9  (2026-05-27) [Series A Phase — Month 2]  ║");
     println!("║  Model     : Lean Canvas Hybrid (9 blocks)               ║");
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Coverage  : {derived_covered}/{total} blocks = {coverage_pct}%                       ║");
@@ -233,15 +243,18 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     }
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Riskiest Assumptions (prioritised)                      ║");
-    println!("║    1. 供給側コールドスタート (pre-commitment 50社)        ║");
-    println!("║    2. 問題の深刻度 (3日超調達率 > 60%)                   ║");
-    println!("║    3. Take rate 受容性 (6% @ both sides)                 ║");
+    println!("║    1. Series A close — グロービス/WiL/DCM term sheet     ║");
+    println!("║    2. NRR 120% — upsell 速度 vs churn (現 118%)          ║");
+    println!("║    3. ゼネコン Enterprise ¥80K — 稟議 3-6ヶ月            ║");
     println!("╠══════════════════════════════════════════════════════════╣");
-    println!("║  Next Iteration (iter-4) Goals: maturity → 5.0           ║");
-    println!("║    · 需要側 20社インタビュー全完了 → p1 統計確定         ║");
-    println!("║    · LP A/B n=500達成 → 勝者 variant 確定               ║");
-    println!("║    · Concierge MVP 月20件達成 → NPS >= 8 validated       ║");
-    println!("║    · 供給側 pre-commitment 10社達成 → cold-start 解消    ║");
+    println!("║  GMV ¥28M (+76%) / v2 AI 94.1% / DID 2,341件 / NRR 118% ║");
+    println!("║  全国 174社 / 3拠点 launch / Series A pitch 2026-07       ║");
+    println!("╠══════════════════════════════════════════════════════════╣");
+    println!("║  Next (iter-10) → avg 5.0 (Series A VALIDATED)           ║");
+    println!("║    · Series A term sheet 1社以上取得                     ║");
+    println!("║    · v2 AI 本番 rollout (2026-08-01)                     ║");
+    println!("║    · NRR 120%+ 確認                                      ║");
+    println!("║    · ゼネコン Enterprise 1社契約 / GMV ¥40M 軌道         ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 }
 

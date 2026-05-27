@@ -12,7 +12,7 @@ use kotoba_kse::{sync_window::SyncWindow, AgentIdentity, Journal, KseStore, PreK
 use kotoba_kqe::quad::Quad;
 use kotoba_graph::QuadStore;
 use kotoba_kse::SecureVault;
-use kotoba_store::KotobasePinClient;
+use kotoba_store::IpfsPinClient;
 use kotoba_runtime::{host::InferenceFn, UdfExecutor, WasmExecutor};
 use kotoba_ingest::embed_client::{EmbedClient, HttpEmbedClient};
 use kotoba_vm::{distributed::DistributedPregelRunner, InvokeRouter};
@@ -97,7 +97,7 @@ pub struct KotobaState {
     pub quad_store:  Arc<QuadStore>,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
     /// Optional kotobase.gftd.ai XRPC pin client (KOTOBA_PIN_TOKEN).
-    pub kotobase_pin: Option<Arc<KotobasePinClient>>,
+    pub ipfs_pin: Arc<IpfsPinClient>,
     // ── Email E2E Storage ────────────────────────────────────────────────────
     /// AES-256-GCM encrypted vault for email body blobs (legacy; kept for compat).
     pub secure_vault: Arc<SecureVault>,
@@ -233,11 +233,9 @@ impl KotobaState {
         };
         let udf = Arc::new(UdfExecutor::new()?);
 
-        // kotobase.gftd.ai pin client — optional; requires KOTOBA_PIN_TOKEN
-        let kotobase_pin = KotobasePinClient::from_env();
-        if kotobase_pin.is_some() {
-            tracing::info!("kotobase pinning enabled (KOTOBA_PIN_TOKEN)");
-        }
+        // IPFS pin client — always initialised; pins against KOTOBA_IPFS_ENDPOINT (default localhost:5001)
+        let ipfs_pin = IpfsPinClient::from_env();
+        tracing::info!("IPFS pin client ready (KOTOBA_IPFS_ENDPOINT)");
 
         // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path
         let quad_store = Arc::new(QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store)));
@@ -306,7 +304,7 @@ impl KotobaState {
             inference_engine,
             block_store,
             quad_store,
-            kotobase_pin,
+            ipfs_pin,
             secure_vault,
             crypto:            None,
             kse_store,

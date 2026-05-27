@@ -548,12 +548,12 @@ pub async fn handle_pin_create(
     state.quad_store.assert_batch_silent(pin_quads).await;
 
     // Fire-and-forget IPFS pin
-    if let Some(ipfs) = &state.kotobase_pin {
-        let ipfs_c    = Arc::clone(ipfs);
-        let cid_c     = resolved_cid.clone();
-        let state_c   = Arc::clone(&state);
-        let pin_id_c  = pin_id.clone();
-        let pin_g_c   = pin_g.clone();
+    {
+        let ipfs_c   = Arc::clone(&state.ipfs_pin);
+        let cid_c    = resolved_cid.clone();
+        let state_c  = Arc::clone(&state);
+        let pin_id_c = pin_id.clone();
+        let pin_g_c  = pin_g.clone();
         tokio::spawn(async move {
             ipfs_c.pin(&cid_c).await;
             let done = vec![
@@ -562,17 +562,13 @@ pub async fn handle_pin_create(
             ];
             state_c.quad_store.assert_batch_silent(done).await;
         });
-    } else {
-        // No IPFS — mark pinned immediately (Sled-only local storage)
-        let done = vec![text_quad(&pin_g, &pin_id, "kotobase/pin/status", "pinned")];
-        state.quad_store.assert_batch_silent(done).await;
     }
 
     (StatusCode::OK, Json(PinCreateResp {
         ok:     true,
         pin_id,
         cid:    resolved_cid,
-        status: if state.kotobase_pin.is_some() { "pinning" } else { "pinned" }.into(),
+        status: "pinning".into(),
         size_bytes: size,
         error:  None,
     }))
