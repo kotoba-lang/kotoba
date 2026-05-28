@@ -305,18 +305,21 @@ mod tests {
 
     #[test]
     fn delegation_verify_chain_depth_exceeded_errors() {
+        // Depth=2 is now supported; depth=3+ is still rejected.
         let cacao1 = Cacao {
             h: CacaoHeader { t: "eip4361".into() },
             p: test_payload(vec![]),
             s: CacaoSig { t: "eip191".into(), s: "00".into() },
         };
         let cacao2 = cacao1.clone();
+        let cacao3 = cacao1.clone();
         let mut chain = delegation::DelegationChain::new(cacao1);
-        chain.chain.push(cacao2); // forge a second link
+        chain.chain.push(cacao2);
+        chain.chain.push(cacao3); // depth-3 chain
         let err = chain.verify("graph_cid", "quad:write").unwrap_err();
         assert!(
-            matches!(err, DelegationError::ChainDepthExceeded(2)),
-            "expected ChainDepthExceeded(2), got {err:?}"
+            matches!(err, DelegationError::ChainDepthExceeded(3)),
+            "expected ChainDepthExceeded(3), got {err:?}"
         );
     }
 

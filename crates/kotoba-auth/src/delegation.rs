@@ -101,11 +101,16 @@ impl DelegationChain {
     pub fn verify(&self, graph_cid: &str, required_cap: &str) -> Result<String, DelegationError> {
         match self.chain.len() {
             0 => return Err(DelegationError::EmptyChain),
-            // Multi-link delegation is not implemented; extra links would be silently
-            // ignored, which could allow an attacker to bypass capability checks by
-            // appending forged sub-delegations.  Hard-reject until it is designed.
-            n if n > 1 => return Err(DelegationError::ChainDepthExceeded(n)),
-            _ => {}
+            1 => {} // single CACAO — verified below
+            2 => {
+                // Depth-2 delegation: chain[0] = root grant, chain[1] = leaf invocation.
+                //   chain[0].iss → chain[0].aud = chain[1].iss → chain[1].aud (resource)
+                //   chain[1] is what the caller is presenting now — verify its sig +
+                //   capability + graph + temporal, then check the parent delegation
+                //   from chain[0] to chain[1].iss.
+                return self.verify_depth2(graph_cid, required_cap);
+            }
+            n => return Err(DelegationError::ChainDepthExceeded(n)),
         }
         let cacao = &self.chain[0];
 
@@ -162,6 +167,96 @@ impl DelegationChain {
         let issuer_did = cacao.verify_signature().map_err(DelegationError::Cacao)?;
 
         Ok(issuer_did)
+    }
+
+    /// Verify a depth-2 delegation chain.
+    ///
+    /// Layout:
+    ///   chain[0] = root CACAO: root_iss → root_aud, granting `cap` on `graph_cid`
+    ///   chain[1] = leaf CACAO: leaf_iss → final_aud (caller), claiming the same
+    ///                          (or attenuated) capability on the same graph
+    ///
+    /// Checks (in order):
+    ///   1. Both CACAOs are temporally valid (exp + max-age)
+    ///   2. leaf.iss == root.aud  (audience-issuer chain)
+    ///   3. leaf.capability ⊆ root.capability  (capability attenuation)
+    ///   4. leaf.graph_cid == root.graph_cid (graph-scope attenuation)
+    ///   5. leaf.graph_cid == graph_cid (caller's request matches)
+    ///   6. leaf.capability == required_cap
+    ///   7. Both signatures verify cryptographically (leaf must be signed by
+    ///      its declared iss, root must be signed by its declared iss)
+    ///
+    /// Returns the root issuer DID (the ultimate authority for this invocation).
+    fn verify_depth2(&self, graph_cid: &str, required_cap: &str) -> Result<String, DelegationError> {
+        let root = &self.chain[0];
+        let leaf = &self.chain[1];
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        // 1. Temporal validity on both
+        for c in [root, leaf] {
+            if let Some(exp) = &c.p.expiry {
+                if !is_utc_iso8601(exp) {
+                    return Err(DelegationError::InvalidExpiry(exp.clone()));
+                }
+                let now_iso = format_iso8601(now_secs);
+                if now_iso > *exp { return Err(DelegationError::Expired); }
+            } else {
+                match parse_utc_iso8601(&c.p.issued_at) {
+                    None => return Err(DelegationError::InvalidExpiry(c.p.issued_at.clone())),
+                    Some(iat) => {
+                        if now_secs.saturating_sub(iat) > MAX_CACAO_AGE_SECS {
+                            return Err(DelegationError::Expired);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Audience-issuer chain: root.aud == leaf.iss
+        if root.p.aud != leaf.p.iss {
+            return Err(DelegationError::AttenuationViolation(format!(
+                "root.aud '{}' != leaf.iss '{}'", root.p.aud, leaf.p.iss
+            )));
+        }
+
+        // 3/4. Capability + graph attenuation: leaf must claim same cap+graph as root
+        let root_cap   = root.p.capability().unwrap_or("");
+        let leaf_cap   = leaf.p.capability().unwrap_or("");
+        let root_graph = root.p.graph_cid().unwrap_or("");
+        let leaf_graph = leaf.p.graph_cid().unwrap_or("");
+        if root_cap != leaf_cap {
+            return Err(DelegationError::AttenuationViolation(format!(
+                "root grants '{root_cap}', leaf claims '{leaf_cap}'"
+            )));
+        }
+        if root_graph != leaf_graph {
+            return Err(DelegationError::AttenuationViolation(format!(
+                "root graph '{root_graph}' != leaf graph '{leaf_graph}'"
+            )));
+        }
+
+        // 5. Caller's graph request matches the chain's grant
+        if !root_graph.is_empty() && root_graph != graph_cid {
+            return Err(DelegationError::GraphMismatch {
+                expected: root_graph.to_string(),
+                got:      graph_cid.to_string(),
+            });
+        }
+
+        // 6. Required capability matches
+        if leaf_cap != required_cap {
+            return Err(DelegationError::CapabilityDenied(format!(
+                "need '{required_cap}', leaf grants '{leaf_cap}'"
+            )));
+        }
+
+        // 7. Cryptographic signatures on both
+        let root_iss = root.verify_signature().map_err(DelegationError::Cacao)?;
+        let _leaf_iss = leaf.verify_signature().map_err(DelegationError::Cacao)?;
+
+        Ok(root_iss)
     }
 }
 
@@ -267,8 +362,10 @@ fn is_leap(y: u64) -> bool {
 pub enum DelegationError {
     #[error("empty delegation chain")]
     EmptyChain,
-    #[error("chain depth {0} exceeds maximum (1); multi-link delegation not implemented")]
+    #[error("chain depth {0} exceeds maximum supported (2)")]
     ChainDepthExceeded(usize),
+    #[error("delegation attenuation broken: {0}")]
+    AttenuationViolation(String),
     #[error("cacao error: {0}")]
     Cacao(#[from] CacaoError),
     #[error("capability not granted: {0}")]
@@ -448,7 +545,7 @@ mod tests {
     fn delegation_error_chain_depth_display() {
         assert_eq!(
             DelegationError::ChainDepthExceeded(3).to_string(),
-            "chain depth 3 exceeds maximum (1); multi-link delegation not implemented",
+            "chain depth 3 exceeds maximum supported (2)",
         );
     }
 
@@ -498,7 +595,141 @@ mod tests {
         // We cannot easily construct a valid Cacao without crypto in a unit test,
         // but we can test the chain-depth guard by passing an artificial chain length.
         // Instead, just test the error variant displays correctly (covered above).
-        let e = DelegationError::ChainDepthExceeded(2);
-        assert!(e.to_string().contains("chain depth 2"));
+        let e = DelegationError::ChainDepthExceeded(3);
+        assert!(e.to_string().contains("chain depth 3"));
+    }
+
+    // ─── Depth-2 delegation chains (root → leaf) ────────────────────────────
+
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::{Signer, SigningKey};
+    use super::super::cacao::{Cacao, CacaoHeader, CacaoPayload, CacaoSig};
+    use super::super::did_key::ed25519_pubkey_to_did_key;
+
+    /// Build a real-signed CACAO with the given iss/aud/cap/graph.
+    fn make_real_cacao(sk: &SigningKey, iss: &str, aud: &str, cap: &str, graph: &str, nonce: &str) -> Cacao {
+        let template = Cacao {
+            h: CacaoHeader { t: "eip4361".into() },
+            p: CacaoPayload {
+                iss:       iss.to_string(),
+                aud:       aud.to_string(),
+                issued_at: "2026-01-01T00:00:00Z".into(),
+                expiry:    Some("2099-01-01T00:00:00Z".into()),
+                nonce:     nonce.into(),
+                domain:    "kotoba.test".into(),
+                statement: None,
+                version:   "1".into(),
+                resources: vec![
+                    format!("kotoba://can/{cap}"),
+                    format!("kotoba://graph/{graph}"),
+                ],
+            },
+            s: CacaoSig { t: "EdDSA".into(), s: String::new() },
+        };
+        let msg     = template.siwe_message();
+        let sig     = sk.sign(msg.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        Cacao { s: CacaoSig { t: "EdDSA".into(), s: sig_b64 }, ..template }
+    }
+
+    fn signing_key_seed(seed: u8) -> (SigningKey, String) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let did = ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes());
+        (sk, did)
+    }
+
+    #[test]
+    fn depth2_valid_chain_accepted() {
+        let graph = "graph-abc";
+        let (root_sk, root_did) = signing_key_seed(1);
+        let (leaf_sk, leaf_did) = signing_key_seed(2);
+        let final_aud = "did:final:caller";
+
+        let root = make_real_cacao(&root_sk, &root_did, &leaf_did, "quad:read", graph, "n-root");
+        let leaf = make_real_cacao(&leaf_sk, &leaf_did, final_aud, "quad:read", graph, "n-leaf");
+        let chain = DelegationChain { chain: vec![root, leaf] };
+
+        let issuer = chain.verify(graph, "quad:read").expect("valid depth-2 chain");
+        assert_eq!(issuer, root_did, "root issuer must be returned");
+    }
+
+    #[test]
+    fn depth2_broken_aud_iss_rejected() {
+        // root.aud != leaf.iss → attenuation violation
+        let graph = "graph-abc";
+        let (root_sk, root_did)  = signing_key_seed(3);
+        let (_other_sk, other_did) = signing_key_seed(4);
+        let (leaf_sk, leaf_did)  = signing_key_seed(5);
+
+        let root = make_real_cacao(&root_sk, &root_did, &other_did /* not leaf_did */,
+            "quad:read", graph, "n-root");
+        let leaf = make_real_cacao(&leaf_sk, &leaf_did, "did:final", "quad:read", graph, "n-leaf");
+        let chain = DelegationChain { chain: vec![root, leaf] };
+
+        let err = chain.verify(graph, "quad:read").unwrap_err();
+        assert!(matches!(err, DelegationError::AttenuationViolation(_)),
+            "expected AttenuationViolation, got {err:?}");
+    }
+
+    #[test]
+    fn depth2_capability_escalation_rejected() {
+        // root grants read, leaf claims write → must be rejected
+        let graph = "graph-abc";
+        let (root_sk, root_did) = signing_key_seed(6);
+        let (leaf_sk, leaf_did) = signing_key_seed(7);
+
+        let root = make_real_cacao(&root_sk, &root_did, &leaf_did, "quad:read",  graph, "n-root");
+        let leaf = make_real_cacao(&leaf_sk, &leaf_did, "did:final", "quad:write", graph, "n-leaf");
+        let chain = DelegationChain { chain: vec![root, leaf] };
+
+        let err = chain.verify(graph, "quad:write").unwrap_err();
+        assert!(matches!(err, DelegationError::AttenuationViolation(_)),
+            "capability escalation must be rejected: {err:?}");
+    }
+
+    #[test]
+    fn depth2_graph_mismatch_rejected() {
+        let (root_sk, root_did) = signing_key_seed(8);
+        let (leaf_sk, leaf_did) = signing_key_seed(9);
+
+        let root = make_real_cacao(&root_sk, &root_did, &leaf_did, "quad:read", "graph-X", "n-root");
+        let leaf = make_real_cacao(&leaf_sk, &leaf_did, "did:final", "quad:read", "graph-Y", "n-leaf");
+        let chain = DelegationChain { chain: vec![root, leaf] };
+
+        let err = chain.verify("graph-X", "quad:read").unwrap_err();
+        assert!(matches!(err, DelegationError::AttenuationViolation(_)),
+            "graph attenuation violation expected: {err:?}");
+    }
+
+    #[test]
+    fn depth2_caller_graph_outside_grant_rejected() {
+        // chain grants graph-A but caller asks for graph-B
+        let (root_sk, root_did) = signing_key_seed(10);
+        let (leaf_sk, leaf_did) = signing_key_seed(11);
+
+        let root = make_real_cacao(&root_sk, &root_did, &leaf_did, "quad:read", "graph-A", "n-root");
+        let leaf = make_real_cacao(&leaf_sk, &leaf_did, "did:final", "quad:read", "graph-A", "n-leaf");
+        let chain = DelegationChain { chain: vec![root, leaf] };
+
+        let err = chain.verify("graph-B", "quad:read").unwrap_err();
+        assert!(matches!(err, DelegationError::GraphMismatch { .. }),
+            "caller-graph mismatch must be rejected: {err:?}");
+    }
+
+    #[test]
+    fn depth3_rejected() {
+        // 3-link chain is not supported
+        let (root_sk, root_did) = signing_key_seed(12);
+        let (_m_sk,   m_did)    = signing_key_seed(13);
+        let (leaf_sk, leaf_did) = signing_key_seed(14);
+
+        let root = make_real_cacao(&root_sk, &root_did, &m_did, "quad:read", "g", "n1");
+        let leaf = make_real_cacao(&leaf_sk, &leaf_did, "did:final", "quad:read", "g", "n3");
+        // Insert a dummy middle just to make the chain length 3
+        let middle = root.clone();
+        let chain = DelegationChain { chain: vec![root, middle, leaf] };
+
+        let err = chain.verify("g", "quad:read").unwrap_err();
+        assert!(matches!(err, DelegationError::ChainDepthExceeded(3)));
     }
 }
