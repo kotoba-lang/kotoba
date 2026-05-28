@@ -643,6 +643,56 @@ impl QuadStore {
     ///     r#"SELECT * WHERE { ?s <role> "admin" }"#,
     /// ).await?;
     /// ```
+    /// CID-addressed materialised view of a SPARQL query result.
+    ///
+    /// Computes a deterministic projector CID from
+    /// `("kotoba-mv:v1", commit_cid_for_graph, query_form, normalised_sparql)`,
+    /// looks it up in the BlockStore, and:
+    ///   - hit  → deserialise and return cached `Vec<Quad>` (≈ µs, no compute)
+    ///   - miss → run query, serialise result via dag-cbor, `put` under the
+    ///            computed CID, return live result
+    ///
+    /// This turns repeated identical queries against a sealed graph commit into
+    /// content-addressed lookups — the same query against the same commit
+    /// always yields the same result, so the answer has a deterministic CID.
+    ///
+    /// Cache invalidation is automatic: a new commit yields a new graph commit
+    /// CID, which produces a new MV CID — the old MV remains addressable but
+    /// is no longer consulted by callers using the new graph state.
+    pub async fn cold_query_sparql_bgp_cached(
+        &self,
+        graph_cid: &KotobaCid,
+        sparql:    &str,
+    ) -> anyhow::Result<(Vec<Quad>, KotobaCid, bool /* cache_hit */)> {
+        // Resolve the latest commit CID for this graph (for cache-key freshness).
+        let commit_cid = {
+            let dag = self.commit_dag.read().await;
+            dag.head(graph_cid).map(|c| c.cid.clone()).unwrap_or_else(|| graph_cid.clone())
+        };
+        let key = format!(
+            "kotoba-mv:v1\n{}\n{}\nSELECT-MV\n{}",
+            commit_cid.to_multibase(),
+            graph_cid.to_multibase(),
+            sparql.trim(),
+        );
+        let mv_cid = KotobaCid::from_bytes(key.as_bytes());
+
+        // Cache hit?
+        if let Some(blob) = self.block_store.get(&mv_cid)? {
+            if let Ok(quads) = ciborium::from_reader::<Vec<Quad>, _>(&blob[..]) {
+                return Ok((quads, mv_cid, true));
+            }
+        }
+
+        // Cache miss: run live query, materialise, persist
+        let quads = self.cold_query_sparql_bgp(graph_cid, sparql).await?;
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&quads, &mut bytes)
+            .map_err(|e| anyhow::anyhow!("MV serialise: {e}"))?;
+        self.block_store.put(&mv_cid, &bytes)?;
+        Ok((quads, mv_cid, false))
+    }
+
     pub async fn cold_query_sparql_bgp(
         &self,
         graph_cid: &KotobaCid,
@@ -5103,6 +5153,50 @@ mod tests {
         ).await.unwrap();
         assert!(federated.is_empty(),
             "g2 quads must be filtered out (not in authorized_graphs), got {}", federated.len());
+    }
+
+    // ─── CID-addressed materialised view cache ─────────────────────────────────
+
+    #[tokio::test]
+    async fn cached_query_first_call_miss_second_hit() {
+        // First call: cache miss, computes result + persists under MV CID.
+        // Second call: cache hit, returns same result with same CID, no recompute.
+        let (qs, graph) = setup_sparql_qs().await;
+        let q = r#"SELECT * WHERE { ?s <role> "admin" }"#;
+        let (r1, cid1, hit1) = qs.cold_query_sparql_bgp_cached(&graph, q).await.unwrap();
+        let (r2, cid2, hit2) = qs.cold_query_sparql_bgp_cached(&graph, q).await.unwrap();
+
+        assert!(!hit1, "first call must be a miss");
+        assert!(hit2,  "second call must be a hit");
+        assert_eq!(cid1, cid2, "MV CID must be stable across calls");
+        assert_eq!(r1.len(), r2.len(), "cached result must equal live result");
+        assert_eq!(r1, r2, "byte-identical cached vs live");
+        assert_eq!(r1.len(), 2, "2 admins expected");
+    }
+
+    #[tokio::test]
+    async fn cached_query_distinct_sparql_distinct_cids() {
+        // Different SPARQL strings → different MV CIDs.
+        let (qs, graph) = setup_sparql_qs().await;
+        let (_, cid_a, _) = qs.cold_query_sparql_bgp_cached(
+            &graph, r#"SELECT * WHERE { ?s <role> "admin" }"#).await.unwrap();
+        let (_, cid_b, _) = qs.cold_query_sparql_bgp_cached(
+            &graph, r#"SELECT * WHERE { ?s <role> "user" }"#).await.unwrap();
+        assert_ne!(cid_a, cid_b, "different queries must yield different MV CIDs");
+    }
+
+    #[tokio::test]
+    async fn cached_query_aggregate_persists_under_cid() {
+        // GROUP BY aggregate query — exactly the case where CID-MV is most valuable.
+        let (qs, graph) = setup_sparql_qs().await;
+        let q = "SELECT ?r (COUNT(*) AS ?n) WHERE { ?s <role> ?r } GROUP BY ?r";
+        let (r1, cid1, hit1) = qs.cold_query_sparql_bgp_cached(&graph, q).await.unwrap();
+        assert!(!hit1, "first aggregate call must be a miss");
+        assert_eq!(r1.len(), 2, "two role groups");
+        let (r2, cid2, hit2) = qs.cold_query_sparql_bgp_cached(&graph, q).await.unwrap();
+        assert!(hit2, "second aggregate call must be a hit");
+        assert_eq!(cid1, cid2, "aggregate MV CID stable");
+        assert_eq!(r1, r2, "aggregate result identical");
     }
 
     #[tokio::test]
