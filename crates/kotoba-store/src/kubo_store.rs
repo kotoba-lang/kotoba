@@ -56,6 +56,30 @@ impl KuboBlockStore {
         }
     }
 
+    /// Probe the Kubo daemon's `/api/v0/version` endpoint.
+    ///
+    /// Returns `Ok((version, commit))` on a 200 response so operators can log
+    /// the running daemon version at startup.  Falls back to `Err` if the
+    /// daemon is unreachable, returns a non-2xx, or the JSON is malformed.
+    pub async fn probe_version(&self) -> anyhow::Result<(String, String)> {
+        let url = format!("{}/api/v0/version", self.endpoint.trim_end_matches('/'));
+        let mut req = self.client.post(&url);
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await
+            .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        if !resp.status().is_success() {
+            anyhow::bail!("HTTP {}", resp.status());
+        }
+        // Extract just Version/Commit fields from the JSON body without pulling
+        // serde_json into the crate's deps — we only need two string lookups.
+        let body = resp.text().await.map_err(|e| anyhow::anyhow!("read: {e}"))?;
+        let version = extract_json_string_field(&body, "Version").unwrap_or_default();
+        let commit  = extract_json_string_field(&body, "Commit").unwrap_or_default();
+        Ok((version, commit))
+    }
+
     pub fn from_env() -> Self {
         let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:5001".into());
@@ -289,4 +313,26 @@ mod tests {
         store.unpin(&cid);
         assert!(!store.is_pinned(&cid));
     }
+
+    #[test]
+    fn extract_json_string_field_basic() {
+        let body = r#"{"Version":"0.27.0","Commit":"abc123","Other":42}"#;
+        assert_eq!(extract_json_string_field(body, "Version"), Some("0.27.0".into()));
+        assert_eq!(extract_json_string_field(body, "Commit"),  Some("abc123".into()));
+        assert_eq!(extract_json_string_field(body, "Missing"), None);
+    }
+}
+
+/// Minimal JSON string-field extractor (avoids a serde_json dep).
+/// Looks for `"<key>":"<value>"` and returns the unescaped value.
+fn extract_json_string_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let i = body.find(&needle)?;
+    let rest = &body[i + needle.len()..];
+    let colon = rest.find(':')?;
+    let after_colon = rest[colon + 1..].trim_start();
+    if !after_colon.starts_with('"') { return None; }
+    let val = &after_colon[1..];
+    let end = val.find('"')?;
+    Some(val[..end].to_string())
 }

@@ -477,6 +477,27 @@ pub async fn run() -> anyhow::Result<()> {
     let state = server::KotobaState::new(inference_engine)?;
     let state = state.init_crypto().await?;
 
+    // IPFS daemon liveness probe — non-fatal but logs a clear warning so the
+    // operator notices when Kubo isn't reachable.  Skipped when KOTOBA_IPFS=off.
+    let ipfs_off = std::env::var("KOTOBA_IPFS")
+        .map(|v| v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    if !ipfs_off {
+        let probe = kotoba_store::KuboBlockStore::from_env();
+        match probe.probe_version().await {
+            Ok((ver, commit)) => tracing::info!(
+                kubo_version = %ver,
+                kubo_commit  = %commit,
+                "IPFS daemon reachable"
+            ),
+            Err(e) => tracing::warn!(
+                error  = %e,
+                hint   = "set KOTOBA_IPFS=off to silence, or start `ipfs daemon`",
+                "IPFS daemon NOT reachable — block writes/reads will fall back to hot cache only"
+            ),
+        }
+    }
+
     tracing::info!(
         version  = state.version,
         node_id  = %hex::encode(state.local_node_id.0),
