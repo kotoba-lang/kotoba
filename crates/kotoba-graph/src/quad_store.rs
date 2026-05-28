@@ -1585,6 +1585,13 @@ impl QuadStore {
         }
     }
 
+    /// Maximum hops for transitive property paths (`<pred>+` / `<pred>*`).
+    /// Earlier value 8 silently truncated `?s <knows>+ ?o` on long chains.
+    /// 64 covers typical knowledge-graph workloads while still bounding the
+    /// BFS frontier.  Callers needing larger should use `sparql_describe_n_hop`
+    /// or `multi_hop_cold` directly.
+    const PROPERTY_PATH_MAX_HOPS: usize = 64;
+
     /// Evaluate a SPARQL property path pattern.
     ///
     /// Supports:
@@ -1624,19 +1631,28 @@ impl QuadStore {
             PropertyPathExpression::OneOrMore(inner) => {
                 let pred = extract_named_node_from_path(inner)
                     .ok_or_else(|| anyhow::anyhow!("OneOrMore: only simple <pred>+ supported"))?;
-                self.bfs_pred_path(graph_cid, &start_cid, pred, 1, 8).await
+                // Lift the 8-hop cap to PROPERTY_PATH_MAX_HOPS for realistic
+                // transitive-closure workloads.  Earlier value (8) silently
+                // truncated long chains in `?s <knows>+ ?o`.
+                self.bfs_pred_path(graph_cid, &start_cid, pred, 1, Self::PROPERTY_PATH_MAX_HOPS).await
             }
 
             PropertyPathExpression::ZeroOrMore(inner) => {
                 let pred = extract_named_node_from_path(inner)
                     .ok_or_else(|| anyhow::anyhow!("ZeroOrMore: only simple <pred>* supported"))?;
-                let mut results = self.bfs_pred_path(graph_cid, &start_cid, pred, 0, 8).await?;
-                // ZeroOrMore includes the start node's own quads with this predicate
+                let mut results = self.bfs_pred_path(graph_cid, &start_cid, pred, 0, Self::PROPERTY_PATH_MAX_HOPS).await?;
+                // ZeroOrMore includes the start node's own quads with this predicate.
+                // Dedupe via HashSet — earlier linear `results.iter().any()` was
+                // O(R²) and dominated cost at large R.
                 let own = self.get_entity_quads_cold(graph_cid, &start_cid).await?;
+                let mut seen: std::collections::HashSet<(KotobaCid, String, Vec<u8>)> = results.iter()
+                    .map(|q| (q.subject.clone(), q.predicate.clone(),
+                        serde_json::to_vec(&q.object).unwrap_or_default()))
+                    .collect();
                 for q in own {
-                    if !results.iter().any(|r| quad_eq(r, &q)) {
-                        results.push(q);
-                    }
+                    let key = (q.subject.clone(), q.predicate.clone(),
+                        serde_json::to_vec(&q.object).unwrap_or_default());
+                    if seen.insert(key) { results.push(q); }
                 }
                 Ok(results)
             }

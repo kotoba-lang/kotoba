@@ -409,6 +409,7 @@ MemoryBlockStore、10K entities × 4 quads (name/role/status/knows)。reset_arra
   - 6-hop: **27 304 quads (full tree)**, p50 **65 ms / 14 QPS**
   - 6-hop c=16: 27304 quads, p50 188 ms / **75 QPS** (5.3× concurrent speedup)
   Latency scales sub-linearly with reach (1700× quads → 500× latency) thanks to parallel per-layer `try_join_all`.  Concurrent dispatch additionally hides per-layer fan-out cost.  CLI now drives this end-to-end: `kotoba bench --max-hops N "DESCRIBE <cid:root>"`.
+- **SPARQL property path depth cap 8→64 + O(R²) dedupe fix (2026-05-28)**: `eval_property_path` was capping `<pred>+` / `<pred>*` at 8 hops (silently truncating long transitive chains) and using linear `results.iter().any()` dedupe (O(R²)). Lifted to `PROPERTY_PATH_MAX_HOPS = 64`; replaced `ZeroOrMore` dedupe with `HashSet<(s, p, o-bytes)>`. Measured at 1000-entity knows-chain (release, KOTOBA_IPFS=off): `<knows>+` returns **64 results / 0.33ms p50 / 2441 QPS** (was 8 results / 0.12ms — same QPS, 8× more reachable nodes); `<knows>*` returns 67 (64 + start own quads) / 0.35ms / 2450 QPS. 209 kotoba-graph tests still pass.
 - **CACAO-gated wide-fanout multi-pop matrix (2026-05-28)**: identical 4-ary tree depth-6 workload + `kotoba bench --max-hops N --cacao-seed $SEED --cacao-private`, server in `KOTOBA_DEFAULT_VISIBILITY=private`:
 
   | hops | reach   | unauthed QPS | CACAO QPS | overhead |
