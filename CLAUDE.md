@@ -389,6 +389,12 @@ MemoryBlockStore、10K entities × 4 quads (name/role/status/knows)。reset_arra
   - 2-triple JOIN `role + dept` (3334 quads): seq p50 **41.0 ms / 23 QPS**, 30/30 successful
   - `GROUP BY ?role COUNT(*)` (2 groups): seq p50 **4.5 ms / 189 QPS**, 50/50 successful
   CACAO adds ~10–20% per-request overhead on result-set-bound queries (where work dominates), and is the dominant cost on result-free queries like ASK (where the ~1ms Ed25519 sign+verify is the entire latency).  No request failures across all four shapes — replay nonce + audience-binding + capability checks all pass under sustained load.
+- **CACAO concurrency sweep (2026-05-28)**: CACAO-gated ASK sustained under 4 concurrency levels (3000-entity graph, `kotoba bench --cacao-seed $SEED --cacao-private`, release):
+  - c=1  → **1240 QPS** (p50 0.63ms, 500/500)
+  - c=8  → **3777 QPS** (p50 1.56ms, 1000/1000)  — 3× scale-up
+  - c=16 → **3686 QPS** (p50 3.91ms, 2000/2000) — plateau
+  - c=32 → **4125 QPS** (p50 6.36ms, 3000/3000) — peak
+  100% success across all levels. Saturation at ~4K QPS — bottleneck is server-side Ed25519 verify CPU (single-core bound; no parallel verification yet). Linear scaling 1→8, then flat — server has sufficient async-IO headroom but the verify work is unscaled.
 - **kg.query (Datalog) vs kg.sparql (direct) HTTP head-to-head (2026-05-28, 2000-entity)**: same SPARQL string `SELECT ?s ?role WHERE { ?s <kg/claim/role> ?role }` (returns 2000 quads):
   - `kg.query` (compile → DatalogProgram → semi-naive fixpoint over snapshot Δ): **36 QPS**, 27.8ms/req
   - `kg.sparql` (spargebra → cold-path BGP scan): **75 QPS**, 12.7ms/req
