@@ -74,6 +74,19 @@ enum Cmd {
 
     /// Ping the server's /health endpoint
     Health,
+
+    /// Initialise device-local identity (Ed25519 + X25519 + DID) and persist to
+    /// macOS Keychain (or ~/.gftd/kotoba.env on Linux/other).  Subsequent
+    /// `kotoba serve` invocations will load these automatically and the DID
+    /// remains stable across restarts.
+    Init {
+        /// Overwrite any existing device-local identity.
+        #[arg(long)]
+        force: bool,
+        /// Print the resulting DID + hex material to stdout.
+        #[arg(long)]
+        show: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -153,6 +166,28 @@ async fn main() -> Result<()> {
 
         Cmd::Cypher { query, limit, cacao } => {
             run_kg_query(&cli.url, &cli.token, "cypher", &query, limit, cacao).await?;
+        }
+
+        Cmd::Init { force, show } => {
+            // Refuse to overwrite an existing identity unless --force.
+            if !force {
+                if let Some(existing) = kotoba_kse::AgentIdentity::from_keychain() {
+                    anyhow::bail!(
+                        "device-local identity already exists (DID={}). \
+                         Use --force to overwrite.",
+                        existing.did
+                    );
+                }
+            }
+            let id = kotoba_kse::AgentIdentity::generate_persistent();
+            id.persist_to_keychain().context("persisting identity")?;
+            println!("Persisted identity to macOS Keychain (or ~/.gftd/kotoba.env).");
+            println!("DID: {}", id.did);
+            if show {
+                println!("KOTOBA_AGENT_ED25519_HEX={}", hex::encode(id.signing_key.to_bytes()));
+                println!("KOTOBA_AGENT_X25519_HEX={}",  hex::encode(id.dh_secret.to_bytes()));
+                println!("KOTOBA_AGENT_DID={}",         id.did);
+            }
         }
 
         Cmd::Health => {

@@ -154,23 +154,26 @@ impl KotobaState {
                 kotoba_store::MemoryBlockStore::new(),
                 hot_cache_bytes,
             );
-            // Cold tier: KuboBlockStore (Kubo/IPFS HTTP, SHA2-256 CIDv1).
-            // Enabled when KOTOBA_STORE_PATH is set (signals persistent mode).
+            // Cold tier: KuboBlockStore (Kubo/IPFS HTTP, SHA2-256 CIDv1) — ENABLED BY DEFAULT.
             // Endpoint from KOTOBA_IPFS_ENDPOINT (default: http://localhost:5001).
-            if store_path.is_some() {
+            // Set KOTOBA_IPFS=off to disable (in-memory only mode for tests/dev).
+            let ipfs_off = std::env::var("KOTOBA_IPFS")
+                .map(|v| v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
+                .unwrap_or(false);
+            if !ipfs_off {
                 let cold = kotoba_store::KuboBlockStore::from_env();
                 let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
                     .unwrap_or_else(|_| "http://localhost:5001".into());
                 tracing::info!(
                     hot_cache_mib = hot_cache_bytes / (1024 * 1024),
                     ipfs_endpoint = %endpoint,
-                    "BlockStore: TieredBlockStore<BudgetedMemory, KuboIpfs> — dual-CID IPFS cold tier enabled"
+                    "BlockStore: TieredBlockStore<BudgetedMemory, KuboIpfs> — IPFS cold tier ENABLED by default"
                 );
                 Arc::new(kotoba_store::TieredBlockStore::new(hot, cold))
             } else {
-                tracing::info!(
+                tracing::warn!(
                     hot_cache_mib = hot_cache_bytes / (1024 * 1024),
-                    "BlockStore: BudgetedBlockStore<MemoryBlockStore> hot cache (no KOTOBA_STORE_PATH)"
+                    "BlockStore: BudgetedBlockStore<MemoryBlockStore> — IPFS cold tier DISABLED via KOTOBA_IPFS=off"
                 );
                 Arc::new(hot)
             }
@@ -380,13 +383,30 @@ impl KotobaState {
 
     /// Look up the visibility of a named graph by its CID.
     ///
-    /// Falls back to `Authenticated` for unknown graphs (safe default).
+    /// Default visibility for unknown graphs is controlled by
+    /// `KOTOBA_DEFAULT_VISIBILITY`:
+    ///   - `private`         (default) — requires CACAO delegation chain on operator DID
+    ///   - `authenticated`              — requires any non-empty Bearer token
+    ///   - `public`                     — open access
+    ///
+    /// The DEFAULT is `private` so CACAO is the canonical authentication path
+    /// out-of-the-box.
     pub async fn graph_visibility(&self, cid: &KotobaCid) -> GraphVisibility {
         let registry = self.graph_registry.read().await;
-        registry
-            .get(cid)
-            .map(|(_, v)| v.clone())
-            .unwrap_or(GraphVisibility::Authenticated)
+        if let Some((_, v)) = registry.get(cid) {
+            return v.clone();
+        }
+        match std::env::var("KOTOBA_DEFAULT_VISIBILITY")
+            .unwrap_or_else(|_| "private".into())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "public"        => GraphVisibility::Public,
+            "authenticated" => GraphVisibility::Authenticated,
+            _ /* private */ => GraphVisibility::Private {
+                owner_did: self.operator_did.clone(),
+            },
+        }
     }
 
     /// Register a named graph in the registry.

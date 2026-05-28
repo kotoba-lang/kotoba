@@ -7,6 +7,7 @@ pub mod store;
 pub mod sync_window;
 pub mod secure_vault;
 pub mod agent_identity;
+pub mod keychain;
 pub mod sovereign_key;
 pub mod pre_key_registry;
 

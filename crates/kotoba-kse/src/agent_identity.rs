@@ -40,8 +40,28 @@ impl AgentIdentity {
         Self { signing_key, dh_secret, did, ephemeral: true }
     }
 
-    /// Load from environment variables, or fall back to ephemeral if not set.
+    /// Try device-local secret storage first (macOS Keychain or
+    /// `~/.gftd/kotoba.env`), then fall back to env vars, then ephemeral.
+    ///
+    /// Discovery order:
+    ///   1. `crate::keychain::read_identity()` — Keychain on macOS,
+    ///      `~/.gftd/kotoba.env` on Linux/other
+    ///   2. `KOTOBA_AGENT_ED25519_HEX` + `KOTOBA_AGENT_X25519_HEX` +
+    ///      `KOTOBA_AGENT_DID` env vars
+    ///   3. ephemeral keypair (DID changes on restart)
     pub fn from_env() -> Self {
+        // 1. Device-local Keychain / dotfile
+        if let Some(stored) = crate::keychain::read_identity() {
+            if let Some(id) = Self::from_hex_triple(
+                &stored.ed25519_hex, &stored.x25519_hex, &stored.did,
+            ) {
+                tracing::info!(did = %id.did, source = "keychain",
+                    "AgentIdentity loaded from device-local store");
+                return id;
+            }
+        }
+
+        // 2. Env vars
         let ed_hex  = std::env::var("KOTOBA_AGENT_ED25519_HEX").ok();
         let dh_hex  = std::env::var("KOTOBA_AGENT_X25519_HEX").ok();
         let did_env = std::env::var("KOTOBA_AGENT_DID").ok();
@@ -83,6 +103,54 @@ impl AgentIdentity {
                 Self::generate_ephemeral()
             }
         }
+    }
+
+    /// Build a non-ephemeral identity from the three hex/string fields.
+    /// Returns `None` if the bytes are malformed.
+    fn from_hex_triple(ed_hex: &str, dh_hex: &str, did: &str) -> Option<Self> {
+        let ed_bytes = hex::decode(ed_hex.trim()).ok()?;
+        if ed_bytes.len() != 32 { return None; }
+        let dh_bytes = hex::decode(dh_hex.trim()).ok()?;
+        if dh_bytes.len() != 32 { return None; }
+        let mut seed = [0u8; 32]; seed.copy_from_slice(&ed_bytes);
+        let mut dh   = [0u8; 32]; dh.copy_from_slice(&dh_bytes);
+        Some(Self {
+            signing_key: SigningKey::from_bytes(&seed),
+            dh_secret:   StaticSecret::from(dh),
+            did:         did.to_string(),
+            ephemeral:   false,
+        })
+    }
+
+    /// Explicit keychain-only load (no env fallback).  Used by tools that want
+    /// to fail loudly when the device-local store is missing.
+    pub fn from_keychain() -> Option<Self> {
+        let stored = crate::keychain::read_identity()?;
+        Self::from_hex_triple(&stored.ed25519_hex, &stored.x25519_hex, &stored.did)
+    }
+
+    /// Persist this identity's private material to the device-local backend
+    /// (macOS Keychain or `~/.gftd/kotoba.env`).  Refuses ephemeral identities
+    /// — `kotoba init` should generate a fresh non-ephemeral one before calling.
+    pub fn persist_to_keychain(&self) -> anyhow::Result<()> {
+        if self.ephemeral {
+            anyhow::bail!("refusing to persist ephemeral identity — generate a fresh one first");
+        }
+        let ed_hex = hex::encode(self.signing_key.to_bytes());
+        let dh_hex = hex::encode(self.dh_secret.to_bytes());
+        crate::keychain::write_identity(&crate::keychain::StoredIdentity {
+            ed25519_hex: ed_hex,
+            x25519_hex:  dh_hex,
+            did:         self.did.clone(),
+        })
+    }
+
+    /// Generate a fresh non-ephemeral identity intended for persistence.
+    /// The DID format is `did:key:z{hex(verifying_key)}`.
+    pub fn generate_persistent() -> Self {
+        let mut id = Self::generate_ephemeral();
+        id.ephemeral = false;
+        id
     }
 
     /// Return the X25519 public key for wrapping vault keys.
