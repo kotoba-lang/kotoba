@@ -1928,13 +1928,21 @@ impl QuadStore {
             shared = shared.intersection(&s).cloned().collect();
         }
 
-        // Collect all quads for shared subjects (preserve order, deduplicate)
-        let mut results: Vec<Quad> = Vec::new();
+        // Collect all quads for shared subjects (preserve order, deduplicate).
+        // The dedupe set is keyed by (subject, predicate, object_bytes) so the
+        // inner loop is O(1) instead of the O(R²) `results.iter().any()` scan
+        // — critical at large result-set sizes (6680 quads → 44M cmps).
+        let mut seen: std::collections::HashSet<(KotobaCid, String, Vec<u8>)> =
+            std::collections::HashSet::with_capacity(
+                per_triple.iter().map(|q| q.len()).sum()
+            );
+        let mut results: Vec<Quad> = Vec::with_capacity(seen.capacity());
         for quads in per_triple {
             for q in quads {
-                if shared.contains(&q.subject.to_multibase())
-                    && !results.iter().any(|r| quad_eq(r, &q))
-                {
+                if !shared.contains(&q.subject.to_multibase()) { continue; }
+                let key = (q.subject.clone(), q.predicate.clone(),
+                    serde_json::to_vec(&q.object).unwrap_or_default());
+                if seen.insert(key) {
                     results.push(q);
                 }
             }
