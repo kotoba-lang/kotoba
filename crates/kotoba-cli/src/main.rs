@@ -180,6 +180,9 @@ enum Cmd {
         /// Treat the graph as Private (rewrite scope to `private/<did>`).
         #[arg(long)]
         cacao_private: bool,
+        /// DESCRIBE only: N-hop multi-pop subgraph expansion depth.
+        #[arg(long, default_value = "0")]
+        max_hops: usize,
     },
 }
 
@@ -357,12 +360,12 @@ async fn main() -> Result<()> {
             println!("{}", B64.encode(&cbor));
         }
 
-        Cmd::Bench { query, iters, concurrency, token, cacao, cacao_seed, cacao_graph, cacao_private } => {
+        Cmd::Bench { query, iters, concurrency, token, cacao, cacao_seed, cacao_graph, cacao_private, max_hops } => {
             let tok = token
                 .or_else(|| cli.token.clone())
                 .unwrap_or_else(|| "demo-token".into());
             run_bench(&cli.url, &tok, &query, iters, concurrency,
-                cacao, cacao_seed, cacao_graph, cacao_private).await?;
+                cacao, cacao_seed, cacao_graph, cacao_private, max_hops).await?;
         }
 
         Cmd::Whoami => {
@@ -650,6 +653,7 @@ async fn run_bench(
     cacao_seed:    Option<String>,
     cacao_graph:   String,
     cacao_private: bool,
+    max_hops:      usize,
 ) -> Result<()> {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -722,8 +726,9 @@ async fn run_bench(
                 };
                 let body = serde_json::json!({
                     "query":    &*query,
-                    "limit":    10_000,
+                    "limit":    100_000,
                     "cacaoB64": cacao_field,
+                    "maxHops":  max_hops,
                 });
                 let t0 = Instant::now();
                 let resp = match client.post(url.as_str())

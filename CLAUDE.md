@@ -402,6 +402,13 @@ MemoryBlockStore、10K entities × 4 quads (name/role/status/knows)。reset_arra
   - 5-hop: 30 quads
   - 10-hop: 55 quads (11 entities × 5 predicates)
   HTTP throughput is **~105 QPS regardless of hop depth (0-16)** because per-hop work is O(1) on a chain and the HTTP + axum + CACAO + JSON pipeline dominates. Multi-pop expansion is essentially free at this scale; the perf gap shows up only on wide-fanout trees where each hop multiplies the frontier.
+- **Wide-fanout multi-pop bench — 4-ary tree depth 6 (2026-05-28)**: seeded 5461 nodes (1+4+16+64+256+1024+4096) each with 4 child relations + 4 metadata quads.  `DESCRIBE <root>` with increasing `maxHops` to drive the parallel per-layer fetch path through real fan-out:
+  - 0-hop: 8 quads, p50 **0.13 ms / 5297 QPS**
+  - 1-hop: 40 quads, p50 0.22 ms / 3420 QPS
+  - 3-hop: 680 quads, p50 1.58 ms / 568 QPS
+  - 6-hop: **27 304 quads (full tree)**, p50 **65 ms / 14 QPS**
+  - 6-hop c=16: 27304 quads, p50 188 ms / **75 QPS** (5.3× concurrent speedup)
+  Latency scales sub-linearly with reach (1700× quads → 500× latency) thanks to parallel per-layer `try_join_all`.  Concurrent dispatch additionally hides per-layer fan-out cost.  CLI now drives this end-to-end: `kotoba bench --max-hops N "DESCRIBE <cid:root>"`.
 - **NonceStore: RwLock<HashMap> → DashMap (2026-05-28)**: replaced the single global write-lock with 64-way sharded `DashMap<String, u64>` + `AtomicUsize` size cache. Concurrent writers on different nonces never serialise on the same shard. **Measured CACAO ASK throughput post-fix** (same setup): c=1 1240→**3916 QPS** (3.2×), c=8 3777→**10113** (2.7×), c=16 3686→**10140** (2.8×), c=32 4125→**12753 QPS** (3.1× — **new peak**). 100% success at c≤32. c=64 hits the 16384 MAX_NONCES cap at 320K total requests (`nonce store at capacity` warns) — expected; a longer-running workload with realistic 5-minute CACAO expiries would naturally evict. **CACAO trust-boundary throughput moved from 4K → 12.8K QPS without compromising replay protection**.
 - **kg.query (Datalog) vs kg.sparql (direct) HTTP head-to-head (2026-05-28, 2000-entity)**: same SPARQL string `SELECT ?s ?role WHERE { ?s <kg/claim/role> ?role }` (returns 2000 quads):
   - `kg.query` (compile → DatalogProgram → semi-naive fixpoint over snapshot Δ): **36 QPS**, 27.8ms/req
