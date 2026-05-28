@@ -2344,13 +2344,23 @@ impl QuadStore {
             ("vaet", vaet_entries),
         ];
 
+        // BlockStore::put on the Kubo cold tier uses `tokio::task::block_in_place
+        // + Handle::current().block_on(...)` for the HTTP RPC.  The std::thread
+        // workers below have no implicit tokio runtime, so we capture the
+        // current Handle from the calling async context and enter() it inside
+        // each worker — this lets KuboBlockStore::put work transparently
+        // alongside MemoryBlockStore::put.
+        let tokio_handle = tokio::runtime::Handle::try_current().ok();
+
         let mut handles = Vec::with_capacity(4);
         for (name, entries) in tree_inputs {
             let inner = Arc::clone(&bs);
+            let rt    = tokio_handle.clone();
             let handle = std::thread::Builder::new()
                 .stack_size(64 * 1024 * 1024)
                 .name(format!("kotoba-prolly-{name}"))
                 .spawn(move || -> TreeResult {
+                    let _guard = rt.as_ref().map(|h| h.enter());
                     let cap = Arc::new(CapturingBlockStore::new(inner));
                     let root = ProllyTree::build_tree(entries, &*cap)?;
                     let blocks = cap.drain();
