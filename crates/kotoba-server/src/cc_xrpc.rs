@@ -145,24 +145,11 @@ async fn bridge_cc_graph_to_distributed_head(
     graph_cid: KotobaCid,
     graph_name: &'static str,
     author: &str,
+    datoms: Vec<KqeDatom>,
 ) -> Result<(String, usize), (StatusCode, String)> {
-    let history = state
-        .quad_store
-        .history_datoms_cold(&graph_cid)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("cc ingest history read: {e}"),
-            )
-        })?;
-    if history.is_empty() {
+    if datoms.is_empty() {
         return Ok((String::new(), 0));
     }
-    let datoms = history
-        .into_iter()
-        .map(kotoba_datomic::Datom::from_kqe)
-        .collect::<Vec<_>>();
     let tx_cid = KotobaCid::from_bytes(
         format!(
             "cc.ingest:{graph_name}:{}:{}",
@@ -174,6 +161,13 @@ async fn bridge_cc_graph_to_distributed_head(
         )
         .as_bytes(),
     );
+    let datoms = datoms
+        .into_iter()
+        .map(|mut datom| {
+            datom.tx = tx_cid.clone();
+            kotoba_datomic::Datom::from_kqe(datom)
+        })
+        .collect::<Vec<_>>();
     let resp = crate::xrpc::commit_protocol_datoms(
         state,
         graph_cid.clone(),
@@ -524,14 +518,16 @@ pub async fn cc_ingest(
         let dir = std::path::Path::new(&parquet_dir);
         if mode == "pages" || mode == "both" {
             let ingestor = CcPageIngestor::new(Arc::clone(&quad_store));
-            match ingestor.ingest_dir(dir, max_batches).await {
-                Ok(s) => {
-                    tracing::info!(?s, "CC pages ingest complete");
+            match ingestor.ingest_dir_datoms(dir, max_batches).await {
+                Ok((files, datoms)) => {
+                    let datom_count = datoms.len();
+                    tracing::info!(files, datom_count, "CC pages ingest datoms built");
                     match bridge_cc_graph_to_distributed_head(
                         &state_for_ingest,
                         cc_pages_graph(),
                         "cc:2026-12:pages",
                         &owner_did,
+                        datoms,
                     )
                     .await
                     {
@@ -550,14 +546,21 @@ pub async fn cc_ingest(
             let client: Arc<dyn EmbedClient> =
                 embed_client.unwrap_or_else(|| Arc::new(Blake3EmbedClient::new(384)));
             let ingestor = CcChunkIngestor::new(Arc::clone(&quad_store), client);
-            match ingestor.ingest_dir(dir, max_batches).await {
-                Ok(s) => {
-                    tracing::info!(?s, "CC chunks ingest complete");
+            match ingestor.ingest_dir_datoms(dir, max_batches).await {
+                Ok((chunks, embeddings, datoms)) => {
+                    let datom_count = datoms.len();
+                    tracing::info!(
+                        chunks,
+                        embeddings,
+                        datom_count,
+                        "CC chunks ingest datoms built"
+                    );
                     match bridge_cc_graph_to_distributed_head(
                         &state_for_ingest,
                         cc_chunks_graph(),
                         "cc:2026-12:chunks",
                         &owner_did,
+                        datoms,
                     )
                     .await
                     {

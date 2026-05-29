@@ -913,6 +913,27 @@ impl KotobaIpfsNode {
         self.object_put(&object.data, object.links).await
     }
 
+    /// Kubo-like `object/patch/append-data` for dag-pb objects.
+    pub async fn object_patch_append_data(
+        &self,
+        cid: &IpldCid,
+        data: impl AsRef<[u8]>,
+    ) -> Result<IpldCid> {
+        let mut object = self.object_get(cid).await?;
+        object.data.extend_from_slice(data.as_ref());
+        self.object_put(&object.data, object.links).await
+    }
+
+    /// Kubo-like `object/patch/set-data` for dag-pb objects.
+    pub async fn object_patch_set_data(
+        &self,
+        cid: &IpldCid,
+        data: impl AsRef<[u8]>,
+    ) -> Result<IpldCid> {
+        let object = self.object_get(cid).await?;
+        self.object_put(data.as_ref(), object.links).await
+    }
+
     /// Remove a local block without pin protection.
     pub async fn delete_block(&self, cid: &IpldCid) -> Result<bool> {
         self.block_rm_force(cid).await

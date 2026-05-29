@@ -175,6 +175,40 @@ impl CcPageIngestor {
         Ok((total_files, total_quads))
     }
 
+    /// Read all page parquet files and return Datoms without mutating QuadStore.
+    /// Server-side distributed ingest uses this path to commit directly to IPLD/IPNS.
+    pub async fn ingest_dir_datoms(
+        &self,
+        parquet_dir: &Path,
+        max_batches: Option<usize>,
+    ) -> Result<(usize, Vec<Datom>)> {
+        let mut files: Vec<_> = std::fs::read_dir(parquet_dir)
+            .with_context(|| format!("read_dir {}", parquet_dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with("_pages.parquet"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        if let Some(max) = max_batches {
+            files.truncate(max);
+        }
+
+        let total_files = files.len();
+        let mut datoms = Vec::new();
+        for path in &files {
+            datoms
+                .extend(quads_to_datoms(self.read_page_file(path).with_context(
+                    || format!("read_page_file {}", path.display()),
+                )?));
+        }
+        Ok((total_files, datoms))
+    }
+
     async fn flush_commit(&self, pending: &mut Vec<Quad>, seq: u64) -> Result<()> {
         self.quad_store
             .assert_datom_batch_silent(
@@ -367,11 +401,75 @@ impl CcChunkIngestor {
         Ok((total_chunks, total_embeds))
     }
 
+    /// Read all chunk parquet files and return Datoms without mutating QuadStore.
+    /// Returns (chunks_ingested, embeddings_computed, datoms).
+    pub async fn ingest_dir_datoms(
+        &self,
+        parquet_dir: &Path,
+        max_files: Option<usize>,
+    ) -> Result<(u64, u64, Vec<Datom>)> {
+        let mut files: Vec<_> = std::fs::read_dir(parquet_dir)
+            .with_context(|| format!("read_dir {}", parquet_dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with("_wet_chunks.parquet"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        if let Some(max) = max_files {
+            files.truncate(max);
+        }
+
+        let mut total_chunks = 0u64;
+        let mut total_embeds = 0u64;
+        let mut datoms = Vec::new();
+        for path in &files {
+            let (chunks, embeds, mut file_datoms) = self.ingest_file_datoms(path).await?;
+            total_chunks += chunks;
+            total_embeds += embeds;
+            datoms.append(&mut file_datoms);
+        }
+        Ok((total_chunks, total_embeds, datoms))
+    }
+
     /// Ingest a single wet_chunks parquet file.
     pub async fn ingest_file(&self, path: &Path) -> Result<(u64, u64)> {
+        let (chunks, embeds, datoms) = self.ingest_file_datoms(path).await?;
+        if datoms.is_empty() {
+            return Ok((chunks, embeds));
+        }
+        let graph = &self.graph_cid;
+        self.quad_store
+            .assert_datom_batch_silent(graph.clone(), datoms)
+            .await;
+
+        let commit_seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.quad_store
+            .commit("did:web:kotoba.gftd.ai", graph.clone(), commit_seq)
+            .await?;
+        self.quad_store.reset_arrangement(graph).await;
+
+        info!(
+            path = %path.display(),
+            chunks,
+            embeddings = embeds,
+            "CcChunkIngestor: file done"
+        );
+        Ok((chunks, embeds))
+    }
+
+    /// Build Datoms for a single wet_chunks parquet file without writing them.
+    pub async fn ingest_file_datoms(&self, path: &Path) -> Result<(u64, u64, Vec<Datom>)> {
         let rows = self.read_chunk_file(path)?;
         if rows.is_empty() {
-            return Ok((0, 0));
+            return Ok((0, 0, vec![]));
         }
 
         let model_id = self.embed_client.model_id().to_string();
@@ -402,9 +500,7 @@ impl CcChunkIngestor {
             }
         }
 
-        self.quad_store
-            .assert_datom_batch_silent(graph.clone(), quads_to_datoms(chunk_quads))
-            .await;
+        let mut datoms = quads_to_datoms(chunk_quads);
 
         // ── Step 2: embed text chunks ─────────────────────────────────────────
         const EMBED_BATCH: usize = 64;
@@ -420,33 +516,33 @@ impl CcChunkIngestor {
                 let subj = subject_from_chunk(&row.page_rkey, row.chunk_index);
                 let pred = format!("cc/embed/{}", model_id);
 
+                let embedding = row.precomputed_embedding.clone().unwrap_or(vec);
+
                 // dim ≤ 1024: inline VectorF32, else TensorCid
-                let value = if vec.len() <= 1024 {
-                    Value::VectorF32(vec.clone())
+                let value = if embedding.len() <= 1024 {
+                    Value::VectorF32(embedding.clone())
                 } else {
-                    let raw: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let raw: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
                     let tcid = KotobaCid::from_bytes(&raw);
                     Value::TensorCid {
                         cid: tcid,
-                        shape: vec![vec.len() as u32],
+                        shape: vec![embedding.len() as u32],
                         dtype: kotoba_kqe::datom::TensorDtype::F32,
                     }
                 };
 
                 // Pre-compute L2 norm for fast cosine
-                let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-                self.quad_store
-                    .assert_datom(graph.clone(), datom_assert(graph, &subj, pred, value))
-                    .await;
-                self.quad_store
-                    .assert_datom(
-                        graph.clone(),
-                        datom_assert(graph, &subj, "cc/embed_norm", Value::Float(norm as f64)),
-                    )
-                    .await;
+                datoms.push(datom_assert(graph, &subj, pred, value));
+                datoms.push(datom_assert(
+                    graph,
+                    &subj,
+                    "cc/embed_norm",
+                    Value::Float(norm as f64),
+                ));
 
-                all_embeddings.push((subj, vec));
+                all_embeddings.push((subj, embedding));
                 embed_count += 1;
             }
         }
@@ -471,34 +567,14 @@ impl CcChunkIngestor {
                 member_counts[centroid_id] += 1;
                 assign_quads.push(int_quad(graph, subj, "cc/ivf/cluster", centroid_id as i64));
             }
-            self.quad_store
-                .assert_datom_batch_silent(graph.clone(), quads_to_datoms(assign_quads))
-                .await;
+            datoms.extend(quads_to_datoms(assign_quads));
 
             // Write centroid quads
             let centroid_quads = ivf.to_quads(graph, &member_counts);
-            self.quad_store
-                .assert_datom_batch_silent(graph.clone(), quads_to_datoms(centroid_quads))
-                .await;
+            datoms.extend(quads_to_datoms(centroid_quads));
         }
 
-        // ── Step 4: final commit ──────────────────────────────────────────────
-        let commit_seq = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.quad_store
-            .commit("did:web:kotoba.gftd.ai", graph.clone(), commit_seq)
-            .await?;
-        self.quad_store.reset_arrangement(graph).await;
-
-        info!(
-            path = %path.display(),
-            chunks = n,
-            embeddings = embed_count,
-            "CcChunkIngestor: file done"
-        );
-        Ok((n as u64, embed_count))
+        Ok((n as u64, embed_count, datoms))
     }
 
     fn read_chunk_file(&self, path: &Path) -> Result<Vec<ChunkRow>> {
@@ -738,6 +814,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn page_ingest_dir_datoms_empty_dir_does_not_mutate_store() {
+        let qs = make_store();
+        let ing = CcPageIngestor::new(Arc::clone(&qs));
+        let dir =
+            std::env::temp_dir().join(format!("kotoba-cc-pages-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (files, datoms) = ing.ingest_dir_datoms(&dir, None).await.unwrap();
+
+        assert_eq!(files, 0);
+        assert!(datoms.is_empty());
+        assert!(qs.arrangement(&cc_pages_graph()).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn chunk_ingestor_constructs_with_blake3() {
         use crate::embed_client::Blake3EmbedClient;
         let qs = make_store();
@@ -745,6 +837,25 @@ mod tests {
         let ing = CcChunkIngestor::new(qs, embed).with_k(10);
         assert_eq!(ing.k_centroids, 10);
         assert_eq!(ing.graph_cid, cc_chunks_graph());
+    }
+
+    #[tokio::test]
+    async fn chunk_ingest_dir_datoms_empty_dir_does_not_mutate_store() {
+        use crate::embed_client::Blake3EmbedClient;
+        let qs = make_store();
+        let embed = Arc::new(Blake3EmbedClient::new(128));
+        let ing = CcChunkIngestor::new(Arc::clone(&qs), embed);
+        let dir =
+            std::env::temp_dir().join(format!("kotoba-cc-chunks-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (chunks, embeds, datoms) = ing.ingest_dir_datoms(&dir, None).await.unwrap();
+
+        assert_eq!(chunks, 0);
+        assert_eq!(embeds, 0);
+        assert!(datoms.is_empty());
+        assert!(qs.arrangement(&cc_chunks_graph()).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
