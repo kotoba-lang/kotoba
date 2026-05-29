@@ -70,6 +70,7 @@ impl LegacyQuad {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 
     fn cid(tag: &[u8]) -> KotobaCid {
         KotobaCid::from_bytes(tag)

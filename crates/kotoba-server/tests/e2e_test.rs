@@ -7072,6 +7072,65 @@ async fn kg_ingest_and_entity_roundtrip() {
 }
 
 #[tokio::test]
+async fn kg_commit_returns_distributed_datomic_head() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            json!({
+                "id":      "kg-commit-e2e-001",
+                "labelEn": "KG Commit E2E",
+                "type":    "TestEntity",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "ingest: {put}");
+    assert!(put["ok"].as_bool().unwrap_or(false), "ingest: {put}");
+
+    let (status, commit) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotobase.kg.commit",
+            json!({ "author": s.operator_did }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "commit: {commit}");
+    assert_eq!(commit["ok"], true, "{commit}");
+    let commit_cid = commit["commitCid"]
+        .as_str()
+        .expect("commitCid present")
+        .to_string();
+    assert!(
+        kotoba_core::cid::KotobaCid::from_multibase(&commit_cid).is_some(),
+        "commitCid must be a kotoba/IPFS-compatible CID: {commit}"
+    );
+    assert!(
+        commit["ipnsName"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "ipnsName missing: {commit}"
+    );
+    assert!(
+        commit["ipnsSequence"].as_u64().unwrap_or(0) >= 1,
+        "ipnsSequence missing: {commit}"
+    );
+
+    let (status, second) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotobase.kg.commit",
+            json!({ "author": s.operator_did }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "second commit: {second}");
+    assert_eq!(second["commitCid"], commit["commitCid"], "{second}");
+    assert_eq!(second["ipnsSequence"], commit["ipnsSequence"], "{second}");
+}
+
+#[tokio::test]
 async fn kg_ingest_with_relations() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt("did:key:zKgRelations1");

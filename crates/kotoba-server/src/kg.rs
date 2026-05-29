@@ -28,6 +28,10 @@ use axum::{
     Json,
 };
 use kotoba_core::cid::KotobaCid;
+use kotoba_datomic::distributed::{
+    CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter,
+};
+use kotoba_ipfs::{IpnsName, IpnsRegistryError};
 use kotoba_kqe::{
     datom::{Datom as KqeDatom, Value as KqeValue},
     quad::LegacyQuadObject as QuadObject,
@@ -1169,21 +1173,17 @@ pub struct KgCommitReq {
 pub struct KgCommitResp {
     pub ok: bool,
     pub commit_cid: String,
+    pub ipns_name: String,
+    pub ipns_sequence: u64,
     pub elapsed_ms: u128,
 }
 
 /// POST /xrpc/ai.gftd.apps.kotobase.kg.commit
 ///
-/// Seal the current hot Arrangement for the kg graph into 4 covering
-/// ProllyTrees (EAVT / AEVT / AVET / VAET), persist them to the BlockStore
-/// (Kubo when KOTOBA_IPFS=on), and update the CommitDag head.  This is the
-/// canonical way to make pending ingest_batch writes durable across crash.
-///
-/// Side effects:
-///   - writes ~5-50 dag-cbor blocks per commit (4 ProllyTree roots + tree
-///     pages + 1 Commit block + 1 CAR bundle block)
-///   - updates Journal checkpoint to the current seq → next replay
-///     short-circuits past all pre-commit WAL entries
+/// Return the distributed Datomic/IPLD head for the KG graph.  New KG writes
+/// publish their own DAG-CBOR/ProllyTree commits through IPNS; this endpoint is
+/// now a compatibility checkpoint.  If no distributed KG head exists yet, it
+/// snapshots the current KG DB view as the first distributed commit.
 ///
 /// Restricted to operator DID — only the node operator may seal a commit.
 pub async fn kg_commit(
@@ -1208,20 +1208,77 @@ pub async fn kg_commit(
         .unwrap_or_default()
         .as_secs();
 
-    match state.quad_store.commit(&author, graph, seq).await {
-        Ok(cid) => Json(KgCommitResp {
+    let ipns_name = crate::xrpc::distributed_graph_ipns_name(&graph);
+    match state
+        .ipns_registry
+        .resolve(&IpnsName::new(ipns_name.clone()))
+    {
+        Ok(record) => {
+            return Json(KgCommitResp {
+                ok: true,
+                commit_cid: record.value,
+                ipns_name,
+                ipns_sequence: record.sequence,
+                elapsed_ms: t0.elapsed().as_millis(),
+            })
+            .into_response();
+        }
+        Err(IpnsRegistryError::NotFound(_)) => {}
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false, "error": format!("ipns resolve: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let db = match crate::xrpc::current_db_for_graph(&state, &graph).await {
+        Ok(db) => db,
+        Err((code, msg)) => {
+            return (code, Json(serde_json::json!({"ok": false, "error": msg}))).into_response();
+        }
+    };
+    let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
+    match writer.commit_datoms(CommitDatomsRequest {
+        ipns_name: ipns_name.clone(),
+        graph: graph.clone(),
+        datoms: db.datoms(),
+        expected_parent: None,
+        tx_cid: Some(KotobaCid::from_bytes(
+            format!("kg.commit:{}:{author}:{seq}", graph.to_multibase()).as_bytes(),
+        )),
+        author,
+        seq: 1,
+        valid_until: "2099-01-01T00:00:00Z".to_string(),
+        ttl_secs: Some(60),
+        cacao_proof_cid: None,
+        ipns_controller_did: Some(state.operator_did.clone()),
+        ipns_signing_key: Some(state.ipns_signing_key()),
+    }) {
+        Ok(report) => Json(KgCommitResp {
             ok: true,
-            commit_cid: cid.to_multibase(),
+            commit_cid: report.commit.cid.to_multibase(),
+            ipns_name,
+            ipns_sequence: report.ipns_record.sequence,
             elapsed_ms: t0.elapsed().as_millis(),
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false, "error": format!("commit failed: {e}"),
-            })),
-        )
-            .into_response(),
+        Err(e) => {
+            let code = match e {
+                DistributedCommitError::StaleParent { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                code,
+                Json(serde_json::json!({
+                    "ok": false, "error": format!("distributed commit: {e}"),
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
