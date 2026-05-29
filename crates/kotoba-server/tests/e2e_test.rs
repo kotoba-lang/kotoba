@@ -5058,6 +5058,24 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
             "missing DID-derived entity attr {attr}: {entity_body}"
         );
     }
+    assert!(
+        entity_datoms.iter().any(|datom| {
+            datom["a"] == "did/entityCid" && datom["v_edn"] == format!("\"{did_entity}\"")
+        }),
+        "missing DID entity CID projection: {entity_body}"
+    );
+    assert!(
+        entity_datoms
+            .iter()
+            .any(|datom| { datom["a"] == "did/method" && datom["v_edn"] == "\"plc\"" }),
+        "missing DID method projection: {entity_body}"
+    );
+    assert!(
+        entity_datoms.iter().any(|datom| {
+            datom["a"] == "did/hasKotobaProtocolServices" && datom["v_edn"] == "true"
+        }),
+        "missing Kotoba protocol service completeness projection: {entity_body}"
+    );
     for attr in ["did/keyAgreement", "https://www.w3.org/ns/did#keyAgreement"] {
         assert!(
             entity_datoms.iter().any(|datom| {

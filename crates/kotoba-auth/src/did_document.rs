@@ -37,6 +37,9 @@ pub const ATTR_DID_CORE_CAPABILITY_DELEGATION: &str =
 pub const ATTR_DID_CORE_SERVICE: &str = "https://www.w3.org/ns/did#service";
 pub const ATTR_DID_CORE_SERVICE_ENDPOINT: &str = "https://www.w3.org/ns/did#serviceEndpoint";
 pub const ATTR_RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+pub const ATTR_DID_ENTITY_CID: &str = "did/entityCid";
+pub const ATTR_DID_METHOD: &str = "did/method";
+pub const ATTR_DID_HAS_KOTOBA_PROTOCOL_SERVICES: &str = "did/hasKotobaProtocolServices";
 
 /// DID Document — Kotoba Vertex declaration
 /// capabilityInvocation key → Source Chain write right
@@ -272,6 +275,12 @@ impl DidDocument {
         let mut out = vec![
             did_datom(
                 &e,
+                ATTR_DID_ENTITY_CID,
+                kotoba_datomic::Value::string(e.to_multibase()),
+                &tx,
+            ),
+            did_datom(
+                &e,
                 ATTR_DID_ID,
                 kotoba_datomic::Value::string(&self.id),
                 &tx,
@@ -280,6 +289,18 @@ impl DidDocument {
                 &e,
                 ATTR_DID_CORE_ID,
                 kotoba_datomic::Value::string(&self.id),
+                &tx,
+            ),
+            did_datom(
+                &e,
+                ATTR_DID_METHOD,
+                kotoba_datomic::Value::string(did_method_name(&self.id)),
+                &tx,
+            ),
+            did_datom(
+                &e,
+                ATTR_DID_HAS_KOTOBA_PROTOCOL_SERVICES,
+                kotoba_datomic::Value::Bool(self.has_kotoba_protocol_services()),
                 &tx,
             ),
             did_datom(&e, ATTR_DID_CONTEXT, string_vec(&self.context), &tx),
@@ -503,6 +524,10 @@ impl DidDocument {
 
         Some(doc)
     }
+}
+
+fn did_method_name(did: &str) -> &str {
+    did.split(':').nth(1).unwrap_or("")
 }
 
 fn did_datom(
@@ -786,6 +811,21 @@ mod tests {
                 && datom.v == kotoba_datomic::Value::string("did:key:zDatomServices")
                 && datom.t == tx
                 && datom.added
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_ENTITY_CID
+                && datom.v == kotoba_datomic::Value::string(doc.entity_cid().to_multibase())
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_METHOD
+                && datom.v == kotoba_datomic::Value::string("key")
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_HAS_KOTOBA_PROTOCOL_SERVICES
+                && datom.v == kotoba_datomic::Value::Bool(true)
         }));
         for service_type in [
             DIDCOMM_MESSAGING_SERVICE,
