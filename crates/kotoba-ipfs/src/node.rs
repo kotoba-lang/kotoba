@@ -882,6 +882,37 @@ impl KotobaIpfsNode {
         self.object_put(&[], Vec::new()).await
     }
 
+    /// Kubo-like `object/patch/add-link` for dag-pb objects.
+    pub async fn object_patch_add_link(
+        &self,
+        cid: &IpldCid,
+        name: impl Into<String>,
+        child: IpldCid,
+    ) -> Result<IpldCid> {
+        let mut object = self.object_get(cid).await?;
+        let name = name.into();
+        object.links.retain(|link| link.name != name);
+        object.links.push(ObjectLink { name, cid: child });
+        object.links.sort_by(|a, b| a.name.cmp(&b.name));
+        self.object_put(&object.data, object.links).await
+    }
+
+    /// Kubo-like `object/patch/rm-link` for dag-pb objects.
+    pub async fn object_patch_rm_link(
+        &self,
+        cid: &IpldCid,
+        name: impl AsRef<str>,
+    ) -> Result<IpldCid> {
+        let mut object = self.object_get(cid).await?;
+        let name = name.as_ref();
+        let before = object.links.len();
+        object.links.retain(|link| link.name != name);
+        if object.links.len() == before {
+            bail!("object link not found: {name}");
+        }
+        self.object_put(&object.data, object.links).await
+    }
+
     /// Remove a local block without pin protection.
     pub async fn delete_block(&self, cid: &IpldCid) -> Result<bool> {
         self.block_rm_force(cid).await

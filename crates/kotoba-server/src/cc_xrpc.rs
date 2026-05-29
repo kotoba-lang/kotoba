@@ -25,7 +25,7 @@ use kotoba_core::cid::KotobaCid;
 #[cfg(feature = "cc-parquet")]
 use kotoba_ingest::embed_client::EmbedClient;
 use kotoba_ingest::ivf::IvfIndex;
-use kotoba_kqe::Value as KqeValue;
+use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
 
 use crate::server::KotobaState;
 
@@ -61,36 +61,49 @@ fn brute_force_cosine(
     scored
 }
 
-/// Collect (subject, embedding_vec) pairs from Arrangement via "cc/embed/" prefix scan.
-fn collect_chunk_embeddings(
-    arrangement: &kotoba_kqe::arrangement::Arrangement,
+async fn current_cc_chunk_datoms(
+    state: &KotobaState,
+) -> Result<Vec<KqeDatom>, (StatusCode, String)> {
+    current_cc_graph_datoms(state, &cc_chunks_graph()).await
+}
+
+async fn current_cc_graph_datoms(
+    state: &KotobaState,
     graph_cid: &KotobaCid,
-) -> Vec<(KotobaCid, Vec<f32>)> {
-    let datoms = arrangement.datoms_with_attribute_prefix(graph_cid, "cc/embed/");
+) -> Result<Vec<KqeDatom>, (StatusCode, String)> {
+    Ok(crate::xrpc::current_db_for_graph(state, graph_cid)
+        .await?
+        .datoms()
+        .into_iter()
+        .filter_map(|datom| datom.to_kqe().ok())
+        .collect())
+}
+
+/// Collect (subject, embedding_vec) pairs from the distributed Datom view.
+fn collect_chunk_embeddings(datoms: &[KqeDatom]) -> Vec<(KotobaCid, Vec<f32>)> {
     let mut out: Vec<(KotobaCid, Vec<f32>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for datom in datoms {
+        if !datom.a.starts_with("cc/embed/") {
+            continue;
+        }
         if !seen.insert(datom.e.to_multibase()) {
             continue;
         }
-        if let KqeValue::VectorF32(v) = datom.v {
-            out.push((datom.e, v));
+        if let KqeValue::VectorF32(v) = &datom.v {
+            out.push((datom.e.clone(), v.clone()));
         }
     }
     out
 }
 
-fn get_chunk_field(
-    arrangement: &kotoba_kqe::arrangement::Arrangement,
-    subject: &KotobaCid,
-    predicate: &str,
-) -> Option<String> {
-    arrangement
-        .get_values(subject, predicate)
-        .into_iter()
-        .find_map(|value| {
-            if let KqeValue::Text(t) = value {
-                Some(t)
+fn get_chunk_field(datoms: &[KqeDatom], subject: &KotobaCid, predicate: &str) -> Option<String> {
+    datoms
+        .iter()
+        .find(|datom| datom.e == *subject && datom.a == predicate)
+        .and_then(|datom| {
+            if let KqeValue::Text(t) = &datom.v {
+                Some(t.clone())
             } else {
                 None
             }
@@ -190,18 +203,12 @@ pub async fn cc_search(
         }
     };
     let query_vec = &vecs[0];
-    let graph_cid = cc_chunks_graph();
-
-    let arrangement = match state.quad_store.arrangement(&graph_cid).await {
-        Some(a) => a,
-        None => {
-            return Json(json!({ "results": [], "total": 0,
-                                       "note": "no cc chunks indexed" }))
-            .into_response()
-        }
+    let datoms = match current_cc_chunk_datoms(&state).await {
+        Ok(datoms) => datoms,
+        Err((code, msg)) => return (code, Json(json!({"error": msg}))).into_response(),
     };
 
-    let chunk_embeddings = collect_chunk_embeddings(&arrangement, &graph_cid);
+    let chunk_embeddings = collect_chunk_embeddings(&datoms);
     if chunk_embeddings.is_empty() {
         return Json(json!({ "results": [], "total": 0, "note": "no embeddings found" }))
             .into_response();
@@ -210,7 +217,11 @@ pub async fn cc_search(
     let top_k = q.top_k.min(MAX_TOP_K);
 
     // Use IVF if centroids were persisted, else brute-force
-    let ivf_datoms = arrangement.datoms_with_attribute_prefix(&graph_cid, "cc/ivf/");
+    let ivf_datoms = datoms
+        .iter()
+        .filter(|datom| datom.a.starts_with("cc/ivf/"))
+        .cloned()
+        .collect::<Vec<_>>();
     let ranked: Vec<(f32, usize)> = if !ivf_datoms.is_empty() {
         match IvfIndex::from_datoms(&ivf_datoms) {
             Some(ivf) => {
@@ -230,16 +241,16 @@ pub async fn cc_search(
         let Some((subj, _)) = chunk_embeddings.get(idx) else {
             continue;
         };
-        let lang = get_chunk_field(&arrangement, subj, "cc/chunk/lang");
+        let lang = get_chunk_field(&datoms, subj, "cc/chunk/lang");
         if let Some(ref lf) = q.lang {
             if lang.as_deref() != Some(lf.as_str()) {
                 continue;
             }
         }
         results.push(CcSearchResult {
-            url: get_chunk_field(&arrangement, subj, "cc/chunk/url").unwrap_or_default(),
-            domain: get_chunk_field(&arrangement, subj, "cc/chunk/domain").unwrap_or_default(),
-            text: get_chunk_field(&arrangement, subj, "cc/chunk/text").unwrap_or_default(),
+            url: get_chunk_field(&datoms, subj, "cc/chunk/url").unwrap_or_default(),
+            domain: get_chunk_field(&datoms, subj, "cc/chunk/domain").unwrap_or_default(),
+            text: get_chunk_field(&datoms, subj, "cc/chunk/text").unwrap_or_default(),
             score,
             lang,
         });
@@ -323,21 +334,20 @@ pub async fn cc_rag(
         }
     };
     let query_vec = &vecs[0];
-    let graph_cid = cc_chunks_graph();
-
-    let arrangement = match state.quad_store.arrangement(&graph_cid).await {
-        Some(a) => a,
-        None => {
-            return Json(json!({
-                "answer":  "(no CC data indexed)",
-                "context": [],
-                "query":   body.query,
-            }))
-            .into_response()
-        }
+    let datoms = match current_cc_chunk_datoms(&state).await {
+        Ok(datoms) => datoms,
+        Err((code, msg)) => return (code, Json(json!({"error": msg}))).into_response(),
     };
 
-    let chunk_embeddings = collect_chunk_embeddings(&arrangement, &graph_cid);
+    let chunk_embeddings = collect_chunk_embeddings(&datoms);
+    if chunk_embeddings.is_empty() {
+        return Json(json!({
+            "answer":  "(no CC data indexed)",
+            "context": [],
+            "query":   body.query,
+        }))
+        .into_response();
+    }
     let ranked = brute_force_cosine(
         query_vec,
         &chunk_embeddings,
@@ -351,15 +361,15 @@ pub async fn cc_rag(
         let Some((subj, _)) = chunk_embeddings.get(*idx) else {
             continue;
         };
-        let lang = get_chunk_field(&arrangement, subj, "cc/chunk/lang");
+        let lang = get_chunk_field(&datoms, subj, "cc/chunk/lang");
         if let Some(ref lf) = body.lang {
             if lang.as_deref() != Some(lf.as_str()) {
                 continue;
             }
         }
-        let text = get_chunk_field(&arrangement, subj, "cc/chunk/text").unwrap_or_default();
-        let url = get_chunk_field(&arrangement, subj, "cc/chunk/url").unwrap_or_default();
-        let domain = get_chunk_field(&arrangement, subj, "cc/chunk/domain").unwrap_or_default();
+        let text = get_chunk_field(&datoms, subj, "cc/chunk/text").unwrap_or_default();
+        let url = get_chunk_field(&datoms, subj, "cc/chunk/url").unwrap_or_default();
+        let domain = get_chunk_field(&datoms, subj, "cc/chunk/domain").unwrap_or_default();
         context_texts.push(text.clone());
         context_meta.push(json!({ "url": url, "domain": domain, "score": score, "text": text }));
     }
@@ -519,26 +529,33 @@ pub async fn cc_status(
     let chunks_graph = cc_chunks_graph();
     let pages_graph = cc_pages_graph();
 
-    let chunk_count = state
-        .quad_store
-        .arrangement(&chunks_graph)
-        .await
-        .map(|a| a.get_by_attribute("cc/chunk/text").len())
-        .unwrap_or(0);
+    let chunk_datoms = match current_cc_graph_datoms(&state, &chunks_graph).await {
+        Ok(datoms) => datoms,
+        Err((code, msg)) => return (code, Json(json!({"error": msg}))).into_response(),
+    };
+    let page_datoms = match current_cc_graph_datoms(&state, &pages_graph).await {
+        Ok(datoms) => datoms,
+        Err((code, msg)) => return (code, Json(json!({"error": msg}))).into_response(),
+    };
 
-    let page_count = state
-        .quad_store
-        .arrangement(&pages_graph)
-        .await
-        .map(|a| a.get_by_attribute("cc/url").len())
-        .unwrap_or(0);
-
-    let ivf_centroids = state
-        .quad_store
-        .arrangement(&chunks_graph)
-        .await
-        .map(|a| a.get_by_attribute("cc/ivf/centroid_id").len())
-        .unwrap_or(0);
+    let chunk_count = chunk_datoms
+        .iter()
+        .filter(|datom| datom.a == "cc/chunk/text")
+        .map(|datom| datom.e.to_multibase())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let page_count = page_datoms
+        .iter()
+        .filter(|datom| datom.a == "cc/url")
+        .map(|datom| datom.e.to_multibase())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let ivf_centroids = chunk_datoms
+        .iter()
+        .filter(|datom| datom.a == "cc/ivf/centroid_id")
+        .map(|datom| datom.e.to_multibase())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
     Json(json!({
         "chunks_indexed":   chunk_count,

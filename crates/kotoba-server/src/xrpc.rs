@@ -5434,29 +5434,36 @@ pub async fn invoke_run(
     use kotoba_runtime::host::WitQuad;
     use kotoba_vm::DispatchResult;
 
-    // Build quad snapshot from the named graph's Arrangement for kqe.query in WASM guests.
+    // Build quad snapshot from the distributed Datom head for kqe.query in WASM guests.
     let graph_cid_for_snapshot = req
         .graph_cid
         .as_deref()
         .map(KotobaCid::from_multibase)
         .and_then(|x| x);
     let quad_snapshot: Vec<WitQuad> = if let Some(gcid) = &graph_cid_for_snapshot {
-        state
-            .quad_store
-            .arrangement(gcid)
-            .await
-            .map(|arr| {
-                arr.quads(gcid)
-                    .into_iter()
-                    .map(|q| WitQuad {
-                        graph: q.graph.to_multibase(),
-                        subject: q.subject.to_multibase(),
-                        predicate: q.predicate,
-                        object_cbor: serde_json::to_vec(&q.object).unwrap_or_default(),
+        match current_db_for_graph(&state, gcid).await {
+            Ok(db) => db
+                .datoms()
+                .into_iter()
+                .filter_map(|datom| {
+                    let substrate = datom.to_kqe().ok()?;
+                    let object: kotoba_kqe::quad::LegacyQuadObject = substrate.v.into();
+                    Some(WitQuad {
+                        graph: gcid.to_multibase(),
+                        subject: substrate.e.to_multibase(),
+                        predicate: substrate.a,
+                        object_cbor: serde_json::to_vec(&object).unwrap_or_default(),
                     })
-                    .collect()
-            })
-            .unwrap_or_default()
+                })
+                .collect(),
+            Err((code, msg)) => {
+                return (
+                    code,
+                    Json(json!({"error": format!("invoke graph snapshot: {msg}")})),
+                )
+                    .into_response();
+            }
+        }
     } else {
         vec![]
     };

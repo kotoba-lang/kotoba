@@ -406,6 +406,32 @@ async fn kubo_compatible_local_api_surface() {
         .expect("object/get new");
     assert!(empty_get.data.is_empty());
     assert!(empty_get.links.is_empty());
+    let patched_add = node
+        .object_patch_add_link(&empty_object, "hello.txt", raw)
+        .await
+        .expect("object/patch/add-link");
+    assert_eq!(
+        node.object_links(&patched_add)
+            .await
+            .expect("object/links patched add"),
+        vec![kotoba_ipfs::ObjectLink {
+            name: "hello.txt".into(),
+            cid: raw,
+        }]
+    );
+    let patched_rm = node
+        .object_patch_rm_link(&patched_add, "hello.txt")
+        .await
+        .expect("object/patch/rm-link");
+    assert!(node
+        .object_links(&patched_rm)
+        .await
+        .expect("object/links patched rm")
+        .is_empty());
+    assert!(node
+        .object_patch_rm_link(&patched_rm, "missing")
+        .await
+        .is_err());
     assert_eq!(
         node.object_links(&pb_dir)
             .await
