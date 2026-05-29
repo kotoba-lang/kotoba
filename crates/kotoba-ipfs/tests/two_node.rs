@@ -419,10 +419,41 @@ async fn kubo_compatible_local_api_surface() {
     node.pin_rm(&linked).await.expect("pin/rm recursive dag");
     assert_eq!(node.add(b"hello").await.expect("re-add raw"), raw);
     assert_eq!(node.dag_put(&doc).await.expect("re-add dag"), dag);
+    assert_eq!(
+        node.add_unixfs_file(b"hello").await.expect("re-add unixfs"),
+        unixfs
+    );
 
     node.files_write("/docs/hello.txt", &raw)
         .await
         .expect("files/write");
+    node.files_write("/unixfs/hello.txt", &unixfs)
+        .await
+        .expect("files/write unixfs");
+    assert_eq!(
+        node.files_read("/unixfs/hello.txt")
+            .await
+            .expect("files/read unixfs"),
+        b"hello"[..]
+    );
+    let unixfs_stat = node
+        .files_stat("/unixfs/hello.txt")
+        .await
+        .expect("files/stat unixfs");
+    assert_eq!(unixfs_stat.cid, unixfs);
+    assert_eq!(unixfs_stat.size, 5);
+    assert_eq!(
+        node.files_du("/unixfs/hello.txt", false)
+            .await
+            .expect("files/du unixfs file"),
+        5
+    );
+    assert_eq!(
+        node.files_rm("/unixfs/hello.txt", false)
+            .await
+            .expect("files/rm unixfs"),
+        1
+    );
     let write_bytes_stat = node
         .files_write_bytes("/docs/generated.txt", b"generated", true)
         .await

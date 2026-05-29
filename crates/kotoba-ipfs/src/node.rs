@@ -1239,7 +1239,7 @@ impl KotobaIpfsNode {
             .await
             .get(&path)
             .ok_or_else(|| anyhow!("mfs path not found: {path}"))?;
-        self.get_block(&cid).await
+        self.cat(&cid).await
     }
 
     /// Kubo-like MFS `files/stat`.
@@ -1252,12 +1252,8 @@ impl KotobaIpfsNode {
             .await
             .get(&path)
             .ok_or_else(|| anyhow!("mfs path not found: {path}"))?;
-        let stat = self.block_stat(&cid).await?;
-        Ok(MfsStat {
-            path,
-            cid,
-            size: stat.size,
-        })
+        let size = self.mfs_file_size(&cid).await?;
+        Ok(MfsStat { path, cid, size })
     }
 
     /// Kubo-like MFS `files/flush`.
@@ -1270,7 +1266,7 @@ impl KotobaIpfsNode {
         self.files_stat(path).await
     }
 
-    /// Kubo-like MFS `files/du`: sum raw block sizes reachable from an MFS path.
+    /// Kubo-like MFS `files/du`: sum file payload sizes reachable from an MFS path.
     pub async fn files_du(&self, path: impl AsRef<str>, recursive: bool) -> Result<u64> {
         let path = normalize_mfs_path(path.as_ref())?;
         let files = self.state.files.read().await;
@@ -1297,7 +1293,7 @@ impl KotobaIpfsNode {
 
         let mut total = 0;
         for cid in cids {
-            total += self.block_stat(&cid).await?.size;
+            total += self.mfs_file_size(&cid).await?;
         }
         Ok(total)
     }
@@ -1440,6 +1436,15 @@ impl KotobaIpfsNode {
             out.extend_from_slice(&child);
         }
         Ok(out)
+    }
+
+    async fn mfs_file_size(&self, cid: &IpldCid) -> Result<u64> {
+        match cid.codec() {
+            crate::cid::CODEC_RAW | crate::cid::CODEC_DAG_PB => {
+                Ok(self.cat(cid).await?.len() as u64)
+            }
+            _ => Ok(self.block_stat(cid).await?.size),
+        }
     }
 }
 

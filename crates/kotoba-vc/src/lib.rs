@@ -55,6 +55,13 @@ pub const ATTR_VC_VALID_UNTIL_IRI: &str = "https://www.w3.org/2018/credentials#v
 pub const ATTR_VC_CREDENTIAL_STATUS_IRI: &str =
     "https://www.w3.org/2018/credentials#credentialStatus";
 pub const ATTR_VC_PROOF_IRI: &str = "https://w3id.org/security#proof";
+pub const ATTR_DI_CRYPTOSUITE_IRI: &str = "https://w3id.org/security#cryptosuite";
+pub const ATTR_DI_PROOF_PURPOSE_IRI: &str = "https://w3id.org/security#proofPurpose";
+pub const ATTR_DI_VERIFICATION_METHOD_IRI: &str = "https://w3id.org/security#verificationMethod";
+pub const ATTR_DI_CREATED_IRI: &str = "https://w3id.org/security#created";
+pub const ATTR_DI_PROOF_VALUE_IRI: &str = "https://w3id.org/security#proofValue";
+pub const ATTR_DI_CHALLENGE_IRI: &str = "https://w3id.org/security#challenge";
+pub const ATTR_DI_DOMAIN_IRI: &str = "https://w3id.org/security#domain";
 pub const ATTR_VP_HOLDER_IRI: &str = "https://www.w3.org/2018/credentials#holder";
 pub const ATTR_VP_VERIFIABLE_CREDENTIAL_IRI: &str =
     "https://www.w3.org/2018/credentials#verifiableCredential";
@@ -563,13 +570,31 @@ fn append_proof_datoms(
     ));
     out.push(datom(
         e,
+        ATTR_DI_PROOF_PURPOSE_IRI,
+        EdnValue::string(&proof.proof_purpose),
+        tx,
+    ));
+    out.push(datom(
+        e,
         attrs.verification_method,
         EdnValue::string(&proof.verification_method),
         tx,
     ));
     out.push(datom(
         e,
+        ATTR_DI_VERIFICATION_METHOD_IRI,
+        EdnValue::string(&proof.verification_method),
+        tx,
+    ));
+    out.push(datom(
+        e,
         attrs.proof_value,
+        EdnValue::string(&proof.proof_value),
+        tx,
+    ));
+    out.push(datom(
+        e,
+        ATTR_DI_PROOF_VALUE_IRI,
         EdnValue::string(&proof.proof_value),
         tx,
     ));
@@ -580,15 +605,29 @@ fn append_proof_datoms(
             EdnValue::string(cryptosuite),
             tx,
         ));
+        out.push(datom(
+            e,
+            ATTR_DI_CRYPTOSUITE_IRI,
+            EdnValue::string(cryptosuite),
+            tx,
+        ));
     }
     if let Some(created) = &proof.created {
         out.push(datom(e, attrs.created, EdnValue::string(created), tx));
+        out.push(datom(e, ATTR_DI_CREATED_IRI, EdnValue::string(created), tx));
     }
     if let Some(challenge) = &proof.challenge {
         out.push(datom(e, attrs.challenge, EdnValue::string(challenge), tx));
+        out.push(datom(
+            e,
+            ATTR_DI_CHALLENGE_IRI,
+            EdnValue::string(challenge),
+            tx,
+        ));
     }
     if let Some(domain) = &proof.domain {
         out.push(datom(e, attrs.domain, EdnValue::string(domain), tx));
+        out.push(datom(e, ATTR_DI_DOMAIN_IRI, EdnValue::string(domain), tx));
     }
 }
 
@@ -788,15 +827,22 @@ mod tests {
         for (attr, value) in [
             (ATTR_CREDENTIAL_PROOF_TYPE, "DataIntegrityProof"),
             (ATTR_CREDENTIAL_PROOF_CRYPTOSUITE, "eddsa-2022"),
+            (ATTR_DI_CRYPTOSUITE_IRI, "eddsa-2022"),
             (ATTR_CREDENTIAL_PROOF_PURPOSE, "assertionMethod"),
+            (ATTR_DI_PROOF_PURPOSE_IRI, "assertionMethod"),
             (
                 ATTR_CREDENTIAL_PROOF_VERIFICATION_METHOD,
                 "did:key:zIssuer#key-1",
             ),
+            (ATTR_DI_VERIFICATION_METHOD_IRI, "did:key:zIssuer#key-1"),
             (ATTR_CREDENTIAL_PROOF_CREATED, "2026-05-29T00:00:00Z"),
+            (ATTR_DI_CREATED_IRI, "2026-05-29T00:00:00Z"),
             (ATTR_CREDENTIAL_PROOF_VALUE, "zProofValue"),
+            (ATTR_DI_PROOF_VALUE_IRI, "zProofValue"),
             (ATTR_CREDENTIAL_PROOF_CHALLENGE, "challenge-1"),
+            (ATTR_DI_CHALLENGE_IRI, "challenge-1"),
             (ATTR_CREDENTIAL_PROOF_DOMAIN, "kotoba.example"),
+            (ATTR_DI_DOMAIN_IRI, "kotoba.example"),
         ] {
             assert!(
                 datoms
@@ -877,15 +923,22 @@ mod tests {
         for (attr, value) in [
             (ATTR_PRESENTATION_PROOF_TYPE, "DataIntegrityProof"),
             (ATTR_PRESENTATION_PROOF_CRYPTOSUITE, "eddsa-2022"),
+            (ATTR_DI_CRYPTOSUITE_IRI, "eddsa-2022"),
             (ATTR_PRESENTATION_PROOF_PURPOSE, "authentication"),
+            (ATTR_DI_PROOF_PURPOSE_IRI, "authentication"),
             (
                 ATTR_PRESENTATION_PROOF_VERIFICATION_METHOD,
                 "did:key:zAlice#key-1",
             ),
+            (ATTR_DI_VERIFICATION_METHOD_IRI, "did:key:zAlice#key-1"),
             (ATTR_PRESENTATION_PROOF_CREATED, "2026-05-29T00:00:00Z"),
+            (ATTR_DI_CREATED_IRI, "2026-05-29T00:00:00Z"),
             (ATTR_PRESENTATION_PROOF_VALUE, "zVpProofValue"),
+            (ATTR_DI_PROOF_VALUE_IRI, "zVpProofValue"),
             (ATTR_PRESENTATION_PROOF_CHALLENGE, "vp-challenge"),
+            (ATTR_DI_CHALLENGE_IRI, "vp-challenge"),
             (ATTR_PRESENTATION_PROOF_DOMAIN, "kotoba.example"),
+            (ATTR_DI_DOMAIN_IRI, "kotoba.example"),
         ] {
             assert!(
                 datoms
