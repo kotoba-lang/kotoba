@@ -819,13 +819,66 @@ async fn kubo_compatible_local_api_surface() {
             .expect("files/read generated"),
         b"generated"[..]
     );
+    assert_eq!(
+        node.files_read_range("/docs/generated.txt", 2, Some(4))
+            .await
+            .expect("files/read range"),
+        b"nera"[..]
+    );
+    assert_eq!(
+        node.files_read_range("/docs/generated.txt", 4, None)
+            .await
+            .expect("files/read range tail"),
+        b"rated"[..]
+    );
+    assert!(node
+        .files_read_range("/docs/generated.txt", 99, Some(1))
+        .await
+        .is_err());
+    let offset_write = node
+        .files_write_bytes_at("/docs/generated.txt", b"XYZ", 3, false, false, false)
+        .await
+        .expect("files/write offset");
+    assert_eq!(offset_write.size, 9);
+    assert_eq!(
+        node.files_read("/docs/generated.txt")
+            .await
+            .expect("files/read offset write"),
+        b"genXYZted"[..]
+    );
+    let sparse_write = node
+        .files_write_bytes_at("/docs/sparse.bin", b"end", 4, true, true, false)
+        .await
+        .expect("files/write sparse create");
+    assert_eq!(sparse_write.size, 7);
+    assert_eq!(
+        node.files_read("/docs/sparse.bin")
+            .await
+            .expect("files/read sparse"),
+        b"\0\0\0\0end"[..]
+    );
+    let truncated_write = node
+        .files_write_bytes_at("/docs/generated.txt", b"short", 0, false, false, true)
+        .await
+        .expect("files/write truncate");
+    assert_eq!(truncated_write.size, 5);
+    assert_eq!(
+        node.files_read("/docs/generated.txt")
+            .await
+            .expect("files/read truncated"),
+        b"short"[..]
+    );
+    assert!(node
+        .files_write_bytes_at("/docs/missing.txt", b"nope", 0, false, false, false)
+        .await
+        .is_err());
     let chcid_pb = node
         .files_chcid("/docs/generated.txt", kotoba_ipfs::CODEC_DAG_PB)
         .await
         .expect("files/chcid dag-pb");
     assert_eq!(chcid_pb.path, "/docs/generated.txt");
     assert_eq!(chcid_pb.kind, kotoba_ipfs::MfsKind::File);
-    assert_eq!(chcid_pb.size, 9);
+    assert_eq!(chcid_pb.size, 5);
     assert_eq!(
         chcid_pb.cid.expect("files/chcid cid").codec(),
         kotoba_ipfs::CODEC_DAG_PB
@@ -834,16 +887,14 @@ async fn kubo_compatible_local_api_surface() {
         node.files_read("/docs/generated.txt")
             .await
             .expect("files/read generated dag-pb"),
-        b"generated"[..]
+        b"short"[..]
     );
     let chcid_raw = node
         .files_chcid("/docs/generated.txt", kotoba_ipfs::CODEC_RAW)
         .await
         .expect("files/chcid raw");
-    assert_eq!(
-        chcid_raw.cid.expect("files/chcid raw cid").codec(),
-        kotoba_ipfs::CODEC_RAW
-    );
+    let generated_cid = chcid_raw.cid.expect("files/chcid raw cid");
+    assert_eq!(generated_cid.codec(), kotoba_ipfs::CODEC_RAW);
     assert!(node
         .files_chcid("/docs/generated.txt", kotoba_ipfs::CODEC_DAG_CBOR)
         .await
@@ -884,13 +935,16 @@ async fn kubo_compatible_local_api_surface() {
         file_stat
     );
     let files = node.files_ls("/docs").await.expect("files/ls");
-    assert_eq!(files.len(), 3);
+    assert_eq!(files.len(), 4);
     assert!(files
         .iter()
         .any(|entry| entry.path == "/docs/hello.txt" && entry.cid == Some(raw)));
     assert!(files
         .iter()
-        .any(|entry| entry.path == "/docs/generated.txt" && entry.cid == write_bytes_stat.cid));
+        .any(|entry| entry.path == "/docs/generated.txt" && entry.cid == Some(generated_cid)));
+    assert!(files
+        .iter()
+        .any(|entry| { entry.path == "/docs/sparse.bin" && entry.cid == sparse_write.cid }));
     assert!(files
         .iter()
         .any(|entry| entry.path == "/docs/empty.txt" && entry.cid == touched.cid));
@@ -906,9 +960,9 @@ async fn kubo_compatible_local_api_surface() {
     assert_eq!(docs_stat.cid, None);
     assert_eq!(docs_stat.kind, kotoba_ipfs::MfsKind::Directory);
     assert_eq!(docs_stat.kind.as_str(), "directory");
-    assert_eq!(docs_stat.size, 14);
-    assert_eq!(docs_stat.cumulative_size, 14);
-    assert_eq!(docs_stat.blocks, 3);
+    assert_eq!(docs_stat.size, 17);
+    assert_eq!(docs_stat.cumulative_size, 17);
+    assert_eq!(docs_stat.blocks, 4);
     assert_eq!(
         node.files_du("/docs/hello.txt", false)
             .await
@@ -919,7 +973,7 @@ async fn kubo_compatible_local_api_surface() {
         node.files_du("/docs", true)
             .await
             .expect("files/du recursive"),
-        14
+        17
     );
 
     node.files_mkdir("/docs/archive", true)
@@ -1138,7 +1192,7 @@ async fn kubo_compatible_local_api_surface() {
         .contains(&raw));
     assert!(node.has_block(&raw).await.expect("has raw under mfs"));
     assert!(!node.has_block(&dag).await.expect("has dag after gc"));
-    assert_eq!(node.files_rm("/docs", true).await.expect("files/rm"), 15);
+    assert_eq!(node.files_rm("/docs", true).await.expect("files/rm"), 16);
     assert!(node
         .files_ls("/docs")
         .await

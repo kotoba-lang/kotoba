@@ -1432,6 +1432,56 @@ impl KotobaIpfsNode {
         self.files_stat(&path).await
     }
 
+    /// Kubo-like MFS `files/write` byte update.
+    ///
+    /// This models Kubo's common `--offset`, `--truncate`, `--create`, and
+    /// `--parents` flags for this lightweight path-to-CID MFS.  Writes beyond
+    /// the current end create a sparse byte range filled with zeroes.
+    pub async fn files_write_bytes_at(
+        &self,
+        path: impl AsRef<str>,
+        data: &[u8],
+        offset: u64,
+        create: bool,
+        parents: bool,
+        truncate: bool,
+    ) -> Result<MfsStat> {
+        let path = normalize_mfs_path(path.as_ref())?;
+        if parents {
+            for dir in ancestor_dirs(&path) {
+                self.files_mkdir(dir, true).await?;
+            }
+        } else {
+            self.ensure_mfs_parent(&path).await?;
+        }
+
+        let existing = if self.state.files.read().await.contains_key(&path) {
+            self.files_read(&path).await?.to_vec()
+        } else if create {
+            Vec::new()
+        } else {
+            bail!("mfs path not found: {path}");
+        };
+
+        let offset = usize::try_from(offset).context("files/write offset does not fit usize")?;
+        let mut out = if truncate { Vec::new() } else { existing };
+        if out.len() < offset {
+            out.resize(offset, 0);
+        }
+        let end = offset
+            .checked_add(data.len())
+            .context("files/write offset plus data length overflowed")?;
+        if out.len() < end {
+            out.resize(end, 0);
+        }
+        out[offset..end].copy_from_slice(data);
+
+        let cid = self.put_raw_block(&out).await?;
+        self.state.files.write().await.insert(path.clone(), cid);
+        persist_repo_state(&self.state).await?;
+        self.files_stat(&path).await
+    }
+
     /// Kubo-like MFS `files/mkdir`.
     pub async fn files_mkdir(&self, path: impl AsRef<str>, parents: bool) -> Result<()> {
         let path = normalize_mfs_path(path.as_ref())?;
@@ -1595,6 +1645,31 @@ impl KotobaIpfsNode {
             .get(&path)
             .ok_or_else(|| anyhow!("mfs path not found: {path}"))?;
         self.cat(&cid).await
+    }
+
+    /// Kubo-like MFS `files/read` with `--offset` and `--count`.
+    pub async fn files_read_range(
+        &self,
+        path: impl AsRef<str>,
+        offset: u64,
+        count: Option<u64>,
+    ) -> Result<Bytes> {
+        let data = self.files_read(path).await?;
+        let offset = usize::try_from(offset).context("files/read offset does not fit usize")?;
+        if offset > data.len() {
+            bail!(
+                "files/read offset {offset} exceeds file size {}",
+                data.len()
+            );
+        }
+        let end = match count {
+            Some(count) => offset
+                .checked_add(usize::try_from(count).context("files/read count does not fit usize")?)
+                .context("files/read offset plus count overflowed")?
+                .min(data.len()),
+            None => data.len(),
+        };
+        Ok(Bytes::copy_from_slice(&data[offset..end]))
     }
 
     /// Kubo-like MFS `files/stat`.
