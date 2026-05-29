@@ -5960,6 +5960,12 @@ async fn agent_run_with_stub_engine_completes() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "ok");
     assert!(body["session_cid"].as_str().is_some());
+    assert!(
+        body["commit_cid"]
+            .as_str()
+            .is_some_and(|cid| { kotoba_core::cid::KotobaCid::from_multibase(cid).is_some() }),
+        "agent.run must return a distributed Datomic commit CID: {body}"
+    );
     assert!(body["supersteps"].as_u64().unwrap_or(0) >= 1);
 }
 
@@ -8523,6 +8529,50 @@ async fn kg_search_after_ingest_returns_entity() {
     assert!(body["results"].is_array(), "{body}");
     // At minimum the field must be present; exact match depends on vector similarity
     assert!(body["elapsedMs"].is_number(), "elapsedMs missing: {body}");
+}
+
+#[tokio::test]
+async fn kg_embed_commits_vector_to_distributed_search_view() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zKgEmbedSearch1");
+
+    let (status, ingest) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            json!({
+                "id":      "ent-embed-search-1",
+                "labelEn": "Distributed Vector Entity",
+                "type":    "TestEntity",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "ingest: {ingest}");
+
+    let (status, embed) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotobase.kg.embed",
+            json!({
+                "entityId": "ent-embed-search-1",
+                "text":     "distributed vector entity",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "embed: {embed}");
+    assert_eq!(embed["ok"], true, "{embed}");
+    assert!(embed["dims"].as_u64().unwrap_or(0) > 0, "{embed}");
+
+    let (status, body) = s
+        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.search?q=distributed+vector+entity")
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["results"].as_array().unwrap().iter().any(|row| {
+            row["id"] == "ent-embed-search-1" && row["labelEn"] == "Distributed Vector Entity"
+        }),
+        "{body}"
+    );
 }
 
 #[tokio::test]

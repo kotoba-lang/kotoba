@@ -31,11 +31,16 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_datomic::distributed::{
     CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter,
 };
+use kotoba_graph::quad_store::QuadStore;
 use kotoba_ipfs::{IpnsName, IpnsRegistryError};
 use kotoba_kqe::{
     datom::{Datom as KqeDatom, Value as KqeValue},
+    delta::Delta,
+    quad::LegacyQuad,
     quad::LegacyQuadObject as QuadObject,
 };
+use kotoba_kse::journal::Journal;
+use kotoba_store::MemoryBlockStore;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -142,6 +147,70 @@ fn kg_write_author(headers: &HeaderMap, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+async fn current_graph_quads(
+    state: &Arc<KotobaState>,
+    graph_cid: &KotobaCid,
+) -> Result<Vec<LegacyQuad>, (StatusCode, String)> {
+    let db = crate::xrpc::current_db_for_graph(state, graph_cid).await?;
+    Ok(db
+        .datoms()
+        .into_iter()
+        .filter_map(|datom| {
+            let substrate = datom.to_kqe().ok()?;
+            Some(LegacyQuad {
+                graph: graph_cid.clone(),
+                subject: substrate.e,
+                predicate: substrate.a,
+                object: substrate.v.into(),
+            })
+        })
+        .collect())
+}
+
+async fn current_graph_deltas(
+    state: &Arc<KotobaState>,
+    graph_cid: &KotobaCid,
+) -> Result<Vec<Delta>, (StatusCode, String)> {
+    let db = crate::xrpc::current_db_for_graph(state, graph_cid).await?;
+    Ok(db
+        .datoms()
+        .into_iter()
+        .filter_map(|datom| datom.to_kqe().ok())
+        .map(Delta::from_datom)
+        .collect())
+}
+
+async fn distributed_query_store(
+    state: &Arc<KotobaState>,
+    graph_cid: &KotobaCid,
+) -> Result<QuadStore, (StatusCode, String)> {
+    let quads = current_graph_quads(state, graph_cid).await?;
+    let query_store = QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
+    query_store.assert_batch_silent(quads).await;
+    Ok(query_store)
+}
+
+fn kg_subject_by_predicate_value(
+    quads: &[LegacyQuad],
+    predicate: &str,
+    value: &str,
+) -> Option<KotobaCid> {
+    quads
+        .iter()
+        .find(|quad| {
+            quad.predicate == predicate
+                && matches!(&quad.object, QuadObject::Text(text) if text == value)
+        })
+        .map(|quad| quad.subject.clone())
+}
+
+fn kg_entity_quads<'a>(
+    quads: &'a [LegacyQuad],
+    subject: &'a KotobaCid,
+) -> impl Iterator<Item = &'a LegacyQuad> {
+    quads.iter().filter(move |quad| &quad.subject == subject)
+}
+
 const MAX_KG_ID_LEN: usize = 256;
 const MAX_KG_TEXT_LEN: usize = 8_192; // max embed text — prevents inference-engine DoS
 const MAX_KG_QUERY_LEN: usize = 2_048;
@@ -229,12 +298,8 @@ pub async fn kg_entity(
         }
     };
 
-    let subjects = state
-        .quad_store
-        .lookup_subject_by_po(Some(&graph_cid), lookup_pred, lookup_val)
-        .await;
-
-    let subject_cid = match subjects.into_iter().next() {
+    let quads = current_graph_quads(&state, &graph_cid).await?;
+    let subject_cid = match kg_subject_by_predicate_value(&quads, lookup_pred, lookup_val) {
         Some(s) => s,
         None => {
             return Ok(Json(KgEntityResp {
@@ -246,16 +311,11 @@ pub async fn kg_entity(
         }
     };
 
-    let quads = state
-        .quad_store
-        .get_entity_quads(Some(&graph_cid), &subject_cid)
-        .await;
-
     let mut meta: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut claims: Vec<serde_json::Value> = Vec::new();
     let mut relations: Vec<serde_json::Value> = Vec::new();
 
-    for quad in &quads {
+    for quad in kg_entity_quads(&quads, &subject_cid) {
         let pred = quad.predicate.as_str();
         match pred {
             "kg/id" => {
@@ -354,7 +414,7 @@ pub struct KgCatalogQuery {
 }
 
 /// GET /xrpc/ai.gftd.apps.kotobase.kg.catalog
-/// Returns aggregate stats and source breakdown from the QuadStore.
+/// Returns aggregate stats and source breakdown from the distributed Datomic DB.
 pub async fn kg_catalog(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,
@@ -375,28 +435,25 @@ pub async fn kg_catalog(
     )
     .map_err(AccessDenied::into_response)?;
 
-    let entity_count = state
-        .quad_store
-        .count_by_attribute_prefix(&graph_cid, "kg/id")
-        .await;
-    let claim_count = state
-        .quad_store
-        .count_by_attribute_prefix(&graph_cid, "kg/claim/")
-        .await;
-    let relation_count = state
-        .quad_store
-        .count_by_attribute_prefix(&graph_cid, "kg/relation/")
-        .await;
+    let quads = current_graph_quads(&state, &graph_cid).await?;
+    let entity_count = quads
+        .iter()
+        .filter(|quad| quad.predicate == "kg/id")
+        .count();
+    let claim_count = quads
+        .iter()
+        .filter(|quad| quad.predicate.starts_with("kg/claim/"))
+        .count();
+    let relation_count = quads
+        .iter()
+        .filter(|quad| quad.predicate.starts_with("kg/relation/"))
+        .count();
 
-    // Gather source_ids from kg/source_id quads
-    let source_quads = state
-        .quad_store
-        .quads_by_predicate_prefix(Some(&graph_cid), "kg/source_id")
-        .await;
+    // Gather source_ids from kg/source_id datoms.
     let mut source_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for q in &source_quads {
-        let src = match &q.object {
+    for quad in quads.iter().filter(|quad| quad.predicate == "kg/source_id") {
+        let src = match &quad.object {
             QuadObject::Text(s) => s.clone(),
             other => format!("{other:?}"),
         };
@@ -460,16 +517,14 @@ pub async fn kg_embed(
     }
     let graph_cid = kg_graph_cid();
 
-    let subjects = state
-        .quad_store
-        .lookup_subject_by_po(Some(&graph_cid), "kg/id", &req.entity_id)
-        .await;
-    let subject = subjects.into_iter().next().ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("entity not found: {}", req.entity_id),
-        )
-    })?;
+    let quads = current_graph_quads(&state, &graph_cid).await?;
+    let subject =
+        kg_subject_by_predicate_value(&quads, "kg/id", &req.entity_id).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("entity not found: {}", req.entity_id),
+            )
+        })?;
 
     let vector: Vec<f32> = if let Some(engine) = &state.inference_engine {
         let engine = engine.clone();
@@ -584,14 +639,12 @@ pub async fn kg_search(
         blake3_pseudo_vector(&q.q, 128)
     };
 
-    let vec_quads = state
-        .quad_store
-        .quads_by_predicate_prefix(Some(&graph_cid), "kg/label_vec")
-        .await;
+    let quads = current_graph_quads(&state, &graph_cid).await?;
 
     // Score each entity
-    let mut scored: Vec<(f32, KotobaCid)> = vec_quads
+    let mut scored: Vec<(f32, KotobaCid)> = quads
         .iter()
+        .filter(|quad| quad.predicate == "kg/label_vec")
         .filter_map(|quad| {
             if let QuadObject::VectorF32(v) = &quad.object {
                 Some((cosine(&query_vec, v), quad.subject.clone()))
@@ -607,13 +660,9 @@ pub async fn kg_search(
     // Fetch entity metadata for top-k subjects
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(scored.len());
     for (score, subject) in &scored {
-        let quads = state
-            .quad_store
-            .get_entity_quads(Some(&graph_cid), subject)
-            .await;
         let mut meta: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         meta.insert("score".into(), serde_json::json!(score));
-        for quad in &quads {
+        for quad in kg_entity_quads(&quads, subject) {
             match quad.predicate.as_str() {
                 "kg/id" => {
                     meta.insert("id".into(), obj_to_json(&quad.object));
@@ -1470,18 +1519,13 @@ pub async fn kg_query(
         }
     };
 
-    // Evaluate Datalog program against IPFS-backed cold storage (hot+cold union).
-    // This path loads facts via ProllyTree scans on the configured BlockStore —
-    // which can be Kubo HTTP (KOTOBA_IPFS_ENDPOINT) or a multi-peer
-    // DistributedBlockStore. Falls back to hot arrangement if not yet committed.
-    let derived = state
-        .quad_store
-        .evaluate_datalog_cold(&graph_cid, &program)
+    let input_deltas = current_graph_deltas(&state, &graph_cid).await?;
+    let derived = tokio::task::spawn_blocking(move || program.evaluate_delta(&input_deltas))
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("datalog eval: {e}"),
+                format!("datalog eval join: {e}"),
             )
         })?;
 
@@ -1535,7 +1579,7 @@ pub struct SparqlReq {
 
 /// POST /xrpc/ai.gftd.apps.kotoba.graph.sparql
 ///
-/// Execute a SPARQL query directly against the QuadStore cold path.
+/// Execute a SPARQL query directly against the distributed Datomic DB view.
 /// Supports all four query forms; result shape varies:
 ///
 ///   - SELECT    →  `{ "form": "select",    "quads": [{...}] }`
@@ -1543,8 +1587,8 @@ pub struct SparqlReq {
 ///   - CONSTRUCT →  `{ "form": "construct", "quads": [{...}] }`
 ///   - ASK       →  `{ "form": "ask",       "result": true }`
 ///
-/// Goes through the IPFS-backed cold path (DistributedBlockStore / Kubo HTTP);
-/// honours CACAO gating per the graph's visibility policy.
+/// Loads the current graph basis from IPNS/IPLD ProllyTree indexes, materialises
+/// a local query-only projection, and honours CACAO gating per visibility policy.
 pub async fn kg_sparql(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,
@@ -1598,7 +1642,7 @@ pub async fn kg_sparql(
         .take(10)
         .collect::<String>()
         .to_ascii_uppercase();
-    let qs = &state.quad_store;
+    let qs = distributed_query_store(&state, &graph_cid).await?;
 
     let response = if upper.starts_with("ASK") {
         let result = qs

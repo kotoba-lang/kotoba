@@ -273,13 +273,17 @@ impl<'a> Parser<'a> {
         self.pos += 1; // '"'
         let mut s = String::new();
         loop {
-            let b = self.bump().ok_or(ParseError::Unbalanced {
+            let b = self.peek().ok_or(ParseError::Unbalanced {
                 kind: "string",
                 offset: start,
             })?;
             match b {
-                b'"' => return Ok(EdnValue::String(s)),
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(EdnValue::String(s));
+                }
                 b'\\' => {
+                    self.pos += 1;
                     let esc_off = self.pos;
                     let esc = self.bump().ok_or(ParseError::UnexpectedEof(esc_off))?;
                     let ch = match esc {
@@ -316,7 +320,20 @@ impl<'a> Parser<'a> {
                     };
                     s.push(ch);
                 }
-                _ => s.push(b as char),
+                _ => {
+                    let tail = std::str::from_utf8(&self.src[self.pos..]).map_err(|_| {
+                        ParseError::UnexpectedChar {
+                            ch: b as char,
+                            offset: self.pos,
+                        }
+                    })?;
+                    let ch = tail.chars().next().ok_or(ParseError::Unbalanced {
+                        kind: "string",
+                        offset: start,
+                    })?;
+                    self.pos += ch.len_utf8();
+                    s.push(ch);
+                }
             }
         }
     }
@@ -516,6 +533,10 @@ mod tests {
         assert_eq!(parse("-7").unwrap(), EdnValue::Integer(-7));
         assert_eq!(parse("3.14").unwrap(), EdnValue::float(3.14));
         assert_eq!(parse("\"hi\\n\"").unwrap(), EdnValue::String("hi\n".into()));
+        assert_eq!(
+            parse("\"テスト会社\"").unwrap(),
+            EdnValue::String("テスト会社".into())
+        );
         assert_eq!(parse(":foo").unwrap(), EdnValue::kw_bare("foo"));
         assert_eq!(parse(":db/id").unwrap(), EdnValue::kw("db", "id"));
         assert_eq!(parse("foo").unwrap(), EdnValue::sym("foo"));

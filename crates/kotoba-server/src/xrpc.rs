@@ -7007,7 +7007,6 @@ pub async fn agent_run(
     let max_tokens = req.max_tokens.unwrap_or(256).min(MAX_TOKENS_LIMIT);
     let task = req.task.clone();
     let graph_cid2 = graph_cid.clone();
-    let qs = Arc::clone(&state.quad_store);
     let journal = Arc::clone(&state.journal);
 
     // Run the Pregel ReAct loop in a blocking thread (LLM is sync).
@@ -7058,21 +7057,36 @@ pub async fn agent_run(
         }
     });
 
-    // Store session steps as Quads in the QuadStore
-    let deltas = session_to_quads(&session);
-    for delta in &deltas {
-        if delta.is_assert() {
-            let graph_cid = delta.datom.tx.clone();
-            qs.assert_datom(graph_cid, delta.datom.clone()).await;
-        }
-    }
-
-    // Commit session history to BlockStore (ProllyTree)
-    let commit_cid = qs
-        .commit("agent", graph_cid.clone(), session.steps.len() as u64)
-        .await
-        .ok()
-        .map(|c| c.to_multibase());
+    // Store session steps through the Datomic/IPLD commit path.  The legacy
+    // Journal/QuadStore projection is still updated inside commit_protocol_datoms.
+    let session_cid = session.session_cid.clone();
+    let tx_cid = KotobaCid::from_bytes(
+        format!(
+            "agent.run:{}:{}:{}",
+            graph_cid.to_multibase(),
+            session_cid.to_multibase(),
+            session.steps.len()
+        )
+        .as_bytes(),
+    );
+    let datoms = session_to_quads(&session)
+        .into_iter()
+        .map(|delta| kotoba_datomic::Datom::from_kqe(delta.datom))
+        .collect::<Vec<_>>();
+    let commit_resp = commit_protocol_datoms(
+        &state,
+        graph_cid.clone(),
+        graph_cid.to_multibase(),
+        session_cid.clone(),
+        datoms,
+        tx_cid,
+        state.operator_did.clone(),
+        kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+        None,
+        None,
+    )
+    .await?;
+    let commit_cid = Some(commit_resp.commit_cid.clone());
 
     // Pin the commit block in the background
     if let Some(cid_str) = commit_cid.clone() {
@@ -7080,7 +7094,7 @@ pub async fn agent_run(
         tokio::spawn(async move { pin.pin(&cid_str).await });
     }
 
-    let session_cid = session.session_cid.to_multibase();
+    let session_cid = session_cid.to_multibase();
     let steps = session
         .steps
         .into_iter()

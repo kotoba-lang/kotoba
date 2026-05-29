@@ -4833,6 +4833,21 @@ fn edn_to_kqe_value(value: &EdnValue) -> Result<kotoba_kqe::Value> {
         EdnValue::Float(f) => Ok(kotoba_kqe::Value::Float(f.0)),
         EdnValue::String(s) => Ok(kotoba_kqe::Value::Text(s.clone())),
         EdnValue::Keyword(k) => Ok(kotoba_kqe::Value::Text(keyword_to_attr(k))),
+        EdnValue::Vector(values)
+            if values
+                .iter()
+                .all(|value| matches!(value, EdnValue::Integer(_) | EdnValue::Float(_))) =>
+        {
+            let mut vector = Vec::with_capacity(values.len());
+            for value in values {
+                match value {
+                    EdnValue::Integer(i) => vector.push(*i as f32),
+                    EdnValue::Float(f) => vector.push(f.0 as f32),
+                    _ => unreachable!("guarded by all() above"),
+                }
+            }
+            Ok(kotoba_kqe::Value::VectorF32(vector))
+        }
         EdnValue::Tagged { tag, value } if tag.to_qualified() == "cid" => {
             let Some(cid) = value
                 .as_string()
@@ -4933,6 +4948,15 @@ mod tests {
 
         let datom = Datom::assert(e.clone(), a.clone(), v.clone(), t.clone());
         assert_eq!(datom.as_tuple(), (&e, &a, &v, &t, true));
+    }
+
+    #[test]
+    fn edn_numeric_vector_converts_to_kqe_vector_f32() {
+        let value = parse("[1 2.5 -3]").unwrap();
+        assert_eq!(
+            edn_to_kqe_value(&value).unwrap(),
+            kotoba_kqe::Value::VectorF32(vec![1.0, 2.5, -3.0])
+        );
     }
 
     #[tokio::test]

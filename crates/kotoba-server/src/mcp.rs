@@ -48,6 +48,10 @@ use axum::{
     Json,
 };
 use kotoba_core::cid::KotobaCid;
+use kotoba_graph::quad_store::QuadStore;
+use kotoba_kqe::{delta::Delta, quad::LegacyQuad};
+use kotoba_kse::journal::Journal;
+use kotoba_store::MemoryBlockStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -440,6 +444,53 @@ async fn commit_mcp_datoms(
     .map_err(map_xrpc_err)
 }
 
+async fn current_graph_quads(
+    state: &Arc<KotobaState>,
+    graph_cid: &KotobaCid,
+) -> Result<Vec<LegacyQuad>, (i32, String)> {
+    let db = crate::xrpc::current_db_for_graph(state, graph_cid)
+        .await
+        .map_err(|(_, msg)| (ERR_INTERNAL, msg))?;
+    Ok(db
+        .datoms()
+        .into_iter()
+        .filter_map(|datom| {
+            let substrate = datom.to_kqe().ok()?;
+            Some(LegacyQuad {
+                graph: graph_cid.clone(),
+                subject: substrate.e,
+                predicate: substrate.a,
+                object: substrate.v.into(),
+            })
+        })
+        .collect())
+}
+
+async fn current_graph_deltas(
+    state: &Arc<KotobaState>,
+    graph_cid: &KotobaCid,
+) -> Result<Vec<Delta>, (i32, String)> {
+    let db = crate::xrpc::current_db_for_graph(state, graph_cid)
+        .await
+        .map_err(|(_, msg)| (ERR_INTERNAL, msg))?;
+    Ok(db
+        .datoms()
+        .into_iter()
+        .filter_map(|datom| datom.to_kqe().ok())
+        .map(Delta::from_datom)
+        .collect())
+}
+
+async fn distributed_query_store(
+    state: &Arc<KotobaState>,
+    graph_cid: &KotobaCid,
+) -> Result<QuadStore, (i32, String)> {
+    let quads = current_graph_quads(state, graph_cid).await?;
+    let query_store = QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
+    query_store.assert_batch_silent(quads).await;
+    Ok(query_store)
+}
+
 // ── Dispatch to state methods ────────────────────────────────────────────────
 
 async fn call_tool(
@@ -536,7 +587,6 @@ async fn call_tool(
         // ── kotoba_graph_query ───────────────────────────────────────────────
         MCP_TOOL_GRAPH_QUERY => {
             use kotoba_core::cid::KotobaCid;
-            use kotoba_kqe::quad::LegacyQuad as Quad;
 
             let graph = get_str("graph")?;
             let graph_cid = KotobaCid::from_bytes(graph.as_bytes());
@@ -575,57 +625,37 @@ async fn call_tool(
                 }
             }
 
+            let mut quads = current_graph_quads(&state, &graph_cid).await?;
             let quads: Vec<_> = if let Some(prefix) = predicate_prefix {
-                // AVET BTree prefix range scan — O(k) where k = matching quads
-                let mut q = state
-                    .quad_store
-                    .quads_by_predicate_prefix(Some(&graph_cid), prefix)
-                    .await;
+                let mut q: Vec<_> = quads
+                    .into_iter()
+                    .filter(|quad| quad.predicate.starts_with(prefix))
+                    .collect();
                 q.truncate(limit);
                 q
             } else if let (Some(pred), Some(obj)) = (predicate, object_key) {
-                // AVET P+O→S lookup then EAVT subject→quad reconstruction
-                let subjects = state
-                    .quad_store
-                    .lookup_subject_by_po(Some(&graph_cid), pred, obj)
-                    .await;
-                let arr = match state.quad_store.arrangement(&graph_cid).await {
-                    None => return Ok(json!({ "graph": graph, "count": 0, "quads": [] })),
-                    Some(a) => a,
-                };
-                let pred_owned = pred.to_owned();
-                let mut q: Vec<_> = subjects
-                    .iter()
-                    .flat_map(|subject| {
-                        arr.get_values(subject, &pred_owned)
-                            .into_iter()
-                            .filter(|value| datom_value_key(value).as_deref() == Some(obj))
-                            .map(|value| Quad {
-                                graph: graph_cid.clone(),
-                                subject: subject.clone(),
-                                predicate: pred_owned.clone(),
-                                object: value.into(),
-                            })
+                let mut q: Vec<_> = quads
+                    .into_iter()
+                    .filter(|quad| {
+                        if quad.predicate != pred {
+                            return false;
+                        }
+                        let value: kotoba_kqe::datom::Value = quad.object.clone().into();
+                        datom_value_key(&value).as_deref() == Some(obj)
                     })
                     .collect();
                 q.truncate(limit);
                 q
             } else {
-                // Full-scan fallback with optional subject / predicate filters
-                let arr = match state.quad_store.arrangement(&graph_cid).await {
-                    None => return Ok(json!({ "graph": graph, "count": 0, "quads": [] })),
-                    Some(a) => a,
-                };
-                let mut qs = arr.quads(&graph_cid);
                 if let Some(s) = subject_str {
                     let s_cid = KotobaCid::from_bytes(s.as_bytes());
-                    qs.retain(|q| q.subject == s_cid);
+                    quads.retain(|q| q.subject == s_cid);
                 }
                 if let Some(p) = predicate {
-                    qs.retain(|q| q.predicate == p);
+                    quads.retain(|q| q.predicate == p);
                 }
-                qs.truncate(limit);
-                qs
+                quads.truncate(limit);
+                quads
             };
 
             Ok(json!({
@@ -1242,7 +1272,6 @@ async fn call_tool(
         // ── kotoba_datalog_run ───────────────────────────────────────────────
         MCP_TOOL_DATALOG_RUN => {
             use kotoba_core::cid::KotobaCid;
-            use kotoba_kqe::delta::Delta;
             use kotoba_kqe::{CitationLedger, DatalogProgram, DatalogRule};
 
             let graph_str = get_str("graph")?;
@@ -1283,19 +1312,7 @@ async fn call_tool(
             }
 
             let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
-
-            // Load arrangement from QuadStore
-            let arrangement = match state.quad_store.arrangement(&graph_cid).await {
-                None => {
-                    return Ok(json!({
-                        "derived": [], "citations": 0, "royalty_quads": 0
-                    }))
-                }
-                Some(a) => a,
-            };
-
-            // Convert arrangement quads to input Deltas
-            let input_deltas: Vec<Delta> = arrangement.to_datom_deltas(&graph_cid);
+            let input_deltas = current_graph_deltas(&state, &graph_cid).await?;
 
             let mut program = DatalogProgram::new();
             for rule in rules {
@@ -1472,6 +1489,7 @@ async fn call_tool(
                 ));
             }
             let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
+            let query_store = distributed_query_store(&state, &graph_cid).await?;
 
             let quads = if let Some(b64) = args.get("cacao_b64").and_then(Value::as_str) {
                 if b64.len() > 8 * 1024 {
@@ -1481,14 +1499,12 @@ async fn call_tool(
                 let cacao = Cacao::from_cbor(&cbor)
                     .map_err(|e| (ERR_INVALID_PARAMS, format!("CACAO parse error: {e}")))?;
                 let chain = DelegationChain::new(cacao);
-                state
-                    .quad_store
+                query_store
                     .cold_query_sparql_bgp_authed(&graph_cid, &sparql, &chain)
                     .await
                     .map_err(|e| (ERR_AUTH, e.to_string()))?
             } else {
-                state
-                    .quad_store
+                query_store
                     .cold_query_sparql_bgp(&graph_cid, &sparql)
                     .await
                     .map_err(|e| (ERR_INTERNAL, e.to_string()))?
@@ -2372,8 +2388,7 @@ mod tests {
         .await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
-        // Empty graph returns early with derived=[], citations=0, royalty_quads=0
-        assert_eq!(v["derived"], json!([]));
+        assert_eq!(v["derived"], json!(0));
         assert_eq!(v["citations"].as_u64().unwrap_or(1), 0);
     }
 
