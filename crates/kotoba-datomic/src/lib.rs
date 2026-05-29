@@ -3408,6 +3408,7 @@ fn is_find_expression(seq: &[EdnValue]) -> bool {
             if matches!(
                 symbol.name.as_str(),
                 "pull" | "count" | "count-distinct" | "sum" | "min" | "max" | "avg"
+                    | "median" | "variance" | "stddev"
             )
     )
 }
@@ -3422,6 +3423,9 @@ enum FindItem {
     Min(EdnValue),
     Max(EdnValue),
     Avg(EdnValue),
+    Median(EdnValue),
+    Variance(EdnValue),
+    Stddev(EdnValue),
 }
 
 impl FindItem {
@@ -3434,6 +3438,9 @@ impl FindItem {
                 | Self::Min(_)
                 | Self::Max(_)
                 | Self::Avg(_)
+                | Self::Median(_)
+                | Self::Variance(_)
+                | Self::Stddev(_)
         )
     }
 
@@ -3445,7 +3452,10 @@ impl FindItem {
             | Self::Sum(value)
             | Self::Min(value)
             | Self::Max(value)
-            | Self::Avg(value) => Ok(match variable_name(value) {
+            | Self::Avg(value)
+            | Self::Median(value)
+            | Self::Variance(value)
+            | Self::Stddev(value) => Ok(match variable_name(value) {
                 Some(var) => binding.get(var).cloned().unwrap_or(EdnValue::Nil),
                 None => value.clone(),
             }),
@@ -3487,6 +3497,15 @@ fn parse_find_item(value: &EdnValue) -> Result<FindItem> {
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "avg") {
         return Ok(FindItem::Avg(seq[1].clone()));
     }
+    if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "median") {
+        return Ok(FindItem::Median(seq[1].clone()));
+    }
+    if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "variance") {
+        return Ok(FindItem::Variance(seq[1].clone()));
+    }
+    if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "stddev") {
+        return Ok(FindItem::Stddev(seq[1].clone()));
+    }
     if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "pull") {
         return Ok(FindItem::Pull {
             entity: seq[1].clone(),
@@ -3504,9 +3523,12 @@ enum AggregateValue {
     Count(i64),
     CountDistinct(BTreeSet<EdnValue>),
     Sum(i64),
-    Min(Option<i64>),
-    Max(Option<i64>),
+    Min(Option<EdnValue>),
+    Max(Option<EdnValue>),
     Avg { sum: i64, count: i64 },
+    Median(Vec<i64>),
+    Variance(Vec<i64>),
+    Stddev(Vec<i64>),
 }
 
 impl AggregateValue {
@@ -3520,6 +3542,9 @@ impl AggregateValue {
             FindItem::Min(_) => Some(Self::Min(None)),
             FindItem::Max(_) => Some(Self::Max(None)),
             FindItem::Avg(_) => Some(Self::Avg { sum: 0, count: 0 }),
+            FindItem::Median(_) => Some(Self::Median(Vec::new())),
+            FindItem::Variance(_) => Some(Self::Variance(Vec::new())),
+            FindItem::Stddev(_) => Some(Self::Stddev(Vec::new())),
         }
     }
 
@@ -3534,16 +3559,27 @@ impl AggregateValue {
             }
             Self::Sum(sum) => *sum += aggregate_integer(&value)?,
             Self::Min(min) => {
-                let value = aggregate_integer(&value)?;
-                *min = Some(min.map_or(value, |current| current.min(value)));
+                if min
+                    .as_ref()
+                    .is_none_or(|current| query_sort_order(&value, current).is_lt())
+                {
+                    *min = Some(value);
+                }
             }
             Self::Max(max) => {
-                let value = aggregate_integer(&value)?;
-                *max = Some(max.map_or(value, |current| current.max(value)));
+                if max
+                    .as_ref()
+                    .is_none_or(|current| query_sort_order(&value, current).is_gt())
+                {
+                    *max = Some(value);
+                }
             }
             Self::Avg { sum, count } => {
                 *sum += aggregate_integer(&value)?;
                 *count += 1;
+            }
+            Self::Median(values) | Self::Variance(values) | Self::Stddev(values) => {
+                values.push(aggregate_integer(&value)?);
             }
         }
         Ok(())
@@ -3554,8 +3590,8 @@ impl AggregateValue {
             Self::Count(count) => EdnValue::Integer(*count),
             Self::CountDistinct(values) => EdnValue::Integer(values.len() as i64),
             Self::Sum(sum) => EdnValue::Integer(*sum),
-            Self::Min(min) => min.map(EdnValue::Integer).unwrap_or(EdnValue::Nil),
-            Self::Max(max) => max.map(EdnValue::Integer).unwrap_or(EdnValue::Nil),
+            Self::Min(min) => min.clone().unwrap_or(EdnValue::Nil),
+            Self::Max(max) => max.clone().unwrap_or(EdnValue::Nil),
             Self::Avg { sum, count } => {
                 if *count == 0 {
                     EdnValue::Nil
@@ -3563,8 +3599,52 @@ impl AggregateValue {
                     EdnValue::float(*sum as f64 / *count as f64)
                 }
             }
+            Self::Median(values) => aggregate_median(values),
+            Self::Variance(values) => aggregate_variance(values),
+            Self::Stddev(values) => match aggregate_variance_f64(values) {
+                Some(variance) => EdnValue::float(variance.sqrt()),
+                None => EdnValue::Nil,
+            },
         }
     }
+}
+
+fn aggregate_median(values: &[i64]) -> EdnValue {
+    if values.is_empty() {
+        return EdnValue::Nil;
+    }
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        EdnValue::Integer(values[mid])
+    } else {
+        EdnValue::float((values[mid - 1] as f64 + values[mid] as f64) / 2.0)
+    }
+}
+
+fn aggregate_variance(values: &[i64]) -> EdnValue {
+    match aggregate_variance_f64(values) {
+        Some(value) => EdnValue::float(value),
+        None => EdnValue::Nil,
+    }
+}
+
+fn aggregate_variance_f64(values: &[i64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mean = values.iter().sum::<i64>() as f64 / values.len() as f64;
+    Some(
+        values
+            .iter()
+            .map(|value| {
+                let diff = *value as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / values.len() as f64,
+    )
 }
 
 fn aggregate_integer(value: &EdnValue) -> Result<i64> {
@@ -7367,6 +7447,47 @@ mod tests {
             vec![
                 vec![kw_value(":admin"), EdnValue::float(10.0)],
                 vec![kw_value(":guest"), EdnValue::float(5.5)]
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn q_supports_datomic_statistical_aggregates() {
+        let conn = Connection::new();
+        conn.transact(
+            parse(
+                r#"[
+                  {:db/id "alice" :person/role :admin :person/score 10}
+                  {:db/id "bob" :person/role :guest :person/score 3}
+                  {:db/id "eve" :person/role :guest :person/score 8}
+                ]"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let query = parse(
+            r#"{:find [?role (median ?score) (variance ?score) (stddev ?score)]
+                :where [[?e :person/role ?role]
+                        [?e :person/score ?score]]}"#,
+        )
+        .unwrap();
+        let rows = q(query, &conn.db(), &[]).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    kw_value(":admin"),
+                    EdnValue::Integer(10),
+                    EdnValue::float(0.0),
+                    EdnValue::float(0.0)
+                ],
+                vec![
+                    kw_value(":guest"),
+                    EdnValue::float(5.5),
+                    EdnValue::float(6.25),
+                    EdnValue::float(2.5)
+                ]
             ]
         );
     }

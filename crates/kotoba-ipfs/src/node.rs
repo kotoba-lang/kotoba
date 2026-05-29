@@ -760,6 +760,19 @@ impl KotobaIpfsNode {
         })
     }
 
+    /// Kubo-like `object/links` for locally available dag-cbor objects.
+    pub async fn object_links(&self, cid: &IpldCid) -> Result<Vec<ObjectLink>> {
+        Ok(self
+            .refs(cid, false)
+            .await?
+            .into_iter()
+            .map(|cid| ObjectLink {
+                name: String::new(),
+                cid,
+            })
+            .collect())
+    }
+
     /// Kubo-like `block/rm`.
     pub async fn delete_block(&self, cid: &IpldCid) -> Result<bool> {
         let mut removed = self.state.blocks.write().await.remove(cid).is_some();
@@ -1450,6 +1463,12 @@ pub struct ObjectStat {
     pub codec: u64,
     pub block_size: u64,
     pub cumulative_size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectLink {
+    pub name: String,
+    pub cid: IpldCid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1866,7 +1866,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
             "/xrpc/ai.gftd.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
-                "query_edn": r#"{:find [?role (sum ?age) (min ?age) (max ?age)] :where [[?e :person/role ?role] [?e :person/age ?age]]}"#
+                "query_edn": r#"{:find [?role (sum ?age) (min ?age) (max ?age) (median ?age) (variance ?age) (stddev ?age)] :where [[?e :person/role ?role] [?e :person/age ?age]]}"#
             }),
             &tok,
         )
@@ -1874,7 +1874,10 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     assert_eq!(status, 200, "{numeric_aggregate_body}");
     assert_eq!(
         numeric_aggregate_body["rows_edn"],
-        json!([[":admin", "30", "30", "30"], [":guest", "7", "7", "7"]]),
+        json!([
+            [":admin", "30", "30", "30", "30", "0.0", "0.0"],
+            [":guest", "7", "7", "7", "7", "0.0", "0.0"]
+        ]),
         "{numeric_aggregate_body}"
     );
 

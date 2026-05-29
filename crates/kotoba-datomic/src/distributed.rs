@@ -2348,6 +2348,9 @@ enum DistributedFindItem {
     Min(Value),
     Max(Value),
     Avg(Value),
+    Median(Value),
+    Variance(Value),
+    Stddev(Value),
 }
 
 impl DistributedFindItem {
@@ -2360,6 +2363,9 @@ impl DistributedFindItem {
                 | Self::Min(_)
                 | Self::Max(_)
                 | Self::Avg(_)
+                | Self::Median(_)
+                | Self::Variance(_)
+                | Self::Stddev(_)
         )
     }
 }
@@ -2389,6 +2395,15 @@ fn parse_distributed_find_item(
     }
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "avg") {
         return Ok(DistributedFindItem::Avg(seq[1].clone()));
+    }
+    if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "median") {
+        return Ok(DistributedFindItem::Median(seq[1].clone()));
+    }
+    if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "variance") {
+        return Ok(DistributedFindItem::Variance(seq[1].clone()));
+    }
+    if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "stddev") {
+        return Ok(DistributedFindItem::Stddev(seq[1].clone()));
     }
     if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "pull") {
         return Ok(DistributedFindItem::Pull {
@@ -2428,6 +2443,7 @@ fn is_distributed_find_expression(seq: &[Value]) -> bool {
             if matches!(
                 symbol.name.as_str(),
                 "pull" | "count" | "count-distinct" | "sum" | "min" | "max" | "avg"
+                    | "median" | "variance" | "stddev"
             )
     )
 }
@@ -2444,7 +2460,10 @@ fn resolve_distributed_find_item(
         | DistributedFindItem::Sum(value)
         | DistributedFindItem::Min(value)
         | DistributedFindItem::Max(value)
-        | DistributedFindItem::Avg(value) => Ok(match variable_name(value) {
+        | DistributedFindItem::Avg(value)
+        | DistributedFindItem::Median(value)
+        | DistributedFindItem::Variance(value)
+        | DistributedFindItem::Stddev(value) => Ok(match variable_name(value) {
             Some(var) => binding.get(var).cloned().unwrap_or(Value::Nil),
             None => value.clone(),
         }),
@@ -2469,9 +2488,12 @@ enum DistributedAggregateValue {
     Count(i64),
     CountDistinct(BTreeSet<Value>),
     Sum(i64),
-    Min(Option<i64>),
-    Max(Option<i64>),
+    Min(Option<Value>),
+    Max(Option<Value>),
     Avg { sum: i64, count: i64 },
+    Median(Vec<i64>),
+    Variance(Vec<i64>),
+    Stddev(Vec<i64>),
 }
 
 impl DistributedAggregateValue {
@@ -2484,6 +2506,9 @@ impl DistributedAggregateValue {
             DistributedFindItem::Min(_) => Some(Self::Min(None)),
             DistributedFindItem::Max(_) => Some(Self::Max(None)),
             DistributedFindItem::Avg(_) => Some(Self::Avg { sum: 0, count: 0 }),
+            DistributedFindItem::Median(_) => Some(Self::Median(Vec::new())),
+            DistributedFindItem::Variance(_) => Some(Self::Variance(Vec::new())),
+            DistributedFindItem::Stddev(_) => Some(Self::Stddev(Vec::new())),
         }
     }
 
@@ -2498,16 +2523,27 @@ impl DistributedAggregateValue {
             }
             Self::Sum(sum) => *sum += aggregate_query_integer(&value)?,
             Self::Min(min) => {
-                let value = aggregate_query_integer(&value)?;
-                *min = Some(min.map_or(value, |current| current.min(value)));
+                if min
+                    .as_ref()
+                    .is_none_or(|current| crate::query_sort_order(&value, current).is_lt())
+                {
+                    *min = Some(value);
+                }
             }
             Self::Max(max) => {
-                let value = aggregate_query_integer(&value)?;
-                *max = Some(max.map_or(value, |current| current.max(value)));
+                if max
+                    .as_ref()
+                    .is_none_or(|current| crate::query_sort_order(&value, current).is_gt())
+                {
+                    *max = Some(value);
+                }
             }
             Self::Avg { sum, count } => {
                 *sum += aggregate_query_integer(&value)?;
                 *count += 1;
+            }
+            Self::Median(values) | Self::Variance(values) | Self::Stddev(values) => {
+                values.push(aggregate_query_integer(&value)?);
             }
         }
         Ok(())
@@ -2518,8 +2554,8 @@ impl DistributedAggregateValue {
             Self::Count(count) => Value::Integer(*count),
             Self::CountDistinct(values) => Value::Integer(values.len() as i64),
             Self::Sum(sum) => Value::Integer(*sum),
-            Self::Min(min) => min.map(Value::Integer).unwrap_or(Value::Nil),
-            Self::Max(max) => max.map(Value::Integer).unwrap_or(Value::Nil),
+            Self::Min(min) => min.clone().unwrap_or(Value::Nil),
+            Self::Max(max) => max.clone().unwrap_or(Value::Nil),
             Self::Avg { sum, count } => {
                 if *count == 0 {
                     Value::Nil
@@ -2527,8 +2563,52 @@ impl DistributedAggregateValue {
                     Value::float(*sum as f64 / *count as f64)
                 }
             }
+            Self::Median(values) => aggregate_query_median(values),
+            Self::Variance(values) => aggregate_query_variance(values),
+            Self::Stddev(values) => match aggregate_query_variance_f64(values) {
+                Some(variance) => Value::float(variance.sqrt()),
+                None => Value::Nil,
+            },
         }
     }
+}
+
+fn aggregate_query_median(values: &[i64]) -> Value {
+    if values.is_empty() {
+        return Value::Nil;
+    }
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Value::Integer(values[mid])
+    } else {
+        Value::float((values[mid - 1] as f64 + values[mid] as f64) / 2.0)
+    }
+}
+
+fn aggregate_query_variance(values: &[i64]) -> Value {
+    match aggregate_query_variance_f64(values) {
+        Some(value) => Value::float(value),
+        None => Value::Nil,
+    }
+}
+
+fn aggregate_query_variance_f64(values: &[i64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mean = values.iter().sum::<i64>() as f64 / values.len() as f64;
+    Some(
+        values
+            .iter()
+            .map(|value| {
+                let diff = *value as f64 - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / values.len() as f64,
+    )
 }
 
 fn aggregate_query_integer(value: &Value) -> Result<i64, DistributedCommitError> {
@@ -4966,7 +5046,7 @@ mod tests {
             .unwrap();
 
         let grouped = kotoba_edn::parse(
-            r#"{:find [?role (count ?e) (sum ?score) (min ?score) (max ?score) (avg ?score)]
+            r#"{:find [?role (count ?e) (sum ?score) (min ?score) (max ?score) (avg ?score) (median ?score) (variance ?score) (stddev ?score)]
                 :where [[?e :person/role ?role]
                         [?e :person/score ?score]]
                 :order-by [[(count ?e) :desc] [?role :asc]]}"#,
@@ -4985,6 +5065,9 @@ mod tests {
                     EdnValue::Integer(3),
                     EdnValue::Integer(8),
                     EdnValue::float(5.5),
+                    EdnValue::float(5.5),
+                    EdnValue::float(6.25),
+                    EdnValue::float(2.5),
                 ],
                 vec![
                     EdnValue::Keyword(Keyword::parse("admin")),
@@ -4993,6 +5076,9 @@ mod tests {
                     EdnValue::Integer(10),
                     EdnValue::Integer(10),
                     EdnValue::float(10.0),
+                    EdnValue::Integer(10),
+                    EdnValue::float(0.0),
+                    EdnValue::float(0.0),
                 ],
             ]
         );

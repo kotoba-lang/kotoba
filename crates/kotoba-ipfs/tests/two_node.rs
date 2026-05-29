@@ -295,6 +295,13 @@ async fn kubo_compatible_local_api_surface() {
     .expect("dag linked");
     assert_eq!(node.refs(&linked, false).await.expect("refs"), vec![child]);
     assert_eq!(
+        node.object_links(&linked).await.expect("object/links"),
+        vec![kotoba_ipfs::ObjectLink {
+            name: String::new(),
+            cid: child,
+        }]
+    );
+    assert_eq!(
         node.refs(&linked, true).await.expect("recursive refs"),
         vec![child, leaf]
     );
