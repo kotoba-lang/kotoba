@@ -4590,6 +4590,68 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
 }
 
 #[tokio::test]
+async fn did_document_publish_rejects_missing_protocol_services() {
+    let s = TestServer::start(false).await;
+    let graph =
+        kotoba_core::cid::KotobaCid::from_bytes(b"did-document-publish-missing-services-e2e")
+            .to_multibase();
+    let cacao_b64 = build_ed25519_cacao_for_operation(
+        &graph,
+        &s.operator_did,
+        kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+        "nonce-did-document-publish-missing-services-e2e",
+    );
+
+    let document = json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": "did:plc:incompleteagent",
+        "verificationMethod": [],
+        "authentication": [],
+        "assertionMethod": [],
+        "capabilityInvocation": [],
+        "capabilityDelegation": [],
+        "service": [
+            {
+                "id": "did:plc:incompleteagent#didcomm",
+                "type": "DIDCommMessaging",
+                "serviceEndpoint": "didcomm://mediator/incompleteagent"
+            }
+        ]
+    });
+
+    let (status, body) = s
+        .post(
+            "/xrpc/ai.gftd.apps.kotoba.did.document.publish",
+            json!({
+                "graph": graph,
+                "cacao_b64": cacao_b64,
+                "document": document
+            }),
+        )
+        .await;
+
+    assert_eq!(status, 400, "{body}");
+    let message = body.as_str().unwrap_or("");
+    for missing in [
+        "AtprotoPersonalDataServer",
+        "KotobaNode",
+        "KotobaGraphMembership",
+    ] {
+        assert!(
+            message.contains(missing),
+            "missing service {missing} should be named in error: {body}"
+        );
+    }
+    assert!(
+        s.state
+            .did_resolver
+            .resolve("did:plc:incompleteagent")
+            .is_err(),
+        "rejected DID document must not be published to distributed DID registry"
+    );
+}
+
+#[tokio::test]
 async fn didcomm_send_projects_message_to_distributed_datoms() {
     let s = TestServer::start(false).await;
     let graph = kotoba_core::cid::KotobaCid::from_bytes(b"didcomm-send-e2e").to_multibase();

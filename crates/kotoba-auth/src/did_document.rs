@@ -8,6 +8,12 @@ pub const DIDCOMM_MESSAGING_SERVICE: &str = "DIDCommMessaging";
 pub const ATPROTO_PDS_SERVICE: &str = "AtprotoPersonalDataServer";
 pub const KOTOBA_NODE_SERVICE: &str = "KotobaNode";
 pub const KOTOBA_GRAPH_MEMBERSHIP_SERVICE: &str = "KotobaGraphMembership";
+pub const KOTOBA_PROTOCOL_DID_SERVICES: [&str; 4] = [
+    DIDCOMM_MESSAGING_SERVICE,
+    ATPROTO_PDS_SERVICE,
+    KOTOBA_NODE_SERVICE,
+    KOTOBA_GRAPH_MEMBERSHIP_SERVICE,
+];
 pub const ATTR_DID_ID: &str = "did/id";
 pub const ATTR_DID_CONTEXT: &str = "did/context";
 pub const ATTR_DID_VERIFICATION_METHOD: &str = "did/verificationMethod";
@@ -129,6 +135,18 @@ impl DidDocument {
                 ServiceEndpointValue::Multiple(v) => Some(v.iter().map(|s| s.as_str()).collect()),
             })
             .unwrap_or_default()
+    }
+
+    pub fn missing_kotoba_protocol_services(&self) -> Vec<&'static str> {
+        KOTOBA_PROTOCOL_DID_SERVICES
+            .iter()
+            .copied()
+            .filter(|service_type| self.service_by_type(service_type).is_none())
+            .collect()
+    }
+
+    pub fn has_kotoba_protocol_services(&self) -> bool {
+        self.missing_kotoba_protocol_services().is_empty()
     }
 
     /// Extract the X25519 key agreement public key from `verificationMethod`.
@@ -676,6 +694,41 @@ mod tests {
             doc.graph_memberships(),
             vec!["kotoba://graph/a", "kotoba://graph/b"]
         );
+    }
+
+    #[test]
+    fn kotoba_protocol_service_check_requires_all_protocol_services() {
+        let mut doc = DidDocument::empty("did:key:zProtocolServices");
+        assert_eq!(
+            doc.missing_kotoba_protocol_services(),
+            vec![
+                DIDCOMM_MESSAGING_SERVICE,
+                ATPROTO_PDS_SERVICE,
+                KOTOBA_NODE_SERVICE,
+                KOTOBA_GRAPH_MEMBERSHIP_SERVICE,
+            ]
+        );
+        assert!(!doc.has_kotoba_protocol_services());
+
+        doc.push_single_service(
+            "didcomm",
+            DIDCOMM_MESSAGING_SERVICE,
+            "didcomm://agent/inbox",
+        );
+        doc.push_single_service(
+            "atproto-pds",
+            ATPROTO_PDS_SERVICE,
+            "https://pds.example.com",
+        );
+        doc.push_single_service(
+            "kotoba-node",
+            KOTOBA_NODE_SERVICE,
+            "/ip4/127.0.0.1/tcp/4001",
+        );
+        doc.push_graph_membership_service(["kotoba://graph/a"]);
+
+        assert!(doc.missing_kotoba_protocol_services().is_empty());
+        assert!(doc.has_kotoba_protocol_services());
     }
 
     #[test]

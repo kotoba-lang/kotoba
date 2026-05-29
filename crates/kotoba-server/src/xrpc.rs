@@ -4769,6 +4769,17 @@ pub async fn did_document_publish(
         }
     }
 
+    let missing_services = req.document.missing_kotoba_protocol_services();
+    if !missing_services.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "DID Document missing Kotoba protocol service(s): {}",
+                missing_services.join(", ")
+            ),
+        ));
+    }
+
     let graph_cid = parse_graph_cid(&req.graph)?;
     let entity_cid = req.document.entity_cid();
     let tx_cid = kotoba_core::cid::KotobaCid::from_bytes(
@@ -7542,6 +7553,118 @@ mod tests {
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/did/document/publish.json"),
         ] {
             assert_lexicon_input_presentation_schema(src, "auth_presentation");
+        }
+    }
+
+    #[test]
+    fn did_document_publish_lexicon_exposes_w3c_did_document_and_write_response() {
+        let src = include_str!("../../../lexicons/ai/gftd/apps/kotoba/did/document/publish.json");
+        assert_lexicon_input_fields(
+            src,
+            &["graph", "document"],
+            &["cacao_b64", "auth_presentation"],
+        );
+        assert_lexicon_input_object_fields(
+            src,
+            "document",
+            &[
+                "@context",
+                "id",
+                "verificationMethod",
+                "authentication",
+                "assertionMethod",
+                "capabilityInvocation",
+                "capabilityDelegation",
+                "service",
+            ],
+            &[],
+        );
+        assert_lexicon_input_nested_array_item_fields(
+            src,
+            "document",
+            "service",
+            &["id", "type", "serviceEndpoint"],
+        );
+        assert_lexicon_output_fields(
+            src,
+            &[
+                "status",
+                "graph",
+                "entity_cid",
+                "tx_cid",
+                "commit_cid",
+                "ipns_name",
+                "ipns_sequence",
+                "datom_count",
+                "journal_cids",
+            ],
+            &["auth_proof_cid"],
+        );
+    }
+
+    fn assert_lexicon_input_object_fields(
+        src: &str,
+        field: &str,
+        required: &[&str],
+        properties: &[&str],
+    ) {
+        let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
+        let schema = &value["defs"]["main"]["input"]["schema"]["properties"][field];
+        assert_eq!(
+            schema["type"], "object",
+            "{} input {field} must be object",
+            value["id"]
+        );
+        let required_values = schema["required"].as_array().expect("required array");
+        for required in required {
+            assert!(
+                required_values
+                    .iter()
+                    .any(|value| value.as_str() == Some(*required)),
+                "{} input {field} missing required field {required}",
+                value["id"]
+            );
+        }
+        let property_values = schema["properties"].as_object().expect("properties object");
+        for property in required.iter().chain(properties.iter()) {
+            assert!(
+                property_values.contains_key(*property),
+                "{} input {field} missing property {property}",
+                value["id"]
+            );
+        }
+    }
+
+    fn assert_lexicon_input_nested_array_item_fields(
+        src: &str,
+        outer_field: &str,
+        inner_field: &str,
+        required: &[&str],
+    ) {
+        let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
+        let item = &value["defs"]["main"]["input"]["schema"]["properties"][outer_field]
+            ["properties"][inner_field]["items"];
+        assert_eq!(
+            item["type"], "object",
+            "{} input {outer_field}.{inner_field} items must be object",
+            value["id"]
+        );
+        let required_values = item["required"].as_array().expect("required array");
+        for field in required {
+            assert!(
+                required_values
+                    .iter()
+                    .any(|value| value.as_str() == Some(field)),
+                "{} input nested array item missing required field {field}",
+                value["id"]
+            );
+            assert!(
+                item["properties"]
+                    .as_object()
+                    .is_some_and(|props| props.contains_key(*field)),
+                "{} input nested array item missing property {field}",
+                value["id"]
+            );
         }
     }
 
