@@ -5892,7 +5892,8 @@ async fn embed_create_returns_quad_cid() {
     use kotoba_core::cid::KotobaCid;
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
-    let graph_cid = KotobaCid::from_bytes(b"embed-e2e").to_multibase();
+    let graph = KotobaCid::from_bytes(b"embed-e2e");
+    let graph_cid = graph.to_multibase();
     let (status, body) = s
         .post_auth(
             "/xrpc/ai.gftd.apps.kotoba.embed.create",
@@ -5908,6 +5909,42 @@ async fn embed_create_returns_quad_cid() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "ok");
     assert!(body["dims"].as_u64().unwrap_or(0) > 0);
+
+    let doc_cid = KotobaCid::from_bytes(b"doc1");
+    let model_cid = KotobaCid::from_bytes(b"model1");
+    let tx_cid = KotobaCid::from_bytes(
+        format!(
+            "embed.create:{}:{}:{}",
+            graph_cid,
+            doc_cid.to_multibase(),
+            model_cid.to_multibase()
+        )
+        .as_bytes(),
+    );
+    let reader = kotoba_datomic::distributed::DistributedDatomReader::new(
+        &*s.state.block_store,
+        &*s.state.ipns_registry,
+    );
+    let head = reader
+        .resolve_head(&format!("k51-kotoba-{}", graph.to_multibase()))
+        .expect("resolve distributed embed head")
+        .expect("distributed embed head");
+    let tea_datoms = reader
+        .history_datoms_index(
+            &head.cid,
+            kotoba_datomic::DatomIndex::Tea,
+            &[kotoba_edn::EdnValue::string(tx_cid.to_multibase())],
+        )
+        .expect("embedding datoms by tx");
+    assert!(
+        tea_datoms.iter().any(|datom| {
+            datom.e == doc_cid
+                && datom.a == format!("embedding/{}", model_cid.to_multibase())
+                && datom.t == tx_cid
+                && datom.added
+        }),
+        "embed.create must publish embedding datoms with Datomic T equal to the tx CID"
+    );
 }
 
 #[tokio::test]

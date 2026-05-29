@@ -786,9 +786,13 @@ async fn call_tool(
                 caller,
             )
             .await?;
-            let quad_cid = resp.journal_cids.first().cloned().unwrap_or(resp.tx_cid);
+            let quad_cid = resp
+                .journal_cids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| resp.tx_cid.clone());
 
-            Ok(json!({ "status": "ok", "quad_cid": quad_cid, "dims": dims }))
+            Ok(json!({ "status": "ok", "quad_cid": quad_cid, "tx_cid": resp.tx_cid, "dims": dims }))
         }
 
         // ── kotoba_weight_put ────────────────────────────────────────────────
@@ -2118,6 +2122,36 @@ mod tests {
         assert_eq!(v["status"], "ok");
         assert!(v["dims"].as_u64().unwrap_or(0) > 0, "dims must be > 0");
         assert!(v["quad_cid"].is_string(), "quad_cid must be a string");
+
+        let graph_cid = KotobaCid::from_bytes(b"graph1");
+        let doc_cid = KotobaCid::from_bytes(b"doc1");
+        let model_cid = KotobaCid::from_bytes(b"model1");
+        let tx_cid =
+            KotobaCid::from_multibase(v["tx_cid"].as_str().expect("tx_cid string")).unwrap();
+        let reader = kotoba_datomic::distributed::DistributedDatomReader::new(
+            &*state.block_store,
+            &*state.ipns_registry,
+        );
+        let tea_datoms = reader
+            .history_datoms_index(
+                &reader
+                    .resolve_head(&crate::xrpc::distributed_graph_ipns_name(&graph_cid))
+                    .expect("resolve distributed embed head")
+                    .expect("distributed embed head")
+                    .cid,
+                kotoba_datomic::DatomIndex::Tea,
+                &[kotoba_edn::EdnValue::string(tx_cid.to_multibase())],
+            )
+            .expect("embedding datoms by tx");
+        assert!(
+            tea_datoms.iter().any(|datom| {
+                datom.e == doc_cid
+                    && datom.a == format!("embedding/{}", model_cid.to_multibase())
+                    && datom.t == tx_cid
+                    && datom.added
+            }),
+            "embed.create must write embedding datoms with Datomic T equal to the tx CID"
+        );
     }
 
     #[tokio::test]
