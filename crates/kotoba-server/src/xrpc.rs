@@ -5997,11 +5997,52 @@ pub async fn commit_store(
 
     let graph_cid = KotobaCid::from_multibase(&req.graph)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph CID".into()))?;
-    let cid = state
-        .quad_store
-        .commit(&req.author, graph_cid, req.seq)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let ipns_name = distributed_graph_ipns_name(&graph_cid);
+    let current_head = match state
+        .ipns_registry
+        .resolve(&IpnsName::new(ipns_name.clone()))
+    {
+        Ok(record) => Some(record),
+        Err(IpnsRegistryError::NotFound(_)) => None,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ipns resolve: {e}"),
+            ));
+        }
+    };
+    let expected_parent = current_head
+        .as_ref()
+        .and_then(|record| KotobaCid::from_multibase(&record.value));
+    let db = current_db_for_graph(&state, &graph_cid).await?;
+    let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
+    let report = writer
+        .commit_datoms(CommitDatomsRequest {
+            ipns_name,
+            graph: graph_cid,
+            datoms: db.datoms(),
+            expected_parent,
+            tx_cid: Some(KotobaCid::from_bytes(
+                format!("commit.store:{}:{}:{}", req.graph, req.author, req.seq).as_bytes(),
+            )),
+            author: req.author.clone(),
+            seq: req.seq,
+            valid_until: "2099-01-01T00:00:00Z".to_string(),
+            ttl_secs: Some(60),
+            cacao_proof_cid: None,
+            ipns_controller_did: Some(state.operator_did.clone()),
+            ipns_signing_key: Some(state.ipns_signing_key()),
+        })
+        .map_err(|e| match e {
+            DistributedCommitError::StaleParent { .. } => {
+                (StatusCode::CONFLICT, format!("distributed commit: {e}"))
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("distributed commit: {e}"),
+            ),
+        })?;
+    let cid = report.commit.cid;
 
     {
         let pin = state.ipfs_pin.clone();

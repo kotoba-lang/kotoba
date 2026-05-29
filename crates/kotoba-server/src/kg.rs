@@ -34,6 +34,7 @@ use kotoba_kqe::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Require a valid, non-expired Bearer JWT to authorise KG write operations.
 /// Any authenticated principal with a `sub` claim and a valid `exp` is accepted.
@@ -82,29 +83,59 @@ pub fn kg_graph_cid() -> KotobaCid {
     KotobaCid::from_bytes(b"kotobase-kg-v1")
 }
 
-fn kg_pending_tx_cid() -> KotobaCid {
-    KotobaCid::from_bytes(b"kotoba-kg-pending-tx")
+fn kg_tx_cid(label: &str, parts: &[&str]) -> KotobaCid {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    KotobaCid::from_bytes(format!("kg:{label}:{nanos}:{}", parts.join(":")).as_bytes())
 }
 
-async fn assert_kg_datom(
-    state: &KotobaState,
-    graph: &KotobaCid,
-    subject: &KotobaCid,
-    predicate: impl Into<String>,
-    value: KqeValue,
-) {
-    state
-        .quad_store
-        .assert_datom(
-            graph.clone(),
-            KqeDatom::assert(
-                subject.clone(),
-                predicate.into(),
-                value,
-                kg_pending_tx_cid(),
-            ),
-        )
-        .await;
+fn kg_datom(subject: &KotobaCid, predicate: impl Into<String>, value: KqeValue) -> KqeDatom {
+    KqeDatom::assert(
+        subject.clone(),
+        predicate.into(),
+        value,
+        KotobaCid::from_bytes(b"kotoba-kg-pending-tx"),
+    )
+}
+
+async fn commit_kg_datoms(
+    state: &Arc<KotobaState>,
+    entity: KotobaCid,
+    tx_cid: KotobaCid,
+    mut datoms: Vec<KqeDatom>,
+    author: String,
+) -> Result<crate::xrpc::ProtocolDatomWriteResp, (StatusCode, String)> {
+    let graph = kg_graph_cid();
+    for datom in &mut datoms {
+        datom.tx = tx_cid.clone();
+    }
+    crate::xrpc::commit_protocol_datoms(
+        state,
+        graph.clone(),
+        graph.to_multibase(),
+        entity,
+        datoms
+            .into_iter()
+            .map(kotoba_datomic::Datom::from_kqe)
+            .collect(),
+        tx_cid,
+        author,
+        kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+        None,
+        None,
+    )
+    .await
+}
+
+fn kg_write_author(headers: &HeaderMap, fallback: &str) -> String {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(crate::graph_auth::jwt_sub)
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 const MAX_KG_ID_LEN: usize = 256;
@@ -457,14 +488,16 @@ pub async fn kg_embed(
     };
 
     let dims = vector.len();
-    assert_kg_datom(
+    let datom = kg_datom(&subject, "kg/label_vec", KqeValue::VectorF32(vector));
+    let tx_cid = kg_tx_cid("embed", &[&req.entity_id]);
+    commit_kg_datoms(
         &state,
-        &graph_cid,
-        &subject,
-        "kg/label_vec",
-        KqeValue::VectorF32(vector),
+        subject,
+        tx_cid,
+        vec![datom],
+        kg_write_author(&headers, &state.operator_did),
     )
-    .await;
+    .await?;
 
     Ok(Json(KgEmbedResp { ok: true, dims }))
 }
@@ -782,27 +815,20 @@ pub async fn kg_ingest(
                 .into_response();
         }
     }
-    let graph = kg_graph_cid();
     let subject = KotobaCid::from_bytes(req.id.as_bytes());
 
     let mut count = 0usize;
+    let mut datoms = Vec::new();
 
     macro_rules! assert_text {
         ($pred:expr, $val:expr) => {{
-            assert_kg_datom(
-                &state,
-                &graph,
-                &subject,
-                $pred,
-                KqeValue::Text($val.to_string()),
-            )
-            .await;
+            datoms.push(kg_datom(&subject, $pred, KqeValue::Text($val.to_string())));
             count += 1;
         }};
     }
 
     // Always write kg/id so lookup_subject_by_po works
-    assert_text!("kg/id", req.id);
+    assert_text!("kg/id", &req.id);
 
     if let Some(v) = &req.qid {
         assert_text!("kg/qid", v);
@@ -844,27 +870,38 @@ pub async fn kg_ingest(
 
     for rel in &req.relations {
         let dst_cid = KotobaCid::from_bytes(rel.dst_id.as_bytes());
-        assert_kg_datom(
-            &state,
-            &graph,
+        datoms.push(kg_datom(
             &subject,
             format!("kg/relation/{}", rel.pred),
             KqeValue::Cid(dst_cid),
-        )
-        .await;
+        ));
         count += 1;
     }
 
     if !req.label_vec.is_empty() {
-        assert_kg_datom(
-            &state,
-            &graph,
+        datoms.push(kg_datom(
             &subject,
             "kg/label_vec",
             KqeValue::VectorF32(req.label_vec.clone()),
-        )
-        .await;
+        ));
         count += 1;
+    }
+
+    let tx_cid = kg_tx_cid("ingest", &[&req.id]);
+    if let Err((code, msg)) = commit_kg_datoms(
+        &state,
+        subject.clone(),
+        tx_cid,
+        datoms,
+        kg_write_author(&headers, &state.operator_did),
+    )
+    .await
+    {
+        return (
+            code,
+            AxumJson(serde_json::json!({"ok": false, "error": msg})),
+        )
+            .into_response();
     }
 
     Json(KgIngestResp {
@@ -950,9 +987,10 @@ pub async fn kg_ingest_batch(
         }
     }
 
-    let graph = kg_graph_cid();
     let mut subject_cids = Vec::with_capacity(req.entities.len());
     let mut total_quads = 0usize;
+    let mut all_datoms = Vec::new();
+    let first_subject = KotobaCid::from_bytes(req.entities[0].id.as_bytes());
 
     for e in &req.entities {
         let subject = KotobaCid::from_bytes(e.id.as_bytes());
@@ -961,19 +999,12 @@ pub async fn kg_ingest_batch(
 
         macro_rules! assert_text {
             ($pred:expr, $val:expr) => {{
-                assert_kg_datom(
-                    &state,
-                    &graph,
-                    &subject,
-                    $pred,
-                    KqeValue::Text($val.to_string()),
-                )
-                .await;
+                all_datoms.push(kg_datom(&subject, $pred, KqeValue::Text($val.to_string())));
                 count += 1;
             }};
         }
 
-        assert_text!("kg/id", e.id);
+        assert_text!("kg/id", &e.id);
         if let Some(v) = &e.qid {
             assert_text!("kg/qid", v);
         }
@@ -1013,28 +1044,39 @@ pub async fn kg_ingest_batch(
         }
         for rel in &e.relations {
             let dst_cid = KotobaCid::from_bytes(rel.dst_id.as_bytes());
-            assert_kg_datom(
-                &state,
-                &graph,
+            all_datoms.push(kg_datom(
                 &subject,
                 format!("kg/relation/{}", rel.pred),
                 KqeValue::Cid(dst_cid),
-            )
-            .await;
+            ));
             count += 1;
         }
         if !e.label_vec.is_empty() {
-            assert_kg_datom(
-                &state,
-                &graph,
+            all_datoms.push(kg_datom(
                 &subject,
                 "kg/label_vec",
                 KqeValue::VectorF32(e.label_vec.clone()),
-            )
-            .await;
+            ));
             count += 1;
         }
         total_quads += count;
+    }
+
+    let tx_cid = kg_tx_cid("ingest_batch", &[&req.entities.len().to_string()]);
+    if let Err((code, msg)) = commit_kg_datoms(
+        &state,
+        first_subject,
+        tx_cid,
+        all_datoms,
+        kg_write_author(&headers, &state.operator_did),
+    )
+    .await
+    {
+        return (
+            code,
+            AxumJson(serde_json::json!({"ok": false, "error": msg})),
+        )
+            .into_response();
     }
 
     AxumJson(KgIngestBatchResp {
@@ -1588,7 +1630,6 @@ fn quad_to_json(q: kotoba_kqe::quad::LegacyQuad) -> serde_json::Value {
 mod tests {
     use super::*;
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::quad::LegacyQuadObject;
 
     // ── kg_graph_cid ──────────────────────────────────────────────────────────
 
