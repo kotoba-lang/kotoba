@@ -266,6 +266,37 @@ impl ProllyTree {
         }
     }
 
+    /// Return all `(key, value)` pairs whose key is greater than or equal to `start`.
+    ///
+    /// This is the ordered-tree primitive behind Datomic-style `seek-datoms`.
+    /// Traversal skips subtrees whose max key is still before the seek key, then
+    /// streams the remaining leaves in index order.
+    pub fn scan_from(
+        root: &KotobaCid,
+        start: &[u8],
+        store: &dyn BlockStore,
+    ) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(node) = Self::load_node(root, store)? else {
+            return Ok(vec![]);
+        };
+        match node {
+            ProllyNode::Leaf { entries, .. } => Ok(entries
+                .into_iter()
+                .filter(|(k, _)| k.as_slice() >= start)
+                .collect()),
+            ProllyNode::Internal { children, .. } => {
+                let mut result = Vec::new();
+                for (max_key, child_cid) in children {
+                    if max_key.as_slice() < start {
+                        continue;
+                    }
+                    result.extend(Self::scan_from(&child_cid, start, store)?);
+                }
+                Ok(result)
+            }
+        }
+    }
+
     fn build_internal_level(
         children: Vec<(Vec<u8>, KotobaCid)>,
         store: &dyn BlockStore,
@@ -509,6 +540,46 @@ mod tests {
         let matches = ProllyTree::scan_prefix(&root, b"b", &store).unwrap();
         assert_eq!(matches.len(), 50, "expected 50 'b' entries");
         assert!(matches.iter().all(|(k, _)| k.starts_with(b"b")));
+    }
+
+    // ── scan_from ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scan_from_returns_ordered_entries_at_or_after_start() {
+        let store = MemoryBlockStore::new();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = ["a001", "a002", "b001", "b002", "c001"]
+            .into_iter()
+            .map(|key| (key.as_bytes().to_vec(), format!("v-{key}").into_bytes()))
+            .collect();
+        let root = ProllyTree::build_tree(entries, &store).unwrap();
+
+        let matches = ProllyTree::scan_from(&root, b"b001", &store).unwrap();
+        let keys = matches
+            .into_iter()
+            .map(|(key, _)| String::from_utf8(key).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["b001", "b002", "c001"]);
+    }
+
+    #[test]
+    fn scan_from_larger_tree_skips_subtrees_before_start() {
+        let store = MemoryBlockStore::new();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0u32..1_000)
+            .map(|i| {
+                (
+                    format!("k{i:04}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let root = ProllyTree::build_tree(entries, &store).unwrap();
+
+        let matches = ProllyTree::scan_from(&root, b"k0995", &store).unwrap();
+        let keys = matches
+            .into_iter()
+            .map(|(key, _)| String::from_utf8(key).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec!["k0995", "k0996", "k0997", "k0998", "k0999"]);
     }
 
     // ── additional gap tests ──────────────────────────────────────────────────

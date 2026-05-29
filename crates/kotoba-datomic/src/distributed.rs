@@ -398,10 +398,10 @@ where
         index: DatomIndex,
         components: &[Value],
     ) -> Result<Vec<Datom>, DistributedCommitError> {
-        let datoms = current_datoms(&self.history_for_index_components(
+        let datoms = current_datoms(&self.history_from_index_seek(
             head,
             root_for_datom_index(index),
-            &[],
+            components,
         )?);
         seek_datoms_index(datoms, index, components).map_err(Into::into)
     }
@@ -1555,6 +1555,23 @@ where
         Ok(datoms)
     }
 
+    fn history_from_index_seek(
+        &self,
+        head: &KotobaCid,
+        root_name: &'static str,
+        components: &[Value],
+    ) -> Result<Vec<Datom>, DistributedCommitError> {
+        let chain = self.commit_chain_from_head(head)?;
+        let start = index_components_prefix(root_name, components)?.unwrap_or_default();
+        let mut datoms = Vec::new();
+        for commit in chain.into_iter().rev() {
+            datoms.extend(datoms_from_index_seek(
+                &commit, root_name, &start, self.store,
+            )?);
+        }
+        Ok(datoms)
+    }
+
     fn history_from_index_prefix_since_tx(
         &self,
         head: &KotobaCid,
@@ -1838,6 +1855,26 @@ fn datoms_from_index_prefix(
     })?;
     let entries =
         ProllyTree::scan_prefix(root, prefix, store).map_err(DistributedCommitError::Store)?;
+    entries
+        .into_iter()
+        .map(|(_, value)| decode_stored_datom(&value))
+        .collect()
+}
+
+fn datoms_from_index_seek(
+    commit: &DistributedDatomCommit,
+    root_name: &'static str,
+    start: &[u8],
+    store: &dyn BlockStore,
+) -> Result<Vec<Datom>, DistributedCommitError> {
+    let root = commit.index_roots.get(root_name).ok_or_else(|| {
+        DistributedCommitError::MissingIndexRoot {
+            commit: commit.cid.to_multibase(),
+            root: root_name,
+        }
+    })?;
+    let entries =
+        ProllyTree::scan_from(root, start, store).map_err(DistributedCommitError::Store)?;
     entries
         .into_iter()
         .map(|(_, value)| decode_stored_datom(&value))
@@ -3677,6 +3714,20 @@ mod tests {
         assert_eq!(range.len(), 1);
         assert_eq!(range[0].e, bob);
         assert_eq!(range[0].v, EdnValue::Integer(20));
+
+        let seek = reader
+            .seek_datoms(
+                &second.commit.cid,
+                DatomIndex::Avet,
+                &[
+                    kotoba_edn::parse(":person/score").unwrap(),
+                    EdnValue::Integer(0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(seek.len(), 1);
+        assert_eq!(seek[0].e, bob);
+        assert_eq!(seek[0].v, EdnValue::Integer(20));
     }
 
     #[test]
