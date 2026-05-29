@@ -584,6 +584,8 @@ pub struct DatomicTxRangeTxResp {
     pub seq: u64,
     pub author: String,
     pub ts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_instant_ms: Option<i64>,
     pub datom_count: usize,
     pub datoms: Vec<DatomicDatomResp>,
 }
@@ -606,6 +608,8 @@ pub struct DatomicTxResp {
 #[derive(Debug, Serialize)]
 pub struct DatomicLogTxResp {
     pub tx_cid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_instant_ms: Option<i64>,
     pub datom_count: usize,
     pub datoms: Vec<DatomicDatomResp>,
 }
@@ -2160,24 +2164,6 @@ fn append_tx_metadata_datoms(
             tx_cid,
             ":tx/expectedParentCommit",
             kotoba_edn::EdnValue::String(expected_parent.to_multibase()),
-        );
-    }
-    if !datoms
-        .iter()
-        .any(|datom| datom.e == *tx_cid && datom.a == ":db/txInstant")
-    {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        assert_tx(
-            datoms,
-            tx_cid,
-            ":db/txInstant",
-            kotoba_edn::EdnValue::Tagged {
-                tag: kotoba_edn::Symbol::bare("inst"),
-                value: Box::new(kotoba_edn::EdnValue::String(now.to_string())),
-            },
         );
     }
 }
@@ -4782,6 +4768,7 @@ pub async fn datomic_history(
 fn datomic_tx_resp_from_entry(
     entry: kotoba_datomic::distributed::DistributedTxRangeEntry,
 ) -> DatomicTxRangeTxResp {
+    let tx_instant_ms = datomic_tx_instant_ms(&entry.datoms);
     let datoms = entry
         .datoms
         .into_iter()
@@ -4794,9 +4781,23 @@ fn datomic_tx_resp_from_entry(
         seq: entry.commit.seq,
         author: entry.commit.author,
         ts: entry.commit.ts,
+        tx_instant_ms,
         datom_count: datoms.len(),
         datoms,
     }
+}
+
+fn datomic_tx_instant_ms(datoms: &[kotoba_datomic::Datom]) -> Option<i64> {
+    datoms.iter().find_map(|datom| {
+        if datom.e == datom.t && datom.a == ":db/txInstant" {
+            match &datom.v {
+                kotoba_edn::EdnValue::Integer(value) if *value > 0 => Some(*value),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
 }
 
 /// POST /xrpc/ai.gftd.apps.kotoba.datomic.tx
@@ -4895,6 +4896,7 @@ pub async fn datomic_log(
         .into_iter()
         .take(limit)
         .map(|entry| {
+            let tx_instant_ms = datomic_tx_instant_ms(&entry.datoms);
             let datoms = entry
                 .datoms
                 .into_iter()
@@ -4902,6 +4904,7 @@ pub async fn datomic_log(
                 .collect::<Vec<_>>();
             DatomicLogTxResp {
                 tx_cid: entry.tx.to_multibase(),
+                tx_instant_ms,
                 datom_count: datoms.len(),
                 datoms,
             }
@@ -8317,6 +8320,12 @@ mod tests {
         assert_eq!(tx_range_body["txes"][1]["tx_cid"], second_tx);
         assert_eq!(tx_range_body["txes"][0]["seq"], 1);
         assert_eq!(tx_range_body["txes"][1]["seq"], 2);
+        assert!(tx_range_body["txes"][0]["tx_instant_ms"]
+            .as_i64()
+            .is_some_and(|value| value > 0));
+        assert!(tx_range_body["txes"][1]["tx_instant_ms"]
+            .as_i64()
+            .is_some_and(|value| value > 0));
 
         let log = datomic_log(
             axum::extract::State(Arc::clone(&state)),
@@ -8342,6 +8351,12 @@ mod tests {
         assert_eq!(log_body["tx_count"], 2);
         assert_eq!(log_body["txes"][0]["tx_cid"], first_tx);
         assert_eq!(log_body["txes"][1]["tx_cid"], second_tx);
+        assert!(log_body["txes"][0]["tx_instant_ms"]
+            .as_i64()
+            .is_some_and(|value| value > 0));
+        assert!(log_body["txes"][1]["tx_instant_ms"]
+            .as_i64()
+            .is_some_and(|value| value > 0));
     }
 
     #[test]
@@ -8981,7 +8996,7 @@ mod tests {
                 "datom_count",
                 "datoms",
             ],
-            &["prev_commit_cid"],
+            &["prev_commit_cid", "tx_instant_ms"],
         );
         assert_lexicon_output_object_nested_array_item_fields(
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
@@ -9018,6 +9033,11 @@ mod tests {
                 "datoms",
             ],
         );
+        assert_lexicon_array_item_optional_fields(
+            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
+            "txes",
+            &["prev_commit_cid", "tx_instant_ms"],
+        );
         assert_lexicon_nested_array_item_fields(
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
             "txes",
@@ -9033,6 +9053,11 @@ mod tests {
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
             "txes",
             &["tx_cid", "datom_count", "datoms"],
+        );
+        assert_lexicon_array_item_optional_fields(
+            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
+            "txes",
+            &["tx_instant_ms"],
         );
         assert_lexicon_nested_array_item_fields(
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
@@ -9681,6 +9706,29 @@ mod tests {
                     .as_object()
                     .is_some_and(|props| props.contains_key(*field)),
                 "{} output array item missing property {field}",
+                value["id"]
+            );
+        }
+    }
+
+    fn assert_lexicon_array_item_optional_fields(src: &str, field: &str, properties: &[&str]) {
+        let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
+        let item = &value["defs"]["main"]["output"]["schema"]["properties"][field]["items"];
+        let property_values = item["properties"]
+            .as_object()
+            .expect("array item properties object");
+        let required_values = item["required"].as_array().expect("required array");
+        for field in properties {
+            assert!(
+                property_values.contains_key(*field),
+                "{} output array item missing optional property {field}",
+                value["id"]
+            );
+            assert!(
+                !required_values
+                    .iter()
+                    .any(|value| value.as_str() == Some(field)),
+                "{} output array item optional property {field} must not be required",
                 value["id"]
             );
         }

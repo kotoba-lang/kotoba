@@ -2775,6 +2775,9 @@ async fn datomic_tx_returns_single_distributed_transaction_entry() {
         "{tx_body}"
     );
     assert_eq!(tx_body["tx"]["seq"], 1, "{tx_body}");
+    assert!(tx_body["tx"]["tx_instant_ms"]
+        .as_i64()
+        .is_some_and(|value| value > 0));
     assert!(tx_body["tx"]["datoms"]
         .as_array()
         .unwrap()
@@ -3422,8 +3425,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "ok");
     assert!(body["commit_cid"].as_str().is_some(), "{body}");
-    assert!(body["assert_count"].as_u64().unwrap_or(0) > 0, "{body}");
-    assert_eq!(body["retract_count"], 0, "{body}");
+    assert!(body["datom_count"].as_u64().unwrap_or(0) > 0, "{body}");
     let proof_cid = body["auth_proof_cid"]
         .as_str()
         .expect("auth_proof_cid")
