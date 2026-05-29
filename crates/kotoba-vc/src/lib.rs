@@ -14,6 +14,10 @@ pub const VC_CONTEXT_V2: &str = "https://www.w3.org/ns/credentials/v2";
 pub const DATA_INTEGRITY_CONTEXT: &str = "https://w3id.org/security/data-integrity/v2";
 
 pub const ATTR_CREDENTIAL_ID: &str = "credential/id";
+pub const ATTR_CREDENTIAL_CID: &str = "credential/cid";
+pub const ATTR_CREDENTIAL_WIRE_FORMAT: &str = "credential/wireFormat";
+pub const ATTR_CREDENTIAL_DATA_MODEL: &str = "credential/dataModel";
+pub const ATTR_CREDENTIAL_CONTEXT: &str = "credential/context";
 pub const ATTR_CREDENTIAL_TYPE: &str = "credential/type";
 pub const ATTR_CREDENTIAL_ISSUER: &str = "credential/issuer";
 pub const ATTR_CREDENTIAL_SUBJECT: &str = "credential/subject";
@@ -33,6 +37,10 @@ pub const ATTR_CREDENTIAL_PROOF_CHALLENGE: &str = "credential/proof/challenge";
 pub const ATTR_CREDENTIAL_PROOF_DOMAIN: &str = "credential/proof/domain";
 pub const ATTR_CREDENTIAL_SUBJECT_FIELD_PREFIX: &str = "credential/subject/";
 pub const ATTR_PRESENTATION_ID: &str = "presentation/id";
+pub const ATTR_PRESENTATION_CID: &str = "presentation/cid";
+pub const ATTR_PRESENTATION_WIRE_FORMAT: &str = "presentation/wireFormat";
+pub const ATTR_PRESENTATION_DATA_MODEL: &str = "presentation/dataModel";
+pub const ATTR_PRESENTATION_CONTEXT: &str = "presentation/context";
 pub const ATTR_PRESENTATION_HOLDER: &str = "presentation/holder";
 pub const ATTR_PRESENTATION_CREDENTIAL: &str = "presentation/credential";
 pub const ATTR_PRESENTATION_PROOF: &str = "presentation/proof";
@@ -232,6 +240,25 @@ impl VerifiableCredential {
         let mut out = vec![
             datom(
                 &e,
+                ATTR_CREDENTIAL_CID,
+                EdnValue::string(e.to_multibase()),
+                &tx,
+            ),
+            datom(
+                &e,
+                ATTR_CREDENTIAL_WIRE_FORMAT,
+                EdnValue::string("application/vc+ld+json"),
+                &tx,
+            ),
+            datom(
+                &e,
+                ATTR_CREDENTIAL_DATA_MODEL,
+                EdnValue::string(vc_data_model_name(&self.context)),
+                &tx,
+            ),
+            datom(&e, ATTR_CREDENTIAL_CONTEXT, string_vec(&self.context), &tx),
+            datom(
+                &e,
                 ATTR_CREDENTIAL_ID,
                 EdnValue::string(self.id.clone()),
                 &tx,
@@ -347,6 +374,30 @@ impl VerifiablePresentation {
         let e = self.cid()?;
         let types = string_vec(&self.types);
         let mut out = vec![
+            datom(
+                &e,
+                ATTR_PRESENTATION_CID,
+                EdnValue::string(e.to_multibase()),
+                &tx,
+            ),
+            datom(
+                &e,
+                ATTR_PRESENTATION_WIRE_FORMAT,
+                EdnValue::string("application/vp+ld+json"),
+                &tx,
+            ),
+            datom(
+                &e,
+                ATTR_PRESENTATION_DATA_MODEL,
+                EdnValue::string(vc_data_model_name(&self.context)),
+                &tx,
+            ),
+            datom(
+                &e,
+                ATTR_PRESENTATION_CONTEXT,
+                string_vec(&self.context),
+                &tx,
+            ),
             datom(
                 &e,
                 ATTR_PRESENTATION_ID,
@@ -482,6 +533,14 @@ fn verify_data_integrity_proof_with_pubkey(
 
 fn datom(e: &KotobaCid, a: &str, v: EdnValue, tx: &KotobaCid) -> Datom {
     Datom::assert(e.clone(), a.to_string(), v, tx.clone())
+}
+
+fn vc_data_model_name(context: &[String]) -> &'static str {
+    if context.iter().any(|value| value == VC_CONTEXT_V2) {
+        "W3C VC Data Model 2.0"
+    } else {
+        "W3C VC Data Model"
+    }
 }
 
 fn append_credential_status_datoms(
@@ -774,6 +833,19 @@ mod tests {
         );
         let tx = KotobaCid::from_bytes(b"tx");
         let datoms = vc.to_datoms(tx).unwrap();
+        let credential_cid = vc.cid().unwrap().to_multibase();
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_CREDENTIAL_CID && d.v == EdnValue::string(credential_cid.clone())
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_CREDENTIAL_WIRE_FORMAT && d.v == EdnValue::string("application/vc+ld+json")
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_CREDENTIAL_DATA_MODEL && d.v == EdnValue::string("W3C VC Data Model 2.0")
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_CREDENTIAL_CONTEXT && kotoba_edn::to_string(&d.v).contains(VC_CONTEXT_V2)
+        }));
         assert!(datoms.iter().any(|d| d.a == ATTR_CREDENTIAL_ID));
         assert!(datoms.iter().any(|d| d.a == ATTR_VC_ID_IRI));
         assert!(datoms.iter().any(|d| d.a == ATTR_CREDENTIAL_ISSUER));
@@ -882,6 +954,20 @@ mod tests {
             proof: None,
         };
         let datoms = vp.to_datoms(KotobaCid::from_bytes(b"tx")).unwrap();
+        let presentation_cid = vp.cid().unwrap().to_multibase();
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_PRESENTATION_CID && d.v == EdnValue::string(presentation_cid.clone())
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_PRESENTATION_WIRE_FORMAT
+                && d.v == EdnValue::string("application/vp+ld+json")
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_PRESENTATION_DATA_MODEL && d.v == EdnValue::string("W3C VC Data Model 2.0")
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.a == ATTR_PRESENTATION_CONTEXT && kotoba_edn::to_string(&d.v).contains(VC_CONTEXT_V2)
+        }));
         assert!(datoms.iter().any(|d| d.a == ATTR_PRESENTATION_CREDENTIAL));
         assert!(datoms
             .iter()
