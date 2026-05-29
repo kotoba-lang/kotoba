@@ -150,7 +150,7 @@ fn attestation_credential(
         issuer: issuer_did.to_string(),
         valid_from: None,
         valid_until: None,
-        credential_subject: subject,
+        credential_subject: subject.into(),
         credential_status: Some(CredentialStatus {
             id: format!("kotoba://attestation/{}/status", claim_cid.to_multibase()),
             status_type: "KotobaAttestationStatus".to_string(),

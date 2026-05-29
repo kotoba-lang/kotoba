@@ -7320,7 +7320,8 @@ fn build_vp_capability_presentation_with_resources(
             "id": holder,
             "resources": resources,
             "operations": operations
-        }),
+        })
+        .into(),
         credential_status: None,
         proof: None,
     };
@@ -7359,7 +7360,8 @@ fn build_vp_capability_presentation_with_resources(
             "id": holder,
             "resources": [format!("kotoba://graph/{graph}")],
             "operations": [kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT]
-        });
+        })
+        .into();
     }
     (
         holder,

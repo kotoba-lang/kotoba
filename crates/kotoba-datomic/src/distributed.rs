@@ -398,7 +398,11 @@ where
         index: DatomIndex,
         components: &[Value],
     ) -> Result<Vec<Datom>, DistributedCommitError> {
-        let datoms = self.current_db_from_head(head)?.datoms();
+        let datoms = current_datoms(&self.history_for_index_components(
+            head,
+            root_for_datom_index(index),
+            &[],
+        )?);
         seek_datoms_index(datoms, index, components).map_err(Into::into)
     }
 
@@ -410,7 +414,14 @@ where
         start: Option<&Value>,
         end: Option<&Value>,
     ) -> Result<Vec<Datom>, DistributedCommitError> {
-        let datoms = self.current_db_from_head(head)?.datoms();
+        let mut history = Vec::new();
+        for attr in attr_lookup_variants(attr) {
+            extend_unique_datoms(
+                &mut history,
+                self.history_from_index_prefix(head, ROOT_AVET, &attr_prefix(attr))?,
+            );
+        }
+        let datoms = current_datoms(&history);
         index_range_datoms(datoms, attr, start, end).map_err(Into::into)
     }
 
@@ -3254,8 +3265,34 @@ mod tests {
         for name in [ROOT_EAVT, ROOT_AEVT, ROOT_AVET, ROOT_VAET, ROOT_TEA] {
             let root = report.commit.index_roots.get(name).expect("root present");
             assert!(store.has(root), "{name} root must be persisted");
+            assert!(
+                root.is_ipfs_compatible(),
+                "{name} root must be CIDv1 dag-cbor sha2-256"
+            );
+            let node = ProllyTree::load_node(root, &store)
+                .unwrap()
+                .expect("root must decode as DAG-CBOR ProllyNode");
+            assert_eq!(node.cid(), root);
         }
         assert!(store.has(&report.commit.cid));
+        assert!(report.commit.cid.is_ipfs_compatible());
+        assert_eq!(
+            kotoba_ipfs::parse_cid(&report.commit.cid.to_multibase())
+                .unwrap()
+                .codec(),
+            u64::from(KotobaCid::CODEC_DAG_CBOR)
+        );
+        let loaded = DistributedDatomCommit::load(&report.commit.cid, &store)
+            .unwrap()
+            .expect("commit must decode as DAG-CBOR");
+        assert_eq!(loaded, report.commit);
+        let stored = datoms_from_commit(&report.commit, &store).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].e, KotobaCid::from_bytes(b"alice"));
+        assert_eq!(stored[0].a, "person/name");
+        assert_eq!(stored[0].v, EdnValue::string("Alice"));
+        assert_eq!(stored[0].t, report.commit.tx_cid);
+        assert!(stored[0].added);
         let resolved = ipns.resolve(&IpnsName::new("k51-kotoba-db")).unwrap();
         assert_eq!(resolved.value, report.commit.cid.to_multibase());
     }
@@ -3584,6 +3621,62 @@ mod tests {
             .unwrap();
         assert_eq!(range.len(), 1);
         assert_eq!(range[0].v, EdnValue::String("Alice".into()));
+    }
+
+    #[test]
+    fn reader_index_range_uses_current_distributed_avet_history() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"graph");
+        let alice = KotobaCid::from_bytes(b"alice");
+        let bob = KotobaCid::from_bytes(b"bob");
+        let first = writer
+            .commit_datoms(request(
+                "k51-kotoba-db",
+                graph.clone(),
+                vec![
+                    Datom::assert(
+                        alice.clone(),
+                        ":person/score".into(),
+                        EdnValue::Integer(10),
+                        KotobaCid::from_bytes(b"tx1"),
+                    ),
+                    Datom::assert(
+                        bob.clone(),
+                        ":person/score".into(),
+                        EdnValue::Integer(20),
+                        KotobaCid::from_bytes(b"tx1"),
+                    ),
+                ],
+            ))
+            .unwrap();
+        let mut second_req = request(
+            "k51-kotoba-db",
+            graph,
+            vec![Datom::retract(
+                alice,
+                ":person/score".into(),
+                EdnValue::Integer(10),
+                KotobaCid::from_bytes(b"tx2"),
+            )],
+        );
+        second_req.expected_parent = Some(first.commit.cid);
+        second_req.seq = 2;
+        let second = writer.commit_datoms(second_req).unwrap();
+        let reader = DistributedDatomReader::new(&store, &ipns);
+
+        let range = reader
+            .index_range(
+                &second.commit.cid,
+                ":person/score",
+                Some(&EdnValue::Integer(0)),
+                Some(&EdnValue::Integer(30)),
+            )
+            .unwrap();
+        assert_eq!(range.len(), 1);
+        assert_eq!(range[0].e, bob);
+        assert_eq!(range[0].v, EdnValue::Integer(20));
     }
 
     #[test]

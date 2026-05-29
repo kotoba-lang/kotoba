@@ -64,7 +64,37 @@ pub const ATTR_VP_VERIFIABLE_CREDENTIAL_IRI: &str =
 /// VC 2.0 permits object-valued or graph-shaped subject payloads, so Kotoba
 /// keeps this as JSON-LD at the wire boundary and projects it to Datoms at the
 /// storage boundary.
-pub type CredentialSubject = serde_json::Value;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CredentialSubject(pub serde_json::Value);
+
+impl CredentialSubject {
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    pub fn as_json(&self) -> &serde_json::Value {
+        &self.0
+    }
+
+    pub fn into_json(self) -> serde_json::Value {
+        self.0
+    }
+}
+
+impl From<serde_json::Value> for CredentialSubject {
+    fn from(value: serde_json::Value) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::ops::Deref for CredentialSubject {
+    type Target = serde_json::Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum VcError {
@@ -162,7 +192,7 @@ impl VerifiableCredential {
     pub fn new(
         id: impl Into<String>,
         issuer: impl Into<String>,
-        subject: CredentialSubject,
+        subject: impl Into<CredentialSubject>,
     ) -> Self {
         Self {
             context: vec![VC_CONTEXT_V2.to_string()],
@@ -171,7 +201,7 @@ impl VerifiableCredential {
             issuer: issuer.into(),
             valid_from: None,
             valid_until: None,
-            credential_subject: subject,
+            credential_subject: subject.into(),
             credential_status: None,
             proof: None,
         }
@@ -682,7 +712,8 @@ mod tests {
         let subject: CredentialSubject = json!({
             "id": "did:key:zAlice",
             "role": "admin"
-        });
+        })
+        .into();
         let vc = VerifiableCredential::new("urn:uuid:vc-subject", "did:key:zIssuer", subject);
         assert_eq!(vc.subject_id(), Some("did:key:zAlice"));
         assert_eq!(
@@ -881,7 +912,7 @@ mod tests {
             issuer: "did:key:zIssuer".into(),
             valid_from: None,
             valid_until: None,
-            credential_subject: json!({"id": holder, "operations": ["graph:query"]}),
+            credential_subject: json!({"id": holder, "operations": ["graph:query"]}).into(),
             credential_status: None,
             proof: None,
         };
@@ -907,7 +938,7 @@ mod tests {
 
         vp.verify_did_key_proof().unwrap();
         vp.verifiable_credentials[0].credential_subject =
-            json!({"id": holder, "operations": ["datom:transact"]});
+            json!({"id": holder, "operations": ["datom:transact"]}).into();
         assert!(vp.verify_did_key_proof().is_err());
     }
 
@@ -929,7 +960,7 @@ mod tests {
             issuer: "did:kotoba:operator".into(),
             valid_from: None,
             valid_until: None,
-            credential_subject: json!({"id": holder, "operations": ["graph:query"]}),
+            credential_subject: json!({"id": holder, "operations": ["graph:query"]}).into(),
             credential_status: None,
             proof: None,
         };
@@ -985,7 +1016,7 @@ mod tests {
             issuer: issuer.to_string(),
             valid_from: None,
             valid_until: None,
-            credential_subject: json!({"id": "did:plc:alice", "role": "admin"}),
+            credential_subject: json!({"id": "did:plc:alice", "role": "admin"}).into(),
             credential_status: None,
             proof: None,
         };

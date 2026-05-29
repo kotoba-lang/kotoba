@@ -76,8 +76,14 @@ impl ProllyTree {
         match store.get(cid)? {
             None => Ok(None),
             Some(bytes) => {
-                let node: ProllyNode = ciborium::from_reader(&bytes[..])
+                let mut node: ProllyNode = ciborium::from_reader(&bytes[..])
                     .map_err(|e| anyhow::anyhow!("cbor decode: {e}"))?;
+                match &mut node {
+                    ProllyNode::Leaf { cid: node_cid, .. }
+                    | ProllyNode::Internal { cid: node_cid, .. } => {
+                        *node_cid = cid.clone();
+                    }
+                }
                 Ok(Some(node))
             }
         }
