@@ -589,23 +589,29 @@ impl KotobaIpfsNode {
 
     /// Kubo-like `dag/get` decoded into the IPLD data model.
     pub async fn dag_get_ipld(&self, cid: &IpldCid) -> Result<Ipld> {
-        if cid.codec() != crate::cid::CODEC_DAG_CBOR {
-            bail!(
-                "dag_get_ipld only supports dag-cbor blocks, got codec {}",
-                cid.codec()
-            );
-        }
         let bytes = self.get_block(cid).await?;
-        let value: CborValue =
-            ciborium::from_reader(&bytes[..]).map_err(|e| anyhow!("dag-cbor decode: {e}"))?;
-        cbor_value_to_ipld(value)
+        match cid.codec() {
+            crate::cid::CODEC_DAG_CBOR => {
+                let value: CborValue = ciborium::from_reader(&bytes[..])
+                    .map_err(|e| anyhow!("dag-cbor decode: {e}"))?;
+                cbor_value_to_ipld(value)
+            }
+            crate::cid::CODEC_DAG_PB => dag_pb_node_to_ipld(decode_dag_pb_node(&bytes)?),
+            _ => bail!(
+                "dag_get_ipld only supports dag-cbor and dag-pb blocks, got codec {}",
+                cid.codec()
+            ),
+        }
     }
 
     /// Kubo-like `dag/stat` for local single-block DAG nodes.
     pub async fn dag_stat(&self, cid: &IpldCid) -> Result<DagStat> {
-        if cid.codec() != crate::cid::CODEC_DAG_CBOR {
+        if !matches!(
+            cid.codec(),
+            crate::cid::CODEC_DAG_CBOR | crate::cid::CODEC_DAG_PB
+        ) {
             bail!(
-                "dag_stat only supports dag-cbor blocks, got codec {}",
+                "dag_stat only supports dag-cbor and dag-pb blocks, got codec {}",
                 cid.codec()
             );
         }
@@ -2134,6 +2140,32 @@ fn cbor_value_to_ipld(value: CborValue) -> Result<Ipld> {
         CborValue::Tag(tag, _) => bail!("unsupported dag-cbor tag {tag}"),
         _ => bail!("unsupported dag-cbor value"),
     })
+}
+
+fn dag_pb_node_to_ipld(node: crate::cid::DagPbNode) -> Result<Ipld> {
+    let mut map = BTreeMap::new();
+    map.insert(
+        "Data".to_string(),
+        Ipld::Bytes(node.data.unwrap_or_default()),
+    );
+    map.insert(
+        "Links".to_string(),
+        Ipld::List(
+            node.links
+                .into_iter()
+                .map(|link| {
+                    let mut link_map = BTreeMap::new();
+                    link_map.insert("Hash".to_string(), Ipld::Link(link.cid));
+                    link_map.insert("Name".to_string(), Ipld::String(link.name));
+                    if let Some(tsize) = link.tsize {
+                        link_map.insert("Tsize".to_string(), Ipld::Integer(i128::from(tsize)));
+                    }
+                    Ipld::Map(link_map)
+                })
+                .collect(),
+        ),
+    );
+    Ok(Ipld::Map(map))
 }
 
 fn write_car_header(out: &mut Vec<u8>, roots: &[IpldCid]) -> Result<()> {

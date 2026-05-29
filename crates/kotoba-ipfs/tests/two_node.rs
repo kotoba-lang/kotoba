@@ -368,6 +368,25 @@ async fn kubo_compatible_local_api_surface() {
             .expect("object/links dag-pb"),
         object.links
     );
+    let pb_ipld = node.dag_get_ipld(&pb_dir).await.expect("dag/get dag-pb");
+    let Ipld::Map(pb_map) = pb_ipld else {
+        panic!("dag-pb root should decode as IPLD map");
+    };
+    assert!(matches!(pb_map.get("Data"), Some(Ipld::Bytes(data)) if data.is_empty()));
+    let Some(Ipld::List(pb_links)) = pb_map.get("Links") else {
+        panic!("dag-pb root should expose Links");
+    };
+    assert_eq!(pb_links.len(), 1);
+    let Ipld::Map(pb_link) = &pb_links[0] else {
+        panic!("dag-pb Link should decode as IPLD map");
+    };
+    assert!(matches!(pb_link.get("Hash"), Some(Ipld::Link(link)) if link == &raw));
+    assert!(matches!(pb_link.get("Name"), Some(Ipld::String(name)) if name == "hello.txt"));
+    assert!(matches!(pb_link.get("Tsize"), Some(Ipld::Integer(size)) if *size == 5));
+    let pb_stat = node.dag_stat(&pb_dir).await.expect("dag/stat dag-pb");
+    assert_eq!(pb_stat.cid, pb_dir);
+    assert_eq!(pb_stat.codec, CODEC_DAG_PB);
+    assert_eq!(pb_stat.size, pb_dir_block.len() as u64);
     assert_eq!(
         node.resolve_path(format!("/ipfs/{pb_dir}/hello.txt"))
             .await

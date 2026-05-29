@@ -5511,29 +5511,72 @@ pub async fn invoke_run(
                 ));
             }
 
-            // Publish and apply each asserted Datom through the compatibility path.
-            let mut journal_cids = Vec::with_capacity(r.assert_quads.len().min(MAX_ASSERT_QUADS));
+            if r.retract_quads.len() > MAX_ASSERT_QUADS {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "WASM produced {} retract quads (limit {MAX_ASSERT_QUADS})",
+                        r.retract_quads.len()
+                    ),
+                ));
+            }
+
+            let mut by_graph: BTreeMap<String, Vec<KqeDatom>> = BTreeMap::new();
             for sq in &r.assert_quads {
                 let graph_cid = KotobaCid::from_bytes(sq.graph.as_bytes());
                 let datom = KqeDatom::assert(
                     KotobaCid::from_bytes(sq.subject.as_bytes()),
                     sq.predicate.clone(),
                     KqeValue::Bytes(sq.object_cbor.clone()),
-                    graph_cid.clone(),
+                    graph_cid,
                 );
-                let cid = state.assert_datom_compat(graph_cid, datom).await;
-                journal_cids.push(cid);
+                by_graph.entry(sq.graph.clone()).or_default().push(datom);
             }
-            // Publish retracts
             for sq in &r.retract_quads {
                 let graph_cid = KotobaCid::from_bytes(sq.graph.as_bytes());
                 let datom = KqeDatom::retract(
                     KotobaCid::from_bytes(sq.subject.as_bytes()),
                     sq.predicate.clone(),
                     KqeValue::Bytes(sq.object_cbor.clone()),
-                    graph_cid.clone(),
+                    graph_cid,
                 );
-                state.retract_datom_compat(graph_cid, datom).await;
+                by_graph.entry(sq.graph.clone()).or_default().push(datom);
+            }
+            let mut journal_cids =
+                Vec::with_capacity(r.assert_quads.len().saturating_add(r.retract_quads.len()));
+            for (graph, mut datoms) in by_graph {
+                let graph_cid = KotobaCid::from_bytes(graph.as_bytes());
+                let tx_cid = KotobaCid::from_bytes(
+                    format!(
+                        "invoke.run:{}:{}:{}:{}",
+                        req.program_cid, req.agent_did, graph, r.gas_used
+                    )
+                    .as_bytes(),
+                );
+                let entity_cid = datoms
+                    .first()
+                    .map(|datom| datom.e.clone())
+                    .unwrap_or_else(|| graph_cid.clone());
+                for datom in &mut datoms {
+                    datom.tx = tx_cid.clone();
+                }
+                let distributed = commit_protocol_datoms(
+                    &state,
+                    graph_cid,
+                    graph,
+                    entity_cid,
+                    datoms
+                        .into_iter()
+                        .map(kotoba_datomic::Datom::from_kqe)
+                        .collect(),
+                    tx_cid,
+                    req.agent_did.clone(),
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    None,
+                    None,
+                )
+                .await?;
+                journal_cids.extend(distributed.journal_cids);
             }
             // Apply kse.publish calls buffered by guest WASM
             for (topic, payload) in &r.pending_publishes {
