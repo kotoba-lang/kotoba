@@ -40,6 +40,10 @@ pub const ATTR_RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type
 pub const ATTR_DID_ENTITY_CID: &str = "did/entityCid";
 pub const ATTR_DID_METHOD: &str = "did/method";
 pub const ATTR_DID_HAS_KOTOBA_PROTOCOL_SERVICES: &str = "did/hasKotobaProtocolServices";
+pub const ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT: &str = "did/didcommMessagingEndpoint";
+pub const ATTR_DID_ATPROTO_PDS_ENDPOINT: &str = "did/atprotoPdsEndpoint";
+pub const ATTR_DID_KOTOBA_NODE_ENDPOINT: &str = "did/kotobaNodeEndpoint";
+pub const ATTR_DID_KOTOBA_GRAPH_MEMBERSHIP: &str = "did/kotobaGraphMembership";
 
 /// DID Document — Kotoba Vertex declaration
 /// capabilityInvocation key → Source Chain write right
@@ -89,6 +93,15 @@ pub struct ServiceEndpoint {
 pub enum ServiceEndpointValue {
     Single(String),
     Multiple(Vec<String>),
+}
+
+impl ServiceEndpointValue {
+    fn values(&self) -> Vec<&str> {
+        match self {
+            Self::Single(value) => vec![value.as_str()],
+            Self::Multiple(values) => values.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 impl DidDocument {
@@ -381,6 +394,9 @@ impl DidDocument {
         }
         for service in &self.service {
             let service_entity = kotoba_core::cid::KotobaCid::from_bytes(service.id.as_bytes());
+            for (attr, endpoint) in protocol_service_endpoint_datoms(service) {
+                out.push(did_datom(&e, attr, endpoint, &tx));
+            }
             out.push(did_datom(
                 &e,
                 ATTR_DID_CORE_SERVICE,
@@ -537,6 +553,37 @@ fn did_datom(
     tx: &kotoba_core::cid::KotobaCid,
 ) -> kotoba_datomic::Datom {
     kotoba_datomic::Datom::assert(e.clone(), a.to_string(), v, tx.clone())
+}
+
+fn protocol_service_endpoint_datoms(
+    service: &ServiceEndpoint,
+) -> Vec<(&'static str, kotoba_datomic::Value)> {
+    match service.service_type.as_str() {
+        DIDCOMM_MESSAGING_SERVICE => vec![(
+            ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT,
+            service_endpoint_value(&service.endpoint),
+        )],
+        ATPROTO_PDS_SERVICE => vec![(
+            ATTR_DID_ATPROTO_PDS_ENDPOINT,
+            service_endpoint_value(&service.endpoint),
+        )],
+        KOTOBA_NODE_SERVICE => vec![(
+            ATTR_DID_KOTOBA_NODE_ENDPOINT,
+            service_endpoint_value(&service.endpoint),
+        )],
+        KOTOBA_GRAPH_MEMBERSHIP_SERVICE => service
+            .endpoint
+            .values()
+            .into_iter()
+            .map(|membership| {
+                (
+                    ATTR_DID_KOTOBA_GRAPH_MEMBERSHIP,
+                    kotoba_datomic::Value::string(membership),
+                )
+            })
+            .collect(),
+        _ => vec![],
+    }
 }
 
 fn string_vec(values: &[String]) -> kotoba_datomic::Value {
@@ -827,6 +874,31 @@ mod tests {
                 && datom.a == ATTR_DID_HAS_KOTOBA_PROTOCOL_SERVICES
                 && datom.v == kotoba_datomic::Value::Bool(true)
         }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT
+                && datom.v == kotoba_datomic::Value::string("didcomm://mediator/abc")
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_ATPROTO_PDS_ENDPOINT
+                && datom.v == kotoba_datomic::Value::string("https://pds.example.com")
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_KOTOBA_NODE_ENDPOINT
+                && datom.v == kotoba_datomic::Value::string("/ip4/127.0.0.1/tcp/4001")
+        }));
+        for membership in ["kotoba://graph/a", "kotoba://graph/b"] {
+            assert!(
+                datoms.iter().any(|datom| {
+                    datom.e == doc.entity_cid()
+                        && datom.a == ATTR_DID_KOTOBA_GRAPH_MEMBERSHIP
+                        && datom.v == kotoba_datomic::Value::string(membership)
+                }),
+                "missing graph membership projection {membership}"
+            );
+        }
         for service_type in [
             DIDCOMM_MESSAGING_SERVICE,
             ATPROTO_PDS_SERVICE,
