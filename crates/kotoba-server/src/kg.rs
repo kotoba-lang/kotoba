@@ -155,14 +155,20 @@ async fn current_graph_quads(
     Ok(db
         .datoms()
         .into_iter()
-        .filter_map(|datom| {
-            let substrate = datom.to_kqe().ok()?;
-            Some(LegacyQuad {
+        .map(|datom| {
+            let substrate = datom.to_kqe().unwrap_or_else(|_| KqeDatom {
+                e: datom.e,
+                a: datom.a,
+                v: KqeValue::Text(kotoba_edn::to_string(&datom.v)),
+                tx: datom.t,
+                op: datom.added,
+            });
+            LegacyQuad {
                 graph: graph_cid.clone(),
                 subject: substrate.e,
                 predicate: substrate.a,
                 object: substrate.v.into(),
-            })
+            }
         })
         .collect())
 }
@@ -175,7 +181,15 @@ async fn current_graph_deltas(
     Ok(db
         .datoms()
         .into_iter()
-        .filter_map(|datom| datom.to_kqe().ok())
+        .map(|datom| {
+            datom.to_kqe().unwrap_or_else(|_| KqeDatom {
+                e: datom.e,
+                a: datom.a,
+                v: KqeValue::Text(kotoba_edn::to_string(&datom.v)),
+                tx: datom.t,
+                op: datom.added,
+            })
+        })
         .map(Delta::from_datom)
         .collect())
 }
