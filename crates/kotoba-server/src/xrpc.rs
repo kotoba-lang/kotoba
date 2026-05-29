@@ -7642,12 +7642,14 @@ pub async fn agent_sync_close(
 mod tests {
     use super::{
         append_auth_capability_datoms, atproto_repo_record_entity_cid, atproto_repo_write_datoms,
-        datomic_basis_t, datomic_db_stats, datomic_entid, datomic_entity, datomic_history,
-        datomic_ident, datomic_log, datomic_pull, datomic_pull_many, datomic_transact,
-        datomic_tx_range, distributed_graph_ipns_name, enforce_datomic_range_tx_scope,
-        is_did_web_ip_host, AtprotoRepoWriteReq, AuthCapabilityProjection, DatomicBasisTReq,
+        datomic_basis_t, datomic_datoms, datomic_db_stats, datomic_entid, datomic_entity,
+        datomic_history, datomic_ident, datomic_index_pull, datomic_index_range, datomic_log,
+        datomic_pull, datomic_pull_many, datomic_seek_datoms, datomic_transact, datomic_tx_range,
+        distributed_graph_ipns_name, enforce_datomic_range_tx_scope, is_did_web_ip_host,
+        AtprotoRepoWriteReq, AuthCapabilityProjection, DatomicBasisTReq, DatomicDatomsReq,
         DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq, DatomicIdentReq,
-        DatomicLogReq, DatomicPullManyReq, DatomicPullReq, DatomicTransactReq, DatomicTxRangeReq,
+        DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq, DatomicPullManyReq,
+        DatomicPullReq, DatomicSeekDatomsReq, DatomicTransactReq, DatomicTxRangeReq,
         ZCAP_ALLOWED_ACTION_IRI, ZCAP_CONTROLLER_IRI, ZCAP_INVOCATION_PROOF_IRI,
         ZCAP_INVOCATION_TARGET_IRI,
     };
@@ -8301,6 +8303,139 @@ mod tests {
         assert!(stats_body["datom_count"].as_u64().unwrap() >= 6);
         assert_eq!(stats_body["tx_count"], 2);
         assert!(stats_body["entity_count"].as_u64().unwrap() >= 2);
+
+        let datoms = datomic_datoms(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicDatomsReq {
+                graph: graph_mb.clone(),
+                index: ":aevt".into(),
+                components_edn: vec![":person/name".into()],
+                as_of: Some(first_tx.clone()),
+                since: None,
+                cacao_b64: None,
+                presentation: None,
+                limit: Some(100),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(datoms.status(), axum::http::StatusCode::OK);
+        let datoms_body = axum::body::to_bytes(datoms.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let datoms_body: serde_json::Value = serde_json::from_slice(&datoms_body).unwrap();
+        assert_eq!(datoms_body["basis_t"], first_tx);
+        assert!(datoms_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["a"] == ":person/name" && datom["v_edn"] == "\"Alice\""));
+        assert!(!datoms_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["a"] == ":person/name" && datom["v_edn"] == "\"Bob\""));
+
+        let seek_datoms = datomic_seek_datoms(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicSeekDatomsReq {
+                graph: graph_mb.clone(),
+                index: ":aevt".into(),
+                components_edn: vec![":person/name".into()],
+                as_of: None,
+                since: Some(first_tx.clone()),
+                cacao_b64: None,
+                presentation: None,
+                limit: Some(100),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(seek_datoms.status(), axum::http::StatusCode::OK);
+        let seek_body = axum::body::to_bytes(seek_datoms.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let seek_body: serde_json::Value = serde_json::from_slice(&seek_body).unwrap();
+        assert_eq!(seek_body["basis_t"], second_tx);
+        assert!(seek_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["a"] == ":person/name" && datom["v_edn"] == "\"Bob\""));
+        assert!(!seek_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["a"] == ":person/name" && datom["v_edn"] == "\"Alice\""));
+
+        let index_range = datomic_index_range(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicIndexRangeReq {
+                graph: graph_mb.clone(),
+                attr_edn: ":person/name".into(),
+                start_edn: Some(r#""A""#.into()),
+                end_edn: Some(r#""C""#.into()),
+                as_of: Some(first_tx.clone()),
+                since: None,
+                cacao_b64: None,
+                presentation: None,
+                limit: Some(100),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(index_range.status(), axum::http::StatusCode::OK);
+        let range_body = axum::body::to_bytes(index_range.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let range_body: serde_json::Value = serde_json::from_slice(&range_body).unwrap();
+        assert_eq!(range_body["basis_t"], first_tx);
+        assert!(range_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["a"] == ":person/name" && datom["v_edn"] == "\"Alice\""));
+        assert!(!range_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["a"] == ":person/name" && datom["v_edn"] == "\"Bob\""));
+
+        let index_pull = datomic_index_pull(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicIndexPullReq {
+                graph: graph_mb.clone(),
+                index: ":aevt".into(),
+                components_edn: vec![":person/name".into()],
+                pattern_edn: Some(r#"[:person/name :person/role]"#.into()),
+                as_of: None,
+                since: Some(first_tx.clone()),
+                cacao_b64: None,
+                presentation: None,
+                limit: Some(100),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(index_pull.status(), axum::http::StatusCode::OK);
+        let index_pull_body = axum::body::to_bytes(index_pull.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let index_pull_body: serde_json::Value = serde_json::from_slice(&index_pull_body).unwrap();
+        assert_eq!(index_pull_body["basis_t"], second_tx);
+        assert_eq!(index_pull_body["entity_count"], 1);
+        assert!(index_pull_body["entities"][0]["entity_edn"]
+            .as_str()
+            .unwrap()
+            .contains("Bob"));
 
         let history = datomic_history(
             axum::extract::State(Arc::clone(&state)),
