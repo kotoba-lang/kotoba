@@ -1057,6 +1057,12 @@ async fn kubo_compatible_local_api_surface() {
         .expect("key/list")
         .iter()
         .any(|entry| entry == &publish_key));
+    let keys = node.key_list().await.expect("key/list self");
+    assert!(keys
+        .iter()
+        .any(|entry| entry.name == "self" && entry.id.starts_with("k51-")));
+    assert!(node.key_rename("self", "not-self", false).await.is_err());
+    assert!(node.key_rm("self").await.is_err());
     let renamed = node
         .key_rename("publish", "publish-renamed", false)
         .await

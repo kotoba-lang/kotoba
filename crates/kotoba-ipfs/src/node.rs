@@ -1311,6 +1311,7 @@ impl KotobaIpfsNode {
     /// Kubo-like `key/list`: list locally managed publishing keys.
     pub async fn key_list(&self) -> Result<Vec<KeyEntry>> {
         let mut keys: Vec<_> = self.state.keys.read().await.values().cloned().collect();
+        keys.push(self.self_key());
         keys.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(keys)
     }
@@ -1323,6 +1324,9 @@ impl KotobaIpfsNode {
         force: bool,
     ) -> Result<KeyEntry> {
         let old = old.as_ref();
+        if old == "self" {
+            bail!("key name is reserved: self");
+        }
         let new = validate_key_name(new.into())?;
         if old == new {
             let key = self
@@ -1358,6 +1362,9 @@ impl KotobaIpfsNode {
         if name.trim().is_empty() {
             bail!("key name must not be empty");
         }
+        if name == "self" {
+            bail!("key name is reserved: self");
+        }
         let key = self
             .state
             .keys
@@ -1367,6 +1374,16 @@ impl KotobaIpfsNode {
             .ok_or_else(|| anyhow!("key not found: {name}"))?;
         persist_repo_state(&self.state).await?;
         Ok(key)
+    }
+
+    fn self_key(&self) -> KeyEntry {
+        KeyEntry {
+            name: "self".to_string(),
+            id: format!(
+                "k51-{}",
+                raw_cid(format!("kotoba-ipfs-self-key:v1:{}", self.peer_id.0).as_bytes())
+            ),
+        }
     }
 
     /// Kubo-like MFS `files/write`: bind an MFS path to a CID.
