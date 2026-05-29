@@ -17,6 +17,9 @@ use kotoba_ipfs::{IpnsName, IpnsRecord, IpnsRegistry, IpnsRegistryError};
 use kotoba_kqe::Datom as KqeDatom;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Mutex;
 
 pub const ROOT_EAVT: &str = "eavt";
 pub const ROOT_AEVT: &str = "aevt";
@@ -110,6 +113,136 @@ struct StoredDatom {
     v_edn: String,
     t: String,
     added: bool,
+}
+
+/// Synchronous block-store adapter for a remote `kotoba-ipfs/1` peer.
+///
+/// This is the bridge that lets [`DistributedDatomReader`] traverse a Datomic
+/// commit chain whose commit blocks and ProllyTree index blocks live on another
+/// Kotoba/IPFS node.
+pub struct RemoteIpfsBlockStore {
+    socket: SocketAddr,
+    cache: Mutex<HashMap<KotobaCid, bytes::Bytes>>,
+}
+
+impl RemoteIpfsBlockStore {
+    pub fn new(socket: SocketAddr) -> Self {
+        Self {
+            socket,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl BlockStore for RemoteIpfsBlockStore {
+    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        self.cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
+            .insert(cid.clone(), bytes::Bytes::copy_from_slice(data));
+        Ok(())
+    }
+
+    fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
+        if let Some(bytes) = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
+            .get(cid)
+            .cloned()
+        {
+            return Ok(Some(bytes));
+        }
+        let Some(bytes) = fetch_remote_block(self.socket, cid)? else {
+            return Ok(None);
+        };
+        self.cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
+            .insert(cid.clone(), bytes.clone());
+        Ok(Some(bytes))
+    }
+
+    fn has(&self, cid: &KotobaCid) -> bool {
+        self.get(cid).ok().flatten().is_some()
+    }
+}
+
+/// IPNS registry adapter for resolving Datomic heads from a remote
+/// `kotoba-ipfs/1` peer.
+pub struct RemoteIpfsIpnsRegistry {
+    socket: SocketAddr,
+}
+
+impl RemoteIpfsIpnsRegistry {
+    pub fn new(socket: SocketAddr) -> Self {
+        Self { socket }
+    }
+}
+
+impl IpnsRegistry for RemoteIpfsIpnsRegistry {
+    fn publish(&self, _record: IpnsRecord) -> Result<(), IpnsRegistryError> {
+        Err(IpnsRegistryError::Kubo(
+            "remote kotoba-ipfs IPNS registry is read-only".into(),
+        ))
+    }
+
+    fn resolve(&self, name: &IpnsName) -> Result<IpnsRecord, IpnsRegistryError> {
+        fetch_remote_ipns_record(self.socket, name)
+    }
+}
+
+fn fetch_remote_block(socket: SocketAddr, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
+    let mut stream = TcpStream::connect(socket)?;
+    stream.write_all(format!("GET kotoba-ipfs/1 {}\n", cid.to_multibase()).as_bytes())?;
+    stream.flush()?;
+    let mut len_buf = [0u8; 8];
+    stream.read_exact(&mut len_buf)?;
+    let len = u64::from_be_bytes(len_buf);
+    if len == u64::MAX {
+        return Ok(None);
+    }
+    if len > usize::MAX as u64 {
+        return Err(anyhow::anyhow!("remote block too large: {len}"));
+    }
+    let mut buf = vec![0u8; len as usize];
+    stream.read_exact(&mut buf)?;
+    if KotobaCid::from_bytes(&buf) != *cid {
+        return Err(anyhow::anyhow!("remote block CID mismatch: {cid}"));
+    }
+    Ok(Some(bytes::Bytes::from(buf)))
+}
+
+fn fetch_remote_ipns_record(
+    socket: SocketAddr,
+    name: &IpnsName,
+) -> Result<IpnsRecord, IpnsRegistryError> {
+    let mut stream =
+        TcpStream::connect(socket).map_err(|e| IpnsRegistryError::Kubo(e.to_string()))?;
+    stream
+        .write_all(format!("NAME kotoba-ipfs/1 {}\n", name.0).as_bytes())
+        .map_err(|e| IpnsRegistryError::Kubo(e.to_string()))?;
+    stream
+        .flush()
+        .map_err(|e| IpnsRegistryError::Kubo(e.to_string()))?;
+    let mut len_buf = [0u8; 8];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| IpnsRegistryError::Kubo(e.to_string()))?;
+    let len = u64::from_be_bytes(len_buf);
+    if len == u64::MAX {
+        return Err(IpnsRegistryError::NotFound(name.0.clone()));
+    }
+    if len > usize::MAX as u64 {
+        return Err(IpnsRegistryError::Kubo(format!(
+            "remote IPNS record too large: {len}"
+        )));
+    }
+    let mut buf = vec![0u8; len as usize];
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| IpnsRegistryError::Kubo(e.to_string()))?;
+    ciborium::from_reader(&buf[..]).map_err(|e| IpnsRegistryError::Kubo(e.to_string()))
 }
 
 pub struct DistributedDatomReader<'a, R>
@@ -3645,10 +3778,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use kotoba_ipfs::{InMemoryIpnsRegistry, KuboIpnsRegistry, SignedIpnsRegistry};
     use kotoba_store::MemoryBlockStore;
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream};
     use std::sync::Arc;
-    use std::sync::Mutex;
 
     fn datom(e: &[u8], a: &str, v: &str, tx: &[u8]) -> Datom {
         Datom::assert(
@@ -3721,116 +3851,7 @@ mod tests {
         .map_err(Into::into)
     }
 
-    struct PeerBlockStore {
-        socket: SocketAddr,
-        cache: Mutex<HashMap<KotobaCid, bytes::Bytes>>,
-    }
-
-    impl PeerBlockStore {
-        fn new(socket: SocketAddr) -> Self {
-            Self {
-                socket,
-                cache: Mutex::new(HashMap::new()),
-            }
-        }
-    }
-
-    impl kotoba_core::store::BlockStore for PeerBlockStore {
-        fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-            self.cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("peer block cache lock poisoned"))?
-                .insert(cid.clone(), bytes::Bytes::copy_from_slice(data));
-            Ok(())
-        }
-
-        fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
-            if let Some(bytes) = self
-                .cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("peer block cache lock poisoned"))?
-                .get(cid)
-                .cloned()
-            {
-                return Ok(Some(bytes));
-            }
-            let mut stream = TcpStream::connect(self.socket)?;
-            stream.write_all(format!("GET kotoba-ipfs/1 {}\n", cid.to_multibase()).as_bytes())?;
-            stream.flush()?;
-            let mut len_buf = [0u8; 8];
-            stream.read_exact(&mut len_buf)?;
-            let len = u64::from_be_bytes(len_buf);
-            if len == u64::MAX {
-                return Ok(None);
-            }
-            let mut buf = vec![0u8; len as usize];
-            stream.read_exact(&mut buf)?;
-            if KotobaCid::from_bytes(&buf) != *cid {
-                return Err(anyhow::anyhow!("remote block CID mismatch: {cid}"));
-            }
-            let bytes = bytes::Bytes::from(buf);
-            self.cache
-                .lock()
-                .map_err(|_| anyhow::anyhow!("peer block cache lock poisoned"))?
-                .insert(cid.clone(), bytes.clone());
-            Ok(Some(bytes))
-        }
-
-        fn has(&self, cid: &KotobaCid) -> bool {
-            self.get(cid).ok().flatten().is_some()
-        }
-    }
-
-    struct PeerIpnsRegistry {
-        socket: SocketAddr,
-    }
-
-    impl PeerIpnsRegistry {
-        fn new(socket: SocketAddr) -> Self {
-            Self { socket }
-        }
-    }
-
-    impl kotoba_ipfs::IpnsRegistry for PeerIpnsRegistry {
-        fn publish(
-            &self,
-            _record: kotoba_ipfs::IpnsRecord,
-        ) -> Result<(), kotoba_ipfs::IpnsRegistryError> {
-            Err(kotoba_ipfs::IpnsRegistryError::Kubo(
-                "test peer registry is read-only".into(),
-            ))
-        }
-
-        fn resolve(
-            &self,
-            name: &kotoba_ipfs::IpnsName,
-        ) -> Result<kotoba_ipfs::IpnsRecord, kotoba_ipfs::IpnsRegistryError> {
-            let mut stream = TcpStream::connect(self.socket)
-                .map_err(|e| kotoba_ipfs::IpnsRegistryError::Kubo(e.to_string()))?;
-            stream
-                .write_all(format!("NAME kotoba-ipfs/1 {}\n", name.0).as_bytes())
-                .map_err(|e| kotoba_ipfs::IpnsRegistryError::Kubo(e.to_string()))?;
-            stream
-                .flush()
-                .map_err(|e| kotoba_ipfs::IpnsRegistryError::Kubo(e.to_string()))?;
-            let mut len_buf = [0u8; 8];
-            stream
-                .read_exact(&mut len_buf)
-                .map_err(|e| kotoba_ipfs::IpnsRegistryError::Kubo(e.to_string()))?;
-            let len = u64::from_be_bytes(len_buf);
-            if len == u64::MAX {
-                return Err(kotoba_ipfs::IpnsRegistryError::NotFound(name.0.clone()));
-            }
-            let mut buf = vec![0u8; len as usize];
-            stream
-                .read_exact(&mut buf)
-                .map_err(|e| kotoba_ipfs::IpnsRegistryError::Kubo(e.to_string()))?;
-            ciborium::from_reader(&buf[..])
-                .map_err(|e| kotoba_ipfs::IpnsRegistryError::Kubo(e.to_string()))
-        }
-    }
-
-    fn socket_from_listen_addr(addr: &kotoba_ipfs::Multiaddr) -> SocketAddr {
+    fn socket_from_listen_addr(addr: &kotoba_ipfs::Multiaddr) -> std::net::SocketAddr {
         let parts = addr.to_string();
         let segments = parts.split('/').collect::<Vec<_>>();
         let ip = segments
@@ -3949,8 +3970,8 @@ mod tests {
             .await
             .expect("publish remote ipns head");
 
-        let remote_store = PeerBlockStore::new(source_socket);
-        let remote_ipns = PeerIpnsRegistry::new(source_socket);
+        let remote_store = RemoteIpfsBlockStore::new(source_socket);
+        let remote_ipns = RemoteIpfsIpnsRegistry::new(source_socket);
         let reader = DistributedDatomReader::new(&remote_store, &remote_ipns);
         let query = kotoba_edn::parse(
             r#"{:find [?name ?role]
