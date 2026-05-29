@@ -2225,6 +2225,12 @@ fn append_auth_capability_datoms(
         assert_tx(
             datoms,
             tx_cid,
+            ":capability/operation",
+            kotoba_edn::EdnValue::String(action.clone()),
+        );
+        assert_tx(
+            datoms,
+            tx_cid,
             ZCAP_ALLOWED_ACTION_IRI,
             kotoba_edn::EdnValue::String(action.clone()),
         );
@@ -2234,6 +2240,12 @@ fn append_auth_capability_datoms(
             datoms,
             tx_cid,
             ":capability/invocationTarget",
+            kotoba_edn::EdnValue::String(target.clone()),
+        );
+        assert_tx(
+            datoms,
+            tx_cid,
+            ":capability/resource",
             kotoba_edn::EdnValue::String(target.clone()),
         );
         assert_tx(
@@ -7889,10 +7901,12 @@ mod tests {
 
         for action in actions {
             assert!(has(":capability/allowedAction", &action));
+            assert!(has(":capability/operation", &action));
             assert!(has(ZCAP_ALLOWED_ACTION_IRI, &action));
         }
         for target in targets {
             assert!(has(":capability/invocationTarget", &target));
+            assert!(has(":capability/resource", &target));
             assert!(has(ZCAP_INVOCATION_TARGET_IRI, &target));
         }
         assert!(has(":capability/controller", "did:key:zController"));

@@ -3564,6 +3564,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
                                  :where [[?tx :capability/proofCid ?proof]
                                          [?tx :capability/controller ?controller]
                                          [?tx :capability/allowedAction ?action]
+                                         [?tx :capability/operation ?action]
                                          [?tx :capability/invocationTarget ?target]]}"#
             }),
             &tok,
@@ -3582,6 +3583,28 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
                 && row[3] == format!("\"kotoba://graph/{graph}\"")
         })),
         "{cap_body}"
+    );
+
+    let (status, resource_body) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            json!({
+                "graph": graph,
+                "query_edn": r#"{:find [?resource]
+                                 :where [[?tx :capability/proofCid ?proof]
+                                         [?tx :capability/resource ?resource]]}"#
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{resource_body}");
+    assert!(
+        resource_body["rows_edn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row[0] == format!("\"kotoba://graph/{graph}\"")),
+        "{resource_body}"
     );
 }
 
@@ -3923,7 +3946,8 @@ async fn datomic_transact_accepts_vp_capability_and_persists_proof_block() {
                 "graph": graph,
                 "query_edn": r#"{:find [?action]
                                  :where [[?tx :capability/proofCid ?proof]
-                                         [?tx :capability/allowedAction ?action]]}"#
+                                         [?tx :capability/allowedAction ?action]
+                                         [?tx :capability/operation ?action]]}"#
             }),
             &tok,
         )
@@ -4433,6 +4457,36 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
         .contains("StatusList2021Entry"));
     assert!(row[5].as_str().unwrap_or("").contains("DataIntegrityProof"));
 
+    let (status, wire_body) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            json!({
+                "graph": graph,
+                "query_edn": r#"{:find [?cid ?wireFormat ?dataModel ?context]
+                                :where [[?e :credential/id "urn:uuid:vc-e2e-1"]
+                                        [?e :credential/cid ?cid]
+                                        [?e :credential/wireFormat ?wireFormat]
+                                        [?e :credential/dataModel ?dataModel]
+                                        [?e :credential/context ?context]]}"#
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{wire_body}");
+    assert!(
+        wire_body["rows_edn"].as_array().unwrap().iter().any(|row| {
+            row.as_array().is_some_and(|row| {
+                row[0] == format!("\"{}\"", body["entity_cid"].as_str().unwrap())
+                    && row[1] == "\"application/vc+ld+json\""
+                    && row[2] == "\"W3C VC Data Model 2.0\""
+                    && row[3].as_str().is_some_and(|context| {
+                        context.contains("https://www.w3.org/ns/credentials/v2")
+                    })
+            })
+        }),
+        "{wire_body}"
+    );
+
     let (status, subject_body) = s
         .post_auth(
             "/xrpc/ai.gftd.apps.kotoba.datomic.q",
@@ -4734,6 +4788,36 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
         .await;
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"][0][0], "\"did:key:zAlice\"", "{q_body}");
+
+    let (status, wire_body) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            json!({
+                "graph": graph,
+                "query_edn": r#"{:find [?cid ?wireFormat ?dataModel ?context]
+                                 :where [[?e :presentation/id "urn:uuid:vp-e2e-1"]
+                                         [?e :presentation/cid ?cid]
+                                         [?e :presentation/wireFormat ?wireFormat]
+                                         [?e :presentation/dataModel ?dataModel]
+                                         [?e :presentation/context ?context]]}"#
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{wire_body}");
+    assert!(
+        wire_body["rows_edn"].as_array().unwrap().iter().any(|row| {
+            row.as_array().is_some_and(|row| {
+                row[0] == format!("\"{}\"", body["entity_cid"].as_str().unwrap())
+                    && row[1] == "\"application/vp+ld+json\""
+                    && row[2] == "\"W3C VC Data Model 2.0\""
+                    && row[3].as_str().is_some_and(|context| {
+                        context.contains("https://www.w3.org/ns/credentials/v2")
+                    })
+            })
+        }),
+        "{wire_body}"
+    );
 
     let (status, proof_body) = s
         .post_auth(
@@ -6140,6 +6224,8 @@ async fn assert_protocol_tx_metadata(
                                  :where [[?tx :capability/proofCid ?proof]
                                          [?tx :capability/controller ?controller]
                                          [?tx :capability/allowedAction ?action]
+                                         [?tx :capability/operation ?action]
+                                         [?tx :capability/resource ?target]
                                          [?tx :capability/invocationTarget ?target]]}"#
             }),
             &tok,
@@ -6235,6 +6321,7 @@ async fn assert_capability_invocation_target(
     let tok = tenant_jwt(&s.operator_did);
     for attr in [
         ":capability/invocationTarget",
+        ":capability/resource",
         "\"https://w3id.org/security#invocationTarget\"",
     ] {
         let (status, body) = s
