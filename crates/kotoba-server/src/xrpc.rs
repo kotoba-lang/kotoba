@@ -2720,25 +2720,6 @@ fn parse_optional_tx_cid(
         .transpose()
 }
 
-fn apply_datomic_basis(
-    db: kotoba_datomic::Db,
-    as_of: Option<&str>,
-    since: Option<&str>,
-) -> Result<kotoba_datomic::Db, (StatusCode, String)> {
-    match (
-        parse_optional_tx_cid("as_of", as_of)?,
-        parse_optional_tx_cid("since", since)?,
-    ) {
-        (Some(_), Some(_)) => Err((
-            StatusCode::BAD_REQUEST,
-            "as_of and since are mutually exclusive".to_string(),
-        )),
-        (Some(t), None) => Ok(db.as_of(&t)),
-        (None, Some(t)) => Ok(db.since(&t)),
-        (None, None) => Ok(db),
-    }
-}
-
 fn basis_t_resp(db: &kotoba_datomic::Db) -> Option<String> {
     db.basis_t.as_ref().map(|cid| cid.to_multibase())
 }
@@ -3078,6 +3059,28 @@ fn distributed_datomic_db(
     Ok(Some(db))
 }
 
+fn missing_distributed_datomic_head(
+    graph_cid: &kotoba_core::cid::KotobaCid,
+) -> (StatusCode, String) {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "no distributed Datomic/IPNS head for graph {}",
+            graph_cid.to_multibase()
+        ),
+    )
+}
+
+fn require_distributed_datomic_db(
+    state: &KotobaState,
+    graph_cid: &kotoba_core::cid::KotobaCid,
+    as_of: Option<&str>,
+    since: Option<&str>,
+) -> Result<kotoba_datomic::Db, (StatusCode, String)> {
+    distributed_datomic_db(state, graph_cid, as_of, since)?
+        .ok_or_else(|| missing_distributed_datomic_head(graph_cid))
+}
+
 fn distributed_datomic_history_db(
     state: &KotobaState,
     graph_cid: &kotoba_core::cid::KotobaCid,
@@ -3117,6 +3120,16 @@ fn distributed_datomic_history_db(
         )
     })?;
     Ok(Some(db))
+}
+
+fn require_distributed_datomic_history_db(
+    state: &KotobaState,
+    graph_cid: &kotoba_core::cid::KotobaCid,
+    as_of: Option<&str>,
+    since: Option<&str>,
+) -> Result<kotoba_datomic::Db, (StatusCode, String)> {
+    distributed_datomic_history_db(state, graph_cid, as_of, since)?
+        .ok_or_else(|| missing_distributed_datomic_head(graph_cid))
 }
 
 fn distributed_datomic_q(
@@ -3540,13 +3553,16 @@ pub async fn datomic_transact(
     let db_before = match expected_parent.as_ref() {
         Some(parent) => DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
             .db_from_head(parent)
-            .map_err(|e| {
-                (
+            .map_err(|e| match e {
+                DistributedCommitError::MissingCommit(_) => {
+                    (StatusCode::CONFLICT, format!("distributed db before: {e}"))
+                }
+                _ => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("distributed db before: {e}"),
-                )
+                ),
             })?,
-        None => current_db_for_graph(&state, &graph_cid).await?,
+        None => kotoba_datomic::Db::from_datoms(Vec::new(), None),
     };
     let tx_preview = kotoba_datomic::Connection::from_datoms(db_before.all_datoms())
         .transact(tx_data.clone())
@@ -3741,23 +3757,7 @@ pub async fn datomic_with(
         req.since.as_deref(),
     )? {
         Some(db) => db,
-        None => {
-            let db = current_db_for_graph(&state, &graph_cid).await?;
-            let as_of = parse_optional_tx_cid("as_of", req.as_of.as_deref())?;
-            let since = parse_optional_tx_cid("since", req.since.as_deref())?;
-            if as_of.is_some() && since.is_some() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "as_of and since are mutually exclusive".to_string(),
-                ));
-            }
-            match (as_of.as_ref(), since.as_ref()) {
-                (Some(tx), None) => db.as_of(tx),
-                (None, Some(tx)) => db.since(tx),
-                (None, None) => db,
-                (Some(_), Some(_)) => unreachable!("checked above"),
-            }
-        }
+        None => kotoba_datomic::Db::from_datoms(Vec::new(), None),
     };
     let db_before_basis_t = db_before.basis_t.as_ref().map(|tx| tx.to_multibase());
     let conn = kotoba_datomic::Connection::from_datoms(db_before.all_datoms());
@@ -3816,19 +3816,12 @@ pub async fn datomic_datoms(
 
     let index = DatomicDatomsIndex::parse(&req.index)?;
     let components = parse_datomic_datoms_components(&req.components_edn)?;
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let components = resolve_datomic_index_components(&db, index, &components)?;
     if let Some((basis_t, mut datoms)) = distributed_datomic_datoms(
         &state,
@@ -3902,19 +3895,12 @@ pub async fn datomic_seek_datoms(
 
     let index = DatomicDatomsIndex::parse(&req.index)?;
     let components = parse_datomic_datoms_components(&req.components_edn)?;
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let components = resolve_datomic_index_components(&db, index, &components)?;
     let seek_key = datomic_seek_key(index, &components)?;
     if let Some((basis_t, mut datoms)) = distributed_datomic_seek_datoms(
@@ -3989,19 +3975,12 @@ pub async fn datomic_index_range(
         &kotoba_edn::parse(&req.attr_edn)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("attr_edn parse: {e}")))?,
     )?;
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let start = resolve_datomic_index_range_bound(
         &db,
         parse_optional_edn("start_edn", req.start_edn.as_deref())?,
@@ -4106,19 +4085,12 @@ pub async fn datomic_pull(
         None => kotoba_edn::EdnValue::Vector(vec![]),
     };
 
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let entity = datomic_entity_from_request(&db, &req.entity)?;
     let entity_edn = db
         .pull(pattern, entity.clone())
@@ -4177,19 +4149,12 @@ pub async fn datomic_pull_many(
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("pattern_edn parse: {e}")))?,
         None => kotoba_edn::EdnValue::Vector(vec![]),
     };
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let entity_cids = req
         .entities
         .iter()
@@ -4261,7 +4226,7 @@ pub async fn datomic_q(
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("inputs_edn parse: {e}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some((basis_t, rows)) = distributed_datomic_q(
+    let (basis_t, rows) = distributed_datomic_q(
         &state,
         &graph_cid,
         &query,
@@ -4269,40 +4234,15 @@ pub async fn datomic_q(
         req.as_of.as_deref(),
         req.since.as_deref(),
         req.history,
-    )? {
-        let rows_map = datomic_q_rows_map(&query, &rows)?;
-        return Ok((
-            StatusCode::OK,
-            Json(DatomicQResp {
-                graph: req.graph,
-                basis_t,
-                rows_edn: rows
-                    .into_iter()
-                    .map(|row| row.into_iter().map(|v| kotoba_edn::to_string(&v)).collect())
-                    .collect(),
-                rows_map_edn: rows_map.as_ref().map(|rows| rows.edn.clone()),
-                rows_map_json: rows_map.map(|rows| rows.json),
-            }),
-        ));
-    }
-    let db = apply_datomic_basis(
-        current_db_for_graph(&state, &graph_cid).await?,
-        req.as_of.as_deref(),
-        req.since.as_deref(),
-    )?;
-    let rows = if req.history {
-        kotoba_datomic::q_history(query.clone(), &db.history(), &inputs)
-    } else {
-        kotoba_datomic::q(query.clone(), &db, &inputs)
-    }
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic q: {e}")))?;
+    )?
+    .ok_or_else(|| missing_distributed_datomic_head(&graph_cid))?;
     let rows_map = datomic_q_rows_map(&query, &rows)?;
 
     Ok((
         StatusCode::OK,
         Json(DatomicQResp {
             graph: req.graph,
-            basis_t: basis_t_resp(&db),
+            basis_t,
             rows_edn: rows
                 .into_iter()
                 .map(|row| row.into_iter().map(|v| kotoba_edn::to_string(&v)).collect())
@@ -4452,19 +4392,12 @@ pub async fn datomic_history(
     )
     .await?;
     let limit = req.limit.unwrap_or(1000).min(10_000);
-    let db = match distributed_datomic_history_db(
+    let db = require_distributed_datomic_history_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let datoms = db
         .history()
         .datoms()
@@ -4560,49 +4493,9 @@ pub async fn datomic_log(
     )
     .await?;
     let limit = req.limit.unwrap_or(100).min(10_000);
-    let (basis_t, entries) = match distributed_datomic_log(
-        &state,
-        &graph_cid,
-        req.start.as_deref(),
-        req.end.as_deref(),
-    )? {
-        Some(log) => log,
-        None => {
-            let db = current_db_for_graph(&state, &graph_cid).await?;
-            let conn = kotoba_datomic::Connection::from_datoms(db.all_datoms());
-            let start = parse_optional_tx_cid("start", req.start.as_deref())?;
-            let end = parse_optional_tx_cid("end", req.end.as_deref())?;
-            let entries = conn.log().entries().to_vec();
-            if let Some(start) = &start {
-                if !entries.iter().any(|entry| &entry.tx == start) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "datomic log start transaction not found: {}",
-                            start.to_multibase()
-                        ),
-                    ));
-                }
-            }
-            if let Some(end) = &end {
-                if !entries.iter().any(|entry| &entry.tx == end) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "datomic log end transaction not found: {}",
-                            end.to_multibase()
-                        ),
-                    ));
-                }
-            }
-            let entries = entries
-                .into_iter()
-                .skip_while(|entry| start.as_ref().is_some_and(|start| &entry.tx != start))
-                .take_while(|entry| end.as_ref().is_none_or(|end| &entry.tx != end))
-                .collect::<Vec<_>>();
-            (basis_t_resp(&db), entries)
-        }
-    };
+    let (basis_t, entries) =
+        distributed_datomic_log(&state, &graph_cid, req.start.as_deref(), req.end.as_deref())?
+            .ok_or_else(|| missing_distributed_datomic_head(&graph_cid))?;
     let txes = entries
         .into_iter()
         .take(limit)
@@ -4649,19 +4542,12 @@ pub async fn datomic_basis_t(
         req.since.as_deref(),
     )
     .await?;
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
 
     Ok((
         StatusCode::OK,
@@ -4690,19 +4576,12 @@ pub async fn datomic_db_stats(
         req.since.as_deref(),
     )
     .await?;
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
 
     Ok((StatusCode::OK, Json(datomic_db_stats_resp(req.graph, &db))))
 }
@@ -4725,19 +4604,12 @@ pub async fn datomic_entity(
         req.since.as_deref(),
     )
     .await?;
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let entity = datomic_entity_from_request(&db, &req.entity)?;
     let entity_edn = db
         .entity(entity.clone())
@@ -4781,19 +4653,12 @@ pub async fn datomic_ident(
     )
     .await?;
     let entity = parse_datomic_entity(&req.entity);
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let ident_edn =
         datomic_ident_for_entity(&db, &entity).map(|value| kotoba_edn::to_string(&value));
 
@@ -4828,19 +4693,12 @@ pub async fn datomic_entid(
     .await?;
     let ident = kotoba_edn::parse(&req.ident_edn)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("ident_edn parse: {e}")))?;
-    let db = match distributed_datomic_db(
+    let db = require_distributed_datomic_db(
         &state,
         &graph_cid,
         req.as_of.as_deref(),
         req.since.as_deref(),
-    )? {
-        Some(db) => db,
-        None => apply_datomic_basis(
-            current_db_for_graph(&state, &graph_cid).await?,
-            req.as_of.as_deref(),
-            req.since.as_deref(),
-        )?,
-    };
+    )?;
     let entity = datomic_entid_for_value(&db, &ident)?.map(|cid| cid.to_multibase());
 
     Ok((
@@ -5281,7 +5139,8 @@ pub async fn atproto_repo_write(
         .as_slice(),
     );
     let datoms = if operation == "delete" {
-        let db = current_db_for_graph(&state, &graph_cid).await?;
+        let db = distributed_datomic_db(&state, &graph_cid, None, None)?
+            .unwrap_or_else(|| kotoba_datomic::Db::from_datoms(Vec::new(), None));
         atproto_repo_delete_datoms(&db, &req, &uri, &entity_cid, &tx_cid)
     } else {
         atproto_repo_write_datoms(&req, &uri, &entity_cid, &tx_cid)
@@ -6016,7 +5875,7 @@ pub async fn commit_store(
     let expected_parent = current_head
         .as_ref()
         .and_then(|record| KotobaCid::from_multibase(&record.value));
-    let db = current_db_for_graph(&state, &graph_cid).await?;
+    let db = require_distributed_datomic_db(&state, &graph_cid, None, None)?;
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     let report = writer
         .commit_datoms(CommitDatomsRequest {
@@ -6139,7 +5998,7 @@ pub async fn graph_query(
     const MAX_QUERY_RESULTS: u64 = 1_000;
     let limit = req.limit.unwrap_or(100).min(MAX_QUERY_RESULTS) as usize;
 
-    let db = current_db_for_graph(&state, &graph_cid).await?;
+    let db = require_distributed_datomic_db(&state, &graph_cid, None, None)?;
     let mut quads: Vec<_> = db
         .datoms()
         .into_iter()
@@ -6774,7 +6633,7 @@ pub async fn embed_create(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     use kotoba_core::cid::KotobaCid;
-    use kotoba_llm::embed::{embed_to_quad, Embedding};
+    use kotoba_llm::embed::{embed_to_delta, Embedding};
 
     // 64 KiB covers any realistic embedding unit (paragraph / document chunk).
     // Larger inputs must be split by the caller's chunker before calling embed.create.
@@ -6838,9 +6697,7 @@ pub async fn embed_create(
         )
         .as_bytes(),
     );
-    let delta = embed_to_quad(&emb, graph_cid.clone());
-    let mut datom = delta.datom;
-    datom.tx = tx_cid.clone();
+    let datom = embed_to_delta(&emb, tx_cid.clone()).datom;
     let resp = commit_protocol_datoms(
         &state,
         graph_cid,
@@ -8790,7 +8647,7 @@ mod tests {
                 "capabilityDelegation",
                 "service",
             ],
-            &[],
+            &["keyAgreement"],
         );
         assert_lexicon_input_nested_array_item_fields(
             src,

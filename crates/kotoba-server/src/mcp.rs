@@ -179,7 +179,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": MCP_TOOL_EMBED_CREATE,
-                "description": "Compute a text embedding and store it as a Quad in the named graph.",
+                "description": "Compute a text embedding and store it as a Datom in the named graph.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -716,7 +716,7 @@ async fn call_tool(
         // ── kotoba_embed_create ──────────────────────────────────────────────
         MCP_TOOL_EMBED_CREATE => {
             use kotoba_core::cid::KotobaCid;
-            use kotoba_llm::embed::{embed_to_quad, Embedding};
+            use kotoba_llm::embed::{embed_to_delta, Embedding};
 
             let text = get_str("text")?;
             let doc_cid = get_str("doc_cid")?;
@@ -767,7 +767,6 @@ async fn call_tool(
                 model_cid: model_cid.clone(),
                 vector,
             };
-            let delta = embed_to_quad(&emb, graph_cid.clone());
             let tx_cid = mcp_tx_cid(
                 "embed.create",
                 &[
@@ -776,8 +775,7 @@ async fn call_tool(
                     &model_cid.to_multibase(),
                 ],
             );
-            let mut datom = delta.datom;
-            datom.tx = tx_cid.clone();
+            let datom = embed_to_delta(&emb, tx_cid.clone()).datom;
             let resp = commit_mcp_datoms(
                 state,
                 graph_cid,

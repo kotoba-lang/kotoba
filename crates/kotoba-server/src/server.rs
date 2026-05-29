@@ -729,17 +729,31 @@ impl KotobaState {
             multibase::Base::Base58Btc,
             self.identity.verifying_key().to_bytes(),
         );
+        let x25519_key_id = format!("{did}#agent-x25519");
+        let x25519_public_key_multibase = multibase::encode(
+            multibase::Base::Base58Btc,
+            self.identity.x25519_public_key().to_bytes(),
+        );
         DidDocument {
             context: vec![DID_CONTEXT_V1.to_string()],
             id: did.clone(),
-            verification_method: vec![VerificationMethod {
-                id: key_id.clone(),
-                key_type: "Ed25519VerificationKey2020".to_string(),
-                controller: did.clone(),
-                public_key_multibase,
-            }],
+            verification_method: vec![
+                VerificationMethod {
+                    id: key_id.clone(),
+                    key_type: "Ed25519VerificationKey2020".to_string(),
+                    controller: did.clone(),
+                    public_key_multibase,
+                },
+                VerificationMethod {
+                    id: x25519_key_id.clone(),
+                    key_type: "X25519KeyAgreementKey2020".to_string(),
+                    controller: did.clone(),
+                    public_key_multibase: x25519_public_key_multibase,
+                },
+            ],
             authentication: vec![key_id.clone()],
             assertion_method: vec![key_id.clone()],
+            key_agreement: vec![x25519_key_id],
             capability_invocation: vec![key_id.clone()],
             capability_delegation: vec![key_id],
             service: vec![],
@@ -1104,6 +1118,8 @@ mod tests {
 
         assert_eq!(doc.id, state.operator_did);
         assert!(doc.ed25519_public_key().is_some());
+        assert!(doc.x25519_public_key().is_some());
+        assert_eq!(doc.key_agreement.len(), 1);
         assert!(doc.kotoba_endpoint().is_some());
         assert!(doc.didcomm_endpoint().is_some());
         assert_eq!(doc.atproto_pds_endpoint(), Some("https://pds.example.com"));

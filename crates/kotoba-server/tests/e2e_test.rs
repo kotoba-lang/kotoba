@@ -4474,9 +4474,17 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
     let document = json!({
         "@context": ["https://www.w3.org/ns/did/v1"],
         "id": "did:plc:kotobaagent",
-        "verificationMethod": [],
+        "verificationMethod": [
+            {
+                "id": "did:plc:kotobaagent#x25519-1",
+                "type": "X25519KeyAgreementKey2020",
+                "controller": "did:plc:kotobaagent",
+                "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, [42u8; 32])
+            }
+        ],
         "authentication": [],
         "assertionMethod": [],
+        "keyAgreement": ["did:plc:kotobaagent#x25519-1"],
         "capabilityInvocation": [],
         "capabilityDelegation": [],
         "service": [
@@ -4609,12 +4617,28 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
             "missing DID-derived entity attr {attr}: {entity_body}"
         );
     }
+    for attr in ["did/keyAgreement", "https://www.w3.org/ns/did#keyAgreement"] {
+        assert!(
+            entity_datoms.iter().any(|datom| {
+                datom["a"] == attr
+                    && datom["v_edn"]
+                        .as_str()
+                        .is_some_and(|edn| edn.contains("\"did:plc:kotobaagent#x25519-1\""))
+            }),
+            "missing DID keyAgreement attr {attr}: {entity_body}"
+        );
+    }
 
     let resolved = s
         .state
         .did_resolver
         .resolve("did:plc:kotobaagent")
         .expect("published DID document should resolve from distributed DID registry");
+    assert_eq!(
+        resolved.key_agreement,
+        vec!["did:plc:kotobaagent#x25519-1".to_string()]
+    );
+    assert_eq!(resolved.x25519_public_key(), Some([42u8; 32]));
     assert_eq!(
         resolved.didcomm_endpoint(),
         Some("didcomm://mediator/kotobaagent")

@@ -19,6 +19,7 @@ pub const ATTR_DID_CONTEXT: &str = "did/context";
 pub const ATTR_DID_VERIFICATION_METHOD: &str = "did/verificationMethod";
 pub const ATTR_DID_AUTHENTICATION: &str = "did/authentication";
 pub const ATTR_DID_ASSERTION_METHOD: &str = "did/assertionMethod";
+pub const ATTR_DID_KEY_AGREEMENT: &str = "did/keyAgreement";
 pub const ATTR_DID_CAPABILITY_INVOCATION: &str = "did/capabilityInvocation";
 pub const ATTR_DID_CAPABILITY_DELEGATION: &str = "did/capabilityDelegation";
 pub const ATTR_DID_SERVICE_ID: &str = "did/service/id";
@@ -28,6 +29,7 @@ pub const ATTR_DID_CORE_ID: &str = "https://www.w3.org/ns/did#id";
 pub const ATTR_DID_CORE_VERIFICATION_METHOD: &str = "https://www.w3.org/ns/did#verificationMethod";
 pub const ATTR_DID_CORE_AUTHENTICATION: &str = "https://www.w3.org/ns/did#authentication";
 pub const ATTR_DID_CORE_ASSERTION_METHOD: &str = "https://www.w3.org/ns/did#assertionMethod";
+pub const ATTR_DID_CORE_KEY_AGREEMENT: &str = "https://www.w3.org/ns/did#keyAgreement";
 pub const ATTR_DID_CORE_CAPABILITY_INVOCATION: &str =
     "https://www.w3.org/ns/did#capabilityInvocation";
 pub const ATTR_DID_CORE_CAPABILITY_DELEGATION: &str =
@@ -51,6 +53,8 @@ pub struct DidDocument {
     pub authentication: Vec<String>,
     #[serde(rename = "assertionMethod")]
     pub assertion_method: Vec<String>,
+    #[serde(default, rename = "keyAgreement")]
+    pub key_agreement: Vec<String>,
     #[serde(rename = "capabilityInvocation")]
     pub capability_invocation: Vec<String>,
     #[serde(rename = "capabilityDelegation")]
@@ -92,6 +96,7 @@ impl DidDocument {
             verification_method: vec![],
             authentication: vec![],
             assertion_method: vec![],
+            key_agreement: vec![],
             capability_invocation: vec![],
             capability_delegation: vec![],
             service: vec![],
@@ -155,9 +160,14 @@ impl DidDocument {
     /// if the multibase-encoded key cannot be decoded to exactly 32 bytes.
     pub fn x25519_public_key(&self) -> Option<[u8; 32]> {
         let vm = self
-            .verification_method
+            .key_agreement
             .iter()
-            .find(|vm| vm.key_type == X25519_KEY_TYPE)?;
+            .find_map(|key_id| self.verification_method.iter().find(|vm| vm.id == *key_id))
+            .or_else(|| {
+                self.verification_method
+                    .iter()
+                    .find(|vm| vm.key_type == X25519_KEY_TYPE)
+            })?;
 
         let (_base, raw) = multibase::decode(&vm.public_key_multibase).ok()?;
         if raw.len() != 32 {
@@ -299,6 +309,18 @@ impl DidDocument {
             ),
             did_datom(
                 &e,
+                ATTR_DID_KEY_AGREEMENT,
+                string_vec(&self.key_agreement),
+                &tx,
+            ),
+            did_datom(
+                &e,
+                ATTR_DID_CORE_KEY_AGREEMENT,
+                string_vec(&self.key_agreement),
+                &tx,
+            ),
+            did_datom(
+                &e,
                 ATTR_DID_CAPABILITY_INVOCATION,
                 string_vec(&self.capability_invocation),
                 &tx,
@@ -410,6 +432,9 @@ impl DidDocument {
                 }
                 ATTR_DID_ASSERTION_METHOD | ATTR_DID_CORE_ASSERTION_METHOD => {
                     doc.assertion_method = string_list(&datom.v)
+                }
+                ATTR_DID_KEY_AGREEMENT | ATTR_DID_CORE_KEY_AGREEMENT => {
+                    doc.key_agreement = string_list(&datom.v)
                 }
                 ATTR_DID_CAPABILITY_INVOCATION | ATTR_DID_CORE_CAPABILITY_INVOCATION => {
                     doc.capability_invocation = string_list(&datom.v)
@@ -573,6 +598,7 @@ mod tests {
             verification_method: vec![],
             authentication: vec![],
             assertion_method: vec![],
+            key_agreement: vec![],
             capability_invocation: vec![],
             capability_delegation: vec![],
             service: vec![],
@@ -788,6 +814,11 @@ mod tests {
                 && datom.v == kotoba_datomic::Value::string("did:key:zDatomServices#didcomm")
         }));
         assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_CORE_KEY_AGREEMENT
+                && datom.v == kotoba_datomic::Value::vector(Vec::<kotoba_datomic::Value>::new())
+        }));
+        assert!(datoms.iter().any(|datom| {
             datom.a == ATTR_DID_SERVICE_ENDPOINT
                 && datom.v
                     == kotoba_datomic::Value::vector([
@@ -814,8 +845,16 @@ mod tests {
             controller: "did:key:zDatomRoundtrip".to_string(),
             public_key_multibase: multibase::encode(multibase::Base::Base58Btc, [7u8; 32]),
         });
+        doc.verification_method.push(VerificationMethod {
+            id: "did:key:zDatomRoundtrip#x25519-1".to_string(),
+            key_type: X25519_KEY_TYPE.to_string(),
+            controller: "did:key:zDatomRoundtrip".to_string(),
+            public_key_multibase: multibase::encode(multibase::Base::Base58Btc, [8u8; 32]),
+        });
         doc.authentication
             .push("did:key:zDatomRoundtrip#key-1".to_string());
+        doc.key_agreement
+            .push("did:key:zDatomRoundtrip#x25519-1".to_string());
         doc.capability_invocation
             .push("did:key:zDatomRoundtrip#key-1".to_string());
         doc.push_single_service(
@@ -841,6 +880,7 @@ mod tests {
 
         assert_eq!(restored.id, doc.id);
         assert_eq!(restored.authentication, doc.authentication);
+        assert_eq!(restored.key_agreement, doc.key_agreement);
         assert_eq!(restored.capability_invocation, doc.capability_invocation);
         assert_eq!(
             restored.verification_method[0].public_key_multibase,
@@ -913,6 +953,29 @@ mod tests {
         });
         let extracted = doc.ed25519_public_key().unwrap();
         assert_eq!(extracted, raw_key);
+    }
+
+    #[test]
+    fn x25519_public_key_prefers_w3c_key_agreement_relationship() {
+        let first_key = [0xABu8; 32];
+        let agreed_key = [0xCDu8; 32];
+        let mut doc = base_doc("did:key:zX25519Agreement");
+        doc.verification_method.push(VerificationMethod {
+            id: "did:key:zX25519Agreement#unreferenced-x25519".to_string(),
+            key_type: X25519_KEY_TYPE.to_string(),
+            controller: "did:key:zX25519Agreement".to_string(),
+            public_key_multibase: multibase::encode(multibase::Base::Base58Btc, first_key),
+        });
+        doc.verification_method.push(VerificationMethod {
+            id: "did:key:zX25519Agreement#agreement-x25519".to_string(),
+            key_type: X25519_KEY_TYPE.to_string(),
+            controller: "did:key:zX25519Agreement".to_string(),
+            public_key_multibase: multibase::encode(multibase::Base::Base58Btc, agreed_key),
+        });
+        doc.key_agreement
+            .push("did:key:zX25519Agreement#agreement-x25519".to_string());
+
+        assert_eq!(doc.x25519_public_key().unwrap(), agreed_key);
     }
 
     // ── JSON roundtrip ────────────────────────────────────────────────────────

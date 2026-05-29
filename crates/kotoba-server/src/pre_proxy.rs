@@ -89,17 +89,19 @@ mod tests {
 
     fn make_doc_with_x25519(did: &str, key: [u8; 32]) -> DidDocument {
         let encoded = multibase::encode(multibase::Base::Base58Btc, &key);
+        let key_id = format!("{did}#key-x25519-1");
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".into()],
             id: did.to_owned(),
             verification_method: vec![VerificationMethod {
-                id: format!("{did}#key-x25519-1"),
+                id: key_id.clone(),
                 key_type: "X25519KeyAgreementKey2020".into(),
                 controller: did.to_owned(),
                 public_key_multibase: encoded,
             }],
             authentication: vec![],
             assertion_method: vec![],
+            key_agreement: vec![key_id],
             capability_invocation: vec![],
             capability_delegation: vec![],
             service: vec![ServiceEndpoint {

@@ -567,6 +567,7 @@ mod tests {
             verification_method: vec![],
             authentication: vec![],
             assertion_method: vec![],
+            key_agreement: vec![],
             capability_invocation: vec![],
             capability_delegation: vec![],
             service: vec![
