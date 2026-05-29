@@ -351,7 +351,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
             "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
-                "tx_edn": r#"[{:db/id "alice" :person/name "Alice" :person/age 30 :person/role :admin :person/friend "bob" :atproto/uri "at://did:plc:alice/app.bsky.feed.post/r1"}
+                "tx_edn": r#"[{:db/id "alice" :person/name "Alice" :person/age 30 :person/role :admin :person/friend "bob" :person/bio "Kotoba stores W3C credentials as Datoms. Kotoba queries run on IPLD." :atproto/uri "at://did:plc:alice/app.bsky.feed.post/r1"}
                               {:db/id "vc1" :credential/claims {:claim/type "VerifiableCredential" :claim/status "active" :claim/verified true :claim/score 42 :claim/tags [:vc :ipld] :claim/subject {:subject/id "did:example:alice" :subject/roles [:issuer :holder]}}}]"#
             }),
             &tok,
@@ -505,6 +505,29 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"][0][0], "\"Alice\"", "{q_body}");
     assert_eq!(q_body["basis_t"], tx_body["tx_cid"], "{q_body}");
+
+    let (status, fulltext_body) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            json!({
+                "graph": graph,
+                "query_edn": r#"{:find [?name ?score]
+                                 :where [[(fulltext $ :person/bio "KOTOBA") [[?e ?bio ?tx ?score]]]
+                                         [?e :person/name ?name]]}"#
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{fulltext_body}");
+    assert_eq!(
+        fulltext_body["rows_edn"],
+        json!([["\"Alice\"", "2"]]),
+        "{fulltext_body}"
+    );
+    assert_eq!(
+        fulltext_body["basis_t"], tx_body["tx_cid"],
+        "{fulltext_body}"
+    );
 
     let (status, predicate_body) = s
         .post_auth(
@@ -1458,6 +1481,15 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
         }),
         "{keys_body}"
     );
+    let key_json_rows = keys_body["rows_map_json"]
+        .as_array()
+        .expect("rows_map_json");
+    assert!(
+        key_json_rows
+            .iter()
+            .any(|row| row[":name"] == "\"Alice\"" && row[":role"] == ":admin"),
+        "{keys_body}"
+    );
 
     let (status, strs_body) = s
         .post_auth(
@@ -1481,6 +1513,15 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
         }),
         "{strs_body}"
     );
+    let str_json_rows = strs_body["rows_map_json"]
+        .as_array()
+        .expect("rows_map_json");
+    assert!(
+        str_json_rows
+            .iter()
+            .any(|row| row["name"] == "\"Alice\"" && row["role"] == ":admin"),
+        "{strs_body}"
+    );
 
     let (status, syms_body) = s
         .post_auth(
@@ -1502,6 +1543,15 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
             let row = row.as_str().unwrap_or_default();
             row.contains("name \"Alice\"") && row.contains("role :admin")
         }),
+        "{syms_body}"
+    );
+    let sym_json_rows = syms_body["rows_map_json"]
+        .as_array()
+        .expect("rows_map_json");
+    assert!(
+        sym_json_rows
+            .iter()
+            .any(|row| row["name"] == "\"Alice\"" && row["role"] == ":admin"),
         "{syms_body}"
     );
 

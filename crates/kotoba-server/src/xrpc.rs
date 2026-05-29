@@ -493,6 +493,8 @@ pub struct DatomicQResp {
     pub rows_edn: Vec<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_map_edn: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_map_json: Option<Vec<std::collections::BTreeMap<String, String>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3969,7 +3971,7 @@ pub async fn datomic_q(
         req.since.as_deref(),
         req.history,
     )? {
-        let rows_map_edn = datomic_q_rows_map_edn(&query, &rows)?;
+        let rows_map = datomic_q_rows_map(&query, &rows)?;
         return Ok((
             StatusCode::OK,
             Json(DatomicQResp {
@@ -3979,7 +3981,8 @@ pub async fn datomic_q(
                     .into_iter()
                     .map(|row| row.into_iter().map(|v| kotoba_edn::to_string(&v)).collect())
                     .collect(),
-                rows_map_edn,
+                rows_map_edn: rows_map.as_ref().map(|rows| rows.edn.clone()),
+                rows_map_json: rows_map.map(|rows| rows.json),
             }),
         ));
     }
@@ -3994,7 +3997,7 @@ pub async fn datomic_q(
         kotoba_datomic::q(query.clone(), &db, &inputs)
     }
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic q: {e}")))?;
-    let rows_map_edn = datomic_q_rows_map_edn(&query, &rows)?;
+    let rows_map = datomic_q_rows_map(&query, &rows)?;
 
     Ok((
         StatusCode::OK,
@@ -4005,7 +4008,8 @@ pub async fn datomic_q(
                 .into_iter()
                 .map(|row| row.into_iter().map(|v| kotoba_edn::to_string(&v)).collect())
                 .collect(),
-            rows_map_edn,
+            rows_map_edn: rows_map.as_ref().map(|rows| rows.edn.clone()),
+            rows_map_json: rows_map.map(|rows| rows.json),
         }),
     ))
 }
@@ -4017,14 +4021,20 @@ enum DatomicQMapKeyStyle {
     Symbol,
 }
 
-fn datomic_q_rows_map_edn(
+struct DatomicQRowsMap {
+    edn: Vec<String>,
+    json: Vec<std::collections::BTreeMap<String, String>>,
+}
+
+fn datomic_q_rows_map(
     query: &kotoba_edn::EdnValue,
     rows: &[Vec<kotoba_edn::EdnValue>],
-) -> Result<Option<Vec<String>>, (StatusCode, String)> {
+) -> Result<Option<DatomicQRowsMap>, (StatusCode, String)> {
     let Some((style, keys)) = datomic_q_map_keys(query)? else {
         return Ok(None);
     };
-    let mut out = Vec::with_capacity(rows.len());
+    let mut edn_rows = Vec::with_capacity(rows.len());
+    let mut json_rows = Vec::with_capacity(rows.len());
     for row in rows {
         if row.len() != keys.len() {
             return Err((
@@ -4036,15 +4046,29 @@ fn datomic_q_rows_map_edn(
                 ),
             ));
         }
-        let map = keys
+        let edn_map = keys
             .iter()
             .cloned()
             .zip(row.iter().cloned())
             .map(|(key, value)| (datomic_q_map_key(style, &key), value))
             .collect::<std::collections::BTreeMap<_, _>>();
-        out.push(kotoba_edn::to_string(&kotoba_edn::EdnValue::Map(map)));
+        let json_map = keys
+            .iter()
+            .zip(row.iter())
+            .map(|(key, value)| {
+                (
+                    datomic_q_json_map_key(style, key),
+                    kotoba_edn::to_string(value),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        edn_rows.push(kotoba_edn::to_string(&kotoba_edn::EdnValue::Map(edn_map)));
+        json_rows.push(json_map);
     }
-    Ok(Some(out))
+    Ok(Some(DatomicQRowsMap {
+        edn: edn_rows,
+        json: json_rows,
+    }))
 }
 
 fn datomic_q_map_keys(
@@ -4100,6 +4124,13 @@ fn datomic_q_map_key(style: DatomicQMapKeyStyle, key: &str) -> kotoba_edn::EdnVa
         }
         DatomicQMapKeyStyle::String => kotoba_edn::EdnValue::String(key.to_string()),
         DatomicQMapKeyStyle::Symbol => kotoba_edn::EdnValue::Symbol(kotoba_edn::Symbol::parse(key)),
+    }
+}
+
+fn datomic_q_json_map_key(style: DatomicQMapKeyStyle, key: &str) -> String {
+    match style {
+        DatomicQMapKeyStyle::Keyword => format!(":{key}"),
+        DatomicQMapKeyStyle::String | DatomicQMapKeyStyle::Symbol => key.to_string(),
     }
 }
 
@@ -7252,8 +7283,39 @@ mod tests {
                 "presentation",
             ],
         );
-        for src in [
+        assert_lexicon_description_mentions(
+            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+            &[
+                "fulltext",
+                "history",
+                "pull",
+                "rules",
+                "aggregates",
+                "rows_map_json",
+                "Verifiable Presentation",
+            ],
+        );
+        assert_lexicon_output_fields(
+            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+            &["graph", "rows_edn"],
+            &["basis_t", "rows_map_edn", "rows_map_json"],
+        );
+        assert_lexicon_array_items_schema(
+            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+            "rows_map_json",
+            "object",
+        );
+        assert_lexicon_output_fields(
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/datoms.json"),
+            &["graph", "index", "datom_count", "datoms"],
+            &["basis_t"],
+        );
+        assert_lexicon_array_item_fields(
+            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/datoms.json"),
+            "datoms",
+            &["e", "a", "v_edn", "t", "added"],
+        );
+        for src in [
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/seekDatoms.json"),
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexRange.json"),
             include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/history.json"),
@@ -7290,6 +7352,89 @@ mod tests {
                 property_values.contains_key(*field),
                 "{} missing input property {field}",
                 value["id"]
+            );
+        }
+    }
+
+    fn assert_lexicon_array_item_fields(src: &str, field: &str, required: &[&str]) {
+        let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
+        let item = &value["defs"]["main"]["output"]["schema"]["properties"][field]["items"];
+        assert_eq!(
+            item["type"], "object",
+            "{} output {field} items must be object",
+            value["id"]
+        );
+        let required_values = item["required"].as_array().expect("required array");
+        for field in required {
+            assert!(
+                required_values
+                    .iter()
+                    .any(|value| value.as_str() == Some(field)),
+                "{} output array item missing required field {field}",
+                value["id"]
+            );
+            assert!(
+                item["properties"]
+                    .as_object()
+                    .is_some_and(|props| props.contains_key(*field)),
+                "{} output array item missing property {field}",
+                value["id"]
+            );
+        }
+    }
+
+    fn assert_lexicon_array_items_schema(src: &str, field: &str, item_type: &str) {
+        let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
+        let property = &value["defs"]["main"]["output"]["schema"]["properties"][field];
+        assert_eq!(
+            property["type"], "array",
+            "{} output {field} must be array",
+            value["id"]
+        );
+        assert_eq!(
+            property["items"]["type"], item_type,
+            "{} output {field} items must be {item_type}",
+            value["id"]
+        );
+    }
+
+    fn assert_lexicon_output_fields(src: &str, required: &[&str], properties: &[&str]) {
+        let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
+        let schema = &value["defs"]["main"]["output"]["schema"];
+        assert_eq!(
+            schema["type"], "object",
+            "{} output must be object",
+            value["id"]
+        );
+        let required_values = schema["required"].as_array().expect("required array");
+        for field in required {
+            assert!(
+                required_values
+                    .iter()
+                    .any(|value| value.as_str() == Some(field)),
+                "{} missing required output field {field}",
+                value["id"]
+            );
+        }
+        let property_values = schema["properties"].as_object().expect("properties object");
+        for field in required.iter().chain(properties.iter()) {
+            assert!(
+                property_values.contains_key(*field),
+                "{} missing output property {field}",
+                value["id"]
+            );
+        }
+    }
+
+    fn assert_lexicon_description_mentions(src: &str, needles: &[&str]) {
+        let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
+        let description = value["defs"]["main"]["description"]
+            .as_str()
+            .expect("lexicon description");
+        for needle in needles {
+            assert!(
+                description.contains(needle),
+                "lexicon description must mention {needle}: {description}"
             );
         }
     }

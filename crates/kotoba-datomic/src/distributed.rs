@@ -1095,6 +1095,15 @@ where
         let args = &expr[1..];
         let mut out = Vec::new();
         for binding in bindings {
+            if op == "fulltext" {
+                for value in self.eval_fulltext_function(head, args, &binding)? {
+                    let mut next = binding.clone();
+                    if bind_relation_or_function_target(target, value, &mut next)? {
+                        out.push(next);
+                    }
+                }
+                continue;
+            }
             let value = self.eval_query_function(head, &op, args, &binding)?;
             let mut next = binding;
             if bind_function_target(target, value, &mut next)? {
@@ -1368,6 +1377,48 @@ where
             }
             other => Err(DatomicError::UnsupportedOperation(other.into()).into()),
         }
+    }
+
+    fn eval_fulltext_function(
+        &self,
+        head: &KotobaCid,
+        args: &[Value],
+        binding: &BTreeMap<String, Value>,
+    ) -> Result<Vec<Value>, DistributedCommitError> {
+        if args.len() != 3 || !crate::is_query_source_symbol(&args[0]) {
+            return Err(
+                DatomicError::Query("fulltext expects ($ attr search-string)".into()).into(),
+            );
+        }
+        let attr = attr_string(&args[1]).ok_or(DatomicError::AttributeMustBeKeyword)?;
+        let search = required_query_value(&args[2], binding)?;
+        let needle = search.as_string().ok_or_else(|| {
+            DatomicError::Query(format!(
+                "fulltext search term must be a string, got {}",
+                kotoba_edn::to_string(&search)
+            ))
+        })?;
+        let needle = needle.to_ascii_lowercase();
+        if needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = BTreeSet::new();
+        for datom in self.current_for_attribute(head, &attr)? {
+            let Some(haystack) = datom.v.as_string() else {
+                continue;
+            };
+            let haystack = haystack.to_ascii_lowercase();
+            let score = haystack.matches(&needle).count() as i64;
+            if score > 0 {
+                rows.insert(Value::Vector(vec![
+                    cid_value(&datom.e),
+                    datom.v,
+                    cid_value(&datom.t),
+                    Value::Integer(score),
+                ]));
+            }
+        }
+        Ok(rows.into_iter().collect())
     }
 
     fn db_value_from_head(
@@ -2185,6 +2236,48 @@ fn bind_function_target(
     }
     *binding = next;
     Ok(true)
+}
+
+fn bind_relation_or_function_target(
+    target: &Value,
+    value: Value,
+    binding: &mut BTreeMap<String, Value>,
+) -> Result<bool, DistributedCommitError> {
+    if let Some(targets) = relation_binding_targets(target) {
+        let values = value.as_seq().ok_or_else(|| {
+            DatomicError::Query(format!(
+                "relation binding target requires tuple value, got {}",
+                kotoba_edn::to_string(&value)
+            ))
+        })?;
+        if targets.len() != values.len() {
+            return Err(DatomicError::Query(format!(
+                "relation binding target width {} does not match value width {}",
+                targets.len(),
+                values.len()
+            ))
+            .into());
+        }
+        let mut next = binding.clone();
+        for (target, value) in targets.iter().zip(values.iter()) {
+            if !bind_term(target, value.clone(), &mut next) {
+                return Ok(false);
+            }
+        }
+        *binding = next;
+        Ok(true)
+    } else {
+        bind_function_target(target, value, binding)
+    }
+}
+
+fn relation_binding_targets(target: &Value) -> Option<&[Value]> {
+    let outer = target.as_seq()?;
+    if outer.len() == 1 {
+        outer[0].as_seq()
+    } else {
+        None
+    }
 }
 
 fn lookup_ref_parts(term: &Value, binding: &BTreeMap<String, Value>) -> Option<(String, Value)> {
@@ -5173,5 +5266,75 @@ mod tests {
             .q_triples(&report.commit.cid, &scalar_query)
             .unwrap();
         assert_eq!(rows, vec![vec![EdnValue::String("Alice".into())]]);
+    }
+
+    #[test]
+    fn reader_supports_datomic_fulltext_relation_binding_from_distributed_head() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"graph");
+        let tx = KotobaCid::from_bytes(b"tx1");
+        let report = writer
+            .commit_datoms(request(
+                "k51-kotoba-db",
+                graph,
+                vec![
+                    Datom::assert(
+                        KotobaCid::from_bytes(b"alice"),
+                        ":person/name".into(),
+                        EdnValue::String("Alice".into()),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        KotobaCid::from_bytes(b"alice"),
+                        ":person/bio".into(),
+                        EdnValue::String("Kotoba stores W3C credentials as Datoms.".into()),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        KotobaCid::from_bytes(b"bob"),
+                        ":person/name".into(),
+                        EdnValue::String("Bob".into()),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        KotobaCid::from_bytes(b"bob"),
+                        ":person/bio".into(),
+                        EdnValue::String("kotoba kotoba distributed query".into()),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        KotobaCid::from_bytes(b"carol"),
+                        ":person/name".into(),
+                        EdnValue::String("Carol".into()),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        KotobaCid::from_bytes(b"carol"),
+                        ":person/bio".into(),
+                        EdnValue::String("unrelated text".into()),
+                        tx,
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        let query = kotoba_edn::parse(
+            r#"{:find [?name ?score]
+                :where [[(fulltext $ :person/bio "KOTOBA") [[?e ?bio ?tx ?score]]]
+                        [?e :person/name ?name]]}"#,
+        )
+        .unwrap();
+        let rows = DistributedDatomReader::new(&store, &ipns)
+            .q_triples(&report.commit.cid, &query)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![EdnValue::String("Alice".into()), EdnValue::Integer(1)],
+                vec![EdnValue::String("Bob".into()), EdnValue::Integer(2)],
+            ]
+        );
     }
 }

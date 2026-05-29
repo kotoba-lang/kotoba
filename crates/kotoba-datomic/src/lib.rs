@@ -4156,6 +4156,15 @@ fn eval_function_binding(
     let args = &expr[1..];
     let mut out = Vec::new();
     for binding in bindings {
+        if op == "fulltext" {
+            for value in eval_fulltext_function(args, db, &binding)? {
+                let mut next = binding.clone();
+                if bind_relation_or_function_target(target, value, &mut next)? {
+                    out.push(next);
+                }
+            }
+            continue;
+        }
         let value = eval_query_function(&op, args, db, &binding)?;
         let mut next = binding;
         if bind_function_target(target, value, &mut next)? {
@@ -4416,6 +4425,50 @@ fn eval_query_function(
     }
 }
 
+fn eval_fulltext_function(
+    args: &[EdnValue],
+    db: &Db,
+    binding: &BTreeMap<String, EdnValue>,
+) -> Result<Vec<EdnValue>> {
+    if args.len() != 3 || !is_query_source_symbol(&args[0]) {
+        return Err(DatomicError::Query(
+            "fulltext expects ($ attr search-string)".into(),
+        ));
+    }
+    let attr = attr_to_string(&args[1])?;
+    let search = resolve_query_value(&args[2], binding)?;
+    let needle = search.as_string().ok_or_else(|| {
+        DatomicError::Query(format!(
+            "fulltext search term must be a string, got {}",
+            edn_to_string(&search)
+        ))
+    })?;
+    let needle = needle.to_ascii_lowercase();
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows = BTreeSet::new();
+    for datom in db.datoms() {
+        if datom.a != attr {
+            continue;
+        }
+        let Some(haystack) = datom.v.as_string() else {
+            continue;
+        };
+        let haystack = haystack.to_ascii_lowercase();
+        let score = haystack.matches(&needle).count() as i64;
+        if score > 0 {
+            rows.insert(EdnValue::Vector(vec![
+                cid_value(&datom.e),
+                datom.v,
+                cid_value(&datom.t),
+                EdnValue::Integer(score),
+            ]));
+        }
+    }
+    Ok(rows.into_iter().collect())
+}
+
 fn bind_function_target(
     target: &EdnValue,
     value: EdnValue,
@@ -4445,6 +4498,47 @@ fn bind_function_target(
     }
     *binding = next;
     Ok(true)
+}
+
+fn bind_relation_or_function_target(
+    target: &EdnValue,
+    value: EdnValue,
+    binding: &mut BTreeMap<String, EdnValue>,
+) -> Result<bool> {
+    if let Some(targets) = relation_binding_targets(target) {
+        let values = value.as_seq().ok_or_else(|| {
+            DatomicError::Query(format!(
+                "relation binding target requires tuple value, got {}",
+                edn_to_string(&value)
+            ))
+        })?;
+        if targets.len() != values.len() {
+            return Err(DatomicError::Query(format!(
+                "relation binding target width {} does not match value width {}",
+                targets.len(),
+                values.len()
+            )));
+        }
+        let mut next = binding.clone();
+        for (target, value) in targets.iter().zip(values.iter()) {
+            if !bind_term(target, value.clone(), &mut next)? {
+                return Ok(false);
+            }
+        }
+        *binding = next;
+        Ok(true)
+    } else {
+        bind_function_target(target, value, binding)
+    }
+}
+
+fn relation_binding_targets(target: &EdnValue) -> Option<&[EdnValue]> {
+    let outer = target.as_seq()?;
+    if outer.len() == 1 {
+        outer[0].as_seq()
+    } else {
+        None
+    }
 }
 
 fn db_value(db: &Db, eid: &KotobaCid, attr: &str) -> Option<EdnValue> {
@@ -6190,6 +6284,44 @@ mod tests {
         .unwrap();
         let rows = q(scalar_query, &conn.db(), &[]).unwrap();
         assert_eq!(rows, vec![vec![EdnValue::String("Alice".into())]]);
+    }
+
+    #[tokio::test]
+    async fn q_supports_datomic_fulltext_relation_binding() {
+        let conn = Connection::new();
+        conn.transact(
+            parse(
+                r#"[
+                  {:db/id "alice"
+                   :person/name "Alice"
+                   :person/bio "Kotoba stores W3C credentials as Datoms."}
+                  {:db/id "bob"
+                   :person/name "Bob"
+                   :person/bio "kotoba kotoba distributed query"}
+                  {:db/id "carol"
+                   :person/name "Carol"
+                   :person/bio "unrelated text"}
+                ]"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let query = parse(
+            r#"{:find [?name ?score]
+                :where [[(fulltext $ :person/bio "KOTOBA") [[?e ?bio ?tx ?score]]]
+                        [?e :person/name ?name]]}"#,
+        )
+        .unwrap();
+        let rows = q(query, &conn.db(), &[]).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![EdnValue::String("Alice".into()), EdnValue::Integer(1)],
+                vec![EdnValue::String("Bob".into()), EdnValue::Integer(2)],
+            ]
+        );
     }
 
     #[tokio::test]
