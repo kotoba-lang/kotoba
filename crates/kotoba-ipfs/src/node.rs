@@ -6,7 +6,7 @@
 
 use crate::cid::{
     cid_for_bytes, dag_cbor_block, decode_dag_pb_node, decode_unixfs_file_data, raw_cid,
-    unixfs_file_block,
+    unixfs_chunked_file_blocks, unixfs_file_block,
 };
 use crate::ipns::{IpnsName, IpnsRecord};
 use anyhow::{anyhow, bail, Context, Result};
@@ -485,6 +485,16 @@ impl KotobaIpfsNode {
         let (cid, block) = unixfs_file_block(data);
         self.put_block(&cid, &block).await?;
         Ok(cid)
+    }
+
+    /// Kubo-compatible chunked `add` using CIDv1/raw leaves and a dag-pb UnixFS root.
+    pub async fn add_unixfs_file_chunked(&self, data: &[u8], chunk_size: usize) -> Result<IpldCid> {
+        let (root, root_block, leaves) = unixfs_chunked_file_blocks(data, chunk_size)?;
+        for (cid, block) in leaves {
+            self.put_block(&cid, &block).await?;
+        }
+        self.put_block(&root, &root_block).await?;
+        Ok(root)
     }
 
     /// Store bytes with an explicit multicodec (CIDv1/{codec}/sha2-256).

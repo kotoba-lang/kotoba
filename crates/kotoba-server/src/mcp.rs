@@ -49,7 +49,7 @@ use axum::{
 };
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::{delta::Delta, quad::LegacyQuad};
+use kotoba_kqe::{delta::Delta, quad::LegacyQuad, quad::LegacyQuadObject};
 use kotoba_kse::journal::Journal;
 use kotoba_store::MemoryBlockStore;
 use serde::{Deserialize, Serialize};
@@ -489,6 +489,20 @@ async fn distributed_query_store(
     let query_store = QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
     query_store.assert_batch_silent(quads).await;
     Ok(query_store)
+}
+
+fn text_from_quads(quads: &[LegacyQuad], subject: &KotobaCid, predicate: &str) -> String {
+    quads
+        .iter()
+        .find_map(|quad| {
+            if &quad.subject == subject && quad.predicate == predicate {
+                if let LegacyQuadObject::Text(text) = &quad.object {
+                    return Some(text.clone());
+                }
+            }
+            None
+        })
+        .unwrap_or_default()
 }
 
 // ── Dispatch to state methods ────────────────────────────────────────────────
@@ -961,7 +975,6 @@ async fn call_tool(
         // ── kotoba_email_list ────────────────────────────────────────────────
         MCP_TOOL_EMAIL_LIST => {
             use kotoba_ingest::graph_cid_for;
-            use kotoba_kqe::Value as KqeValue;
 
             let owner_did = get_str("owner_did")?;
             crate::graph_auth::validate_did(&owner_did, "owner_did", 512)
@@ -974,51 +987,29 @@ async fn call_tool(
             let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
             let graph_cid = graph_cid_for(&owner_did);
-            let arrangement = match state.quad_store.arrangement(&graph_cid).await {
-                None => return Ok(json!({ "emails": [], "total": 0 })),
-                Some(a) => a,
-            };
+            let quads = current_graph_quads(&state, &graph_cid).await?;
 
-            let mut entries: Vec<(String, String)> = arrangement
-                .get_by_attribute("email/date")
-                .into_iter()
-                .filter_map(|(subject_cid, values)| {
-                    let date = values.into_iter().find_map(|value| {
-                        if let KqeValue::Text(t) = value {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    })?;
-                    Some((subject_cid.to_multibase(), date))
+            let mut entries: Vec<(KotobaCid, String)> = quads
+                .iter()
+                .filter_map(|quad| {
+                    if quad.predicate != "email/date" {
+                        return None;
+                    }
+                    match &quad.object {
+                        LegacyQuadObject::Text(date) => Some((quad.subject.clone(), date.clone())),
+                        _ => None,
+                    }
                 })
                 .collect();
             entries.sort_by(|a, b| b.1.cmp(&a.1));
             let total = entries.len();
 
             let mut emails: Vec<Value> = Vec::new();
-            for (cid_mb, date) in entries.into_iter().skip(offset).take(limit) {
-                let get_text = |pred: &str| -> String {
-                    if let Some(cid) = kotoba_core::cid::KotobaCid::from_multibase(&cid_mb) {
-                        arrangement
-                            .get_values(&cid, pred)
-                            .into_iter()
-                            .find_map(|value| {
-                                if let KqeValue::Text(t) = value {
-                                    Some(t)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    }
-                };
-                let message_id = get_text("email/message_id");
-                let subject_enc = get_text("email/subject");
-                let from_enc = get_text("email/from");
-
+            for (email_cid, date) in entries.into_iter().skip(offset).take(limit) {
+                let cid_mb = email_cid.to_multibase();
+                let message_id = text_from_quads(&quads, &email_cid, "email/message_id");
+                let subject_enc = text_from_quads(&quads, &email_cid, "email/subject");
+                let from_enc = text_from_quads(&quads, &email_cid, "email/from");
                 let (subject, from) = if let Some(ref crypto) = state.crypto {
                     let s = crypto
                         .open_field(b"email/subject", &subject_enc)
@@ -1042,7 +1033,6 @@ async fn call_tool(
         // ── kotoba_email_read ────────────────────────────────────────────────
         MCP_TOOL_EMAIL_READ => {
             use kotoba_ingest::graph_cid_for;
-            use kotoba_kqe::Value as KqeValue;
 
             let email_cid_str = get_str("email_cid")?;
             let owner_did = get_str("owner_did")?;
@@ -1055,31 +1045,16 @@ async fn call_tool(
                 .ok_or_else(|| (ERR_INTERNAL, "crypto not initialised".to_string()))?;
 
             let graph_cid = graph_cid_for(&owner_did);
-            let arrangement = state
-                .quad_store
-                .arrangement(&graph_cid)
-                .await
-                .ok_or_else(|| (ERR_NOT_FOUND, "no emails found for owner_did".to_string()))?;
+            let quads = current_graph_quads(&state, &graph_cid).await?;
+            if quads.is_empty() {
+                return Err((ERR_NOT_FOUND, "no emails found for owner_did".to_string()));
+            }
 
             let email_cid = kotoba_core::cid::KotobaCid::from_multibase(&email_cid_str)
                 .ok_or_else(|| (ERR_INTERNAL, "invalid email_cid multibase".to_string()))?;
 
-            let get_text = |pred: &str| -> String {
-                arrangement
-                    .get_values(&email_cid, pred)
-                    .into_iter()
-                    .find_map(|value| {
-                        if let KqeValue::Text(t) = value {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
-            };
-
             // body_cid → Vault decrypt via AgentCrypto
-            let body_cid_str = get_text("email/body_cid");
+            let body_cid_str = text_from_quads(&quads, &email_cid, "email/body_cid");
             if body_cid_str.is_empty() {
                 return Err((ERR_NOT_FOUND, "email/body_cid not found".to_string()));
             }
@@ -1109,16 +1084,15 @@ async fn call_tool(
 
             Ok(json!({
                 "email_cid":  email_cid_str,
-                "message_id": get_text("email/message_id"),
-                "from":       open_f(b"email/from",    get_text("email/from")).await,
-                "to":         open_f(b"email/to",      get_text("email/to")).await,
-                "subject":    open_f(b"email/subject", get_text("email/subject")).await,
-                "date":       get_text("email/date"),
-                "thread_id":  get_text("email/thread_id"),
+                "message_id": text_from_quads(&quads, &email_cid, "email/message_id"),
+                "from":       open_f(b"email/from",    text_from_quads(&quads, &email_cid, "email/from")).await,
+                "to":         open_f(b"email/to",      text_from_quads(&quads, &email_cid, "email/to")).await,
+                "subject":    open_f(b"email/subject", text_from_quads(&quads, &email_cid, "email/subject")).await,
+                "date":       text_from_quads(&quads, &email_cid, "email/date"),
+                "thread_id":  text_from_quads(&quads, &email_cid, "email/thread_id"),
                 "body":       body,
             }))
         }
-
         // ── kotoba_wasm_run ──────────────────────────────────────────────────
         #[cfg(feature = "wasm-runtime")]
         MCP_TOOL_WASM_RUN => {
@@ -2630,6 +2604,71 @@ mod tests {
         let v = result.unwrap();
         assert_eq!(v["count"], 0);
         assert!(v["quads"].is_array());
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_reads_distributed_datomic_view() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let owner_did = "did:key:zEmailListDistributed1";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"email-list-distributed-1");
+        let tx_cid = mcp_tx_cid("email.list.test", &[owner_did]);
+        let datoms = vec![
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/date".into(),
+                KqeValue::Text("2000000000".into()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/message_id".into(),
+                KqeValue::Text("<distributed@example.test>".into()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/subject".into(),
+                KqeValue::Text("Distributed subject".into()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/from".into(),
+                KqeValue::Text("sender@example.test".into()),
+                tx_cid.clone(),
+            ),
+        ];
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        let email = &value["emails"][0];
+        assert_eq!(email["cid"], email_cid.to_multibase(), "{value}");
+        assert_eq!(email["message_id"], "<distributed@example.test>", "{value}");
+        assert_eq!(email["subject"], "Distributed subject", "{value}");
+        assert_eq!(email["from"], "sender@example.test", "{value}");
     }
 
     #[tokio::test]

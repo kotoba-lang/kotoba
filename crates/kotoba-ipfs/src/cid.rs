@@ -72,6 +72,45 @@ pub fn unixfs_file_block(data: &[u8]) -> (Cid, Vec<u8>) {
     (cid_for_bytes(CODEC_DAG_PB, &pb_node), pb_node)
 }
 
+/// Encode a Kubo-compatible chunked UnixFS file DAG using CIDv1/raw leaves.
+///
+/// Returns the dag-pb root block first, followed by `(cid, block)` pairs for
+/// every raw leaf.  This mirrors Kubo's common `ipfs add --raw-leaves
+/// --cid-version=1 --chunker=size-N` shape closely enough for public IPFS
+/// tooling to traverse and `cat` the produced DAG.
+pub fn unixfs_chunked_file_blocks(
+    data: &[u8],
+    chunk_size: usize,
+) -> Result<(Cid, Vec<u8>, Vec<(Cid, Vec<u8>)>), CidError> {
+    if chunk_size == 0 {
+        return Err(CidError::Unixfs(
+            "chunk size must be greater than zero".into(),
+        ));
+    }
+    let leaves: Vec<(Cid, Vec<u8>)> = data
+        .chunks(chunk_size)
+        .map(|chunk| (raw_cid(chunk), chunk.to_vec()))
+        .collect();
+
+    let mut unixfs = Vec::new();
+    write_varint_field(&mut unixfs, 1, 2);
+    write_varint_field(&mut unixfs, 3, data.len() as u64);
+    for (_, block) in &leaves {
+        write_varint_field(&mut unixfs, 4, block.len() as u64);
+    }
+
+    let mut pb_node = Vec::new();
+    write_bytes_field(&mut pb_node, 1, &unixfs);
+    for (cid, block) in &leaves {
+        let mut link = Vec::new();
+        write_bytes_field(&mut link, 1, &cid.to_bytes());
+        write_varint_field(&mut link, 3, block.len() as u64);
+        write_bytes_field(&mut pb_node, 2, &link);
+    }
+
+    Ok((cid_for_bytes(CODEC_DAG_PB, &pb_node), pb_node, leaves))
+}
+
 /// Decode the single-file UnixFS dag-pb block shape produced by
 /// [`unixfs_file_block`].
 pub fn decode_unixfs_file_block(block: &[u8]) -> Result<Vec<u8>, CidError> {
@@ -285,6 +324,29 @@ mod tests {
         );
         assert_eq!(decode_unixfs_file_block(&block).unwrap(), b"hello");
         assert_eq!(cid, cid_for_bytes(CODEC_DAG_PB, &block));
+    }
+
+    #[test]
+    fn unixfs_chunked_file_blocks_use_raw_leaves_and_dag_pb_root() {
+        let data = b"abcdefghijklmnopqrstuvwxyz";
+        let (root, root_block, leaves) = unixfs_chunked_file_blocks(data, 5).unwrap();
+        assert_eq!(root.codec(), CODEC_DAG_PB);
+        assert_eq!(root, cid_for_bytes(CODEC_DAG_PB, &root_block));
+        assert_eq!(leaves.len(), 6);
+        assert!(leaves
+            .iter()
+            .all(|(cid, block)| { cid.codec() == CODEC_RAW && *cid == raw_cid(block) }));
+
+        let root_node = decode_dag_pb_node(&root_block).unwrap();
+        assert_eq!(root_node.links.len(), leaves.len());
+        assert_eq!(
+            root_node
+                .links
+                .iter()
+                .map(|link| link.cid)
+                .collect::<Vec<_>>(),
+            leaves.iter().map(|(cid, _)| *cid).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -245,6 +245,24 @@ async fn kubo_compatible_local_api_surface() {
         node.cat(&unixfs).await.expect("cat unixfs file"),
         b"hello"[..]
     );
+    let chunked = node
+        .add_unixfs_file_chunked(b"abcdefghijklmnopqrstuvwxyz", 5)
+        .await
+        .expect("add chunked unixfs file");
+    assert_eq!(chunked.codec(), CODEC_DAG_PB);
+    let chunked_refs = node.refs(&chunked, false).await.expect("refs chunked file");
+    assert_eq!(chunked_refs.len(), 6);
+    assert!(chunked_refs.iter().all(|cid| cid.codec() == CODEC_RAW));
+    assert_eq!(
+        node.cat(&chunked).await.expect("cat chunked unixfs file"),
+        b"abcdefghijklmnopqrstuvwxyz"[..]
+    );
+    assert_eq!(
+        node.cat_path(format!("/ipfs/{chunked}"))
+            .await
+            .expect("cat /ipfs chunked unixfs file"),
+        b"abcdefghijklmnopqrstuvwxyz"[..]
+    );
     assert_eq!(
         node.cat_path(format!("/ipfs/{unixfs}"))
             .await
