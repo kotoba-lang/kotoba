@@ -303,15 +303,13 @@ async fn kubo_compatible_local_api_surface() {
     .expect("dag child");
     let mut link_bytes = vec![0];
     link_bytes.extend(child.to_bytes());
-    let linked = put_cbor_value(
-        &node,
-        CborValue::Map(vec![(
-            CborValue::Text("child".into()),
-            CborValue::Tag(42, Box::new(CborValue::Bytes(link_bytes))),
-        )]),
-    )
-    .await
-    .expect("dag linked");
+    let linked_doc = CborValue::Map(vec![(
+        CborValue::Text("child".into()),
+        CborValue::Tag(42, Box::new(CborValue::Bytes(link_bytes))),
+    )]);
+    let linked = put_cbor_value(&node, linked_doc.clone())
+        .await
+        .expect("dag linked");
     assert_eq!(node.refs(&linked, false).await.expect("refs"), vec![child]);
     assert_eq!(
         node.object_links(&linked).await.expect("object/links"),
@@ -425,6 +423,8 @@ async fn kubo_compatible_local_api_surface() {
     assert!(dag_pins
         .iter()
         .any(|entry| entry.cid == leaf && entry.kind == kotoba_ipfs::PinKind::Indirect));
+    assert!(node.block_rm(&linked).await.is_err());
+    assert!(node.block_rm(&child).await.is_err());
     assert!(node
         .pin_verify()
         .await
@@ -439,6 +439,37 @@ async fn kubo_compatible_local_api_surface() {
     assert!(node.has_block(&child).await.expect("has child after gc"));
     assert!(node.has_block(&leaf).await.expect("has leaf after gc"));
     node.pin_rm(&linked).await.expect("pin/rm recursive dag");
+    assert!(node
+        .block_rm(&linked)
+        .await
+        .expect("block/rm unpinned root"));
+    assert!(!node
+        .has_block(&linked)
+        .await
+        .expect("has root after block/rm"));
+    assert_eq!(
+        put_cbor_value(&node, linked_doc.clone())
+            .await
+            .expect("re-add linked"),
+        linked
+    );
+    node.pin_add(&linked)
+        .await
+        .expect("pin/add linked for force rm");
+    assert!(node
+        .block_rm_force(&linked)
+        .await
+        .expect("block/rm force pinned root"));
+    assert!(!node
+        .is_pinned(&linked)
+        .await
+        .expect("forced root pin removed"));
+    assert_eq!(
+        put_cbor_value(&node, linked_doc.clone())
+            .await
+            .expect("re-add linked"),
+        linked
+    );
     assert_eq!(node.add(b"hello").await.expect("re-add raw"), raw);
     assert_eq!(node.dag_put(&doc).await.expect("re-add dag"), dag);
     assert_eq!(

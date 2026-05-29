@@ -795,8 +795,13 @@ impl KotobaIpfsNode {
             .collect())
     }
 
-    /// Kubo-like `block/rm`.
+    /// Remove a local block without pin protection.
     pub async fn delete_block(&self, cid: &IpldCid) -> Result<bool> {
+        self.block_rm_force(cid).await
+    }
+
+    /// Kubo-like `block/rm` with `force=true`.
+    pub async fn block_rm_force(&self, cid: &IpldCid) -> Result<bool> {
         let mut removed = self.state.blocks.write().await.remove(cid).is_some();
         self.state.pins.write().await.remove(cid);
         if let Some(path) = block_path(&self.state, cid) {
@@ -812,7 +817,10 @@ impl KotobaIpfsNode {
 
     /// Kubo-like `block/rm`.
     pub async fn block_rm(&self, cid: &IpldCid) -> Result<bool> {
-        self.delete_block(cid).await
+        if self.is_pinned_or_indirect(cid).await? {
+            bail!("cannot remove pinned block without force: {cid}");
+        }
+        self.block_rm_force(cid).await
     }
 
     /// Kubo-like local block listing.
@@ -1431,6 +1439,19 @@ impl KotobaIpfsNode {
         let mut roots = self.state.pins.read().await.clone();
         roots.extend(self.state.files.read().await.values().copied());
         roots
+    }
+
+    async fn is_pinned_or_indirect(&self, cid: &IpldCid) -> Result<bool> {
+        let pins = self.state.pins.read().await.clone();
+        if pins.contains(cid) {
+            return Ok(true);
+        }
+        for root in pins {
+            if self.refs(&root, true).await?.contains(cid) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn refs_inner(

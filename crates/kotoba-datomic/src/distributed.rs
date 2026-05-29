@@ -1996,6 +1996,24 @@ where
             &mut Vec<Datom>,
         ) -> Result<(), DistributedCommitError>,
     {
+        self.transact_with_tx_fns(req, |_| Ok(()), augment_datoms)
+            .await
+    }
+
+    pub async fn transact_with_tx_fns<F, G>(
+        &self,
+        req: DistributedTransactRequest,
+        register_tx_fns: F,
+        augment_datoms: G,
+    ) -> Result<DistributedTransactReport, DistributedCommitError>
+    where
+        F: FnOnce(&Connection) -> Result<(), DistributedCommitError>,
+        G: FnOnce(
+            &TransactReport,
+            &DistributedTransactContext,
+            &mut Vec<Datom>,
+        ) -> Result<(), DistributedCommitError>,
+    {
         let name = IpnsName::new(req.ipns_name.clone());
         let current = match self.ipns.resolve(&name) {
             Ok(record) => Some(record),
@@ -2013,9 +2031,9 @@ where
             }
             None => Db::from_datoms(vec![], None),
         };
-        let transact = Connection::from_datoms(db_before.all_datoms())
-            .transact(req.tx_data)
-            .await?;
+        let conn = Connection::from_datoms(db_before.all_datoms());
+        register_tx_fns(&conn)?;
+        let transact = conn.transact(req.tx_data).await?;
         let seq = current
             .as_ref()
             .map(|record| record.sequence + 1)
@@ -3660,6 +3678,46 @@ mod tests {
         }
     }
 
+    fn register_increment_tx_fn(conn: &Connection) -> Result<(), DistributedCommitError> {
+        conn.register_tx_fn("my.fn/increment", |db, args| {
+            if args.len() != 3 {
+                return Err(DatomicError::InvalidOpForm);
+            }
+            let entity = args[0]
+                .as_string()
+                .map(|value| {
+                    KotobaCid::from_multibase(value)
+                        .unwrap_or_else(|| KotobaCid::from_bytes(value.as_bytes()))
+                })
+                .ok_or(DatomicError::InvalidOpForm)?;
+            let attr = args[1]
+                .as_keyword()
+                .map(|keyword| format!(":{}", keyword.to_qualified()))
+                .or_else(|| args[1].as_string().map(str::to_string))
+                .ok_or(DatomicError::AttributeMustBeKeyword)?;
+            let EdnValue::Integer(amount) = args[2] else {
+                return Err(DatomicError::InvalidOpForm);
+            };
+            let current = db
+                .datoms()
+                .into_iter()
+                .find(|datom| datom.e == entity && datom.a == attr)
+                .and_then(|datom| match datom.v {
+                    EdnValue::Integer(value) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or(0);
+
+            Ok(EdnValue::Vector(vec![EdnValue::Vector(vec![
+                EdnValue::Keyword(Keyword::parse("db/add")),
+                args[0].clone(),
+                args[1].clone(),
+                EdnValue::Integer(current + amount),
+            ])]))
+        })
+        .map_err(Into::into)
+    }
+
     #[test]
     fn commit_datoms_writes_five_roots_and_ipns_head() {
         let store = MemoryBlockStore::new();
@@ -4521,6 +4579,104 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn writer_transact_preserves_datomic_schema_unique_identity_and_cardinality_one() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"distributed-schema-graph");
+
+        let schema = writer
+            .transact(DistributedTransactRequest {
+                ipns_name: "k51-kotoba-schema-db".into(),
+                graph: graph.clone(),
+                tx_data: kotoba_edn::parse(
+                    r#"[
+                      {:db/id "email" :db/ident :person/email :db/unique :db.unique/identity}
+                      {:db/id "name" :db/ident :person/name :db/cardinality :db.cardinality/one}
+                    ]"#,
+                )
+                .unwrap(),
+                expected_parent: None,
+                author: "did:key:zWriter".into(),
+                valid_until: "2026-05-29T00:00:00Z".into(),
+                ttl_secs: Some(60),
+                cacao_proof_cid: None,
+                ipns_controller_did: None,
+                ipns_signing_key: None,
+            })
+            .await
+            .unwrap();
+        let inserted = writer
+            .transact(DistributedTransactRequest {
+                ipns_name: "k51-kotoba-schema-db".into(),
+                graph: graph.clone(),
+                tx_data: kotoba_edn::parse(
+                    r#"[{:db/id "alice" :person/email "a@example.com" :person/name "Alice"}]"#,
+                )
+                .unwrap(),
+                expected_parent: Some(schema.commit.commit.cid.clone()),
+                author: "did:key:zWriter".into(),
+                valid_until: "2026-05-29T00:00:00Z".into(),
+                ttl_secs: Some(60),
+                cacao_proof_cid: None,
+                ipns_controller_did: None,
+                ipns_signing_key: None,
+            })
+            .await
+            .unwrap();
+        let upserted = writer
+            .transact(DistributedTransactRequest {
+                ipns_name: "k51-kotoba-schema-db".into(),
+                graph,
+                tx_data: kotoba_edn::parse(
+                    r#"[{:db/id "alice-2" :person/email "a@example.com" :person/name "Alicia"}]"#,
+                )
+                .unwrap(),
+                expected_parent: Some(inserted.commit.commit.cid.clone()),
+                author: "did:key:zWriter".into(),
+                valid_until: "2026-05-29T00:00:00Z".into(),
+                ttl_secs: Some(60),
+                cacao_proof_cid: None,
+                ipns_controller_did: None,
+                ipns_signing_key: None,
+            })
+            .await
+            .unwrap();
+
+        let alice = inserted.transact.tempids["alice"].clone();
+        assert_eq!(upserted.transact.tempids["alice-2"], alice);
+        assert!(upserted.datoms.iter().any(|datom| !datom.added
+            && datom.e == alice
+            && datom.a == ":person/name"
+            && datom.v == EdnValue::String("Alice".into())));
+
+        let reader = DistributedDatomReader::new(&store, &ipns);
+        let head = reader
+            .resolve_head("k51-kotoba-schema-db")
+            .unwrap()
+            .expect("ipns head");
+        assert_eq!(head.cid, upserted.commit.commit.cid);
+        let current_name = reader
+            .current_for_entity_attribute(&head.cid, &alice, ":person/name")
+            .unwrap();
+        assert_eq!(current_name.len(), 1);
+        assert_eq!(current_name[0].v, EdnValue::String("Alicia".into()));
+
+        let rows = reader
+            .q_triples_for_name(
+                "k51-kotoba-schema-db",
+                &kotoba_edn::parse(
+                    r#"{:find [?name]
+                        :where [[[:person/email "a@example.com"] :person/name ?name]]}"#,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(rows, vec![vec![EdnValue::String("Alicia".into())]]);
+        assert_eq!(upserted.commit.ipns_record.sequence, 3);
+    }
+
     #[test]
     fn reader_pulls_entities_from_distributed_ipns_head_and_time_views() {
         let store = MemoryBlockStore::new();
@@ -4690,6 +4846,81 @@ mod tests {
         assert!(tx_datoms
             .iter()
             .any(|datom| datom.a == ":tx/seq" && datom.v == EdnValue::Integer(1)));
+    }
+
+    #[tokio::test]
+    async fn writer_transact_with_tx_fns_expands_custom_functions_before_distributed_commit() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"distributed-custom-tx-fn-graph");
+
+        let first = writer
+            .transact_with_tx_fns(
+                DistributedTransactRequest {
+                    ipns_name: "k51-kotoba-tx-fn-db".into(),
+                    graph: graph.clone(),
+                    tx_data: kotoba_edn::parse(r#"[[:my.fn/increment "alice" :person/score 10]]"#)
+                        .unwrap(),
+                    expected_parent: None,
+                    author: "did:key:zWriter".into(),
+                    valid_until: "2026-05-29T00:00:00Z".into(),
+                    ttl_secs: Some(60),
+                    cacao_proof_cid: None,
+                    ipns_controller_did: None,
+                    ipns_signing_key: None,
+                },
+                register_increment_tx_fn,
+                |_, _, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        let second = writer
+            .transact_with_tx_fns(
+                DistributedTransactRequest {
+                    ipns_name: "k51-kotoba-tx-fn-db".into(),
+                    graph,
+                    tx_data: kotoba_edn::parse(r#"[[:my.fn/increment "alice" :person/score 5]]"#)
+                        .unwrap(),
+                    expected_parent: Some(first.commit.commit.cid.clone()),
+                    author: "did:key:zWriter".into(),
+                    valid_until: "2026-05-29T00:00:00Z".into(),
+                    ttl_secs: Some(60),
+                    cacao_proof_cid: None,
+                    ipns_controller_did: None,
+                    ipns_signing_key: None,
+                },
+                register_increment_tx_fn,
+                |transact, context, datoms| {
+                    datoms.push(Datom::assert(
+                        transact.tx_cid.clone(),
+                        ":tx/customFn".into(),
+                        EdnValue::String(context.ipns_name.clone()),
+                        transact.tx_cid.clone(),
+                    ));
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+
+        let reader = DistributedDatomReader::new(&store, &ipns);
+        let alice = KotobaCid::from_bytes(b"alice");
+        let scores = reader
+            .current_for_entity_attribute(&second.commit.commit.cid, &alice, ":person/score")
+            .unwrap();
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0].v, EdnValue::Integer(15));
+        let tx_datoms = reader
+            .history_datoms_index(
+                &second.commit.commit.cid,
+                DatomIndex::Tea,
+                &[EdnValue::String(second.transact.tx_cid.to_multibase())],
+            )
+            .unwrap();
+        assert!(tx_datoms.iter().any(|datom| datom.a == ":tx/customFn"
+            && datom.v == EdnValue::String("k51-kotoba-tx-fn-db".into())));
+        assert_eq!(second.commit.ipns_record.sequence, 2);
     }
 
     #[test]
