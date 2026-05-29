@@ -263,7 +263,7 @@ impl IpnsRegistry for InMemoryIpnsRegistry {
 /// checks the local cache, then falls back to Kubo for already-published names.
 #[derive(Clone)]
 pub struct KuboIpnsRegistry {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     endpoint: String,
     token: Option<String>,
     local: InMemoryIpnsRegistry,
@@ -289,9 +289,23 @@ struct KuboBlockPutResp {
     key: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct KuboIdResp {
+    #[serde(rename = "ID")]
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KuboKeyGenResp {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Id")]
+    pub id: String,
+}
+
 impl KuboIpnsRegistry {
     pub fn new(endpoint: impl Into<String>) -> Self {
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(500))
             .timeout(Duration::from_secs(30))
             .build()
@@ -319,15 +333,58 @@ impl KuboIpnsRegistry {
         self
     }
 
+    pub fn self_id(&self) -> Result<String, IpnsRegistryError> {
+        let resp = Self::wait(
+            "id send",
+            self.authed(self.client.post(self.api_url("id"))).send(),
+        )?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = Self::wait("id body", resp.text()).unwrap_or_default();
+            return Err(IpnsRegistryError::Kubo(format!("id {status}: {text}")));
+        }
+        let parsed: KuboIdResp = Self::wait("id parse", resp.json())?;
+        Ok(parsed.id)
+    }
+
+    pub fn generate_ed25519_key(&self, name: &str) -> Result<KuboKeyGenResp, IpnsRegistryError> {
+        let url = format!(
+            "{}?arg={name}&type=ed25519&ipns-base=base36",
+            self.api_url("key/gen")
+        );
+        let resp = Self::wait("key/gen send", self.authed(self.client.post(url)).send())?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = Self::wait("key/gen body", resp.text()).unwrap_or_default();
+            return Err(IpnsRegistryError::Kubo(format!("key/gen {status}: {text}")));
+        }
+        Self::wait("key/gen parse", resp.json())
+    }
+
     fn api_url(&self, method: &str) -> String {
         format!("{}/api/v0/{method}", self.endpoint.trim_end_matches('/'))
     }
 
-    fn authed(&self, rb: reqwest::blocking::RequestBuilder) -> reqwest::blocking::RequestBuilder {
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.token {
             Some(token) => rb.bearer_auth(token),
             None => rb,
         }
+    }
+
+    fn wait<T, E: std::fmt::Display>(
+        context: &str,
+        fut: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, IpnsRegistryError> {
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| IpnsRegistryError::Kubo(format!("runtime build: {e}")))?
+                .block_on(fut),
+        };
+        result.map_err(|e| IpnsRegistryError::Kubo(format!("{context}: {e}")))
     }
 
     fn signed_record_block(record: &IpnsRecord) -> Result<(IpldCid, Vec<u8>), IpnsRegistryError> {
@@ -340,22 +397,20 @@ impl KuboIpnsRegistry {
             "{}?cid-codec=dag-cbor&mhtype=sha2-256",
             self.api_url("block/put")
         );
-        let part = reqwest::blocking::multipart::Part::bytes(data).file_name("ipns-record.cbor");
-        let form = reqwest::blocking::multipart::Form::new().part("data", part);
-        let resp = self
-            .authed(self.client.post(url).multipart(form))
-            .send()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("block/put send: {e}")))?;
+        let part = reqwest::multipart::Part::bytes(data).file_name("ipns-record.cbor");
+        let form = reqwest::multipart::Form::new().part("data", part);
+        let resp = Self::wait(
+            "block/put send",
+            self.authed(self.client.post(url).multipart(form)).send(),
+        )?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = Self::wait("block/put body", resp.text()).unwrap_or_default();
             return Err(IpnsRegistryError::Kubo(format!(
                 "block/put {status}: {text}"
             )));
         }
-        let parsed: KuboBlockPutResp = resp
-            .json()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("block/put parse: {e}")))?;
+        let parsed: KuboBlockPutResp = Self::wait("block/put parse", resp.json())?;
         if parsed.key != cid.to_string() {
             return Err(IpnsRegistryError::Kubo(format!(
                 "block/put returned CID {}, expected {}",
@@ -371,16 +426,13 @@ impl KuboIpnsRegistry {
         record_cid: &str,
     ) -> Result<Option<IpnsRecord>, IpnsRegistryError> {
         let url = format!("{}?arg={record_cid}", self.api_url("block/get"));
-        let resp = self
-            .authed(self.client.post(url))
-            .send()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("block/get send: {e}")))?;
+        let resp = Self::wait("block/get send", self.authed(self.client.post(url)).send())?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !status.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = Self::wait("block/get body", resp.text()).unwrap_or_default();
             if text.contains("block not found") || text.contains("not found") {
                 return Ok(None);
             }
@@ -388,9 +440,7 @@ impl KuboIpnsRegistry {
                 "block/get {status}: {text}"
             )));
         }
-        let bytes = resp
-            .bytes()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("block/get body: {e}")))?;
+        let bytes = Self::wait("block/get body", resp.bytes())?;
         let record: IpnsRecord = match ciborium::from_reader(bytes.as_ref()) {
             Ok(record) => record,
             Err(_) => return Ok(None),
@@ -414,26 +464,24 @@ impl KuboIpnsRegistry {
             .map(|secs| format!("{secs}s"))
             .unwrap_or_else(|| "60s".to_string());
         let url = format!(
-            "{}?arg=/ipfs/{}&key={}&resolve=false&allow-offline=true&ttl={}",
+            "{}?arg=/ipfs/{}&key={}&resolve=false&offline=true&ttl={}",
             self.api_url("name/publish"),
             record_cid,
             record.name.as_str(),
             ttl,
         );
-        let resp = self
-            .authed(self.client.post(url))
-            .send()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("name/publish send: {e}")))?;
+        let resp = Self::wait(
+            "name/publish send",
+            self.authed(self.client.post(url)).send(),
+        )?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = Self::wait("name/publish body", resp.text()).unwrap_or_default();
             return Err(IpnsRegistryError::Kubo(format!(
                 "name/publish {status}: {text}"
             )));
         }
-        let parsed: KuboNamePublishResp = resp
-            .json()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("name/publish parse: {e}")))?;
+        let parsed: KuboNamePublishResp = Self::wait("name/publish parse", resp.json())?;
         let published = parsed.value.strip_prefix("/ipfs/").unwrap_or(&parsed.value);
         if published != record_cid.to_string() {
             return Err(IpnsRegistryError::Kubo(format!(
@@ -449,16 +497,16 @@ impl KuboIpnsRegistry {
             self.api_url("name/resolve"),
             name.as_str()
         );
-        let resp = self
-            .authed(self.client.post(url))
-            .send()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("name/resolve send: {e}")))?;
+        let resp = Self::wait(
+            "name/resolve send",
+            self.authed(self.client.post(url)).send(),
+        )?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(IpnsRegistryError::NotFound(name.0.clone()));
         }
         if !status.is_success() {
-            let text = resp.text().unwrap_or_default();
+            let text = Self::wait("name/resolve body", resp.text()).unwrap_or_default();
             if text.contains("not found") || text.contains("could not resolve") {
                 return Err(IpnsRegistryError::NotFound(name.0.clone()));
             }
@@ -466,9 +514,7 @@ impl KuboIpnsRegistry {
                 "name/resolve {status}: {text}"
             )));
         }
-        let parsed: KuboNameResolveResp = resp
-            .json()
-            .map_err(|e| IpnsRegistryError::Kubo(format!("name/resolve parse: {e}")))?;
+        let parsed: KuboNameResolveResp = Self::wait("name/resolve parse", resp.json())?;
         let value = parsed
             .path
             .strip_prefix("/ipfs/")

@@ -49,7 +49,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use ed25519_dalek::Signer;
 use kotoba_datomic::distributed::{
     CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter, DistributedDatomCommit,
-    DistributedDatomReader, ROOT_AEVT, ROOT_AVET, ROOT_EAVT, ROOT_TEA, ROOT_VAET,
+    DistributedDatomReader, DistributedTransactRequest, ROOT_AEVT, ROOT_AVET, ROOT_EAVT, ROOT_TEA,
+    ROOT_VAET,
 };
 use kotoba_ipfs::{IpnsName, IpnsRegistryError};
 use serde::{Deserialize, Serialize};
@@ -3345,46 +3346,6 @@ pub async fn datomic_transact(
 
     let tx_data = kotoba_edn::parse(&req.tx_edn)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("tx_edn parse: {e}")))?;
-    let db_before = match distributed_datomic_db(&state, &graph_cid, None, None)? {
-        Some(db) => db,
-        None => current_db_for_graph(&state, &graph_cid).await?,
-    };
-    let conn = kotoba_datomic::Connection::from_datoms(db_before.all_datoms());
-    let report = conn
-        .transact(tx_data)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic transact: {e}")))?;
-    if let Some(payload) = &cacao_payload {
-        enforce_datomic_write_tx_scope(payload, &report.tx_cid)?;
-    }
-    if let Some(presentation) = &req.presentation {
-        if vc_presentation_declares_tx_scope(presentation) {
-            let tx_scope = format!("kotoba://tx/{}", report.tx_cid.to_multibase());
-            verify_vc_presentation_capabilities_scope(
-                &state,
-                &req.graph,
-                presentation,
-                &[
-                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
-                    kotoba_auth::CacaoPayload::OP_TX_CREATE,
-                ],
-                Some(&tx_scope),
-            )?;
-        }
-    }
-    if let Some(cacao_b64) = req.cacao_b64.as_deref() {
-        auth_proof_cid = Some(persist_cacao_auth_proof(&state, cacao_b64)?);
-        if let Some(payload) = &cacao_payload {
-            auth_capability = Some(cacao_capability_projection(payload, auth_proof_cid.clone()));
-        }
-    } else if let Some(presentation) = &req.presentation {
-        auth_proof_cid = Some(persist_vp_auth_proof(&state, presentation)?);
-        auth_capability = Some(vp_capability_projection(
-            presentation,
-            auth_proof_cid.clone(),
-        ));
-    }
-
     let ipns_name = distributed_graph_ipns_name(&graph_cid);
     let current_head = match state
         .ipns_registry
@@ -3412,6 +3373,52 @@ pub async fn datomic_transact(
             .as_ref()
             .and_then(|record| kotoba_core::cid::KotobaCid::from_multibase(&record.value)),
     };
+    let db_before = match expected_parent.as_ref() {
+        Some(parent) => DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
+            .db_from_head(parent)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("distributed db before: {e}"),
+                )
+            })?,
+        None => current_db_for_graph(&state, &graph_cid).await?,
+    };
+    let tx_preview = kotoba_datomic::Connection::from_datoms(db_before.all_datoms())
+        .transact(tx_data.clone())
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic transact: {e}")))?;
+    if let Some(payload) = &cacao_payload {
+        enforce_datomic_write_tx_scope(payload, &tx_preview.tx_cid)?;
+    }
+    if let Some(presentation) = &req.presentation {
+        if vc_presentation_declares_tx_scope(presentation) {
+            let tx_scope = format!("kotoba://tx/{}", tx_preview.tx_cid.to_multibase());
+            verify_vc_presentation_capabilities_scope(
+                &state,
+                &req.graph,
+                presentation,
+                &[
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    kotoba_auth::CacaoPayload::OP_TX_CREATE,
+                ],
+                Some(&tx_scope),
+            )?;
+        }
+    }
+    if let Some(cacao_b64) = req.cacao_b64.as_deref() {
+        auth_proof_cid = Some(persist_cacao_auth_proof(&state, cacao_b64)?);
+        if let Some(payload) = &cacao_payload {
+            auth_capability = Some(cacao_capability_projection(payload, auth_proof_cid.clone()));
+        }
+    } else if let Some(presentation) = &req.presentation {
+        auth_proof_cid = Some(persist_vp_auth_proof(&state, presentation)?);
+        auth_capability = Some(vp_capability_projection(
+            presentation,
+            auth_proof_cid.clone(),
+        ));
+    }
+
     let explicit_cacao_proof_cid = match req.cacao_proof_cid.as_deref() {
         Some(cid) => Some(
             kotoba_core::cid::KotobaCid::from_multibase(cid).ok_or_else(|| {
@@ -3424,51 +3431,56 @@ pub async fn datomic_transact(
         None => None,
     };
     let cacao_proof_cid = auth_proof_cid.clone().or(explicit_cacao_proof_cid);
-    let seq = current_head
-        .as_ref()
-        .map(|record| record.sequence + 1)
-        .unwrap_or(1);
-    let mut tx_datoms = report.tx_data.clone();
-    append_tx_metadata_datoms(
-        &mut tx_datoms,
-        &report.tx_cid,
-        &graph_cid,
-        kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
-        &write_author,
-        cacao_proof_cid.as_ref(),
-        &ipns_name,
-        seq,
-        &state.operator_did,
-        expected_parent.as_ref(),
-    );
-    if let Some(auth_capability) = &auth_capability {
-        append_auth_capability_datoms(&mut tx_datoms, &report.tx_cid, auth_capability);
-    }
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     let distributed = writer
-        .commit_datoms(CommitDatomsRequest {
-            ipns_name: ipns_name.clone(),
-            graph: graph_cid.clone(),
-            datoms: tx_datoms.clone(),
-            expected_parent,
-            tx_cid: Some(report.tx_cid.clone()),
-            author: write_author,
-            seq,
-            valid_until: "2099-01-01T00:00:00Z".to_string(),
-            ttl_secs: Some(60),
-            cacao_proof_cid,
-            ipns_controller_did: Some(state.operator_did.clone()),
-            ipns_signing_key: Some(state.ipns_signing_key()),
-        })
+        .transact_with(
+            DistributedTransactRequest {
+                ipns_name: ipns_name.clone(),
+                graph: graph_cid.clone(),
+                tx_data,
+                expected_parent,
+                author: write_author.clone(),
+                valid_until: "2099-01-01T00:00:00Z".to_string(),
+                ttl_secs: Some(60),
+                cacao_proof_cid: cacao_proof_cid.clone(),
+                ipns_controller_did: Some(state.operator_did.clone()),
+                ipns_signing_key: Some(state.ipns_signing_key()),
+            },
+            |report, context, tx_datoms| {
+                append_tx_metadata_datoms(
+                    tx_datoms,
+                    &report.tx_cid,
+                    &context.graph,
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    &write_author,
+                    cacao_proof_cid.as_ref(),
+                    &context.ipns_name,
+                    context.seq,
+                    &state.operator_did,
+                    context.expected_parent.as_ref(),
+                );
+                if let Some(auth_capability) = &auth_capability {
+                    append_auth_capability_datoms(tx_datoms, &report.tx_cid, auth_capability);
+                }
+                Ok(())
+            },
+        )
+        .await
         .map_err(|e| match e {
             DistributedCommitError::StaleParent { .. } => {
                 (StatusCode::CONFLICT, format!("distributed commit: {e}"))
+            }
+            DistributedCommitError::Datom(_) => {
+                (StatusCode::BAD_REQUEST, format!("datomic transact: {e}"))
             }
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("distributed commit: {e}"),
             ),
         })?;
+    let report = distributed.transact;
+    let distributed_commit = distributed.commit;
+    let tx_datoms = distributed.datoms;
 
     let mut journal_cids = Vec::with_capacity(tx_datoms.len());
     for datom in &tx_datoms {
@@ -3497,16 +3509,16 @@ pub async fn datomic_transact(
             status: "ok",
             graph: req.graph,
             tx_cid: report.tx_cid.to_multibase(),
-            commit_cid: distributed.commit.cid.to_multibase(),
-            auth_proof_cid: distributed
+            commit_cid: distributed_commit.commit.cid.to_multibase(),
+            auth_proof_cid: distributed_commit
                 .commit
                 .cacao_proof_cid
                 .as_ref()
                 .map(|cid| cid.to_multibase()),
             ipns_name,
-            ipns_sequence: distributed.ipns_record.sequence,
-            ipns_valid_until: distributed.ipns_record.valid_until,
-            index_roots: distributed
+            ipns_sequence: distributed_commit.ipns_record.sequence,
+            ipns_valid_until: distributed_commit.ipns_record.valid_until,
+            index_roots: distributed_commit
                 .commit
                 .index_roots
                 .into_iter()
