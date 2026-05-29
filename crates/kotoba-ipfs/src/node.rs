@@ -902,8 +902,25 @@ impl KotobaIpfsNode {
     }
 
     /// Kubo-like `pin/ls`.
-    pub async fn pin_ls(&self) -> Result<Vec<IpldCid>> {
-        self.list_pins().await
+    ///
+    /// Recursive pin roots are returned as `recursive`; locally reachable
+    /// descendants are returned as `indirect`, matching Kubo's default `pin ls`
+    /// view closely enough for callers that need root-vs-child pin semantics.
+    pub async fn pin_ls(&self) -> Result<Vec<PinLsEntry>> {
+        let roots = self.list_pins().await?;
+        let mut entries = BTreeMap::<IpldCid, PinKind>::new();
+        for root in &roots {
+            entries.insert(*root, PinKind::Recursive);
+        }
+        for root in roots {
+            for child in self.refs(&root, true).await? {
+                entries.entry(child).or_insert(PinKind::Indirect);
+            }
+        }
+        Ok(entries
+            .into_iter()
+            .map(|(cid, kind)| PinLsEntry { cid, kind })
+            .collect())
     }
 
     /// Kubo-like `pin/verify` for locally pinned roots.
@@ -1485,6 +1502,27 @@ pub struct PinVerify {
     pub cid: IpldCid,
     pub ok: bool,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinKind {
+    Recursive,
+    Indirect,
+}
+
+impl PinKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recursive => "recursive",
+            Self::Indirect => "indirect",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinLsEntry {
+    pub cid: IpldCid,
+    pub kind: PinKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

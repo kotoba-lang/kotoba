@@ -377,7 +377,19 @@ async fn kubo_compatible_local_api_surface() {
     let updated_pin = node.add(b"hello v2").await.expect("add updated pin");
     node.pin_add(&raw).await.expect("pin/add");
     assert!(node.is_pinned(&raw).await.expect("is pinned"));
-    assert_eq!(node.pin_ls().await.expect("pin/ls"), vec![raw]);
+    assert_eq!(
+        node.pin_ls().await.expect("pin/ls"),
+        vec![kotoba_ipfs::PinLsEntry {
+            cid: raw,
+            kind: kotoba_ipfs::PinKind::Recursive,
+        }]
+    );
+    assert!(node
+        .pin_ls()
+        .await
+        .expect("pin/ls kind")
+        .iter()
+        .all(|entry| entry.kind.as_str() == "recursive"));
     assert_eq!(
         node.pin_verify().await.expect("pin/verify"),
         vec![kotoba_ipfs::PinVerify {
@@ -403,6 +415,16 @@ async fn kubo_compatible_local_api_surface() {
     node.pin_rm(&raw).await.expect("pin/rm");
     assert!(!node.is_pinned(&raw).await.expect("is pinned after rm"));
     node.pin_add(&linked).await.expect("pin/add recursive dag");
+    let dag_pins = node.pin_ls().await.expect("pin/ls recursive dag");
+    assert!(dag_pins
+        .iter()
+        .any(|entry| { entry.cid == linked && entry.kind == kotoba_ipfs::PinKind::Recursive }));
+    assert!(dag_pins
+        .iter()
+        .any(|entry| entry.cid == child && entry.kind == kotoba_ipfs::PinKind::Indirect));
+    assert!(dag_pins
+        .iter()
+        .any(|entry| entry.cid == leaf && entry.kind == kotoba_ipfs::PinKind::Indirect));
     assert!(node
         .pin_verify()
         .await

@@ -7004,13 +7004,16 @@ pub async fn agent_sync_close(
 mod tests {
     use super::{
         append_auth_capability_datoms, atproto_repo_record_entity_cid, atproto_repo_write_datoms,
-        datomic_transact, distributed_graph_ipns_name, is_did_web_ip_host, AtprotoRepoWriteReq,
-        AuthCapabilityProjection, DatomicTransactReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CONTROLLER_IRI,
+        datomic_entity, datomic_pull, datomic_pull_many, datomic_transact,
+        distributed_graph_ipns_name, is_did_web_ip_host, AtprotoRepoWriteReq,
+        AuthCapabilityProjection, DatomicEntityReq, DatomicPullManyReq, DatomicPullReq,
+        DatomicTransactReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CONTROLLER_IRI,
         ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI,
     };
     use crate::server::KotobaState;
     use axum::response::IntoResponse;
     use kotoba_core::cid::KotobaCid;
+    use kotoba_core::named_graph::GraphVisibility;
     use kotoba_datomic::distributed::{
         CommitDatomsRequest, DistributedCommitWriter, DistributedDatomReader,
     };
@@ -7307,6 +7310,154 @@ mod tests {
         assert!(tx_datoms
             .iter()
             .any(|datom| datom.a == ":person/name" && datom.v == EdnValue::string("Alice")));
+    }
+
+    #[tokio::test]
+    async fn datomic_pull_entity_xrpc_reads_distributed_ipns_head() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = KotobaCid::from_bytes(b"xrpc-distributed-pull-graph");
+        let graph_mb = graph.to_multibase();
+        state.graph_registry.write().await.insert(
+            graph.clone(),
+            (
+                "xrpc-distributed-pull-graph".into(),
+                GraphVisibility::Public,
+            ),
+        );
+        let alice = KotobaCid::from_bytes(b"alice").to_multibase();
+        let bob = KotobaCid::from_bytes(b"bob").to_multibase();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", test_operator_jwt(&state.operator_did))
+                .parse()
+                .unwrap(),
+        );
+
+        let first = datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicTransactReq {
+                graph: graph_mb.clone(),
+                tx_edn: r#"[[:db/add "alice" :person/name "Alice"]
+                            [:db/add "alice" :person/role "admin"]]"#
+                    .into(),
+                cacao_b64: None,
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_body: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let first_tx = first_body["tx_cid"].as_str().unwrap().to_string();
+
+        let second = datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicTransactReq {
+                graph: graph_mb.clone(),
+                tx_edn: r#"[[:db/add "bob" :person/name "Bob"]
+                            [:db/add "bob" :person/role "operator"]]"#
+                    .into(),
+                cacao_b64: None,
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(second.status(), axum::http::StatusCode::OK);
+
+        let pull = datomic_pull(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicPullReq {
+                graph: graph_mb.clone(),
+                entity: alice.clone(),
+                pattern_edn: Some(r#"[:person/name :person/role]"#.into()),
+                as_of: Some(first_tx.clone()),
+                since: None,
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(pull.status(), axum::http::StatusCode::OK);
+        let pull_body = axum::body::to_bytes(pull.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull_body: serde_json::Value = serde_json::from_slice(&pull_body).unwrap();
+        assert_eq!(pull_body["basis_t"], first_tx);
+        assert!(pull_body["entity_edn"].as_str().unwrap().contains("Alice"));
+        assert!(pull_body["entity_edn"].as_str().unwrap().contains("admin"));
+        assert!(!pull_body["entity_edn"].as_str().unwrap().contains("Bob"));
+
+        let pull_many = datomic_pull_many(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicPullManyReq {
+                graph: graph_mb.clone(),
+                entities: vec![alice, bob.clone()],
+                pattern_edn: Some(r#"[:person/name]"#.into()),
+                as_of: None,
+                since: None,
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(pull_many.status(), axum::http::StatusCode::OK);
+        let pull_many_body = axum::body::to_bytes(pull_many.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pull_many_body: serde_json::Value = serde_json::from_slice(&pull_many_body).unwrap();
+        assert_eq!(pull_many_body["entity_count"], 2);
+        assert!(pull_many_body["entities"][0]["entity_edn"]
+            .as_str()
+            .unwrap()
+            .contains("Alice"));
+        assert!(pull_many_body["entities"][1]["entity_edn"]
+            .as_str()
+            .unwrap()
+            .contains("Bob"));
+
+        let entity = datomic_entity(
+            axum::extract::State(Arc::clone(&state)),
+            headers,
+            axum::Json(DatomicEntityReq {
+                graph: graph_mb,
+                entity: bob,
+                as_of: None,
+                since: Some(first_tx),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(entity.status(), axum::http::StatusCode::OK);
+        let entity_body = axum::body::to_bytes(entity.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let entity_body: serde_json::Value = serde_json::from_slice(&entity_body).unwrap();
+        assert!(entity_body["entity_edn"].as_str().unwrap().contains("Bob"));
+        assert_eq!(entity_body["datom_count"], 2);
     }
 
     #[test]
