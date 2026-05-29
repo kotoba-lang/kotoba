@@ -594,8 +594,9 @@ pub struct InvokeRunReq {
     pub agent_did: String,
     pub wasm_b64: Option<String>,
     pub ctx_b64: Option<String>,
-    /// Named graph CID (multibase) — when supplied, the graph's Arrangement is
-    /// snapshotted into HostState so WASM guests can call `kqe.query`.
+    /// Named graph CID (multibase) — when supplied, the graph's distributed
+    /// Datomic/IPNS head is snapshotted into HostState so WASM guests can call
+    /// `kqe.query` and `kqe.get-head`.
     pub graph_cid: Option<String>,
 }
 
@@ -5468,8 +5469,27 @@ pub async fn invoke_run(
         vec![]
     };
 
-    // Build head commits map for kqe.get-head in WASM guests.
-    let head_commits = state.quad_store.head_commit_map().await;
+    // Build distributed IPNS head map for kqe.get-head in WASM guests.
+    let mut head_commits = std::collections::HashMap::new();
+    if let Some(gcid) = &graph_cid_for_snapshot {
+        let ipns_name = distributed_graph_ipns_name(gcid);
+        match state
+            .ipns_registry
+            .resolve(&IpnsName::new(ipns_name.clone()))
+        {
+            Ok(record) => {
+                head_commits.insert(gcid.to_multibase(), record.value);
+            }
+            Err(IpnsRegistryError::NotFound(_)) => {}
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("invoke graph head: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Move owned data into spawn_blocking — dispatch is CPU-bound (Cranelift JIT)
     let program_cid = req.program_cid.clone();
@@ -5899,35 +5919,10 @@ pub async fn commit_get(
         }
     }
 
-    match state.quad_store.head_commit(&graph_cid).await {
-        None => Err((StatusCode::NOT_FOUND, "no commit for graph".into())),
-        Some(c) => Ok(Json(CommitGetResp {
-            cid: c.cid.to_multibase(),
-            graph: c.graph.to_multibase(),
-            root: c.root.to_multibase(),
-            prev: c.prev.map(|p| p.to_multibase()),
-            author: c.author,
-            seq: c.seq,
-            ts: c.ts,
-            commit_type: "quad-store",
-            tx_cid: None,
-            index_roots: BTreeMap::new(),
-            cacao_proof_cid: None,
-            ipns_name: None,
-            ipns_value_cid: None,
-            ipns_sequence: None,
-            ipns_value_matches_commit: None,
-            ipns_sequence_matches_commit: None,
-            ipns_graph_matches_request: None,
-            ipns_controller_did: None,
-            ipns_controller_matches_node: None,
-            ipns_controller_key_matches_did: None,
-            ipns_public_key_multibase: None,
-            ipns_signature_multibase: None,
-            ipns_signature_verified: None,
-            ipns_verified: None,
-        })),
-    }
+    Err((
+        StatusCode::NOT_FOUND,
+        "no distributed commit for graph".into(),
+    ))
 }
 
 /// POST /xrpc/ai.gftd.apps.kotoba.commit.store

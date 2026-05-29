@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 
 use ed25519_dalek::Signer;
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::quad::LegacyQuadObject as QuadObject;
 use kotoba_vc::{CredentialStatus, DataIntegrityProof, VerifiableCredential, VC_CONTEXT_V2};
 
 use crate::server::KotobaState;
@@ -100,13 +99,24 @@ fn audit_graph_cid() -> KotobaCid {
     KotobaCid::from_bytes(b"kotoba/audit/requests/v1")
 }
 
-/// Extract a displayable string from a QuadObject: Text → clone, Cid → multibase, others → empty.
-fn quad_object_text(obj: &QuadObject) -> String {
-    match obj {
-        QuadObject::Text(s) => s.clone(),
-        QuadObject::Cid(c) => c.to_multibase(),
+fn datom_text(value: &kotoba_edn::EdnValue) -> String {
+    match value {
+        kotoba_edn::EdnValue::String(s) => s.clone(),
         _ => String::new(),
     }
+}
+
+fn datom_integer(value: &kotoba_edn::EdnValue) -> Option<i64> {
+    match value {
+        kotoba_edn::EdnValue::Integer(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn datom_u64(value: &kotoba_edn::EdnValue) -> u64 {
+    datom_integer(value)
+        .and_then(|n| u64::try_from(n).ok())
+        .unwrap_or(0)
 }
 
 fn now_unix() -> u64 {
@@ -462,7 +472,7 @@ pub async fn attest_claim(
     }
 
     // Reject stake values that exceed i64::MAX to prevent silent truncation when
-    // stored as QuadObject::Integer(i64).  Real stakes are at most ~10^10 mKOTO,
+    // stored as Datom EDN Integer(i64). Real stakes are at most ~10^10 mKOTO,
     // orders of magnitude below the 9.2×10^18 i64 ceiling.
     if req.stake_mkoto > i64::MAX as u64 {
         return (
@@ -689,8 +699,8 @@ pub async fn attest_challenge(
 /// GET `ai.gftd.apps.kotoba.attest.query`
 ///
 /// Query attestation records by entity_did or attester_did.
-/// Scans the hot Arrangement via AVET (POS) index; returns empty when neither
-/// filter is provided (full-scan is intentionally not supported to bound cost).
+/// Reads from the distributed Datomic/IPNS head; returns empty when neither
+/// filter is provided to avoid an unbounded public full-scan.
 pub async fn attest_query(
     State(state): State<Arc<KotobaState>>,
     Query(params): Query<AttestQueryParams>,
@@ -715,19 +725,27 @@ pub async fn attest_query(
     }
     let limit = params.limit.unwrap_or(20).min(100);
     let graph = attest_graph_cid();
+    let db = match crate::xrpc::current_db_for_graph(&state, &graph).await {
+        Ok(db) => db,
+        Err((code, msg)) => {
+            return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+        }
+    };
+    let datoms = db.datoms();
 
-    // Resolve claim CIDs via AVET (POS) reverse lookup.
-    // entity/attester are stored as Text (not Cid), so the object_key is the DID string.
-    let claim_cids: Vec<kotoba_core::cid::KotobaCid> = if let Some(ref did) = params.entity_did {
-        state
-            .quad_store
-            .lookup_subject_by_po(Some(&graph), "attest/entity", did)
-            .await
+    let mut claim_cids: Vec<kotoba_core::cid::KotobaCid> = if let Some(ref did) = params.entity_did
+    {
+        datoms
+            .iter()
+            .filter(|datom| datom.a == "attest/entity" && datom_text(&datom.v) == *did)
+            .map(|datom| datom.e.clone())
+            .collect()
     } else if let Some(ref did) = params.attester_did {
-        state
-            .quad_store
-            .lookup_subject_by_po(Some(&graph), "attest/attester", did)
-            .await
+        datoms
+            .iter()
+            .filter(|datom| datom.a == "attest/attester" && datom_text(&datom.v) == *did)
+            .map(|datom| datom.e.clone())
+            .collect()
     } else {
         // No filter: return empty to avoid unbounded full-scan.
         return Json(AttestQueryResp {
@@ -736,13 +754,11 @@ pub async fn attest_query(
         })
         .into_response();
     };
+    claim_cids.sort_by_key(|cid| cid.to_multibase());
+    claim_cids.dedup();
 
     let mut claims: Vec<AttestRecord> = Vec::new();
     for claim_cid in claim_cids.into_iter().take(limit) {
-        let quads = state
-            .quad_store
-            .get_entity_quads(Some(&graph), &claim_cid)
-            .await;
         let mut rec = AttestRecord {
             claim_cid: claim_cid.to_multibase(),
             credential_cid: String::new(),
@@ -754,24 +770,16 @@ pub async fn attest_query(
             stake_mkoto: 0,
             ts_unix: 0,
         };
-        for q in &quads {
-            match q.predicate.as_str() {
-                "attest/credentialCid" => rec.credential_cid = quad_object_text(&q.object),
-                "attest/credentialId" => rec.credential_id = quad_object_text(&q.object),
-                "attest/credentialStatus" => rec.credential_status = quad_object_text(&q.object),
-                "attest/entity" => rec.entity_did = quad_object_text(&q.object),
-                "attest/type" => rec.claim_type = quad_object_text(&q.object),
-                "attest/attester" => rec.attester_did = quad_object_text(&q.object),
-                "attest/stake_mkoto" => {
-                    if let kotoba_kqe::quad::LegacyQuadObject::Integer(n) = &q.object {
-                        rec.stake_mkoto = *n as u64;
-                    }
-                }
-                "attest/ts_unix" => {
-                    if let kotoba_kqe::quad::LegacyQuadObject::Integer(n) = &q.object {
-                        rec.ts_unix = *n as u64;
-                    }
-                }
+        for datom in datoms.iter().filter(|datom| datom.e == claim_cid) {
+            match datom.a.as_str() {
+                "attest/credentialCid" => rec.credential_cid = datom_text(&datom.v),
+                "attest/credentialId" => rec.credential_id = datom_text(&datom.v),
+                "attest/credentialStatus" => rec.credential_status = datom_text(&datom.v),
+                "attest/entity" => rec.entity_did = datom_text(&datom.v),
+                "attest/type" => rec.claim_type = datom_text(&datom.v),
+                "attest/attester" => rec.attester_did = datom_text(&datom.v),
+                "attest/stake_mkoto" => rec.stake_mkoto = datom_u64(&datom.v),
+                "attest/ts_unix" => rec.ts_unix = datom_u64(&datom.v),
                 _ => {}
             }
         }
@@ -794,7 +802,7 @@ pub async fn attest_query(
 /// GET `ai.gftd.apps.kotoba.request.log`
 ///
 /// Query the request audit log stored by the fingerprint middleware.
-/// Scans the audit graph Arrangement via predicate-prefix lookup.
+/// Reads from the audit graph's distributed Datomic/IPNS head.
 /// Requires operator auth — audit logs are internal security instruments.
 pub async fn request_log_query(
     State(state): State<Arc<KotobaState>>,
@@ -808,19 +816,23 @@ pub async fn request_log_query(
     }
     let limit = params.limit.unwrap_or(20).min(100);
     let graph = audit_graph_cid();
+    let db = match crate::xrpc::current_db_for_graph(&state, &graph).await {
+        Ok(db) => db,
+        Err((code, msg)) => {
+            return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+        }
+    };
 
-    // Fetch all quads in the audit graph whose predicate starts with "request/".
+    // Fetch all datoms in the audit graph whose attribute starts with "request/".
     // Group by subject CID → hydrate each RequestLogEntry.
-    let all_quads = state
-        .quad_store
-        .quads_by_predicate_prefix(Some(&graph), "request/")
-        .await;
-
-    // Build per-request-cid entry map.
     let mut map: std::collections::HashMap<String, RequestLogEntry> =
         std::collections::HashMap::new();
-    for q in &all_quads {
-        let subj_key = q.subject.to_multibase();
+    for datom in db
+        .datoms()
+        .into_iter()
+        .filter(|datom| datom.a.starts_with("request/"))
+    {
+        let subj_key = datom.e.to_multibase();
         let entry = map
             .entry(subj_key.clone())
             .or_insert_with(|| RequestLogEntry {
@@ -829,17 +841,15 @@ pub async fn request_log_query(
                 path: String::new(),
                 ts_unix: 0,
             });
-        match q.predicate.as_str() {
+        match datom.a.as_str() {
             "request/method" => {
-                entry.method = quad_object_text(&q.object);
+                entry.method = datom_text(&datom.v);
             }
             "request/path" => {
-                entry.path = quad_object_text(&q.object);
+                entry.path = datom_text(&datom.v);
             }
             "request/ts_unix" => {
-                if let QuadObject::Integer(n) = &q.object {
-                    entry.ts_unix = *n as u64;
-                }
+                entry.ts_unix = datom_u64(&datom.v);
             }
             _ => {}
         }
@@ -1077,31 +1087,6 @@ mod tests {
             .unwrap()
             .iter()
             .all(|datom| datom.t == tx_cid));
-    }
-
-    #[test]
-    fn quad_object_text_returns_text_clone() {
-        let obj = QuadObject::Text("hello world".to_string());
-        assert_eq!(quad_object_text(&obj), "hello world");
-    }
-
-    #[test]
-    fn quad_object_text_returns_cid_multibase() {
-        let cid = KotobaCid::from_bytes(b"test-cid-seed");
-        let obj = QuadObject::Cid(cid.clone());
-        let result = quad_object_text(&obj);
-        assert_eq!(result, cid.to_multibase());
-        assert!(!result.is_empty(), "multibase should be non-empty");
-    }
-
-    #[test]
-    fn quad_object_text_returns_empty_for_integer() {
-        let obj = QuadObject::Integer(42);
-        assert_eq!(
-            quad_object_text(&obj),
-            "",
-            "Integer variant should yield empty string"
-        );
     }
 
     #[test]
