@@ -1,7 +1,7 @@
 /// Two-node block exchange: A stores a block, B fetches it via `/kotoba/ipfs/1.0.0`.
 use ciborium::value::Value as CborValue;
 use ipld_core::ipld::Ipld;
-use kotoba_ipfs::{raw_cid, IpfsConfig, Multiaddr, CODEC_DAG_CBOR, CODEC_RAW};
+use kotoba_ipfs::{raw_cid, IpfsConfig, Multiaddr, CODEC_DAG_CBOR, CODEC_DAG_PB, CODEC_RAW};
 use serde::{Deserialize, Serialize};
 use tokio::time::{timeout, Duration};
 
@@ -207,6 +207,25 @@ async fn kubo_compatible_local_api_surface() {
     let raw = node.add(b"hello").await.expect("add");
     assert_eq!(node.block_get(&raw).await.expect("block/get"), b"hello"[..]);
     assert_eq!(node.cat(&raw).await.expect("cat"), b"hello"[..]);
+    let unixfs = node
+        .add_unixfs_file(b"hello")
+        .await
+        .expect("add unixfs file");
+    assert_eq!(unixfs.codec(), CODEC_DAG_PB);
+    assert_eq!(
+        unixfs.to_string(),
+        "bafybeid3weurg3gvyoi7nisadzolomlvoxoppe2sesktnpvdve3256n5tq"
+    );
+    assert_eq!(
+        node.cat(&unixfs).await.expect("cat unixfs file"),
+        b"hello"[..]
+    );
+    assert_eq!(
+        node.cat_path(format!("/ipfs/{unixfs}"))
+            .await
+            .expect("cat /ipfs unixfs file"),
+        b"hello"[..]
+    );
     assert_eq!(
         node.resolve_path(format!("/ipfs/{raw}"))
             .await

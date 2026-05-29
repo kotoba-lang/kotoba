@@ -805,6 +805,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     assert_eq!(status, 200, "{second_tx_body}");
     assert_eq!(second_tx_body["ipns_sequence"], 2);
     let bob = second_tx_body["tempids"]["bob"].as_str().unwrap();
+    let second_tx = second_tx_body["tx_cid"].as_str().unwrap().to_string();
 
     let (status, window_body) = s
         .post_auth(
@@ -868,6 +869,41 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     assert_eq!(seek_body["datoms"][0]["e"], bob, "{seek_body}");
     assert_eq!(seek_body["datoms"][0]["a"], ":person/name", "{seek_body}");
     assert_eq!(seek_body["datoms"][0]["v_edn"], "\"Bob\"", "{seek_body}");
+
+    let (status, tea_body) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            json!({
+                "graph": graph,
+                "index": ":tea",
+                "components_edn": [format!("\"{second_tx}\"")],
+                "limit": 10
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{tea_body}");
+    assert_eq!(tea_body["basis_t"], second_tx_body["tx_cid"], "{tea_body}");
+    assert!(
+        tea_body["datom_count"].as_u64().unwrap_or(0) >= 3,
+        "{tea_body}"
+    );
+    assert!(
+        tea_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|datom| datom["t"] == second_tx_body["tx_cid"]),
+        "{tea_body}"
+    );
+    assert!(
+        tea_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["e"] == bob && datom["a"] == ":person/name"),
+        "{tea_body}"
+    );
 
     let (status, range_body) = s
         .post_auth(

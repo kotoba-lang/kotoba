@@ -4,7 +4,9 @@
 //! needs first: IPFS CID-compatible block addressing, local persistence hooks,
 //! pin state, and a tiny TCP block exchange protocol between kotoba nodes.
 
-use crate::cid::{cid_for_bytes, dag_cbor_block, raw_cid};
+use crate::cid::{
+    cid_for_bytes, dag_cbor_block, decode_unixfs_file_block, raw_cid, unixfs_file_block,
+};
 use crate::ipns::{IpnsName, IpnsRecord};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
@@ -477,6 +479,13 @@ impl KotobaIpfsNode {
         self.put_raw_block(data).await
     }
 
+    /// Kubo-compatible `add` for a single UnixFS/dag-pb file block.
+    pub async fn add_unixfs_file(&self, data: &[u8]) -> Result<IpldCid> {
+        let (cid, block) = unixfs_file_block(data);
+        self.put_block(&cid, &block).await?;
+        Ok(cid)
+    }
+
     /// Store bytes with an explicit multicodec (CIDv1/{codec}/sha2-256).
     pub async fn put_codec_block(&self, codec: u64, data: &[u8]) -> Result<IpldCid> {
         let cid = cid_for_bytes(codec, data);
@@ -512,12 +521,21 @@ impl KotobaIpfsNode {
         self.get_block(cid).await
     }
 
-    /// Kubo-like `cat` for raw blocks.
+    /// Kubo-like `cat` for raw blocks and single-block UnixFS/dag-pb files.
     pub async fn cat(&self, cid: &IpldCid) -> Result<Bytes> {
-        if cid.codec() != crate::cid::CODEC_RAW {
-            bail!("cat only supports raw blocks, got codec {}", cid.codec());
+        let bytes = self.get_block(cid).await?;
+        if cid.codec() == crate::cid::CODEC_RAW {
+            return Ok(bytes);
         }
-        self.get_block(cid).await
+        if cid.codec() == crate::cid::CODEC_DAG_PB {
+            return decode_unixfs_file_block(&bytes)
+                .map(Bytes::from)
+                .map_err(Into::into);
+        }
+        bail!(
+            "cat only supports raw blocks and UnixFS dag-pb files, got codec {}",
+            cid.codec()
+        );
     }
 
     /// Kubo-like path resolver for `/ipfs/<cid>` and locally published `/ipns/<name>`.

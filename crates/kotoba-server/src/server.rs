@@ -1106,6 +1106,20 @@ mod tests {
             DIDCOMM_MESSAGING_SERVICE,
             "didcomm://mediator/distributedagent",
         );
+        doc.push_single_service(
+            "atproto-pds",
+            ATPROTO_PDS_SERVICE,
+            "https://pds.distributedagent.example",
+        );
+        doc.push_single_service(
+            "kotoba-node",
+            KOTOBA_NODE_SERVICE,
+            "/ip4/127.0.0.1/tcp/4101",
+        );
+        doc.push_graph_membership_service([
+            "kotoba://graph/distributed-a",
+            "kotoba://graph/distributed-b",
+        ]);
         let tx_cid = KotobaCid::from_bytes(b"did-resolver-datomic-tx");
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
@@ -1132,6 +1146,19 @@ mod tests {
             resolved.didcomm_endpoint(),
             Some("didcomm://mediator/distributedagent")
         );
+        assert_eq!(
+            resolved.atproto_pds_endpoint(),
+            Some("https://pds.distributedagent.example")
+        );
+        assert_eq!(resolved.kotoba_endpoint(), Some("/ip4/127.0.0.1/tcp/4101"));
+        assert_eq!(
+            resolved.graph_memberships(),
+            vec![
+                "kotoba://graph/distributed-a",
+                "kotoba://graph/distributed-b"
+            ]
+        );
+        assert!(resolved.has_kotoba_protocol_services());
     }
 
     #[test]

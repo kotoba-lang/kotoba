@@ -20,6 +20,8 @@ pub enum CidError {
     Parse(String),
     #[error("dag-cbor encode: {0}")]
     Cbor(String),
+    #[error("unixfs dag-pb decode: {0}")]
+    Unixfs(String),
 }
 
 /// Build a CIDv1 for an already-encoded IPFS block.
@@ -40,6 +42,80 @@ pub fn dag_cbor_block<T: Serialize>(value: &T) -> Result<(Cid, Vec<u8>), CidErro
     Ok((cid_for_bytes(CODEC_DAG_CBOR, &data), data))
 }
 
+/// Encode a Kubo-compatible single-file UnixFS dag-pb block.
+///
+/// This is the dag-pb shape Kubo emits for a small file when raw leaves are
+/// disabled: PBNode.Data contains a UnixFS Data message with Type=File, Data,
+/// and filesize.  It intentionally has no links, so it covers the common
+/// single-block file case without pulling in a full UnixFS importer.
+pub fn unixfs_file_block(data: &[u8]) -> (Cid, Vec<u8>) {
+    let mut unixfs = Vec::new();
+    write_varint_field(&mut unixfs, 1, 2);
+    write_bytes_field(&mut unixfs, 2, data);
+    write_varint_field(&mut unixfs, 3, data.len() as u64);
+
+    let mut pb_node = Vec::new();
+    write_bytes_field(&mut pb_node, 1, &unixfs);
+    (cid_for_bytes(CODEC_DAG_PB, &pb_node), pb_node)
+}
+
+/// Decode the single-file UnixFS dag-pb block shape produced by
+/// [`unixfs_file_block`].
+pub fn decode_unixfs_file_block(block: &[u8]) -> Result<Vec<u8>, CidError> {
+    let mut pos = 0;
+    let mut unixfs_data = None;
+    while pos < block.len() {
+        let (field, wire) = read_key(block, &mut pos)?;
+        match (field, wire) {
+            (1, 2) => unixfs_data = Some(read_len_bytes(block, &mut pos)?.to_vec()),
+            (_, 0) => {
+                read_varint(block, &mut pos)?;
+            }
+            (_, 2) => {
+                read_len_bytes(block, &mut pos)?;
+            }
+            _ => {
+                return Err(CidError::Unixfs(format!(
+                    "unsupported PBNode field {field}/{wire}"
+                )))
+            }
+        }
+    }
+    let unixfs = unixfs_data.ok_or_else(|| CidError::Unixfs("missing PBNode.Data".into()))?;
+
+    let mut pos = 0;
+    let mut typ = None;
+    let mut file_data = None;
+    let mut filesize = None;
+    while pos < unixfs.len() {
+        let (field, wire) = read_key(&unixfs, &mut pos)?;
+        match (field, wire) {
+            (1, 0) => typ = Some(read_varint(&unixfs, &mut pos)?),
+            (2, 2) => file_data = Some(read_len_bytes(&unixfs, &mut pos)?.to_vec()),
+            (3, 0) => filesize = Some(read_varint(&unixfs, &mut pos)?),
+            (_, 0) => {
+                read_varint(&unixfs, &mut pos)?;
+            }
+            (_, 2) => {
+                read_len_bytes(&unixfs, &mut pos)?;
+            }
+            _ => {
+                return Err(CidError::Unixfs(format!(
+                    "unsupported UnixFS field {field}/{wire}"
+                )))
+            }
+        }
+    }
+    if typ != Some(2) {
+        return Err(CidError::Unixfs("UnixFS block is not a file".into()));
+    }
+    let file_data = file_data.ok_or_else(|| CidError::Unixfs("missing UnixFS Data".into()))?;
+    if filesize.is_some_and(|size| size != file_data.len() as u64) {
+        return Err(CidError::Unixfs("UnixFS filesize mismatch".into()));
+    }
+    Ok(file_data)
+}
+
 /// Parse any valid IPFS CID string accepted by the upstream CID crate.
 pub fn parse_cid(s: &str) -> Result<Cid, CidError> {
     s.parse::<Cid>().map_err(|e| CidError::Parse(e.to_string()))
@@ -47,6 +123,65 @@ pub fn parse_cid(s: &str) -> Result<Cid, CidError> {
 
 pub fn is_sha2_256(cid: &Cid) -> bool {
     cid.hash().code() == MH_SHA2_256 && cid.hash().size() == 32
+}
+
+fn write_key(out: &mut Vec<u8>, field: u64, wire: u64) {
+    write_varint(out, (field << 3) | wire);
+}
+
+fn write_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    write_key(out, field, 0);
+    write_varint(out, value);
+}
+
+fn write_bytes_field(out: &mut Vec<u8>, field: u64, value: &[u8]) {
+    write_key(out, field, 2);
+    write_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn read_key(input: &[u8], pos: &mut usize) -> Result<(u64, u64), CidError> {
+    let key = read_varint(input, pos)?;
+    Ok((key >> 3, key & 0x07))
+}
+
+fn read_varint(input: &[u8], pos: &mut usize) -> Result<u64, CidError> {
+    let mut out = 0u64;
+    let mut shift = 0;
+    loop {
+        let Some(byte) = input.get(*pos).copied() else {
+            return Err(CidError::Unixfs("truncated varint".into()));
+        };
+        *pos += 1;
+        out |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(out);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(CidError::Unixfs("varint overflow".into()));
+        }
+    }
+}
+
+fn read_len_bytes<'a>(input: &'a [u8], pos: &mut usize) -> Result<&'a [u8], CidError> {
+    let len = read_varint(input, pos)? as usize;
+    let end = pos.saturating_add(len);
+    let Some(bytes) = input.get(*pos..end) else {
+        return Err(CidError::Unixfs(
+            "length-delimited field exceeds input".into(),
+        ));
+    };
+    *pos = end;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -71,6 +206,18 @@ mod tests {
             "bafkreibm6jg3ux5qumhcn2b3flc3tyu6dmlb4xa7u5bf44yegnrjhc4yeq"
         );
         assert_eq!(parse_cid(&cid.to_string()).unwrap(), cid);
+    }
+
+    #[test]
+    fn unixfs_file_block_matches_kubo_single_file_dag_pb_vector() {
+        let (cid, block) = unixfs_file_block(b"hello");
+        assert_eq!(cid.codec(), CODEC_DAG_PB);
+        assert_eq!(
+            cid.to_string(),
+            "bafybeid3weurg3gvyoi7nisadzolomlvoxoppe2sesktnpvdve3256n5tq"
+        );
+        assert_eq!(decode_unixfs_file_block(&block).unwrap(), b"hello");
+        assert_eq!(cid, cid_for_bytes(CODEC_DAG_PB, &block));
     }
 
     #[test]

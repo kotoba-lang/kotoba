@@ -2609,6 +2609,7 @@ enum DatomicDatomsIndex {
     Aevt,
     Avet,
     Vaet,
+    Tea,
 }
 
 impl DatomicDatomsIndex {
@@ -2618,9 +2619,12 @@ impl DatomicDatomsIndex {
             ":aevt" | "aevt" => Ok(Self::Aevt),
             ":avet" | "avet" => Ok(Self::Avet),
             ":vaet" | "vaet" => Ok(Self::Vaet),
+            ":tea" | "tea" => Ok(Self::Tea),
             _ => Err((
                 StatusCode::BAD_REQUEST,
-                format!("unsupported datoms index {index}; expected :eavt, :aevt, :avet, or :vaet"),
+                format!(
+                    "unsupported datoms index {index}; expected :eavt, :aevt, :avet, :vaet, or :tea"
+                ),
             )),
         }
     }
@@ -2631,6 +2635,7 @@ impl DatomicDatomsIndex {
             Self::Aevt => ROOT_AEVT,
             Self::Avet => ROOT_AVET,
             Self::Vaet => ROOT_VAET,
+            Self::Tea => ROOT_TEA,
         }
     }
 }
@@ -2685,6 +2690,8 @@ fn datomic_index_component_is_entity(index: DatomicDatomsIndex, position: usize)
             | (DatomicDatomsIndex::Avet, 2)
             | (DatomicDatomsIndex::Vaet, 0)
             | (DatomicDatomsIndex::Vaet, 2)
+            | (DatomicDatomsIndex::Tea, 0)
+            | (DatomicDatomsIndex::Tea, 1)
     )
 }
 
@@ -2769,6 +2776,10 @@ fn datomic_datoms_match_components(
             (DatomicDatomsIndex::Vaet, 1) => datom.a == datomic_component_attr(component)?,
             (DatomicDatomsIndex::Vaet, 2) => datom.e == datomic_component_entity(component),
             (DatomicDatomsIndex::Vaet, 3) => datom.t == datomic_component_entity(component),
+            (DatomicDatomsIndex::Tea, 0) => datom.t == datomic_component_entity(component),
+            (DatomicDatomsIndex::Tea, 1) => datom.e == datomic_component_entity(component),
+            (DatomicDatomsIndex::Tea, 2) => datom.a == datomic_component_attr(component)?,
+            (DatomicDatomsIndex::Tea, 3) => datom.v == *component,
             (_, _) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -2801,6 +2812,7 @@ fn datomic_datoms_sort_key(
         DatomicDatomsIndex::Aevt => (a, e, v, t),
         DatomicDatomsIndex::Avet => (a, v, e, t),
         DatomicDatomsIndex::Vaet => (v, a, e, t),
+        DatomicDatomsIndex::Tea => (t, e, a, v),
     }
 }
 
@@ -2838,6 +2850,10 @@ fn datomic_seek_component_sort_value(
         (DatomicDatomsIndex::Vaet, 1) => attr(),
         (DatomicDatomsIndex::Vaet, 2) => Ok(entity()),
         (DatomicDatomsIndex::Vaet, 3) => Ok(entity()),
+        (DatomicDatomsIndex::Tea, 0) => Ok(entity()),
+        (DatomicDatomsIndex::Tea, 1) => Ok(entity()),
+        (DatomicDatomsIndex::Tea, 2) => attr(),
+        (DatomicDatomsIndex::Tea, 3) => value(),
         (_, _) => Err((
             StatusCode::BAD_REQUEST,
             "seekDatoms supports at most 4 index components".to_string(),
