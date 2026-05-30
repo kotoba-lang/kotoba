@@ -3782,6 +3782,8 @@ enum FindItem {
     Sum(EdnValue),
     Min(EdnValue),
     Max(EdnValue),
+    MinN { limit: usize, value: EdnValue },
+    MaxN { limit: usize, value: EdnValue },
     Avg(EdnValue),
     Median(EdnValue),
     Variance(EdnValue),
@@ -3799,6 +3801,8 @@ impl FindItem {
                 | Self::Sum(_)
                 | Self::Min(_)
                 | Self::Max(_)
+                | Self::MinN { .. }
+                | Self::MaxN { .. }
                 | Self::Avg(_)
                 | Self::Median(_)
                 | Self::Variance(_)
@@ -3816,6 +3820,8 @@ impl FindItem {
             | Self::Sum(value)
             | Self::Min(value)
             | Self::Max(value)
+            | Self::MinN { value, .. }
+            | Self::MaxN { value, .. }
             | Self::Avg(value)
             | Self::Median(value)
             | Self::Variance(value)
@@ -3857,8 +3863,22 @@ fn parse_find_item(value: &EdnValue) -> Result<FindItem> {
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "min") {
         return Ok(FindItem::Min(seq[1].clone()));
     }
+    if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "min") {
+        let limit = aggregate_limit("min", &seq[1])?;
+        return Ok(FindItem::MinN {
+            limit,
+            value: seq[2].clone(),
+        });
+    }
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "max") {
         return Ok(FindItem::Max(seq[1].clone()));
+    }
+    if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "max") {
+        let limit = aggregate_limit("max", &seq[1])?;
+        return Ok(FindItem::MaxN {
+            limit,
+            value: seq[2].clone(),
+        });
     }
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "avg") {
         return Ok(FindItem::Avg(seq[1].clone()));
@@ -3876,15 +3896,7 @@ fn parse_find_item(value: &EdnValue) -> Result<FindItem> {
         return Ok(FindItem::Rand(seq[1].clone()));
     }
     if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "sample") {
-        let limit = match &seq[1] {
-            EdnValue::Integer(limit) if *limit >= 0 => *limit as usize,
-            other => {
-                return Err(DatomicError::Query(format!(
-                    "sample expects a non-negative integer limit, got {}",
-                    edn_to_string(other)
-                )));
-            }
-        };
+        let limit = aggregate_limit("sample", &seq[1])?;
         return Ok(FindItem::Sample {
             limit,
             value: seq[2].clone(),
@@ -3909,6 +3921,8 @@ enum AggregateValue {
     Sum(i64),
     Min(Option<EdnValue>),
     Max(Option<EdnValue>),
+    MinN { limit: usize, values: Vec<EdnValue> },
+    MaxN { limit: usize, values: Vec<EdnValue> },
     Avg { sum: i64, count: i64 },
     Median(Vec<i64>),
     Variance(Vec<i64>),
@@ -3927,6 +3941,14 @@ impl AggregateValue {
             FindItem::Sum(_) => Some(Self::Sum(0)),
             FindItem::Min(_) => Some(Self::Min(None)),
             FindItem::Max(_) => Some(Self::Max(None)),
+            FindItem::MinN { limit, .. } => Some(Self::MinN {
+                limit: *limit,
+                values: Vec::new(),
+            }),
+            FindItem::MaxN { limit, .. } => Some(Self::MaxN {
+                limit: *limit,
+                values: Vec::new(),
+            }),
             FindItem::Avg(_) => Some(Self::Avg { sum: 0, count: 0 }),
             FindItem::Median(_) => Some(Self::Median(Vec::new())),
             FindItem::Variance(_) => Some(Self::Variance(Vec::new())),
@@ -3965,6 +3987,9 @@ impl AggregateValue {
                     *max = Some(value);
                 }
             }
+            Self::MinN { values, .. } | Self::MaxN { values, .. } => {
+                values.push(value);
+            }
             Self::Avg { sum, count } => {
                 *sum += aggregate_integer(&value)?;
                 *count += 1;
@@ -3993,6 +4018,8 @@ impl AggregateValue {
             Self::Sum(sum) => EdnValue::Integer(*sum),
             Self::Min(min) => min.clone().unwrap_or(EdnValue::Nil),
             Self::Max(max) => max.clone().unwrap_or(EdnValue::Nil),
+            Self::MinN { limit, values } => aggregate_top_n(values, *limit, false),
+            Self::MaxN { limit, values } => aggregate_top_n(values, *limit, true),
             Self::Avg { sum, count } => {
                 if *count == 0 {
                     EdnValue::Nil
@@ -4010,6 +4037,30 @@ impl AggregateValue {
             Self::Sample { values, .. } => EdnValue::Vector(values.clone()),
         }
     }
+}
+
+fn aggregate_limit(op: &str, value: &EdnValue) -> Result<usize> {
+    match value {
+        EdnValue::Integer(limit) if *limit >= 0 => Ok(*limit as usize),
+        other => Err(DatomicError::Query(format!(
+            "{op} expects a non-negative integer limit, got {}",
+            edn_to_string(other)
+        ))),
+    }
+}
+
+fn aggregate_top_n(values: &[EdnValue], limit: usize, desc: bool) -> EdnValue {
+    let mut values = values.to_vec();
+    values.sort_by(|left, right| {
+        let ordering = query_sort_order(left, right);
+        if desc {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    values.truncate(limit);
+    EdnValue::Vector(values)
 }
 
 fn aggregate_median(values: &[i64]) -> EdnValue {
@@ -8170,7 +8221,7 @@ mod tests {
         .await
         .unwrap();
         let query = parse(
-            r#"{:find [?role (sum ?score) (min ?score) (max ?score)]
+            r#"{:find [?role (sum ?score) (min ?score) (max ?score) (min 2 ?score) (max 2 ?score)]
                 :where [[?e :person/role ?role]
                         [?e :person/score ?score]]}"#,
         )
@@ -8183,13 +8234,17 @@ mod tests {
                     kw_value(":admin"),
                     EdnValue::Integer(10),
                     EdnValue::Integer(10),
-                    EdnValue::Integer(10)
+                    EdnValue::Integer(10),
+                    EdnValue::Vector(vec![EdnValue::Integer(10)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(10)])
                 ],
                 vec![
                     kw_value(":guest"),
                     EdnValue::Integer(10),
                     EdnValue::Integer(3),
-                    EdnValue::Integer(7)
+                    EdnValue::Integer(7),
+                    EdnValue::Vector(vec![EdnValue::Integer(3), EdnValue::Integer(7)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(7), EdnValue::Integer(3)])
                 ]
             ]
         );

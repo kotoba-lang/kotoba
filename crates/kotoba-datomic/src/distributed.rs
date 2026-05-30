@@ -3067,6 +3067,8 @@ enum DistributedFindItem {
     Sum(Value),
     Min(Value),
     Max(Value),
+    MinN { limit: usize, value: Value },
+    MaxN { limit: usize, value: Value },
     Avg(Value),
     Median(Value),
     Variance(Value),
@@ -3082,6 +3084,8 @@ impl DistributedFindItem {
                 | Self::Sum(_)
                 | Self::Min(_)
                 | Self::Max(_)
+                | Self::MinN { .. }
+                | Self::MaxN { .. }
                 | Self::Avg(_)
                 | Self::Median(_)
                 | Self::Variance(_)
@@ -3110,8 +3114,22 @@ fn parse_distributed_find_item(
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "min") {
         return Ok(DistributedFindItem::Min(seq[1].clone()));
     }
+    if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "min") {
+        let limit = aggregate_query_limit("min", &seq[1])?;
+        return Ok(DistributedFindItem::MinN {
+            limit,
+            value: seq[2].clone(),
+        });
+    }
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "max") {
         return Ok(DistributedFindItem::Max(seq[1].clone()));
+    }
+    if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "max") {
+        let limit = aggregate_query_limit("max", &seq[1])?;
+        return Ok(DistributedFindItem::MaxN {
+            limit,
+            value: seq[2].clone(),
+        });
     }
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "avg") {
         return Ok(DistributedFindItem::Avg(seq[1].clone()));
@@ -3180,6 +3198,8 @@ fn resolve_distributed_find_item(
         | DistributedFindItem::Sum(value)
         | DistributedFindItem::Min(value)
         | DistributedFindItem::Max(value)
+        | DistributedFindItem::MinN { value, .. }
+        | DistributedFindItem::MaxN { value, .. }
         | DistributedFindItem::Avg(value)
         | DistributedFindItem::Median(value)
         | DistributedFindItem::Variance(value)
@@ -3210,6 +3230,8 @@ enum DistributedAggregateValue {
     Sum(i64),
     Min(Option<Value>),
     Max(Option<Value>),
+    MinN { limit: usize, values: Vec<Value> },
+    MaxN { limit: usize, values: Vec<Value> },
     Avg { sum: i64, count: i64 },
     Median(Vec<i64>),
     Variance(Vec<i64>),
@@ -3225,6 +3247,14 @@ impl DistributedAggregateValue {
             DistributedFindItem::Sum(_) => Some(Self::Sum(0)),
             DistributedFindItem::Min(_) => Some(Self::Min(None)),
             DistributedFindItem::Max(_) => Some(Self::Max(None)),
+            DistributedFindItem::MinN { limit, .. } => Some(Self::MinN {
+                limit: *limit,
+                values: Vec::new(),
+            }),
+            DistributedFindItem::MaxN { limit, .. } => Some(Self::MaxN {
+                limit: *limit,
+                values: Vec::new(),
+            }),
             DistributedFindItem::Avg(_) => Some(Self::Avg { sum: 0, count: 0 }),
             DistributedFindItem::Median(_) => Some(Self::Median(Vec::new())),
             DistributedFindItem::Variance(_) => Some(Self::Variance(Vec::new())),
@@ -3258,6 +3288,9 @@ impl DistributedAggregateValue {
                     *max = Some(value);
                 }
             }
+            Self::MinN { values, .. } | Self::MaxN { values, .. } => {
+                values.push(value);
+            }
             Self::Avg { sum, count } => {
                 *sum += aggregate_query_integer(&value)?;
                 *count += 1;
@@ -3276,6 +3309,8 @@ impl DistributedAggregateValue {
             Self::Sum(sum) => Value::Integer(*sum),
             Self::Min(min) => min.clone().unwrap_or(Value::Nil),
             Self::Max(max) => max.clone().unwrap_or(Value::Nil),
+            Self::MinN { limit, values } => aggregate_query_top_n(values, *limit, false),
+            Self::MaxN { limit, values } => aggregate_query_top_n(values, *limit, true),
             Self::Avg { sum, count } => {
                 if *count == 0 {
                     Value::Nil
@@ -3291,6 +3326,31 @@ impl DistributedAggregateValue {
             },
         }
     }
+}
+
+fn aggregate_query_limit(op: &str, value: &Value) -> Result<usize, DistributedCommitError> {
+    match value {
+        Value::Integer(limit) if *limit >= 0 => Ok(*limit as usize),
+        other => Err(DatomicError::Query(format!(
+            "{op} expects a non-negative integer limit, got {}",
+            kotoba_edn::to_string(other)
+        ))
+        .into()),
+    }
+}
+
+fn aggregate_query_top_n(values: &[Value], limit: usize, desc: bool) -> Value {
+    let mut values = values.to_vec();
+    values.sort_by(|left, right| {
+        let ordering = crate::query_sort_order(left, right);
+        if desc {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    values.truncate(limit);
+    Value::Vector(values)
 }
 
 fn aggregate_query_median(values: &[i64]) -> Value {
@@ -6705,7 +6765,7 @@ mod tests {
             .unwrap();
 
         let grouped = kotoba_edn::parse(
-            r#"{:find [?role (count ?e) (sum ?score) (min ?score) (max ?score) (avg ?score) (median ?score) (variance ?score) (stddev ?score)]
+            r#"{:find [?role (count ?e) (sum ?score) (min ?score) (max ?score) (min 2 ?score) (max 2 ?score) (avg ?score) (median ?score) (variance ?score) (stddev ?score)]
                 :where [[?e :person/role ?role]
                         [?e :person/score ?score]]
                 :order-by [[(count ?e) :desc] [?role :asc]]}"#,
@@ -6723,6 +6783,8 @@ mod tests {
                     EdnValue::Integer(11),
                     EdnValue::Integer(3),
                     EdnValue::Integer(8),
+                    EdnValue::Vector(vec![EdnValue::Integer(3), EdnValue::Integer(8)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(8), EdnValue::Integer(3)]),
                     EdnValue::float(5.5),
                     EdnValue::float(5.5),
                     EdnValue::float(6.25),
@@ -6734,6 +6796,8 @@ mod tests {
                     EdnValue::Integer(10),
                     EdnValue::Integer(10),
                     EdnValue::Integer(10),
+                    EdnValue::Vector(vec![EdnValue::Integer(10)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(10)]),
                     EdnValue::float(10.0),
                     EdnValue::Integer(10),
                     EdnValue::float(0.0),
