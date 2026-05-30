@@ -18,6 +18,7 @@ mod inner {
     pub struct HttpInferEngine {
         base_url: String,
         model: String,
+        api_key: Option<String>,
     }
 
     impl HttpInferEngine {
@@ -30,9 +31,15 @@ mod inner {
                 .map_err(|_| anyhow!("KOTOBA_INFERENCE_URL not set"))?;
             let model = std::env::var("KOTOBA_INFERENCE_MODEL")
                 .unwrap_or_else(|_| "gemma4:e4b".to_string());
+            // Optional bearer key for OpenAI-compatible gateways (e.g. the
+            // Murakumo LiteLLM gateway on 127.0.0.1:4000, ADR-2605215000).
+            let api_key = std::env::var("KOTOBA_INFERENCE_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty());
             Ok(Self {
                 base_url: base_url.trim_end_matches('/').to_string(),
                 model,
+                api_key,
             })
         }
 
@@ -73,10 +80,14 @@ mod inner {
                 "max_tokens": max_tokens,
                 "stream": false,
             });
-            let resp = client
+            let mut req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
-                .json(&body)
+                .json(&body);
+            if let Some(key) = &self.api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = req
                 .send()
                 .await
                 .map_err(|e| {
