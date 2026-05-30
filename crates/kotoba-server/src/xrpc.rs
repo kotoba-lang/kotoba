@@ -563,6 +563,7 @@ const ZCAP_ALLOWED_ACTION_IRI: &str = "https://w3id.org/security#allowedAction";
 const ZCAP_INVOCATION_TARGET_IRI: &str = "https://w3id.org/security#invocationTarget";
 const ZCAP_CONTROLLER_IRI: &str = "https://w3id.org/security#controller";
 const ZCAP_INVOCATION_PROOF_IRI: &str = "https://w3id.org/security#proof";
+const ZCAP_CAPABILITY_INVOCATION_IRI: &str = "https://w3id.org/security#CapabilityInvocation";
 
 #[derive(Debug, Serialize)]
 pub struct DatomicPullResp {
@@ -2357,6 +2358,18 @@ fn append_auth_capability_datoms(
         tx_cid,
         ":capability/proofFormat",
         kotoba_edn::EdnValue::String(projection.proof_format.to_string()),
+    );
+    assert_tx(
+        datoms,
+        tx_cid,
+        ":capability/type",
+        kotoba_edn::EdnValue::String("CapabilityInvocation".to_string()),
+    );
+    assert_tx(
+        datoms,
+        tx_cid,
+        kotoba_auth::did_document::ATTR_RDF_TYPE,
+        kotoba_edn::EdnValue::String(ZCAP_CAPABILITY_INVOCATION_IRI.to_string()),
     );
     if !projection.controller.is_empty() {
         assert_tx(
@@ -8396,8 +8409,8 @@ mod tests {
         DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq, DatomicPullManyReq,
         DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq, DatomicTransactReq,
         DatomicTxRangeReq, DatomicWithReq, DidCommSendReq, DidDocumentPublishReq, VcIssueReq,
-        ZCAP_ALLOWED_ACTION_IRI, ZCAP_CONTROLLER_IRI, ZCAP_INVOCATION_PROOF_IRI,
-        ZCAP_INVOCATION_TARGET_IRI,
+        ZCAP_ALLOWED_ACTION_IRI, ZCAP_CAPABILITY_INVOCATION_IRI, ZCAP_CONTROLLER_IRI,
+        ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI,
     };
     use crate::server::KotobaState;
     use axum::response::IntoResponse;
@@ -9320,6 +9333,11 @@ mod tests {
                 .any(|datom| datom.e == tx && datom.a == attr && datom.v == EdnValue::string(value))
         };
 
+        assert!(has(":capability/type", "CapabilityInvocation"));
+        assert!(has(
+            kotoba_auth::did_document::ATTR_RDF_TYPE,
+            ZCAP_CAPABILITY_INVOCATION_IRI
+        ));
         for action in actions {
             assert!(has(":capability/allowedAction", &action));
             assert!(has(":capability/operation", &action));
