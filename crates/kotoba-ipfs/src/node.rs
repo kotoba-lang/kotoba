@@ -1845,14 +1845,23 @@ impl KotobaIpfsNode {
         self.files_stat(path).await
     }
 
-    /// Kubo-like MFS `files/chcid` for file paths.
+    /// Kubo-like MFS `files/chcid` for file and directory paths.
     ///
     /// This lightweight MFS stores paths as direct file-CID bindings rather
-    /// than materialized directory DAGs, so `chcid` rewrites the target file
+    /// than materialized directory DAGs.  File `chcid` rewrites the target file
     /// block into the requested root codec and updates the path binding.
-    /// Supported codecs are `raw` and `dag-pb` UnixFS file blocks.
+    /// Directory `chcid` materializes and returns the current dag-pb directory
+    /// root.  Supported codecs are `raw` for files and `dag-pb` for files and
+    /// directories.
     pub async fn files_chcid(&self, path: impl AsRef<str>, codec: u64) -> Result<MfsStat> {
         let path = normalize_mfs_path(path.as_ref())?;
+        if path == "/" || self.state.dirs.read().await.contains(&path) {
+            if codec != crate::cid::CODEC_DAG_PB {
+                bail!("files/chcid directory only supports dag-pb codec: {codec}");
+            }
+            self.materialize_mfs_dir(&path).await?;
+            return self.files_stat(&path).await;
+        }
         let data = self.files_read(&path).await?;
         let new_cid = match codec {
             crate::cid::CODEC_RAW => self.put_raw_block(&data).await?,

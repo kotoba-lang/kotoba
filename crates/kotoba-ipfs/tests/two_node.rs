@@ -952,6 +952,20 @@ async fn kubo_compatible_local_api_surface() {
         .files_chcid("/docs/generated.txt", kotoba_ipfs::CODEC_DAG_CBOR)
         .await
         .is_err());
+    let docs_chcid = node
+        .files_chcid("/docs", kotoba_ipfs::CODEC_DAG_PB)
+        .await
+        .expect("files/chcid dir dag-pb");
+    assert_eq!(docs_chcid.path, "/docs");
+    assert_eq!(docs_chcid.kind, kotoba_ipfs::MfsKind::Directory);
+    assert_eq!(
+        docs_chcid.cid.expect("files/chcid dir cid").codec(),
+        kotoba_ipfs::CODEC_DAG_PB
+    );
+    assert!(node
+        .files_chcid("/docs", kotoba_ipfs::CODEC_RAW)
+        .await
+        .is_err());
     let touched = node
         .files_touch("/docs/empty.txt", true)
         .await
