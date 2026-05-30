@@ -2748,7 +2748,7 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
         | "clojure.set/difference"
         | "set/difference" => query_set_operation_value(op, args),
         "hash-map" => query_hash_map_value(args),
-        "keys" | "vals" | "merge" | "select-keys" => query_map_operation_value(op, args),
+        "keys" | "vals" | "merge" | "select-keys" | "zipmap" => query_map_operation_value(op, args),
         "every?" | "not-every?" | "not-any?" => {
             query_collection_predicate_value(op, args).map(EdnValue::Bool)
         }
@@ -2764,6 +2764,7 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
             query_collection_transform_value(op, args)
         }
         "frequencies" => query_frequencies_value(args),
+        "range" | "repeat" => query_sequence_constructor_value(op, args),
         "reduce" => query_reduce_value(args),
         "apply" => query_apply_function_value(args),
         "seq" | "first" | "last" | "rest" | "next" => match args.as_slice() {
@@ -3105,8 +3106,71 @@ pub(crate) fn query_map_operation_value(op: &str, args: Vec<EdnValue>) -> Result
             }
             Ok(EdnValue::Map(out))
         }
+        "zipmap" => {
+            let [keys, vals]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("zipmap expects keys and values".into()))?;
+            let keys = query_seq_values(keys)?;
+            let vals = query_seq_values(vals)?;
+            Ok(EdnValue::Map(keys.into_iter().zip(vals).collect()))
+        }
         other => Err(DatomicError::UnsupportedOperation(other.into())),
     }
+}
+
+pub(crate) fn query_sequence_constructor_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
+    match op {
+        "range" => {
+            let (start, end, step) = match args.as_slice() {
+                [end] => (0, query_integer_arg(end, "range")?, 1),
+                [start, end] => (
+                    query_integer_arg(start, "range")?,
+                    query_integer_arg(end, "range")?,
+                    1,
+                ),
+                [start, end, step] => (
+                    query_integer_arg(start, "range")?,
+                    query_integer_arg(end, "range")?,
+                    query_integer_arg(step, "range")?,
+                ),
+                _ => {
+                    return Err(DatomicError::Query(
+                        "range expects end, optional start, and optional step".into(),
+                    ))
+                }
+            };
+            if step == 0 {
+                return Err(DatomicError::Query("range step must be non-zero".into()));
+            }
+            let mut out = Vec::new();
+            let mut value = start;
+            while if step > 0 { value < end } else { value > end } {
+                out.push(EdnValue::Integer(value));
+                value = value
+                    .checked_add(step)
+                    .ok_or_else(|| DatomicError::Query("range integer overflow".into()))?;
+            }
+            Ok(EdnValue::Vector(out))
+        }
+        "repeat" => {
+            let [n, value]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("repeat expects count and value".into()))?;
+            let n = query_non_negative_usize(&n, "repeat")?;
+            Ok(EdnValue::Vector(vec![value; n]))
+        }
+        other => Err(DatomicError::UnsupportedOperation(other.into())),
+    }
+}
+
+fn query_integer_arg(value: &EdnValue, op: &str) -> Result<i64> {
+    let EdnValue::Integer(value) = value else {
+        return Err(DatomicError::Query(format!(
+            "{op} expects integer arguments, got {}",
+            edn_to_string(value)
+        )));
+    };
+    Ok(*value)
 }
 
 pub(crate) fn query_count_value(value: EdnValue) -> Result<EdnValue> {
@@ -5486,7 +5550,7 @@ fn eval_query_function(
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(query_hash_map_value),
-        "keys" | "vals" | "merge" | "select-keys" => args
+        "keys" | "vals" | "merge" | "select-keys" | "zipmap" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
@@ -5529,6 +5593,11 @@ fn eval_query_function(
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(query_frequencies_value),
+        "range" | "repeat" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|values| query_sequence_constructor_value(op, values)),
         "reduce" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
@@ -8760,7 +8829,7 @@ mod tests {
         .await
         .unwrap();
         let query = parse(
-            r#"{:find [?allScores ?notEveryScoreString ?noNilScores ?allNames ?scoresVector ?sameScore ?hasAdmin ?notFalse ?truthyScores ?namesString ?incScores ?oddScores ?nonOddScores ?nonEmptyNames ?scoreSum ?scoreProduct ?scoreMax ?applySum ?applyMax ?scoreSet ?initialOdds ?afterOdds ?splitScores ?splitOdds ?groupedScores ?partitionedScores ?scoreFrequencies ?flatScores ?interposedScores ?interleavedScores ?pairs ?windows ?paddedPairs ?allPairs]
+            r#"{:find [?allScores ?notEveryScoreString ?noNilScores ?allNames ?scoresVector ?sameScore ?hasAdmin ?notFalse ?truthyScores ?namesString ?incScores ?oddScores ?nonOddScores ?nonEmptyNames ?scoreSum ?scoreProduct ?scoreMax ?applySum ?applyMax ?scoreSet ?initialOdds ?afterOdds ?splitScores ?splitOdds ?groupedScores ?partitionedScores ?scoreFrequencies ?numberRange ?repeatedScore ?scoreMap ?flatScores ?interposedScores ?interleavedScores ?pairs ?windows ?paddedPairs ?allPairs]
                 :where [[?e :person/scores ?scores]
                         [?e :person/names ?names]
                         [(distinct? 1 2 3)]
@@ -8792,6 +8861,9 @@ mod tests {
                         [(group-by odd? ?scores) ?groupedScores]
                         [(partition-by odd? ?scores) ?partitionedScores]
                         [(frequencies [1 1 2]) ?scoreFrequencies]
+                        [(range 1 6 2) ?numberRange]
+                        [(repeat 3 :ok) ?repeatedScore]
+                        [(zipmap [:a :b] ?scores) ?scoreMap]
                         [(flatten [[1 2 3] [4 [5]]]) ?flatScores]
                         [(interpose 0 ?scores) ?interposedScores]
                         [(interleave ?scores [:a :b :c]) ?interleavedScores]
@@ -8874,6 +8946,16 @@ mod tests {
                 EdnValue::Map(BTreeMap::from([
                     (EdnValue::Integer(1), EdnValue::Integer(2)),
                     (EdnValue::Integer(2), EdnValue::Integer(1)),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![kw_value(":ok"), kw_value(":ok"), kw_value(":ok")]),
+                EdnValue::Map(BTreeMap::from([
+                    (kw_value(":a"), EdnValue::Integer(1)),
+                    (kw_value(":b"), EdnValue::Integer(2)),
                 ])),
                 EdnValue::Vector(vec![
                     EdnValue::Integer(1),

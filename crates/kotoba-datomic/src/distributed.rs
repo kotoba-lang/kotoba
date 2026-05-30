@@ -1762,7 +1762,7 @@ where
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| crate::query_hash_map_value(values).map_err(Into::into)),
-            "keys" | "vals" | "merge" | "select-keys" => args
+            "keys" | "vals" | "merge" | "select-keys" | "zipmap" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
@@ -1818,6 +1818,13 @@ where
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| crate::query_frequencies_value(values).map_err(Into::into)),
+            "range" | "repeat" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| {
+                    crate::query_sequence_constructor_value(op, values).map_err(Into::into)
+                }),
             "reduce" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
@@ -6747,7 +6754,7 @@ mod tests {
         );
 
         let collection_predicate_query = kotoba_edn::parse(
-            r#"{:find [?allTags ?noNilTags ?notEveryTagString ?tagsVector ?sameTag ?hasTag ?notFalse ?truthyTags ?tagsString ?tagKeywords ?nonStringTags ?keptTags ?sum ?product ?max ?applySum ?applyMax ?applySet ?initialOdds ?afterOdds ?splitNumbers ?splitOdds ?groupedNumbers ?partitionedNumbers ?numberFrequencies ?flat ?interposed ?interleaved ?pairs ?windows ?paddedPairs ?allPairs]
+            r#"{:find [?allTags ?noNilTags ?notEveryTagString ?tagsVector ?sameTag ?hasTag ?notFalse ?truthyTags ?tagsString ?tagKeywords ?nonStringTags ?keptTags ?sum ?product ?max ?applySum ?applyMax ?applySet ?initialOdds ?afterOdds ?splitNumbers ?splitOdds ?groupedNumbers ?partitionedNumbers ?numberFrequencies ?numberRange ?repeatedTag ?tagMap ?flat ?interposed ?interleaved ?pairs ?windows ?paddedPairs ?allPairs]
                 :where [[?e :credential/claims ?claims]
                         [(get ?claims :claim/tags) ?tags]
                         [(distinct? :role/admin :role/auditor :role/operator)]
@@ -6777,6 +6784,9 @@ mod tests {
                         [(group-by odd? [1 2 3]) ?groupedNumbers]
                         [(partition-by odd? [1 3 2 5]) ?partitionedNumbers]
                         [(frequencies [1 1 2]) ?numberFrequencies]
+                        [(range 1 6 2) ?numberRange]
+                        [(repeat 3 :ok) ?repeatedTag]
+                        [(zipmap [:a :b] [1 2 3]) ?tagMap]
                         [(flatten [[1 2] [3 [4]]]) ?flat]
                         [(interpose 0 [1 2 3]) ?interposed]
                         [(interleave [1 2 3] [:a :b :c]) ?interleaved]
@@ -6860,6 +6870,20 @@ mod tests {
                 EdnValue::Map(BTreeMap::from([
                     (EdnValue::Integer(1), EdnValue::Integer(2)),
                     (EdnValue::Integer(2), EdnValue::Integer(1)),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Keyword(Keyword::parse("ok")),
+                    EdnValue::Keyword(Keyword::parse("ok")),
+                    EdnValue::Keyword(Keyword::parse("ok")),
+                ]),
+                EdnValue::Map(BTreeMap::from([
+                    (EdnValue::Keyword(Keyword::parse("a")), EdnValue::Integer(1),),
+                    (EdnValue::Keyword(Keyword::parse("b")), EdnValue::Integer(2),),
                 ])),
                 EdnValue::Vector(vec![
                     EdnValue::Integer(1),
