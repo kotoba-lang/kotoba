@@ -1840,7 +1840,7 @@ where
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| crate::query_cons_value(values).map_err(Into::into)),
-            "take" | "drop" | "subvec" => args
+            "take" | "drop" | "take-while" | "drop-while" | "subvec" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
@@ -6741,7 +6741,7 @@ mod tests {
         );
 
         let collection_predicate_query = kotoba_edn::parse(
-            r#"{:find [?allTags ?noNilTags ?notEveryTagString ?tagsVector ?sameTag ?hasTag ?notFalse ?truthyTags ?tagsString ?tagKeywords ?nonStringTags ?keptTags ?sum ?product ?max ?applySum ?applyMax ?applySet]
+            r#"{:find [?allTags ?noNilTags ?notEveryTagString ?tagsVector ?sameTag ?hasTag ?notFalse ?truthyTags ?tagsString ?tagKeywords ?nonStringTags ?keptTags ?sum ?product ?max ?applySum ?applyMax ?applySet ?initialOdds ?afterOdds]
                 :where [[?e :credential/claims ?claims]
                         [(get ?claims :claim/tags) ?tags]
                         [(distinct? :role/admin :role/auditor :role/operator)]
@@ -6764,6 +6764,8 @@ mod tests {
                         [(apply + [1 2 3]) ?applySum]
                         [(apply max [1 2 3]) ?applyMax]
                         [(apply hash-set [1 2 3]) ?applySet]
+                        [(take-while odd? [1 3 2 5]) ?initialOdds]
+                        [(drop-while odd? [1 3 2 5]) ?afterOdds]
                         [(= ?allTags true)]
                         [(= ?noNilTags true)]
                         [(= ?notEveryTagString true)]
@@ -6812,6 +6814,8 @@ mod tests {
                     EdnValue::Integer(2),
                     EdnValue::Integer(3),
                 ])),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
+                EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(5)]),
             ]]
         );
 

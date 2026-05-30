@@ -2768,7 +2768,9 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
             _ => Err(DatomicError::Query(format!("{op} expects one argument"))),
         },
         "nth" => query_nth_value(args),
-        "take" | "drop" | "subvec" => query_collection_slice_value(op, args),
+        "take" | "drop" | "take-while" | "drop-while" | "subvec" => {
+            query_collection_slice_value(op, args)
+        }
         "reverse" | "sort" => query_collection_order_value(op, args),
         "cons" => query_cons_value(args),
         "conj" => query_conj_value(args),
@@ -3172,6 +3174,32 @@ pub(crate) fn query_collection_slice_value(op: &str, args: Vec<EdnValue>) -> Res
                 )));
             }
             Ok(EdnValue::Vector(values[start..end].to_vec()))
+        }
+        "take-while" | "drop-while" => {
+            let [predicate, collection]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query(format!("{op} expects two arguments")))?;
+            let predicate = query_function_name(&predicate)?;
+            let mut out = Vec::new();
+            let mut dropping = op == "drop-while";
+            for value in query_seq_values(collection)? {
+                let matched = query_truthy(&query_apply_value_function(
+                    &predicate,
+                    vec![value.clone()],
+                )?);
+                if op == "take-while" {
+                    if !matched {
+                        break;
+                    }
+                    out.push(value);
+                } else if dropping && matched {
+                    continue;
+                } else {
+                    dropping = false;
+                    out.push(value);
+                }
+            }
+            Ok(EdnValue::Vector(out))
         }
         other => Err(DatomicError::UnsupportedOperation(other.into())),
     }
@@ -5320,7 +5348,7 @@ fn eval_query_function(
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(query_cons_value),
-        "take" | "drop" | "subvec" => args
+        "take" | "drop" | "take-while" | "drop-while" | "subvec" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
@@ -8524,7 +8552,7 @@ mod tests {
         .await
         .unwrap();
         let query = parse(
-            r#"{:find [?allScores ?notEveryScoreString ?noNilScores ?allNames ?scoresVector ?sameScore ?hasAdmin ?notFalse ?truthyScores ?namesString ?incScores ?oddScores ?nonOddScores ?nonEmptyNames ?scoreSum ?scoreProduct ?scoreMax ?applySum ?applyMax ?scoreSet]
+            r#"{:find [?allScores ?notEveryScoreString ?noNilScores ?allNames ?scoresVector ?sameScore ?hasAdmin ?notFalse ?truthyScores ?namesString ?incScores ?oddScores ?nonOddScores ?nonEmptyNames ?scoreSum ?scoreProduct ?scoreMax ?applySum ?applyMax ?scoreSet ?initialOdds ?afterOdds]
                 :where [[?e :person/scores ?scores]
                         [?e :person/names ?names]
                         [(distinct? 1 2 3)]
@@ -8549,6 +8577,8 @@ mod tests {
                         [(apply + ?scores) ?applySum]
                         [(apply max ?scores) ?applyMax]
                         [(apply hash-set ?scores) ?scoreSet]
+                        [(take-while odd? ?scores) ?initialOdds]
+                        [(drop-while odd? ?scores) ?afterOdds]
                         [(= ?allScores true)]
                         [(= ?notEveryScoreString true)]
                         [(= ?noNilScores true)]
@@ -8596,6 +8626,8 @@ mod tests {
                     EdnValue::Integer(2),
                     EdnValue::Integer(3),
                 ])),
+                EdnValue::Vector(vec![EdnValue::Integer(1)]),
+                EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(3)]),
             ]]
         );
     }
