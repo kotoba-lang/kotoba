@@ -1257,12 +1257,34 @@ async fn kubo_compatible_local_api_surface() {
     assert!(bitswap.provide_buf_len >= 1);
     assert!(bitswap.wantlist.is_empty());
 
+    let docs_dir_cid = node
+        .files_stat("/docs")
+        .await
+        .expect("files/stat current docs dir")
+        .cid
+        .expect("current docs dir cid");
+    let root_dir_cid = node
+        .files_stat("/")
+        .await
+        .expect("files/stat current root dir")
+        .cid
+        .expect("current root dir cid");
+    assert_eq!(docs_dir_cid.codec(), CODEC_DAG_PB);
+    assert_eq!(root_dir_cid.codec(), CODEC_DAG_PB);
     assert!(!node
         .repo_gc()
         .await
         .expect("repo/gc mfs root")
         .contains(&raw));
     assert!(node.has_block(&raw).await.expect("has raw under mfs"));
+    assert!(node
+        .has_block(&docs_dir_cid)
+        .await
+        .expect("has materialized mfs dir after gc"));
+    assert!(node
+        .has_block(&root_dir_cid)
+        .await
+        .expect("has materialized mfs root after gc"));
     assert!(!node.has_block(&dag).await.expect("has dag after gc"));
     assert_eq!(node.files_rm("/docs", true).await.expect("files/rm"), 16);
     assert!(node
@@ -1271,7 +1293,9 @@ async fn kubo_compatible_local_api_surface() {
         .expect("files/ls empty")
         .is_empty());
 
-    assert!(node.repo_gc().await.expect("repo/gc").contains(&raw));
+    let removed_after_mfs_rm = node.repo_gc().await.expect("repo/gc");
+    assert!(removed_after_mfs_rm.contains(&raw));
+    assert!(removed_after_mfs_rm.contains(&docs_dir_cid));
     assert!(!node.has_block(&raw).await.expect("has raw"));
 }
 

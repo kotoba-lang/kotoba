@@ -1230,7 +1230,7 @@ impl KotobaIpfsNode {
     }
 
     pub async fn gc(&self) -> Result<Vec<IpldCid>> {
-        let roots = self.live_roots().await;
+        let roots = self.live_roots().await?;
         let mut live = roots.clone();
         for root in roots {
             if let Ok(refs) = self.refs(&root, true).await {
@@ -2010,10 +2010,17 @@ impl KotobaIpfsNode {
         Ok(())
     }
 
-    async fn live_roots(&self) -> HashSet<IpldCid> {
+    async fn live_roots(&self) -> Result<HashSet<IpldCid>> {
         let mut roots: HashSet<_> = self.state.pins.read().await.keys().copied().collect();
-        roots.extend(self.state.files.read().await.values().copied());
-        roots
+        let files = self.state.files.read().await;
+        let has_files = !files.is_empty();
+        roots.extend(files.values().copied());
+        drop(files);
+        let has_dirs = !self.state.dirs.read().await.is_empty();
+        if has_files || has_dirs {
+            roots.insert(self.materialize_mfs_dir("/").await?);
+        }
+        Ok(roots)
     }
 
     async fn is_pinned_or_indirect(&self, cid: &IpldCid) -> Result<bool> {

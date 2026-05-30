@@ -8775,6 +8775,41 @@ mod tests {
             serde_json::json!([{ ":total": "2", ":totalScore": "30" }])
         );
 
+        let speculative = datomic_with(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicWithReq {
+                graph: graph_mb.clone(),
+                tx_edn: r#"[[:db/add "remote-alice" :person/title "Lead"]]"#.into(),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(speculative.status(), axum::http::StatusCode::OK);
+        let speculative_body = axum::body::to_bytes(speculative.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let speculative_body: serde_json::Value =
+            serde_json::from_slice(&speculative_body).unwrap();
+        assert_eq!(
+            speculative_body["db_before_basis_t"],
+            report.commit.tx_cid.to_multibase()
+        );
+        let speculative_datoms = speculative_body["db_after_datoms"].as_array().unwrap();
+        assert!(speculative_datoms
+            .iter()
+            .any(|datom| datom["a"] == ":person/name" && datom["v_edn"] == r#""Alice""#));
+        assert!(speculative_datoms
+            .iter()
+            .any(|datom| datom["a"] == ":person/title" && datom["v_edn"] == r#""Lead""#));
+
         let pull = datomic_pull(
             axum::extract::State(Arc::clone(&state)),
             headers.clone(),
