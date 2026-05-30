@@ -81,7 +81,7 @@ CACAO ecosystem helpers:
 ```bash
 kotoba did-derive <32-byte-hex-seed>             # → did:key:z…
 kotoba cacao-sign <seed> --graph <cid> \
-    --capability quad:read [--private] [--aud <did>]
+    --capability datom:read [--private] [--aud <did>]
 ```
 
 ## Defaults that just work

@@ -2,7 +2,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::{
     arrangement::Arrangement,
-    quad::{Quad, QuadObject},
+    datom::Value,
+    quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
 
 fn make_cid(n: u64) -> KotobaCid {
@@ -226,7 +227,7 @@ fn bench_population_count_aevt(c: &mut Criterion) {
                 std::collections::HashMap::new();
             for (_, objs) in &all {
                 for obj in objs {
-                    if let kotoba_kqe::quad::LegacyQuadObject::Text(v) = obj {
+                    if let Value::Text(v) = obj {
                         *counts.entry(v.clone()).or_default() += 1;
                     }
                 }

@@ -1,9 +1,9 @@
 //! gftdcojp: Chargespot BMA — kotoba-server ingest client
 //!
 //! Generates an ephemeral Ed25519 keypair, builds a self-signed CACAO with
-//! `quad:write` capability, and ingests all Chargespot BMA Quads into a
+//! `datom:write` capability, and ingests all Chargespot BMA Datom projections into a
 //! running kotoba-server via:
-//!   - XRPC  POST /xrpc/ai.gftd.apps.kotoba.quad.create   (one per Quad)
+//!   - XRPC  POST /xrpc/ai.gftd.apps.kotoba.quad.create   (legacy projection)
 //!   - XRPC  POST /xrpc/ai.gftd.apps.kotoba.commit.store  (once at end)
 //!   - MCP   POST /mcp  kotoba_graph_query                 (verify round-trip)
 //!
@@ -17,7 +17,7 @@ use kotoba_auth::{did_key::ed25519_pubkey_to_did_key, Cacao, CacaoHeader, CacaoP
 use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::{
     delta::Delta,
-    quad::{Quad, QuadObject},
+    quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ── Graph identifier ──────────────────────────────────────────────────────────
 const GRAPH_ID: &str = "gftdcojp:bma:chargespot:v1";
 
-// ── Quad data (same as gftdcojp-chargespot-bma example) ──────────────────────
+// ── Datom projection data (same as gftdcojp-chargespot-bma example) ──────────
 
 const COMPETITORS: &[(&str, &str, &str, &str, &str)] = &[
     (
@@ -193,54 +193,54 @@ fn quad(subject: &str, predicate: &str, object: QuadObject) -> Quad {
 
 fn build_facts() -> Vec<Delta> {
     let mut d = Vec::new();
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/namespace",
         QuadObject::Text("gftdcojp".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/subject",
         QuadObject::Text("モバイルバッテリーシェアリング競合分析".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/model_type",
         QuadObject::Text("mobile-battery-sharing".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/date",
         QuadObject::Text("2026-05-27".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/version",
         QuadObject::Text("v1".into()),
     )));
     for (id, region, name, status, notes) in COMPETITORS {
         let cid_str = format!("gftdcojp:bma:chargespot:competitor:{id}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/competitor",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/region",
             QuadObject::Text(region.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/name",
             QuadObject::Text(name.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/status",
             QuadObject::Text(status.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/notes",
             QuadObject::Text(notes.to_string()),
@@ -248,32 +248,32 @@ fn build_facts() -> Vec<Delta> {
     }
     for (rid, name, count, maturity, share_pct) in REGIONS {
         let cid_str = format!("gftdcojp:bma:chargespot:region:{rid}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/region",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/code",
             QuadObject::Text(rid.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/name",
             QuadObject::Text(name.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/competitor_count",
             QuadObject::Integer(*count),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/maturity",
             QuadObject::Integer(*maturity),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/market_share_pct",
             QuadObject::Integer(*share_pct),
@@ -281,22 +281,22 @@ fn build_facts() -> Vec<Delta> {
     }
     for (fid, category, desc, severity) in STRUGGLE_FACTORS {
         let cid_str = format!("gftdcojp:bma:chargespot:factor:{fid}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/struggle_factor",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "factor/category",
             QuadObject::Text(category.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "factor/description",
             QuadObject::Text(desc.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "factor/severity",
             QuadObject::Integer(*severity),
@@ -304,17 +304,17 @@ fn build_facts() -> Vec<Delta> {
     }
     for (scid, desc, regions) in SUCCESS_CONDITIONS {
         let cid_str = format!("gftdcojp:bma:chargespot:success:{scid}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/success_condition",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "condition/description",
             QuadObject::Text(desc.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "condition/present_in",
             QuadObject::Text(regions.to_string()),
@@ -338,7 +338,7 @@ impl IngestIdentity {
         Self { signing_key, did }
     }
 
-    /// Build a self-signed CACAO granting `quad:write` on all graphs.
+    /// Build a self-signed CACAO granting `datom:write` on all graphs.
     /// Signed with EdDSA (Ed25519) over the SIWE plaintext.
     fn make_cacao(&self, server_url: &str) -> Result<String> {
         let now = SystemTime::now()
@@ -370,7 +370,7 @@ impl IngestIdentity {
             domain: "localhost".to_string(),
             statement: Some("kotoba ingest: gftdcojp BMA chargespot".to_string()),
             version: "1".to_string(),
-            resources: vec!["kotoba://can/quad:write".to_string()],
+            resources: vec!["kotoba://can/datom:write".to_string()],
         };
 
         let cacao = Cacao {
@@ -592,12 +592,12 @@ async fn main() -> Result<()> {
 
     let client = reqwest::Client::new();
 
-    // 2. Build Quads
+    // 2. Build Datom facts and project them to legacy Quad XRPC payloads.
     let facts = build_facts();
-    let assert_quads: Vec<&Quad> = facts
+    let assert_quads: Vec<Quad> = facts
         .iter()
         .filter(|d| d.is_assert())
-        .map(|d| &d.quad)
+        .map(|d| d.to_legacy_quad())
         .collect();
     println!("quads to ingest: {}", assert_quads.len());
 
@@ -647,7 +647,7 @@ async fn main() -> Result<()> {
         serde_json::to_string_pretty(&query_result)?
     );
 
-    println!("\n✓ Done. Knowledge is now in kotoba-server QuadStore.");
+    println!("\n✓ Done. Knowledge is now in kotoba-server Datom projection store.");
     println!("  graph_cid (multibase): {graph_mb}");
     println!("  commit_cid:            {commit_cid}");
     println!("\nAgent query example (MCP kotoba_graph_query):");

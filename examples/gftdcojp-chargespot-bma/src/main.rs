@@ -4,7 +4,7 @@
 //! namespace: gftdcojp
 //! date: 2026-05-27
 //!
-//! Quads encode:
+//! Datom facts encode:
 //!   - 競合企業リスト (地域 × 社名 × 状態)
 //!   - 地域別市場評価 (規模・成熟度・苦戦理由)
 //!   - 苦戦要因分析 (5カテゴリ)
@@ -15,7 +15,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::{
     datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term},
     delta::Delta,
-    quad::{Quad, QuadObject},
+    quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
 use kotoba_store::MemoryBlockStore;
 use std::sync::Arc;
@@ -190,7 +190,7 @@ const SUCCESS_CONDITIONS: &[(&str, &str, &str)] = &[
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Quad helpers
+// Datom projection helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn cid(s: &str) -> KotobaCid {
@@ -218,32 +218,32 @@ fn build_facts() -> Vec<Delta> {
     let mut d = Vec::new();
 
     // analysis root
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/namespace",
         QuadObject::Text("gftdcojp".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/subject",
         QuadObject::Text("モバイルバッテリーシェアリング競合分析".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/model_type",
         QuadObject::Text("mobile-battery-sharing".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/date",
         QuadObject::Text("2026-05-27".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/version",
         QuadObject::Text("v1".into()),
     )));
-    d.push(Delta::assert(quad(
+    d.push(Delta::assert_legacy_quad(quad(
         "gftdcojp:bma:chargespot",
         "bma/reference",
         QuadObject::Text("chargespot.jp".into()),
@@ -252,27 +252,27 @@ fn build_facts() -> Vec<Delta> {
     // competitors
     for (id, region, name, status, notes) in COMPETITORS {
         let cid_str = format!("gftdcojp:bma:chargespot:competitor:{id}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/competitor",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/region",
             QuadObject::Text(region.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/name",
             QuadObject::Text(name.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/status",
             QuadObject::Text(status.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "competitor/notes",
             QuadObject::Text(notes.to_string()),
@@ -282,32 +282,32 @@ fn build_facts() -> Vec<Delta> {
     // regions
     for (rid, name, count, maturity, share_pct) in REGIONS {
         let cid_str = format!("gftdcojp:bma:chargespot:region:{rid}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/region",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/code",
             QuadObject::Text(rid.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/name",
             QuadObject::Text(name.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/competitor_count",
             QuadObject::Integer(*count),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/maturity",
             QuadObject::Integer(*maturity),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "region/market_share_pct",
             QuadObject::Integer(*share_pct),
@@ -317,22 +317,22 @@ fn build_facts() -> Vec<Delta> {
     // struggle factors
     for (fid, category, desc, severity) in STRUGGLE_FACTORS {
         let cid_str = format!("gftdcojp:bma:chargespot:factor:{fid}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/struggle_factor",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "factor/category",
             QuadObject::Text(category.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "factor/description",
             QuadObject::Text(desc.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "factor/severity",
             QuadObject::Integer(*severity),
@@ -342,17 +342,17 @@ fn build_facts() -> Vec<Delta> {
     // success conditions
     for (scid, desc, regions) in SUCCESS_CONDITIONS {
         let cid_str = format!("gftdcojp:bma:chargespot:success:{scid}");
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             "gftdcojp:bma:chargespot",
             "bma/success_condition",
             QuadObject::Cid(cid(&cid_str)),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "condition/description",
             QuadObject::Text(desc.to_string()),
         )));
-        d.push(Delta::assert(quad(
+        d.push(Delta::assert_legacy_quad(quad(
             &cid_str,
             "condition/present_in",
             QuadObject::Text(regions.to_string()),
@@ -472,7 +472,7 @@ async fn main() -> Result<()> {
 
     let facts = build_facts();
     println!(
-        "Loaded {} Quads into gftdcojp:bma:chargespot:v1",
+        "Loaded {} Datom facts into gftdcojp:bma:chargespot:v1",
         facts.len()
     );
 
@@ -481,22 +481,22 @@ async fn main() -> Result<()> {
 
     let region_count = derived
         .iter()
-        .filter(|d| d.quad.predicate == "has_region_data" && d.is_assert())
-        .map(|d| d.quad.subject.clone())
+        .filter(|d| d.to_legacy_quad().predicate == "has_region_data" && d.is_assert())
+        .map(|d| d.to_legacy_quad().subject)
         .collect::<std::collections::HashSet<_>>()
         .len();
 
     let competitor_count = derived
         .iter()
-        .filter(|d| d.quad.predicate == "has_competitor" && d.is_assert())
-        .map(|d| d.quad.subject.clone())
+        .filter(|d| d.to_legacy_quad().predicate == "has_competitor" && d.is_assert())
+        .map(|d| d.to_legacy_quad().subject)
         .collect::<std::collections::HashSet<_>>()
         .len();
 
     let factor_count = derived
         .iter()
-        .filter(|d| d.quad.predicate == "has_factor" && d.is_assert())
-        .map(|d| d.quad.subject.clone())
+        .filter(|d| d.to_legacy_quad().predicate == "has_factor" && d.is_assert())
+        .map(|d| d.to_legacy_quad().subject)
         .collect::<std::collections::HashSet<_>>()
         .len();
 

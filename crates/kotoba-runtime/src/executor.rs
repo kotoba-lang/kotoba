@@ -22,7 +22,7 @@ pub struct InvokeContext {
 pub struct InvokeResult {
     pub output_cbor: Vec<u8>,
     pub gas_used: u64,
-    /// Quads to apply to Arrangement after successful execution
+    /// Datom projection writes to apply after successful execution
     pub assert_quads: Vec<SerializedQuad>,
     pub retract_quads: Vec<SerializedQuad>,
     /// kse.publish calls made by the guest — caller routes to KSE Journal
