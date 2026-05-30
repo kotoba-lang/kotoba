@@ -2069,7 +2069,16 @@ fn pull_entity_inner(db: &Db, pattern: &EdnValue, eid: &Entity, depth: usize) ->
         if let Some(limit) = pattern.limit_for(reverse_attr) {
             values.truncate(limit);
         }
-        map.insert(pattern.attr_key(reverse_attr), EdnValue::Vector(values));
+        let key = pattern.attr_key(reverse_attr);
+        if values.is_empty() {
+            if let Some(default) = pattern.defaults.get(reverse_attr) {
+                map.insert(key, pattern.apply_xform(reverse_attr, default.clone())?);
+            } else {
+                map.insert(key, EdnValue::Vector(values));
+            }
+        } else {
+            map.insert(key, EdnValue::Vector(values));
+        }
     }
     for (attr, value) in &pattern.defaults {
         let key = pattern.attr_key(attr);
@@ -6573,6 +6582,36 @@ mod tests {
                 EdnValue::String("Alice".into()),
                 EdnValue::String("Carol".into())
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_supports_reverse_ref_default_option() {
+        let conn = Connection::new();
+        let report = conn
+            .transact(
+                parse(
+                    r#"[
+                      {:db/id "bob" :person/name "Bob" :person/role :guest}
+                    ]"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bob = report.tempids["bob"].clone();
+        let pulled = conn
+            .db()
+            .pull(
+                parse(r#"[[:person/_friend :default :friend/none :xform name :as :referrers]]"#)
+                    .unwrap(),
+                bob,
+            )
+            .unwrap();
+        let map = pulled.as_map().unwrap();
+        assert_eq!(
+            map.get(&kw_value(":referrers")),
+            Some(&EdnValue::String("none".into()))
         );
     }
 
