@@ -5366,7 +5366,8 @@ mod tests {
         let second = writer.commit_datoms(second_req).unwrap();
 
         let reader = DistributedDatomReader::new(&store, &ipns);
-        let pattern = kotoba_edn::parse(r#"[:person/name :person/role]"#).unwrap();
+        let pattern = kotoba_edn::parse(r#"[:db/id :person/name :person/role]"#).unwrap();
+        let id_key = kotoba_edn::parse(":db/id").unwrap();
         let name_key = kotoba_edn::parse(":person/name").unwrap();
         let role_key = kotoba_edn::parse(":person/role").unwrap();
 
@@ -5375,6 +5376,7 @@ mod tests {
             .unwrap()
             .expect("ipns head");
         let pulled_map = pulled.as_map().unwrap();
+        assert_eq!(pulled_map.get(&id_key), Some(&cid_value(&alice)));
         assert_eq!(
             pulled_map.get(&name_key),
             Some(&EdnValue::String("Alice".into()))
@@ -5394,6 +5396,10 @@ mod tests {
             .expect("ipns head");
         assert_eq!(pulled_many.len(), 2);
         assert_eq!(
+            pulled_many[1].as_map().unwrap().get(&id_key),
+            Some(&cid_value(&bob))
+        );
+        assert_eq!(
             pulled_many[1].as_map().unwrap().get(&name_key),
             Some(&EdnValue::String("Bob".into()))
         );
@@ -5403,10 +5409,14 @@ mod tests {
                 "k51-kotoba-db",
                 &first.commit.tx_cid,
                 pattern.clone(),
-                alice,
+                alice.clone(),
             )
             .unwrap()
             .expect("ipns head");
+        assert_eq!(
+            as_of.as_map().unwrap().get(&id_key),
+            Some(&cid_value(&alice))
+        );
         assert_eq!(
             as_of.as_map().unwrap().get(&name_key),
             Some(&EdnValue::String("Alice".into()))
@@ -6481,7 +6491,7 @@ mod tests {
             .unwrap();
 
         let query = kotoba_edn::parse(
-            r#"{:find [(pull ?e [:person/name {:person/friend [:person/name :person/role]}])]
+            r#"{:find [(pull ?e [:db/id :person/name {:person/friend [:db/id :person/name :person/role]}])]
                 :where [[?e :person/name "Alice"]]}"#,
         )
         .unwrap();
@@ -6492,6 +6502,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let pulled = rows[0][0].as_map().unwrap();
         assert_eq!(
+            pulled.get(&EdnValue::Keyword(Keyword::namespaced("db", "id"))),
+            Some(&cid_value(&KotobaCid::from_bytes(b"alice")))
+        );
+        assert_eq!(
             pulled.get(&EdnValue::Keyword(Keyword::namespaced("person", "name"))),
             Some(&EdnValue::String("Alice".into()))
         );
@@ -6499,6 +6513,10 @@ mod tests {
             .get(&EdnValue::Keyword(Keyword::namespaced("person", "friend")))
             .and_then(EdnValue::as_map)
             .unwrap();
+        assert_eq!(
+            friend.get(&EdnValue::Keyword(Keyword::namespaced("db", "id"))),
+            Some(&cid_value(&KotobaCid::from_bytes(b"bob")))
+        );
         assert_eq!(
             friend.get(&EdnValue::Keyword(Keyword::namespaced("person", "name"))),
             Some(&EdnValue::String("Bob".into()))
