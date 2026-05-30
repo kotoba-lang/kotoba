@@ -913,6 +913,7 @@ impl KotobaIpfsNode {
                 .map(|link| ObjectLink {
                     name: link.name,
                     cid: link.cid,
+                    size: link.tsize,
                 })
                 .collect(),
         })
@@ -927,18 +928,24 @@ impl KotobaIpfsNode {
                 .map(|link| ObjectLink {
                     name: link.name,
                     cid: link.cid,
+                    size: link.tsize,
                 })
                 .collect());
         }
-        Ok(self
-            .refs(cid, false)
-            .await?
-            .into_iter()
-            .map(|cid| ObjectLink {
+        let mut out = Vec::new();
+        for cid in self.refs(cid, false).await? {
+            let size = self
+                .object_stat(&cid)
+                .await
+                .ok()
+                .map(|stat| stat.cumulative_size);
+            out.push(ObjectLink {
                 name: String::new(),
                 cid,
-            })
-            .collect())
+                size,
+            });
+        }
+        Ok(out)
     }
 
     /// Kubo-like `object/put` for dag-pb objects.
@@ -948,7 +955,7 @@ impl KotobaIpfsNode {
             .map(|link| crate::cid::DagPbLink {
                 name: link.name,
                 cid: link.cid,
-                tsize: None,
+                tsize: link.size,
             })
             .collect::<Vec<_>>();
         let (cid, block) = dag_pb_object_block(data, &links);
@@ -971,7 +978,12 @@ impl KotobaIpfsNode {
         let mut object = self.object_get(cid).await?;
         let name = name.into();
         object.links.retain(|link| link.name != name);
-        object.links.push(ObjectLink { name, cid: child });
+        let size = Some(self.object_stat(&child).await?.cumulative_size);
+        object.links.push(ObjectLink {
+            name,
+            cid: child,
+            size,
+        });
         object.links.sort_by(|a, b| a.name.cmp(&b.name));
         self.object_put(&object.data, object.links).await
     }
@@ -2337,6 +2349,7 @@ pub struct ObjectStat {
 pub struct ObjectLink {
     pub name: String,
     pub cid: IpldCid,
+    pub size: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

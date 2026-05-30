@@ -8148,7 +8148,7 @@ mod tests {
         let graph = KotobaCid::from_bytes(b"protocol-normalization-graph");
         let tx = KotobaCid::from_bytes(b"protocol-normalization-tx");
 
-        let credential = kotoba_vc::VerifiableCredential::new(
+        let mut credential = kotoba_vc::VerifiableCredential::new(
             "urn:uuid:vc-normalized-1",
             "did:key:zIssuer",
             json!({
@@ -8157,6 +8157,20 @@ mod tests {
                 "profile": {"name": "Alice"}
             }),
         );
+        credential.credential_status = Some(kotoba_vc::CredentialStatus {
+            id: "kotoba://credential/status/normalized-1".into(),
+            status_type: "KotobaCredentialStatus".into(),
+        });
+        credential.proof = Some(kotoba_vc::DataIntegrityProof {
+            proof_type: "DataIntegrityProof".into(),
+            cryptosuite: Some("eddsa-jcs-2022".into()),
+            proof_purpose: "assertionMethod".into(),
+            verification_method: "did:key:zIssuer#key-1".into(),
+            created: Some("2026-05-29T00:00:00Z".into()),
+            proof_value: "zNormalizedProofValue".into(),
+            challenge: Some("normalization-challenge".into()),
+            domain: Some("kotoba.example".into()),
+        });
         let message = kotoba_didcomm::DidCommMessage {
             id: "msg-normalized-1".into(),
             message_type: "https://didcomm.org/basicmessage/2.0/message".into(),
@@ -8214,9 +8228,11 @@ mod tests {
 
         let reader = DistributedDatomReader::new(&store, &ipns);
         let query = kotoba_edn::parse(
-            r#"{:find [?issuer ?thread ?text]
+            r#"{:find [?issuer ?status ?proofPurpose ?thread ?text]
                 :where [[?vc :credential/issuer ?issuer]
                         [?vc :credential/subject/role "issuer"]
+                        [?vc :credential/status/id ?status]
+                        [?vc :credential/proof/proofPurpose ?proofPurpose]
                         [?msg :didcomm/thread ?thread]
                         [?post :atproto/record/text ?text]]}"#,
         )
@@ -8227,6 +8243,8 @@ mod tests {
             rows,
             vec![vec![
                 EdnValue::string("did:key:zIssuer"),
+                EdnValue::string("kotoba://credential/status/normalized-1"),
+                EdnValue::string("assertionMethod"),
                 EdnValue::string("thread-normalized-1"),
                 EdnValue::string("hello from ATProto"),
             ]]

@@ -414,11 +414,17 @@ async fn kubo_compatible_local_api_surface() {
         .await
         .expect("dag linked");
     assert_eq!(node.refs(&linked, false).await.expect("refs"), vec![child]);
+    let child_object_size = node
+        .object_stat(&child)
+        .await
+        .expect("object/stat child")
+        .cumulative_size;
     assert_eq!(
         node.object_links(&linked).await.expect("object/links"),
         vec![kotoba_ipfs::ObjectLink {
             name: String::new(),
             cid: child,
+            size: Some(child_object_size),
         }]
     );
     let pb_dir_block = dag_pb_node_with_link("hello.txt", &raw, 5);
@@ -438,6 +444,7 @@ async fn kubo_compatible_local_api_surface() {
         vec![kotoba_ipfs::ObjectLink {
             name: "hello.txt".into(),
             cid: raw,
+            size: Some(5),
         }]
     );
     let object_put = node
@@ -446,6 +453,7 @@ async fn kubo_compatible_local_api_surface() {
             vec![kotoba_ipfs::ObjectLink {
                 name: "hello.txt".into(),
                 cid: raw,
+                size: Some(5),
             }],
         )
         .await
@@ -457,6 +465,7 @@ async fn kubo_compatible_local_api_surface() {
         vec![kotoba_ipfs::ObjectLink {
             name: "hello.txt".into(),
             cid: raw,
+            size: Some(5),
         }]
     );
     let empty_object = node.object_new().await.expect("object/new");
@@ -477,6 +486,7 @@ async fn kubo_compatible_local_api_surface() {
         vec![kotoba_ipfs::ObjectLink {
             name: "hello.txt".into(),
             cid: raw,
+            size: Some(5),
         }]
     );
     let patched_rm = node
@@ -510,6 +520,7 @@ async fn kubo_compatible_local_api_surface() {
         vec![kotoba_ipfs::ObjectLink {
             name: "hello.txt".into(),
             cid: raw,
+            size: Some(5),
         }]
     );
     let patched_set = node
