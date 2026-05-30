@@ -5310,6 +5310,22 @@ fn datomic_q_rows_map(
     let mut edn_rows = Vec::with_capacity(rows.len());
     let mut json_rows = Vec::with_capacity(rows.len());
     for row in rows {
+        if row.len() == 1 {
+            if let Some(map) = row[0].as_map() {
+                edn_rows.push(kotoba_edn::to_string(&row[0]));
+                json_rows.push(
+                    map.iter()
+                        .map(|(key, value)| {
+                            (
+                                datomic_q_json_key_from_edn(key),
+                                kotoba_edn::to_string(value),
+                            )
+                        })
+                        .collect(),
+                );
+                continue;
+            }
+        }
         if row.len() != keys.len() {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -5343,6 +5359,15 @@ fn datomic_q_rows_map(
         edn: edn_rows,
         json: json_rows,
     }))
+}
+
+fn datomic_q_json_key_from_edn(key: &kotoba_edn::EdnValue) -> String {
+    match key {
+        kotoba_edn::EdnValue::Keyword(keyword) => format!(":{}", keyword.to_qualified()),
+        kotoba_edn::EdnValue::String(value) => value.clone(),
+        kotoba_edn::EdnValue::Symbol(symbol) => symbol.to_qualified(),
+        other => kotoba_edn::to_string(other),
+    }
 }
 
 fn datomic_q_map_keys(
@@ -10157,7 +10182,10 @@ mod tests {
             .await
             .unwrap();
         let aggregate_body: serde_json::Value = serde_json::from_slice(&aggregate_body).unwrap();
-        assert_eq!(aggregate_body["rows_edn"], serde_json::json!([["2", "30"]]));
+        assert_eq!(
+            aggregate_body["rows_edn"],
+            serde_json::json!([[r#"{:total 2 :totalScore 30}"#]])
+        );
         assert_eq!(
             aggregate_body["rows_map_json"],
             serde_json::json!([{ ":total": "2", ":totalScore": "30" }])

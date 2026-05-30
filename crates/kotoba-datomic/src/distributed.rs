@@ -6752,6 +6752,23 @@ mod tests {
             .unwrap();
         assert_eq!(rows, vec![vec![EdnValue::Integer(3), EdnValue::Integer(2)]]);
 
+        let named = kotoba_edn::parse(
+            r#"{:find [(count ?role) (count-distinct ?role)]
+                :keys [total distinctRoles]
+                :where [[?e :person/role ?role]]}"#,
+        )
+        .unwrap();
+        let rows = DistributedDatomReader::new(&store, &ipns)
+            .q_triples(&report.commit.cid, &named)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![EdnValue::map([
+                (EdnValue::kw_bare("total"), EdnValue::Integer(3)),
+                (EdnValue::kw_bare("distinctRoles"), EdnValue::Integer(2)),
+            ])]]
+        );
+
         let with_entity = kotoba_edn::parse(
             r#"{:find [?role (count ?score)]
                 :with [?e]
