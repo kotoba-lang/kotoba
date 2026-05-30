@@ -539,6 +539,15 @@ where
     }
 
     /// Datomic-compatible current datom scan over a distributed Prolly index.
+    pub fn datoms(
+        &self,
+        head: &KotobaCid,
+        index: DatomIndex,
+        components: &[Value],
+    ) -> Result<Vec<Datom>, DistributedCommitError> {
+        self.datoms_index(head, index, components)
+    }
+
     pub fn datoms_index(
         &self,
         head: &KotobaCid,
@@ -546,6 +555,15 @@ where
         components: &[Value],
     ) -> Result<Vec<Datom>, DistributedCommitError> {
         self.current_for_index_components(head, root_for_datom_index(index), components)
+    }
+
+    pub fn datoms_for_name(
+        &self,
+        ipns_name: &str,
+        index: DatomIndex,
+        components: &[Value],
+    ) -> Result<Vec<Datom>, DistributedCommitError> {
+        self.datoms_index_for_name(ipns_name, index, components)
     }
 
     pub fn datoms_index_for_name(
@@ -786,6 +804,41 @@ where
         query: &Value,
     ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
         self.q_triples_with_inputs(head, query, &[])
+    }
+
+    /// Datomic-compatible `q` over a distributed Prolly/DAG-CBOR database head.
+    pub fn q(
+        &self,
+        head: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_with_inputs(head, query, &[])
+    }
+
+    pub fn q_with_inputs(
+        &self,
+        head: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_with_inputs(head, query, inputs)
+    }
+
+    pub fn q_for_name(
+        &self,
+        ipns_name: &str,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_for_name_with_inputs(ipns_name, query, &[])
+    }
+
+    pub fn q_for_name_with_inputs(
+        &self,
+        ipns_name: &str,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_for_name_with_inputs(ipns_name, query, inputs)
     }
 
     pub fn q_triples_for_name(
@@ -1065,6 +1118,44 @@ where
         self.q_triples_as_of_tx_with_inputs(head, tx_cid, query, &[])
     }
 
+    pub fn q_as_of_tx(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_as_of_tx_with_inputs(head, tx_cid, query, &[])
+    }
+
+    pub fn q_as_of_tx_with_inputs(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_as_of_tx_with_inputs(head, tx_cid, query, inputs)
+    }
+
+    pub fn q_as_of_tx_for_name(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_as_of_tx_for_name_with_inputs(ipns_name, tx_cid, query, &[])
+    }
+
+    pub fn q_as_of_tx_for_name_with_inputs(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_as_of_tx_for_name_with_inputs(ipns_name, tx_cid, query, inputs)
+    }
+
     pub fn q_triples_as_of_tx_for_name(
         &self,
         ipns_name: &str,
@@ -1111,6 +1202,44 @@ where
         query: &Value,
     ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
         self.q_triples_since_tx_with_inputs(head, tx_cid, query, &[])
+    }
+
+    pub fn q_since_tx(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_since_tx_with_inputs(head, tx_cid, query, &[])
+    }
+
+    pub fn q_since_tx_with_inputs(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_since_tx_with_inputs(head, tx_cid, query, inputs)
+    }
+
+    pub fn q_since_tx_for_name(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_since_tx_for_name_with_inputs(ipns_name, tx_cid, query, &[])
+    }
+
+    pub fn q_since_tx_for_name_with_inputs(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_since_tx_for_name_with_inputs(ipns_name, tx_cid, query, inputs)
     }
 
     pub fn q_triples_since_tx_for_name(
@@ -4435,6 +4564,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(rows, vec![vec![EdnValue::String("thread-1".into())]]);
+    }
+
+    #[test]
+    fn reader_exposes_datomic_q_and_datoms_api_over_distributed_head() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"graph");
+        let report = writer
+            .commit_datoms(request(
+                "k51-kotoba-datomic-api",
+                graph,
+                vec![
+                    datom(b"alice", ":person/name", "Alice", b"tx1"),
+                    datom(b"alice", ":person/role", "admin", b"tx1"),
+                ],
+            ))
+            .unwrap();
+        let reader = DistributedDatomReader::new(&store, &ipns);
+        let query = kotoba_edn::parse(
+            r#"{:find [?name ?role]
+               :where [[?e :person/name ?name]
+                       [?e :person/role ?role]]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reader.q(&report.commit.cid, &query).unwrap(),
+            vec![vec![
+                EdnValue::String("Alice".into()),
+                EdnValue::String("admin".into())
+            ]]
+        );
+        assert_eq!(
+            reader.q_for_name("k51-kotoba-datomic-api", &query).unwrap(),
+            reader
+                .q_triples_for_name("k51-kotoba-datomic-api", &query)
+                .unwrap()
+        );
+
+        let components = [kotoba_edn::parse(":person/name").unwrap()];
+        assert_eq!(
+            reader
+                .datoms(&report.commit.cid, DatomIndex::Avet, &components)
+                .unwrap(),
+            reader
+                .datoms_index(&report.commit.cid, DatomIndex::Avet, &components)
+                .unwrap()
+        );
+        assert_eq!(
+            reader
+                .datoms_for_name("k51-kotoba-datomic-api", DatomIndex::Avet, &components)
+                .unwrap(),
+            reader
+                .datoms_index_for_name("k51-kotoba-datomic-api", DatomIndex::Avet, &components)
+                .unwrap()
+        );
     }
 
     #[test]
