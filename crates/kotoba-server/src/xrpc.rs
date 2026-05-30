@@ -9922,6 +9922,18 @@ mod tests {
                         tx.clone(),
                     ),
                     Datom::assert(
+                        KotobaCid::from_bytes(b"remote-alice"),
+                        ":person/email".into(),
+                        EdnValue::string("remote-alice@example.com"),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        KotobaCid::from_bytes(b"remote-alice"),
+                        ":db/ident".into(),
+                        EdnValue::Keyword(kotoba_edn::Keyword::parse("person/remote-alice")),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
                         KotobaCid::from_bytes(b"remote-bob"),
                         ":person/role".into(),
                         EdnValue::string("admin"),
@@ -10199,6 +10211,274 @@ mod tests {
             serde_json::from_slice(&remote_range_body).unwrap();
         assert_eq!(remote_range_body["datom_count"], 1);
         assert_eq!(remote_range_body["datoms"][0]["v_edn"], "20");
+
+        let remote_pull_many = datomic_pull_many(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicPullManyReq {
+                graph: graph_mb.clone(),
+                entities: vec![
+                    KotobaCid::from_bytes(b"remote-alice").to_multibase(),
+                    KotobaCid::from_bytes(b"remote-bob").to_multibase(),
+                ],
+                pattern_edn: Some(r#"[:person/role :person/score]"#.into()),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_pull_many.status(), axum::http::StatusCode::OK);
+        let remote_pull_many_body = axum::body::to_bytes(remote_pull_many.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_pull_many_body: serde_json::Value =
+            serde_json::from_slice(&remote_pull_many_body).unwrap();
+        assert_eq!(
+            remote_pull_many_body["basis_t"],
+            report.commit.tx_cid.to_multibase()
+        );
+        assert_eq!(remote_pull_many_body["entity_count"], 2);
+        assert!(remote_pull_many_body["entities"][0]["entity_edn"]
+            .as_str()
+            .unwrap()
+            .contains("admin"));
+
+        let remote_index_pull = datomic_index_pull(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicIndexPullReq {
+                graph: graph_mb.clone(),
+                index: ":aevt".into(),
+                components_edn: vec![":person/role".into()],
+                pattern_edn: Some(r#"[:person/role :person/score]"#.into()),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_index_pull.status(), axum::http::StatusCode::OK);
+        let remote_index_pull_body =
+            axum::body::to_bytes(remote_index_pull.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        let remote_index_pull_body: serde_json::Value =
+            serde_json::from_slice(&remote_index_pull_body).unwrap();
+        assert_eq!(
+            remote_index_pull_body["basis_t"],
+            report.commit.tx_cid.to_multibase()
+        );
+        assert_eq!(remote_index_pull_body["entity_count"], 2);
+
+        let remote_ident = datomic_ident(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicIdentReq {
+                graph: graph_mb.clone(),
+                entity: KotobaCid::from_bytes(b"remote-alice").to_multibase(),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_ident.status(), axum::http::StatusCode::OK);
+        let remote_ident_body = axum::body::to_bytes(remote_ident.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_ident_body: serde_json::Value =
+            serde_json::from_slice(&remote_ident_body).unwrap();
+        assert_eq!(remote_ident_body["ident_edn"], ":person/remote-alice");
+
+        let remote_entid = datomic_entid(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicEntidReq {
+                graph: graph_mb.clone(),
+                ident_edn: r#"[:person/email "remote-alice@example.com"]"#.into(),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_entid.status(), axum::http::StatusCode::OK);
+        let remote_entid_body = axum::body::to_bytes(remote_entid.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_entid_body: serde_json::Value =
+            serde_json::from_slice(&remote_entid_body).unwrap();
+        assert_eq!(
+            remote_entid_body["entity"],
+            KotobaCid::from_bytes(b"remote-alice").to_multibase()
+        );
+
+        let remote_entity = datomic_entity(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicEntityReq {
+                graph: graph_mb.clone(),
+                entity: KotobaCid::from_bytes(b"remote-bob").to_multibase(),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_entity.status(), axum::http::StatusCode::OK);
+        let remote_entity_body = axum::body::to_bytes(remote_entity.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_entity_body: serde_json::Value =
+            serde_json::from_slice(&remote_entity_body).unwrap();
+        assert!(remote_entity_body["entity_edn"]
+            .as_str()
+            .unwrap()
+            .contains("20"));
+
+        let remote_basis = datomic_basis_t(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicBasisTReq {
+                graph: graph_mb.clone(),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_basis.status(), axum::http::StatusCode::OK);
+        let remote_basis_body = axum::body::to_bytes(remote_basis.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_basis_body: serde_json::Value =
+            serde_json::from_slice(&remote_basis_body).unwrap();
+        assert_eq!(
+            remote_basis_body["basis_t"],
+            report.commit.tx_cid.to_multibase()
+        );
+
+        let remote_stats = datomic_db_stats(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicDbStatsReq {
+                graph: graph_mb.clone(),
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_stats.status(), axum::http::StatusCode::OK);
+        let remote_stats_body = axum::body::to_bytes(remote_stats.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_stats_body: serde_json::Value =
+            serde_json::from_slice(&remote_stats_body).unwrap();
+        assert_eq!(
+            remote_stats_body["basis_t"],
+            report.commit.tx_cid.to_multibase()
+        );
+        assert_eq!(remote_stats_body["tx_count"], 1);
+        assert!(remote_stats_body["datom_count"].as_u64().unwrap() >= 7);
+
+        let remote_history = datomic_history(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicHistoryReq {
+                graph: graph_mb.clone(),
+                cacao_b64: None,
+                presentation: None,
+                as_of: None,
+                since: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                limit: Some(20),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_history.status(), axum::http::StatusCode::OK);
+        let remote_history_body = axum::body::to_bytes(remote_history.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_history_body: serde_json::Value =
+            serde_json::from_slice(&remote_history_body).unwrap();
+        assert_eq!(
+            remote_history_body["basis_t"],
+            report.commit.tx_cid.to_multibase()
+        );
+        assert!(remote_history_body["datoms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|datom| datom["a"] == ":person/email"));
+
+        let remote_log = datomic_log(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(DatomicLogReq {
+                graph: graph_mb.clone(),
+                start: None,
+                end: None,
+                remote_peer: Some(remote_peer.clone()),
+                remote_ipns_name: Some(ipns_name.clone()),
+                cacao_b64: None,
+                presentation: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(remote_log.status(), axum::http::StatusCode::OK);
+        let remote_log_body = axum::body::to_bytes(remote_log.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let remote_log_body: serde_json::Value = serde_json::from_slice(&remote_log_body).unwrap();
+        assert_eq!(remote_log_body["tx_count"], 1);
+        assert_eq!(
+            remote_log_body["txes"][0]["tx_cid"],
+            report.commit.tx_cid.to_multibase()
+        );
 
         let sync = datomic_sync(
             axum::extract::State(Arc::clone(&state)),
