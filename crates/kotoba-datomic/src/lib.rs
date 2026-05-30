@@ -2682,7 +2682,7 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
         "assoc" => query_assoc_value(args),
         "dissoc" => query_dissoc_value(args),
         "disj" => query_disj_value(args),
-        "inc" | "dec" | "+" | "-" | "*" | "quot" | "rem" | "mod" | "min" | "max" => {
+        "inc" | "dec" | "abs" | "+" | "-" | "*" | "quot" | "rem" | "mod" | "min" | "max" => {
             query_arithmetic_value(op, args)
         }
         other => Err(DatomicError::UnsupportedOperation(format!(
@@ -3117,6 +3117,15 @@ pub(crate) fn query_arithmetic_value(op: &str, args: Vec<EdnValue>) -> Result<Ed
                 .checked_sub(1)
                 .ok_or_else(|| DatomicError::Query("dec integer overflow".into()))?
         }
+        "abs" => {
+            if ints.len() != 1 {
+                return Err(DatomicError::Query("abs expects one argument".into()));
+            }
+            ints.next()
+                .expect("arity checked")
+                .checked_abs()
+                .ok_or_else(|| DatomicError::Query("abs integer overflow".into()))?
+        }
         "*" => ints.try_fold(1_i64, |acc, value| {
             acc.checked_mul(value)
                 .ok_or_else(|| DatomicError::Query("* integer overflow".into()))
@@ -3353,6 +3362,8 @@ pub(crate) fn query_unary_predicate(op: &str, value: &EdnValue) -> Result<bool> 
         "zero?" => Ok(matches!(value, EdnValue::Integer(0))),
         "pos?" => Ok(matches!(value, EdnValue::Integer(value) if *value > 0)),
         "neg?" => Ok(matches!(value, EdnValue::Integer(value) if *value < 0)),
+        "even?" => Ok(matches!(value, EdnValue::Integer(value) if value % 2 == 0)),
+        "odd?" => Ok(matches!(value, EdnValue::Integer(value) if value % 2 != 0)),
         "string?" => Ok(matches!(value, EdnValue::String(_))),
         "keyword?" => Ok(matches!(value, EdnValue::Keyword(_))),
         "symbol?" => Ok(matches!(value, EdnValue::Symbol(_))),
@@ -4770,7 +4781,7 @@ fn eval_query_function(
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(query_disj_value),
-        "inc" | "dec" | "+" | "-" | "*" | "quot" | "rem" | "mod" | "min" | "max" => args
+        "inc" | "dec" | "abs" | "+" | "-" | "*" | "quot" | "rem" | "mod" | "min" | "max" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
@@ -7741,6 +7752,43 @@ mod tests {
                 EdnValue::Integer(43),
             ]]
         );
+    }
+
+    #[tokio::test]
+    async fn q_supports_abs_even_and_odd_function_bindings() {
+        let conn = Connection::new();
+        conn.transact(
+            parse(
+                r#"[
+                  {:db/id "alice" :person/score -42}
+                  {:db/id "bob" :person/score 7}
+                ]"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let query = parse(
+            r#"{:find [?score ?absolute]
+                :where [[?e :person/score ?score]
+                        [(abs ?score) ?absolute]
+                        [(even? ?absolute)]]}"#,
+        )
+        .unwrap();
+        let rows = q(query, &conn.db(), &[]).unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![EdnValue::Integer(-42), EdnValue::Integer(42)]]
+        );
+
+        let odd_query = parse(
+            r#"{:find [?score]
+                :where [[?e :person/score ?score]
+                        [(odd? ?score)]]}"#,
+        )
+        .unwrap();
+        let rows = q(odd_query, &conn.db(), &[]).unwrap();
+        assert_eq!(rows, vec![vec![EdnValue::Integer(7)]]);
     }
 
     #[tokio::test]
