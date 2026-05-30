@@ -1935,7 +1935,8 @@ where
                 crate::query_not_empty_value(required_query_value(&args[0], binding)?)
                     .map_err(Into::into)
             }
-            "map" | "filter" | "remove" | "keep" | "some" | "group-by" | "partition-by" => args
+            "map" | "mapcat" | "filter" | "remove" | "keep" | "some" | "group-by"
+            | "partition-by" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
@@ -1981,6 +1982,11 @@ where
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| crate::query_cons_value(values).map_err(Into::into)),
+            "into" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| crate::query_into_value(values).map_err(Into::into)),
             "take" | "drop" | "take-while" | "drop-while" | "split-at" | "split-with"
             | "partition" | "partition-all" | "subvec" => args
                 .iter()
@@ -6941,7 +6947,7 @@ mod tests {
         );
 
         let collection_predicate_query = kotoba_edn::parse(
-            r#"{:find [?allTags ?noNilTags ?notEveryTagString ?tagsVector ?sameTag ?hasTag ?notFalse ?truthyTags ?tagsString ?tagKeywords ?nonStringTags ?keptTags ?someTag ?sum ?product ?max ?applySum ?applyMax ?applySet ?initialOdds ?afterOdds ?splitNumbers ?splitOdds ?groupedNumbers ?partitionedNumbers ?numberFrequencies ?numberRange ?repeatedTag ?tagMap ?flat ?concatenated ?distinctNumbers ?interposed ?interleaved ?pairs ?windows ?paddedPairs ?allPairs]
+            r#"{:find [?allTags ?noNilTags ?notEveryTagString ?tagsVector ?sameTag ?hasTag ?notFalse ?truthyTags ?tagsString ?tagKeywords ?tails ?nonStringTags ?keptTags ?someTag ?sum ?product ?max ?applySum ?applyMax ?applySet ?initialOdds ?afterOdds ?splitNumbers ?splitOdds ?groupedNumbers ?partitionedNumbers ?numberFrequencies ?numberRange ?repeatedTag ?tagMap ?flat ?numbersIntoVector ?concatenated ?distinctNumbers ?interposed ?interleaved ?pairs ?windows ?paddedPairs ?allPairs]
                 :where [[?e :credential/claims ?claims]
                         [(get ?claims :claim/tags) ?tags]
                         [(distinct? :role/admin :role/auditor :role/operator)]
@@ -6956,6 +6962,7 @@ mod tests {
                         [(boolean ?tags) ?truthyTags]
                         [(string? ?tags) ?tagsString]
                         [(filter keyword? ?tags) ?tagKeywords]
+                        [(mapcat rest [[0 1] [0 2]]) ?tails]
                         [(remove string? ?tags) ?nonStringTags]
                         [(keep identity ?tags) ?keptTags]
                         [(some identity ?tags) ?someTag]
@@ -6976,6 +6983,7 @@ mod tests {
                         [(repeat 3 :ok) ?repeatedTag]
                         [(zipmap [:a :b] [1 2 3]) ?tagMap]
                         [(flatten [[1 2] [3 [4]]]) ?flat]
+                        [(into [:seed] [1 2 3]) ?numbersIntoVector]
                         [(concat [1 2] [3 4]) ?concatenated]
                         [(distinct [1 2 1 3]) ?distinctNumbers]
                         [(interpose 0 [1 2 3]) ?interposed]
@@ -7014,6 +7022,7 @@ mod tests {
                     EdnValue::Keyword(Keyword::parse("vc")),
                     EdnValue::Keyword(Keyword::parse("ipld")),
                 ]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
                 EdnValue::Vector(vec![
                     EdnValue::Keyword(Keyword::parse("vc")),
                     EdnValue::Keyword(Keyword::parse("ipld")),
@@ -7081,6 +7090,12 @@ mod tests {
                     EdnValue::Integer(2),
                     EdnValue::Integer(3),
                     EdnValue::Integer(4),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Keyword(Keyword::parse("seed")),
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
                 ]),
                 EdnValue::Vector(vec![
                     EdnValue::Integer(1),

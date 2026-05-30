@@ -2760,7 +2760,7 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
             [value] => query_not_empty_value(value.clone()),
             _ => Err(DatomicError::Query("not-empty expects one argument".into())),
         },
-        "map" | "filter" | "remove" | "keep" | "some" | "group-by" | "partition-by" => {
+        "map" | "mapcat" | "filter" | "remove" | "keep" | "some" | "group-by" | "partition-by" => {
             query_collection_transform_value(op, args)
         }
         "frequencies" => query_frequencies_value(args),
@@ -2778,6 +2778,7 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
             query_collection_order_value(op, args)
         }
         "cons" => query_cons_value(args),
+        "into" => query_into_value(args),
         "conj" => query_conj_value(args),
         "assoc" => query_assoc_value(args),
         "dissoc" => query_dissoc_value(args),
@@ -2828,6 +2829,16 @@ pub(crate) fn query_collection_transform_value(op: &str, args: Vec<EdnValue>) ->
             .into_iter()
             .map(|value| query_apply_value_function(&function, vec![value]))
             .collect::<Result<Vec<_>>>()?,
+        "mapcat" => {
+            let mut out = Vec::new();
+            for value in values {
+                out.extend(query_seq_values(query_apply_value_function(
+                    &function,
+                    vec![value],
+                )?)?);
+            }
+            out
+        }
         "filter" | "remove" => {
             let keep_matching = op == "filter";
             values
@@ -3261,6 +3272,15 @@ pub(crate) fn query_cons_value(args: Vec<EdnValue>) -> Result<EdnValue> {
     let mut values = vec![head];
     values.extend(query_seq_values(tail)?);
     Ok(EdnValue::Vector(values))
+}
+
+pub(crate) fn query_into_value(args: Vec<EdnValue>) -> Result<EdnValue> {
+    let [target, source]: [EdnValue; 2] = args
+        .try_into()
+        .map_err(|_| DatomicError::Query("into expects target and source".into()))?;
+    let mut conj_args = vec![target];
+    conj_args.extend(query_seq_values(source)?);
+    query_conj_value(conj_args)
 }
 
 pub(crate) fn query_collection_slice_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
@@ -5612,11 +5632,12 @@ fn eval_query_function(
             }
             query_not_empty_value(resolve_query_value(&args[0], binding)?)
         }
-        "map" | "filter" | "remove" | "keep" | "some" | "group-by" | "partition-by" => args
-            .iter()
-            .map(|arg| resolve_query_value(arg, binding))
-            .collect::<Result<Vec<_>>>()
-            .and_then(|values| query_collection_transform_value(op, values)),
+        "map" | "mapcat" | "filter" | "remove" | "keep" | "some" | "group-by" | "partition-by" => {
+            args.iter()
+                .map(|arg| resolve_query_value(arg, binding))
+                .collect::<Result<Vec<_>>>()
+                .and_then(|values| query_collection_transform_value(op, values))
+        }
         "frequencies" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
@@ -5653,6 +5674,11 @@ fn eval_query_function(
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(query_cons_value),
+        "into" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(query_into_value),
         "take" | "drop" | "take-while" | "drop-while" | "split-at" | "split-with" | "partition"
         | "partition-all" | "subvec" => args
             .iter()
@@ -8858,7 +8884,7 @@ mod tests {
         .await
         .unwrap();
         let query = parse(
-            r#"{:find [?allScores ?notEveryScoreString ?noNilScores ?allNames ?scoresVector ?sameScore ?hasAdmin ?notFalse ?truthyScores ?namesString ?incScores ?oddScores ?nonOddScores ?nonEmptyNames ?someName ?scoreSum ?scoreProduct ?scoreMax ?applySum ?applyMax ?scoreSet ?initialOdds ?afterOdds ?splitScores ?splitOdds ?groupedScores ?partitionedScores ?scoreFrequencies ?numberRange ?repeatedScore ?scoreMap ?flatScores ?concatenatedScores ?distinctScores ?interposedScores ?interleavedScores ?pairs ?windows ?paddedPairs ?allPairs]
+            r#"{:find [?allScores ?notEveryScoreString ?noNilScores ?allNames ?scoresVector ?sameScore ?hasAdmin ?notFalse ?truthyScores ?namesString ?incScores ?tailedScores ?oddScores ?nonOddScores ?nonEmptyNames ?someName ?scoreSum ?scoreProduct ?scoreMax ?applySum ?applyMax ?scoreSet ?initialOdds ?afterOdds ?splitScores ?splitOdds ?groupedScores ?partitionedScores ?scoreFrequencies ?numberRange ?repeatedScore ?scoreMap ?flatScores ?scoresIntoVector ?concatenatedScores ?distinctScores ?interposedScores ?interleavedScores ?pairs ?windows ?paddedPairs ?allPairs]
                 :where [[?e :person/scores ?scores]
                         [?e :person/names ?names]
                         [(distinct? 1 2 3)]
@@ -8874,6 +8900,7 @@ mod tests {
                         [(boolean ?scores) ?truthyScores]
                         [(string? ?names) ?namesString]
                         [(map inc ?scores) ?incScores]
+                        [(mapcat rest [[0 1] [0 2]]) ?tailedScores]
                         [(filter odd? ?scores) ?oddScores]
                         [(remove odd? ?scores) ?nonOddScores]
                         [(keep not-empty ?names) ?nonEmptyNames]
@@ -8895,6 +8922,7 @@ mod tests {
                         [(repeat 3 :ok) ?repeatedScore]
                         [(zipmap [:a :b] ?scores) ?scoreMap]
                         [(flatten [[1 2 3] [4 [5]]]) ?flatScores]
+                        [(into [:seed] ?scores) ?scoresIntoVector]
                         [(concat ?scores [4 5]) ?concatenatedScores]
                         [(distinct [1 2 1 3]) ?distinctScores]
                         [(interpose 0 ?scores) ?interposedScores]
@@ -8934,6 +8962,7 @@ mod tests {
                     EdnValue::Integer(3),
                     EdnValue::Integer(4),
                 ]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
                 EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
                 EdnValue::Vector(vec![EdnValue::Integer(2)]),
                 EdnValue::Vector(vec![
@@ -8996,6 +9025,12 @@ mod tests {
                     EdnValue::Integer(3),
                     EdnValue::Integer(4),
                     EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![
+                    kw_value(":seed"),
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
                 ]),
                 EdnValue::Vector(vec![
                     EdnValue::Integer(1),
