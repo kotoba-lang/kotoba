@@ -15,6 +15,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const KUBO_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const KUBO_POOL_MAX_IDLE_PER_HOST: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IpnsName(pub String);
 
@@ -305,13 +310,8 @@ pub struct KuboKeyGenResp {
 
 impl KuboIpnsRegistry {
     pub fn new(endpoint: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(500))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
         Self {
-            client,
+            client: kubo_http_client(),
             endpoint: endpoint.into(),
             token: None,
             local: InMemoryIpnsRegistry::new(),
@@ -537,6 +537,16 @@ impl KuboIpnsRegistry {
     }
 }
 
+fn kubo_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(KUBO_CONNECT_TIMEOUT)
+        .timeout(KUBO_REQUEST_TIMEOUT)
+        .pool_idle_timeout(KUBO_POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(KUBO_POOL_MAX_IDLE_PER_HOST)
+        .build()
+        .unwrap_or_default()
+}
+
 impl IpnsRegistry for KuboIpnsRegistry {
     fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError> {
         self.local.publish(record.clone())?;
@@ -578,6 +588,14 @@ mod tests {
             .publish(IpnsRecord::new(name, &cid, 1, "2030-01-01T00:00:00Z"))
             .unwrap_err();
         assert!(matches!(err, IpnsRegistryError::StaleRecord { .. }));
+    }
+
+    #[test]
+    fn kubo_ipns_client_uses_bounded_sidecar_timeouts() {
+        assert_eq!(KUBO_CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(KUBO_REQUEST_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(KUBO_POOL_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(KUBO_POOL_MAX_IDLE_PER_HOST, 8);
     }
 
     #[test]

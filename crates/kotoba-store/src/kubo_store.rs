@@ -25,6 +25,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const KUBO_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const KUBO_POOL_MAX_IDLE_PER_HOST: usize = 8;
+
 #[derive(Deserialize)]
 struct BlockPutResponse {
     #[serde(rename = "Key")]
@@ -42,11 +47,11 @@ pub struct KuboBlockStore {
 
 impl KuboBlockStore {
     pub fn new(endpoint: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(500))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        // 5 s connect timeout absorbs sidecar startup race; pool reuse + capped
+        // idle keep the Kubo handler from leaking CLOSE_WAIT under burst commits
+        // (observed 318 CLOSE_WAIT + 287 FIN_WAIT2 on Kubo 0.34.1 with the prior
+        // 500 ms / unbounded pool config).
+        let client = kubo_http_client();
         Self {
             client,
             endpoint: endpoint.into(),
@@ -89,11 +94,7 @@ impl KuboBlockStore {
         let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:5001".into());
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(500))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
+        let client = kubo_http_client();
         Self {
             client,
             endpoint,
@@ -116,6 +117,16 @@ impl KuboBlockStore {
     pub fn is_available(&self) -> bool {
         self.available.load(Ordering::Relaxed)
     }
+}
+
+fn kubo_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(KUBO_CONNECT_TIMEOUT)
+        .timeout(KUBO_REQUEST_TIMEOUT)
+        .pool_idle_timeout(KUBO_POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(KUBO_POOL_MAX_IDLE_PER_HOST)
+        .build()
+        .unwrap_or_default()
 }
 
 impl Clone for KuboBlockStore {
@@ -323,6 +334,14 @@ mod tests {
         assert!(mb.starts_with('b'), "multibase prefix must be 'b'");
         let cid2 = KotobaCid::from_multibase(&mb).expect("round-trip");
         assert_eq!(cid, cid2);
+    }
+
+    #[test]
+    fn kubo_http_client_uses_bounded_sidecar_timeouts() {
+        assert_eq!(KUBO_CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(KUBO_REQUEST_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(KUBO_POOL_IDLE_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(KUBO_POOL_MAX_IDLE_PER_HOST, 8);
     }
 
     #[test]
