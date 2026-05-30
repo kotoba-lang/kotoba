@@ -7127,7 +7127,8 @@ pub struct GraphQueryReq {
 /// GET /xrpc/ai.gftd.apps.kotoba.graph.query
 /// SPO pattern query over the distributed Datomic head, with legacy hot/cold
 /// projection fallback handled by `current_db_for_graph`.
-/// Full Datalog evaluation: use invoke.run with program_type=datalog.
+/// Full Datomic/Datalog evaluation: use `ai.gftd.apps.kotoba.datomic.q`.
+/// SPARQL remains an auxiliary query surface over the same Datom SSoT.
 pub async fn graph_query(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -7214,11 +7215,15 @@ pub async fn graph_query(
 
     Ok(Json(serde_json::json!({
         "graph":     req.graph,
+        "queryEngine": "datomic",
+        "primaryQuery": NSID_DATOMIC_Q,
+        "auxiliaryQuery": crate::kg::NSID_KG_SPARQL,
+        "storageModel": "ipld-dag-cbor-prolly-tree",
         "count":     quads.len(),
         "quads":     quads,
         "limit":     limit,
         "truncated": truncated,
-        "note":  if req.rules.is_some() { "use invoke.run for Datalog evaluation" } else { "" },
+        "note":  if req.rules.is_some() { "use ai.gftd.apps.kotoba.datomic.q for Datomic/Datalog evaluation" } else { "" },
     })))
 }
 
@@ -12755,10 +12760,41 @@ mod tests {
     #[test]
     fn graph_query_lexicons_expose_structured_sparql_and_quad_outputs() {
         let graph_query = include_str!("../../../lexicons/ai/gftd/apps/kotoba/graph/query.json");
+        let graph_query_value: serde_json::Value =
+            serde_json::from_str(graph_query).expect("graph.query lexicon JSON");
+        let graph_query_description = graph_query_value["defs"]["main"]["description"]
+            .as_str()
+            .expect("graph.query description");
+        assert!(
+            graph_query_description.contains("primary Kotoba distributed Datomic/Datom graph"),
+            "graph.query must declare Datomic/Datom as the primary graph"
+        );
+        assert!(
+            graph_query_description.contains("SPARQL is an auxiliary query surface"),
+            "graph.query must keep SPARQL auxiliary to Datomic"
+        );
         assert_lexicon_output_fields(
             graph_query,
-            &["graph", "count", "quads"],
+            &[
+                "graph",
+                "queryEngine",
+                "primaryQuery",
+                "auxiliaryQuery",
+                "storageModel",
+                "count",
+                "quads",
+            ],
             &["limit", "truncated", "note"],
+        );
+        assert_eq!(
+            graph_query_value["defs"]["main"]["output"]["schema"]["properties"]["queryEngine"]
+                ["knownValues"][0],
+            "datomic"
+        );
+        assert_eq!(
+            graph_query_value["defs"]["main"]["output"]["schema"]["properties"]["storageModel"]
+                ["knownValues"][0],
+            "ipld-dag-cbor-prolly-tree"
         );
         assert_lexicon_array_item_fields(
             graph_query,
