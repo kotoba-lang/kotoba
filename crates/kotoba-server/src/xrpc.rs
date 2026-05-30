@@ -8052,12 +8052,12 @@ mod tests {
         datomic_history, datomic_ident, datomic_index_pull, datomic_index_range, datomic_log,
         datomic_pull, datomic_pull_many, datomic_q, datomic_seek_datoms, datomic_transact,
         datomic_tx_range, datomic_with, did_document_publish, distributed_graph_ipns_name,
-        enforce_datomic_range_tx_scope, is_did_web_ip_host, AtprotoRepoWriteReq,
+        enforce_datomic_range_tx_scope, is_did_web_ip_host, vc_issue, AtprotoRepoWriteReq,
         AuthCapabilityProjection, DatomicBasisTReq, DatomicDatomsReq, DatomicDbStatsReq,
         DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq, DatomicIdentReq, DatomicIndexPullReq,
         DatomicIndexRangeReq, DatomicLogReq, DatomicPullManyReq, DatomicPullReq, DatomicQReq,
         DatomicSeekDatomsReq, DatomicTransactReq, DatomicTxRangeReq, DatomicWithReq,
-        DidDocumentPublishReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CONTROLLER_IRI,
+        DidDocumentPublishReq, VcIssueReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CONTROLLER_IRI,
         ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI,
     };
     use crate::server::KotobaState;
@@ -8258,6 +8258,103 @@ mod tests {
             .unwrap()
             .iter()
             .all(|datom| datom.t == tx));
+    }
+
+    #[tokio::test]
+    async fn vc_issue_xrpc_writes_status_and_operator_proof_to_distributed_datom_head() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = KotobaCid::from_bytes(b"xrpc-vc-issue-status-proof-graph");
+        let graph_mb = graph.to_multibase();
+        state.graph_registry.write().await.insert(
+            graph.clone(),
+            (
+                "xrpc-vc-issue-status-proof-graph".into(),
+                GraphVisibility::Public,
+            ),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", test_operator_jwt(&state.operator_did))
+                .parse()
+                .unwrap(),
+        );
+
+        let mut credential = kotoba_vc::VerifiableCredential::new(
+            "urn:uuid:vc-xrpc-status-proof",
+            "did:key:zRequestedIssuer",
+            serde_json::json!({
+                "id": "did:key:zAlice",
+                "role": "issuer"
+            }),
+        );
+        credential.credential_status = Some(kotoba_vc::CredentialStatus {
+            id: "kotoba://credential/status/xrpc-1".into(),
+            status_type: "KotobaCredentialStatus".into(),
+        });
+
+        let response = vc_issue(
+            axum::extract::State(Arc::clone(&state)),
+            headers.clone(),
+            axum::Json(VcIssueReq {
+                graph: graph_mb.clone(),
+                credential,
+                cacao_b64: None,
+                auth_presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["ipns_name"], distributed_graph_ipns_name(&graph));
+
+        let expected_issuer = format!(r#""{}""#, state.operator_did);
+        let response = datomic_q(
+            axum::extract::State(state),
+            headers,
+            axum::Json(DatomicQReq {
+                graph: graph_mb,
+                query_edn: r#"{:find [?issuer ?status ?proofPurpose ?proofDomain]
+                    :where [[?vc :credential/id "urn:uuid:vc-xrpc-status-proof"]
+                            [?vc :credential/issuer ?issuer]
+                            [?vc :credential/status/id ?status]
+                            [?vc :credential/proof/proofPurpose ?proofPurpose]
+                            [?vc :credential/proof/domain ?proofDomain]]}"#
+                    .into(),
+                inputs_edn: vec![],
+                as_of: None,
+                since: None,
+                history: false,
+                remote_peer: None,
+                remote_ipns_name: None,
+                cacao_b64: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["rows_edn"],
+            serde_json::json!([[
+                expected_issuer,
+                r#""kotoba://credential/status/xrpc-1""#,
+                r#""assertionMethod""#,
+                r#""kotoba.vc.issue""#
+            ]])
+        );
     }
 
     #[test]
