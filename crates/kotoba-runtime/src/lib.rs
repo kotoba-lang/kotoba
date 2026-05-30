@@ -229,6 +229,92 @@ mod tests {
                     Ok((Ok("0x0".to_string()),))
                 },
             )?;
+            // Read-only RPC expansion (must mirror world.wit's evm interface so a
+            // guest regenerated against the new WIT instantiates cleanly).
+            inst.func_wrap(
+                "eth-chain-id",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url,): (String,)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("0x1".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "eth-block-number",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url,): (String,)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("0x0".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "eth-get-code",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _addr, _bt): (String, String, Option<String>)|
+                 -> Result<(Result<Vec<u8>, String>,)> { Ok((Ok(vec![]),)) },
+            )?;
+            inst.func_wrap(
+                "eth-get-transaction-count",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _addr, _bt): (String, String, Option<String>)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("0x0".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "eth-get-transaction-receipt",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _tx): (String, String)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("null".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "eth-get-logs",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _filter): (String, String)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("[]".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "erc20-balance-of",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _token, _holder): (String, String, String)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("0".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "erc20-total-supply",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _token): (String, String)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("0".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "erc20-decimals",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _token): (String, String)|
+                 -> Result<(Result<u8, String>,)> { Ok((Ok(18),)) },
+            )?;
+            inst.func_wrap(
+                "erc20-symbol",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _token): (String, String)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("TKN".to_string()),))
+                },
+            )?;
+            inst.func_wrap(
+                "erc20-name",
+                |_: wasmtime::StoreContextMut<TestState>,
+                 (_url, _token): (String, String)|
+                 -> Result<(Result<String, String>,)> {
+                    Ok((Ok("Token".to_string()),))
+                },
+            )?;
         }
 
         let state = TestState {

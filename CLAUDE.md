@@ -18,7 +18,7 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 | kotoba-kqe | Datalog engine, Arrangement, Delta, MV (KQE) |
 | kotoba-dht | Source Chain, Warrant, Neighborhood (KDHT) |
 | kotoba-net | libp2p QUIC/Noise/GossipSub |
-| kotoba-auth | CACAO chain verification, DID Document |
+| kotoba-auth | CACAO chain verification, DID Document; **EVM read+verify surface** (`eth.rs` + `eth/{abi,token,caip,eip1271}.rs`, 2026-05-30) |
 | kotoba-graph | Quad API, SPARQL→Datalog, Commit DAG |
 | kotoba-vm | Invoke/Result ChainEntry, CALL_FOREIGN bridge (KVM) |
 | kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference, WebGPU training (embed+lm_head), WebGPU inference (full transformer, Gemma 4 E2B/E4B) |
@@ -732,6 +732,30 @@ let thread = compiled.run(thread)?;
 **Browser / Edge WASM (Phase N)**:
 - `wasmtime` は native-only (wasm32 にコンパイル不可)
 - ブラウザ実行は `kotoba-runtime-web` crate が必要 (browser native WebAssembly + IdbBlockStore + metered interpreter)
+
+## EVM 互換 — read + verify surface (2026-05-30)
+
+kotoba の Ethereum 互換は **read(チェーン状態の読み取り)+ verify(署名検証)のみ**。tx 署名・鍵生成・on-chain settlement・DID/on-chain origination は **etzhayyim-exclusive** (operating-entity boundary) のため kotoba 側では実装しない。
+
+### pure codec (`crates/kotoba-auth/src/eth/` — deps は `sha3` + `hex` のみで portable)
+
+| module | 内容 |
+|---|---|
+| `eth.rs` | EIP-191 `personal_sign_hash` / secp256k1 `recover_eth_address` / DID parse / **EIP-55 checksum** (`to_checksum_address` / `is_valid_checksum_address` / `parse_address`) / `keccak256` |
+| `eth/abi.rs` | ABI `selector` / encode(address,uint256,bool) / decode(uint256,address,bool,**dynamic string**,legacy bytes32) / `u256_to_decimal_string` / `format_units` |
+| `eth/token.rs` | **ERC-20 / ERC-721 / ERC-1155** view calldata builder + response decoder (`balanceOf`/`name`/`symbol`/`decimals`/`totalSupply`/`allowance`/`ownerOf`/`tokenURI`/`uri`/`isApprovedForAll`) |
+| `eth/caip.rs` | CAIP-2 (`eip155:1`) / CAIP-10 (account) / CAIP-19 (erc20/erc721/erc1155 asset) |
+| `eth/eip1271.rs` | **ERC-1271 calldata codec** (`isValidSignature` calldata + magic value `0x1626ba7e`)。ERC-4337 Smart Wallet の署名は ECDSA recover 不可 |
+
+### EVM JSON-RPC bridge (`crates/kotoba-runtime/src/host.rs` `bind_evm` + `wit/world.wit` interface `evm`)
+
+read-only RPC 9 メソッド (各 CALL_FOREIGN = 1000 gas, 5s timeout): `eth_call` / `eth_getStorageAt` / `eth_getBalance` / **`eth_chainId`** / **`eth_blockNumber`** / **`eth_getCode`** / **`eth_getTransactionCount`** / **`eth_getTransactionReceipt`** (raw JSON) / **`eth_getLogs`** (raw JSON, filter は JSON string)。receipt/logs は WIT で型付けせず JSON string を返し caller-side decode。
+
+**ERC-20 read host fns** (RPC + ABI codec を host 側で合成 — guest は ABI を再実装せず token を直接読める): `erc20-balance-of` / `erc20-total-supply` (decimal string) / `erc20-decimals` (u8) / `erc20-symbol` / `erc20-name` (dynamic string + legacy bytes32 両対応)。ERC-721/1155 codec は `eth/token.rs` で native/server から利用可 (host fn は未公開)。
+
+**Smart-account verify (EIP-1271, opt-in)**: `cacao.rs::verify_signature_eip191_smart(&dyn EthRpc)` が EOA recover → 不一致時 `eth_getCode` で contract 判定 → contract なら `eth_call(isValidSignature)` で EIP-191 digest を magic value 検証。`EthRpc` trait は注入式 (kotoba-auth は I/O-free を維持)。EOA fast-path は RPC を呼ばない。**注**: これは opt-in メソッドで、default の `verify_signature` / `DelegationChain::verify` は EOA-only のまま未変更 (現状この smart メソッドを呼ぶ production caller はなし)。xrpc / DelegationChain への routing は次の increment (各 call site に `EthRpc` 実装を thread する必要)。
+
+guest は `wit_bindgen::generate!` で world.wit から自動再生成 (`examples/kotoba-hello` で検証済み)。テスト: kotoba-auth 239 / kotoba-runtime 26 (`test_wasm_instantiate` が拡張 WIT = evm 14 funcs の component instantiate を検証)。
 
 ## 禁止
 
