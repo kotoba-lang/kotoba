@@ -415,6 +415,22 @@ mod tests {
     }
 
     #[test]
+    fn unixfs_directory_block_encodes_named_child_links() {
+        let child = raw_cid(b"child");
+        let links = vec![DagPbLink {
+            name: "child.txt".into(),
+            cid: child,
+            tsize: Some(5),
+        }];
+        let (cid, block) = unixfs_directory_block(&links);
+        assert_eq!(cid.codec(), CODEC_DAG_PB);
+        assert_eq!(cid, cid_for_bytes(CODEC_DAG_PB, &block));
+        let decoded = decode_dag_pb_node(&block).unwrap();
+        assert_eq!(decoded.links, links);
+        assert!(decode_unixfs_file_block(&block).is_err());
+    }
+
+    #[test]
     fn cid_for_bytes_is_codec_sensitive() {
         let data = b"same bytes";
         let raw = cid_for_bytes(CODEC_RAW, data);

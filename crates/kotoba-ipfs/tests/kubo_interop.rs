@@ -1,6 +1,6 @@
 use kotoba_ipfs::{
-    dag_pb_object_block, decode_dag_pb_node, raw_cid, unixfs_file_block, DagPbLink, IpfsConfig,
-    IpldCid, CODEC_DAG_PB, CODEC_RAW,
+    dag_pb_object_block, decode_dag_pb_node, raw_cid, unixfs_directory_block, unixfs_file_block,
+    DagPbLink, IpfsConfig, IpldCid, CODEC_DAG_PB, CODEC_RAW,
 };
 use reqwest::blocking::{multipart, Client};
 use serde_json::Value;
@@ -134,9 +134,13 @@ fn kubo_block_get(client: &Client, api: &str, cid: &IpldCid) -> Vec<u8> {
 }
 
 fn kubo_cat(client: &Client, api: &str, cid: &IpldCid) -> Vec<u8> {
+    kubo_cat_arg(client, api, &cid.to_string())
+}
+
+fn kubo_cat_arg(client: &Client, api: &str, arg: &str) -> Vec<u8> {
     client
         .post(format!("{api}/cat"))
-        .query(&[("arg", cid.to_string())])
+        .query(&[("arg", arg)])
         .send()
         .expect("kubo cat")
         .error_for_status()
@@ -272,6 +276,33 @@ fn kotoba_dag_pb_object_links_are_kubo_refs_compatible() {
     assert_eq!(kubo_block_get(&client, &kubo.api, &parent), parent_block);
     assert_eq!(kubo_refs(&client, &kubo.api, &parent), vec![child]);
     assert_eq!(kubo_cat(&client, &kubo.api, &child), child_data);
+}
+
+#[test]
+#[ignore = "requires Docker and a local Kubo image; run with --ignored"]
+fn kotoba_unixfs_directory_links_are_kubo_path_compatible() {
+    let kubo = start_kubo();
+    let client = Client::new();
+    let child_data = b"directory child payload";
+    let child = raw_cid(child_data);
+    let child_put = kubo_block_put(&client, &kubo.api, "raw", child_data.to_vec());
+    assert_eq!(child_put["Key"], child.to_string());
+
+    let (dir, dir_block) = unixfs_directory_block(&[DagPbLink {
+        name: "child.txt".into(),
+        cid: child,
+        tsize: Some(child_data.len() as u64),
+    }]);
+    assert_eq!(dir.codec(), CODEC_DAG_PB);
+    let dir_put = kubo_block_put(&client, &kubo.api, "dag-pb", dir_block.clone());
+    assert_eq!(dir_put["Key"], dir.to_string());
+
+    assert_eq!(kubo_block_get(&client, &kubo.api, &dir), dir_block);
+    assert_eq!(kubo_refs(&client, &kubo.api, &dir), vec![child]);
+    assert_eq!(
+        kubo_cat_arg(&client, &kubo.api, &format!("/ipfs/{dir}/child.txt")),
+        child_data
+    );
 }
 
 #[test]
