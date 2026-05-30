@@ -21,6 +21,8 @@ pub const ATTR_CREDENTIAL_CONTEXT: &str = "credential/context";
 pub const ATTR_CREDENTIAL_TYPE: &str = "credential/type";
 pub const ATTR_CREDENTIAL_ISSUER: &str = "credential/issuer";
 pub const ATTR_CREDENTIAL_SUBJECT: &str = "credential/subject";
+pub const ATTR_CREDENTIAL_SUBJECT_ID: &str = "credential/subjectId";
+pub const ATTR_CREDENTIAL_SUBJECT_DID_CID: &str = "credential/subject/didCid";
 pub const ATTR_CREDENTIAL_VALID_FROM: &str = "credential/validFrom";
 pub const ATTR_CREDENTIAL_VALID_UNTIL: &str = "credential/validUntil";
 pub const ATTR_CREDENTIAL_STATUS: &str = "credential/status";
@@ -303,10 +305,18 @@ impl VerifiableCredential {
         for subject_id in self.subject_ids() {
             out.push(datom(
                 &e,
-                "credential/subjectId",
+                ATTR_CREDENTIAL_SUBJECT_ID,
                 EdnValue::string(subject_id),
                 &tx,
             ));
+            if subject_id.starts_with("did:") {
+                out.push(datom(
+                    &e,
+                    ATTR_CREDENTIAL_SUBJECT_DID_CID,
+                    EdnValue::string(KotobaCid::from_bytes(subject_id.as_bytes()).to_multibase()),
+                    &tx,
+                ));
+            }
         }
         append_subject_field_datoms(&mut out, &e, &self.credential_subject, &tx);
         if let Some(valid_from) = &self.valid_from {
@@ -893,9 +903,17 @@ mod tests {
         for subject_id in ["did:plc:alice", "did:web:bob.example"] {
             assert!(
                 datoms.iter().any(|datom| {
-                    datom.a == "credential/subjectId" && datom.v == EdnValue::string(subject_id)
+                    datom.a == ATTR_CREDENTIAL_SUBJECT_ID && datom.v == EdnValue::string(subject_id)
                 }),
                 "missing credential/subjectId for {subject_id}"
+            );
+            let subject_did_cid = KotobaCid::from_bytes(subject_id.as_bytes()).to_multibase();
+            assert!(
+                datoms.iter().any(|datom| {
+                    datom.a == ATTR_CREDENTIAL_SUBJECT_DID_CID
+                        && datom.v == EdnValue::string(&subject_did_cid)
+                }),
+                "missing credential/subject/didCid for {subject_id}"
             );
         }
         for role in ["admin", "auditor"] {
@@ -949,7 +967,10 @@ mod tests {
         assert!(datoms.iter().any(|d| d.a == ATTR_VC_ISSUER_IRI));
         assert!(datoms.iter().any(|d| d.a == ATTR_VC_TYPE_IRI));
         assert!(datoms.iter().any(|d| d.a == ATTR_VC_CREDENTIAL_SUBJECT_IRI));
-        assert!(datoms.iter().any(|d| d.a == "credential/subjectId"));
+        assert!(datoms.iter().any(|d| d.a == ATTR_CREDENTIAL_SUBJECT_ID));
+        assert!(datoms
+            .iter()
+            .any(|d| d.a == ATTR_CREDENTIAL_SUBJECT_DID_CID));
         assert!(datoms
             .iter()
             .any(|d| d.a == "credential/subject/role" && d.v == EdnValue::string("admin")));
