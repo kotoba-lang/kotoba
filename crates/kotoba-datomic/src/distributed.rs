@@ -3073,6 +3073,8 @@ enum DistributedFindItem {
     Median(Value),
     Variance(Value),
     Stddev(Value),
+    Rand(Value),
+    Sample { limit: usize, value: Value },
 }
 
 impl DistributedFindItem {
@@ -3090,6 +3092,8 @@ impl DistributedFindItem {
                 | Self::Median(_)
                 | Self::Variance(_)
                 | Self::Stddev(_)
+                | Self::Rand(_)
+                | Self::Sample { .. }
         )
     }
 }
@@ -3143,6 +3147,16 @@ fn parse_distributed_find_item(
     if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "stddev") {
         return Ok(DistributedFindItem::Stddev(seq[1].clone()));
     }
+    if seq.len() == 2 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "rand") {
+        return Ok(DistributedFindItem::Rand(seq[1].clone()));
+    }
+    if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "sample") {
+        let limit = aggregate_query_limit("sample", &seq[1])?;
+        return Ok(DistributedFindItem::Sample {
+            limit,
+            value: seq[2].clone(),
+        });
+    }
     if seq.len() == 3 && matches!(seq[0].as_symbol(), Some(symbol) if symbol.name == "pull") {
         return Ok(DistributedFindItem::Pull {
             entity: seq[1].clone(),
@@ -3181,7 +3195,7 @@ fn is_distributed_find_expression(seq: &[Value]) -> bool {
             if matches!(
                 symbol.name.as_str(),
                 "pull" | "count" | "count-distinct" | "sum" | "min" | "max" | "avg"
-                    | "median" | "variance" | "stddev"
+                    | "median" | "variance" | "stddev" | "rand" | "sample"
             )
     )
 }
@@ -3203,7 +3217,9 @@ fn resolve_distributed_find_item(
         | DistributedFindItem::Avg(value)
         | DistributedFindItem::Median(value)
         | DistributedFindItem::Variance(value)
-        | DistributedFindItem::Stddev(value) => Ok(match variable_name(value) {
+        | DistributedFindItem::Stddev(value)
+        | DistributedFindItem::Rand(value)
+        | DistributedFindItem::Sample { value, .. } => Ok(match variable_name(value) {
             Some(var) => binding.get(var).cloned().unwrap_or(Value::Nil),
             None => value.clone(),
         }),
@@ -3236,6 +3252,8 @@ enum DistributedAggregateValue {
     Median(Vec<i64>),
     Variance(Vec<i64>),
     Stddev(Vec<i64>),
+    Rand(Option<Value>),
+    Sample { limit: usize, values: Vec<Value> },
 }
 
 impl DistributedAggregateValue {
@@ -3259,6 +3277,11 @@ impl DistributedAggregateValue {
             DistributedFindItem::Median(_) => Some(Self::Median(Vec::new())),
             DistributedFindItem::Variance(_) => Some(Self::Variance(Vec::new())),
             DistributedFindItem::Stddev(_) => Some(Self::Stddev(Vec::new())),
+            DistributedFindItem::Rand(_) => Some(Self::Rand(None)),
+            DistributedFindItem::Sample { limit, .. } => Some(Self::Sample {
+                limit: *limit,
+                values: Vec::new(),
+            }),
         }
     }
 
@@ -3298,6 +3321,16 @@ impl DistributedAggregateValue {
             Self::Median(values) | Self::Variance(values) | Self::Stddev(values) => {
                 values.push(aggregate_query_integer(&value)?);
             }
+            Self::Rand(current) => {
+                if current.is_none() {
+                    *current = Some(value);
+                }
+            }
+            Self::Sample { limit, values } => {
+                if values.len() < *limit {
+                    values.push(value);
+                }
+            }
         }
         Ok(())
     }
@@ -3324,6 +3357,8 @@ impl DistributedAggregateValue {
                 Some(variance) => Value::float(variance.sqrt()),
                 None => Value::Nil,
             },
+            Self::Rand(value) => value.clone().unwrap_or(Value::Nil),
+            Self::Sample { values, .. } => Value::Vector(values.clone()),
         }
     }
 }
@@ -6765,7 +6800,7 @@ mod tests {
             .unwrap();
 
         let grouped = kotoba_edn::parse(
-            r#"{:find [?role (count ?e) (sum ?score) (min ?score) (max ?score) (min 2 ?score) (max 2 ?score) (min 0 ?score) (max 0 ?score) (avg ?score) (median ?score) (variance ?score) (stddev ?score)]
+            r#"{:find [?role (count ?e) (sum ?score) (min ?score) (max ?score) (min 2 ?score) (max 2 ?score) (min 0 ?score) (max 0 ?score) (rand ?score) (sample 2 ?score) (avg ?score) (median ?score) (variance ?score) (stddev ?score)]
                 :where [[?e :person/role ?role]
                         [?e :person/score ?score]]
                 :order-by [[(count ?e) :desc] [?role :asc]]}"#,
@@ -6787,6 +6822,8 @@ mod tests {
                     EdnValue::Vector(vec![EdnValue::Integer(8), EdnValue::Integer(3)]),
                     EdnValue::Vector(vec![]),
                     EdnValue::Vector(vec![]),
+                    EdnValue::Integer(3),
+                    EdnValue::Vector(vec![EdnValue::Integer(3), EdnValue::Integer(8)]),
                     EdnValue::float(5.5),
                     EdnValue::float(5.5),
                     EdnValue::float(6.25),
@@ -6802,6 +6839,8 @@ mod tests {
                     EdnValue::Vector(vec![EdnValue::Integer(10)]),
                     EdnValue::Vector(vec![]),
                     EdnValue::Vector(vec![]),
+                    EdnValue::Integer(10),
+                    EdnValue::Vector(vec![EdnValue::Integer(10)]),
                     EdnValue::float(10.0),
                     EdnValue::Integer(10),
                     EdnValue::float(0.0),
