@@ -540,6 +540,12 @@ pub struct ProtocolDatomWriteResp {
     pub journal_cids: Vec<String>,
 }
 
+pub(crate) struct ProtocolWriteAuth {
+    pub author: String,
+    pub auth_proof_cid: Option<kotoba_core::cid::KotobaCid>,
+    pub auth_capability: Option<AuthCapabilityProjection>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AuthCapabilityProjection {
     proof_format: &'static str,
@@ -2066,6 +2072,74 @@ fn persist_auth_proof_block(
     })?;
     state.block_store.pin(&cid);
     Ok(cid)
+}
+
+pub(crate) fn authorize_protocol_datom_write(
+    state: &KotobaState,
+    headers: &axum::http::HeaderMap,
+    graph: &str,
+    cacao_b64: Option<&str>,
+    presentation: Option<&kotoba_vc::VerifiablePresentation>,
+    operations: &[&str],
+    tx_cid: Option<&kotoba_core::cid::KotobaCid>,
+) -> Result<ProtocolWriteAuth, (StatusCode, String)> {
+    if let Some(cacao_b64) = cacao_b64 {
+        let payload = verify_datomic_cacao_payload_with_operations(
+            state,
+            graph,
+            Some(cacao_b64),
+            operations,
+        )?;
+        if let Some(tx_cid) = tx_cid {
+            enforce_datomic_write_tx_scope(&payload, tx_cid)?;
+        }
+        let auth_proof_cid = Some(persist_cacao_auth_proof(state, cacao_b64)?);
+        let auth_capability = Some(cacao_capability_projection(
+            &payload,
+            auth_proof_cid.clone(),
+        ));
+        return Ok(ProtocolWriteAuth {
+            author: payload.iss.clone(),
+            auth_proof_cid,
+            auth_capability,
+        });
+    }
+
+    if let Some(presentation) = presentation {
+        verify_vc_presentation_capabilities_scope(state, graph, presentation, operations, None)?;
+        if let Some(tx_cid) = tx_cid {
+            if vc_presentation_declares_tx_scope(presentation) {
+                let tx_scope = format!("kotoba://tx/{}", tx_cid.to_multibase());
+                verify_vc_presentation_capabilities_scope(
+                    state,
+                    graph,
+                    presentation,
+                    operations,
+                    Some(&tx_scope),
+                )?;
+            }
+        }
+        let auth_proof_cid = Some(persist_vp_auth_proof(state, presentation)?);
+        let auth_capability = Some(vp_capability_projection(
+            presentation,
+            auth_proof_cid.clone(),
+        ));
+        return Ok(ProtocolWriteAuth {
+            author: presentation
+                .holder
+                .clone()
+                .unwrap_or_else(|| state.operator_did.clone()),
+            auth_proof_cid,
+            auth_capability,
+        });
+    }
+
+    crate::graph_auth::require_operator_auth(headers, &state.operator_did)?;
+    Ok(ProtocolWriteAuth {
+        author: state.operator_did.clone(),
+        auth_proof_cid: None,
+        auth_capability: None,
+    })
 }
 
 fn db_from_kqe_datoms(datoms: Vec<kotoba_kqe::Datom>) -> kotoba_datomic::Db {

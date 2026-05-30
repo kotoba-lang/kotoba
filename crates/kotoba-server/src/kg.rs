@@ -1,4 +1,4 @@
-//! yatabase KG entity lookup endpoint backed by kotoba QuadStore.
+//! yatabase KG entity lookup endpoint backed by kotoba Datom projection indexes.
 //!
 //! NSID: ai.gftd.apps.kotobase.kg.entity
 //! All KG quads live in the named graph `kotobase-kg-v1`.
@@ -115,6 +115,8 @@ async fn commit_kg_datoms(
     tx_cid: KotobaCid,
     mut datoms: Vec<KqeDatom>,
     author: String,
+    auth_proof_cid: Option<KotobaCid>,
+    auth_capability: Option<crate::xrpc::AuthCapabilityProjection>,
 ) -> Result<crate::xrpc::ProtocolDatomWriteResp, (StatusCode, String)> {
     let graph = kg_graph_cid();
     for datom in &mut datoms {
@@ -132,10 +134,43 @@ async fn commit_kg_datoms(
         tx_cid,
         author,
         kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
-        None,
-        None,
+        auth_proof_cid,
+        auth_capability,
     )
     .await
+}
+
+fn kg_legacy_write_auth(
+    headers: &HeaderMap,
+    fallback: &str,
+) -> Result<crate::xrpc::ProtocolWriteAuth, (StatusCode, String)> {
+    require_kg_write_auth(headers)?;
+    Ok(crate::xrpc::ProtocolWriteAuth {
+        author: kg_write_author(headers, fallback),
+        auth_proof_cid: None,
+        auth_capability: None,
+    })
+}
+
+fn authorize_kg_write(
+    state: &KotobaState,
+    headers: &HeaderMap,
+    cacao_b64: Option<&str>,
+    presentation: Option<&kotoba_vc::VerifiablePresentation>,
+    tx_cid: &KotobaCid,
+) -> Result<crate::xrpc::ProtocolWriteAuth, (StatusCode, String)> {
+    if cacao_b64.is_some() || presentation.is_some() {
+        return crate::xrpc::authorize_protocol_datom_write(
+            state,
+            headers,
+            &kg_graph_cid().to_multibase(),
+            cacao_b64,
+            presentation,
+            &[kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT],
+            Some(tx_cid),
+        );
+    }
+    kg_legacy_write_auth(headers, &state.operator_did)
 }
 
 fn kg_write_author(headers: &HeaderMap, fallback: &str) -> String {
@@ -541,6 +576,10 @@ pub struct KgEmbedReq {
     pub entity_id: String,
     /// Text to embed (typically labelEn or labelJa).
     pub text: String,
+    /// CACAO delegation chain for distributed Datom writes.
+    pub cacao_b64: Option<String>,
+    /// W3C Verifiable Presentation carrying a datom:transact capability.
+    pub auth_presentation: Option<kotoba_vc::VerifiablePresentation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -558,7 +597,6 @@ pub async fn kg_embed(
     headers: HeaderMap,
     Json(req): Json<KgEmbedReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    require_kg_write_auth(&headers)?;
     if req.entity_id.is_empty() || req.entity_id.len() > MAX_KG_ID_LEN {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -605,12 +643,21 @@ pub async fn kg_embed(
     let dims = vector.len();
     let datom = kg_datom(&subject, "kg/label_vec", KqeValue::VectorF32(vector));
     let tx_cid = kg_tx_cid("embed", &[&req.entity_id]);
+    let auth = authorize_kg_write(
+        &state,
+        &headers,
+        req.cacao_b64.as_deref(),
+        req.auth_presentation.as_ref(),
+        &tx_cid,
+    )?;
     commit_kg_datoms(
         &state,
         subject,
         tx_cid,
         vec![datom],
-        kg_write_author(&headers, &state.operator_did),
+        auth.author,
+        auth.auth_proof_cid,
+        auth.auth_capability,
     )
     .await?;
 
@@ -790,6 +837,10 @@ pub struct KgIngestReq {
     pub claims: Vec<KgClaim>,
     #[serde(default)]
     pub relations: Vec<KgRelation>,
+    /// CACAO delegation chain for distributed Datom writes.
+    pub cacao_b64: Option<String>,
+    /// W3C Verifiable Presentation carrying a datom:transact capability.
+    pub auth_presentation: Option<kotoba_vc::VerifiablePresentation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -814,13 +865,6 @@ pub async fn kg_ingest(
     headers: HeaderMap,
     Json(req): Json<KgIngestReq>,
 ) -> impl IntoResponse {
-    if let Err((code, msg)) = require_kg_write_auth(&headers) {
-        return (
-            code,
-            axum::Json(serde_json::json!({"ok": false, "error": msg})),
-        )
-            .into_response();
-    }
     use axum::Json as AxumJson;
     if req.id.is_empty() || req.id.len() > MAX_KG_ID_LEN {
         return (
@@ -997,12 +1041,30 @@ pub async fn kg_ingest(
     }
 
     let tx_cid = kg_tx_cid("ingest", &[&req.id]);
+    let auth = match authorize_kg_write(
+        &state,
+        &headers,
+        req.cacao_b64.as_deref(),
+        req.auth_presentation.as_ref(),
+        &tx_cid,
+    ) {
+        Ok(auth) => auth,
+        Err((code, msg)) => {
+            return (
+                code,
+                AxumJson(serde_json::json!({"ok": false, "error": msg})),
+            )
+                .into_response();
+        }
+    };
     if let Err((code, msg)) = commit_kg_datoms(
         &state,
         subject.clone(),
         tx_cid,
         datoms,
-        kg_write_author(&headers, &state.operator_did),
+        auth.author,
+        auth.auth_proof_cid,
+        auth.auth_capability,
     )
     .await
     {
@@ -1028,6 +1090,10 @@ pub async fn kg_ingest(
 pub struct KgIngestBatchReq {
     /// Up to MAX_KG_BATCH_SIZE entities to ingest in a single HTTP request.
     pub entities: Vec<KgIngestReq>,
+    /// CACAO delegation chain for distributed Datom writes.
+    pub cacao_b64: Option<String>,
+    /// W3C Verifiable Presentation carrying a datom:transact capability.
+    pub auth_presentation: Option<kotoba_vc::VerifiablePresentation>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1051,7 +1117,7 @@ const MAX_KG_BATCH_SIZE: usize = 1_000;
 /// Ingest up to `MAX_KG_BATCH_SIZE` entities in a single HTTP request.
 /// Validation is run once before any writes; if any entity fails the entire
 /// batch is rejected (all-or-nothing semantics).  Inserts are then performed
-/// serially through the same QuadStore path as single-ingest, amortising the
+/// serially through the same Datom projection path as single-ingest, amortising the
 /// HTTP + JSON + auth-gate cost across the whole batch.
 pub async fn kg_ingest_batch(
     State(state): State<Arc<KotobaState>>,
@@ -1059,13 +1125,6 @@ pub async fn kg_ingest_batch(
     Json(req): Json<KgIngestBatchReq>,
 ) -> impl IntoResponse {
     use axum::Json as AxumJson;
-    if let Err((code, msg)) = require_kg_write_auth(&headers) {
-        return (
-            code,
-            AxumJson(serde_json::json!({"ok": false, "error": msg})),
-        )
-            .into_response();
-    }
     if req.entities.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1172,12 +1231,30 @@ pub async fn kg_ingest_batch(
     }
 
     let tx_cid = kg_tx_cid("ingest_batch", &[&req.entities.len().to_string()]);
+    let auth = match authorize_kg_write(
+        &state,
+        &headers,
+        req.cacao_b64.as_deref(),
+        req.auth_presentation.as_ref(),
+        &tx_cid,
+    ) {
+        Ok(auth) => auth,
+        Err((code, msg)) => {
+            return (
+                code,
+                AxumJson(serde_json::json!({"ok": false, "error": msg})),
+            )
+                .into_response();
+        }
+    };
     if let Err((code, msg)) = commit_kg_datoms(
         &state,
         first_subject,
         tx_cid,
         all_datoms,
-        kg_write_author(&headers, &state.operator_did),
+        auth.author,
+        auth.auth_proof_cid,
+        auth.auth_capability,
     )
     .await
     {
@@ -1261,6 +1338,10 @@ fn validate_ingest_req(e: &KgIngestReq) -> Result<(), String> {
 pub struct KgDeleteReq {
     /// Entity nanoid — same as the `id` field used in kg.ingest.
     pub id: String,
+    /// CACAO delegation chain for distributed Datom writes.
+    pub cacao_b64: Option<String>,
+    /// W3C Verifiable Presentation carrying a datom:transact capability.
+    pub auth_presentation: Option<kotoba_vc::VerifiablePresentation>,
 }
 
 // ── kg.commit ─────────────────────────────────────────────────────────────────
@@ -1396,14 +1477,6 @@ pub async fn kg_delete(
     headers: HeaderMap,
     Json(req): Json<KgDeleteReq>,
 ) -> impl IntoResponse {
-    // Delete is irreversible and there is no per-entity ownership model, so
-    // restrict to the operator DID to prevent any authenticated user from
-    // wiping arbitrary entities.
-    if let Err((code, msg)) =
-        crate::graph_auth::require_operator_auth(&headers, &state.operator_did)
-    {
-        return (code, Json(serde_json::json!({"ok": false, "error": msg}))).into_response();
-    }
     if req.id.is_empty() || req.id.len() > MAX_KG_ID_LEN {
         return (
             StatusCode::BAD_REQUEST,
@@ -1415,6 +1488,31 @@ pub async fn kg_delete(
     }
     let graph = kg_graph_cid();
     let subject = KotobaCid::from_bytes(req.id.as_bytes());
+    let tx_cid = KotobaCid::from_bytes(format!("kg.delete:{}", req.id).as_bytes());
+    let auth = match if req.cacao_b64.is_some() || req.auth_presentation.is_some() {
+        crate::xrpc::authorize_protocol_datom_write(
+            &state,
+            &headers,
+            &graph.to_multibase(),
+            req.cacao_b64.as_deref(),
+            req.auth_presentation.as_ref(),
+            &[kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT],
+            Some(&tx_cid),
+        )
+    } else {
+        crate::graph_auth::require_operator_auth(&headers, &state.operator_did).map(|_| {
+            crate::xrpc::ProtocolWriteAuth {
+                author: state.operator_did.clone(),
+                auth_proof_cid: None,
+                auth_capability: None,
+            }
+        })
+    } {
+        Ok(auth) => auth,
+        Err((code, msg)) => {
+            return (code, Json(serde_json::json!({"ok": false, "error": msg}))).into_response();
+        }
+    };
 
     let db = match crate::xrpc::current_db_for_graph(&state, &graph).await {
         Ok(db) => db,
@@ -1431,7 +1529,6 @@ pub async fn kg_delete(
     let retracted = current_datoms.len();
 
     if retracted > 0 {
-        let tx_cid = KotobaCid::from_bytes(format!("kg.delete:{}", req.id).as_bytes());
         let retract_datoms: Vec<_> = current_datoms
             .into_iter()
             .map(|datom| kotoba_datomic::Datom::retract(datom.e, datom.a, datom.v, tx_cid.clone()))
@@ -1443,10 +1540,10 @@ pub async fn kg_delete(
             subject.clone(),
             retract_datoms,
             tx_cid,
-            state.operator_did.clone(),
+            auth.author,
             kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
-            None,
-            None,
+            auth.auth_proof_cid,
+            auth.auth_capability,
         )
         .await
         {
@@ -1497,7 +1594,7 @@ pub struct KgQueryReq {
 }
 
 /// POST /xrpc/ai.gftd.apps.kotobase.kg.query
-/// Execute a SPARQL SELECT or Cypher MATCH/RETURN against the QuadStore.
+/// Execute a SPARQL SELECT or Cypher MATCH/RETURN against the Datom projection.
 ///
 /// Both compilers enforce binary-relation arity (exactly 2 RETURN variables).
 /// Results are returned as `[{ "a": "<cid>", "b": "<cid>" }]` pairs where
@@ -2050,7 +2147,12 @@ mod tests {
                 as_of: None,
                 since: None,
                 cacao_b64: None,
-                presentation: Some(signed_graph_query_presentation(&state, &graph)),
+                presentation: Some(signed_capability_presentation(
+                    &state,
+                    &graph,
+                    kotoba_auth::CacaoPayload::OP_GRAPH_QUERY,
+                    "graph.sparql",
+                )),
                 limit: None,
                 max_hops: 0,
             }),
@@ -2068,18 +2170,72 @@ mod tests {
         assert_eq!(body["quads"][0]["object"]["text"], "admin");
     }
 
-    fn signed_graph_query_presentation(
+    #[tokio::test]
+    async fn kg_ingest_accepts_vp_datom_transact_capability() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = kg_graph_cid();
+
+        let response = kg_ingest(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(KgIngestReq {
+                id: "kg-vp-ingest-1".into(),
+                qid: None,
+                kind: Some("test".into()),
+                label_ja: None,
+                label_en: Some("VP Ingest".into()),
+                confidence: None,
+                license: None,
+                extractor: None,
+                valid_from: None,
+                valid_to: None,
+                ingested_at: None,
+                source_id: None,
+                label_vec: vec![],
+                claims: vec![],
+                relations: vec![],
+                cacao_b64: None,
+                auth_presentation: Some(signed_capability_presentation(
+                    &state,
+                    &graph,
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    "kg.ingest",
+                )),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let db = crate::xrpc::current_db_for_graph(&state, &graph)
+            .await
+            .unwrap();
+        assert!(db.datoms().iter().any(|datom| {
+            datom.a == ":capability/operation"
+                && datom.v == EdnValue::string(kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT)
+        }));
+        assert!(db.datoms().iter().any(|datom| {
+            datom.a == ":capability/proofFormat"
+                && datom.v == EdnValue::string("W3C VerifiablePresentation")
+        }));
+    }
+
+    fn signed_capability_presentation(
         state: &KotobaState,
         graph: &KotobaCid,
+        operation: &str,
+        challenge: &str,
     ) -> kotoba_vc::VerifiablePresentation {
         let holder = state.operator_did.clone();
         let mut credential = kotoba_vc::VerifiableCredential::new(
-            "urn:uuid:kg-sparql-vp-capability",
+            format!("urn:uuid:{challenge}-vp-capability"),
             state.operator_did.clone(),
             serde_json::json!({
                 "id": holder,
                 "graph": graph.to_multibase(),
-                "operation": kotoba_auth::CacaoPayload::OP_GRAPH_QUERY,
+                "operation": operation,
                 "scope": format!("kotoba://graph/{}", graph.to_multibase()),
             }),
         );
@@ -2099,13 +2255,13 @@ mod tests {
                 multibase::Base::Base58Btc,
                 credential_signature.to_bytes(),
             ),
-            challenge: Some("graph.sparql".into()),
-            domain: Some("kotoba.graph.sparql".into()),
+            challenge: Some(challenge.into()),
+            domain: Some("kotoba.protocol.write".into()),
         });
 
         let mut presentation = kotoba_vc::VerifiablePresentation {
             context: vec![kotoba_vc::VC_CONTEXT_V2.into()],
-            id: "urn:uuid:kg-sparql-vp".into(),
+            id: format!("urn:uuid:{challenge}-vp"),
             types: vec!["VerifiablePresentation".into()],
             holder: Some(state.operator_did.clone()),
             verifiable_credentials: vec![credential],
@@ -2124,8 +2280,8 @@ mod tests {
                 multibase::Base::Base58Btc,
                 presentation_signature.to_bytes(),
             ),
-            challenge: Some("graph.sparql".into()),
-            domain: Some("kotoba.graph.sparql".into()),
+            challenge: Some(challenge.into()),
+            domain: Some("kotoba.protocol.write".into()),
         });
         presentation
     }
