@@ -1141,7 +1141,13 @@ async fn call_tool(
                 .map_err(|e| (ERR_INVALID_PARAMS, format!("invalid ctx_cbor_b64: {e}")))?;
 
             let executor = Arc::clone(&state.executor);
-            let program_cid = format!("did/wasm/{agent_did}");
+            // program_cid MUST be the content-address of the wasm bytes so the
+            // ProgramStore cache keys by what's actually being run.  Keying by
+            // `did/wasm/{agent_did}` meant a second call with different wasm
+            // for the same DID silently returned the previously compiled
+            // Component (wrong module loaded, stale ProgramStore growth, and
+            // a likely cause of the post-first-call OOM seen in production).
+            let program_cid = kotoba_core::cid::KotobaCid::from_bytes(&wasm_bytes).to_multibase();
 
             let runner =
                 WasmPregelRunner::new(executor, &program_cid, wasm_bytes, &agent_did, max_ss);

@@ -6583,11 +6583,7 @@ pub async fn invoke_run(
                 })
                 .collect(),
             Err((code, msg)) => {
-                return (
-                    code,
-                    Json(serde_json::json!({"error": format!("invoke graph snapshot: {msg}")})),
-                )
-                    .into_response();
+                return Err((code, format!("invoke graph snapshot: {msg}")));
             }
         }
     } else {
@@ -6607,11 +6603,10 @@ pub async fn invoke_run(
             }
             Err(IpnsRegistryError::NotFound(_)) => {}
             Err(e) => {
-                return (
+                return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("invoke graph head: {e}")})),
-                )
-                    .into_response();
+                    format!("invoke graph head: {e}"),
+                ));
             }
         }
     }

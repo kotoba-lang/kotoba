@@ -54,6 +54,25 @@ impl IpfsPinClient {
         })
     }
 
+    /// Build a remote pin client from `KOTOBA_IPFS_PIN_ENDPOINT` +
+    /// `KOTOBA_IPFS_PIN_JWT`.  Returns `None` when neither secret is set, so
+    /// the caller can no-op when kotobase pinning is intentionally disabled
+    /// (e.g. local dev).  Used to dispatch every recursive pin to
+    /// kotobase.gftd.ai (or any Kubo-compatible service) in addition to the
+    /// pod-local sidecar — the F-3 pin chain wiring.
+    pub fn from_pin_env() -> Option<Arc<Self>> {
+        let endpoint = std::env::var("KOTOBA_IPFS_PIN_ENDPOINT").ok()?;
+        if endpoint.trim().is_empty() {
+            return None;
+        }
+        let token = std::env::var("KOTOBA_IPFS_PIN_JWT").ok();
+        Some(Arc::new(Self {
+            client: reqwest::Client::new(),
+            endpoint,
+            token,
+        }))
+    }
+
     fn api_url(&self, method: &str) -> String {
         format!("{}/api/v0/{method}", self.endpoint.trim_end_matches('/'))
     }

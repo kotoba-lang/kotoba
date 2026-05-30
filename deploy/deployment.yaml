@@ -51,6 +51,19 @@ spec:
               value: /data/sled/wal
             - name: KOTOBA_STORAGE_BUDGET_BYTES
               value: "8589934592"
+            # Without this kotoba uses InMemoryIpnsRegistry — graph heads
+            # vanish on every pod restart and `datomic.q` returns
+            # "no distributed Datomic/IPNS head for graph" even though the
+            # datom blocks are durably in Kubo.  Kubo's own IPNS publish path
+            # writes the heads to the local IPFS keystore (PVC).
+            - name: KOTOBA_IPNS
+              value: kubo
+            # Disable the per-request audit fingerprint commit — it pile-ups
+            # against Kubo and slows user queries.  Re-enable when audit
+            # durability becomes a requirement (and after the audit graph
+            # has its own commit-batching / sampling story).
+            - name: KOTOBA_AUDIT_DISABLED
+              value: "1"
             # IPFS Pinning Service (optional — set kotoba-ipfs-pin Secret to enable)
             # kotobase.gftd.ai IS the pin service; external IPFS is optional secondary
             - name: KOTOBA_IPFS_PIN_ENDPOINT
@@ -104,21 +117,36 @@ spec:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 15
+            # WAL replay + IPNS publish + SovereignCrypto retry can take
+            # 30-60 s on a fresh kubo, so we delay liveness checks until the
+            # ready window has had a chance to fire.  timeout=10 absorbs the
+            # occasional slow /health when commit-in-flight blocks the
+            # runtime briefly.
+            initialDelaySeconds: 60
             periodSeconds: 20
-            timeoutSeconds: 3
+            timeoutSeconds: 10
+            failureThreshold: 6
 
           readinessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 5
+            initialDelaySeconds: 10
             periodSeconds: 10
-            timeoutSeconds: 3
+            timeoutSeconds: 10
+            failureThreshold: 6
 
           resources:
+            # Split requests/limits so the scheduler accepts the pod even when
+            # the GPU node is largely allocated.  Steady-state RSS is ~2 GiB;
+            # 8 GiB limit gives headroom for kotoba_wasm_run bursts.  Defaulting
+            # request==limit=8Gi left the pod Pending with
+            # "Insufficient memory" because both A16 nodes are heavily
+            # subscribed by other workloads.
+            requests:
+              memory: "2Gi"
             limits:
-              memory: "1Gi"
+              memory: "8Gi"
 
           volumeMounts:
             # NOTE: no `subPath` here — kotoba's existing /data/sled tree lives
@@ -134,7 +162,7 @@ spec:
         # Without this sidecar the cold-put fails silently and content blocks
         # are lost on every pod restart.
         - name: kubo
-          image: ipfs/kubo:v0.41.0
+          image: ipfs/kubo:v0.34.1
           command: ["/bin/sh","-c"]
           args:
             - |
@@ -146,8 +174,20 @@ spec:
               # this the readiness probe loops on "lock /data/ipfs/repo.lock:
               # someone else has the lock" because Kubo refuses to start.
               # Safe to run unconditionally: only this pod ever touches the
-              # PVC (Recreate strategy + single replica).
-              rm -f /data/ipfs/repo.lock /data/ipfs/api
+              # PVC (Recreate strategy + single replica + Multi-Attach guard
+              # from the volume controller already serialised access).
+              #
+              # Loop a few times in case the previous pod's lockholder PID
+              # is still being scrubbed by the kubelet — the PVC mount
+              # itself was just attached so any lock file is by definition
+              # orphaned.
+              for i in 1 2 3; do
+                rm -f /data/ipfs/repo.lock /data/ipfs/api
+                sleep 1
+                if [ ! -f /data/ipfs/repo.lock ]; then
+                  break
+                fi
+              done
               # Pod-local only (kotoba container reaches us via localhost).
               ipfs config Addresses.API     /ip4/127.0.0.1/tcp/5001
               ipfs config Addresses.Gateway /ip4/127.0.0.1/tcp/8081

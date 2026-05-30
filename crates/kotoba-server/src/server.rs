@@ -355,6 +355,20 @@ impl KotobaState {
                 .unwrap_or(false);
             if !ipfs_off {
                 let cold = kotoba_store::KuboBlockStore::from_env();
+                // F-3: attach the kotobase remote-pin client if configured so
+                // every local recursive pin/add also lands on kotobase.gftd.ai.
+                // Falls back to a single-pin (local only) when the env vars
+                // are absent — preserves dev / local-Kubo workflows.
+                let cold = match kotoba_store::IpfsPinClient::from_pin_env() {
+                    Some(remote) => {
+                        tracing::info!(
+                            "kotobase pin fanout enabled \
+                             (KOTOBA_IPFS_PIN_ENDPOINT)"
+                        );
+                        cold.with_remote_pin(remote)
+                    }
+                    None => cold,
+                };
                 let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
                     .unwrap_or_else(|_| "http://localhost:5001".into());
                 let tiered = kotoba_store::TieredBlockStore::new(hot, cold);

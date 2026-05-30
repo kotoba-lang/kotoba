@@ -7,8 +7,12 @@ use crate::host::KotobaEngine;
 
 /// ProgramStore caches compiled WASM Components by their program_cid.
 ///
-/// program_cid = IPFS-compatible Kotoba CIDv1 sha2-256 of the raw .wasm bytes.
-/// Compiled Component is reused across invocations (amortises Cranelift JIT cost).
+/// program_cid SHOULD be the content-address of the raw .wasm bytes; the
+/// cache is bounded so a long-running pod that loads many distinct programs
+/// (e.g. distinct LangGraph actors) cannot grow without bound.  Compiled
+/// Components reuse Cranelift JIT output across invocations.
+const PROGRAM_CACHE_MAX: usize = 16;
+
 #[derive(Clone)]
 pub struct ProgramStore {
     engine: KotobaEngine,
@@ -28,6 +32,18 @@ impl ProgramStore {
     pub fn get_or_compile(&self, program_cid: &str, wasm_bytes: &[u8]) -> Result<Component> {
         if let Some(cached) = self.cache.get(program_cid) {
             return Ok(cached.clone());
+        }
+        // Bound the cache to avoid unbounded memory growth.  Each cached
+        // Component holds Cranelift-compiled artefacts (~50-200 MB for
+        // Python WASM bundles), so 16 entries is the practical ceiling on
+        // a 4Gi pod once you account for ~600 MB of live instance memory
+        // per active call.  Drop a random entry on overflow — LRU would
+        // need per-call bookkeeping; for this access pattern (rare new
+        // program loads) random eviction is fine.
+        if self.cache.len() >= PROGRAM_CACHE_MAX {
+            if let Some(stale) = self.cache.iter().next().map(|e| e.key().clone()) {
+                self.cache.remove(&stale);
+            }
         }
         let component = self.engine.compile(wasm_bytes)?;
         self.cache

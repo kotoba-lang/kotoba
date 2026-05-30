@@ -272,6 +272,13 @@ pub struct KuboIpnsRegistry {
     endpoint: String,
     token: Option<String>,
     local: InMemoryIpnsRegistry,
+    /// Cache of alias → kubo-issued IPNS id (the actual peer-id-style hash
+    /// `name/resolve` requires).  Populated lazily on `key/gen` and on
+    /// startup via `bootstrap_aliases_from_kubo` (which scans `key/list`).
+    /// Without this mapping, every name/resolve hits an unresolvable alias
+    /// string and returns 500 "cannot resolve" — datomic.* read endpoints
+    /// then 404 even though the data is durably stored.
+    alias_id: Arc<RwLock<HashMap<String, String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -308,6 +315,12 @@ pub struct KuboKeyGenResp {
     pub id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct KuboKeyListResp {
+    #[serde(rename = "Keys")]
+    keys: Vec<KuboKeyGenResp>,
+}
+
 impl KuboIpnsRegistry {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
@@ -315,6 +328,7 @@ impl KuboIpnsRegistry {
             endpoint: endpoint.into(),
             token: None,
             local: InMemoryIpnsRegistry::new(),
+            alias_id: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -322,10 +336,71 @@ impl KuboIpnsRegistry {
         let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:5001".into());
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
-        Self {
+        let registry = Self {
             token,
             ..Self::new(endpoint)
+        };
+        // Best-effort hydrate of alias → kubo id from the daemon's keystore so
+        // restart-without-prior-publish still resolves names that previous
+        // runs created.  A failure here is non-fatal (kubo may be down at
+        // boot); resolve_kubo will still work for aliases that get re-published
+        // in this process lifetime.
+        if let Err(e) = registry.bootstrap_aliases_from_kubo() {
+            tracing::warn!(err = %e, "KuboIpnsRegistry: alias bootstrap from key/list failed");
         }
+        registry
+    }
+
+    /// Populate the alias→id cache by listing all keys in Kubo's keystore.
+    /// Called from `from_env` on startup; safe to call again at any time.
+    pub fn bootstrap_aliases_from_kubo(&self) -> Result<(), IpnsRegistryError> {
+        let url = format!("{}?ipns-base=base36", self.api_url("key/list"));
+        let resp = Self::wait(
+            "key/list send",
+            self.authed(self.client.post(url)).send(),
+        )?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = Self::wait("key/list body", resp.text()).unwrap_or_default();
+            return Err(IpnsRegistryError::Kubo(format!("key/list {status}: {text}")));
+        }
+        let parsed: KuboKeyListResp = Self::wait("key/list parse", resp.json())?;
+        let mut map = self
+            .alias_id
+            .write()
+            .map_err(|_| IpnsRegistryError::LockPoisoned)?;
+        let mut hydrated = 0usize;
+        for k in parsed.keys {
+            if k.name.starts_with("k51-kotoba-") {
+                map.insert(k.name, k.id);
+                hydrated += 1;
+            }
+        }
+        if hydrated > 0 {
+            tracing::info!(
+                hydrated,
+                "KuboIpnsRegistry: alias→id cache populated from key/list"
+            );
+        }
+        Ok(())
+    }
+
+    fn record_alias(&self, alias: &str, id: &str) {
+        if let Ok(mut m) = self.alias_id.write() {
+            m.insert(alias.to_string(), id.to_string());
+        }
+    }
+
+    /// Resolve a kotoba alias to the Kubo-issued IPNS id (peer-id-style hash).
+    /// Falls back to the alias itself when no mapping is known so the caller
+    /// can still attempt a Kubo lookup (and trigger NotFound the normal way).
+    fn alias_to_resolve_arg(&self, alias: &str) -> String {
+        if let Ok(m) = self.alias_id.read() {
+            if let Some(id) = m.get(alias) {
+                return id.clone();
+            }
+        }
+        alias.to_string()
     }
 
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
@@ -458,13 +533,44 @@ impl KuboIpnsRegistry {
     }
 
     fn publish_kubo(&self, record: &IpnsRecord) -> Result<(), IpnsRegistryError> {
+        // Kubo refuses `name/publish` if the key alias does not already exist
+        // in its keystore (returns 500 "no key by the given name was found").
+        // We auto-create the key here so first-write to a graph just works
+        // without out-of-band `ipfs key gen` ceremony.
+        match self.try_publish_kubo(record) {
+            Ok(()) => Ok(()),
+            Err(IpnsRegistryError::Kubo(msg))
+                if msg.contains("no key by the given name was found")
+                    || msg.contains("not found in keystore") =>
+            {
+                tracing::info!(
+                    name = %record.name.as_str(),
+                    "ipns: kubo key not in keystore, generating it"
+                );
+                let gen = self.generate_ed25519_key(record.name.as_str())?;
+                // Remember the alias → kubo IPNS id binding so future
+                // resolve_kubo calls can target the actual peer-id-style
+                // hash that Kubo will recognise.
+                self.record_alias(&gen.name, &gen.id);
+                self.try_publish_kubo(record)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn try_publish_kubo(&self, record: &IpnsRecord) -> Result<(), IpnsRegistryError> {
         let record_cid = self.put_record_block_kubo(record)?;
         let ttl = record
             .ttl_secs
             .map(|secs| format!("{secs}s"))
             .unwrap_or_else(|| "60s".to_string());
+        // `offline=true` made publish skip the Kubo datastore write on 0.34.1,
+        // so records vanished the moment the kubo sidecar restarted (and
+        // therefore on every pod restart, since kotoba+kubo share a lifecycle).
+        // Dropping the flag lets Kubo persist the IPNS entry to the local
+        // repo (PVC) AND announce on the DHT — durable across restarts.
         let url = format!(
-            "{}?arg=/ipfs/{}&key={}&resolve=false&offline=true&ttl={}",
+            "{}?arg=/ipfs/{}&key={}&resolve=false&ttl={}",
             self.api_url("name/publish"),
             record_cid,
             record.name.as_str(),
@@ -492,10 +598,16 @@ impl KuboIpnsRegistry {
     }
 
     fn resolve_kubo(&self, name: &IpnsName) -> Result<IpnsRecord, IpnsRegistryError> {
+        // name/resolve needs the Kubo-issued peer-id hash, not our alias
+        // string.  Look up the mapping (populated by publish_kubo's auto
+        // key/gen + bootstrap_aliases_from_kubo).  Falls back to the alias
+        // itself when unknown so the request still gets sent — Kubo's
+        // 500 "cannot resolve" path then maps to NotFound below.
+        let resolve_arg = self.alias_to_resolve_arg(name.as_str());
         let url = format!(
             "{}?arg={}&recursive=true&nocache=false",
             self.api_url("name/resolve"),
-            name.as_str()
+            resolve_arg
         );
         let resp = Self::wait(
             "name/resolve send",
@@ -507,7 +619,17 @@ impl KuboIpnsRegistry {
         }
         if !status.is_success() {
             let text = Self::wait("name/resolve body", resp.text()).unwrap_or_default();
-            if text.contains("not found") || text.contains("could not resolve") {
+            // Kubo returns 500 with body variants like "cannot resolve",
+            // "could not resolve", or "name not found" depending on version
+            // and whether the name was ever published.  Treat all of them
+            // as NotFound so the caller can fall back to a fresh head
+            // instead of bubbling up a hard 500 (which currently kills
+            // datomic.transact and datomic.q at startup before any name has
+            // been published).
+            if text.contains("not found")
+                || text.contains("could not resolve")
+                || text.contains("cannot resolve")
+            {
                 return Err(IpnsRegistryError::NotFound(name.0.clone()));
             }
             return Err(IpnsRegistryError::Kubo(format!(
@@ -549,8 +671,31 @@ fn kubo_http_client() -> reqwest::Client {
 
 impl IpnsRegistry for KuboIpnsRegistry {
     fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError> {
+        // Persist to the in-memory cache synchronously so subsequent
+        // resolve() calls on the same node see the new head immediately.
         self.local.publish(record.clone())?;
-        self.publish_kubo(&record)
+        // Kubo's name/publish blocks for DHT propagation (~20 s on Kubo
+        // 0.34.1).  When the caller can be served from the local resolve
+        // cache (single-pod deploys, immediate read-after-write within the
+        // same process), the DHT confirmation does not need to be on the
+        // user's critical path.  Spawn it so transact returns as soon as
+        // the block puts complete; the IPNS update propagates asynchronously
+        // and shows up via Kubo's IPFS resolve to other peers.
+        let me = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = tokio::task::spawn_blocking(move || me.publish_kubo(&record))
+                    .await
+                    .unwrap_or_else(|join| Err(IpnsRegistryError::Kubo(format!("join: {join}"))))
+                {
+                    tracing::warn!(error = %e, "ipns: kubo publish failed (async)");
+                }
+            });
+        } else {
+            // No tokio runtime — fall back to sync publish (tests, CLI).
+            self.publish_kubo(&record)?;
+        }
+        Ok(())
     }
 
     fn resolve(&self, name: &IpnsName) -> Result<IpnsRecord, IpnsRegistryError> {

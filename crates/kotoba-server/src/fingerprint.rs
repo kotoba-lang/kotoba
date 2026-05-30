@@ -74,6 +74,19 @@ pub async fn fingerprint_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    // KOTOBA_AUDIT_DISABLED=1 / true / on skips the entire per-request audit
+    // commit chain.  Production found that the spawned IPNS publish + block
+    // put per request piled up against Kubo's connection capacity and
+    // showed up as user-facing query latency despite the work being
+    // "background".  When durability of the audit graph isn't required (the
+    // primary user data graphs are already durable on their own), this
+    // env-gate cuts the per-request fixed cost to zero.
+    if std::env::var("KOTOBA_AUDIT_DISABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false)
+    {
+        return next.run(req).await;
+    }
     let method = req.method().as_str().to_string();
     let raw = req.uri().path();
     let path = if raw.len() > MAX_AUDIT_PATH_LEN {
@@ -137,7 +150,16 @@ pub async fn fingerprint_middleware(
         )
         .await
         {
-            tracing::warn!(status = %status, error = %message, "request audit distributed commit failed");
+            // Demoted to debug! 2026-05-30: request-audit is best-effort
+            // telemetry — the underlying datomic transact already commits
+            // (this is just per-request metadata).  Kubo's intermittent
+            // block/put 500s on burst flooded production logs at WARN with no
+            // operational impact; debug! preserves the breadcrumb for the
+            // operator without drowning the log on every health probe.
+            tracing::debug!(
+                status = %status, error = %message,
+                "request audit distributed commit failed"
+            );
         }
     });
 
