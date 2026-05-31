@@ -487,6 +487,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", kotobase_xrpc::NSID_USAGE_GET),
             post(kotobase_xrpc::handle_usage_get),
         )
+        .route(
+            &format!("/xrpc/{}", kotobase_xrpc::NSID_PRE_REVOKE),
+            post(kotobase_xrpc::handle_pre_revoke),
+        )
         // ── Common Crawl vector search / RAG ───────────────────────────────
         .route(
             &format!("/xrpc/{}", cc_xrpc::NSID_CC_SEARCH),
