@@ -789,6 +789,29 @@ impl KotobaState {
             .derive_wrapping_key(owner_did.as_bytes()))
     }
 
+    /// Revoke a PRE re-key grant locally AND propagate the revocation to peers
+    /// over GossipSub (`rekey/revoke` topic) — the §23.7 emit path. The
+    /// gossiped payload is the serialized `RekeyRevocationRecord`, which peers
+    /// apply via `apply_revocation_warrant_bytes` (no BlockStore fetch).
+    /// No-op when no registry is attached; gossip is best-effort (try_send).
+    pub async fn revoke_pre_key_grant(
+        &self,
+        owner_did: &str,
+        accessor_did: &str,
+    ) -> anyhow::Result<()> {
+        let Some(reg) = &self.pre_key_registry else {
+            return Ok(());
+        };
+        let (_evidence_cid, bytes) = reg
+            .revoke_emit_warrant_bytes(owner_did, accessor_did)
+            .await?;
+        // Channel carries raw KSE names (no "kotoba/" prefix); publish adds it.
+        if let Some(tx) = &self.gossip_tx {
+            tx.try_send(("rekey/revoke".to_string(), bytes)).ok();
+        }
+        Ok(())
+    }
+
     /// Look up the visibility of a named graph by its CID.
     ///
     /// Default visibility for unknown graphs is controlled by

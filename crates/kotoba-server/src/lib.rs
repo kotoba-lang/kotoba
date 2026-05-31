@@ -738,6 +738,7 @@ pub async fn run() -> anyhow::Result<()> {
                     pregel_outbound_rx,
                     block_store_arc,
                     quad_store_arc,
+                    state.pre_key_registry.clone(),
                     relay,
                 ));
 
