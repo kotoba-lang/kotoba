@@ -86,6 +86,11 @@ impl SchemaBasedSqlCompiler {
         if let Some(fetch) = &query.fetch {
             extract_fetch(fetch, &mut pp);
         }
+        if let Some(offset) = &query.offset {
+            if let Some(n) = expr_to_usize(&offset.value) {
+                pp.offset = Some(n);
+            }
+        }
         for ob in &query.order_by {
             if let Some(col) = order_by_col(ob) {
                 pp.order_by.push(col);

@@ -21,8 +21,8 @@ pub use datom::{
 pub use delta::Delta;
 pub use enterprise::{
     BigQueryDialect, CompiledEnterpriseQuery, Db2Dialect, EnterpriseDialect, EnterpriseFeature,
-    HanaDialect, HiveQlDialect, MdxDialect, OracleDialect, PostProcess, PrestoDialect,
-    SnowflakeDialect, TSqlDialect, TeradataDialect,
+    HanaDialect, HiveQlDialect, MdxDialect, MySqlDialect, OracleDialect, PostProcess,
+    PostgreSqlDialect, PrestoDialect, SnowflakeDialect, TSqlDialect, TeradataDialect,
 };
 pub use mv::MaterializedView;
 pub use quad::{LegacyQuad, LegacyQuadObject};
