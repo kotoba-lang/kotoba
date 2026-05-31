@@ -28,6 +28,7 @@ use axum::{
     Json,
 };
 use kotoba_core::cid::KotobaCid;
+use kotoba_crypto::AgentCrypto;
 use kotoba_datomic::distributed::{
     CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter,
 };
@@ -100,6 +101,75 @@ fn kg_tx_cid(label: &str, parts: &[&str]) -> KotobaCid {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     KotobaCid::from_bytes(format!("kg:{label}:{nanos}:{}", parts.join(":")).as_bytes())
+}
+
+// ── Operator-trusted Pattern B content encryption (ADR-2605240001 §29.6) ──────
+//
+// Sensitive claim values are sealed at rest with the node's opaque vault key
+// (`signal:v1:` envelope, stored as opaque Text — no AVET / SPARQL FILTER on the
+// ciphertext: the documented §29.3 trade-off) and decrypted for CACAO-authorized
+// readers. Operator-trusted (the node holds the key), NOT zero-knowledge.
+//
+// Opt-in via `KOTOBA_ENCRYPT_CLAIM_PREDS` = comma-separated FULL predicate names
+// (e.g. "kg/claim/settlementAmount,kg/claim/ssn"). Unset/empty → no encryption,
+// byte-identical to prior behaviour (zero regression for existing deploys).
+
+/// `signal:v1:` envelope prefix (matches `kotoba_crypto::envelope::SIGNAL_VAL_PREFIX`).
+const SIGNAL_ENVELOPE_PREFIX: &str = "signal:v1:";
+
+/// Parse the sensitive-claim-predicate allowlist from the environment.
+fn sensitive_claim_preds() -> std::collections::HashSet<String> {
+    std::env::var("KOTOBA_ENCRYPT_CLAIM_PREDS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Encrypt-on-write for a sensitive claim value. Scope = the full predicate
+/// (domain separation). Falls back to plaintext when the predicate is not in
+/// the allowlist, crypto is absent, or sealing fails — never silently drops data.
+async fn maybe_seal_claim_value(
+    crypto: Option<&Arc<dyn AgentCrypto>>,
+    sensitive: &std::collections::HashSet<String>,
+    full_pred: &str,
+    value: &str,
+) -> String {
+    if !sensitive.contains(full_pred) {
+        return value.to_string();
+    }
+    match crypto {
+        Some(c) => c
+            .seal_field(full_pred.as_bytes(), value)
+            .await
+            .unwrap_or_else(|_| value.to_string()),
+        None => value.to_string(),
+    }
+}
+
+/// Decrypt-on-read counterpart. Returns plaintext for a `signal:v1:` Text claim
+/// object (scope = full predicate); otherwise delegates to `obj_to_json`.
+/// Callers MUST have passed `check_read_access` first (operator-trusted: the
+/// node decrypts for any CACAO-authorized reader).
+async fn decrypt_claim_obj(
+    crypto: Option<&Arc<dyn AgentCrypto>>,
+    full_pred: &str,
+    obj: &QuadObject,
+) -> serde_json::Value {
+    if let QuadObject::Text(s) = obj {
+        if s.starts_with(SIGNAL_ENVELOPE_PREFIX) {
+            if let Some(c) = crypto {
+                if let Ok(pt) = c.open_field(full_pred.as_bytes(), s).await {
+                    return serde_json::Value::String(pt);
+                }
+            }
+        }
+    }
+    obj_to_json(obj)
 }
 
 fn kg_datom(subject: &KotobaCid, predicate: impl Into<String>, value: KqeValue) -> KqeDatom {
@@ -229,6 +299,42 @@ async fn current_graph_deltas(
         })
         .map(Delta::from_datom)
         .collect())
+}
+
+/// Build an EAV `SchemaMap` from the predicates present in `deltas`.
+///
+/// Each distinct predicate `P` becomes a binary table `P(s, o)` whose value
+/// column `o` maps straight to predicate `P` (entity column `s` = subject), so
+/// enterprise SQL can address KG predicates directly: `SELECT t.s, t.o FROM "P" t`.
+/// Without this, the compiler's binary fallback would read predicate `P/o`, which
+/// no KG datom uses — the endpoint would be reachable but always return 0 rows.
+fn schema_from_predicates(deltas: &[Delta]) -> kotoba_kqe::SchemaMap {
+    use kotoba_kqe::{AttrDef, SchemaMap, TableSchema};
+    let mut schema = SchemaMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for d in deltas {
+        let p = d.attribute();
+        if seen.insert(p.to_string()) {
+            schema.add(
+                p,
+                TableSchema::new("s").with_attr(AttrDef::scalar("o", p).with_predicate(p)),
+            );
+        }
+    }
+    schema
+}
+
+/// Readable string form of a datom object value, for resolving enterprise-SQL
+/// result objects back from their content-hash CID. Matches the variants that
+/// `kotoba_kqe::object_value_cid` indexes (Text/Integer/Bool/Cid).
+fn readable_value(v: &KqeValue) -> String {
+    match v {
+        KqeValue::Text(s) => s.clone(),
+        KqeValue::Integer(n) => n.to_string(),
+        KqeValue::Bool(b) => b.to_string(),
+        KqeValue::Cid(c) => c.to_multibase(),
+        other => format!("{other:?}"),
+    }
 }
 
 async fn distributed_query_store(
@@ -449,9 +555,12 @@ pub async fn kg_entity(
             }
             _ if pred.starts_with("kg/claim/") && q.include_claims => {
                 let claim_pred = &pred["kg/claim/".len()..];
+                // Decrypt operator-trusted Pattern B sealed claims for this
+                // CACAO-authorized reader (no-op for plaintext claims).
+                let value = decrypt_claim_obj(state.crypto.as_ref(), pred, &quad.object).await;
                 claims.push(serde_json::json!({
                     "predicate": claim_pred,
-                    "value":     obj_to_json(&quad.object),
+                    "value":     value,
                 }));
             }
             _ if pred.starts_with("kg/relation/")
@@ -1019,8 +1128,13 @@ pub async fn kg_ingest(
         assert_text!("kg/source_id", v);
     }
 
+    let sensitive = sensitive_claim_preds();
     for claim in &req.claims {
-        assert_text!(format!("kg/claim/{}", claim.pred), claim.value);
+        let pred = format!("kg/claim/{}", claim.pred);
+        let value =
+            maybe_seal_claim_value(state.crypto.as_ref(), &sensitive, &pred, &claim.value).await;
+        datoms.push(kg_datom(&subject, pred, KqeValue::Text(value)));
+        count += 1;
     }
 
     for rel in &req.relations {
@@ -1161,6 +1275,7 @@ pub async fn kg_ingest_batch(
     let mut total_quads = 0usize;
     let mut all_datoms = Vec::new();
     let first_subject = KotobaCid::from_bytes(req.entities[0].id.as_bytes());
+    let sensitive = sensitive_claim_preds();
 
     for e in &req.entities {
         let subject = KotobaCid::from_bytes(e.id.as_bytes());
@@ -1210,7 +1325,12 @@ pub async fn kg_ingest_batch(
         }
 
         for claim in &e.claims {
-            assert_text!(format!("kg/claim/{}", claim.pred), claim.value);
+            let pred = format!("kg/claim/{}", claim.pred);
+            let value =
+                maybe_seal_claim_value(state.crypto.as_ref(), &sensitive, &pred, &claim.value)
+                    .await;
+            all_datoms.push(kg_datom(&subject, pred, KqeValue::Text(value)));
+            count += 1;
         }
         for rel in &e.relations {
             let dst_cid = KotobaCid::from_bytes(rel.dst_id.as_bytes());
@@ -1585,7 +1705,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KgQueryReq {
-    /// "sparql" or "cypher"
+    /// Query language: "sparql", "cypher", or an enterprise SQL dialect
+    /// (oracle/tsql/hana/db2/teradata/snowflake/bigquery/presto/mdx/hiveql/mysql/postgresql).
     pub lang: String,
     /// Query string
     pub query: String,
@@ -1596,11 +1717,14 @@ pub struct KgQueryReq {
 }
 
 /// POST /xrpc/ai.gftd.apps.kotobase.kg.query
-/// Execute a SPARQL SELECT or Cypher MATCH/RETURN against the Datom projection.
+/// Execute a SPARQL SELECT, Cypher MATCH/RETURN, or enterprise SQL SELECT
+/// against the Datom projection. All compilers lower to a `DatalogProgram`.
 ///
-/// Both compilers enforce binary-relation arity (exactly 2 RETURN variables).
+/// All compilers enforce binary-relation arity (exactly 2 projected columns).
 /// Results are returned as `[{ "a": "<cid>", "b": "<cid>" }]` pairs where
-/// the variable names come from the compiled output_relation.
+/// the variable names come from the compiled output_relation. For enterprise
+/// SQL dialects, `LIMIT`/`OFFSET` are honoured (`ORDER BY` is not — output is
+/// opaque content-addressed CID pairs).
 const MAX_KG_QUERY_PROG_LEN: usize = 65_536; // 64 KiB — SPARQL/Cypher compile DoS guard
 
 pub async fn kg_query(
@@ -1629,10 +1753,13 @@ pub async fn kg_query(
             format!("query must be 1–{MAX_KG_QUERY_PROG_LEN} bytes"),
         ));
     }
-    if !matches!(req.lang.as_str(), "sparql" | "cypher") {
+    let is_enterprise_sql = kotoba_kqe::enterprise::dialect_by_name(&req.lang).is_some();
+    if !matches!(req.lang.as_str(), "sparql" | "cypher") && !is_enterprise_sql {
         return Err((
             StatusCode::BAD_REQUEST,
-            "lang must be 'sparql' or 'cypher'".to_string(),
+            "lang must be 'sparql', 'cypher', or an enterprise SQL dialect \
+             (oracle/tsql/hana/db2/teradata/snowflake/bigquery/presto/mdx/hiveql/mysql/postgresql)"
+                .to_string(),
         ));
     }
     let result_limit = req
@@ -1654,27 +1781,73 @@ pub async fn kg_query(
     )
     .map_err(AccessDenied::into_response)?;
 
-    // Compile query to DatalogProgram
-    let (program, output_relation) = match req.lang.as_str() {
+    // Load the current graph projection first — enterprise SQL builds its EAV
+    // schema from the live predicate set.
+    let input_deltas = current_graph_deltas(&state, &graph_cid).await?;
+
+    // Compile query to DatalogProgram (+ PostProcess for SQL LIMIT/OFFSET).
+    let (program, output_relation, post_process) = match req.lang.as_str() {
         "sparql" => {
             let compiled = SparqlCompiler::compile(&req.query, "kg_query_result")
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("SPARQL compile: {e}")))?;
-            (compiled.program, compiled.output_relation)
+            (
+                compiled.program,
+                compiled.output_relation,
+                kotoba_kqe::PostProcess::default(),
+            )
         }
         "cypher" => {
             let compiled = CypherCompiler::compile(&req.query, "kg_query_result")
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("Cypher compile: {e}")))?;
-            (compiled.program, compiled.output_relation)
+            (
+                compiled.program,
+                compiled.output_relation,
+                kotoba_kqe::PostProcess::default(),
+            )
         }
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("unknown lang: {other}; use sparql or cypher"),
-            ))
+        sql_lang => {
+            // Enterprise SQL dialect → DatalogProgram + PostProcess. Each live KG
+            // predicate `P` is registered as a binary table `P(s, o)`, so
+            // `SELECT t.s, t.o FROM "<predicate>" t` projects that predicate's
+            // (subject, object) pairs.
+            //
+            // WHERE: equality (`col = 'literal'`, ANDed) filters correctly — the
+            // engine normalises stored text and the literal through the same
+            // cid_of_str hash. Non-equality operators (`<>`, `>`, `<`, `LIKE`, `OR`)
+            // are now REJECTED fail-loud by apply_where (they cannot be evaluated
+            // in CID space and previously returned an unfiltered superset).
+            // ORDER BY is not applied. Object values in the response are resolved
+            // back to their source scalar text via `value_index` (see below).
+            let dialect = kotoba_kqe::enterprise::dialect_by_name(sql_lang)
+                .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown lang: {sql_lang}")))?;
+            let schema = schema_from_predicates(&input_deltas);
+            let compiled = dialect
+                .compile(&req.query, &schema, "kg_query_result")
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("{sql_lang} compile: {e}")))?;
+            (
+                compiled.program,
+                compiled.output_relation,
+                compiled.post_process,
+            )
         }
     };
+    // For enterprise SQL, build a reverse index (object CID → source scalar) so
+    // the response carries readable values instead of opaque content hashes. The
+    // datalog engine stores only the hashed object CID in derived facts; we
+    // recover the original from the input deltas. SPARQL/Cypher keep their
+    // existing CID-multibase output shape (empty index → fallback).
+    let value_index: std::collections::HashMap<String, String> = if is_enterprise_sql {
+        input_deltas
+            .iter()
+            .filter_map(|d| {
+                kotoba_kqe::object_value_cid(d.value())
+                    .map(|cid| (cid.to_multibase(), readable_value(d.value())))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
 
-    let input_deltas = current_graph_deltas(&state, &graph_cid).await?;
     let derived = tokio::task::spawn_blocking(move || program.evaluate_delta(&input_deltas))
         .await
         .map_err(|e| {
@@ -1684,19 +1857,28 @@ pub async fn kg_query(
             )
         })?;
 
-    // Collect derived facts for the output_relation, bounded by result_limit.
+    // Collect derived facts for the output_relation. SQL OFFSET skips leading
+    // rows; the effective cap is the tighter of SQL LIMIT and the request limit.
+    let sql_offset = post_process.offset.unwrap_or(0);
+    let effective_limit = post_process
+        .limit
+        .map(|l| l.min(result_limit))
+        .unwrap_or(result_limit);
     let results: Vec<serde_json::Value> = derived
         .iter()
         .filter(|d| d.attribute() == output_relation && d.is_assert())
-        .take(result_limit)
+        .skip(sql_offset)
+        .take(effective_limit)
         .map(|d| {
-            serde_json::json!({
-                "a": d.entity().to_multibase(),
-                "b": match d.value() {
-                    kotoba_kqe::Value::Cid(c) => c.to_multibase(),
-                    other              => format!("{other:?}"),
-                },
-            })
+            let b = match d.value() {
+                kotoba_kqe::Value::Cid(c) => {
+                    let mb = c.to_multibase();
+                    // SQL path: resolve content-hash CID back to its source scalar.
+                    value_index.get(&mb).cloned().unwrap_or(mb)
+                }
+                other => format!("{other:?}"),
+            };
+            serde_json::json!({ "a": d.entity().to_multibase(), "b": b })
         })
         .collect();
 
@@ -2247,6 +2429,132 @@ mod tests {
         }));
     }
 
+    /// 実動作検証 (real e2e, ADR §21.8): operator-trusted Pattern B through the
+    /// live `kg_ingest` → QuadStore → `kg_entity` handlers. Proves (1) a sensitive
+    /// claim is SEALED at rest in the real store, (2) a non-sensitive claim stays
+    /// plaintext, (3) an authorized read DECRYPTS the sealed claim back.
+    #[tokio::test]
+    async fn pattern_b_end_to_end_through_kg_handlers() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        // Unique predicate so this process-global env never seals another test's claims.
+        std::env::set_var("KOTOBA_ENCRYPT_CLAIM_PREDS", "kg/claim/secretAmount");
+
+        let state = KotobaState::new(None).unwrap();
+        let state = Arc::new(state.init_crypto().await.unwrap());
+        let graph = kg_graph_cid();
+        // Public so the kg_entity read gate passes without a CACAO.
+        state
+            .graph_registry
+            .write()
+            .await
+            .insert(graph.clone(), ("kg-default".into(), GraphVisibility::Public));
+
+        // ── Ingest one sensitive + one non-sensitive claim via the real handler ──
+        let resp = kg_ingest(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(KgIngestReq {
+                id: "verify-ent-1".into(),
+                qid: None,
+                kind: Some("test".into()),
+                label_ja: None,
+                label_en: Some("PublicLabel".into()),
+                confidence: None,
+                license: None,
+                extractor: None,
+                valid_from: None,
+                valid_to: None,
+                ingested_at: None,
+                source_id: None,
+                label_vec: vec![],
+                claims: vec![
+                    KgClaim {
+                        pred: "secretAmount".into(),
+                        value: "JPY 12,300,000".into(),
+                    },
+                    KgClaim {
+                        pred: "publicNote".into(),
+                        value: "not-secret".into(),
+                    },
+                ],
+                relations: vec![],
+                cacao_b64: None,
+                auth_presentation: Some(signed_capability_presentation(
+                    &state,
+                    &graph,
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    "kg.ingest",
+                )),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "ingest must succeed");
+
+        // ── At rest: sensitive claim sealed, plaintext absent, public claim plain ──
+        let db = crate::xrpc::current_db_for_graph(&state, &graph)
+            .await
+            .unwrap();
+        let values: Vec<String> = db
+            .datoms()
+            .iter()
+            .map(|d| kotoba_edn::to_string(&d.v))
+            .collect();
+        assert!(
+            values.iter().any(|v| v.contains("signal:v1:")),
+            "sensitive claim must be SEALED at rest; datom values = {values:?}"
+        );
+        assert!(
+            !values.iter().any(|v| v.contains("JPY 12,300,000")),
+            "plaintext of the sealed claim must NOT appear at rest"
+        );
+        assert!(
+            values.iter().any(|v| v.contains("not-secret")),
+            "non-sensitive claim must remain plaintext at rest"
+        );
+
+        // ── Authorized read decrypts the sealed claim back to plaintext ──
+        let resp = kg_entity(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Query(KgEntityQuery {
+                id: Some("verify-ent-1".into()),
+                qid: None,
+                include_claims: true,
+                include_relations: false,
+                max_relations: 50,
+                cacao_b64: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let claims = body["entity"]["claims"]
+            .as_array()
+            .expect("entity.claims array");
+        let secret = claims
+            .iter()
+            .find(|c| c["predicate"] == "secretAmount")
+            .expect("secretAmount claim present");
+        assert_eq!(
+            secret["value"], "JPY 12,300,000",
+            "authorized read must DECRYPT the sealed claim"
+        );
+        let public = claims
+            .iter()
+            .find(|c| c["predicate"] == "publicNote")
+            .expect("publicNote claim present");
+        assert_eq!(public["value"], "not-secret");
+
+        std::env::remove_var("KOTOBA_ENCRYPT_CLAIM_PREDS");
+    }
+
     fn signed_capability_presentation(
         state: &KotobaState,
         graph: &KotobaCid,
@@ -2309,6 +2617,71 @@ mod tests {
             domain: Some("kotoba.protocol.write".into()),
         });
         presentation
+    }
+
+    // ── Pattern B operator-trusted claim encryption (ADR §29.6 / §28.5 inc.2) ──
+
+    #[tokio::test]
+    async fn pattern_b_claim_seal_open_roundtrip() {
+        use kotoba_crypto::VaultKeyedCrypto;
+        use zeroize::Zeroizing;
+
+        let crypto: Arc<dyn AgentCrypto> =
+            Arc::new(VaultKeyedCrypto::new(Zeroizing::new([7u8; 32])));
+        let mut sensitive = std::collections::HashSet::new();
+        sensitive.insert("kg/claim/settlementAmount".to_string());
+
+        // Sensitive claim → sealed `signal:v1:` envelope at rest.
+        let sealed = maybe_seal_claim_value(
+            Some(&crypto),
+            &sensitive,
+            "kg/claim/settlementAmount",
+            "JPY 12,300,000",
+        )
+        .await;
+        assert!(
+            sealed.starts_with(SIGNAL_ENVELOPE_PREFIX),
+            "sensitive claim must be sealed at rest, got {sealed}"
+        );
+
+        // Authorized read decrypts back to plaintext.
+        let opened = decrypt_claim_obj(
+            Some(&crypto),
+            "kg/claim/settlementAmount",
+            &QuadObject::Text(sealed.clone()),
+        )
+        .await;
+        assert_eq!(opened, serde_json::json!("JPY 12,300,000"));
+
+        // Non-sensitive predicate → plaintext passthrough (queryable).
+        assert_eq!(
+            maybe_seal_claim_value(Some(&crypto), &sensitive, "kg/claim/labelEn", "Acme").await,
+            "Acme"
+        );
+
+        // Empty allowlist (default) → zero-regression passthrough.
+        assert_eq!(
+            maybe_seal_claim_value(
+                Some(&crypto),
+                &std::collections::HashSet::new(),
+                "kg/claim/settlementAmount",
+                "x",
+            )
+            .await,
+            "x"
+        );
+
+        // Wrong scope (predicate) must NOT decrypt — domain separation; the
+        // envelope is returned unchanged rather than leaking plaintext.
+        assert_eq!(
+            decrypt_claim_obj(
+                Some(&crypto),
+                "kg/claim/other",
+                &QuadObject::Text(sealed.clone()),
+            )
+            .await,
+            serde_json::Value::String(sealed)
+        );
     }
 
     // ── obj_to_json ───────────────────────────────────────────────────────────
@@ -2482,5 +2855,246 @@ mod tests {
         // Caller-supplied small value passes through unchanged.
         let caller_small = Some(42usize).unwrap_or(MAX_KG_LIMIT).min(10_000);
         assert_eq!(caller_small, 42);
+    }
+
+    // ── kg.query enterprise SQL dialect wiring ────────────────────────────────
+
+    #[tokio::test]
+    async fn kg_query_rejects_unknown_lang_naming_dialects() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        // lang validation runs before the read-access gate, so no graph/auth setup.
+        let result = kg_query(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(KgQueryReq {
+                lang: "sqlite".into(),
+                query: "SELECT t.s, t.o FROM role t".into(),
+                cacao_b64: None,
+                limit: None,
+            }),
+        )
+        .await;
+        match result {
+            Ok(_) => panic!("unknown lang must be rejected"),
+            Err((status, msg)) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(
+                    msg.contains("mysql") && msg.contains("postgresql"),
+                    "error should name the enterprise dialects, got: {msg}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end reachability of the enterprise SQL path: validation → public
+    /// read-access → dialect resolve → SQL compile → datalog eval → JSON.
+    /// Data-bearing correctness of each dialect is covered by kotoba-kqe tests;
+    /// here the empty kg graph yields count=0 but proves the pipeline runs.
+    async fn assert_dialect_reachable(lang: &str) {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        // Register the fixed kg graph as Public in this test's own state so the
+        // read-access gate passes without CACAO (no global env mutation).
+        state.graph_registry.write().await.insert(
+            kg_graph_cid(),
+            ("kg".into(), GraphVisibility::Public),
+        );
+
+        let resp = kg_query(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(KgQueryReq {
+                lang: lang.into(),
+                // Binary EAV fallback: table `role` → predicate `role/o`, cols s/o.
+                query: "SELECT t.s, t.o FROM role t".into(),
+                cacao_b64: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{lang} query should succeed: {e:?}"))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "{lang} → 200");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["lang"], lang);
+        assert_eq!(body["count"], 0, "empty kg graph → 0 rows");
+    }
+
+    #[tokio::test]
+    async fn kg_query_accepts_postgresql_dialect_end_to_end() {
+        assert_dialect_reachable("postgresql").await;
+    }
+
+    #[tokio::test]
+    async fn kg_query_accepts_mysql_dialect_end_to_end() {
+        assert_dialect_reachable("mysql").await;
+    }
+
+    /// Decisive data round-trip: schema_from_predicates maps a real KG predicate
+    /// so `SELECT t.s, t.o FROM "<predicate>" t` actually projects its rows
+    /// (proving the path is not inert). Uses the kqe compiler directly with the
+    /// exact SchemaMap the handler builds.
+    #[test]
+    fn schema_from_predicates_projects_real_kg_predicate_rows() {
+        use kotoba_core::cid::KotobaCid;
+        use kotoba_kqe::datom::{Datom, Value};
+
+        let g = KotobaCid::from_bytes(b"g");
+        let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
+        let deltas = vec![
+            Delta::assert_datom(Datom::assert(
+                cid("alice"),
+                "kg/claim/role".into(),
+                Value::Text("admin".into()),
+                g.clone(),
+            )),
+            Delta::assert_datom(Datom::assert(
+                cid("bob"),
+                "kg/claim/role".into(),
+                Value::Text("user".into()),
+                g.clone(),
+            )),
+            Delta::assert_datom(Datom::assert(
+                cid("alice"),
+                "kg/name".into(),
+                Value::Text("Alice".into()),
+                g,
+            )),
+        ];
+
+        let schema = schema_from_predicates(&deltas);
+        for lang in ["postgresql", "mysql"] {
+            let dialect = kotoba_kqe::enterprise::dialect_by_name(lang).unwrap();
+            let compiled = dialect
+                .compile(
+                    r#"SELECT t.s, t.o FROM "kg/claim/role" t"#,
+                    &schema,
+                    "kg_query_result",
+                )
+                .unwrap_or_else(|e| panic!("{lang} compile failed: {e}"));
+            let derived = compiled.program.evaluate_delta(&deltas);
+            let rows = derived
+                .iter()
+                .filter(|d| d.attribute() == "kg_query_result" && d.is_assert())
+                .count();
+            // Both role rows project; the kg/name predicate is excluded.
+            assert_eq!(rows, 2, "{lang}: expected 2 role rows, got {rows}");
+        }
+    }
+
+    /// Precise WHERE semantics over KG scalar (text) objects. The datalog engine
+    /// normalises both stored `Value::Text` and the WHERE literal through
+    /// `cid_of_str` into the same CID space, so **equality filters correctly**.
+    /// Non-equality operators (`<>`, `>`, `LIKE`) cannot be evaluated in CID space
+    /// and are now REJECTED fail-loud by `apply_where` (previously silently dropped
+    /// → unfiltered superset). This test pins that contract.
+    #[test]
+    fn sql_where_equality_works_and_inequality_is_rejected() {
+        use kotoba_core::cid::KotobaCid;
+        use kotoba_kqe::datom::{Datom, Value};
+
+        let g = KotobaCid::from_bytes(b"g");
+        let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
+        let deltas = vec![
+            Delta::assert_datom(Datom::assert(
+                cid("alice"),
+                "kg/claim/role".into(),
+                Value::Text("admin".into()),
+                g.clone(),
+            )),
+            Delta::assert_datom(Datom::assert(
+                cid("bob"),
+                "kg/claim/role".into(),
+                Value::Text("user".into()),
+                g,
+            )),
+        ];
+        let schema = schema_from_predicates(&deltas);
+        let pg = kotoba_kqe::enterprise::dialect_by_name("postgresql").unwrap();
+
+        // Equality compiles and filters to the matching row.
+        let eq = pg
+            .compile(
+                r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o = 'admin'"#,
+                &schema,
+                "out",
+            )
+            .unwrap();
+        let n = eq
+            .program
+            .evaluate_delta(&deltas)
+            .iter()
+            .filter(|d| d.attribute() == "out" && d.is_assert())
+            .count();
+        assert_eq!(n, 1, "equality on scalar text must filter to the matching row");
+
+        // Non-equality operators are rejected at compile (fail-loud).
+        for sql in [
+            r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o <> 'user'"#,
+            r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o LIKE 'adm%'"#,
+            r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o > 'm'"#,
+        ] {
+            match pg.compile(sql, &schema, "out") {
+                Ok(_) => panic!("non-equality WHERE must be rejected: {sql}"),
+                Err(e) => assert!(
+                    e.to_string().contains("unsupported WHERE"),
+                    "unexpected error for {sql}: {e}"
+                ),
+            }
+        }
+    }
+
+    /// (a) Object value resolution: the handler reverse-indexes object CIDs back
+    /// to source scalar text via `object_value_cid` + `readable_value` (the exact
+    /// two lines kg_query uses), so `SELECT t.s, t.o` returns "admin", not a hash.
+    #[test]
+    fn sql_object_values_resolve_to_readable_text() {
+        use kotoba_core::cid::KotobaCid;
+        use kotoba_kqe::datom::{Datom, Value};
+
+        let g = KotobaCid::from_bytes(b"g");
+        let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
+        let deltas = vec![
+            Delta::assert_datom(Datom::assert(
+                cid("alice"),
+                "kg/claim/role".into(),
+                Value::Text("admin".into()),
+                g.clone(),
+            )),
+            Delta::assert_datom(Datom::assert(
+                cid("bob"),
+                "kg/claim/age".into(),
+                Value::Integer(42),
+                g,
+            )),
+        ];
+        let index: std::collections::HashMap<String, String> = deltas
+            .iter()
+            .filter_map(|d| {
+                kotoba_kqe::object_value_cid(d.value())
+                    .map(|c| (c.to_multibase(), readable_value(d.value())))
+            })
+            .collect();
+
+        // A derived fact carries the object as Value::Cid(object_value_cid(value)).
+        let admin_cid =
+            kotoba_kqe::object_value_cid(&Value::Text("admin".into())).unwrap();
+        assert_eq!(
+            index.get(&admin_cid.to_multibase()).map(String::as_str),
+            Some("admin"),
+            "text object CID must resolve back to readable text"
+        );
+        let age_cid = kotoba_kqe::object_value_cid(&Value::Integer(42)).unwrap();
+        assert_eq!(
+            index.get(&age_cid.to_multibase()).map(String::as_str),
+            Some("42"),
+            "integer object CID must resolve back to its decimal string"
+        );
     }
 }

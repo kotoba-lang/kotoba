@@ -37,6 +37,20 @@ pub trait AgentCrypto: Send + Sync + 'static {
         ciphertext: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, CryptoError>;
 
+    /// Derive a deterministic 32-byte wrapping key bound to this node's vault
+    /// key and `owner_did`.
+    ///
+    /// Used by the operator-trusted PRE layer (ADR-2605240001 §28.4(a)) as the
+    /// `owner_enc_key` argument to `PreKeyRegistry::grant`/`get_rekey_authed`.
+    /// Only the node (the Consensys/Infura-layer operator) can derive this key,
+    /// because it is bound to the node's opaque vault key; external or
+    /// other-tenant principals cannot reconstruct it. Deterministic (no nonce)
+    /// so the same `(node, owner_did)` pair always wraps and unwraps the same
+    /// grants. This is intentionally NOT zero-knowledge from the operator —
+    /// that property belongs to the kotoba/etzhayyim protocol layer, not this
+    /// vendor-hosted (Infura-equivalent) service.
+    fn derive_wrapping_key(&self, owner_did: &[u8]) -> Zeroizing<[u8; 32]>;
+
     /// Encrypt a UTF-8 text field and return a `signal:v1:<base64>` envelope.
     async fn seal_field(&self, scope: &[u8], text: &str) -> Result<String, CryptoError> {
         let ct = self.encrypt(scope, text.as_bytes()).await?;
@@ -100,6 +114,16 @@ impl AgentCrypto for VaultKeyedCrypto {
         let sk = self.scope_key(scope);
         open(&sk, ciphertext)
     }
+
+    fn derive_wrapping_key(&self, owner_did: &[u8]) -> Zeroizing<[u8; 32]> {
+        // Distinct `info` from scope_key so a PRE wrapping key never collides
+        // with a field-encryption scope key derived for the same label.
+        Zeroizing::new(derive_key_with_salt(
+            self.vault_key.as_ref(),
+            owner_did,
+            b"kotoba/pre-wrap/v1",
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +143,39 @@ mod tests {
         let ct = c.encrypt(scope, msg).await.unwrap();
         let pt = c.decrypt(scope, &ct).await.unwrap();
         assert_eq!(pt.as_slice(), msg);
+    }
+
+    #[test]
+    fn derive_wrapping_key_is_deterministic_and_owner_bound() {
+        let c = test_crypto();
+        let k1 = c.derive_wrapping_key(b"did:plc:alice");
+        let k2 = c.derive_wrapping_key(b"did:plc:alice");
+        let k_other = c.derive_wrapping_key(b"did:plc:bob");
+        // Deterministic: same (node, owner) → same wrapping key (wrap/unwrap parity).
+        assert_eq!(k1.as_ref(), k2.as_ref());
+        // Owner-bound: different owner → different key.
+        assert_ne!(k1.as_ref(), k_other.as_ref());
+    }
+
+    #[test]
+    fn derive_wrapping_key_is_bound_to_vault_key() {
+        let a = VaultKeyedCrypto::new(Zeroizing::new([0x11u8; 32]));
+        let b = VaultKeyedCrypto::new(Zeroizing::new([0x22u8; 32]));
+        // Different node vault keys → different wrapping key for the same owner.
+        // (External principals cannot reconstruct the node's wrapping key.)
+        assert_ne!(
+            a.derive_wrapping_key(b"did:plc:alice").as_ref(),
+            b.derive_wrapping_key(b"did:plc:alice").as_ref()
+        );
+    }
+
+    #[test]
+    fn derive_wrapping_key_differs_from_scope_key_same_label() {
+        // Distinct HKDF `info` must keep a PRE wrapping key separate from a
+        // field-encryption scope key derived for the same label.
+        let c = test_crypto();
+        let label = b"did:plc:alice";
+        assert_ne!(c.derive_wrapping_key(label).as_ref(), &c.scope_key(label));
     }
 
     #[tokio::test]

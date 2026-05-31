@@ -19,13 +19,17 @@
 //! | Presto / Trino       | presto      | GenericDialect + rewrite |
 //! | MDX (OLAP)           | mdx         | hand-written parser     |
 //! | HiveQL               | hiveql      | HiveDialect             |
+//! | MySQL / MariaDB      | mysql       | MySqlDialect            |
+//! | PostgreSQL           | postgresql  | PostgreSqlDialect       |
 
 pub mod bigquery;
 pub mod db2;
 pub mod hana;
 pub mod hiveql;
 pub mod mdx;
+pub mod mysql;
 pub mod oracle;
+pub mod postgresql;
 pub mod presto;
 pub mod snowflake;
 pub mod sql_base;
@@ -37,7 +41,9 @@ pub use db2::Db2Dialect;
 pub use hana::HanaDialect;
 pub use hiveql::HiveQlDialect;
 pub use mdx::MdxDialect;
+pub use mysql::MySqlDialect;
 pub use oracle::OracleDialect;
+pub use postgresql::PostgreSqlDialect;
 pub use presto::PrestoDialect;
 pub use snowflake::SnowflakeDialect;
 pub use teradata::TeradataDialect;
@@ -107,9 +113,85 @@ pub trait EnterpriseDialect {
     ) -> anyhow::Result<CompiledEnterpriseQuery>;
 }
 
+// ── Name → dialect resolver ───────────────────────────────────────────────────
+
+/// Canonical names of every supported enterprise dialect, matching each
+/// dialect's `dialect_name()`. Stable order for introspection / docs.
+pub const ENTERPRISE_DIALECT_NAMES: &[&str] = &[
+    "oracle",
+    "tsql",
+    "hana",
+    "db2",
+    "teradata",
+    "snowflake",
+    "bigquery",
+    "presto",
+    "mdx",
+    "hiveql",
+    "mysql",
+    "postgresql",
+];
+
+/// Resolve an enterprise SQL dialect by name. Returns `None` for unknown names.
+///
+/// Accepts each dialect's canonical `dialect_name()` plus a few common aliases
+/// (`trino`→presto, `hive`→hiveql, `mariadb`→mysql, `postgres`/`pg`→postgresql).
+/// This is the single name-based entry point so callers (XRPC / MCP) can route a
+/// `lang` string to a compiler without enumerating concrete types.
+pub fn dialect_by_name(name: &str) -> Option<Box<dyn EnterpriseDialect>> {
+    match name {
+        "oracle" => Some(Box::new(OracleDialect)),
+        "tsql" => Some(Box::new(TSqlDialect)),
+        "hana" => Some(Box::new(HanaDialect)),
+        "db2" => Some(Box::new(Db2Dialect)),
+        "teradata" => Some(Box::new(TeradataDialect)),
+        "snowflake" => Some(Box::new(SnowflakeDialect)),
+        "bigquery" => Some(Box::new(BigQueryDialect)),
+        "presto" | "trino" => Some(Box::new(PrestoDialect)),
+        "mdx" => Some(Box::new(MdxDialect)),
+        "hiveql" | "hive" => Some(Box::new(HiveQlDialect)),
+        "mysql" | "mariadb" => Some(Box::new(MySqlDialect)),
+        "postgresql" | "postgres" | "pg" => Some(Box::new(PostgreSqlDialect)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialect_by_name_resolves_all_canonical_names() {
+        for name in ENTERPRISE_DIALECT_NAMES {
+            let d = dialect_by_name(name)
+                .unwrap_or_else(|| panic!("canonical name {name} should resolve"));
+            assert_eq!(
+                &d.dialect_name(),
+                name,
+                "dialect_name() must round-trip its canonical name"
+            );
+        }
+        assert_eq!(ENTERPRISE_DIALECT_NAMES.len(), 12);
+    }
+
+    #[test]
+    fn dialect_by_name_resolves_aliases() {
+        assert_eq!(dialect_by_name("trino").unwrap().dialect_name(), "presto");
+        assert_eq!(dialect_by_name("hive").unwrap().dialect_name(), "hiveql");
+        assert_eq!(dialect_by_name("mariadb").unwrap().dialect_name(), "mysql");
+        assert_eq!(
+            dialect_by_name("postgres").unwrap().dialect_name(),
+            "postgresql"
+        );
+        assert_eq!(dialect_by_name("pg").unwrap().dialect_name(), "postgresql");
+    }
+
+    #[test]
+    fn dialect_by_name_unknown_returns_none() {
+        assert!(dialect_by_name("sqlite").is_none());
+        assert!(dialect_by_name("sparql").is_none());
+        assert!(dialect_by_name("").is_none());
+    }
 
     #[test]
     fn post_process_default_all_none() {

@@ -21,6 +21,9 @@ const MAX_DELTA_COMMITS_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 /// GossipSub topic carrying the full KSE Journal firehose (E: relay role).
 const FIREHOSE_TOPIC: &str = "firehose";
+/// GossipSub topic carrying PRE re-key revocation warrants (ADR §23.7 wire).
+/// Payload = serialized `RekeyRevocationRecord` (applied without a block fetch).
+const REKEY_REVOKE_TOPIC: &str = "rekey/revoke";
 /// Bound on the echo-guard set that stops a relay re-gossiping what it received.
 const FIREHOSE_SEEN_CAP: usize = 8192;
 
@@ -87,10 +90,12 @@ pub async fn run(
     mut pregel_out_rx: tokio::sync::mpsc::Receiver<DistributedMessage>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
     quad_store: Arc<QuadStore>,
+    pre_key_registry: Option<Arc<kotoba_kse::PreKeyRegistry>>,
     relay: bool,
 ) {
     swarm.subscribe("quad/assert").ok();
     swarm.subscribe("quad/retract").ok();
+    swarm.subscribe(REKEY_REVOKE_TOPIC).ok();
     swarm.subscribe_pregel().ok();
 
     // Full gossip topic string as published by KotobaSwarm (has "kotoba/" prefix)
@@ -254,6 +259,14 @@ pub async fn run(
                                             .await;
                                     }
                                     Err(e) => tracing::warn!(err = %e, "firehose: bad JournalEntry envelope — skipped"),
+                                }
+                            } else if kse_name == REKEY_REVOKE_TOPIC {
+                                // PRE re-key revocation warrant (§23.7 wire):
+                                // apply the gossiped record bytes directly — no
+                                // BlockStore fetch needed. No-op if we hold no
+                                // registry or the pair was never granted here.
+                                if let Some(reg) = &pre_key_registry {
+                                    reg.apply_revocation_warrant_bytes(&data).await;
                                 }
                             } else {
                                 let maybe_quad_op = if kse_name == "quad/assert" {

@@ -17,6 +17,8 @@ pub const NSID_PIN_CREATE: &str = "ai.gftd.apps.kotobase.pinCreate";
 pub const NSID_PIN_LIST: &str = "ai.gftd.apps.kotobase.pinList";
 pub const NSID_PIN_DELETE: &str = "ai.gftd.apps.kotobase.pinDelete";
 pub const NSID_USAGE_GET: &str = "ai.gftd.apps.kotobase.usageGet";
+/// Revoke a PRE re-key grant + propagate over GossipSub (ADR §23.7 / §28.5).
+pub const NSID_PRE_REVOKE: &str = "ai.gftd.apps.kotobase.preRevoke";
 
 use crate::server::KotobaState;
 use axum::{
@@ -519,7 +521,51 @@ pub struct UsageGetResp {
     pub remaining_bytes: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PreRevokeReq {
+    /// DID that owns the grant being revoked. The caller's JWT `sub` must match
+    /// this (or `operator_did`) — only the owner/operator may revoke.
+    pub tenant_did: String,
+    /// DID whose re-key access is being revoked.
+    pub accessor_did: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreRevokeResp {
+    pub ok: bool,
+    pub tenant_did: String,
+    pub accessor_did: String,
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────
+
+/// POST /xrpc/ai.gftd.apps.kotobase.preRevoke
+///
+/// Revoke a PRE re-key grant (owner → accessor) and propagate the revocation
+/// to peers over GossipSub (ADR §23.7 / §28.5 emit path). Owner-authenticated.
+pub async fn handle_pre_revoke(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Json(req): Json<PreRevokeReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_did(&req.tenant_did)?;
+    crate::graph_auth::validate_did(&req.accessor_did, "accessor_did", MAX_DID_LEN)?;
+    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+
+    state
+        .revoke_pre_key_grant(&req.tenant_did, &req.accessor_did)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("revoke failed: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(PreRevokeResp {
+            ok: true,
+            tenant_did: req.tenant_did,
+            accessor_did: req.accessor_did,
+        }),
+    ))
+}
 
 pub async fn handle_account_create(
     State(state): State<Arc<KotobaState>>,
@@ -1021,11 +1067,58 @@ pub const ALL_NSIDS: &[&str] = &[
     NSID_PIN_LIST,
     NSID_PIN_DELETE,
     NSID_USAGE_GET,
+    NSID_PRE_REVOKE,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── preRevoke endpoint (ADR §23.7 / §28.5) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn pre_revoke_owner_authenticated_revokes_grant() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        std::env::set_var("KOTOBA_IPFS", "off");
+
+        let state = KotobaState::new(None).unwrap();
+        let state = Arc::new(state.init_pre_key_registry().await);
+        let owner = state.operator_did.clone(); // caller owns the grant
+        let accessor = "did:key:zAccessorRevoke".to_string();
+
+        // Seed a grant in the live registry.
+        let reg = state.pre_key_registry.clone().expect("registry attached");
+        reg.grant(&owner, &accessor, &[3u8; 32], &[7u8; 32])
+            .await
+            .unwrap();
+        assert_eq!(reg.list_accessors(&owner).await, vec![accessor.clone()]);
+
+        let req = || PreRevokeReq {
+            tenant_did: owner.clone(),
+            accessor_did: accessor.clone(),
+        };
+
+        // No Bearer token → 401, grant untouched.
+        let unauth = handle_pre_revoke(State(Arc::clone(&state)), HeaderMap::new(), Json(req())).await;
+        assert!(unauth.is_err(), "missing auth must be rejected");
+        assert_eq!(reg.list_accessors(&owner).await.len(), 1);
+
+        // Owner-authenticated JWT (sub == operator) → revoke succeeds.
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{owner}","exp":9999999999}}"#));
+        let jwt = format!("{header}.{payload}.sig");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {jwt}").parse().unwrap(),
+        );
+        let ok = handle_pre_revoke(State(Arc::clone(&state)), headers, Json(req())).await;
+        assert!(ok.is_ok(), "owner-authenticated revoke must succeed");
+        assert!(
+            reg.list_accessors(&owner).await.is_empty(),
+            "grant must be revoked after authenticated preRevoke"
+        );
+    }
 
     // ── quota_for_tier ────────────────────────────────────────────────────────
 

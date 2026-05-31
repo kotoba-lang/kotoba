@@ -311,4 +311,118 @@ mod tests {
             "expected DidResolve, got {err:?}"
         );
     }
+
+    /// End-to-end operator-trusted PRE round trip (ADR-2605240001 §28.4(a) / §29.9).
+    ///
+    /// Proves the wired pieces compose into a working content-encryption path:
+    ///   1. the node derives `owner_enc_key` from its own opaque vault key
+    ///      (`AgentCrypto::derive_wrapping_key`) — only the node can do this;
+    ///   2. a `data_key` encrypts a real plaintext blob (AES-256-GCM);
+    ///   3. the owner grants the `data_key` to an accessor via the registry;
+    ///   4. the proxy re-seals it to the accessor after CACAO verification;
+    ///   5. the accessor HPKE-opens it and decrypts the blob to plaintext.
+    ///
+    /// This is operator-trusted (the node CAN derive `owner_enc_key`), not
+    /// zero-knowledge — exactly the §28.4(a) Consensys/Infura-layer model.
+    #[tokio::test]
+    async fn operator_trusted_pre_roundtrip_end_to_end() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use ed25519_dalek::{Signer, SigningKey};
+        use kotoba_auth::ed25519_pubkey_to_did_key;
+        use kotoba_auth::{Cacao, CacaoHeader, CacaoPayload, CacaoSig, DelegationChain};
+        use kotoba_crypto::aead::{open, seal};
+        use kotoba_crypto::hpke::hpke_open;
+        use kotoba_crypto::{AgentCrypto, VaultKeyedCrypto};
+        use x25519_dalek::StaticSecret;
+        use zeroize::Zeroizing;
+
+        let owner_did = "did:key:zOwnerE2E";
+
+        // ── 1. Node derives owner_enc_key from its opaque vault key ──────────
+        let node_crypto = VaultKeyedCrypto::new(Zeroizing::new([0x5au8; 32]));
+        let owner_enc_key = node_crypto.derive_wrapping_key(owner_did.as_bytes());
+
+        // ── 2. A data_key encrypts a confidential blob (AES-256-GCM) ─────────
+        let data_key = [0x11u8; 32];
+        let plaintext = b"confidential lawfirm case note: settlement amount JPY 12,300,000";
+        let blob = seal(&data_key, plaintext).expect("blob seal");
+
+        // ── Accessor key material (Ed25519 for CACAO, X25519 for HPKE) ───────
+        let ed_sk = SigningKey::from_bytes(&[7u8; 32]);
+        let accessor_did = ed25519_pubkey_to_did_key(ed_sk.verifying_key().as_bytes());
+        let x25519_sk = StaticSecret::from([9u8; 32]);
+        let x25519_pk = x25519_dalek::PublicKey::from(&x25519_sk);
+
+        // ── 3. Owner grants the data_key to the accessor ────────────────────
+        let store = Arc::new(MemoryBlockStore::new());
+        let registry = Arc::new(PreKeyRegistry::new(store));
+        registry
+            .grant(owner_did, &accessor_did, &data_key, &owner_enc_key)
+            .await
+            .expect("grant");
+
+        // CACAO signed by the accessor (empty resources → all caps/graphs).
+        let mut cacao = Cacao {
+            h: CacaoHeader {
+                t: "caip122".into(),
+            },
+            p: CacaoPayload {
+                iss: accessor_did.clone(),
+                aud: "kotoba://test".into(),
+                issued_at: "2026-05-31T00:00:00Z".into(),
+                expiry: None,
+                nonce: "e2e-roundtrip-nonce".into(),
+                domain: "kotoba.test".into(),
+                statement: None,
+                version: "1".into(),
+                resources: vec![],
+            },
+            s: CacaoSig {
+                t: "EdDSA".into(),
+                s: String::new(),
+            },
+        };
+        let sig = ed_sk.sign(cacao.siwe_message().as_bytes());
+        cacao.s.s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        let chain = DelegationChain::new(cacao);
+
+        // ── 4. Proxy re-seals the data_key to the accessor (CACAO-verified) ──
+        let resolver = Arc::new(InMemoryDidResolver::new());
+        resolver.insert(
+            &accessor_did,
+            make_doc_with_x25519(&accessor_did, *x25519_pk.as_bytes()),
+        );
+        let proxy = PreProxy::new(registry, resolver);
+        let sealed = proxy
+            .reencrypt_for(
+                &chain,
+                owner_did,
+                &accessor_did,
+                &owner_enc_key,
+                x25519_pk.as_bytes(),
+            )
+            .await
+            .expect("reencrypt_for");
+
+        // ── 5. Accessor HPKE-opens the data_key and decrypts the blob ───────
+        let recovered_key = hpke_open(&x25519_sk, &sealed).expect("hpke_open");
+        assert_eq!(recovered_key.as_slice(), &data_key, "data_key must survive");
+
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&recovered_key);
+        let recovered_pt = open(&k, &blob).expect("blob open");
+        assert_eq!(
+            recovered_pt.as_slice(),
+            plaintext,
+            "accessor must recover the confidential plaintext"
+        );
+
+        // ── Negative: a different node cannot derive the same owner_enc_key ──
+        let other_node = VaultKeyedCrypto::new(Zeroizing::new([0x99u8; 32]));
+        assert_ne!(
+            other_node.derive_wrapping_key(owner_did.as_bytes()).as_ref(),
+            owner_enc_key.as_ref(),
+            "owner_enc_key must be bound to the originating node's vault key"
+        );
+    }
 }

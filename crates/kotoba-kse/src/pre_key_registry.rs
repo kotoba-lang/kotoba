@@ -182,6 +182,20 @@ impl PreKeyRegistry {
         owner_did: &str,
         accessor_did: &str,
     ) -> Result<KotobaCid, PreKeyError> {
+        self.revoke_emit_warrant_bytes(owner_did, accessor_did)
+            .await
+            .map(|(cid, _)| cid)
+    }
+
+    /// Like `revoke_emit_warrant` but also returns the serialized
+    /// `RekeyRevocationRecord` bytes for GossipSub propagation (the
+    /// `rekey/revoke` topic). Peers apply it via `apply_revocation_warrant_bytes`
+    /// with NO BlockStore fetch — completes the §23.7 wire integration.
+    pub async fn revoke_emit_warrant_bytes(
+        &self,
+        owner_did: &str,
+        accessor_did: &str,
+    ) -> Result<(KotobaCid, Vec<u8>), PreKeyError> {
         self.revoke_inner(owner_did, accessor_did).await;
 
         let ts = SystemTime::now()
@@ -200,7 +214,7 @@ impl PreKeyRegistry {
         self.store
             .put(&evidence_cid, &evidence_bytes)
             .map_err(|e| PreKeyError::Store(e.to_string()))?;
-        Ok(evidence_cid)
+        Ok((evidence_cid, evidence_bytes))
     }
 
     /// Process an incoming peer Warrant with `rule_id = RULE_REKEY_REVOKED`.
@@ -211,17 +225,23 @@ impl PreKeyRegistry {
         let Some(bytes) = self.store.get(evidence_cid).ok().flatten() else {
             return;
         };
+        self.apply_revocation_warrant_bytes(&bytes).await;
+    }
 
-        let Ok(record) = serde_json::from_slice::<RekeyRevocationRecord>(&bytes) else {
+    /// Apply a revocation warrant directly from its serialized record bytes —
+    /// the GossipSub receive path (§23.7 wire). The gossiped payload IS the
+    /// record, so no BlockStore fetch is needed (unlike `apply_revocation_warrant`).
+    /// No-ops on malformed bytes or already-revoked pairs.
+    pub async fn apply_revocation_warrant_bytes(&self, bytes: &[u8]) {
+        let Ok(record) = serde_json::from_slice::<RekeyRevocationRecord>(bytes) else {
             return;
         };
-
         self.revoke_inner(&record.owner_did, &record.accessor_did)
             .await;
         tracing::info!(
             owner_did = %record.owner_did,
             accessor_did = %record.accessor_did,
-            "PreKeyRegistry: applied peer revocation warrant",
+            "PreKeyRegistry: applied peer revocation warrant (gossip bytes)",
         );
     }
 
@@ -610,6 +630,46 @@ mod tests {
     }
 
     // ---- New tests --------------------------------------------------------
+
+    /// GossipSub wire path: node A revokes + serializes; node B applies the
+    /// bytes directly WITHOUT a shared BlockStore (the gossip payload IS the
+    /// record). This is the §23.7 propagation that `apply_revocation_warrant`
+    /// (block-fetch) could not do across independent nodes.
+    #[tokio::test]
+    async fn revocation_warrant_bytes_propagate_without_shared_store() {
+        let enc_key = rand_key();
+
+        // Node A: holds the grant, revokes, and emits warrant bytes.
+        let node_a = PreKeyRegistry::new(store());
+        node_a
+            .grant("did:alice", "did:bob", &rand_key(), &enc_key)
+            .await
+            .unwrap();
+        let (_cid, bytes) = node_a
+            .revoke_emit_warrant_bytes("did:alice", "did:bob")
+            .await
+            .unwrap();
+
+        // Node B: a SEPARATE store (no block replication) — receives only the
+        // gossiped bytes and applies them.
+        let node_b = PreKeyRegistry::new(store());
+        node_b
+            .grant("did:alice", "did:bob", &rand_key(), &enc_key)
+            .await
+            .unwrap();
+        node_b.apply_revocation_warrant_bytes(&bytes).await;
+
+        assert!(
+            node_b
+                .revoked
+                .read()
+                .await
+                .contains(&("did:alice".to_string(), "did:bob".to_string())),
+            "node B must revoke from gossiped warrant bytes alone"
+        );
+        // Malformed bytes must be a safe no-op.
+        node_b.apply_revocation_warrant_bytes(b"not-a-record").await;
+    }
 
     #[test]
     fn rule_rekey_revoked_constant_is_seven() {

@@ -778,6 +778,63 @@ impl KotobaState {
         self
     }
 
+    /// Build and attach a persistent PRE key registry from this node's own
+    /// block store + shelf (operator-trusted content-encryption grants,
+    /// ADR-2605240001 §28.5 step 1). Grants survive restarts via the shelf.
+    ///
+    /// Additive: this only makes the PRE substrate live (grant/revoke/lookup).
+    /// It does NOT change the existing quad read/write path — encrypt-on-write
+    /// and decrypt-on-read are a separate increment (§28.5 steps 2–3).
+    pub async fn init_pre_key_registry(mut self) -> Self {
+        let registry = Arc::new(
+            PreKeyRegistry::with_shelf(Arc::clone(&self.block_store), Arc::clone(&self.shelf))
+                .await,
+        );
+        self.pre_key_registry = Some(registry);
+        tracing::info!("PRE key registry attached (persistent, shelf-backed)");
+        self
+    }
+
+    /// Derive this node's per-owner wrapping key (`owner_enc_key`) for the
+    /// operator-trusted PRE layer (ADR-2605240001 §28.4(a) / §28.5 step 4).
+    ///
+    /// Bound to the node's opaque vault key via HKDF, so only this node can
+    /// reconstruct it. Intentionally not zero-knowledge from the operator —
+    /// that property belongs to the kotoba/etzhayyim protocol layer, not this
+    /// vendor-hosted (Infura-equivalent) service. Errors if crypto is not yet
+    /// initialised (`init_crypto()` must run first).
+    pub fn pre_wrapping_key(
+        &self,
+        owner_did: &str,
+    ) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
+        Ok(self
+            .crypto_required()?
+            .derive_wrapping_key(owner_did.as_bytes()))
+    }
+
+    /// Revoke a PRE re-key grant locally AND propagate the revocation to peers
+    /// over GossipSub (`rekey/revoke` topic) — the §23.7 emit path. The
+    /// gossiped payload is the serialized `RekeyRevocationRecord`, which peers
+    /// apply via `apply_revocation_warrant_bytes` (no BlockStore fetch).
+    /// No-op when no registry is attached; gossip is best-effort (try_send).
+    pub async fn revoke_pre_key_grant(
+        &self,
+        owner_did: &str,
+        accessor_did: &str,
+    ) -> anyhow::Result<()> {
+        let Some(reg) = &self.pre_key_registry else {
+            return Ok(());
+        };
+        let (_evidence_cid, bytes) = reg
+            .revoke_emit_warrant_bytes(owner_did, accessor_did)
+            .await?;
+        // Channel carries raw KSE names (no "kotoba/" prefix); publish adds it.
+        if let Some(tx) = &self.gossip_tx {
+            tx.try_send(("rekey/revoke".to_string(), bytes)).ok();
+        }
+        Ok(())
+    }
+
     /// Look up the visibility of a named graph by its CID.
     ///
     /// Default visibility for unknown graphs is controlled by
@@ -1020,6 +1077,41 @@ impl KotobaState {
             ipns_name = %ipns_name,
             "node registered in distributed kotoba/network/nodes"
         );
+    }
+
+    /// Register an external app's wasm node (app name → program CID) so the
+    /// generic XRPC→wasm ingress (`generic_invoke`) can resolve and dispatch it.
+    ///
+    /// Writes `node/did = app` + `node/endpoint = program_cid` into the LOCAL
+    /// quad_store projection of `kotoba/network/nodes` via the same
+    /// `apply_journaled_datom` path the server self-registration uses (and that
+    /// `generic_invoke` reads), so a freshly-registered app node is immediately
+    /// resolvable — unlike a raw `datomic.transact`, whose datoms reach the
+    /// distributed head / datomic view but not this arrangement (ADR-2605312355).
+    pub async fn register_external_node(&self, app: &str, program_cid: &str) {
+        let graph_cid = KotobaCid::from_bytes(b"kotoba/network/nodes");
+        let subject_cid = KotobaCid::from_bytes(format!("node:{app}").as_bytes());
+        let datoms = vec![
+            KqeDatom::assert(
+                subject_cid.clone(),
+                "node/did".to_string(),
+                KqeValue::Text(app.to_string()),
+                graph_cid.clone(),
+            ),
+            KqeDatom::assert(
+                subject_cid.clone(),
+                "node/endpoint".to_string(),
+                KqeValue::Text(program_cid.to_string()),
+                graph_cid.clone(),
+            ),
+        ];
+        for datom in datoms {
+            self.journal_assert_datom(&graph_cid, &datom).await;
+            self.quad_store
+                .apply_journaled_datom(graph_cid.clone(), datom)
+                .await;
+        }
+        tracing::info!(app = %app, program_cid = %program_cid, "registered external wasm node");
     }
 
     /// Publish a Quad assert to the KSE Journal (fine SPO topic) and,
