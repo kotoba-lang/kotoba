@@ -2403,6 +2403,52 @@ where
             &mut Vec<Datom>,
         ) -> Result<(), DistributedCommitError>,
     {
+        self.transact_inner(req, None, register_tx_fns, augment_datoms)
+            .await
+    }
+
+    /// Like `transact_with`, but the caller supplies a pre-materialised
+    /// `db_before` so this transact skips the O(graph) cold `db_from_head`
+    /// ProllyTree/Kubo scan (ADR-2605302130).
+    ///
+    /// SAFETY CONTRACT: `injected_db_before`, when `Some`, MUST equal
+    /// `db_from_head(expected_parent)` — same net-live datoms AND same `basis_t`.
+    /// The derived `tx_cid` depends only on the new tx datoms + `db_before.basis_t`,
+    /// and tempid/upsert/schema resolution reads `db_before.datoms`, so an
+    /// equivalent `db_before` yields a byte-identical commit. The server only
+    /// passes `Some` when its cached head matches the resolved IPNS head.
+    pub async fn transact_with_db_before<G>(
+        &self,
+        req: DistributedTransactRequest,
+        injected_db_before: Option<Db>,
+        augment_datoms: G,
+    ) -> Result<DistributedTransactReport, DistributedCommitError>
+    where
+        G: FnOnce(
+            &TransactReport,
+            &DistributedTransactContext,
+            &mut Vec<Datom>,
+        ) -> Result<(), DistributedCommitError>,
+    {
+        self.transact_inner(req, injected_db_before, |_| Ok(()), augment_datoms)
+            .await
+    }
+
+    async fn transact_inner<F, G>(
+        &self,
+        req: DistributedTransactRequest,
+        injected_db_before: Option<Db>,
+        register_tx_fns: F,
+        augment_datoms: G,
+    ) -> Result<DistributedTransactReport, DistributedCommitError>
+    where
+        F: FnOnce(&Connection) -> Result<(), DistributedCommitError>,
+        G: FnOnce(
+            &TransactReport,
+            &DistributedTransactContext,
+            &mut Vec<Datom>,
+        ) -> Result<(), DistributedCommitError>,
+    {
         let name = IpnsName::new(req.ipns_name.clone());
         let current = match self.ipns.resolve(&name) {
             Ok(record) => Some(record),
@@ -2414,11 +2460,14 @@ where
                 .as_ref()
                 .and_then(|record| KotobaCid::from_multibase(&record.value))
         });
-        let db_before = match &expected_parent {
-            Some(parent) => {
-                DistributedDatomReader::new(self.store, self.ipns).db_from_head(parent)?
-            }
-            None => Db::from_datoms(vec![], None),
+        let db_before = match injected_db_before {
+            Some(db) => db,
+            None => match &expected_parent {
+                Some(parent) => {
+                    DistributedDatomReader::new(self.store, self.ipns).db_from_head(parent)?
+                }
+                None => Db::from_datoms(vec![], None),
+            },
         };
         let conn = Connection::from_datoms(db_before.all_datoms());
         register_tx_fns(&conn)?;
@@ -5214,6 +5263,76 @@ mod tests {
                 )
                 .unwrap(),
             vec![vec![EdnValue::String("Alice".into())]]
+        );
+    }
+
+    /// ADR-2605302130 safety contract: the value the server caches as the resident
+    /// `db_before` — `current_datoms(db_after)` keyed by the new head — MUST equal
+    /// the cold path `db_from_head(head)`: same net-live datom set AND same
+    /// `basis_t`. Both are derived from the SAME commit so this is timestamp-
+    /// independent (the wall-clock `:db/txInstant` is baked identically into both).
+    /// `tx_cid` depends only on the new tx datoms + `db_before.basis_t`, and
+    /// tempid/upsert/schema resolution reads `db_before.datoms`, so an equal
+    /// `db_before` yields a byte-identical commit — no DAG fork. tx2 retracts a
+    /// value to prove the netting drops tombstones consistently on both paths.
+    #[tokio::test]
+    async fn cached_db_before_equals_cold_db_from_head() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"cached-db-before-equivalence");
+        let mk_req = |tx: &str, parent: Option<KotobaCid>| DistributedTransactRequest {
+            ipns_name: "k51-cache-eq".into(),
+            graph: graph.clone(),
+            tx_data: kotoba_edn::parse(tx).unwrap(),
+            expected_parent: parent,
+            author: "did:key:zWriter".into(),
+            valid_until: "2030-01-01T00:00:00Z".into(),
+            ttl_secs: Some(60),
+            cacao_proof_cid: None,
+            ipns_controller_did: None,
+            ipns_signing_key: None,
+        };
+
+        let t1 = writer
+            .transact(mk_req(
+                r#"[[:db/add "alice" :person/name "Alice"]
+                    [:db/add "alice" :person/score 10]]"#,
+                None,
+            ))
+            .await
+            .unwrap();
+        let t2 = writer
+            .transact(mk_req(
+                r#"[[:db/add "bob" :person/name "Bob"]
+                    [:db/retract "alice" :person/score 10]]"#,
+                Some(t1.commit.commit.cid.clone()),
+            ))
+            .await
+            .unwrap();
+        let head = t2.commit.commit.cid.clone();
+
+        // What the server caches after committing t2:
+        let cached = crate::current_datoms(&t2.transact.db_after.all_datoms());
+        let cached_basis = t2.transact.db_after.basis_t.clone();
+        // What a cold transact would reconstruct:
+        let reader = DistributedDatomReader::new(&store, &ipns);
+        let cold = reader.db_from_head(&head).unwrap();
+        let cold_datoms = cold.all_datoms();
+
+        assert_eq!(
+            cached.len(),
+            cold_datoms.len(),
+            "cached net-live datom count != cold db_from_head"
+        );
+        assert!(
+            cached.iter().all(|d| cold_datoms.contains(d))
+                && cold_datoms.iter().all(|d| cached.contains(d)),
+            "cached db_before datom set diverges from cold db_from_head"
+        );
+        assert_eq!(
+            cached_basis, cold.basis_t,
+            "basis_t mismatch — tx_cid would diverge"
         );
     }
 

@@ -4470,18 +4470,39 @@ pub async fn datomic_transact(
             .as_ref()
             .and_then(|record| kotoba_core::cid::KotobaCid::from_multibase(&record.value)),
     };
+    // Serialise transacts for this graph and serve `db_before` from the resident
+    // in-memory cache when it is already at the expected head — this is the fix
+    // for the ADR-2605302130 scaling blocker: it avoids the O(graph) cold
+    // ProllyTree/Kubo scan (`db_from_head`) on every transact. The guard is held
+    // across the commit + cache refresh below so the cached head cannot race a
+    // concurrent transact for the same graph. On a head miss (first transact
+    // after startup, or an externally-advanced head) we pay one cold scan and
+    // re-seed the cache after committing.
+    let graph_mb = graph_cid.to_multibase();
+    let live_slot = state.datomic_live_slot(&graph_mb);
+    let mut live_guard = live_slot.lock().await;
     let db_before = match expected_parent.as_ref() {
-        Some(parent) => DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
-            .db_from_head(parent)
-            .map_err(|e| match e {
-                DistributedCommitError::MissingCommit(_) => {
-                    (StatusCode::CONFLICT, format!("distributed db before: {e}"))
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("distributed db before: {e}"),
-                ),
-            })?,
+        Some(parent) => match live_guard.as_ref().filter(|live| &live.head == parent) {
+            Some(live) => live.db.clone(),
+            None => {
+                // Cache miss on a non-empty graph: pay the one O(graph) cold scan
+                // (first transact after (re)start, or an externally-advanced head).
+                state
+                    .datomic_cold_db_loads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
+                    .db_from_head(parent)
+                    .map_err(|e| match e {
+                        DistributedCommitError::MissingCommit(_) => {
+                            (StatusCode::CONFLICT, format!("distributed db before: {e}"))
+                        }
+                        _ => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("distributed db before: {e}"),
+                        ),
+                    })?
+            }
+        },
         None => kotoba_datomic::Db::from_datoms(Vec::new(), None),
     };
     let tx_preview = kotoba_datomic::Connection::from_datoms(db_before.all_datoms())
@@ -4533,7 +4554,7 @@ pub async fn datomic_transact(
     let cacao_proof_cid = auth_proof_cid.clone().or(explicit_cacao_proof_cid);
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     let distributed = writer
-        .transact_with(
+        .transact_with_db_before(
             DistributedTransactRequest {
                 ipns_name: ipns_name.clone(),
                 graph: graph_cid.clone(),
@@ -4546,6 +4567,9 @@ pub async fn datomic_transact(
                 ipns_controller_did: Some(state.operator_did.clone()),
                 ipns_signing_key: Some(state.ipns_signing_key()),
             },
+            // Same DB the preview used; equals db_from_head(expected_parent) so the
+            // writer skips its own cold scan without changing the commit hash.
+            Some(db_before),
             |report, context, tx_datoms| {
                 append_tx_metadata_datoms(
                     tx_datoms,
@@ -4602,6 +4626,21 @@ pub async fn datomic_transact(
         };
         journal_cids.push(journal_cid);
     }
+
+    // Refresh the resident db_before cache so the next transact for this graph
+    // serves from RAM instead of a cold scan. The cached DB is netted via
+    // `current_datoms` (retraction tombstones removed) with `basis_t` = the new
+    // head's tx_cid, making it byte-identical to `db_from_head(new_head)` — so a
+    // cache-served db_before produces the same tx_cid/commit_cid as a cold scan
+    // (ADR-2605302130).
+    *live_guard = Some(crate::server::LiveDatomicGraph {
+        head: distributed_commit.commit.cid.clone(),
+        db: kotoba_datomic::Db::from_datoms(
+            kotoba_datomic::current_datoms(&report.db_after.all_datoms()),
+            report.db_after.basis_t.clone(),
+        ),
+    });
+    drop(live_guard);
 
     Ok((
         StatusCode::OK,
@@ -9646,6 +9685,119 @@ mod tests {
         assert!(resolved
             .service_by_type(KOTOBA_GRAPH_MEMBERSHIP_SERVICE)
             .is_some());
+    }
+
+    /// Drive the real `datomic_transact` handler once and return the commit CID.
+    async fn run_transact_for_cache_test(
+        state: &Arc<KotobaState>,
+        graph_mb: &str,
+        edn: &str,
+    ) -> String {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", test_operator_jwt(&state.operator_did))
+                .parse()
+                .unwrap(),
+        );
+        let resp = datomic_transact(
+            axum::extract::State(Arc::clone(state)),
+            headers,
+            axum::Json(DatomicTransactReq {
+                graph: graph_mb.to_string(),
+                tx_edn: edn.to_string(),
+                ipns_name: None,
+                cacao_b64: None,
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        body["commit_cid"].as_str().unwrap().to_string()
+    }
+
+    /// ADR-2605302130 efficacy: prove the resident db_before cache actually HITS
+    /// in the real handler flow rather than silently falling through to a cold
+    /// scan (the correctness tests cannot distinguish hit from always-miss, since
+    /// the cold path is also correct + fast on MemoryBlockStore). Drives three
+    /// sequential transacts on one graph, simulating a restart (cache clear)
+    /// between the 1st and 2nd, and asserts the expensive cold `db_from_head`
+    /// path runs exactly once — proving the warm transact is served from RAM.
+    #[tokio::test]
+    async fn datomic_transact_resident_cache_hits_after_warm() {
+        use std::sync::atomic::Ordering;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = KotobaCid::from_bytes(b"resident-cache-hit-graph");
+        let graph_mb = graph.to_multibase();
+
+        // tx1: fresh graph → genesis (expected_parent = None) → NOT a cold load.
+        let c1 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "alice" :person/name "Alice"]]"#,
+        )
+        .await;
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            0,
+            "genesis transact must not cold-load"
+        );
+        {
+            let slot = state.datomic_live_slot(&graph_mb);
+            let g = slot.lock().await;
+            assert_eq!(g.as_ref().expect("slot seeded after tx1").head.to_multibase(), c1);
+        }
+
+        // Simulate a restart on an already-populated graph: drop the resident
+        // cache (IPNS + block store still hold the graph). The next transact must
+        // pay exactly one cold `db_from_head` — this is the ADR's cold-start path.
+        state.datomic_live.lock().unwrap().clear();
+
+        let c2 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "bob" :person/name "Bob"]]"#,
+        )
+        .await;
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            1,
+            "post-restart transact must cold-load exactly once"
+        );
+
+        // tx3: cache is warm again → must HIT (no new cold load).
+        let c3 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "carol" :person/name "Carol"]]"#,
+        )
+        .await;
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            1,
+            "warm transact must hit the resident cache, not cold-scan"
+        );
+        {
+            let slot = state.datomic_live_slot(&graph_mb);
+            let g = slot.lock().await;
+            assert_eq!(
+                g.as_ref().expect("slot seeded after tx3").head.to_multibase(),
+                c3,
+                "cache head must track the latest commit"
+            );
+        }
+        assert_ne!(c1, c2);
+        assert_ne!(c2, c3);
     }
 
     #[tokio::test]
