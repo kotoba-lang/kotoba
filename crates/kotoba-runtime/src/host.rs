@@ -1052,16 +1052,18 @@ fn bind_evm(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
-// ── kotoba:kais/http ───────────────────────────────────────────────────────
+// ── kotoba:kais/egress ─────────────────────────────────────────────────────
 // Generic outbound HTTP for guests. The runtime already does host-side HTTP for
 // `evm` (ureq JSON-RPC); this exposes it generically so componentize-py guests —
 // which cannot reach wasi:http — can call external services (ADR-2605312355).
+// Named `egress` (NOT `http`): an interface named `http` collides with
+// componentize-py's wasi:http packing and breaks guests at instantiation.
 
 fn bind_http(linker: &mut Linker<HostState>) -> Result<()> {
     use std::io::Read;
     use std::time::Duration;
 
-    let mut inst = linker.instance("kotoba:kais/http@0.1.0")?;
+    let mut inst = linker.instance("kotoba:kais/egress@0.1.0")?;
     inst.func_wrap(
         "fetch",
         move |mut ctx: wasmtime::StoreContextMut<HostState>,

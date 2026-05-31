@@ -13797,7 +13797,62 @@ pub async fn generic_invoke(
     let program_bytes = kotoba_core::cid::KotobaCid::from_multibase(&program_cid)
         .and_then(|cid| state.block_store.get(&cid).ok().flatten());
 
+    // Build the guest's kqe read-snapshot + IPNS head map from the request body's
+    // `graph_cid` (multibase), mirroring `invoke.run` (L6602-6651). Without this the
+    // generic app-dispatch path passed an empty snapshot, so guests could not read
+    // committed graph data (ADR-2605312355 Stage-3 persistence blocker). Absent
+    // graph_cid → empty snapshot (write-only / read-nothing guests still work).
+    use kotoba_core::cid::KotobaCid;
+    use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+    use kotoba_runtime::host::WitQuad;
+
+    let snapshot_graph_cid = req_body
+        .get("graph_cid")
+        .and_then(|v| v.as_str())
+        .and_then(KotobaCid::from_multibase);
+    let quad_snapshot: Vec<WitQuad> = if let Some(gcid) = &snapshot_graph_cid {
+        match current_db_for_graph(&state, gcid).await {
+            Ok(db) => db
+                .datoms()
+                .into_iter()
+                .filter_map(|datom| {
+                    let substrate = datom.to_kqe().ok()?;
+                    let object: kotoba_kqe::quad::LegacyQuadObject = substrate.v.into();
+                    Some(WitQuad {
+                        graph: gcid.to_multibase(),
+                        subject: substrate.e.to_multibase(),
+                        predicate: substrate.a,
+                        object_cbor: serde_json::to_vec(&object).unwrap_or_default(),
+                    })
+                })
+                .collect(),
+            Err((code, msg)) => {
+                return Err((code, format!("generic invoke graph snapshot: {msg}")))
+            }
+        }
+    } else {
+        vec![]
+    };
+    let mut head_commits = std::collections::HashMap::new();
+    if let Some(gcid) = &snapshot_graph_cid {
+        let ipns_name = distributed_graph_ipns_name(gcid);
+        match state.ipns_registry.resolve(&IpnsName::new(ipns_name.clone())) {
+            Ok(record) => {
+                head_commits.insert(gcid.to_multibase(), record.value);
+            }
+            Err(IpnsRegistryError::NotFound(_)) => {}
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("generic invoke graph head: {e}"),
+                ))
+            }
+        }
+    }
+
     let agent_did = state.operator_did.clone();
+    let agent_did_commit = state.operator_did.clone();
+    let program_cid_commit = program_cid.clone();
     let router = Arc::clone(&state.router);
 
     let result = tokio::task::spawn_blocking(move || {
@@ -13812,8 +13867,8 @@ pub async fn generic_invoke(
             None,
             &[],
             10_000,
-            vec![],
-            std::collections::HashMap::new(),
+            quad_snapshot,
+            head_commits,
         )
     })
     .await
@@ -13822,6 +13877,83 @@ pub async fn generic_invoke(
 
     match result {
         kotoba_vm::DispatchResult::Wasm(r) => {
+            // Persist the guest's asserted/retracted quads, mirroring invoke.run's commit
+            // loop (L6710-6766, ADR-2605312355). Without this, generic dispatch discarded
+            // ALL guest writes. Keyed per-quad on `sq.graph`; the read-snapshot above closes
+            // the read half. Together these make yukkuri-as-guest persist via the prod path.
+            const MAX_ASSERT_QUADS: usize = 10_000;
+            if r.assert_quads.len() > MAX_ASSERT_QUADS || r.retract_quads.len() > MAX_ASSERT_QUADS {
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "WASM produced too many quads (assert {} / retract {}, limit {MAX_ASSERT_QUADS})",
+                        r.assert_quads.len(),
+                        r.retract_quads.len()
+                    ),
+                ));
+            }
+            let mut by_graph: std::collections::BTreeMap<String, Vec<KqeDatom>> =
+                std::collections::BTreeMap::new();
+            for sq in &r.assert_quads {
+                let graph_cid = KotobaCid::from_bytes(sq.graph.as_bytes());
+                let datom = KqeDatom::assert(
+                    KotobaCid::from_bytes(sq.subject.as_bytes()),
+                    sq.predicate.clone(),
+                    KqeValue::Bytes(sq.object_cbor.clone()),
+                    graph_cid,
+                );
+                by_graph.entry(sq.graph.clone()).or_default().push(datom);
+            }
+            for sq in &r.retract_quads {
+                let graph_cid = KotobaCid::from_bytes(sq.graph.as_bytes());
+                let datom = KqeDatom::retract(
+                    KotobaCid::from_bytes(sq.subject.as_bytes()),
+                    sq.predicate.clone(),
+                    KqeValue::Bytes(sq.object_cbor.clone()),
+                    graph_cid,
+                );
+                by_graph.entry(sq.graph.clone()).or_default().push(datom);
+            }
+            for (graph, mut datoms) in by_graph {
+                let graph_cid = KotobaCid::from_bytes(graph.as_bytes());
+                let tx_cid = KotobaCid::from_bytes(
+                    format!(
+                        "generic_invoke.run:{}:{}:{}:{}",
+                        program_cid_commit, agent_did_commit, graph, r.gas_used
+                    )
+                    .as_bytes(),
+                );
+                let entity_cid = datoms
+                    .first()
+                    .map(|datom| datom.e.clone())
+                    .unwrap_or_else(|| graph_cid.clone());
+                for datom in &mut datoms {
+                    datom.tx = tx_cid.clone();
+                }
+                commit_protocol_datoms(
+                    &state,
+                    graph_cid,
+                    graph,
+                    entity_cid,
+                    datoms
+                        .into_iter()
+                        .map(kotoba_datomic::Datom::from_kqe)
+                        .collect(),
+                    tx_cid,
+                    agent_did_commit.clone(),
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+            for (topic, payload) in &r.pending_publishes {
+                use kotoba_kse::Topic;
+                state
+                    .journal
+                    .publish(Topic(topic.clone()), bytes::Bytes::from(payload.clone()))
+                    .await;
+            }
             let out_val: serde_json::Value = ciborium::from_reader(r.output_cbor.as_slice())
                 .unwrap_or(serde_json::json!({ "output_bytes": r.output_cbor }));
             Ok(Json(out_val))
