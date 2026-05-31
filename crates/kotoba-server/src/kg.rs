@@ -28,6 +28,7 @@ use axum::{
     Json,
 };
 use kotoba_core::cid::KotobaCid;
+use kotoba_crypto::AgentCrypto;
 use kotoba_datomic::distributed::{
     CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter,
 };
@@ -100,6 +101,75 @@ fn kg_tx_cid(label: &str, parts: &[&str]) -> KotobaCid {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     KotobaCid::from_bytes(format!("kg:{label}:{nanos}:{}", parts.join(":")).as_bytes())
+}
+
+// ── Operator-trusted Pattern B content encryption (ADR-2605240001 §29.6) ──────
+//
+// Sensitive claim values are sealed at rest with the node's opaque vault key
+// (`signal:v1:` envelope, stored as opaque Text — no AVET / SPARQL FILTER on the
+// ciphertext: the documented §29.3 trade-off) and decrypted for CACAO-authorized
+// readers. Operator-trusted (the node holds the key), NOT zero-knowledge.
+//
+// Opt-in via `KOTOBA_ENCRYPT_CLAIM_PREDS` = comma-separated FULL predicate names
+// (e.g. "kg/claim/settlementAmount,kg/claim/ssn"). Unset/empty → no encryption,
+// byte-identical to prior behaviour (zero regression for existing deploys).
+
+/// `signal:v1:` envelope prefix (matches `kotoba_crypto::envelope::SIGNAL_VAL_PREFIX`).
+const SIGNAL_ENVELOPE_PREFIX: &str = "signal:v1:";
+
+/// Parse the sensitive-claim-predicate allowlist from the environment.
+fn sensitive_claim_preds() -> std::collections::HashSet<String> {
+    std::env::var("KOTOBA_ENCRYPT_CLAIM_PREDS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Encrypt-on-write for a sensitive claim value. Scope = the full predicate
+/// (domain separation). Falls back to plaintext when the predicate is not in
+/// the allowlist, crypto is absent, or sealing fails — never silently drops data.
+async fn maybe_seal_claim_value(
+    crypto: Option<&Arc<dyn AgentCrypto>>,
+    sensitive: &std::collections::HashSet<String>,
+    full_pred: &str,
+    value: &str,
+) -> String {
+    if !sensitive.contains(full_pred) {
+        return value.to_string();
+    }
+    match crypto {
+        Some(c) => c
+            .seal_field(full_pred.as_bytes(), value)
+            .await
+            .unwrap_or_else(|_| value.to_string()),
+        None => value.to_string(),
+    }
+}
+
+/// Decrypt-on-read counterpart. Returns plaintext for a `signal:v1:` Text claim
+/// object (scope = full predicate); otherwise delegates to `obj_to_json`.
+/// Callers MUST have passed `check_read_access` first (operator-trusted: the
+/// node decrypts for any CACAO-authorized reader).
+async fn decrypt_claim_obj(
+    crypto: Option<&Arc<dyn AgentCrypto>>,
+    full_pred: &str,
+    obj: &QuadObject,
+) -> serde_json::Value {
+    if let QuadObject::Text(s) = obj {
+        if s.starts_with(SIGNAL_ENVELOPE_PREFIX) {
+            if let Some(c) = crypto {
+                if let Ok(pt) = c.open_field(full_pred.as_bytes(), s).await {
+                    return serde_json::Value::String(pt);
+                }
+            }
+        }
+    }
+    obj_to_json(obj)
 }
 
 fn kg_datom(subject: &KotobaCid, predicate: impl Into<String>, value: KqeValue) -> KqeDatom {
@@ -485,9 +555,12 @@ pub async fn kg_entity(
             }
             _ if pred.starts_with("kg/claim/") && q.include_claims => {
                 let claim_pred = &pred["kg/claim/".len()..];
+                // Decrypt operator-trusted Pattern B sealed claims for this
+                // CACAO-authorized reader (no-op for plaintext claims).
+                let value = decrypt_claim_obj(state.crypto.as_ref(), pred, &quad.object).await;
                 claims.push(serde_json::json!({
                     "predicate": claim_pred,
-                    "value":     obj_to_json(&quad.object),
+                    "value":     value,
                 }));
             }
             _ if pred.starts_with("kg/relation/")
@@ -1055,8 +1128,13 @@ pub async fn kg_ingest(
         assert_text!("kg/source_id", v);
     }
 
+    let sensitive = sensitive_claim_preds();
     for claim in &req.claims {
-        assert_text!(format!("kg/claim/{}", claim.pred), claim.value);
+        let pred = format!("kg/claim/{}", claim.pred);
+        let value =
+            maybe_seal_claim_value(state.crypto.as_ref(), &sensitive, &pred, &claim.value).await;
+        datoms.push(kg_datom(&subject, pred, KqeValue::Text(value)));
+        count += 1;
     }
 
     for rel in &req.relations {
@@ -1197,6 +1275,7 @@ pub async fn kg_ingest_batch(
     let mut total_quads = 0usize;
     let mut all_datoms = Vec::new();
     let first_subject = KotobaCid::from_bytes(req.entities[0].id.as_bytes());
+    let sensitive = sensitive_claim_preds();
 
     for e in &req.entities {
         let subject = KotobaCid::from_bytes(e.id.as_bytes());
@@ -1246,7 +1325,12 @@ pub async fn kg_ingest_batch(
         }
 
         for claim in &e.claims {
-            assert_text!(format!("kg/claim/{}", claim.pred), claim.value);
+            let pred = format!("kg/claim/{}", claim.pred);
+            let value =
+                maybe_seal_claim_value(state.crypto.as_ref(), &sensitive, &pred, &claim.value)
+                    .await;
+            all_datoms.push(kg_datom(&subject, pred, KqeValue::Text(value)));
+            count += 1;
         }
         for rel in &e.relations {
             let dst_cid = KotobaCid::from_bytes(rel.dst_id.as_bytes());
@@ -2407,6 +2491,71 @@ mod tests {
             domain: Some("kotoba.protocol.write".into()),
         });
         presentation
+    }
+
+    // ── Pattern B operator-trusted claim encryption (ADR §29.6 / §28.5 inc.2) ──
+
+    #[tokio::test]
+    async fn pattern_b_claim_seal_open_roundtrip() {
+        use kotoba_crypto::VaultKeyedCrypto;
+        use zeroize::Zeroizing;
+
+        let crypto: Arc<dyn AgentCrypto> =
+            Arc::new(VaultKeyedCrypto::new(Zeroizing::new([7u8; 32])));
+        let mut sensitive = std::collections::HashSet::new();
+        sensitive.insert("kg/claim/settlementAmount".to_string());
+
+        // Sensitive claim → sealed `signal:v1:` envelope at rest.
+        let sealed = maybe_seal_claim_value(
+            Some(&crypto),
+            &sensitive,
+            "kg/claim/settlementAmount",
+            "JPY 12,300,000",
+        )
+        .await;
+        assert!(
+            sealed.starts_with(SIGNAL_ENVELOPE_PREFIX),
+            "sensitive claim must be sealed at rest, got {sealed}"
+        );
+
+        // Authorized read decrypts back to plaintext.
+        let opened = decrypt_claim_obj(
+            Some(&crypto),
+            "kg/claim/settlementAmount",
+            &QuadObject::Text(sealed.clone()),
+        )
+        .await;
+        assert_eq!(opened, serde_json::json!("JPY 12,300,000"));
+
+        // Non-sensitive predicate → plaintext passthrough (queryable).
+        assert_eq!(
+            maybe_seal_claim_value(Some(&crypto), &sensitive, "kg/claim/labelEn", "Acme").await,
+            "Acme"
+        );
+
+        // Empty allowlist (default) → zero-regression passthrough.
+        assert_eq!(
+            maybe_seal_claim_value(
+                Some(&crypto),
+                &std::collections::HashSet::new(),
+                "kg/claim/settlementAmount",
+                "x",
+            )
+            .await,
+            "x"
+        );
+
+        // Wrong scope (predicate) must NOT decrypt — domain separation; the
+        // envelope is returned unchanged rather than leaking plaintext.
+        assert_eq!(
+            decrypt_claim_obj(
+                Some(&crypto),
+                "kg/claim/other",
+                &QuadObject::Text(sealed.clone()),
+            )
+            .await,
+            serde_json::Value::String(sealed)
+        );
     }
 
     // ── obj_to_json ───────────────────────────────────────────────────────────
