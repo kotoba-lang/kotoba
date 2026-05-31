@@ -47,6 +47,9 @@ OUTPUT="${OUTPUT:-${AGENT_DIR}/${AGENT_MODULE}.wasm}"
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 WIT_PATH="${KOTOBA_WIT_PATH:-${KOTOBA_DIR}/crates/kotoba-runtime/wit/world.wit}"
+# componentize-py resolves wit/deps/ (vendored plain wasi:http@0.2.0 + io/clocks/
+# random/cli/filesystem/sockets) only when -d points at the wit DIRECTORY.
+WIT_DIR="$(dirname "$WIT_PATH")"
 BINDINGS_DIR="${KOTOBA_DIR}/target/pywasm-bindings"
 PY_PKG_DIR="${KOTOBA_DIR}/py"
 
@@ -80,7 +83,7 @@ if [[ ! -f "$BINDINGS_STAMP" ]] || [[ "$(cat "$BINDINGS_STAMP" 2>/dev/null)" != 
     echo "Generating WIT bindings → $BINDINGS_DIR" >&2
     mkdir -p "$BINDINGS_DIR"
     componentize-py \
-        -d "$WIT_PATH" \
+        -d "$WIT_DIR" \
         -w kotoba-node \
         bindings "$BINDINGS_DIR"
     echo "$WIT_MTIME" > "$BINDINGS_STAMP"
@@ -90,7 +93,7 @@ fi
 echo "Building $AGENT_MODULE → $OUTPUT" >&2
 
 componentize-py \
-    -d "$WIT_PATH" \
+    -d "$WIT_DIR" \
     -w kotoba-node \
     componentize "$AGENT_MODULE" \
     -p "$AGENT_DIR" \
