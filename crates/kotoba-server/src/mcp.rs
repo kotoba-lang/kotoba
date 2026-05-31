@@ -1141,7 +1141,7 @@ async fn call_tool(
                 .map_err(|e| (ERR_INVALID_PARAMS, format!("invalid ctx_cbor_b64: {e}")))?;
 
             let executor = Arc::clone(&state.executor);
-            let program_cid = format!("did/wasm/{agent_did}");
+            let program_cid = args.get("program_cid").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| format!("did/wasm/{agent_did}"));
 
             let runner =
                 WasmPregelRunner::new(executor, &program_cid, wasm_bytes, &agent_did, max_ss);
