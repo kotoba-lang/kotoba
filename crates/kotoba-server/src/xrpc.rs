@@ -13718,6 +13718,16 @@ pub async fn generic_invoke(
     let mut ctx_cbor = Vec::new();
     ciborium::into_writer(&req_body, &mut ctx_cbor).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cbor encode: {e}")))?;
 
+    // Load the registered WasmNode program bytes from the block store by CID.
+    // `program_cid` is the resolved `node/endpoint` value (a wasm CID) when the
+    // app is registered in `kotoba/network/nodes`; when it is the bare app-name
+    // fallback (not a multibase CID) this resolves to None and dispatch returns
+    // `MissingWasmBytes` as before. Fixes the ADR-2605311200 generic_invoke gap.
+    // `block_store.get` yields `Option<bytes::Bytes>`; `Bytes: Deref<[u8]>` so
+    // `.as_deref()` below gives the `Option<&[u8]>` dispatch expects.
+    let program_bytes = kotoba_core::cid::KotobaCid::from_multibase(&program_cid)
+        .and_then(|cid| state.block_store.get(&cid).ok().flatten());
+
     let agent_did = state.operator_did.clone();
     let router = Arc::clone(&state.router);
 
@@ -13727,7 +13737,7 @@ pub async fn generic_invoke(
             kotoba_dht::source_chain::ProgramType::WasmNode,
             &agent_did,
             0,
-            None,
+            program_bytes.as_deref(),
             ctx_cbor,
             None,
             None,
