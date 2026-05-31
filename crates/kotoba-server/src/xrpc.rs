@@ -6931,6 +6931,35 @@ pub async fn block_get(
     }
 }
 
+// ── WasmNode registration ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct NodeRegisterReq {
+    /// app name (the `<app>` in `ai.gftd.apps.<app>.<method>`)
+    pub app: String,
+    /// program CID (the wasm component, e.g. from block.put)
+    pub endpoint: String,
+}
+
+/// POST /xrpc/ai.gftd.apps.kotoba.node.register
+/// Register an external app's wasm node so `generic_invoke` resolves+dispatches it.
+pub async fn node_register(
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<NodeRegisterReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+    if req.app.trim().is_empty() || req.endpoint.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "app and endpoint are required".into()));
+    }
+    state.register_external_node(&req.app, &req.endpoint).await;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "app": req.app,
+        "endpoint": req.endpoint,
+    })))
+}
+
 // ── Commit endpoints ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -13695,20 +13724,60 @@ pub async fn generic_invoke(
     let app = parts[3];
 
     let graph_cid = kotoba_core::cid::KotobaCid::from_bytes(b"kotoba/network/nodes");
-    let ipns_name = distributed_graph_ipns_name(&graph_cid);
     let mut program_cid = app.to_string();
 
-    if let Ok(Some(db)) = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry).current_db_for_name(&ipns_name) {
-        for datom in db.datoms() {
-            if datom.a == "node/did" {
-                if let kotoba_datomic::Value::String(s) = &datom.v {
+    // Resolve app → wasm endpoint CID from the LOCAL quad_store hot arrangement of the
+    // kotoba/network/nodes graph. Both the server self-registration AND external
+    // `datomic.transact` node registrations land here (apply_journaled_datom →
+    // insert_datom into the arrangement), so this reliably surfaces freshly-registered
+    // app nodes — unlike the distributed IPNS head, which did not (ADR-2605312355).
+    // Fall back to the distributed head for federation (an app hosted on a remote peer).
+    {
+        use kotoba_kqe::quad::LegacyQuadObject;
+        let node_quads = state
+            .quad_store
+            .quads_by_predicate_prefix(Some(&graph_cid), "node/")
+            .await;
+        for q in &node_quads {
+            if q.predicate == "node/did" {
+                if let LegacyQuadObject::Text(s) = &q.object {
                     if s == app || s.ends_with(&format!("{app}.gftd.co.jp")) {
-                        if let Some(endpoint) = db.datoms().iter().find(|d| d.e == datom.e && d.a == "node/endpoint") {
-                            if let kotoba_datomic::Value::String(ep) = &endpoint.v {
-                                program_cid = ep.to_string();
+                        if let Some(ep) = node_quads
+                            .iter()
+                            .find(|d| d.subject == q.subject && d.predicate == "node/endpoint")
+                        {
+                            if let LegacyQuadObject::Text(cid) = &ep.object {
+                                program_cid = cid.to_string();
                             }
                         }
                         break;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            app = %app,
+            node_quads = node_quads.len(),
+            program_cid = %program_cid,
+            resolved = program_cid != app,
+            "generic_invoke: quad_store node resolution"
+        );
+    }
+
+    if program_cid == app {
+        let ipns_name = distributed_graph_ipns_name(&graph_cid);
+        if let Ok(Some(db)) = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry).current_db_for_name(&ipns_name) {
+            for datom in db.datoms() {
+                if datom.a == "node/did" {
+                    if let kotoba_datomic::Value::String(s) = &datom.v {
+                        if s == app || s.ends_with(&format!("{app}.gftd.co.jp")) {
+                            if let Some(endpoint) = db.datoms().iter().find(|d| d.e == datom.e && d.a == "node/endpoint") {
+                                if let kotoba_datomic::Value::String(ep) = &endpoint.v {
+                                    program_cid = ep.to_string();
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
             }
