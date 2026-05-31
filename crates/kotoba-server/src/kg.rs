@@ -1712,10 +1712,15 @@ pub async fn kg_query(
             // Enterprise SQL dialect → DatalogProgram + PostProcess. Each live KG
             // predicate `P` is registered as a binary table `P(s, o)`, so
             // `SELECT t.s, t.o FROM "<predicate>" t` projects that predicate's
-            // (subject, object) pairs. Supported shape = projection + LIMIT/OFFSET.
-            // NOT supported: WHERE on scalar object literals (the EAV compiler
-            // models objects as CIDs while KG scalars are stored as text), and
-            // ORDER BY (output is opaque content-addressed pairs).
+            // (subject, object) pairs.
+            //
+            // WHERE: equality (`col = 'literal'`, ANDed) filters correctly — the
+            // engine normalises stored text and the literal through the same
+            // cid_of_str hash. Non-equality operators (`<>`, `>`, `<`, `LIKE`, `OR`)
+            // are SILENTLY DROPPED by the EAV compiler (apply_where only emits `=`
+            // atoms) and return the unfiltered superset — use `=` only.
+            // ORDER BY is not applied. Object values come back as content-hash CIDs
+            // (the original scalar text is not yet resolved in the response).
             let dialect = kotoba_kqe::enterprise::dialect_by_name(sql_lang)
                 .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown lang: {sql_lang}")))?;
             let schema = schema_from_predicates(&input_deltas);
@@ -2674,5 +2679,61 @@ mod tests {
             // Both role rows project; the kg/name predicate is excluded.
             assert_eq!(rows, 2, "{lang}: expected 2 role rows, got {rows}");
         }
+    }
+
+    /// Precise WHERE semantics over KG scalar (text) objects. The datalog engine
+    /// normalises both stored `Value::Text` and the WHERE literal through
+    /// `cid_of_str` into the same CID space, so **equality filters correctly**.
+    /// Non-equality operators (`<>`, `>`, `<`, `LIKE`) are silently dropped by the
+    /// compiler (`apply_where` only emits `=` atoms) → they return the unfiltered
+    /// superset. This test pins that contract so the docs stay honest.
+    #[test]
+    fn sql_where_equality_filters_but_inequality_returns_superset() {
+        use kotoba_core::cid::KotobaCid;
+        use kotoba_kqe::datom::{Datom, Value};
+
+        let g = KotobaCid::from_bytes(b"g");
+        let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
+        let deltas = vec![
+            Delta::assert_datom(Datom::assert(
+                cid("alice"),
+                "kg/claim/role".into(),
+                Value::Text("admin".into()),
+                g.clone(),
+            )),
+            Delta::assert_datom(Datom::assert(
+                cid("bob"),
+                "kg/claim/role".into(),
+                Value::Text("user".into()),
+                g,
+            )),
+        ];
+        let schema = schema_from_predicates(&deltas);
+        let pg = kotoba_kqe::enterprise::dialect_by_name("postgresql").unwrap();
+        let count = |sql: &str| {
+            let c = pg.compile(sql, &schema, "out").unwrap();
+            c.program
+                .evaluate_delta(&deltas)
+                .iter()
+                .filter(|d| d.attribute() == "out" && d.is_assert())
+                .count()
+        };
+        // Equality filters correctly.
+        assert_eq!(
+            count(r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o = 'admin'"#),
+            1,
+            "equality on scalar text must filter to the matching row"
+        );
+        // Non-equality is silently dropped → unfiltered superset (documented footgun).
+        assert_eq!(
+            count(r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o <> 'user'"#),
+            2,
+            "non-equality WHERE is currently a no-op (returns all rows)"
+        );
+        assert_eq!(
+            count(r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o LIKE 'adm%'"#),
+            2,
+            "LIKE on scalar is currently a no-op (returns all rows)"
+        );
     }
 }
