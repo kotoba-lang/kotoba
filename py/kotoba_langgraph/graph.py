@@ -71,6 +71,31 @@ def _apply_update(state: dict, update: dict, schema: type) -> None:
             state[key] = value
 
 
+def _declared_channels(schema: type) -> Optional[set]:
+    """Return the set of declared channel keys, or None for a dynamic (untyped)
+    ``StateGraph(dict)`` schema.
+
+    Real LangGraph keeps only *channel* values in the output state. For a typed
+    schema the channels are its declared keys; for ``StateGraph(dict)`` there are
+    no declared channels and the effective channel set is "keys some node writes"
+    (input-only keys that no node writes are dropped from the output)."""
+    try:
+        hints = typing.get_type_hints(schema, include_extras=True)
+    except Exception:
+        hints = {}
+    return set(hints) if hints else None
+
+
+def _prune_dynamic_channels(state: dict, written: set, prior_keys: set) -> None:
+    """For dynamic (``StateGraph(dict)``) graphs, drop keys that came only from the
+    input and were never written by a node — matching real LangGraph, which never
+    surfaces unwritten input keys in the output. Keys written by a node, or carried
+    over from a prior checkpoint, are preserved."""
+    for key in list(state):
+        if key not in written and key not in prior_keys:
+            del state[key]
+
+
 # ── StateGraph ───────────────────────────────────────────────────────────────
 
 class StateGraph:
@@ -171,6 +196,11 @@ class CompiledGraph:
             except Exception:
                 pass
 
+        # Channel-semantics bookkeeping: keys present before input (prior checkpoint)
+        # are channels; in a dynamic StateGraph(dict) only node-written keys survive.
+        prior_keys = set(state)
+        written: set = set()
+
         # Apply initial input (using reducers)
         _apply_update(state, input_state, self._graph._schema)
 
@@ -186,6 +216,7 @@ class CompiledGraph:
 
             update = fn(state)
             if update:
+                written |= set(update)
                 _apply_update(state, update, self._graph._schema)
 
             edge = self._graph._edges.get(node)
@@ -197,6 +228,11 @@ class CompiledGraph:
                 node = edge
 
             steps += 1
+
+        # Faithful channel semantics: drop input-only, unwritten keys for dynamic
+        # (StateGraph(dict)) graphs so the output matches real LangGraph.
+        if _declared_channels(self._graph._schema) is None:
+            _prune_dynamic_channels(state, written, prior_keys)
 
         # Persist state to checkpointer
         if self._checkpointer is not None:
@@ -235,9 +271,12 @@ class CompiledGraph:
             except Exception:
                 pass
 
+        prior_keys = set(state)
+        written: set = set()
         _apply_update(state, input_state, self._graph._schema)
         _se2: Union[str, Callable, None] = self._graph._edges.get(START)
         node: Optional[str] = _se2(state) if callable(_se2) else _se2
+        dynamic = _declared_channels(self._graph._schema) is None
 
         steps = 0
         while node and node != END and steps < self.MAX_STEPS:
@@ -246,14 +285,21 @@ class CompiledGraph:
                 break
             update = fn(state)
             if update:
+                written |= set(update)
                 _apply_update(state, update, self._graph._schema)
             if stream_mode == "values":
-                yield dict(state)
+                snap = dict(state)
+                if dynamic:
+                    _prune_dynamic_channels(snap, written, prior_keys)
+                yield snap
             edge = self._graph._edges.get(node)
             if edge is None:
                 break
             node = edge(state) if callable(edge) else edge
             steps += 1
+
+        if dynamic:
+            _prune_dynamic_channels(state, written, prior_keys)
 
         if self._checkpointer is not None:
             try:
