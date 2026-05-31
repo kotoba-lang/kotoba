@@ -285,6 +285,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             post(xrpc::datomic_transact),
         )
         .route(
+            "/xrpc/ai.gftd.apps.kotoba.node.register",
+            post(xrpc::node_register),
+        )
+        .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_DATOMS),
             post(xrpc::datomic_datoms),
         )
@@ -629,6 +633,9 @@ pub async fn run() -> anyhow::Result<()> {
 
     let state = server::KotobaState::new(inference_engine)?;
     let state = state.init_crypto().await?;
+    // Make the operator-trusted PRE substrate live (persistent grants).
+    // Additive — does not change the quad read/write path (ADR-2605240001 §28.5).
+    let state = state.init_pre_key_registry().await;
 
     // IPFS daemon liveness probe — non-fatal but logs a clear warning so the
     // operator notices when Kubo isn't reachable.  Skipped when KOTOBA_IPFS=off.

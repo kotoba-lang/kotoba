@@ -289,6 +289,10 @@ impl AgentCrypto for SovereignCrypto {
     ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         self.inner.decrypt(scope, ciphertext).await
     }
+
+    fn derive_wrapping_key(&self, owner_did: &[u8]) -> Zeroizing<[u8; 32]> {
+        self.inner.derive_wrapping_key(owner_did)
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
