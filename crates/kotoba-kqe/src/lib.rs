@@ -13,7 +13,7 @@ pub mod sql;
 pub use arrangement::Arrangement;
 pub use citation::{CitationLedger, DatomKey};
 pub use cypher::{CompiledCypherMv, CypherCompiler};
-pub use datalog::{DatalogProgram, DatalogRule};
+pub use datalog::{object_value_cid, DatalogProgram, DatalogRule};
 pub use datom::{
     Datom, DatomArrangement, DatomIndex, DatomIndexComponent, TensorDtype as DatomTensorDtype,
     Value,

@@ -178,23 +178,28 @@ mod tests {
     }
 
     #[test]
-    fn ilike_rewritten_to_like() {
+    fn ilike_is_rejected_fail_loud() {
+        // ILIKE is preprocessed to LIKE, but LIKE is not a supported WHERE filter
+        // in the CID-hashed object space — it must be rejected, not silently
+        // dropped (which would return an unfiltered superset).
+        assert_eq!(preprocess_postgres("WHERE x ILIKE 'a%'"), "WHERE x LIKE 'a%'");
+
         let mut schema = SchemaMap::new();
         schema.add(
             "docs",
             TableSchema::new("id").with_attr(AttrDef::scalar("title", "docs")),
         );
-        // Should compile cleanly with ILIKE rewritten to LIKE.
-        let result = PostgreSqlDialect.compile(
+        match PostgreSqlDialect.compile(
             "SELECT d.id, d.title FROM docs d WHERE d.title ILIKE 'report%'",
             &schema,
             "out",
-        );
-        assert!(
-            result.is_ok(),
-            "ILIKE should compile: {:?}",
-            result.err()
-        );
+        ) {
+            Ok(_) => panic!("LIKE/ILIKE WHERE must be rejected fail-loud"),
+            Err(e) => assert!(
+                e.to_string().contains("unsupported WHERE"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 
     #[test]

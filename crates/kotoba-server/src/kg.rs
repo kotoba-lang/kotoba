@@ -254,6 +254,19 @@ fn schema_from_predicates(deltas: &[Delta]) -> kotoba_kqe::SchemaMap {
     schema
 }
 
+/// Readable string form of a datom object value, for resolving enterprise-SQL
+/// result objects back from their content-hash CID. Matches the variants that
+/// `kotoba_kqe::object_value_cid` indexes (Text/Integer/Bool/Cid).
+fn readable_value(v: &KqeValue) -> String {
+    match v {
+        KqeValue::Text(s) => s.clone(),
+        KqeValue::Integer(n) => n.to_string(),
+        KqeValue::Bool(b) => b.to_string(),
+        KqeValue::Cid(c) => c.to_multibase(),
+        other => format!("{other:?}"),
+    }
+}
+
 async fn distributed_query_store(
     state: &Arc<KotobaState>,
     graph_cid: &KotobaCid,
@@ -1717,10 +1730,10 @@ pub async fn kg_query(
             // WHERE: equality (`col = 'literal'`, ANDed) filters correctly — the
             // engine normalises stored text and the literal through the same
             // cid_of_str hash. Non-equality operators (`<>`, `>`, `<`, `LIKE`, `OR`)
-            // are SILENTLY DROPPED by the EAV compiler (apply_where only emits `=`
-            // atoms) and return the unfiltered superset — use `=` only.
-            // ORDER BY is not applied. Object values come back as content-hash CIDs
-            // (the original scalar text is not yet resolved in the response).
+            // are now REJECTED fail-loud by apply_where (they cannot be evaluated
+            // in CID space and previously returned an unfiltered superset).
+            // ORDER BY is not applied. Object values in the response are resolved
+            // back to their source scalar text via `value_index` (see below).
             let dialect = kotoba_kqe::enterprise::dialect_by_name(sql_lang)
                 .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown lang: {sql_lang}")))?;
             let schema = schema_from_predicates(&input_deltas);
@@ -1734,6 +1747,23 @@ pub async fn kg_query(
             )
         }
     };
+    // For enterprise SQL, build a reverse index (object CID → source scalar) so
+    // the response carries readable values instead of opaque content hashes. The
+    // datalog engine stores only the hashed object CID in derived facts; we
+    // recover the original from the input deltas. SPARQL/Cypher keep their
+    // existing CID-multibase output shape (empty index → fallback).
+    let value_index: std::collections::HashMap<String, String> = if is_enterprise_sql {
+        input_deltas
+            .iter()
+            .filter_map(|d| {
+                kotoba_kqe::object_value_cid(d.value())
+                    .map(|cid| (cid.to_multibase(), readable_value(d.value())))
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let derived = tokio::task::spawn_blocking(move || program.evaluate_delta(&input_deltas))
         .await
         .map_err(|e| {
@@ -1756,13 +1786,15 @@ pub async fn kg_query(
         .skip(sql_offset)
         .take(effective_limit)
         .map(|d| {
-            serde_json::json!({
-                "a": d.entity().to_multibase(),
-                "b": match d.value() {
-                    kotoba_kqe::Value::Cid(c) => c.to_multibase(),
-                    other              => format!("{other:?}"),
-                },
-            })
+            let b = match d.value() {
+                kotoba_kqe::Value::Cid(c) => {
+                    let mb = c.to_multibase();
+                    // SQL path: resolve content-hash CID back to its source scalar.
+                    value_index.get(&mb).cloned().unwrap_or(mb)
+                }
+                other => format!("{other:?}"),
+            };
+            serde_json::json!({ "a": d.entity().to_multibase(), "b": b })
         })
         .collect();
 
@@ -2684,11 +2716,11 @@ mod tests {
     /// Precise WHERE semantics over KG scalar (text) objects. The datalog engine
     /// normalises both stored `Value::Text` and the WHERE literal through
     /// `cid_of_str` into the same CID space, so **equality filters correctly**.
-    /// Non-equality operators (`<>`, `>`, `<`, `LIKE`) are silently dropped by the
-    /// compiler (`apply_where` only emits `=` atoms) → they return the unfiltered
-    /// superset. This test pins that contract so the docs stay honest.
+    /// Non-equality operators (`<>`, `>`, `LIKE`) cannot be evaluated in CID space
+    /// and are now REJECTED fail-loud by `apply_where` (previously silently dropped
+    /// → unfiltered superset). This test pins that contract.
     #[test]
-    fn sql_where_equality_filters_but_inequality_returns_superset() {
+    fn sql_where_equality_works_and_inequality_is_rejected() {
         use kotoba_core::cid::KotobaCid;
         use kotoba_kqe::datom::{Datom, Value};
 
@@ -2710,30 +2742,84 @@ mod tests {
         ];
         let schema = schema_from_predicates(&deltas);
         let pg = kotoba_kqe::enterprise::dialect_by_name("postgresql").unwrap();
-        let count = |sql: &str| {
-            let c = pg.compile(sql, &schema, "out").unwrap();
-            c.program
-                .evaluate_delta(&deltas)
-                .iter()
-                .filter(|d| d.attribute() == "out" && d.is_assert())
-                .count()
-        };
-        // Equality filters correctly.
+
+        // Equality compiles and filters to the matching row.
+        let eq = pg
+            .compile(
+                r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o = 'admin'"#,
+                &schema,
+                "out",
+            )
+            .unwrap();
+        let n = eq
+            .program
+            .evaluate_delta(&deltas)
+            .iter()
+            .filter(|d| d.attribute() == "out" && d.is_assert())
+            .count();
+        assert_eq!(n, 1, "equality on scalar text must filter to the matching row");
+
+        // Non-equality operators are rejected at compile (fail-loud).
+        for sql in [
+            r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o <> 'user'"#,
+            r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o LIKE 'adm%'"#,
+            r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o > 'm'"#,
+        ] {
+            match pg.compile(sql, &schema, "out") {
+                Ok(_) => panic!("non-equality WHERE must be rejected: {sql}"),
+                Err(e) => assert!(
+                    e.to_string().contains("unsupported WHERE"),
+                    "unexpected error for {sql}: {e}"
+                ),
+            }
+        }
+    }
+
+    /// (a) Object value resolution: the handler reverse-indexes object CIDs back
+    /// to source scalar text via `object_value_cid` + `readable_value` (the exact
+    /// two lines kg_query uses), so `SELECT t.s, t.o` returns "admin", not a hash.
+    #[test]
+    fn sql_object_values_resolve_to_readable_text() {
+        use kotoba_core::cid::KotobaCid;
+        use kotoba_kqe::datom::{Datom, Value};
+
+        let g = KotobaCid::from_bytes(b"g");
+        let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
+        let deltas = vec![
+            Delta::assert_datom(Datom::assert(
+                cid("alice"),
+                "kg/claim/role".into(),
+                Value::Text("admin".into()),
+                g.clone(),
+            )),
+            Delta::assert_datom(Datom::assert(
+                cid("bob"),
+                "kg/claim/age".into(),
+                Value::Integer(42),
+                g,
+            )),
+        ];
+        let index: std::collections::HashMap<String, String> = deltas
+            .iter()
+            .filter_map(|d| {
+                kotoba_kqe::object_value_cid(d.value())
+                    .map(|c| (c.to_multibase(), readable_value(d.value())))
+            })
+            .collect();
+
+        // A derived fact carries the object as Value::Cid(object_value_cid(value)).
+        let admin_cid =
+            kotoba_kqe::object_value_cid(&Value::Text("admin".into())).unwrap();
         assert_eq!(
-            count(r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o = 'admin'"#),
-            1,
-            "equality on scalar text must filter to the matching row"
+            index.get(&admin_cid.to_multibase()).map(String::as_str),
+            Some("admin"),
+            "text object CID must resolve back to readable text"
         );
-        // Non-equality is silently dropped → unfiltered superset (documented footgun).
+        let age_cid = kotoba_kqe::object_value_cid(&Value::Integer(42)).unwrap();
         assert_eq!(
-            count(r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o <> 'user'"#),
-            2,
-            "non-equality WHERE is currently a no-op (returns all rows)"
-        );
-        assert_eq!(
-            count(r#"SELECT t.s, t.o FROM "kg/claim/role" t WHERE t.o LIKE 'adm%'"#),
-            2,
-            "LIKE on scalar is currently a no-op (returns all rows)"
+            index.get(&age_cid.to_multibase()).map(String::as_str),
+            Some("42"),
+            "integer object CID must resolve back to its decimal string"
         );
     }
 }

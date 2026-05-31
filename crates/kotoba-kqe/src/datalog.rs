@@ -91,6 +91,17 @@ fn value_to_cid(value: &Value) -> Option<KotobaCid> {
     }
 }
 
+/// The object CID a `Value` normalises to in the datalog fact base — the same
+/// mapping `evaluate_delta` uses internally. Returns `None` for variants that
+/// are not indexed as objects (e.g. `Float`, `Bytes`, `VectorF32`).
+///
+/// Public so callers can build a reverse index (object CID → source value) and
+/// resolve derived object CIDs back to their original values, which the engine
+/// itself does not carry (derived facts store only the CID).
+pub fn object_value_cid(value: &Value) -> Option<KotobaCid> {
+    value_to_cid(value)
+}
+
 // ---------------------------------------------------------------------------
 // DatalogProgram implementation
 // ---------------------------------------------------------------------------

@@ -423,7 +423,18 @@ fn apply_where(
             apply_where(left, tables, schema, state)?;
             apply_where(right, tables, schema, state)
         }
-        _ => Ok(()),
+        // Parenthesised sub-expression — unwrap and recurse.
+        Expr::Nested(inner) => apply_where(inner, tables, schema, state),
+        // Fail loud on anything else. The EAV projection compiles objects into a
+        // CID space that has no ordering or substring structure, so `<>`, `>`, `<`,
+        // `>=`, `<=`, `LIKE`, `OR`, `IN`, `BETWEEN` cannot be evaluated correctly —
+        // previously they were silently dropped and returned the unfiltered
+        // superset. Reject them so callers get an error instead of wrong rows.
+        other => bail!(
+            "unsupported WHERE expression: only equality `col = 'literal'` joined by AND \
+             is supported (operators like <>, >, <, LIKE, OR, IN, BETWEEN have no meaning \
+             in the CID-hashed object space and would silently return unfiltered rows); got {other:?}"
+        ),
     }
 }
 
