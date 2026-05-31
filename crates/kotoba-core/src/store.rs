@@ -11,6 +11,18 @@ pub trait BlockStore: Send + Sync {
     fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>>;
     fn has(&self, cid: &KotobaCid) -> bool;
 
+    /// Write a block synchronously to every persistent tier, returning Ok
+    /// only after durability is confirmed.  Default = `put` (single-tier
+    /// stores are already durable).  Multi-tier implementations such as
+    /// `TieredBlockStore` MUST override to bypass the fire-and-forget cold
+    /// spawn and surface real errors to the caller.
+    ///
+    /// Use for blocks where silent cold-tier loss would be catastrophic:
+    /// wrapped vault keys, root commit pointers, IPNS heads.
+    fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        self.put(cid, data)
+    }
+
     /// Remove a block. Default no-op for read-only or append-only stores.
     fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
         let _ = cid;

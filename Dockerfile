@@ -20,6 +20,7 @@ RUN sed -i '/^[[:space:]]*"examples\//d' Cargo.toml
 # binary that exposes serve / sparql / cypher / kg / block / quad / health
 # subcommands (unified CLI, ADR-aligned, 2026-05-27).
 RUN cargo build --release --locked -p kotoba-cli \
+        --features kotoba-server/wasm-runtime \
     && strip target/release/kotoba
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────

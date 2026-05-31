@@ -86,10 +86,19 @@ impl SovereignCrypto {
                     serde_json::from_slice(&data).context("parse key-ref JSON")?;
                 let cid = KotobaCid::from_multibase(&key_ref.cid)
                     .ok_or_else(|| anyhow!("parse key ref CID: {}", key_ref.cid))?;
-                let wrapped = block_store
-                    .get(&cid)
+                // Symmetric retry with store_block_durable: the cold IPFS
+                // sidecar (Kubo) often isn't bound to localhost:5001 yet
+                // when init_crypto runs at t≈0.4s after process start.
+                // Without this loop the first get() returned a connection
+                // error, was caught by the outer match arm, and re-fired
+                // genesis — losing the previously stored vault key on
+                // every pod restart.
+                let block = load_block_durable(block_store, &cid)
+                    .await
                     .context("load wrapped key block")?
                     .ok_or_else(|| anyhow!("wrapped key block not found: {}", key_ref.cid))?;
+                let wrapped = decode_wrapped_block(&block)
+                    .context("decode wrapped key block")?;
                 let vault_key_bytes =
                     hpke_open(&identity.dh_secret, &wrapped).context("HPKE unwrap vault key")?;
                 if vault_key_bytes.len() != 32 {
@@ -131,6 +140,14 @@ impl SovereignCrypto {
     }
 
     /// Genesis flow: generate a new random vault key, wrap it, persist.
+    ///
+    /// The wrapped-key block is critical: if it is lost (e.g. the cold tier
+    /// silently dropped it because the IPFS sidecar wasn't ready when this pod
+    /// fired the put), the next restart sees a stale pointer + missing block
+    /// and re-genesises, losing every prior encrypted blob.  To avoid that
+    /// dead-loop we (a) write the pointer ONLY after `block_store.has(cid)`
+    /// confirms the block has actually landed, and (b) retry the put with
+    /// backoff for up to ~30 s before giving up.
     async fn genesis(
         identity: &AgentIdentity,
         kse_store: &KseStore,
@@ -143,12 +160,20 @@ impl SovereignCrypto {
         // HPKE-wrap with agent's X25519 public key
         let pk = identity.x25519_public_key();
         let wrapped = hpke_seal(&pk, raw_key.as_ref()).context("HPKE wrap vault key")?;
+        // The block store labels every put with cid-codec=dag-cbor, so the
+        // bytes MUST be valid DAG-CBOR or Kubo's `pin/add` rejects the block
+        // ("pin: unexpected content after end of cbor object").  Wrap the raw
+        // HPKE bytes in a CBOR byte string so the on-the-wire payload parses.
+        let block = encode_wrapped_block(&wrapped)
+            .context("CBOR-encode wrapped key block for IPFS storage")?;
 
-        // Store wrapped blob under an IPFS-compatible content CID.
-        let cid = store_block(block_store, &wrapped)?;
+        // Store wrapped blob under an IPFS-compatible content CID — retried
+        // until the block is durably present in the BlockStore (which for the
+        // production TieredBlockStore<Memory, Kubo> means landed in Kubo).
+        let cid = store_block_durable(block_store, &block).await?;
         let cid_mb = cid.to_multibase();
 
-        // Write key-ref pointer
+        // Write key-ref pointer ONLY after durability is confirmed.
         let key_ref = KeyRef {
             cid: cid_mb.clone(),
             version: 1,
@@ -205,7 +230,9 @@ impl SovereignCrypto {
         // Wrap and store
         let pk = identity.x25519_public_key();
         let wrapped = hpke_seal(&pk, raw_key.as_ref()).context("HPKE wrap rotated vault key")?;
-        let cid = store_block(block_store, &wrapped)?;
+        let block = encode_wrapped_block(&wrapped)
+            .context("CBOR-encode rotated wrapped key block")?;
+        let cid = store_block(block_store, &block)?;
         let cid_mb = cid.to_multibase();
 
         let new_version = current_version + 1;
@@ -277,6 +304,69 @@ async fn write_key_ref(kse_store: &KseStore, slug: &str, key_ref: &KeyRef) -> Re
     Ok(())
 }
 
+/// Symmetric to `store_block_durable`: retry `block_store.get` with
+/// exponential backoff so the wrapped-key load path can wait for the IPFS
+/// sidecar to come up at pod startup.  Returns `Ok(None)` only when Kubo
+/// affirmatively reports the block as missing; transient connection
+/// failures keep retrying within the budget.
+async fn load_block_durable(
+    block_store: &Arc<dyn BlockStore + Send + Sync>,
+    cid: &KotobaCid,
+) -> Result<Option<bytes::Bytes>> {
+    // ~60 s total budget — pod1 cleared the bar at 15.6 s in production but
+    // pod2 needed just over 15.5 s and fell through, so we extend the tail
+    // out to 30 s singles to absorb worse-case Kubo restart latency
+    // (PVC attach, lock cleanup loop, sled WAL replay).
+    let backoffs_ms: [u64; 8] = [500, 1_000, 2_000, 4_000, 8_000, 15_000, 15_000, 15_000];
+    let mut last_err: Option<anyhow::Error> = None;
+    for (i, wait_ms) in std::iter::once(0u64).chain(backoffs_ms).enumerate() {
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+        match block_store.get(cid) {
+            Ok(Some(b)) => {
+                if i > 0 {
+                    tracing::info!(cid = %cid.to_multibase(), attempts = i + 1,
+                        "load_block_durable: retrieved after retry");
+                }
+                return Ok(Some(b));
+            }
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                tracing::warn!(cid = %cid.to_multibase(), attempt = i, err = %e,
+                    "load_block_durable: cold get failed, will retry");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("load_block_durable exhausted retries")))
+}
+
+/// Wrap raw HPKE-sealed bytes in a DAG-CBOR byte string so the resulting
+/// block parses cleanly as DAG-CBOR.  Kubo's `pin/add` validates the block
+/// against the codec announced at put time (we use `cid-codec=dag-cbor`);
+/// if the bytes aren't valid CBOR, pin/add returns 500 "pin: unexpected
+/// content after end of cbor object".  This wrapper makes the wrapped vault
+/// key a single `bytes(...)` CBOR atom — parseable, no children, eligible
+/// for direct pinning.
+fn encode_wrapped_block(wrapped: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(wrapped.len() + 16);
+    ciborium::into_writer(&serde_bytes::Bytes::new(wrapped), &mut buf)
+        .map_err(|e| anyhow!("cbor encode wrapped key block: {e}"))?;
+    Ok(buf)
+}
+
+/// Inverse of `encode_wrapped_block`.  Falls back to returning the input
+/// verbatim when decoding fails so legacy blocks (written before the
+/// CBOR-wrapping fix) remain loadable across the upgrade.
+fn decode_wrapped_block(block: &[u8]) -> Result<Vec<u8>> {
+    let decoded: Result<serde_bytes::ByteBuf, _> = ciborium::from_reader(block);
+    match decoded {
+        Ok(buf) => Ok(buf.into_vec()),
+        Err(_) => Ok(block.to_vec()),
+    }
+}
+
 /// Store raw bytes in the BlockStore and return the CID.
 fn store_block(block_store: &Arc<dyn BlockStore + Send + Sync>, data: &[u8]) -> Result<KotobaCid> {
     // CID = IPFS-compatible content-address of the stored bytes.
@@ -285,6 +375,53 @@ fn store_block(block_store: &Arc<dyn BlockStore + Send + Sync>, data: &[u8]) -> 
         .put(&cid, data)
         .context("write wrapped key block")?;
     Ok(cid)
+}
+
+/// Store raw bytes using the BlockStore's `put_durable` path (= synchronous
+/// across every tier).  Retries with exponential backoff for ~30 s to absorb
+/// the pod-startup window where the cold IPFS sidecar isn't bound yet.
+///
+/// Used for the wrapped-key block at genesis time, where a silent cold-tier
+/// drop would cause the next restart to re-genesis and lose every prior
+/// encrypted blob.
+async fn store_block_durable(
+    block_store: &Arc<dyn BlockStore + Send + Sync>,
+    data: &[u8],
+) -> Result<KotobaCid> {
+    let cid = KotobaCid::from_bytes(data);
+    let backoffs_ms: [u64; 5] = [1_000, 2_000, 4_000, 8_000, 15_000];
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for (i, wait_ms) in std::iter::once(0u64).chain(backoffs_ms).enumerate() {
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
+        match block_store.put_durable(&cid, data) {
+            Ok(()) => {
+                if i > 0 {
+                    tracing::info!(cid = %cid.to_multibase(), attempts = i + 1,
+                        "store_block_durable: confirmed after retry");
+                }
+                // Pin the block so the cold tier (Kubo) does not GC it under
+                // storage pressure.  Without this, the durable put protects
+                // against the startup-race drop but not against Kubo's
+                // background GC of unpinned blocks.
+                block_store.pin(&cid);
+                return Ok(cid);
+            }
+            Err(e) => {
+                tracing::warn!(cid = %cid.to_multibase(), attempt = i, err = %e,
+                    "store_block_durable: cold put failed, will retry");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| anyhow!("store_block_durable exhausted retries"))
+        .context(format!(
+            "wrapped key block never landed in cold tier (cid={})",
+            cid.to_multibase()
+        )))
 }
 
 #[cfg(test)]

@@ -22,6 +22,23 @@ pub enum CacaoError {
     Ed25519(String),
     #[error("did resolver error: {0}")]
     DidResolver(String),
+    #[error("eth rpc error: {0}")]
+    Rpc(String),
+    #[error("ERC-1271 isValidSignature returned a non-magic value")]
+    Eip1271Invalid,
+}
+
+/// Read-only EVM access needed for ERC-1271 smart-account signature checks.
+///
+/// `kotoba-auth` is I/O-free by design (synchronous, used in hot verification
+/// paths), so the network round-trips are injected by the caller — the host EVM
+/// bridge (`kotoba-runtime`) or `kotoba-server`. Implementations perform the
+/// corresponding `eth_getCode` / `eth_call` JSON-RPC requests.
+pub trait EthRpc {
+    /// `eth_getCode(address)` → deployed bytecode (empty ⇒ EOA, not a contract).
+    fn get_code(&self, address: &[u8; 20]) -> Result<Vec<u8>, String>;
+    /// `eth_call(to, calldata)` → ABI-encoded return bytes (view call).
+    fn call(&self, to: &[u8; 20], calldata: &[u8]) -> Result<Vec<u8>, String>;
 }
 
 impl From<DidResolverError> for CacaoError {
@@ -175,6 +192,68 @@ impl Cacao {
                 Ok(self.p.iss.clone())
             }
             other => Err(CacaoError::UnsupportedSigType(other.to_string())),
+        }
+    }
+
+    /// Verify an `eip191` CACAO supporting BOTH externally-owned accounts (EOA,
+    /// secp256k1 recovery) and ERC-1271 smart-contract accounts (ERC-4337 Smart
+    /// Wallets, whose signatures are NOT ECDSA-recoverable).
+    ///
+    /// Strategy:
+    /// 1. Try EOA recovery — if it recovers the issuer address, done (no RPC).
+    /// 2. Otherwise probe `eth_getCode(issuer)`. Empty ⇒ a real EOA whose sig
+    ///    simply didn't match ⇒ `AddressMismatch`.
+    /// 3. Non-empty ⇒ contract account ⇒ call `isValidSignature(hash, sig)`
+    ///    (EIP-1271) and accept iff it returns the `0x1626ba7e` magic value.
+    ///
+    /// The `rpc` calls are injected so this crate stays I/O-free. For `EdDSA`
+    /// CACAOs this delegates to [`verify_signature`].
+    ///
+    /// The hash passed to `isValidSignature` is the **EIP-191 personal_sign
+    /// digest** of the SIWE message (matching the `eip191` CACAO type and the EOA
+    /// branch), not an EIP-712 hash.
+    ///
+    /// This is an **opt-in** method: the default [`verify_signature`] and
+    /// `DelegationChain::verify` paths remain EOA-only and do not call it.
+    /// Routing smart-account CACAOs here requires threading an [`EthRpc`] through
+    /// those call sites — a separate increment.
+    pub fn verify_signature_eip191_smart(&self, rpc: &dyn EthRpc) -> Result<String, CacaoError> {
+        if self.s.t != "eip191" {
+            return self.verify_signature();
+        }
+        let expected_addr = eth::parse_eth_address_from_did(&self.p.iss)?;
+        let msg = self.siwe_message();
+        let hash = eth::personal_sign_hash(msg.as_bytes());
+        let sig_bytes = hex::decode(self.s.s.trim_start_matches("0x"))?;
+
+        // 1. EOA fast path — only meaningful for a 65-byte recoverable sig.
+        if sig_bytes.len() == 65 {
+            if let Ok(recovered) = eth::recover_eth_address(&hash, &sig_bytes) {
+                if recovered == expected_addr {
+                    return Ok(eth::eth_address_to_erc725_did(&recovered));
+                }
+            }
+        }
+
+        // 2. Is the issuer a contract?
+        let code = rpc.get_code(&expected_addr).map_err(CacaoError::Rpc)?;
+        if code.is_empty() {
+            // Genuine EOA whose recovery failed/mismatched.
+            return Err(CacaoError::AddressMismatch {
+                expected: hex::encode(expected_addr),
+                got: "eoa-recovery-mismatch".to_string(),
+            });
+        }
+
+        // 3. ERC-1271 on-chain verification.
+        let calldata = eth::eip1271::is_valid_signature_calldata(&hash, &sig_bytes);
+        let ret = rpc
+            .call(&expected_addr, &calldata)
+            .map_err(CacaoError::Rpc)?;
+        if eth::eip1271::is_magic_value(&ret) {
+            Ok(eth::eth_address_to_erc725_did(&expected_addr))
+        } else {
+            Err(CacaoError::Eip1271Invalid)
         }
     }
 
@@ -1026,5 +1105,104 @@ mod tests {
         let chain = DelegationChain::new(cacao);
         let result = chain.verify("g", "datom:transact");
         assert!(result.is_err(), "wrong capability must be rejected");
+    }
+
+    // ── ERC-1271 smart-account verification (verify_signature_eip191_smart) ───
+
+    /// Mock EVM RPC: configurable `eth_getCode` result and `eth_call` return.
+    /// `None` for either field makes that method panic (proves it wasn't called).
+    struct MockRpc {
+        code: Option<Vec<u8>>,
+        call_ret: Option<Vec<u8>>,
+    }
+    impl EthRpc for MockRpc {
+        fn get_code(&self, _address: &[u8; 20]) -> Result<Vec<u8>, String> {
+            Ok(self.code.clone().expect("get_code must not be called"))
+        }
+        fn call(&self, _to: &[u8; 20], _calldata: &[u8]) -> Result<Vec<u8>, String> {
+            Ok(self.call_ret.clone().expect("call must not be called"))
+        }
+    }
+
+    /// Build an eip191 CACAO signed by a real secp256k1 key, with `iss` set to
+    /// the derived address (so EOA recovery succeeds).
+    fn signed_eip191_cacao() -> Cacao {
+        use k256::ecdsa::SigningKey;
+        use sha3::{Digest, Keccak256};
+
+        let sk = SigningKey::from_bytes((&[0x33u8; 32]).into()).unwrap();
+        let pk = sk.verifying_key();
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&Keccak256::digest(&pk.to_encoded_point(false).as_bytes()[1..])[12..]);
+
+        let mut cacao = base_cacao(&eth::eth_address_to_erc725_did(&addr));
+        let hash = eth::personal_sign_hash(cacao.siwe_message().as_bytes());
+        let (sig, rec_id) = sk.sign_prehash_recoverable(&hash).unwrap();
+        let mut sig65 = sig.to_bytes().to_vec();
+        sig65.push(u8::from(rec_id) + 27);
+        cacao.s.s = hex::encode(&sig65);
+        cacao
+    }
+
+    #[test]
+    fn smart_verify_eoa_fast_path_skips_rpc() {
+        let cacao = signed_eip191_cacao();
+        // Both RPC methods panic if touched — the EOA fast path must short-circuit.
+        let rpc = MockRpc {
+            code: None,
+            call_ret: None,
+        };
+        let did = cacao.verify_signature_eip191_smart(&rpc).unwrap();
+        assert!(did.starts_with("did:erc725:gftd:"));
+    }
+
+    #[test]
+    fn smart_verify_contract_account_magic_value_accepts() {
+        // iss address that the (zero) signature won't recover to → forces the
+        // ERC-1271 contract path.
+        let mut cacao =
+            base_cacao("did:erc725:gftd:260425:0x4242424242424242424242424242424242424242");
+        cacao.s.s = "00".repeat(65);
+        let mut magic = vec![0u8; 32];
+        magic[..4].copy_from_slice(&eth::eip1271::MAGIC_VALUE);
+        let rpc = MockRpc {
+            code: Some(vec![0x60, 0x80, 0x60, 0x40]), // non-empty ⇒ contract
+            call_ret: Some(magic),
+        };
+        let did = cacao.verify_signature_eip191_smart(&rpc).unwrap();
+        assert_eq!(
+            did,
+            "did:erc725:gftd:260425:0x4242424242424242424242424242424242424242"
+        );
+    }
+
+    #[test]
+    fn smart_verify_contract_account_non_magic_rejects() {
+        let mut cacao =
+            base_cacao("did:erc725:gftd:260425:0x4242424242424242424242424242424242424242");
+        cacao.s.s = "00".repeat(65);
+        let rpc = MockRpc {
+            code: Some(vec![0x60, 0x80]),
+            call_ret: Some(vec![0u8; 32]), // zero word ⇒ invalid
+        };
+        assert!(matches!(
+            cacao.verify_signature_eip191_smart(&rpc),
+            Err(CacaoError::Eip1271Invalid)
+        ));
+    }
+
+    #[test]
+    fn smart_verify_eoa_mismatch_rejects_without_eip1271() {
+        let mut cacao =
+            base_cacao("did:erc725:gftd:260425:0x4242424242424242424242424242424242424242");
+        cacao.s.s = "00".repeat(65);
+        let rpc = MockRpc {
+            code: Some(vec![]), // empty ⇒ EOA, not a contract
+            call_ret: None,     // call must NOT happen
+        };
+        assert!(matches!(
+            cacao.verify_signature_eip191_smart(&rpc),
+            Err(CacaoError::AddressMismatch { .. })
+        ));
     }
 }

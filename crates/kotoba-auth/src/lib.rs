@@ -17,7 +17,10 @@ pub use did_document::{
     KOTOBA_NODE_SERVICE,
 };
 pub use did_key::{ed25519_pubkey_to_did_key, parse_ed25519_did_key};
-pub use eth::{eth_address_to_erc725_did, personal_sign_hash, recover_eth_address};
+pub use eth::{
+    eth_address_to_erc725_did, is_valid_address, is_valid_checksum_address, keccak256,
+    parse_address, personal_sign_hash, recover_eth_address, to_checksum_address,
+};
 pub use passkey::{
     AuthLevel, Authorization, KeyHierarchy, KeyOpKind, KeyOpPolicy, PasskeyAssertion, PasskeyGate,
     PasskeyGateError,

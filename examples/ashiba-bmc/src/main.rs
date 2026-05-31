@@ -2,7 +2,7 @@
 //! Journal WAL → ProllyTree indexes → Kubo cold tier → AEAD summary → IPFS self-pin) + Datalog
 //! coverage scoring.
 //!
-//! Data source:  `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v51.toml`
+//! Data source:  `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v60.toml`
 //! Rules source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/coverage.dl`
 //!
 //! Requires a running Kubo daemon (default `http://localhost:5001`); override with
@@ -176,13 +176,42 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     ("sol_outbound_emailer_datomic",   "solution",   "outbound_emailer Datomic-first ✓ (iter-51) — Pull join 2 actor 6-var q() → Murakumo + vendor 3社 + mailer XRPC → transact 5 Datoms", true),
     ("sol_safety_predictor_datomic",   "solution",   "safety_predictor Datomic-first ✓ (iter-51) — Pull image_cid q() → EVO-X2 v7 multimodal → transact 4 Datoms + alert escalator", true),
     ("sol_actors_datomic_complete",    "solution",   "4 actor 全部 Datomic-first 完成 ✓ (iter-51) — Pull-Transact pattern, BPMN slim, Datom 5-tuple SSoT", true),
+    // === iter-52 BPMN slim + Datomic schema seed + preflight ===
+    ("sol_bpmn_slim_payload",     "solution",   "BPMN slim payload ✓ (iter-52) — owner-resolver ioMapping 3 inputs only, body pulled via Datomic q(), Zeebe payload 43× reduction", true),
+    ("sol_datomic_schema_seed",   "solution",   "kotoba-datomic schema EDN ✓ (iter-52) — 21 :ashiba/* attrs (sat 7 + own 5 + out 5 + saf 4), :db/index on 4 hot attrs, :db/unique on site-id", true),
+    ("sol_preflight_8_checks",    "solution",   "Preflight script ✓ (iter-52) — 8 checks all pass: manifest, 4 py modules, app.py smoke, Dockerfile, schema.edn 21 attrs, BPMN xml + slim ioMapping, kubectl dry-run, BMC linkage", true),
+    // === iter-53 actor integrity smoke + Pull-Transact graph verification ===
+    ("sol_smoke_harness",                  "solution",   "Actor integrity smoke ✓ (iter-53) — 4 module import + WRITTEN_ATTRIBUTES 21/21 == schema.edn + PULLS_FROM graph all-upstream-resolved", true),
+    ("sol_pull_transact_graph_verified",   "solution",   "Pull-Transact graph 静的検証 ✓ (iter-53) — owner→sat (7), outbound→sat+own (12 join), safety→sat (7), 全 schema drift CI block", true),
+    // === iter-54 BPMN seed script + 1-tile E2E test oracle ===
+    ("sol_bpmn_seed_script",    "solution",   "BPMN seed script ✓ (iter-54) — deploy_jp_ashiba.sh / preflight gate + zbctl deploy + kotoba transact schema + Zeebe REST verify", true),
+    ("sol_1tile_test_oracle",   "solution",   "1-tile E2E test oracle ✓ (iter-54) — Tokyo Marunouchi tile fixture + expected Datoms (21/21 attrs) + 4 positive q() + 2 negative assertion", true),
+    // === iter-55 verify_1tile.sh + Deploy Runbook ===
+    ("sol_verify_1tile_runner",   "solution",   "verify_1tile.sh ✓ (iter-55) — 6 assertion (Q1-Q4 positive + N1 N2 negative) using kotoba datalog CLI, exit 0/1 for CI", true),
+    ("sol_deploy_runbook",        "solution",   "Deploy runbook ✓ (iter-55) — RUNBOOK-deploy.md with 13-artifact inventory, pre-deploy/build/deploy/smoke/rollback/observability sections", true),
+    // === iter-56 GH Actions CI workflow ===
+    ("sol_gh_actions_ci",         "solution",   "GH Actions CI ✓ (iter-56) — 3 jobs (preflight 9/9 + smoke / BPMN xml + slim check / cargo build + BMC 9/9 regression gate) on every PR", true),
+    ("sol_bpmn_slim_ci_check",    "solution",   "BPMN slim ioMapping CI ✓ (iter-56) — 3 downstream tasks forced to slim payload (site_id+run_graph+*_tx_cid), body leak blocked at CI", true),
+    // === iter-57 2nd outbound pilot design ===
+    ("sol_pilot_2_design",  "solution",  "PILOT-2-design.md ✓ (iter-57) — 100 sites / 4 weeks / 6 demoted hypotheses target table / KILL-PIVOT-SCALE decision criteria / 4 kotoba q() measurement plan / daily 09:00 JST snapshot discipline", true),
+    // === iter-58 Security audit → sovereign migration plan ===
+    ("sol_security_audit_iter57",       "solution",          "Security audit ✓ (iter-57 conv) — 4 gaps: kotoba.gftd.ai 未deploy, SecureVault wrapper 0件, IPFS pin permanence, plaintext cache. Mac key OK", true),
+    ("sol_sovereign_migration_plan",    "solution",          "Sovereign migration plan ✓ (iter-58) — 7 step + cutover gate + 5 risk register, jp-ashiba only", true),
+    ("ua_sovereign_data_stack",         "unfair_advantage",  "Sovereign stack design ✓ (iter-58) — SecureVault + Sovereign X25519 + CACAO + default-private + 12.7K QPS nonce, vendor Vultr 依存脱却", true),
+    ("sol_sovereign_deploy_remaining",  "solution",          "Sovereign deploy 残り — kotoba server deploy, operator key, 4 CACAO chains, 21 attrs SecureVault, IPFS kill-switch, FileVault, 14-day shadow diff", false),
+    // === iter-59 SecureVault Python wrapper + tier classification ===
+    ("sol_kotoba_seal_helper",      "solution",  "kotoba_seal.py ✓ (iter-59) — 14 public + 4 tier-2 + 3 tier-3 = 21 attrs, validate_tx_payload() rejects plaintext at runtime + CI", true),
+    ("sol_smoke_5_checks",          "solution",  "smoke 5-check ✓ (iter-59) — schema 21 + WRITTEN 21 + Pull-Transact + tier cover 21 + all-classified", true),
+    ("sol_outbound_tier3_reference","solution",  "outbound_emailer Tier-3 reference impl ✓ (iter-59) — seal()+validate_tx_payload() comment showing wire pattern", true),
+    // === iter-60 4 actor seal+validate wired ===
+    ("sol_4_actor_seal_wired",  "solution",  "4 actor seal+validate ✓ (iter-60) — sat defense-in-depth + own/saf Tier-2 + out Tier-3 + run_graph param across all transact_*", true),
 ];
 
 fn cid(s: &str) -> KotobaCid {
     KotobaCid::from_bytes(s.as_bytes())
 }
 fn graph_cid() -> KotobaCid {
-    cid("bmc:ashiba:v51")
+    cid("bmc:ashiba:v60")
 }
 fn quad(subject: &str, predicate: &str, object: QuadObject) -> Quad {
     Quad {
@@ -198,7 +227,7 @@ fn build_bmc_facts() -> Vec<Delta> {
     deltas.push(Delta::assert_legacy_quad(quad(
         "bmc:ashiba",
         "bmc/version",
-        QuadObject::Text("v51".into()),
+        QuadObject::Text("v60".into()),
     )));
     deltas.push(Delta::assert_legacy_quad(quad(
         "bmc:ashiba",

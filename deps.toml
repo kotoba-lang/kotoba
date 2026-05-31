@@ -23,6 +23,7 @@ depends_on = [
   "90-docs/adr/2605260004-kotoba-distributed-execution-host.md",
   "90-docs/adr/2605260005-kotoba-passkey-root-authenticator.md",
   "90-docs/adr/2605270000-kotoba-integer-cast-security-hardening.md",
+  "90-docs/adr/2605301800-kotoba-evm-read-verify-surface.md",
   "90-docs/adr/2605302200-kotoba-multimodal-cross-modal-search.md",
 ]
 
@@ -156,3 +157,201 @@ name = "kotoba-agent-identity"
 cluster = "vultr-vke-sjc-31d5f7dc"
 keys = ["KOTOBA_AGENT_ED25519_HEX", "KOTOBA_AGENT_X25519_HEX", "KOTOBA_AGENT_DID"]
 notes = "Stable Ed25519+X25519 keypair for agent DID; prevents ephemeral DID rotation on pod restarts. Created 2026-05-26. All three keys optional in deployment.yaml — falls back to ephemeral did:key if Secret absent."
+
+# ─── 2026-05-30 production hardening: durability chain + WASM host ───────────
+# Single-session 27-fix push that turned kotoba.gftd.ai into a
+# Datomic-over-IPFS substrate + WASM Python LangGraph host.
+# ADR: 90-docs/adr/2605301045-kotoba-durability-chain-wasm-langgraph-host.md
+
+[knowledge.kubo-block-store-connection-pool]
+discovered_on = "2026-05-30"
+category      = "optimization"
+severity      = "critical"
+status        = "resolved"
+summary       = "KuboBlockStore connection burst → 318 CLOSE_WAIT + 287 FIN_WAIT2 + 361/min cold-put failures."
+details       = """
+Original config: reqwest default pool (unbounded) + 500 ms connect_timeout
++ no concurrency cap.  Each ProllyTree builder thread fired hundreds of
+parallel block/put requests.  Kubo's HTTP handler leaked CLOSE_WAIT under
+burst, the local pool saturated, and every additional put timed out at
+500 ms.  Fix combo: `pool_max_idle_per_host = 8`, `connect_timeout = 5 s`,
+`pool_idle_timeout = 30 s`, AND an explicit `tokio::sync::Semaphore` with
+`KUBO_MAX_INFLIGHT = 16` permits gating put/get.  Result: 361/min ⇒ 0.
+"""
+impact        = "Production wrote correctly but failed every cold-put burst until F-1f."
+resolved_on   = "2026-05-30"
+affects_files = ["crates/kotoba-store/src/kubo_store.rs"]
+references    = ["F-1f"]
+
+[knowledge.wrapped-vault-key-durable-write-load]
+discovered_on = "2026-05-30"
+category      = "bug"
+severity      = "critical"
+status        = "resolved"
+summary       = "Wrapped vault key was lost on every pod restart; load_or_genesis fell through to genesis on startup race."
+details       = """
+1) `TieredBlockStore::put` spawned cold-puts fire-and-forget — the wrapped
+   key block could be silently dropped if Kubo wasn't ready yet at genesis.
+   Fix: new trait method `put_durable` which `TieredBlockStore` overrides
+   to a synchronous cold write + error propagation.  `SovereignCrypto::
+   genesis` now retries `put_durable` with exponential backoff (~30 s).
+2) Even when the block landed, `load_or_genesis` called `block_store.get`
+   once at process start (t ≈ 0.4 s) before Kubo bound localhost:5001;
+   the transport error was caught and the path fell through to genesis,
+   discarding the existing key.  Fix: symmetric retry helper
+   `load_block_durable` with 8 attempts / ~60 s budget.  Only Ok(None)
+   from Kubo (block genuinely missing) falls through.
+3) `TieredBlockStore::pin/unpin` only touched the hot tier; pin syscall
+   never reached Kubo.  Fix: dispatch to both tiers.
+4) `KuboBlockStore::pin` was an in-memory HashSet — never issued
+   `/api/v0/pin/add`.  Fix: real HTTP pin/add (recursive=false because
+   recursive traversal requires valid DAG-CBOR child links).
+5) Wrapped key was raw HPKE bytes but put with `cid-codec=dag-cbor`, so
+   `pin/add` 500-d with "pin: unexpected content after end of cbor
+   object".  Fix: CBOR-wrap the HPKE bytes as `serde_bytes::Bytes` via
+   ciborium so the block IS valid DAG-CBOR.
+Result: vault key `bafyreic56r2zn…` persisted across 9+ deploys and
+multiple pod deletions.
+"""
+impact        = "Every restart used to lose the vault key — all prior encrypted blobs would have been undecryptable."
+resolved_on   = "2026-05-30"
+affects_files = [
+    "crates/kotoba-kse/src/sovereign_key.rs",
+    "crates/kotoba-store/src/tiered_store.rs",
+    "crates/kotoba-store/src/kubo_store.rs",
+    "crates/kotoba-core/src/store.rs",
+]
+references    = ["F-1g", "F-1j", "F-1k", "F-1l", "F-1n"]
+
+[knowledge.ipns-head-persistence]
+discovered_on = "2026-05-30"
+category      = "bug"
+severity      = "critical"
+status        = "resolved"
+summary       = "Graph IPNS heads vanished on every pod restart (InMemoryIpnsRegistry default + Kubo offline=true)."
+details       = """
+1) `InMemoryIpnsRegistry` was the default — no PVC persistence.  Set
+   `KOTOBA_IPNS=kubo` so `KuboIpnsRegistry` (real Kubo /api/v0/name)
+   is used.
+2) Kubo `name/publish` requires the key alias in the local keystore
+   first.  Added auto-keygen retry: on "no key by the given name was
+   found", call `generate_ed25519_key(name)` then retry publish.
+3) `name/publish?offline=true` skipped the local datastore write on Kubo
+   0.34.1 — records vanished on kubo container restart.  Dropped the
+   flag so publish persists to repo + DHT.
+4) `name/resolve` 500 with body "cannot resolve" was treated as a hard
+   error; mapped it to NotFound (alongside the existing "not found" /
+   "could not resolve" matches) so callers can treat uninitialised
+   heads as fresh-start.
+5) Synchronous publish blocked `datomic.transact` for 20 s on DHT
+   propagation.  Now: in-memory cache updated synchronously,
+   `publish_kubo` runs via `tokio::spawn` + `spawn_blocking`.  Same-pod
+   read-after-write still hits the cache; cross-peer propagation is
+   eventually-consistent.
+"""
+impact        = "Without these, `datomic.q` returned 'no distributed Datomic/IPNS head' on every restart; transact took 20 s."
+resolved_on   = "2026-05-30"
+affects_files = [
+    "crates/kotoba-ipfs/src/ipns.rs",
+    "deploy/deployment.yaml",
+]
+references    = ["F-1h", "F-1i", "F-1q"]
+
+[knowledge.deployment-pod-lifecycle]
+discovered_on = "2026-05-30"
+category      = "optimization"
+severity      = "high"
+status        = "resolved"
+summary       = "Pod startup chowned 350k+ files; stale repo.lock blocked kubo; probes too strict for WAL replay."
+details       = """
+- `fsGroup = 1000` + `fsGroupChangePolicy = OnRootMismatch` skips the
+  per-pod recursive chown of 350 k Kubo block files (12 min ⇒ 36 s).
+- kubo sidecar args delete `/data/ipfs/repo.lock` and `/data/ipfs/api`
+  (3-retry loop) before `ipfs daemon` so a previous pod's stale lock
+  doesn't pin readiness on "someone else has the lock".
+- readinessProbe `timeoutSeconds 10 failureThreshold 6
+  initialDelaySeconds 10`; livenessProbe `initialDelaySeconds 60
+  timeoutSeconds 10 failureThreshold 6`.  WAL replay + IPNS init can
+  take 35 s before kotoba binds 8080.
+- `resources.requests.memory = 2Gi` / `limits.memory = 8Gi` split so
+  the scheduler can place the pod on the heavily-subscribed A16 nodes
+  while still permitting wasmtime / Python WASM bursts.
+"""
+impact        = "Without these, pod restarts cascaded into 12-min crashloops; PVC Multi-Attach + probe failures compounded."
+resolved_on   = "2026-05-30"
+affects_files = ["deploy/deployment.yaml"]
+references    = ["F-1d", "F-1e", "F-1m"]
+
+[knowledge.audit-fingerprint-opt-out]
+discovered_on = "2026-05-30"
+category      = "limitation"
+severity      = "high"
+status        = "workaround"
+summary       = "Per-request audit middleware piled distributed-commit work on Kubo, manifesting as user query latency."
+details       = """
+`fingerprint_middleware` spawned `commit_protocol_datoms` for every
+incoming request.  The spawned task did block/put + IPNS publish.
+Under burst, the spawn pile-up saturated Kubo's connection cap and
+showed up as user-facing `datomic.q` latency (25 s timeouts).
+Workaround: env gate `KOTOBA_AUDIT_DISABLED=1` set in production.
+Resolved on production but the audit subsystem itself needs a
+sampling / batching story before it can be safely re-enabled.
+"""
+impact        = "User queries timed out at LB while pod was 'healthy' via port-forward — masked by audit pressure on Kubo."
+workaround    = "KOTOBA_AUDIT_DISABLED=1 env var in deploy/deployment.yaml"
+affects_files = ["crates/kotoba-server/src/fingerprint.rs", "deploy/deployment.yaml"]
+references    = ["F-1o", "F-1p"]
+
+[knowledge.wasm-python-langgraph-host]
+discovered_on = "2026-05-30"
+category      = "optimization"
+severity      = "medium"
+status        = "resolved"
+summary       = "kotoba pod = WASM Python LangGraph actor host (componentize-py + MCP kotoba_wasm_run)."
+details       = """
+Production Dockerfile builds with `--features kotoba-server/wasm-runtime`
+so the `kotoba_wasm_run` MCP tool is live.  ProgramStore cache key
+changed from `did/wasm/{agent_did}` to content-CID
+(`KotobaCid::from_bytes(&wasm_bytes).to_multibase()`) so different wasm
+bundles for the same agent DID no longer return the cached old
+Component, and the cache is capped at 16 entries with random eviction
+to bound Cranelift JIT memory.
+Empirical: hakken phase_promotion compiled to an 18 MB componentize-py
+bundle and ran on the production pod via `kotoba_wasm_run` in 8.5 s
+with `assert_quads=1 supersteps_run=1 total_gas_used=215 status=ok`,
+pod stable at 0 restarts.
+"""
+impact        = "Removes the need for a separate K8s LangServer pod per LangGraph actor — kotoba IS the runtime."
+resolved_on   = "2026-05-30"
+affects_files = [
+    "Dockerfile",
+    "crates/kotoba-server/src/mcp.rs",
+    "crates/kotoba-runtime/src/program.rs",
+    "../ai-gftd-project-hakken/lg/wasm/agent.py",
+]
+references    = ["W-1", "W-2", "W-3", "W-4", "W-5"]
+
+[knowledge.kotobase-pin-fanout-dormant]
+discovered_on = "2026-05-30"
+category      = "limitation"
+severity      = "low"
+status        = "open"
+summary       = "F-3 kotobase pin fanout wired in code but inactive — awaits F-4 (kotobase real IPFS backend)."
+details       = """
+`KuboBlockStore::with_remote_pin(IpfsPinClient::from_pin_env())` is
+attached in `server.rs` when `KOTOBA_IPFS_PIN_ENDPOINT` /
+`KOTOBA_IPFS_PIN_JWT` are set.  When configured, every successful
+local `pin/add` fans out (fire-and-forget) to the remote endpoint.
+Currently the `kotoba-ipfs-pin` k8s Secret is not created in
+production — kotobase.gftd.ai is still a CF Worker stub that proxies
+back to the same kotoba backend (would be circular pinning).
+Activation: build a separate kotobase pod with its own Kubo + B2/R2
+datastore plugin, point KOTOBA_IPFS_PIN_ENDPOINT at it, mint a JWT.
+"""
+workaround    = "None needed — kotoba pod is fully durable on its own; kotobase fanout is for off-pod replication only."
+affects_files = [
+    "crates/kotoba-store/src/kubo_store.rs",
+    "crates/kotoba-store/src/ipfs_pin.rs",
+    "crates/kotoba-server/src/server.rs",
+]
+references    = ["F-3", "F-4"]

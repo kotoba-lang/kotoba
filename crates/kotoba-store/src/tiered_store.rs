@@ -64,6 +64,15 @@ impl<H: BlockStore + 'static, C: BlockStore + 'static> BlockStore for TieredBloc
         Ok(())
     }
 
+    /// Durable put: write hot AND cold synchronously, surface cold errors.
+    /// Caller is blocked until both tiers confirm the write — used for the
+    /// wrapped vault key at genesis and similar load-bearing blocks.
+    fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> Result<()> {
+        self.hot.put(cid, data)?;
+        self.cold.put(cid, data)?;
+        Ok(())
+    }
+
     fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>> {
         // Fast path: hot hit
         if let Some(b) = self.hot.get(cid)? {
@@ -89,12 +98,19 @@ impl<H: BlockStore + 'static, C: BlockStore + 'static> BlockStore for TieredBloc
         self.hot.delete(cid)
     }
 
+    /// Pin to BOTH tiers.  Hot is just a flag (BudgetedBlockStore eviction
+    /// guard); cold is the durable pin (Kubo's recursive pin set) that keeps
+    /// the block out of GC.  Pinning only to hot — the previous behaviour —
+    /// left wrapped vault keys eligible for Kubo GC and caused the
+    /// "wrapped key block missing — re-genesising" loop after restart.
     fn pin(&self, cid: &KotobaCid) {
         self.hot.pin(cid);
+        self.cold.pin(cid);
     }
 
     fn unpin(&self, cid: &KotobaCid) {
         self.hot.unpin(cid);
+        self.cold.unpin(cid);
     }
 
     fn is_pinned(&self, cid: &KotobaCid) -> bool {

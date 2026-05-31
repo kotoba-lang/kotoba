@@ -4,9 +4,11 @@ use std::sync::Arc;
 /// `(topic, payload)` pair drained from the KSE inbox.
 type KseInboxItem = (String, Vec<u8>);
 use kotoba_auth::delegation::DelegationChain;
+use kotoba_auth::eth::{abi, token::erc20};
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 /// Type alias for a synchronous local inference function.
 ///
@@ -85,6 +87,10 @@ pub struct HostState {
     /// Dense embedding function — routes to HttpEmbedClient when configured.
     /// Type-erased to avoid kotoba-runtime → kotoba-ingest dependency.
     pub embed_fn: Option<EmbedFn>,
+    /// WASI HTTP context for wasi:http egress.
+    pub wasi_http_ctx: WasiHttpCtx,
+    /// Optional allow-list for outbound HTTP host glob patterns (None = allow all).
+    pub http_egress_allow: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +104,16 @@ pub struct PendingQuad {
 impl HostState {
     pub fn new(agent_did: impl Into<String>, gas_limit: u64) -> Self {
         let wasi_ctx = WasiCtxBuilder::new().inherit_stderr().build();
+        let allow_list = std::env::var("KOTOBA_HTTP_EGRESS_ALLOW")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+
         Self {
             agent_did: agent_did.into(),
             gas_remaining: gas_limit,
@@ -114,6 +130,8 @@ impl HostState {
             kse_inbox: Vec::new(),
             source_chain_head: None,
             embed_fn: None,
+            wasi_http_ctx: WasiHttpCtx::new(),
+            http_egress_allow: allow_list,
         }
     }
 
@@ -196,6 +214,45 @@ impl WasiView for HostState {
     }
 }
 
+impl WasiHttpView for HostState {
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        &mut self.wasi_http_ctx
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.wasi_table
+    }
+
+    fn send_request(
+        &mut self,
+        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+        // Charge gas for outbound HTTP
+        if let Err(_) = self.charge_gas(1000) {
+            return Err(wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(Some("gas exhausted".to_string())).into());
+        }
+
+        // Check allow-list
+        if let Some(allow_list) = &self.http_egress_allow {
+            let host = request.uri().host().unwrap_or("");
+            let allowed = allow_list.iter().any(|pattern| {
+                if pattern.starts_with("*.") {
+                    let suffix = &pattern[1..];
+                    host == &pattern[2..] || host.ends_with(suffix)
+                } else {
+                    host == pattern
+                }
+            });
+            if !allowed {
+                return Err(wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied.into());
+            }
+        }
+
+        Ok(wasmtime_wasi_http::types::default_send_request(request, config))
+    }
+}
+
 /// Central wasmtime Engine shared across all invocations (thread-safe, clone is cheap).
 #[derive(Clone)]
 pub struct KotobaEngine(Engine);
@@ -241,6 +298,8 @@ impl KotobaLinker {
     pub fn bind_kotoba_interfaces(&mut self) -> Result<()> {
         // WASI preview2 — needed by all wasm32-wasip2 components
         wasmtime_wasi::add_to_linker_sync(&mut self.0)?;
+        // WASI HTTP preview2
+        wasmtime_wasi_http::add_only_http_to_linker_sync(&mut self.0)?;
         // Kotoba host interfaces
         bind_kqe(&mut self.0)?;
         bind_kse(&mut self.0)?;
@@ -604,6 +663,76 @@ fn bind_chain(linker: &mut Linker<HostState>) -> Result<()> {
 // EVM JSON-RPC bridge — CALL_FOREIGN class (gas = 1000 per call)
 // All calls use a shared ureq Agent with 5-second timeout.
 
+/// Issue a JSON-RPC POST and return the `result` field, mapping a JSON-RPC
+/// `error` object (or transport failure) to `Err(String)`. Shared by every EVM
+/// bridge method so the request/response handling lives in one place.
+fn evm_rpc_result(
+    agent: &ureq::Agent,
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let resp: serde_json::Value = agent
+        .post(rpc_url)
+        .set("Content-Type", "application/json")
+        .send_json(body)
+        .map_err(|e| e.to_string())?
+        .into_json()
+        .map_err(|e| e.to_string())?;
+    if let Some(err) = resp.get("error") {
+        return Err(err.to_string());
+    }
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
+/// Decode a `0x`-prefixed hex result value into raw bytes.
+fn evm_hex_bytes(result: &serde_json::Value) -> Result<Vec<u8>, String> {
+    hex::decode(result.as_str().unwrap_or("0x").trim_start_matches("0x")).map_err(|e| e.to_string())
+}
+
+/// Leniently parse a `0x`-prefixed hex address into 20 bytes (no EIP-55 check —
+/// these come from trusted app/guest code, not untrusted signatures).
+fn evm_parse_addr(s: &str) -> Result<[u8; 20], String> {
+    let body = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    let bytes = hex::decode(body).map_err(|e| e.to_string())?;
+    if bytes.len() != 20 {
+        return Err(format!("address must be 20 bytes, got {}", bytes.len()));
+    }
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&bytes);
+    Ok(addr)
+}
+
+/// Perform an `eth_call` view call against `to` with ABI `calldata`, returning
+/// the raw return bytes (used by the ERC-20 read helpers).
+fn evm_eth_call(
+    agent: &ureq::Agent,
+    rpc_url: &str,
+    to: &[u8; 20],
+    calldata: &[u8],
+) -> Result<Vec<u8>, String> {
+    let to_hex = format!("0x{}", hex::encode(to));
+    let data_hex = format!("0x{}", hex::encode(calldata));
+    let result = evm_rpc_result(
+        agent,
+        rpc_url,
+        "eth_call",
+        serde_json::json!([{"to": to_hex, "data": data_hex}, "latest"]),
+    )?;
+    evm_hex_bytes(&result)
+}
+
 fn bind_evm(linker: &mut Linker<HostState>) -> Result<()> {
     use std::time::Duration;
 
@@ -614,7 +743,19 @@ fn bind_evm(linker: &mut Linker<HostState>) -> Result<()> {
 
     let agent1 = agent.clone();
     let agent2 = agent.clone();
-    let agent3 = agent;
+    let agent3 = agent.clone();
+    let agent4 = agent.clone();
+    let agent5 = agent.clone();
+    let agent6 = agent.clone();
+    let agent7 = agent.clone();
+    let agent8 = agent.clone();
+    let agent9 = agent.clone();
+    // ERC-20 read helpers
+    let agent_e1 = agent.clone();
+    let agent_e2 = agent.clone();
+    let agent_e3 = agent.clone();
+    let agent_e4 = agent.clone();
+    let agent_e5 = agent;
 
     let mut inst = linker.instance("kotoba:kais/evm@0.1.0")?;
 
@@ -714,6 +855,194 @@ fn bind_evm(linker: &mut Linker<HostState>) -> Result<()> {
                     return Err(err.to_string());
                 }
                 Ok(resp["result"].as_str().unwrap_or("0x0").to_string())
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // eth-chain-id: hex chain id string
+    inst.func_wrap(
+        "eth-chain-id",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url,): (String,)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = evm_rpc_result(&agent4, &rpc_url, "eth_chainId", serde_json::json!([]))
+                .map(|v| v.as_str().unwrap_or("0x0").to_string());
+            Ok((result,))
+        },
+    )?;
+
+    // eth-block-number: hex latest block number string
+    inst.func_wrap(
+        "eth-block-number",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url,): (String,)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result =
+                evm_rpc_result(&agent5, &rpc_url, "eth_blockNumber", serde_json::json!([]))
+                    .map(|v| v.as_str().unwrap_or("0x0").to_string());
+            Ok((result,))
+        },
+    )?;
+
+    // eth-get-code: deployed bytecode (empty = EOA)
+    inst.func_wrap(
+        "eth-get-code",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, address, block_tag): (String, String, Option<String>)|
+              -> Result<(Result<Vec<u8>, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let block = block_tag.as_deref().unwrap_or("latest");
+            let result = evm_rpc_result(
+                &agent6,
+                &rpc_url,
+                "eth_getCode",
+                serde_json::json!([address, block]),
+            )
+            .and_then(|v| evm_hex_bytes(&v));
+            Ok((result,))
+        },
+    )?;
+
+    // eth-get-transaction-count: account nonce as hex string
+    inst.func_wrap(
+        "eth-get-transaction-count",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, address, block_tag): (String, String, Option<String>)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let block = block_tag.as_deref().unwrap_or("latest");
+            let result = evm_rpc_result(
+                &agent7,
+                &rpc_url,
+                "eth_getTransactionCount",
+                serde_json::json!([address, block]),
+            )
+            .map(|v| v.as_str().unwrap_or("0x0").to_string());
+            Ok((result,))
+        },
+    )?;
+
+    // eth-get-transaction-receipt: raw JSON receipt string ("null" if unknown)
+    inst.func_wrap(
+        "eth-get-transaction-receipt",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, tx_hash): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = evm_rpc_result(
+                &agent8,
+                &rpc_url,
+                "eth_getTransactionReceipt",
+                serde_json::json!([tx_hash]),
+            )
+            .map(|v| v.to_string());
+            Ok((result,))
+        },
+    )?;
+
+    // eth-get-logs: raw JSON array string of matching logs
+    inst.func_wrap(
+        "eth-get-logs",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, filter_json): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<String, String> {
+                let filter: serde_json::Value = serde_json::from_str(&filter_json)
+                    .map_err(|e| format!("bad filter json: {e}"))?;
+                evm_rpc_result(
+                    &agent9,
+                    &rpc_url,
+                    "eth_getLogs",
+                    serde_json::json!([filter]),
+                )
+                .map(|v| v.to_string())
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // erc20-balance-of: eth_call balanceOf(holder) → decimal string
+    inst.func_wrap(
+        "erc20-balance-of",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, token, holder): (String, String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<String, String> {
+                let token = evm_parse_addr(&token)?;
+                let holder = evm_parse_addr(&holder)?;
+                let ret = evm_eth_call(&agent_e1, &rpc_url, &token, &erc20::balance_of(&holder))?;
+                let raw = erc20::decode_balance(&ret).map_err(|e| e.to_string())?;
+                Ok(abi::u256_to_decimal_string(&raw))
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // erc20-total-supply: eth_call totalSupply() → decimal string
+    inst.func_wrap(
+        "erc20-total-supply",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, token): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<String, String> {
+                let token = evm_parse_addr(&token)?;
+                let ret = evm_eth_call(&agent_e2, &rpc_url, &token, &erc20::total_supply())?;
+                let raw = erc20::decode_balance(&ret).map_err(|e| e.to_string())?;
+                Ok(abi::u256_to_decimal_string(&raw))
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // erc20-decimals: eth_call decimals() → u8
+    inst.func_wrap(
+        "erc20-decimals",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, token): (String, String)|
+              -> Result<(Result<u8, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<u8, String> {
+                let token = evm_parse_addr(&token)?;
+                let ret = evm_eth_call(&agent_e3, &rpc_url, &token, &erc20::decimals())?;
+                erc20::decode_decimals(&ret).map_err(|e| e.to_string())
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // erc20-symbol: eth_call symbol() → string (dynamic or legacy bytes32)
+    inst.func_wrap(
+        "erc20-symbol",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, token): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<String, String> {
+                let token = evm_parse_addr(&token)?;
+                let ret = evm_eth_call(&agent_e4, &rpc_url, &token, &erc20::symbol())?;
+                erc20::decode_string(&ret).map_err(|e| e.to_string())
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // erc20-name: eth_call name() → string (dynamic or legacy bytes32)
+    inst.func_wrap(
+        "erc20-name",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (rpc_url, token): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<String, String> {
+                let token = evm_parse_addr(&token)?;
+                let ret = evm_eth_call(&agent_e5, &rpc_url, &token, &erc20::name())?;
+                erc20::decode_string(&ret).map_err(|e| e.to_string())
             })();
             Ok((result,))
         },

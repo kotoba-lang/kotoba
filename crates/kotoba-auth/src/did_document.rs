@@ -25,6 +25,9 @@ pub const ATTR_DID_CAPABILITY_DELEGATION: &str = "did/capabilityDelegation";
 pub const ATTR_DID_SERVICE_ID: &str = "did/service/id";
 pub const ATTR_DID_SERVICE_TYPE: &str = "did/service/type";
 pub const ATTR_DID_SERVICE_ENDPOINT: &str = "did/service/endpoint";
+pub const ATTR_DID_SERVICE_ENDPOINT_URI: &str = "did/service/endpoint/uri";
+pub const ATTR_DID_SERVICE_ENDPOINT_ACCEPT: &str = "did/service/endpoint/accept";
+pub const ATTR_DID_SERVICE_ENDPOINT_ROUTING_KEY: &str = "did/service/endpoint/routingKey";
 pub const ATTR_DID_CORE_ID: &str = "https://www.w3.org/ns/did#id";
 pub const ATTR_DID_CORE_VERIFICATION_METHOD: &str = "https://www.w3.org/ns/did#verificationMethod";
 pub const ATTR_DID_CORE_AUTHENTICATION: &str = "https://www.w3.org/ns/did#authentication";
@@ -41,6 +44,9 @@ pub const ATTR_DID_ENTITY_CID: &str = "did/entityCid";
 pub const ATTR_DID_METHOD: &str = "did/method";
 pub const ATTR_DID_HAS_KOTOBA_PROTOCOL_SERVICES: &str = "did/hasKotobaProtocolServices";
 pub const ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT: &str = "did/didcommMessagingEndpoint";
+pub const ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT_URI: &str = "did/didcommMessagingEndpoint/uri";
+pub const ATTR_DID_DIDCOMM_MESSAGING_ACCEPT: &str = "did/didcommMessagingEndpoint/accept";
+pub const ATTR_DID_DIDCOMM_MESSAGING_ROUTING_KEY: &str = "did/didcommMessagingEndpoint/routingKey";
 pub const ATTR_DID_ATPROTO_PDS_ENDPOINT: &str = "did/atprotoPdsEndpoint";
 pub const ATTR_DID_KOTOBA_NODE_ENDPOINT: &str = "did/kotobaNodeEndpoint";
 pub const ATTR_DID_KOTOBA_GRAPH_MEMBERSHIP: &str = "did/kotobaGraphMembership";
@@ -113,7 +119,7 @@ impl ServiceEndpointValue {
     fn primary_uri(&self) -> Option<&str> {
         match self {
             Self::Single(value) => Some(value.as_str()),
-            Self::Multiple(_) => None,
+            Self::Multiple(values) => values.first().map(String::as_str),
             Self::Object(value) => value
                 .get("uri")
                 .or_else(|| value.get("endpoint"))
@@ -455,6 +461,9 @@ impl DidDocument {
                 service_endpoint_value(&service.endpoint),
                 &tx,
             ));
+            for (attr, value) in service_endpoint_field_datoms(&service.endpoint) {
+                out.push(did_datom(&service_entity, attr, value, &tx));
+            }
         }
         out
     }
@@ -569,10 +578,33 @@ fn protocol_service_endpoint_datoms(
     service: &ServiceEndpoint,
 ) -> Vec<(&'static str, kotoba_datomic::Value)> {
     match service.service_type.as_str() {
-        DIDCOMM_MESSAGING_SERVICE => vec![(
-            ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT,
-            service_endpoint_value(&service.endpoint),
-        )],
+        DIDCOMM_MESSAGING_SERVICE => {
+            let mut out = vec![(
+                ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT,
+                service_endpoint_value(&service.endpoint),
+            )];
+            if let Some(uri) = service.endpoint.primary_uri() {
+                out.push((
+                    ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT_URI,
+                    kotoba_datomic::Value::string(uri),
+                ));
+            }
+            if let ServiceEndpointValue::Object(endpoint) = &service.endpoint {
+                for accept in json_string_array(endpoint, "accept") {
+                    out.push((
+                        ATTR_DID_DIDCOMM_MESSAGING_ACCEPT,
+                        kotoba_datomic::Value::string(accept),
+                    ));
+                }
+                for routing_key in json_string_array(endpoint, "routingKeys") {
+                    out.push((
+                        ATTR_DID_DIDCOMM_MESSAGING_ROUTING_KEY,
+                        kotoba_datomic::Value::string(routing_key),
+                    ));
+                }
+            }
+            out
+        }
         ATPROTO_PDS_SERVICE => vec![(
             ATTR_DID_ATPROTO_PDS_ENDPOINT,
             service_endpoint_value(&service.endpoint),
@@ -594,6 +626,46 @@ fn protocol_service_endpoint_datoms(
             .collect(),
         _ => vec![],
     }
+}
+
+fn service_endpoint_field_datoms(
+    endpoint: &ServiceEndpointValue,
+) -> Vec<(&'static str, kotoba_datomic::Value)> {
+    let mut out = Vec::new();
+    if let Some(uri) = endpoint.primary_uri() {
+        out.push((
+            ATTR_DID_SERVICE_ENDPOINT_URI,
+            kotoba_datomic::Value::string(uri),
+        ));
+    }
+    if let ServiceEndpointValue::Object(endpoint) = endpoint {
+        for accept in json_string_array(endpoint, "accept") {
+            out.push((
+                ATTR_DID_SERVICE_ENDPOINT_ACCEPT,
+                kotoba_datomic::Value::string(accept),
+            ));
+        }
+        for routing_key in json_string_array(endpoint, "routingKeys") {
+            out.push((
+                ATTR_DID_SERVICE_ENDPOINT_ROUTING_KEY,
+                kotoba_datomic::Value::string(routing_key),
+            ));
+        }
+    }
+    out
+}
+
+fn json_string_array<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Vec<&'a str> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
 }
 
 fn string_vec(values: &[String]) -> kotoba_datomic::Value {
@@ -804,13 +876,16 @@ mod tests {
     }
 
     #[test]
-    fn kotoba_endpoint_returns_none_for_multiple_value() {
+    fn kotoba_endpoint_returns_first_uri_for_multiple_value() {
         let doc = with_service(
             base_doc("did:key:zTest"),
             "KotobaNode",
-            ServiceEndpointValue::Multiple(vec!["/ip4/1.2.3.4/tcp/4001".to_string()]),
+            ServiceEndpointValue::Multiple(vec![
+                "/ip4/1.2.3.4/tcp/4001".to_string(),
+                "/ip4/5.6.7.8/tcp/4001".to_string(),
+            ]),
         );
-        assert!(doc.kotoba_endpoint().is_none());
+        assert_eq!(doc.kotoba_endpoint(), Some("/ip4/1.2.3.4/tcp/4001"));
     }
 
     // ── graph_memberships ─────────────────────────────────────────────────────
@@ -854,6 +929,61 @@ mod tests {
     }
 
     #[test]
+    fn protocol_service_helpers_accept_endpoint_arrays() {
+        let mut doc = DidDocument::empty("did:plc:arrayservices");
+        doc.service.push(ServiceEndpoint {
+            id: "did:plc:arrayservices#didcomm".into(),
+            service_type: DIDCOMM_MESSAGING_SERVICE.into(),
+            endpoint: ServiceEndpointValue::Multiple(vec![
+                "didcomm://mediator/primary".into(),
+                "didcomm://mediator/backup".into(),
+            ]),
+        });
+        doc.service.push(ServiceEndpoint {
+            id: "did:plc:arrayservices#atproto-pds".into(),
+            service_type: ATPROTO_PDS_SERVICE.into(),
+            endpoint: ServiceEndpointValue::Multiple(vec![
+                "https://pds.primary.example".into(),
+                "https://pds.backup.example".into(),
+            ]),
+        });
+        doc.service.push(ServiceEndpoint {
+            id: "did:plc:arrayservices#kotoba-node".into(),
+            service_type: KOTOBA_NODE_SERVICE.into(),
+            endpoint: ServiceEndpointValue::Multiple(vec![
+                "/ip4/127.0.0.1/tcp/4001".into(),
+                "/ip4/127.0.0.1/tcp/4002".into(),
+            ]),
+        });
+        doc.push_graph_membership_service(["kotoba://graph/array"]);
+
+        assert_eq!(doc.didcomm_endpoint(), Some("didcomm://mediator/primary"));
+        assert_eq!(
+            doc.atproto_pds_endpoint(),
+            Some("https://pds.primary.example")
+        );
+        assert_eq!(doc.kotoba_endpoint(), Some("/ip4/127.0.0.1/tcp/4001"));
+        assert!(doc.has_kotoba_protocol_services());
+
+        let datoms = doc.to_datoms(kotoba_core::cid::KotobaCid::from_bytes(
+            b"did-array-services-tx",
+        ));
+        let restored =
+            DidDocument::from_datoms("did:plc:arrayservices", &datoms).expect("restore DID doc");
+
+        assert_eq!(
+            restored.didcomm_endpoint(),
+            Some("didcomm://mediator/primary")
+        );
+        assert_eq!(
+            restored.atproto_pds_endpoint(),
+            Some("https://pds.primary.example")
+        );
+        assert_eq!(restored.kotoba_endpoint(), Some("/ip4/127.0.0.1/tcp/4001"));
+        assert!(restored.has_kotoba_protocol_services());
+    }
+
+    #[test]
     fn didcomm_object_service_endpoint_roundtrips_through_datoms() {
         let mut doc = DidDocument::empty("did:plc:didcommobject");
         doc.service.push(ServiceEndpoint {
@@ -892,6 +1022,38 @@ mod tests {
                     .as_map()
                     .and_then(|map| map.get(&kotoba_datomic::Value::kw_bare("uri")))
                     == Some(&kotoba_datomic::Value::string("didcomm://mediator/object"))
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_DIDCOMM_MESSAGING_ENDPOINT_URI
+                && datom.v == kotoba_datomic::Value::string("didcomm://mediator/object")
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_DIDCOMM_MESSAGING_ACCEPT
+                && datom.v == kotoba_datomic::Value::string("didcomm/v2")
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == doc.entity_cid()
+                && datom.a == ATTR_DID_DIDCOMM_MESSAGING_ROUTING_KEY
+                && datom.v == kotoba_datomic::Value::string("did:key:zMediator#key-x25519")
+        }));
+        let service_entity =
+            kotoba_core::cid::KotobaCid::from_bytes(b"did:plc:didcommobject#didcomm");
+        assert!(datoms.iter().any(|datom| {
+            datom.e == service_entity
+                && datom.a == ATTR_DID_SERVICE_ENDPOINT_URI
+                && datom.v == kotoba_datomic::Value::string("didcomm://mediator/object")
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == service_entity
+                && datom.a == ATTR_DID_SERVICE_ENDPOINT_ACCEPT
+                && datom.v == kotoba_datomic::Value::string("didcomm/v2")
+        }));
+        assert!(datoms.iter().any(|datom| {
+            datom.e == service_entity
+                && datom.a == ATTR_DID_SERVICE_ENDPOINT_ROUTING_KEY
+                && datom.v == kotoba_datomic::Value::string("did:key:zMediator#key-x25519")
         }));
 
         let restored =

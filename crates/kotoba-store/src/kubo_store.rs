@@ -33,6 +33,13 @@ const KUBO_POOL_MAX_IDLE_PER_HOST: usize = 8;
 /// re-probe Kubo. Avoids a permanently-stuck `available=false` state where
 /// every block silently drops while Kubo has already recovered.
 const KUBO_FAILURE_COOLDOWN_SECS: u64 = 5;
+/// Maximum simultaneous in-flight HTTP requests against the local Kubo node.
+/// `pool_max_idle_per_host` only caps keep-alive reuse — without an explicit
+/// concurrency limit each ProllyTree builder thread can fire hundreds of
+/// parallel puts, saturating Kubo's connection handler (observed 256+
+/// ESTABLISHED + 318 CLOSE_WAIT on commit bursts).  16 lets a 4-tree commit
+/// keep 4 puts per tree in flight while leaving headroom for reads.
+const KUBO_MAX_INFLIGHT: usize = 16;
 
 #[derive(Deserialize)]
 struct BlockPutResponse {
@@ -52,6 +59,16 @@ pub struct KuboBlockStore {
     /// the cooldown probes it and resumes normal operation.  `0` means
     /// "never failed".
     failed_at_unix: Arc<AtomicU64>,
+    /// Concurrency cap for in-flight requests to Kubo.  Each put/get acquires
+    /// a permit before touching the socket; the rest of the burst queues here
+    /// instead of opening fresh connections.
+    inflight: Arc<tokio::sync::Semaphore>,
+    /// Optional remote pin client (kotobase.gftd.ai).  When set, every
+    /// successful local `pin/add` is fanned out asynchronously to the remote
+    /// endpoint so commit roots / vault keys / IPNS records replicate beyond
+    /// the pod-local PVC.  Mirrors the F-3 "kotoba IPFS only / kotobase pins
+    /// for durability" architecture.
+    remote_pin: Option<Arc<crate::ipfs_pin::IpfsPinClient>>,
 }
 
 impl KuboBlockStore {
@@ -67,6 +84,8 @@ impl KuboBlockStore {
             token: None,
             pinned: Arc::new(RwLock::new(HashSet::new())),
             failed_at_unix: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(tokio::sync::Semaphore::new(KUBO_MAX_INFLIGHT)),
+            remote_pin: None,
         }
     }
 
@@ -110,6 +129,8 @@ impl KuboBlockStore {
             token,
             pinned: Arc::new(RwLock::new(HashSet::new())),
             failed_at_unix: Arc::new(AtomicU64::new(0)),
+            inflight: Arc::new(tokio::sync::Semaphore::new(KUBO_MAX_INFLIGHT)),
+            remote_pin: None,
         }
     }
 
@@ -158,7 +179,18 @@ impl Clone for KuboBlockStore {
             token: self.token.clone(),
             pinned: Arc::clone(&self.pinned),
             failed_at_unix: Arc::clone(&self.failed_at_unix),
+            inflight: Arc::clone(&self.inflight),
+            remote_pin: self.remote_pin.clone(),
         }
+    }
+}
+
+impl KuboBlockStore {
+    /// Attach a remote pin client (kotobase.gftd.ai) so every successful
+    /// local `pin/add` is also fanned out to the remote endpoint.
+    pub fn with_remote_pin(mut self, remote: Arc<crate::ipfs_pin::IpfsPinClient>) -> Self {
+        self.remote_pin = Some(remote);
+        self
     }
 }
 
@@ -176,9 +208,17 @@ impl BlockStore for KuboBlockStore {
         let client = self.client.clone();
         let token = self.token.clone();
         let cid_mb = cid.to_multibase();
+        let inflight = Arc::clone(&self.inflight);
 
         let resp_key = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
+                // Wait for an in-flight permit before opening the socket.
+                // `acquire_owned` on a never-closed semaphore can only fail if
+                // the runtime is shutting down — bubble that up as an error.
+                let _permit = inflight
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| anyhow!("kubo block/put permit: {e}"))?;
                 let part = reqwest::multipart::Part::bytes(body).file_name("blob");
                 let form = reqwest::multipart::Form::new().part("data", part);
                 let rb = client.post(&url).multipart(form);
@@ -226,9 +266,14 @@ impl BlockStore for KuboBlockStore {
         let url = format!("{}?arg={}", self.api_url("block/get"), cid.to_multibase());
         let client = self.client.clone();
         let token = self.token.clone();
+        let inflight = Arc::clone(&self.inflight);
 
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
+                let _permit = inflight
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| anyhow!("kubo block/get permit: {e}"))?;
                 let rb = client.post(&url);
                 let rb = match &token {
                     Some(t) => rb.bearer_auth(t),
@@ -329,12 +374,108 @@ impl BlockStore for KuboBlockStore {
         })
     }
 
+    /// Add the CID to Kubo's pin set (direct pin, NOT recursive) so the
+    /// daemon's GC cannot reclaim it.  Direct pins avoid Kubo's CBOR
+    /// traversal — recursive pin/add 500-s on blocks that are not valid
+    /// DAG-CBOR (e.g. HPKE-wrapped vault key blocks stored as opaque bytes
+    /// under cid-codec=dag-cbor: "pin: unexpected content after end of cbor
+    /// object").  Kotoba already calls `put_durable` on every load-bearing
+    /// block individually, so recursive traversal is not needed — pinning
+    /// each block directly gives the same durability guarantee.
     fn pin(&self, cid: &KotobaCid) {
         self.pinned.write().unwrap().insert(cid.0);
+        if !self.is_available() {
+            return;
+        }
+        let url = format!(
+            "{}?arg={}&recursive=false",
+            self.api_url("pin/add"),
+            cid.to_multibase()
+        );
+        let client = self.client.clone();
+        let token = self.token.clone();
+        let inflight = Arc::clone(&self.inflight);
+        let cid_mb = cid.to_multibase();
+        // Skip the HTTP round-trip when called outside a Tokio runtime (e.g.
+        // sync unit tests) — the in-memory pin set above is already updated.
+        let pin_result = match tokio::runtime::Handle::try_current() {
+            Err(_) => Ok::<(), anyhow::Error>(()),
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
+                    let rb = client.post(&url);
+                    let rb = match &token {
+                        Some(t) => rb.bearer_auth(t),
+                        None => rb,
+                    };
+                    let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/add: {e}"))?;
+                    if !resp.status().is_success() {
+                        let st = resp.status();
+                        let tx = resp.text().await.unwrap_or_default();
+                        return Err(anyhow!("kubo pin/add {st}: {tx}"));
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+            }),
+        };
+        if let Err(e) = pin_result {
+            tracing::warn!(cid = %cid_mb, err = %e, "kubo pin/add failed");
+            if e.to_string().contains("connect") {
+                self.mark_unavailable();
+            }
+        } else {
+            tracing::debug!(cid = %cid_mb, "kubo cid pinned recursively");
+            // F-3: fan the pin out to kotobase (or any KOTOBA_IPFS_PIN_ENDPOINT)
+            // — fire-and-forget; failures are logged but never block kotoba.
+            if let Some(remote) = &self.remote_pin {
+                let remote = Arc::clone(remote);
+                let cid_for_remote = cid_mb.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move { remote.pin(&cid_for_remote).await });
+                }
+            }
+        }
     }
 
+    /// Remove the CID from Kubo's pin set so it becomes GC-eligible again.
     fn unpin(&self, cid: &KotobaCid) {
         self.pinned.write().unwrap().remove(&cid.0);
+        if !self.is_available() {
+            return;
+        }
+        let url = format!("{}?arg={}", self.api_url("pin/rm"), cid.to_multibase());
+        let client = self.client.clone();
+        let token = self.token.clone();
+        let inflight = Arc::clone(&self.inflight);
+        let cid_mb = cid.to_multibase();
+        let unpin_result = match tokio::runtime::Handle::try_current() {
+            Err(_) => Ok::<(), anyhow::Error>(()),
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
+                    let rb = client.post(&url);
+                    let rb = match &token {
+                        Some(t) => rb.bearer_auth(t),
+                        None => rb,
+                    };
+                    let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/rm: {e}"))?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let tx = resp.text().await.unwrap_or_default();
+                        // "not pinned" is benign — the local pinned-set may have
+                        // tracked a CID Kubo never saw, e.g. across restarts.
+                        if tx.contains("not pinned") {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        return Err(anyhow!("kubo pin/rm {status}: {tx}"));
+                    }
+                    Ok(())
+                })
+            }),
+        };
+        if let Err(e) = unpin_result {
+            tracing::warn!(cid = %cid_mb, err = %e, "kubo pin/rm failed");
+        }
     }
 
     fn is_pinned(&self, cid: &KotobaCid) -> bool {

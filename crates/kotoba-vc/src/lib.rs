@@ -21,9 +21,12 @@ pub const ATTR_CREDENTIAL_CONTEXT: &str = "credential/context";
 pub const ATTR_CREDENTIAL_TYPE: &str = "credential/type";
 pub const ATTR_CREDENTIAL_ISSUER: &str = "credential/issuer";
 pub const ATTR_CREDENTIAL_SUBJECT: &str = "credential/subject";
+pub const ATTR_CREDENTIAL_SUBJECT_ID: &str = "credential/subjectId";
+pub const ATTR_CREDENTIAL_SUBJECT_DID_CID: &str = "credential/subject/didCid";
 pub const ATTR_CREDENTIAL_VALID_FROM: &str = "credential/validFrom";
 pub const ATTR_CREDENTIAL_VALID_UNTIL: &str = "credential/validUntil";
 pub const ATTR_CREDENTIAL_STATUS: &str = "credential/status";
+pub const ATTR_CREDENTIAL_STATUS_CID: &str = "credential/status/cid";
 pub const ATTR_CREDENTIAL_STATUS_ID: &str = "credential/status/id";
 pub const ATTR_CREDENTIAL_STATUS_TYPE: &str = "credential/status/type";
 pub const ATTR_CREDENTIAL_PROOF: &str = "credential/proof";
@@ -227,6 +230,11 @@ impl VerifiableCredential {
         Ok(KotobaCid::from_bytes(&bytes))
     }
 
+    pub fn ensure_data_integrity_context(&mut self) {
+        ensure_context(&mut self.context, VC_CONTEXT_V2);
+        ensure_context(&mut self.context, DATA_INTEGRITY_CONTEXT);
+    }
+
     pub fn subject_id(&self) -> Option<&str> {
         self.subject_ids().into_iter().next()
     }
@@ -248,6 +256,7 @@ impl VerifiableCredential {
 
     pub fn to_datoms(&self, tx: KotobaCid) -> Result<Vec<Datom>, VcError> {
         let e = self.cid()?;
+        let context = projected_context(&self.context, self.proof.is_some());
         let subject = json_to_edn(&self.credential_subject);
         let types = string_vec(&self.types);
         let mut out = vec![
@@ -266,10 +275,10 @@ impl VerifiableCredential {
             datom(
                 &e,
                 ATTR_CREDENTIAL_DATA_MODEL,
-                EdnValue::string(vc_data_model_name(&self.context)),
+                EdnValue::string(vc_data_model_name(&context)),
                 &tx,
             ),
-            datom(&e, ATTR_CREDENTIAL_CONTEXT, string_vec(&self.context), &tx),
+            datom(&e, ATTR_CREDENTIAL_CONTEXT, string_vec(&context), &tx),
             datom(
                 &e,
                 ATTR_CREDENTIAL_ID,
@@ -297,10 +306,18 @@ impl VerifiableCredential {
         for subject_id in self.subject_ids() {
             out.push(datom(
                 &e,
-                "credential/subjectId",
+                ATTR_CREDENTIAL_SUBJECT_ID,
                 EdnValue::string(subject_id),
                 &tx,
             ));
+            if subject_id.starts_with("did:") {
+                out.push(datom(
+                    &e,
+                    ATTR_CREDENTIAL_SUBJECT_DID_CID,
+                    EdnValue::string(KotobaCid::from_bytes(subject_id.as_bytes()).to_multibase()),
+                    &tx,
+                ));
+            }
         }
         append_subject_field_datoms(&mut out, &e, &self.credential_subject, &tx);
         if let Some(valid_from) = &self.valid_from {
@@ -383,8 +400,14 @@ impl VerifiablePresentation {
         Ok(KotobaCid::from_bytes(&bytes))
     }
 
+    pub fn ensure_data_integrity_context(&mut self) {
+        ensure_context(&mut self.context, VC_CONTEXT_V2);
+        ensure_context(&mut self.context, DATA_INTEGRITY_CONTEXT);
+    }
+
     pub fn to_datoms(&self, tx: KotobaCid) -> Result<Vec<Datom>, VcError> {
         let e = self.cid()?;
+        let context = projected_context(&self.context, self.proof.is_some());
         let types = string_vec(&self.types);
         let mut out = vec![
             datom(
@@ -402,15 +425,10 @@ impl VerifiablePresentation {
             datom(
                 &e,
                 ATTR_PRESENTATION_DATA_MODEL,
-                EdnValue::string(vc_data_model_name(&self.context)),
+                EdnValue::string(vc_data_model_name(&context)),
                 &tx,
             ),
-            datom(
-                &e,
-                ATTR_PRESENTATION_CONTEXT,
-                string_vec(&self.context),
-                &tx,
-            ),
+            datom(&e, ATTR_PRESENTATION_CONTEXT, string_vec(&context), &tx),
             datom(
                 &e,
                 ATTR_PRESENTATION_ID,
@@ -556,12 +574,41 @@ fn vc_data_model_name(context: &[String]) -> &'static str {
     }
 }
 
+fn ensure_context(context: &mut Vec<String>, value: &str) {
+    if !context.iter().any(|existing| existing == value) {
+        context.push(value.to_string());
+    }
+}
+
+fn projected_context(context: &[String], has_proof: bool) -> Vec<String> {
+    let mut context = context.to_vec();
+    ensure_context(&mut context, VC_CONTEXT_V2);
+    if has_proof {
+        ensure_context(&mut context, DATA_INTEGRITY_CONTEXT);
+    }
+    context
+}
+
 fn append_credential_status_datoms(
     out: &mut Vec<Datom>,
     e: &KotobaCid,
     status: &CredentialStatus,
     tx: &KotobaCid,
 ) {
+    let status_entity = KotobaCid::from_bytes(status.id.as_bytes());
+    let status_entity_value = EdnValue::string(status_entity.to_multibase());
+    out.push(datom(
+        e,
+        ATTR_CREDENTIAL_STATUS_CID,
+        status_entity_value.clone(),
+        tx,
+    ));
+    out.push(datom(
+        e,
+        ATTR_VC_CREDENTIAL_STATUS_IRI,
+        EdnValue::string(&status.id),
+        tx,
+    ));
     out.push(datom(
         e,
         ATTR_CREDENTIAL_STATUS_ID,
@@ -571,6 +618,36 @@ fn append_credential_status_datoms(
     out.push(datom(
         e,
         ATTR_CREDENTIAL_STATUS_TYPE,
+        EdnValue::string(&status.status_type),
+        tx,
+    ));
+    out.push(datom(
+        &status_entity,
+        ATTR_CREDENTIAL_STATUS_CID,
+        status_entity_value,
+        tx,
+    ));
+    out.push(datom(
+        &status_entity,
+        ATTR_CREDENTIAL_STATUS_ID,
+        EdnValue::string(&status.id),
+        tx,
+    ));
+    out.push(datom(
+        &status_entity,
+        ATTR_VC_ID_IRI,
+        EdnValue::string(&status.id),
+        tx,
+    ));
+    out.push(datom(
+        &status_entity,
+        ATTR_CREDENTIAL_STATUS_TYPE,
+        EdnValue::string(&status.status_type),
+        tx,
+    ));
+    out.push(datom(
+        &status_entity,
+        ATTR_VC_TYPE_IRI,
         EdnValue::string(&status.status_type),
         tx,
     ));
@@ -871,9 +948,17 @@ mod tests {
         for subject_id in ["did:plc:alice", "did:web:bob.example"] {
             assert!(
                 datoms.iter().any(|datom| {
-                    datom.a == "credential/subjectId" && datom.v == EdnValue::string(subject_id)
+                    datom.a == ATTR_CREDENTIAL_SUBJECT_ID && datom.v == EdnValue::string(subject_id)
                 }),
                 "missing credential/subjectId for {subject_id}"
+            );
+            let subject_did_cid = KotobaCid::from_bytes(subject_id.as_bytes()).to_multibase();
+            assert!(
+                datoms.iter().any(|datom| {
+                    datom.a == ATTR_CREDENTIAL_SUBJECT_DID_CID
+                        && datom.v == EdnValue::string(&subject_did_cid)
+                }),
+                "missing credential/subject/didCid for {subject_id}"
             );
         }
         for role in ["admin", "auditor"] {
@@ -927,7 +1012,10 @@ mod tests {
         assert!(datoms.iter().any(|d| d.a == ATTR_VC_ISSUER_IRI));
         assert!(datoms.iter().any(|d| d.a == ATTR_VC_TYPE_IRI));
         assert!(datoms.iter().any(|d| d.a == ATTR_VC_CREDENTIAL_SUBJECT_IRI));
-        assert!(datoms.iter().any(|d| d.a == "credential/subjectId"));
+        assert!(datoms.iter().any(|d| d.a == ATTR_CREDENTIAL_SUBJECT_ID));
+        assert!(datoms
+            .iter()
+            .any(|d| d.a == ATTR_CREDENTIAL_SUBJECT_DID_CID));
         assert!(datoms
             .iter()
             .any(|d| d.a == "credential/subject/role" && d.v == EdnValue::string("admin")));
@@ -964,12 +1052,41 @@ mod tests {
 
         let datoms = vc.to_datoms(KotobaCid::from_bytes(b"tx")).unwrap();
 
+        let context = datoms
+            .iter()
+            .find(|d| d.a == ATTR_CREDENTIAL_CONTEXT)
+            .map(|d| kotoba_edn::to_string(&d.v))
+            .expect("credential context datom");
+        assert!(context.contains(VC_CONTEXT_V2), "{context}");
+        assert!(context.contains(DATA_INTEGRITY_CONTEXT), "{context}");
         assert!(datoms.iter().any(|d| {
             d.a == ATTR_CREDENTIAL_STATUS_ID
                 && d.v == EdnValue::string("kotoba://credential/status/1")
         }));
+        let status_entity = KotobaCid::from_bytes(b"kotoba://credential/status/1");
+        let status_cid = status_entity.to_multibase();
+        assert!(datoms.iter().any(|d| {
+            d.e == vc.cid().unwrap()
+                && d.a == ATTR_CREDENTIAL_STATUS_CID
+                && d.v == EdnValue::string(&status_cid)
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.e == vc.cid().unwrap()
+                && d.a == ATTR_VC_CREDENTIAL_STATUS_IRI
+                && d.v == EdnValue::string("kotoba://credential/status/1")
+        }));
         assert!(datoms.iter().any(|d| {
             d.a == ATTR_CREDENTIAL_STATUS_TYPE && d.v == EdnValue::string("KotobaCredentialStatus")
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.e == status_entity
+                && d.a == ATTR_VC_ID_IRI
+                && d.v == EdnValue::string("kotoba://credential/status/1")
+        }));
+        assert!(datoms.iter().any(|d| {
+            d.e == status_entity
+                && d.a == ATTR_VC_TYPE_IRI
+                && d.v == EdnValue::string("KotobaCredentialStatus")
         }));
         for (attr, value) in [
             (ATTR_CREDENTIAL_PROOF_TYPE, "DataIntegrityProof"),
@@ -1081,6 +1198,13 @@ mod tests {
 
         let datoms = vp.to_datoms(KotobaCid::from_bytes(b"tx")).unwrap();
 
+        let context = datoms
+            .iter()
+            .find(|d| d.a == ATTR_PRESENTATION_CONTEXT)
+            .map(|d| kotoba_edn::to_string(&d.v))
+            .expect("presentation context datom");
+        assert!(context.contains(VC_CONTEXT_V2), "{context}");
+        assert!(context.contains(DATA_INTEGRITY_CONTEXT), "{context}");
         for (attr, value) in [
             (ATTR_PRESENTATION_PROOF_TYPE, "DataIntegrityProof"),
             (ATTR_PRESENTATION_PROOF_CRYPTOSUITE, "eddsa-2022"),

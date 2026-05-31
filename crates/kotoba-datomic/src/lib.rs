@@ -23,6 +23,7 @@ const DB_RETRACT: &str = ":db/retract";
 const DB_FN_CAS: &str = ":db.fn/cas";
 const DB_FN_RETRACT_ENTITY: &str = ":db.fn/retractEntity";
 const DB_FN_RETRACT_ATTRIBUTE: &str = ":db.fn/retractAttribute";
+const DB_ID: &str = ":db/id";
 const DB_IDENT: &str = ":db/ident";
 const DB_CARDINALITY: &str = ":db/cardinality";
 const DB_CARDINALITY_ONE: &str = ":db.cardinality/one";
@@ -2006,6 +2007,10 @@ fn pull_entity_inner(db: &Db, pattern: &EdnValue, eid: &Entity, depth: usize) ->
     let pattern = PullPattern::parse(pattern)?;
     let schema = Schema::from_datoms(&db.datoms);
     let mut map = BTreeMap::new();
+    if pattern.wants(DB_ID) {
+        let value = pattern.apply_xform(DB_ID, cid_value(eid))?;
+        map.insert(pattern.attr_key(DB_ID), value);
+    }
     for datom in db.datoms().into_iter().filter(|d| &d.e == eid) {
         if !pattern.wants(&datom.a) {
             continue;
@@ -2069,7 +2074,16 @@ fn pull_entity_inner(db: &Db, pattern: &EdnValue, eid: &Entity, depth: usize) ->
         if let Some(limit) = pattern.limit_for(reverse_attr) {
             values.truncate(limit);
         }
-        map.insert(pattern.attr_key(reverse_attr), EdnValue::Vector(values));
+        let key = pattern.attr_key(reverse_attr);
+        if values.is_empty() {
+            if let Some(default) = pattern.defaults.get(reverse_attr) {
+                map.insert(key, pattern.apply_xform(reverse_attr, default.clone())?);
+            } else {
+                map.insert(key, EdnValue::Vector(values));
+            }
+        } else {
+            map.insert(key, EdnValue::Vector(values));
+        }
     }
     for (attr, value) in &pattern.defaults {
         let key = pattern.attr_key(attr);
@@ -2497,6 +2511,17 @@ pub(crate) fn query_string_case_value(op: &str, args: Vec<EdnValue>) -> Result<E
         "upper-case" | "clojure.string/upper-case" | "str/upper-case" => {
             Ok(EdnValue::String(value.to_uppercase()))
         }
+        "capitalize" | "clojure.string/capitalize" | "str/capitalize" => {
+            let mut chars = value.chars();
+            let Some(first) = chars.next() else {
+                return Ok(EdnValue::String(String::new()));
+            };
+            Ok(EdnValue::String(format!(
+                "{}{}",
+                first.to_uppercase(),
+                chars.as_str().to_lowercase()
+            )))
+        }
         other => Err(DatomicError::UnsupportedOperation(other.into())),
     }
 }
@@ -2675,7 +2700,20 @@ fn query_function_name(value: &EdnValue) -> Result<String> {
     }
 }
 
+fn query_predicate_name(value: &EdnValue) -> Result<String> {
+    match value {
+        EdnValue::Symbol(symbol) => Ok(symbol.to_qualified()),
+        EdnValue::Keyword(keyword) => Ok(keyword.to_qualified()),
+        EdnValue::String(value) => Ok(value.clone()),
+        other => Err(DatomicError::Query(format!(
+            "collection predicate expects a predicate symbol, keyword, or string, got {}",
+            edn_to_string(other)
+        ))),
+    }
+}
+
 fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
+    let op = query_core_op(op);
     match op {
         "identity" => match args.as_slice() {
             [value] => Ok(value.clone()),
@@ -2694,7 +2732,10 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
         | "str/lower-case"
         | "upper-case"
         | "clojure.string/upper-case"
-        | "str/upper-case" => query_string_case_value(op, args),
+        | "str/upper-case"
+        | "capitalize"
+        | "clojure.string/capitalize"
+        | "str/capitalize" => query_string_case_value(op, args),
         "trim"
         | "clojure.string/trim"
         | "str/trim"
@@ -2721,7 +2762,10 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
         | "clojure.set/difference"
         | "set/difference" => query_set_operation_value(op, args),
         "hash-map" => query_hash_map_value(args),
-        "keys" | "vals" | "merge" | "select-keys" => query_map_operation_value(op, args),
+        "keys" | "vals" | "merge" | "select-keys" | "zipmap" => query_map_operation_value(op, args),
+        "every?" | "not-every?" | "not-any?" => {
+            query_collection_predicate_value(op, args).map(EdnValue::Bool)
+        }
         "count" => match args.as_slice() {
             [value] => query_count_value(value.clone()),
             _ => Err(DatomicError::Query("count expects one argument".into())),
@@ -2730,14 +2774,30 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
             [value] => query_not_empty_value(value.clone()),
             _ => Err(DatomicError::Query("not-empty expects one argument".into())),
         },
-        "seq" | "first" | "last" | "rest" | "next" => match args.as_slice() {
-            [value] => query_collection_value(op, value.clone()),
-            _ => Err(DatomicError::Query(format!("{op} expects one argument"))),
-        },
+        "map" | "mapcat" | "map-indexed" | "filter" | "remove" | "keep" | "keep-indexed"
+        | "some" | "group-by" | "partition-by" | "sort-by" => {
+            query_collection_transform_value(op, args)
+        }
+        "frequencies" => query_frequencies_value(args),
+        "range" | "repeat" => query_sequence_constructor_value(op, args),
+        "reduce" => query_reduce_value(args),
+        "apply" => query_apply_function_value(args),
+        "seq" | "first" | "second" | "last" | "peek" | "rest" | "next" | "pop" | "butlast" => {
+            match args.as_slice() {
+                [value] => query_collection_value(op, value.clone()),
+                _ => Err(DatomicError::Query(format!("{op} expects one argument"))),
+            }
+        }
         "nth" => query_nth_value(args),
-        "take" | "drop" | "subvec" => query_collection_slice_value(op, args),
-        "reverse" | "sort" => query_collection_order_value(op, args),
+        "take" | "drop" | "drop-last" | "take-nth" | "take-while" | "drop-while" | "split-at"
+        | "split-with" | "partition" | "partition-all" | "subvec" => {
+            query_collection_slice_value(op, args)
+        }
+        "concat" | "distinct" | "reverse" | "sort" | "flatten" | "interpose" | "interleave" => {
+            query_collection_order_value(op, args)
+        }
         "cons" => query_cons_value(args),
+        "into" => query_into_value(args),
         "conj" => query_conj_value(args),
         "assoc" => query_assoc_value(args),
         "dissoc" => query_dissoc_value(args),
@@ -2745,10 +2805,228 @@ fn query_apply_value_function(op: &str, args: Vec<EdnValue>) -> Result<EdnValue>
         "inc" | "dec" | "abs" | "+" | "-" | "*" | "quot" | "rem" | "mod" | "min" | "max" => {
             query_arithmetic_value(op, args)
         }
+        "not" | "boolean" => query_truth_function_value(op, args),
+        _ if is_query_unary_predicate_op(op) || is_query_variadic_predicate_op(op) => {
+            query_predicate_function_value(op, args)
+        }
         other => Err(DatomicError::UnsupportedOperation(format!(
             "update function {other}"
         ))),
     }
+}
+
+pub(crate) fn query_core_op(op: &str) -> &str {
+    op.strip_prefix("clojure.core/").unwrap_or(op)
+}
+
+pub(crate) fn query_truthy(value: &EdnValue) -> bool {
+    !matches!(value, EdnValue::Nil | EdnValue::Bool(false))
+}
+
+pub(crate) fn query_truth_function_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
+    if args.len() != 1 {
+        return Err(DatomicError::Query(format!("{op} expects one argument")));
+    }
+    let truthy = query_truthy(&args[0]);
+    Ok(EdnValue::Bool(match op {
+        "not" => !truthy,
+        "boolean" => truthy,
+        other => return Err(DatomicError::UnsupportedOperation(other.into())),
+    }))
+}
+
+pub(crate) fn query_collection_transform_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
+    if args.len() != 2 {
+        return Err(DatomicError::Query(format!(
+            "{op} expects a function and one collection"
+        )));
+    }
+    let function = query_function_name(&args[0])?;
+    let values = query_seq_values(args[1].clone())?;
+    let out = match op {
+        "map" => values
+            .into_iter()
+            .map(|value| query_apply_value_function(&function, vec![value]))
+            .collect::<Result<Vec<_>>>()?,
+        "mapcat" => {
+            let mut out = Vec::new();
+            for value in values {
+                out.extend(query_seq_values(query_apply_value_function(
+                    &function,
+                    vec![value],
+                )?)?);
+            }
+            out
+        }
+        "map-indexed" => values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                query_apply_value_function(&function, vec![EdnValue::Integer(index as i64), value])
+            })
+            .collect::<Result<Vec<_>>>()?,
+        "filter" | "remove" => {
+            let keep_matching = op == "filter";
+            values
+                .into_iter()
+                .filter_map(|value| {
+                    match query_apply_value_function(&function, vec![value.clone()]) {
+                        Ok(result) if query_truthy(&result) == keep_matching => Some(Ok(value)),
+                        Ok(_) => None,
+                        Err(err) => Some(Err(err)),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+        "keep" => values
+            .into_iter()
+            .filter_map(
+                |value| match query_apply_value_function(&function, vec![value]) {
+                    Ok(EdnValue::Nil) => None,
+                    Ok(value) => Some(Ok(value)),
+                    Err(err) => Some(Err(err)),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?,
+        "keep-indexed" => values
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                match query_apply_value_function(
+                    &function,
+                    vec![EdnValue::Integer(index as i64), value],
+                ) {
+                    Ok(EdnValue::Nil) => None,
+                    Ok(value) => Some(Ok(value)),
+                    Err(err) => Some(Err(err)),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?,
+        "some" => {
+            for value in values {
+                let result = query_apply_value_function(&function, vec![value])?;
+                if query_truthy(&result) {
+                    return Ok(result);
+                }
+            }
+            return Ok(EdnValue::Nil);
+        }
+        "group-by" => {
+            let mut out: BTreeMap<EdnValue, EdnValue> = BTreeMap::new();
+            for value in values {
+                let key = query_apply_value_function(&function, vec![value.clone()])?;
+                match out.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(EdnValue::Vector(vec![value]));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let EdnValue::Vector(existing) = entry.get_mut() else {
+                            unreachable!("group-by stores vector values")
+                        };
+                        existing.push(value);
+                    }
+                }
+            }
+            return Ok(EdnValue::Map(out));
+        }
+        "partition-by" => {
+            let mut out = Vec::new();
+            let mut current_key = None;
+            let mut current_values = Vec::new();
+            for value in values {
+                let key = query_apply_value_function(&function, vec![value.clone()])?;
+                if current_key
+                    .as_ref()
+                    .map_or(true, |existing| existing == &key)
+                {
+                    current_key = Some(key);
+                    current_values.push(value);
+                } else {
+                    out.push(EdnValue::Vector(current_values));
+                    current_key = Some(key);
+                    current_values = vec![value];
+                }
+            }
+            if !current_values.is_empty() {
+                out.push(EdnValue::Vector(current_values));
+            }
+            out
+        }
+        "sort-by" => {
+            let mut keyed = values
+                .into_iter()
+                .map(|value| {
+                    query_apply_value_function(&function, vec![value.clone()])
+                        .map(|key| (key, value))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            keyed.sort_by(|(left_key, left_value), (right_key, right_value)| {
+                query_sort_order(left_key, right_key)
+                    .then_with(|| query_sort_order(left_value, right_value))
+            });
+            keyed.into_iter().map(|(_, value)| value).collect()
+        }
+        other => return Err(DatomicError::UnsupportedOperation(other.into())),
+    };
+    Ok(EdnValue::Vector(out))
+}
+
+pub(crate) fn query_frequencies_value(args: Vec<EdnValue>) -> Result<EdnValue> {
+    let [collection]: [EdnValue; 1] = args
+        .try_into()
+        .map_err(|_| DatomicError::Query("frequencies expects one argument".into()))?;
+    let mut out = BTreeMap::new();
+    for value in query_seq_values(collection)? {
+        let count = match out.remove(&value) {
+            Some(EdnValue::Integer(count)) => count + 1,
+            Some(_) => unreachable!("frequencies stores integer counts"),
+            None => 1,
+        };
+        out.insert(value, EdnValue::Integer(count));
+    }
+    Ok(EdnValue::Map(out))
+}
+
+pub(crate) fn query_reduce_value(args: Vec<EdnValue>) -> Result<EdnValue> {
+    let (function, mut values, mut acc) = match args.as_slice() {
+        [function, collection] => {
+            let mut values = query_seq_values(collection.clone())?.into_iter();
+            let acc = values.next().map(Ok).unwrap_or_else(|| {
+                query_apply_value_function(&query_function_name(function)?, vec![])
+            })?;
+            (
+                query_function_name(function)?,
+                values.collect::<Vec<_>>(),
+                acc,
+            )
+        }
+        [function, init, collection] => (
+            query_function_name(function)?,
+            query_seq_values(collection.clone())?,
+            init.clone(),
+        ),
+        _ => {
+            return Err(DatomicError::Query(
+                "reduce expects a function, optional init, and one collection".into(),
+            ))
+        }
+    };
+    for value in values.drain(..) {
+        acc = query_apply_value_function(&function, vec![acc, value])?;
+    }
+    Ok(acc)
+}
+
+pub(crate) fn query_apply_function_value(args: Vec<EdnValue>) -> Result<EdnValue> {
+    if args.len() < 2 {
+        return Err(DatomicError::Query(
+            "apply expects a function and at least one collection argument".into(),
+        ));
+    }
+    let function = query_function_name(&args[0])?;
+    let mut fn_args = args[1..args.len() - 1].to_vec();
+    fn_args.extend(query_seq_values(args[args.len() - 1].clone())?);
+    query_apply_value_function(&function, fn_args)
 }
 
 fn assoc_in_path(collection: EdnValue, path: &[EdnValue], value: EdnValue) -> Result<EdnValue> {
@@ -2902,8 +3180,71 @@ pub(crate) fn query_map_operation_value(op: &str, args: Vec<EdnValue>) -> Result
             }
             Ok(EdnValue::Map(out))
         }
+        "zipmap" => {
+            let [keys, vals]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("zipmap expects keys and values".into()))?;
+            let keys = query_seq_values(keys)?;
+            let vals = query_seq_values(vals)?;
+            Ok(EdnValue::Map(keys.into_iter().zip(vals).collect()))
+        }
         other => Err(DatomicError::UnsupportedOperation(other.into())),
     }
+}
+
+pub(crate) fn query_sequence_constructor_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
+    match op {
+        "range" => {
+            let (start, end, step) = match args.as_slice() {
+                [end] => (0, query_integer_arg(end, "range")?, 1),
+                [start, end] => (
+                    query_integer_arg(start, "range")?,
+                    query_integer_arg(end, "range")?,
+                    1,
+                ),
+                [start, end, step] => (
+                    query_integer_arg(start, "range")?,
+                    query_integer_arg(end, "range")?,
+                    query_integer_arg(step, "range")?,
+                ),
+                _ => {
+                    return Err(DatomicError::Query(
+                        "range expects end, optional start, and optional step".into(),
+                    ))
+                }
+            };
+            if step == 0 {
+                return Err(DatomicError::Query("range step must be non-zero".into()));
+            }
+            let mut out = Vec::new();
+            let mut value = start;
+            while if step > 0 { value < end } else { value > end } {
+                out.push(EdnValue::Integer(value));
+                value = value
+                    .checked_add(step)
+                    .ok_or_else(|| DatomicError::Query("range integer overflow".into()))?;
+            }
+            Ok(EdnValue::Vector(out))
+        }
+        "repeat" => {
+            let [n, value]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("repeat expects count and value".into()))?;
+            let n = query_non_negative_usize(&n, "repeat")?;
+            Ok(EdnValue::Vector(vec![value; n]))
+        }
+        other => Err(DatomicError::UnsupportedOperation(other.into())),
+    }
+}
+
+fn query_integer_arg(value: &EdnValue, op: &str) -> Result<i64> {
+    let EdnValue::Integer(value) = value else {
+        return Err(DatomicError::Query(format!(
+            "{op} expects integer arguments, got {}",
+            edn_to_string(value)
+        )));
+    };
+    Ok(*value)
 }
 
 pub(crate) fn query_count_value(value: EdnValue) -> Result<EdnValue> {
@@ -2934,7 +3275,9 @@ pub(crate) fn query_collection_value(op: &str, value: EdnValue) -> Result<EdnVal
             }
         }
         "first" => values.into_iter().next().unwrap_or(EdnValue::Nil),
+        "second" => values.into_iter().nth(1).unwrap_or(EdnValue::Nil),
         "last" => values.into_iter().next_back().unwrap_or(EdnValue::Nil),
+        "peek" => values.last().cloned().unwrap_or(EdnValue::Nil),
         "rest" => EdnValue::Vector(values.into_iter().skip(1).collect()),
         "next" => {
             let rest = values.into_iter().skip(1).collect::<Vec<_>>();
@@ -2942,6 +3285,20 @@ pub(crate) fn query_collection_value(op: &str, value: EdnValue) -> Result<EdnVal
                 EdnValue::Nil
             } else {
                 EdnValue::Vector(rest)
+            }
+        }
+        "pop" => {
+            let mut out = values;
+            out.pop();
+            EdnValue::Vector(out)
+        }
+        "butlast" => {
+            let mut out = values;
+            out.pop();
+            if out.is_empty() {
+                EdnValue::Nil
+            } else {
+                EdnValue::Vector(out)
             }
         }
         other => return Err(DatomicError::UnsupportedOperation(other.into())),
@@ -2987,6 +3344,15 @@ pub(crate) fn query_cons_value(args: Vec<EdnValue>) -> Result<EdnValue> {
     Ok(EdnValue::Vector(values))
 }
 
+pub(crate) fn query_into_value(args: Vec<EdnValue>) -> Result<EdnValue> {
+    let [target, source]: [EdnValue; 2] = args
+        .try_into()
+        .map_err(|_| DatomicError::Query("into expects target and source".into()))?;
+    let mut conj_args = vec![target];
+    conj_args.extend(query_seq_values(source)?);
+    query_conj_value(conj_args)
+}
+
 pub(crate) fn query_collection_slice_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
     match op {
         "take" | "drop" => {
@@ -3001,6 +3367,47 @@ pub(crate) fn query_collection_slice_value(op: &str, args: Vec<EdnValue>) -> Res
                 values.into_iter().skip(n).collect()
             };
             Ok(EdnValue::Vector(values))
+        }
+        "drop-last" => {
+            let (n, collection) = match args.as_slice() {
+                [collection] => (1, collection.clone()),
+                [n, collection] => (
+                    query_non_negative_usize(n, "drop-last")?,
+                    collection.clone(),
+                ),
+                _ => {
+                    return Err(DatomicError::Query(
+                        "drop-last expects a collection and optional count".into(),
+                    ))
+                }
+            };
+            let values = query_seq_values(collection)?;
+            let keep = values.len().saturating_sub(n);
+            Ok(EdnValue::Vector(values.into_iter().take(keep).collect()))
+        }
+        "take-nth" => {
+            let [n, collection]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("take-nth expects two arguments".into()))?;
+            let n = query_positive_usize(&n, "take-nth")?;
+            Ok(EdnValue::Vector(
+                query_seq_values(collection)?
+                    .into_iter()
+                    .step_by(n)
+                    .collect(),
+            ))
+        }
+        "split-at" => {
+            let [n, collection]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("split-at expects two arguments".into()))?;
+            let n = query_non_negative_usize(&n, "split-at")?;
+            let values = query_seq_values(collection)?;
+            let split = n.min(values.len());
+            Ok(EdnValue::Vector(vec![
+                EdnValue::Vector(values[..split].to_vec()),
+                EdnValue::Vector(values[split..].to_vec()),
+            ]))
         }
         "subvec" => {
             let (collection, start, end) = match args.as_slice() {
@@ -3033,21 +3440,188 @@ pub(crate) fn query_collection_slice_value(op: &str, args: Vec<EdnValue>) -> Res
             }
             Ok(EdnValue::Vector(values[start..end].to_vec()))
         }
+        "take-while" | "drop-while" => {
+            let [predicate, collection]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query(format!("{op} expects two arguments")))?;
+            let predicate = query_function_name(&predicate)?;
+            let mut out = Vec::new();
+            let mut dropping = op == "drop-while";
+            for value in query_seq_values(collection)? {
+                let matched = query_truthy(&query_apply_value_function(
+                    &predicate,
+                    vec![value.clone()],
+                )?);
+                if op == "take-while" {
+                    if !matched {
+                        break;
+                    }
+                    out.push(value);
+                } else if dropping && matched {
+                    continue;
+                } else {
+                    dropping = false;
+                    out.push(value);
+                }
+            }
+            Ok(EdnValue::Vector(out))
+        }
+        "split-with" => {
+            let [predicate, collection]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("split-with expects two arguments".into()))?;
+            let predicate = query_function_name(&predicate)?;
+            let values = query_seq_values(collection)?;
+            let mut split = values.len();
+            for (index, value) in values.iter().enumerate() {
+                let matched = query_truthy(&query_apply_value_function(
+                    &predicate,
+                    vec![value.clone()],
+                )?);
+                if !matched {
+                    split = index;
+                    break;
+                }
+            }
+            Ok(EdnValue::Vector(vec![
+                EdnValue::Vector(values[..split].to_vec()),
+                EdnValue::Vector(values[split..].to_vec()),
+            ]))
+        }
+        "partition" | "partition-all" => query_partition_value(op, args),
         other => Err(DatomicError::UnsupportedOperation(other.into())),
     }
 }
 
+fn query_partition_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
+    let (n, step, pad, collection) = match args.as_slice() {
+        [n, collection] => (
+            query_positive_usize(n, op)?,
+            query_positive_usize(n, op)?,
+            None,
+            collection.clone(),
+        ),
+        [n, step, collection] => (
+            query_positive_usize(n, op)?,
+            query_positive_usize(step, op)?,
+            None,
+            collection.clone(),
+        ),
+        [n, step, pad, collection] if op == "partition" => (
+            query_positive_usize(n, op)?,
+            query_positive_usize(step, op)?,
+            Some(query_seq_values(pad.clone())?),
+            collection.clone(),
+        ),
+        _ => {
+            return Err(DatomicError::Query(format!(
+                "{op} expects n, optional step, optional pad, and a collection"
+            )))
+        }
+    };
+    let values = query_seq_values(collection)?;
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < values.len() {
+        let end = (start + n).min(values.len());
+        let mut chunk = values[start..end].to_vec();
+        if chunk.len() == n {
+            out.push(EdnValue::Vector(chunk));
+        } else if op == "partition-all" {
+            out.push(EdnValue::Vector(chunk));
+        } else if let Some(pad) = &pad {
+            chunk.extend(pad.iter().take(n - chunk.len()).cloned());
+            out.push(EdnValue::Vector(chunk));
+        }
+        start += step;
+    }
+    Ok(EdnValue::Vector(out))
+}
+
 pub(crate) fn query_collection_order_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
-    let [collection]: [EdnValue; 1] = args
-        .try_into()
-        .map_err(|_| DatomicError::Query(format!("{op} expects one argument")))?;
-    let mut values = query_seq_values(collection)?;
     match op {
-        "reverse" => values.reverse(),
-        "sort" => values.sort_by(query_sort_order),
+        "concat" => {
+            let mut out = Vec::new();
+            for arg in args {
+                out.extend(query_seq_values(arg)?);
+            }
+            Ok(EdnValue::Vector(out))
+        }
+        "distinct" => {
+            let [collection]: [EdnValue; 1] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("distinct expects one argument".into()))?;
+            let mut seen = BTreeSet::new();
+            let mut out = Vec::new();
+            for value in query_seq_values(collection)? {
+                if seen.insert(value.clone()) {
+                    out.push(value);
+                }
+            }
+            Ok(EdnValue::Vector(out))
+        }
+        "reverse" | "sort" | "flatten" => {
+            let [collection]: [EdnValue; 1] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query(format!("{op} expects one argument")))?;
+            let mut values = query_seq_values(collection)?;
+            match op {
+                "reverse" => values.reverse(),
+                "sort" => values.sort_by(query_sort_order),
+                "flatten" => {
+                    let mut out = Vec::new();
+                    query_flatten_into(values, &mut out);
+                    values = out;
+                }
+                _ => unreachable!("matched collection order op"),
+            }
+            Ok(EdnValue::Vector(values))
+        }
+        "interpose" => {
+            let [separator, collection]: [EdnValue; 2] = args
+                .try_into()
+                .map_err(|_| DatomicError::Query("interpose expects two arguments".into()))?;
+            let values = query_seq_values(collection)?;
+            let mut out = Vec::with_capacity(values.len().saturating_mul(2).saturating_sub(1));
+            for (idx, value) in values.into_iter().enumerate() {
+                if idx > 0 {
+                    out.push(separator.clone());
+                }
+                out.push(value);
+            }
+            Ok(EdnValue::Vector(out))
+        }
+        "interleave" => {
+            if args.is_empty() {
+                return Err(DatomicError::Query(
+                    "interleave expects at least one collection".into(),
+                ));
+            }
+            let columns = args
+                .into_iter()
+                .map(query_seq_values)
+                .collect::<Result<Vec<_>>>()?;
+            let min_len = columns.iter().map(Vec::len).min().unwrap_or(0);
+            let mut out = Vec::with_capacity(min_len.saturating_mul(columns.len()));
+            for idx in 0..min_len {
+                for column in &columns {
+                    out.push(column[idx].clone());
+                }
+            }
+            Ok(EdnValue::Vector(out))
+        }
         other => return Err(DatomicError::UnsupportedOperation(other.into())),
     }
-    Ok(EdnValue::Vector(values))
+}
+
+fn query_flatten_into(values: Vec<EdnValue>, out: &mut Vec<EdnValue>) {
+    for value in values {
+        match value {
+            EdnValue::Vector(values) | EdnValue::List(values) => query_flatten_into(values, out),
+            EdnValue::Set(values) => query_flatten_into(values.into_iter().collect(), out),
+            other => out.push(other),
+        }
+    }
 }
 
 fn query_sort_order(left: &EdnValue, right: &EdnValue) -> std::cmp::Ordering {
@@ -3083,6 +3657,14 @@ fn query_non_negative_usize(value: &EdnValue, op: &str) -> Result<usize> {
     };
     usize::try_from(*value)
         .map_err(|_| DatomicError::Query(format!("{op} index must be non-negative, got {value}")))
+}
+
+fn query_positive_usize(value: &EdnValue, op: &str) -> Result<usize> {
+    let value = query_non_negative_usize(value, op)?;
+    if value == 0 {
+        return Err(DatomicError::Query(format!("{op} size must be positive")));
+    }
+    Ok(value)
 }
 
 pub(crate) fn query_conj_value(args: Vec<EdnValue>) -> Result<EdnValue> {
@@ -3476,9 +4058,14 @@ pub(crate) fn query_string_search_predicate(
 }
 
 pub(crate) fn query_variadic_predicate(op: &str, args: &[EdnValue]) -> Result<bool> {
+    let op = query_core_op(op);
     Ok(match op {
         "=" => args.windows(2).all(|pair| pair[0] == pair[1]),
         "!=" | "not=" => !args.windows(2).all(|pair| pair[0] == pair[1]),
+        "distinct?" => {
+            let mut seen = BTreeSet::new();
+            args.iter().all(|value| seen.insert(value))
+        }
         ">" => query_chained_numbers(args, |a, b| a > b),
         "<" => query_chained_numbers(args, |a, b| a < b),
         ">=" => query_chained_numbers(args, |a, b| a >= b),
@@ -3526,8 +4113,81 @@ pub(crate) fn query_variadic_predicate(op: &str, args: &[EdnValue]) -> Result<bo
             }
             query_string_search_predicate(op, &args[0], &args[1])?
         }
+        "every?" | "not-every?" | "not-any?" => {
+            query_collection_predicate_value(op, args.iter().cloned().collect::<Vec<_>>())?
+        }
         other => return Err(DatomicError::UnsupportedOperation(other.into())),
     })
+}
+
+pub(crate) fn query_collection_predicate_value(op: &str, args: Vec<EdnValue>) -> Result<bool> {
+    if args.len() != 2 {
+        return Err(DatomicError::Query(format!(
+            "{op} expects a predicate and a collection"
+        )));
+    }
+    let predicate = query_predicate_name(&args[0])?;
+    let values = query_seq_values(args[1].clone())?;
+    let matches = values
+        .iter()
+        .map(|value| query_unary_predicate(&predicate, value))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(match op {
+        "every?" => matches.into_iter().all(|matched| matched),
+        "not-every?" => !matches.into_iter().all(|matched| matched),
+        "not-any?" => !matches.into_iter().any(|matched| matched),
+        other => return Err(DatomicError::UnsupportedOperation(other.into())),
+    })
+}
+
+pub(crate) fn query_predicate_function_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
+    let op = query_core_op(op);
+    if is_query_unary_predicate_op(op) {
+        if args.len() != 1 {
+            return Err(DatomicError::Query(format!("{op} expects one argument")));
+        }
+        return query_unary_predicate(op, &args[0]).map(EdnValue::Bool);
+    }
+    if is_query_variadic_predicate_op(op) {
+        return query_variadic_predicate(op, &args).map(EdnValue::Bool);
+    }
+    Err(DatomicError::UnsupportedOperation(op.into()))
+}
+
+pub(crate) fn is_query_predicate_function_op(op: &str) -> bool {
+    is_query_unary_predicate_op(op) || is_query_variadic_predicate_op(op)
+}
+
+fn is_query_variadic_predicate_op(op: &str) -> bool {
+    matches!(
+        query_core_op(op),
+        "=" | "!="
+            | "not="
+            | "distinct?"
+            | ">"
+            | "<"
+            | ">="
+            | "<="
+            | "contains?"
+            | "subset?"
+            | "clojure.set/subset?"
+            | "set/subset?"
+            | "superset?"
+            | "clojure.set/superset?"
+            | "set/superset?"
+            | "starts-with?"
+            | "clojure.string/starts-with?"
+            | "str/starts-with?"
+            | "includes?"
+            | "clojure.string/includes?"
+            | "str/includes?"
+            | "ends-with?"
+            | "clojure.string/ends-with?"
+            | "str/ends-with?"
+            | "every?"
+            | "not-every?"
+            | "not-any?"
+    )
 }
 
 fn query_number_as_f64(value: &EdnValue) -> Option<f64> {
@@ -3549,7 +4209,57 @@ fn query_chained_numbers(args: &[EdnValue], f: impl Fn(f64, f64) -> bool) -> boo
     })
 }
 
+fn is_query_unary_predicate_op(op: &str) -> bool {
+    matches!(
+        query_core_op(op),
+        "nil?"
+            | "some?"
+            | "true?"
+            | "false?"
+            | "empty?"
+            | "boolean?"
+            | "char?"
+            | "integer?"
+            | "int?"
+            | "bigint?"
+            | "number?"
+            | "float?"
+            | "double?"
+            | "decimal?"
+            | "zero?"
+            | "pos?"
+            | "neg?"
+            | "even?"
+            | "odd?"
+            | "inst?"
+            | "uuid?"
+            | "string?"
+            | "clojure.string/blank?"
+            | "str/blank?"
+            | "keyword?"
+            | "simple-keyword?"
+            | "qualified-keyword?"
+            | "symbol?"
+            | "simple-symbol?"
+            | "qualified-symbol?"
+            | "ident?"
+            | "simple-ident?"
+            | "qualified-ident?"
+            | "vector?"
+            | "list?"
+            | "map?"
+            | "set?"
+            | "coll?"
+            | "colls?"
+            | "seqable?"
+            | "sequential?"
+            | "associative?"
+            | "counted?"
+    )
+}
+
 pub(crate) fn query_unary_predicate(op: &str, value: &EdnValue) -> Result<bool> {
+    let op = query_core_op(op);
     match op {
         "nil?" => Ok(matches!(value, EdnValue::Nil)),
         "some?" => Ok(!matches!(value, EdnValue::Nil)),
@@ -3557,19 +4267,61 @@ pub(crate) fn query_unary_predicate(op: &str, value: &EdnValue) -> Result<bool> 
         "false?" => Ok(matches!(value, EdnValue::Bool(false))),
         "empty?" => query_empty_predicate(value),
         "boolean?" => Ok(matches!(value, EdnValue::Bool(_))),
+        "char?" => Ok(matches!(value, EdnValue::Char(_))),
         "integer?" => Ok(matches!(value, EdnValue::Integer(_))),
+        "int?" => Ok(matches!(value, EdnValue::Integer(_))),
+        "bigint?" => Ok(matches!(value, EdnValue::BigInt(_))),
         "number?" => Ok(matches!(
             value,
             EdnValue::Integer(_) | EdnValue::BigInt(_) | EdnValue::Float(_) | EdnValue::BigDec(_)
         )),
+        "float?" | "double?" => Ok(matches!(value, EdnValue::Float(_))),
+        "decimal?" => Ok(matches!(value, EdnValue::BigDec(_))),
         "zero?" => Ok(matches!(value, EdnValue::Integer(0))),
         "pos?" => Ok(matches!(value, EdnValue::Integer(value) if *value > 0)),
         "neg?" => Ok(matches!(value, EdnValue::Integer(value) if *value < 0)),
         "even?" => Ok(matches!(value, EdnValue::Integer(value) if value % 2 == 0)),
         "odd?" => Ok(matches!(value, EdnValue::Integer(value) if value % 2 != 0)),
+        "inst?" => Ok(matches!(
+            value,
+            EdnValue::Tagged { tag, .. } if tag.to_qualified() == "inst"
+        )),
+        "uuid?" => Ok(matches!(
+            value,
+            EdnValue::Tagged { tag, .. } if tag.to_qualified() == "uuid"
+        )),
         "string?" => Ok(matches!(value, EdnValue::String(_))),
+        "clojure.string/blank?" | "str/blank?" => match value {
+            EdnValue::Nil => Ok(true),
+            EdnValue::String(value) => Ok(value.trim().is_empty()),
+            other => Err(DatomicError::Query(format!(
+                "{op} expects nil or a string, got {}",
+                edn_to_string(other)
+            ))),
+        },
         "keyword?" => Ok(matches!(value, EdnValue::Keyword(_))),
+        "simple-keyword?" => {
+            Ok(matches!(value, EdnValue::Keyword(keyword) if keyword.namespace().is_none()))
+        }
+        "qualified-keyword?" => {
+            Ok(matches!(value, EdnValue::Keyword(keyword) if keyword.namespace().is_some()))
+        }
         "symbol?" => Ok(matches!(value, EdnValue::Symbol(_))),
+        "simple-symbol?" => {
+            Ok(matches!(value, EdnValue::Symbol(symbol) if symbol.namespace.is_none()))
+        }
+        "qualified-symbol?" => {
+            Ok(matches!(value, EdnValue::Symbol(symbol) if symbol.namespace.is_some()))
+        }
+        "ident?" => Ok(matches!(value, EdnValue::Keyword(_) | EdnValue::Symbol(_))),
+        "simple-ident?" => Ok(matches!(
+            value,
+            EdnValue::Keyword(keyword) if keyword.namespace().is_none()
+        ) || matches!(value, EdnValue::Symbol(symbol) if symbol.namespace.is_none())),
+        "qualified-ident?" => Ok(matches!(
+            value,
+            EdnValue::Keyword(keyword) if keyword.namespace().is_some()
+        ) || matches!(value, EdnValue::Symbol(symbol) if symbol.namespace.is_some())),
         "vector?" => Ok(matches!(value, EdnValue::Vector(_))),
         "list?" => Ok(matches!(value, EdnValue::List(_))),
         "map?" => Ok(matches!(value, EdnValue::Map(_))),
@@ -3577,6 +4329,25 @@ pub(crate) fn query_unary_predicate(op: &str, value: &EdnValue) -> Result<bool> 
         "coll?" | "colls?" => Ok(matches!(
             value,
             EdnValue::List(_) | EdnValue::Vector(_) | EdnValue::Map(_) | EdnValue::Set(_)
+        )),
+        "seqable?" => Ok(matches!(
+            value,
+            EdnValue::Nil
+                | EdnValue::String(_)
+                | EdnValue::List(_)
+                | EdnValue::Vector(_)
+                | EdnValue::Map(_)
+                | EdnValue::Set(_)
+        )),
+        "sequential?" => Ok(matches!(value, EdnValue::List(_) | EdnValue::Vector(_))),
+        "associative?" => Ok(matches!(value, EdnValue::Map(_) | EdnValue::Vector(_))),
+        "counted?" => Ok(matches!(
+            value,
+            EdnValue::String(_)
+                | EdnValue::List(_)
+                | EdnValue::Vector(_)
+                | EdnValue::Map(_)
+                | EdnValue::Set(_)
         )),
         other => Err(DatomicError::UnsupportedOperation(other.into())),
     }
@@ -4854,6 +5625,7 @@ fn eval_query_function(
     db: &Db,
     binding: &BTreeMap<String, EdnValue>,
 ) -> Result<EdnValue> {
+    let op = query_core_op(op);
     match op {
         "ground" => {
             if args.len() != 1 {
@@ -4914,7 +5686,10 @@ fn eval_query_function(
         | "str/lower-case"
         | "upper-case"
         | "clojure.string/upper-case"
-        | "str/upper-case" => args
+        | "str/upper-case"
+        | "capitalize"
+        | "clojure.string/capitalize"
+        | "str/capitalize" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
@@ -4995,11 +5770,27 @@ fn eval_query_function(
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(query_hash_map_value),
-        "keys" | "vals" | "merge" | "select-keys" => args
+        "keys" | "vals" | "merge" | "select-keys" | "zipmap" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(|values| query_map_operation_value(op, values)),
+        "every?" | "not-every?" | "not-any?" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|values| query_collection_predicate_value(op, values))
+            .map(EdnValue::Bool),
+        "not" | "boolean" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|values| query_truth_function_value(op, values)),
+        _ if is_query_unary_predicate_op(op) || is_query_variadic_predicate_op(op) => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|values| query_predicate_function_value(op, values)),
         "count" => {
             if args.len() != 1 {
                 return Err(DatomicError::Query("count expects one argument".into()));
@@ -5012,7 +5803,33 @@ fn eval_query_function(
             }
             query_not_empty_value(resolve_query_value(&args[0], binding)?)
         }
-        "seq" | "first" | "last" | "rest" | "next" => {
+        "map" | "mapcat" | "map-indexed" | "filter" | "remove" | "keep" | "keep-indexed"
+        | "some" | "group-by" | "partition-by" | "sort-by" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|values| query_collection_transform_value(op, values)),
+        "frequencies" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(query_frequencies_value),
+        "range" | "repeat" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|values| query_sequence_constructor_value(op, values)),
+        "reduce" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(query_reduce_value),
+        "apply" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(query_apply_function_value),
+        "seq" | "first" | "second" | "last" | "peek" | "rest" | "next" | "pop" | "butlast" => {
             if args.len() != 1 {
                 return Err(DatomicError::Query(format!("{op} expects one argument")));
             }
@@ -5028,12 +5845,18 @@ fn eval_query_function(
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(query_cons_value),
-        "take" | "drop" | "subvec" => args
+        "into" => args
+            .iter()
+            .map(|arg| resolve_query_value(arg, binding))
+            .collect::<Result<Vec<_>>>()
+            .and_then(query_into_value),
+        "take" | "drop" | "drop-last" | "take-nth" | "take-while" | "drop-while" | "split-at"
+        | "split-with" | "partition" | "partition-all" | "subvec" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
             .and_then(|values| query_collection_slice_value(op, values)),
-        "reverse" | "sort" => args
+        "concat" | "distinct" | "reverse" | "sort" | "flatten" | "interpose" | "interleave" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
@@ -5604,8 +6427,12 @@ mod tests {
             .await
             .unwrap();
         let alice = report.tempids["alice"].clone();
-        let pulled = conn.db().pull(parse(r#"[*]"#).unwrap(), alice).unwrap();
+        let pulled = conn
+            .db()
+            .pull(parse(r#"[*]"#).unwrap(), alice.clone())
+            .unwrap();
         let map = pulled.as_map().unwrap();
+        assert_eq!(map.get(&kw_value(":db/id")), Some(&cid_value(&alice)));
         assert_eq!(
             map.get(&kw_value(":person/name")),
             Some(&EdnValue::String("Alice".into()))
@@ -5613,6 +6440,43 @@ mod tests {
         assert_eq!(
             map.get(&kw_value(":person/age")),
             Some(&EdnValue::Integer(30))
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_supports_datomic_db_id_pattern() {
+        let conn = Connection::new();
+        let report = conn
+            .transact(
+                parse(
+                    r#"[
+                      {:db/id "alice" :person/name "Alice" :person/friend "bob"}
+                      {:db/id "bob" :person/name "Bob"}
+                    ]"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let alice = report.tempids["alice"].clone();
+        let bob = report.tempids["bob"].clone();
+        let pulled = conn
+            .db()
+            .pull(
+                parse(r#"[[:db/id :as :id] {:person/friend [:db/id :person/name]}]"#).unwrap(),
+                alice.clone(),
+            )
+            .unwrap();
+        let map = pulled.as_map().unwrap();
+        assert_eq!(map.get(&kw_value(":id")), Some(&cid_value(&alice)));
+        let friend = map
+            .get(&kw_value(":person/friend"))
+            .and_then(EdnValue::as_map)
+            .unwrap();
+        assert_eq!(friend.get(&kw_value(":db/id")), Some(&cid_value(&bob)));
+        assert_eq!(
+            friend.get(&kw_value(":person/name")),
+            Some(&EdnValue::String("Bob".into()))
         );
     }
 
@@ -5836,6 +6700,36 @@ mod tests {
                 EdnValue::String("Alice".into()),
                 EdnValue::String("Carol".into())
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_supports_reverse_ref_default_option() {
+        let conn = Connection::new();
+        let report = conn
+            .transact(
+                parse(
+                    r#"[
+                      {:db/id "bob" :person/name "Bob" :person/role :guest}
+                    ]"#,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bob = report.tempids["bob"].clone();
+        let pulled = conn
+            .db()
+            .pull(
+                parse(r#"[[:person/_friend :default :friend/none :xform name :as :referrers]]"#)
+                    .unwrap(),
+                bob,
+            )
+            .unwrap();
+        let map = pulled.as_map().unwrap();
+        assert_eq!(
+            map.get(&kw_value(":referrers")),
+            Some(&EdnValue::String("none".into()))
         );
     }
 
@@ -7796,7 +8690,7 @@ mod tests {
         .await
         .unwrap();
         let query = parse(
-            r#"{:find [?name ?uri ?collection ?rkey ?splitCollection ?splitRkey ?nthCollection ?lastRkey ?joinedUri ?normalizedUri ?scheme ?trimmedScheme]
+            r#"{:find [?name ?displayName ?uri ?collection ?rkey ?splitCollection ?splitRkey ?nthCollection ?lastRkey ?joinedUri ?normalizedUri ?scheme ?trimmedScheme]
                 :where [[?e :person/role ?role]
                         [(contains? #{:role/admin :role/moderator} ?role)]
                         [?e :atproto/uri ?uri]
@@ -7816,6 +8710,8 @@ mod tests {
                         [(upper-case "at") ?upperScheme]
                         [(clojure.string/lower-case ?upperScheme) ?scheme]
                         [(str/trim "  at  ") ?trimmedScheme]
+                        [(clojure.string/blank? "   ")]
+                        [(clojure.string/capitalize "alice") ?displayName]
                         [?e :person/name ?name]]}"#,
         )
         .unwrap();
@@ -7823,6 +8719,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![vec![
+                EdnValue::String("Alice".into()),
                 EdnValue::String("Alice".into()),
                 EdnValue::String("at://did:plc:alice/app.bsky.feed.post/r1".into()),
                 EdnValue::String("app.bsky.feed.post".into()),
@@ -8013,11 +8910,11 @@ mod tests {
         let query = parse(
             r#"{:find [?incScore ?decScore ?updatedScore]
                 :where [[?e :person/score ?score]
-                        [(inc ?score) ?incScore]
-                        [(dec ?score) ?decScore]
+                        [(clojure.core/inc ?score) ?incScore]
+                        [(clojure.core/dec ?score) ?decScore]
                         [?e :person/claims ?claims]
-                        [(update ?claims :claim/score inc) ?updatedClaims]
-                        [(get ?updatedClaims :claim/score) ?updatedScore]]}"#,
+                        [(clojure.core/update ?claims :claim/score clojure.core/inc) ?updatedClaims]
+                        [(clojure.core/get ?updatedClaims :claim/score) ?updatedScore]]}"#,
         )
         .unwrap();
         let rows = q(query, &conn.db(), &[]).unwrap();
@@ -8211,6 +9108,331 @@ mod tests {
                 ])),
                 EdnValue::Vector(vec![kw_value(":person/name")]),
                 EdnValue::Vector(vec![EdnValue::String("Alice".into())]),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn q_supports_clojure_collection_predicates() {
+        let conn = Connection::new();
+        conn.transact(
+            parse(
+                r#"[
+                  {:db/id "alice" :person/scores [1 2 3] :person/names ["Alice" "" "Alicia"]}
+                ]"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let query = parse(
+            r#"{:find [?allScores ?notEveryScoreString ?noNilScores ?allNames ?scoresVector ?sameScore ?hasAdmin ?notFalse ?truthyScores ?namesString ?secondScore ?lastScore ?poppedScores ?butlastScores ?droppedLastScores ?everyOtherScore ?incScores ?indexedScores ?indexedNames ?sortedNestedScores ?tailedScores ?oddScores ?nonOddScores ?nonEmptyNames ?someName ?scoreSum ?scoreProduct ?scoreMax ?applySum ?applyMax ?scoreSet ?initialOdds ?afterOdds ?splitScores ?splitOdds ?groupedScores ?partitionedScores ?scoreFrequencies ?numberRange ?repeatedScore ?scoreMap ?flatScores ?scoresIntoVector ?concatenatedScores ?distinctScores ?interposedScores ?interleavedScores ?pairs ?windows ?paddedPairs ?allPairs]
+                :where [[?e :person/scores ?scores]
+                        [?e :person/names ?names]
+                        [(distinct? 1 2 3)]
+                        [(every? integer? ?scores)]
+                        [(every? integer? ?scores) ?allScores]
+                        [(not-every? string? ?scores) ?notEveryScoreString]
+                        [(not-any? nil? ?scores) ?noNilScores]
+                        [(every? string? ?names) ?allNames]
+                        [(vector? ?scores) ?scoresVector]
+                        [(= 3 3) ?sameScore]
+                        [(contains? #{:role/admin :role/auditor} :role/admin) ?hasAdmin]
+                        [(clojure.core/not false) ?notFalse]
+                        [(boolean ?scores) ?truthyScores]
+                        [(string? ?names) ?namesString]
+                        [(second ?scores) ?secondScore]
+                        [(peek ?scores) ?lastScore]
+                        [(pop ?scores) ?poppedScores]
+                        [(butlast ?scores) ?butlastScores]
+                        [(drop-last 2 [1 2 3 4]) ?droppedLastScores]
+                        [(take-nth 2 [1 2 3 4 5]) ?everyOtherScore]
+                        [(map inc ?scores) ?incScores]
+                        [(map-indexed vector ?scores) ?indexedScores]
+                        [(keep-indexed vector ?names) ?indexedNames]
+                        [(sort-by count [[1 2 3] [1] [1 2]]) ?sortedNestedScores]
+                        [(mapcat rest [[0 1] [0 2]]) ?tailedScores]
+                        [(filter odd? ?scores) ?oddScores]
+                        [(remove odd? ?scores) ?nonOddScores]
+                        [(keep not-empty ?names) ?nonEmptyNames]
+                        [(some not-empty ?names) ?someName]
+                        [(reduce + 0 ?scores) ?scoreSum]
+                        [(reduce * ?scores) ?scoreProduct]
+                        [(reduce max ?scores) ?scoreMax]
+                        [(apply + ?scores) ?applySum]
+                        [(apply max ?scores) ?applyMax]
+                        [(apply hash-set ?scores) ?scoreSet]
+                        [(take-while odd? ?scores) ?initialOdds]
+                        [(drop-while odd? ?scores) ?afterOdds]
+                        [(split-at 2 ?scores) ?splitScores]
+                        [(split-with odd? ?scores) ?splitOdds]
+                        [(group-by odd? ?scores) ?groupedScores]
+                        [(partition-by odd? ?scores) ?partitionedScores]
+                        [(frequencies [1 1 2]) ?scoreFrequencies]
+                        [(range 1 6 2) ?numberRange]
+                        [(repeat 3 :ok) ?repeatedScore]
+                        [(zipmap [:a :b] ?scores) ?scoreMap]
+                        [(flatten [[1 2 3] [4 [5]]]) ?flatScores]
+                        [(into [:seed] ?scores) ?scoresIntoVector]
+                        [(concat ?scores [4 5]) ?concatenatedScores]
+                        [(distinct [1 2 1 3]) ?distinctScores]
+                        [(interpose 0 ?scores) ?interposedScores]
+                        [(interleave ?scores [:a :b :c]) ?interleavedScores]
+                        [(partition 2 ?scores) ?pairs]
+                        [(partition 2 1 ?scores) ?windows]
+                        [(partition 2 2 [0] ?scores) ?paddedPairs]
+                        [(partition-all 2 ?scores) ?allPairs]
+                        [(= ?allScores true)]
+                        [(= ?notEveryScoreString true)]
+                        [(= ?noNilScores true)]
+                        [(= ?allNames true)]
+                        [(= ?scoresVector true)]
+                        [(= ?sameScore true)]
+                        [(= ?hasAdmin true)]
+                        [(= ?notFalse true)]
+                        [(= ?truthyScores true)]
+                        [(= ?namesString false)]]}"#,
+        )
+        .unwrap();
+        let rows = q(query, &conn.db(), &[]).unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(false),
+                EdnValue::Integer(2),
+                EdnValue::Integer(3),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(4),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(0), EdnValue::Integer(1)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(3)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(0), EdnValue::String("Alice".into()),]),
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::String("".into())]),
+                    EdnValue::Vector(vec![
+                        EdnValue::Integer(2),
+                        EdnValue::String("Alicia".into()),
+                    ]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![
+                        EdnValue::Integer(1),
+                        EdnValue::Integer(2),
+                        EdnValue::Integer(3),
+                    ]),
+                ]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
+                EdnValue::Vector(vec![EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![
+                    EdnValue::String("Alice".into()),
+                    EdnValue::String("Alicia".into()),
+                ]),
+                EdnValue::String("Alice".into()),
+                EdnValue::Integer(6),
+                EdnValue::Integer(6),
+                EdnValue::Integer(3),
+                EdnValue::Integer(6),
+                EdnValue::Integer(3),
+                EdnValue::Set(BTreeSet::from([
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                ])),
+                EdnValue::Vector(vec![EdnValue::Integer(1)]),
+                EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(3)]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(3)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(3)]),
+                ]),
+                EdnValue::Map(BTreeMap::from([
+                    (
+                        EdnValue::Bool(false),
+                        EdnValue::Vector(vec![EdnValue::Integer(2)]),
+                    ),
+                    (
+                        EdnValue::Bool(true),
+                        EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
+                    ),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(3)]),
+                ]),
+                EdnValue::Map(BTreeMap::from([
+                    (EdnValue::Integer(1), EdnValue::Integer(2)),
+                    (EdnValue::Integer(2), EdnValue::Integer(1)),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![kw_value(":ok"), kw_value(":ok"), kw_value(":ok")]),
+                EdnValue::Map(BTreeMap::from([
+                    (kw_value(":a"), EdnValue::Integer(1)),
+                    (kw_value(":b"), EdnValue::Integer(2)),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(4),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![
+                    kw_value(":seed"),
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(4),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(0),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(0),
+                    EdnValue::Integer(3),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    kw_value(":a"),
+                    EdnValue::Integer(2),
+                    kw_value(":b"),
+                    EdnValue::Integer(3),
+                    kw_value(":c"),
+                ]),
+                EdnValue::Vector(vec![EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                ])]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(3)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(3), EdnValue::Integer(0)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(3)]),
+                ]),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn q_supports_edn_type_predicates() {
+        let conn = Connection::new();
+        conn.transact(
+            parse(
+                r#"[
+                  {:db/id "value"
+                   :value/char \k
+                   :value/float 1.5
+                   :value/bigint 42N
+                   :value/bigdec 2.5M
+                   :value/inst #inst "2026-05-30T00:00:00Z"
+                   :value/uuid #uuid "123e4567-e89b-12d3-a456-426614174000"}
+                ]"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let query = parse(
+            r#"{:find [?char ?float ?bigint ?bigdec ?inst ?uuid]
+                :where [[?e :value/char ?char]
+                        [?e :value/float ?float]
+                        [?e :value/bigint ?bigint]
+                        [?e :value/bigdec ?bigdec]
+                        [?e :value/inst ?inst]
+                        [?e :value/uuid ?uuid]
+                        [(char? ?char)]
+                        [(float? ?float)]
+                        [(double? ?float)]
+                        [(bigint? ?bigint)]
+                        [(number? ?bigdec)]
+                        [(decimal? ?bigdec)]
+                        [(inst? ?inst)]
+                        [(uuid? ?uuid)]
+                        [(simple-keyword? :ready)]
+                        [(qualified-keyword? :state/ready)]
+                        [(simple-symbol? ready)]
+                        [(qualified-symbol? state/ready)]
+                        [(ident? :state/ready)]
+                        [(ident? state/ready)]
+                        [(simple-ident? ready)]
+                        [(qualified-ident? state/ready)]
+                        [(seqable? nil)]
+                        [(seqable? "abc")]
+                        [(sequential? [1 2])]
+                        [(associative? {:a 1})]
+                        [(associative? [1 2])]
+                        [(counted? #{1 2})]]}"#,
+        )
+        .unwrap();
+
+        let rows = q(query, &conn.db(), &[]).unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                EdnValue::Char('k'),
+                EdnValue::float(1.5),
+                EdnValue::BigInt("42".into()),
+                EdnValue::BigDec("2.5".into()),
+                EdnValue::Tagged {
+                    tag: Symbol::bare("inst"),
+                    value: Box::new(EdnValue::String("2026-05-30T00:00:00Z".into())),
+                },
+                EdnValue::Tagged {
+                    tag: Symbol::bare("uuid"),
+                    value: Box::new(EdnValue::String(
+                        "123e4567-e89b-12d3-a456-426614174000".into()
+                    )),
+                },
             ]]
         );
     }

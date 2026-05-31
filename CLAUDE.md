@@ -18,13 +18,13 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 | kotoba-kqe | Datalog engine, Arrangement, Delta, MV (KQE) |
 | kotoba-dht | Source Chain, Warrant, Neighborhood (KDHT) |
 | kotoba-net | libp2p QUIC/Noise/GossipSub |
-| kotoba-auth | CACAO chain verification, DID Document |
+| kotoba-auth | CACAO chain verification, DID Document; **EVM read+verify surface** (`eth.rs` + `eth/{abi,token,caip,eip1271}.rs`, 2026-05-30) |
 | kotoba-graph | Quad API, SPARQL→Datalog, Commit DAG |
 | kotoba-vm | Invoke/Result ChainEntry, CALL_FOREIGN bridge (KVM) |
 | kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference, WebGPU training (embed+lm_head), WebGPU inference (full transformer, Gemma 4 E2B/E4B) |
 | kotoba-runtime | WASM Component Model host: WasmExecutor + UdfExecutor + WIT bindings |
 | kotoba-ingest | Gmail OAuth2 poll + RFC 2822 parse + E2E encrypt → QuadStore (ADR-2605252400); **EmailIngestor** now uses `Arc<dyn AgentCrypto>` + `Arc<Vault>` (raw vault_key removed 2026-05-26); **multimodal search 2026-05-30**: `media_embed` (`MediaEmbedClient` trait — `HttpMediaEmbedClient` CLIP/SigLIP/ImageBind shared-space encoder over HTTP + `Blake3MediaEmbedClient` caption-bridged offline client; `Modality` text/image/audio/video/document) + `media` (`MediaIngestor` → Vault blob + `media/*` datoms + `media/ivf/*` IVF into `media:2026:assets` graph; `rank_by_cosine` cross-modal retrieval). IVF persistence generalised: `IvfIndex::to_quads_ns(ns)` + namespace-agnostic `from_quads`/`from_datoms` (`cc/ivf/*` and `media/ivf/*`) |
-| kotoba-server | XRPC / MCP endpoints; **media cross-modal search 2026-05-30**: `media_xrpc` (`media.search` text-query→any-modality cosine rank, `media.ingest` base64 assets, `media.status`); `KotobaState.media_embed_client` (Option, `KOTOBA_MM_EMBED_URL`; deterministic fallback when unset) |
+| kotoba-server | XRPC / MCP endpoints; **media cross-modal search 2026-05-30**: `media_xrpc` (`media.search` text-query→any-modality cosine rank, `media.ingest` base64 assets, `media.status`); `KotobaState.media_embed_client` (Option, `KOTOBA_MM_EMBED_URL`; deterministic fallback when unset); **Firehose egress surface (D+E, 2026-05-30)** — see below |
 | kotoba-store | BlockStore implementations: Memory (hot); **KuboBlockStore** (Kubo HTTP cold tier, Dual-CID: blake3 internal + SHA2-256 IPFS, 2026-05-27); BudgetedBlockStore<S> LRU eviction; TieredBlockStore<H,C> hot/cold tiering; **CapturingBlockStore** (pass-through + recorder for CAR bundling); **CarBundleWriter / CarBlockIndex** (CARv1 format: 72B header + blocks + 48B/entry index, 3.8 GiB/s serialize); **IpfsPinClient** (Kubo-compatible HTTP RPC: pin/add, pin/rm, pin/ls — kotoba 自体が IPFS node として自前 pin; 1GB 超の extended pin は kotobase.gftd.ai が担当). S3BlockStore + LayeredBlockStore + KotobasePinClient + IrohBlockStore removed 2026-05-27. |
 | kotoba-store-web | Browser IndexedDB block store (wasm32), AsyncBlockStore trait |
 
@@ -732,6 +732,50 @@ let thread = compiled.run(thread)?;
 **Browser / Edge WASM (Phase N)**:
 - `wasmtime` は native-only (wasm32 にコンパイル不可)
 - ブラウザ実行は `kotoba-runtime-web` crate が必要 (browser native WebAssembly + IdbBlockStore + metered interpreter)
+
+## EVM 互換 — read + verify surface (2026-05-30)
+
+kotoba の Ethereum 互換は **read(チェーン状態の読み取り)+ verify(署名検証)のみ**。tx 署名・鍵生成・on-chain settlement・DID/on-chain origination は **etzhayyim-exclusive** (operating-entity boundary) のため kotoba 側では実装しない。
+
+### pure codec (`crates/kotoba-auth/src/eth/` — deps は `sha3` + `hex` のみで portable)
+
+| module | 内容 |
+|---|---|
+| `eth.rs` | EIP-191 `personal_sign_hash` / secp256k1 `recover_eth_address` / DID parse / **EIP-55 checksum** (`to_checksum_address` / `is_valid_checksum_address` / `parse_address`) / `keccak256` |
+| `eth/abi.rs` | ABI `selector` / encode(address,uint256,bool) / decode(uint256,address,bool,**dynamic string**,legacy bytes32) / `u256_to_decimal_string` / `format_units` |
+| `eth/token.rs` | **ERC-20 / ERC-721 / ERC-1155** view calldata builder + response decoder (`balanceOf`/`name`/`symbol`/`decimals`/`totalSupply`/`allowance`/`ownerOf`/`tokenURI`/`uri`/`isApprovedForAll`) |
+| `eth/caip.rs` | CAIP-2 (`eip155:1`) / CAIP-10 (account) / CAIP-19 (erc20/erc721/erc1155 asset) |
+| `eth/eip1271.rs` | **ERC-1271 calldata codec** (`isValidSignature` calldata + magic value `0x1626ba7e`)。ERC-4337 Smart Wallet の署名は ECDSA recover 不可 |
+
+### EVM JSON-RPC bridge (`crates/kotoba-runtime/src/host.rs` `bind_evm` + `wit/world.wit` interface `evm`)
+
+read-only RPC 9 メソッド (各 CALL_FOREIGN = 1000 gas, 5s timeout): `eth_call` / `eth_getStorageAt` / `eth_getBalance` / **`eth_chainId`** / **`eth_blockNumber`** / **`eth_getCode`** / **`eth_getTransactionCount`** / **`eth_getTransactionReceipt`** (raw JSON) / **`eth_getLogs`** (raw JSON, filter は JSON string)。receipt/logs は WIT で型付けせず JSON string を返し caller-side decode。
+
+**ERC-20 read host fns** (RPC + ABI codec を host 側で合成 — guest は ABI を再実装せず token を直接読める): `erc20-balance-of` / `erc20-total-supply` (decimal string) / `erc20-decimals` (u8) / `erc20-symbol` / `erc20-name` (dynamic string + legacy bytes32 両対応)。ERC-721/1155 codec は `eth/token.rs` で native/server から利用可 (host fn は未公開)。
+
+**Smart-account verify (EIP-1271, opt-in)**: `cacao.rs::verify_signature_eip191_smart(&dyn EthRpc)` が EOA recover → 不一致時 `eth_getCode` で contract 判定 → contract なら `eth_call(isValidSignature)` で EIP-191 digest を magic value 検証。`EthRpc` trait は注入式 (kotoba-auth は I/O-free を維持)。EOA fast-path は RPC を呼ばない。**注**: これは opt-in メソッドで、default の `verify_signature` / `DelegationChain::verify` は EOA-only のまま未変更 (現状この smart メソッドを呼ぶ production caller はなし)。xrpc / DelegationChain への routing は次の increment (各 call site に `EthRpc` 実装を thread する必要)。
+
+guest は `wit_bindgen::generate!` で world.wit から自動再生成 (`examples/kotoba-hello` で検証済み)。テスト: kotoba-auth 239 / kotoba-runtime 26 (`test_wasm_instantiate` が拡張 WIT = evm 14 funcs の component instantiate を検証)。
+
+## Firehose Egress — D+E federation surface (2026-05-30)
+
+KSE Journal (seq 順序ログ + broadcast `subscribe()` + `read_since()` cold-fallback) を「同一 cursor の 2 シンク」に開く。cursor == Journal `seq`。
+
+**D — HTTP tap (`kotoba-server/src/firehose.rs`)**
+- `GET /xrpc/ai.gftd.apps.kotoba.sync.subscribe?cursor=N&topic_prefix=...` — **SSE live-tail**。live broadcast を先に subscribe → `read_since(cursor+1)` で backfill → 新規を stream。各 frame に `id: <seq>`、再接続は `?cursor=` / `Last-Event-ID` で resume。重複 seq は `last_seq` で除去。
+- `GET /xrpc/ai.gftd.apps.kotoba.sync.events?cursor=N&limit=K&topic_prefix=...` — **JSON cursor paging / long-poll**（WS/SSE 非対応の proxy・CF Worker 向け）。`{events, cursor, current_seq, has_more}`、`limit` cap 1000。
+- payload は JSON なら inline、非 JSON は base64 string。fingerprint middleware は request-side のみで SSE stream は素通り。
+- **Auth gate (node-level)**: firehose は cross-graph 全 Journal stream のため per-graph credential で bound できない → `KOTOBA_DEFAULT_VISIBILITY` で node 単位 gate（`check_read_access` 共用）。`public`=open / `authenticated`=Bearer 必須 / `private`(**default**)=operator DID への CACAO `datom:read` 必須 (`?cacao_b64=`)。default private なので無認証 leak は無い。per-entry per-graph filter（private node で public graph だけ出す）は scope 外（follow-up）。
+
+**E — gossip relay role (`net_actor.rs`, `NodeRole::Relay`)**
+- `KOTOBA_NODE_ROLES=relay` で opt-in（default `pin,compute` は不変 = 既存挙動に影響なし）。
+- relay node は local Journal を `kotoba/firehose` gossip topic に bridge し、peer の firehose entry を受信 → ローカル Journal に re-log（re-sequence、durability + D-tap 可視 + onward forward）。
+- **Loop/seq-inflation guard**: `FirehoseSeen`（bounded ring+set, cap 8192, content-CID dedup）。inbound firehose の `entry.cid` を記録 → 自分の firehose cursor が同一 payload (= 同一 blake3 CID) を再 gossip するのを抑止。gossipsub message-id dedup と二重で storm-free。
+- `quad/assert` / `quad/retract` / pregel は専用 gossip 経路があるため firehose egress から除外（二重伝播回避）。relay は firehose topic を **log+forward** するのみで QuadStore へは projection しない（重い graph-merge は別 increment）。
+
+**A (faithful `com.atproto.sync.subscribeRepos`) を出さない理由**: kotoba は MST / 署名済み commit / CAR を持たず（record-log semantics）、quad projection が repo DID + collection NSID を一方向 hash 化（`did_to_cid`/`collection_to_cid` = blake3、逆 index 無し）→ AT commit 復元不能。AT-MST origination は **etzhayyim-exclusive**（operating-entity boundary; DID/on-chain origination と同類）なので、datomic ベースの origin-PDS 化は etzhayyim/root 側 ADR マター。
+
+NSID は kotoba namespace（`ai.gftd.apps.kotoba.sync.*`）— 非 spec body を `com.atproto.sync.subscribeRepos` path に squat しない。
 
 ## 禁止
 

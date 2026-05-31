@@ -539,6 +539,15 @@ where
     }
 
     /// Datomic-compatible current datom scan over a distributed Prolly index.
+    pub fn datoms(
+        &self,
+        head: &KotobaCid,
+        index: DatomIndex,
+        components: &[Value],
+    ) -> Result<Vec<Datom>, DistributedCommitError> {
+        self.datoms_index(head, index, components)
+    }
+
     pub fn datoms_index(
         &self,
         head: &KotobaCid,
@@ -546,6 +555,15 @@ where
         components: &[Value],
     ) -> Result<Vec<Datom>, DistributedCommitError> {
         self.current_for_index_components(head, root_for_datom_index(index), components)
+    }
+
+    pub fn datoms_for_name(
+        &self,
+        ipns_name: &str,
+        index: DatomIndex,
+        components: &[Value],
+    ) -> Result<Vec<Datom>, DistributedCommitError> {
+        self.datoms_index_for_name(ipns_name, index, components)
     }
 
     pub fn datoms_index_for_name(
@@ -786,6 +804,41 @@ where
         query: &Value,
     ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
         self.q_triples_with_inputs(head, query, &[])
+    }
+
+    /// Datomic-compatible `q` over a distributed Prolly/DAG-CBOR database head.
+    pub fn q(
+        &self,
+        head: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_with_inputs(head, query, &[])
+    }
+
+    pub fn q_with_inputs(
+        &self,
+        head: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_with_inputs(head, query, inputs)
+    }
+
+    pub fn q_for_name(
+        &self,
+        ipns_name: &str,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_for_name_with_inputs(ipns_name, query, &[])
+    }
+
+    pub fn q_for_name_with_inputs(
+        &self,
+        ipns_name: &str,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_for_name_with_inputs(ipns_name, query, inputs)
     }
 
     pub fn q_triples_for_name(
@@ -1065,6 +1118,44 @@ where
         self.q_triples_as_of_tx_with_inputs(head, tx_cid, query, &[])
     }
 
+    pub fn q_as_of_tx(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_as_of_tx_with_inputs(head, tx_cid, query, &[])
+    }
+
+    pub fn q_as_of_tx_with_inputs(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_as_of_tx_with_inputs(head, tx_cid, query, inputs)
+    }
+
+    pub fn q_as_of_tx_for_name(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_as_of_tx_for_name_with_inputs(ipns_name, tx_cid, query, &[])
+    }
+
+    pub fn q_as_of_tx_for_name_with_inputs(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_as_of_tx_for_name_with_inputs(ipns_name, tx_cid, query, inputs)
+    }
+
     pub fn q_triples_as_of_tx_for_name(
         &self,
         ipns_name: &str,
@@ -1111,6 +1202,44 @@ where
         query: &Value,
     ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
         self.q_triples_since_tx_with_inputs(head, tx_cid, query, &[])
+    }
+
+    pub fn q_since_tx(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_since_tx_with_inputs(head, tx_cid, query, &[])
+    }
+
+    pub fn q_since_tx_with_inputs(
+        &self,
+        head: &KotobaCid,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_since_tx_with_inputs(head, tx_cid, query, inputs)
+    }
+
+    pub fn q_since_tx_for_name(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_since_tx_for_name_with_inputs(ipns_name, tx_cid, query, &[])
+    }
+
+    pub fn q_since_tx_for_name_with_inputs(
+        &self,
+        ipns_name: &str,
+        tx_cid: &KotobaCid,
+        query: &Value,
+        inputs: &[Value],
+    ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        self.q_triples_since_tx_for_name_with_inputs(ipns_name, tx_cid, query, inputs)
     }
 
     pub fn q_triples_since_tx_for_name(
@@ -1614,6 +1743,7 @@ where
         args: &[Value],
         binding: &BTreeMap<String, Value>,
     ) -> Result<Value, DistributedCommitError> {
+        let op = crate::query_core_op(op);
         match op {
             "ground" => {
                 if args.len() != 1 {
@@ -1675,7 +1805,10 @@ where
             | "str/lower-case"
             | "upper-case"
             | "clojure.string/upper-case"
-            | "str/upper-case" => args
+            | "str/upper-case"
+            | "capitalize"
+            | "clojure.string/capitalize"
+            | "str/capitalize" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
@@ -1758,12 +1891,35 @@ where
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| crate::query_hash_map_value(values).map_err(Into::into)),
-            "keys" | "vals" | "merge" | "select-keys" => args
+            "keys" | "vals" | "merge" | "select-keys" | "zipmap" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| {
                     crate::query_map_operation_value(op, values).map_err(Into::into)
+                }),
+            "every?" | "not-every?" | "not-any?" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| {
+                    crate::query_collection_predicate_value(op, values)
+                        .map(Value::Bool)
+                        .map_err(Into::into)
+                }),
+            "not" | "boolean" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| {
+                    crate::query_truth_function_value(op, values).map_err(Into::into)
+                }),
+            _ if crate::is_query_predicate_function_op(op) => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| {
+                    crate::query_predicate_function_value(op, values).map_err(Into::into)
                 }),
             "count" => {
                 if args.len() != 1 {
@@ -1779,7 +1935,37 @@ where
                 crate::query_not_empty_value(required_query_value(&args[0], binding)?)
                     .map_err(Into::into)
             }
-            "seq" | "first" | "last" | "rest" | "next" => {
+            "map" | "mapcat" | "map-indexed" | "filter" | "remove" | "keep" | "keep-indexed"
+            | "some" | "group-by" | "partition-by" | "sort-by" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| {
+                    crate::query_collection_transform_value(op, values).map_err(Into::into)
+                }),
+            "frequencies" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| crate::query_frequencies_value(values).map_err(Into::into)),
+            "range" | "repeat" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| {
+                    crate::query_sequence_constructor_value(op, values).map_err(Into::into)
+                }),
+            "reduce" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| crate::query_reduce_value(values).map_err(Into::into)),
+            "apply" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| crate::query_apply_function_value(values).map_err(Into::into)),
+            "seq" | "first" | "second" | "last" | "peek" | "rest" | "next" | "pop" | "butlast" => {
                 if args.len() != 1 {
                     return Err(DatomicError::Query(format!("{op} expects one argument")).into());
                 }
@@ -1796,20 +1982,27 @@ where
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| crate::query_cons_value(values).map_err(Into::into)),
-            "take" | "drop" | "subvec" => args
+            "into" => args
+                .iter()
+                .map(|arg| required_query_value(arg, binding))
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|values| crate::query_into_value(values).map_err(Into::into)),
+            "take" | "drop" | "drop-last" | "take-nth" | "take-while" | "drop-while"
+            | "split-at" | "split-with" | "partition" | "partition-all" | "subvec" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
                 .collect::<Result<Vec<_>, _>>()
                 .and_then(|values| {
                     crate::query_collection_slice_value(op, values).map_err(Into::into)
                 }),
-            "reverse" | "sort" => args
-                .iter()
-                .map(|arg| required_query_value(arg, binding))
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|values| {
-                    crate::query_collection_order_value(op, values).map_err(Into::into)
-                }),
+            "concat" | "distinct" | "reverse" | "sort" | "flatten" | "interpose" | "interleave" => {
+                args.iter()
+                    .map(|arg| required_query_value(arg, binding))
+                    .collect::<Result<Vec<_>, _>>()
+                    .and_then(|values| {
+                        crate::query_collection_order_value(op, values).map_err(Into::into)
+                    })
+            }
             "conj" => args
                 .iter()
                 .map(|arg| required_query_value(arg, binding))
@@ -2210,6 +2403,52 @@ where
             &mut Vec<Datom>,
         ) -> Result<(), DistributedCommitError>,
     {
+        self.transact_inner(req, None, register_tx_fns, augment_datoms)
+            .await
+    }
+
+    /// Like `transact_with`, but the caller supplies a pre-materialised
+    /// `db_before` so this transact skips the O(graph) cold `db_from_head`
+    /// ProllyTree/Kubo scan (ADR-2605302130).
+    ///
+    /// SAFETY CONTRACT: `injected_db_before`, when `Some`, MUST equal
+    /// `db_from_head(expected_parent)` — same net-live datoms AND same `basis_t`.
+    /// The derived `tx_cid` depends only on the new tx datoms + `db_before.basis_t`,
+    /// and tempid/upsert/schema resolution reads `db_before.datoms`, so an
+    /// equivalent `db_before` yields a byte-identical commit. The server only
+    /// passes `Some` when its cached head matches the resolved IPNS head.
+    pub async fn transact_with_db_before<G>(
+        &self,
+        req: DistributedTransactRequest,
+        injected_db_before: Option<Db>,
+        augment_datoms: G,
+    ) -> Result<DistributedTransactReport, DistributedCommitError>
+    where
+        G: FnOnce(
+            &TransactReport,
+            &DistributedTransactContext,
+            &mut Vec<Datom>,
+        ) -> Result<(), DistributedCommitError>,
+    {
+        self.transact_inner(req, injected_db_before, |_| Ok(()), augment_datoms)
+            .await
+    }
+
+    async fn transact_inner<F, G>(
+        &self,
+        req: DistributedTransactRequest,
+        injected_db_before: Option<Db>,
+        register_tx_fns: F,
+        augment_datoms: G,
+    ) -> Result<DistributedTransactReport, DistributedCommitError>
+    where
+        F: FnOnce(&Connection) -> Result<(), DistributedCommitError>,
+        G: FnOnce(
+            &TransactReport,
+            &DistributedTransactContext,
+            &mut Vec<Datom>,
+        ) -> Result<(), DistributedCommitError>,
+    {
         let name = IpnsName::new(req.ipns_name.clone());
         let current = match self.ipns.resolve(&name) {
             Ok(record) => Some(record),
@@ -2221,11 +2460,14 @@ where
                 .as_ref()
                 .and_then(|record| KotobaCid::from_multibase(&record.value))
         });
-        let db_before = match &expected_parent {
-            Some(parent) => {
-                DistributedDatomReader::new(self.store, self.ipns).db_from_head(parent)?
-            }
-            None => Db::from_datoms(vec![], None),
+        let db_before = match injected_db_before {
+            Some(db) => db,
+            None => match &expected_parent {
+                Some(parent) => {
+                    DistributedDatomReader::new(self.store, self.ipns).db_from_head(parent)?
+                }
+                None => Db::from_datoms(vec![], None),
+            },
         };
         let conn = Connection::from_datoms(db_before.all_datoms());
         register_tx_fns(&conn)?;
@@ -3934,6 +4176,7 @@ mod tests {
     use super::*;
     use crate::EdnValue;
     use ed25519_dalek::SigningKey;
+    use kotoba_edn::Symbol;
     use kotoba_ipfs::{InMemoryIpnsRegistry, KuboIpnsRegistry, SignedIpnsRegistry};
     use kotoba_store::MemoryBlockStore;
     use std::sync::Arc;
@@ -4378,6 +4621,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(rows, vec![vec![EdnValue::String("thread-1".into())]]);
+    }
+
+    #[test]
+    fn reader_exposes_datomic_q_and_datoms_api_over_distributed_head() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"graph");
+        let report = writer
+            .commit_datoms(request(
+                "k51-kotoba-datomic-api",
+                graph,
+                vec![
+                    datom(b"alice", ":person/name", "Alice", b"tx1"),
+                    datom(b"alice", ":person/role", "admin", b"tx1"),
+                ],
+            ))
+            .unwrap();
+        let reader = DistributedDatomReader::new(&store, &ipns);
+        let query = kotoba_edn::parse(
+            r#"{:find [?name ?role]
+               :where [[?e :person/name ?name]
+                       [?e :person/role ?role]]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reader.q(&report.commit.cid, &query).unwrap(),
+            vec![vec![
+                EdnValue::String("Alice".into()),
+                EdnValue::String("admin".into())
+            ]]
+        );
+        assert_eq!(
+            reader.q_for_name("k51-kotoba-datomic-api", &query).unwrap(),
+            reader
+                .q_triples_for_name("k51-kotoba-datomic-api", &query)
+                .unwrap()
+        );
+
+        let components = [kotoba_edn::parse(":person/name").unwrap()];
+        assert_eq!(
+            reader
+                .datoms(&report.commit.cid, DatomIndex::Avet, &components)
+                .unwrap(),
+            reader
+                .datoms_index(&report.commit.cid, DatomIndex::Avet, &components)
+                .unwrap()
+        );
+        assert_eq!(
+            reader
+                .datoms_for_name("k51-kotoba-datomic-api", DatomIndex::Avet, &components)
+                .unwrap(),
+            reader
+                .datoms_index_for_name("k51-kotoba-datomic-api", DatomIndex::Avet, &components)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -4966,6 +5266,76 @@ mod tests {
         );
     }
 
+    /// ADR-2605302130 safety contract: the value the server caches as the resident
+    /// `db_before` — `current_datoms(db_after)` keyed by the new head — MUST equal
+    /// the cold path `db_from_head(head)`: same net-live datom set AND same
+    /// `basis_t`. Both are derived from the SAME commit so this is timestamp-
+    /// independent (the wall-clock `:db/txInstant` is baked identically into both).
+    /// `tx_cid` depends only on the new tx datoms + `db_before.basis_t`, and
+    /// tempid/upsert/schema resolution reads `db_before.datoms`, so an equal
+    /// `db_before` yields a byte-identical commit — no DAG fork. tx2 retracts a
+    /// value to prove the netting drops tombstones consistently on both paths.
+    #[tokio::test]
+    async fn cached_db_before_equals_cold_db_from_head() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"cached-db-before-equivalence");
+        let mk_req = |tx: &str, parent: Option<KotobaCid>| DistributedTransactRequest {
+            ipns_name: "k51-cache-eq".into(),
+            graph: graph.clone(),
+            tx_data: kotoba_edn::parse(tx).unwrap(),
+            expected_parent: parent,
+            author: "did:key:zWriter".into(),
+            valid_until: "2030-01-01T00:00:00Z".into(),
+            ttl_secs: Some(60),
+            cacao_proof_cid: None,
+            ipns_controller_did: None,
+            ipns_signing_key: None,
+        };
+
+        let t1 = writer
+            .transact(mk_req(
+                r#"[[:db/add "alice" :person/name "Alice"]
+                    [:db/add "alice" :person/score 10]]"#,
+                None,
+            ))
+            .await
+            .unwrap();
+        let t2 = writer
+            .transact(mk_req(
+                r#"[[:db/add "bob" :person/name "Bob"]
+                    [:db/retract "alice" :person/score 10]]"#,
+                Some(t1.commit.commit.cid.clone()),
+            ))
+            .await
+            .unwrap();
+        let head = t2.commit.commit.cid.clone();
+
+        // What the server caches after committing t2:
+        let cached = crate::current_datoms(&t2.transact.db_after.all_datoms());
+        let cached_basis = t2.transact.db_after.basis_t.clone();
+        // What a cold transact would reconstruct:
+        let reader = DistributedDatomReader::new(&store, &ipns);
+        let cold = reader.db_from_head(&head).unwrap();
+        let cold_datoms = cold.all_datoms();
+
+        assert_eq!(
+            cached.len(),
+            cold_datoms.len(),
+            "cached net-live datom count != cold db_from_head"
+        );
+        assert!(
+            cached.iter().all(|d| cold_datoms.contains(d))
+                && cold_datoms.iter().all(|d| cached.contains(d)),
+            "cached db_before datom set diverges from cold db_from_head"
+        );
+        assert_eq!(
+            cached_basis, cold.basis_t,
+            "basis_t mismatch — tx_cid would diverge"
+        );
+    }
+
     #[tokio::test]
     async fn writer_transact_preserves_datomic_schema_unique_identity_and_cardinality_one() {
         let store = MemoryBlockStore::new();
@@ -5115,7 +5485,8 @@ mod tests {
         let second = writer.commit_datoms(second_req).unwrap();
 
         let reader = DistributedDatomReader::new(&store, &ipns);
-        let pattern = kotoba_edn::parse(r#"[:person/name :person/role]"#).unwrap();
+        let pattern = kotoba_edn::parse(r#"[:db/id :person/name :person/role]"#).unwrap();
+        let id_key = kotoba_edn::parse(":db/id").unwrap();
         let name_key = kotoba_edn::parse(":person/name").unwrap();
         let role_key = kotoba_edn::parse(":person/role").unwrap();
 
@@ -5124,6 +5495,7 @@ mod tests {
             .unwrap()
             .expect("ipns head");
         let pulled_map = pulled.as_map().unwrap();
+        assert_eq!(pulled_map.get(&id_key), Some(&cid_value(&alice)));
         assert_eq!(
             pulled_map.get(&name_key),
             Some(&EdnValue::String("Alice".into()))
@@ -5143,6 +5515,10 @@ mod tests {
             .expect("ipns head");
         assert_eq!(pulled_many.len(), 2);
         assert_eq!(
+            pulled_many[1].as_map().unwrap().get(&id_key),
+            Some(&cid_value(&bob))
+        );
+        assert_eq!(
             pulled_many[1].as_map().unwrap().get(&name_key),
             Some(&EdnValue::String("Bob".into()))
         );
@@ -5152,10 +5528,14 @@ mod tests {
                 "k51-kotoba-db",
                 &first.commit.tx_cid,
                 pattern.clone(),
-                alice,
+                alice.clone(),
             )
             .unwrap()
             .expect("ipns head");
+        assert_eq!(
+            as_of.as_map().unwrap().get(&id_key),
+            Some(&cid_value(&alice))
+        );
         assert_eq!(
             as_of.as_map().unwrap().get(&name_key),
             Some(&EdnValue::String("Alice".into()))
@@ -6230,7 +6610,7 @@ mod tests {
             .unwrap();
 
         let query = kotoba_edn::parse(
-            r#"{:find [(pull ?e [:person/name {:person/friend [:person/name :person/role]}])]
+            r#"{:find [(pull ?e [:db/id :person/name {:person/friend [:db/id :person/name :person/role]}])]
                 :where [[?e :person/name "Alice"]]}"#,
         )
         .unwrap();
@@ -6241,6 +6621,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let pulled = rows[0][0].as_map().unwrap();
         assert_eq!(
+            pulled.get(&EdnValue::Keyword(Keyword::namespaced("db", "id"))),
+            Some(&cid_value(&KotobaCid::from_bytes(b"alice")))
+        );
+        assert_eq!(
             pulled.get(&EdnValue::Keyword(Keyword::namespaced("person", "name"))),
             Some(&EdnValue::String("Alice".into()))
         );
@@ -6248,6 +6632,10 @@ mod tests {
             .get(&EdnValue::Keyword(Keyword::namespaced("person", "friend")))
             .and_then(EdnValue::as_map)
             .unwrap();
+        assert_eq!(
+            friend.get(&EdnValue::Keyword(Keyword::namespaced("db", "id"))),
+            Some(&cid_value(&KotobaCid::from_bytes(b"bob")))
+        );
         assert_eq!(
             friend.get(&EdnValue::Keyword(Keyword::namespaced("person", "name"))),
             Some(&EdnValue::String("Bob".into()))
@@ -6547,16 +6935,17 @@ mod tests {
             .unwrap();
 
         let query = kotoba_edn::parse(
-            r#"{:find [?name ?copy ?role ?found ?roleName ?roleNamespace ?resource ?rebuilt ?uri ?collection ?rkey ?splitCollection ?splitRkey ?nthCollection ?lastRkey ?joinedUri ?normalizedUri ?scheme ?trimmedScheme]
+            r#"{:find [?name ?displayName ?copy ?role ?found ?roleName ?roleNamespace ?resource ?rebuilt ?uri ?collection ?rkey ?splitCollection ?splitRkey ?nthCollection ?lastRkey ?joinedUri ?normalizedUri ?scheme ?trimmedScheme]
                 :where [[(ground :guest) ?guest]
                         [?e :person/name ?name]
+                        [(clojure.string/capitalize "alice") ?displayName]
                         [?e :person/age ?age]
-                        [(>= ?age 30)]
-                        [(not= ?name "Bob")]
+                        [(clojure.core/>= ?age 30)]
+                        [(clojure.core/not= ?name "Bob")]
                         [(missing? $ ?e :person/ban-reason)]
                         [(identity ?name) ?copy]
                         [(get-else $ ?e :person/role ?guest) ?role]
-                        [(contains? #{:role/admin :role/moderator} ?role)]
+                        [(clojure.core/contains? #{:role/admin :role/moderator} ?role)]
                         [(get-some $ ?e :person/email :person/role) ?found]
                         [(name ?role) ?roleName]
                         [(namespace ?role) ?roleNamespace]
@@ -6569,15 +6958,16 @@ mod tests {
                         [(subs ?uri 19 37) ?collection]
                         [(clojure.core/subs ?uri 38) ?rkey]
                         [(clojure.string/split ?uri "/") ?uriParts]
-                        [(get ?uriParts 3) ?splitCollection]
-                        [(get ?uriParts 4) ?splitRkey]
-                        [(nth ?uriParts 3) ?nthCollection]
-                        [(last ?uriParts) ?lastRkey]
+                        [(clojure.core/get ?uriParts 3) ?splitCollection]
+                        [(clojure.core/get ?uriParts 4) ?splitRkey]
+                        [(clojure.core/nth ?uriParts 3) ?nthCollection]
+                        [(clojure.core/last ?uriParts) ?lastRkey]
                         [(clojure.string/join "/" ?uriParts) ?joinedUri]
                         [(= ?joinedUri ?uri)]
                         [(clojure.string/replace ?uri "at://" "at-uri://") ?normalizedUri]
                         [(upper-case "at") ?upperScheme]
                         [(clojure.string/lower-case ?upperScheme) ?scheme]
+                        [(clojure.string/blank? "   ")]
                         [(str/trim "  at  ") ?trimmedScheme]]}"#,
         )
         .unwrap();
@@ -6588,6 +6978,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![vec![
+                EdnValue::String("Alice".into()),
                 EdnValue::String("Alice".into()),
                 EdnValue::String("Alice".into()),
                 EdnValue::Keyword(Keyword::parse("role/admin")),
@@ -6690,6 +7081,244 @@ mod tests {
                 ])),
                 EdnValue::Vector(vec![EdnValue::Keyword(Keyword::parse("claim/type"))]),
                 EdnValue::Vector(vec![EdnValue::String("VerifiableCredential".into())]),
+            ]]
+        );
+
+        let collection_predicate_query = kotoba_edn::parse(
+            r#"{:find [?allTags ?noNilTags ?notEveryTagString ?tagsVector ?sameTag ?hasTag ?notFalse ?truthyTags ?tagsString ?secondNumber ?lastNumber ?poppedNumbers ?butlastNumbers ?droppedLastNumbers ?everyOtherNumber ?indexedTags ?indexedNumbers ?sortedNested ?tagKeywords ?tails ?nonStringTags ?keptTags ?someTag ?sum ?product ?max ?applySum ?applyMax ?applySet ?initialOdds ?afterOdds ?splitNumbers ?splitOdds ?groupedNumbers ?partitionedNumbers ?numberFrequencies ?numberRange ?repeatedTag ?tagMap ?flat ?numbersIntoVector ?concatenated ?distinctNumbers ?interposed ?interleaved ?pairs ?windows ?paddedPairs ?allPairs]
+                :where [[?e :credential/claims ?claims]
+                        [(get ?claims :claim/tags) ?tags]
+                        [(distinct? :role/admin :role/auditor :role/operator)]
+                        [(every? keyword? ?tags)]
+                        [(every? keyword? ?tags) ?allTags]
+                        [(not-any? nil? ?tags) ?noNilTags]
+                        [(not-every? string? ?tags) ?notEveryTagString]
+                        [(vector? ?tags) ?tagsVector]
+                        [(= :vc :vc) ?sameTag]
+                        [(contains? #{:vc :ipld} :vc) ?hasTag]
+                        [(clojure.core/not false) ?notFalse]
+                        [(boolean ?tags) ?truthyTags]
+                        [(string? ?tags) ?tagsString]
+                        [(second [1 2 3]) ?secondNumber]
+                        [(peek [1 2 3]) ?lastNumber]
+                        [(pop [1 2 3]) ?poppedNumbers]
+                        [(butlast [1 2 3]) ?butlastNumbers]
+                        [(drop-last 2 [1 2 3 4]) ?droppedLastNumbers]
+                        [(take-nth 2 [1 2 3 4 5]) ?everyOtherNumber]
+                        [(map-indexed vector ?tags) ?indexedTags]
+                        [(keep-indexed vector [1 2]) ?indexedNumbers]
+                        [(sort-by count [[1 2 3] [1] [1 2]]) ?sortedNested]
+                        [(filter keyword? ?tags) ?tagKeywords]
+                        [(mapcat rest [[0 1] [0 2]]) ?tails]
+                        [(remove string? ?tags) ?nonStringTags]
+                        [(keep identity ?tags) ?keptTags]
+                        [(some identity ?tags) ?someTag]
+                        [(reduce + 0 [1 2 3]) ?sum]
+                        [(reduce * [1 2 3]) ?product]
+                        [(reduce max [1 2 3]) ?max]
+                        [(apply + [1 2 3]) ?applySum]
+                        [(apply max [1 2 3]) ?applyMax]
+                        [(apply hash-set [1 2 3]) ?applySet]
+                        [(take-while odd? [1 3 2 5]) ?initialOdds]
+                        [(drop-while odd? [1 3 2 5]) ?afterOdds]
+                        [(split-at 2 [1 2 3]) ?splitNumbers]
+                        [(split-with odd? [1 3 2 5]) ?splitOdds]
+                        [(group-by odd? [1 2 3]) ?groupedNumbers]
+                        [(partition-by odd? [1 3 2 5]) ?partitionedNumbers]
+                        [(frequencies [1 1 2]) ?numberFrequencies]
+                        [(range 1 6 2) ?numberRange]
+                        [(repeat 3 :ok) ?repeatedTag]
+                        [(zipmap [:a :b] [1 2 3]) ?tagMap]
+                        [(flatten [[1 2] [3 [4]]]) ?flat]
+                        [(into [:seed] [1 2 3]) ?numbersIntoVector]
+                        [(concat [1 2] [3 4]) ?concatenated]
+                        [(distinct [1 2 1 3]) ?distinctNumbers]
+                        [(interpose 0 [1 2 3]) ?interposed]
+                        [(interleave [1 2 3] [:a :b :c]) ?interleaved]
+                        [(partition 2 [1 2 3]) ?pairs]
+                        [(partition 2 1 [1 2 3]) ?windows]
+                        [(partition 2 2 [0] [1 2 3]) ?paddedPairs]
+                        [(partition-all 2 [1 2 3]) ?allPairs]
+                        [(= ?allTags true)]
+                        [(= ?noNilTags true)]
+                        [(= ?notEveryTagString true)]
+                        [(= ?tagsVector true)]
+                        [(= ?sameTag true)]
+                        [(= ?hasTag true)]
+                        [(= ?notFalse true)]
+                        [(= ?truthyTags true)]
+                        [(= ?tagsString false)]]}"#,
+        )
+        .unwrap();
+        let rows = DistributedDatomReader::new(&store, &ipns)
+            .q_triples(&report.commit.cid, &collection_predicate_query)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(true),
+                EdnValue::Bool(false),
+                EdnValue::Integer(2),
+                EdnValue::Integer(3),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![
+                        EdnValue::Integer(0),
+                        EdnValue::Keyword(Keyword::parse("vc")),
+                    ]),
+                    EdnValue::Vector(vec![
+                        EdnValue::Integer(1),
+                        EdnValue::Keyword(Keyword::parse("ipld")),
+                    ]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(0), EdnValue::Integer(1)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![
+                        EdnValue::Integer(1),
+                        EdnValue::Integer(2),
+                        EdnValue::Integer(3),
+                    ]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Keyword(Keyword::parse("vc")),
+                    EdnValue::Keyword(Keyword::parse("ipld")),
+                ]),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                EdnValue::Vector(vec![
+                    EdnValue::Keyword(Keyword::parse("vc")),
+                    EdnValue::Keyword(Keyword::parse("ipld")),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Keyword(Keyword::parse("vc")),
+                    EdnValue::Keyword(Keyword::parse("ipld")),
+                ]),
+                EdnValue::Keyword(Keyword::parse("vc")),
+                EdnValue::Integer(6),
+                EdnValue::Integer(6),
+                EdnValue::Integer(3),
+                EdnValue::Integer(6),
+                EdnValue::Integer(3),
+                EdnValue::Set(BTreeSet::from([
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                ])),
+                EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
+                EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(5)]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(3)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(5)]),
+                ]),
+                EdnValue::Map(BTreeMap::from([
+                    (
+                        EdnValue::Bool(false),
+                        EdnValue::Vector(vec![EdnValue::Integer(2)]),
+                    ),
+                    (
+                        EdnValue::Bool(true),
+                        EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
+                    ),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(3)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(5)]),
+                ]),
+                EdnValue::Map(BTreeMap::from([
+                    (EdnValue::Integer(1), EdnValue::Integer(2)),
+                    (EdnValue::Integer(2), EdnValue::Integer(1)),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(5),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Keyword(Keyword::parse("ok")),
+                    EdnValue::Keyword(Keyword::parse("ok")),
+                    EdnValue::Keyword(Keyword::parse("ok")),
+                ]),
+                EdnValue::Map(BTreeMap::from([
+                    (EdnValue::Keyword(Keyword::parse("a")), EdnValue::Integer(1),),
+                    (EdnValue::Keyword(Keyword::parse("b")), EdnValue::Integer(2),),
+                ])),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(4),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Keyword(Keyword::parse("seed")),
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(4),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(0),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(0),
+                    EdnValue::Integer(3),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Keyword(Keyword::parse("a")),
+                    EdnValue::Integer(2),
+                    EdnValue::Keyword(Keyword::parse("b")),
+                    EdnValue::Integer(3),
+                    EdnValue::Keyword(Keyword::parse("c")),
+                ]),
+                EdnValue::Vector(vec![EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                ])]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(2), EdnValue::Integer(3)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(3), EdnValue::Integer(0)]),
+                ]),
+                EdnValue::Vector(vec![
+                    EdnValue::Vector(vec![EdnValue::Integer(1), EdnValue::Integer(2)]),
+                    EdnValue::Vector(vec![EdnValue::Integer(3)]),
+                ]),
             ]]
         );
 
@@ -7020,6 +7649,110 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn reader_evaluates_distributed_edn_type_predicates() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"graph");
+        let entity = KotobaCid::from_bytes(b"value");
+        let tx = KotobaCid::from_bytes(b"tx1");
+        let report = writer
+            .commit_datoms(request(
+                "k51-kotoba-db",
+                graph,
+                vec![
+                    Datom::assert(
+                        entity.clone(),
+                        ":value/char".into(),
+                        EdnValue::Char('k'),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        entity.clone(),
+                        ":value/float".into(),
+                        EdnValue::float(1.5),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        entity.clone(),
+                        ":value/bigint".into(),
+                        EdnValue::BigInt("42".into()),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        entity.clone(),
+                        ":value/bigdec".into(),
+                        EdnValue::BigDec("2.5".into()),
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        entity.clone(),
+                        ":value/inst".into(),
+                        EdnValue::Tagged {
+                            tag: Symbol::bare("inst"),
+                            value: Box::new(EdnValue::String("2026-05-30T00:00:00Z".into())),
+                        },
+                        tx.clone(),
+                    ),
+                    Datom::assert(
+                        entity,
+                        ":value/uuid".into(),
+                        EdnValue::Tagged {
+                            tag: Symbol::bare("uuid"),
+                            value: Box::new(EdnValue::String(
+                                "123e4567-e89b-12d3-a456-426614174000".into(),
+                            )),
+                        },
+                        tx,
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        let query = kotoba_edn::parse(
+            r#"{:find [?char ?float ?bigint ?bigdec ?inst ?uuid]
+                :where [[?e :value/char ?char]
+                        [?e :value/float ?float]
+                        [?e :value/bigint ?bigint]
+                        [?e :value/bigdec ?bigdec]
+                        [?e :value/inst ?inst]
+                        [?e :value/uuid ?uuid]
+                        [(char? ?char)]
+                        [(float? ?float)]
+                        [(double? ?float)]
+                        [(bigint? ?bigint)]
+                        [(number? ?bigdec)]
+                        [(decimal? ?bigdec)]
+                        [(inst? ?inst)]
+                        [(uuid? ?uuid)]
+                        [(simple-keyword? :ready)]
+                        [(qualified-keyword? :state/ready)]
+                        [(simple-symbol? ready)]
+                        [(qualified-symbol? state/ready)]
+                        [(ident? :state/ready)]
+                        [(ident? state/ready)]
+                        [(simple-ident? ready)]
+                        [(qualified-ident? state/ready)]
+                        [(seqable? nil)]
+                        [(seqable? "abc")]
+                        [(sequential? [1 2])]
+                        [(associative? {:a 1})]
+                        [(associative? [1 2])]
+                        [(counted? #{1 2})]]}"#,
+        )
+        .unwrap();
+        let rows = DistributedDatomReader::new(&store, &ipns)
+            .q_triples(&report.commit.cid, &query)
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], EdnValue::Char('k'));
+        assert_eq!(rows[0][1], EdnValue::float(1.5));
+        assert_eq!(rows[0][2], EdnValue::BigInt("42".into()));
+        assert_eq!(rows[0][3], EdnValue::BigDec("2.5".into()));
     }
 
     #[test]

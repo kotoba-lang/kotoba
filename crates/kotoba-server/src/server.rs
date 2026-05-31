@@ -42,6 +42,10 @@ pub enum NodeRole {
     Pin,
     /// Execution provider — earns gas/consumed_mkoto Quad per WASM superstep.
     Compute,
+    /// Firehose relay — bridges the local KSE Journal onto the libp2p `firehose`
+    /// gossip topic and forwards peers' firehose entries (the mesh half of the
+    /// D+E federation surface, 2026-05-30). Opt-in: not in the default set.
+    Relay,
 }
 
 impl NodeRole {
@@ -53,6 +57,7 @@ impl NodeRole {
             match part.trim().to_ascii_lowercase().as_str() {
                 "pin" => roles.push(NodeRole::Pin),
                 "compute" => roles.push(NodeRole::Compute),
+                "relay" => roles.push(NodeRole::Relay),
                 other => tracing::warn!(role = other, "unknown KOTOBA_NODE_ROLES value, ignoring"),
             }
         }
@@ -67,6 +72,7 @@ impl NodeRole {
         match self {
             NodeRole::Pin => "pin",
             NodeRole::Compute => "compute",
+            NodeRole::Relay => "relay",
         }
     }
 }
@@ -207,6 +213,20 @@ fn did_document_resolver_ipns_names() -> Vec<String> {
 }
 
 /// Shared server state — Arc-wrapped and injected into every axum handler.
+/// Resident materialised Datomic DB for one graph, used as an in-memory
+/// `db_before` for `datomic.transact` so each transact skips the O(graph) cold
+/// ProllyTree/Kubo scan that caused the superlinear blowup in ADR-2605302130.
+///
+/// `head` is the IPNS commit CID the cached `db` corresponds to; `db` is the
+/// **net-live** datom set at that head (netted via `current_datoms`, so it is
+/// byte-identical to `db_from_head(head)` — same datoms + same `basis_t` — which
+/// keeps the derived `tx_cid` / `commit_cid` deterministic regardless of whether
+/// `db_before` came from this cache or a cold scan).
+pub struct LiveDatomicGraph {
+    pub head: KotobaCid,
+    pub db: kotoba_datomic::Db,
+}
+
 pub struct KotobaState {
     pub version: &'static str,
     // ── Node identity / participation (ADR-2605260005) ────────────────────
@@ -297,6 +317,20 @@ pub struct KotobaState {
     /// Shared HTTP client — used for did:web DID document resolution and other
     /// outbound fetches.  10-second timeout; connection pool reused across requests.
     pub http_client: reqwest::Client,
+    // ── Resident Datomic DB cache (ADR-2605302130) ───────────────────────────
+    /// Per-graph materialised net-live `db_before` so `datomic.transact` serves
+    /// the prior DB from RAM instead of an O(graph) cold ProllyTree/Kubo scan.
+    /// Outer std Mutex guards the slot map (held only to get-or-insert); the inner
+    /// per-graph async Mutex serialises db_before read + commit + cache update so
+    /// the cached head never races a concurrent transact for the same graph.
+    pub datomic_live:
+        Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<LiveDatomicGraph>>>>>>,
+    /// Count of cold `db_from_head` loads taken by `datomic.transact` — the
+    /// expensive O(graph) ProllyTree/Kubo path, hit only on a cache miss against
+    /// a non-empty graph (first transact after (re)start). Observability + the
+    /// efficacy hook proving the resident cache actually serves steady-state
+    /// transacts rather than silently falling through to a cold scan.
+    pub datomic_cold_db_loads: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl KotobaState {
@@ -361,6 +395,20 @@ impl KotobaState {
                 .unwrap_or(false);
             if !ipfs_off {
                 let cold = kotoba_store::KuboBlockStore::from_env();
+                // F-3: attach the kotobase remote-pin client if configured so
+                // every local recursive pin/add also lands on kotobase.gftd.ai.
+                // Falls back to a single-pin (local only) when the env vars
+                // are absent — preserves dev / local-Kubo workflows.
+                let cold = match kotoba_store::IpfsPinClient::from_pin_env() {
+                    Some(remote) => {
+                        tracing::info!(
+                            "kotobase pin fanout enabled \
+                             (KOTOBA_IPFS_PIN_ENDPOINT)"
+                        );
+                        cold.with_remote_pin(remote)
+                    }
+                    None => cold,
+                };
                 let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
                     .unwrap_or_else(|_| "http://localhost:5001".into());
                 let tiered = kotoba_store::TieredBlockStore::new(hot, cold);
@@ -626,6 +674,8 @@ impl KotobaState {
             pre_key_registry: None,
             graph_registry,
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
+            datomic_live: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            datomic_cold_db_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -690,6 +740,23 @@ impl KotobaState {
     /// written in previous runs; with in-memory-only Journal it is a no-op.
     pub async fn replay_wal(&self) {
         self.quad_store.replay_from_journal().await;
+    }
+
+    /// Get-or-create the per-graph serialisation lock + resident `db_before`
+    /// slot for `datomic.transact` (ADR-2605302130). The returned async Mutex is
+    /// held across a transact so db_before read + commit + cache refresh are
+    /// atomic for one graph; distinct graphs never contend.
+    pub fn datomic_live_slot(
+        &self,
+        graph_mb: &str,
+    ) -> Arc<tokio::sync::Mutex<Option<LiveDatomicGraph>>> {
+        let mut map = self
+            .datomic_live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(graph_mb.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .clone()
     }
 
     /// Attach a GossipSub outbound channel after construction.

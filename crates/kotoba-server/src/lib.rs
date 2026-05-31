@@ -2,6 +2,7 @@ pub mod attestation;
 pub mod cc_xrpc;
 pub mod email_xrpc;
 pub mod fingerprint;
+pub mod firehose;
 pub mod graph_auth;
 pub mod kg;
 pub mod kotobase_xrpc;
@@ -211,6 +212,26 @@ mod tests {
                 "kotobase NSID must not contain consecutive dots: {nsid}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn generic_xrpc_dispatch_resolves() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+        
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+        let app = super::build_router(state);
+        
+        let req = Request::builder()
+            .method("POST")
+            .uri("/xrpc/ai.gftd.apps.yata.some_method")
+            .body(axum::body::Body::empty())
+            .unwrap();
+            
+        let response = app.oneshot(req).await.unwrap();
+        // Since we provided empty body, we expect a 400 Bad Request or 401 Unauthorized,
+        // but definitely NOT a 404 Not Found (which means no route matched)
+        assert_ne!(response.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }
 
@@ -551,6 +572,17 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", attestation::NSID_REQUEST_LOG),
             get(attestation::request_log_query),
         )
+        // ── Firehose egress (D): SSE live-tail + JSON cursor paging over Journal ──
+        .route(
+            &format!("/xrpc/{}", firehose::NSID_SYNC_SUBSCRIBE),
+            get(firehose::subscribe),
+        )
+        .route(
+            &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS),
+            get(firehose::events),
+        )
+        // ── Generic XRPC dispatch ──────────────────────────────────────────
+        .route("/xrpc/:nsid", post(xrpc::generic_invoke))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             fingerprint::fingerprint_middleware,
@@ -705,6 +737,10 @@ pub async fn run() -> anyhow::Result<()> {
                 let journal_arc = Arc::clone(&state.journal);
                 let block_store_arc = Arc::clone(&state.block_store);
                 let quad_store_arc = Arc::clone(&state.quad_store);
+                let relay = state
+                    .node_roles
+                    .iter()
+                    .any(|r| matches!(r, server::NodeRole::Relay));
 
                 tokio::spawn(net_actor::run(
                     swarm,
@@ -714,6 +750,7 @@ pub async fn run() -> anyhow::Result<()> {
                     pregel_outbound_rx,
                     block_store_arc,
                     quad_store_arc,
+                    relay,
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");

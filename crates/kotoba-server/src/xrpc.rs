@@ -557,12 +557,16 @@ pub(crate) struct AuthCapabilityProjection {
     invocation_targets: Vec<String>,
     proof_cid: Option<kotoba_core::cid::KotobaCid>,
     credential_ids: Vec<String>,
+    presentation_id: Option<String>,
+    presentation_cid: Option<kotoba_core::cid::KotobaCid>,
 }
 
 const ZCAP_ALLOWED_ACTION_IRI: &str = "https://w3id.org/security#allowedAction";
 const ZCAP_INVOCATION_TARGET_IRI: &str = "https://w3id.org/security#invocationTarget";
 const ZCAP_CONTROLLER_IRI: &str = "https://w3id.org/security#controller";
+const ZCAP_INVOKER_IRI: &str = "https://w3id.org/security#invoker";
 const ZCAP_INVOCATION_PROOF_IRI: &str = "https://w3id.org/security#proof";
+const ZCAP_CAPABILITY_INVOCATION_IRI: &str = "https://w3id.org/security#CapabilityInvocation";
 
 #[derive(Debug, Serialize)]
 pub struct DatomicPullResp {
@@ -1779,6 +1783,8 @@ fn cacao_capability_projection(
             .collect(),
         proof_cid,
         credential_ids: vec![],
+        presentation_id: None,
+        presentation_cid: None,
     }
 }
 
@@ -1787,6 +1793,7 @@ fn vp_capability_projection(
     proof_cid: Option<kotoba_core::cid::KotobaCid>,
 ) -> AuthCapabilityProjection {
     let invoker = presentation.holder.clone().unwrap_or_default();
+    let presentation_cid = presentation.cid().ok().or_else(|| proof_cid.clone());
     let mut allowed_actions = Vec::new();
     let mut invocation_targets = Vec::new();
     let mut credential_ids = Vec::new();
@@ -1848,6 +1855,8 @@ fn vp_capability_projection(
         invocation_targets,
         proof_cid,
         credential_ids,
+        presentation_id: Some(presentation.id.clone()),
+        presentation_cid,
     }
 }
 
@@ -2358,6 +2367,18 @@ fn append_auth_capability_datoms(
         ":capability/proofFormat",
         kotoba_edn::EdnValue::String(projection.proof_format.to_string()),
     );
+    assert_tx(
+        datoms,
+        tx_cid,
+        ":capability/type",
+        kotoba_edn::EdnValue::String("CapabilityInvocation".to_string()),
+    );
+    assert_tx(
+        datoms,
+        tx_cid,
+        kotoba_auth::did_document::ATTR_RDF_TYPE,
+        kotoba_edn::EdnValue::String(ZCAP_CAPABILITY_INVOCATION_IRI.to_string()),
+    );
     if !projection.controller.is_empty() {
         assert_tx(
             datoms,
@@ -2377,6 +2398,12 @@ fn append_auth_capability_datoms(
             datoms,
             tx_cid,
             ":capability/invoker",
+            kotoba_edn::EdnValue::String(projection.invoker.clone()),
+        );
+        assert_tx(
+            datoms,
+            tx_cid,
+            ZCAP_INVOKER_IRI,
             kotoba_edn::EdnValue::String(projection.invoker.clone()),
         );
     }
@@ -2472,6 +2499,28 @@ fn append_auth_capability_datoms(
             tx_cid,
             ":capability/credential",
             kotoba_edn::EdnValue::String(credential_id.clone()),
+        );
+    }
+    if let Some(presentation_id) = &projection.presentation_id {
+        assert_tx(
+            datoms,
+            tx_cid,
+            ":capability/presentation",
+            kotoba_edn::EdnValue::String(presentation_id.clone()),
+        );
+    }
+    if let Some(presentation_cid) = &projection.presentation_cid {
+        assert_tx(
+            datoms,
+            tx_cid,
+            ":capability/presentationCid",
+            kotoba_edn::EdnValue::String(presentation_cid.to_multibase()),
+        );
+        assert_tx(
+            datoms,
+            tx_cid,
+            kotoba_vc::ATTR_PRESENTATION_CID,
+            kotoba_edn::EdnValue::String(presentation_cid.to_multibase()),
         );
     }
 }
@@ -2743,6 +2792,10 @@ fn atproto_repo_record_entity_cid(uri: &str) -> kotoba_core::cid::KotobaCid {
     kotoba_core::cid::KotobaCid::from_bytes(uri.as_bytes())
 }
 
+fn atproto_did_derived_cid(did: &str) -> kotoba_core::cid::KotobaCid {
+    kotoba_core::cid::KotobaCid::from_bytes(did.as_bytes())
+}
+
 fn append_atproto_cid_datoms(
     out: &mut Vec<kotoba_datomic::Datom>,
     entity_cid: &kotoba_core::cid::KotobaCid,
@@ -2755,7 +2808,14 @@ fn append_atproto_cid_datoms(
         kotoba_edn::EdnValue::string(at_cid),
         tx_cid.clone(),
     ));
+    out.push(kotoba_datomic::Datom::assert(
+        entity_cid.clone(),
+        "atproto/recordCid".to_string(),
+        kotoba_edn::EdnValue::string(at_cid),
+        tx_cid.clone(),
+    ));
     if let Some(kotoba_cid) = kotoba_graph::at_cid_str_to_kotoba(at_cid) {
+        let kotoba_cid_value = kotoba_cid.to_multibase();
         out.extend([
             kotoba_datomic::Datom::assert(
                 entity_cid.clone(),
@@ -2784,7 +2844,13 @@ fn append_atproto_cid_datoms(
             kotoba_datomic::Datom::assert(
                 entity_cid.clone(),
                 "atproto/kotobaCid".to_string(),
-                kotoba_edn::EdnValue::string(kotoba_cid.to_multibase()),
+                kotoba_edn::EdnValue::string(kotoba_cid_value.clone()),
+                tx_cid.clone(),
+            ),
+            kotoba_datomic::Datom::assert(
+                entity_cid.clone(),
+                "atproto/recordKotobaCid".to_string(),
+                kotoba_edn::EdnValue::string(kotoba_cid_value),
                 tx_cid.clone(),
             ),
         ]);
@@ -2809,6 +2875,12 @@ fn atproto_repo_write_datoms(
         kotoba_datomic::Datom::assert(
             entity_cid.clone(),
             "atproto/uri".to_string(),
+            kotoba_edn::EdnValue::string(&req.uri),
+            tx_cid.clone(),
+        ),
+        kotoba_datomic::Datom::assert(
+            entity_cid.clone(),
+            "atproto/resource".to_string(),
             kotoba_edn::EdnValue::string(&req.uri),
             tx_cid.clone(),
         ),
@@ -2850,12 +2922,22 @@ fn atproto_repo_write_datoms(
         ),
     ];
     if uri.authority.starts_with("did:") {
-        out.push(kotoba_datomic::Datom::assert(
-            entity_cid.clone(),
-            "atproto/did".to_string(),
-            kotoba_edn::EdnValue::string(&uri.authority),
-            tx_cid.clone(),
-        ));
+        out.extend([
+            kotoba_datomic::Datom::assert(
+                entity_cid.clone(),
+                "atproto/did".to_string(),
+                kotoba_edn::EdnValue::string(&uri.authority),
+                tx_cid.clone(),
+            ),
+            kotoba_datomic::Datom::assert(
+                entity_cid.clone(),
+                "atproto/didCid".to_string(),
+                kotoba_edn::EdnValue::string(
+                    atproto_did_derived_cid(&uri.authority).to_multibase(),
+                ),
+                tx_cid.clone(),
+            ),
+        ]);
     }
     if let Some(record_edn) = &record_edn {
         out.push(kotoba_datomic::Datom::assert(
@@ -2933,6 +3015,7 @@ fn atproto_repo_delete_datoms(
                 && !matches!(
                     datom.a.as_str(),
                     "atproto/uri"
+                        | "atproto/resource"
                         | "atproto/entityCid"
                         | "atproto/wireFormat"
                         | "atproto/authority"
@@ -2940,6 +3023,7 @@ fn atproto_repo_delete_datoms(
                         | "atproto/nsid"
                         | "atproto/rkey"
                         | "atproto/did"
+                        | "atproto/didCid"
                 )
         })
         .map(|datom| kotoba_datomic::Datom::retract(datom.e, datom.a, datom.v, tx_cid.clone()))
@@ -2954,6 +3038,12 @@ fn atproto_repo_delete_datoms(
         kotoba_datomic::Datom::assert(
             entity_cid.clone(),
             "atproto/uri".to_string(),
+            kotoba_edn::EdnValue::string(&req.uri),
+            tx_cid.clone(),
+        ),
+        kotoba_datomic::Datom::assert(
+            entity_cid.clone(),
+            "atproto/resource".to_string(),
             kotoba_edn::EdnValue::string(&req.uri),
             tx_cid.clone(),
         ),
@@ -3001,12 +3091,22 @@ fn atproto_repo_delete_datoms(
         ),
     ]);
     if uri.authority.starts_with("did:") {
-        out.push(kotoba_datomic::Datom::assert(
-            entity_cid.clone(),
-            "atproto/did".to_string(),
-            kotoba_edn::EdnValue::string(&uri.authority),
-            tx_cid.clone(),
-        ));
+        out.extend([
+            kotoba_datomic::Datom::assert(
+                entity_cid.clone(),
+                "atproto/did".to_string(),
+                kotoba_edn::EdnValue::string(&uri.authority),
+                tx_cid.clone(),
+            ),
+            kotoba_datomic::Datom::assert(
+                entity_cid.clone(),
+                "atproto/didCid".to_string(),
+                kotoba_edn::EdnValue::string(
+                    atproto_did_derived_cid(&uri.authority).to_multibase(),
+                ),
+                tx_cid.clone(),
+            ),
+        ]);
     }
     out
 }
@@ -4370,18 +4470,39 @@ pub async fn datomic_transact(
             .as_ref()
             .and_then(|record| kotoba_core::cid::KotobaCid::from_multibase(&record.value)),
     };
+    // Serialise transacts for this graph and serve `db_before` from the resident
+    // in-memory cache when it is already at the expected head — this is the fix
+    // for the ADR-2605302130 scaling blocker: it avoids the O(graph) cold
+    // ProllyTree/Kubo scan (`db_from_head`) on every transact. The guard is held
+    // across the commit + cache refresh below so the cached head cannot race a
+    // concurrent transact for the same graph. On a head miss (first transact
+    // after startup, or an externally-advanced head) we pay one cold scan and
+    // re-seed the cache after committing.
+    let graph_mb = graph_cid.to_multibase();
+    let live_slot = state.datomic_live_slot(&graph_mb);
+    let mut live_guard = live_slot.lock().await;
     let db_before = match expected_parent.as_ref() {
-        Some(parent) => DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
-            .db_from_head(parent)
-            .map_err(|e| match e {
-                DistributedCommitError::MissingCommit(_) => {
-                    (StatusCode::CONFLICT, format!("distributed db before: {e}"))
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("distributed db before: {e}"),
-                ),
-            })?,
+        Some(parent) => match live_guard.as_ref().filter(|live| &live.head == parent) {
+            Some(live) => live.db.clone(),
+            None => {
+                // Cache miss on a non-empty graph: pay the one O(graph) cold scan
+                // (first transact after (re)start, or an externally-advanced head).
+                state
+                    .datomic_cold_db_loads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
+                    .db_from_head(parent)
+                    .map_err(|e| match e {
+                        DistributedCommitError::MissingCommit(_) => {
+                            (StatusCode::CONFLICT, format!("distributed db before: {e}"))
+                        }
+                        _ => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("distributed db before: {e}"),
+                        ),
+                    })?
+            }
+        },
         None => kotoba_datomic::Db::from_datoms(Vec::new(), None),
     };
     let tx_preview = kotoba_datomic::Connection::from_datoms(db_before.all_datoms())
@@ -4433,7 +4554,7 @@ pub async fn datomic_transact(
     let cacao_proof_cid = auth_proof_cid.clone().or(explicit_cacao_proof_cid);
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     let distributed = writer
-        .transact_with(
+        .transact_with_db_before(
             DistributedTransactRequest {
                 ipns_name: ipns_name.clone(),
                 graph: graph_cid.clone(),
@@ -4446,6 +4567,9 @@ pub async fn datomic_transact(
                 ipns_controller_did: Some(state.operator_did.clone()),
                 ipns_signing_key: Some(state.ipns_signing_key()),
             },
+            // Same DB the preview used; equals db_from_head(expected_parent) so the
+            // writer skips its own cold scan without changing the commit hash.
+            Some(db_before),
             |report, context, tx_datoms| {
                 append_tx_metadata_datoms(
                     tx_datoms,
@@ -4502,6 +4626,21 @@ pub async fn datomic_transact(
         };
         journal_cids.push(journal_cid);
     }
+
+    // Refresh the resident db_before cache so the next transact for this graph
+    // serves from RAM instead of a cold scan. The cached DB is netted via
+    // `current_datoms` (retraction tombstones removed) with `basis_t` = the new
+    // head's tx_cid, making it byte-identical to `db_from_head(new_head)` — so a
+    // cache-served db_before produces the same tx_cid/commit_cid as a cold scan
+    // (ADR-2605302130).
+    *live_guard = Some(crate::server::LiveDatomicGraph {
+        head: distributed_commit.commit.cid.clone(),
+        db: kotoba_datomic::Db::from_datoms(
+            kotoba_datomic::current_datoms(&report.db_after.all_datoms()),
+            report.db_after.basis_t.clone(),
+        ),
+    });
+    drop(live_guard);
 
     Ok((
         StatusCode::OK,
@@ -5934,6 +6073,7 @@ fn issue_credential_with_operator_proof(
 ) -> Result<kotoba_vc::VerifiableCredential, kotoba_vc::VcError> {
     credential.issuer = state.operator_did.clone();
     credential.proof = None;
+    credential.ensure_data_integrity_context();
     let signature = state.ipns_signing_key().sign(&credential.proof_bytes()?);
     credential.proof = Some(kotoba_vc::DataIntegrityProof {
         proof_type: "DataIntegrityProof".to_string(),
@@ -7095,7 +7235,8 @@ pub struct GraphQueryReq {
 /// GET /xrpc/ai.gftd.apps.kotoba.graph.query
 /// SPO pattern query over the distributed Datomic head, with legacy hot/cold
 /// projection fallback handled by `current_db_for_graph`.
-/// Full Datalog evaluation: use invoke.run with program_type=datalog.
+/// Full Datomic/Datalog evaluation: use `ai.gftd.apps.kotoba.datomic.q`.
+/// SPARQL remains an auxiliary query surface over the same Datom SSoT.
 pub async fn graph_query(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -7182,11 +7323,15 @@ pub async fn graph_query(
 
     Ok(Json(serde_json::json!({
         "graph":     req.graph,
+        "queryEngine": "datomic",
+        "primaryQuery": NSID_DATOMIC_Q,
+        "auxiliaryQuery": crate::kg::NSID_KG_SPARQL,
+        "storageModel": "ipld-dag-cbor-prolly-tree",
         "count":     quads.len(),
         "quads":     quads,
         "limit":     limit,
         "truncated": truncated,
-        "note":  if req.rules.is_some() { "use invoke.run for Datalog evaluation" } else { "" },
+        "note":  if req.rules.is_some() { "use ai.gftd.apps.kotoba.datomic.q for Datomic/Datalog evaluation" } else { "" },
     })))
 }
 
@@ -8365,20 +8510,21 @@ pub async fn agent_sync_close(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_auth_capability_datoms, atproto_repo_record_entity_cid, atproto_repo_write,
-        atproto_repo_write_datoms, datomic_basis_t, datomic_datoms, datomic_db_stats,
-        datomic_entid, datomic_entity, datomic_history, datomic_ident, datomic_index_pull,
-        datomic_index_range, datomic_log, datomic_pull, datomic_pull_many, datomic_q,
-        datomic_seek_datoms, datomic_sync, datomic_transact, datomic_tx_range, datomic_with,
-        did_document_publish, didcomm_send, distributed_graph_ipns_name,
+        append_auth_capability_datoms, atproto_repo_delete_datoms, atproto_repo_record_entity_cid,
+        atproto_repo_write, atproto_repo_write_datoms, datomic_basis_t, datomic_datoms,
+        datomic_db_stats, datomic_entid, datomic_entity, datomic_history, datomic_ident,
+        datomic_index_pull, datomic_index_range, datomic_log, datomic_pull, datomic_pull_many,
+        datomic_q, datomic_seek_datoms, datomic_sync, datomic_transact, datomic_tx_range,
+        datomic_with, did_document_publish, didcomm_send, distributed_graph_ipns_name,
         enforce_datomic_range_tx_scope, is_did_web_ip_host, protocol_payload_tx_cid, vc_issue,
-        AtprotoRepoWriteReq, AuthCapabilityProjection, DatomicBasisTReq, DatomicDatomsReq,
-        DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq, DatomicIdentReq,
-        DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq, DatomicPullManyReq,
-        DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq, DatomicTransactReq,
-        DatomicTxRangeReq, DatomicWithReq, DidCommSendReq, DidDocumentPublishReq, VcIssueReq,
-        ZCAP_ALLOWED_ACTION_IRI, ZCAP_CONTROLLER_IRI, ZCAP_INVOCATION_PROOF_IRI,
-        ZCAP_INVOCATION_TARGET_IRI,
+        vp_capability_projection, AtprotoRepoWriteReq, AuthCapabilityProjection, DatomicBasisTReq,
+        DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq,
+        DatomicIdentReq, DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq,
+        DatomicPullManyReq, DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq,
+        DatomicTransactReq, DatomicTxRangeReq, DatomicWithReq, DidCommSendReq,
+        DidDocumentPublishReq, VcIssueReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CAPABILITY_INVOCATION_IRI,
+        ZCAP_CONTROLLER_IRI, ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI,
+        ZCAP_INVOKER_IRI,
     };
     use crate::server::KotobaState;
     use axum::response::IntoResponse;
@@ -8548,7 +8694,12 @@ mod tests {
             created_time: Some(1),
             expires_time: None,
             body: json!({"content": "hello from DIDComm"}),
-            attachments: vec![],
+            attachments: vec![kotoba_didcomm::Attachment {
+                id: "attachment-normalized-1".into(),
+                description: Some("DIDComm attachment normalized as datom entity".into()),
+                media_type: Some("application/json".into()),
+                data: json!({"profile": {"name": "Alice"}}),
+            }],
         };
         let atproto_req = AtprotoRepoWriteReq {
             graph: graph.to_multibase(),
@@ -8595,12 +8746,19 @@ mod tests {
 
         let reader = DistributedDatomReader::new(&store, &ipns);
         let query = kotoba_edn::parse(
-            r#"{:find [?issuer ?status ?proofPurpose ?thread ?text]
+            r#"{:find [?issuer ?status ?proofPurpose ?thread ?threadScope ?attachmentMedia ?attachmentName ?atprotoResource ?text]
                 :where [[?vc :credential/issuer ?issuer]
                         [?vc :credential/subject/role "issuer"]
                         [?vc :credential/status/id ?status]
                         [?vc :credential/proof/proofPurpose ?proofPurpose]
                         [?msg :didcomm/thread ?thread]
+                        [?msg :didcomm/threadScope ?threadScope]
+                        [?msg :didcomm/attachmentCid ?attachmentCid]
+                        [?attachment :didcomm/attachmentCid ?attachmentCid]
+                        [?attachment :didcomm/attachment/mediaType ?attachmentMedia]
+                        [?attachment :didcomm/attachment/data ?attachmentData]
+                        [(get-in ?attachmentData [:profile :name]) ?attachmentName]
+                        [?post :atproto/resource ?atprotoResource]
                         [?post :atproto/record/text ?text]]}"#,
         )
         .unwrap();
@@ -8613,6 +8771,10 @@ mod tests {
                 EdnValue::string("kotoba://credential/status/normalized-1"),
                 EdnValue::string("assertionMethod"),
                 EdnValue::string("thread-normalized-1"),
+                EdnValue::string("didcomm://thread/thread-normalized-1"),
+                EdnValue::string("application/json"),
+                EdnValue::string("Alice"),
+                EdnValue::string("at://did:plc:alice/app.bsky.feed.post/r1"),
                 EdnValue::string("hello from ATProto"),
             ]]
         );
@@ -9262,6 +9424,8 @@ mod tests {
             invocation_targets: targets.clone(),
             proof_cid: Some(proof_cid.clone()),
             credential_ids: vec!["urn:uuid:capability-vc-1".into()],
+            presentation_id: Some("urn:uuid:capability-vp-1".into()),
+            presentation_cid: Some(KotobaCid::from_bytes(b"capability-presentation")),
         };
         let mut datoms = Vec::<Datom>::new();
         append_auth_capability_datoms(&mut datoms, &tx, &projection);
@@ -9297,6 +9461,11 @@ mod tests {
                 .any(|datom| datom.e == tx && datom.a == attr && datom.v == EdnValue::string(value))
         };
 
+        assert!(has(":capability/type", "CapabilityInvocation"));
+        assert!(has(
+            kotoba_auth::did_document::ATTR_RDF_TYPE,
+            ZCAP_CAPABILITY_INVOCATION_IRI
+        ));
         for action in actions {
             assert!(has(":capability/allowedAction", &action));
             assert!(has(":capability/operation", &action));
@@ -9310,6 +9479,7 @@ mod tests {
         assert!(has(":capability/controller", "did:key:zController"));
         assert!(has(ZCAP_CONTROLLER_IRI, "did:key:zController"));
         assert!(has(":capability/invoker", "did:key:zInvoker"));
+        assert!(has(ZCAP_INVOKER_IRI, "did:key:zInvoker"));
         assert!(has(
             ":capability/graph",
             graph_scope.trim_start_matches("kotoba://graph/")
@@ -9323,7 +9493,73 @@ mod tests {
         assert!(has(":capability/proofCid", &proof_cid.to_multibase()));
         assert!(has(ZCAP_INVOCATION_PROOF_IRI, &proof_cid.to_multibase()));
         assert!(has(":capability/credential", "urn:uuid:capability-vc-1"));
+        assert!(has(":capability/presentation", "urn:uuid:capability-vp-1"));
+        let presentation_cid = KotobaCid::from_bytes(b"capability-presentation").to_multibase();
+        assert!(has(":capability/presentationCid", &presentation_cid));
+        assert!(has(kotoba_vc::ATTR_PRESENTATION_CID, &presentation_cid));
         assert!(tea_datoms.iter().all(|datom| datom.t == tx));
+    }
+
+    #[test]
+    fn vp_capability_projection_preserves_presentation_evidence() {
+        let graph = KotobaCid::from_bytes(b"vp-capability-graph").to_multibase();
+        let tx_scope = format!(
+            "kotoba://tx/{}",
+            KotobaCid::from_bytes(b"vp-capability-tx").to_multibase()
+        );
+        let mut credential = kotoba_vc::VerifiableCredential::new(
+            "urn:uuid:vp-capability-credential",
+            "did:key:zOperator",
+            serde_json::json!({
+                "id": "did:key:zHolder",
+                "operations": [
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    kotoba_auth::CacaoPayload::OP_VC_PRESENT
+                ],
+                "resources": [
+                    format!("kotoba://graph/{graph}"),
+                    tx_scope
+                ]
+            }),
+        );
+        credential
+            .types
+            .push("KotobaCapabilityCredential".to_string());
+        let presentation = kotoba_vc::VerifiablePresentation {
+            context: vec![kotoba_vc::VC_CONTEXT_V2.to_string()],
+            id: "urn:uuid:vp-capability-presentation".to_string(),
+            types: vec!["VerifiablePresentation".to_string()],
+            holder: Some("did:key:zHolder".to_string()),
+            verifiable_credentials: vec![credential],
+            proof: None,
+        };
+        let presentation_cid = presentation.cid().expect("presentation cid");
+        let projection = vp_capability_projection(&presentation, None);
+
+        assert_eq!(projection.proof_format, "W3C VerifiablePresentation");
+        assert_eq!(projection.controller, "did:key:zOperator");
+        assert_eq!(projection.invoker, "did:key:zHolder");
+        assert_eq!(
+            projection.presentation_id.as_deref(),
+            Some("urn:uuid:vp-capability-presentation")
+        );
+        assert_eq!(
+            projection.presentation_cid.as_ref(),
+            Some(&presentation_cid)
+        );
+        assert!(projection
+            .credential_ids
+            .contains(&"urn:uuid:vp-capability-credential".to_string()));
+        assert!(projection
+            .allowed_actions
+            .contains(&kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT.to_string()));
+        assert!(projection
+            .allowed_actions
+            .contains(&kotoba_auth::CacaoPayload::OP_VC_PRESENT.to_string()));
+        assert!(projection
+            .invocation_targets
+            .contains(&format!("kotoba://graph/{graph}")));
+        assert!(projection.invocation_targets.contains(&tx_scope));
     }
 
     #[tokio::test]
@@ -9449,6 +9685,119 @@ mod tests {
         assert!(resolved
             .service_by_type(KOTOBA_GRAPH_MEMBERSHIP_SERVICE)
             .is_some());
+    }
+
+    /// Drive the real `datomic_transact` handler once and return the commit CID.
+    async fn run_transact_for_cache_test(
+        state: &Arc<KotobaState>,
+        graph_mb: &str,
+        edn: &str,
+    ) -> String {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", test_operator_jwt(&state.operator_did))
+                .parse()
+                .unwrap(),
+        );
+        let resp = datomic_transact(
+            axum::extract::State(Arc::clone(state)),
+            headers,
+            axum::Json(DatomicTransactReq {
+                graph: graph_mb.to_string(),
+                tx_edn: edn.to_string(),
+                ipns_name: None,
+                cacao_b64: None,
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        body["commit_cid"].as_str().unwrap().to_string()
+    }
+
+    /// ADR-2605302130 efficacy: prove the resident db_before cache actually HITS
+    /// in the real handler flow rather than silently falling through to a cold
+    /// scan (the correctness tests cannot distinguish hit from always-miss, since
+    /// the cold path is also correct + fast on MemoryBlockStore). Drives three
+    /// sequential transacts on one graph, simulating a restart (cache clear)
+    /// between the 1st and 2nd, and asserts the expensive cold `db_from_head`
+    /// path runs exactly once — proving the warm transact is served from RAM.
+    #[tokio::test]
+    async fn datomic_transact_resident_cache_hits_after_warm() {
+        use std::sync::atomic::Ordering;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = KotobaCid::from_bytes(b"resident-cache-hit-graph");
+        let graph_mb = graph.to_multibase();
+
+        // tx1: fresh graph → genesis (expected_parent = None) → NOT a cold load.
+        let c1 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "alice" :person/name "Alice"]]"#,
+        )
+        .await;
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            0,
+            "genesis transact must not cold-load"
+        );
+        {
+            let slot = state.datomic_live_slot(&graph_mb);
+            let g = slot.lock().await;
+            assert_eq!(g.as_ref().expect("slot seeded after tx1").head.to_multibase(), c1);
+        }
+
+        // Simulate a restart on an already-populated graph: drop the resident
+        // cache (IPNS + block store still hold the graph). The next transact must
+        // pay exactly one cold `db_from_head` — this is the ADR's cold-start path.
+        state.datomic_live.lock().unwrap().clear();
+
+        let c2 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "bob" :person/name "Bob"]]"#,
+        )
+        .await;
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            1,
+            "post-restart transact must cold-load exactly once"
+        );
+
+        // tx3: cache is warm again → must HIT (no new cold load).
+        let c3 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "carol" :person/name "Carol"]]"#,
+        )
+        .await;
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            1,
+            "warm transact must hit the resident cache, not cold-scan"
+        );
+        {
+            let slot = state.datomic_live_slot(&graph_mb);
+            let g = slot.lock().await;
+            assert_eq!(
+                g.as_ref().expect("slot seeded after tx3").head.to_multibase(),
+                c3,
+                "cache head must track the latest commit"
+            );
+        }
+        assert_ne!(c1, c2);
+        assert_ne!(c2, c3);
     }
 
     #[tokio::test]
@@ -9577,7 +9926,17 @@ mod tests {
             })
         };
 
-        assert!(has("atproto/cid", EdnValue::string(at_cid)));
+        assert!(has("atproto/cid", EdnValue::string(at_cid.clone())));
+        assert!(has("atproto/recordCid", EdnValue::string(at_cid.clone())));
+        assert!(has(
+            "atproto/resource",
+            EdnValue::string("at://did:plc:alice/app.bsky.feed.post/r1")
+        ));
+        assert!(has("atproto/did", EdnValue::string("did:plc:alice")));
+        assert!(has(
+            "atproto/didCid",
+            EdnValue::string(KotobaCid::from_bytes(b"did:plc:alice").to_multibase())
+        ));
         assert!(has(
             "atproto/recordWireFormat",
             EdnValue::string("application/dag-cbor")
@@ -9589,6 +9948,65 @@ mod tests {
             "atproto/kotobaCid",
             EdnValue::string(kotoba_cid.to_multibase())
         ));
+        assert!(has(
+            "atproto/recordKotobaCid",
+            EdnValue::string(kotoba_cid.to_multibase())
+        ));
+    }
+
+    #[test]
+    fn atproto_repo_delete_preserves_resource_scope_projection() {
+        let tx_cid = KotobaCid::from_bytes(b"atproto-delete-resource-scope-tx");
+        let delete_tx_cid = KotobaCid::from_bytes(b"atproto-delete-resource-scope-delete-tx");
+        let uri_value = "at://did:plc:alice/app.bsky.feed.post/r-delete";
+        let create_req = AtprotoRepoWriteReq {
+            graph: KotobaCid::from_bytes(b"atproto-delete-resource-scope-graph").to_multibase(),
+            uri: uri_value.into(),
+            operation: Some("create".into()),
+            cid: None,
+            record: Some(serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "delete me"
+            })),
+            cacao_b64: None,
+            auth_presentation: None,
+        };
+        let uri = kotoba_graph::AtUri::parse(&create_req.uri).unwrap();
+        let entity_cid = atproto_repo_record_entity_cid(&create_req.uri);
+        let create_datoms = atproto_repo_write_datoms(&create_req, &uri, &entity_cid, &tx_cid);
+        let db = kotoba_datomic::Db::from_datoms(create_datoms, None);
+        let delete_req = AtprotoRepoWriteReq {
+            operation: Some("delete".into()),
+            record: None,
+            cid: None,
+            ..create_req
+        };
+
+        let delete_datoms =
+            atproto_repo_delete_datoms(&db, &delete_req, &uri, &entity_cid, &delete_tx_cid);
+
+        assert!(delete_datoms.iter().any(|datom| {
+            datom.e == entity_cid
+                && datom.a == "atproto/resource"
+                && datom.v == EdnValue::string(uri_value)
+                && datom.t == delete_tx_cid
+                && datom.added
+        }));
+        assert!(delete_datoms.iter().any(|datom| {
+            datom.e == entity_cid
+                && datom.a == "atproto/deleted"
+                && datom.v == EdnValue::Bool(true)
+                && datom.t == delete_tx_cid
+                && datom.added
+        }));
+        assert!(delete_datoms.iter().any(|datom| {
+            datom.e == entity_cid
+                && datom.a == "atproto/didCid"
+                && datom.v
+                    == EdnValue::string(KotobaCid::from_bytes(b"did:plc:alice").to_multibase())
+                && datom.t == delete_tx_cid
+                && datom.added
+        }));
     }
 
     #[tokio::test]
@@ -12663,10 +13081,41 @@ mod tests {
     #[test]
     fn graph_query_lexicons_expose_structured_sparql_and_quad_outputs() {
         let graph_query = include_str!("../../../lexicons/ai/gftd/apps/kotoba/graph/query.json");
+        let graph_query_value: serde_json::Value =
+            serde_json::from_str(graph_query).expect("graph.query lexicon JSON");
+        let graph_query_description = graph_query_value["defs"]["main"]["description"]
+            .as_str()
+            .expect("graph.query description");
+        assert!(
+            graph_query_description.contains("primary Kotoba distributed Datomic/Datom graph"),
+            "graph.query must declare Datomic/Datom as the primary graph"
+        );
+        assert!(
+            graph_query_description.contains("SPARQL is an auxiliary query surface"),
+            "graph.query must keep SPARQL auxiliary to Datomic"
+        );
         assert_lexicon_output_fields(
             graph_query,
-            &["graph", "count", "quads"],
+            &[
+                "graph",
+                "queryEngine",
+                "primaryQuery",
+                "auxiliaryQuery",
+                "storageModel",
+                "count",
+                "quads",
+            ],
             &["limit", "truncated", "note"],
+        );
+        assert_eq!(
+            graph_query_value["defs"]["main"]["output"]["schema"]["properties"]["queryEngine"]
+                ["knownValues"][0],
+            "datomic"
+        );
+        assert_eq!(
+            graph_query_value["defs"]["main"]["output"]["schema"]["properties"]["storageModel"]
+                ["knownValues"][0],
+            "ipld-dag-cbor-prolly-tree"
         );
         assert_lexicon_array_item_fields(
             graph_query,
@@ -12705,7 +13154,15 @@ mod tests {
         );
         assert_lexicon_output_fields(
             graph_sparql,
-            &["ok", "form", "elapsedMs"],
+            &[
+                "ok",
+                "form",
+                "queryEngine",
+                "primaryQuery",
+                "auxiliaryQuery",
+                "storageModel",
+                "elapsedMs",
+            ],
             &["result", "basisT", "count", "maxHops", "quads"],
         );
         assert_lexicon_array_item_fields(
@@ -13218,4 +13675,89 @@ mod tests {
     fn max_cacao_b64_len_is_8kib() {
         assert_eq!(super::MAX_CACAO_B64_LEN, 8 * 1024);
     }
+}
+
+// ── Generic XRPC dispatch ──────────────────────────────────────────────────
+
+#[cfg(feature = "wasm-runtime")]
+pub async fn generic_invoke(
+    axum::extract::Path(nsid): axum::extract::Path<String>,
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+    Json(req_body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+
+    let parts: Vec<&str> = nsid.split('.').collect();
+    if parts.len() < 5 || parts[0..3] != ["ai", "gftd", "apps"] {
+        return Err((StatusCode::BAD_REQUEST, "invalid generic nsid".into()));
+    }
+    let app = parts[3];
+
+    let graph_cid = kotoba_core::cid::KotobaCid::from_bytes(b"kotoba/network/nodes");
+    let ipns_name = distributed_graph_ipns_name(&graph_cid);
+    let mut program_cid = app.to_string();
+
+    if let Ok(Some(db)) = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry).current_db_for_name(&ipns_name) {
+        for datom in db.datoms() {
+            if datom.a == "node/did" {
+                if let kotoba_datomic::Value::String(s) = &datom.v {
+                    if s == app || s.ends_with(&format!("{app}.gftd.co.jp")) {
+                        if let Some(endpoint) = db.datoms().iter().find(|d| d.e == datom.e && d.a == "node/endpoint") {
+                            if let kotoba_datomic::Value::String(ep) = &endpoint.v {
+                                program_cid = ep.to_string();
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ctx_cbor = Vec::new();
+    ciborium::into_writer(&req_body, &mut ctx_cbor).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cbor encode: {e}")))?;
+
+    let agent_did = state.operator_did.clone();
+    let router = Arc::clone(&state.router);
+
+    let result = tokio::task::spawn_blocking(move || {
+        router.dispatch_with_snapshot(
+            &program_cid,
+            kotoba_dht::source_chain::ProgramType::WasmNode,
+            &agent_did,
+            0,
+            None,
+            ctx_cbor,
+            None,
+            None,
+            &[],
+            10_000,
+            vec![],
+            std::collections::HashMap::new(),
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match result {
+        kotoba_vm::DispatchResult::Wasm(r) => {
+            let out_val: serde_json::Value = ciborium::from_reader(r.output_cbor.as_slice())
+                .unwrap_or(serde_json::json!({ "output_bytes": r.output_cbor }));
+            Ok(Json(out_val))
+        }
+        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "expected wasm result".into())),
+    }
+}
+
+#[cfg(not(feature = "wasm-runtime"))]
+pub async fn generic_invoke(
+    axum::extract::Path(_nsid): axum::extract::Path<String>,
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+    Json(_req_body): Json<serde_json::Value>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+    Err((StatusCode::SERVICE_UNAVAILABLE, "generic dispatch requires the `wasm-runtime` feature".to_string()))
 }
