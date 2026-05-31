@@ -307,6 +307,7 @@ impl KotobaLinker {
         bind_llm(&mut self.0)?;
         bind_chain(&mut self.0)?;
         bind_evm(&mut self.0)?;
+        bind_http(&mut self.0)?;
         Ok(())
     }
 }
@@ -1043,6 +1044,69 @@ fn bind_evm(linker: &mut Linker<HostState>) -> Result<()> {
                 let token = evm_parse_addr(&token)?;
                 let ret = evm_eth_call(&agent_e5, &rpc_url, &token, &erc20::name())?;
                 erc20::decode_string(&ret).map_err(|e| e.to_string())
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    Ok(())
+}
+
+// ── kotoba:kais/http ───────────────────────────────────────────────────────
+// Generic outbound HTTP for guests. The runtime already does host-side HTTP for
+// `evm` (ureq JSON-RPC); this exposes it generically so componentize-py guests —
+// which cannot reach wasi:http — can call external services (ADR-2605312355).
+
+fn bind_http(linker: &mut Linker<HostState>) -> Result<()> {
+    use std::io::Read;
+    use std::time::Duration;
+
+    let mut inst = linker.instance("kotoba:kais/http@0.1.0")?;
+    inst.func_wrap(
+        "fetch",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (method, url, headers, body, timeout_ms): (
+            String,
+            String,
+            Vec<(String, String)>,
+            Option<Vec<u8>>,
+            u32,
+        )|
+              -> Result<(Result<(u16, Vec<u8>), String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<(u16, Vec<u8>), String> {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout(Duration::from_millis(u64::from(timeout_ms.max(1))))
+                    .build();
+                let mut req = agent.request(&method, &url);
+                for (k, v) in &headers {
+                    req = req.set(k, v);
+                }
+                let sent = match &body {
+                    Some(b) => req.send_bytes(b),
+                    None => req.call(),
+                };
+                // ureq treats non-2xx as an error; surface its status + body instead.
+                let response = match sent {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(code, r)) => {
+                        let mut buf = Vec::new();
+                        r.into_reader()
+                            .take(16 * 1024 * 1024)
+                            .read_to_end(&mut buf)
+                            .map_err(|e| e.to_string())?;
+                        return Ok((code, buf));
+                    }
+                    Err(e) => return Err(e.to_string()),
+                };
+                let status = response.status();
+                let mut buf = Vec::new();
+                response
+                    .into_reader()
+                    .take(16 * 1024 * 1024)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                Ok((status, buf))
             })();
             Ok((result,))
         },
