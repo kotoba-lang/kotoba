@@ -2429,6 +2429,132 @@ mod tests {
         }));
     }
 
+    /// 実動作検証 (real e2e, ADR §21.8): operator-trusted Pattern B through the
+    /// live `kg_ingest` → QuadStore → `kg_entity` handlers. Proves (1) a sensitive
+    /// claim is SEALED at rest in the real store, (2) a non-sensitive claim stays
+    /// plaintext, (3) an authorized read DECRYPTS the sealed claim back.
+    #[tokio::test]
+    async fn pattern_b_end_to_end_through_kg_handlers() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        // Unique predicate so this process-global env never seals another test's claims.
+        std::env::set_var("KOTOBA_ENCRYPT_CLAIM_PREDS", "kg/claim/secretAmount");
+
+        let state = KotobaState::new(None).unwrap();
+        let state = Arc::new(state.init_crypto().await.unwrap());
+        let graph = kg_graph_cid();
+        // Public so the kg_entity read gate passes without a CACAO.
+        state
+            .graph_registry
+            .write()
+            .await
+            .insert(graph.clone(), ("kg-default".into(), GraphVisibility::Public));
+
+        // ── Ingest one sensitive + one non-sensitive claim via the real handler ──
+        let resp = kg_ingest(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(KgIngestReq {
+                id: "verify-ent-1".into(),
+                qid: None,
+                kind: Some("test".into()),
+                label_ja: None,
+                label_en: Some("PublicLabel".into()),
+                confidence: None,
+                license: None,
+                extractor: None,
+                valid_from: None,
+                valid_to: None,
+                ingested_at: None,
+                source_id: None,
+                label_vec: vec![],
+                claims: vec![
+                    KgClaim {
+                        pred: "secretAmount".into(),
+                        value: "JPY 12,300,000".into(),
+                    },
+                    KgClaim {
+                        pred: "publicNote".into(),
+                        value: "not-secret".into(),
+                    },
+                ],
+                relations: vec![],
+                cacao_b64: None,
+                auth_presentation: Some(signed_capability_presentation(
+                    &state,
+                    &graph,
+                    kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+                    "kg.ingest",
+                )),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK, "ingest must succeed");
+
+        // ── At rest: sensitive claim sealed, plaintext absent, public claim plain ──
+        let db = crate::xrpc::current_db_for_graph(&state, &graph)
+            .await
+            .unwrap();
+        let values: Vec<String> = db
+            .datoms()
+            .iter()
+            .map(|d| kotoba_edn::to_string(&d.v))
+            .collect();
+        assert!(
+            values.iter().any(|v| v.contains("signal:v1:")),
+            "sensitive claim must be SEALED at rest; datom values = {values:?}"
+        );
+        assert!(
+            !values.iter().any(|v| v.contains("JPY 12,300,000")),
+            "plaintext of the sealed claim must NOT appear at rest"
+        );
+        assert!(
+            values.iter().any(|v| v.contains("not-secret")),
+            "non-sensitive claim must remain plaintext at rest"
+        );
+
+        // ── Authorized read decrypts the sealed claim back to plaintext ──
+        let resp = kg_entity(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Query(KgEntityQuery {
+                id: Some("verify-ent-1".into()),
+                qid: None,
+                include_claims: true,
+                include_relations: false,
+                max_relations: 50,
+                cacao_b64: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let claims = body["entity"]["claims"]
+            .as_array()
+            .expect("entity.claims array");
+        let secret = claims
+            .iter()
+            .find(|c| c["predicate"] == "secretAmount")
+            .expect("secretAmount claim present");
+        assert_eq!(
+            secret["value"], "JPY 12,300,000",
+            "authorized read must DECRYPT the sealed claim"
+        );
+        let public = claims
+            .iter()
+            .find(|c| c["predicate"] == "publicNote")
+            .expect("publicNote claim present");
+        assert_eq!(public["value"], "not-secret");
+
+        std::env::remove_var("KOTOBA_ENCRYPT_CLAIM_PREDS");
+    }
+
     fn signed_capability_presentation(
         state: &KotobaState,
         graph: &KotobaCid,
