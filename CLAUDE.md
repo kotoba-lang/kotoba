@@ -23,9 +23,9 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 | kotoba-vm | Invoke/Result ChainEntry, CALL_FOREIGN bridge (KVM) |
 | kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference, WebGPU training (embed+lm_head), WebGPU inference (full transformer, Gemma 4 E2B/E4B) |
 | kotoba-runtime | WASM Component Model host: WasmExecutor + UdfExecutor + WIT bindings |
-| kotoba-ingest | Gmail OAuth2 poll + RFC 2822 parse + E2E encrypt → QuadStore (ADR-2605252400); **EmailIngestor** now uses `Arc<dyn AgentCrypto>` + `Arc<Vault>` (raw vault_key removed 2026-05-26) |
-| kotoba-server | XRPC / MCP endpoints; **Firehose egress surface (D+E, 2026-05-30)** — see below |
-| kotoba-store | BlockStore implementations: Memory (hot); **KuboBlockStore** (Kubo HTTP cold tier, Dual-CID: blake3 internal + SHA2-256 IPFS, 2026-05-27); BudgetedBlockStore<S> LRU eviction; TieredBlockStore<H,C> hot/cold tiering; **CapturingBlockStore** (pass-through + recorder for CAR bundling); **CarBundleWriter / CarBlockIndex** (CARv1 format: 72B header + blocks + 48B/entry index, 3.8 GiB/s serialize); **IpfsPinClient** (Kubo-compatible HTTP RPC: pin/add, pin/rm, pin/ls — kotoba 自体が IPFS node として自前 pin; 1GB 超の extended pin は kotobase.gftd.ai が担当). S3BlockStore + LayeredBlockStore + KotobasePinClient + IrohBlockStore removed 2026-05-27. |
+| kotoba-ingest | Gmail OAuth2 poll + RFC 2822 parse + E2E encrypt → QuadStore (ADR-2605252400); **EmailIngestor** now uses `Arc<dyn AgentCrypto>` + `Arc<Vault>` (raw vault_key removed 2026-05-26); **multimodal search 2026-05-30**: `media_embed` (`MediaEmbedClient` trait — `HttpMediaEmbedClient` CLIP/SigLIP/ImageBind shared-space encoder over HTTP + `Blake3MediaEmbedClient` caption-bridged offline client; `Modality` text/image/audio/video/document) + `media` (`MediaIngestor` → Vault blob + `media/*` datoms + `media/ivf/*` IVF into `media:2026:assets` graph; `rank_by_cosine` cross-modal retrieval). IVF persistence generalised: `IvfIndex::to_quads_ns(ns)` + namespace-agnostic `from_quads`/`from_datoms` (`cc/ivf/*` and `media/ivf/*`) |
+| kotoba-server | XRPC / MCP endpoints; **media cross-modal search 2026-05-30**: `media_xrpc` (`media.search` text-query→any-modality cosine rank, `media.ingest` base64 assets, `media.status`); `KotobaState.media_embed_client` (Option, `KOTOBA_MM_EMBED_URL`; deterministic fallback when unset); **Firehose egress surface (D+E, 2026-05-30)** — see below |
+| kotoba-store | BlockStore implementations: Memory (hot); **KuboBlockStore** (Kubo HTTP cold tier, **Single-CID: SHA2-256 CIDv1 dag-cbor, IPFS-compatible** — dual-CID/blake3 index removed 2026-05-27); BudgetedBlockStore<S> LRU eviction; TieredBlockStore<H,C> hot/cold tiering; **CapturingBlockStore** (pass-through + recorder for CAR bundling); **CarBundleWriter / CarBlockIndex** (CARv1 format: 72B header + blocks + 48B/entry index, 3.8 GiB/s serialize); **IpfsPinClient** (Kubo-compatible HTTP RPC: pin/add, pin/rm, pin/ls — kotoba 自体が IPFS node として自前 pin; 1GB 超の extended pin は kotobase.gftd.ai が担当). S3BlockStore + LayeredBlockStore + KotobasePinClient + IrohBlockStore removed 2026-05-27. |
 | kotoba-store-web | Browser IndexedDB block store (wasm32), AsyncBlockStore trait |
 
 ## 実装順序
@@ -177,9 +177,9 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
   - put: hot に即時書き込み + cold に `tokio::spawn` fire-and-forget
   - get: hot ヒット → 即返却; hot miss → cold fetch + hot promote
   - pin/unpin: hot 層に委譲 (SyncWindow compatible)
-- `KuboBlockStore`: Kubo HTTP RPC cold store (Dual-CID, 2026-05-27)
-  - 内部キー = `KotobaCid` (blake3-256 CIDv1); ストレージ境界で SHA2-256 CIDv1 を計算
-  - インデックス: `HashMap<[u8;36], String>` (blake3 → SHA2-256 multibase)
+- `KuboBlockStore`: Kubo HTTP RPC cold store (**Single-CID SHA2-256**, 2026-05-27)
+  - キー = `KotobaCid` (**SHA2-256 CIDv1 dag-cbor, IPFS-compatible**); 内部 = IPFS 境界が同一 CID（単一化）
+  - dual-CID マッピング（blake3 → SHA2-256）は撤去済み (`144df21`, 2026-05-27)
   - `KOTOBA_IPFS_ENDPOINT` (default `http://localhost:5001`); `KOTOBA_IPFS_TOKEN` optional Bearer
   - `/api/v0/block/put?cid-codec=raw&mhtype=sha2-256` (multipart), `/api/v0/block/get`, `/api/v0/block/rm`
   - sync BlockStore は `tokio::task::block_in_place` でブリッジ

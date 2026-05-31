@@ -221,6 +221,22 @@ impl IvfIndex {
     /// Each centroid `k_idx` produces a cluster of quads sharing the subject
     /// `KotobaCid::from_bytes(b"ivf-centroid:{k_idx}")`.
     pub fn to_quads(&self, graph_cid: &KotobaCid, member_counts: &[usize]) -> Vec<Quad> {
+        self.to_quads_ns(graph_cid, member_counts, "cc")
+    }
+
+    /// Like [`IvfIndex::to_quads`] but with a configurable predicate namespace
+    /// (`{ns}/ivf/*`).
+    ///
+    /// Use `"cc"` for the Common Crawl chunk graph and `"media"` for the
+    /// multimodal asset graph.  The restore paths ([`IvfIndex::from_quads`] /
+    /// [`IvfIndex::from_datoms`]) are namespace-agnostic, so any prefix
+    /// round-trips.
+    pub fn to_quads_ns(
+        &self,
+        graph_cid: &KotobaCid,
+        member_counts: &[usize],
+        ns: &str,
+    ) -> Vec<Quad> {
         let mut quads = Vec::with_capacity(self.k * 5);
         for (k_idx, centroid) in self.centroids.iter().enumerate() {
             let subject = KotobaCid::from_bytes(format!("ivf-centroid:{}", k_idx).as_bytes());
@@ -229,31 +245,31 @@ impl IvfIndex {
             quads.push(Quad {
                 graph: graph_cid.clone(),
                 subject: subject.clone(),
-                predicate: "cc/ivf/centroid_id".to_string(),
+                predicate: format!("{ns}/ivf/centroid_id"),
                 object: QuadObject::Integer(k_idx as i64),
             });
             quads.push(Quad {
                 graph: graph_cid.clone(),
                 subject: subject.clone(),
-                predicate: "cc/ivf/vector".to_string(),
+                predicate: format!("{ns}/ivf/vector"),
                 object: QuadObject::VectorF32(centroid.clone()),
             });
             quads.push(Quad {
                 graph: graph_cid.clone(),
                 subject: subject.clone(),
-                predicate: "cc/ivf/model".to_string(),
+                predicate: format!("{ns}/ivf/model"),
                 object: QuadObject::Text(self.model_id.clone()),
             });
             quads.push(Quad {
                 graph: graph_cid.clone(),
                 subject: subject.clone(),
-                predicate: "cc/ivf/k".to_string(),
+                predicate: format!("{ns}/ivf/k"),
                 object: QuadObject::Integer(self.k as i64),
             });
             quads.push(Quad {
                 graph: graph_cid.clone(),
                 subject: subject.clone(),
-                predicate: "cc/ivf/n".to_string(),
+                predicate: format!("{ns}/ivf/n"),
                 object: QuadObject::Integer(n as i64),
             });
         }
@@ -273,14 +289,14 @@ impl IvfIndex {
         let mut total_k: Option<i64> = None;
 
         for q in quads {
-            match q.predicate.as_str() {
-                "cc/ivf/centroid_id" => {
+            match ivf_leaf(&q.predicate) {
+                Some("centroid_id") => {
                     // Just a marker; actual index is the integer value.
                     if let QuadObject::Integer(id) = &q.object {
                         id_to_vector.entry(*id).or_default();
                     }
                 }
-                "cc/ivf/vector" => {
+                Some("vector") => {
                     if let QuadObject::VectorF32(v) = &q.object {
                         // Derive the centroid index from the subject CID by
                         // matching any already-seen centroid_id quad with the
@@ -289,12 +305,12 @@ impl IvfIndex {
                         id_to_vector.insert(key, v.clone());
                     }
                 }
-                "cc/ivf/model" => {
+                Some("model") => {
                     if let QuadObject::Text(m) = &q.object {
                         model_id = m.clone();
                     }
                 }
-                "cc/ivf/k" => {
+                Some("k") => {
                     if let QuadObject::Integer(v) = &q.object {
                         total_k = Some(*v);
                     }
@@ -335,24 +351,24 @@ impl IvfIndex {
         let mut total_k: Option<i64> = None;
 
         for datom in datoms.iter().filter(|d| d.op) {
-            match datom.a.as_str() {
-                "cc/ivf/centroid_id" => {
+            match ivf_leaf(&datom.a) {
+                Some("centroid_id") => {
                     if let Value::Integer(id) = &datom.v {
                         id_to_vector.entry(*id).or_default();
                     }
                 }
-                "cc/ivf/vector" => {
+                Some("vector") => {
                     if let Value::VectorF32(v) = &datom.v {
                         let key = subject_to_centroid_id(&datom.e)?;
                         id_to_vector.insert(key, v.clone());
                     }
                 }
-                "cc/ivf/model" => {
+                Some("model") => {
                     if let Value::Text(m) = &datom.v {
                         model_id = m.clone();
                     }
                 }
-                "cc/ivf/k" => {
+                Some("k") => {
                     if let Value::Integer(v) = &datom.v {
                         total_k = Some(*v);
                     }
@@ -379,6 +395,15 @@ impl IvfIndex {
             model_id,
         })
     }
+}
+
+/// Extract the trailing component of an `{ns}/ivf/<leaf>` predicate.
+///
+/// Namespace-agnostic: `"cc/ivf/vector"` and `"media/ivf/vector"` both yield
+/// `Some("vector")`.  Returns `None` for any predicate that is not an IVF
+/// predicate.
+fn ivf_leaf(pred: &str) -> Option<&str> {
+    pred.split("/ivf/").nth(1)
 }
 
 /// Extract the integer centroid id encoded in `"ivf-centroid:{id}"` subject CID.

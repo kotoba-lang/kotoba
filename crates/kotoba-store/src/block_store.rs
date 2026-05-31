@@ -11,7 +11,7 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
 }
 
-/// Verify that `blake3(data) == cid`, then put.  Returns `Err` on CID mismatch.
+/// Verify that `sha2-256(data) == cid` (single canonical CIDv1), then put.  Returns `Err` on CID mismatch.
 pub fn put_verified(store: &dyn BlockStore, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
     let computed = KotobaCid::from_bytes(data);
     anyhow::ensure!(

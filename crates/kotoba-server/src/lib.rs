@@ -7,6 +7,7 @@ pub mod graph_auth;
 pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
+pub mod media_xrpc;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
@@ -79,6 +80,10 @@ mod tests {
         super::cc_xrpc::NSID_CC_RAG,
         super::cc_xrpc::NSID_CC_INGEST,
         super::cc_xrpc::NSID_CC_STATUS,
+        // multimodal cross-modal search
+        super::media_xrpc::NSID_MEDIA_SEARCH,
+        super::media_xrpc::NSID_MEDIA_INGEST,
+        super::media_xrpc::NSID_MEDIA_STATUS,
     ];
 
     #[test]
@@ -499,6 +504,20 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", cc_xrpc::NSID_CC_STATUS),
             get(cc_xrpc::cc_status),
+        )
+        // ── Multimodal cross-modal search ──────────────────────────────────
+        .route(
+            &format!("/xrpc/{}", media_xrpc::NSID_MEDIA_SEARCH),
+            get(media_xrpc::media_search),
+        )
+        .route(
+            &format!("/xrpc/{}", media_xrpc::NSID_MEDIA_INGEST),
+            post(media_xrpc::media_ingest)
+                .layer(DefaultBodyLimit::max(media_xrpc::MEDIA_INGEST_BODY_LIMIT)),
+        )
+        .route(
+            &format!("/xrpc/{}", media_xrpc::NSID_MEDIA_STATUS),
+            get(media_xrpc::media_status),
         )
         // ── Email E2E XRPC ──────────────────────────────────────────────────
         .route(

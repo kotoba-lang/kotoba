@@ -85,6 +85,43 @@ enum Cmd {
         cacao: Option<String>,
     },
 
+    /// Cross-modal search: a text query retrieves matching assets across ALL
+    /// modalities (image / video / audio / document) from one shared embedding
+    /// space.  GET /xrpc/ai.gftd.apps.kotoba.media.search.  Uses operator auth
+    /// (built from the local `kotoba init` identity).
+    MediaSearch {
+        /// Free-text query (max 8 KiB).
+        query: String,
+        /// Maximum results (default 10, server cap 100).
+        #[arg(long, default_value = "10")]
+        top_k: usize,
+        /// Restrict to one modality: text|image|audio|video|document.
+        #[arg(long)]
+        modality: Option<String>,
+    },
+
+    /// Ingest one media file (image / video / audio / book / PDF) into the
+    /// shared search space.  POST /xrpc/ai.gftd.apps.kotoba.media.ingest.
+    /// MIME is inferred from the file extension; the caption (if given) is the
+    /// strongest cross-modal bridge to text queries.
+    MediaIngest {
+        /// Path to the asset file.
+        path: String,
+        /// Caption / OCR / transcript text describing the asset.
+        #[arg(long)]
+        caption: Option<String>,
+        /// Display title (defaults to the file name).
+        #[arg(long)]
+        title: Option<String>,
+        /// Page index for paginated documents (books / PDFs).
+        #[arg(long, default_value = "0")]
+        page: i64,
+    },
+
+    /// Show multimodal index status: asset count, embeddings, IVF centroids,
+    /// and a per-modality breakdown.  GET /xrpc/ai.gftd.apps.kotoba.media.status.
+    MediaStatus,
+
     /// Ping the server's /health endpoint
     Health,
 
@@ -303,6 +340,27 @@ async fn main() -> Result<()> {
             cacao,
         } => {
             run_kg_query(&cli.url, &cli.token, "cypher", &query, limit, cacao).await?;
+        }
+
+        Cmd::MediaSearch {
+            query,
+            top_k,
+            modality,
+        } => {
+            run_media_search(&cli.url, &query, top_k, modality).await?;
+        }
+
+        Cmd::MediaIngest {
+            path,
+            caption,
+            title,
+            page,
+        } => {
+            run_media_ingest(&cli.url, &path, caption, title, page).await?;
+        }
+
+        Cmd::MediaStatus => {
+            run_media_status(&cli.url).await?;
         }
 
         Cmd::Init { force, show } => {
@@ -1123,6 +1181,153 @@ async fn run_kg_query(
     let v: serde_json::Value = resp.json().await.context("decode kg.query JSON")?;
     println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
+}
+
+/// Build an operator Bearer JWT from the local persisted identity.
+///
+/// Mirrors `run_commit`: the server's `require_operator_auth` accepts a JWT
+/// whose `sub` claim equals the operator DID.  Requires `kotoba init` to have
+/// run on this machine with the same identity `kotoba serve` uses.
+fn operator_token() -> Result<String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let id = kotoba_kse::AgentIdentity::from_env();
+    if id.ephemeral {
+        anyhow::bail!(
+            "no persisted identity — media commands need a stable operator DID. \
+             Run `kotoba init` first, then restart `kotoba serve`."
+        );
+    }
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload =
+        URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{}","exp":9999999999}}"#, id.did).as_bytes());
+    Ok(format!("{header}.{payload}.kotoba-cli-media"))
+}
+
+/// GET media.search — cross-modal text→any-modality retrieval.
+async fn run_media_search(
+    base_url: &str,
+    query: &str,
+    top_k: usize,
+    modality: Option<String>,
+) -> Result<()> {
+    let token = operator_token()?;
+    let mut params: Vec<(&str, String)> =
+        vec![("q", query.to_string()), ("topK", top_k.to_string())];
+    if let Some(m) = &modality {
+        params.push(("modality", m.clone()));
+    }
+    let url = format!(
+        "{}/xrpc/ai.gftd.apps.kotoba.media.search",
+        base_url.trim_end_matches('/')
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .query(&params)
+        .send()
+        .await
+        .context("GET media.search failed")?;
+    check_status(&resp)?;
+    let v: serde_json::Value = resp.json().await.context("decode media.search JSON")?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+/// POST media.ingest — ingest a single file into the shared search space.
+async fn run_media_ingest(
+    base_url: &str,
+    path: &str,
+    caption: Option<String>,
+    title: Option<String>,
+    page: i64,
+) -> Result<()> {
+    let token = operator_token()?;
+    let bytes = std::fs::read(path).with_context(|| format!("read {path}"))?;
+    let mime = mime_for_path(path);
+    let title = title.or_else(|| {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+    });
+    let item = serde_json::json!({
+        "mime":    mime,
+        "b64":     B64.encode(&bytes),
+        "title":   title,
+        "source":  path,
+        "page":    page,
+        "caption": caption,
+    });
+    let url = format!(
+        "{}/xrpc/ai.gftd.apps.kotoba.media.ingest",
+        base_url.trim_end_matches('/')
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "items": [item] }))
+        .send()
+        .await
+        .context("POST media.ingest failed")?;
+    check_status(&resp)?;
+    let v: serde_json::Value = resp.json().await.context("decode media.ingest JSON")?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+/// GET media.status — index summary + per-modality breakdown.
+async fn run_media_status(base_url: &str) -> Result<()> {
+    let token = operator_token()?;
+    let url = format!(
+        "{}/xrpc/ai.gftd.apps.kotoba.media.status",
+        base_url.trim_end_matches('/')
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .context("GET media.status failed")?;
+    check_status(&resp)?;
+    let v: serde_json::Value = resp.json().await.context("decode media.status JSON")?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
+/// Map a file extension to a MIME type (best-effort; octet-stream fallback).
+/// Mirrors `kotoba_ingest::media`'s server-side mapping so CLI and server agree.
+fn mime_for_path(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" | "oga" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "pdf" => "application/pdf",
+        "epub" => "application/epub+zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "txt" | "md" => "text/plain",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 /// POST kg.commit to seal pending writes into a ProllyTree commit + checkpoint.
