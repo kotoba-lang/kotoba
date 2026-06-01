@@ -2365,7 +2365,14 @@ where
             })
             .collect::<Vec<_>>();
         let datom_count = datoms.len();
-        let mut roots = build_datom_roots(&datoms, self.store)?;
+        // Durability fix (2026-06-01 yukkuri-kg-v2 incident): route this commit's
+        // block writes through `put_durable` (synchronous cold/kubo write-through)
+        // instead of TieredBlockStore's default fire-and-forget async cold copy.
+        // Without it, a liveness/OOM restart between commit and the async copy
+        // loses the head's reachable blocks → cold `db_from_head` → kubo block/get →
+        // bitswap timeout → permanent 500. Mirrors the wrapped-vault-key put_durable+pin.
+        let durable = DurableStore(self.store);
+        let mut roots = build_datom_roots(&datoms, &durable)?;
         // Covering EAVT (ADR-2605302130): materialise the full netted current
         // state into its own ProllyTree so `current_db_from_head` is O(state)
         // not O(history). ProllyTree structural sharing means unchanged subtrees
@@ -2378,7 +2385,7 @@ where
                 let kqe = indexable_kqe_datom(datom);
                 ceavt_entries.push((kqe.eavt_key(), encode_stored_datom(datom)?));
             }
-            let ceavt_root = ProllyTree::build_tree(ceavt_entries, self.store)
+            let ceavt_root = ProllyTree::build_tree(ceavt_entries, &durable)
                 .map_err(DistributedCommitError::Store)?;
             roots.insert(ROOT_CEAVT.to_string(), ceavt_root);
         }
@@ -2391,7 +2398,12 @@ where
             roots,
             req.cacao_proof_cid,
         )?;
-        commit.persist(self.store)?;
+        commit.persist(&durable)?;
+        // All reachable blocks (index roots, covering EAVT, commit pointer) are now
+        // durably in the cold tier, so recursive-pin the new head once: TieredBlockStore
+        // pin → cold KuboBlockStore pin (pin/add recursive=true) keeps the whole commit
+        // DAG out of kubo GC, and the budgeted hot tier never evicts it. Idempotent.
+        self.store.pin(&commit.cid);
 
         let commit_ipfs_cid = kotoba_ipfs::parse_cid(&commit.cid.to_multibase())
             .map_err(|e| DistributedCommitError::InvalidCommitCid(e.to_string()))?;
@@ -2678,6 +2690,46 @@ impl DistributedDatomCommit {
             .map_err(|e| DistributedCommitError::Cbor(e.to_string()))?;
         commit.cid = cid.clone();
         Ok(Some(commit))
+    }
+}
+
+/// Wraps a `BlockStore` so every `put` is routed through `put_durable`
+/// (synchronous write-through to the persistent cold tier, surfacing errors).
+///
+/// Used for Datomic commit writes: the head and its reachable index/commit
+/// blocks must be durable before `commit_datoms` returns, otherwise a restart
+/// before `TieredBlockStore`'s fire-and-forget async cold copy runs loses them
+/// and `db_from_head` can never reconstruct the head again (kubo block/get →
+/// bitswap → 30s timeout → permanent 500). Mirrors the wrapped-vault-key fix.
+struct DurableStore<'a>(&'a dyn BlockStore);
+
+impl<'a> BlockStore for DurableStore<'a> {
+    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        self.0.put_durable(cid, data)
+    }
+    fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        self.0.put_durable(cid, data)
+    }
+    fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
+        self.0.get(cid)
+    }
+    fn has(&self, cid: &KotobaCid) -> bool {
+        self.0.has(cid)
+    }
+    fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+        self.0.delete(cid)
+    }
+    fn pin(&self, cid: &KotobaCid) {
+        self.0.pin(cid)
+    }
+    fn unpin(&self, cid: &KotobaCid) {
+        self.0.unpin(cid)
+    }
+    fn is_pinned(&self, cid: &KotobaCid) -> bool {
+        self.0.is_pinned(cid)
+    }
+    fn all_cids(&self) -> Vec<KotobaCid> {
+        self.0.all_cids()
     }
 }
 
