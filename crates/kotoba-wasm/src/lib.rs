@@ -63,6 +63,45 @@ impl Node {
         self.arr.insert_datom(&d);
     }
 
+    /// Hydrate the arrangement from the exact JSON a remote kotoba
+    /// `ai.gftd.apps.kotoba.datomic.datoms` returns: `[{e, a, v_edn, ...}]`.
+    ///
+    /// This is the P1 sync path (ADR-2606013600 D5): a one-time / delta block
+    /// pull from a peer is decoded into Datoms and loaded into the kqe read
+    /// engine — **without** the native `DistributedDatomReader` / kotoba-ipfs
+    /// IPNS stack, which the browser node deliberately does not carry. The
+    /// only added value-scalars are EDN strings (`"..."`) and keywords (`:kw`).
+    pub fn load_server_datoms(&mut self, json: &str) -> Result<usize, String> {
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let mut n = 0usize;
+        for d in &arr {
+            // Skip retractions if the server marks them.
+            if d.get("added").and_then(|b| b.as_bool()) == Some(false) {
+                continue;
+            }
+            let (Some(e), Some(a), Some(v_edn)) = (
+                d.get("e").and_then(|x| x.as_str()),
+                d.get("a").and_then(|x| x.as_str()),
+                d.get("v_edn").and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            // Group by the server's content-addressed entity string; the read
+            // engine only needs a stable per-entity key, so hashing the `e`
+            // multibase string is sufficient for the browser arrangement.
+            let datom = Datom::assert(
+                KotobaCid::from_bytes(e.as_bytes()),
+                a.to_string(),
+                Value::Text(parse_edn_scalar(v_edn)),
+                self.tx.clone(),
+            );
+            self.arr.insert_datom(&datom);
+            n += 1;
+        }
+        Ok(n)
+    }
+
     /// All current datoms whose attribute starts with `prefix` (AEVT-shaped scan).
     pub fn datoms_by_attr_prefix(&self, prefix: &str) -> Vec<Datom> {
         self.arr.datoms_with_attribute_prefix(&self.tx, prefix)
@@ -104,6 +143,24 @@ impl Node {
     }
 }
 
+/// Minimal EDN-scalar decoder mirroring `@etzhayyim/yoro-rw-free`'s
+/// `parseEdnScalar`: `"str"` → str, `:kw` → bare name, else the raw token.
+fn parse_edn_scalar(v_edn: &str) -> String {
+    let s = v_edn.trim();
+    if let Some(rest) = s.strip_prefix('"') {
+        // EDN string — same escaping as JSON for our content.
+        if let Ok(serde_json::Value::String(decoded)) = serde_json::from_str::<serde_json::Value>(s)
+        {
+            return decoded;
+        }
+        return rest.strip_suffix('"').unwrap_or(rest).to_string();
+    }
+    if let Some(kw) = s.strip_prefix(':') {
+        return kw.to_string();
+    }
+    s.to_string()
+}
+
 /// A yoro actor profile materialised from `:yoro.profile/*` Datoms.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Profile {
@@ -141,6 +198,15 @@ mod wasm {
             self.inner.assert_text(entity, attr, value);
         }
 
+        /// Hydrate from a remote kotoba `datomic.datoms` JSON array (P1 sync).
+        /// Returns the number of datoms loaded.
+        #[wasm_bindgen(js_name = loadDatoms)]
+        pub fn load_datoms(&mut self, datoms_json: &str) -> Result<usize, JsValue> {
+            self.inner
+                .load_server_datoms(datoms_json)
+                .map_err(|e| JsValue::from_str(&e))
+        }
+
         /// `searchActors(q)` → JSON `{ actors: [...] }` (same shape as the XRPC).
         #[wasm_bindgen(js_name = searchActors)]
         pub fn search_actors(&self, q: &str) -> Result<String, JsValue> {
@@ -171,5 +237,24 @@ mod tests {
         let hit = n.search_actors("tsumugi");
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].display_name, "紡ぎ Tsumugi");
+    }
+
+    #[test]
+    fn hydrate_from_server_datoms_json_then_search() {
+        // Exact shape returned by ai.gftd.apps.kotoba.datomic.datoms (P1 sync).
+        let json = r#"[
+          {"e":"bafyA","a":":yoro.profile/did","v_edn":"\"did:web:etzhayyim.com:actor:tsumugi\"","added":true},
+          {"e":"bafyA","a":":yoro.profile/displayName","v_edn":"\"紡ぎ Tsumugi — Engi KG\"","added":true},
+          {"e":"bafyB","a":":yoro.profile/did","v_edn":"\"did:web:etzhayyim.com:actor:watatsuna\"","added":true},
+          {"e":"bafyC","a":":yoro.post/text","v_edn":"\"hello\"","added":true}
+        ]"#;
+        let mut n = Node::new();
+        let loaded = n.load_server_datoms(json).unwrap();
+        assert_eq!(loaded, 4);
+        // Two profiles materialised; the post datom is ignored by searchActors.
+        assert_eq!(n.search_actors("").len(), 2);
+        let hit = n.search_actors("watatsuna");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].did, "did:web:etzhayyim.com:actor:watatsuna");
     }
 }
