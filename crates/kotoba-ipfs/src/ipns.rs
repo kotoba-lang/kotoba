@@ -402,8 +402,12 @@ impl KuboIpnsRegistry {
         }
         let store = std::env::var("KOTOBA_STORE_PATH").ok()?;
         let p = PathBuf::from(store);
-        // Climb to the volume root (…/sled/wal → …) and keep heads beside it.
-        let base = p.parent().and_then(|x| x.parent()).unwrap_or(p.as_path());
+        // Keep heads beside the store dir, on the SAME persistent volume:
+        // KOTOBA_STORE_PATH=/data/sled/wal → /data/sled/ipns-heads. The PVC is
+        // mounted at the store's parent (/data/sled); climbing two levels would
+        // land on the container-ephemeral /data and lose heads on restart
+        // (2026-06-01 incident: cold read 404 "no distributed Datomic/IPNS head").
+        let base = p.parent().unwrap_or(p.as_path());
         Some(base.join("ipns-heads"))
     }
 
