@@ -1,5 +1,7 @@
 pub mod attestation;
+pub mod availability_xrpc;
 pub mod cc_xrpc;
+pub mod dht_transport;
 pub mod email_xrpc;
 pub mod fingerprint;
 pub mod firehose;
@@ -80,6 +82,9 @@ mod tests {
         super::cc_xrpc::NSID_CC_RAG,
         super::cc_xrpc::NSID_CC_INGEST,
         super::cc_xrpc::NSID_CC_STATUS,
+        // hybrid web search (lexical + semantic + authority)
+        super::cc_xrpc::NSID_WEB_SEARCH,
+        super::cc_xrpc::NSID_SEARCH_REINDEX,
         // multimodal cross-modal search
         super::media_xrpc::NSID_MEDIA_SEARCH,
         super::media_xrpc::NSID_MEDIA_INGEST,
@@ -513,6 +518,15 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", cc_xrpc::NSID_CC_STATUS),
             get(cc_xrpc::cc_status),
         )
+        // ── Hybrid web search (lexical + semantic + authority) ─────────────
+        .route(
+            &format!("/xrpc/{}", cc_xrpc::NSID_WEB_SEARCH),
+            get(cc_xrpc::web_search),
+        )
+        .route(
+            &format!("/xrpc/{}", cc_xrpc::NSID_SEARCH_REINDEX),
+            post(cc_xrpc::search_reindex),
+        )
         // ── Multimodal cross-modal search ──────────────────────────────────
         .route(
             &format!("/xrpc/{}", media_xrpc::NSID_MEDIA_SEARCH),
@@ -590,6 +604,13 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             get(firehose::events),
         )
         // ── Generic XRPC dispatch ──────────────────────────────────────────
+        .route(
+            &format!(
+                "/xrpc/{}",
+                crate::availability_xrpc::NSID_AVAILABILITY_CHALLENGE
+            ),
+            post(crate::availability_xrpc::availability_challenge),
+        )
         .route("/xrpc/:nsid", post(xrpc::generic_invoke))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),

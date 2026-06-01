@@ -325,6 +325,106 @@ impl CcPageIngestor {
         debug!(path = %path.display(), quads = out.len(), "read_page_file done");
         Ok(out)
     }
+
+    /// Ingest the page link graph (outlink edges) into the `cc:2026-12:links`
+    /// named graph as `cc/link/to` Cid edges, for PageRank.
+    ///
+    /// Reads the optional `outlinks` column (a `List<Utf8>` of destination
+    /// `vertex_id`s) from each `*_pages.parquet`.  Datasets that only carry the
+    /// scalar `outlink_count` produce no edges (the links graph stays empty and
+    /// the authority signal is simply absent — honest degradation).
+    pub async fn ingest_links_dir_datoms(
+        &self,
+        parquet_dir: &Path,
+        max_batches: Option<usize>,
+    ) -> Result<(usize, Vec<Datom>)> {
+        let mut files: Vec<_> = std::fs::read_dir(parquet_dir)
+            .with_context(|| format!("read_dir {}", parquet_dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.ends_with("_pages.parquet"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        files.sort();
+        if let Some(max) = max_batches {
+            files.truncate(max);
+        }
+
+        let mut datoms = Vec::new();
+        for path in &files {
+            datoms.extend(quads_to_datoms(self.read_page_links(path).with_context(
+                || format!("read_page_links {}", path.display()),
+            )?));
+        }
+        Ok((files.len(), datoms))
+    }
+
+    /// Read outlink edges from a single pages parquet → `cc/link/to` quads in
+    /// the links graph.  Returns an empty vec if there is no `outlinks` column.
+    pub fn read_page_links(&self, path: &Path) -> Result<Vec<Quad>> {
+        use arrow::array::{Array, ListArray, StringArray};
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use std::fs::File;
+
+        let file = File::open(path)?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let reader = builder.build()?;
+        let links_graph = cc_links_graph();
+        let mut out: Vec<Quad> = Vec::new();
+
+        for batch_result in reader {
+            let batch = batch_result?;
+            let nrows = batch.num_rows();
+
+            let vertex_id_col = batch
+                .schema()
+                .index_of("vertex_id")
+                .ok()
+                .and_then(|i| batch.column(i).as_any().downcast_ref::<StringArray>());
+            let outlinks_col = batch
+                .schema()
+                .index_of("outlinks")
+                .ok()
+                .and_then(|i| batch.column(i).as_any().downcast_ref::<ListArray>());
+
+            let (Some(vcol), Some(lcol)) = (vertex_id_col, outlinks_col) else {
+                continue; // no link column in this file
+            };
+
+            for row in 0..nrows {
+                if vcol.is_null(row) || lcol.is_null(row) {
+                    continue;
+                }
+                let vid = vcol.value(row);
+                if vid.is_empty() {
+                    continue;
+                }
+                let src = subject_from_vertex(vid);
+                let list_val = lcol.value(row);
+                let Some(arr) = list_val.as_any().downcast_ref::<StringArray>() else {
+                    continue;
+                };
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    let dst_id = arr.value(i);
+                    if dst_id.is_empty() || dst_id == vid {
+                        continue; // skip self-loops
+                    }
+                    let dst = subject_from_vertex(dst_id);
+                    out.push(cid_quad(&links_graph, &src, "cc/link/to", &dst));
+                }
+            }
+        }
+
+        debug!(path = %path.display(), edges = out.len(), "read_page_links done");
+        Ok(out)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

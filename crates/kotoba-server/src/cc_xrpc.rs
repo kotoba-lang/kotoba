@@ -1,15 +1,19 @@
 //! XRPC handlers for Common Crawl vector search and knowledge query.
 //!
 //! NSIDs:
-//!   ai.gftd.apps.kotoba.cc.search  — ANN vector search over CC chunks (GET)
-//!   ai.gftd.apps.kotoba.cc.rag     — RAG: search + LLM synthesis (POST)
-//!   ai.gftd.apps.kotoba.cc.ingest  — trigger CC parquet ingest job (POST)
-//!   ai.gftd.apps.kotoba.cc.status  — ingest / index status (GET)
+//!   ai.gftd.apps.kotoba.cc.search   — ANN vector search over CC chunks (GET)
+//!   ai.gftd.apps.kotoba.cc.rag      — RAG: search + LLM synthesis (POST)
+//!   ai.gftd.apps.kotoba.cc.ingest   — trigger CC parquet ingest job (POST)
+//!   ai.gftd.apps.kotoba.cc.status   — ingest / index status (GET)
+//!   ai.gftd.apps.kotoba.search.web  — hybrid web search (lexical + semantic +
+//!                                     authority, RRF-fused) over CC chunks (GET)
 
 pub const NSID_CC_SEARCH: &str = "ai.gftd.apps.kotoba.cc.search";
 pub const NSID_CC_RAG: &str = "ai.gftd.apps.kotoba.cc.rag";
 pub const NSID_CC_INGEST: &str = "ai.gftd.apps.kotoba.cc.ingest";
 pub const NSID_CC_STATUS: &str = "ai.gftd.apps.kotoba.cc.status";
+pub const NSID_WEB_SEARCH: &str = "ai.gftd.apps.kotoba.search.web";
+pub const NSID_SEARCH_REINDEX: &str = "ai.gftd.apps.kotoba.search.reindex";
 
 use axum::{
     extract::{Query, State},
@@ -19,12 +23,16 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use kotoba_core::cid::KotobaCid;
+use kotoba_ingest::bm25::Bm25Index;
 #[cfg(feature = "cc-parquet")]
 use kotoba_ingest::embed_client::EmbedClient;
+use kotoba_ingest::fusion::{reciprocal_rank_fusion, Ranking, Signal, RRF_K};
 use kotoba_ingest::ivf::IvfIndex;
+use kotoba_ingest::pagerank::PageRankIndex;
 use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
 
 use crate::server::KotobaState;
@@ -37,6 +45,138 @@ fn cc_pages_graph() -> KotobaCid {
 
 fn cc_chunks_graph() -> KotobaCid {
     KotobaCid::from_bytes(b"cc:2026-12:chunks")
+}
+
+fn cc_links_graph() -> KotobaCid {
+    KotobaCid::from_bytes(b"cc:2026-12:links")
+}
+
+/// Map each chunk subject (multibase) → its persisted IVF cluster id, from the
+/// `cc/ivf/cluster` datoms written at ingest time.
+fn collect_chunk_clusters(datoms: &[KqeDatom]) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    for d in datoms {
+        if d.a == "cc/ivf/cluster" {
+            if let KqeValue::Integer(c) = &d.v {
+                out.insert(d.e.to_multibase(), *c as usize);
+            }
+        }
+    }
+    out
+}
+
+/// Semantic ranking over chunk embeddings.
+///
+/// Uses the persisted IVF index (`cc/ivf/*` centroids + per-chunk
+/// `cc/ivf/cluster` assignments) when present — probing only the `nprobe`
+/// nearest centroids — and otherwise falls back to a brute-force cosine scan.
+/// Returns `(score, chunk_embeddings_index)` pairs, best first.
+fn semantic_ranking(
+    datoms: &[KqeDatom],
+    chunk_embeddings: &[(KotobaCid, Vec<f32>)],
+    query_vec: &[f32],
+    nprobe: usize,
+    top_k: usize,
+) -> Vec<(f32, usize)> {
+    let ivf_datoms: Vec<KqeDatom> = datoms
+        .iter()
+        .filter(|d| d.a.starts_with("cc/ivf/") && d.a != "cc/ivf/cluster")
+        .cloned()
+        .collect();
+
+    if let Some(ivf) = IvfIndex::from_datoms(&ivf_datoms) {
+        let clusters = collect_chunk_clusters(datoms);
+        // Only chunks with a known cluster assignment can be IVF-probed.
+        let candidates: Vec<(usize, &[f32])> = chunk_embeddings
+            .iter()
+            .filter_map(|(cid, v)| {
+                clusters
+                    .get(&cid.to_multibase())
+                    .map(|&c| (c, v.as_slice()))
+            })
+            .collect();
+        // candidate index i lines up with chunk_embeddings index i only when
+        // every chunk has a cluster; guard by rebuilding an index map.
+        if candidates.len() == chunk_embeddings.len() && !candidates.is_empty() {
+            return ivf.search(query_vec, &candidates, nprobe, top_k);
+        }
+    }
+    brute_force_cosine(query_vec, chunk_embeddings, top_k)
+}
+
+// ── search-index build (BM25 + PageRank precompute) ─────────────────────────────
+
+/// Build a corpus-global BM25 lexical index over every `cc/chunk/text` and
+/// return its `cc/bm25/*` persistence datoms (to commit into the chunks graph).
+/// Global by construction (df / N / avgdl span the whole corpus), so it must
+/// run as a post-ingest pass, not per-file.
+fn build_bm25_datoms(chunk_datoms: &[KqeDatom]) -> Vec<KqeDatom> {
+    let texts = collect_chunk_texts(chunk_datoms);
+    if texts.is_empty() {
+        return Vec::new();
+    }
+    Bm25Index::build(&texts)
+        .to_quads(&cc_chunks_graph())
+        .into_iter()
+        .map(|q| KqeDatom::from_legacy_quad(q, true))
+        .collect()
+}
+
+/// Extract directed `cc/link/to` edges from the links graph.
+fn collect_link_edges(link_datoms: &[KqeDatom]) -> Vec<(KotobaCid, KotobaCid)> {
+    link_datoms
+        .iter()
+        .filter(|d| d.a == "cc/link/to")
+        .filter_map(|d| match &d.v {
+            KqeValue::Cid(dst) => Some((d.e.clone(), dst.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Compute PageRank over the links graph and return its `cc/rank/*`
+/// persistence datoms (to commit into the links graph).
+fn build_pagerank_datoms(link_datoms: &[KqeDatom]) -> Vec<KqeDatom> {
+    let edges = collect_link_edges(link_datoms);
+    if edges.is_empty() {
+        return Vec::new();
+    }
+    PageRankIndex::compute(&edges)
+        .to_quads(&cc_links_graph())
+        .into_iter()
+        .map(|q| KqeDatom::from_legacy_quad(q, true))
+        .collect()
+}
+
+/// Rebuild and persist the search indexes (BM25 over chunks, PageRank over
+/// links) from the current canonical Datom view.  Returns
+/// `(bm25_datoms, pagerank_datoms, link_edges)` counts.
+async fn rebuild_search_indexes(
+    state: &KotobaState,
+    author: &str,
+) -> Result<(usize, usize, usize), (StatusCode, String)> {
+    // BM25 over the committed chunk corpus.
+    let chunk_datoms = current_cc_chunk_datoms(state).await?;
+    let bm25 = build_bm25_datoms(&chunk_datoms);
+    let bm25_n = bm25.len();
+    bridge_cc_graph_to_distributed_head(
+        state,
+        cc_chunks_graph(),
+        "cc:2026-12:chunks",
+        author,
+        bm25,
+    )
+    .await?;
+
+    // PageRank over the link graph.
+    let link_datoms = current_cc_graph_datoms(state, &cc_links_graph()).await?;
+    let edge_n = collect_link_edges(&link_datoms).len();
+    let pr = build_pagerank_datoms(&link_datoms);
+    let pr_n = pr.len();
+    bridge_cc_graph_to_distributed_head(state, cc_links_graph(), "cc:2026-12:links", author, pr)
+        .await?;
+
+    Ok((bm25_n, pr_n, edge_n))
 }
 
 fn cosine_score(a: &[f32], b: &[f32]) -> f32 {
@@ -139,7 +279,8 @@ const MAX_NPROBE: usize = 256; // cap IVF probe count to prevent brute-force fal
 #[cfg(feature = "cc-parquet")]
 const MAX_PARQUET_DIR: usize = 1_024;
 
-#[cfg(feature = "cc-parquet")]
+// Commit a batch of CC datoms to a graph's distributed head.  Un-gated so the
+// reindex / search-index build path works without the `cc-parquet` feature.
 async fn bridge_cc_graph_to_distributed_head(
     state: &KotobaState,
     graph_cid: KotobaCid,
@@ -261,25 +402,9 @@ pub async fn cc_search(
 
     let top_k = q.top_k.min(MAX_TOP_K);
 
-    // Use IVF if centroids were persisted, else brute-force
-    let ivf_datoms = datoms
-        .iter()
-        .filter(|datom| datom.a.starts_with("cc/ivf/"))
-        .cloned()
-        .collect::<Vec<_>>();
-    let ranked: Vec<(f32, usize)> = if !ivf_datoms.is_empty() {
-        match IvfIndex::from_datoms(&ivf_datoms) {
-            Some(ivf) => {
-                // IVF search needs cluster assignments — fall back for now
-                // since the Arrangement doesn't store per-chunk cluster IDs in indexed form
-                let _ = ivf;
-                brute_force_cosine(query_vec, &chunk_embeddings, top_k)
-            }
-            None => brute_force_cosine(query_vec, &chunk_embeddings, top_k),
-        }
-    } else {
-        brute_force_cosine(query_vec, &chunk_embeddings, top_k)
-    };
+    // IVF (probe `nprobe` nearest centroids via persisted `cc/ivf/cluster`
+    // assignments) when an index is present, else brute-force cosine.
+    let ranked = semantic_ranking(&datoms, &chunk_embeddings, query_vec, q.nprobe, top_k);
 
     let mut results: Vec<CcSearchResult> = Vec::new();
     for (score, idx) in ranked {
@@ -302,6 +427,262 @@ pub async fn cc_search(
     }
 
     Json(json!({ "results": results, "total": results.len() })).into_response()
+}
+
+// ── search.web (hybrid: lexical + semantic + authority) ─────────────────────────
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchQuery {
+    pub q: String,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default = "default_nprobe")]
+    pub nprobe: usize,
+    pub lang: Option<String>,
+    /// Lexical (BM25) RRF weight.
+    #[serde(default = "default_signal_weight")]
+    pub w_lex: f32,
+    /// Semantic (vector) RRF weight.
+    #[serde(default = "default_signal_weight")]
+    pub w_sem: f32,
+    /// Authority (PageRank) RRF weight.
+    #[serde(default = "default_authority_weight")]
+    pub w_auth: f32,
+}
+
+fn default_signal_weight() -> f32 {
+    1.0
+}
+fn default_authority_weight() -> f32 {
+    0.5
+}
+
+#[derive(Serialize)]
+pub struct WebSearchResult {
+    pub url: String,
+    pub domain: String,
+    pub text: String,
+    pub lang: Option<String>,
+    /// Fused RRF score (higher = better).
+    pub score: f32,
+    /// Per-signal 1-based rank for this document (lex / sem / auth).
+    pub signals: serde_json::Value,
+}
+
+/// Collect `(chunk_subject, chunk_text)` for lexical indexing.
+fn collect_chunk_texts(datoms: &[KqeDatom]) -> Vec<(KotobaCid, String)> {
+    let mut out = Vec::new();
+    for d in datoms {
+        if d.a == "cc/chunk/text" {
+            if let KqeValue::Text(t) = &d.v {
+                out.push((d.e.clone(), t.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Map each chunk subject (multibase) → its parent page CID (`cc/chunk/page`).
+fn collect_chunk_pages(datoms: &[KqeDatom]) -> HashMap<String, KotobaCid> {
+    let mut out = HashMap::new();
+    for d in datoms {
+        if d.a == "cc/chunk/page" {
+            if let KqeValue::Cid(c) = &d.v {
+                out.insert(d.e.to_multibase(), c.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Hybrid web search: fuse lexical (BM25), semantic (IVF/cosine) and authority
+/// (PageRank) rankings via Reciprocal Rank Fusion.
+///
+/// Lexical search needs no embedding backend, so this endpoint degrades
+/// gracefully: if `KOTOBA_EMBED_URL` is unset the semantic leg is simply
+/// dropped and results come from BM25 + PageRank alone.  Authority is included
+/// only when the `cc:2026-12:links` graph has PageRank scores.
+pub async fn web_search(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Query(q): Query<WebSearchQuery>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) =
+        crate::graph_auth::require_operator_auth(&headers, &state.operator_did)
+    {
+        return (code, Json(json!({"error": msg}))).into_response();
+    }
+    if q.q.is_empty() || q.q.len() > MAX_QUERY_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("q must be 1–{MAX_QUERY_LEN} bytes")})),
+        )
+            .into_response();
+    }
+    if let Some(ref lang) = q.lang {
+        if lang.len() > MAX_LANG_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("lang exceeds {MAX_LANG_LEN} characters")})),
+            )
+                .into_response();
+        }
+    }
+    if q.nprobe > MAX_NPROBE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("nprobe must not exceed {MAX_NPROBE}")})),
+        )
+            .into_response();
+    }
+
+    let top_k = q.top_k.min(MAX_TOP_K);
+    // Over-fetch each signal so fusion has depth to work with.
+    let signal_k = (top_k * 4).clamp(top_k, MAX_TOP_K * 4);
+
+    let datoms = match current_cc_chunk_datoms(&state).await {
+        Ok(d) => d,
+        Err((code, msg)) => return (code, Json(json!({"error": msg}))).into_response(),
+    };
+    if datoms.is_empty() {
+        return Json(json!({ "results": [], "total": 0, "note": "no CC data indexed" }))
+            .into_response();
+    }
+
+    // ── lexical (BM25) ──
+    // Prefer the precomputed `cc/bm25/*` index (built by search.reindex / the
+    // ingest job); fall back to a query-time build over the in-memory corpus.
+    let texts = collect_chunk_texts(&datoms);
+    let bm25 = Bm25Index::from_datoms(&datoms)
+        .filter(|idx| !idx.is_empty())
+        .unwrap_or_else(|| Bm25Index::build(&texts));
+    let lex_ranking: Ranking = bm25
+        .search_cids(&q.q, signal_k)
+        .into_iter()
+        .map(|(score, cid)| (cid, score))
+        .collect();
+
+    // ── semantic (vector / IVF) ── (optional — needs an embed backend)
+    let mut sem_ranking: Ranking = Vec::new();
+    if let Some(client) = state.cc_embed_client.as_ref() {
+        match client.embed_batch(&[q.q.as_str()]).await {
+            Ok(vecs) if !vecs.is_empty() => {
+                let chunk_embeddings = collect_chunk_embeddings(&datoms);
+                if !chunk_embeddings.is_empty() {
+                    let ranked =
+                        semantic_ranking(&datoms, &chunk_embeddings, &vecs[0], q.nprobe, signal_k);
+                    sem_ranking = ranked
+                        .into_iter()
+                        .filter_map(|(s, idx)| {
+                            chunk_embeddings.get(idx).map(|(cid, _)| (cid.clone(), s))
+                        })
+                        .collect();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(err = %e, "web_search: query embedding failed; lexical-only"),
+        }
+    }
+
+    // ── authority (PageRank over the links graph) ──
+    let auth_ranking: Ranking = match current_cc_graph_datoms(&state, &cc_links_graph()).await {
+        Ok(link_datoms) => match PageRankIndex::from_datoms(&link_datoms) {
+            Some(pr) => {
+                let chunk_pages = collect_chunk_pages(&datoms);
+                // A chunk's authority is its parent page's normalised PageRank.
+                texts
+                    .iter()
+                    .filter_map(|(chunk_cid, _)| {
+                        chunk_pages.get(&chunk_cid.to_multibase()).map(|page| {
+                            (chunk_cid.clone(), pr.normalized_score(page) as f32)
+                        })
+                    })
+                    .filter(|(_, s)| *s > 0.0)
+                    .collect()
+            }
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+
+    // ── fuse (RRF) ──
+    let mut signals: Vec<Signal<'_>> = Vec::new();
+    if !lex_ranking.is_empty() {
+        signals.push(Signal { name: "lex", weight: q.w_lex.max(0.0), ranking: &lex_ranking });
+    }
+    if !sem_ranking.is_empty() {
+        signals.push(Signal { name: "sem", weight: q.w_sem.max(0.0), ranking: &sem_ranking });
+    }
+    if !auth_ranking.is_empty() {
+        signals.push(Signal { name: "auth", weight: q.w_auth.max(0.0), ranking: &auth_ranking });
+    }
+
+    let fused = reciprocal_rank_fusion(&signals, RRF_K, top_k.max(1) * 2);
+
+    // ── materialise results (+ lang filter) ──
+    let mut results: Vec<WebSearchResult> = Vec::new();
+    for hit in fused {
+        if results.len() >= top_k {
+            break;
+        }
+        let lang = get_chunk_field(&datoms, &hit.cid, "cc/chunk/lang");
+        if let Some(ref lf) = q.lang {
+            if lang.as_deref() != Some(lf.as_str()) {
+                continue;
+            }
+        }
+        results.push(WebSearchResult {
+            url: get_chunk_field(&datoms, &hit.cid, "cc/chunk/url").unwrap_or_default(),
+            domain: get_chunk_field(&datoms, &hit.cid, "cc/chunk/domain").unwrap_or_default(),
+            text: get_chunk_field(&datoms, &hit.cid, "cc/chunk/text").unwrap_or_default(),
+            lang,
+            score: hit.score,
+            signals: json!(hit.ranks),
+        });
+    }
+
+    Json(json!({
+        "results": results,
+        "total":   results.len(),
+        "fused":   signals.iter().map(|s| s.name).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+// ── search.reindex (rebuild BM25 + PageRank) ────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ReindexBody {
+    #[serde(default = "default_owner_did")]
+    pub owner_did: String,
+}
+
+/// Rebuild the persisted search indexes: a corpus-global BM25 over the chunk
+/// graph and PageRank over the link graph.  Idempotent — run after a CC ingest
+/// (the ingest job also triggers it automatically) or whenever the link graph
+/// changes.
+pub async fn search_reindex(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Json(body): Json<ReindexBody>,
+) -> impl IntoResponse {
+    if let Err((code, msg)) =
+        crate::graph_auth::require_operator_auth(&headers, &state.operator_did)
+    {
+        return (code, Json(json!({"error": msg}))).into_response();
+    }
+    match rebuild_search_indexes(&state, &body.owner_did).await {
+        Ok((bm25_n, pr_n, edge_n)) => Json(json!({
+            "status":          "ok",
+            "bm25_datoms":     bm25_n,
+            "pagerank_datoms": pr_n,
+            "link_edges":      edge_n,
+        }))
+        .into_response(),
+        Err((code, msg)) => (code, Json(json!({"error": msg}))).into_response(),
+    }
 }
 
 // ── cc.rag ────────────────────────────────────────────────────────────────────
@@ -541,6 +922,31 @@ pub async fn cc_ingest(
                 }
                 Err(e) => tracing::error!(err = %e, "CC pages ingest failed"),
             }
+
+            // Link graph (outlink edges) → cc:2026-12:links, for PageRank.
+            match ingestor.ingest_links_dir_datoms(dir, max_batches).await {
+                Ok((_files, link_datoms)) if !link_datoms.is_empty() => {
+                    let edge_count = link_datoms.len();
+                    match bridge_cc_graph_to_distributed_head(
+                        &state_for_ingest,
+                        cc_links_graph(),
+                        "cc:2026-12:links",
+                        &owner_did,
+                        link_datoms,
+                    )
+                    .await
+                    {
+                        Ok((commit_cid, assert_count)) => {
+                            tracing::info!(%commit_cid, assert_count, edge_count, "CC links distributed commit complete");
+                        }
+                        Err((status, msg)) => {
+                            tracing::error!(%status, error = %msg, "CC links distributed commit failed");
+                        }
+                    }
+                }
+                Ok(_) => tracing::info!("CC links: no outlink edges in dataset (authority signal absent)"),
+                Err(e) => tracing::error!(err = %e, "CC links ingest failed"),
+            }
         }
         if mode == "chunks" || mode == "both" {
             let client: Arc<dyn EmbedClient> =
@@ -573,6 +979,18 @@ pub async fn cc_ingest(
                     }
                 }
                 Err(e) => tracing::error!(err = %e, "CC chunks ingest failed"),
+            }
+        }
+
+        // Post-ingest: rebuild the corpus-global search indexes (BM25 over the
+        // chunk graph, PageRank over the link graph) so search.web reads a
+        // precomputed index rather than rebuilding per query.
+        match rebuild_search_indexes(&state_for_ingest, &owner_did).await {
+            Ok((bm25_n, pr_n, edge_n)) => {
+                tracing::info!(bm25_n, pr_n, edge_n, "CC search indexes rebuilt");
+            }
+            Err((status, msg)) => {
+                tracing::error!(%status, error = %msg, "CC search index rebuild failed");
             }
         }
     });
@@ -645,14 +1063,31 @@ pub async fn cc_status(
         .map(|datom| datom.e.to_multibase())
         .collect::<std::collections::HashSet<_>>()
         .len();
+    let bm25_terms = chunk_datoms
+        .iter()
+        .filter(|datom| datom.a == "cc/bm25/term")
+        .count();
+
+    let links_graph = cc_links_graph();
+    let (link_edges, pagerank_nodes) = match current_cc_graph_datoms(&state, &links_graph).await {
+        Ok(link_datoms) => (
+            link_datoms.iter().filter(|d| d.a == "cc/link/to").count(),
+            link_datoms.iter().filter(|d| d.a == "cc/rank/score").count(),
+        ),
+        Err(_) => (0, 0),
+    };
 
     Json(json!({
         "chunks_indexed":   chunk_count,
         "pages_indexed":    page_count,
         "ivf_centroids":    ivf_centroids,
+        "bm25_terms":       bm25_terms,
+        "link_edges":       link_edges,
+        "pagerank_nodes":   pagerank_nodes,
         "embed_configured": state.cc_embed_client.is_some(),
         "chunks_graph_cid": chunks_graph.to_multibase(),
         "pages_graph_cid":  pages_graph.to_multibase(),
+        "links_graph_cid":  links_graph.to_multibase(),
     }))
     .into_response()
 }
@@ -816,5 +1251,116 @@ mod tests {
             oversized > MAX_NPROBE,
             "oversized nprobe must exceed the cap"
         );
+    }
+
+    // ── hybrid web-search helpers ─────────────────────────────────────────────
+
+    fn tx() -> KotobaCid {
+        KotobaCid::from_bytes(b"tx")
+    }
+    fn d_int(e: &KotobaCid, a: &str, v: i64) -> KqeDatom {
+        KqeDatom::assert(e.clone(), a.to_string(), KqeValue::Integer(v), tx())
+    }
+    fn d_text(e: &KotobaCid, a: &str, v: &str) -> KqeDatom {
+        KqeDatom::assert(e.clone(), a.to_string(), KqeValue::Text(v.to_string()), tx())
+    }
+    fn d_cid(e: &KotobaCid, a: &str, v: &KotobaCid) -> KqeDatom {
+        KqeDatom::assert(e.clone(), a.to_string(), KqeValue::Cid(v.clone()), tx())
+    }
+
+    #[test]
+    fn collect_chunk_clusters_reads_ivf_assignments() {
+        let c0 = KotobaCid::from_bytes(b"chunk0");
+        let c1 = KotobaCid::from_bytes(b"chunk1");
+        let datoms = vec![
+            d_int(&c0, "cc/ivf/cluster", 3),
+            d_int(&c1, "cc/ivf/cluster", 7),
+            d_text(&c0, "cc/chunk/text", "ignored"),
+        ];
+        let m = collect_chunk_clusters(&datoms);
+        assert_eq!(m.get(&c0.to_multibase()), Some(&3));
+        assert_eq!(m.get(&c1.to_multibase()), Some(&7));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn collect_chunk_texts_and_pages() {
+        let chunk = KotobaCid::from_bytes(b"chunkA");
+        let page = KotobaCid::from_bytes(b"pageA");
+        let datoms = vec![
+            d_text(&chunk, "cc/chunk/text", "hello world"),
+            d_cid(&chunk, "cc/chunk/page", &page),
+        ];
+        let texts = collect_chunk_texts(&datoms);
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0].1, "hello world");
+
+        let pages = collect_chunk_pages(&datoms);
+        assert_eq!(pages.get(&chunk.to_multibase()), Some(&page));
+    }
+
+    #[test]
+    fn semantic_ranking_brute_forces_without_ivf() {
+        // No cc/ivf/* datoms → falls back to brute-force cosine.
+        let c0 = KotobaCid::from_bytes(b"e0");
+        let c1 = KotobaCid::from_bytes(b"e1");
+        let embeddings = vec![(c0, vec![1.0f32, 0.0]), (c1, vec![0.0f32, 1.0])];
+        let datoms: Vec<KqeDatom> = Vec::new();
+        let ranked = semantic_ranking(&datoms, &embeddings, &[1.0, 0.0], 8, 2);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].1, 0, "query [1,0] should rank e0 first");
+        assert!(ranked[0].0 >= ranked[1].0);
+    }
+
+    #[test]
+    fn build_bm25_datoms_then_restore_searches() {
+        // Two chunks → global BM25 → persistence datoms → restore → search.
+        let c0 = KotobaCid::from_bytes(b"chunk0");
+        let c1 = KotobaCid::from_bytes(b"chunk1");
+        let chunk_datoms = vec![
+            d_text(&c0, "cc/chunk/text", "quantum machine learning"),
+            d_text(&c1, "cc/chunk/text", "the lazy brown dog"),
+        ];
+        let bm25_datoms = build_bm25_datoms(&chunk_datoms);
+        assert!(!bm25_datoms.is_empty(), "should emit cc/bm25/* datoms");
+        assert!(bm25_datoms.iter().any(|d| d.a == "cc/bm25/term"));
+        assert!(bm25_datoms.iter().any(|d| d.a == "cc/bm25/len"));
+
+        // Restoring the persisted index reproduces the ranking.
+        let idx = Bm25Index::from_datoms(&bm25_datoms).expect("restore");
+        let top = idx.search_cids("quantum", 1);
+        assert_eq!(top[0].1, c0, "quantum should retrieve chunk0");
+    }
+
+    #[test]
+    fn build_bm25_datoms_empty_corpus() {
+        assert!(build_bm25_datoms(&[]).is_empty());
+    }
+
+    #[test]
+    fn collect_link_edges_and_pagerank_datoms() {
+        // 3 → 1, 2 → 1 : page1 is the authority hub.
+        let p1 = KotobaCid::from_bytes(b"page1");
+        let p2 = KotobaCid::from_bytes(b"page2");
+        let p3 = KotobaCid::from_bytes(b"page3");
+        let link_datoms = vec![
+            d_cid(&p3, "cc/link/to", &p1),
+            d_cid(&p2, "cc/link/to", &p1),
+            d_cid(&p1, "cc/link/to", &p2),
+        ];
+        let edges = collect_link_edges(&link_datoms);
+        assert_eq!(edges.len(), 3);
+
+        let pr_datoms = build_pagerank_datoms(&link_datoms);
+        assert!(pr_datoms.iter().any(|d| d.a == "cc/rank/score"));
+
+        // The persisted scores rank page1 highest.
+        let pr = PageRankIndex::from_datoms(&pr_datoms).expect("restore");
+        assert!(pr.score(&p1).unwrap() > pr.score(&p3).unwrap());
+    }
+
+    #[test]
+    fn build_pagerank_datoms_no_edges() {
+        assert!(build_pagerank_datoms(&[]).is_empty());
     }
 }
