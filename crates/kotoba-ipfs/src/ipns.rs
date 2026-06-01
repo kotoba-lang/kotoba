@@ -12,6 +12,7 @@ use ipld_core::cid::Cid as IpldCid;
 use multibase::Base;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -272,6 +273,11 @@ pub struct KuboIpnsRegistry {
     endpoint: String,
     token: Option<String>,
     local: InMemoryIpnsRegistry,
+    /// Durable directory for the local IPNS head cache. When set, every
+    /// published head is written here and reloaded into `local` at boot, so a
+    /// graph head survives a restart without a (slow, frequently-failing) Kubo
+    /// DHT resolve. `None` = in-memory only (tests / CLI). See `from_env`.
+    persist_dir: Option<PathBuf>,
     /// Cache of alias → kubo-issued IPNS id (the actual peer-id-style hash
     /// `name/resolve` requires).  Populated lazily on `key/gen` and on
     /// startup via `bootstrap_aliases_from_kubo` (which scans `key/list`).
@@ -328,6 +334,7 @@ impl KuboIpnsRegistry {
             endpoint: endpoint.into(),
             token: None,
             local: InMemoryIpnsRegistry::new(),
+            persist_dir: None,
             alias_id: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -336,10 +343,18 @@ impl KuboIpnsRegistry {
         let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:5001".into());
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
+        let persist_dir = Self::persist_dir_from_env();
         let registry = Self {
             token,
+            persist_dir,
             ..Self::new(endpoint)
         };
+        // Reload durably-persisted graph heads into the in-memory cache so
+        // resolve() serves them locally after a restart. Without this the cache
+        // is empty on boot → resolve falls through to a Kubo DHT lookup that
+        // times out (~28s) and 404s → "no distributed Datomic/IPNS head for
+        // graph" → db_from_head can never reconstruct (2026-06-01 incident).
+        registry.hydrate_local_from_disk();
         // Best-effort hydrate of alias → kubo id from the daemon's keystore so
         // restart-without-prior-publish still resolves names that previous
         // runs created.  A failure here is non-fatal (kubo may be down at
@@ -374,6 +389,100 @@ impl KuboIpnsRegistry {
             });
         }
         registry
+    }
+
+    /// Directory for the durable local IPNS head cache. `KOTOBA_IPNS_PERSIST_DIR`
+    /// if set, else a sibling of the persistent volume root inferred from
+    /// `KOTOBA_STORE_PATH` (e.g. `/data/sled/wal` → `/data/ipns-heads`).
+    fn persist_dir_from_env() -> Option<PathBuf> {
+        if let Ok(d) = std::env::var("KOTOBA_IPNS_PERSIST_DIR") {
+            if !d.is_empty() {
+                return Some(PathBuf::from(d));
+            }
+        }
+        let store = std::env::var("KOTOBA_STORE_PATH").ok()?;
+        let p = PathBuf::from(store);
+        // Climb to the volume root (…/sled/wal → …) and keep heads beside it.
+        let base = p.parent().and_then(|x| x.parent()).unwrap_or(p.as_path());
+        Some(base.join("ipns-heads"))
+    }
+
+    fn head_file(&self, name: &IpnsName) -> Option<PathBuf> {
+        let dir = self.persist_dir.as_ref()?;
+        let safe: String = name
+            .0
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Some(dir.join(format!("{safe}.json")))
+    }
+
+    /// Persist a published head record so it outlives the process. Best-effort:
+    /// a failure only costs a slow Kubo resolve on the next cold start, never a
+    /// failed publish.
+    fn persist_record(&self, record: &IpnsRecord) {
+        let (Some(path), Some(dir)) = (self.head_file(&record.name), self.persist_dir.as_ref())
+        else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(err = %e, "ipns: persist dir create failed");
+            return;
+        }
+        let json = match serde_json::to_vec(record) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(err = %e, "ipns: head serialize failed");
+                return;
+            }
+        };
+        // Write to a temp file then rename for an atomic head swap.
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) =
+            std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path))
+        {
+            tracing::warn!(err = %e, path = %path.display(), "ipns: head persist failed");
+        }
+    }
+
+    /// Reload all persisted head records into `local` at boot.
+    fn hydrate_local_from_disk(&self) {
+        let Some(dir) = self.persist_dir.as_ref() else {
+            return;
+        };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return, // first boot — no dir yet
+        };
+        let mut n = 0u32;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<IpnsRecord>(&bytes) else {
+                continue;
+            };
+            if self.local.publish(record).is_ok() {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            tracing::info!(
+                hydrated = n,
+                dir = %dir.display(),
+                "KuboIpnsRegistry: local IPNS head cache hydrated from disk"
+            );
+        }
     }
 
     /// Populate the alias→id cache by listing all keys in Kubo's keystore.
@@ -699,6 +808,9 @@ impl IpnsRegistry for KuboIpnsRegistry {
         // Persist to the in-memory cache synchronously so subsequent
         // resolve() calls on the same node see the new head immediately.
         self.local.publish(record.clone())?;
+        // Also persist durably so the head survives a restart and resolve()
+        // serves it locally instead of a slow/failing Kubo DHT lookup.
+        self.persist_record(&record);
         // Kubo's name/publish blocks for DHT propagation (~20 s on Kubo
         // 0.34.1).  When the caller can be served from the local resolve
         // cache (single-pod deploys, immediate read-after-write within the
