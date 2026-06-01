@@ -82,6 +82,9 @@ mod tests {
         super::cc_xrpc::NSID_CC_RAG,
         super::cc_xrpc::NSID_CC_INGEST,
         super::cc_xrpc::NSID_CC_STATUS,
+        // hybrid web search (lexical + semantic + authority)
+        super::cc_xrpc::NSID_WEB_SEARCH,
+        super::cc_xrpc::NSID_SEARCH_REINDEX,
         // multimodal cross-modal search
         super::media_xrpc::NSID_MEDIA_SEARCH,
         super::media_xrpc::NSID_MEDIA_INGEST,
@@ -506,6 +509,15 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", cc_xrpc::NSID_CC_STATUS),
             get(cc_xrpc::cc_status),
+        )
+        // ── Hybrid web search (lexical + semantic + authority) ─────────────
+        .route(
+            &format!("/xrpc/{}", cc_xrpc::NSID_WEB_SEARCH),
+            get(cc_xrpc::web_search),
+        )
+        .route(
+            &format!("/xrpc/{}", cc_xrpc::NSID_SEARCH_REINDEX),
+            post(cc_xrpc::search_reindex),
         )
         // ── Multimodal cross-modal search ──────────────────────────────────
         .route(
