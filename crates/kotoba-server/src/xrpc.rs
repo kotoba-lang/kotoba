@@ -3684,6 +3684,82 @@ fn distributed_datomic_q(
     distributed_datomic_q_with_reader(&reader, &ipns_name, query, inputs, as_of, since, history)
 }
 
+/// Resident-cache fast path for the first-tier `datomic.q` reads.
+///
+/// The cold `distributed_datomic_q` path reconstructs the full datomic `Db`
+/// from the head commit's covering EAVT on EVERY query (one O(state) cold
+/// ProllyTree/Kubo scan — ~3 s at 10k entities). This serves the SAME net-live
+/// `Db` from the resident per-graph cache (`datomic_live_slot`) that
+/// `datomic.transact` already maintains: on a head match the in-memory datalog
+/// engine runs against RAM (O(result)); on a miss we pay one cold `db_from_head`
+/// and re-seed the slot so the next read — and the next transact's `db_before` —
+/// serve from RAM. The cached `Db` is byte-identical to the transact path's
+/// `db_before` (both are `db_from_head(head)`), so the two paths stay coherent.
+///
+/// Only valid for local current-state reads (no as_of / since / history /
+/// remote); those keep the existing reconstruction path. Returns `Ok(None)`
+/// when the graph has no head yet, so the caller falls back to the cold path's
+/// identical "missing head" handling.
+async fn try_resident_datomic_q(
+    state: &KotobaState,
+    graph_cid: &kotoba_core::cid::KotobaCid,
+    query: &kotoba_edn::EdnValue,
+    inputs: &[kotoba_edn::EdnValue],
+) -> Result<Option<(Option<String>, Vec<Vec<kotoba_edn::EdnValue>>)>, (StatusCode, String)> {
+    let ipns_name = distributed_graph_ipns_name(graph_cid);
+    let head_record = match state.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
+        Ok(record) => record,
+        Err(IpnsRegistryError::NotFound(_)) => return Ok(None),
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ipns resolve: {e}"),
+            ))
+        }
+    };
+    let Some(head_cid) = kotoba_core::cid::KotobaCid::from_multibase(&head_record.value) else {
+        return Ok(None);
+    };
+
+    let graph_mb = graph_cid.to_multibase();
+    let live_slot = state.datomic_live_slot(&graph_mb);
+    // The guard is held across the (read-or-rebuild + reseed) so a concurrent
+    // transact for the same graph serialises against it, exactly as the transact
+    // path's own db_before critical section does.
+    let mut live_guard = live_slot.lock().await;
+
+    // Cache hit: run the datalog query against the resident Db — no cold read.
+    if let Some(live) = live_guard.as_ref() {
+        if live.head == head_cid {
+            let rows = kotoba_datomic::q(query.clone(), &live.db, inputs)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic q: {e}")))?;
+            let basis_t = live.db.basis_t.as_ref().map(|t| t.to_multibase());
+            return Ok(Some((basis_t, rows)));
+        }
+    }
+
+    // Cache miss (first read after (re)start, or an externally-advanced head):
+    // pay one O(state) cold reconstruction, then re-seed the slot.
+    state
+        .datomic_cold_db_loads
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let reader = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry);
+    let db = reader.db_from_head(&head_cid).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("datomic db_from_head: {e}"),
+        )
+    })?;
+    let rows = kotoba_datomic::q(query.clone(), &db, inputs)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic q: {e}")))?;
+    let basis_t = db.basis_t.as_ref().map(|t| t.to_multibase());
+    *live_guard = Some(crate::server::LiveDatomicGraph {
+        head: head_cid,
+        db,
+    });
+    Ok(Some((basis_t, rows)))
+}
+
 fn distributed_datomic_q_with_reader<R>(
     reader: &DistributedDatomReader<'_, R>,
     ipns_name: &str,
@@ -5400,18 +5476,34 @@ pub async fn datomic_q(
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("inputs_edn parse: {e}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (basis_t, rows) = distributed_datomic_q(
-        &state,
-        &graph_cid,
-        &query,
-        &inputs,
-        req.as_of.as_deref(),
-        req.since.as_deref(),
-        req.history,
-        req.remote_peer.as_deref(),
-        req.remote_ipns_name.as_deref(),
-    )?
-    .ok_or_else(|| missing_distributed_datomic_head(&graph_cid))?;
+    // First-tier read fast path: for local current-state queries (no time-travel,
+    // history, or remote peer) serve from the resident `datomic_live_slot` Db
+    // cache instead of reconstructing the graph from cold storage on every call.
+    let is_local_current = req.remote_peer.is_none()
+        && req.remote_ipns_name.is_none()
+        && req.as_of.is_none()
+        && req.since.is_none()
+        && !req.history;
+    let resident = if is_local_current {
+        try_resident_datomic_q(&state, &graph_cid, &query, &inputs).await?
+    } else {
+        None
+    };
+    let (basis_t, rows) = match resident {
+        Some(result) => result,
+        None => distributed_datomic_q(
+            &state,
+            &graph_cid,
+            &query,
+            &inputs,
+            req.as_of.as_deref(),
+            req.since.as_deref(),
+            req.history,
+            req.remote_peer.as_deref(),
+            req.remote_ipns_name.as_deref(),
+        )?
+        .ok_or_else(|| missing_distributed_datomic_head(&graph_cid))?,
+    };
     let rows_map = datomic_q_rows_map(&query, &rows)?;
 
     Ok((

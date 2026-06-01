@@ -4002,6 +4002,10 @@ fn current_datoms(history: Vec<Datom>) -> Vec<Datom> {
 mod tests {
     use super::*;
     use kotoba_kqe::quad::LegacyQuadObject;
+    // The test bodies refer to the object enum by its short name `QuadObject`
+    // (the lib historically re-exported it under that alias). Keep the alias so
+    // the test module compiles against the renamed `LegacyQuadObject`.
+    use kotoba_kqe::quad::LegacyQuadObject as QuadObject;
     use kotoba_kse::Journal;
     use kotoba_store::MemoryBlockStore;
 

@@ -1395,13 +1395,20 @@ fn civil_from_unix_days(days_since_epoch: i64) -> (i64, u32, u32) {
 
 pub fn current_datoms(datoms: &[Datom]) -> Vec<Datom> {
     let mut out = Vec::new();
-    let mut seen = Vec::<(Entity, Attribute, Value)>::new();
+    // Dedup by (E, A, V), keeping the most-recent assertion (reverse iteration).
+    // This previously used a `Vec` + linear `contains` → O(N²): at 60k datoms
+    // that is ~3.6e9 tuple comparisons (~2.4 s) and it ran on EVERY `datomic.q`
+    // via `Db::datoms()`, dominating first-tier query latency. A `BTreeSet` keyed
+    // on borrowed `(E.bytes, A, V)` makes it O(N log N) with no extra clones.
+    // `EdnValue` is `Ord` (but not `Hash`) and `KotobaCid` exposes its `[u8; 36]`,
+    // so a reference tuple is totally ordered and borrows straight from `datoms`.
+    let mut seen: std::collections::BTreeSet<(&[u8; 36], &Attribute, &Value)> =
+        std::collections::BTreeSet::new();
     for datom in datoms.iter().rev() {
-        let key = (datom.e.clone(), datom.a.clone(), datom.v.clone());
-        if seen.contains(&key) {
+        let key = (&datom.e.0, &datom.a, &datom.v);
+        if !seen.insert(key) {
             continue;
         }
-        seen.push(key);
         if datom.added {
             out.push(datom.clone());
         }
