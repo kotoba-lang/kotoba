@@ -48,3 +48,31 @@ This closes the P3 browser-native Pregel/UDF path end to end: a guest component
 (the same ABI wasmtime runs natively) executes on the browser's WebAssembly
 engine via jco, with host imports wired to `KotobaNode` (`../p3-kotoba-guest/`)
 and a JS BSP driver orchestrating supersteps. Build artifacts gitignored.
+
+## Real-browser verification (Chromium)
+
+The same driver + jco guest run in an actual browser (not just node):
+
+```sh
+npm install cbor-x @bytecodealliance/preview2-shim esbuild
+npx @bytecodealliance/jco transpile target/wasm32-wasip2/release/bsp_counter.wasm \
+  -o out --name bsp --map 'host-log=../host.js'
+# bundle for the browser (node:* externalised — the guest never invokes stdio)
+npx esbuild browser-entry.mjs --bundle --format=esm --outdir=www \
+  --platform=browser --external:'node:*'
+cp out/bsp.core.wasm www/          # new URL('./bsp.core.wasm', import.meta.url)
+# serve www/ and load index.html → globalThis.__bspResult
+```
+
+Verified in headless Chromium (Playwright):
+
+```
+__bspResult: {"supersteps":4,"trace":["continue","continue","continue","ok"],
+              "final":{"status":"ok","n":0,"acc":"..."}}   (no console errors)
+P3 BSP DRIVER — REAL BROWSER VERIFY: PASS ✅
+```
+
+The jco-transpiled Component guest instantiates on the browser's own WebAssembly
+engine and the JS BSP driver loops it through supersteps — browser-native
+Pregel/UDF, end to end. `browser-entry.mjs` is the bundle entry; `www/` is
+build output (gitignored).
