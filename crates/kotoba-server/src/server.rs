@@ -413,13 +413,66 @@ impl KotobaState {
                     .unwrap_or_else(|_| "http://localhost:5001".into());
                 let tiered = kotoba_store::TieredBlockStore::new(hot, cold);
 
+                let peers_str = std::env::var("KOTOBA_PEERS").unwrap_or_default();
+
+                // ADR-2606011330 — DHT durability tier (opt-in via
+                // KOTOBA_DURABILITY_DHT). Wraps the tiered store in a
+                // NeighborhoodBlockStore: each block is replicated to the K
+                // DHT nodes nearest its content address, `put_durable` confirms
+                // KOTOBA_DHT_MIN_REPLICAS copies (local + peers), and the store
+                // answers AvailabilityChallenges from blocks it holds. This is
+                // the durability OWNER beneath the canonical Datom log; IPFS
+                // stays as the CIDv1 cold/interop backstop underneath `tiered`.
+                // NeighborhoodBlockStore also fans out reads to responsible
+                // peers, so it supersedes DistributedBlockStore when enabled.
+                let durability_dht = std::env::var("KOTOBA_DURABILITY_DHT")
+                    .map(|v| {
+                        v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
+                    })
+                    .unwrap_or(false);
+                if durability_dht {
+                    let peers: Vec<Arc<dyn kotoba_dht::PeerTransport>> = peers_str
+                        .split_whitespace()
+                        .map(|s| s.trim_end_matches('/'))
+                        .filter(|s| !s.is_empty())
+                        .map(|url| {
+                            Arc::new(crate::dht_transport::KuboPeerTransport::new(url))
+                                as Arc<dyn kotoba_dht::PeerTransport>
+                        })
+                        .collect();
+                    let peer_count = peers.len();
+                    // Safe default (ADR-2606011330 R2): when peers exist, require
+                    // ≥2 replicas (local + ≥1 peer) so durability is real, not
+                    // local-only. With no peers, fall back to 1 (single-node).
+                    let min_replicas: usize = std::env::var("KOTOBA_DHT_MIN_REPLICAS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(if peer_count > 0 { 2 } else { 1 });
+                    if min_replicas > 1 + peer_count {
+                        tracing::warn!(
+                            min_replicas,
+                            peer_count,
+                            "KOTOBA_DHT_MIN_REPLICAS exceeds 1 + peer_count — put_durable will FAIL until more peers join the neighborhood"
+                        );
+                    }
+                    let local_id = NodeId::from_pubkey(endpoint.as_bytes());
+                    let nb = kotoba_dht::NeighborhoodBlockStore::new(Arc::new(tiered), local_id)
+                        .with_peers(peers)
+                        .with_min_replicas(min_replicas);
+                    tracing::info!(
+                        hot_cache_mib = hot_cache_bytes / (1024 * 1024),
+                        ipfs_endpoint = %endpoint,
+                        peer_count,
+                        min_replicas,
+                        "BlockStore: NeighborhoodBlockStore<TieredBlockStore<…>> — DHT durability tier ENABLED (ADR-2606011330)"
+                    );
+                    Arc::new(nb) as Arc<dyn BlockStore + Send + Sync>
                 // KOTOBA_PEERS — space-separated Kubo HTTP URLs for federated
                 // read.  When set, wrap the tiered store in a
                 // DistributedBlockStore so cache misses fan out to peer Kubo
                 // nodes before failing.  Each peer is a `KOTOBA_IPFS_ENDPOINT`-
                 // shaped URL.
-                let peers_str = std::env::var("KOTOBA_PEERS").unwrap_or_default();
-                if !peers_str.trim().is_empty() {
+                } else if !peers_str.trim().is_empty() {
                     let local: Arc<dyn BlockStore + Send + Sync> = Arc::new(tiered);
                     let dist = kotoba_store::DistributedBlockStore::from_peers_str(
                         &peers_str,

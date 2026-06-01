@@ -1,11 +1,14 @@
+pub mod bm25;
 #[cfg(feature = "cc-parquet")]
 pub mod cc;
 pub mod embed_client;
+pub mod fusion;
 pub mod gmail;
 pub mod ingest;
 pub mod ivf;
 pub mod media;
 pub mod media_embed;
+pub mod pagerank;
 
 pub use gmail::GmailClient;
 pub use ingest::{graph_cid_for, EmailIngestor};
