@@ -171,6 +171,54 @@ fn kubo_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// Dedicated multi-thread runtime that drives Kubo HTTP I/O for the synchronous
+/// `BlockStore` trait. Keeping I/O off the *caller's* runtime is what prevents
+/// the deadlock: the previous `block_in_place(|| Handle::current().block_on(..))`
+/// drove the HTTP future on the SAME runtime whose worker the call was blocking,
+/// so under concurrency (a commit's background put-storm + concurrent reads) all
+/// workers ended up parked inside `block_on`, starving the very runtime that had
+/// to make the futures progress → the server wedged (observed at c≈8–16).
+fn kubo_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_name("kubo-io")
+            .build()
+            .expect("build kubo-io runtime")
+    })
+}
+
+/// Drive a Kubo HTTP future to completion from a synchronous `BlockStore`
+/// method without starving the caller's runtime.
+///
+/// - Inside a Tokio runtime: spawn the future onto the dedicated `kubo-io`
+///   runtime (its own threads run the I/O) and block the current worker on a
+///   std channel via `block_in_place`, so the caller's runtime spins up a
+///   replacement worker and keeps making progress. No nested `block_on`, so no
+///   "runtime within a runtime" panic and no pool starvation.
+/// - Outside any runtime (e.g. sync unit tests): block directly on the
+///   dedicated runtime.
+fn kubo_block_on<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let rt = kubo_runtime();
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            rt.spawn(async move {
+                let _ = tx.send(fut.await);
+            });
+            tokio::task::block_in_place(|| rx.recv())
+                .expect("kubo-io runtime dropped the in-flight result")
+        }
+        Err(_) => rt.block_on(fut),
+    }
+}
+
 impl Clone for KuboBlockStore {
     fn clone(&self) -> Self {
         Self {
@@ -210,8 +258,7 @@ impl BlockStore for KuboBlockStore {
         let cid_mb = cid.to_multibase();
         let inflight = Arc::clone(&self.inflight);
 
-        let resp_key = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
+        let resp_key = kubo_block_on(async move {
                 // Wait for an in-flight permit before opening the socket.
                 // `acquire_owned` on a never-closed semaphore can only fail if
                 // the runtime is shutting down — bubble that up as an error.
@@ -240,7 +287,6 @@ impl BlockStore for KuboBlockStore {
                     .await
                     .map_err(|e| anyhow!("kubo block/put parse: {e}"))?;
                 Ok::<String, anyhow::Error>(parsed.key)
-            })
         });
 
         match resp_key {
@@ -268,8 +314,7 @@ impl BlockStore for KuboBlockStore {
         let token = self.token.clone();
         let inflight = Arc::clone(&self.inflight);
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
+        let result = kubo_block_on(async move {
                 let _permit = inflight
                     .acquire_owned()
                     .await
@@ -300,7 +345,6 @@ impl BlockStore for KuboBlockStore {
                     .await
                     .map_err(|e| anyhow!("kubo block/get body: {e}"))?;
                 Ok(Some(bytes))
-            })
         });
 
         match result {
@@ -326,8 +370,7 @@ impl BlockStore for KuboBlockStore {
         let client = self.client.clone();
         let token = self.token.clone();
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
+        kubo_block_on(async move {
                 let rb = client.post(&url);
                 let rb = match &token {
                     Some(t) => rb.bearer_auth(t),
@@ -337,7 +380,6 @@ impl BlockStore for KuboBlockStore {
                     Ok(resp) => resp.status().is_success(),
                     Err(_) => false,
                 }
-            })
         })
     }
 
@@ -354,8 +396,7 @@ impl BlockStore for KuboBlockStore {
         let client = self.client.clone();
         let token = self.token.clone();
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
+        kubo_block_on(async move {
                 let rb = client.post(&url);
                 let rb = match &token {
                     Some(t) => rb.bearer_auth(t),
@@ -370,7 +411,6 @@ impl BlockStore for KuboBlockStore {
                     }
                 }
                 Ok::<_, anyhow::Error>(())
-            })
         })
     }
 
@@ -400,8 +440,7 @@ impl BlockStore for KuboBlockStore {
         // sync unit tests) — the in-memory pin set above is already updated.
         let pin_result = match tokio::runtime::Handle::try_current() {
             Err(_) => Ok::<(), anyhow::Error>(()),
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(async move {
+            Ok(_) => kubo_block_on(async move {
                     let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
                     let rb = client.post(&url);
                     let rb = match &token {
@@ -415,7 +454,6 @@ impl BlockStore for KuboBlockStore {
                         return Err(anyhow!("kubo pin/add {st}: {tx}"));
                     }
                     Ok::<(), anyhow::Error>(())
-                })
             }),
         };
         if let Err(e) = pin_result {
@@ -450,8 +488,7 @@ impl BlockStore for KuboBlockStore {
         let cid_mb = cid.to_multibase();
         let unpin_result = match tokio::runtime::Handle::try_current() {
             Err(_) => Ok::<(), anyhow::Error>(()),
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(async move {
+            Ok(_) => kubo_block_on(async move {
                     let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
                     let rb = client.post(&url);
                     let rb = match &token {
@@ -470,7 +507,6 @@ impl BlockStore for KuboBlockStore {
                         return Err(anyhow!("kubo pin/rm {status}: {tx}"));
                     }
                     Ok(())
-                })
             }),
         };
         if let Err(e) = unpin_result {
