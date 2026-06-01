@@ -9,7 +9,7 @@ use kotoba_core::store::BlockStore;
 ///
 /// Design:
 ///   hot: small + fast (BudgetedBlockStore<MemoryBlockStore>)
-///   cold: large + persistent (KuboBlockStore — Kubo/IPFS HTTP, SHA2-256 dual-CID)
+///   cold: large + persistent (KuboBlockStore — Kubo/IPFS HTTP, single SHA2-256 CIDv1)
 ///
 /// Each node keeps its working set in hot memory while the full dataset is
 /// stored persistently in the Kubo cold tier.  Remote durability is handled by

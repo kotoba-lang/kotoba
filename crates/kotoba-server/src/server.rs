@@ -18,6 +18,7 @@ use kotoba_datomic::distributed::{
 use kotoba_dht::{neighborhood::Neighborhood, node_id::NodeId};
 use kotoba_graph::QuadStore;
 use kotoba_ingest::embed_client::{EmbedClient, HttpEmbedClient};
+use kotoba_ingest::media_embed::{HttpMediaEmbedClient, MediaEmbedClient};
 use kotoba_ipfs::{
     InMemoryIpnsRegistry, IpnsName, IpnsRecord, IpnsRegistry, KuboIpnsRegistry, SignedIpnsRegistry,
 };
@@ -294,6 +295,11 @@ pub struct KotobaState {
     // ── CC Vector Search ─────────────────────────────────────────────────────
     /// Optional embed client for CC vector search (KOTOBA_EMBED_URL).
     pub cc_embed_client: Option<Arc<dyn EmbedClient>>,
+    // ── Multimodal Search ──────────────────────────────────────────────────────
+    /// Optional multimodal embed client for cross-modal media search
+    /// (KOTOBA_MM_EMBED_URL).  `None` falls back to a deterministic
+    /// caption-bridged client at request time.
+    pub media_embed_client: Option<Arc<dyn MediaEmbedClient>>,
     // ── PRE Key Registry ─────────────────────────────────────────────────────
     /// Maps (owner_did, accessor_did) → wrapped re-encryption key.
     /// `None` until `attach_pre_key_registry()` is called.
@@ -583,6 +589,22 @@ impl KotobaState {
             tracing::info!("CC embed client enabled (KOTOBA_EMBED_URL)");
         }
 
+        // Multimodal embed client — optional; enables cross-modal media search.
+        // Only enabled when KOTOBA_MM_EMBED_URL is explicitly set (the default
+        // localhost:8800 is not assumed reachable), so absence is the norm and
+        // the handler falls back to a deterministic client.
+        let media_embed_client: Option<Arc<dyn MediaEmbedClient>> =
+            if std::env::var("KOTOBA_MM_EMBED_URL").is_ok() {
+                HttpMediaEmbedClient::from_env()
+                    .ok()
+                    .map(|c| Arc::new(c) as Arc<dyn MediaEmbedClient>)
+            } else {
+                None
+            };
+        if media_embed_client.is_some() {
+            tracing::info!("Multimodal embed client enabled (KOTOBA_MM_EMBED_URL)");
+        }
+
         let did_resolver_base: Arc<dyn DidDocumentResolver> =
             Arc::new(LayeredDidResolver::new(vec![
                 Arc::new(DistributedDidResolver::new(
@@ -661,6 +683,7 @@ impl KotobaState {
             kse_store,
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             cc_embed_client,
+            media_embed_client,
             pre_key_registry: None,
             graph_registry,
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),

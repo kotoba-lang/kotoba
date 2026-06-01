@@ -4,9 +4,17 @@ pub mod embed_client;
 pub mod gmail;
 pub mod ingest;
 pub mod ivf;
+pub mod media;
+pub mod media_embed;
 
 pub use gmail::GmailClient;
 pub use ingest::{graph_cid_for, EmailIngestor};
+pub use media::{
+    media_assets_graph, rank_by_cosine, MediaIngestReport, MediaIngestor, MediaInput,
+};
+pub use media_embed::{
+    Blake3MediaEmbedClient, HttpMediaEmbedClient, MediaEmbedClient, MediaItem, Modality,
+};
 
 use kotoba_crypto::AgentCrypto;
 use kotoba_graph::QuadStore;
