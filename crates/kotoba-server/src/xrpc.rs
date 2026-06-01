@@ -2579,6 +2579,7 @@ pub(crate) async fn commit_protocol_datoms(
             ipns_name: ipns_name.clone(),
             graph: graph_cid.clone(),
             datoms: datoms.clone(),
+            covering_datoms: None,
             expected_parent,
             tx_cid: Some(tx_cid.clone()),
             author,
@@ -2701,6 +2702,7 @@ fn commit_did_document_registry_datoms(
             ipns_name,
             graph: graph_cid,
             datoms,
+            covering_datoms: None,
             expected_parent,
             tx_cid: Some(tx_cid),
             author,
@@ -7211,6 +7213,7 @@ pub async fn commit_store(
             ipns_name,
             graph: graph_cid,
             datoms: db.datoms(),
+            covering_datoms: None,
             expected_parent,
             tx_cid: Some(KotobaCid::from_bytes(
                 format!("commit.store:{}:{}:{}", req.graph, req.author, req.seq).as_bytes(),
@@ -7372,13 +7375,22 @@ pub const NSID_WEIGHT_GET: &str = "ai.gftd.apps.kotoba.weight.get";
 pub struct WeightPutReq {
     /// model CID (multibase) — identifies the model this weight belongs to
     pub model_cid: String,
-    /// layer index
+    /// layer index (used only when `param_key` is absent → `weight/layer/{layer}`)
     pub layer: u32,
-    /// raw FP8 tensor bytes, base64-encoded
+    /// OPTIONAL verbatim parameter key used as the Datom predicate, e.g.
+    /// `language_model.model.layers.3.experts.switch_glu.gate_proj.weight`
+    /// (ADR-2606010000 D2). When present and non-empty it REPLACES the legacy
+    /// `weight/layer/{layer}` predicate so distributed loaders can address each
+    /// proj/weight/scale tensor individually. Backward-compatible: omit it for the
+    /// old per-layer behaviour.
+    #[serde(default)]
+    pub param_key: Option<String>,
+    /// raw tensor bytes, base64-encoded
     pub data_b64: String,
     /// tensor shape e.g. [4096, 4096]
     pub shape: Vec<u32>,
-    /// dtype string: "fp8e4m3" | "fp8e5m2" | "fp16" | "bf16" | "f32"
+    /// dtype string: float — "fp8e4m3"|"fp8e5m2"|"fp16"|"bf16"|"f32";
+    /// raw safetensors — "u32"|"i32"|"u16"|"i16"|"u8"|"i8" (e.g. 4-bit packed weight = u32)
     pub dtype: String,
     /// named graph CID (multibase) to index this weight in
     pub graph: String,
@@ -7436,6 +7448,18 @@ pub async fn weight_put(
                 req.dtype.len()
             ),
         ));
+    }
+    const MAX_PARAM_KEY_LEN: usize = 256;
+    if let Some(pk) = req.param_key.as_deref() {
+        if pk.len() > MAX_PARAM_KEY_LEN {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "param_key too long ({} bytes, limit {MAX_PARAM_KEY_LEN})",
+                    pk.len()
+                ),
+            ));
+        }
     }
 
     // ── CACAO auth ────────────────────────────────────────────────────────
@@ -7516,11 +7540,18 @@ pub async fn weight_put(
     let graph_cid = KotobaCid::from_multibase(&req.graph)
         .unwrap_or_else(|| KotobaCid::from_bytes(req.graph.as_bytes()));
 
-    let dtype = match req.dtype.as_str() {
+    let dtype = match req.dtype.to_ascii_lowercase().as_str() {
         "fp8e4m3" | "f8e4m3" => DatomTensorDtype::F8E4M3,
         "fp8e5m2" | "f8e5m2" => DatomTensorDtype::F8E5M2,
         "fp16" | "f16" => DatomTensorDtype::F16,
         "bf16" => DatomTensorDtype::BF16,
+        // Raw safetensors storage dtypes (ADR-2606010000 D2) — 4-bit packed weight = u32.
+        "u32" => DatomTensorDtype::U32,
+        "i32" => DatomTensorDtype::I32,
+        "u16" => DatomTensorDtype::U16,
+        "i16" => DatomTensorDtype::I16,
+        "u8" => DatomTensorDtype::U8,
+        "i8" => DatomTensorDtype::I8,
         _ => DatomTensorDtype::F32,
     };
 
@@ -7540,9 +7571,15 @@ pub async fn weight_put(
     );
 
     // 4. Assert WeightRef Datom through the distributed Datomic/IPNS commit log.
+    //    predicate = verbatim param_key (ADR-2606010000 D2) when supplied, else the
+    //    legacy per-layer predicate. Lets distributed loaders address each tensor.
+    let predicate = match req.param_key.as_deref() {
+        Some(pk) if !pk.is_empty() => pk.to_string(),
+        _ => format!("weight/layer/{}", req.layer),
+    };
     let datom = KqeDatom::assert(
         model_cid,
-        format!("weight/layer/{}", req.layer),
+        predicate,
         KqeValue::TensorCid {
             cid: blob_cid.clone(),
             shape: req.shape.clone(),
@@ -8761,6 +8798,7 @@ mod tests {
                 ipns_name: "k51-protocol-normalization".into(),
                 graph,
                 datoms,
+                covering_datoms: None,
                 expected_parent: None,
                 tx_cid: Some(tx.clone()),
                 author: "did:key:zIssuer".into(),
@@ -9464,6 +9502,7 @@ mod tests {
                 ipns_name: "k51-capability-scope".into(),
                 graph,
                 datoms,
+                covering_datoms: None,
                 expected_parent: None,
                 tx_cid: Some(tx.clone()),
                 author: "did:key:zController".into(),
@@ -10509,6 +10548,7 @@ mod tests {
             .commit_datoms(CommitDatomsRequest {
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
+                covering_datoms: None,
                 datoms: vec![
                     Datom::assert(
                         KotobaCid::from_bytes(b"remote-alice"),
