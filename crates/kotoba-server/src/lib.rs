@@ -1,5 +1,7 @@
 pub mod attestation;
+pub mod availability_xrpc;
 pub mod cc_xrpc;
+pub mod dht_transport;
 pub mod email_xrpc;
 pub mod fingerprint;
 pub mod firehose;
@@ -582,6 +584,13 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             get(firehose::events),
         )
         // ── Generic XRPC dispatch ──────────────────────────────────────────
+        .route(
+            &format!(
+                "/xrpc/{}",
+                crate::availability_xrpc::NSID_AVAILABILITY_CHALLENGE
+            ),
+            post(crate::availability_xrpc::availability_challenge),
+        )
         .route("/xrpc/:nsid", post(xrpc::generic_invoke))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
