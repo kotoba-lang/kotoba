@@ -1554,6 +1554,7 @@ pub async fn kg_commit(
         ipns_name: ipns_name.clone(),
         graph: graph.clone(),
         datoms: db.datoms(),
+        covering_datoms: None,
         expected_parent: None,
         tx_cid: Some(KotobaCid::from_bytes(
             format!("kg.commit:{}:{author}:{seq}", graph.to_multibase()).as_bytes(),

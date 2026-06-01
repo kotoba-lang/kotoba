@@ -45,6 +45,18 @@ pub enum TensorDtype {
     BF16,
     F8E4M3,
     F8E5M2,
+    // Raw safetensors storage dtypes — needed to faithfully round-trip checkpoints
+    // whose weights are not floats. In particular mlx/HF 4-bit checkpoints store the
+    // packed quantized weight as U32 (e.g. gemma4 `gate_proj.weight`), with BF16
+    // scales; ingesting those for distributed inference (ADR-2606010000 D2) requires
+    // representing the on-disk dtype verbatim rather than coercing to a float kind.
+    // Debug-formatted (`{dtype:?}`) into EDN, so the exporter reads "U32"/"U8"/… back.
+    U32,
+    I32,
+    U16,
+    I16,
+    U8,
+    I8,
 }
 
 /// DatomArrangement — five covering indexes: EAVT / AEVT / AVET / VAET / TEA.
@@ -232,6 +244,12 @@ impl From<crate::quad::TensorDtype> for TensorDtype {
             crate::quad::TensorDtype::BF16 => Self::BF16,
             crate::quad::TensorDtype::F8E4M3 => Self::F8E4M3,
             crate::quad::TensorDtype::F8E5M2 => Self::F8E5M2,
+            crate::quad::TensorDtype::U32 => Self::U32,
+            crate::quad::TensorDtype::I32 => Self::I32,
+            crate::quad::TensorDtype::U16 => Self::U16,
+            crate::quad::TensorDtype::I16 => Self::I16,
+            crate::quad::TensorDtype::U8 => Self::U8,
+            crate::quad::TensorDtype::I8 => Self::I8,
         }
     }
 }
@@ -244,6 +262,12 @@ impl From<TensorDtype> for crate::quad::TensorDtype {
             TensorDtype::BF16 => Self::BF16,
             TensorDtype::F8E4M3 => Self::F8E4M3,
             TensorDtype::F8E5M2 => Self::F8E5M2,
+            TensorDtype::U32 => Self::U32,
+            TensorDtype::I32 => Self::I32,
+            TensorDtype::U16 => Self::U16,
+            TensorDtype::I16 => Self::I16,
+            TensorDtype::U8 => Self::U8,
+            TensorDtype::I8 => Self::I8,
         }
     }
 }

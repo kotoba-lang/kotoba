@@ -26,6 +26,12 @@ pub const ROOT_AEVT: &str = "aevt";
 pub const ROOT_AVET: &str = "avet";
 pub const ROOT_VAET: &str = "vaet";
 pub const ROOT_TEA: &str = "tea";
+/// Covering EAVT: a per-commit ProllyTree of the FULL netted current state
+/// (EAVT-keyed), as opposed to the delta-only `ROOT_EAVT`. Lets
+/// `current_db_from_head` reconstruct current state in one O(state) scan
+/// instead of replaying the whole commit chain (ADR-2605302130 scaling fix).
+/// Absent on legacy delta-only commits → callers fall back to chain replay.
+pub const ROOT_CEAVT: &str = "ceavt";
 const DISTRIBUTED_RULE_RECURSION_LIMIT: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
@@ -1062,6 +1068,18 @@ where
         query: &Value,
         inputs: &[Value],
     ) -> Result<Vec<Vec<Value>>, DistributedCommitError> {
+        // Fast path (ADR-2605302130): if the head commit carries a covering EAVT
+        // ("ceavt"), reconstruct the full current state in one O(state) scan and
+        // run the in-memory datalog engine against it, instead of replaying the
+        // delta index of every commit per where-clause (O(history) — 500s/OOMs
+        // on grown graphs). Legacy delta-only heads fall through to the existing
+        // chain-replay evaluator, so other graphs are unaffected.
+        if let Some(commit) = DistributedDatomCommit::load(head, self.store)? {
+            if commit.index_roots.contains_key(ROOT_CEAVT) {
+                let db = self.current_db_from_head(head)?;
+                return crate::q(query.clone(), &db, inputs).map_err(Into::into);
+            }
+        }
         let query = crate::query_map(query)?;
         let find = query_vec(&query, ":find")?;
         let where_clauses = query_vec(&query, ":where")?;
@@ -1276,6 +1294,23 @@ where
     }
 
     fn current_db_from_head(&self, head: &KotobaCid) -> Result<Db, DistributedCommitError> {
+        // Fast path (ADR-2605302130): if the head commit carries a covering EAVT
+        // ("ceavt"), it already materialises the full netted current state, so a
+        // single O(state) scan reconstructs the DB without replaying the entire
+        // commit chain (which is O(total-history) in time AND memory and is what
+        // OOM-killed the pod under write-heavy workloads). Legacy delta-only
+        // commits lack `ceavt` and fall through to the chain replay below.
+        if let Some(commit) = DistributedDatomCommit::load(head, self.store)? {
+            if let Some(ceavt_root) = commit.index_roots.get(ROOT_CEAVT) {
+                let entries = ProllyTree::scan_prefix(ceavt_root, &[], self.store)
+                    .map_err(DistributedCommitError::Store)?;
+                let datoms = entries
+                    .into_iter()
+                    .map(|(_, value)| decode_stored_datom(&value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(Db::from_datoms(datoms, Some(commit.tx_cid)));
+            }
+        }
         let history_db = self.history_db_from_head_cid(head)?;
         let history_datoms = history_db.datoms();
         let datoms = current_datoms(&history_datoms);
@@ -2330,7 +2365,23 @@ where
             })
             .collect::<Vec<_>>();
         let datom_count = datoms.len();
-        let roots = build_datom_roots(&datoms, self.store)?;
+        let mut roots = build_datom_roots(&datoms, self.store)?;
+        // Covering EAVT (ADR-2605302130): materialise the full netted current
+        // state into its own ProllyTree so `current_db_from_head` is O(state)
+        // not O(history). ProllyTree structural sharing means unchanged subtrees
+        // are deduplicated by CID, so the extra tree costs ~O(delta) of new
+        // blocks despite covering all live datoms.
+        if let Some(covering) = req.covering_datoms.as_ref() {
+            let live = current_datoms(covering);
+            let mut ceavt_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(live.len());
+            for datom in &live {
+                let kqe = indexable_kqe_datom(datom);
+                ceavt_entries.push((kqe.eavt_key(), encode_stored_datom(datom)?));
+            }
+            let ceavt_root = ProllyTree::build_tree(ceavt_entries, self.store)
+                .map_err(DistributedCommitError::Store)?;
+            roots.insert(ROOT_CEAVT.to_string(), ceavt_root);
+        }
         let commit = DistributedDatomCommit::seal(
             req.graph,
             tx_cid.clone(),
@@ -2484,10 +2535,20 @@ where
         };
         let mut datoms = transact.tx_data.clone();
         augment_datoms(&transact, &context, &mut datoms)?;
+        // Covering state for the ceavt index = prior live state (db_before is
+        // already netted) plus this commit's full delta (tx datoms + augmented
+        // metadata). commit_datoms nets it via current_datoms, so the result is
+        // identical to what a chain replay would reconstruct for this head.
+        let covering = {
+            let mut c = db_before.all_datoms();
+            c.extend(datoms.iter().cloned());
+            c
+        };
         let commit = self.commit_datoms(CommitDatomsRequest {
             ipns_name: req.ipns_name,
             graph: req.graph,
             datoms: datoms.clone(),
+            covering_datoms: Some(covering),
             expected_parent,
             tx_cid: Some(transact.tx_cid.clone()),
             author: req.author,
@@ -2511,6 +2572,12 @@ pub struct CommitDatomsRequest {
     pub ipns_name: String,
     pub graph: KotobaCid,
     pub datoms: Vec<Datom>,
+    /// Full netted current state (db_after) for the covering `ceavt` index. When
+    /// `Some`, the commit also writes a `ROOT_CEAVT` tree so reads/db_before
+    /// reconstruct current state in O(state) instead of replaying the chain
+    /// (ADR-2605302130). `None` keeps the legacy delta-only commit (chain
+    /// replay) — used by paths that don't have db_after on hand.
+    pub covering_datoms: Option<Vec<Datom>>,
     pub expected_parent: Option<KotobaCid>,
     pub tx_cid: Option<KotobaCid>,
     pub author: String,
@@ -4200,6 +4267,7 @@ mod tests {
             ipns_name: ipns_name.to_string(),
             graph,
             datoms,
+            covering_datoms: None,
             expected_parent: None,
             tx_cid: None,
             author: "did:key:zWriter".to_string(),

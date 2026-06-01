@@ -634,9 +634,22 @@ impl KotobaState {
             let pub_g = NamedGraph::public();
             let auth_g = NamedGraph::authenticated();
             let kg_g = NamedGraph::new("kotobase-kg-v1", GraphVisibility::Authenticated);
+            // Per-app data-plane graph for yukkuri (ai-gftd-project-yukkuri lg
+            // pipeline). Registered Authenticated so the lg pod's Bearer token is
+            // accepted for reads, and — being a fresh low-history graph — keeps
+            // Datomic db_before reconstruction cheap (the shared kotobase-kg-v1
+            // graph's accumulated history OOM'd the pod under produce write load,
+            // 2026-06-01). Writes still require Bearer auth (require_kg_write_auth).
+            let yk_g = NamedGraph::new("yukkuri-kg-v1", GraphVisibility::Authenticated);
+            // v2: clean-slate graph paired with the covering-index (ceavt) fix so
+            // it starts with O(state) reads/db_before from the first transact
+            // (no legacy delta-only history to cold-replay).
+            let yk_g2 = NamedGraph::new("yukkuri-kg-v2", GraphVisibility::Authenticated);
             map.insert(pub_g.cid.clone(), (pub_g.name.clone(), pub_g.visibility));
             map.insert(auth_g.cid.clone(), (auth_g.name.clone(), auth_g.visibility));
             map.insert(kg_g.cid.clone(), (kg_g.name.clone(), kg_g.visibility));
+            map.insert(yk_g.cid.clone(), (yk_g.name.clone(), yk_g.visibility));
+            map.insert(yk_g2.cid.clone(), (yk_g2.name.clone(), yk_g2.visibility));
             Arc::new(tokio::sync::RwLock::new(map))
         };
 
@@ -1042,6 +1055,7 @@ impl KotobaState {
                 ipns_name: ipns_name.clone(),
                 graph: graph_cid.clone(),
                 datoms: distributed_datoms,
+                covering_datoms: None,
                 expected_parent,
                 tx_cid: None,
                 author: self.operator_did.clone(),

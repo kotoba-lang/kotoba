@@ -49,6 +49,14 @@ pub enum TensorDtype {
     BF16,
     F8E4M3,
     F8E5M2,
+    // Raw safetensors storage dtypes (mirror of datom::TensorDtype) — e.g. 4-bit
+    // packed weight = U32. See ADR-2606010000 D2.
+    U32,
+    I32,
+    U16,
+    I16,
+    U8,
+    I8,
 }
 
 impl LegacyQuad {

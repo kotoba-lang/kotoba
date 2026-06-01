@@ -9283,6 +9283,73 @@ async fn weight_put_then_get_roundtrip() {
     assert_eq!(returned, data, "roundtripped bytes must match");
 }
 
+// ADR-2606010000 D2: weight.put accepts a verbatim mlx-vlm `param_key` predicate and
+// the raw safetensors `u32` dtype (4-bit packed weight), so distributed loaders can
+// address each proj/weight tensor individually. Verifies the new predicate + dtype.
+#[tokio::test]
+async fn weight_put_param_key_and_u32_dtype() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start(false).await;
+    // datomic.pull strictly validates graph/entity as CIDs, so use real multibase CIDs
+    // (weight.put itself is lenient, but we read back via pull).
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"weight-paramkey-graph").to_multibase();
+    let model = kotoba_core::cid::KotobaCid::from_bytes(b"weight-paramkey-model").to_multibase();
+    let graph = graph.as_str();
+    let model = model.as_str();
+    let (_, cacao_b64) = build_ed25519_cacao(graph);
+    let tok = tenant_jwt(&s.operator_did);
+    let param_key = "language_model.model.layers.3.experts.switch_glu.gate_proj.weight";
+
+    // one u32 element (4 bytes) — exercises the new U32 dtype path
+    let data = vec![0x01u8, 0x02u8, 0x03u8, 0x04u8];
+    let (status, put_body) = s
+        .post(
+            "/xrpc/ai.gftd.apps.kotoba.weight.put",
+            json!({
+                "model_cid":  model,
+                "layer":      3u32,
+                "param_key":  param_key,
+                "data_b64":   B64.encode(&data),
+                "shape":      [1u32],
+                "dtype":      "u32",
+                "graph":      graph,
+                "cacao_b64":  cacao_b64,
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let blob_cid = put_body["blob_cid"].as_str().expect("blob_cid").to_string();
+
+    // blob round-trips
+    let (status, get_body) = s
+        .get(&format!("/xrpc/ai.gftd.apps.kotoba.weight.get?cid={blob_cid}"))
+        .await;
+    assert_eq!(status, 200, "{get_body}");
+    assert_eq!(
+        B64.decode(get_body["data_b64"].as_str().expect("data_b64"))
+            .expect("valid base64"),
+        data,
+        "roundtripped bytes must match"
+    );
+
+    // the Datom predicate is the VERBATIM param_key (not `weight/layer/N`),
+    // and the dtype serialized as `U32`.
+    let (status, pull_body) = s
+        .post_auth(
+            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            json!({ "graph": graph, "entity": model, "pattern_edn": r#"[*]"# }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{pull_body}");
+    let txt = pull_body.to_string();
+    assert!(
+        txt.contains(param_key),
+        "predicate must be the verbatim param_key: {pull_body}"
+    );
+    assert!(txt.contains("U32"), "dtype must serialize as U32: {pull_body}");
+}
+
 // ── kg.search / kg.query / kg.delete smoke tests ─────────────────────────────
 
 #[tokio::test]
