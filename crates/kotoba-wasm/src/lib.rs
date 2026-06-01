@@ -107,6 +107,42 @@ impl Node {
         self.arr.datoms_with_attribute_prefix(&self.tx, prefix)
     }
 
+    /// P2 local write: assert a batch of datoms into the arrangement (same
+    /// `[{e,a,v_edn}]` shape as a read). The write lands in the local read
+    /// engine immediately; durability is the caller's IndexedDB/OPFS layer.
+    /// (Simplified Datomic transact — assertions only; tempid/unique-identity
+    /// upsert + retraction semantics are a later increment.)
+    pub fn transact(&mut self, datoms_json: &str) -> Result<usize, String> {
+        self.load_server_datoms(datoms_json)
+    }
+
+    /// Export the full current datom set as the server `[{e,a,v_edn}]` JSON
+    /// shape, so the caller can persist post-write state (seed + local writes)
+    /// and re-`load_server_datoms` it on the next cold start. The exact `e`
+    /// string is not round-trip-identical to the original CID, but is stable
+    /// per entity within the snapshot — which is all the read engine needs.
+    pub fn export_datoms_json(&self) -> String {
+        let datoms = self.arr.datoms(&self.tx);
+        let mut out = String::from("[");
+        for (i, d) in datoms.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let v_edn = match &d.v {
+                Value::Text(s) => serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()),
+                Value::Integer(n) => n.to_string(),
+                Value::Float(f) => f.to_string(),
+                Value::Cid(c) => serde_json::to_string(&format!("{c:?}")).unwrap(),
+                other => serde_json::to_string(&format!("{other:?}")).unwrap(),
+            };
+            let e = serde_json::to_string(&format!("{:?}", d.e)).unwrap();
+            let a = serde_json::to_string(&d.a).unwrap();
+            out.push_str(&format!("{{\"e\":{e},\"a\":{a},\"v_edn\":{v_edn},\"added\":true}}"));
+        }
+        out.push(']');
+        out
+    }
+
     /// yoro-style actor search: scan `:yoro.profile/*` Datoms, group by entity,
     /// and return profiles whose did/handle/displayName/description contains `q`
     /// (case-insensitive). Empty `q` returns all. This mirrors
@@ -207,6 +243,19 @@ mod wasm {
                 .map_err(|e| JsValue::from_str(&e))
         }
 
+        /// P2 local write — assert `[{e,a,v_edn}]` datoms into the local engine.
+        pub fn transact(&mut self, datoms_json: &str) -> Result<usize, JsValue> {
+            self.inner
+                .transact(datoms_json)
+                .map_err(|e| JsValue::from_str(&e))
+        }
+
+        /// Export current state as `[{e,a,v_edn}]` for IndexedDB/OPFS persistence.
+        #[wasm_bindgen(js_name = exportDatoms)]
+        pub fn export_datoms(&self) -> String {
+            self.inner.export_datoms_json()
+        }
+
         /// `searchActors(q)` → JSON `{ actors: [...] }` (same shape as the XRPC).
         #[wasm_bindgen(js_name = searchActors)]
         pub fn search_actors(&self, q: &str) -> Result<String, JsValue> {
@@ -256,5 +305,25 @@ mod tests {
         let hit = n.search_actors("watatsuna");
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].did, "did:web:etzhayyim.com:actor:watatsuna");
+    }
+
+    #[test]
+    fn transact_then_export_roundtrips_into_a_fresh_node() {
+        let mut n = Node::new();
+        // P2 local write
+        let tx = r#"[
+          {"e":"e1","a":":yoro.profile/did","v_edn":"\"did:web:etzhayyim.com:actor:newcomer\""},
+          {"e":"e1","a":":yoro.profile/displayName","v_edn":"\"新人 Newcomer\""}
+        ]"#;
+        assert_eq!(n.transact(tx).unwrap(), 2);
+        assert_eq!(n.search_actors("newcomer").len(), 1);
+
+        // Export → re-import into a fresh node (persistence round-trip).
+        let dump = n.export_datoms_json();
+        let mut restored = Node::new();
+        restored.load_server_datoms(&dump).unwrap();
+        let hit = restored.search_actors("Newcomer");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].display_name, "新人 Newcomer");
     }
 }
