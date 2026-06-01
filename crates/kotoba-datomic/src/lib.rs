@@ -5375,15 +5375,64 @@ fn eval_rule_invocation(
     Ok(out.into_iter().collect())
 }
 
+/// Per-clause inverted index over the constant fact base.
+///
+/// `eval_triple` is invoked once per where-clause but iterates over EVERY current
+/// binding. Resolving candidates by re-scanning all facts per binding is
+/// O(bindings × facts) — a 2-clause join over 10k entities ran ~28 s (3334
+/// bindings × 60k facts ≈ 2e8 clones per query). Building this index once per
+/// clause turns the per-binding lookup into O(datoms-per-entity) for the common
+/// bound-subject join, so the whole clause is O(facts + bindings × result).
+struct FactIndex<'a> {
+    datoms: &'a [Datom],
+    by_entity: HashMap<&'a Entity, Vec<&'a Datom>>,
+    /// Keyed by the colon-normalised attribute, matching `attr_matches`' lenient
+    /// `:kw` ↔ `kw` equivalence.
+    by_attr: HashMap<String, Vec<&'a Datom>>,
+}
+
+fn normalize_attr_key(attr: &str) -> String {
+    attr.strip_prefix(':').unwrap_or(attr).to_string()
+}
+
+impl<'a> FactIndex<'a> {
+    fn build(datoms: &'a [Datom]) -> Self {
+        let mut by_entity: HashMap<&'a Entity, Vec<&'a Datom>> = HashMap::new();
+        let mut by_attr: HashMap<String, Vec<&'a Datom>> = HashMap::new();
+        for datom in datoms {
+            by_entity.entry(&datom.e).or_default().push(datom);
+            by_attr
+                .entry(normalize_attr_key(&datom.a))
+                .or_default()
+                .push(datom);
+        }
+        Self {
+            datoms,
+            by_entity,
+            by_attr,
+        }
+    }
+    fn entity(&self, entity: &Entity) -> &[&'a Datom] {
+        self.by_entity.get(entity).map(Vec::as_slice).unwrap_or(&[])
+    }
+    fn attr(&self, attr: &str) -> &[&'a Datom] {
+        self.by_attr
+            .get(&normalize_attr_key(attr))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
 fn eval_triple(
     triple: &[EdnValue],
     db: &Db,
     facts: &[Datom],
     bindings: Vec<BTreeMap<String, EdnValue>>,
 ) -> Result<Vec<BTreeMap<String, EdnValue>>> {
+    let index = FactIndex::build(facts);
     let mut out = Vec::new();
     for binding in bindings {
-        let candidates = candidate_datoms_for_triple(triple, db, facts, &binding)?;
+        let candidates = candidate_datoms_for_triple(triple, db, &index, &binding)?;
         for datom in &candidates {
             if !term_matches(&triple[1], &attr_value(&datom.a), &binding)? {
                 continue;
@@ -5431,7 +5480,7 @@ fn bind_datom_added_term(
 fn candidate_datoms_for_triple(
     triple: &[EdnValue],
     db: &Db,
-    facts: &[Datom],
+    index: &FactIndex<'_>,
     binding: &BTreeMap<String, EdnValue>,
 ) -> Result<Vec<Datom>> {
     let lookup = match lookup_ref_entity_term(&triple[0], db, binding)? {
@@ -5443,26 +5492,26 @@ fn candidate_datoms_for_triple(
         None => datom_lookup_for_triple(triple, binding)?,
     };
     Ok(match lookup {
-        distributed::DatomIndexLookup::All => facts.to_vec(),
-        distributed::DatomIndexLookup::Entity(entity) => facts
+        distributed::DatomIndexLookup::All => index.datoms.to_vec(),
+        // Bound subject → fetch just that entity's datoms (the join hot path).
+        distributed::DatomIndexLookup::Entity(entity) => {
+            index.entity(&entity).iter().map(|d| (*d).clone()).collect()
+        }
+        distributed::DatomIndexLookup::EntityAttribute { entity, attr } => index
+            .entity(&entity)
             .iter()
-            .cloned()
-            .filter(|datom| datom.e == entity)
-            .collect(),
-        distributed::DatomIndexLookup::EntityAttribute { entity, attr } => facts
-            .iter()
-            .cloned()
-            .filter(|datom| datom.e == entity && attr_matches(&datom.a, &attr))
-            .collect(),
-        distributed::DatomIndexLookup::Attribute(attr) => facts
-            .iter()
-            .cloned()
             .filter(|datom| attr_matches(&datom.a, &attr))
+            .map(|d| (*d).clone())
             .collect(),
-        distributed::DatomIndexLookup::AttributeValue { attr, value } => facts
+        // Bound attribute → fetch just that attribute's datoms (skip full scan).
+        distributed::DatomIndexLookup::Attribute(attr) => {
+            index.attr(&attr).iter().map(|d| (*d).clone()).collect()
+        }
+        distributed::DatomIndexLookup::AttributeValue { attr, value } => index
+            .attr(&attr)
             .iter()
-            .cloned()
-            .filter(|datom| attr_matches(&datom.a, &attr) && datom.v == value)
+            .filter(|datom| datom.v == value)
+            .map(|d| (*d).clone())
             .collect(),
     })
 }
