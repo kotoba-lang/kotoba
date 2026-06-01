@@ -585,14 +585,39 @@ impl QuadStore {
         ordered.sort_unstable_by_key(|(seq, _, _, _)| *seq);
         let total = ordered.len();
 
+        // Track which graphs the replay touched so we can re-evaluate their
+        // `hot_covers_all` flag once the full WAL has been loaded.
+        let mut replayed_graphs: std::collections::HashMap<String, KotobaCid> =
+            std::collections::HashMap::new();
+
         for (_, tx_cid, is_assert, quad) in ordered {
             let graph_cid = quad.graph.clone();
+            replayed_graphs
+                .entry(graph_cid.to_multibase())
+                .or_insert_with(|| graph_cid.clone());
             let mut datom = Datom::from_legacy_quad(quad, is_assert);
             datom.tx = tx_cid;
             if is_assert {
                 self.assert_datom_silent(graph_cid, datom).await;
             } else {
                 self.retract_datom_silent(graph_cid, datom).await;
+            }
+        }
+
+        // `assert_datom_silent`/`retract_datom_silent` conservatively mark
+        // `hot_covers_all = false` (replay may load only post-checkpoint delta on
+        // top of committed cold state). But when a graph has NO CommitDag head,
+        // the in-memory Arrangement is the *sole* source of its committed state —
+        // there is no cold ProllyTree to fall through to. In that case hot truly
+        // covers all committed datoms, so reads MUST (and may safely) be served
+        // from the hot index. Flip the flag to `true` for those graphs so the
+        // SPARQL hot-path activates instead of cold-scanning an empty/absent tree.
+        {
+            let dag = self.commit_dag.read().await;
+            for (key, graph_cid) in &replayed_graphs {
+                if dag.head(graph_cid).is_none() {
+                    self.hot_covers_all.insert(key.clone(), true);
+                }
             }
         }
 

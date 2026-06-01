@@ -344,12 +344,11 @@ async fn distributed_query_store(
     since: Option<&str>,
     remote_peer: Option<&str>,
     remote_ipns_name: Option<&str>,
-) -> Result<(QuadStore, Option<String>), (StatusCode, String)> {
-    let (quads, basis_t) = if remote_peer.is_some()
-        || remote_ipns_name.is_some()
-        || as_of.is_some()
-        || since.is_some()
-    {
+) -> Result<(Arc<QuadStore>, Option<String>), (StatusCode, String)> {
+    // Time-travel (as_of / since) and remote/distributed reads need a
+    // point-in-time snapshot reconstructed from the datomic history → build an
+    // ephemeral query store from that snapshot.
+    if remote_peer.is_some() || remote_ipns_name.is_some() || as_of.is_some() || since.is_some() {
         let db = crate::xrpc::require_distributed_datomic_db(
             state,
             graph_cid,
@@ -359,13 +358,21 @@ async fn distributed_query_store(
             remote_ipns_name,
         )?;
         let basis_t = db.basis_t.as_ref().map(KotobaCid::to_multibase);
-        (datomic_db_quads(graph_cid, db), basis_t)
-    } else {
-        (current_graph_quads(state, graph_cid).await?, None)
-    };
-    let query_store = QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
-    query_store.assert_batch_silent(quads).await;
-    Ok((query_store, basis_t))
+        let quads = datomic_db_quads(graph_cid, db);
+        let query_store =
+            QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
+        query_store.assert_batch_silent(quads).await;
+        return Ok((Arc::new(query_store), basis_t));
+    }
+
+    // Local current-state read: serve directly from the resident QuadStore.
+    // Its hot 4-index Arrangement already reflects all committed datoms (applied
+    // via `apply_journaled_datom` on every commit + WAL replay on startup), so
+    // the SPARQL hot-path returns in O(result) — no O(graph) cold ProllyTree/Kubo
+    // reconstruction and no per-query throwaway rebuild. (Previously every query
+    // re-materialised the whole graph from cold storage: 71ms@1K → ~3s@10K, and
+    // the concurrent cold reads wedged the Kubo sync-bridge pool at c≈16.)
+    Ok((Arc::clone(&state.quad_store), None))
 }
 
 fn datomic_db_quads(graph_cid: &KotobaCid, db: kotoba_datomic::Db) -> Vec<LegacyQuad> {
