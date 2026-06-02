@@ -1140,6 +1140,42 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(state);
+
+    // ADR-2605302130 startup cache-warm: pre-seed the resident `db_before` cache
+    // for configured large graphs OFF the request path, so the first transact
+    // after a (re)start does not pay an on-deadline O(graph) cold `db_from_head`
+    // (the cold-start failure yukkuri hit on `yukkuri-kg-v3`). Comma-separated
+    // graph CIDs in `KOTOBA_DATOMIC_WARM_GRAPHS`; each warmed in the background
+    // with bounded exponential-backoff retry so a transient cold-load failure
+    // does not leave the graph permanently cold.
+    if let Ok(graphs) = std::env::var("KOTOBA_DATOMIC_WARM_GRAPHS") {
+        for spec in graphs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(graph_cid) = kotoba_core::cid::KotobaCid::from_multibase(spec) else {
+                tracing::warn!(graph = %spec, "KOTOBA_DATOMIC_WARM_GRAPHS: invalid graph CID, skipping");
+                continue;
+            };
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let ipns_name = xrpc::distributed_graph_ipns_name(&graph_cid);
+                let graph_mb = graph_cid.to_multibase();
+                let mut backoff_secs = 2u64;
+                for attempt in 1..=6u32 {
+                    match xrpc::warm_datomic_resident_cache(&state, &graph_cid, &ipns_name).await {
+                        Ok(outcome) => {
+                            tracing::info!(graph = %graph_mb, ?outcome, attempt, "datomic resident cache warm");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(graph = %graph_mb, attempt, err = %e, "datomic resident cache warm failed; retrying");
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                            backoff_secs = (backoff_secs * 2).min(60);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     let app = build_router(Arc::clone(&state));
 
     let port = std::env::var("KOTOBA_PORT")

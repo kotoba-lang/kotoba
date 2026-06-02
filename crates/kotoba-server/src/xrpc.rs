@@ -4529,7 +4529,71 @@ where
     Ok(Some((Some(head.tx_cid.to_multibase()), entries)))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.transact
+/// Outcome of a resident `db_before` cache warm (ADR-2605302130 startup-warm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatomicWarmOutcome {
+    /// Graph has no published IPNS head yet — nothing to load.
+    EmptyGraph,
+    /// The resident cache already held the resolved head — no cold scan taken.
+    AlreadyWarm,
+    /// Paid one cold `db_from_head` off the request path and seeded the cache.
+    Warmed,
+}
+
+/// Pre-seed the resident `db_before` cache for one graph OFF the client request
+/// deadline (ADR-2605302130 startup-warm follow-up).
+///
+/// `datomic.transact` serves `db_before` from RAM once the resident cache is
+/// warm, but the FIRST transact after a (re)start (or an externally-advanced
+/// head) still pays one O(graph) cold `db_from_head`. On an already-large graph
+/// that single cold load can itself exceed the client's HTTP deadline (30s /
+/// 120s) and fail the transact — and re-fail on every restart (the cold-start
+/// failure yukkuri hit on `yukkuri-kg-v3`). Running that same one-time cold load
+/// here — at startup, with no client waiting and with retry — moves it off the
+/// request path so the first real transact hits RAM.
+///
+/// Idempotent and concurrency-safe: it takes the SAME per-graph
+/// `datomic_live_slot` async lock the transact path takes, so a transact that
+/// arrives mid-warm simply waits for the warm (rather than launching its own
+/// redundant cold scan), and a warm that arrives after a transact already seeded
+/// the slot is a no-op (`AlreadyWarm`). The seeded `Db` is exactly what a cold
+/// `db_from_head` would produce (proved by `cached_db_before_equals_cold_db_from_head`).
+pub(crate) async fn warm_datomic_resident_cache(
+    state: &Arc<KotobaState>,
+    graph_cid: &kotoba_core::cid::KotobaCid,
+    ipns_name: &str,
+) -> Result<DatomicWarmOutcome, DistributedCommitError> {
+    let head = match state
+        .ipns_registry
+        .resolve(&IpnsName::new(ipns_name.to_string()))
+    {
+        Ok(record) => kotoba_core::cid::KotobaCid::from_multibase(&record.value),
+        Err(IpnsRegistryError::NotFound(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let Some(head) = head else {
+        return Ok(DatomicWarmOutcome::EmptyGraph);
+    };
+
+    let graph_mb = graph_cid.to_multibase();
+    let live_slot = state.datomic_live_slot(&graph_mb);
+    let mut live_guard = live_slot.lock().await;
+    if live_guard.as_ref().is_some_and(|live| live.head == head) {
+        return Ok(DatomicWarmOutcome::AlreadyWarm);
+    }
+
+    // The one cold O(graph) scan — but off the request path, so a Kubo-slow
+    // large graph gets unbounded wall-clock here instead of failing a transact.
+    state
+        .datomic_cold_db_loads
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let db = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
+        .db_from_head(&head)?;
+    *live_guard = Some(crate::server::LiveDatomicGraph { head, db });
+    Ok(DatomicWarmOutcome::Warmed)
+}
+
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.transact
 /// Apply EDN transaction data, preserving Datomic's `(E,A,V,T,Added)` semantics
 /// at the API boundary and projecting each datom into the current graph store.
 pub async fn datomic_transact(
@@ -8751,8 +8815,9 @@ mod tests {
         datomic_index_pull, datomic_index_range, datomic_log, datomic_pull, datomic_pull_many,
         datomic_q, datomic_seek_datoms, datomic_sync, datomic_transact, datomic_tx_range,
         datomic_with, did_document_publish, didcomm_send, distributed_graph_ipns_name,
-        enforce_datomic_range_tx_scope, is_did_web_ip_host, protocol_payload_tx_cid, vc_issue,
-        vp_capability_projection, AtprotoRepoWriteReq, AuthCapabilityProjection, DatomicBasisTReq,
+        enforce_datomic_range_tx_scope, is_did_web_ip_host, protocol_payload_tx_cid,
+        warm_datomic_resident_cache, vc_issue, vp_capability_projection, AtprotoRepoWriteReq,
+        AuthCapabilityProjection, DatomicBasisTReq, DatomicWarmOutcome,
         DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq,
         DatomicIdentReq, DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq,
         DatomicPullManyReq, DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq,
@@ -10035,6 +10100,105 @@ mod tests {
         }
         assert_ne!(c1, c2);
         assert_ne!(c2, c3);
+    }
+
+    /// ADR-2605302130 startup-warm: prove the resident `db_before` cache can be
+    /// pre-seeded OFF the request path so the FIRST transact after a (re)start on
+    /// an already-large graph HITS RAM instead of paying an on-deadline cold
+    /// `db_from_head` (the cold-start gap yukkuri hit on `yukkuri-kg-v3`). The one
+    /// cold load is absorbed by the warm, not by the client request.
+    #[tokio::test]
+    async fn datomic_startup_warm_absorbs_cold_load_so_first_transact_hits() {
+        use std::sync::atomic::Ordering;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = KotobaCid::from_bytes(b"startup-warm-graph");
+        let graph_mb = graph.to_multibase();
+        let ipns_name = distributed_graph_ipns_name(&graph);
+
+        // Populate a non-empty graph (genesis + one tx), then simulate a (re)start
+        // by clearing the resident cache. The IPNS head + blocks survive.
+        run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "alice" :person/name "Alice"]]"#,
+        )
+        .await;
+        let c2 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "bob" :person/name "Bob"]]"#,
+        )
+        .await;
+        state.datomic_live.lock().unwrap().clear();
+        let before = state.datomic_cold_db_loads.load(Ordering::Relaxed);
+
+        // Startup warm pays exactly one cold `db_from_head` — off the request path.
+        let outcome = warm_datomic_resident_cache(&state, &graph, &ipns_name)
+            .await
+            .unwrap();
+        assert_eq!(outcome, DatomicWarmOutcome::Warmed);
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            before + 1,
+            "warm must absorb exactly one cold load"
+        );
+        {
+            let slot = state.datomic_live_slot(&graph_mb);
+            let g = slot.lock().await;
+            assert_eq!(
+                g.as_ref().expect("warm seeds the slot").head.to_multibase(),
+                c2,
+                "warm must seed the cache at the resolved IPNS head"
+            );
+        }
+
+        // Warming again is idempotent — cache already holds the head → no scan.
+        let outcome = warm_datomic_resident_cache(&state, &graph, &ipns_name)
+            .await
+            .unwrap();
+        assert_eq!(outcome, DatomicWarmOutcome::AlreadyWarm);
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            before + 1,
+            "re-warm must not cold-scan"
+        );
+
+        // The first real transact after warm HITS RAM — no on-request cold scan.
+        run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "carol" :person/name "Carol"]]"#,
+        )
+        .await;
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            before + 1,
+            "post-warm transact must hit the resident cache, not cold-scan"
+        );
+    }
+
+    /// Warming an empty (never-transacted) graph is a no-op — there is no head to
+    /// load, so no cold scan is taken.
+    #[tokio::test]
+    async fn datomic_startup_warm_on_empty_graph_is_noop() {
+        use std::sync::atomic::Ordering;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = KotobaCid::from_bytes(b"startup-warm-empty-graph");
+        let ipns_name = distributed_graph_ipns_name(&graph);
+        let before = state.datomic_cold_db_loads.load(Ordering::Relaxed);
+        let outcome = warm_datomic_resident_cache(&state, &graph, &ipns_name)
+            .await
+            .unwrap();
+        assert_eq!(outcome, DatomicWarmOutcome::EmptyGraph);
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            before,
+            "warming an empty graph must not cold-scan"
+        );
     }
 
     #[tokio::test]
