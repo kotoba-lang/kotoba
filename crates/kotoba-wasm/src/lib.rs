@@ -24,6 +24,7 @@
 
 use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::{Arrangement, Datom, Value};
+use serde::Deserialize;
 
 /// A browser-local kotoba read node over an in-memory Datom arrangement.
 ///
@@ -32,6 +33,7 @@ use kotoba_kqe::{Arrangement, Datom, Value};
 /// so the read engine can be exercised in isolation.
 pub struct Node {
     arr: Arrangement,
+    datomic_datoms: Vec<kotoba_datomic::Datom>,
     tx: KotobaCid,
 }
 
@@ -45,6 +47,7 @@ impl Node {
     pub fn new() -> Self {
         Node {
             arr: Arrangement::new(),
+            datomic_datoms: Vec::new(),
             // A single synthetic transaction CID for the PoC. Real nodes carry
             // the commit CID resolved from the graph head.
             tx: KotobaCid::from_bytes(b"kotoba-wasm-poc-tx"),
@@ -61,10 +64,16 @@ impl Node {
             self.tx.clone(),
         );
         self.arr.insert_datom(&d);
+        self.datomic_datoms.push(kotoba_datomic::Datom::assert(
+            KotobaCid::from_bytes(entity.as_bytes()),
+            attr.to_string(),
+            kotoba_edn::EdnValue::String(value.to_string()),
+            self.tx.clone(),
+        ));
     }
 
     /// Hydrate the arrangement from the exact JSON a remote kotoba
-    /// `ai.gftd.apps.kotoba.datomic.datoms` returns: `[{e, a, v_edn, ...}]`.
+    /// `com.etzhayyim.apps.kotoba.datomic.datoms` returns: `[{e, a, v_edn, ...}]`.
     ///
     /// This is the P1 sync path (ADR-2606013600 D5): a one-time / delta block
     /// pull from a peer is decoded into Datoms and loaded into the kqe read
@@ -72,31 +81,24 @@ impl Node {
     /// IPNS stack, which the browser node deliberately does not carry. The
     /// only added value-scalars are EDN strings (`"..."`) and keywords (`:kw`).
     pub fn load_server_datoms(&mut self, json: &str) -> Result<usize, String> {
-        let arr: Vec<serde_json::Value> =
-            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let arr: Vec<ServerDatom> = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let mut n = 0usize;
         for d in &arr {
             // Skip retractions if the server marks them.
-            if d.get("added").and_then(|b| b.as_bool()) == Some(false) {
+            if d.added == Some(false) {
                 continue;
             }
-            let (Some(e), Some(a), Some(v_edn)) = (
-                d.get("e").and_then(|x| x.as_str()),
-                d.get("a").and_then(|x| x.as_str()),
-                d.get("v_edn").and_then(|x| x.as_str()),
-            ) else {
-                continue;
-            };
             // Group by the server's content-addressed entity string; the read
             // engine only needs a stable per-entity key, so hashing the `e`
             // multibase string is sufficient for the browser arrangement.
             let datom = Datom::assert(
-                KotobaCid::from_bytes(e.as_bytes()),
-                a.to_string(),
-                Value::Text(parse_edn_scalar(v_edn)),
+                KotobaCid::from_bytes(d.e.as_bytes()),
+                d.a.clone(),
+                Value::Text(parse_edn_scalar(&d.v_edn)),
                 self.tx.clone(),
             );
             self.arr.insert_datom(&datom);
+            self.datomic_datoms.push(d.to_datomic(&self.tx)?);
             n += 1;
         }
         Ok(n)
@@ -137,10 +139,46 @@ impl Node {
             };
             let e = serde_json::to_string(&format!("{:?}", d.e)).unwrap();
             let a = serde_json::to_string(&d.a).unwrap();
-            out.push_str(&format!("{{\"e\":{e},\"a\":{a},\"v_edn\":{v_edn},\"added\":true}}"));
+            let v_edn_json = serde_json::to_string(&v_edn).unwrap();
+            out.push_str(&format!(
+                "{{\"e\":{e},\"a\":{a},\"v_edn\":{v_edn_json},\"added\":true}}"
+            ));
         }
         out.push(']');
         out
+    }
+
+    /// Run a Datomic query against the browser-local Datomic DB hydrated by
+    /// `load_server_datoms` / `transact`.
+    pub fn datomic_q(&self, query_edn: &str, inputs_json: &str) -> Result<String, String> {
+        let query = kotoba_edn::parse(query_edn).map_err(|e| format!("query_edn parse: {e}"))?;
+        let input_sources: Vec<String> = if inputs_json.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(inputs_json).map_err(|e| format!("inputs_json parse: {e}"))?
+        };
+        let inputs = input_sources
+            .iter()
+            .map(|src| kotoba_edn::parse(src).map_err(|e| format!("inputs_edn parse: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let db = kotoba_datomic::Db::from_datoms(
+            self.datomic_datoms.clone(),
+            self.datomic_datoms.last().map(|d| d.t.clone()),
+        );
+        let rows = kotoba_datomic::q(query, &db, &inputs).map_err(|e| e.to_string())?;
+        let rows_edn = rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|v| kotoba_edn::to_string(&v))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string(&serde_json::json!({
+            "basis_t": db.basis_t.map(|cid| cid.to_multibase()),
+            "rows_edn": rows_edn,
+        }))
+        .map_err(|e| e.to_string())
     }
 
     /// yoro-style actor search: scan `:yoro.profile/*` Datoms, group by entity,
@@ -179,6 +217,36 @@ impl Node {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ServerDatom {
+    e: String,
+    a: String,
+    v_edn: String,
+    t: Option<String>,
+    added: Option<bool>,
+}
+
+impl ServerDatom {
+    fn to_datomic(&self, default_tx: &KotobaCid) -> Result<kotoba_datomic::Datom, String> {
+        let e = parse_cid_or_hash(&self.e);
+        let t = self
+            .t
+            .as_deref()
+            .map(parse_cid_or_hash)
+            .unwrap_or_else(|| default_tx.clone());
+        let v = kotoba_edn::parse(&self.v_edn).map_err(|e| format!("v_edn parse: {e}"))?;
+        Ok(if self.added == Some(false) {
+            kotoba_datomic::Datom::retract(e, self.a.clone(), v, t)
+        } else {
+            kotoba_datomic::Datom::assert(e, self.a.clone(), v, t)
+        })
+    }
+}
+
+fn parse_cid_or_hash(value: &str) -> KotobaCid {
+    KotobaCid::from_multibase(value).unwrap_or_else(|| KotobaCid::from_bytes(value.as_bytes()))
+}
+
 /// Minimal EDN-scalar decoder mirroring `@etzhayyim/yoro-rw-free`'s
 /// `parseEdnScalar`: `"str"` → str, `:kw` → bare name, else the raw token.
 fn parse_edn_scalar(v_edn: &str) -> String {
@@ -210,7 +278,7 @@ pub struct Profile {
 // ─── wasm-bindgen surface (browser) ────────────────────────────────────────
 //
 // Mirrors the kotoba XRPC NSIDs so a Service Worker can dispatch
-// `/xrpc/ai.gftd.apps.kotoba.datomic.*` to these methods (ADR-2606013600 D3),
+// `/xrpc/com.etzhayyim.apps.kotoba.datomic.*` to these methods (ADR-2606013600 D3),
 // keeping `@etzhayyim/yoro-rw-free` unchanged.
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -263,6 +331,14 @@ mod wasm {
             serde_json::to_string(&serde_json::json!({ "actors": actors }))
                 .map_err(|e| JsValue::from_str(&e.to_string()))
         }
+
+        /// `com.etzhayyim.apps.kotoba.datomic.q` over the local browser DB.
+        #[wasm_bindgen(js_name = datomicQ)]
+        pub fn datomic_q(&self, query_edn: &str, inputs_json: &str) -> Result<String, JsValue> {
+            self.inner
+                .datomic_q(query_edn, inputs_json)
+                .map_err(|e| JsValue::from_str(&e))
+        }
     }
 }
 
@@ -277,7 +353,11 @@ mod tests {
         n.assert_text(did, ":yoro.profile/did", did);
         n.assert_text(did, ":yoro.profile/handle", "etzhayyim.com.actor.tsumugi");
         n.assert_text(did, ":yoro.profile/displayName", "紡ぎ Tsumugi");
-        n.assert_text(did, ":yoro.profile/description", "Engi Knowledge Graph intel weaver");
+        n.assert_text(
+            did,
+            ":yoro.profile/description",
+            "Engi Knowledge Graph intel weaver",
+        );
 
         let other = "did:web:etzhayyim.com:actor:watatsuna";
         n.assert_text(other, ":yoro.profile/did", other);
@@ -290,7 +370,7 @@ mod tests {
 
     #[test]
     fn hydrate_from_server_datoms_json_then_search() {
-        // Exact shape returned by ai.gftd.apps.kotoba.datomic.datoms (P1 sync).
+        // Exact shape returned by com.etzhayyim.apps.kotoba.datomic.datoms (P1 sync).
         let json = r#"[
           {"e":"bafyA","a":":yoro.profile/did","v_edn":"\"did:web:etzhayyim.com:actor:tsumugi\"","added":true},
           {"e":"bafyA","a":":yoro.profile/displayName","v_edn":"\"紡ぎ Tsumugi — Engi KG\"","added":true},
@@ -305,6 +385,25 @@ mod tests {
         let hit = n.search_actors("watatsuna");
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].did, "did:web:etzhayyim.com:actor:watatsuna");
+    }
+
+    #[test]
+    fn datomic_q_runs_over_hydrated_server_datoms() {
+        let json = r#"[
+          {"e":"bafyA","a":":person/name","v_edn":"\"Alice\"","t":"bafyTx","added":true},
+          {"e":"bafyA","a":":person/role","v_edn":":admin","t":"bafyTx","added":true},
+          {"e":"bafyB","a":":person/name","v_edn":"\"Bob\"","t":"bafyTx","added":true}
+        ]"#;
+        let mut n = Node::new();
+        n.load_server_datoms(json).unwrap();
+        let out = n
+            .datomic_q(
+                r#"{:find [?name] :where [[?e :person/role :admin] [?e :person/name ?name]]}"#,
+                "[]",
+            )
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(body["rows_edn"], serde_json::json!([["\"Alice\""]]));
     }
 
     #[test]
