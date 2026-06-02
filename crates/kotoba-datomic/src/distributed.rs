@@ -2365,14 +2365,17 @@ where
             })
             .collect::<Vec<_>>();
         let datom_count = datoms.len();
-        // Durability fix (2026-06-01 yukkuri-kg-v2 incident): route this commit's
-        // block writes through `put_durable` (synchronous cold/kubo write-through)
-        // instead of TieredBlockStore's default fire-and-forget async cold copy.
-        // Without it, a liveness/OOM restart between commit and the async copy
-        // loses the head's reachable blocks → cold `db_from_head` → kubo block/get →
-        // bitswap timeout → permanent 500. Mirrors the wrapped-vault-key put_durable+pin.
-        let durable = DurableStore(self.store);
-        let mut roots = build_datom_roots(&datoms, &durable)?;
+        // Durability fix (yukkuri-kg-v2 incident): a commit's reachable blocks must
+        // be durable before we return, else a restart between commit and
+        // TieredBlockStore's fire-and-forget async cold copy loses them → cold
+        // db_from_head → kubo block/get → bitswap timeout → permanent 500.
+        // Capture every block written during the build (fast normal put = hot +
+        // async cold), then flush the whole set durably in ONE concurrent batch
+        // (put_many_durable) + recursive-pin the head. Batching keeps a commit's
+        // O(state) cold writes to ~one round-trip instead of N sequential
+        // put_durable calls (2026-06-02 throughput fix, ADR-2606012200).
+        let cap = CommitCapture::new(self.store);
+        let mut roots = build_datom_roots(&datoms, &cap)?;
         // Covering EAVT (ADR-2605302130): materialise the full netted current
         // state into its own ProllyTree so `current_db_from_head` is O(state)
         // not O(history). ProllyTree structural sharing means unchanged subtrees
@@ -2385,7 +2388,7 @@ where
                 let kqe = indexable_kqe_datom(datom);
                 ceavt_entries.push((kqe.eavt_key(), encode_stored_datom(datom)?));
             }
-            let ceavt_root = ProllyTree::build_tree(ceavt_entries, &durable)
+            let ceavt_root = ProllyTree::build_tree(ceavt_entries, &cap)
                 .map_err(DistributedCommitError::Store)?;
             roots.insert(ROOT_CEAVT.to_string(), ceavt_root);
         }
@@ -2398,11 +2401,15 @@ where
             roots,
             req.cacao_proof_cid,
         )?;
-        commit.persist(&durable)?;
-        // All reachable blocks (index roots, covering EAVT, commit pointer) are now
-        // durably in the cold tier, so recursive-pin the new head once: TieredBlockStore
-        // pin → cold KuboBlockStore pin (pin/add recursive=true) keeps the whole commit
-        // DAG out of kubo GC, and the budgeted hot tier never evicts it. Idempotent.
+        commit.persist(&cap)?;
+        // Durably flush this commit's captured blocks in ONE concurrent batch so the
+        // head's reachable set is in the cold tier before we return.
+        self.store
+            .put_many_durable(&cap.take())
+            .map_err(DistributedCommitError::Store)?;
+        // All reachable blocks are now durable in cold, so recursive-pin the head
+        // once: TieredBlockStore pin → cold KuboBlockStore pin (pin/add recursive=true)
+        // keeps the whole commit DAG out of kubo GC, and the hot tier never evicts it.
         self.store.pin(&commit.cid);
 
         let commit_ipfs_cid = kotoba_ipfs::parse_cid(&commit.cid.to_multibase())
@@ -2693,43 +2700,62 @@ impl DistributedDatomCommit {
     }
 }
 
-/// Wraps a `BlockStore` so every `put` is routed through `put_durable`
-/// (synchronous write-through to the persistent cold tier, surfacing errors).
+/// Wraps a `BlockStore`, forwarding every `put` to the inner store at NORMAL
+/// speed (hot + fire-and-forget async cold) while RECORDING each (cid, data).
 ///
-/// Used for Datomic commit writes: the head and its reachable index/commit
-/// blocks must be durable before `commit_datoms` returns, otherwise a restart
-/// before `TieredBlockStore`'s fire-and-forget async cold copy runs loses them
-/// and `db_from_head` can never reconstruct the head again (kubo block/get →
-/// bitswap → 30s timeout → permanent 500). Mirrors the wrapped-vault-key fix.
-struct DurableStore<'a>(&'a dyn BlockStore);
+/// Used by the Datomic commit path: the build (index roots, covering EAVT,
+/// commit pointer) writes through this at hot speed, then `commit_datoms` flushes
+/// the captured set durably in ONE concurrent `put_many_durable` batch + pins the
+/// head. This keeps a commit's O(state) cold writes to ~one round-trip instead of
+/// N sequential `put_durable` calls (2026-06-02 throughput fix, ADR-2606012200),
+/// while still guaranteeing the head's reachable blocks are durable before return.
+struct CommitCapture<'a> {
+    inner: &'a dyn BlockStore,
+    captured: std::sync::Mutex<Vec<(KotobaCid, Vec<u8>)>>,
+}
 
-impl<'a> BlockStore for DurableStore<'a> {
-    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-        self.0.put_durable(cid, data)
+impl<'a> CommitCapture<'a> {
+    fn new(inner: &'a dyn BlockStore) -> Self {
+        Self {
+            inner,
+            captured: std::sync::Mutex::new(Vec::new()),
+        }
     }
-    fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-        self.0.put_durable(cid, data)
+    /// Drain the captured (cid, data) blocks, leaving the buffer empty.
+    fn take(&self) -> Vec<(KotobaCid, Vec<u8>)> {
+        std::mem::take(&mut *self.captured.lock().unwrap())
+    }
+}
+
+impl<'a> BlockStore for CommitCapture<'a> {
+    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put(cid, data)?;
+        self.captured
+            .lock()
+            .unwrap()
+            .push((cid.clone(), data.to_vec()));
+        Ok(())
     }
     fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
-        self.0.get(cid)
+        self.inner.get(cid)
     }
     fn has(&self, cid: &KotobaCid) -> bool {
-        self.0.has(cid)
+        self.inner.has(cid)
     }
     fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
-        self.0.delete(cid)
+        self.inner.delete(cid)
     }
     fn pin(&self, cid: &KotobaCid) {
-        self.0.pin(cid)
+        self.inner.pin(cid)
     }
     fn unpin(&self, cid: &KotobaCid) {
-        self.0.unpin(cid)
+        self.inner.unpin(cid)
     }
     fn is_pinned(&self, cid: &KotobaCid) -> bool {
-        self.0.is_pinned(cid)
+        self.inner.is_pinned(cid)
     }
     fn all_cids(&self) -> Vec<KotobaCid> {
-        self.0.all_cids()
+        self.inner.all_cids()
     }
 }
 

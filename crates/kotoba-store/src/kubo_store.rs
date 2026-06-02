@@ -304,6 +304,89 @@ impl BlockStore for KuboBlockStore {
         }
     }
 
+    /// Durably write a batch of blocks CONCURRENTLY (bounded by the inflight
+    /// semaphore) in one `kubo_block_on`, so a commit's O(state) blocks overlap
+    /// into ~one round-trip instead of N sequential `block/put`s. Throughput fix
+    /// for the put_durable commit path (2026-06-02; ADR-2606012200). Fails if any
+    /// block fails (surfaces the first error).
+    fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> Result<()> {
+        if !self.is_available() || blocks.is_empty() {
+            return Ok(());
+        }
+        let url = format!(
+            "{}?cid-codec=dag-cbor&mhtype=sha2-256",
+            self.api_url("block/put")
+        );
+        let client = self.client.clone();
+        let token = self.token.clone();
+        let inflight = Arc::clone(&self.inflight);
+        let bodies: Vec<Vec<u8>> = blocks.iter().map(|(_, d)| d.clone()).collect();
+        let result = kubo_block_on(async move {
+            let mut set = tokio::task::JoinSet::new();
+            for body in bodies {
+                let url = url.clone();
+                let client = client.clone();
+                let token = token.clone();
+                let inflight = Arc::clone(&inflight);
+                set.spawn(async move {
+                    let _permit = inflight
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| anyhow!("kubo block/put permit: {e}"))?;
+                    let part = reqwest::multipart::Part::bytes(body).file_name("blob");
+                    let form = reqwest::multipart::Form::new().part("data", part);
+                    let rb = client.post(&url).multipart(form);
+                    let rb = match &token {
+                        Some(t) => rb.bearer_auth(t),
+                        None => rb,
+                    };
+                    let resp = rb
+                        .send()
+                        .await
+                        .map_err(|e| anyhow!("kubo block/put: {e}"))?;
+                    if !resp.status().is_success() {
+                        let st = resp.status();
+                        let tx = resp.text().await.unwrap_or_default();
+                        return Err(anyhow!("kubo block/put {st}: {tx}"));
+                    }
+                    let _parsed: BlockPutResponse = resp
+                        .json()
+                        .await
+                        .map_err(|e| anyhow!("kubo block/put parse: {e}"))?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+            let mut first_err: Option<anyhow::Error> = None;
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        first_err.get_or_insert(e);
+                    }
+                    Err(e) => {
+                        first_err.get_or_insert(anyhow!("kubo block/put join: {e}"));
+                    }
+                }
+            }
+            match first_err {
+                Some(e) => Err(e),
+                None => Ok::<(), anyhow::Error>(()),
+            }
+        });
+        match result {
+            Err(e) => {
+                if e.to_string().contains("connect") {
+                    self.mark_unavailable();
+                }
+                Err(e)
+            }
+            Ok(()) => {
+                self.mark_available();
+                Ok(())
+            }
+        }
+    }
+
     fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>> {
         if !self.is_available() {
             return Ok(None);
