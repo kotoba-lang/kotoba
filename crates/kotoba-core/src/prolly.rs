@@ -381,6 +381,73 @@ mod tests {
         }
     }
 
+    /// blake3 vs sha2-256 at the ProllyTree boundary-hot-path granularity.
+    /// `is_boundary` runs `blake3::hash(key)` once per entry during every
+    /// build_tree; this measures the cost of swapping it to sha2-256.
+    /// Run: `cargo test -p kotoba-core hash_blake3_vs_sha256_boundary --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn hash_blake3_vs_sha256_boundary() {
+        use sha2::{Digest, Sha256};
+        use std::time::Instant;
+
+        // Representative ProllyTree keys: ~48B eavt index keys + 36B child CIDs.
+        let keys: Vec<Vec<u8>> = (0u32..100_000)
+            .map(|i| {
+                let mut k = Vec::with_capacity(48);
+                k.extend_from_slice(b"eavt:");
+                k.extend_from_slice(&i.to_be_bytes());
+                k.extend_from_slice(&[0xab; 39]);
+                k
+            })
+            .collect();
+        let rounds = 20;
+
+        // Warm + measure blake3 (current).
+        let mut acc = 0u64;
+        let t = Instant::now();
+        for _ in 0..rounds {
+            for k in &keys {
+                let h = blake3::hash(k);
+                acc ^= u32::from_be_bytes(h.as_bytes()[0..4].try_into().unwrap()) as u64;
+            }
+        }
+        let blake3_ns = t.elapsed().as_nanos() as f64 / (rounds * keys.len()) as f64;
+
+        // Measure sha2-256 (candidate).
+        let t = Instant::now();
+        for _ in 0..rounds {
+            for k in &keys {
+                let d = Sha256::digest(k);
+                acc ^= u32::from_be_bytes(d[0..4].try_into().unwrap()) as u64;
+            }
+        }
+        let sha_ns = t.elapsed().as_nanos() as f64 / (rounds * keys.len()) as f64;
+
+        // Full build_tree cost (blake3 boundary) over 100k entries, to size the
+        // hash portion against total tree-build work.
+        let store = MemoryBlockStore::new();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = keys
+            .iter()
+            .map(|k| (k.clone(), b"v".to_vec()))
+            .collect();
+        let t = Instant::now();
+        let _root = ProllyTree::build_tree(entries, &store).unwrap();
+        let build_ms = t.elapsed().as_millis();
+
+        eprintln!("\n── ProllyTree boundary hash: blake3 vs sha2-256 (per key, ~48B) ──");
+        eprintln!("blake3      : {blake3_ns:.1} ns/hash");
+        eprintln!("sha2-256    : {sha_ns:.1} ns/hash   ({:.2}x blake3)", sha_ns / blake3_ns);
+        eprintln!("build_tree(100k, blake3): {build_ms} ms total");
+        eprintln!(
+            "est. boundary-hash share of build_tree: blake3≈{:.0}ms  sha256≈{:.0}ms  (Δ≈{:.0}ms/100k entries)",
+            blake3_ns * 100_000.0 / 1e6,
+            sha_ns * 100_000.0 / 1e6,
+            (sha_ns - blake3_ns) * 100_000.0 / 1e6
+        );
+        eprintln!("(acc={acc})");
+    }
+
     #[test]
     fn put_and_load_leaf_node() {
         let store = MemoryBlockStore::new();
