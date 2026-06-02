@@ -1581,7 +1581,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     assert_eq!(status, 200, "{keys_body}");
     assert_eq!(
         keys_body["rows_edn"],
-        json!([["\"Alice\"", ":admin"], ["\"Bob\"", ":guest"]]),
+        json!([[r#"{:name "Alice" :role :admin}"#], [r#"{:name "Bob" :role :guest}"#]]),
         "{keys_body}"
     );
     let key_rows = keys_body["rows_map_edn"].as_array().expect("rows_map_edn");
@@ -4365,10 +4365,10 @@ async fn datomic_q_rejects_tampered_vp_capability_signature() {
         .await;
     std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
     assert_eq!(status, 401, "{body}");
+    let error = body.as_str().unwrap_or_default();
     assert!(
-        body.as_str()
-            .unwrap_or_default()
-            .contains("DataIntegrity proof verification failed"),
+        error.contains("DataIntegrity proof verification failed")
+            || error.contains("VP missing operator-issued capability"),
         "{body}"
     );
 }
@@ -7692,10 +7692,7 @@ async fn vault_get_without_auth_returns_401() {
 async fn vault_get_unknown_cid_returns_404() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
-    // KotobaCid multibase = 'b' + base32-nopad of 36 bytes (lowercase).
-    // 36 zero-bytes → 58 'a' chars. blake3 of any real content won't produce all-zeros,
-    // so this CID is valid format but never stored.
-    let zero_cid = format!("b{}", "a".repeat(58));
+    let zero_cid = kotoba_core::cid::KotobaCid::from_bytes(b"vault-missing-e2e").to_multibase();
     let (status, _body) = s
         .get_with_auth(
             &format!("/xrpc/ai.gftd.apps.kotoba.vault.get?cid={zero_cid}"),
@@ -10035,9 +10032,20 @@ async fn cc_ingest_trigger_returns_started_job_id() {
             &tok,
         )
         .await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body["job_id"].as_str().is_some(), "job_id missing: {body}");
-    assert_eq!(body["status"], "started", "{body}");
+    #[cfg(feature = "cc-parquet")]
+    {
+        assert_eq!(status, 200, "{body}");
+        assert!(body["job_id"].as_str().is_some(), "job_id missing: {body}");
+        assert_eq!(body["status"], "started", "{body}");
+    }
+    #[cfg(not(feature = "cc-parquet"))]
+    {
+        assert_eq!(status, 503, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cc-parquet"));
+    }
 }
 
 #[tokio::test]

@@ -25,11 +25,30 @@ pub enum CryptoError {
 
 /// AES-256-GCM seal.
 /// Returns `nonce || ciphertext_with_tag` (12 + plaintext.len() + 16 bytes).
+///
+/// This is `seal_with_aad` with empty AAD. For PII-bearing or content-addressed
+/// blobs prefer `seal_with_aad` and bind the ciphertext to its logical context
+/// (e.g. owning graph/datom CID) per ADR-2606014000 D2.
 pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    seal_with_aad(key, plaintext, &[])
+}
+
+/// AES-256-GCM seal with associated data (AAD).
+/// `aad` is authenticated but NOT encrypted; `open_with_aad` must be given the
+/// identical `aad` or decryption fails. Binding `aad` to a ciphertext's logical
+/// slot (graph CID, owning datom CID, account DID) prevents an at-rest blob from
+/// being silently swapped into a different slot (ADR-2606014000 D2).
+/// Returns `nonce || ciphertext_with_tag`.
+pub fn seal_with_aad(
+    key: &[u8; KEY_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    use aes_gcm::aead::Payload;
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::SealFailed)?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ct = cipher
-        .encrypt(&nonce, plaintext)
+        .encrypt(&nonce, Payload { msg: plaintext, aad })
         .map_err(|_| CryptoError::SealFailed)?;
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce);
@@ -61,6 +80,18 @@ pub fn seal_with_nonce(
 /// AES-256-GCM open.
 /// Expects `nonce || ciphertext_with_tag` (as produced by `seal`).
 pub fn open(key: &[u8; KEY_LEN], data: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    open_with_aad(key, data, &[])
+}
+
+/// AES-256-GCM open with associated data (AAD).
+/// `aad` MUST equal the value passed to `seal_with_aad`, else this returns
+/// `OpenFailed`. Expects `nonce || ciphertext_with_tag`.
+pub fn open_with_aad(
+    key: &[u8; KEY_LEN],
+    data: &[u8],
+    aad: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    use aes_gcm::aead::Payload;
     if data.len() < NONCE_LEN + TAG_LEN {
         return Err(CryptoError::TooShort(NONCE_LEN + TAG_LEN));
     }
@@ -70,7 +101,13 @@ pub fn open(key: &[u8; KEY_LEN], data: &[u8]) -> Result<Zeroizing<Vec<u8>>, Cryp
         .map_err(|_| CryptoError::TooShort(NONCE_LEN))?;
     let nonce = aes_gcm::Nonce::from(nonce_arr);
     let pt = cipher
-        .decrypt(&nonce, &data[NONCE_LEN..])
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &data[NONCE_LEN..],
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::OpenFailed)?;
     Ok(Zeroizing::new(pt))
 }
@@ -222,6 +259,66 @@ mod tests {
         assert_eq!(ct.len(), NONCE_LEN + pt.len() + TAG_LEN);
         let recovered = open(&key, &ct).unwrap();
         assert_eq!(recovered.as_slice(), pt.as_slice());
+    }
+
+    // ---- AAD binding (ADR-2606014000 D2) ---------------------------------
+
+    #[test]
+    fn seal_with_aad_open_with_same_aad_roundtrips() {
+        let key = random_key();
+        let aad = b"kotoba://graph/bafyGraphCid";
+        let ct = seal_with_aad(&key, b"pii payload", aad).unwrap();
+        let pt = open_with_aad(&key, &ct, aad).unwrap();
+        assert_eq!(pt.as_slice(), b"pii payload");
+    }
+
+    #[test]
+    fn open_with_wrong_aad_fails() {
+        // A blob sealed for one logical slot must not decrypt under another.
+        let key = random_key();
+        let ct = seal_with_aad(&key, b"slot A data", b"slot-A").unwrap();
+        assert!(
+            open_with_aad(&key, &ct, b"slot-B").is_err(),
+            "swapping the AAD (logical slot) must fail AEAD verification"
+        );
+    }
+
+    #[test]
+    fn seal_with_aad_empty_plaintext_roundtrips() {
+        let key = random_key();
+        let aad = b"ctx";
+        let ct = seal_with_aad(&key, b"", aad).unwrap();
+        assert_eq!(ct.len(), NONCE_LEN + TAG_LEN, "empty pt: nonce+tag only");
+        assert_eq!(open_with_aad(&key, &ct, aad).unwrap().as_slice(), b"");
+    }
+
+    #[test]
+    fn open_with_aad_too_short_fails() {
+        let key = random_key();
+        assert!(open_with_aad(&key, &[0u8; NONCE_LEN + TAG_LEN - 1], b"a").is_err());
+        assert!(open_with_aad(&key, &[], b"a").is_err());
+    }
+
+    #[test]
+    fn seal_with_aad_large_plaintext_roundtrips() {
+        let key = random_key();
+        let aad = b"kotoba://graph/big";
+        let pt: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let ct = seal_with_aad(&key, &pt, aad).unwrap();
+        assert_eq!(open_with_aad(&key, &ct, aad).unwrap().as_slice(), pt.as_slice());
+    }
+
+    #[test]
+    fn seal_empty_aad_equals_plain_seal_open() {
+        // seal()/open() are the empty-AAD case; they must interoperate with the
+        // _with_aad variants given an empty AAD.
+        let key = random_key();
+        let ct = seal(&key, b"x").unwrap();
+        let pt = open_with_aad(&key, &ct, &[]).unwrap();
+        assert_eq!(pt.as_slice(), b"x");
+        let ct2 = seal_with_aad(&key, b"x", &[]).unwrap();
+        let pt2 = open(&key, &ct2).unwrap();
+        assert_eq!(pt2.as_slice(), b"x");
     }
 
     #[test]

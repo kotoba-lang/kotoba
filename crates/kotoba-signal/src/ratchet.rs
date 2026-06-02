@@ -156,7 +156,12 @@ impl RatchetState {
 
     fn skip_message_keys(&mut self, until: u32) -> Result<(), SignalError> {
         if until.saturating_sub(self.recv_counter) > MAX_SKIP {
-            return Err(SignalError::CounterMismatch);
+            // Skip gap exceeds MAX_SKIP → DoS guard against unbounded skipped-key
+            // allocation. Use the purpose-built variant (distinct from a
+            // malformed-counter `CounterMismatch`) so callers can tell the
+            // skip-limit case apart. Previously this returned `CounterMismatch`,
+            // leaving `TooManySkippedKeys` dead.
+            return Err(SignalError::TooManySkippedKeys);
         }
         while let Some(ck) = self.recv_chain_key.as_mut() {
             if self.recv_counter >= until {
@@ -310,5 +315,31 @@ mod tests {
         // Deliver second before first — skipped-keys path
         assert_eq!(bob.decrypt(&m1).unwrap(), b"second");
         assert_eq!(bob.decrypt(&m0).unwrap(), b"first");
+    }
+
+    #[test]
+    fn too_many_skipped_keys_rejected() {
+        // DoS protection: a message whose counter is more than MAX_SKIP (1000)
+        // ahead of the receiver must be rejected rather than allocating unbounded
+        // skipped-key state.
+        let (mut alice, mut bob) = make_pair();
+        let _m0 = alice.encrypt(b"m0").unwrap(); // counter 0
+        let mut last = alice.encrypt(b"m").unwrap();
+        for _ in 0..1001 {
+            last = alice.encrypt(b"m").unwrap(); // advance well past MAX_SKIP
+        }
+        // bob is still at recv_counter 0; decrypting `last` would skip > 1000 keys.
+        let result = bob.decrypt(&last);
+        assert!(
+            matches!(result, Err(crate::SignalError::TooManySkippedKeys)),
+            "expected TooManySkippedKeys, got {result:?}"
+        );
+        // The bounded gap (out_of_order_delivery) still works, proving the limit is
+        // a ceiling, not a hard cap on any skipping.
+        let (mut a2, mut b2) = make_pair();
+        let first = a2.encrypt(b"a").unwrap();
+        let second = a2.encrypt(b"b").unwrap();
+        assert_eq!(b2.decrypt(&second).unwrap(), b"b");
+        assert_eq!(b2.decrypt(&first).unwrap(), b"a");
     }
 }

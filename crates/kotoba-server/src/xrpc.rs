@@ -3364,6 +3364,9 @@ fn datomic_datoms_match_components(
     index: DatomicDatomsIndex,
     components: &[kotoba_edn::EdnValue],
 ) -> Result<bool, (StatusCode, String)> {
+    if !datomic_datoms_value_matches_index(datom, index) {
+        return Ok(false);
+    }
     for (position, component) in components.iter().enumerate() {
         let matches = match (index, position) {
             (DatomicDatomsIndex::Eavt, 0) => datom.e == datomic_component_entity(component),
@@ -3398,6 +3401,21 @@ fn datomic_datoms_match_components(
         }
     }
     Ok(true)
+}
+
+fn datomic_datoms_value_matches_index(
+    datom: &kotoba_datomic::Datom,
+    index: DatomicDatomsIndex,
+) -> bool {
+    if !matches!(index, DatomicDatomsIndex::Vaet) {
+        return true;
+    }
+    match &datom.v {
+        kotoba_edn::EdnValue::String(value) => {
+            kotoba_core::cid::KotobaCid::from_multibase(value).is_some()
+        }
+        _ => false,
+    }
 }
 
 fn datomic_datoms_sort_key(
@@ -4970,8 +4988,19 @@ pub async fn datomic_datoms(
         req.remote_peer.as_deref(),
         req.remote_ipns_name.as_deref(),
     )? {
+        let limit = req.limit.unwrap_or(1000).min(10_000) as usize;
+        datoms.retain(|datom| datomic_datoms_value_matches_index(datom, index));
+        let mut fallback_datoms = db.datoms();
+        fallback_datoms.sort_by_key(|datom| datomic_datoms_sort_key(datom, index));
+        for datom in fallback_datoms {
+            if datoms.contains(&datom) {
+                continue;
+            }
+            if datomic_datoms_match_components(&datom, index, &components)? {
+                datoms.push(datom);
+            }
+        }
         datoms.sort_by_key(|datom| datomic_datoms_sort_key(datom, index));
-        let limit = req.limit.unwrap_or(1000).min(10_000);
         let datoms = datoms.into_iter().take(limit).collect::<Vec<_>>();
         let datom_count = datoms.len();
         return Ok((
@@ -7298,7 +7327,7 @@ pub async fn commit_store(
     let expected_parent = current_head
         .as_ref()
         .and_then(|record| KotobaCid::from_multibase(&record.value));
-    let db = require_distributed_datomic_db(&state, &graph_cid, None, None, None, None)?;
+    let db = current_db_for_graph(&state, &graph_cid).await?;
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     let report = writer
         .commit_datoms(CommitDatomsRequest {
@@ -7423,7 +7452,7 @@ pub async fn graph_query(
     const MAX_QUERY_RESULTS: u64 = 1_000;
     let limit = req.limit.unwrap_or(100).min(MAX_QUERY_RESULTS) as usize;
 
-    let db = require_distributed_datomic_db(&state, &graph_cid, None, None, None, None)?;
+    let db = current_db_for_graph(&state, &graph_cid).await?;
     let mut quads: Vec<_> = db
         .datoms()
         .into_iter()

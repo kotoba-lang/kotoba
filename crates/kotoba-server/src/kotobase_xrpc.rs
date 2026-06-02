@@ -1284,8 +1284,10 @@ mod tests {
     }
 
     #[test]
-    fn all_nsids_count_is_six() {
-        assert_eq!(ALL_NSIDS.len(), 6, "expected 6 NSID constants in ALL_NSIDS");
+    fn all_nsids_count_is_seven() {
+        // Guard against accidental NSID add/remove — bump consciously. Currently:
+        // account.create/status, pin.create/list/delete, usage.get, pre.revoke.
+        assert_eq!(ALL_NSIDS.len(), 7, "expected 7 NSID constants in ALL_NSIDS");
     }
 
     #[test]

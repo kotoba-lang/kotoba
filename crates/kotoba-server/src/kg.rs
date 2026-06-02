@@ -728,6 +728,14 @@ pub async fn kg_embed(
         ));
     }
     let graph_cid = kg_graph_cid();
+    let tx_cid = kg_tx_cid("embed", &[&req.entity_id]);
+    let auth = authorize_kg_write(
+        &state,
+        &headers,
+        req.cacao_b64.as_deref(),
+        req.auth_presentation.as_ref(),
+        &tx_cid,
+    )?;
 
     let quads = current_graph_quads(&state, &graph_cid).await?;
     let subject =
@@ -760,14 +768,6 @@ pub async fn kg_embed(
 
     let dims = vector.len();
     let datom = kg_datom(&subject, "kg/label_vec", KqeValue::VectorF32(vector));
-    let tx_cid = kg_tx_cid("embed", &[&req.entity_id]);
-    let auth = authorize_kg_write(
-        &state,
-        &headers,
-        req.cacao_b64.as_deref(),
-        req.auth_presentation.as_ref(),
-        &tx_cid,
-    )?;
     commit_kg_datoms(
         &state,
         subject,

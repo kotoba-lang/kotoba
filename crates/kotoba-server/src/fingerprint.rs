@@ -328,6 +328,7 @@ mod tests {
 
         let commit = writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: "k51-request-audit-distributed".into(),
                 graph,
                 datoms,

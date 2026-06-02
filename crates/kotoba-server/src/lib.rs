@@ -2,6 +2,7 @@ pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
 pub mod dht_transport;
+pub mod econ;
 pub mod email_xrpc;
 pub mod fingerprint;
 pub mod firehose;
@@ -13,6 +14,9 @@ pub mod media_xrpc;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
+pub mod account_xrpc;
+pub mod pds_session;
+pub mod pds_xrpc;
 pub mod pre_proxy;
 pub mod server;
 pub mod signal_xrpc;
@@ -72,6 +76,7 @@ mod tests {
         super::email_xrpc::NSID_EMAIL_LIST,
         super::email_xrpc::NSID_EMAIL_READ,
         super::email_xrpc::NSID_EMAIL_INGEST,
+        super::email_xrpc::NSID_EMAIL_SEND,
         // attestation
         super::attestation::NSID_ATTEST_CLAIM,
         super::attestation::NSID_ATTEST_CHALLENGE,
@@ -238,6 +243,203 @@ mod tests {
         // but definitely NOT a 404 Not Found (which means no route matched)
         assert_ne!(response.status(), axum::http::StatusCode::NOT_FOUND);
     }
+
+    // ── HTTP integration: PDS session PoP + zero-access endpoints (ADR-2606015000) ──
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn post_json(uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Build a valid did:key session PoP (compact EdDSA JWS) for an integration test.
+    fn make_didkey_pop() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&sk.verifying_key().to_bytes());
+        let header = B64U.encode(b"{\"alg\":\"EdDSA\"}");
+        let payload = B64U.encode(format!("{{\"iss\":\"{did}\",\"exp\":9999999999}}").as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let sig = sk.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", B64U.encode(sig.to_bytes()))
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_accepts_valid_didkey_pop() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(&uri, serde_json::json!({ "token": make_didkey_pop() })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], serde_json::Value::Bool(true), "body={v}");
+        assert!(v["did"].as_str().unwrap().starts_with("did:key:z6Mk"));
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_rejects_garbage_token() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(&uri, serde_json::json!({ "token": "not.a.jws" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["valid"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn account_wrapped_ark_put_requires_auth() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        // No Authorization header → owner-auth must reject (not 404, not 200).
+        let resp = app
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({ "did": "did:web:etzhayyim.com:actor:alice", "credentialId": "cred-1", "wrappedArk": "AAAA" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn signal_resolve_identity_unknown_returns_404() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!(
+            "/xrpc/{}?did=did:key:zUnknownActor",
+            super::signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY
+        );
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // No binding stored for this DID → 404 (route matched, not 404-no-route).
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn signal_publish_identity_requires_auth() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY);
+        // No Authorization header → publish must reject (not store unauthenticated).
+        let resp = app
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({
+                    "did": "did:key:zAlice",
+                    "signalIdentityKey": "AAAA",
+                    "signalDhKey": "AAAA",
+                    "signalRegistrationId": 1,
+                    "createdAt": "2026-06-02T00:00:00Z",
+                    "signature": "AAAA"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_wrapped_ark_put_then_get_roundtrip() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let did = "did:web:etzhayyim.com:actor:rt";
+        // jwt_sub/jwt_exp_elapsed are signature-agnostic (edge BFF is the trust
+        // boundary), so a sub-only, exp-less bearer authenticates as `did`.
+        let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{payload_b64}.x");
+        let wrapped = "QUFBQUFBQUFBQUFB"; // opaque wrap blob (server stores verbatim)
+
+        // PUT — store the wrapped ARK.
+        let put_uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let put_req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&put_uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({ "did": did, "credentialId": "cred-rt", "wrappedArk": wrapped }).to_string(),
+            ))
+            .unwrap();
+        let put_resp = app.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(put_resp.status(), axum::http::StatusCode::OK, "put should succeed");
+
+        // GET — same opaque blob comes back (shelf roundtrip through the same state).
+        let get_uri = format!(
+            "/xrpc/{}?did={}&credentialId=cred-rt",
+            super::account_xrpc::NSID_ACCOUNT_GET_WRAPPED_ARK,
+            did
+        );
+        let get_req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&get_uri)
+            .header("authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let get_resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), axum::http::StatusCode::OK, "get should succeed");
+        let v = body_json(get_resp).await;
+        assert_eq!(v["wrappedArk"], serde_json::Value::String(wrapped.to_string()));
+        assert_eq!(v["did"], serde_json::Value::String(did.to_string()));
+    }
+
+    #[tokio::test]
+    async fn account_wrapped_ark_get_missing_returns_404() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let did = "did:web:etzhayyim.com:actor:nobody";
+        let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{payload_b64}.x");
+        // Authenticated, but no wrap was ever stored for this (did, credentialId).
+        let uri = format!(
+            "/xrpc/{}?did={}&credentialId=never-stored",
+            super::account_xrpc::NSID_ACCOUNT_GET_WRAPPED_ARK,
+            did
+        );
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
 }
 
 pub fn build_router(state: Arc<KotobaState>) -> Router {
@@ -280,6 +482,14 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", xrpc::NSID_GRAPH_QUERY),
             get(xrpc::graph_query),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_ECON_BALANCE),
+            post(xrpc::econ_balance),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_ECON_CREDIT),
+            post(xrpc::econ_credit),
         )
         .route(
             &format!("/xrpc/{}", xrpc::NSID_WEIGHT_PUT),
@@ -555,6 +765,11 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             // 33 MiB raw email base64 + JSON framing overhead
             post(email_xrpc::email_ingest).layer(DefaultBodyLimit::max(36 * 1024 * 1024)),
         )
+        .route(
+            &format!("/xrpc/{}", email_xrpc::NSID_EMAIL_SEND),
+            // up to 256 recipients × 1 MiB Signal envelope + JSON framing
+            post(email_xrpc::email_send).layer(DefaultBodyLimit::max(300 * 1024 * 1024)),
+        )
         // ── Signal Protocol E2E (ai.gftd.signal.*) ─────────────────────────
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS),
@@ -576,6 +791,28 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY),
             post(signal_xrpc::distribute_sender_key),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY),
+            post(signal_xrpc::publish_signal_identity),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY),
+            get(signal_xrpc::resolve_signal_identity),
+        )
+        // ── Account key custody (wrapped-ARK store, ADR-2606014000 L1) ──────
+        .route(
+            &format!("/xrpc/{}", account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK),
+            post(account_xrpc::put_wrapped_ark),
+        )
+        .route(
+            &format!("/xrpc/{}", account_xrpc::NSID_ACCOUNT_GET_WRAPPED_ARK),
+            get(account_xrpc::get_wrapped_ark),
+        )
+        // ── PDS session auth (ADR-2606015000 — PDS-on-kotoba refactor) ──────
+        .route(
+            &format!("/xrpc/{}", pds_xrpc::NSID_PDS_SESSION_VERIFY),
+            post(pds_xrpc::session_verify),
         )
         // ── Attestation ────────────────────────────────────────────────────
         .route(

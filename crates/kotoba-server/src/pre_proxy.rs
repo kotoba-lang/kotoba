@@ -203,7 +203,11 @@ mod tests {
             iss: accessor_did.clone(),
             aud: "kotoba://test".into(),
             issued_at: "2026-05-26T00:00:00Z".into(),
-            expiry: None,
+            // Explicit far-future expiry → DelegationChain::verify takes the `exp`
+            // branch and skips the `issued_at` 7-day max-age cap. Without this the
+            // fixture was a date-rot time bomb (failed once `now` passed issued_at
+            // + MAX_CACAO_AGE_SECS).
+            expiry: Some("2099-12-31T23:59:59Z".into()),
             nonce: "happy-path-nonce".into(),
             domain: "kotoba.test".into(),
             statement: None,

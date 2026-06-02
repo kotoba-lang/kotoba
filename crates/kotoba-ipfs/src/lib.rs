@@ -18,7 +18,7 @@ pub use cid::{
 pub use ipld_core::cid::Cid as IpldCid;
 pub use ipns::{
     InMemoryIpnsRegistry, IpnsName, IpnsRecord, IpnsRegistry, IpnsRegistryError, KuboIpnsRegistry,
-    SignedIpnsRegistry,
+    PersistentIpnsRegistry, SignedIpnsRegistry,
 };
 pub use node::{
     BandwidthStats, BitswapStats, BlockPut, BlockRm, BlockStat, DagImport, DagResolve, DagStat,
