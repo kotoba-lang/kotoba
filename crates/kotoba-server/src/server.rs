@@ -698,11 +698,21 @@ impl KotobaState {
             // it starts with O(state) reads/db_before from the first transact
             // (no legacy delta-only history to cold-replay).
             let yk_g2 = NamedGraph::new("yukkuri-kg-v2", GraphVisibility::Authenticated);
+            // v3: clean-slate graph paired with the commit-block durability fix
+            // (put_durable + recursive head pin in kotoba-datomic, 2026-06-01). v2's
+            // head blocks were lost to TieredBlockStore's fire-and-forget async cold
+            // copy across a liveness/OOM restart → cold db_from_head 500'd forever.
+            // v3 starts fresh AND every commit's blocks are now synchronously durable
+            // in the kubo cold tier + recursively pinned, so a restart can always
+            // reconstruct the head. Authenticated so the lg pod's Bearer token reads
+            // back without a CACAO delegation chain.
+            let yk_g3 = NamedGraph::new("yukkuri-kg-v3", GraphVisibility::Authenticated);
             map.insert(pub_g.cid.clone(), (pub_g.name.clone(), pub_g.visibility));
             map.insert(auth_g.cid.clone(), (auth_g.name.clone(), auth_g.visibility));
             map.insert(kg_g.cid.clone(), (kg_g.name.clone(), kg_g.visibility));
             map.insert(yk_g.cid.clone(), (yk_g.name.clone(), yk_g.visibility));
             map.insert(yk_g2.cid.clone(), (yk_g2.name.clone(), yk_g2.visibility));
+            map.insert(yk_g3.cid.clone(), (yk_g3.name.clone(), yk_g3.visibility));
             Arc::new(tokio::sync::RwLock::new(map))
         };
 
