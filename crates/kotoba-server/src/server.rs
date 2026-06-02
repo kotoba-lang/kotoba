@@ -926,9 +926,8 @@ impl KotobaState {
         &self,
         owner_did: &str,
     ) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
-        Ok(self
-            .crypto_required()?
-            .derive_wrapping_key(owner_did.as_bytes()))
+        let key = blake3::derive_key("kotoba-server-pre-wrapping-key", owner_did.as_bytes());
+        Ok(zeroize::Zeroizing::new(key))
     }
 
     /// Revoke a PRE re-key grant locally AND propagate the revocation to peers
@@ -944,12 +943,11 @@ impl KotobaState {
         let Some(reg) = &self.pre_key_registry else {
             return Ok(());
         };
-        let (_evidence_cid, bytes) = reg
-            .revoke_emit_warrant_bytes(owner_did, accessor_did)
-            .await?;
+        let evidence_cid = reg.revoke_emit_warrant(owner_did, accessor_did).await?;
         // Channel carries raw KSE names (no "kotoba/" prefix); publish adds it.
         if let Some(tx) = &self.gossip_tx {
-            tx.try_send(("rekey/revoke".to_string(), bytes)).ok();
+            tx.try_send(("rekey/revoke".to_string(), evidence_cid.to_multibase().into_bytes()))
+                .ok();
         }
         Ok(())
     }
@@ -1161,7 +1159,6 @@ impl KotobaState {
                 ipns_name: ipns_name.clone(),
                 graph: graph_cid.clone(),
                 datoms: distributed_datoms,
-                covering_datoms: None,
                 expected_parent,
                 tx_cid: None,
                 author: self.operator_did.clone(),
@@ -1607,7 +1604,6 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
-                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
                 datoms: doc.to_datoms(tx_cid.clone()),
@@ -1717,7 +1713,6 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
-                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
                 datoms,

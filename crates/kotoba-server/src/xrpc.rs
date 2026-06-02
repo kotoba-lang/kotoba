@@ -47,6 +47,8 @@ pub const NSID_AGENT_SYNC_ADV: &str = "ai.gftd.apps.kotoba.agent.syncadvance";
 pub const NSID_AGENT_SYNC_CLOSE: &str = "ai.gftd.apps.kotoba.agent.syncclose";
 pub const NSID_VAULT_PUT: &str = "ai.gftd.apps.kotoba.vault.put";
 pub const NSID_VAULT_GET: &str = "ai.gftd.apps.kotoba.vault.get";
+pub const NSID_ECON_BALANCE: &str = "ai.gftd.apps.kotoba.econ.balance";
+pub const NSID_ECON_CREDIT: &str = "ai.gftd.apps.kotoba.econ.credit";
 
 use crate::server::KotobaState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -78,6 +80,17 @@ pub struct QuadCreateReq {
     /// When present: verified before write; `cacao.p.graph_cid()` must match `graph`.
     /// Issuer DID becomes the authoritative namespace for this write.
     pub cacao_b64: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EconBalanceReq {
+    pub did: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EconCreditReq {
+    pub did: String,
+    pub amount: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -803,6 +816,41 @@ pub async fn health(State(state): State<Arc<KotobaState>>) -> impl IntoResponse 
             peer_count: neighborhood.peers.len(),
         },
     })
+}
+
+pub async fn econ_balance(
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<EconBalanceReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+    if req.did.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "did required".to_string()));
+    }
+    let balance = state.econ.balance(&req.did).await;
+    Ok(Json(serde_json::json!({
+        "did": req.did,
+        "balance_mkoto": balance,
+        "cost_per_datom_mkoto": state.econ.cost_per_datom(),
+        "enabled": state.econ.enabled(),
+    })))
+}
+
+pub async fn econ_credit(
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<EconCreditReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+    if req.did.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "did required".to_string()));
+    }
+    let balance = state.econ.credit(&req.did, req.amount).await;
+    Ok(Json(serde_json::json!({
+        "did": req.did,
+        "credited_mkoto": req.amount,
+        "balance_mkoto": balance,
+    })))
 }
 
 fn map_delegation_error(e: kotoba_auth::DelegationError) -> (StatusCode, String) {
