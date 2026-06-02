@@ -440,6 +440,69 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn signal_identity_publish_then_resolve_didkey_roundtrip() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use ed25519_dalek::SigningKey;
+        use kotoba_signal::SignalBinding;
+        use tower::ServiceExt;
+
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+
+        // did:key issuer — the binding is signed by the very key the DID encodes,
+        // so resolve verifies it trustlessly (no external resolution).
+        let did_sk = SigningKey::from_bytes(&[5u8; 32]);
+        let did = kotoba_auth::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
+        let signal = kotoba_signal::identity::IdentityKeyPair::generate().public_key();
+        let binding = SignalBinding::from_identity(&did, &signal, 99, "2026-06-02T00:00:00Z");
+        let sig = binding.sign(&did_sk);
+
+        let sub_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{sub_b64}.x");
+
+        // PUBLISH — store the DID-signed binding (verified on publish for did:key).
+        let pub_uri = format!("/xrpc/{}", super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY);
+        let pub_req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&pub_uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "did": did,
+                    "signalIdentityKey": B64U.encode(&binding.signal_identity_key),
+                    "signalDhKey": B64U.encode(&binding.signal_dh_key),
+                    "signalRegistrationId": 99,
+                    "createdAt": "2026-06-02T00:00:00Z",
+                    "signature": B64U.encode(&sig),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let pub_resp = app.clone().oneshot(pub_req).await.unwrap();
+        assert_eq!(pub_resp.status(), axum::http::StatusCode::OK, "publish should succeed");
+        assert_eq!(body_json(pub_resp).await["verifiedOnPublish"], serde_json::Value::Bool(true));
+
+        // RESOLVE — the stored binding verifies against the did:key (trustless).
+        let res_uri = format!(
+            "/xrpc/{}?did={}",
+            super::signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY,
+            did
+        );
+        let res_req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&res_uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res_resp = app.oneshot(res_req).await.unwrap();
+        assert_eq!(res_resp.status(), axum::http::StatusCode::OK, "resolve should succeed");
+        let v = body_json(res_resp).await;
+        assert_eq!(v["verified"], serde_json::Value::Bool(true), "body={v}");
+        assert_eq!(v["did"], serde_json::Value::String(did));
+    }
 }
 
 pub fn build_router(state: Arc<KotobaState>) -> Router {

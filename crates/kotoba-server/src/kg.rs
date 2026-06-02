@@ -2143,6 +2143,7 @@ mod tests {
         let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
         let first = writer
             .commit_datoms(CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
                 datoms: vec![
@@ -2167,6 +2168,7 @@ mod tests {
             .unwrap();
         writer
             .commit_datoms(CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
                 datoms: vec![
@@ -2309,6 +2311,7 @@ mod tests {
         let alice = KotobaCid::from_bytes(b"kg-sparql-vp-private-alice");
         DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
             .commit_datoms(CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
                 datoms: vec![Datom::assert(

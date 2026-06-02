@@ -4649,7 +4649,8 @@ pub async fn datomic_transact(
         },
         None => kotoba_datomic::Db::from_datoms(Vec::new(), None),
     };
-    let tx_preview = kotoba_datomic::Connection::from_datoms(db_before.all_datoms())
+    let db_before_datoms = db_before.all_datoms();
+    let tx_preview = kotoba_datomic::Connection::from_datoms(db_before_datoms.clone())
         .transact(tx_data.clone())
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic transact: {e}")))?;
@@ -4771,16 +4772,15 @@ pub async fn datomic_transact(
         journal_cids.push(journal_cid);
     }
 
-    // Refresh the resident db_before cache so the next transact for this graph
-    // serves from RAM instead of a cold scan. The cached DB is netted via
-    // `current_datoms` (retraction tombstones removed) with `basis_t` = the new
-    // head's tx_cid, making it byte-identical to `db_from_head(new_head)` — so a
-    // cache-served db_before produces the same tx_cid/commit_cid as a cold scan
-    // (ADR-2605302130).
+    // Refresh the resident db_before cache from the actual committed datoms
+    // (including auth/capability metadata injected by the distributed writer), so
+    // immediate reads see the same DB that a cold scan of the new head would.
+    let mut cached_datoms = db_before_datoms;
+    cached_datoms.extend(tx_datoms.iter().cloned());
     *live_guard = Some(crate::server::LiveDatomicGraph {
         head: distributed_commit.commit.cid.clone(),
         db: kotoba_datomic::Db::from_datoms(
-            kotoba_datomic::current_datoms(&report.db_after.all_datoms()),
+            kotoba_datomic::current_datoms(&cached_datoms),
             report.db_after.basis_t.clone(),
         ),
     });

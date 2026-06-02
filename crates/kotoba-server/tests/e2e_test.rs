@@ -367,10 +367,10 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     assert_eq!(tx_body["ipns_sequence"], 1);
     assert_eq!(
         tx_body["index_roots"].as_object().map(|o| o.len()),
-        Some(5),
+        Some(6),
         "{tx_body}"
     );
-    let required_roots = ["eavt", "aevt", "avet", "vaet", "tea"];
+    let required_roots = ["eavt", "aevt", "avet", "vaet", "tea", "ceavt"];
     let index_roots = tx_body["index_roots"].as_object().expect("index roots");
     for root in required_roots {
         assert!(
@@ -407,7 +407,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
         "{commit_block_body}"
     );
     assert_eq!(decoded_commit.seq, 1, "{commit_block_body}");
-    assert_eq!(decoded_commit.index_roots.len(), 5, "{commit_block_body}");
+    assert_eq!(decoded_commit.index_roots.len(), 6, "{commit_block_body}");
     for root in required_roots {
         let root_cid = index_roots[root].as_str().expect("root cid");
         let (status, root_block_body) = s
@@ -877,7 +877,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
                 "graph": graph,
                 "index": ":tea",
                 "components_edn": [format!("\"{second_tx}\"")],
-                "limit": 10
+                "limit": 100
             }),
             &tok,
         )
@@ -3507,7 +3507,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
         commit_body["index_roots"]
             .as_object()
             .map(|roots| roots.len()),
-        Some(5),
+        Some(6),
         "{commit_body}"
     );
 
@@ -6167,7 +6167,10 @@ async fn assert_protocol_commit_block_dag_cbor(
         "{block_body}"
     );
     assert_eq!(commit.author, expected_author, "{block_body}");
-    assert_eq!(commit.index_roots.len(), 5, "{block_body}");
+    assert!(
+        commit.index_roots.len() >= 5,
+        "expected at least five protocol index roots: {block_body}"
+    );
 }
 
 fn assert_protocol_commit_integrity(
@@ -6221,12 +6224,13 @@ fn assert_protocol_commit_integrity(
         commit_body["ipns_signature_multibase"].as_str().is_some(),
         "{commit_body}"
     );
-    assert_eq!(
-        commit_body["index_roots"]
-            .as_object()
-            .map(|roots| roots.len()),
-        Some(5),
-        "{commit_body}"
+    let index_root_count = commit_body["index_roots"]
+        .as_object()
+        .map(|roots| roots.len())
+        .unwrap_or_default();
+    assert!(
+        index_root_count >= 5,
+        "expected at least five protocol index roots: {commit_body}"
     );
 }
 

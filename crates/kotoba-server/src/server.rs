@@ -1159,6 +1159,7 @@ impl KotobaState {
                 ipns_name: ipns_name.clone(),
                 graph: graph_cid.clone(),
                 datoms: distributed_datoms,
+                covering_datoms: None,
                 expected_parent,
                 tx_cid: None,
                 author: self.operator_did.clone(),
@@ -1444,11 +1445,13 @@ mod tests {
     fn kotoba_state_new_node_id_deterministic_in_ephemeral_mode() {
         // Two states created without env vars both derive NodeId from a freshly
         // generated ephemeral key — they should differ (each is random).
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
         std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_DID");
         let a = KotobaState::new(None).expect("a");
         let b = KotobaState::new(None).expect("b");
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
         // ephemeral → each call generates a fresh key → different NodeIds
         assert_ne!(
             a.local_node_id.0, b.local_node_id.0,
@@ -1458,8 +1461,17 @@ mod tests {
 
     #[tokio::test]
     async fn register_node_writes_distributed_datomic_head_and_quads() {
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS", "memory");
+        std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
+        std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
+        std::env::remove_var("KOTOBA_AGENT_DID");
         let state = KotobaState::new(None).expect("new");
         state.register_node().await;
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        std::env::remove_var("KOTOBA_IPNS");
 
         use kotoba_core::cid::KotobaCid;
         let graph_cid = KotobaCid::from_bytes(b"kotoba/network/nodes");
@@ -1604,6 +1616,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
                 datoms: doc.to_datoms(tx_cid.clone()),
@@ -1713,6 +1726,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
                 datoms,
@@ -1817,12 +1831,18 @@ mod tests {
     async fn init_crypto_preserves_operator_did() {
         // Guard against the double-generation bug: init_crypto() must not call
         // AgentIdentity::from_env() again; it must reuse the Arc stored in new().
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS", "memory");
         std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_DID");
         let state = KotobaState::new(None).expect("new");
         let did_before = state.operator_did.clone();
         let state = state.init_crypto().await.expect("init_crypto");
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        std::env::remove_var("KOTOBA_IPNS");
         assert_eq!(
             state.operator_did, did_before,
             "operator_did must be unchanged after init_crypto"
