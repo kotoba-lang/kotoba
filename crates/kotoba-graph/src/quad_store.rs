@@ -1299,8 +1299,8 @@ impl QuadStore {
         pred2: &str,
         val2: &str,
     ) -> anyhow::Result<Vec<KotobaCid>> {
-        let vk1 = avet_value_key(&LegacyQuadObject::Text(val1.to_string()));
-        let vk2 = avet_value_key(&LegacyQuadObject::Text(val2.to_string()));
+        let vk1 = avet_value_key(&typed_literal_object(val1));
+        let vk2 = avet_value_key(&typed_literal_object(val2));
         let set1: std::collections::HashSet<[u8; 36]> = self
             .lookup_subject_by_po_cold(graph_cid, pred1, &vk1)
             .await?
@@ -2691,11 +2691,10 @@ impl QuadStore {
                 // Bound object (literal or named node)?
                 match &tp.object {
                     TermPattern::Literal(lit) => {
-                        // AVET: pred + literal (Text-typed, matching the result + store)
-                        let obj_key = lit.value().to_string();
-                        let vk = avet_value_key(&kotoba_kqe::quad::LegacyQuadObject::Text(
-                            obj_key.clone(),
-                        ));
+                        // AVET: pred + literal, typed exactly as the store types it
+                        // (Integer/Float/Bool/Text) so the canonical keys match.
+                        let obj = typed_literal_object(lit.value());
+                        let vk = avet_value_key(&obj);
                         let subjects = self
                             .lookup_subject_by_po_cold(graph_cid, &pred, &vk)
                             .await?;
@@ -2705,7 +2704,7 @@ impl QuadStore {
                                 graph: graph_cid.clone(),
                                 subject: s,
                                 predicate: pred.clone(),
-                                object: kotoba_kqe::quad::LegacyQuadObject::Text(obj_key.clone()),
+                                object: obj.clone(),
                             })
                             .collect());
                     }
@@ -3745,19 +3744,9 @@ fn sparql_term_to_quad_object(
 ) -> anyhow::Result<kotoba_kqe::quad::LegacyQuadObject> {
     use spargebra::term::Term;
     match term {
-        Term::Literal(lit) => {
-            let v = lit.value();
-            if let Ok(i) = v.parse::<i64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Integer(i));
-            }
-            if let Ok(f) = v.parse::<f64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Float(f));
-            }
-            if v == "true" || v == "false" {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Bool(v == "true"));
-            }
-            Ok(kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string()))
-        }
+        // Same typing as the AVET query path (`typed_literal_object`) so stored
+        // and queried values share one canonical key.
+        Term::Literal(lit) => Ok(typed_literal_object(lit.value())),
         Term::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
@@ -4134,6 +4123,23 @@ fn enc_object(o: &LegacyQuadObject) -> Vec<u8> {
 /// route through this.
 fn avet_value_key(object: &LegacyQuadObject) -> Vec<u8> {
     kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::from(object.clone()))
+}
+
+/// Type a SPARQL literal value string into a `LegacyQuadObject` exactly as the
+/// **store** does (`sparql_term_to_quad_object`): `i64` → Integer, `f64` →
+/// Float, `true`/`false` → Bool, else Text. The AVET query path MUST type a
+/// literal the same way the value was stored, or the canonical keys won't match
+/// (a `"100"` stored as Integer would never be found by a Text-typed query).
+fn typed_literal_object(v: &str) -> LegacyQuadObject {
+    if let Ok(i) = v.parse::<i64>() {
+        LegacyQuadObject::Integer(i)
+    } else if let Ok(f) = v.parse::<f64>() {
+        LegacyQuadObject::Float(f)
+    } else if v == "true" || v == "false" {
+        LegacyQuadObject::Bool(v == "true")
+    } else {
+        LegacyQuadObject::Text(v.to_string())
+    }
 }
 
 /// Decode a CBOR-encoded [`LegacyQuadObject`]; empty-text fallback on error.
@@ -6630,6 +6636,44 @@ mod tests {
             "?".into()
         };
         assert_eq!(role, "admin");
+    }
+
+    /// Regression (ADR-2606022150 P2b): a numeric literal is stored as `Integer`
+    /// by the SPARQL writer, so the AVET query path must type the query literal
+    /// the same way — otherwise `keycodec(Integer 100) != keycodec(Text "100")`
+    /// and the value is never found. (The old String `value_key` matched by
+    /// stringification; the canonical codec must not regress this.)
+    #[tokio::test]
+    async fn sparql_insert_numeric_then_select_by_literal_matches() {
+        let qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
+        );
+        let graph = KotobaCid::from_bytes(b"numeric-avet-graph");
+        let a = KotobaCid::from_bytes(b"ent-a").to_multibase();
+        let b = KotobaCid::from_bytes(b"ent-b").to_multibase();
+        qs.sparql_update(
+            &graph,
+            &format!(r#"INSERT DATA {{ <cid:{a}> <score> "100" . <cid:{b}> <score> "20" }}"#),
+        )
+        .await
+        .unwrap();
+
+        // SELECT ?s <score> "100" must find exactly ent-a (numeric match, not "20").
+        let hits = qs
+            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <score> "100" }"#)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "numeric literal 100 must match its entity");
+        assert_eq!(hits[0].subject, KotobaCid::from_multibase(&a).unwrap());
+
+        // "20" matches its own entity, not 100's — no cross-collision.
+        let hits20 = qs
+            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <score> "20" }"#)
+            .await
+            .unwrap();
+        assert_eq!(hits20.len(), 1);
+        assert_eq!(hits20[0].subject, KotobaCid::from_multibase(&b).unwrap());
     }
 
     #[tokio::test]
