@@ -1,9 +1,12 @@
 use anyhow::Result;
 use futures::StreamExt;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
-    gossipsub, identify,
+    autonat, dcutr, gossipsub, identify,
     identity::Keypair,
-    kad, ping, request_response,
+    kad,
+    multiaddr::Protocol,
+    ping, relay, request_response,
     swarm::{Swarm, SwarmEvent},
     Multiaddr, PeerId,
 };
@@ -13,6 +16,37 @@ use crate::bitswap::{BitswapRequest, BitswapResponse, WantSince, BITSWAP_PROTOCO
 use crate::protocol::KOTOBA_SYNC_PROTOCOL;
 
 pub type KotobaSwarmType = Swarm<KotobaBehaviour>;
+
+/// NAT-traversal configuration (clean-room WireGuard/Tailscale-equivalent over
+/// libp2p — AutoNAT + Circuit Relay v2 + DCUtR).
+///
+/// Edge / donated nodes (behind home NAT) use the defaults: they probe their
+/// reachability with AutoNAT, take a relay reservation as a fallback path, and
+/// let DCUtR upgrade relayed links to direct hole-punched connections. Only a
+/// publicly reachable fleet node should set `relay_server = true` so it can
+/// relay for others — a relay is just another peer (no central master).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NatConfig {
+    /// Run the Circuit Relay v2 *server*. Enable only on publicly reachable
+    /// nodes (public IP or port-forward). Off by default.
+    pub relay_server: bool,
+}
+
+/// Build a stable libp2p Ed25519 identity from a 32-byte hex seed (e.g. the
+/// `KOTOBA_P2P_ED25519_HEX` env var) so a node keeps the same `PeerId` — and
+/// therefore the same relay reservations and addresses — across restarts.
+///
+/// Kept deliberately separate from the CACAO/DID *agent* key: the networking
+/// identity and the signing identity are different roles.
+pub fn ed25519_keypair_from_hex(seed_hex: &str) -> Result<Keypair> {
+    let mut bytes = hex::decode(seed_hex.trim())
+        .map_err(|e| anyhow::anyhow!("p2p ed25519 seed: invalid hex: {e}"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("p2p ed25519 seed: expected 32 bytes, got {}", bytes.len());
+    }
+    Keypair::ed25519_from_bytes(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("p2p ed25519 seed: {e}"))
+}
 
 /// High-level wrapper around the libp2p Swarm.
 pub struct KotobaSwarm {
@@ -42,6 +76,21 @@ pub enum KotobaNetEvent {
         peer: PeerId,
         response: BitswapResponse,
     },
+    /// AutoNAT determined our public reachability. `public = true` ⇒ directly
+    /// dialable; `false` ⇒ behind a NAT, so a relay reservation is needed.
+    NatStatusChanged {
+        public: bool,
+    },
+    /// A relayed connection to `peer` was upgraded to a direct (hole-punched)
+    /// connection by DCUtR.
+    DirectConnectionUpgraded {
+        peer: PeerId,
+    },
+    /// A Circuit Relay v2 reservation was accepted by `relay` — this node is now
+    /// reachable at `<relay-addr>/p2p-circuit/p2p/<self>`.
+    RelayReservationAccepted {
+        relay: PeerId,
+    },
 }
 
 impl KotobaSwarm {
@@ -49,11 +98,29 @@ impl KotobaSwarm {
     /// `listen_addr` example: `"/ip4/0.0.0.0/udp/0/quic-v1"`.
     pub async fn new(listen_addr: Multiaddr) -> Result<Self> {
         let keypair = Keypair::generate_ed25519();
-        Self::with_keypair(keypair, listen_addr).await
+        Self::with_config(keypair, listen_addr, NatConfig::default()).await
     }
 
-    /// Create with an existing keypair (for persistent node identity).
+    /// Like [`KotobaSwarm::new`] (fresh identity) but with an explicit
+    /// NAT-traversal config — e.g. to enable the Circuit Relay v2 server on a
+    /// publicly reachable node.
+    pub async fn new_with_config(listen_addr: Multiaddr, nat: NatConfig) -> Result<Self> {
+        let keypair = Keypair::generate_ed25519();
+        Self::with_config(keypair, listen_addr, nat).await
+    }
+
+    /// Create with an existing keypair (for persistent node identity), default
+    /// NAT config (relay client + AutoNAT + DCUtR on, relay server off).
     pub async fn with_keypair(keypair: Keypair, listen_addr: Multiaddr) -> Result<Self> {
+        Self::with_config(keypair, listen_addr, NatConfig::default()).await
+    }
+
+    /// Create with an existing keypair and an explicit NAT-traversal config.
+    pub async fn with_config(
+        keypair: Keypair,
+        listen_addr: Multiaddr,
+        nat: NatConfig,
+    ) -> Result<Self> {
         let local_peer_id = PeerId::from_public_key(&keypair.public());
 
         // GossipSub — lenient validation thresholds for dev
@@ -84,18 +151,39 @@ impl KotobaSwarm {
             request_response::Config::default(),
         );
 
-        let behaviour = KotobaBehaviour {
-            gossipsub,
-            kademlia,
-            identify,
-            ping,
-            bitswap,
+        // ── NAT traversal behaviours (clean-room WG/TS-equivalent) ──────────
+        let autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
+        let dcutr = dcutr::Behaviour::new(local_peer_id);
+        let relay_server = if nat.relay_server {
+            Toggle::from(Some(relay::Behaviour::new(
+                local_peer_id,
+                relay::Config::default(),
+            )))
+        } else {
+            Toggle::from(None)
         };
 
+        // `with_relay_client` injects the Circuit Relay v2 client behaviour into
+        // the builder closure; the relayed connection is secured with Noise and
+        // multiplexed with Yamux (same upgrades as the base QUIC transport).
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic()
-            .with_behaviour(|_| Ok(behaviour))?
+            .with_dns()?
+            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
+            .with_behaviour(move |_keypair, relay_client| {
+                Ok(KotobaBehaviour {
+                    gossipsub,
+                    kademlia,
+                    identify,
+                    ping,
+                    bitswap,
+                    autonat,
+                    relay_client,
+                    dcutr,
+                    relay_server,
+                })
+            })?
             // libp2p defaults idle_connection_timeout to 0 → idle connections close
             // immediately (KeepAliveTimeout) before GossipSub can graft them into a
             // mesh, so the firehose relay never propagates. Hold idle connections
@@ -111,6 +199,51 @@ impl KotobaSwarm {
             swarm,
             local_peer_id,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // NAT traversal helpers (Circuit Relay v2 + DCUtR + AutoNAT)
+    // ------------------------------------------------------------------
+
+    /// Take a Circuit Relay v2 reservation on `relay_addr` so this (NAT'd) node
+    /// becomes reachable at `<relay_addr>/p2p-circuit/p2p/<self>`. Peers that
+    /// dial the circuit then get upgraded to a direct connection by DCUtR.
+    ///
+    /// `relay_addr` MUST already include the relay's `/p2p/<relay-peer-id>`
+    /// suffix (e.g. `/ip4/1.2.3.4/udp/4001/quic-v1/p2p/<relay-id>`).
+    pub fn reserve_relay(&mut self, relay_addr: Multiaddr) -> Result<()> {
+        let circuit = relay_addr.with(Protocol::P2pCircuit);
+        self.swarm.listen_on(circuit)?;
+        Ok(())
+    }
+
+    /// Convenience over [`KotobaSwarm::reserve_relay`] for the `peerid@multiaddr`
+    /// config form (e.g. `KOTOBA_RELAY_PEERS`): appends the relay's
+    /// `/p2p/<peer>` to a bare transport multiaddr before reserving.
+    pub fn reserve_relay_with_peer(
+        &mut self,
+        relay_peer: PeerId,
+        relay_addr: Multiaddr,
+    ) -> Result<()> {
+        self.reserve_relay(relay_addr.with(Protocol::P2p(relay_peer)))
+    }
+
+    /// Dial `target` through a relay. Once the relayed connection is up, DCUtR
+    /// attempts to upgrade it to a direct (hole-punched) link automatically.
+    ///
+    /// `relay_addr` MUST include the relay's `/p2p/<relay-peer-id>` suffix.
+    pub fn dial_via_relay(&mut self, relay_addr: Multiaddr, target: PeerId) -> Result<()> {
+        let addr = relay_addr
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(target));
+        self.swarm.dial(addr)?;
+        Ok(())
+    }
+
+    /// Register a confirmed external (publicly reachable) address — e.g. one
+    /// learned from AutoNAT — so it is advertised to peers via identify.
+    pub fn add_external_address(&mut self, addr: Multiaddr) {
+        self.swarm.add_external_address(addr);
     }
 
     /// Subscribe to a GossipSub topic mapped from a KSE topic name.
@@ -273,7 +406,42 @@ impl KotobaSwarm {
                     return Some(KotobaNetEvent::BitswapResponse { peer, response });
                 }
 
-                _ => { /* ignore ping, identify::Sent, bitswap failures, etc. */ }
+                // AutoNAT: reachability verdict changed (public vs behind-NAT)
+                SwarmEvent::Behaviour(KotobaBehaviourEvent::Autonat(
+                    autonat::Event::StatusChanged { new, .. },
+                )) => {
+                    let public = matches!(new, autonat::NatStatus::Public(_));
+                    tracing::info!(?new, "kotoba-net: autonat reachability changed");
+                    return Some(KotobaNetEvent::NatStatusChanged { public });
+                }
+
+                // DCUtR: a relayed link was upgraded to a direct (hole-punched) one
+                SwarmEvent::Behaviour(KotobaBehaviourEvent::Dcutr(dcutr::Event {
+                    remote_peer_id,
+                    result,
+                })) => match result {
+                    Ok(_) => {
+                        tracing::info!(peer = %remote_peer_id, "kotoba-net: dcutr hole-punch succeeded");
+                        return Some(KotobaNetEvent::DirectConnectionUpgraded {
+                            peer: remote_peer_id,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!(peer = %remote_peer_id, err = ?e, "kotoba-net: dcutr hole-punch failed");
+                    }
+                },
+
+                // Relay client: our reservation on a relay was accepted
+                SwarmEvent::Behaviour(KotobaBehaviourEvent::RelayClient(
+                    relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+                )) => {
+                    tracing::info!(relay = %relay_peer_id, "kotoba-net: relay reservation accepted");
+                    return Some(KotobaNetEvent::RelayReservationAccepted {
+                        relay: relay_peer_id,
+                    });
+                }
+
+                _ => { /* ignore ping, identify::Sent, relay server, bitswap failures, etc. */ }
             }
         }
     }
@@ -491,5 +659,91 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    // ── NAT traversal (AutoNAT + Circuit Relay v2 + DCUtR) ────────────────────
+
+    #[test]
+    fn nat_config_default_has_relay_server_off() {
+        let cfg = NatConfig::default();
+        assert!(!cfg.relay_server, "relay server must be opt-in");
+    }
+
+    #[tokio::test]
+    async fn swarm_with_relay_server_enabled_builds() {
+        // A public node enables the Circuit Relay v2 *server* so it can relay
+        // for NAT'd peers. Construction wires relay_client + dcutr + autonat +
+        // the toggled relay server without panicking.
+        let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let keypair = Keypair::generate_ed25519();
+        let swarm = KotobaSwarm::with_config(keypair, addr, NatConfig { relay_server: true })
+            .await
+            .expect("relay-server swarm init");
+        assert!(!swarm.local_peer_id.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserve_relay_appends_p2p_circuit_without_panic() {
+        // An edge node asks a relay for a reservation. We can't complete the
+        // handshake without a live relay, but listen_on must accept the
+        // /p2p-circuit-suffixed multiaddr (smoke: no panic, no error).
+        let addr: Multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap();
+        let mut swarm = KotobaSwarm::new(addr).await.expect("swarm init");
+        let relay_addr: Multiaddr =
+            format!("/ip4/127.0.0.1/udp/4999/quic-v1/p2p/{}", PeerId::random())
+                .parse()
+                .unwrap();
+        swarm.reserve_relay(relay_addr).expect("reserve_relay accepts circuit addr");
+    }
+
+    #[test]
+    fn kotoba_net_event_nat_status_changed_holds_public() {
+        let event = KotobaNetEvent::NatStatusChanged { public: true };
+        if let KotobaNetEvent::NatStatusChanged { public } = event {
+            assert!(public);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn kotoba_net_event_relay_reservation_holds_relay() {
+        let relay = PeerId::random();
+        let event = KotobaNetEvent::RelayReservationAccepted { relay };
+        if let KotobaNetEvent::RelayReservationAccepted { relay: r } = event {
+            assert_eq!(r, relay);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn kotoba_net_event_direct_connection_upgraded_holds_peer() {
+        let peer = PeerId::random();
+        let event = KotobaNetEvent::DirectConnectionUpgraded { peer };
+        if let KotobaNetEvent::DirectConnectionUpgraded { peer: p } = event {
+            assert_eq!(p, peer);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn ed25519_keypair_from_hex_is_deterministic() {
+        // Same 32-byte seed → same PeerId (stable identity across restarts).
+        let seed = "11".repeat(32); // 32 bytes
+        let a = ed25519_keypair_from_hex(&seed).expect("valid seed");
+        let b = ed25519_keypair_from_hex(&seed).expect("valid seed");
+        assert_eq!(
+            PeerId::from_public_key(&a.public()),
+            PeerId::from_public_key(&b.public()),
+            "same seed must yield the same PeerId"
+        );
+    }
+
+    #[test]
+    fn ed25519_keypair_from_hex_rejects_bad_input() {
+        assert!(ed25519_keypair_from_hex("deadbeef").is_err(), "too short");
+        assert!(ed25519_keypair_from_hex(&"zz".repeat(32)).is_err(), "non-hex");
     }
 }

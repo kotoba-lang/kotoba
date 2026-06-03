@@ -1351,7 +1351,32 @@ pub async fn run() -> anyhow::Result<()> {
             .unwrap_or(0);
         let listen_addr = kotoba_net::quic_addr(listen_port);
 
-        match KotobaSwarm::new(listen_addr).await {
+        // A node with the `relay` role is a designated public helper: it bridges
+        // the firehose gossip AND runs the libp2p Circuit Relay v2 server so NAT'd
+        // (donated/edge) peers can reach the mesh through it. AutoNAT + DCUtR +
+        // relay-client are always on, so edge nodes need no extra config.
+        let relay_server = state
+            .node_roles
+            .iter()
+            .any(|r| matches!(r, server::NodeRole::Relay));
+        let nat_cfg = kotoba_net::NatConfig { relay_server };
+
+        // Persistent libp2p identity: a 32-byte hex seed in KOTOBA_P2P_ED25519_HEX
+        // pins the PeerId (and relay reservations / addresses) across restarts.
+        // Kept separate from the CACAO/DID agent key by design. Absent/invalid →
+        // ephemeral per-boot identity (previous behaviour).
+        let swarm_result = match std::env::var("KOTOBA_P2P_ED25519_HEX") {
+            Ok(seed_hex) => match kotoba_net::ed25519_keypair_from_hex(&seed_hex) {
+                Ok(kp) => KotobaSwarm::with_config(kp, listen_addr, nat_cfg).await,
+                Err(e) => {
+                    tracing::warn!("KOTOBA_P2P_ED25519_HEX invalid ({e}); using ephemeral identity");
+                    KotobaSwarm::new_with_config(listen_addr, nat_cfg).await
+                }
+            },
+            Err(_) => KotobaSwarm::new_with_config(listen_addr, nat_cfg).await,
+        };
+
+        match swarm_result {
             Ok(mut swarm) => {
                 if let Ok(peers_str) = std::env::var("KOTOBA_BOOTSTRAP_PEERS") {
                     let mut bootstrapped = false;
@@ -1381,16 +1406,49 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                 }
 
+                // Edge/NAT'd nodes: take a Circuit Relay v2 reservation on each
+                // configured relay (`peerid@multiaddr`, comma-separated) so peers
+                // can reach us via the relay; DCUtR then upgrades to a direct link.
+                if let Ok(relays_str) = std::env::var("KOTOBA_RELAY_PEERS") {
+                    for entry in relays_str.split(',') {
+                        let entry = entry.trim();
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        if let Some((pid_str, addr_str)) = entry.split_once('@') {
+                            match (
+                                pid_str.trim().parse::<kotoba_net::PeerId>(),
+                                addr_str.trim().parse::<kotoba_net::Multiaddr>(),
+                            ) {
+                                (Ok(peer_id), Ok(addr)) => {
+                                    swarm.add_peer(peer_id, addr.clone());
+                                    match swarm.reserve_relay_with_peer(peer_id, addr.clone()) {
+                                        Ok(()) => tracing::info!(
+                                            %peer_id, %addr,
+                                            "reserving Circuit Relay v2 slot"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            %peer_id, %addr,
+                                            "relay reservation failed: {e}"
+                                        ),
+                                    }
+                                }
+                                (Err(e), _) => tracing::warn!("invalid relay peer_id: {e}"),
+                                (_, Err(e)) => tracing::warn!("invalid relay multiaddr: {e}"),
+                            }
+                        }
+                    }
+                }
+
                 let (publish_tx, publish_rx) =
                     tokio::sync::mpsc::channel::<(String, Vec<u8>)>(1024);
 
                 let journal_arc = Arc::clone(&state.journal);
                 let block_store_arc = Arc::clone(&state.block_store);
                 let quad_store_arc = Arc::clone(&state.quad_store);
-                let relay = state
-                    .node_roles
-                    .iter()
-                    .any(|r| matches!(r, server::NodeRole::Relay));
+                // Same `relay` role drives both the firehose bridge and the
+                // libp2p relay server (computed above as `relay_server`).
+                let relay = relay_server;
 
                 tokio::spawn(net_actor::run(
                     swarm,
