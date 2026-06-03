@@ -35,9 +35,16 @@ fn loose_path(git_dir: &Path, oid: GitOid) -> PathBuf {
 pub fn read_loose_object(git_dir: &Path, oid: GitOid) -> Result<GitObject> {
     let path = loose_path(git_dir, oid);
     let compressed = std::fs::read(&path)?;
-    let mut decoder = ZlibDecoder::new(&compressed[..]);
+    // Bound decompression so a malicious loose object in a cloned repo cannot
+    // inflate to gigabytes and exhaust memory (zlib bomb). 1 GiB matches the pack
+    // decoder's cap; generous for legit blobs, finite against a bomb.
+    const MAX_LOOSE_INFLATE: u64 = 1 << 30;
+    let mut decoder = ZlibDecoder::new(&compressed[..]).take(MAX_LOOSE_INFLATE + 1);
     let mut framed = Vec::new();
     decoder.read_to_end(&mut framed)?;
+    if framed.len() as u64 > MAX_LOOSE_INFLATE {
+        return Err(GitError::MalformedHeader); // decompressed object exceeds cap
+    }
     let obj = GitObject::parse_framed(&framed)?;
     // sanity: stored object must hash to the path it lives under
     if obj.oid() != oid {

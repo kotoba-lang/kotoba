@@ -178,4 +178,43 @@ mod tests {
         let got = shelf.get(custom_bucket, "some-key").await;
         assert_eq!(got, Some(Bytes::from_static(b"val")));
     }
+
+    #[tokio::test]
+    async fn same_key_in_different_buckets_is_isolated() {
+        // Buckets must be independent keyspaces: the account store (KOTOBA_ACCOUNT)
+        // and signal store (KOTOBA_SIGNAL) use the SAME key shapes, so a shared
+        // keyspace would leak one member's wrapped ARK into the other's surface.
+        let shelf = Shelf::new();
+        shelf
+            .put("bucket-a", "shared-key".into(), Bytes::from_static(b"value-a"))
+            .await;
+        shelf
+            .put("bucket-b", "shared-key".into(), Bytes::from_static(b"value-b"))
+            .await;
+
+        assert_eq!(
+            shelf.get("bucket-a", "shared-key").await,
+            Some(Bytes::from_static(b"value-a")),
+            "bucket-a keeps its own value"
+        );
+        assert_eq!(
+            shelf.get("bucket-b", "shared-key").await,
+            Some(Bytes::from_static(b"value-b")),
+            "bucket-b's same-named key is a distinct entry"
+        );
+
+        // Re-putting in one bucket must not bleed into the other.
+        shelf
+            .put("bucket-a", "shared-key".into(), Bytes::from_static(b"value-a2"))
+            .await;
+        assert_eq!(
+            shelf.get("bucket-a", "shared-key").await,
+            Some(Bytes::from_static(b"value-a2"))
+        );
+        assert_eq!(
+            shelf.get("bucket-b", "shared-key").await,
+            Some(Bytes::from_static(b"value-b")),
+            "updating bucket-a must not touch bucket-b"
+        );
+    }
 }

@@ -184,6 +184,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn k_nearest_returns_the_globally_closest_not_just_a_sorted_subset() {
+        // `k_nearest_sorted_by_distance` only proves the result is internally
+        // sorted — a wrong-slice regression (`.skip(j).take(k)`) or partial sort
+        // would still return a sorted-but-not-closest subset and pass it. The
+        // routing-correctness property is SELECTION: every chosen node must be at
+        // least as close as every excluded one (max selected ≤ min excluded).
+        let target = NodeId::from_pubkey(b"target-global");
+        let candidates: Vec<NodeId> = (0..12u8).map(|i| NodeId::from_pubkey(&[i; 8])).collect();
+        let k = 4;
+        let nearest = NodeId::k_nearest(&target, &candidates, k);
+        assert_eq!(nearest.len(), k);
+
+        let max_selected = nearest
+            .iter()
+            .map(|n| target.xor_distance(n))
+            .max()
+            .unwrap();
+        for c in &candidates {
+            let is_selected = nearest.iter().any(|n| *n == c);
+            if !is_selected {
+                assert!(
+                    target.xor_distance(c) >= max_selected,
+                    "an excluded candidate is closer than a selected one — k_nearest picked the wrong set"
+                );
+            }
+        }
+    }
+
     /// k=0 returns empty slice regardless of candidates.
     #[test]
     fn k_nearest_k_zero_returns_empty() {

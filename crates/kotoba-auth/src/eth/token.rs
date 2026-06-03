@@ -253,4 +253,75 @@ mod tests {
         assert_eq!(&cd[16..36], &[0xAB; 20]);
         assert_eq!(cd[67], 7);
     }
+
+    #[test]
+    fn all_token_calldata_selectors_match_canonical_eip_values() {
+        // Every selector is keccak256(signature)[..4]. A typo in any signature
+        // string (a stray space, wrong arg type) computes a WRONG selector — the
+        // call reverts on-chain while a structural test (length/arg-placement) still
+        // passes. Pin each builder against its published 4-byte value (these are the
+        // canonical, widely-documented ERC-20/721/1155 selectors).
+        let a = [0u8; 20];
+        let id = [0u8; 32];
+        // ── ERC-20 ──
+        assert_eq!(
+            &erc20::balance_of(&a)[..4],
+            &[0x70, 0xa0, 0x82, 0x31],
+            "balanceOf(address)"
+        );
+        assert_eq!(
+            &erc20::allowance(&a, &a)[..4],
+            &[0xdd, 0x62, 0xed, 0x3e],
+            "allowance(address,address)"
+        );
+        assert_eq!(
+            &erc20::total_supply()[..4],
+            &[0x18, 0x16, 0x0d, 0xdd],
+            "totalSupply()"
+        );
+        assert_eq!(
+            &erc20::decimals()[..4],
+            &[0x31, 0x3c, 0xe5, 0x67],
+            "decimals()"
+        );
+        assert_eq!(&erc20::name()[..4], &[0x06, 0xfd, 0xde, 0x03], "name()");
+        assert_eq!(&erc20::symbol()[..4], &[0x95, 0xd8, 0x9b, 0x41], "symbol()");
+        // ── ERC-721 ──
+        assert_eq!(
+            &erc721::owner_of(&id)[..4],
+            &[0x63, 0x52, 0x21, 0x1e],
+            "ownerOf(uint256)"
+        );
+        assert_eq!(
+            &erc721::balance_of(&a)[..4],
+            &[0x70, 0xa0, 0x82, 0x31],
+            "balanceOf(address)"
+        );
+        assert_eq!(
+            &erc721::token_uri(&id)[..4],
+            &[0xc8, 0x7b, 0x56, 0xdd],
+            "tokenURI(uint256)"
+        );
+        assert_eq!(
+            &erc721::get_approved(&id)[..4],
+            &[0x08, 0x18, 0x12, 0xfc],
+            "getApproved(uint256)"
+        );
+        assert_eq!(
+            &erc721::is_approved_for_all(&a, &a)[..4],
+            &[0xe9, 0x85, 0xe9, 0xc5],
+            "isApprovedForAll(address,address)"
+        );
+        // ── ERC-1155 ──
+        assert_eq!(
+            &erc1155::balance_of(&a, &id)[..4],
+            &[0x00, 0xfd, 0xd5, 0x8e],
+            "balanceOf(address,uint256)"
+        );
+        assert_eq!(
+            &erc1155::is_approved_for_all(&a, &a)[..4],
+            &[0xe9, 0x85, 0xe9, 0xc5],
+            "isApprovedForAll(address,address)"
+        );
+    }
 }

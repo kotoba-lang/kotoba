@@ -151,3 +151,35 @@ impl IpfsPinClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(endpoint: &str) -> IpfsPinClient {
+        IpfsPinClient {
+            client: reqwest::Client::new(),
+            endpoint: endpoint.into(),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn api_url_normalizes_trailing_slash() {
+        // The endpoint may or may not carry a trailing slash (env var, config).
+        // `api_url` must produce exactly one separator either way — a double slash
+        // (`//api/v0`) is rejected by some Kubo gateways and would break every pin.
+        assert_eq!(
+            client("http://localhost:5001").api_url("pin/add"),
+            "http://localhost:5001/api/v0/pin/add"
+        );
+        assert_eq!(
+            client("http://localhost:5001/").api_url("pin/add"),
+            "http://localhost:5001/api/v0/pin/add",
+            "trailing slash must be normalized, not doubled"
+        );
+        assert_eq!(client("http://h/").api_url("pin/ls"), "http://h/api/v0/pin/ls");
+        // Multiple trailing slashes are all trimmed.
+        assert_eq!(client("http://h///").api_url("pin/rm"), "http://h/api/v0/pin/rm");
+    }
+}

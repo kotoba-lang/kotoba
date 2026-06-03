@@ -18,7 +18,7 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 | kotoba-kqe | Datalog engine, Arrangement, Delta, MV (KQE) |
 | kotoba-dht | Source Chain, Warrant, Neighborhood (KDHT) |
 | kotoba-net | libp2p QUIC/Noise/GossipSub |
-| kotoba-auth | CACAO chain verification, DID Document; **EVM read+verify surface** (`eth.rs` + `eth/{abi,token,caip,eip1271}.rs`, 2026-05-30) |
+| kotoba-auth | CACAO chain verification, DID Document; **EVM read+verify surface** (`eth.rs` + `eth/{abi,token,caip,eip1271}.rs`, 2026-05-30); **Bitcoin read+verify surface** (`btc.rs` + `btc/{address,caip,bip322}.rs`, BIP-122/CAIP-2/10/19 + Base58Check/bech32/bech32m + legacy signmessage verify, 2026-06-03, ADR-2606035800) |
 | kotoba-graph | Quad API, SPARQL→Datalog, Commit DAG |
 | kotoba-vm | Invoke/Result ChainEntry, CALL_FOREIGN bridge (KVM) |
 | kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference, WebGPU training (embed+lm_head), WebGPU inference (full transformer, Gemma 4 E2B/E4B) |
@@ -757,6 +757,27 @@ read-only RPC 9 メソッド (各 CALL_FOREIGN = 1000 gas, 5s timeout): `eth_cal
 **Smart-account verify (EIP-1271, opt-in)**: `cacao.rs::verify_signature_eip191_smart(&dyn EthRpc)` が EOA recover → 不一致時 `eth_getCode` で contract 判定 → contract なら `eth_call(isValidSignature)` で EIP-191 digest を magic value 検証。`EthRpc` trait は注入式 (kotoba-auth は I/O-free を維持)。EOA fast-path は RPC を呼ばない。**注**: これは opt-in メソッドで、default の `verify_signature` / `DelegationChain::verify` は EOA-only のまま未変更 (現状この smart メソッドを呼ぶ production caller はなし)。xrpc / DelegationChain への routing は次の increment (各 call site に `EthRpc` 実装を thread する必要)。
 
 guest は `wit_bindgen::generate!` で world.wit から自動再生成 (`examples/kotoba-hello` で検証済み)。テスト: kotoba-auth 239 / kotoba-runtime 26 (`test_wasm_instantiate` が拡張 WIT = evm 14 funcs の component instantiate を検証)。
+
+## Bitcoin 互換 — read + verify surface (2026-06-03, ADR-2606035800)
+
+EVM (`eth/*`) の鏡写し。**read + verify のみ** — tx 署名・鍵生成・UTXO spend・on-chain origination は etzhayyim-exclusive (operating-entity boundary, ADR-2605231525)。送受信は member の self-custody wallet (Coinbase **Smart Wallet** 型) が担い、kotoba はアドレス所有検証と fact 観測のみ。CAIP を EVM-only (`eip155`) から `eip155` + `bip122` に拡張 = multichain identity 標準そのもの。
+
+### pure codec (`crates/kotoba-auth/src/btc/` — deps は `k256` + `sha2` + `ripemd` + `bs58` + `hex` のみで portable)
+
+| module | 内容 |
+|---|---|
+| `btc.rs` | `sha256` / `hash256` (double-SHA256) / `hash160` (SHA256→RIPEMD160) / legacy **Bitcoin Signed Message** digest + 65B recoverable-ECDSA recover (`recover_pubkey_from_message`) + `verify_message` (P2PKH/P2WPKH) / `did:pkh:bip122` parse |
+| `btc/address.rs` | hand-rolled **Base58Check** (P2PKH/P2SH) + **bech32/bech32m** (P2WPKH/P2WSH v0 / P2TR v1) — parse + checksum-validate + round-trip render。`BtcAddress` / `AddressKind` / `BtcNetwork` |
+| `btc/caip.rs` | **CAIP-2** (`bip122:<genesis-prefix>`) / **CAIP-10** account (case-significant) / **CAIP-19** native (`/slip44:0`); mainnet/testnet genesis ref 定数 |
+| `btc/bip322.rs` | scheme enum + 正直な boundary。**full BIP-322 (simple/full, Script-VM 必要) は deferred**; R0 は legacy signmessage のみ |
+
+テスト: kotoba-auth **278** (252 → +26 btc): BIP-173/350 address vectors (genesis P2PKH / P2WPKH / P2TR / testnet P2WSH) + checksum-reject + **実 sign→recover→derive→verify roundtrip** (k256 署名を P2PKH/P2WPKH 両方で検証, tamper は fail)。
+
+### BTC chain observation bridge (`kotoba-runtime` `bind_btc` + `wit/world.wit` interface `btc`)
+
+EVM `bind_evm` の鏡写し。read-only **Esplora REST** (Blockstream / mempool.space / self-hosted electrs) 経由の Bitcoin chain 観測。6 host fn (各 CALL_FOREIGN = 1000 gas): `tip-height` / `address-info` (raw JSON) / `address-utxos` (raw JSON) / `address-balance-sat` (composed: `chain_stats.funded - spent`, confirmed のみ) / `tx` (raw JSON) / `tx-confirmations` (composed: `tip - block_height + 1`, unconfirmed は 0)。**observation only** — Esplora `POST /tx` (broadcast) は意図的に非公開 (署名・送信は member self-custody wallet)。kotoba-runtime 32+21 tests green (+5 pure-helper test; `test_wasm_instantiate` も新 `btc` interface 込みで instantiate OK)。
+
+**honest R0**: full BIP-322 (P2TR/script 所有) 未 / chain 観測は Esplora REST 依存で SPV-trustless ではない / client-side BTC wallet 連携は ADR design-only。詳細 ADR-2606035800。
 
 ## Firehose Egress — D+E federation surface (2026-05-30)
 

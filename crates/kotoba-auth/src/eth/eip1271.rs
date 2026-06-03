@@ -106,4 +106,37 @@ mod tests {
         // Too short
         assert!(!is_magic_value(&[0x16, 0x26]));
     }
+
+    #[test]
+    fn is_magic_value_rejects_near_misses_and_wrong_position() {
+        // This is the SOLE gate for smart-wallet (ERC-1271) signatures, so it must
+        // be an exact 4-byte match at offset 0. The realistic forgery is an
+        // "almost-magic" return — a one-byte-off value — which a loose/partial
+        // comparison or an off-by-one constant would wrongly accept.
+        let mut last_off = [0u8; 32];
+        last_off[..4].copy_from_slice(&[0x16, 0x26, 0xba, 0x7f]); // 7f ≠ 7e
+        assert!(
+            !is_magic_value(&last_off),
+            "one-byte-off magic must be rejected"
+        );
+
+        let mut first_off = [0u8; 32];
+        first_off[..4].copy_from_slice(&[0x17, 0x26, 0xba, 0x7e]); // 17 ≠ 16
+        assert!(
+            !is_magic_value(&first_off),
+            "leading-byte-off magic must be rejected"
+        );
+
+        // Magic bytes present but NOT left-aligned (at bytes 4..8) → reject: the
+        // magic is the ABI-encoded bytes4 left-aligned at offset 0, nowhere else.
+        let mut shifted = [0u8; 32];
+        shifted[4..8].copy_from_slice(&MAGIC_VALUE);
+        assert!(
+            !is_magic_value(&shifted),
+            "magic must be left-aligned at byte 0"
+        );
+
+        // The exact 4 magic bytes (minimal accepted form) → true.
+        assert!(is_magic_value(&MAGIC_VALUE));
+    }
 }

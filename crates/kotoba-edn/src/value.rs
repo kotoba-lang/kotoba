@@ -250,4 +250,32 @@ mod ord_tests {
         assert!(EdnValue::Integer(i64::MAX) < EdnValue::Float(OrderedFloat(f64::NEG_INFINITY)));
         assert!(EdnValue::Float(OrderedFloat(f64::INFINITY)) < EdnValue::String(String::new()));
     }
+
+    #[test]
+    fn as_seq_unifies_vector_and_list_others_return_none() {
+        // `as_seq` is the one accessor with real branching: it must accept BOTH
+        // Vector and List (the "sequence" abstraction) and reject everything else.
+        // A regression handling only one variant would break seq-generic callers.
+        let v = EdnValue::Vector(vec![EdnValue::Integer(1)]);
+        let l = EdnValue::List(vec![EdnValue::Integer(1)]);
+        assert_eq!(v.as_seq().map(|s| s.len()), Some(1), "as_seq accepts Vector");
+        assert_eq!(l.as_seq().map(|s| s.len()), Some(1), "as_seq accepts List");
+        assert!(EdnValue::Integer(1).as_seq().is_none(), "as_seq rejects a scalar");
+        assert!(EdnValue::Bool(true).as_seq().is_none());
+    }
+
+    #[test]
+    fn typed_accessors_match_their_variant_and_reject_others() {
+        // Pins the variant-extraction contract: each accessor returns Some only for
+        // its own variant, None otherwise — guarding against a future refactor that
+        // mismatches an arm.
+        assert_eq!(EdnValue::Integer(7).as_integer(), Some(7));
+        assert_eq!(EdnValue::String("x".into()).as_integer(), None);
+        assert_eq!(EdnValue::String("hi".into()).as_string(), Some("hi"));
+        assert_eq!(EdnValue::Integer(1).as_string(), None);
+        assert_eq!(EdnValue::Bool(true).as_bool(), Some(true));
+        assert_eq!(EdnValue::Integer(0).as_bool(), None, "integer 0 is not a bool");
+        assert_eq!(EdnValue::Float(OrderedFloat(1.5)).as_float(), Some(1.5));
+        assert_eq!(EdnValue::Integer(2).as_float(), None, "integer is not a float");
+    }
 }

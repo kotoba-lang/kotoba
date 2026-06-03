@@ -196,10 +196,25 @@ fn pack_type_to_kind(t: u8) -> Result<GitObjectKind> {
 
 /// Inflate a zlib stream that begins at the start of `buf` (consuming only as
 /// many bytes as the stream needs).
+/// Absolute upper bound on a single decompressed git object. Bounds zlib
+/// "decompression bombs" (a few KB inflating to gigabytes) from a hostile pack —
+/// generous enough for legitimately large blobs, but not unbounded.
+const MAX_INFLATE: u64 = 1 << 30; // 1 GiB
+
 fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = ZlibDecoder::new(buf);
+    inflate_capped(buf, MAX_INFLATE)
+}
+
+/// Inflate `buf`, refusing to materialise more than `max` decompressed bytes.
+/// `Read::take` bounds the work the decompressor is allowed to do, so a bomb is
+/// rejected after reading one byte past the cap rather than exhausting memory.
+fn inflate_capped(buf: &[u8], max: u64) -> Result<Vec<u8>> {
+    let mut decoder = ZlibDecoder::new(buf).take(max.saturating_add(1));
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).map_err(GitError::Io)?;
+    if out.len() as u64 > max {
+        return Err(GitError::MalformedHeader); // decompressed object exceeds cap (possible bomb)
+    }
     Ok(out)
 }
 
@@ -390,6 +405,34 @@ mod tests {
         ];
         let result = apply_delta(b"", &delta);
         assert!(result.is_err(), "huge dst_size must be rejected, not OOM");
+    }
+
+    #[test]
+    fn inflate_capped_rejects_oversized_output() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+        // 100 KiB of zeros compresses to a tiny stream but inflates back to 100 KiB —
+        // a miniature decompression bomb. The cap must reject it when below the
+        // decompressed size, and accept it when above. (The production cap is 1 GiB;
+        // this exercises the same mechanism with cheap data.)
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&vec![0u8; 100 * 1024]).unwrap();
+        let compressed = enc.finish().unwrap();
+        assert!(
+            (compressed.len() as u64) < 4096,
+            "sanity: compressed form is tiny ({}B)",
+            compressed.len()
+        );
+
+        // Cap below the decompressed size → rejected (bomb protection).
+        assert!(
+            inflate_capped(&compressed, 1024).is_err(),
+            "output exceeding the cap must be rejected, not materialised"
+        );
+        // Cap above → succeeds and returns the full original bytes.
+        let out = inflate_capped(&compressed, 1 << 20).expect("within cap");
+        assert_eq!(out.len(), 100 * 1024);
+        assert!(out.iter().all(|&b| b == 0));
     }
 
     #[test]

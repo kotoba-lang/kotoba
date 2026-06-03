@@ -176,6 +176,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fp8_saturation_clamps_negative_preserving_sign() {
+        // The positive-saturation test above misses the sign path: a large NEGATIVE
+        // value must clamp to −max (≈ −448), NOT lose its sign (→ +448) or collapse
+        // to 0. A sign bug here would corrupt half of every overflowing weight tensor.
+        let enc = quantize_f32_to_fp8_e4m3(&[-1000.0f32]);
+        let dec = dequantize_fp8_e4m3(&enc);
+        assert!(dec[0] < 0.0, "negative overflow must keep its sign, got {}", dec[0]);
+        assert!(dec[0] >= -448.0 - 1.0, "must clamp to −max, got {}", dec[0]);
+        assert!(
+            (dec[0] - (-448.0)).abs() < 1.0,
+            "negative overflow should saturate to ≈ −448, got {}",
+            dec[0]
+        );
+    }
+
     // ── FP8 zero ─────────────────────────────────────────────────────────────
 
     #[test]

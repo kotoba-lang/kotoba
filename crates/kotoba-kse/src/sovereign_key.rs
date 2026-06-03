@@ -77,7 +77,12 @@ impl SovereignCrypto {
             // gone (e.g. backing IPFS daemon was wiped between runs but the
             // KseStore pointer file survived), fall through to genesis instead
             // of bricking the startup.
-            let result: Result<Self> = (async {
+            // Returns `Ok(Some(_))` on success, `Ok(None)` ONLY when the wrapped
+            // block is *confirmed missing* (store reachable, block absent), and
+            // `Err` for everything else (pointer/CID unparseable, store
+            // unreachable, block present-but-corrupt, HPKE unwrap failed). Re-genesis
+            // fires ONLY on `Ok(None)` — see the match below.
+            let result: Result<Option<Self>> = (async {
                 let data = kse_store
                     .get(&cur_key)
                     .await
@@ -89,14 +94,20 @@ impl SovereignCrypto {
                 // Symmetric retry with store_block_durable: the cold IPFS
                 // sidecar (Kubo) often isn't bound to localhost:5001 yet
                 // when init_crypto runs at t≈0.4s after process start.
-                // Without this loop the first get() returned a connection
-                // error, was caught by the outer match arm, and re-fired
-                // genesis — losing the previously stored vault key on
-                // every pod restart.
-                let block = load_block_durable(block_store, &cid)
+                // load_block_durable distinguishes a *confirmed-absent* block
+                // (`Ok(None)`) from an *unreachable* store (`Err`) so we only
+                // re-genesis on the former, never on a transient outage.
+                let block = match load_block_durable(block_store, &cid)
                     .await
                     .context("load wrapped key block")?
-                    .ok_or_else(|| anyhow!("wrapped key block not found: {}", key_ref.cid))?;
+                {
+                    Some(b) => b,
+                    None => return Ok(None), // confirmed missing → caller re-genesises
+                };
+                // The block IS present: any failure from here is corruption,
+                // tampering, or a wrong-identity load — NOT a missing block. It must
+                // be a hard error so we never re-genesis OVER a recoverable key and
+                // orphan every blob encrypted under it.
                 let wrapped = decode_wrapped_block(&block)
                     .context("decode wrapped key block")?;
                 let vault_key_bytes =
@@ -115,23 +126,29 @@ impl SovereignCrypto {
                     cid = %key_ref.cid,
                     "SovereignCrypto: vault key loaded from store"
                 );
-                Ok(Self {
+                Ok(Some(Self {
                     inner: VaultKeyedCrypto::new(arr),
-                })
+                }))
             })
             .await;
 
             match result {
-                Ok(c) => Ok(c),
-                Err(e) => {
+                Ok(Some(c)) => Ok(c),
+                Ok(None) => {
                     tracing::warn!(
                         did = %identity.did,
-                        error = %e,
-                        "SovereignCrypto: pointer found but wrapped key block missing — \
-                         re-genesising (backing block-store may have been wiped)"
+                        "SovereignCrypto: pointer found but wrapped key block confirmed \
+                         missing — re-genesising (backing block-store may have been wiped)"
                     );
                     Self::genesis(identity, kse_store, block_store).await
                 }
+                // Pointer/CID unparseable, store unreachable, or block present but
+                // corrupt/unwrappable: fail loud rather than silently minting a new
+                // key over a recoverable one.
+                Err(e) => Err(e).context(
+                    "SovereignCrypto: refusing to re-genesis over a present-but-unreadable \
+                     vault key (corruption, tampering, or wrong identity)",
+                ),
             }
         } else {
             // Genesis: generate and persist
@@ -665,6 +682,40 @@ mod tests {
             pt.as_slice(),
             b"",
             "empty plaintext must round-trip correctly"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_wrapped_key_block_fails_loud_does_not_regenesis() {
+        let dir = tmp_dir("corrupt");
+        let (kse, blk) = make_stores(&dir);
+        let id = AgentIdentity::generate_ephemeral();
+
+        // Genesis writes the pointer + the HPKE-wrapped vault key block.
+        SovereignCrypto::load_or_genesis(&id, &kse, &blk)
+            .await
+            .unwrap();
+
+        // Resolve the wrapped-block CID from the pointer, then corrupt the block
+        // IN PLACE (overwrite at its CID with a flipped tag byte) — present, but bad.
+        let slug = id.did_slug();
+        let cur_key = format!("agent/crypto/{slug}/current.json");
+        let ptr = kse.get(&cur_key).await.expect("pointer present");
+        let key_ref: KeyRef = serde_json::from_slice(&ptr).unwrap();
+        let cid = KotobaCid::from_multibase(&key_ref.cid).unwrap();
+        let block = blk.get(&cid).unwrap().expect("wrapped block present");
+        let mut corrupt = block.to_vec();
+        let n = corrupt.len();
+        corrupt[n - 1] ^= 0xFF; // flip the AEAD tag region of the wrapped blob
+        blk.put(&cid, &corrupt).unwrap();
+
+        // A fresh load (simulating a restart) against a PRESENT-but-corrupt block
+        // must FAIL — never silently re-genesis a new key (which would orphan every
+        // blob previously encrypted under the recoverable one).
+        let reload = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await;
+        assert!(
+            reload.is_err(),
+            "corrupt-but-present wrapped key block must fail loud, not re-genesis"
         );
     }
 }

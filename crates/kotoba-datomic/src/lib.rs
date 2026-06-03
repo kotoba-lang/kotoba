@@ -6844,6 +6844,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn as_of_and_since_partition_the_timeline_at_t() {
+        // The defining as-of/since semantics: as_of(t) sees tx ≤ t and NEVER the
+        // future; since(t) sees tx > t and NEVER the past. The existing tombstone
+        // test only checks each *includes* the expected side — this pins the
+        // *exclusion* (a bug leaking the future into as_of would pass that test).
+        let conn = Connection::new();
+        let t1 = conn
+            .transact(parse(r#"[[:db/add "a" :k/x "v1"]]"#).unwrap())
+            .await
+            .unwrap();
+        let _t2 = conn
+            .transact(parse(r#"[[:db/add "b" :k/y "v2"]]"#).unwrap())
+            .await
+            .unwrap();
+
+        let aof = conn.db().as_of(&t1.tx_cid);
+        assert!(aof.datoms().iter().any(|d| d.a == ":k/x"), "as_of(t1) includes t1's datom");
+        assert!(
+            aof.datoms().iter().all(|d| d.a != ":k/y"),
+            "as_of(t1) must NOT see the later transaction's datom (no peeking into the future)"
+        );
+
+        let sin = conn.db().since(&t1.tx_cid);
+        assert!(sin.datoms().iter().any(|d| d.a == ":k/y"), "since(t1) includes the later datom");
+        assert!(
+            sin.datoms().iter().all(|d| d.a != ":k/x"),
+            "since(t1) must NOT see t1's datom (the past is excluded)"
+        );
+    }
+
+    #[tokio::test]
     async fn db_exposes_datomic_five_index_datoms_scans() {
         let conn = Connection::new();
         conn.transact(
@@ -6990,6 +7021,52 @@ mod tests {
         assert!(!facts
             .iter()
             .any(|d| d.a == ":person/name" && d.v == EdnValue::String("Alice".into())));
+    }
+
+    #[tokio::test]
+    async fn cardinality_one_replacement_retains_old_value_as_history_tombstone() {
+        // A card-one assert of a new value drops the old from the CURRENT view (the
+        // sibling test pins that). The accretion guarantee is that it does so by
+        // RETRACTING the old value — not deleting it — so `history()` still carries
+        // the full lineage (and `as-of`/audit can recover it). A bug that physically
+        // deleted the prior value would pass the current-view test but lose history.
+        let conn = Connection::new();
+        conn.transact(
+            parse(
+                r#"[
+                  {:db/id "email" :db/ident :person/email :db/unique :db.unique/identity}
+                  {:db/id "name" :db/ident :person/name :db/cardinality :db.cardinality/one}
+                ]"#,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        conn.transact(
+            parse(r#"[{:db/id "alice" :person/email "a@example.com" :person/name "Alice"}]"#)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        conn.transact(
+            parse(r#"[[:db/add [:person/email "a@example.com"] :person/name "Alicia"]]"#).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let hist = conn.db().history();
+        let h = hist.datoms();
+        let name_is = |v: &str, added: bool| {
+            h.iter().any(|d| {
+                d.a == ":person/name" && d.v == EdnValue::String(v.into()) && d.added == added
+            })
+        };
+        assert!(name_is("Alice", true), "original Alice assertion must remain in history");
+        assert!(
+            name_is("Alice", false),
+            "card-one replacement must RETRACT the old value into history, not delete it"
+        );
+        assert!(name_is("Alicia", true), "the new value is asserted in history");
     }
 
     #[tokio::test]

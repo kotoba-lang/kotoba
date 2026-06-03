@@ -507,6 +507,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn re_grant_after_revoke_restores_access_and_clears_revocation() {
+        // Revocation is intentionally non-permanent (`grant` clears it = re-enrollment).
+        // Pin the full lifecycle: a regression making revocation sticky — or re-grant
+        // failing to clear it — would silently keep denying a re-granted accessor.
+        let reg = PreKeyRegistry::new(store());
+        let enc_key = rand_key();
+        let pair = ("did:owner".to_string(), "did:bob".to_string());
+
+        reg.grant("did:owner", "did:bob", &rand_key(), &enc_key)
+            .await
+            .unwrap();
+        assert!(
+            reg.unwrap_rekey("did:owner", "did:bob", &enc_key).await.is_ok(),
+            "granted → access works"
+        );
+
+        reg.revoke("did:owner", "did:bob").await;
+        assert!(
+            reg.unwrap_rekey("did:owner", "did:bob", &enc_key).await.is_err(),
+            "revoked → access denied"
+        );
+        assert!(reg.revoked.read().await.contains(&pair), "revoked set holds the pair");
+
+        // Re-grant must restore access AND clear the revocation flag.
+        reg.grant("did:owner", "did:bob", &rand_key(), &enc_key)
+            .await
+            .unwrap();
+        assert!(
+            reg.unwrap_rekey("did:owner", "did:bob", &enc_key).await.is_ok(),
+            "re-grant restores access"
+        );
+        assert!(
+            !reg.revoked.read().await.contains(&pair),
+            "re-grant must clear the revocation (re-enrollment)"
+        );
+    }
+
+    #[tokio::test]
     async fn emit_warrant_returns_evidence_cid() {
         let s = store();
         let reg = PreKeyRegistry::new(Arc::clone(&s));

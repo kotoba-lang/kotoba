@@ -473,6 +473,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_since_fallback_preserves_payloads() {
+        // The fallback test above pins seq *ordering*, but a resuming agent replays
+        // the entries' PAYLOADS. A bug in the persistent fallback (wrong CID lookup,
+        // empty reconstruction) could return correct seqs with corrupt payloads —
+        // silently replaying garbage. Pin that each block-store-recovered entry is
+        // byte-identical to what was published, not just correctly sequenced.
+        use kotoba_core::store::BlockStore;
+        use std::collections::HashMap;
+        use std::sync::{Arc, RwLock as StdRwLock};
+
+        #[derive(Default)]
+        struct MemStore(StdRwLock<HashMap<[u8; 36], bytes::Bytes>>);
+        impl BlockStore for MemStore {
+            fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+                self.0
+                    .write()
+                    .unwrap()
+                    .insert(cid.0, bytes::Bytes::copy_from_slice(data));
+                Ok(())
+            }
+            fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
+                Ok(self.0.read().unwrap().get(&cid.0).cloned())
+            }
+            fn has(&self, cid: &KotobaCid) -> bool {
+                self.0.read().unwrap().contains_key(&cid.0)
+            }
+            fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+                self.0.write().unwrap().remove(&cid.0);
+                Ok(())
+            }
+            fn pin(&self, _: &KotobaCid) {}
+            fn unpin(&self, _: &KotobaCid) {}
+            fn is_pinned(&self, _: &KotobaCid) -> bool {
+                false
+            }
+        }
+
+        let store = Arc::new(MemStore::default()) as Arc<dyn BlockStore + Send + Sync>;
+        let tmp = tempfile::tempdir().unwrap();
+        let head_path = tmp.path().join("journal-head.json");
+        let journal = {
+            let (tx, _) = broadcast::channel(4096);
+            Journal {
+                seq: Arc::new(RwLock::new(0)),
+                tx,
+                log: Arc::new(RwLock::new(VecDeque::with_capacity(3))),
+                log_cap: 3, // ring holds 3 → seq 1,2 evicted to block store
+                store: Some(store),
+                head_path: Some(head_path),
+                head: Arc::new(Mutex::new((0, None))),
+            }
+        };
+
+        let t = Topic::new("payload/fidelity");
+        // Distinct, content-checkable payloads.
+        let expected: Vec<Bytes> = (0..5u8)
+            .map(|i| Bytes::from(format!("payload-{i}")))
+            .collect();
+        for p in &expected {
+            journal.publish(t.clone(), p.clone()).await;
+        }
+
+        let all = journal.read_since(1).await;
+        assert_eq!(all.len(), 5, "all 5 entries (incl. evicted) must be recovered");
+        for (idx, entry) in all.iter().enumerate() {
+            assert_eq!(entry.seq, idx as u64 + 1, "seq order");
+            assert_eq!(
+                entry.payload, expected[idx],
+                "entry seq {} payload must match what was published (idx {idx})",
+                entry.seq
+            );
+        }
+    }
+
     // ── additional gap tests ──────────────────────────────────────────────────
 
     #[tokio::test]

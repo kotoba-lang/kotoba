@@ -36,11 +36,19 @@ pub enum ParseError {
     OddMap { offset: usize },
     #[error("trailing data after value at offset {offset}")]
     TrailingData { offset: usize },
+    #[error("nesting too deep (limit {max}) at offset {offset}")]
+    TooDeep { offset: usize, max: usize },
 }
+
+/// Maximum collection-nesting depth for the recursive descent. Bounds the stack
+/// so a pathologically nested input (`[[[…]]]` ×N) returns `TooDeep` instead of
+/// overflowing the process — far beyond any legitimate schema/ontology document.
+const MAX_DEPTH: usize = 1024;
 
 struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -48,6 +56,7 @@ impl<'a> Parser<'a> {
         Self {
             src: src.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -85,7 +94,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Depth-gated entry to value parsing. All collection parsers recurse through
+    /// here, so incrementing on entry / decrementing on exit caps total nesting
+    /// (preventing a stack-overflow DoS on hostile input) with one guard.
     fn parse_value(&mut self) -> Result<EdnValue, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError::TooDeep {
+                offset: self.pos,
+                max: MAX_DEPTH,
+            });
+        }
+        let r = self.parse_value_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_value_inner(&mut self) -> Result<EdnValue, ParseError> {
         loop {
             self.skip_ws();
             // Discard `#_ form` may appear before the value we want.
@@ -712,5 +738,66 @@ mod tests {
         assert_eq!(parse("-").unwrap(), EdnValue::sym("-"));
         assert_eq!(parse("+").unwrap(), EdnValue::sym("+"));
         assert_eq!(parse("-1").unwrap(), EdnValue::Integer(-1));
+    }
+
+    #[test]
+    fn parse_rejects_malformed_input_without_panicking() {
+        // A parser over schema/ontology files (and any ingested EDN) must fail
+        // gracefully with Err — never panic — on structurally-broken input. These
+        // are unambiguous errors: unbalanced/unterminated collections, an
+        // unterminated string, and stray close delimiters.
+        for bad in [
+            "[1 2",            // unbalanced vector
+            "{:a 1",           // unterminated map
+            "#{1 2",           // unterminated set
+            "(a b",            // unterminated list
+            "\"unterminated",  // unterminated string
+            "]",               // stray close delimiter
+            "}",
+            ")",
+            "[ ( ] )",         // crossed delimiters
+        ] {
+            let r = parse(bad);
+            assert!(
+                r.is_err(),
+                "malformed input {bad:?} must be rejected with Err, got {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_handles_moderate_nesting() {
+        // Reasonably deep nesting (well under the cap) must parse, structure intact.
+        let depth = 200;
+        let src = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        let v = parse(&src).expect("moderately-nested input must parse");
+        let mut cur = &v;
+        let mut seen = 0;
+        while let EdnValue::Vector(xs) = cur {
+            seen += 1;
+            match xs.first() {
+                Some(inner) => cur = inner,
+                None => break,
+            }
+        }
+        assert_eq!(seen, depth, "all {depth} nesting levels must be parsed");
+    }
+
+    #[test]
+    fn parse_rejects_pathological_nesting_with_too_deep_not_stack_overflow() {
+        // A deeply-nested bomb (`[[[…` ×N, N ≫ MAX_DEPTH) must return TooDeep before
+        // the recursive descent can overflow the stack. MAX_DEPTH (1024) is checked
+        // at recursion frame ~1025 — far below any stack limit — so this is safe to
+        // run and proves the DoS guard fires (same class as the pack-delta fix).
+        let n = MAX_DEPTH + 50;
+        let src = "[".repeat(n); // unterminated *and* over-deep; depth cap trips first
+        let r = parse(&src);
+        assert!(
+            matches!(r, Err(ParseError::TooDeep { .. })),
+            "over-deep input must be rejected with TooDeep, got {r:?}"
+        );
+        // And a structure exactly at the cap still parses (boundary is inclusive).
+        let at_cap = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert!(parse(&at_cap).is_ok(), "nesting at exactly MAX_DEPTH must parse");
     }
 }
