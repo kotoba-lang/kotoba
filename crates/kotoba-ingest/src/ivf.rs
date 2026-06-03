@@ -518,6 +518,59 @@ mod tests {
     }
 
     #[test]
+    fn search_full_probe_matches_brute_force_and_finds_nearest() {
+        // ANN soundness anchor: probing all clusters (nprobe = k) must return exactly
+        // the brute-force cosine top-k — IVF is only an *acceleration*, not a
+        // different answer when fully probed. The fixture places 5 points at exactly
+        // (10,0) (cosine 1.0 with the query), so the top-5 set is unambiguous.
+        let pts = two_cluster_points(50);
+        let idx = IvfIndex::build(&pts, 2, "test-model", 30);
+        let assigned: Vec<(usize, Vec<f32>)> =
+            pts.iter().map(|(_, v)| (idx.assign(v).0, v.clone())).collect();
+        let cand: Vec<(usize, &[f32])> =
+            assigned.iter().map(|(ci, v)| (*ci, v.as_slice())).collect();
+        let query = vec![10.0f32, 0.0];
+
+        // Brute force over ALL candidates (same index convention as search: enumerate).
+        let mut brute: Vec<(f32, usize)> = cand
+            .iter()
+            .enumerate()
+            .map(|(i, (_, v))| (cosine(&query, v), i))
+            .collect();
+        brute.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut brute_top: Vec<usize> = brute.iter().take(5).map(|(_, i)| *i).collect();
+        brute_top.sort_unstable();
+
+        let mut got: Vec<usize> =
+            idx.search(&query, &cand, 2, 5).into_iter().map(|(_, i)| i).collect();
+        got.sort_unstable();
+
+        assert_eq!(got, brute_top, "full-probe IVF must equal brute-force top-k");
+        // The 5 exact-(10,0) points are the even indices with i%5==0.
+        assert_eq!(got, vec![0, 10, 20, 30, 40], "the true nearest points");
+    }
+
+    #[test]
+    fn nprobe_one_restricts_to_probed_cluster() {
+        // The recall/speed knob actually works: nprobe=1 scores only the single
+        // nearest cluster's candidates (≈half here), while nprobe=k scores all of
+        // them. A bug ignoring nprobe would return the same count for both.
+        let pts = two_cluster_points(50); // 25 positive-cluster, 25 negative-cluster
+        let idx = IvfIndex::build(&pts, 2, "test-model", 30);
+        let assigned: Vec<(usize, Vec<f32>)> =
+            pts.iter().map(|(_, v)| (idx.assign(v).0, v.clone())).collect();
+        let cand: Vec<(usize, &[f32])> =
+            assigned.iter().map(|(ci, v)| (*ci, v.as_slice())).collect();
+        let query = vec![10.0f32, 0.0];
+
+        let n_one = idx.search(&query, &cand, 1, 50).len();
+        let n_all = idx.search(&query, &cand, 2, 50).len();
+        assert_eq!(n_all, 50, "probing all clusters sees every candidate");
+        assert_eq!(n_one, 25, "probing one cluster sees only that cluster's candidates");
+        assert!(n_one < n_all, "nprobe must restrict the candidate set");
+    }
+
+    #[test]
     fn to_quads_and_from_quads_roundtrip() {
         let pts = two_cluster_points(20);
         let idx = IvfIndex::build(&pts, 2, "round-trip-model", 20);

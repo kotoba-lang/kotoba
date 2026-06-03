@@ -230,6 +230,46 @@ mod tests {
     }
 
     #[test]
+    fn rrf_agreement_beats_single_signal_strength() {
+        // THE defining RRF property (sharper than `rrf_agreement_wins`, which uses a
+        // doc that is *best* in both signals): a doc at a modest rank in TWO signals
+        // must outrank a doc at the very top of only ONE. With k=60:
+        //   m: 1/(60+2) + 1/(60+2) = 0.03226   (rank 2 in both)
+        //   t: 1/(60+1)            = 0.01639   (rank 1 in one)
+        // So agreement, not raw strength, wins.
+        let sig1: Ranking = vec![(cid("t"), 9.0), (cid("m"), 5.0)]; // t#1, m#2
+        let sig2: Ranking = vec![(cid("u"), 9.0), (cid("m"), 5.0)]; // u#1, m#2
+        let signals = vec![
+            Signal { name: "s1", weight: 1.0, ranking: &sig1 },
+            Signal { name: "s2", weight: 1.0, ranking: &sig2 },
+        ];
+        let fused = reciprocal_rank_fusion(&signals, RRF_K, 10);
+        assert_eq!(fused[0].cid, cid("m"), "doc present in both signals must win");
+        assert_eq!(fused[0].ranks.len(), 2, "m contributed from both signals");
+        // The single-signal leaders sit below it.
+        assert!(fused[1].cid == cid("t") || fused[1].cid == cid("u"));
+        assert_eq!(fused[1].ranks.len(), 1);
+    }
+
+    #[test]
+    fn rrf_score_matches_reciprocal_formula() {
+        // Pin the exact contribution w/(k+rank), 1-based — guards against silent
+        // drift to 0-based ranks or a k*rank denominator.
+        let k = RRF_K;
+        let r: Ranking = vec![(cid("first"), 9.0), (cid("second"), 1.0)];
+        let signals = vec![Signal { name: "s", weight: 1.0, ranking: &r }];
+        let fused = reciprocal_rank_fusion(&signals, k, 10);
+        let by = |c: &str| fused.iter().find(|h| h.cid == cid(c)).unwrap().score;
+        assert!((by("first") - 1.0 / (k + 1.0)).abs() < 1e-6, "rank-1 score = 1/(k+1)");
+        assert!((by("second") - 1.0 / (k + 2.0)).abs() < 1e-6, "rank-2 score = 1/(k+2)");
+        // Weight scales the contribution linearly.
+        let signals_w = vec![Signal { name: "s", weight: 3.0, ranking: &r }];
+        let fused_w = reciprocal_rank_fusion(&signals_w, k, 10);
+        let first_w = fused_w.iter().find(|h| h.cid == cid("first")).unwrap().score;
+        assert!((first_w - 3.0 / (k + 1.0)).abs() < 1e-6, "weight multiplies the contribution");
+    }
+
+    #[test]
     fn weighted_fusion_authority_boost_changes_order() {
         // Without boost, a and b are equally relevant; authority lifts b.
         let lex: Ranking = vec![(cid("a"), 1.0), (cid("b"), 1.0)];

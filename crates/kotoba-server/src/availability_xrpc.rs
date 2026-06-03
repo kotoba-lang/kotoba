@@ -18,7 +18,7 @@ use axum::{extract::State, response::IntoResponse, Json};
 use kotoba_dht::availability_proof::AvailabilityChallenge;
 use std::sync::Arc;
 
-pub const NSID_AVAILABILITY_CHALLENGE: &str = "ai.gftd.apps.kotoba.dht.availability_challenge";
+pub const NSID_AVAILABILITY_CHALLENGE: &str = "com.etzhayyim.apps.kotoba.dht.availability_challenge";
 
 /// Answer an availability challenge from this node's block store.
 pub async fn availability_challenge(

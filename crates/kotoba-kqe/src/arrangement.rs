@@ -1,5 +1,6 @@
 use crate::datom::{Datom, DatomArrangement, DatomIndex, DatomIndexComponent, Value};
 use crate::delta::Delta;
+use crate::keycodec;
 use crate::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use kotoba_core::cid::KotobaCid;
 use std::collections::{BTreeMap, HashMap};
@@ -21,8 +22,11 @@ pub struct Arrangement {
     spo: HashMap<KotobaCid, BTreeMap<String, Vec<QuadObject>>>,
     /// AEVT ≅ PSO: predicate → subject → [object]  (BTreeMap for attribute range scan)
     pso: BTreeMap<String, HashMap<KotobaCid, Vec<QuadObject>>>,
-    /// AVET ≅ POS: predicate → object_key → [subject]
-    pos: BTreeMap<String, BTreeMap<String, Vec<KotobaCid>>>,
+    /// AVET ≅ POS: predicate → canonical-value-key → [subject].
+    /// The inner key is the **canonical order-preserving codec** (keycodec),
+    /// so value range/order is numeric (no `"100" < "20"`) and type-segregated,
+    /// matching the cold Prolly AVET keys (ADR-2606022150 D2 / P2b).
+    pos: BTreeMap<String, BTreeMap<Vec<u8>, Vec<KotobaCid>>>,
     /// VAET ≅ OCP: object_cid → predicate → [subject]  (ref-type only)
     ocp: HashMap<KotobaCid, BTreeMap<String, Vec<KotobaCid>>>,
     count: usize,
@@ -193,12 +197,23 @@ impl Arrangement {
 
     // ── AVET queries ─────────────────────────────────────────────────────────
 
-    /// Entities that have (attr, value_key) — AVET index.
-    /// `object_key` matches Text values directly and CID multibase strings.
-    pub fn get_entities_by_attribute_value(&self, attr: &str, object_key: &str) -> Vec<KotobaCid> {
+    /// Entities that have `(attr, value)` — AVET point lookup. The value is
+    /// encoded with the canonical key codec, so it matches the cold AVET keys.
+    pub fn get_entities_by_attribute_value(&self, attr: &str, value: &Value) -> Vec<KotobaCid> {
+        self.get_entities_by_attribute_value_bytes(attr, &keycodec::value_key(value))
+    }
+
+    /// Entities that have `(attr, value)` where the value is already encoded as
+    /// a canonical key (keycodec) — for callers that share one encoding with the
+    /// cold Prolly AVET scan prefix.
+    pub fn get_entities_by_attribute_value_bytes(
+        &self,
+        attr: &str,
+        value_key: &[u8],
+    ) -> Vec<KotobaCid> {
         self.pos
             .get(attr)
-            .and_then(|omap| omap.get(object_key))
+            .and_then(|omap| omap.get(value_key))
             .cloned()
             .unwrap_or_default()
     }
@@ -359,8 +374,9 @@ impl Arrangement {
         out
     }
 
-    /// All (predicate, object_key, subjects) sorted by predicate — AVET scan.
-    pub fn avet_entity_entries(&self) -> Vec<(String, String, Vec<KotobaCid>)> {
+    /// All (predicate, canonical-value-key, subjects) sorted by predicate — AVET
+    /// scan. The value key is the keycodec encoding (shared with the cold AVET).
+    pub fn avet_entity_entries(&self) -> Vec<(String, Vec<u8>, Vec<KotobaCid>)> {
         let mut out = vec![];
         for (pred, omap) in &self.pos {
             for (okey, subs) in omap {
@@ -382,14 +398,11 @@ impl Arrangement {
     }
 }
 
-fn value_key(value: &Value) -> String {
-    match value {
-        Value::Cid(c) => c.to_multibase(),
-        Value::Text(s) => s.clone(),
-        Value::Integer(n) => n.to_string(),
-        Value::Encrypted { ct_cid, .. } => format!("enc:{}", ct_cid.to_multibase()),
-        _ => "?".to_string(),
-    }
+/// Canonical order-preserving AVET value key (keycodec) — the single encoding
+/// shared by the hot `pos` index and the cold Prolly AVET keys, so they order
+/// identically and `searchActors`/range/ORDER-BY are numeric + type-segregated.
+fn value_key(value: &Value) -> Vec<u8> {
+    keycodec::value_key(value)
 }
 
 #[cfg(test)]
@@ -399,6 +412,66 @@ mod tests {
 
     fn cid(s: &str) -> KotobaCid {
         KotobaCid::from_bytes(s.as_bytes())
+    }
+
+    // P2b (ADR-2606022150 D2): the AVET value key is the canonical codec, so
+    // non-text values no longer collapse to the old `"?"` bucket, and numeric
+    // values sort numerically. Point lookup is exact + type-segregated.
+    #[test]
+    fn avet_value_key_is_canonical_no_collision() {
+        let mut arr = Arrangement::new();
+        let tx = cid("tx");
+        let mk = |e: &str, v: Value| Datom::assert(cid(e), ":x".into(), v, tx.clone());
+        // Three values that ALL mapped to "?" under the old String value_key.
+        arr.insert_datom(&mk("e_bool", Value::Bool(true)));
+        arr.insert_datom(&mk("e_float", Value::Float(1.0)));
+        arr.insert_datom(&mk("e_int", Value::Integer(100)));
+
+        // Each value addresses exactly its own subject — no collision.
+        assert_eq!(
+            arr.get_entities_by_attribute_value(":x", &Value::Bool(true)),
+            vec![cid("e_bool")]
+        );
+        assert_eq!(
+            arr.get_entities_by_attribute_value(":x", &Value::Float(1.0)),
+            vec![cid("e_float")]
+        );
+        assert_eq!(
+            arr.get_entities_by_attribute_value(":x", &Value::Integer(100)),
+            vec![cid("e_int")]
+        );
+        // A value that isn't present returns nothing (not a "?" bucket of everything).
+        assert!(arr
+            .get_entities_by_attribute_value(":x", &Value::Bool(false))
+            .is_empty());
+    }
+
+    #[test]
+    fn avet_pos_orders_integers_numerically() {
+        // The hot `pos` inner key now sorts numerically (keycodec), not "100" < "20".
+        let mut arr = Arrangement::new();
+        let tx = cid("tx");
+        for n in [100i64, 20, 3, -5] {
+            arr.insert_datom(&Datom::assert(
+                cid(&format!("e{n}")),
+                ":score".into(),
+                Value::Integer(n),
+                tx.clone(),
+            ));
+        }
+        let keys: Vec<Vec<u8>> = arr
+            .avet_entity_entries()
+            .into_iter()
+            .filter(|(p, _, _)| p == ":score")
+            .map(|(_, k, _)| k)
+            .collect();
+        // avet_entity_entries iterates the pos BTreeMap in key order → numeric.
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "keys already emitted in sorted order");
+        // Decode-free check: the canonical order is -5 < 3 < 20 < 100.
+        assert_eq!(keys[0], keycodec::value_key(&Value::Integer(-5)));
+        assert_eq!(keys[3], keycodec::value_key(&Value::Integer(100)));
     }
 
     fn quad(s: &str, p: &str, o: &str) -> Quad {
@@ -433,7 +506,7 @@ mod tests {
         assert!(subs.contains(&cid("alice")));
 
         // AVET (POS): who has name="Alice"?
-        let subs = arr.get_entities_by_attribute_value("name", "Alice");
+        let subs = arr.get_entities_by_attribute_value("name", &Value::Text("Alice".into()));
         assert!(subs.contains(&cid("alice")));
 
         // VAET (OCP): who references bob?

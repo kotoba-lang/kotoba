@@ -142,7 +142,7 @@ the immutable `(E,A,V,T,Added)` history. SPARQL is intentionally a secondary
 RDF-compatible query surface over that Datomic/IPLD head, not a competing
 source of truth.
 
-Server endpoint: `POST /xrpc/ai.gftd.apps.kotoba.graph.sparql`
+Server endpoint: `POST /xrpc/com.etzhayyim.apps.kotoba.graph.sparql`
 
 Auto-detects the form from the leading keyword and dispatches to the
 matching Datom-backed cold-path method:

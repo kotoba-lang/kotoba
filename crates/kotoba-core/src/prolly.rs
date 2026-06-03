@@ -1,9 +1,15 @@
 use crate::cid::KotobaCid;
 use crate::store::BlockStore;
+use serde_bytes::ByteBuf;
 use std::collections::BTreeMap;
 
-/// Prolly Tree — probabilistic boundary, content-addressed ordered set
-/// boundary condition: blake3(node_bytes)[0..4] == 0x00000000 (1/2^32 prob → ~4B chunk)
+/// Prolly Tree — probabilistic boundary, content-addressed ordered set.
+///
+/// The **boundary** is a content-defined chunk split keyed on the *entry key*:
+/// `blake3(key)[0..4] & BOUNDARY_MASK == 0` (history-independent, structurally
+/// shared). The **block CID** is independent of the boundary: nodes are encoded
+/// as canonical **DAG-CBOR** (ADR-2606022150) and addressed by
+/// `sha2-256(dag-cbor-bytes)` — a genuine CIDv1 dag-cbor link (see `put_node`).
 pub const BOUNDARY_MASK: u32 = 0x0000_00FF; // tune for ~256 byte chunks in PoC
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -16,6 +22,74 @@ pub enum ProllyNode {
         children: Vec<(Vec<u8>, KotobaCid)>, // (boundary_key, child_cid)
         cid: KotobaCid,
     },
+}
+
+/// On-block serialization mirror of [`ProllyNode`], encoded as **true DAG-CBOR**
+/// (ADR-2606022150 D1):
+///
+/// - child links are `::cid::Cid` → emitted as **IPLD CID tag-42**, not raw bytes,
+///   so a generic DAG-CBOR / IPFS tool can walk the tree;
+/// - keys/values are `serde_bytes::ByteBuf` → CBOR byte strings, not arrays;
+/// - the node's **own CID is not stored inside the block** (it is the hash of the
+///   block — storing it would be circular and non-canonical); `load_node` restores
+///   it from the lookup CID.
+///
+/// `KotobaCid`'s global serde is deliberately left unchanged (byte array in commit
+/// blocks / server JSON / `StoredDatom`); tag-42 is contained to this codec.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum ProllyNodeDag {
+    Leaf {
+        entries: Vec<(ByteBuf, ByteBuf)>,
+    },
+    Internal {
+        children: Vec<(ByteBuf, ::cid::Cid)>,
+    },
+}
+
+impl ProllyNodeDag {
+    fn from_node(node: &ProllyNode) -> anyhow::Result<Self> {
+        Ok(match node {
+            ProllyNode::Leaf { entries, .. } => ProllyNodeDag::Leaf {
+                entries: entries
+                    .iter()
+                    .map(|(k, v)| (ByteBuf::from(k.clone()), ByteBuf::from(v.clone())))
+                    .collect(),
+            },
+            ProllyNode::Internal { children, .. } => ProllyNodeDag::Internal {
+                children: children
+                    .iter()
+                    .map(|(k, c)| {
+                        c.to_standard_cid()
+                            .map(|cid| (ByteBuf::from(k.clone()), cid))
+                            .map_err(|e| anyhow::anyhow!("child link → CID: {e:?}"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            },
+        })
+    }
+
+    fn into_node(self, self_cid: KotobaCid) -> anyhow::Result<ProllyNode> {
+        Ok(match self {
+            ProllyNodeDag::Leaf { entries } => ProllyNode::Leaf {
+                entries: entries
+                    .into_iter()
+                    .map(|(k, v)| (k.into_vec(), v.into_vec()))
+                    .collect(),
+                cid: self_cid,
+            },
+            ProllyNodeDag::Internal { children } => ProllyNode::Internal {
+                children: children
+                    .into_iter()
+                    .map(|(k, cid)| {
+                        KotobaCid::from_standard_cid(&cid)
+                            .map(|kc| (k.into_vec(), kc))
+                            .ok_or_else(|| anyhow::anyhow!("CID tag-42 link → KotobaCid"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+                cid: self_cid,
+            },
+        })
+    }
 }
 
 impl ProllyNode {
@@ -247,17 +321,21 @@ impl ProllyTree {
         Ok(out)
     }
 
-    /// Serialize a node to DAG-CBOR and write it to the block store.
-    /// Returns the node's CID (= blake3(cbor_bytes)).
+    /// Serialize a node to **canonical DAG-CBOR** (tag-42 CID links) and write it
+    /// to the block store. Returns the node's CID = `sha2-256(dag-cbor-bytes)`
+    /// (CIDv1, codec dag-cbor) — a genuine IPLD link (ADR-2606022150 D1). The
+    /// self-CID field is excluded from the encoded block (it is the block's hash).
     pub fn put_node(node: &ProllyNode, store: &dyn BlockStore) -> anyhow::Result<KotobaCid> {
-        let mut buf = Vec::new();
-        ciborium::into_writer(node, &mut buf).map_err(|e| anyhow::anyhow!("cbor encode: {e}"))?;
+        let dag = ProllyNodeDag::from_node(node)?;
+        let buf = serde_ipld_dagcbor::to_vec(&dag)
+            .map_err(|e| anyhow::anyhow!("dag-cbor encode: {e}"))?;
         let cid = KotobaCid::from_bytes(&buf);
         store.put(&cid, &buf)?;
         Ok(cid)
     }
 
-    /// Load a ProllyNode from the block store by CID.
+    /// Load a ProllyNode from the block store by CID, decoding the DAG-CBOR block
+    /// and restoring the node's own CID from the lookup key.
     pub fn load_node(
         cid: &KotobaCid,
         store: &dyn BlockStore,
@@ -265,15 +343,9 @@ impl ProllyTree {
         match store.get(cid)? {
             None => Ok(None),
             Some(bytes) => {
-                let mut node: ProllyNode = ciborium::from_reader(&bytes[..])
-                    .map_err(|e| anyhow::anyhow!("cbor decode: {e}"))?;
-                match &mut node {
-                    ProllyNode::Leaf { cid: node_cid, .. }
-                    | ProllyNode::Internal { cid: node_cid, .. } => {
-                        *node_cid = cid.clone();
-                    }
-                }
-                Ok(Some(node))
+                let dag: ProllyNodeDag = serde_ipld_dagcbor::from_slice(&bytes)
+                    .map_err(|e| anyhow::anyhow!("dag-cbor decode: {e}"))?;
+                Ok(Some(dag.into_node(cid.clone())?))
             }
         }
     }
@@ -759,6 +831,70 @@ mod tests {
             }
             _ => panic!("expected leaf"),
         }
+    }
+
+    // ── ADR-2606022150 D1: blocks are genuine DAG-CBOR with tag-42 CID links ──
+
+    /// An `Internal` node's encoded block must carry its child links as **IPLD
+    /// CID tag-42** (CBOR major-7 tag 42 = bytes `0xD8 0x2A`), not the old raw
+    /// `[u8;36]` byte array. This is the difference between a real IPLD DAG (any
+    /// dag-cbor tool can walk it) and dag-cbor-in-name-only.
+    #[test]
+    fn internal_node_block_encodes_cid_links_as_tag42() {
+        let store = MemoryBlockStore::new();
+        // Two real child blocks → two CIDv1 dag-cbor links in the parent.
+        let child_a = ProllyTree::put_node(
+            &ProllyNode::Leaf { entries: vec![(b"a".to_vec(), b"1".to_vec())], cid: KotobaCid::from_bytes(b"x") },
+            &store,
+        ).unwrap();
+        let child_b = ProllyTree::put_node(
+            &ProllyNode::Leaf { entries: vec![(b"b".to_vec(), b"2".to_vec())], cid: KotobaCid::from_bytes(b"x") },
+            &store,
+        ).unwrap();
+        let parent = ProllyNode::Internal {
+            children: vec![(b"a".to_vec(), child_a.clone()), (b"b".to_vec(), child_b.clone())],
+            cid: KotobaCid::from_bytes(b"x"),
+        };
+        let parent_cid = ProllyTree::put_node(&parent, &store).unwrap();
+
+        // Inspect the RAW block bytes the store holds.
+        let raw = store.get(&parent_cid).unwrap().unwrap();
+        // CBOR tag 42 prefix appears once per child link.
+        let tag42 = raw.windows(2).filter(|w| w == b"\xd8\x2a").count();
+        assert_eq!(tag42, 2, "two children → two tag-42 CID links in the DAG-CBOR block");
+
+        // And the canonical tag-42 payload is `0x00 || cid-bytes` (multibase
+        // identity prefix), so each child's 36 CID bytes appear verbatim.
+        assert!(raw.windows(36).any(|w| w == child_a.0), "child_a CID bytes present in block");
+        assert!(raw.windows(36).any(|w| w == child_b.0), "child_b CID bytes present in block");
+
+        // Round-trips back to the same KotobaCid links.
+        match ProllyTree::load_node(&parent_cid, &store).unwrap().unwrap() {
+            ProllyNode::Internal { children, .. } => {
+                assert_eq!(children[0].1, child_a);
+                assert_eq!(children[1].1, child_b);
+            }
+            _ => panic!("expected internal"),
+        }
+    }
+
+    /// The node CID is `sha2-256(dag-cbor)` and deterministic: identical content
+    /// → identical CID (content addressing), and the self-CID field is excluded
+    /// from the block (so it can't perturb the hash).
+    #[test]
+    fn dagcbor_node_cid_is_deterministic_and_self_cid_excluded() {
+        let store = MemoryBlockStore::new();
+        let mk = |self_cid: &[u8]| ProllyNode::Leaf {
+            entries: vec![(b"k".to_vec(), b"v".to_vec())],
+            cid: KotobaCid::from_bytes(self_cid),
+        };
+        // Same entries, DIFFERENT bogus self-cid → same block CID (self-cid not encoded).
+        let c1 = ProllyTree::put_node(&mk(b"self-one"), &store).unwrap();
+        let c2 = ProllyTree::put_node(&mk(b"self-two"), &store).unwrap();
+        assert_eq!(c1, c2, "self-CID field must not affect the content-addressed block");
+        // The CID is a valid CIDv1 dag-cbor sha2-256 link.
+        assert!(c1.is_ipfs_compatible());
+        assert!(c1.to_standard_cid().is_ok());
     }
 
     // ── regression: build_internal_level must use CID not max_key ────────────

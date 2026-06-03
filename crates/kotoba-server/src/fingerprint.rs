@@ -319,7 +319,7 @@ mod tests {
         let datoms = build_request_datoms(
             subject,
             "POST",
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             "deadbeef",
             1_779_945_602,
             Some("203.0.113.1"),
@@ -362,7 +362,7 @@ mod tests {
             rows,
             vec![vec![
                 kotoba_edn::EdnValue::string("POST"),
-                kotoba_edn::EdnValue::string("/xrpc/ai.gftd.apps.kotoba.datomic.q"),
+                kotoba_edn::EdnValue::string("/xrpc/com.etzhayyim.apps.kotoba.datomic.q"),
                 kotoba_edn::EdnValue::string("203.0.113.1"),
             ]]
         );
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn path_short_of_limit_is_not_truncated() {
         // A path shorter than MAX_AUDIT_PATH_LEN must pass through unchanged.
-        let short = "/xrpc/ai.gftd.apps.kotoba.graph.query";
+        let short = "/xrpc/com.etzhayyim.apps.kotoba.graph.query";
         assert!(short.len() < MAX_AUDIT_PATH_LEN);
         // Simulate the truncation logic used in fingerprint_middleware.
         let result = if short.len() > MAX_AUDIT_PATH_LEN {

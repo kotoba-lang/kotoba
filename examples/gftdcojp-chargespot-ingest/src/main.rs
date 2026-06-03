@@ -3,8 +3,8 @@
 //! Generates an ephemeral Ed25519 keypair, builds a self-signed CACAO with
 //! `datom:write` capability, and ingests all Chargespot BMA Datom projections into a
 //! running kotoba-server via:
-//!   - XRPC  POST /xrpc/ai.gftd.apps.kotoba.quad.create   (legacy projection)
-//!   - XRPC  POST /xrpc/ai.gftd.apps.kotoba.commit.store  (once at end)
+//!   - XRPC  POST /xrpc/com.etzhayyim.apps.kotoba.quad.create   (legacy projection)
+//!   - XRPC  POST /xrpc/com.etzhayyim.apps.kotoba.commit.store  (once at end)
 //!   - MCP   POST /mcp  kotoba_graph_query                 (verify round-trip)
 //!
 //! Usage:
@@ -522,7 +522,7 @@ async fn xrpc_quad_create(
     object: &str,
     cacao_b64: &str,
 ) -> Result<()> {
-    let url = format!("{base}/xrpc/ai.gftd.apps.kotoba.quad.create");
+    let url = format!("{base}/xrpc/com.etzhayyim.apps.kotoba.quad.create");
     let body = json!({
         "graph":     graph,
         "subject":   subject,
@@ -551,7 +551,7 @@ async fn xrpc_commit(
     author: &str,
     cacao_b64: &str,
 ) -> Result<String> {
-    let url = format!("{base}/xrpc/ai.gftd.apps.kotoba.commit.store");
+    let url = format!("{base}/xrpc/com.etzhayyim.apps.kotoba.commit.store");
     let body = json!({
         "graph":     graph,
         "author":    author,

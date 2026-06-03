@@ -1,10 +1,10 @@
 //! Entity attestation with stake enforcement.
 //!
 //! XRPC endpoints:
-//! - POST `ai.gftd.apps.kotoba.attest.claim`      — submit or renew an attestation
-//! - POST `ai.gftd.apps.kotoba.attest.challenge`  — challenge an existing attestation
-//! - GET  `ai.gftd.apps.kotoba.attest.query`      — query attestation status
-//! - GET  `ai.gftd.apps.kotoba.request.log`       — query audit log for requests
+//! - POST `com.etzhayyim.apps.kotoba.attest.claim`      — submit or renew an attestation
+//! - POST `com.etzhayyim.apps.kotoba.attest.challenge`  — challenge an existing attestation
+//! - GET  `com.etzhayyim.apps.kotoba.attest.query`      — query attestation status
+//! - GET  `com.etzhayyim.apps.kotoba.request.log`       — query audit log for requests
 //!
 //! Stake thresholds (mKOTO):
 //! - Self-attested claim:    1,000 KOTO  = 1_000_000_000 mKOTO
@@ -107,10 +107,10 @@ fn authorize_attestation_write(
 
 // ── NSID constants ────────────────────────────────────────────────────────────
 
-pub const NSID_ATTEST_CLAIM: &str = "ai.gftd.apps.kotoba.attest.claim";
-pub const NSID_ATTEST_CHALLENGE: &str = "ai.gftd.apps.kotoba.attest.challenge";
-pub const NSID_ATTEST_QUERY: &str = "ai.gftd.apps.kotoba.attest.query";
-pub const NSID_REQUEST_LOG: &str = "ai.gftd.apps.kotoba.request.log";
+pub const NSID_ATTEST_CLAIM: &str = "com.etzhayyim.apps.kotoba.attest.claim";
+pub const NSID_ATTEST_CHALLENGE: &str = "com.etzhayyim.apps.kotoba.attest.challenge";
+pub const NSID_ATTEST_QUERY: &str = "com.etzhayyim.apps.kotoba.attest.query";
+pub const NSID_REQUEST_LOG: &str = "com.etzhayyim.apps.kotoba.request.log";
 
 // ── Stake constants (mKOTO) ───────────────────────────────────────────────────
 
@@ -502,7 +502,7 @@ pub struct RequestLogEntry {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-/// POST `ai.gftd.apps.kotoba.attest.claim`
+/// POST `com.etzhayyim.apps.kotoba.attest.claim`
 ///
 /// Validates stake thresholds and writes the attestation as Datoms.
 pub async fn attest_claim(
@@ -687,7 +687,7 @@ pub async fn attest_claim(
         .into_response()
 }
 
-/// POST `ai.gftd.apps.kotoba.attest.challenge`
+/// POST `com.etzhayyim.apps.kotoba.attest.challenge`
 ///
 /// Records a challenge against an existing attestation claim.
 pub async fn attest_challenge(
@@ -790,7 +790,7 @@ pub async fn attest_challenge(
         .into_response()
 }
 
-/// GET `ai.gftd.apps.kotoba.attest.query`
+/// GET `com.etzhayyim.apps.kotoba.attest.query`
 ///
 /// Query attestation records by entity_did or attester_did.
 /// Reads from the distributed Datomic/IPNS head; returns empty when neither
@@ -899,7 +899,7 @@ pub async fn attest_query(
     Json(AttestQueryResp { claims, total }).into_response()
 }
 
-/// GET `ai.gftd.apps.kotoba.request.log`
+/// GET `com.etzhayyim.apps.kotoba.request.log`
 ///
 /// Query the request audit log stored by the fingerprint middleware.
 /// Reads from the audit graph's distributed Datomic/IPNS head.
@@ -999,8 +999,8 @@ mod tests {
             NSID_REQUEST_LOG,
         ] {
             assert!(
-                nsid.starts_with("ai.gftd.apps.kotoba."),
-                "NSID does not start with ai.gftd.apps.kotoba.: {nsid}"
+                nsid.starts_with("com.etzhayyim.apps.kotoba."),
+                "NSID does not start with com.etzhayyim.apps.kotoba.: {nsid}"
             );
         }
     }
@@ -1277,17 +1277,17 @@ mod tests {
         let lexicons = [
             (
                 NSID_ATTEST_CLAIM,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/attest/claim.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/claim.json"),
                 "procedure",
             ),
             (
                 NSID_ATTEST_CHALLENGE,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/attest/challenge.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/challenge.json"),
                 "procedure",
             ),
             (
                 NSID_ATTEST_QUERY,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/attest/query.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/query.json"),
                 "query",
             ),
         ];
@@ -1301,7 +1301,7 @@ mod tests {
 
     #[test]
     fn attestation_lexicons_expose_vc_projection_response_fields() {
-        let claim = include_str!("../../../lexicons/ai/gftd/apps/kotoba/attest/claim.json");
+        let claim = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/claim.json");
         assert_lexicon_output_fields(
             claim,
             &[
@@ -1325,7 +1325,7 @@ mod tests {
         );
         assert_lexicon_input_presentation_schema(claim, "auth_presentation");
 
-        let challenge = include_str!("../../../lexicons/ai/gftd/apps/kotoba/attest/challenge.json");
+        let challenge = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/challenge.json");
         assert_lexicon_output_fields(
             challenge,
             &[
@@ -1344,7 +1344,7 @@ mod tests {
         );
         assert_lexicon_input_presentation_schema(challenge, "auth_presentation");
 
-        let query = include_str!("../../../lexicons/ai/gftd/apps/kotoba/attest/query.json");
+        let query = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/query.json");
         assert_lexicon_output_fields(query, &["claims", "total"], &[]);
         assert_lexicon_array_item_fields(
             query,

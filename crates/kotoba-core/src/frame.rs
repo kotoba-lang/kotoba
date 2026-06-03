@@ -99,7 +99,12 @@ impl Frame {
         let flags = FrameFlags::from_nibble(header & 0x0F);
         let (len, varint_bytes) = read_varint(&src[1..])?;
         let offset = 1 + varint_bytes;
-        let end = offset + len as usize;
+        // A frame must not claim a payload length that overflows `usize` or wraps
+        // `end`. Without checked arithmetic an adversarial varint (e.g. u64::MAX)
+        // makes `offset + len` wrap to a small value, slip past the bounds check,
+        // and panic at `src[offset..end]` (slice start > end). Fail closed instead.
+        let len = usize::try_from(len).ok()?;
+        let end = offset.checked_add(len)?;
         if src.len() < end {
             return None;
         }
@@ -231,6 +236,44 @@ mod tests {
         let encoded = frame.encode();
         // Drop last byte to simulate truncation
         assert!(Frame::decode(&encoded[..encoded.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn decode_rejects_overflowing_varint_length_without_panicking() {
+        // Adversarial frame: a valid header followed by a varint that decodes to
+        // u64::MAX as the claimed payload length. Before the checked-arithmetic fix,
+        // `offset + len as usize` wrapped to a small value, slipped past the bounds
+        // check, and panicked at `src[offset..end]` (slice start > end). It must now
+        // fail closed (None) — a wire decoder may never panic on hostile input.
+        let header = Frame {
+            frame_type: FrameType::Read,
+            flags: FrameFlags::default(),
+            payload: Bytes::new(),
+        }
+        .encode()[0];
+        let mut malicious = vec![header];
+        malicious.extend_from_slice(&[0xFF; 9]); // 9 continuation bytes …
+        malicious.push(0x01); // … + terminator → varint = u64::MAX
+        assert!(
+            Frame::decode(&malicious).is_none(),
+            "overflowing length claim must be rejected, not panic"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_length_claim_exceeding_buffer() {
+        // A representable (no-overflow) but oversized length with a short buffer must
+        // also be rejected rather than over-reading.
+        let header = Frame {
+            frame_type: FrameType::Write,
+            flags: FrameFlags::default(),
+            payload: Bytes::new(),
+        }
+        .encode()[0];
+        // LEB128 varint for 1_000_000 = [0xC0, 0x84, 0x3D].
+        let mut buf = vec![header, 0xC0, 0x84, 0x3D];
+        buf.extend_from_slice(b"only-a-few-bytes"); // far fewer than 1e6 bytes
+        assert!(Frame::decode(&buf).is_none());
     }
 
     #[test]

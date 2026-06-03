@@ -405,4 +405,23 @@ mod tests {
         let pt = c.decrypt_blob_bound(aad, &ct).await.unwrap();
         assert_eq!(pt.as_slice(), b"email body PII");
     }
+
+    #[tokio::test]
+    async fn bound_scope_aad_split_is_unambiguous() {
+        // Length-prefixing `scope` makes the (scope, aad) encoding injective:
+        // ("ab", "c") and ("a", "bc") share the concatenation "abc" but MUST derive
+        // different keys (the 4-byte scope-length prefix differs). Without the
+        // prefix a caller could forge a slot boundary and cross-decrypt.
+        let c = test_crypto();
+        let ct = c.encrypt_bound(b"ab", b"c", b"secret").await.unwrap();
+        assert!(
+            c.decrypt_bound(b"a", b"bc", &ct).await.is_err(),
+            "a different (scope,aad) split of the same bytes must not cross-decrypt"
+        );
+        // The exact same (scope, aad) still round-trips.
+        assert_eq!(
+            c.decrypt_bound(b"ab", b"c", &ct).await.unwrap().as_slice(),
+            b"secret"
+        );
+    }
 }

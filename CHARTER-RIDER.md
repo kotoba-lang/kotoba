@@ -187,7 +187,7 @@ is distributed. Acceptance of the License constitutes acceptance of this Rider.
 
    Disputes regarding whether an entity is a Non-Aligned Entity under Section 2
    shall be resolved by the etzhayyim Council (Lv6+ per ADR-2605172600) via an
-   on-chain attestation record (app.etzhayyim.apps.etzhayyim.charter-attestation).
+   on-chain attestation record (com.etzhayyim.apps.etzhayyim.charter-attestation).
    Such attestation creates a public determination but does not preclude
    parallel judicial proceedings under applicable law. Council attestations
    require quorum of three (3) Lv6+ members and are appealable by the

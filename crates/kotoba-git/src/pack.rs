@@ -97,6 +97,25 @@ impl PackSet {
     /// Fully resolve the object at `(pack_index, offset)` into `(kind, body)`,
     /// recursing through OFS/REF deltas.
     fn unpack_at(&self, pack_index: usize, offset: u64) -> Result<(GitObjectKind, Vec<u8>)> {
+        self.unpack_at_depth(pack_index, offset, 0)
+    }
+
+    /// Depth-limited core of [`unpack_at`]. OFS/REF deltas recurse into their base
+    /// object; without a bound, a hostile pack — a self-referential OFS_DELTA
+    /// (`neg=0` → base==self), a REF_DELTA cycle (A→B→A), or a pathologically long
+    /// chain — would recurse until the stack overflows (a remote DoS on any pack
+    /// fetched from an untrusted peer). git itself caps delta chains (default 50);
+    /// we bound at 64 and fail closed beyond it.
+    fn unpack_at_depth(
+        &self,
+        pack_index: usize,
+        offset: u64,
+        depth: usize,
+    ) -> Result<(GitObjectKind, Vec<u8>)> {
+        const MAX_DELTA_DEPTH: usize = 64;
+        if depth > MAX_DELTA_DEPTH {
+            return Err(GitError::MalformedHeader);
+        }
         let pack = &self.packs[pack_index];
         let data = &pack.data;
         let mut pos = offset as usize;
@@ -131,7 +150,8 @@ impl PackSet {
                     .checked_sub(neg)
                     .ok_or(GitError::MalformedHeader)?;
                 let delta = inflate(&data[pos..])?;
-                let (base_kind, base_body) = self.unpack_at(pack_index, base_offset)?;
+                let (base_kind, base_body) =
+                    self.unpack_at_depth(pack_index, base_offset, depth + 1)?;
                 let body = apply_delta(&base_body, &delta)?;
                 Ok((base_kind, body))
             }
@@ -141,7 +161,7 @@ impl PackSet {
                 )?;
                 pos += 20;
                 let delta = inflate(&data[pos..])?;
-                let (base_kind, base_body) = self.resolve_ref_base(base_oid)?;
+                let (base_kind, base_body) = self.resolve_ref_base_depth(base_oid, depth + 1)?;
                 let body = apply_delta(&base_body, &delta)?;
                 Ok((base_kind, body))
             }
@@ -150,10 +170,14 @@ impl PackSet {
     }
 
     /// Resolve a REF_DELTA base oid across all packs.
-    fn resolve_ref_base(&self, oid: GitOid) -> Result<(GitObjectKind, Vec<u8>)> {
+    fn resolve_ref_base_depth(
+        &self,
+        oid: GitOid,
+        depth: usize,
+    ) -> Result<(GitObjectKind, Vec<u8>)> {
         for (i, pack) in self.packs.iter().enumerate() {
             if let Some(&offset) = pack.by_oid.get(&oid) {
-                return self.unpack_at(i, offset);
+                return self.unpack_at_depth(i, offset, depth);
             }
         }
         Err(GitError::ObjectNotFound(oid.to_hex()))
@@ -252,7 +276,13 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let mut pos = 0;
     let _src_size = read_size_varint(delta, &mut pos)?;
     let dst_size = read_size_varint(delta, &mut pos)? as usize;
-    let mut out = Vec::with_capacity(dst_size);
+    // `dst_size` is an untrusted delta-header hint. The output is built purely from
+    // the copy/insert ops below and its final length is validated against dst_size
+    // afterwards, so pre-allocation is only an optimisation — cap it so a hostile
+    // delta claiming a huge dst_size cannot trigger an unbounded speculative
+    // allocation (OOM) before any op runs. Legit larger outputs simply grow.
+    const MAX_DELTA_PREALLOC: usize = 16 << 20; // 16 MiB
+    let mut out = Vec::with_capacity(dst_size.min(MAX_DELTA_PREALLOC));
 
     while pos < delta.len() {
         let op = delta[pos];
@@ -344,6 +374,22 @@ mod tests {
         ];
         let out = apply_delta(base, &delta).unwrap();
         assert_eq!(out, b"hello!!");
+    }
+
+    #[test]
+    fn apply_delta_huge_dst_size_does_not_oom() {
+        // A hostile delta: src_size=0, then a dst_size varint claiming ~2^56 bytes,
+        // and no ops. Before the pre-alloc cap, `Vec::with_capacity(dst_size)` would
+        // attempt a multi-petabyte allocation (OOM/abort). It must instead return a
+        // clean Err (the empty output won't match the claimed dst_size) without OOM.
+        // Encode dst_size as a git size-varint of 0x00 (src) + 8 continuation bytes.
+        let delta = [
+            0x00, // src_size = 0
+            // dst_size: 8 bytes of 0xFF (continuation) + 0x7F terminator → ~2^63
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,
+        ];
+        let result = apply_delta(b"", &delta);
+        assert!(result.is_err(), "huge dst_size must be rejected, not OOM");
     }
 
     #[test]

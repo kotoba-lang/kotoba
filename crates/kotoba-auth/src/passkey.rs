@@ -429,6 +429,36 @@ mod tests {
     }
 
     #[test]
+    fn is_fresh_boundary_is_inclusive() {
+        // Freshness is a replay-window bound: an assertion at EXACTLY max_age must
+        // still pass (the check is `age <= max_age`). `stale_assertion_rejected`
+        // only proves the far-stale side; this pins the off-by-one so a slip to
+        // `<` could not start rejecting assertions that arrive right at the edge of
+        // their legitimate window (a false-positive lockout under normal latency).
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        const MAX_AGE: u64 = 60;
+        let mut a = fresh_assertion(true, true);
+
+        // Age exactly == MAX_AGE → accepted (inclusive boundary).
+        a.issued_at_secs = now - MAX_AGE;
+        assert!(
+            a.is_fresh(MAX_AGE),
+            "assertion aged exactly max_age must be fresh"
+        );
+
+        // A few seconds over → rejected (tight upper edge). Use +5 so test-execution
+        // jitter between `now` capture and the `is_fresh` clock read can't flip it.
+        a.issued_at_secs = now - (MAX_AGE + 5);
+        assert!(
+            !a.is_fresh(MAX_AGE),
+            "assertion older than max_age must be stale"
+        );
+    }
+
+    #[test]
     fn rp_id_mismatch_rejected() {
         let a = fresh_assertion(true, true);
         let expected = [0xFFu8; 32];

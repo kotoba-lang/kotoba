@@ -1,54 +1,54 @@
 //! XRPC endpoint declarations and handlers for Kotoba
-//! NSIDs follow ai.gftd.apps.kotoba.* namespace
+//! NSIDs follow com.etzhayyim.apps.kotoba.* namespace
 
-pub const NSID_DATOM_CREATE: &str = "ai.gftd.apps.kotoba.datom.create";
-pub const NSID_QUAD_CREATE: &str = "ai.gftd.apps.kotoba.quad.create";
-pub const NSID_QUAD_RETRACT: &str = "ai.gftd.apps.kotoba.quad.retract";
-pub const NSID_DATOMIC_TRANSACT: &str = "ai.gftd.apps.kotoba.datomic.transact";
-pub const NSID_DATOMIC_DATOMS: &str = "ai.gftd.apps.kotoba.datomic.datoms";
-pub const NSID_DATOMIC_SEEK_DATOMS: &str = "ai.gftd.apps.kotoba.datomic.seekDatoms";
-pub const NSID_DATOMIC_INDEX_RANGE: &str = "ai.gftd.apps.kotoba.datomic.indexRange";
-pub const NSID_DATOMIC_INDEX_PULL: &str = "ai.gftd.apps.kotoba.datomic.indexPull";
-pub const NSID_DATOMIC_PULL: &str = "ai.gftd.apps.kotoba.datomic.pull";
-pub const NSID_DATOMIC_PULL_MANY: &str = "ai.gftd.apps.kotoba.datomic.pullMany";
-pub const NSID_DATOMIC_Q: &str = "ai.gftd.apps.kotoba.datomic.q";
-pub const NSID_DATOMIC_WITH: &str = "ai.gftd.apps.kotoba.datomic.with";
-pub const NSID_DATOMIC_AS_OF: &str = "ai.gftd.apps.kotoba.datomic.asOf";
-pub const NSID_DATOMIC_SINCE: &str = "ai.gftd.apps.kotoba.datomic.since";
-pub const NSID_DATOMIC_SYNC: &str = "ai.gftd.apps.kotoba.datomic.sync";
-pub const NSID_DATOMIC_HISTORY: &str = "ai.gftd.apps.kotoba.datomic.history";
-pub const NSID_DATOMIC_TX: &str = "ai.gftd.apps.kotoba.datomic.tx";
-pub const NSID_DATOMIC_TX_RANGE: &str = "ai.gftd.apps.kotoba.datomic.txRange";
-pub const NSID_DATOMIC_LOG: &str = "ai.gftd.apps.kotoba.datomic.log";
-pub const NSID_DATOMIC_BASIS_T: &str = "ai.gftd.apps.kotoba.datomic.basisT";
-pub const NSID_DATOMIC_DB_STATS: &str = "ai.gftd.apps.kotoba.datomic.dbStats";
-pub const NSID_DATOMIC_ENTITY: &str = "ai.gftd.apps.kotoba.datomic.entity";
-pub const NSID_DATOMIC_IDENT: &str = "ai.gftd.apps.kotoba.datomic.ident";
-pub const NSID_DATOMIC_ENTID: &str = "ai.gftd.apps.kotoba.datomic.entid";
-pub const NSID_VC_ISSUE: &str = "ai.gftd.apps.kotoba.vc.issue";
-pub const NSID_VC_PRESENT: &str = "ai.gftd.apps.kotoba.vc.present";
-pub const NSID_DID_DOCUMENT_PUBLISH: &str = "ai.gftd.apps.kotoba.did.document.publish";
-pub const NSID_DIDCOMM_SEND: &str = "ai.gftd.apps.kotoba.didcomm.send";
-pub const NSID_ATPROTO_REPO_WRITE: &str = "ai.gftd.apps.kotoba.atproto.repo.write";
-pub const NSID_GRAPH_QUERY: &str = "ai.gftd.apps.kotoba.graph.query";
-pub const NSID_COMMIT_GET: &str = "ai.gftd.apps.kotoba.commit.get";
-pub const NSID_INVOKE_RUN: &str = "ai.gftd.apps.kotoba.invoke.run";
-pub const NSID_INFER_RUN: &str = "ai.gftd.apps.kotoba.infer.run";
-pub const NSID_WEIGHT_PUT: &str = "ai.gftd.apps.kotoba.weight.put";
-pub const NSID_LORA_APPLY: &str = "ai.gftd.apps.kotoba.lora.apply";
-pub const NSID_EMBED_CREATE: &str = "ai.gftd.apps.kotoba.embed.create";
-pub const NSID_NODE_STATUS: &str = "ai.gftd.apps.kotoba.node.status";
-pub const NSID_BLOCK_PUT: &str = "ai.gftd.apps.kotoba.block.put";
-pub const NSID_BLOCK_GET: &str = "ai.gftd.apps.kotoba.block.get";
-pub const NSID_COMMIT_STORE: &str = "ai.gftd.apps.kotoba.commit.store";
-pub const NSID_AGENT_RUN: &str = "ai.gftd.apps.kotoba.agent.run";
-pub const NSID_AGENT_SYNC_OPEN: &str = "ai.gftd.apps.kotoba.agent.syncopen";
-pub const NSID_AGENT_SYNC_ADV: &str = "ai.gftd.apps.kotoba.agent.syncadvance";
-pub const NSID_AGENT_SYNC_CLOSE: &str = "ai.gftd.apps.kotoba.agent.syncclose";
-pub const NSID_VAULT_PUT: &str = "ai.gftd.apps.kotoba.vault.put";
-pub const NSID_VAULT_GET: &str = "ai.gftd.apps.kotoba.vault.get";
-pub const NSID_ECON_BALANCE: &str = "ai.gftd.apps.kotoba.econ.balance";
-pub const NSID_ECON_CREDIT: &str = "ai.gftd.apps.kotoba.econ.credit";
+pub const NSID_DATOM_CREATE: &str = "com.etzhayyim.apps.kotoba.datom.create";
+pub const NSID_QUAD_CREATE: &str = "com.etzhayyim.apps.kotoba.quad.create";
+pub const NSID_QUAD_RETRACT: &str = "com.etzhayyim.apps.kotoba.quad.retract";
+pub const NSID_DATOMIC_TRANSACT: &str = "com.etzhayyim.apps.kotoba.datomic.transact";
+pub const NSID_DATOMIC_DATOMS: &str = "com.etzhayyim.apps.kotoba.datomic.datoms";
+pub const NSID_DATOMIC_SEEK_DATOMS: &str = "com.etzhayyim.apps.kotoba.datomic.seekDatoms";
+pub const NSID_DATOMIC_INDEX_RANGE: &str = "com.etzhayyim.apps.kotoba.datomic.indexRange";
+pub const NSID_DATOMIC_INDEX_PULL: &str = "com.etzhayyim.apps.kotoba.datomic.indexPull";
+pub const NSID_DATOMIC_PULL: &str = "com.etzhayyim.apps.kotoba.datomic.pull";
+pub const NSID_DATOMIC_PULL_MANY: &str = "com.etzhayyim.apps.kotoba.datomic.pullMany";
+pub const NSID_DATOMIC_Q: &str = "com.etzhayyim.apps.kotoba.datomic.q";
+pub const NSID_DATOMIC_WITH: &str = "com.etzhayyim.apps.kotoba.datomic.with";
+pub const NSID_DATOMIC_AS_OF: &str = "com.etzhayyim.apps.kotoba.datomic.asOf";
+pub const NSID_DATOMIC_SINCE: &str = "com.etzhayyim.apps.kotoba.datomic.since";
+pub const NSID_DATOMIC_SYNC: &str = "com.etzhayyim.apps.kotoba.datomic.sync";
+pub const NSID_DATOMIC_HISTORY: &str = "com.etzhayyim.apps.kotoba.datomic.history";
+pub const NSID_DATOMIC_TX: &str = "com.etzhayyim.apps.kotoba.datomic.tx";
+pub const NSID_DATOMIC_TX_RANGE: &str = "com.etzhayyim.apps.kotoba.datomic.txRange";
+pub const NSID_DATOMIC_LOG: &str = "com.etzhayyim.apps.kotoba.datomic.log";
+pub const NSID_DATOMIC_BASIS_T: &str = "com.etzhayyim.apps.kotoba.datomic.basisT";
+pub const NSID_DATOMIC_DB_STATS: &str = "com.etzhayyim.apps.kotoba.datomic.dbStats";
+pub const NSID_DATOMIC_ENTITY: &str = "com.etzhayyim.apps.kotoba.datomic.entity";
+pub const NSID_DATOMIC_IDENT: &str = "com.etzhayyim.apps.kotoba.datomic.ident";
+pub const NSID_DATOMIC_ENTID: &str = "com.etzhayyim.apps.kotoba.datomic.entid";
+pub const NSID_VC_ISSUE: &str = "com.etzhayyim.apps.kotoba.vc.issue";
+pub const NSID_VC_PRESENT: &str = "com.etzhayyim.apps.kotoba.vc.present";
+pub const NSID_DID_DOCUMENT_PUBLISH: &str = "com.etzhayyim.apps.kotoba.did.document.publish";
+pub const NSID_DIDCOMM_SEND: &str = "com.etzhayyim.apps.kotoba.didcomm.send";
+pub const NSID_ATPROTO_REPO_WRITE: &str = "com.etzhayyim.apps.kotoba.atproto.repo.write";
+pub const NSID_GRAPH_QUERY: &str = "com.etzhayyim.apps.kotoba.graph.query";
+pub const NSID_COMMIT_GET: &str = "com.etzhayyim.apps.kotoba.commit.get";
+pub const NSID_INVOKE_RUN: &str = "com.etzhayyim.apps.kotoba.invoke.run";
+pub const NSID_INFER_RUN: &str = "com.etzhayyim.apps.kotoba.infer.run";
+pub const NSID_WEIGHT_PUT: &str = "com.etzhayyim.apps.kotoba.weight.put";
+pub const NSID_LORA_APPLY: &str = "com.etzhayyim.apps.kotoba.lora.apply";
+pub const NSID_EMBED_CREATE: &str = "com.etzhayyim.apps.kotoba.embed.create";
+pub const NSID_NODE_STATUS: &str = "com.etzhayyim.apps.kotoba.node.status";
+pub const NSID_BLOCK_PUT: &str = "com.etzhayyim.apps.kotoba.block.put";
+pub const NSID_BLOCK_GET: &str = "com.etzhayyim.apps.kotoba.block.get";
+pub const NSID_COMMIT_STORE: &str = "com.etzhayyim.apps.kotoba.commit.store";
+pub const NSID_AGENT_RUN: &str = "com.etzhayyim.apps.kotoba.agent.run";
+pub const NSID_AGENT_SYNC_OPEN: &str = "com.etzhayyim.apps.kotoba.agent.syncopen";
+pub const NSID_AGENT_SYNC_ADV: &str = "com.etzhayyim.apps.kotoba.agent.syncadvance";
+pub const NSID_AGENT_SYNC_CLOSE: &str = "com.etzhayyim.apps.kotoba.agent.syncclose";
+pub const NSID_VAULT_PUT: &str = "com.etzhayyim.apps.kotoba.vault.put";
+pub const NSID_VAULT_GET: &str = "com.etzhayyim.apps.kotoba.vault.get";
+pub const NSID_ECON_BALANCE: &str = "com.etzhayyim.apps.kotoba.econ.balance";
+pub const NSID_ECON_CREDIT: &str = "com.etzhayyim.apps.kotoba.econ.credit";
 
 use crate::server::KotobaState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
@@ -640,6 +640,11 @@ pub struct DatomicSyncResp {
     pub target_tx: Option<String>,
     pub reached: bool,
     pub synced_block_count: usize,
+    /// Covering ProllyTree index roots (`eavt`/`aevt`/`avet`/`vaet`/`tea`) → CID.
+    /// Lets a browser node (ADR-2606013600 P3) traverse the canonical tree over
+    /// CID-verified blocks pulled via `block.get`, instead of a JSON snapshot.
+    #[serde(default)]
+    pub index_roots: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1036,8 +1041,8 @@ async fn resolve_and_verify_did_web(
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("did:web sig: {e}")))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datom.create
-/// POST /xrpc/ai.gftd.apps.kotoba.quad.create
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datom.create
+/// POST /xrpc/com.etzhayyim.apps.kotoba.quad.create
 /// Publish a Datom-compatible atomic fact to the KSE Journal.
 ///
 /// `cacao_b64` is required. The CACAO is verified before the write:
@@ -1227,7 +1232,7 @@ pub async fn datom_create(
     quad_create(State(state), Json(req)).await
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.vault.put
+/// POST /xrpc/com.etzhayyim.apps.kotoba.vault.put
 /// Store an opaque blob in the private Vault.  Returns a CID (multibase blake3).
 /// No GossipSub propagation — vault blobs stay local (or in B2 when configured).
 pub async fn vault_put(
@@ -1268,7 +1273,7 @@ pub async fn vault_put(
     ))
 }
 
-/// GET /xrpc/ai.gftd.apps.kotoba.vault.get?cid=<multibase>
+/// GET /xrpc/com.etzhayyim.apps.kotoba.vault.get?cid=<multibase>
 /// Retrieve a blob from the Vault by CID.  Returns 404 if not found.
 pub async fn vault_get(
     State(state): State<Arc<KotobaState>>,
@@ -4307,6 +4312,11 @@ where
         target_tx: target.map(|tx| tx.to_multibase()),
         reached,
         synced_block_count,
+        index_roots: head
+            .index_roots
+            .iter()
+            .map(|(name, cid)| (name.clone(), cid.to_multibase()))
+            .collect(),
     }))
 }
 
@@ -4883,7 +4893,7 @@ pub async fn datomic_transact(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.with
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.with
 /// Apply EDN transaction data to a DB value and return a Datomic-style report
 /// without publishing an IPNS head, writing journal quads, or persisting blocks.
 pub async fn datomic_with(
@@ -4964,7 +4974,7 @@ pub async fn datomic_with(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.asOf
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.asOf
 pub async fn datomic_as_of(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -4997,7 +5007,7 @@ pub async fn datomic_as_of(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.since
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.since
 pub async fn datomic_since(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5030,7 +5040,7 @@ pub async fn datomic_since(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.sync
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.sync
 pub async fn datomic_sync(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5060,7 +5070,7 @@ pub async fn datomic_sync(
     Ok((StatusCode::OK, Json(response)))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.datoms
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.datoms
 pub async fn datomic_datoms(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5154,7 +5164,7 @@ pub async fn datomic_datoms(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.seekDatoms
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.seekDatoms
 pub async fn datomic_seek_datoms(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5236,7 +5246,7 @@ pub async fn datomic_seek_datoms(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.indexRange
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.indexRange
 pub async fn datomic_index_range(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5349,7 +5359,7 @@ pub async fn datomic_index_range(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.indexPull
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.indexPull
 pub async fn datomic_index_pull(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5448,7 +5458,7 @@ pub async fn datomic_index_pull(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.pull
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.pull
 pub async fn datomic_pull(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5504,7 +5514,7 @@ pub async fn datomic_pull(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.pullMany
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.pullMany
 pub async fn datomic_pull_many(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5586,7 +5596,7 @@ pub async fn datomic_pull_many(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.q
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.q
 pub async fn datomic_q(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5807,7 +5817,7 @@ fn datomic_q_json_map_key(style: DatomicQMapKeyStyle, key: &str) -> String {
     }
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.history
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.history
 pub async fn datomic_history(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5890,7 +5900,7 @@ fn datomic_tx_instant_ms(datoms: &[kotoba_datomic::Datom]) -> Option<i64> {
     })
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.tx
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.tx
 pub async fn datomic_tx(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5927,7 +5937,7 @@ pub async fn datomic_tx(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.txRange
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.txRange
 pub async fn datomic_tx_range(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -5972,7 +5982,7 @@ pub async fn datomic_tx_range(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.log
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.log
 pub async fn datomic_log(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6030,7 +6040,7 @@ pub async fn datomic_log(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.basisT
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.basisT
 pub async fn datomic_basis_t(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6066,7 +6076,7 @@ pub async fn datomic_basis_t(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.dbStats
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.dbStats
 pub async fn datomic_db_stats(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6096,7 +6106,7 @@ pub async fn datomic_db_stats(
     Ok((StatusCode::OK, Json(datomic_db_stats_resp(req.graph, &db))))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.entity
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.entity
 pub async fn datomic_entity(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6146,7 +6156,7 @@ pub async fn datomic_entity(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.ident
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.ident
 pub async fn datomic_ident(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6187,7 +6197,7 @@ pub async fn datomic_ident(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.datomic.entid
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.entid
 pub async fn datomic_entid(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6228,7 +6238,7 @@ pub async fn datomic_entid(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.vc.issue
+/// POST /xrpc/com.etzhayyim.apps.kotoba.vc.issue
 pub async fn vc_issue(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6323,7 +6333,7 @@ fn issue_credential_with_operator_proof(
     Ok(credential)
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.vc.present
+/// POST /xrpc/com.etzhayyim.apps.kotoba.vc.present
 pub async fn vc_present(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6397,7 +6407,7 @@ pub async fn vc_present(
     Ok((StatusCode::OK, Json(resp)))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.did.document.publish
+/// POST /xrpc/com.etzhayyim.apps.kotoba.did.document.publish
 pub async fn did_document_publish(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6496,7 +6506,7 @@ pub async fn did_document_publish(
     Ok((StatusCode::OK, Json(resp)))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.didcomm.send
+/// POST /xrpc/com.etzhayyim.apps.kotoba.didcomm.send
 pub async fn didcomm_send(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6590,7 +6600,7 @@ pub async fn didcomm_send(
     Ok((StatusCode::OK, Json(resp)))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.atproto.repo.write
+/// POST /xrpc/com.etzhayyim.apps.kotoba.atproto.repo.write
 pub async fn atproto_repo_write(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -6701,7 +6711,7 @@ pub async fn atproto_repo_write(
     Ok((StatusCode::OK, Json(resp)))
 }
 
-/// GET /xrpc/ai.gftd.apps.kotoba.node.status
+/// GET /xrpc/com.etzhayyim.apps.kotoba.node.status
 /// Operator-only: exposes peer topology that aids targeted DHT attacks.
 pub async fn node_status(
     State(state): State<Arc<KotobaState>>,
@@ -6725,7 +6735,7 @@ pub async fn node_status(
     .into_response()
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.invoke.run
+/// POST /xrpc/com.etzhayyim.apps.kotoba.invoke.run
 /// Execute a WASM component or Datalog program, then publish resulting quads to Journal.
 #[cfg(feature = "wasm-runtime")]
 pub async fn invoke_run(
@@ -7039,7 +7049,7 @@ pub async fn invoke_run(
     }
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.invoke.run
+/// POST /xrpc/com.etzhayyim.apps.kotoba.invoke.run
 /// Heavy WASM/Pregel runtime disabled in the lean server build.
 #[cfg(not(feature = "wasm-runtime"))]
 pub async fn invoke_run(
@@ -7078,7 +7088,7 @@ pub struct BlockGetResp {
     pub data_b64: String,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.block.put
+/// POST /xrpc/com.etzhayyim.apps.kotoba.block.put
 /// Write raw bytes into the block store, returning the CID.
 pub async fn block_put(
     State(state): State<Arc<KotobaState>>,
@@ -7133,7 +7143,7 @@ pub async fn block_put(
     }))
 }
 
-/// GET /xrpc/ai.gftd.apps.kotoba.block.get?cid=<multibase>
+/// GET /xrpc/com.etzhayyim.apps.kotoba.block.get?cid=<multibase>
 pub async fn block_get(
     State(state): State<Arc<KotobaState>>,
     axum::extract::Query(req): axum::extract::Query<BlockGetReq>,
@@ -7170,13 +7180,13 @@ pub async fn block_get(
 
 #[derive(Debug, Deserialize)]
 pub struct NodeRegisterReq {
-    /// app name (the `<app>` in `ai.gftd.apps.<app>.<method>`)
+    /// app name (the `<app>` in `com.etzhayyim.apps.<app>.<method>`)
     pub app: String,
     /// program CID (the wasm component, e.g. from block.put)
     pub endpoint: String,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.node.register
+/// POST /xrpc/com.etzhayyim.apps.kotoba.node.register
 /// Register an external app's wasm node so `generic_invoke` resolves+dispatches it.
 pub async fn node_register(
     State(state): State<Arc<KotobaState>>,
@@ -7230,7 +7240,7 @@ pub struct CommitGetResp {
     pub ipns_verified: Option<bool>,
 }
 
-/// GET /xrpc/ai.gftd.apps.kotoba.commit.get?graph=<multibase>
+/// GET /xrpc/com.etzhayyim.apps.kotoba.commit.get?graph=<multibase>
 pub async fn commit_get(
     State(state): State<Arc<KotobaState>>,
     axum::extract::Query(req): axum::extract::Query<CommitGetReq>,
@@ -7348,7 +7358,7 @@ pub async fn commit_get(
     ))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.commit.store
+/// POST /xrpc/com.etzhayyim.apps.kotoba.commit.store
 /// Flush current Arrangement for the given graph into BlockStore and create a Commit.
 #[derive(Debug, Deserialize)]
 pub struct CommitStoreReq {
@@ -7497,10 +7507,10 @@ pub struct GraphQueryReq {
     pub limit: Option<u64>,
 }
 
-/// GET /xrpc/ai.gftd.apps.kotoba.graph.query
+/// GET /xrpc/com.etzhayyim.apps.kotoba.graph.query
 /// SPO pattern query over the distributed Datomic head, with legacy hot/cold
 /// projection fallback handled by `current_db_for_graph`.
-/// Full Datomic/Datalog evaluation: use `ai.gftd.apps.kotoba.datomic.q`.
+/// Full Datomic/Datalog evaluation: use `com.etzhayyim.apps.kotoba.datomic.q`.
 /// SPARQL remains an auxiliary query surface over the same Datom SSoT.
 pub async fn graph_query(
     State(state): State<Arc<KotobaState>>,
@@ -7596,13 +7606,13 @@ pub async fn graph_query(
         "quads":     quads,
         "limit":     limit,
         "truncated": truncated,
-        "note":  if req.rules.is_some() { "use ai.gftd.apps.kotoba.datomic.q for Datomic/Datalog evaluation" } else { "" },
+        "note":  if req.rules.is_some() { "use com.etzhayyim.apps.kotoba.datomic.q for Datomic/Datalog evaluation" } else { "" },
     })))
 }
 
 // ── Weight put (C) ────────────────────────────────────────────────────────
 
-pub const NSID_WEIGHT_GET: &str = "ai.gftd.apps.kotoba.weight.get";
+pub const NSID_WEIGHT_GET: &str = "com.etzhayyim.apps.kotoba.weight.get";
 
 #[derive(Debug, Deserialize)]
 pub struct WeightPutReq {
@@ -7638,7 +7648,7 @@ pub struct WeightPutResp {
     pub layer: u32,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.weight.put
+/// POST /xrpc/com.etzhayyim.apps.kotoba.weight.put
 ///
 /// `cacao_b64` is required. The CACAO is verified before the write:
 /// - did:web issuer → HTTP resolution + expiry check
@@ -7872,7 +7882,7 @@ pub struct QuadRetractResp {
     pub journal_cid: String,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.quad.retract
+/// POST /xrpc/com.etzhayyim.apps.kotoba.quad.retract
 ///
 /// `cacao_b64` is required. The CACAO is verified before the delete:
 /// - Signature must be valid (EdDSA or eip191)
@@ -8000,7 +8010,7 @@ pub struct WeightGetResp {
     pub data_b64: String,
 }
 
-/// GET /xrpc/ai.gftd.apps.kotoba.weight.get?cid=<multibase>
+/// GET /xrpc/com.etzhayyim.apps.kotoba.weight.get?cid=<multibase>
 pub async fn weight_get(
     State(state): State<Arc<KotobaState>>,
     axum::extract::Query(req): axum::extract::Query<WeightGetReq>,
@@ -8055,7 +8065,7 @@ pub struct LoraApplyResp {
     pub quad_cid: String,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.lora.apply
+/// POST /xrpc/com.etzhayyim.apps.kotoba.lora.apply
 ///
 /// `cacao_b64` is required. The CACAO is verified before the write:
 /// - did:web issuer → HTTP resolution + expiry check
@@ -8229,7 +8239,7 @@ pub struct EmbedCreateResp {
     pub dims: usize,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.embed.create
+/// POST /xrpc/com.etzhayyim.apps.kotoba.embed.create
 pub async fn embed_create(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -8356,7 +8366,7 @@ pub struct InferRunResp {
     pub output: String,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.infer.run
+/// POST /xrpc/com.etzhayyim.apps.kotoba.infer.run
 pub async fn infer_run(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
@@ -8419,7 +8429,7 @@ pub struct AgentRunResp {
     pub commit_cid: Option<String>,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.agent.run
+/// POST /xrpc/com.etzhayyim.apps.kotoba.agent.run
 ///
 /// Runs a ReAct agent loop using the Kotoba **Pregel BSP** engine:
 ///   - vertex_id  = session CID
@@ -8574,7 +8584,7 @@ pub async fn agent_run(
     }))
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.agent.run
+/// POST /xrpc/com.etzhayyim.apps.kotoba.agent.run
 /// Heavy Pregel ReAct runtime disabled in the lean server build.
 #[cfg(not(feature = "wasm-runtime"))]
 pub async fn agent_run(
@@ -8610,7 +8620,7 @@ pub struct AgentSyncOpenResp {
     pub since_seq: u64,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.agent.syncopen
+/// POST /xrpc/com.etzhayyim.apps.kotoba.agent.syncopen
 ///
 /// Opens a SyncWindow session.  The graph and head CIDs are pinned in the
 /// BudgetedBlockStore so they survive eviction for the duration of the session.
@@ -8701,7 +8711,7 @@ pub struct AgentSyncAdvResp {
     pub since_seq: u64,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.agent.syncadvance
+/// POST /xrpc/com.etzhayyim.apps.kotoba.agent.syncadvance
 ///
 /// Advance the SyncWindow: unpin the old head, pin the new head.
 pub async fn agent_sync_advance(
@@ -8764,7 +8774,7 @@ pub struct AgentSyncCloseResp {
     pub session_id: String,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.agent.syncclose
+/// POST /xrpc/com.etzhayyim.apps.kotoba.agent.syncclose
 ///
 /// Close the SyncWindow session, unpinning all anchors.
 pub async fn agent_sync_close(
@@ -8811,8 +8821,9 @@ mod tests {
     use super::{
         append_auth_capability_datoms, atproto_repo_delete_datoms, atproto_repo_record_entity_cid,
         atproto_repo_write, atproto_repo_write_datoms, datomic_basis_t, datomic_datoms,
-        datomic_db_stats, datomic_entid, datomic_entity, datomic_history, datomic_ident,
-        datomic_index_pull, datomic_index_range, datomic_log, datomic_pull, datomic_pull_many,
+        datomic_datoms_sort_values, datomic_db_stats, datomic_entid, datomic_entity,
+        datomic_history, datomic_ident, datomic_index_pull, datomic_index_range, datomic_log,
+        datomic_pull, datomic_pull_many, DatomicDatomsIndex,
         datomic_q, datomic_seek_datoms, datomic_sync, datomic_transact, datomic_tx_range,
         datomic_with, did_document_publish, didcomm_send, distributed_graph_ipns_name,
         enforce_datomic_range_tx_scope, is_did_web_ip_host, protocol_payload_tx_cid,
@@ -8844,6 +8855,37 @@ mod tests {
     use kotoba_ipfs::{InMemoryIpnsRegistry, IpfsConfig};
     use kotoba_store::MemoryBlockStore;
     use std::sync::Arc;
+
+    // First-tier `datomic.datoms` AVET ordering must be numeric, not the
+    // lexicographic "100" < "20" trap, and type-segregated. This sorts via
+    // `datomic_datoms_sort_key` → `EdnValue` Ord (ADR-2606022150 §D1.1: first-tier
+    // Datomic is canonical without the keycodec — distinct from the 2nd-tier
+    // QuadStore/SPARQL hot index whose `value_key` had the string bug).
+    #[test]
+    fn datomic_datoms_avet_orders_integers_numerically() {
+        let e = KotobaCid::from_bytes(b"e");
+        let tx = KotobaCid::from_bytes(b"tx");
+        let mk = |v: EdnValue| Datom::assert(e.clone(), ":n/score".to_string(), v, tx.clone());
+        let d20 = mk(EdnValue::Integer(20));
+        let d100 = mk(EdnValue::Integer(100));
+        let dneg = mk(EdnValue::Integer(-5));
+        let idx = DatomicDatomsIndex::Avet;
+        // 20 before 100 (numeric, not "100" < "20"); negatives before positives.
+        assert!(
+            datomic_datoms_sort_values(&d20, idx) < datomic_datoms_sort_values(&d100, idx),
+            "AVET: 20 must sort before 100"
+        );
+        assert!(
+            datomic_datoms_sort_values(&dneg, idx) < datomic_datoms_sort_values(&d20, idx),
+            "AVET: -5 must sort before 20"
+        );
+        // Type segregation: a string value never interleaves with integers.
+        let dstr = mk(EdnValue::String("30".to_string()));
+        assert!(
+            datomic_datoms_sort_values(&d100, idx) < datomic_datoms_sort_values(&dstr, idx),
+            "AVET: any integer sorts before any string (type-segregated)"
+        );
+    }
 
     fn test_operator_jwt(did: &str) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -12234,7 +12276,7 @@ mod tests {
 
     // ── NSID constants ───────────────────────────────────────────────────────
 
-    const NSID_PREFIX: &str = "ai.gftd.apps.kotoba.";
+    const NSID_PREFIX: &str = "com.etzhayyim.apps.kotoba.";
 
     #[test]
     fn all_nsid_constants_have_kotoba_prefix() {
@@ -12358,100 +12400,100 @@ mod tests {
 
     #[test]
     fn nsid_datom_create_exact_value() {
-        assert_eq!(super::NSID_DATOM_CREATE, "ai.gftd.apps.kotoba.datom.create");
+        assert_eq!(super::NSID_DATOM_CREATE, "com.etzhayyim.apps.kotoba.datom.create");
     }
 
     #[test]
     fn nsid_quad_create_exact_value() {
-        assert_eq!(super::NSID_QUAD_CREATE, "ai.gftd.apps.kotoba.quad.create");
+        assert_eq!(super::NSID_QUAD_CREATE, "com.etzhayyim.apps.kotoba.quad.create");
     }
 
     #[test]
     fn nsid_graph_query_exact_value() {
-        assert_eq!(super::NSID_GRAPH_QUERY, "ai.gftd.apps.kotoba.graph.query");
+        assert_eq!(super::NSID_GRAPH_QUERY, "com.etzhayyim.apps.kotoba.graph.query");
     }
 
     #[test]
     fn nsid_datomic_exact_values() {
         assert_eq!(
             super::NSID_DATOMIC_TRANSACT,
-            "ai.gftd.apps.kotoba.datomic.transact"
+            "com.etzhayyim.apps.kotoba.datomic.transact"
         );
         assert_eq!(
             super::NSID_DATOMIC_DATOMS,
-            "ai.gftd.apps.kotoba.datomic.datoms"
+            "com.etzhayyim.apps.kotoba.datomic.datoms"
         );
         assert_eq!(
             super::NSID_DATOMIC_SEEK_DATOMS,
-            "ai.gftd.apps.kotoba.datomic.seekDatoms"
+            "com.etzhayyim.apps.kotoba.datomic.seekDatoms"
         );
         assert_eq!(
             super::NSID_DATOMIC_INDEX_RANGE,
-            "ai.gftd.apps.kotoba.datomic.indexRange"
+            "com.etzhayyim.apps.kotoba.datomic.indexRange"
         );
         assert_eq!(
             super::NSID_DATOMIC_INDEX_PULL,
-            "ai.gftd.apps.kotoba.datomic.indexPull"
+            "com.etzhayyim.apps.kotoba.datomic.indexPull"
         );
-        assert_eq!(super::NSID_DATOMIC_PULL, "ai.gftd.apps.kotoba.datomic.pull");
+        assert_eq!(super::NSID_DATOMIC_PULL, "com.etzhayyim.apps.kotoba.datomic.pull");
         assert_eq!(
             super::NSID_DATOMIC_PULL_MANY,
-            "ai.gftd.apps.kotoba.datomic.pullMany"
+            "com.etzhayyim.apps.kotoba.datomic.pullMany"
         );
-        assert_eq!(super::NSID_DATOMIC_Q, "ai.gftd.apps.kotoba.datomic.q");
+        assert_eq!(super::NSID_DATOMIC_Q, "com.etzhayyim.apps.kotoba.datomic.q");
         assert_eq!(
             super::NSID_DATOMIC_AS_OF,
-            "ai.gftd.apps.kotoba.datomic.asOf"
+            "com.etzhayyim.apps.kotoba.datomic.asOf"
         );
         assert_eq!(
             super::NSID_DATOMIC_SINCE,
-            "ai.gftd.apps.kotoba.datomic.since"
+            "com.etzhayyim.apps.kotoba.datomic.since"
         );
-        assert_eq!(super::NSID_DATOMIC_SYNC, "ai.gftd.apps.kotoba.datomic.sync");
+        assert_eq!(super::NSID_DATOMIC_SYNC, "com.etzhayyim.apps.kotoba.datomic.sync");
         assert_eq!(
             super::NSID_DATOMIC_HISTORY,
-            "ai.gftd.apps.kotoba.datomic.history"
+            "com.etzhayyim.apps.kotoba.datomic.history"
         );
-        assert_eq!(super::NSID_DATOMIC_TX, "ai.gftd.apps.kotoba.datomic.tx");
+        assert_eq!(super::NSID_DATOMIC_TX, "com.etzhayyim.apps.kotoba.datomic.tx");
         assert_eq!(
             super::NSID_DATOMIC_TX_RANGE,
-            "ai.gftd.apps.kotoba.datomic.txRange"
+            "com.etzhayyim.apps.kotoba.datomic.txRange"
         );
-        assert_eq!(super::NSID_DATOMIC_LOG, "ai.gftd.apps.kotoba.datomic.log");
+        assert_eq!(super::NSID_DATOMIC_LOG, "com.etzhayyim.apps.kotoba.datomic.log");
         assert_eq!(
             super::NSID_DATOMIC_BASIS_T,
-            "ai.gftd.apps.kotoba.datomic.basisT"
+            "com.etzhayyim.apps.kotoba.datomic.basisT"
         );
         assert_eq!(
             super::NSID_DATOMIC_DB_STATS,
-            "ai.gftd.apps.kotoba.datomic.dbStats"
+            "com.etzhayyim.apps.kotoba.datomic.dbStats"
         );
         assert_eq!(
             super::NSID_DATOMIC_ENTITY,
-            "ai.gftd.apps.kotoba.datomic.entity"
+            "com.etzhayyim.apps.kotoba.datomic.entity"
         );
         assert_eq!(
             super::NSID_DATOMIC_IDENT,
-            "ai.gftd.apps.kotoba.datomic.ident"
+            "com.etzhayyim.apps.kotoba.datomic.ident"
         );
         assert_eq!(
             super::NSID_DATOMIC_ENTID,
-            "ai.gftd.apps.kotoba.datomic.entid"
+            "com.etzhayyim.apps.kotoba.datomic.entid"
         );
     }
 
     #[test]
     fn nsid_protocol_projection_exact_values() {
-        assert_eq!(super::NSID_VC_ISSUE, "ai.gftd.apps.kotoba.vc.issue");
-        assert_eq!(super::NSID_VC_PRESENT, "ai.gftd.apps.kotoba.vc.present");
+        assert_eq!(super::NSID_VC_ISSUE, "com.etzhayyim.apps.kotoba.vc.issue");
+        assert_eq!(super::NSID_VC_PRESENT, "com.etzhayyim.apps.kotoba.vc.present");
         assert_eq!(
             super::NSID_DID_DOCUMENT_PUBLISH,
-            "ai.gftd.apps.kotoba.did.document.publish"
+            "com.etzhayyim.apps.kotoba.did.document.publish"
         );
-        assert_eq!(super::NSID_DIDCOMM_SEND, "ai.gftd.apps.kotoba.didcomm.send");
+        assert_eq!(super::NSID_DIDCOMM_SEND, "com.etzhayyim.apps.kotoba.didcomm.send");
         assert_eq!(
             super::NSID_ATPROTO_REPO_WRITE,
-            "ai.gftd.apps.kotoba.atproto.repo.write"
+            "com.etzhayyim.apps.kotoba.atproto.repo.write"
         );
     }
 
@@ -12460,131 +12502,131 @@ mod tests {
         let lexicons = [
             (
                 super::NSID_DATOMIC_TRANSACT,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/transact.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
             ),
             (
                 super::NSID_DATOMIC_DATOMS,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/datoms.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"),
             ),
             (
                 super::NSID_DATOMIC_SEEK_DATOMS,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/seekDatoms.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"),
             ),
             (
                 super::NSID_DATOMIC_INDEX_RANGE,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexRange.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"),
             ),
             (
                 super::NSID_DATOMIC_INDEX_PULL,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexPull.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
             ),
             (
                 super::NSID_DATOMIC_PULL,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pull.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pull.json"),
             ),
             (
                 super::NSID_DATOMIC_PULL_MANY,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pullMany.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
             ),
             (
                 super::NSID_DATOMIC_Q,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/q.json"),
             ),
             (
                 super::NSID_DATOMIC_WITH,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/with.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/with.json"),
             ),
             (
                 super::NSID_DATOMIC_AS_OF,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/asOf.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/asOf.json"),
             ),
             (
                 super::NSID_DATOMIC_SINCE,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/since.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/since.json"),
             ),
             (
                 super::NSID_DATOMIC_SYNC,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/sync.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/sync.json"),
             ),
             (
                 super::NSID_DATOMIC_HISTORY,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/history.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"),
             ),
             (
                 super::NSID_DATOMIC_TX,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/tx.json"),
             ),
             (
                 super::NSID_DATOMIC_TX_RANGE,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
             ),
             (
                 super::NSID_DATOMIC_LOG,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/log.json"),
             ),
             (
                 super::NSID_DATOMIC_BASIS_T,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/basisT.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"),
             ),
             (
                 super::NSID_DATOMIC_DB_STATS,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/dbStats.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"),
             ),
             (
                 super::NSID_DATOMIC_ENTITY,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entity.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
             ),
             (
                 super::NSID_DATOMIC_IDENT,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/ident.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/ident.json"),
             ),
             (
                 super::NSID_DATOMIC_ENTID,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entid.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entid.json"),
             ),
             (
                 super::NSID_GRAPH_QUERY,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/graph/query.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/query.json"),
             ),
             (
                 crate::kg::NSID_KG_SPARQL,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/graph/sparql.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/sparql.json"),
             ),
             (
                 super::NSID_BLOCK_PUT,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/block/put.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/block/put.json"),
             ),
             (
                 super::NSID_BLOCK_GET,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/block/get.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/block/get.json"),
             ),
             (
                 super::NSID_COMMIT_GET,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/commit/get.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/get.json"),
             ),
             (
                 super::NSID_COMMIT_STORE,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/commit/store.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/store.json"),
             ),
             (
                 super::NSID_VC_ISSUE,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/vc/issue.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/issue.json"),
             ),
             (
                 super::NSID_VC_PRESENT,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/vc/present.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json"),
             ),
             (
                 super::NSID_DID_DOCUMENT_PUBLISH,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/did/document/publish.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json"),
             ),
             (
                 super::NSID_DIDCOMM_SEND,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/didcomm/send.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/didcomm/send.json"),
             ),
             (
                 super::NSID_ATPROTO_REPO_WRITE,
-                include_str!("../../../lexicons/ai/gftd/apps/kotoba/atproto/repo/write.json"),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/atproto/repo/write.json"),
             ),
         ];
         for (expected_id, src) in lexicons {
@@ -12617,7 +12659,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_TRANSACT,
                 file_name: "transact.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/transact.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
                 distributed_read: false,
                 distributed_write: true,
                 remote_read: false,
@@ -12626,7 +12668,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_WITH,
                 file_name: "with.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/with.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/with.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12635,7 +12677,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_DATOMS,
                 file_name: "datoms.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/datoms.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12644,7 +12686,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_SEEK_DATOMS,
                 file_name: "seekDatoms.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/seekDatoms.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12653,7 +12695,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_INDEX_RANGE,
                 file_name: "indexRange.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexRange.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12662,7 +12704,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_INDEX_PULL,
                 file_name: "indexPull.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexPull.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12671,7 +12713,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_PULL,
                 file_name: "pull.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pull.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pull.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12680,7 +12722,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_PULL_MANY,
                 file_name: "pullMany.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pullMany.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12689,7 +12731,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_Q,
                 file_name: "q.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/q.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12698,7 +12740,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_AS_OF,
                 file_name: "asOf.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/asOf.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/asOf.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12707,7 +12749,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_SINCE,
                 file_name: "since.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/since.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/since.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12716,7 +12758,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_SYNC,
                 file_name: "sync.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/sync.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/sync.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12725,7 +12767,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_HISTORY,
                 file_name: "history.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/history.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12734,7 +12776,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_TX,
                 file_name: "tx.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/tx.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12743,7 +12785,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_TX_RANGE,
                 file_name: "txRange.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12752,7 +12794,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_LOG,
                 file_name: "log.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/log.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12761,7 +12803,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_BASIS_T,
                 file_name: "basisT.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/basisT.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12770,7 +12812,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_DB_STATS,
                 file_name: "dbStats.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/dbStats.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12779,7 +12821,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_ENTITY,
                 file_name: "entity.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entity.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12788,7 +12830,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_IDENT,
                 file_name: "ident.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/ident.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/ident.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12797,7 +12839,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_ENTID,
                 file_name: "entid.json",
-                src: include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entid.json"),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entid.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -12814,7 +12856,7 @@ mod tests {
             .map(|entry| entry.file_name.to_string())
             .collect();
         let lexicon_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../lexicons/ai/gftd/apps/kotoba/datomic");
+            .join("../../lexicons/com/etzhayyim/apps/kotoba/datomic");
         let actual_files: std::collections::BTreeSet<_> = std::fs::read_dir(&lexicon_dir)
             .expect("read datomic lexicon dir")
             .map(|entry| {
@@ -12908,7 +12950,7 @@ mod tests {
     #[test]
     fn datomic_lexicons_expose_distributed_datomic_api_fields() {
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/transact.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
             &["graph", "tx_edn"],
             &[
                 "cacao_b64",
@@ -12919,7 +12961,7 @@ mod tests {
             ],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/with.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/with.json"),
             &["graph", "tx_edn"],
             &[
                 "as_of",
@@ -12931,7 +12973,7 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/transact.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
             &[
                 "status",
                 "graph",
@@ -12949,12 +12991,12 @@ mod tests {
             &["auth_proof_cid"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/transact.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/with.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/with.json"),
             &[
                 "status",
                 "graph",
@@ -12966,17 +13008,17 @@ mod tests {
             &["db_before_basis_t", "db_after_basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/with.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/with.json"),
             "tx_data",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/with.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/with.json"),
             "db_after_datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexPull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
             &["graph", "index"],
             &[
                 "components_edn",
@@ -12991,24 +13033,24 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexPull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
             &["graph", "entity_count", "entities"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexPull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
             "entities",
             &["entity", "entity_edn", "datom_count", "datoms"],
         );
         assert_lexicon_nested_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexPull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
             "entities",
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         for src in [
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/asOf.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/since.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/asOf.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/since.json"),
         ] {
             assert_lexicon_input_fields(
                 src,
@@ -13035,7 +13077,7 @@ mod tests {
             );
         }
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/sync.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/sync.json"),
             &["graph"],
             &[
                 "tx",
@@ -13046,7 +13088,7 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/sync.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/sync.json"),
             &[
                 "graph",
                 "commit_cid",
@@ -13057,7 +13099,7 @@ mod tests {
             &["basis_t", "target_tx", "synced_block_count"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/q.json"),
             &["graph", "query_edn"],
             &[
                 "inputs_edn",
@@ -13071,7 +13113,7 @@ mod tests {
             ],
         );
         assert_lexicon_description_mentions(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/q.json"),
             &[
                 "fulltext",
                 "history",
@@ -13083,37 +13125,37 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/q.json"),
             &["graph", "rows_edn"],
             &["basis_t", "rows_map_edn", "rows_map_json"],
         );
         assert_lexicon_array_items_schema(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/q.json"),
             "rows_map_json",
             "object",
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/datoms.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"),
             &["graph", "index", "datom_count", "datoms"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/datoms.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"),
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/history.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"),
             &["graph", "datom_count", "datoms"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/history.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"),
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/tx.json"),
             &["graph", "tx"],
             &[
                 "remote_peer",
@@ -13123,12 +13165,12 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/tx.json"),
             &["graph", "tx"],
             &["basis_t"],
         );
         assert_lexicon_output_object_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/tx.json"),
             "tx",
             &[
                 "tx_cid",
@@ -13142,14 +13184,14 @@ mod tests {
             &["prev_commit_cid", "tx_instant_ms"],
         );
         assert_lexicon_output_object_nested_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/tx.json"),
             "tx",
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         for src in [
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/seekDatoms.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexRange.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"),
         ] {
             assert_lexicon_output_fields(
                 src,
@@ -13159,12 +13201,12 @@ mod tests {
             assert_lexicon_array_item_fields(src, "datoms", &["e", "a", "v_edn", "t", "added"]);
         }
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
             &["graph", "tx_count", "txes"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
             "txes",
             &[
                 "tx_cid",
@@ -13177,65 +13219,65 @@ mod tests {
             ],
         );
         assert_lexicon_array_item_optional_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
             "txes",
             &["prev_commit_cid", "tx_instant_ms"],
         );
         assert_lexicon_nested_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
             "txes",
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/log.json"),
             &["graph", "tx_count", "txes"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/log.json"),
             "txes",
             &["tx_cid", "datom_count", "datoms"],
         );
         assert_lexicon_array_item_optional_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/log.json"),
             "txes",
             &["tx_instant_ms"],
         );
         assert_lexicon_nested_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/log.json"),
             "txes",
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pull.json"),
             &["graph", "entity", "entity_edn", "datom_count", "datoms"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pull.json"),
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pullMany.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
             &["graph", "entity_count", "entities"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pullMany.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
             "entities",
             &["entity", "entity_edn", "datom_count", "datoms"],
         );
         assert_lexicon_nested_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pullMany.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
             "entities",
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/basisT.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"),
             &["graph"],
             &[
                 "as_of",
@@ -13247,12 +13289,12 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/basisT.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"),
             &["graph"],
             &["basis_t"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/dbStats.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"),
             &["graph"],
             &[
                 "as_of",
@@ -13264,7 +13306,7 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/dbStats.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"),
             &[
                 "graph",
                 "datom_count",
@@ -13276,7 +13318,7 @@ mod tests {
             &["basis_t"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entity.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
             &["graph", "entity"],
             &[
                 "as_of",
@@ -13288,17 +13330,17 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entity.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
             &["graph", "entity", "entity_edn", "datom_count", "datoms"],
             &["basis_t"],
         );
         assert_lexicon_array_item_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entity.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
             "datoms",
             &["e", "a", "v_edn", "t", "added"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/ident.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/ident.json"),
             &["graph", "entity"],
             &[
                 "as_of",
@@ -13310,12 +13352,12 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/ident.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/ident.json"),
             &["graph", "entity"],
             &["basis_t", "ident_edn"],
         );
         assert_lexicon_input_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entid.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entid.json"),
             &["graph", "ident_edn"],
             &[
                 "as_of",
@@ -13327,7 +13369,7 @@ mod tests {
             ],
         );
         assert_lexicon_output_fields(
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entid.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entid.json"),
             &["graph", "ident_edn"],
             &["basis_t", "entity"],
         );
@@ -13336,38 +13378,38 @@ mod tests {
     #[test]
     fn protocol_lexicons_expose_w3c_vp_auth_input_schema() {
         for src in [
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/transact.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/with.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/asOf.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/since.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/sync.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/q.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/datoms.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/seekDatoms.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexRange.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/indexPull.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pull.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/pullMany.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/history.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/tx.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/txRange.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/log.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/basisT.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/dbStats.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entity.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/ident.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/datomic/entid.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/graph/sparql.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/vc/present.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/with.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/asOf.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/since.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/sync.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/q.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pull.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/tx.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/log.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/ident.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entid.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/sparql.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json"),
         ] {
             assert_lexicon_input_presentation_schema(src, "presentation");
         }
         for src in [
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/vc/issue.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/vc/present.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/didcomm/send.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/atproto/repo/write.json"),
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/did/document/publish.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/issue.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/didcomm/send.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/atproto/repo/write.json"),
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json"),
         ] {
             assert_lexicon_input_presentation_schema(src, "auth_presentation");
         }
@@ -13375,7 +13417,7 @@ mod tests {
 
     #[test]
     fn did_document_publish_lexicon_exposes_w3c_did_document_and_write_response() {
-        let src = include_str!("../../../lexicons/ai/gftd/apps/kotoba/did/document/publish.json");
+        let src = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json");
         assert_lexicon_input_fields(
             src,
             &["graph", "document"],
@@ -13435,7 +13477,7 @@ mod tests {
 
     #[test]
     fn protocol_write_lexicons_expose_payloads_and_datom_write_response() {
-        let vc_issue = include_str!("../../../lexicons/ai/gftd/apps/kotoba/vc/issue.json");
+        let vc_issue = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/issue.json");
         assert_lexicon_input_object_fields(
             vc_issue,
             "credential",
@@ -13444,10 +13486,10 @@ mod tests {
         );
         assert_protocol_datom_write_output_fields(vc_issue);
 
-        let vc_present = include_str!("../../../lexicons/ai/gftd/apps/kotoba/vc/present.json");
+        let vc_present = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json");
         assert_protocol_datom_write_output_fields(vc_present);
 
-        let didcomm_send = include_str!("../../../lexicons/ai/gftd/apps/kotoba/didcomm/send.json");
+        let didcomm_send = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/didcomm/send.json");
         assert_lexicon_input_object_fields(
             didcomm_send,
             "message",
@@ -13466,7 +13508,7 @@ mod tests {
         assert_protocol_datom_write_output_fields(didcomm_send);
 
         let atproto_write =
-            include_str!("../../../lexicons/ai/gftd/apps/kotoba/atproto/repo/write.json");
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/atproto/repo/write.json");
         let atproto_write_value: serde_json::Value =
             serde_json::from_str(atproto_write).expect("atproto repo write lexicon JSON");
         let atproto_write_description = atproto_write_value["defs"]["main"]["description"]
@@ -13482,7 +13524,7 @@ mod tests {
 
     #[test]
     fn graph_query_lexicons_expose_structured_sparql_and_quad_outputs() {
-        let graph_query = include_str!("../../../lexicons/ai/gftd/apps/kotoba/graph/query.json");
+        let graph_query = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/query.json");
         let graph_query_value: serde_json::Value =
             serde_json::from_str(graph_query).expect("graph.query lexicon JSON");
         let graph_query_description = graph_query_value["defs"]["main"]["description"]
@@ -13525,7 +13567,7 @@ mod tests {
             &["graph", "subject", "predicate", "object"],
         );
 
-        let graph_sparql = include_str!("../../../lexicons/ai/gftd/apps/kotoba/graph/sparql.json");
+        let graph_sparql = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/sparql.json");
         let graph_sparql_value: serde_json::Value =
             serde_json::from_str(graph_sparql).expect("graph.sparql lexicon JSON");
         let graph_sparql_description = graph_sparql_value["defs"]["main"]["description"]
@@ -13576,19 +13618,19 @@ mod tests {
 
     #[test]
     fn storage_lexicons_expose_ipld_commit_and_ipns_fields() {
-        let block_put = include_str!("../../../lexicons/ai/gftd/apps/kotoba/block/put.json");
+        let block_put = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/block/put.json");
         assert_lexicon_input_fields(block_put, &["data_b64"], &[]);
         assert_lexicon_output_fields(block_put, &["cid"], &[]);
 
-        let block_get = include_str!("../../../lexicons/ai/gftd/apps/kotoba/block/get.json");
+        let block_get = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/block/get.json");
         assert_lexicon_parameter_fields(block_get, &["cid"], &[]);
         assert_lexicon_output_fields(block_get, &["cid", "data_b64"], &[]);
 
-        let commit_store = include_str!("../../../lexicons/ai/gftd/apps/kotoba/commit/store.json");
+        let commit_store = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/store.json");
         assert_lexicon_input_fields(commit_store, &["graph", "author", "seq"], &["cacao_b64"]);
         assert_lexicon_output_fields(commit_store, &["cid"], &[]);
 
-        let commit_get = include_str!("../../../lexicons/ai/gftd/apps/kotoba/commit/get.json");
+        let commit_get = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/get.json");
         assert_lexicon_parameter_fields(commit_get, &["graph"], &[]);
         assert_lexicon_output_fields(
             commit_get,
@@ -14048,28 +14090,28 @@ mod tests {
 
     #[test]
     fn nsid_invoke_run_exact_value() {
-        assert_eq!(super::NSID_INVOKE_RUN, "ai.gftd.apps.kotoba.invoke.run");
+        assert_eq!(super::NSID_INVOKE_RUN, "com.etzhayyim.apps.kotoba.invoke.run");
     }
 
     #[test]
     fn nsid_vault_put_and_get_exact_values() {
-        assert_eq!(super::NSID_VAULT_PUT, "ai.gftd.apps.kotoba.vault.put");
-        assert_eq!(super::NSID_VAULT_GET, "ai.gftd.apps.kotoba.vault.get");
+        assert_eq!(super::NSID_VAULT_PUT, "com.etzhayyim.apps.kotoba.vault.put");
+        assert_eq!(super::NSID_VAULT_GET, "com.etzhayyim.apps.kotoba.vault.get");
     }
 
     #[test]
     fn nsid_agent_sync_variants_exact_values() {
         assert_eq!(
             super::NSID_AGENT_SYNC_OPEN,
-            "ai.gftd.apps.kotoba.agent.syncopen"
+            "com.etzhayyim.apps.kotoba.agent.syncopen"
         );
         assert_eq!(
             super::NSID_AGENT_SYNC_ADV,
-            "ai.gftd.apps.kotoba.agent.syncadvance"
+            "com.etzhayyim.apps.kotoba.agent.syncadvance"
         );
         assert_eq!(
             super::NSID_AGENT_SYNC_CLOSE,
-            "ai.gftd.apps.kotoba.agent.syncclose"
+            "com.etzhayyim.apps.kotoba.agent.syncclose"
         );
     }
 

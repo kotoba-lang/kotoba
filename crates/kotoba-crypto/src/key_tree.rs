@@ -184,6 +184,19 @@ pub mod recovery {
             return None;
         }
         let xs: Vec<u8> = shares.iter().map(|s| s[0]).collect();
+        // x-indices must be non-zero and pairwise distinct. x=0 is the secret's own
+        // position (never a valid share), and a repeated index makes a Lagrange
+        // denominator (x_i ^ x_j) zero → gf_inv(0)=0 → a silently WRONG secret rather
+        // than a detected failure. Reject instead of mis-reconstructing.
+        {
+            let mut seen = [false; 256];
+            for &x in &xs {
+                if x == 0 || seen[x as usize] {
+                    return None;
+                }
+                seen[x as usize] = true;
+            }
+        }
         let mut out = Zeroizing::new([0u8; KEY_LEN]);
         for (byte_idx, slot) in out.iter_mut().enumerate() {
             let mut secret_byte = 0u8;
@@ -239,6 +252,28 @@ mod tests {
             unwrap_ark(prf, &wrapped, "did:web:b").is_err(),
             "DID is the AAD; a different account DID must fail"
         );
+    }
+
+    #[test]
+    fn wrapped_ark_tamper_is_detected() {
+        // The server stores the opaque ARK-wrap (L1) but must not be able to
+        // tamper it into a DIFFERENT valid ARK — AEAD integrity, not just
+        // confidentiality. Flipping any byte (iv, ciphertext, or tag) must fail
+        // to unwrap rather than silently yield a corrupted/attacker-chosen ARK.
+        let prf = b"device prf material .....";
+        let did = "did:web:etzhayyim.com:actor:alice";
+        let ark = generate_ark();
+        let wrapped = wrap_ark(prf, &ark, did).unwrap();
+        for idx in [0usize, 12, wrapped.len() - 1] {
+            let mut bad = wrapped.clone();
+            bad[idx] ^= 0xFF;
+            assert!(
+                unwrap_ark(prf, &bad, did).is_err(),
+                "tampered byte at {idx} must be detected (AEAD), not yield a different ARK"
+            );
+        }
+        // The untampered wrap still recovers the exact ARK.
+        assert_eq!(unwrap_ark(prf, &wrapped, did).unwrap().as_slice(), ark.as_slice());
     }
 
     #[test]
@@ -326,5 +361,57 @@ mod tests {
         let mut shares = recovery::split(&ark, 2, 3);
         shares[0].truncate(10); // wrong length
         assert!(recovery::combine(&shares).is_none());
+    }
+
+    #[test]
+    fn shamir_combine_rejects_duplicate_share_index() {
+        // A duplicate x-index makes a Lagrange denominator (x_i ^ x_j) zero →
+        // gf_inv(0)=0 → combine would silently yield a WRONG secret. It must instead
+        // reject (None), so a recovery flow that accidentally collects the same
+        // guardian share twice fails loudly rather than reconstructing a corrupt ARK.
+        let ark = generate_ark();
+        let shares = recovery::split(&ark, 2, 3);
+        // Two copies of the SAME share (same x-index) — count meets threshold (2) but
+        // the indices are not distinct.
+        let dup = vec![shares[0].clone(), shares[0].clone()];
+        assert!(
+            recovery::combine(&dup).is_none(),
+            "duplicate share index must be rejected, not silently mis-reconstructed"
+        );
+        // Sanity: two DISTINCT shares of the same split still recover correctly.
+        let ok = vec![shares[0].clone(), shares[1].clone()];
+        assert_eq!(
+            recovery::combine(&ok).unwrap().as_slice(),
+            ark.as_slice(),
+            "two distinct shares must still recover the secret"
+        );
+    }
+
+    #[test]
+    fn shamir_combine_rejects_zero_share_index() {
+        // x=0 is the secret's own evaluation point, never a valid share index.
+        // A forged share claiming x=0 must be rejected (it would corrupt the basis).
+        let ark = generate_ark();
+        let mut shares = recovery::split(&ark, 2, 3);
+        shares[0][0] = 0; // forge the x-index to 0
+        assert!(
+            recovery::combine(&shares[..2].to_vec()).is_none(),
+            "a share with x-index 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn shamir_combine_is_share_order_independent() {
+        // Lagrange interpolation at x=0 is symmetric in the shares, so the recovered
+        // secret must not depend on the order they are supplied — a guardian-recovery
+        // flow can collect shares in any order.
+        let ark = generate_ark();
+        let shares = recovery::split(&ark, 3, 5);
+        let forward = vec![shares[0].clone(), shares[2].clone(), shares[4].clone()];
+        let reversed = vec![shares[4].clone(), shares[2].clone(), shares[0].clone()];
+        let a = recovery::combine(&forward).unwrap();
+        let b = recovery::combine(&reversed).unwrap();
+        assert_eq!(a.as_slice(), b.as_slice(), "order must not change the result");
+        assert_eq!(a.as_slice(), ark.as_slice());
     }
 }

@@ -204,4 +204,47 @@ mod tests {
         // cost 0 → charge always succeeds even for unfunded writers.
         assert!(e.charge("did:key:ext", e.cost_for(99)).await.is_ok());
     }
+
+    #[tokio::test]
+    async fn refund_restores_balance_after_charge() {
+        // The commit-failed-after-charge path: a charge followed by an equal refund
+        // must leave the member exactly where they started — no mKOTO lost or minted.
+        let e = econ(10, "did:key:op");
+        assert_eq!(e.credit("did:key:ext", 100).await, 100);
+        assert_eq!(e.charge("did:key:ext", 30).await, Ok(70));
+        e.refund("did:key:ext", 30).await;
+        assert_eq!(
+            e.balance("did:key:ext").await,
+            100,
+            "charge + equal refund must restore the original balance"
+        );
+    }
+
+    #[tokio::test]
+    async fn refund_operator_and_nonpositive_are_noops() {
+        let e = econ(10, "did:key:op");
+        // Operator balance is sentinel-unlimited; refund must not perturb it.
+        e.refund("did:key:op", 50).await;
+        assert_eq!(e.balance("did:key:op").await, i64::MAX);
+        // Zero / negative refunds are no-ops (cannot be used to mint).
+        e.credit("did:key:ext", 40).await;
+        e.refund("did:key:ext", 0).await;
+        e.refund("did:key:ext", -100).await;
+        assert_eq!(e.balance("did:key:ext").await, 40);
+    }
+
+    #[tokio::test]
+    async fn credit_negative_debit_floors_at_zero() {
+        // Operator-mint can debit (negative amount), but a balance must never go
+        // negative — the `.max(0)` floor protects the accounting invariant.
+        let e = econ(10, "did:key:op");
+        assert_eq!(e.credit("did:key:ext", 30).await, 30);
+        assert_eq!(
+            e.credit("did:key:ext", -50).await,
+            0,
+            "debiting below zero must floor at 0, not go negative"
+        );
+        // Already-zero balance stays at zero under further debit.
+        assert_eq!(e.credit("did:key:ext", -10).await, 0);
+    }
 }

@@ -346,6 +346,42 @@ mod tests {
     }
 
     #[test]
+    fn authority_flows_transitively_not_just_in_degree() {
+        // THE property that makes PageRank ≠ in-degree counting: authority flows.
+        // X and Y each have in-degree exactly 1, but X is cited by a high-authority
+        // hub (H, in-degree 3) while Y is cited by a low-authority leaf (L, in-degree
+        // 0). X must outrank Y despite identical in-degree.
+        //   0,1,2 = A,B,C → 3 = H        (H accrues authority)
+        //   3 = H → 4 = X                (X inherits H's authority)
+        //   5 = L → 6 = Y                (Y inherits ~teleport-only authority)
+        let edges = [
+            (0usize, 3usize), (1, 3), (2, 3), // A,B,C → H
+            (3, 4),                            // H → X
+            (5, 6),                            // L → Y
+        ];
+        let r = pagerank(7, &edges, PageRankConfig::default());
+        let (x, y) = (r[4], r[6]);
+        assert!(
+            x > y,
+            "X (cited by high-authority hub) must outrank Y (cited by low-authority leaf): X={x}, Y={y}"
+        );
+        let sum: f64 = r.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "still a distribution, got {sum}");
+    }
+
+    #[test]
+    fn self_loop_is_handled_and_conserves_mass() {
+        // A page linking to itself is a real edge case (the cc ingest drops them,
+        // but the core fn is public API). It must not NaN/diverge, and the result
+        // must remain a probability distribution.
+        let edges = [(0usize, 0usize), (0, 1)]; // node 0 self-loops AND links to 1
+        let r = pagerank(2, &edges, PageRankConfig::default());
+        assert!(r.iter().all(|v| v.is_finite()), "no NaN/inf with a self-loop");
+        let sum: f64 = r.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "self-loop must not leak/inflate mass, got {sum}");
+    }
+
+    #[test]
     fn cid_index_compute_and_score() {
         let edges = vec![
             (cid("b"), cid("a")),

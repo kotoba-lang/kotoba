@@ -24,7 +24,7 @@ pub struct SignedPreKey {
 }
 
 /// Public pre-key bundle shared during X3DH.
-/// Corresponds to `ai.gftd.signal.getPrekeyBundle` response.
+/// Corresponds to `com.etzhayyim.signal.getPrekeyBundle` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreKeyBundle {
     /// DID of the bundle owner.

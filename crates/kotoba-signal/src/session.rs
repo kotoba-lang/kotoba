@@ -157,6 +157,99 @@ mod tests {
         }
     }
 
+    // ── X3DH establishment via the public Session API ─────────────────────────
+
+    /// A well-formed bundle for `ik`, with a valid signed-prekey signature.
+    fn valid_bundle(ik: &IdentityKeyPair, spk: &SignedPreKey, opk: &PreKey) -> PreKeyBundle {
+        PreKeyBundle {
+            did: "did:plc:bob".into(),
+            device_id: "dev-1".into(),
+            identity_key: ik.public_key(),
+            signed_prekey: spk.public_bytes().to_vec(),
+            signed_prekey_id: spk.id,
+            signed_prekey_sig: spk.signature.clone(),
+            one_time_prekey: Some(opk.public_bytes().to_vec()),
+            one_time_prekey_id: Some(opk.id),
+        }
+    }
+
+    #[test]
+    fn initiate_accept_roundtrip_succeeds() {
+        // Positive control: a valid bundle establishes a session end-to-end through
+        // the public API. Without this, the rejection tests below could pass
+        // vacuously (e.g. if initiate always errored).
+        let alice_ik = IdentityKeyPair::generate();
+        let bob_ik = IdentityKeyPair::generate();
+        let bob_spk = SignedPreKey::generate(1, &bob_ik);
+        let bob_opk = PreKey::generate(100);
+        let bundle = valid_bundle(&bob_ik, &bob_spk, &bob_opk);
+
+        let (mut alice, ep) = Session::initiate(&alice_ik, &bundle).expect("valid bundle");
+        let ep: [u8; 32] = ep.try_into().unwrap();
+        let mut bob = Session::accept(
+            &bob_ik,
+            &bob_spk,
+            Some(&bob_opk),
+            &alice_ik.public_key(),
+            &ep,
+            "did:plc:alice",
+            "dev-a",
+        )
+        .expect("accept valid X3DH");
+
+        let ct = alice.encrypt(b"hello").unwrap();
+        assert_eq!(bob.decrypt(&ct).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn initiate_rejects_forged_signed_prekey_signature() {
+        // Anti-MITM at the PUBLIC entry point: x3dh_init_sender verifies the SPK
+        // signature, but callers go through Session::initiate — this proves the
+        // rejection propagates there. A bundle whose signature is tampered must not
+        // establish a session.
+        let alice_ik = IdentityKeyPair::generate();
+        let bob_ik = IdentityKeyPair::generate();
+        let bob_spk = SignedPreKey::generate(1, &bob_ik);
+        let bob_opk = PreKey::generate(100);
+        let mut bundle = valid_bundle(&bob_ik, &bob_spk, &bob_opk);
+        bundle.signed_prekey_sig[0] ^= 0xFF; // flip a byte of the signature
+
+        assert!(
+            matches!(
+                Session::initiate(&alice_ik, &bundle),
+                Err(SignalError::BadSignature)
+            ),
+            "a forged signed-prekey signature must be rejected by Session::initiate"
+        );
+    }
+
+    #[test]
+    fn initiate_rejects_substituted_prekey_with_stale_signature() {
+        // The realistic substitution: a malicious PDS swaps the signed pre-key for
+        // an attacker-controlled key but cannot re-sign it with the victim's identity
+        // key, so it leaves the original (now-mismatched) signature. The signature is
+        // over the SPK bytes, so the swap must be detected as BadSignature.
+        let alice_ik = IdentityKeyPair::generate();
+        let bob_ik = IdentityKeyPair::generate();
+        let bob_spk = SignedPreKey::generate(1, &bob_ik);
+        let bob_opk = PreKey::generate(100);
+        let mut bundle = valid_bundle(&bob_ik, &bob_spk, &bob_opk);
+
+        // Attacker's own SPK (signed by a DIFFERENT identity), pubkey substituted in
+        // while the bundle keeps bob's original signature.
+        let attacker_ik = IdentityKeyPair::generate();
+        let attacker_spk = SignedPreKey::generate(1, &attacker_ik);
+        bundle.signed_prekey = attacker_spk.public_bytes().to_vec();
+
+        assert!(
+            matches!(
+                Session::initiate(&alice_ik, &bundle),
+                Err(SignalError::BadSignature)
+            ),
+            "a substituted pre-key under a stale signature must be rejected"
+        );
+    }
+
     #[tokio::test]
     async fn load_returns_none_when_empty() {
         let store = InMemorySessionStore::new();

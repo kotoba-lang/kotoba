@@ -9,8 +9,8 @@
 //!
 //! One wrap per (account DID, passkey credential id) → multi-device falls out.
 
-pub const NSID_ACCOUNT_PUT_WRAPPED_ARK: &str = "ai.gftd.account.put.wrapped.ark";
-pub const NSID_ACCOUNT_GET_WRAPPED_ARK: &str = "ai.gftd.account.get.wrapped.ark";
+pub const NSID_ACCOUNT_PUT_WRAPPED_ARK: &str = "com.etzhayyim.account.put.wrapped.ark";
+pub const NSID_ACCOUNT_GET_WRAPPED_ARK: &str = "com.etzhayyim.account.get.wrapped.ark";
 
 use axum::{
     extract::{Query, State},
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn nsids_have_correct_prefix() {
         for n in [NSID_ACCOUNT_PUT_WRAPPED_ARK, NSID_ACCOUNT_GET_WRAPPED_ARK] {
-            assert!(n.starts_with("ai.gftd.account."), "{n}");
+            assert!(n.starts_with("com.etzhayyim.account."), "{n}");
         }
     }
 
