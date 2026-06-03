@@ -1459,13 +1459,19 @@ pub async fn run() -> anyhow::Result<()> {
 
     let state = Arc::new(state);
 
-    // ADR-2605302130 startup cache-warm: pre-seed the resident `db_before` cache
-    // for configured large graphs OFF the request path, so the first transact
-    // after a (re)start does not pay an on-deadline O(graph) cold `db_from_head`
-    // (the cold-start failure yukkuri hit on `yukkuri-kg-v3`). Comma-separated
-    // graph CIDs in `KOTOBA_DATOMIC_WARM_GRAPHS`; each warmed in the background
-    // with bounded exponential-backoff retry so a transient cold-load failure
-    // does not leave the graph permanently cold.
+    // Warm the resident `db_before` cache for every registered graph in the
+    // background, so the first `datomic.transact` after this (re)start is a cache
+    // HIT instead of an inline O(graph) cold `db_from_head` scan on the request
+    // path (ADR-2605302130 / kotoba#19). Spawned — never blocks serve. This is the
+    // best-effort, all-graphs auto-warm (single pass, no retry).
+    tokio::spawn(Arc::clone(&state).warm_datomic_live_caches());
+
+    // Targeted retry backstop over the auto-warm above: for explicitly-configured
+    // large graphs, re-warm OFF the request path with bounded exponential-backoff
+    // retry so a transient cold-load failure (the cold-start failure yukkuri hit on
+    // `yukkuri-kg-v3`) does not leave the graph permanently cold. Comma-separated
+    // graph CIDs in `KOTOBA_DATOMIC_WARM_GRAPHS`; idempotent vs the auto-warm
+    // (each warm skips a graph already resident at the same head).
     if let Ok(graphs) = std::env::var("KOTOBA_DATOMIC_WARM_GRAPHS") {
         for spec in graphs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let Some(graph_cid) = kotoba_core::cid::KotobaCid::from_multibase(spec) else {

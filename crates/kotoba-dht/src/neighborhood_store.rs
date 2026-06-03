@@ -302,6 +302,25 @@ impl BlockStore for NeighborhoodBlockStore {
         Ok(())
     }
 
+    /// Durable batch: write the whole batch to the local tier CONCURRENTLY
+    /// (the cold kubo round-trips overlap — the 2026-06-02 commit-path
+    /// throughput fix, ADR-2606012200), then meet the replica target per block
+    /// exactly as `put_durable` (a no-op extra cost on a single-node deploy
+    /// where peer replication finds no peers). Surfaces the first failure.
+    fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> anyhow::Result<()> {
+        self.local.put_many_durable(blocks)?;
+        for (cid, data) in blocks {
+            let replicas = 1 + self.replicate_confirmed(cid, data);
+            anyhow::ensure!(
+                replicas >= self.min_replicas,
+                "durability not met for {}: confirmed {replicas}/{} replicas",
+                cid.to_multibase(),
+                self.min_replicas,
+            );
+        }
+        Ok(())
+    }
+
     fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
         self.local.delete(cid)
     }

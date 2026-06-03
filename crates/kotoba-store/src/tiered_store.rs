@@ -73,6 +73,18 @@ impl<H: BlockStore + 'static, C: BlockStore + 'static> BlockStore for TieredBloc
         Ok(())
     }
 
+    /// Durable batch: write all blocks to hot (in-memory, fast) then hand the
+    /// whole batch to the cold tier so it can issue the writes concurrently
+    /// (~one round-trip vs N sequential). Surfaces cold errors. Used by the
+    /// distributed commit path to make a commit's O(state) reachable blocks
+    /// durable without N serial cold round-trips (2026-06-02; ADR-2606012200).
+    fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> Result<()> {
+        for (cid, data) in blocks {
+            self.hot.put(cid, data)?;
+        }
+        self.cold.put_many_durable(blocks)
+    }
+
     fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>> {
         // Fast path: hot hit
         if let Some(b) = self.hot.get(cid)? {

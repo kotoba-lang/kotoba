@@ -2318,12 +2318,23 @@ where
         &self,
         req: CommitDatomsRequest,
     ) -> Result<CommitReport, DistributedCommitError> {
+        // ── Per-phase timing (ADR-2606012200 transact-latency root-cause) ──────
+        // The recorded "O(state) covering-EAVT rebuild (CPU)" attribution is
+        // contradicted by a MemoryBlockStore measurement (ceavt build ≈ ms at
+        // N≈1.6k); the prod ~26–36s/transact is flat in both delta and N, which
+        // fits an I/O round-trip (IPNS DHT resolve / cold block put), not CPU.
+        // Time every phase and emit ONE grep-able line so the next real transact
+        // pinpoints the layer from pod logs WITHOUT a produce run. Cheap
+        // (Instant + one info!), safe to leave in.
+        let t_total = std::time::Instant::now();
         let name = IpnsName::new(req.ipns_name.clone());
+        let t_resolve = std::time::Instant::now();
         let current = match self.ipns.resolve(&name) {
             Ok(record) => Some(record),
             Err(IpnsRegistryError::NotFound(_)) => None,
             Err(e) => return Err(e.into()),
         };
+        let resolve_ms = t_resolve.elapsed().as_millis();
         let current_value = current.as_ref().map(|r| r.value.clone());
         let expected = req.expected_parent.as_ref().map(KotobaCid::to_multibase);
         if current_value != expected {
@@ -2356,30 +2367,37 @@ where
             })
             .collect::<Vec<_>>();
         let datom_count = datoms.len();
-        // Durability fix (2026-06-01 yukkuri-kg-v2 incident): route this commit's
-        // block writes through `put_durable` (synchronous cold/kubo write-through)
-        // instead of TieredBlockStore's default fire-and-forget async cold copy.
-        // Without it, a liveness/OOM restart between commit and the async copy
-        // loses the head's reachable blocks → cold `db_from_head` → kubo block/get →
-        // bitswap timeout → permanent 500. Mirrors the wrapped-vault-key put_durable+pin.
-        let durable = DurableStore(self.store);
-        let mut roots = build_datom_roots(&datoms, &durable)?;
+        // Durability fix (yukkuri-kg-v2 incident): a commit's reachable blocks must
+        // be durable before we return, else a restart between commit and
+        // TieredBlockStore's fire-and-forget async cold copy loses them → cold
+        // db_from_head → kubo block/get → bitswap timeout → permanent 500.
+        // Capture every block written during the build (fast normal put = hot +
+        // async cold), then flush the whole set durably in ONE concurrent batch
+        // (put_many_durable) + recursive-pin the head. Batching keeps a commit's
+        // O(state) cold writes to ~one round-trip instead of N sequential
+        // put_durable calls (2026-06-02 throughput fix, ADR-2606012200).
+        let cap = CommitCapture::new(self.store);
+        let mut roots = build_datom_roots(&datoms, &cap)?;
         // Covering EAVT (ADR-2605302130): materialise the full netted current
         // state into its own ProllyTree so `current_db_from_head` is O(state)
         // not O(history). ProllyTree structural sharing means unchanged subtrees
         // are deduplicated by CID, so the extra tree costs ~O(delta) of new
         // blocks despite covering all live datoms.
+        let t_ceavt = std::time::Instant::now();
+        let mut covering_n: usize = 0;
         if let Some(covering) = req.covering_datoms.as_ref() {
             let live = current_datoms(covering);
+            covering_n = live.len();
             let mut ceavt_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(live.len());
             for datom in &live {
                 let kqe = indexable_kqe_datom(datom);
                 ceavt_entries.push((kqe.eavt_key(), encode_stored_datom(datom)?));
             }
-            let ceavt_root = ProllyTree::build_tree(ceavt_entries, &durable)
+            let ceavt_root = ProllyTree::build_tree(ceavt_entries, &cap)
                 .map_err(DistributedCommitError::Store)?;
             roots.insert(ROOT_CEAVT.to_string(), ceavt_root);
         }
+        let ceavt_ms = t_ceavt.elapsed().as_millis();
         let commit = DistributedDatomCommit::seal(
             req.graph,
             tx_cid.clone(),
@@ -2389,12 +2407,22 @@ where
             roots,
             req.cacao_proof_cid,
         )?;
-        commit.persist(&durable)?;
-        // All reachable blocks (index roots, covering EAVT, commit pointer) are now
-        // durably in the cold tier, so recursive-pin the new head once: TieredBlockStore
-        // pin → cold KuboBlockStore pin (pin/add recursive=true) keeps the whole commit
-        // DAG out of kubo GC, and the budgeted hot tier never evicts it. Idempotent.
+        commit.persist(&cap)?;
+        // Durably flush this commit's captured blocks in ONE concurrent batch so the
+        // head's reachable set is in the cold tier before we return.
+        let captured = cap.take();
+        let block_n = captured.len();
+        let t_put = std::time::Instant::now();
+        self.store
+            .put_many_durable(&captured)
+            .map_err(DistributedCommitError::Store)?;
+        let put_ms = t_put.elapsed().as_millis();
+        // All reachable blocks are now durable in cold, so recursive-pin the head
+        // once: TieredBlockStore pin → cold KuboBlockStore pin (pin/add recursive=true)
+        // keeps the whole commit DAG out of kubo GC, and the hot tier never evicts it.
+        let t_pin = std::time::Instant::now();
         self.store.pin(&commit.cid);
+        let pin_ms = t_pin.elapsed().as_millis();
 
         let commit_ipfs_cid = kotoba_ipfs::parse_cid(&commit.cid.to_multibase())
             .map_err(|e| DistributedCommitError::InvalidCommitCid(e.to_string()))?;
@@ -2411,7 +2439,47 @@ where
                 .sign_ed25519(signing_key)
                 .map_err(|e| DistributedCommitError::IpnsSignature(e.to_string()))?;
         }
+        let t_publish = std::time::Instant::now();
         self.ipns.publish(ipns_record.clone())?;
+        let publish_ms = t_publish.elapsed().as_millis();
+
+        // One grep-able line per commit. The marker lives in the MESSAGE (not a
+        // custom tracing target) so any crate-level filter — `RUST_LOG=info` or
+        // `kotoba_datomic=info` — emits it; a dotted target like
+        // "kotoba.commit.timing" would be dropped by EnvFilter prefix matching.
+        // `slowest` names the dominant phase so `grep kotoba.commit.timing` over
+        // pod logs settles the candidate question (ipns_resolve = DHT round-trip;
+        // ceavt = O(state) CPU; put = cold block I/O). `covering_n` is the real
+        // resident-state N (never measured in prod).
+        // NOTE: `total_ms` is the commit_datoms span ONLY; the server's
+        // transact_inner does its OWN `ipns.resolve` BEFORE calling this, so the
+        // per-transact latency = transact_inner resolve + this total_ms. See the
+        // separate "kotoba.transact.timing" line emitted by transact_inner.
+        let total_ms = t_total.elapsed().as_millis();
+        let slowest = [
+            ("ipns_resolve", resolve_ms),
+            ("ceavt_build", ceavt_ms),
+            ("put_many_durable", put_ms),
+            ("pin", pin_ms),
+            ("ipns_publish", publish_ms),
+        ]
+        .into_iter()
+        .max_by_key(|(_, ms)| *ms)
+        .map(|(name, _)| name)
+        .unwrap_or("?");
+        tracing::info!(
+            total_ms,
+            ipns_resolve_ms = resolve_ms,
+            ceavt_build_ms = ceavt_ms,
+            put_many_durable_ms = put_ms,
+            pin_ms,
+            ipns_publish_ms = publish_ms,
+            covering_n,
+            delta_datoms = datom_count,
+            block_n,
+            slowest,
+            "kotoba.commit.timing distributed commit phase timing"
+        );
 
         Ok(CommitReport {
             commit,
@@ -2503,17 +2571,26 @@ where
             &mut Vec<Datom>,
         ) -> Result<(), DistributedCommitError>,
     {
+        // Per-transact timing (ADR-2606012200 LEG-3). This resolve is the FIRST
+        // of two — commit_datoms resolves again — and is the one the server's
+        // per-transact latency includes but commit_datoms's `total_ms` does not.
+        // If candidate (a) holds, BOTH resolves fall to Kubo DHT (~28s each).
+        let t_tx = std::time::Instant::now();
         let name = IpnsName::new(req.ipns_name.clone());
+        let t_resolve1 = std::time::Instant::now();
         let current = match self.ipns.resolve(&name) {
             Ok(record) => Some(record),
             Err(IpnsRegistryError::NotFound(_)) => None,
             Err(e) => return Err(e.into()),
         };
+        let resolve1_ms = t_resolve1.elapsed().as_millis();
         let expected_parent = req.expected_parent.or_else(|| {
             current
                 .as_ref()
                 .and_then(|record| KotobaCid::from_multibase(&record.value))
         });
+        let db_before_injected = injected_db_before.is_some();
+        let t_dbbefore = std::time::Instant::now();
         let db_before = match injected_db_before {
             Some(db) => db,
             None => match &expected_parent {
@@ -2523,6 +2600,8 @@ where
                 None => Db::from_datoms(vec![], None),
             },
         };
+        let db_before_ms = t_dbbefore.elapsed().as_millis();
+        let db_before_n = db_before.all_datoms().len();
         let conn = Connection::from_datoms(db_before.all_datoms());
         register_tx_fns(&conn)?;
         let transact = conn.transact(req.tx_data).await?;
@@ -2562,6 +2641,17 @@ where
             ipns_controller_did: req.ipns_controller_did,
             ipns_signing_key: req.ipns_signing_key,
         })?;
+        // db_before_n is the REAL resident-state N (the number never measured in
+        // prod). resolve1_ms is the first (server-path) IPNS resolve; total
+        // per-transact = resolve1_ms + the commit_datoms "kotoba.commit.timing".
+        tracing::info!(
+            transact_ms = t_tx.elapsed().as_millis(),
+            ipns_resolve1_ms = resolve1_ms,
+            db_before_ms,
+            db_before_n,
+            db_before_injected,
+            "kotoba.transact.timing distributed transact phase timing"
+        );
         Ok(DistributedTransactReport {
             transact,
             commit,
@@ -2684,43 +2774,62 @@ impl DistributedDatomCommit {
     }
 }
 
-/// Wraps a `BlockStore` so every `put` is routed through `put_durable`
-/// (synchronous write-through to the persistent cold tier, surfacing errors).
+/// Wraps a `BlockStore`, forwarding every `put` to the inner store at NORMAL
+/// speed (hot + fire-and-forget async cold) while RECORDING each (cid, data).
 ///
-/// Used for Datomic commit writes: the head and its reachable index/commit
-/// blocks must be durable before `commit_datoms` returns, otherwise a restart
-/// before `TieredBlockStore`'s fire-and-forget async cold copy runs loses them
-/// and `db_from_head` can never reconstruct the head again (kubo block/get →
-/// bitswap → 30s timeout → permanent 500). Mirrors the wrapped-vault-key fix.
-struct DurableStore<'a>(&'a dyn BlockStore);
+/// Used by the Datomic commit path: the build (index roots, covering EAVT,
+/// commit pointer) writes through this at hot speed, then `commit_datoms` flushes
+/// the captured set durably in ONE concurrent `put_many_durable` batch + pins the
+/// head. This keeps a commit's O(state) cold writes to ~one round-trip instead of
+/// N sequential `put_durable` calls (2026-06-02 throughput fix, ADR-2606012200),
+/// while still guaranteeing the head's reachable blocks are durable before return.
+struct CommitCapture<'a> {
+    inner: &'a dyn BlockStore,
+    captured: std::sync::Mutex<Vec<(KotobaCid, Vec<u8>)>>,
+}
 
-impl<'a> BlockStore for DurableStore<'a> {
-    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-        self.0.put_durable(cid, data)
+impl<'a> CommitCapture<'a> {
+    fn new(inner: &'a dyn BlockStore) -> Self {
+        Self {
+            inner,
+            captured: std::sync::Mutex::new(Vec::new()),
+        }
     }
-    fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-        self.0.put_durable(cid, data)
+    /// Drain the captured (cid, data) blocks, leaving the buffer empty.
+    fn take(&self) -> Vec<(KotobaCid, Vec<u8>)> {
+        std::mem::take(&mut *self.captured.lock().unwrap())
+    }
+}
+
+impl<'a> BlockStore for CommitCapture<'a> {
+    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put(cid, data)?;
+        self.captured
+            .lock()
+            .unwrap()
+            .push((cid.clone(), data.to_vec()));
+        Ok(())
     }
     fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
-        self.0.get(cid)
+        self.inner.get(cid)
     }
     fn has(&self, cid: &KotobaCid) -> bool {
-        self.0.has(cid)
+        self.inner.has(cid)
     }
     fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
-        self.0.delete(cid)
+        self.inner.delete(cid)
     }
     fn pin(&self, cid: &KotobaCid) {
-        self.0.pin(cid)
+        self.inner.pin(cid)
     }
     fn unpin(&self, cid: &KotobaCid) {
-        self.0.unpin(cid)
+        self.inner.unpin(cid)
     }
     fn is_pinned(&self, cid: &KotobaCid) -> bool {
-        self.0.is_pinned(cid)
+        self.inner.is_pinned(cid)
     }
     fn all_cids(&self) -> Vec<KotobaCid> {
-        self.0.all_cids()
+        self.inner.all_cids()
     }
 }
 
@@ -8184,5 +8293,189 @@ mod tests {
                 vec![EdnValue::String("Bob".into()), EdnValue::Integer(2)],
             ]
         );
+    }
+
+    /// Verifies the LEG-3 timing lines actually EMIT and survive a crate-level
+    /// `EnvFilter` ("kotoba_datomic=info") — the grep marker is in the MESSAGE,
+    /// not a custom dotted target (which EnvFilter prefix-matching would drop).
+    /// If this passes, the operator's `grep kotoba.commit.timing` over pod logs
+    /// works under any `info`-level filter that covers the crate.
+    ///
+    /// `#[ignore]`: must run STANDALONE — every transact test hits the same
+    /// `info!` callsite, and `tracing` caches per-callsite interest globally the
+    /// first time it's evaluated (with NoSubscriber under the parallel suite →
+    /// cached disabled), so this thread-local-subscriber capture only works in
+    /// isolation. Verified passing via:
+    /// `cargo test -p kotoba-datomic commit_timing_line_emits_under_crate_filter -- --ignored`
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore]
+    async fn commit_timing_line_emits_under_crate_filter() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("kotoba_datomic=info"))
+            .with_writer(BufWriter(Arc::clone(&buf)))
+            .finish();
+
+        // current_thread runtime: the async fn runs on this thread, so a
+        // thread-local default subscriber stays in scope across the .await.
+        let guard = tracing::subscriber::set_default(subscriber);
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"timing-graph");
+        writer
+            .transact(DistributedTransactRequest {
+                ipns_name: "k51-timing".into(),
+                graph,
+                tx_data: kotoba_edn::parse(r#"[[:db/add "a" :p "v"]]"#).unwrap(),
+                expected_parent: None,
+                author: "did:key:zWriter".into(),
+                valid_until: "2030-01-01T00:00:00Z".into(),
+                ttl_secs: Some(60),
+                cacao_proof_cid: None,
+                ipns_controller_did: None,
+                ipns_signing_key: None,
+            })
+            .await
+            .unwrap();
+        drop(guard);
+
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("kotoba.commit.timing"),
+            "commit timing line must emit under kotoba_datomic=info; got:\n{out}"
+        );
+        assert!(
+            out.contains("kotoba.transact.timing"),
+            "transact timing line must emit under kotoba_datomic=info; got:\n{out}"
+        );
+        assert!(
+            out.contains("ipns_resolve_ms") && out.contains("ceavt_build_ms"),
+            "commit timing fields must be present; got:\n{out}"
+        );
+    }
+
+    /// Diagnostic (ADR-2606012200 transact-latency root-cause): isolate the pure
+    /// *warm-path CPU* cost of a tiny transact as a function of resident state N,
+    /// on a MemoryBlockStore (block put/get ≈ free), exactly mirroring the server
+    /// path (`transact_with_db_before(Some(db_before))` — no cold scan). If a
+    /// 2-datom transact at large N takes seconds here, the O(state) covering-EAVT
+    /// rebuild (CPU) theory holds; if it stays sub-100ms, the prod 26–36s is NOT
+    /// write-CPU (→ cold-read / bitswap-timeout / non-isolated-graph instead).
+    ///
+    /// Run: `cargo test -p kotoba-datomic warmpath_transact_cpu_scaling -- --nocapture --ignored`
+    #[tokio::test]
+    #[ignore]
+    async fn warmpath_transact_cpu_scaling() {
+        // NOTE: debug seeding is superlinear (50k seed ≈ 20 min in debug); keep
+        // N ≤ 50k here. Run release for representative absolute numbers:
+        // `cargo test -p kotoba-datomic warmpath_transact_cpu_scaling --release -- --ignored --nocapture`
+        for &n in &[1_000usize, 10_000, 50_000] {
+            let store = MemoryBlockStore::new();
+            let ipns = InMemoryIpnsRegistry::new();
+            let writer = DistributedCommitWriter::new(&store, &ipns);
+            let graph = KotobaCid::from_bytes(format!("scale-graph-{n}").as_bytes());
+            let ipns_name = format!("k51-scale-{n}");
+
+            // Seed N datoms (N/2 entities × 2 attrs) in one transact → head + db_after.
+            let mut seed = String::from("[");
+            for i in 0..(n / 2) {
+                seed.push_str(&format!(
+                    "[:db/add \"e{i}\" :person/name \"Name{i}\"] [:db/add \"e{i}\" :person/score {i}] "
+                ));
+            }
+            seed.push(']');
+            let t0 = std::time::Instant::now();
+            let seeded = writer
+                .transact(DistributedTransactRequest {
+                    ipns_name: ipns_name.clone(),
+                    graph: graph.clone(),
+                    tx_data: kotoba_edn::parse(&seed).unwrap(),
+                    expected_parent: None,
+                    author: "did:key:zWriter".into(),
+                    valid_until: "2030-01-01T00:00:00Z".into(),
+                    ttl_secs: Some(60),
+                    cacao_proof_cid: None,
+                    ipns_controller_did: None,
+                    ipns_signing_key: None,
+                })
+                .await
+                .unwrap();
+            let seed_ms = t0.elapsed().as_millis();
+            let head = seeded.commit.commit.cid.clone();
+            let db_before = seeded.transact.db_after.clone();
+            let state_len = db_before.all_datoms().len();
+
+            // Sub-phase A: build a Connection from all resident datoms (the server
+            // does this every transact: `Connection::from_datoms(db_before.all_datoms())`).
+            let a = std::time::Instant::now();
+            let _conn = Connection::from_datoms(db_before.all_datoms());
+            let from_datoms_ms = a.elapsed().as_millis();
+
+            // Sub-phase B: build the covering ceavt ProllyTree over all live datoms
+            // (what `commit_datoms` does once per transact when covering_datoms=Some).
+            let covering = db_before.all_datoms();
+            let b = std::time::Instant::now();
+            let live = current_datoms(&covering);
+            let mut ceavt_entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(live.len());
+            for d in &live {
+                let kqe = indexable_kqe_datom(d);
+                ceavt_entries.push((kqe.eavt_key(), encode_stored_datom(d).unwrap()));
+            }
+            let _ceavt_root = ProllyTree::build_tree(ceavt_entries, &store).unwrap();
+            let ceavt_ms = b.elapsed().as_millis();
+
+            // Full warm-path 2-datom transact with injected db_before (server path).
+            let c = std::time::Instant::now();
+            let _t = writer
+                .transact_with_db_before(
+                    DistributedTransactRequest {
+                        ipns_name: ipns_name.clone(),
+                        graph: graph.clone(),
+                        tx_data: kotoba_edn::parse(
+                            r#"[[:db/add "newE" :person/name "Zed"] [:db/add "newE" :person/score 1]]"#,
+                        )
+                        .unwrap(),
+                        expected_parent: Some(head.clone()),
+                        author: "did:key:zWriter".into(),
+                        valid_until: "2030-01-01T00:00:00Z".into(),
+                        ttl_secs: Some(60),
+                        cacao_proof_cid: None,
+                        ipns_controller_did: None,
+                        ipns_signing_key: None,
+                    },
+                    Some(db_before),
+                    |_, _, _| Ok(()),
+                )
+                .await
+                .unwrap();
+            let warm_tx_ms = c.elapsed().as_millis();
+
+            eprintln!(
+                "N={state_len:>7}  seed={seed_ms:>6}ms  from_datoms={from_datoms_ms:>5}ms  ceavt_build={ceavt_ms:>5}ms  WARM_2datom_transact={warm_tx_ms:>6}ms"
+            );
+        }
     }
 }

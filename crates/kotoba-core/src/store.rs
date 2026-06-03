@@ -23,6 +23,20 @@ pub trait BlockStore: Send + Sync {
         self.put(cid, data)
     }
 
+    /// Durably write a batch of blocks, ideally in ONE cold round-trip / with
+    /// concurrency, returning Ok only after all are confirmed. Default = a
+    /// sequential `put_durable` loop. Cold tiers with per-block network latency
+    /// (e.g. `KuboBlockStore`) SHOULD override to issue the writes concurrently
+    /// so a commit's O(state) blocks cost ~one round-trip instead of N. Used by
+    /// the distributed commit path to make a whole commit's reachable blocks
+    /// durable without N sequential `block/put`s.
+    fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> anyhow::Result<()> {
+        for (cid, data) in blocks {
+            self.put_durable(cid, data)?;
+        }
+        Ok(())
+    }
+
     /// Remove a block. Default no-op for read-only or append-only stores.
     fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
         let _ = cid;

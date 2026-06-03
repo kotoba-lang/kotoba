@@ -911,13 +911,24 @@ impl IpnsRegistry for KuboIpnsRegistry {
         // Also persist durably so the head survives a restart and resolve()
         // serves it locally instead of a slow/failing Kubo DHT lookup.
         self.persist_record(&record);
-        // Kubo's name/publish blocks for DHT propagation (~20 s on Kubo
-        // 0.34.1).  When the caller can be served from the local resolve
-        // cache (single-pod deploys, immediate read-after-write within the
-        // same process), the DHT confirmation does not need to be on the
-        // user's critical path.  Spawn it so transact returns as soon as
-        // the block puts complete; the IPNS update propagates asynchronously
-        // and shows up via Kubo's IPFS resolve to other peers.
+        // Kubo DHT `name/publish` is OPT-IN (`KOTOBA_IPNS_DHT_PUBLISH=1`).
+        //
+        // Measured 2026-06-02 on the SJC prod pod (Kubo 0.34.1, 172 DHT peers):
+        // `name/publish` HANGS ~40s (context-canceled) and always fails for our
+        // `k51-kotoba-*` aliases. The local cache + on-disk `persist_record`
+        // above already give durability AND fast local-first `resolve` — so for
+        // a single-pod deploy the DHT publish is pure overhead. Worse, under a
+        // produce write burst each commit spawned one of these 40s tasks, which
+        // saturated the single Kubo daemon → block put/get (which transacts need
+        // synchronously) queued behind it → ~25–36s transact stalls (the yukkuri
+        // produce blocker, ADR-2606012200). Gating it OFF removes the saturator;
+        // multi-pod / cross-peer discovery can re-enable it explicitly.
+        let dht_publish = std::env::var("KOTOBA_IPNS_DHT_PUBLISH")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
+        if !dht_publish {
+            return Ok(());
+        }
         let me = self.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -956,6 +967,76 @@ mod tests {
         let record = IpnsRecord::new("k51-kotoba-test", &cid, 1, "2030-01-01T00:00:00Z");
         registry.publish(record.clone()).unwrap();
         assert_eq!(registry.resolve(&record.name).unwrap(), record);
+    }
+
+    /// ADR-2606012200 LEG-3 candidate (a): is the per-transact `ipns.resolve`
+    /// fast (local hydrate) or slow (Kubo DHT name/resolve, ~28s) AFTER a pod
+    /// restart? This is the decisive measurement for the yukkuri 26–36s/transact
+    /// blocker. `from_env()` is exactly what kotoba-server constructs.
+    ///
+    /// `#[ignore]`: needs a Kubo daemon at $KOTOBA_IPFS_ENDPOINT
+    /// (default http://localhost:5001 — `docker run -p 5001:5001 ipfs/kubo`).
+    /// Run: `cargo test -p kotoba-ipfs ipns_resolve_after_restart_locality -- --ignored --nocapture`
+    ///
+    /// Interpretation:
+    ///  • hydrated resolve fast (<1s) AND unpublished resolve ~28s ⇒ the persist+
+    ///    hydrate fix works on THIS branch; candidate (a) is NOT the live blocker
+    ///    (the prod miss must be a name/persist-dir mismatch — chase that).
+    ///  • hydrated resolve also ~28s ⇒ persist/hydrate is broken here → (a)
+    ///    CONFIRMED → fix is the after-restart locality in this file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn ipns_resolve_after_restart_locality() {
+        use std::time::Instant;
+
+        let tmp = std::env::temp_dir().join("kotoba-ipns-restart-repro");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("KOTOBA_IPNS_PERSIST_DIR", tmp.to_str().unwrap());
+        if std::env::var("KOTOBA_IPFS_ENDPOINT").is_err() {
+            std::env::set_var("KOTOBA_IPFS_ENDPOINT", "http://localhost:5001");
+        }
+
+        let name = IpnsName::new("k51-kotoba-restart-repro".to_string());
+        let cid = raw_cid(b"restart-repro-head-1");
+        let rec = IpnsRecord::new(name.0.clone(), &cid, 1, "2030-01-01T00:00:00Z");
+
+        // ipns1: publish (persists the full record to KOTOBA_IPNS_PERSIST_DIR
+        // BEFORE the Kubo publish; kubo publish errors are non-fatal here).
+        let ipns1 = KuboIpnsRegistry::from_env();
+        let _ = ipns1.publish(rec);
+        let head_file = ipns1.head_file(&name).expect("persist dir set");
+        eprintln!(
+            "persisted head file exists = {} ({})",
+            head_file.exists(),
+            head_file.display()
+        );
+
+        // ── RESTART ── new instance; from_env() re-hydrates local from disk.
+        let ipns2 = KuboIpnsRegistry::from_env();
+
+        let t = Instant::now();
+        let hydrated = ipns2.resolve(&name);
+        let hydrated_ms = t.elapsed().as_millis();
+        eprintln!(
+            "RESOLVE after-restart, HYDRATED head: {hydrated_ms} ms (ok={})",
+            hydrated.is_ok()
+        );
+
+        // Contrast: a name never published anywhere → forces resolve_kubo → DHT.
+        let unknown = IpnsName::new("k51-kotoba-never-published-zzz".to_string());
+        let t2 = Instant::now();
+        let miss = ipns2.resolve(&unknown);
+        let dht_ms = t2.elapsed().as_millis();
+        eprintln!(
+            "RESOLVE never-published (DHT fall-through): {dht_ms} ms (result={:?})",
+            miss.as_ref().map(|_| ()).map_err(|e| e.to_string())
+        );
+
+        eprintln!(
+            "VERDICT: hydrated={hydrated_ms}ms dht_miss={dht_ms}ms — \
+             if hydrated≪dht_miss, persist+hydrate works and candidate (a) is not the live blocker"
+        );
+        assert!(hydrated.is_ok(), "hydrated head must resolve after restart");
     }
 
     #[test]
