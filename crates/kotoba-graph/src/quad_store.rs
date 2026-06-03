@@ -757,19 +757,20 @@ impl QuadStore {
             .unwrap_or(0)
     }
 
-    /// Find subject CIDs where predicate = `predicate` and object_key = `object_key`,
+    /// Find subject CIDs where predicate = `predicate` and the object encodes to
+    /// the canonical AVET `value_key` (keycodec; see [`avet_value_key`]),
     /// optionally within a named graph.
     pub async fn lookup_subject_by_po(
         &self,
         graph_cid: Option<&KotobaCid>,
         predicate: &str,
-        object_key: &str,
+        value_key: &[u8],
     ) -> Vec<KotobaCid> {
         if let Some(gcid) = graph_cid {
             return self
                 .arrangements
                 .get(&gcid.to_multibase())
-                .map(|arr| arr.get_entities_by_attribute_value(predicate, object_key))
+                .map(|arr| arr.get_entities_by_attribute_value_bytes(predicate, value_key))
                 .unwrap_or_default();
         }
         let mut out = vec![];
@@ -777,7 +778,7 @@ impl QuadStore {
             out.extend(
                 entry
                     .value()
-                    .get_entities_by_attribute_value(predicate, object_key),
+                    .get_entities_by_attribute_value_bytes(predicate, value_key),
             );
         }
         out
@@ -1111,12 +1112,13 @@ impl QuadStore {
         Ok(quads)
     }
 
-    /// Cold-path AVET scan: resolve subjects by predicate + object_key from the committed ProllyTree.
+    /// Cold-path AVET scan: resolve subjects by predicate + canonical
+    /// `value_key` (keycodec) from the committed ProllyTree.
     pub async fn lookup_subject_by_po_cold(
         &self,
         graph_cid: &KotobaCid,
         predicate: &str,
-        object_key: &str,
+        value_key: &[u8],
     ) -> anyhow::Result<Vec<KotobaCid>> {
         // ── Hot path (only when hot covers all committed state) ───────────────
         {
@@ -1124,7 +1126,7 @@ impl QuadStore {
             if let Some(arr) = self.arrangements.get(&key) {
                 let covers_all = self.hot_covers_all.get(&key).map(|v| *v).unwrap_or(true);
                 if !arr.is_empty() && covers_all {
-                    return Ok(arr.get_entities_by_attribute_value(predicate, object_key));
+                    return Ok(arr.get_entities_by_attribute_value_bytes(predicate, value_key));
                 }
             }
         }
@@ -1142,7 +1144,7 @@ impl QuadStore {
 
         let bs = Arc::clone(&self.block_store);
         let mut prefix_vec = predicate.as_bytes().to_vec();
-        prefix_vec.extend_from_slice(object_key.as_bytes());
+        prefix_vec.extend_from_slice(value_key);
 
         let entries = tokio::task::spawn_blocking(move || {
             ProllyTree::scan_prefix(&root_avet, &prefix_vec, &*bs)
@@ -1167,7 +1169,7 @@ impl QuadStore {
         // Union with hot (post-replay partial view)
         if let Some(arr) = self.arrangements.get(&graph_cid.to_multibase()) {
             if !arr.is_empty() {
-                let hot = arr.get_entities_by_attribute_value(predicate, object_key);
+                let hot = arr.get_entities_by_attribute_value_bytes(predicate, value_key);
                 let mut seen: std::collections::HashSet<KotobaCid> =
                     subjects.iter().cloned().collect();
                 for s in hot {
@@ -1297,8 +1299,10 @@ impl QuadStore {
         pred2: &str,
         val2: &str,
     ) -> anyhow::Result<Vec<KotobaCid>> {
+        let vk1 = avet_value_key(&LegacyQuadObject::Text(val1.to_string()));
+        let vk2 = avet_value_key(&LegacyQuadObject::Text(val2.to_string()));
         let set1: std::collections::HashSet<[u8; 36]> = self
-            .lookup_subject_by_po_cold(graph_cid, pred1, val1)
+            .lookup_subject_by_po_cold(graph_cid, pred1, &vk1)
             .await?
             .into_iter()
             .map(|c| c.0)
@@ -1308,7 +1312,7 @@ impl QuadStore {
         }
 
         let set2 = self
-            .lookup_subject_by_po_cold(graph_cid, pred2, val2)
+            .lookup_subject_by_po_cold(graph_cid, pred2, &vk2)
             .await?;
         Ok(set2.into_iter().filter(|c| set1.contains(&c.0)).collect())
     }
@@ -2687,10 +2691,13 @@ impl QuadStore {
                 // Bound object (literal or named node)?
                 match &tp.object {
                     TermPattern::Literal(lit) => {
-                        // AVET: pred + literal
+                        // AVET: pred + literal (Text-typed, matching the result + store)
                         let obj_key = lit.value().to_string();
+                        let vk = avet_value_key(&kotoba_kqe::quad::LegacyQuadObject::Text(
+                            obj_key.clone(),
+                        ));
                         let subjects = self
-                            .lookup_subject_by_po_cold(graph_cid, &pred, &obj_key)
+                            .lookup_subject_by_po_cold(graph_cid, &pred, &vk)
                             .await?;
                         return Ok(subjects
                             .into_iter()
@@ -2706,9 +2713,11 @@ impl QuadStore {
                         let obj_iri = strip_bgp_base(obj_nn.as_str());
                         if let Some(obj_cid) = parse_cid_iri(obj_iri) {
                             // AVET: pred + cid-object
-                            let obj_mb = obj_cid.to_multibase();
+                            let vk = avet_value_key(&kotoba_kqe::quad::LegacyQuadObject::Cid(
+                                obj_cid.clone(),
+                            ));
                             let subjects = self
-                                .lookup_subject_by_po_cold(graph_cid, &pred, &obj_mb)
+                                .lookup_subject_by_po_cold(graph_cid, &pred, &vk)
                                 .await?;
                             return Ok(subjects
                                 .into_iter()
@@ -3074,11 +3083,11 @@ impl QuadStore {
         &self,
         graph_cid: &KotobaCid,
         predicate: &str,
-        object_key: &str,
+        value_key: &[u8],
         chain: &DelegationChain,
     ) -> Result<Vec<KotobaCid>, AccessError> {
         chain.verify(&graph_cid.to_multibase(), "datom:read")?;
-        self.lookup_subject_by_po_cold(graph_cid, predicate, object_key)
+        self.lookup_subject_by_po_cold(graph_cid, predicate, value_key)
             .await
             .map_err(|e| AccessError::Internal(e.to_string()))
     }
@@ -3246,7 +3255,7 @@ impl QuadStore {
                             subs.into_iter().map(move |s| {
                                 let mut k = Vec::new();
                                 k.extend_from_slice(pred.as_bytes());
-                                k.extend_from_slice(okey.as_bytes());
+                                k.extend_from_slice(&okey); // canonical value key (keycodec)
                                 (k, s.0.to_vec())
                             })
                         })
@@ -4116,6 +4125,15 @@ fn enc_object(o: &LegacyQuadObject) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = ciborium::into_writer(o, &mut buf);
     buf
+}
+
+/// Canonical AVET value key for a query/stored object — the **same keycodec
+/// encoding** the hot `pos` index and the cold Prolly AVET keys use, so query
+/// keys match stored keys and value order is numeric + type-segregated
+/// (ADR-2606022150 D2 / P2b). Both the hot point lookup and the cold scan prefix
+/// route through this.
+fn avet_value_key(object: &LegacyQuadObject) -> Vec<u8> {
+    kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::from(object.clone()))
 }
 
 /// Decode a CBOR-encoded [`LegacyQuadObject`]; empty-text fallback on error.
@@ -5074,8 +5092,9 @@ mod tests {
         let (qs, graph, _) =
             setup_committed_qs("cacao-avet-g", "cacao-avet-s", "role", "admin").await;
         let chain = DelegationChain::new_for_test("wrong-graph", "datom:read");
+        let admin_vk = avet_value_key(&LegacyQuadObject::Text("admin".into()));
         let result = qs
-            .lookup_subject_by_po_cold_authed(&graph, "role", "admin", &chain)
+            .lookup_subject_by_po_cold_authed(&graph, "role", &admin_vk, &chain)
             .await;
         assert!(result.is_err());
     }
@@ -8188,7 +8207,8 @@ mod tests {
             .arrangements
             .get(&graph.to_multibase())
             .expect("hot arrangement present");
-        let editors: Vec<_> = arr_ref.get_entities_by_attribute_value("role", "editor");
+        let editors: Vec<_> =
+            arr_ref.get_entities_by_attribute_value("role", &kotoba_kqe::Value::Text("editor".into()));
         assert_eq!(editors.len(), 1, "uncommitted WAL editor quad must be hot");
         drop(arr_ref);
 
