@@ -287,6 +287,63 @@ mod tests {
         assert_eq!(total, data.len());
     }
 
+    fn pseudo_data(n: usize, seed: u8) -> Vec<u8> {
+        let mut data = Vec::with_capacity(n);
+        let mut v = seed;
+        for _ in 0..n {
+            v = v.wrapping_mul(6).wrapping_add(1);
+            data.push(v);
+        }
+        data
+    }
+
+    #[test]
+    fn cdc_reassembly_deterministic_and_size_bounded() {
+        let data = pseudo_data(2 * 1024 * 1024, 0);
+        let chunks = split(&data, &ChunkStrategy::ContentDefined);
+        assert!(chunks.len() > 1, "expected several CDC chunks");
+
+        // Byte-exact reassembly (stronger than the sum-of-lengths check above).
+        let joined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+        assert_eq!(joined, data, "CDC chunks must concatenate back to the original");
+
+        // Determinism: identical input → identical boundaries (basis of dedup/CAS).
+        let again = split(&data, &ChunkStrategy::ContentDefined);
+        assert_eq!(chunks, again, "CDC must be deterministic");
+
+        // Size bounds: every non-final chunk is within [MIN, MAX]; last ≤ MAX.
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= CDC_MAX_BYTES, "chunk {i} exceeds CDC_MAX_BYTES");
+            if i + 1 < chunks.len() {
+                assert!(
+                    c.len() >= CDC_MIN_BYTES,
+                    "non-final chunk {i} ({} B) is below CDC_MIN_BYTES",
+                    c.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cdc_append_is_locally_stable() {
+        // CDC's raison d'être: a boundary at position p depends only on bytes[..p],
+        // so APPENDING data cannot disturb earlier chunk boundaries — prior chunks
+        // dedup unchanged across versions. Every chunk of data1 except its
+        // EOF-terminated last one must reappear identically when more bytes follow.
+        let data1 = pseudo_data(2 * 1024 * 1024, 0);
+        let mut data2 = data1.clone();
+        data2.extend_from_slice(&pseudo_data(300 * 1024, 99)); // append different content
+        let c1 = split(&data1, &ChunkStrategy::ContentDefined);
+        let c2 = split(&data2, &ChunkStrategy::ContentDefined);
+        assert!(c1.len() >= 2, "need at least two chunks to test stability");
+        for i in 0..c1.len() - 1 {
+            assert_eq!(
+                c1[i], c2[i],
+                "appending data must not shift earlier chunk {i} (CDC stability)"
+            );
+        }
+    }
+
     #[test]
     fn cbor_chunk_roundtrip() {
         // Encode 3 CBOR unsigned integers as separate top-level items.

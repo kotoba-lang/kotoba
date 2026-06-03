@@ -320,6 +320,31 @@ mod tests {
     }
 
     #[test]
+    fn royalty_distribution_is_tight_dust_bounded_by_entry_count() {
+        // Complement of `royalty_sum_never_exceeds_pool`: the distribution must be
+        // TIGHT. Each entry's royalty floors `pool * count/total`, so the pool dust
+        // (pool − sum) is at most one mKOTO per entry. A bug that silently leaked a
+        // large fraction of the pool (e.g. wrong denominator) would still satisfy
+        // "never exceeds" but must fail this lower bound.
+        let mut ledger = CitationLedger::new();
+        // Distinct datoms with varied citation counts 1,2,3,4,5 (total = 15).
+        for (key, n) in [("k1", 1), ("k2", 2), ("k3", 3), ("k4", 4), ("k5", 5)] {
+            for _ in 0..n {
+                ledger.cite_quad(&make_quad(key));
+            }
+        }
+        let pool = 1_000_000_u64;
+        let entries = ledger.flush_epoch(pool);
+        let n = entries.len() as u64;
+        let sum: u64 = entries.iter().map(|e| e.royalty_mkoto).sum();
+        assert!(sum <= pool, "sum {sum} exceeds pool {pool}");
+        assert!(
+            sum >= pool - n,
+            "distribution leaks too much: sum {sum} < pool {pool} − {n} (dust must be ≤ one mKOTO per entry)"
+        );
+    }
+
+    #[test]
     fn sole_citation_gets_full_pool() {
         let mut ledger = CitationLedger::new();
         ledger.cite_quad(&make_quad("only"));

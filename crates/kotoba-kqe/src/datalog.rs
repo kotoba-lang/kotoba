@@ -611,6 +611,42 @@ mod tests {
     }
 
     #[test]
+    fn transitive_closure_over_a_cycle_terminates_and_is_complete() {
+        // reachable(X,Y) :- edge(X,Y).
+        // reachable(X,Z) :- edge(X,Y), reachable(Y,Z).
+        // The cyclic case a→b→c→a is where a naive recursive evaluator would loop
+        // forever. Semi-naive must instead reach a fixpoint by deriving no NEW facts
+        // — and the closure is TOTAL: in a cycle every node reaches every node
+        // (including itself). Pins both termination-by-fixpoint and completeness,
+        // distinct from the acyclic `test_transitive_closure` and the cap-based
+        // `iteration_limit_terminates_long_chain`.
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(DatalogRule {
+            head: head_atom("reachable", &["X", "Y"]),
+            body: vec![pos("edge", &["X", "Y"])],
+        });
+        prog.add_rule(DatalogRule {
+            head: head_atom("reachable", &["X", "Z"]),
+            body: vec![pos("edge", &["X", "Y"]), pos("reachable", &["Y", "Z"])],
+        });
+        let input = vec![
+            fact("edge", &["a", "b"]),
+            fact("edge", &["b", "c"]),
+            fact("edge", &["c", "a"]),
+        ];
+        let derived = prog.evaluate_delta(&input);
+        // Total closure over {a,b,c}: all 9 ordered pairs, self-loops included.
+        for x in ["a", "b", "c"] {
+            for y in ["a", "b", "c"] {
+                assert!(
+                    has_relation(&derived, "reachable", x, y),
+                    "cyclic closure must include reachable({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_no_duplicate_derivations() {
         // Even if two paths can derive the same fact, it should appear once.
         // path(X, Z) :- edge(X, Y), edge(Y, Z).

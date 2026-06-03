@@ -404,6 +404,42 @@ mod tests {
     }
 
     #[test]
+    fn charge_gas_deducts_rejects_overspend_and_spends_to_exact_zero() {
+        // Gas metering is the DoS gate for WASM execution. Pin the mechanics:
+        // deduct on success, reject an overspend WITHOUT mutating (no underflow /
+        // partial charge), allow an exact spend to zero, and refuse further charges.
+        let mut s = crate::host::HostState::new("did:plc:test", 100);
+
+        assert!(s.charge_gas(30).is_ok());
+        assert_eq!(s.gas_remaining, 70, "successful charge deducts the cost");
+
+        assert!(s.charge_gas(71).is_err(), "overspend must be rejected");
+        assert_eq!(s.gas_remaining, 70, "a rejected charge must not deduct or underflow");
+
+        assert!(s.charge_gas(70).is_ok(), "exact spend to zero (cost == remaining) succeeds");
+        assert_eq!(s.gas_remaining, 0);
+
+        assert!(s.charge_gas(1).is_err(), "no gas left → any positive charge fails");
+        assert!(s.charge_gas(0).is_ok(), "a zero-cost charge at zero remaining is allowed");
+    }
+
+    #[test]
+    fn wasm_executor_rejects_zero_gas_limit() {
+        // Constitutional invariant: gas-less WASM execution is prohibited. The check
+        // runs before engine creation, and `with_inference` delegates to `new`, so
+        // a 0 gas_limit can never construct an executor.
+        let result = crate::WasmExecutor::new(0);
+        assert!(result.is_err(), "0 gas_limit must be rejected");
+        // WasmExecutor isn't Debug, so drop the Ok via `.err()` rather than unwrap_err.
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("gas") && err.contains("prohibited"),
+            "0 gas_limit must be rejected with a clear reason, got: {err}"
+        );
+        assert!(crate::WasmExecutor::new(1).is_ok(), "a positive gas_limit constructs");
+    }
+
+    #[test]
     fn host_state_pending_asserts_empty_on_new() {
         let state = crate::host::HostState::new("did:plc:test", 1_000);
         assert!(state.pending_asserts.is_empty());

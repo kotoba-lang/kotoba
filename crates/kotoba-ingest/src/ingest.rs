@@ -71,11 +71,9 @@ impl EmailIngestor {
         let raw_message_id = msg.message_id().unwrap_or("");
         // RFC 5322 §2.1.1 limits a single header line to 998 chars (excluding CRLF).
         // Truncate rather than reject so a malformed Message-ID still produces a CID.
-        let message_id = if raw_message_id.len() > 998 {
-            raw_message_id[..998].to_string()
-        } else {
-            raw_message_id.to_string()
-        };
+        // MUST use the char-safe truncator: a raw byte-slice `[..998]` panics when a
+        // multibyte char straddles byte 998 — a crafted email would crash ingest.
+        let message_id = truncate_str(raw_message_id, 998);
         let email_cid = if message_id.is_empty() {
             KotobaCid::from_bytes(raw)
         } else {
@@ -452,5 +450,52 @@ mod tests {
             "result must end on a char boundary"
         );
         assert_eq!(r, "日"); // 3 bytes, fits in 4
+    }
+
+    #[test]
+    fn addr_header_extracts_all_recipients_and_flattens_groups() {
+        // Tested through the real RFC-5322 parse path so it's robust to mail_parser's
+        // internal Address layout. addr_header must (a) return "" for None, (b) emit
+        // EVERY recipient of a multi-address header — a bug returning only the first
+        // would silently drop recipients from the stored quad — and (c) flatten an
+        // RFC-5322 group to its members.
+        assert_eq!(addr_header(None), "");
+
+        let raw: &[u8] = b"From: Alice <alice@example.com>\r\n\
+            To: Bob <bob@example.com>, carol@example.com\r\n\
+            Subject: hi\r\n\r\nbody";
+        let msg = MessageParser::default().parse(raw).expect("parse");
+        let to = addr_header(msg.to());
+        assert!(to.contains("bob@example.com"), "first recipient kept: {to}");
+        assert!(to.contains("carol@example.com"), "second recipient kept: {to}");
+        assert!(to.contains("Bob"), "display name preserved: {to}");
+        let from = addr_header(msg.from());
+        assert!(from.contains("alice@example.com") && from.contains("Alice"));
+
+        // RFC-5322 group syntax: `Team:bob,carol;` → flattened to both members.
+        let graw: &[u8] = b"To: Team:bob@example.com,carol@example.com;\r\n\
+            Subject: g\r\n\r\nbody";
+        let gmsg = MessageParser::default().parse(graw).expect("parse group");
+        let gto = addr_header(gmsg.to());
+        assert!(gto.contains("bob@example.com"), "group member 1 flattened: {gto}");
+        assert!(gto.contains("carol@example.com"), "group member 2 flattened: {gto}");
+    }
+
+    #[tokio::test]
+    async fn ingest_does_not_panic_on_long_multibyte_message_id() {
+        // A crafted email whose Message-ID exceeds 998 bytes of multibyte text must
+        // not crash ingest while truncating the header for the CID. Regression: a
+        // raw `raw_message_id[..998]` byte-slice panicked when byte 998 landed
+        // mid-char. Now routed through the char-safe `truncate_str`.
+        let ing = make_ingestor();
+        let long_id = "あ".repeat(400); // 1200 bytes (> 998), all multibyte
+        let raw = format!(
+            "From: a@x.com\r\nTo: b@y.com\r\nMessage-ID: <{long_id}>\r\nSubject: hi\r\n\r\nbody"
+        );
+        let cid = ing
+            .ingest_raw(raw.as_bytes(), "thread-mb")
+            .await
+            .expect("oversized multibyte Message-ID must ingest, not panic");
+        assert!(!cid.to_multibase().is_empty());
     }
 }

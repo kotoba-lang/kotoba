@@ -849,10 +849,7 @@ mod tests {
                 domain: "kotoba.test".into(),
                 statement: None,
                 version: "1".into(),
-                resources: vec![
-                    "kotoba://can/datom:read".into(),
-                    "kotoba://graph/g1".into(),
-                ],
+                resources: vec!["kotoba://can/datom:read".into(), "kotoba://graph/g1".into()],
             },
             s: CacaoSig {
                 t: "EdDSA".into(),
@@ -902,16 +899,12 @@ mod tests {
     fn skip_sig_max_age_boundary_with_margin() {
         // Within window (cap minus 1h) → accepted; over window (cap plus 1h) →
         // Expired. 1h margin keeps it robust against test-execution clock drift.
-        let within = no_expiry_chain(&format_iso8601(
-            now_unix() - (MAX_CACAO_AGE_SECS - 3600),
-        ));
+        let within = no_expiry_chain(&format_iso8601(now_unix() - (MAX_CACAO_AGE_SECS - 3600)));
         assert!(
             within.verify_skip_sig("g1", "datom:read").is_ok(),
             "CACAO aged just under the cap must be accepted"
         );
-        let over = no_expiry_chain(&format_iso8601(
-            now_unix() - (MAX_CACAO_AGE_SECS + 3600),
-        ));
+        let over = no_expiry_chain(&format_iso8601(now_unix() - (MAX_CACAO_AGE_SECS + 3600)));
         assert!(
             matches!(
                 over.verify_skip_sig("g1", "datom:read"),
@@ -981,36 +974,65 @@ mod tests {
         let fresh = format_iso8601(now_unix() - 3600);
 
         let old_root = make_real_cacao_dated(
-            &root_sk, &root_did, &leaf_did, "datom:read", graph, "n-root",
-            "2020-01-01T00:00:00Z", None,
+            &root_sk,
+            &root_did,
+            &leaf_did,
+            "datom:read",
+            graph,
+            "n-root",
+            "2020-01-01T00:00:00Z",
+            None,
         );
         let leaf = make_real_cacao_dated(
-            &leaf_sk, &leaf_did, "did:final:caller", "datom:read", graph, "n-leaf",
-            &fresh, None,
+            &leaf_sk,
+            &leaf_did,
+            "did:final:caller",
+            "datom:read",
+            graph,
+            "n-leaf",
+            &fresh,
+            None,
         );
         let chain = DelegationChain {
             chain: vec![old_root, leaf],
         };
         assert!(
-            matches!(chain.verify(graph, "datom:read"), Err(DelegationError::Expired)),
+            matches!(
+                chain.verify(graph, "datom:read"),
+                Err(DelegationError::Expired)
+            ),
             "old no-expiry root must be rejected by max-age even with a fresh leaf"
         );
 
         // Control: identical chain but with a FRESH root → fully valid → Ok(root_did).
         // Proves the root's age is the sole cause of the rejection above.
         let fresh_root = make_real_cacao_dated(
-            &root_sk, &root_did, &leaf_did, "datom:read", graph, "n-root",
-            &fresh, None,
+            &root_sk,
+            &root_did,
+            &leaf_did,
+            "datom:read",
+            graph,
+            "n-root",
+            &fresh,
+            None,
         );
         let leaf2 = make_real_cacao_dated(
-            &leaf_sk, &leaf_did, "did:final:caller", "datom:read", graph, "n-leaf",
-            &fresh, None,
+            &leaf_sk,
+            &leaf_did,
+            "did:final:caller",
+            "datom:read",
+            graph,
+            "n-leaf",
+            &fresh,
+            None,
         );
         let ok_chain = DelegationChain {
             chain: vec![fresh_root, leaf2],
         };
         assert_eq!(
-            ok_chain.verify(graph, "datom:read").expect("fresh depth-2 chain valid"),
+            ok_chain
+                .verify(graph, "datom:read")
+                .expect("fresh depth-2 chain valid"),
             root_did,
             "fresh-root chain must verify and return the root issuer"
         );
@@ -1025,17 +1047,33 @@ mod tests {
         let fresh = format_iso8601(now_unix() - 3600);
 
         let root = make_real_cacao_dated(
-            &root_sk, &root_did, &leaf_did, "datom:read", graph, "n-root", &fresh, None,
+            &root_sk,
+            &root_did,
+            &leaf_did,
+            "datom:read",
+            graph,
+            "n-root",
+            &fresh,
+            None,
         );
         let old_leaf = make_real_cacao_dated(
-            &leaf_sk, &leaf_did, "did:final:caller", "datom:read", graph, "n-leaf",
-            "2020-01-01T00:00:00Z", None,
+            &leaf_sk,
+            &leaf_did,
+            "did:final:caller",
+            "datom:read",
+            graph,
+            "n-leaf",
+            "2020-01-01T00:00:00Z",
+            None,
         );
         let chain = DelegationChain {
             chain: vec![root, old_leaf],
         };
         assert!(
-            matches!(chain.verify(graph, "datom:read"), Err(DelegationError::Expired)),
+            matches!(
+                chain.verify(graph, "datom:read"),
+                Err(DelegationError::Expired)
+            ),
             "old no-expiry leaf must be rejected by max-age"
         );
     }

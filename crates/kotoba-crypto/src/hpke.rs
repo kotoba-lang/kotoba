@@ -103,6 +103,31 @@ mod tests {
     }
 
     #[test]
+    fn hpke_tampering_any_region_fails_to_open() {
+        // Wire format is `eph_pk(32) ‖ nonce(12) ‖ ct`. With the CORRECT recipient
+        // key, tampering ANY region must fail to open — there was no tamper test at
+        // all. Isolates each region as the cause (right key, one byte flipped).
+        let (sk, pk) = random_keypair();
+        let msg = b"forward-secret payload";
+
+        // Ephemeral pubkey: feeds both the DH secret and the HKDF salt → wrong key.
+        let mut t_eph = hpke_seal(&pk, msg).unwrap();
+        t_eph[0] ^= 0xFF;
+        assert!(hpke_open(&sk, &t_eph).is_err(), "tampered ephemeral pk must not open");
+
+        // Nonce region (byte 32) → AES-GCM nonce mismatch.
+        let mut t_nonce = hpke_seal(&pk, msg).unwrap();
+        t_nonce[32] ^= 0xFF;
+        assert!(hpke_open(&sk, &t_nonce).is_err(), "tampered nonce must not open");
+
+        // Final ciphertext/tag byte → AEAD integrity failure.
+        let mut t_ct = hpke_seal(&pk, msg).unwrap();
+        let last = t_ct.len() - 1;
+        t_ct[last] ^= 0xFF;
+        assert!(hpke_open(&sk, &t_ct).is_err(), "tampered ciphertext must not open");
+    }
+
+    #[test]
     fn hpke_sealed_length() {
         let (_sk, pk) = random_keypair();
         let msg = b"hello";

@@ -79,6 +79,38 @@ struct SigningPayload<'a> {
     policy: &'a kotoba_core::DataPolicy,
 }
 
+/// Content-address an entry over the SAME canonical CBOR encoding that
+/// [`ChainEntry::signing_bytes`] signs, binding every identifying field
+/// (`prev, agent, seq, content, ts, policy`) injectively. Single source of truth
+/// for the CID, shared by the constructor and tests.
+///
+/// This replaces an earlier `format!("{:?}{:?}{}{}", prev, content, seq, ts)`
+/// derivation that was **not injective**: `seq`/`ts` were concatenated with no
+/// separator (so `(seq=1, ts=23)` and `(seq=12, ts=3)` both produced `"…123"`),
+/// and `agent` + `policy` were omitted entirely — letting two distinct entries
+/// collide on one CID and undermining content-addressing.
+pub(crate) fn entry_cid(
+    prev: &Option<KotobaCid>,
+    agent: &str,
+    seq: u64,
+    content: &ChainContent,
+    ts: u64,
+    policy: &kotoba_core::DataPolicy,
+) -> KotobaCid {
+    let payload = SigningPayload {
+        prev,
+        agent,
+        seq,
+        content,
+        ts,
+        policy,
+    };
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&payload, &mut buf)
+        .expect("CBOR serialization of SigningPayload is infallible");
+    KotobaCid::from_bytes(&buf)
+}
+
 impl ChainEntry {
     pub fn new(
         prev: Option<KotobaCid>,
@@ -106,8 +138,7 @@ impl ChainEntry {
         policy: kotoba_core::DataPolicy,
     ) -> Self {
         let ts = now_ms();
-        let payload = format!("{:?}{:?}{}{}", prev, content, seq, ts);
-        let cid = KotobaCid::from_bytes(payload.as_bytes());
+        let cid = entry_cid(&prev, &agent, seq, &content, ts, &policy);
         Self {
             cid,
             prev,
@@ -341,6 +372,48 @@ mod tests {
         let mut entry = make_signed_entry(&sk, None, "did:plc:alice", 0, dummy_content());
         entry.sig = vec![0u8; 32]; // wrong length
         assert!(entry.verify_sig(sk.verifying_key().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn entry_cid_is_injective_over_all_fields() {
+        // The entry CID must be a collision-free function of every identifying
+        // field. Driving `entry_cid` directly (with a fixed `ts`, which the public
+        // constructor sets from the clock) isolates the exact collisions the old
+        // `format!` derivation allowed.
+        use kotoba_core::DataPolicy;
+        let prev = None;
+        let content = dummy_content();
+        let base = entry_cid(&prev, "did:a", 1, &content, 1000, &DataPolicy::Open);
+
+        // Determinism.
+        assert_eq!(
+            base,
+            entry_cid(&prev, "did:a", 1, &content, 1000, &DataPolicy::Open),
+            "same inputs must yield the same CID"
+        );
+        // (a) agent (DID) is bound — the old Debug-string CID omitted it entirely.
+        assert_ne!(
+            base,
+            entry_cid(&prev, "did:b", 1, &content, 1000, &DataPolicy::Open),
+            "CID must bind the agent DID"
+        );
+        // (b) seq/ts no longer collide via separator-less concatenation:
+        //     (seq=1, ts=23) vs (seq=12, ts=3) used to both encode "…123".
+        assert_ne!(
+            entry_cid(&prev, "did:a", 1, &content, 23, &DataPolicy::Open),
+            entry_cid(&prev, "did:a", 12, &content, 3, &DataPolicy::Open),
+            "seq/ts must not collide at the digit boundary"
+        );
+        // (c) policy is bound — also omitted by the old derivation.
+        let enc = DataPolicy::Encrypted {
+            ct_cid: KotobaCid::from_bytes(b"ct"),
+            policy_cid: KotobaCid::from_bytes(b"pol"),
+        };
+        assert_ne!(
+            base,
+            entry_cid(&prev, "did:a", 1, &content, 1000, &enc),
+            "CID must bind the data policy"
+        );
     }
 
     #[test]

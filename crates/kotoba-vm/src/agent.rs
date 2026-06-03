@@ -234,7 +234,10 @@ impl Default for ToolRegistry {
                 "kse.publish",
                 "Publish a KSE event: kse.publish(<topic>,<message>)",
                 |input, _snap| ToolOutput {
-                    observation: format!("published: {}", &input[..input.len().min(64)]),
+                    observation: format!(
+                        "published: {}",
+                        input.chars().take(64).collect::<String>()
+                    ),
                     done: false,
                     route: None,
                 },
@@ -300,7 +303,9 @@ impl AgentSession {
             format!(
                 "agent/{}/{}",
                 graph_cid.to_multibase(),
-                &task[..task.len().min(64)]
+                // char-safe: a raw `&task[..64]` byte-slice panics if byte 64 lands
+                // mid-multibyte-char in a non-ASCII task string.
+                task.chars().take(64).collect::<String>()
             )
             .as_bytes(),
         );
@@ -1249,5 +1254,19 @@ mod tests {
             "A should observe the delegation: {:?}",
             result_a.steps
         );
+    }
+
+    #[test]
+    fn agent_session_new_does_not_panic_on_multibyte_task() {
+        // session_cid is derived by truncating the task string. A multibyte task
+        // longer than the 64-byte cutoff must not panic (regression: `&task[..64]`
+        // byte-slice landing mid-char). The task itself is preserved verbatim.
+        let task = "あ".repeat(40); // 120 bytes of multibyte
+        let s = AgentSession::new(task.clone(), KotobaCid::from_bytes(b"g"), 5);
+        assert_eq!(s.task, task, "task preserved verbatim");
+        assert!(!s.session_cid.to_multibase().is_empty());
+        // Determinism: same (task, graph) → same session_cid.
+        let s2 = AgentSession::new(task, KotobaCid::from_bytes(b"g"), 5);
+        assert_eq!(s.session_cid, s2.session_cid);
     }
 }

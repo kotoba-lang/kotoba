@@ -511,4 +511,63 @@ mod tests {
             .iter()
             .any(|d| d.a == "https://didcomm.org/basicmessage/2.0/message"));
     }
+
+    fn msg(id: &str, thid: Option<&str>) -> DidCommMessage {
+        DidCommMessage {
+            id: id.into(),
+            message_type: "https://didcomm.org/basicmessage/2.0/message".into(),
+            from: None,
+            to: vec![],
+            thid: thid.map(Into::into),
+            pthid: None,
+            created_time: None,
+            expires_time: None,
+            body: json!({}),
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn thread_id_and_scope_group_a_conversation() {
+        // DIDComm threading: a thread-starter has no `thid`, so its thread IS its
+        // own id; a reply carries `thid` = the thread root. thread_scope() is what
+        // groups a conversation, so a bug here (returning own id for a reply, or
+        // mismatched scopes) would scatter messages that belong together.
+        let root = msg("msg-root", None);
+        assert_eq!(root.thread_id(), "msg-root", "a starter's thread is its own id");
+        assert_eq!(root.thread_scope(), "didcomm://thread/msg-root");
+
+        let reply = msg("msg-reply-1", Some("msg-root"));
+        assert_eq!(reply.thread_id(), "msg-root", "a reply joins its thread, not its own id");
+        assert_eq!(
+            reply.thread_scope(),
+            root.thread_scope(),
+            "a reply must share the root's thread scope"
+        );
+
+        // A second reply groups into the same conversation …
+        let reply2 = msg("msg-reply-2", Some("msg-root"));
+        assert_eq!(reply2.thread_scope(), root.thread_scope());
+        // … yet remains a distinct content-addressed message.
+        assert_ne!(
+            reply.cid().unwrap(),
+            reply2.cid().unwrap(),
+            "distinct messages must have distinct CIDs"
+        );
+    }
+
+    #[test]
+    fn cid_is_deterministic_and_field_sensitive() {
+        // The message CID is its content-addressed identity: stable for identical
+        // content, and changing any field changes it (so a tampered/edited message
+        // can never masquerade as the original).
+        let a = msg("m", Some("t"));
+        assert_eq!(a.cid().unwrap(), a.cid().unwrap(), "cid must be deterministic");
+        let mut b = a.clone();
+        b.id = "m2".into();
+        assert_ne!(a.cid().unwrap(), b.cid().unwrap(), "changing id changes the cid");
+        let mut c = a.clone();
+        c.body = json!({"x": 1});
+        assert_ne!(a.cid().unwrap(), c.cid().unwrap(), "changing body changes the cid");
+    }
 }

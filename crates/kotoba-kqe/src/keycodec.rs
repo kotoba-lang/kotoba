@@ -186,6 +186,75 @@ mod tests {
     }
 
     #[test]
+    fn integer_encoding_is_monotone_over_a_full_sweep() {
+        // Generalises the pairwise checks: an ascending value sequence must encode
+        // to an ascending key sequence end-to-end (no inversion hides between the
+        // spot-checks), spanning the i64 extremes.
+        let ascending = [
+            i64::MIN,
+            i64::MIN + 1,
+            -(1i64 << 40),
+            -1_000_000,
+            -1,
+            0,
+            1,
+            1_000_000,
+            1i64 << 40,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        for w in ascending.windows(2) {
+            assert!(
+                enc(&Value::Integer(w[0])) < enc(&Value::Integer(w[1])),
+                "integer key encoding must be monotone: {} then {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn float_encoding_is_monotone_including_subnormals_and_extremes() {
+        let subnormal = f64::from_bits(1); // smallest positive subnormal (~5e-324)
+        let ascending = [
+            f64::NEG_INFINITY,
+            f64::MIN, // most-negative finite (~-1.8e308)
+            -1.0,
+            -f64::MIN_POSITIVE, // smallest-magnitude negative normal
+            -subnormal,
+            0.0,
+            subnormal,
+            f64::MIN_POSITIVE,
+            1.0,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        for w in ascending.windows(2) {
+            assert!(
+                enc(&Value::Float(w[0])) < enc(&Value::Float(w[1])),
+                "float key encoding must be monotone: {} then {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn nan_encodes_deterministically_and_to_an_end() {
+        // A NaN in an index key must not panic and must encode deterministically.
+        let k1 = enc(&Value::Float(f64::NAN));
+        let k2 = enc(&Value::Float(f64::NAN));
+        assert_eq!(k1, k2, "NaN must encode deterministically");
+        assert_ne!(k1, enc(&Value::Float(0.0)), "NaN must not collide with 0.0");
+        // The doc promises NaN sorts to an end; the std positive NaN (sign clear)
+        // lands above +INFINITY rather than wedging between finite values.
+        assert!(
+            k1 > enc(&Value::Float(f64::INFINITY)),
+            "positive NaN must sort to the high end, not among finite values"
+        );
+    }
+
+    #[test]
     fn text_is_separator_safe_against_embedded_nul() {
         // "a" < "a\0b" < "ab": the terminator must not be forgeable by a NUL.
         assert_lt(Value::Text("a".into()), Value::Text("a\u{0}b".into()));

@@ -293,6 +293,39 @@ mod tests {
     }
 
     #[test]
+    fn derive_tx_cid_is_injective_over_inputs() {
+        // The tx CID is content-addressed over (graph, root, prev, seq) via
+        // fixed-width fields. Pin its injectivity so a future refactor can't
+        // reintroduce a separator-less collision (the class fixed in source_chain):
+        // every input must change the CID, and the fixed-width `seq` must not
+        // collide at a digit boundary the way a decimal-string concat would.
+        let g = KotobaCid::from_bytes(b"graph");
+        let g2 = KotobaCid::from_bytes(b"graph2");
+        let r = KotobaCid::from_bytes(b"root");
+        let r2 = KotobaCid::from_bytes(b"root2");
+        let p = KotobaCid::from_bytes(b"prev");
+
+        let base = Commit::derive_tx_cid(&g, &r, None, 0);
+        assert_eq!(base, Commit::derive_tx_cid(&g, &r, None, 0), "deterministic");
+        assert_ne!(base, Commit::derive_tx_cid(&g2, &r, None, 0), "graph is bound");
+        assert_ne!(base, Commit::derive_tx_cid(&g, &r2, None, 0), "root is bound");
+        assert_ne!(base, Commit::derive_tx_cid(&g, &r, Some(&p), 0), "prev presence is bound");
+        assert_ne!(base, Commit::derive_tx_cid(&g, &r, None, 1), "seq is bound");
+        assert_ne!(
+            Commit::derive_tx_cid(&g, &r, Some(&p), 0),
+            Commit::derive_tx_cid(&g, &r, Some(&r), 0),
+            "distinct prev values are bound"
+        );
+        // seq is fixed-width big-endian bytes, so 1 and 10 cannot collide the way
+        // a `format!("{}{}", …, seq)` decimal concatenation could.
+        assert_ne!(
+            Commit::derive_tx_cid(&g, &r, None, 1),
+            Commit::derive_tx_cid(&g, &r, None, 10),
+            "seq digit boundary does not collide"
+        );
+    }
+
+    #[test]
     fn commit_with_index_roots_roundtrip() {
         let store = MemoryBlockStore::new();
         let graph = KotobaCid::from_bytes(b"graph-idx");

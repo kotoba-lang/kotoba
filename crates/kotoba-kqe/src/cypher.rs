@@ -121,6 +121,17 @@ struct CypherQuery {
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
+/// Truncate `s` to at most `max` bytes, stepping back to a UTF-8 char boundary.
+/// Used only for clipping (possibly multibyte) query text into diagnostic
+/// messages — a plain `&s[..max]` byte-slice panics when `max` lands mid-char.
+fn clip(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Top-level: parse a Cypher query string into a `CypherQuery`.
 fn parse(input: &str) -> anyhow::Result<CypherQuery> {
     let upper = input.trim();
@@ -130,7 +141,7 @@ fn parse(input: &str) -> anyhow::Result<CypherQuery> {
     if !upper_check.starts_with("MATCH") {
         anyhow::bail!(
             "query must start with MATCH; got: {}",
-            &upper[..upper.len().min(20)]
+            clip(upper, 20)
         );
     }
 
@@ -189,34 +200,27 @@ fn parse(input: &str) -> anyhow::Result<CypherQuery> {
 /// `(text_before_keyword, text_from_after_keyword_to_end)`.
 /// Searches for the keyword at a word boundary.
 fn split_clause_after(input: &str, keyword: &str) -> anyhow::Result<(String, String)> {
-    let upper = input.to_uppercase();
-    let kw_upper = keyword.to_uppercase();
-
-    // Find keyword at start or after whitespace
-    let mut pos = 0;
-    loop {
-        match upper[pos..].find(&kw_upper) {
-            None => anyhow::bail!(
-                "keyword '{}' not found in: {}",
-                keyword,
-                &input[..input.len().min(60)]
-            ),
-            Some(offset) => {
-                let abs = pos + offset;
-                // Verify word-boundary before and after
-                let before_ok = abs == 0 || !upper.as_bytes()[abs - 1].is_ascii_alphanumeric();
-                let after_pos = abs + kw_upper.len();
-                let after_ok = after_pos >= upper.len()
-                    || !upper.as_bytes()[after_pos].is_ascii_alphanumeric();
-                if before_ok && after_ok {
-                    let before = input[..abs].to_string();
-                    let after = input[after_pos..].to_string();
-                    return Ok((before, after));
-                }
-                pos = abs + 1;
-            }
+    // Search `input` directly (case-insensitively) rather than its uppercased copy:
+    // `to_uppercase()` can change byte length (`ß`→`SS`), which desyncs offsets so
+    // `input[..abs]` would slice at the wrong position or mid-char (`MATCH (a:Straße)
+    // WHERE …`). Advancing by whole UTF-8 chars keeps every slice on a boundary.
+    let bytes = input.as_bytes();
+    let klen = keyword.len();
+    let char_len = |i: usize| input[i..].chars().next().map_or(1, |c| c.len_utf8());
+    let mut i = 0usize;
+    while i < input.len() {
+        if i + klen <= input.len()
+            && input.is_char_boundary(i + klen)
+            && input[i..i + klen].eq_ignore_ascii_case(keyword)
+            // word-boundary before and after (so e.g. "REMATCH" doesn't match "MATCH")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + klen == input.len() || !bytes[i + klen].is_ascii_alphanumeric())
+        {
+            return Ok((input[..i].to_string(), input[i + klen..].to_string()));
         }
+        i += char_len(i);
     }
+    anyhow::bail!("keyword '{}' not found in: {}", keyword, clip(input, 60))
 }
 
 /// Parse the MATCH path pattern, e.g.:
@@ -368,6 +372,13 @@ fn parse_where(s: &str) -> anyhow::Result<Vec<(String, String)>> {
         let eq_pos = part
             .find('=')
             .ok_or_else(|| anyhow!("WHERE condition must be an equality: {part}"))?;
+        // `find('=')` matches the `=` inside `!=` / `<=` / `>=`. Reject those: the
+        // only supported operator is a standalone `=`. Without this guard,
+        // `a.x != "y"` would be parsed as `a.x = "y"` — silently INVERTING the
+        // filter. (Standalone `<` / `>` have no `=` and already fail above.)
+        if eq_pos > 0 && matches!(part.as_bytes()[eq_pos - 1], b'!' | b'<' | b'>') {
+            anyhow::bail!("WHERE only supports '=' equality; inequality operators are not supported: {part}");
+        }
         let lhs = part[..eq_pos].trim();
         let rhs = part[eq_pos + 1..].trim();
 
@@ -509,26 +520,49 @@ fn parse_string_literal(s: &str) -> Option<String> {
 }
 
 /// Split `s` on case-insensitive `AND` at word boundaries.
+/// Split a WHERE body on the standalone `AND` keyword (case-insensitive).
+///
+/// Operates directly on `s` (not its uppercased copy — `to_uppercase` can change
+/// byte length, e.g. `ß`→`SS`, desyncing indices), advances by whole UTF-8 chars
+/// (a byte-by-byte cursor panics mid-multibyte-char — `WHERE n.name = "日本"`
+/// would crash the parser), and never splits the `AND` *inside* a quoted value
+/// (`= "Tom AND Jerry"` stays one condition).
 fn split_and(s: &str) -> Vec<String> {
     let mut result = Vec::new();
-    let upper = s.to_uppercase();
+    let bytes = s.as_bytes();
     let mut start = 0usize;
     let mut i = 0usize;
+    let mut in_quote: Option<u8> = None;
 
-    while i < upper.len() {
-        if upper[i..].starts_with("AND") {
-            let before_ok = i == 0 || !upper.as_bytes()[i - 1].is_ascii_alphanumeric();
-            let after_pos = i + 3;
-            let after_ok =
-                after_pos >= upper.len() || !upper.as_bytes()[after_pos].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                result.push(s[start..i].to_string());
-                start = after_pos;
-                i = start;
-                continue;
+    let char_len = |i: usize| s[i..].chars().next().map_or(1, |c| c.len_utf8());
+
+    while i < s.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
             }
+            i += char_len(i);
+            continue;
         }
-        i += 1;
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        // Standalone ASCII `AND` keyword outside any quote, on char boundaries.
+        if i + 3 <= s.len()
+            && s.is_char_boundary(i + 3)
+            && s[i..i + 3].eq_ignore_ascii_case("AND")
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && (i + 3 == s.len() || !bytes[i + 3].is_ascii_alphanumeric())
+        {
+            result.push(s[start..i].to_string());
+            start = i + 3;
+            i = start;
+            continue;
+        }
+        i += char_len(i);
     }
     result.push(s[start..].to_string());
     result
@@ -784,5 +818,111 @@ mod tests {
             !has(&derived, "output", "carol", "dave"),
             "carol->dave must be filtered by single-quoted WHERE"
         );
+    }
+
+    #[test]
+    fn clip_steps_back_to_char_boundary() {
+        assert_eq!(clip("hello", 3), "hel"); // ASCII: exact
+        assert_eq!(clip("あいう", 4), "あ"); // byte 4 is mid-`い` → back to 3
+        assert_eq!(clip("あいう", 9), "あいう"); // whole string
+        assert_eq!(clip("あいう", 100), "あいう"); // max beyond len
+        assert_eq!(clip("", 5), ""); // empty
+    }
+
+    #[test]
+    fn cypher_error_messages_do_not_panic_on_multibyte_input() {
+        // A malformed multibyte query must yield a clean Err, never panic while
+        // byte-slicing the input into the diagnostic. `"あ"×30` = 90 bytes with no
+        // MATCH → the error path clips at byte 20, which lands mid-`あ` (panicked
+        // before the char-safe `clip`).
+        let no_match = "あ".repeat(30);
+        let r = CypherCompiler::compile(&no_match, "out");
+        assert!(r.is_err(), "multibyte non-MATCH query must error, not panic");
+
+        // A MATCH query missing RETURN with long multibyte text → keyword-not-found
+        // diagnostic clips `input` at byte 60; must not panic.
+        let no_return = format!("MATCH {}", "あ".repeat(40));
+        let r2 = CypherCompiler::compile(&no_return, "out");
+        assert!(r2.is_err());
+    }
+
+    #[test]
+    fn where_rejects_inequality_operators_instead_of_silently_treating_as_equality() {
+        // `find('=')` matches the `=` inside `!=`/`<=`/`>=`, so without the guard
+        // `a.role != "admin"` would parse as `a.role = "admin"` — INVERTING the
+        // filter (matching admins instead of excluding them). These must all error.
+        for q in [
+            r#"MATCH (a)-[:r]->(b) WHERE a.role != "admin" RETURN a, b"#,
+            r#"MATCH (a)-[:r]->(b) WHERE a.age <= "5" RETURN a, b"#,
+            r#"MATCH (a)-[:r]->(b) WHERE a.age >= "5" RETURN a, b"#,
+            r#"MATCH (a)-[:r]->(b) WHERE a.age < "5" RETURN a, b"#, // no '=' → already rejected
+        ] {
+            assert!(
+                CypherCompiler::compile(q, "out").is_err(),
+                "inequality WHERE must error, not silently become equality: {q}"
+            );
+        }
+        // Sanity: plain equality still compiles.
+        assert!(
+            CypherCompiler::compile(
+                r#"MATCH (a)-[:r]->(b) WHERE a.role = "admin" RETURN a, b"#,
+                "out"
+            )
+            .is_ok(),
+            "plain equality must still work"
+        );
+    }
+
+    #[test]
+    fn split_and_is_multibyte_safe_and_quote_aware() {
+        // (1) Multibyte value: a byte-by-byte cursor used to land mid-char and panic.
+        assert_eq!(split_and(r#"n.name = "日本語""#).len(), 1, "multibyte value, no panic");
+        // (2) `AND` inside a quoted value must NOT split the condition.
+        assert_eq!(
+            split_and(r#"n.label = "Tom AND Jerry""#).len(),
+            1,
+            "AND inside quotes is part of the value, not a conjunction"
+        );
+        // (3) A real standalone AND still splits into two conditions.
+        assert_eq!(split_and(r#"a.x = "1" AND b.y = "2""#).len(), 2);
+        // (4) `AND` embedded in a word (BRAND) does not split.
+        assert_eq!(split_and(r#"n.name = "BRAND""#).len(), 1);
+    }
+
+    #[test]
+    fn cypher_where_with_multibyte_value_does_not_panic() {
+        // End-to-end: a multibyte WHERE value must compile (or cleanly error), never
+        // panic inside split_and.
+        let q = r#"MATCH (a)-[:r]->(b) WHERE a.name = "日本語" RETURN a, b"#;
+        let _ = CypherCompiler::compile(q, "out"); // must not panic
+    }
+
+    #[test]
+    fn split_clause_after_uses_input_offsets_not_uppercased_copy() {
+        // 'ﬁ' (U+FB01, 3 bytes) uppercases to "FI" (2 bytes) — a BYTE-length change.
+        // The old code searched the uppercased copy then sliced `input` with that
+        // offset, mis-splitting (or panicking) when a length-changing char preceded
+        // the keyword. Searching `input` directly keeps offsets correct.
+        let (before, after) = split_clause_after("aﬁb RETURN x", "RETURN").unwrap();
+        assert_eq!(before, "aﬁb ", "before-clause must keep the trailing space, intact");
+        assert_eq!(after, " x");
+        // End-to-end: a length-changing char before RETURN must not mis-split/panic.
+        let q = r#"MATCH (a)-[:r]->(b) WHERE a.x = "aﬁz" RETURN a, b"#;
+        let _ = CypherCompiler::compile(q, "out");
+    }
+
+    #[test]
+    fn parse_string_literal_handles_malformed_and_multibyte_without_panic() {
+        // Valid quoted forms extract the content; malformed inputs return None
+        // gracefully (the `starts_with` quote check + `len < 2` guard prevent the
+        // `&s[1..]` slice from panicking). Multibyte content survives intact.
+        assert_eq!(parse_string_literal(r#""hi""#), Some("hi".into()));
+        assert_eq!(parse_string_literal("'hi'"), Some("hi".into()));
+        assert_eq!(parse_string_literal(r#""日本""#), Some("日本".into()), "multibyte content");
+        // Malformed → None, never a panic.
+        assert_eq!(parse_string_literal(""), None, "empty");
+        assert_eq!(parse_string_literal("\""), None, "lone quote (len < 2)");
+        assert_eq!(parse_string_literal("\"unterminated"), None, "no closing quote");
+        assert_eq!(parse_string_literal("notquoted"), None, "not quoted");
     }
 }

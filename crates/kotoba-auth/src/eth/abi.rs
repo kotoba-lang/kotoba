@@ -315,6 +315,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_string_rejects_length_exceeding_buffer() {
+        // Valid offset (0x20), but the length word claims more bytes than follow.
+        // A malicious RPC response could over-read / over-allocate here; the decoder
+        // must reject (the checked end-bound), distinct from the bad-offset case.
+        let mut data = vec![0u8; 64];
+        data[31] = 0x20; // offset → word at byte 32 is the length
+        data[63] = 100; // length = 100, but 0 bytes follow the length word
+        assert_eq!(decode_string(&data), Err(AbiError::BadOffset));
+    }
+
+    #[test]
+    fn decode_string_rejects_length_word_with_high_bytes_set() {
+        // A length word whose high bytes are non-zero encodes a value far larger
+        // than usize. word_as_usize must reject it (high 24 bytes must be zero)
+        // rather than truncate to a small in-bounds length and mis-decode / over-read.
+        let mut data = vec![0u8; 64];
+        data[31] = 0x20; // offset → length word at byte 32
+        data[32] = 0xFF; // most-significant byte of the length word is set
+        assert_eq!(decode_string(&data), Err(AbiError::BadOffset));
+    }
+
+    #[test]
     fn decode_bytes32_string_legacy_mkr() {
         // "MKR" left-aligned in a bytes32 word
         let mut data = [0u8; 32];

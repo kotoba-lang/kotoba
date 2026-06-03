@@ -204,4 +204,28 @@ mod tests {
     fn rt_datomic_tx() {
         roundtrip("[[:db/add -1 :person/name \"Alice\"] [:db/add -1 :person/age 30]]");
     }
+
+    #[test]
+    fn rt_strings_with_special_chars() {
+        // The writer escapes `"` `\` `\n` `\r` `\t`; the parser must unescape them.
+        // The source-level roundtrip tests above use only plain strings, so this is
+        // the ONLY place the escape↔unescape path is exercised end-to-end — an
+        // unescaped `"` would emit invalid EDN that fails to reparse, and a missing
+        // unescape would drift the value.
+        for s in [
+            "he said \"hi\"",   // embedded double-quote
+            "back\\slash",       // backslash
+            "line1\nline2",      // newline
+            "carriage\rreturn",  // CR
+            "tab\there",         // tab
+            "all: \"a\\b\nc\"",  // several escapes at once
+            "",                   // empty string
+            "日本語 ✓ unicode",  // multibyte (no escape, must survive verbatim)
+        ] {
+            let v = EdnValue::string(s);
+            let out = to_string(&v);
+            let v2 = parse(&out).unwrap_or_else(|e| panic!("reparse failed for {s:?} -> {out:?}: {e:?}"));
+            assert_eq!(v, v2, "string roundtrip drift for {s:?} -> {out:?}");
+        }
+    }
 }

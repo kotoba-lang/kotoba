@@ -485,6 +485,21 @@ mod tests {
     }
 
     #[test]
+    fn where_unsupported_operator_errors_gracefully() {
+        // Only `=` and `AND`-of-equalities are supported. OR / != / > must produce a
+        // clean Err — never a silent mis-translation (e.g. treating OR as AND, which
+        // would WIDEN the result set) or a panic.
+        for sql in [
+            "SELECT a.s, a.o FROM rel a WHERE a.s = 'x' OR a.o = 'y'",
+            "SELECT a.s, a.o FROM rel a WHERE a.s != 'x'",
+            "SELECT a.s, a.o FROM rel a WHERE a.o > 5",
+        ] {
+            let r = SqlMvCompiler::compile(sql, "out");
+            assert!(r.is_err(), "unsupported WHERE operator must error: {sql}");
+        }
+    }
+
+    #[test]
     fn where_number_literal() {
         // WHERE with a numeric constant (sqlparser parses it as Value::Number)
         let result =

@@ -37,6 +37,22 @@ pub fn verify_session_pop(
     resolver: &dyn DidDocumentResolver,
     now_secs: u64,
 ) -> PopVerdict {
+    // No audience requirement (backwards-compatible default).
+    verify_session_pop_with_audience(token, resolver, now_secs, None)
+}
+
+/// As [`verify_session_pop`], but additionally binds the token to an audience when
+/// `expected_aud` is `Some`. A PoP minted for one service can otherwise be replayed
+/// to another within its `exp` window; passing the verifying service's identifier
+/// closes that cross-service replay. When `Some(want)`, a verified token must carry
+/// `aud == want` — a missing or mismatched `aud` is rejected. `None` preserves the
+/// original (audience-agnostic) behaviour, so the policy is the caller's to choose.
+pub fn verify_session_pop_with_audience(
+    token: &str,
+    resolver: &dyn DidDocumentResolver,
+    now_secs: u64,
+    expected_aud: Option<&str>,
+) -> PopVerdict {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return fail("malformed token (expected 3 JWS segments)");
@@ -96,7 +112,31 @@ pub fn verify_session_pop(
     };
     let signing_input = format!("{h}.{p}");
     match vk.verify(signing_input.as_bytes(), &Signature::from_bytes(&sig_arr)) {
-        Ok(()) => PopVerdict { valid: true, did: Some(did), reason: "ok".into(), claims: Some(payload) },
+        Ok(()) => {
+            // Signature is valid; enforce audience binding if the caller requires it.
+            if let Some(want) = expected_aud {
+                match payload.get("aud").and_then(Value::as_str) {
+                    Some(a) if a == want => {}
+                    Some(_) => {
+                        return PopVerdict {
+                            valid: false,
+                            did: Some(did),
+                            reason: "audience mismatch".into(),
+                            claims: None,
+                        }
+                    }
+                    None => {
+                        return PopVerdict {
+                            valid: false,
+                            did: Some(did),
+                            reason: "missing aud (audience binding required)".into(),
+                            claims: None,
+                        }
+                    }
+                }
+            }
+            PopVerdict { valid: true, did: Some(did), reason: "ok".into(), claims: Some(payload) }
+        }
         Err(_) => PopVerdict { valid: false, did: Some(did), reason: "signature invalid".into(), claims: None },
     }
 }
@@ -122,6 +162,58 @@ mod tests {
         let signing_input = format!("{header}.{payload}");
         let sig = sk.sign(signing_input.as_bytes());
         (format!("{signing_input}.{}", B64U.encode(sig.to_bytes())), did)
+    }
+
+    /// Build a signed PoP carrying an `aud` claim (or none when `aud` is `None`).
+    fn make_pop_with_aud(seed: u8, exp: u64, aud: Option<&str>) -> (String, String) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&sk.verifying_key().to_bytes());
+        let header =
+            B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
+        let mut claims = serde_json::json!({ "iss": did, "exp": exp });
+        if let Some(a) = aud {
+            claims["aud"] = serde_json::json!(a);
+        }
+        let payload = B64U.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let sig = sk.sign(signing_input.as_bytes());
+        (format!("{signing_input}.{}", B64U.encode(sig.to_bytes())), did)
+    }
+
+    #[test]
+    fn audience_binding_accepts_matching_rejects_mismatch_and_missing() {
+        let now = 1_750_000_100;
+        let exp = 1_750_003_600;
+        let r = didkey_resolver();
+
+        // Matching aud → valid.
+        let (tok, _) = make_pop_with_aud(7, exp, Some("did:web:srv-a"));
+        assert!(verify_session_pop_with_audience(&tok, &r, now, Some("did:web:srv-a")).valid);
+
+        // Mismatched aud → rejected (the cross-service-replay case: a token minted
+        // for srv-b presented to srv-a).
+        let (tok_b, _) = make_pop_with_aud(7, exp, Some("did:web:srv-b"));
+        let v = verify_session_pop_with_audience(&tok_b, &r, now, Some("did:web:srv-a"));
+        assert!(!v.valid);
+        assert_eq!(v.reason, "audience mismatch");
+
+        // No aud at all, but the verifier requires one → rejected.
+        let (tok_none, _) = make_pop_with_aud(7, exp, None);
+        let v2 = verify_session_pop_with_audience(&tok_none, &r, now, Some("did:web:srv-a"));
+        assert!(!v2.valid);
+        assert_eq!(v2.reason, "missing aud (audience binding required)");
+    }
+
+    #[test]
+    fn no_audience_requirement_ignores_aud_claim_backward_compatible() {
+        // Default path (expected_aud = None): an `aud` claim is neither required nor
+        // checked, so existing audience-agnostic callers are unaffected.
+        let now = 1_750_000_100;
+        let (tok, _) = make_pop_with_aud(7, 1_750_003_600, Some("did:web:whatever"));
+        assert!(verify_session_pop(&tok, &didkey_resolver(), now).valid);
+        // And a token with no aud still verifies under the no-requirement path.
+        let (tok_none, _) = make_pop_with_aud(7, 1_750_003_600, None);
+        assert!(verify_session_pop(&tok_none, &didkey_resolver(), now).valid);
     }
 
     #[test]
