@@ -1351,7 +1351,17 @@ pub async fn run() -> anyhow::Result<()> {
             .unwrap_or(0);
         let listen_addr = kotoba_net::quic_addr(listen_port);
 
-        match KotobaSwarm::new(listen_addr).await {
+        // A node with the `relay` role is a designated public helper: it bridges
+        // the firehose gossip AND runs the libp2p Circuit Relay v2 server so NAT'd
+        // (donated/edge) peers can reach the mesh through it. AutoNAT + DCUtR +
+        // relay-client are always on, so edge nodes need no extra config.
+        let relay_server = state
+            .node_roles
+            .iter()
+            .any(|r| matches!(r, server::NodeRole::Relay));
+        let nat_cfg = kotoba_net::NatConfig { relay_server };
+
+        match KotobaSwarm::new_with_config(listen_addr, nat_cfg).await {
             Ok(mut swarm) => {
                 if let Ok(peers_str) = std::env::var("KOTOBA_BOOTSTRAP_PEERS") {
                     let mut bootstrapped = false;
@@ -1387,10 +1397,9 @@ pub async fn run() -> anyhow::Result<()> {
                 let journal_arc = Arc::clone(&state.journal);
                 let block_store_arc = Arc::clone(&state.block_store);
                 let quad_store_arc = Arc::clone(&state.quad_store);
-                let relay = state
-                    .node_roles
-                    .iter()
-                    .any(|r| matches!(r, server::NodeRole::Relay));
+                // Same `relay` role drives both the firehose bridge and the
+                // libp2p relay server (computed above as `relay_server`).
+                let relay = relay_server;
 
                 tokio::spawn(net_actor::run(
                     swarm,
