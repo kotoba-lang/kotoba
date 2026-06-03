@@ -186,6 +186,8 @@ pub enum IpnsRegistryError {
     Kubo(String),
     #[error("registry lock poisoned")]
     LockPoisoned,
+    #[error("persistent IPNS store io: {0}")]
+    Io(String),
 }
 
 pub trait IpnsRegistry: Send + Sync {
@@ -246,6 +248,100 @@ impl IpnsRegistry for InMemoryIpnsRegistry {
             }
         }
         records.insert(record.name.clone(), record);
+        Ok(())
+    }
+
+    fn resolve(&self, name: &IpnsName) -> Result<IpnsRecord, IpnsRegistryError> {
+        self.records
+            .read()
+            .map_err(|_| IpnsRegistryError::LockPoisoned)?
+            .get(name)
+            .cloned()
+            .ok_or_else(|| IpnsRegistryError::NotFound(name.0.clone()))
+    }
+}
+
+/// Disk-persistent IPNS registry — the durable single-node default.
+///
+/// Records are held in memory (fast resolve + the same monotonic-sequence
+/// stale-guard as [`InMemoryIpnsRegistry`]) **and** mirrored to a JSON file on
+/// every successful publish; the file is reloaded at construction. This is what
+/// makes a datomic graph's head survive a process restart — the in-memory
+/// registry loses it, so `datomic.datoms` 404s after a restart even though the
+/// commit blocks are still durable in the cold (Kubo) tier. The persisted
+/// records keep their Ed25519 signature, so a wrapping [`SignedIpnsRegistry`]
+/// re-verifies them on reload.
+///
+/// Writes are atomic (temp file + rename) so a crash mid-write cannot corrupt
+/// the head file. The file format is a JSON array of [`IpnsRecord`].
+pub struct PersistentIpnsRegistry {
+    records: Arc<RwLock<HashMap<IpnsName, IpnsRecord>>>,
+    path: std::path::PathBuf,
+}
+
+impl PersistentIpnsRegistry {
+    /// Open (or create) a persistent registry backed by `path`. Existing records
+    /// are loaded; a missing or unreadable file starts empty (logged by caller).
+    pub fn open(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let records: HashMap<IpnsName, IpnsRecord> = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<IpnsRecord>>(&bytes).ok())
+            .map(|recs| recs.into_iter().map(|r| (r.name.clone(), r)).collect())
+            .unwrap_or_default();
+        Self {
+            records: Arc::new(RwLock::new(records)),
+            path,
+        }
+    }
+
+    /// Number of heads currently loaded (for startup logging).
+    pub fn len(&self) -> usize {
+        self.records.read().map(|r| r.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn persist(
+        &self,
+        records: &HashMap<IpnsName, IpnsRecord>,
+    ) -> Result<(), IpnsRegistryError> {
+        let snapshot: Vec<&IpnsRecord> = records.values().collect();
+        let json = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| IpnsRegistryError::Io(e.to_string()))?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| IpnsRegistryError::Io(e.to_string()))?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json).map_err(|e| IpnsRegistryError::Io(e.to_string()))?;
+        std::fs::rename(&tmp, &self.path).map_err(|e| IpnsRegistryError::Io(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl IpnsRegistry for PersistentIpnsRegistry {
+    fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError> {
+        record.value_cid()?;
+        record.verify_signature_if_present()?;
+        let mut records = self
+            .records
+            .write()
+            .map_err(|_| IpnsRegistryError::LockPoisoned)?;
+        if let Some(current) = records.get(&record.name) {
+            if record.sequence <= current.sequence {
+                return Err(IpnsRegistryError::StaleRecord {
+                    name: record.name.0.clone(),
+                    current: current.sequence,
+                    incoming: record.sequence,
+                });
+            }
+        }
+        records.insert(record.name.clone(), record);
+        // Mirror to disk while holding the lock so the file never lags a
+        // concurrent publish that already advanced the in-memory head.
+        self.persist(&records)?;
         Ok(())
     }
 
@@ -874,6 +970,50 @@ mod tests {
             .publish(IpnsRecord::new(name, &cid, 1, "2030-01-01T00:00:00Z"))
             .unwrap_err();
         assert!(matches!(err, IpnsRegistryError::StaleRecord { .. }));
+    }
+
+    #[test]
+    fn persistent_registry_survives_reopen() {
+        // A head published into a PersistentIpnsRegistry must survive dropping
+        // the registry (= a process restart) and reloading from the same file —
+        // this is the durability the in-memory registry lacks.
+        let path = std::env::temp_dir()
+            .join(format!("kotoba-ipns-persist-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cid = raw_cid(b"commit-head");
+        let name = "k51-kotoba-persist-test";
+        {
+            let reg = PersistentIpnsRegistry::open(&path);
+            reg.publish(IpnsRecord::new(name, &cid, 1, "2030-01-01T00:00:00Z"))
+                .unwrap();
+            assert_eq!(reg.len(), 1);
+        } // drop — simulate process exit
+
+        // Reload from the same file — the head is restored.
+        let reopened = PersistentIpnsRegistry::open(&path);
+        assert_eq!(reopened.len(), 1);
+        let resolved = reopened.resolve(&IpnsName::new(name)).unwrap();
+        assert_eq!(resolved.value, cid.to_string());
+        assert_eq!(resolved.sequence, 1);
+
+        // The monotonic stale-guard still applies after a reload.
+        let stale = reopened
+            .publish(IpnsRecord::new(name, &cid, 1, "2030-01-01T00:00:00Z"))
+            .unwrap_err();
+        assert!(matches!(stale, IpnsRegistryError::StaleRecord { .. }));
+
+        // A higher sequence advances and re-persists.
+        reopened
+            .publish(IpnsRecord::new(name, &cid, 2, "2030-01-01T00:00:00Z"))
+            .unwrap();
+        assert_eq!(
+            PersistentIpnsRegistry::open(&path)
+                .resolve(&IpnsName::new(name))
+                .unwrap()
+                .sequence,
+            2
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

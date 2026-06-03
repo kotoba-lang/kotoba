@@ -1,8 +1,9 @@
 # kotoba browser node — web integration (ADR-2606013600)
 
-Run the kotoba **read engine in the browser**: `kotoba-wasm` (the `kotoba-kqe`
-Datom arrangement compiled to wasm) behind a transparent Service Worker, so the
-yoro feed reads resolve locally with no server query round-trip.
+Run the kotoba **read/query engine in the browser**: `kotoba-wasm`
+(`kotoba-kqe` plus the Datomic `q` engine compiled to wasm) behind a transparent
+Service Worker, so yoro feed reads and Datomic queries resolve locally with no
+server query round-trip after sync.
 
 ## Build the wasm bundle
 
@@ -25,6 +26,9 @@ cd web && python3 -m http.server 8088   # then open http://localhost:8088/demo.h
 `demo.html` registers `kotoba-sw.js` and issues the *same* request
 `@etzhayyim/yoro-rw-free` makes — `GET /xrpc/app.bsky.actor.searchActors?q=…` —
 which the Service Worker answers from the local wasm node (`x-kotoba-sw: local-wasm`).
+It also serves same-origin `POST /xrpc/com.etzhayyim.apps.kotoba.datomic.q` from the
+hydrated local Datomic DB (`x-kotoba-sw: local-wasm-datomic`) when the request
+targets the synced graph and does not ask for time-travel/history/remote reads.
 
 ## Wire into the yoro SvelteKit app
 
@@ -49,9 +53,11 @@ searchActors fetches; nothing in `yoro-rw-free` or the search page changes.
 
 ## Sync source
 
-On activate the SW pulls `ai.gftd.apps.kotoba.datomic.datoms` once from
-`https://kotoba.etzhayyim.com` (graph `yoro-social-v1`) and hydrates the
-arrangement. Re-point it at runtime:
+On activate the SW calls `com.etzhayyim.apps.kotoba.datomic.sync` and then pulls
+`com.etzhayyim.apps.kotoba.datomic.datoms` once from `https://kotoba.etzhayyim.com`
+(graph `yoro-social-v1`). The server side resolves the IPNS/Datomic head and
+reads the IPFS-backed blocks; the browser hydrates those Datoms into the local
+KQE and Datomic engines. Re-point it at runtime:
 
 ```js
 navigator.serviceWorker.controller.postMessage({ type: 'config', remote: 'https://…', graph: 'bafy…' });
@@ -59,7 +65,9 @@ navigator.serviceWorker.controller.postMessage({ type: 'config', remote: 'https:
 
 ## Scope (what runs locally vs. falls through)
 
-- **Local (wasm)**: `app.bsky.actor.searchActors` / `app.etzhayyim.yoro.actor.searchActors`.
+- **Local (wasm)**: `app.bsky.actor.searchActors` /
+  `com.etzhayyim.yoro.actor.searchActors` and current-graph
+  `com.etzhayyim.apps.kotoba.datomic.q`.
 - **Network fallback (hybrid)**: every other `/xrpc/*` and any local error —
   `event.respondWith(fetch(request))`. Posts/follows/writes stay on the network
   until P2 (`transact` + OPFS) and the wider reader surface land.
@@ -67,9 +75,11 @@ navigator.serviceWorker.controller.postMessage({ type: 'config', remote: 'https:
 ## Phase status (ADR-2606013600)
 
 - **P0 ✅** kqe read engine on wasm32 (`cargo test -p kotoba-wasm`).
-- **P1 ✅ (this)** `loadDatoms()` hydration from `datomic.datoms` + Service-Worker
-  transparent `/xrpc` shim + wasm-pack web bundle. JS bindings verified in node.
+- **P1 ✅ (this)** `datomic.sync`/`datomic.datoms` hydration from the server's
+  IPFS-backed Datomic head + Service-Worker transparent `/xrpc` shim +
+  wasm-pack web bundle.
+- **P1.5 ✅** browser-local Datomic `q` over hydrated datoms.
 - **P1 remaining** IdbBlockStore persistence (survive reload without reseed) +
-  delta sync.
+  delta sync from block/CID manifests.
 - **P2** local `transact` + OPFS journal.
 - **P3** `BrowserComponentRuntime` (jco) for in-browser Pregel/UDF guests.

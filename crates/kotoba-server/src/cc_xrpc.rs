@@ -1008,12 +1008,19 @@ pub async fn cc_ingest(
 pub async fn cc_ingest(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,
-    Json(_body): Json<CcIngestBody>,
+    Json(body): Json<CcIngestBody>,
 ) -> impl IntoResponse {
     if let Err((code, msg)) =
         crate::graph_auth::require_operator_auth(&headers, &state.operator_did)
     {
         return (code, Json(json!({"error": msg}))).into_response();
+    }
+    if !matches!(body.mode.as_str(), "chunks" | "pages" | "both") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "mode must be 'chunks', 'pages', or 'both'"})),
+        )
+            .into_response();
     }
     (
         StatusCode::SERVICE_UNAVAILABLE,

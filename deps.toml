@@ -145,6 +145,11 @@ role = "browser-block-store"
 tier = "alpha"
 notes = "wasm32-only; IdbBlockStore over IndexedDB 2-store schema (blocks/meta); AsyncBlockStore trait; pin-aware LRU evict_cold_async(max_bytes)"
 
+[subdirs."crates/kotoba-git"]
+role = "git-bridge"
+tier = "alpha"
+notes = "git ↔ kotoba bridge (ADR-2606015000), byte-exact round-trip. Two layers: (1) lossless anchor — every git object's framed bytes (<type> <size>\\0<body>) stored as a KotobaCid block via put_verified, so the git oid (SHA-1) is always recomputable/verifiable; (2) Datom projection — :git/* schema records the SHA↔CID bridge (:git/oid :db.unique/identity ↔ :git.object/cid #cid) + makes the commit DAG/trees/refs Datalog-queryable. Modules: oid (GitOid SHA-1) / object (byte-exact framed codec for blob/tree/commit/tag, proven vs real git hash-object+cat-file vectors) / schema (:git/* install tx) / datafy (object→tx-data) / pack (pure-Rust pack v2 + idx v2 reader with OBJ_OFS_DELTA+OBJ_REF_DELTA recursive resolution) / lib (GitStore facade put_object/put_ref/materialize_framed/materialize_object + query helpers object_cid/all_objects/commit_parents/log/list_refs/resolve_ref) / repo (disk loose-object reader/writer + import_loose_repo (loose) / import_repo (loose+packed) / export_repo). Deps: kotoba-core/-edn/-datomic/-store + sha1 + flate2 + hex. 27 tests green (24 unit + 1 doc + 2 integration: real git CLI loose+packed repos + real-Datalog query via kotoba_datomic::q), clippy clean. Honest R0: thin packs unsupported (REF_DELTA base must be in-pack); commit parent projection is a set (order preserved only in the lossless block); non-UTF-8 names/messages lossy in projection (lossless in block); sha256-format repos out of R0; layered per ADR-2605312345 (blocks=backend, Datom log=first-class state)."
+
 [runtime_dependencies.wasmtime]
 kind = "wasm-runtime"
 version = "22"
@@ -355,3 +360,108 @@ affects_files = [
     "crates/kotoba-server/src/server.rs",
 ]
 references    = ["F-3", "F-4"]
+
+[knowledge.prolly-incremental-commit-and-diff]
+discovered_on = "2026-06-01"
+category      = "optimization"
+severity      = "high"
+status        = "resolved"
+summary       = "commit() is incremental (path-copy) — full-history cold re-read (history_datoms_cold) removed; ProllyTree gains apply_batch + real diff; leaf values are CBOR. See root ADR-2606012000."
+details       = """
+Before: commit() rebuilt every index tree from scratch and called
+history_datoms_cold() — re-reading the ENTIRE datom history back through
+the ProllyTree (over IPFS) every commit, so commit cost grew with total
+DB size (the IPFS-amplified scaling wall).
+
+Now:
+- ProllyTree::apply_batch(prev_root, upserts, deletes) path-copies only
+  the leaves a key routes into (boundary-key split + boundary-delete
+  merge handled locally), keeps untouched leaf CIDs verbatim, rebuilds
+  the spine. Bit-for-bit identical to build_tree (randomized convergence
+  test).
+- commit() applies the per-tx delta onto the previous commit's
+  index_roots: append-only datom_eavt/aevt/tea = additive upserts;
+  current-view datom_avet/vaet = upsert tx net-asserts + retract prior
+  representatives via bounded scan_prefix (Datom::avet_prefix /
+  vaet_prefix). Quad-compat eavt/aevt/avet/vaet unchanged (built from
+  the in-memory Arrangement; multi-valued keys preclude apply_batch).
+- ProllyTree::diff (leaf-CID set, for replication) + diff_entries
+  (added/removed/changed): identical leaves share a CID and are never
+  loaded -> O(|diff|).
+- Persisted leaf values JSON -> CBOR (ciborium) via enc_datom/dec_datom
+  /enc_object/dec_object. Journal WAL format unchanged.
+
+Two read-amplification bugs found via a byte-counting BlockStore test:
+- list_leaves loaded EVERY leaf to read its max_key -> apply_batch read
+  the whole tree each commit. Fixed: read (max_key, leaf_cid) from the
+  bottom internal level (one peek per internal node), never load leaves
+  -> O(#internal nodes).
+- scan_prefix never early-terminated for an ABSENT prefix (pre-existing)
+  -> scanned the whole tail. Fixed with a prefix-upper-bound; speeds up
+  ALL cold reads.
+
+Measured (byte-counting store): per-commit reads for a fixed delta scale
+sublinearly (32k/8k bytes ~1.8x vs the ~4x a full re-read shows),
+trending to the O(delta) plateau.
+"""
+impact        = "Commit no longer re-reads full history; diff/branch/merge/replication-by-diff are cheap. Tests: kotoba-core 100, kotoba-kqe 205, kotoba-graph 228."
+resolved_on   = "2026-06-01"
+honest_limits = """
+Not a flat plateau at small scale — content-hashed keys scatter, so a
+small delta touches many leaves until #leaves >> delta; true per-commit
+locality needs monotonic-T / entity-ordered keys (future ADR).
+Quad-compat indexes still O(current) CPU rebuild from memory (no cold
+read). CBOR is a format break for pre-existing JSON-valued graphs
+(pre-1.0; WAL replay unaffected). diff prunes at leaf granularity.
+"""
+affects_files = [
+    "crates/kotoba-core/src/prolly.rs",
+    "crates/kotoba-graph/src/quad_store.rs",
+    "crates/kotoba-kqe/src/datom.rs",
+]
+references    = ["ADR-2606012000", "ADR-2605312345", "ADR-2605262130"]
+
+[knowledge.serialization-format-roles-transit-rejected]
+discovered_on = "2026-06-01"
+category      = "decision"
+severity      = "low"
+status        = "resolved"
+summary       = "Format split: JSON=HTTP/XRPC wire, EDN=Datomic values/queries, CBOR/dag-cbor=internal block+P2P+CACAO+UDF. Cognitect Transit NOT adopted. See root ADR-2606012200."
+details       = """
+Code audit of kotoba-server + workspace:
+- JSON (serde_json/axum)  = HTTP/XRPC request/response bodies.
+- EDN  (kotoba-edn)       = Datomic tx-data, Datalog queries, VC/datom
+                            values, *.kotoba.edn files.
+- CBOR (ciborium, dag-cbor) = internal: ProllyTree nodes / blocks / CAR,
+                            libp2p gossip+firehose (net_actor.rs), CACAO
+                            chains (DAG-CBOR + base64), WASM UDF invoke
+                            ctx. dag-cbor is the IPLD-canonical codec the
+                            CIDs are computed over.
+- Transit = used NOWHERE (only 'transitivity' Datalog comments).
+
+Decision: do NOT adopt Transit.
+- Its two value-adds are already covered: EDN gives keyword/set/instant
+  semantics; CBOR gives compact IPLD-canonical binary. A 3rd format is
+  Shannon-redundant.
+- Blocker 1: dag-cbor CID lock-in — CIDs = SHA2-256 over dag-cbor bytes;
+  content-addressing + IPFS require dag-cbor in the block layer; Transit
+  can't replace it without breaking CID/IPFS compat.
+- Blocker 2: no maintained production-grade Rust Transit codec; kotoba is
+  Rust-first.
+
+Narrow exception (NOT adopted): Transit-JSON on the HTTP wire is the only
+spot it could help (keyword/set fidelity over JSON-compatible transport +
+key-caching on large attribute-repetitive datom result sets, polyglot
+Datomic-client compat). Reconsider only if a Datomic-compatible polyglot
+client protocol is required — and benchmark first vs EDN-over-wire,
+application/cbor body (codec already present), or zstd-on-JSON.
+"""
+impact        = "Keeps the format surface at JSON+EDN+CBOR; no Rust Transit codec to own."
+resolved_on   = "2026-06-01"
+affects_files = [
+    "crates/kotoba-server/src/xrpc.rs",
+    "crates/kotoba-server/src/kg.rs",
+    "crates/kotoba-server/src/net_actor.rs",
+    "crates/kotoba-edn/src/lib.rs",
+]
+references    = ["ADR-2606012200", "ADR-2606012000", "ADR-2604251830"]

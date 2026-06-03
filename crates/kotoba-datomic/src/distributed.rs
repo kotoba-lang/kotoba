@@ -6,8 +6,8 @@
 
 use crate::{
     current_datoms, edn_to_kqe_value, index_range_datoms, plan_datom_lookup_for_triple,
-    seek_datoms_index, Connection, Datom, DatomIndex, DatomicError, Db, Entity, LogEntry,
-    TransactReport, Value,
+    seek_datoms_index, Connection, Datom, DatomIndex, DatomIndexLookup, DatomicError, Db, Entity,
+    LogEntry, TransactReport, Value,
 };
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::prolly::ProllyTree;
@@ -94,15 +94,6 @@ pub struct CommitReport {
 pub struct DistributedTxRangeEntry {
     pub commit: DistributedDatomCommit,
     pub datoms: Vec<Datom>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DatomIndexLookup {
-    All,
-    Entity(KotobaCid),
-    EntityAttribute { entity: KotobaCid, attr: String },
-    Attribute(String),
-    AttributeValue { attr: String, value: Value },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

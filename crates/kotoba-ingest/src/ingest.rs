@@ -82,13 +82,17 @@ impl EmailIngestor {
             KotobaCid::from_bytes(message_id.as_bytes())
         };
 
-        // ── 1. body → Vault (AES-256-GCM ciphertext blob) ───────────────────
+        // ── 1. body → Vault (AES-256-GCM ciphertext blob, bound to its email) ─
+        // AAD = the owning email CID (the datom subject). A body blob sealed for
+        // one email cannot be silently swapped into another's `email/body_cid`
+        // datom — the reader independently knows this CID (ADR-2606014000 D2).
         let body_text = msg.body_text(0).map(|c| c.into_owned()).unwrap_or_default();
+        let body_aad = email_cid.to_multibase();
         let enc_body = self
             .crypto
-            .encrypt_blob(body_text.as_bytes())
+            .encrypt_blob_bound(body_aad.as_bytes(), body_text.as_bytes())
             .await
-            .context("AgentCrypto::encrypt_blob body failed")?;
+            .context("AgentCrypto::encrypt_blob_bound body failed")?;
         let blob_ref = self.vault.put(Bytes::from(enc_body)).await;
 
         // ── 2. PII fields → signal:v1: envelope ─────────────────────────────
@@ -152,8 +156,14 @@ impl EmailIngestor {
         Ok(email_cid)
     }
 
-    /// Decrypt the body blob stored for a given `BlobRef` CID (multibase).
-    pub async fn decrypt_body(&self, body_cid_mb: &str) -> Result<String> {
+    /// Decrypt the body blob for `body_cid_mb`, bound to its owning `email_cid_mb`.
+    ///
+    /// `email_cid_mb` is the multibase CID of the email datom whose
+    /// `email/body_cid` points at this blob — the AAD used at ingest time. The
+    /// caller already holds it (it is the datom subject), so passing a mismatched
+    /// CID, or a blob lifted from another email, fails the AEAD check rather than
+    /// returning attacker-chosen bytes (ADR-2606014000 D2).
+    pub async fn decrypt_body(&self, email_cid_mb: &str, body_cid_mb: &str) -> Result<String> {
         let cid = KotobaCid::from_multibase(body_cid_mb)
             .ok_or_else(|| anyhow::anyhow!("invalid body_cid multibase: {body_cid_mb}"))?;
         let enc_bytes = self
@@ -163,9 +173,9 @@ impl EmailIngestor {
             .ok_or_else(|| anyhow::anyhow!("body blob not found in vault: {body_cid_mb}"))?;
         let pt = self
             .crypto
-            .decrypt_blob(&enc_bytes)
+            .decrypt_blob_bound(email_cid_mb.as_bytes(), &enc_bytes)
             .await
-            .context("AgentCrypto::decrypt_blob body failed")?;
+            .context("AgentCrypto::decrypt_blob_bound body failed")?;
         String::from_utf8(pt.to_vec()).context("body is not valid UTF-8")
     }
 }
@@ -340,14 +350,45 @@ mod tests {
     #[tokio::test]
     async fn decrypt_body_roundtrip() {
         let ing = make_ingestor();
-        let _cid = ing.ingest_raw(SAMPLE_EMAIL, "t").await.unwrap();
+        let email_cid = ing.ingest_raw(SAMPLE_EMAIL, "t").await.unwrap();
+        let email_cid_mb = email_cid.to_multibase();
 
         let graph_cid = graph_cid_for("did:plc:test");
         let arrangement = ing.quad_store.arrangement(&graph_cid).await.unwrap();
-        let body_cid_values = arrangement.get_values(&_cid, "email/body_cid");
+        let body_cid_values = arrangement.get_values(&email_cid, "email/body_cid");
         if let kotoba_kqe::Value::Text(body_cid_mb) = &body_cid_values[0] {
-            let body = ing.decrypt_body(body_cid_mb).await.unwrap();
+            // Correct owning email CID → decrypts.
+            let body = ing.decrypt_body(&email_cid_mb, body_cid_mb).await.unwrap();
             assert!(body.contains("Hello from kotoba-ingest!"), "body={body}");
+            // Wrong owning CID (blob lifted into another email) → AEAD rejects.
+            assert!(
+                ing.decrypt_body("z-wrong-owner-cid", body_cid_mb).await.is_err(),
+                "body bound to its email CID must not decrypt under a different owner"
+            );
+        } else {
+            panic!("expected Text for body_cid");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_body_bound_roundtrips() {
+        // An email with no body must still seal/unseal (empty plaintext) and stay
+        // bound to its owning email CID.
+        const EMPTY_BODY_EMAIL: &[u8] = b"From: A <a@example.com>\r\n\
+            To: B <b@example.com>\r\n\
+            Subject: empty\r\n\
+            Message-ID: <empty-1@example.com>\r\n\
+            Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n\
+            \r\n";
+        let ing = make_ingestor();
+        let email_cid = ing.ingest_raw(EMPTY_BODY_EMAIL, "t").await.unwrap();
+        let email_cid_mb = email_cid.to_multibase();
+        let graph_cid = graph_cid_for("did:plc:test");
+        let arr = ing.quad_store.arrangement(&graph_cid).await.unwrap();
+        let vals = arr.get_values(&email_cid, "email/body_cid");
+        if let kotoba_kqe::Value::Text(body_cid_mb) = &vals[0] {
+            let body = ing.decrypt_body(&email_cid_mb, body_cid_mb).await.unwrap();
+            assert_eq!(body, "");
         } else {
             panic!("expected Text for body_cid");
         }

@@ -3,11 +3,12 @@
 // ADR-2606013600 D3. Registered as a MODULE service worker:
 //   navigator.serviceWorker.register('/kotoba-sw.js', { type: 'module' })
 //
-// It intercepts same-origin `/xrpc/...searchActors` reads and serves them from
-// the in-browser kotoba read engine (kotoba-wasm) hydrated from a one-time
-// `datomic.datoms` sync. `@etzhayyim/yoro-rw-free` is unchanged: it just does
-// `fetch('/xrpc/...')`, and cannot tell the local wasm node from a remote
-// server. Anything we can't serve falls through to the network (hybrid).
+// It intercepts same-origin `/xrpc/...searchActors` and
+// `/xrpc/com.etzhayyim.apps.kotoba.datomic.q` reads and serves them from the
+// in-browser kotoba read engine (kotoba-wasm) hydrated from an IPFS-backed
+// `datomic.sync`/`datomic.datoms` pull. `@etzhayyim/yoro-rw-free` is unchanged:
+// it just does `fetch('/xrpc/...')`, and cannot tell the local wasm node from a
+// remote server. Anything we can't serve falls through to the network (hybrid).
 //
 // Build the pkg next to this file:  wasm-pack build --target web --out-dir pkg
 
@@ -21,8 +22,9 @@ let GRAPH = "bafyreibljg5gzye47fldkfq6m4vgy55kcjyez2vx432dubttou36g5yryq"; // yo
 // NSIDs we resolve locally (both the bsky alias and the yoro-native form).
 const SEARCH_NSIDS = new Set([
   "app.bsky.actor.searchActors",
-  "app.etzhayyim.yoro.actor.searchActors",
+  "com.etzhayyim.yoro.actor.searchActors",
 ]);
+const DATOMIC_Q_NSID = "com.etzhayyim.apps.kotoba.datomic.q";
 
 let node = null;
 let ready = null;
@@ -30,10 +32,16 @@ let ready = null;
 async function boot() {
   await init(); // instantiate kotoba_wasm_bg.wasm
   node = new KotobaNode();
-  // P1 sync: pull the yoro-social datoms once, CID-addressed + verifiable
-  // upstream, and hydrate the kqe arrangement.
+  // P1 sync: ask the peer to resolve its IPNS Datomic head and expose the
+  // IPFS-backed current datoms. The peer path is CID/IPNS verified; the browser
+  // hydrates those datoms into the local wasm Datomic/KQE engines.
   try {
-    const r = await fetch(`${REMOTE}/xrpc/ai.gftd.apps.kotoba.datomic.datoms`, {
+    await fetch(`${REMOTE}/xrpc/${DATOMIC_Q_NSID.replace(".q", ".sync")}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ graph: GRAPH }),
+    }).catch(() => null);
+    const r = await fetch(`${REMOTE}/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ graph: GRAPH, index: ":aevt" }),
@@ -85,13 +93,29 @@ self.addEventListener("fetch", (event) => {
   }
   if (url.origin !== self.location.origin) return; // same-origin only
   const m = url.pathname.match(/^\/xrpc\/([^/?]+)$/);
-  if (!m || !SEARCH_NSIDS.has(m[1])) return; // not ours → default network
+  if (!m || (!SEARCH_NSIDS.has(m[1]) && m[1] !== DATOMIC_Q_NSID)) return; // not ours → default network
 
   event.respondWith(
     (async () => {
       try {
         if (ready) await ready;
         if (!node) throw new Error("kotoba node not ready");
+        if (m[1] === DATOMIC_Q_NSID) {
+          if (event.request.method !== "POST") return fetch(event.request);
+          const req = await event.request.clone().json();
+          if (req.graph && req.graph !== GRAPH) return fetch(event.request);
+          if (req.as_of || req.since || req.history || req.remote_peer || req.remote_ipns_name) {
+            return fetch(event.request);
+          }
+          const body = node.datomicQ(req.query_edn || "", JSON.stringify(req.inputs_edn || []));
+          return new Response(body, {
+            status: 200,
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "x-kotoba-sw": "local-wasm-datomic",
+            },
+          });
+        }
         const q = url.searchParams.get("q") || "";
         const body = node.searchActors(q); // JSON string: {"actors":[...]}
         return new Response(body, {

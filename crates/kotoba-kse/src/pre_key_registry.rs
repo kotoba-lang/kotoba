@@ -596,7 +596,10 @@ mod tests {
             iss: accessor_a_did.clone(),
             aud: "kotoba://test".into(),
             issued_at: "2026-05-26T00:00:00Z".into(),
-            expiry: None,
+            // Explicit far-future expiry → DelegationChain takes the `exp` branch and
+            // skips the 7-day issued_at max-age, so the RootMismatch path under test
+            // is reached regardless of the current date (was a date-rot time bomb).
+            expiry: Some("2099-12-31T23:59:59Z".into()),
             nonce: "issuer-mismatch-nonce".into(),
             domain: "kotoba.test".into(),
             statement: None,

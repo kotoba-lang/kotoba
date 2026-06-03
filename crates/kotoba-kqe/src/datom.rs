@@ -134,16 +134,35 @@ impl Datom {
 
     /// AVET key: A + V + E + descending T + op.
     pub fn avet_key(&self) -> Vec<u8> {
+        let mut key = self.avet_prefix();
+        push_tx_desc_and_op(&mut key, &self.tx, self.op);
+        key
+    }
+
+    /// AVET key prefix (A + V + E) without the trailing T/op discriminator.
+    ///
+    /// In the current-view AVET index there is at most one datom per `(e, a, v)`
+    /// triple, so this prefix uniquely addresses that triple's representative —
+    /// used by incremental commit to locate (and retract) the prior
+    /// representative via a bounded `scan_prefix`.
+    pub fn avet_prefix(&self) -> Vec<u8> {
         let mut key = Vec::new();
         push_str(&mut key, &self.a);
         push_value(&mut key, &self.v);
         key.extend_from_slice(&self.e.0);
-        push_tx_desc_and_op(&mut key, &self.tx, self.op);
         key
     }
 
     /// VAET key: V + A + E + descending T + op. Only ref values have a key.
     pub fn vaet_key(&self) -> Option<Vec<u8>> {
+        let mut key = self.vaet_prefix()?;
+        push_tx_desc_and_op(&mut key, &self.tx, self.op);
+        Some(key)
+    }
+
+    /// VAET key prefix (V + A + E) without the trailing T/op discriminator.
+    /// `None` for non-ref values (only `Value::Cid` is indexed in VAET).
+    pub fn vaet_prefix(&self) -> Option<Vec<u8>> {
         if !matches!(self.v, Value::Cid(_)) {
             return None;
         }
@@ -151,7 +170,6 @@ impl Datom {
         push_value(&mut key, &self.v);
         push_str(&mut key, &self.a);
         key.extend_from_slice(&self.e.0);
-        push_tx_desc_and_op(&mut key, &self.tx, self.op);
         Some(key)
     }
 

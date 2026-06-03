@@ -3,6 +3,7 @@
 //! The atomic storage unit is a Datom, exactly the 5-tuple
 //! `(E, A, V, T, Added)`.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod distributed;
 
 use kotoba_core::cid::KotobaCid;
@@ -182,6 +183,15 @@ pub enum DatomIndex {
     Avet,
     Vaet,
     Tea,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatomIndexLookup {
+    All,
+    Entity(KotobaCid),
+    EntityAttribute { entity: KotobaCid, attr: String },
+    Attribute(String),
+    AttributeValue { attr: String, value: Value },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -790,7 +800,7 @@ fn query_order_specs(order_by: &EdnValue, find: &[EdnValue]) -> Result<Vec<Query
 pub fn plan_datom_lookup_for_triple(
     triple: &EdnValue,
     binding: &BTreeMap<String, EdnValue>,
-) -> Result<distributed::DatomIndexLookup> {
+) -> Result<DatomIndexLookup> {
     let seq = triple
         .as_seq()
         .ok_or_else(|| DatomicError::Query("triple clause must be vector/list".into()))?;
@@ -5485,29 +5495,29 @@ fn candidate_datoms_for_triple(
 ) -> Result<Vec<Datom>> {
     let lookup = match lookup_ref_entity_term(&triple[0], db, binding)? {
         Some(entity) => match resolved_attr_term(&triple[1], binding)? {
-            Some(attr) => distributed::DatomIndexLookup::EntityAttribute { entity, attr },
-            None => distributed::DatomIndexLookup::Entity(entity),
+            Some(attr) => DatomIndexLookup::EntityAttribute { entity, attr },
+            None => DatomIndexLookup::Entity(entity),
         },
         None if is_lookup_ref_term(&triple[0], binding) => return Ok(vec![]),
         None => datom_lookup_for_triple(triple, binding)?,
     };
     Ok(match lookup {
-        distributed::DatomIndexLookup::All => index.datoms.to_vec(),
+        DatomIndexLookup::All => index.datoms.to_vec(),
         // Bound subject → fetch just that entity's datoms (the join hot path).
-        distributed::DatomIndexLookup::Entity(entity) => {
+        DatomIndexLookup::Entity(entity) => {
             index.entity(&entity).iter().map(|d| (*d).clone()).collect()
         }
-        distributed::DatomIndexLookup::EntityAttribute { entity, attr } => index
+        DatomIndexLookup::EntityAttribute { entity, attr } => index
             .entity(&entity)
             .iter()
             .filter(|datom| attr_matches(&datom.a, &attr))
             .map(|d| (*d).clone())
             .collect(),
         // Bound attribute → fetch just that attribute's datoms (skip full scan).
-        distributed::DatomIndexLookup::Attribute(attr) => {
+        DatomIndexLookup::Attribute(attr) => {
             index.attr(&attr).iter().map(|d| (*d).clone()).collect()
         }
-        distributed::DatomIndexLookup::AttributeValue { attr, value } => index
+        DatomIndexLookup::AttributeValue { attr, value } => index
             .attr(&attr)
             .iter()
             .filter(|datom| datom.v == value)
@@ -5519,21 +5529,17 @@ fn candidate_datoms_for_triple(
 fn datom_lookup_for_triple(
     triple: &[EdnValue],
     binding: &BTreeMap<String, EdnValue>,
-) -> Result<distributed::DatomIndexLookup> {
+) -> Result<DatomIndexLookup> {
     let entity = resolved_entity_term(&triple[0], binding)?;
     let attr = resolved_attr_term(&triple[1], binding)?;
     let value = resolved_value_term(&triple[2], binding)?;
 
     Ok(match (entity, attr, value) {
-        (Some(entity), Some(attr), _) => {
-            distributed::DatomIndexLookup::EntityAttribute { entity, attr }
-        }
-        (None, Some(attr), Some(value)) => {
-            distributed::DatomIndexLookup::AttributeValue { attr, value }
-        }
-        (Some(entity), None, _) => distributed::DatomIndexLookup::Entity(entity),
-        (None, Some(attr), None) => distributed::DatomIndexLookup::Attribute(attr),
-        (None, None, _) => distributed::DatomIndexLookup::All,
+        (Some(entity), Some(attr), _) => DatomIndexLookup::EntityAttribute { entity, attr },
+        (None, Some(attr), Some(value)) => DatomIndexLookup::AttributeValue { attr, value },
+        (Some(entity), None, _) => DatomIndexLookup::Entity(entity),
+        (None, Some(attr), None) => DatomIndexLookup::Attribute(attr),
+        (None, None, _) => DatomIndexLookup::All,
     })
 }
 
@@ -7967,7 +7973,7 @@ mod tests {
         let triple = parse(r#"[?e :person/name ?name]"#).unwrap();
         assert_eq!(
             plan_datom_lookup_for_triple(&triple, &binding).unwrap(),
-            distributed::DatomIndexLookup::EntityAttribute {
+            DatomIndexLookup::EntityAttribute {
                 entity: alice,
                 attr: ":person/name".into()
             }
@@ -7976,7 +7982,7 @@ mod tests {
         let triple = parse(r#"[?e :person/name "Alice"]"#).unwrap();
         assert_eq!(
             plan_datom_lookup_for_triple(&triple, &BTreeMap::new()).unwrap(),
-            distributed::DatomIndexLookup::AttributeValue {
+            DatomIndexLookup::AttributeValue {
                 attr: ":person/name".into(),
                 value: EdnValue::String("Alice".into())
             }
@@ -7985,7 +7991,7 @@ mod tests {
         let triple = parse(r#"[?e :person/name ?name]"#).unwrap();
         assert_eq!(
             plan_datom_lookup_for_triple(&triple, &BTreeMap::new()).unwrap(),
-            distributed::DatomIndexLookup::Attribute(":person/name".into())
+            DatomIndexLookup::Attribute(":person/name".into())
         );
     }
 
