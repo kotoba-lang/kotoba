@@ -234,6 +234,59 @@ mod tests {
     }
 
     #[test]
+    fn unpin_re_enables_eviction() {
+        // Lifecycle completeness: a block protected by pin becomes evictable again
+        // after unpin (e.g. SyncWindow::advance unpins the old head). pin_prevents_
+        // eviction only covers the protected half. NOTE: `put` proactively evicts
+        // when over budget, so each over-budget put is itself an eviction point.
+        let store = budgeted(20);
+        let d1 = b"0123456789"; // 10 bytes
+        let c1 = cid(d1);
+        store.put(&c1, d1).unwrap();
+        store.pin(&c1);
+        store.put(&cid(b"abcdefghij"), b"abcdefghij").unwrap(); // → 20, at budget
+        // Push over budget while c1 is pinned: the unpinned blocks are evicted, c1 survives.
+        store.put(&cid(b"PRESSURE01"), b"PRESSURE01").unwrap(); // 30 > 20 → evict
+        assert!(store.has(&c1), "while pinned, c1 survives eviction pressure");
+
+        // Unpin, then apply pressure again. c1 is now the coldest UNPINNED block and
+        // must be evicted to restore the budget.
+        store.unpin(&c1);
+        assert!(!store.is_pinned(&c1));
+        store.put(&cid(b"PRESSURE02"), b"PRESSURE02").unwrap();
+        store.put(&cid(b"PRESSURE03"), b"PRESSURE03").unwrap(); // forces over budget again
+        assert!(
+            !store.has(&c1),
+            "after unpin, the now-coldest unpinned block must become evictable"
+        );
+        assert!(store.used_bytes() <= 20, "eviction restored the budget");
+    }
+
+    #[test]
+    fn evict_cold_reaches_target_and_reports_freed_bytes() {
+        // evict_cold drives usage down to ≤ 80% of budget (not merely ≤ budget) and
+        // returns the exact number of bytes reclaimed. Neither the target nor the
+        // freed-count return value was previously asserted.
+        let store = budgeted(100);
+        // Ten 10-byte unpinned blocks = 100 bytes (at budget). Auto-eviction on the
+        // boundary puts may fire, so measure against the final explicit call.
+        for i in 0..10u8 {
+            let d = vec![b'a' + i; 10];
+            store.put(&cid(&d), &d).unwrap();
+        }
+        // Push clearly over budget, then evict explicitly.
+        let over = vec![b'Z'; 30];
+        store.put(&cid(&over), &over).unwrap();
+        let before = store.used_bytes();
+        let freed = store.evict_cold();
+        let after = store.used_bytes();
+        // If a prior auto-eviction already left us at/under budget, evict_cold is a
+        // no-op (freed 0); otherwise it must reach the 80% target and report freed.
+        assert_eq!(freed, before - after, "freed must equal the byte delta");
+        assert!(after <= 80, "usage must be driven to ≤ 80% of the 100-byte budget, got {after}");
+    }
+
+    #[test]
     fn delete_removes_from_index() {
         let store = budgeted(1024);
         let data = b"deletable";

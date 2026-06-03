@@ -326,7 +326,7 @@ mod tests {
         let q = Quad {
             graph: cid(b"graph"),
             subject: cid(b"subj"),
-            predicate: "ai.gftd.test/attr".to_string(),
+            predicate: "com.etzhayyim.test/attr".to_string(),
             object: QuadObject::Text("value".to_string()),
         };
         let json = serde_json::to_string(&q).expect("serialize");

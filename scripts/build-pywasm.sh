@@ -72,7 +72,7 @@ fi
 # ── Ensure componentize-py is available ─────────────────────────────────────
 if ! command -v componentize-py &>/dev/null; then
     echo "Installing componentize-py..." >&2
-    pip install "componentize-py>=0.23" cbor2
+    uv pip install "componentize-py>=0.23" cbor2
 fi
 
 # ── Generate WIT bindings (cached) ──────────────────────────────────────────

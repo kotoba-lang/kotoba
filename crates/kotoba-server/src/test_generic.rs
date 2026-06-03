@@ -12,7 +12,7 @@ mod router_tests {
         
         let req = Request::builder()
             .method("POST")
-            .uri("/xrpc/ai.gftd.apps.yata.my_method")
+            .uri("/xrpc/com.etzhayyim.apps.yata.my_method")
             .body(Body::empty())
             .unwrap();
             

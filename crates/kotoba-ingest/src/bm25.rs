@@ -651,4 +651,45 @@ mod tests {
         assert!(idx.idf(idx.len()) >= 0.0);
         assert!(idx.idf(1) > idx.idf(idx.len()));
     }
+
+    #[test]
+    fn bm25_term_frequency_saturates() {
+        // THE property distinguishing BM25 from linear TF-IDF: term-frequency
+        // contribution saturates via k1. Two equal-length docs, same term, one with
+        // 10 occurrences and one with 1 — the 10× doc ranks higher but by FAR less
+        // than 10× (with defaults the ratio is ≈1.96). A linear-TF bug would yield ~10×.
+        let docs = vec![
+            (cid("many"), "x x x x x x x x x x".into()),  // tf=10, len 10
+            (cid("one"), "x a b c d e f g h i".into()),   // tf=1,  len 10 (same length)
+        ];
+        let idx = Bm25Index::build(&docs);
+        let r = idx.search("x", 10);
+        let s_many = r.iter().find(|(_, d)| *d == 0).unwrap().0;
+        let s_one = r.iter().find(|(_, d)| *d == 1).unwrap().0;
+        assert!(s_many > s_one, "more occurrences must rank higher");
+        assert!(
+            s_many < 2.5 * s_one,
+            "TF must saturate: 10× frequency gave {}×, expected strongly sublinear",
+            s_many / s_one
+        );
+    }
+
+    #[test]
+    fn bm25_length_normalization_penalizes_longer_docs() {
+        // The `b` parameter: with identical term frequency (1), a SHORT document
+        // outranks a LONG one — a single match means more in a terse doc. A bug that
+        // dropped length normalization (b=0 behaviour) would tie them.
+        let docs = vec![
+            (cid("short"), "x a".into()),                  // tf=1, len 2
+            (cid("long"), "x a b c d e f g h i".into()),   // tf=1, len 10
+        ];
+        let idx = Bm25Index::build(&docs);
+        let r = idx.search("x", 10);
+        let s_short = r.iter().find(|(_, d)| *d == 0).unwrap().0;
+        let s_long = r.iter().find(|(_, d)| *d == 1).unwrap().0;
+        assert!(
+            s_short > s_long,
+            "same TF, shorter doc must score higher (length normalization): short={s_short}, long={s_long}"
+        );
+    }
 }

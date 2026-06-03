@@ -26,7 +26,7 @@ cargo run --bin kotoba
 WASM_B64=$(base64 -i examples/kotoba-hello/target/wasm32-wasip2/release/kotoba_hello.wasm)
 
 # 3. Invoke via XRPC
-curl -s -X POST http://localhost:8080/xrpc/ai.gftd.apps.kotoba.invoke.run \
+curl -s -X POST http://localhost:8080/xrpc/com.etzhayyim.apps.kotoba.invoke.run \
   -H 'Content-Type: application/json' \
   -d "{
     \"program_cid\":  \"btest_hello_cid\",

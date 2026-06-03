@@ -1,6 +1,6 @@
 //! kotobase XRPC handlers — multi-tenant pinning service (ADR-2605260001)
 //!
-//! NSIDs: ai.gftd.apps.kotobase.*
+//! NSIDs: com.etzhayyim.apps.kotobase.*
 //!
 //! Tenant data lives in kotoba's own QuadStore under namespaced graphs:
 //!   kotobase/accounts/{tenant_did}  — tier + metadata
@@ -11,14 +11,14 @@
 //!   starter: 50 pins,   5 GB  ($9/mo — Stripe stub)
 //!   pro:    500 pins,  50 GB  ($49/mo — Stripe stub)
 
-pub const NSID_ACCOUNT_CREATE: &str = "ai.gftd.apps.kotobase.accountCreate";
-pub const NSID_ACCOUNT_STATUS: &str = "ai.gftd.apps.kotobase.accountStatus";
-pub const NSID_PIN_CREATE: &str = "ai.gftd.apps.kotobase.pinCreate";
-pub const NSID_PIN_LIST: &str = "ai.gftd.apps.kotobase.pinList";
-pub const NSID_PIN_DELETE: &str = "ai.gftd.apps.kotobase.pinDelete";
-pub const NSID_USAGE_GET: &str = "ai.gftd.apps.kotobase.usageGet";
+pub const NSID_ACCOUNT_CREATE: &str = "com.etzhayyim.apps.kotobase.accountCreate";
+pub const NSID_ACCOUNT_STATUS: &str = "com.etzhayyim.apps.kotobase.accountStatus";
+pub const NSID_PIN_CREATE: &str = "com.etzhayyim.apps.kotobase.pinCreate";
+pub const NSID_PIN_LIST: &str = "com.etzhayyim.apps.kotobase.pinList";
+pub const NSID_PIN_DELETE: &str = "com.etzhayyim.apps.kotobase.pinDelete";
+pub const NSID_USAGE_GET: &str = "com.etzhayyim.apps.kotobase.usageGet";
 /// Revoke a PRE re-key grant + propagate over GossipSub (ADR §23.7 / §28.5).
-pub const NSID_PRE_REVOKE: &str = "ai.gftd.apps.kotobase.preRevoke";
+pub const NSID_PRE_REVOKE: &str = "com.etzhayyim.apps.kotobase.preRevoke";
 
 use crate::server::KotobaState;
 use axum::{
@@ -539,7 +539,7 @@ pub struct PreRevokeResp {
 
 // ── Handlers ──────────────────────────────────────────────────────────────
 
-/// POST /xrpc/ai.gftd.apps.kotobase.preRevoke
+/// POST /xrpc/com.etzhayyim.apps.kotobase.preRevoke
 ///
 /// Revoke a PRE re-key grant (owner → accessor) and propagate the revocation
 /// to peers over GossipSub (ADR §23.7 / §28.5 emit path). Owner-authenticated.
@@ -1245,7 +1245,7 @@ mod tests {
     fn all_nsids_have_correct_prefix() {
         for nsid in ALL_NSIDS {
             assert!(
-                nsid.starts_with("ai.gftd.apps.kotobase."),
+                nsid.starts_with("com.etzhayyim.apps.kotobase."),
                 "bad nsid: {nsid}"
             );
         }
@@ -1255,37 +1255,39 @@ mod tests {
 
     #[test]
     fn nsid_account_create_exact_value() {
-        assert_eq!(NSID_ACCOUNT_CREATE, "ai.gftd.apps.kotobase.accountCreate");
+        assert_eq!(NSID_ACCOUNT_CREATE, "com.etzhayyim.apps.kotobase.accountCreate");
     }
 
     #[test]
     fn nsid_account_status_exact_value() {
-        assert_eq!(NSID_ACCOUNT_STATUS, "ai.gftd.apps.kotobase.accountStatus");
+        assert_eq!(NSID_ACCOUNT_STATUS, "com.etzhayyim.apps.kotobase.accountStatus");
     }
 
     #[test]
     fn nsid_pin_create_exact_value() {
-        assert_eq!(NSID_PIN_CREATE, "ai.gftd.apps.kotobase.pinCreate");
+        assert_eq!(NSID_PIN_CREATE, "com.etzhayyim.apps.kotobase.pinCreate");
     }
 
     #[test]
     fn nsid_pin_list_exact_value() {
-        assert_eq!(NSID_PIN_LIST, "ai.gftd.apps.kotobase.pinList");
+        assert_eq!(NSID_PIN_LIST, "com.etzhayyim.apps.kotobase.pinList");
     }
 
     #[test]
     fn nsid_pin_delete_exact_value() {
-        assert_eq!(NSID_PIN_DELETE, "ai.gftd.apps.kotobase.pinDelete");
+        assert_eq!(NSID_PIN_DELETE, "com.etzhayyim.apps.kotobase.pinDelete");
     }
 
     #[test]
     fn nsid_usage_get_exact_value() {
-        assert_eq!(NSID_USAGE_GET, "ai.gftd.apps.kotobase.usageGet");
+        assert_eq!(NSID_USAGE_GET, "com.etzhayyim.apps.kotobase.usageGet");
     }
 
     #[test]
-    fn all_nsids_count_is_six() {
-        assert_eq!(ALL_NSIDS.len(), 6, "expected 6 NSID constants in ALL_NSIDS");
+    fn all_nsids_count_is_seven() {
+        // Guard against accidental NSID add/remove — bump consciously. Currently:
+        // account.create/status, pin.create/list/delete, usage.get, pre.revoke.
+        assert_eq!(ALL_NSIDS.len(), 7, "expected 7 NSID constants in ALL_NSIDS");
     }
 
     #[test]

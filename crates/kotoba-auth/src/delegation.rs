@@ -84,6 +84,20 @@ impl DelegationChain {
             if now_iso > *exp {
                 return Err(DelegationError::Expired);
             }
+        } else {
+            // No explicit expiry — apply the same max-age cap as `verify_inner`.
+            // verify_skip_sig only skips the *cryptographic* signature; its temporal
+            // semantics must otherwise match `verify`, or a no-expiry CACAO that the
+            // real path rejects as too-old would pass here (and the bench's "temporal
+            // overhead" measurement would understate the work `verify` actually does).
+            match parse_utc_iso8601(&cacao.p.issued_at) {
+                None => return Err(DelegationError::InvalidExpiry(cacao.p.issued_at.clone())),
+                Some(iat_secs) => {
+                    if now_secs.saturating_sub(iat_secs) > MAX_CACAO_AGE_SECS {
+                        return Err(DelegationError::Expired);
+                    }
+                }
+            }
         }
 
         // 2. Capability check
@@ -814,6 +828,216 @@ mod tests {
         let sk = SigningKey::from_bytes(&[seed; 32]);
         let did = ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes());
         (sk, did)
+    }
+
+    // ---- verify_skip_sig temporal parity with verify_inner ----
+
+    /// Build an unsigned single-CACAO chain with no explicit expiry and a given
+    /// `issued_at`.  `verify_skip_sig` skips only the signature, so the empty sig
+    /// is irrelevant — this exercises the temporal/capability/graph path.
+    fn no_expiry_chain(issued_at: &str) -> DelegationChain {
+        let cacao = Cacao {
+            h: CacaoHeader {
+                t: "eip4361".into(),
+            },
+            p: CacaoPayload {
+                iss: "did:key:zTest".into(),
+                aud: "kotoba://test".into(),
+                issued_at: issued_at.to_string(),
+                expiry: None,
+                nonce: "n-maxage".into(),
+                domain: "kotoba.test".into(),
+                statement: None,
+                version: "1".into(),
+                resources: vec![
+                    "kotoba://can/datom:read".into(),
+                    "kotoba://graph/g1".into(),
+                ],
+            },
+            s: CacaoSig {
+                t: "EdDSA".into(),
+                s: String::new(),
+            },
+        };
+        DelegationChain::new(cacao)
+    }
+
+    fn now_unix() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    #[test]
+    fn skip_sig_rejects_old_no_expiry_cacao() {
+        // Regression guard: before parity was added, verify_skip_sig had NO max-age
+        // branch for no-expiry CACAOs, so this years-old token was silently accepted
+        // while the real `verify` path rejected it as Expired. The two must agree.
+        let chain = no_expiry_chain("2020-01-01T00:00:00Z");
+        let err = chain.verify_skip_sig("g1", "datom:read").unwrap_err();
+        assert!(
+            matches!(err, DelegationError::Expired),
+            "old no-expiry CACAO must be rejected by max-age cap, got {err:?}"
+        );
+        // And `verify` (full path, temporal-before-sig) agrees on Expired.
+        assert!(matches!(
+            chain.verify("g1", "datom:read").unwrap_err(),
+            DelegationError::Expired
+        ));
+    }
+
+    #[test]
+    fn skip_sig_accepts_fresh_no_expiry_cacao() {
+        // Accept side of the max-age cap: a no-expiry CACAO well within the window
+        // passes verify_skip_sig (returns the issuer DID). Previously untested.
+        let chain = no_expiry_chain(&format_iso8601(now_unix() - 3600)); // 1h ago
+        let iss = chain
+            .verify_skip_sig("g1", "datom:read")
+            .expect("fresh no-expiry CACAO must pass");
+        assert_eq!(iss, "did:key:zTest");
+    }
+
+    #[test]
+    fn skip_sig_max_age_boundary_with_margin() {
+        // Within window (cap minus 1h) → accepted; over window (cap plus 1h) →
+        // Expired. 1h margin keeps it robust against test-execution clock drift.
+        let within = no_expiry_chain(&format_iso8601(
+            now_unix() - (MAX_CACAO_AGE_SECS - 3600),
+        ));
+        assert!(
+            within.verify_skip_sig("g1", "datom:read").is_ok(),
+            "CACAO aged just under the cap must be accepted"
+        );
+        let over = no_expiry_chain(&format_iso8601(
+            now_unix() - (MAX_CACAO_AGE_SECS + 3600),
+        ));
+        assert!(
+            matches!(
+                over.verify_skip_sig("g1", "datom:read"),
+                Err(DelegationError::Expired)
+            ),
+            "CACAO aged just over the cap must be rejected"
+        );
+    }
+
+    // ---- depth-2: temporal bound applies to the ROOT grant, not just the leaf ----
+
+    /// Like `make_real_cacao` but with a caller-chosen `issued_at` and `expiry`,
+    /// so a chain can be built valid in every respect except age.
+    #[allow(clippy::too_many_arguments)]
+    fn make_real_cacao_dated(
+        sk: &SigningKey,
+        iss: &str,
+        aud: &str,
+        cap: &str,
+        graph: &str,
+        nonce: &str,
+        issued_at: &str,
+        expiry: Option<&str>,
+    ) -> Cacao {
+        let template = Cacao {
+            h: CacaoHeader {
+                t: "eip4361".into(),
+            },
+            p: CacaoPayload {
+                iss: iss.to_string(),
+                aud: aud.to_string(),
+                issued_at: issued_at.to_string(),
+                expiry: expiry.map(|e| e.to_string()),
+                nonce: nonce.into(),
+                domain: "kotoba.test".into(),
+                statement: None,
+                version: "1".into(),
+                resources: vec![
+                    format!("kotoba://can/{cap}"),
+                    format!("kotoba://graph/{graph}"),
+                ],
+            },
+            s: CacaoSig {
+                t: "EdDSA".into(),
+                s: String::new(),
+            },
+        };
+        let sig = sk.sign(template.siwe_message().as_bytes());
+        Cacao {
+            s: CacaoSig {
+                t: "EdDSA".into(),
+                s: URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+            },
+            ..template
+        }
+    }
+
+    #[test]
+    fn depth2_old_no_expiry_root_rejected_even_with_fresh_leaf() {
+        // A depth-2 chain valid in EVERY way (real sigs, aud-iss chain, matching
+        // cap+graph) except that the ROOT grant is years old and carries no expiry.
+        // The max-age cap must still reject it — an ancient delegation cannot be
+        // resurrected by minting a fresh leaf under it.
+        let graph = "graph-depth2-age";
+        let (root_sk, root_did) = signing_key_seed(40);
+        let (leaf_sk, leaf_did) = signing_key_seed(41);
+        let fresh = format_iso8601(now_unix() - 3600);
+
+        let old_root = make_real_cacao_dated(
+            &root_sk, &root_did, &leaf_did, "datom:read", graph, "n-root",
+            "2020-01-01T00:00:00Z", None,
+        );
+        let leaf = make_real_cacao_dated(
+            &leaf_sk, &leaf_did, "did:final:caller", "datom:read", graph, "n-leaf",
+            &fresh, None,
+        );
+        let chain = DelegationChain {
+            chain: vec![old_root, leaf],
+        };
+        assert!(
+            matches!(chain.verify(graph, "datom:read"), Err(DelegationError::Expired)),
+            "old no-expiry root must be rejected by max-age even with a fresh leaf"
+        );
+
+        // Control: identical chain but with a FRESH root → fully valid → Ok(root_did).
+        // Proves the root's age is the sole cause of the rejection above.
+        let fresh_root = make_real_cacao_dated(
+            &root_sk, &root_did, &leaf_did, "datom:read", graph, "n-root",
+            &fresh, None,
+        );
+        let leaf2 = make_real_cacao_dated(
+            &leaf_sk, &leaf_did, "did:final:caller", "datom:read", graph, "n-leaf",
+            &fresh, None,
+        );
+        let ok_chain = DelegationChain {
+            chain: vec![fresh_root, leaf2],
+        };
+        assert_eq!(
+            ok_chain.verify(graph, "datom:read").expect("fresh depth-2 chain valid"),
+            root_did,
+            "fresh-root chain must verify and return the root issuer"
+        );
+    }
+
+    #[test]
+    fn depth2_old_no_expiry_leaf_rejected() {
+        // The leaf side of the same bound: fresh root, stale no-expiry leaf → Expired.
+        let graph = "graph-depth2-age2";
+        let (root_sk, root_did) = signing_key_seed(42);
+        let (leaf_sk, leaf_did) = signing_key_seed(43);
+        let fresh = format_iso8601(now_unix() - 3600);
+
+        let root = make_real_cacao_dated(
+            &root_sk, &root_did, &leaf_did, "datom:read", graph, "n-root", &fresh, None,
+        );
+        let old_leaf = make_real_cacao_dated(
+            &leaf_sk, &leaf_did, "did:final:caller", "datom:read", graph, "n-leaf",
+            "2020-01-01T00:00:00Z", None,
+        );
+        let chain = DelegationChain {
+            chain: vec![root, old_leaf],
+        };
+        assert!(
+            matches!(chain.verify(graph, "datom:read"), Err(DelegationError::Expired)),
+            "old no-expiry leaf must be rejected by max-age"
+        );
     }
 
     #[test]

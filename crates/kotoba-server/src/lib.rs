@@ -2,6 +2,7 @@ pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
 pub mod dht_transport;
+pub mod econ;
 pub mod email_xrpc;
 pub mod fingerprint;
 pub mod firehose;
@@ -13,6 +14,9 @@ pub mod media_xrpc;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
+pub mod account_xrpc;
+pub mod pds_session;
+pub mod pds_xrpc;
 pub mod pre_proxy;
 pub mod server;
 pub mod signal_xrpc;
@@ -72,6 +76,7 @@ mod tests {
         super::email_xrpc::NSID_EMAIL_LIST,
         super::email_xrpc::NSID_EMAIL_READ,
         super::email_xrpc::NSID_EMAIL_INGEST,
+        super::email_xrpc::NSID_EMAIL_SEND,
         // attestation
         super::attestation::NSID_ATTEST_CLAIM,
         super::attestation::NSID_ATTEST_CHALLENGE,
@@ -95,8 +100,8 @@ mod tests {
     fn all_nsids_have_kotoba_prefix() {
         for nsid in ALL_NSIDS {
             assert!(
-                nsid.starts_with("ai.gftd.apps.kotoba."),
-                "NSID does not start with ai.gftd.apps.kotoba.: {nsid}"
+                nsid.starts_with("com.etzhayyim.apps.kotoba."),
+                "NSID does not start with com.etzhayyim.apps.kotoba.: {nsid}"
             );
         }
     }
@@ -125,8 +130,8 @@ mod tests {
     fn kotobase_nsids_have_kotobase_prefix() {
         for nsid in super::kotobase_xrpc::ALL_NSIDS {
             assert!(
-                nsid.starts_with("ai.gftd.apps.kotobase."),
-                "kotobase NSID does not start with ai.gftd.apps.kotobase.: {nsid}"
+                nsid.starts_with("com.etzhayyim.apps.kotobase."),
+                "kotobase NSID does not start with com.etzhayyim.apps.kotobase.: {nsid}"
             );
         }
     }
@@ -172,8 +177,8 @@ mod tests {
     fn all_nsids_start_with_ai_gftd_apps() {
         for nsid in ALL_NSIDS {
             assert!(
-                nsid.starts_with("ai.gftd.apps."),
-                "NSID does not start with ai.gftd.apps.: {nsid}"
+                nsid.starts_with("com.etzhayyim.apps."),
+                "NSID does not start with com.etzhayyim.apps.: {nsid}"
             );
         }
     }
@@ -229,7 +234,7 @@ mod tests {
         
         let req = Request::builder()
             .method("POST")
-            .uri("/xrpc/ai.gftd.apps.yata.some_method")
+            .uri("/xrpc/com.etzhayyim.apps.yata.some_method")
             .body(axum::body::Body::empty())
             .unwrap();
             
@@ -237,6 +242,584 @@ mod tests {
         // Since we provided empty body, we expect a 400 Bad Request or 401 Unauthorized,
         // but definitely NOT a 404 Not Found (which means no route matched)
         assert_ne!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // ── HTTP integration: PDS session PoP + zero-access endpoints (ADR-2606015000) ──
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn post_json(uri: &str, body: serde_json::Value) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Build a valid did:key session PoP (compact EdDSA JWS) for an integration test.
+    fn make_didkey_pop() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&sk.verifying_key().to_bytes());
+        let header = B64U.encode(b"{\"alg\":\"EdDSA\"}");
+        let payload = B64U.encode(format!("{{\"iss\":\"{did}\",\"exp\":9999999999}}").as_bytes());
+        let signing_input = format!("{header}.{payload}");
+        let sig = sk.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", B64U.encode(sig.to_bytes()))
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_accepts_valid_didkey_pop() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(&uri, serde_json::json!({ "token": make_didkey_pop() })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], serde_json::Value::Bool(true), "body={v}");
+        assert!(v["did"].as_str().unwrap().starts_with("did:key:z6Mk"));
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_rejects_garbage_token() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(&uri, serde_json::json!({ "token": "not.a.jws" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(resp).await["valid"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn account_wrapped_ark_put_requires_auth() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        // No Authorization header → owner-auth must reject (not 404, not 200).
+        let resp = app
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({ "did": "did:web:etzhayyim.com:actor:alice", "credentialId": "cred-1", "wrappedArk": "AAAA" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn signal_resolve_identity_unknown_returns_404() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!(
+            "/xrpc/{}?did=did:key:zUnknownActor",
+            super::signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY
+        );
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        // No binding stored for this DID → 404 (route matched, not 404-no-route).
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn signal_publish_identity_requires_auth() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY);
+        // No Authorization header → publish must reject (not store unauthenticated).
+        let resp = app
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({
+                    "did": "did:key:zAlice",
+                    "signalIdentityKey": "AAAA",
+                    "signalDhKey": "AAAA",
+                    "signalRegistrationId": 1,
+                    "createdAt": "2026-06-02T00:00:00Z",
+                    "signature": "AAAA"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn account_wrapped_ark_put_then_get_roundtrip() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let did = "did:web:etzhayyim.com:actor:rt";
+        // jwt_sub/jwt_exp_elapsed are signature-agnostic (edge BFF is the trust
+        // boundary), so a sub-only, exp-less bearer authenticates as `did`.
+        let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{payload_b64}.x");
+        let wrapped = "QUFBQUFBQUFBQUFB"; // opaque wrap blob (server stores verbatim)
+
+        // PUT — store the wrapped ARK.
+        let put_uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let put_req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&put_uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({ "did": did, "credentialId": "cred-rt", "wrappedArk": wrapped }).to_string(),
+            ))
+            .unwrap();
+        let put_resp = app.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(put_resp.status(), axum::http::StatusCode::OK, "put should succeed");
+
+        // GET — same opaque blob comes back (shelf roundtrip through the same state).
+        let get_uri = format!(
+            "/xrpc/{}?did={}&credentialId=cred-rt",
+            super::account_xrpc::NSID_ACCOUNT_GET_WRAPPED_ARK,
+            did
+        );
+        let get_req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&get_uri)
+            .header("authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let get_resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), axum::http::StatusCode::OK, "get should succeed");
+        let v = body_json(get_resp).await;
+        assert_eq!(v["wrappedArk"], serde_json::Value::String(wrapped.to_string()));
+        assert_eq!(v["did"], serde_json::Value::String(did.to_string()));
+    }
+
+    #[tokio::test]
+    async fn account_wrapped_ark_get_missing_returns_404() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let did = "did:web:etzhayyim.com:actor:nobody";
+        let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{payload_b64}.x");
+        // Authenticated, but no wrap was ever stored for this (did, credentialId).
+        let uri = format!(
+            "/xrpc/{}?did={}&credentialId=never-stored",
+            super::account_xrpc::NSID_ACCOUNT_GET_WRAPPED_ARK,
+            did
+        );
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("authorization", &bearer)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn account_wrapped_ark_rejects_cross_account_access() {
+        // The wrapped-ARK store is opaque, but read/write is still gated to the
+        // owning member (require_owner_auth: sub == did). A valid token for one
+        // account must NOT read or overwrite another account's wrap — otherwise an
+        // authenticated member could harvest every other member's key-custody blob
+        // or clobber it. This pins that access-control boundary end-to-end.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+
+        let bob = "did:web:etzhayyim.com:actor:bob";
+        let alice = "did:web:etzhayyim.com:actor:alice";
+        let bob_bearer = format!("Bearer x.{}.x", B64U.encode(format!("{{\"sub\":\"{bob}\"}}").as_bytes()));
+        let alice_bearer =
+            format!("Bearer x.{}.x", B64U.encode(format!("{{\"sub\":\"{alice}\"}}").as_bytes()));
+        let wrapped = "Qk9CX1dSQVA"; // bob's opaque wrap
+
+        // Bob stores his own wrap (baseline).
+        let put_uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let put = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&put_uri)
+                    .header("content-type", "application/json")
+                    .header("authorization", &bob_bearer)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "did": bob, "credentialId": "cred-b", "wrappedArk": wrapped })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), axum::http::StatusCode::OK);
+
+        // Alice (validly authenticated as herself) tries to READ bob's wrap → 401.
+        let get_uri = format!(
+            "/xrpc/{}?did={}&credentialId=cred-b",
+            super::account_xrpc::NSID_ACCOUNT_GET_WRAPPED_ARK,
+            bob
+        );
+        let cross_get = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(&get_uri)
+                    .header("authorization", &alice_bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cross_get.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "alice must not read bob's wrapped ARK"
+        );
+
+        // Alice tries to OVERWRITE bob's wrap → 401.
+        let cross_put = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&put_uri)
+                    .header("content-type", "application/json")
+                    .header("authorization", &alice_bearer)
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "did": bob, "credentialId": "cred-b", "wrappedArk": "RVZJTA" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cross_put.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "alice must not overwrite bob's wrapped ARK"
+        );
+
+        // Bob can still read his own, unmodified, wrap (non-vacuous + not clobbered).
+        let bob_get = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(&get_uri)
+                    .header("authorization", &bob_bearer)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bob_get.status(), axum::http::StatusCode::OK);
+        let v = body_json(bob_get).await;
+        assert_eq!(
+            v["wrappedArk"],
+            serde_json::Value::String(wrapped.to_string()),
+            "bob's wrap must be intact (alice's overwrite was rejected)"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_identity_publish_then_resolve_didkey_roundtrip() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use ed25519_dalek::SigningKey;
+        use kotoba_signal::SignalBinding;
+        use tower::ServiceExt;
+
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+
+        // did:key issuer — the binding is signed by the very key the DID encodes,
+        // so resolve verifies it trustlessly (no external resolution).
+        let did_sk = SigningKey::from_bytes(&[5u8; 32]);
+        let did = kotoba_auth::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
+        let signal = kotoba_signal::identity::IdentityKeyPair::generate().public_key();
+        let binding = SignalBinding::from_identity(&did, &signal, 99, "2026-06-02T00:00:00Z");
+        let sig = binding.sign(&did_sk);
+
+        let sub_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{sub_b64}.x");
+
+        // PUBLISH — store the DID-signed binding (verified on publish for did:key).
+        let pub_uri = format!("/xrpc/{}", super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY);
+        let pub_req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&pub_uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "did": did,
+                    "signalIdentityKey": B64U.encode(&binding.signal_identity_key),
+                    "signalDhKey": B64U.encode(&binding.signal_dh_key),
+                    "signalRegistrationId": 99,
+                    "createdAt": "2026-06-02T00:00:00Z",
+                    "signature": B64U.encode(&sig),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let pub_resp = app.clone().oneshot(pub_req).await.unwrap();
+        assert_eq!(pub_resp.status(), axum::http::StatusCode::OK, "publish should succeed");
+        assert_eq!(body_json(pub_resp).await["verifiedOnPublish"], serde_json::Value::Bool(true));
+
+        // RESOLVE — the stored binding verifies against the did:key (trustless).
+        let res_uri = format!(
+            "/xrpc/{}?did={}",
+            super::signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY,
+            did
+        );
+        let res_req = axum::http::Request::builder()
+            .method("GET")
+            .uri(&res_uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res_resp = app.oneshot(res_req).await.unwrap();
+        assert_eq!(res_resp.status(), axum::http::StatusCode::OK, "resolve should succeed");
+        let v = body_json(res_resp).await;
+        assert_eq!(v["verified"], serde_json::Value::Bool(true), "body={v}");
+        assert_eq!(v["did"], serde_json::Value::String(did));
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_empty_token_returns_400() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(&uri, serde_json::json!({ "token": "" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Build a compact EdDSA JWS session PoP for a did:key issuer (resolves with no
+    /// network). `sign_sk` lets a test sign with a key other than the DID's, to drive
+    /// the invalid branch.
+    fn make_didkey_pop_signed_by(
+        did_sk: &ed25519_dalek::SigningKey,
+        sign_sk: &ed25519_dalek::SigningKey,
+        exp: u64,
+    ) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use ed25519_dalek::Signer;
+        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
+        let header = B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
+        let payload =
+            B64U.encode(serde_json::to_vec(&serde_json::json!({ "iss": did, "sub": did, "exp": exp })).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let sig = sign_sk.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", B64U.encode(sig.to_bytes()))
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_valid_didkey_token_returns_200() {
+        // End-to-end through the public XRPC endpoint: a valid did:key PoP must map
+        // to 200 + valid:true + the issuer DID echoed. The verify_session_pop unit is
+        // solid; this pins the handler's verdict→status wiring and the did:key
+        // resolution path (no network needed for did:key).
+        use ed25519_dalek::SigningKey;
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let sk = SigningKey::from_bytes(&[11u8; 32]);
+        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&sk.verifying_key().to_bytes());
+        let token = make_didkey_pop_signed_by(&sk, &sk, 99_999_999_999); // far-future exp vs real clock
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(&uri, serde_json::json!({ "token": token })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "valid PoP must return 200");
+        let v = body_json(resp).await;
+        assert_eq!(v["valid"], serde_json::Value::Bool(true), "body={v}");
+        assert_eq!(v["did"], serde_json::Value::String(did));
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_invalid_token_returns_401() {
+        // The failure branch of the verdict→status mapping: a PoP whose signature is
+        // by the wrong key (valid Ed25519, wrong signer) must return 401 + valid:false
+        // through the endpoint — not 200, and not a 500.
+        use ed25519_dalek::SigningKey;
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let victim = SigningKey::from_bytes(&[12u8; 32]);
+        let attacker = SigningKey::from_bytes(&[13u8; 32]);
+        // iss = victim's did:key, but signed by the attacker.
+        let token = make_didkey_pop_signed_by(&victim, &attacker, 99_999_999_999);
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(&uri, serde_json::json!({ "token": token })))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid PoP must return 401"
+        );
+        assert_eq!(body_json(resp).await["valid"], serde_json::Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn account_put_invalid_credential_id_returns_400() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let did = "did:web:etzhayyim.com:actor:badcred";
+        let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{payload_b64}.x");
+        // Authenticated, but credentialId has a path-traversal slash → 400 (validation).
+        let uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({ "did": did, "credentialId": "bad/slash", "wrappedArk": "AAAA" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn signal_publish_didkey_bad_signature_rejected() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use ed25519_dalek::SigningKey;
+        use kotoba_signal::SignalBinding;
+        use tower::ServiceExt;
+
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let did_sk = SigningKey::from_bytes(&[6u8; 32]);
+        let did = kotoba_auth::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
+        let signal = kotoba_signal::identity::IdentityKeyPair::generate().public_key();
+        let binding = SignalBinding::from_identity(&did, &signal, 1, "2026-06-02T00:00:00Z");
+        // Corrupt the signature → publish must reject a forged did:key binding (400),
+        // since did:key bindings are verified on publish (trustless).
+        let mut sig = binding.sign(&did_sk);
+        sig[0] ^= 0xFF;
+
+        let sub_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{sub_b64}.x");
+        let uri = format!("/xrpc/{}", super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "did": did,
+                    "signalIdentityKey": B64U.encode(&binding.signal_identity_key),
+                    "signalDhKey": B64U.encode(&binding.signal_dh_key),
+                    "signalRegistrationId": 1,
+                    "createdAt": "2026-06-02T00:00:00Z",
+                    "signature": B64U.encode(&sig),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "forged did:key binding must be rejected on publish");
+    }
+
+    #[tokio::test]
+    async fn signal_publish_didkey_valid_signature_by_wrong_key_rejected() {
+        // The IMPERSONATION vector (distinct from the corrupted-bytes test above):
+        // an attacker who controls their own key wants to publish a binding for a
+        // VICTIM's did:key — a DID they do not control. They present a perfectly
+        // valid Ed25519 signature, just produced by the WRONG key, and forge the
+        // bearer's `sub` (the JWT layer is signature-agnostic at this boundary). The
+        // server resolves the victim's did:key to the victim's pubkey and verifies
+        // the binding against it, so a structurally-valid-but-wrong-signer signature
+        // must still be rejected. A malformed signature passing for a different
+        // reason would not prove this.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use ed25519_dalek::SigningKey;
+        use kotoba_signal::SignalBinding;
+        use tower::ServiceExt;
+
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let victim_sk = SigningKey::from_bytes(&[7u8; 32]);
+        let victim_did = kotoba_auth::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
+        let attacker_sk = SigningKey::from_bytes(&[8u8; 32]); // a DIFFERENT key
+        let signal = kotoba_signal::identity::IdentityKeyPair::generate().public_key();
+        let binding = SignalBinding::from_identity(&victim_did, &signal, 1, "2026-06-02T00:00:00Z");
+        // Valid signature — but by the attacker, not the key the victim DID encodes.
+        let sig = binding.sign(&attacker_sk);
+
+        // Forge the bearer to claim the victim DID (passes require_signal_auth; the
+        // binding-signature check is the gate that must still stop impersonation).
+        let sub_b64 = B64U.encode(format!("{{\"sub\":\"{victim_did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{sub_b64}.x");
+        let uri = format!("/xrpc/{}", super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "did": victim_did,
+                    "signalIdentityKey": B64U.encode(&binding.signal_identity_key),
+                    "signalDhKey": B64U.encode(&binding.signal_dh_key),
+                    "signalRegistrationId": 1,
+                    "createdAt": "2026-06-02T00:00:00Z",
+                    "signature": B64U.encode(&sig),
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "a valid signature by a non-DID key must not let an attacker publish a binding for that DID"
+        );
     }
 }
 
@@ -282,6 +865,14 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             get(xrpc::graph_query),
         )
         .route(
+            &format!("/xrpc/{}", xrpc::NSID_ECON_BALANCE),
+            post(xrpc::econ_balance),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_ECON_CREDIT),
+            post(xrpc::econ_credit),
+        )
+        .route(
             &format!("/xrpc/{}", xrpc::NSID_WEIGHT_PUT),
             // 512 MiB base64 tensor + JSON framing overhead
             post(xrpc::weight_put).layer(DefaultBodyLimit::max(530 * 1024 * 1024)),
@@ -295,7 +886,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             post(xrpc::datomic_transact),
         )
         .route(
-            "/xrpc/ai.gftd.apps.kotoba.node.register",
+            "/xrpc/com.etzhayyim.apps.kotoba.node.register",
             post(xrpc::node_register),
         )
         .route(
@@ -555,7 +1146,12 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             // 33 MiB raw email base64 + JSON framing overhead
             post(email_xrpc::email_ingest).layer(DefaultBodyLimit::max(36 * 1024 * 1024)),
         )
-        // ── Signal Protocol E2E (ai.gftd.signal.*) ─────────────────────────
+        .route(
+            &format!("/xrpc/{}", email_xrpc::NSID_EMAIL_SEND),
+            // up to 256 recipients × 1 MiB Signal envelope + JSON framing
+            post(email_xrpc::email_send).layer(DefaultBodyLimit::max(300 * 1024 * 1024)),
+        )
+        // ── Signal Protocol E2E (com.etzhayyim.signal.*) ─────────────────────────
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS),
             // 256 KiB: two 64 KiB bundles + DID/device_id fields + JSON framing
@@ -576,6 +1172,28 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY),
             post(signal_xrpc::distribute_sender_key),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY),
+            post(signal_xrpc::publish_signal_identity),
+        )
+        .route(
+            &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY),
+            get(signal_xrpc::resolve_signal_identity),
+        )
+        // ── Account key custody (wrapped-ARK store, ADR-2606014000 L1) ──────
+        .route(
+            &format!("/xrpc/{}", account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK),
+            post(account_xrpc::put_wrapped_ark),
+        )
+        .route(
+            &format!("/xrpc/{}", account_xrpc::NSID_ACCOUNT_GET_WRAPPED_ARK),
+            get(account_xrpc::get_wrapped_ark),
+        )
+        // ── PDS session auth (ADR-2606015000 — PDS-on-kotoba refactor) ──────
+        .route(
+            &format!("/xrpc/{}", pds_xrpc::NSID_PDS_SESSION_VERIFY),
+            post(pds_xrpc::session_verify),
         )
         // ── Attestation ────────────────────────────────────────────────────
         .route(
@@ -844,8 +1462,43 @@ pub async fn run() -> anyhow::Result<()> {
     // Warm the resident `db_before` cache for every registered graph in the
     // background, so the first `datomic.transact` after this (re)start is a cache
     // HIT instead of an inline O(graph) cold `db_from_head` scan on the request
-    // path (ADR-2605302130 / kotoba#19). Spawned — never blocks serve.
+    // path (ADR-2605302130 / kotoba#19). Spawned — never blocks serve. This is the
+    // best-effort, all-graphs auto-warm (single pass, no retry).
     tokio::spawn(Arc::clone(&state).warm_datomic_live_caches());
+
+    // Targeted retry backstop over the auto-warm above: for explicitly-configured
+    // large graphs, re-warm OFF the request path with bounded exponential-backoff
+    // retry so a transient cold-load failure (the cold-start failure yukkuri hit on
+    // `yukkuri-kg-v3`) does not leave the graph permanently cold. Comma-separated
+    // graph CIDs in `KOTOBA_DATOMIC_WARM_GRAPHS`; idempotent vs the auto-warm
+    // (each warm skips a graph already resident at the same head).
+    if let Ok(graphs) = std::env::var("KOTOBA_DATOMIC_WARM_GRAPHS") {
+        for spec in graphs.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(graph_cid) = kotoba_core::cid::KotobaCid::from_multibase(spec) else {
+                tracing::warn!(graph = %spec, "KOTOBA_DATOMIC_WARM_GRAPHS: invalid graph CID, skipping");
+                continue;
+            };
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let ipns_name = xrpc::distributed_graph_ipns_name(&graph_cid);
+                let graph_mb = graph_cid.to_multibase();
+                let mut backoff_secs = 2u64;
+                for attempt in 1..=6u32 {
+                    match xrpc::warm_datomic_resident_cache(&state, &graph_cid, &ipns_name).await {
+                        Ok(outcome) => {
+                            tracing::info!(graph = %graph_mb, ?outcome, attempt, "datomic resident cache warm");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(graph = %graph_mb, attempt, err = %e, "datomic resident cache warm failed; retrying");
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                            backoff_secs = (backoff_secs * 2).min(60);
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     let app = build_router(Arc::clone(&state));
 

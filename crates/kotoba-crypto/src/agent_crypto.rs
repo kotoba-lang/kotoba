@@ -15,7 +15,20 @@ use crate::{
     aead::{open, seal, CryptoError},
     envelope::{decode_envelope, encode_envelope},
     hkdf::derive_key_with_salt,
+    key_tree::derive_storage_key,
 };
+
+/// Bind a caller context (`aad`) into a scope label so a ciphertext sealed for
+/// one logical slot cannot be opened under another. Length-prefixing `scope`
+/// makes the `(scope, aad)` pair unambiguous (ADR-2606014000 D2). Used by the
+/// default `encrypt_bound` / `decrypt_bound` trait methods.
+fn bind_scope(scope: &[u8], aad: &[u8]) -> Vec<u8> {
+    let mut s = Vec::with_capacity(scope.len() + aad.len() + 4);
+    s.extend_from_slice(&(scope.len() as u32).to_be_bytes());
+    s.extend_from_slice(scope);
+    s.extend_from_slice(aad);
+    s
+}
 
 /// Opaque encryption-engine trait.
 ///
@@ -77,6 +90,48 @@ pub trait AgentCrypto: Send + Sync + 'static {
     async fn decrypt_blob(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         self.decrypt(b"blob", ciphertext).await
     }
+
+    /// Context-bound encrypt (ADR-2606014000 D2). `aad` is a logical slot — e.g.
+    /// the owning graph/datom CID — folded into the scope-key derivation, so a
+    /// ciphertext sealed for one slot cannot be opened under another. Default
+    /// implementation requires no impl change (works through `dyn AgentCrypto`).
+    async fn encrypt_bound(
+        &self,
+        scope: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.encrypt(&bind_scope(scope, aad), plaintext).await
+    }
+
+    /// Context-bound decrypt. `aad` MUST equal the value used by `encrypt_bound`.
+    async fn decrypt_bound(
+        &self,
+        scope: &[u8],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        self.decrypt(&bind_scope(scope, aad), ciphertext).await
+    }
+
+    /// PII-blob encrypt bound to its owning context (`aad`). The intended call
+    /// for manimani intake bodies: `encrypt_blob_bound(intake_subject_cid, body)`.
+    async fn encrypt_blob_bound(
+        &self,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.encrypt_bound(b"blob", aad, plaintext).await
+    }
+
+    /// Decrypt a blob produced by `encrypt_blob_bound`.
+    async fn decrypt_blob_bound(
+        &self,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        self.decrypt_bound(b"blob", aad, ciphertext).await
+    }
 }
 
 /// A key-material-backed implementation of `AgentCrypto`.
@@ -92,6 +147,16 @@ impl VaultKeyedCrypto {
     /// key in a `Zeroizing` allocation; this moves ownership in.
     pub fn new(vault_key: Zeroizing<[u8; 32]>) -> Self {
         Self { vault_key }
+    }
+
+    /// Construct the storage-encryption engine from the passkey-rooted Account
+    /// Root Key (ADR-2606014000): `vault_key = k_storage = HKDF(ARK, "storage")`.
+    /// This sources the PII engine from the device-derived key hierarchy instead
+    /// of a server-held key or env var, satisfying the no-server-key invariant.
+    pub fn from_ark(ark: &[u8; 32]) -> Self {
+        Self {
+            vault_key: Zeroizing::new(derive_storage_key(ark)),
+        }
     }
 
     fn scope_key(&self, scope: &[u8]) -> [u8; 32] {
@@ -265,5 +330,98 @@ mod tests {
         let c = test_crypto();
         let result = c.open_field(b"scope", "not-a-signal-value").await;
         assert!(result.is_err(), "must reject invalid envelope prefix");
+    }
+
+    // ── ARK-sourced engine + context-bound blobs (ADR-2606014000) ──────────
+
+    #[tokio::test]
+    async fn from_ark_is_deterministic_for_same_ark() {
+        let ark = [0x11u8; 32];
+        let c1 = VaultKeyedCrypto::from_ark(&ark);
+        let c2 = VaultKeyedCrypto::from_ark(&ark);
+        // Same ARK → same storage key → c2 can decrypt c1's bound blob.
+        let aad = b"kotoba://graph/intake-1";
+        let ct = c1.encrypt_blob_bound(aad, b"private body").await.unwrap();
+        let pt = c2.decrypt_blob_bound(aad, &ct).await.unwrap();
+        assert_eq!(pt.as_slice(), b"private body");
+    }
+
+    #[tokio::test]
+    async fn from_ark_differs_per_ark() {
+        let a = VaultKeyedCrypto::from_ark(&[0x01u8; 32]);
+        let b = VaultKeyedCrypto::from_ark(&[0x02u8; 32]);
+        let aad = b"slot";
+        let ct = a.encrypt_blob_bound(aad, b"x").await.unwrap();
+        // Different ARK → different storage key → cannot decrypt.
+        assert!(b.decrypt_blob_bound(aad, &ct).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypt_bound_wrong_aad_fails() {
+        let c = test_crypto();
+        let ct = c.encrypt_bound(b"blob", b"slot-A", b"data").await.unwrap();
+        // Same engine + scope, different logical slot → must not decrypt.
+        assert!(c.decrypt_bound(b"blob", b"slot-B", &ct).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypt_bound_empty_aad_roundtrips() {
+        // Empty AAD is a valid degenerate binding (equivalent to unbound scope).
+        let c = test_crypto();
+        let ct = c.encrypt_bound(b"blob", b"", b"data").await.unwrap();
+        let pt = c.decrypt_bound(b"blob", b"", &ct).await.unwrap();
+        assert_eq!(pt.as_slice(), b"data");
+    }
+
+    #[tokio::test]
+    async fn encrypt_blob_bound_large_payload_roundtrips() {
+        let c = test_crypto();
+        let aad = b"kotoba://graph/big";
+        let payload: Vec<u8> = (0u8..=255).cycle().take(8192).collect();
+        let ct = c.encrypt_blob_bound(aad, &payload).await.unwrap();
+        let pt = c.decrypt_blob_bound(aad, &ct).await.unwrap();
+        assert_eq!(pt.as_slice(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn bound_and_unbound_blob_use_distinct_keys() {
+        // encrypt_blob (scope "blob", no aad) and encrypt_blob_bound (scope "blob"
+        // folded with aad) must NOT cross-decrypt — the aad changes the key.
+        let c = test_crypto();
+        let unbound = c.encrypt_blob(b"x").await.unwrap();
+        assert!(c.decrypt_blob_bound(b"slot", &unbound).await.is_err());
+        let bound = c.encrypt_blob_bound(b"slot", b"x").await.unwrap();
+        assert!(c.decrypt_blob(&bound).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn encrypt_blob_bound_roundtrip_via_dyn_trait() {
+        // Confirm the bound methods work through a trait object (the ingest path
+        // holds `Arc<dyn AgentCrypto>`).
+        let c: std::sync::Arc<dyn AgentCrypto> =
+            std::sync::Arc::new(VaultKeyedCrypto::from_ark(&[0x42u8; 32]));
+        let aad = b"kotoba://datom/bafyIntakeSubject";
+        let ct = c.encrypt_blob_bound(aad, b"email body PII").await.unwrap();
+        let pt = c.decrypt_blob_bound(aad, &ct).await.unwrap();
+        assert_eq!(pt.as_slice(), b"email body PII");
+    }
+
+    #[tokio::test]
+    async fn bound_scope_aad_split_is_unambiguous() {
+        // Length-prefixing `scope` makes the (scope, aad) encoding injective:
+        // ("ab", "c") and ("a", "bc") share the concatenation "abc" but MUST derive
+        // different keys (the 4-byte scope-length prefix differs). Without the
+        // prefix a caller could forge a slot boundary and cross-decrypt.
+        let c = test_crypto();
+        let ct = c.encrypt_bound(b"ab", b"c", b"secret").await.unwrap();
+        assert!(
+            c.decrypt_bound(b"a", b"bc", &ct).await.is_err(),
+            "a different (scope,aad) split of the same bytes must not cross-decrypt"
+        );
+        // The exact same (scope, aad) still round-trips.
+        assert_eq!(
+            c.decrypt_bound(b"ab", b"c", &ct).await.unwrap().as_slice(),
+            b"secret"
+        );
     }
 }

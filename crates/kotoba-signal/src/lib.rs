@@ -3,6 +3,7 @@
 //!
 //! Wire format `signal:v1:{base64url}` is preserved for compatibility.
 
+pub mod binding;
 pub mod group;
 pub mod identity;
 pub mod message;
@@ -12,6 +13,7 @@ pub mod session;
 pub mod store;
 pub mod x3dh;
 
+pub use binding::{unwrap_record_key, wrap_record_key, SignalBinding};
 pub use group::{GroupSession, InMemorySenderKeyStore, SenderKeyMessage, SenderKeyState};
 pub use identity::{DeviceId, IdentityKey, IdentityKeyPair};
 pub use message::{MessageType, Reaction, SignalMessage, ThreadMessage};

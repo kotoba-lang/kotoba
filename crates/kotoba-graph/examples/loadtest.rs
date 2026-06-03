@@ -160,7 +160,7 @@ fn query_latencies(
         times.push(t.elapsed());
         // AVET
         let t = Instant::now();
-        let _ = arr.get_entities_by_attribute_value(p, "Alice");
+        let _ = arr.get_entities_by_attribute_value(p, &kotoba_kqe::Value::Text("Alice".into()));
         times.push(t.elapsed());
         // VAET
         let t = Instant::now();
@@ -475,8 +475,12 @@ async fn phase3_cold_queries() {
     // AVET: lookup subjects by predicate+object value
     bench_query!(
         "AVET lookup_subject_by_po_cold",
-        qs.lookup_subject_by_po_cold(&graph, "name", "entity-100")
-            .await
+        qs.lookup_subject_by_po_cold(
+            &graph,
+            "name",
+            &kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".into())),
+        )
+        .await
             .unwrap()
     );
 

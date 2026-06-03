@@ -216,3 +216,38 @@ impl EdnValue {
         matches!(self, Self::Nil)
     }
 }
+
+#[cfg(test)]
+mod ord_tests {
+    use super::*;
+    use ordered_float::OrderedFloat;
+
+    // First-tier `datomic.datoms` ordering (xrpc `datomic_datoms_sort_key`) sorts
+    // by `EdnValue`'s derived `Ord`, so its correctness IS this Ord. Lock it:
+    // integers compare numerically (no "100" < "20" trap) and types are
+    // segregated by variant order (a number never compares against a string).
+    // (ADR-2606022150 §D1.1 — first-tier Datomic is canonical without keycodec.)
+
+    #[test]
+    fn integers_order_numerically_not_lexicographically() {
+        assert!(EdnValue::Integer(20) < EdnValue::Integer(100));
+        assert!(EdnValue::Integer(-1) < EdnValue::Integer(0));
+        assert!(EdnValue::Integer(-100) < EdnValue::Integer(-20));
+        assert!(EdnValue::Integer(i64::MIN) < EdnValue::Integer(i64::MAX));
+    }
+
+    #[test]
+    fn floats_order_numerically() {
+        assert!(EdnValue::Float(OrderedFloat(-1.0)) < EdnValue::Float(OrderedFloat(0.0)));
+        assert!(EdnValue::Float(OrderedFloat(20.0)) < EdnValue::Float(OrderedFloat(100.0)));
+    }
+
+    #[test]
+    fn types_are_segregated_by_variant_order() {
+        // Bool < Integer < Float < String (declaration order) — a huge integer
+        // never sorts among strings; a bool never collides with a float.
+        assert!(EdnValue::Bool(true) < EdnValue::Integer(0));
+        assert!(EdnValue::Integer(i64::MAX) < EdnValue::Float(OrderedFloat(f64::NEG_INFINITY)));
+        assert!(EdnValue::Float(OrderedFloat(f64::INFINITY)) < EdnValue::String(String::new()));
+    }
+}

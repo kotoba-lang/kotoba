@@ -1,10 +1,33 @@
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 
-/// `(label, kv-pairs)` input for one ProllyTree build thread.
-type TreeInput = (&'static str, Vec<(Vec<u8>, Vec<u8>)>);
+/// Per-index work for one ProllyTree build thread (see [`TreeOp`]).
+type TreeInput = (&'static str, TreeOp);
 /// Result from one ProllyTree build thread: `(root_cid, captured_blocks)`.
 type TreeResult = anyhow::Result<(KotobaCid, Vec<(KotobaCid, Vec<u8>)>)>;
+
+/// How a single covering index is materialised for a commit.
+///
+/// `Build` rebuilds the whole tree from a flat entry list (used for the
+/// in-memory Quad-compat indexes, whose source `Arrangement` is already the full
+/// current snapshot).  `Apply` path-copies the previous commit's index root with
+/// only the transaction's delta — eliminating the full-history cold re-read for
+/// the append-only and current-view Datom-native indexes.
+enum TreeOp {
+    /// Rebuild from scratch over the given `(key, value)` entries.
+    Build(Vec<(Vec<u8>, Vec<u8>)>),
+    /// Incrementally apply a delta onto `prev_root`.
+    ///
+    /// `delete_prefixes` are resolved against `prev_root` via `scan_prefix`
+    /// inside the worker (each prefix uniquely addresses a current-view triple's
+    /// prior representative) and folded into the delete set before `apply_batch`.
+    Apply {
+        prev_root: Option<KotobaCid>,
+        upserts: Vec<(Vec<u8>, Vec<u8>)>,
+        deletes: Vec<Vec<u8>>,
+        delete_prefixes: Vec<Vec<u8>>,
+    },
+}
 use dashmap::DashMap;
 use kotoba_auth::delegation::{DelegationChain, DelegationError};
 use kotoba_core::prolly::ProllyTree;
@@ -13,6 +36,7 @@ use kotoba_kqe::datalog::DatalogProgram;
 use kotoba_kqe::datom::{Datom, Value};
 use kotoba_kqe::delta::Delta;
 use kotoba_kqe::quad::LegacyQuad as Quad;
+use kotoba_kqe::quad::LegacyQuadObject;
 use kotoba_kse::journal::Journal;
 use kotoba_kse::topic::Topic;
 use kotoba_store::{CapturingBlockStore, CarBundleWriter};
@@ -733,19 +757,20 @@ impl QuadStore {
             .unwrap_or(0)
     }
 
-    /// Find subject CIDs where predicate = `predicate` and object_key = `object_key`,
+    /// Find subject CIDs where predicate = `predicate` and the object encodes to
+    /// the canonical AVET `value_key` (keycodec; see [`avet_value_key`]),
     /// optionally within a named graph.
     pub async fn lookup_subject_by_po(
         &self,
         graph_cid: Option<&KotobaCid>,
         predicate: &str,
-        object_key: &str,
+        value_key: &[u8],
     ) -> Vec<KotobaCid> {
         if let Some(gcid) = graph_cid {
             return self
                 .arrangements
                 .get(&gcid.to_multibase())
-                .map(|arr| arr.get_entities_by_attribute_value(predicate, object_key))
+                .map(|arr| arr.get_entities_by_attribute_value_bytes(predicate, value_key))
                 .unwrap_or_default();
         }
         let mut out = vec![];
@@ -753,7 +778,7 @@ impl QuadStore {
             out.extend(
                 entry
                     .value()
-                    .get_entities_by_attribute_value(predicate, object_key),
+                    .get_entities_by_attribute_value_bytes(predicate, value_key),
             );
         }
         out
@@ -816,8 +841,7 @@ impl QuadStore {
                 Ok(p) => p.to_string(),
                 Err(_) => continue,
             };
-            let object: kotoba_kqe::quad::LegacyQuadObject = serde_json::from_slice(&val)
-                .unwrap_or(kotoba_kqe::quad::LegacyQuadObject::Text(String::new()));
+            let object = dec_object(&val);
             quads.push(Quad {
                 graph: graph_cid.clone(),
                 subject: subject.clone(),
@@ -988,7 +1012,7 @@ impl QuadStore {
                 .map_err(|e| anyhow::anyhow!("spawn_blocking panic: {e}"))??;
         Ok(entries
             .into_iter()
-            .filter_map(|(_, val)| serde_json::from_slice::<Datom>(&val).ok())
+            .filter_map(|(_, val)| dec_datom(&val))
             .collect())
     }
 
@@ -1047,8 +1071,7 @@ impl QuadStore {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            let object: kotoba_kqe::quad::LegacyQuadObject = serde_json::from_slice(&val)
-                .unwrap_or(kotoba_kqe::quad::LegacyQuadObject::Text(String::new()));
+            let object = dec_object(&val);
             quads.push(Quad {
                 graph: graph_cid.clone(),
                 subject: KotobaCid(subj_arr),
@@ -1089,12 +1112,13 @@ impl QuadStore {
         Ok(quads)
     }
 
-    /// Cold-path AVET scan: resolve subjects by predicate + object_key from the committed ProllyTree.
+    /// Cold-path AVET scan: resolve subjects by predicate + canonical
+    /// `value_key` (keycodec) from the committed ProllyTree.
     pub async fn lookup_subject_by_po_cold(
         &self,
         graph_cid: &KotobaCid,
         predicate: &str,
-        object_key: &str,
+        value_key: &[u8],
     ) -> anyhow::Result<Vec<KotobaCid>> {
         // ── Hot path (only when hot covers all committed state) ───────────────
         {
@@ -1102,7 +1126,7 @@ impl QuadStore {
             if let Some(arr) = self.arrangements.get(&key) {
                 let covers_all = self.hot_covers_all.get(&key).map(|v| *v).unwrap_or(true);
                 if !arr.is_empty() && covers_all {
-                    return Ok(arr.get_entities_by_attribute_value(predicate, object_key));
+                    return Ok(arr.get_entities_by_attribute_value_bytes(predicate, value_key));
                 }
             }
         }
@@ -1120,7 +1144,7 @@ impl QuadStore {
 
         let bs = Arc::clone(&self.block_store);
         let mut prefix_vec = predicate.as_bytes().to_vec();
-        prefix_vec.extend_from_slice(object_key.as_bytes());
+        prefix_vec.extend_from_slice(value_key);
 
         let entries = tokio::task::spawn_blocking(move || {
             ProllyTree::scan_prefix(&root_avet, &prefix_vec, &*bs)
@@ -1145,7 +1169,7 @@ impl QuadStore {
         // Union with hot (post-replay partial view)
         if let Some(arr) = self.arrangements.get(&graph_cid.to_multibase()) {
             if !arr.is_empty() {
-                let hot = arr.get_entities_by_attribute_value(predicate, object_key);
+                let hot = arr.get_entities_by_attribute_value_bytes(predicate, value_key);
                 let mut seen: std::collections::HashSet<KotobaCid> =
                     subjects.iter().cloned().collect();
                 for s in hot {
@@ -1275,8 +1299,10 @@ impl QuadStore {
         pred2: &str,
         val2: &str,
     ) -> anyhow::Result<Vec<KotobaCid>> {
+        let vk1 = avet_value_key(&typed_literal_object(val1));
+        let vk2 = avet_value_key(&typed_literal_object(val2));
         let set1: std::collections::HashSet<[u8; 36]> = self
-            .lookup_subject_by_po_cold(graph_cid, pred1, val1)
+            .lookup_subject_by_po_cold(graph_cid, pred1, &vk1)
             .await?
             .into_iter()
             .map(|c| c.0)
@@ -1286,7 +1312,7 @@ impl QuadStore {
         }
 
         let set2 = self
-            .lookup_subject_by_po_cold(graph_cid, pred2, val2)
+            .lookup_subject_by_po_cold(graph_cid, pred2, &vk2)
             .await?;
         Ok(set2.into_iter().filter(|c| set1.contains(&c.0)).collect())
     }
@@ -2665,10 +2691,12 @@ impl QuadStore {
                 // Bound object (literal or named node)?
                 match &tp.object {
                     TermPattern::Literal(lit) => {
-                        // AVET: pred + literal
-                        let obj_key = lit.value().to_string();
+                        // AVET: pred + literal, typed exactly as the store types it
+                        // (Integer/Float/Bool/Text) so the canonical keys match.
+                        let obj = typed_literal_object(lit.value());
+                        let vk = avet_value_key(&obj);
                         let subjects = self
-                            .lookup_subject_by_po_cold(graph_cid, &pred, &obj_key)
+                            .lookup_subject_by_po_cold(graph_cid, &pred, &vk)
                             .await?;
                         return Ok(subjects
                             .into_iter()
@@ -2676,7 +2704,7 @@ impl QuadStore {
                                 graph: graph_cid.clone(),
                                 subject: s,
                                 predicate: pred.clone(),
-                                object: kotoba_kqe::quad::LegacyQuadObject::Text(obj_key.clone()),
+                                object: obj.clone(),
                             })
                             .collect());
                     }
@@ -2684,9 +2712,11 @@ impl QuadStore {
                         let obj_iri = strip_bgp_base(obj_nn.as_str());
                         if let Some(obj_cid) = parse_cid_iri(obj_iri) {
                             // AVET: pred + cid-object
-                            let obj_mb = obj_cid.to_multibase();
+                            let vk = avet_value_key(&kotoba_kqe::quad::LegacyQuadObject::Cid(
+                                obj_cid.clone(),
+                            ));
                             let subjects = self
-                                .lookup_subject_by_po_cold(graph_cid, &pred, &obj_mb)
+                                .lookup_subject_by_po_cold(graph_cid, &pred, &vk)
                                 .await?;
                             return Ok(subjects
                                 .into_iter()
@@ -3052,11 +3082,11 @@ impl QuadStore {
         &self,
         graph_cid: &KotobaCid,
         predicate: &str,
-        object_key: &str,
+        value_key: &[u8],
         chain: &DelegationChain,
     ) -> Result<Vec<KotobaCid>, AccessError> {
         chain.verify(&graph_cid.to_multibase(), "datom:read")?;
-        self.lookup_subject_by_po_cold(graph_cid, predicate, object_key)
+        self.lookup_subject_by_po_cold(graph_cid, predicate, value_key)
             .await
             .map_err(|e| AccessError::Internal(e.to_string()))
     }
@@ -3165,12 +3195,24 @@ impl QuadStore {
         graph_cid: KotobaCid,
         seq: u64,
     ) -> anyhow::Result<KotobaCid> {
-        let prev = self
+        let prev_commit = self
             .commit_dag
             .read()
             .await
             .head(&graph_cid)
-            .map(|c| c.cid.clone());
+            .cloned();
+        let prev = prev_commit.as_ref().map(|c| c.cid.clone());
+        // Previous index roots — the anchors the incremental Datom-native trees
+        // path-copy from.  EAVT is stored as `Commit::root`; the rest live in
+        // `index_roots`.  Absent on a graph's first commit.
+        let prev_root = |name: &str| -> Option<KotobaCid> {
+            let c = prev_commit.as_ref()?;
+            if name == "eavt" {
+                Some(c.root.clone())
+            } else {
+                c.index_roots.get(name).cloned()
+            }
+        };
 
         let (eavt_entries, aevt_entries, avet_entries, vaet_entries) = {
             match self.arrangements.get(&graph_cid.to_multibase()) {
@@ -3184,7 +3226,7 @@ impl QuadStore {
                             let mut k = Vec::new();
                             k.extend_from_slice(&q.subject.0);
                             k.extend_from_slice(q.predicate.as_bytes());
-                            let v = serde_json::to_vec(&q.object).unwrap_or_default();
+                            let v = enc_object(&q.object);
                             (k, v)
                         })
                         .collect();
@@ -3198,7 +3240,7 @@ impl QuadStore {
                                 let mut k = Vec::new();
                                 k.extend_from_slice(pred.as_bytes());
                                 k.extend_from_slice(&subj.0);
-                                let v = serde_json::to_vec(&obj).unwrap_or_default();
+                                let v = enc_object(&obj);
                                 (k, v)
                             })
                         })
@@ -3212,7 +3254,7 @@ impl QuadStore {
                             subs.into_iter().map(move |s| {
                                 let mut k = Vec::new();
                                 k.extend_from_slice(pred.as_bytes());
-                                k.extend_from_slice(okey.as_bytes());
+                                k.extend_from_slice(&okey); // canonical value key (keycodec)
                                 (k, s.0.to_vec())
                             })
                         })
@@ -3247,18 +3289,15 @@ impl QuadStore {
         let tx_cid = Commit::derive_tx_cid(&graph_cid, &tx_seed_root, prev.as_ref(), seq);
 
         let graph_key = graph_cid.to_multibase();
-        let previous_history = self
-            .history_datoms_cold(&graph_cid)
-            .await
-            .unwrap_or_default();
         let mut tx_datoms = self
             .pending_datoms
             .get(&graph_key)
             .map(|pending| pending.clone())
             .unwrap_or_default();
-        if tx_datoms.is_empty() && previous_history.is_empty() {
+        if tx_datoms.is_empty() && prev_commit.is_none() {
             // Migration/backfill path for callers that populated the hot
-            // Arrangement before Datom-native pending history existed.
+            // Arrangement before Datom-native pending history existed.  Only on a
+            // graph's very first commit (no prior history to incrementally extend).
             tx_datoms = eavt_entries
                 .iter()
                 .filter_map(|(key, value)| {
@@ -3268,8 +3307,7 @@ impl QuadStore {
                     let mut e = [0u8; 36];
                     e.copy_from_slice(&key[..36]);
                     let a = String::from_utf8_lossy(&key[36..]).to_string();
-                    let v: kotoba_kqe::quad::LegacyQuadObject =
-                        serde_json::from_slice(value).ok()?;
+                    let v = dec_object(value);
                     Some(Datom::assert(
                         KotobaCid(e),
                         a,
@@ -3282,48 +3320,107 @@ impl QuadStore {
         for datom in &mut tx_datoms {
             datom.tx = tx_cid.clone();
         }
-        let mut datom_history = previous_history;
-        datom_history.extend(tx_datoms);
-        let current_datom_entries = current_datoms(datom_history.clone());
 
-        let datom_eavt_entries: Vec<(Vec<u8>, Vec<u8>)> = datom_history
+        // ── Datom-native index deltas (no full-history cold re-read) ────────────
+        //
+        // Append-only trees (datom_eavt / datom_aevt / tea) grow by exactly this
+        // transaction's datoms — pure additive upserts onto the previous root.
+        //
+        // Current-view trees (datom_avet / datom_vaet) reflect `current_datoms`
+        // (one representative per (e,a,v) triple).  Their delta is: upsert the
+        // representatives this tx net-asserts, and retract the prior
+        // representative of every triple the tx touches (located via a bounded
+        // `scan_prefix` on the previous root — see `TreeOp::Apply`).  Both are
+        // computed from `tx_datoms` alone; the result is bit-for-bit identical to
+        // a full rebuild because `apply_batch` converges with `build_tree`.
+        let enc = enc_datom;
+
+        let datom_eavt_up: Vec<(Vec<u8>, Vec<u8>)> =
+            tx_datoms.iter().map(|d| (d.eavt_key(), enc(d))).collect();
+        let datom_aevt_up: Vec<(Vec<u8>, Vec<u8>)> =
+            tx_datoms.iter().map(|d| (d.aevt_key(), enc(d))).collect();
+        let tea_up: Vec<(Vec<u8>, Vec<u8>)> =
+            tx_datoms.iter().map(|d| (d.tea_key(), enc(d))).collect();
+
+        let tx_current = current_datoms(tx_datoms.clone());
+        let datom_avet_up: Vec<(Vec<u8>, Vec<u8>)> =
+            tx_current.iter().map(|d| (d.avet_key(), enc(d))).collect();
+        let datom_vaet_up: Vec<(Vec<u8>, Vec<u8>)> = tx_current
             .iter()
-            .map(|d| (d.eavt_key(), serde_json::to_vec(d).unwrap_or_default()))
-            .collect();
-        let datom_aevt_entries: Vec<(Vec<u8>, Vec<u8>)> = datom_history
-            .iter()
-            .map(|d| (d.aevt_key(), serde_json::to_vec(d).unwrap_or_default()))
-            .collect();
-        let datom_avet_entries: Vec<(Vec<u8>, Vec<u8>)> = current_datom_entries
-            .iter()
-            .map(|d| (d.avet_key(), serde_json::to_vec(d).unwrap_or_default()))
-            .collect();
-        let datom_vaet_entries: Vec<(Vec<u8>, Vec<u8>)> = current_datom_entries
-            .iter()
-            .filter_map(|d| {
-                d.vaet_key()
-                    .map(|key| (key, serde_json::to_vec(d).unwrap_or_default()))
-            })
-            .collect();
-        let tea_entries: Vec<(Vec<u8>, Vec<u8>)> = datom_history
-            .iter()
-            .map(|d| (d.tea_key(), serde_json::to_vec(d).unwrap_or_default()))
+            .filter_map(|d| d.vaet_key().map(|k| (k, enc(d))))
             .collect();
 
-        // Build Quad compatibility trees plus Datom-native 5 indexes in parallel.
+        // Distinct triples touched by the tx → prior-representative delete keys.
+        let mut avet_del_prefixes: Vec<Vec<u8>> = Vec::new();
+        let mut vaet_del_prefixes: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            for d in &tx_datoms {
+                let p = d.avet_prefix();
+                if seen.insert(p.clone()) {
+                    avet_del_prefixes.push(p);
+                    if let Some(vp) = d.vaet_prefix() {
+                        vaet_del_prefixes.push(vp);
+                    }
+                }
+            }
+        }
+
+        // Build Quad compatibility trees (full rebuild from the in-memory
+        // Arrangement) plus the Datom-native 5 indexes (incremental) in parallel.
         // Each thread gets a CapturingBlockStore that writes through to the shared hot store
         // and simultaneously records every block written — used below for CAR bundling.
         let bs = Arc::clone(&self.block_store);
         let tree_inputs: Vec<TreeInput> = vec![
-            ("eavt", eavt_entries),
-            ("aevt", aevt_entries),
-            ("avet", avet_entries),
-            ("vaet", vaet_entries),
-            ("datom_eavt", datom_eavt_entries),
-            ("datom_aevt", datom_aevt_entries),
-            ("datom_avet", datom_avet_entries),
-            ("datom_vaet", datom_vaet_entries),
-            ("tea", tea_entries),
+            ("eavt", TreeOp::Build(eavt_entries)),
+            ("aevt", TreeOp::Build(aevt_entries)),
+            ("avet", TreeOp::Build(avet_entries)),
+            ("vaet", TreeOp::Build(vaet_entries)),
+            (
+                "datom_eavt",
+                TreeOp::Apply {
+                    prev_root: prev_root("datom_eavt"),
+                    upserts: datom_eavt_up,
+                    deletes: vec![],
+                    delete_prefixes: vec![],
+                },
+            ),
+            (
+                "datom_aevt",
+                TreeOp::Apply {
+                    prev_root: prev_root("datom_aevt"),
+                    upserts: datom_aevt_up,
+                    deletes: vec![],
+                    delete_prefixes: vec![],
+                },
+            ),
+            (
+                "datom_avet",
+                TreeOp::Apply {
+                    prev_root: prev_root("datom_avet"),
+                    upserts: datom_avet_up,
+                    deletes: vec![],
+                    delete_prefixes: avet_del_prefixes,
+                },
+            ),
+            (
+                "datom_vaet",
+                TreeOp::Apply {
+                    prev_root: prev_root("datom_vaet"),
+                    upserts: datom_vaet_up,
+                    deletes: vec![],
+                    delete_prefixes: vaet_del_prefixes,
+                },
+            ),
+            (
+                "tea",
+                TreeOp::Apply {
+                    prev_root: prev_root("tea"),
+                    upserts: tea_up,
+                    deletes: vec![],
+                    delete_prefixes: vec![],
+                },
+            ),
         ];
 
         // BlockStore::put on the Kubo cold tier uses `tokio::task::block_in_place
@@ -3336,7 +3433,7 @@ impl QuadStore {
 
         let input_names: Vec<&'static str> = tree_inputs.iter().map(|(name, _)| *name).collect();
         let mut handles = Vec::with_capacity(tree_inputs.len());
-        for (name, entries) in tree_inputs {
+        for (name, op) in tree_inputs {
             let inner = Arc::clone(&bs);
             let rt = tokio_handle.clone();
             let handle = std::thread::Builder::new()
@@ -3345,7 +3442,33 @@ impl QuadStore {
                 .spawn(move || -> TreeResult {
                     let _guard = rt.as_ref().map(|h| h.enter());
                     let cap = Arc::new(CapturingBlockStore::new(inner));
-                    let root = ProllyTree::build_tree(entries, &*cap)?;
+                    let root = match op {
+                        TreeOp::Build(entries) => ProllyTree::build_tree(entries, &*cap)?,
+                        TreeOp::Apply {
+                            prev_root,
+                            upserts,
+                            mut deletes,
+                            delete_prefixes,
+                        } => {
+                            // Resolve each prior-representative prefix against the
+                            // previous root (bounded scan_prefix, delta-sized).
+                            if let Some(root) = prev_root.as_ref() {
+                                for prefix in &delete_prefixes {
+                                    for (k, _) in
+                                        ProllyTree::scan_prefix(root, prefix, &*cap)?
+                                    {
+                                        deletes.push(k);
+                                    }
+                                }
+                            }
+                            ProllyTree::apply_batch(
+                                prev_root.as_ref(),
+                                upserts,
+                                deletes,
+                                &*cap,
+                            )?
+                        }
+                    };
                     let blocks = cap.drain();
                     Ok((root, blocks))
                 })
@@ -3621,19 +3744,9 @@ fn sparql_term_to_quad_object(
 ) -> anyhow::Result<kotoba_kqe::quad::LegacyQuadObject> {
     use spargebra::term::Term;
     match term {
-        Term::Literal(lit) => {
-            let v = lit.value();
-            if let Ok(i) = v.parse::<i64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Integer(i));
-            }
-            if let Ok(f) = v.parse::<f64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Float(f));
-            }
-            if v == "true" || v == "false" {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Bool(v == "true"));
-            }
-            Ok(kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string()))
-        }
+        // Same typing as the AVET query path (`typed_literal_object`) so stored
+        // and queried values share one canonical key.
+        Term::Literal(lit) => Ok(typed_literal_object(lit.value())),
         Term::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
@@ -3979,6 +4092,61 @@ fn extract_pred_literal_triple(
     Some((pred, val, svar))
 }
 
+/// CBOR (de)serialisation for persisted ProllyTree leaf values.
+///
+/// kotoba's block layer is DAG-CBOR throughout (CIDv1 dag-cbor); encoding leaf
+/// values as CBOR rather than JSON keeps them compact and byte-stable, so
+/// identical facts hash to identical leaf CIDs (structural sharing + dedup) and
+/// blocks are smaller on disk / over IPFS.
+fn enc_datom(d: &Datom) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = ciborium::into_writer(d, &mut buf);
+    buf
+}
+
+/// Decode a CBOR-encoded [`Datom`] leaf value.
+fn dec_datom(bytes: &[u8]) -> Option<Datom> {
+    ciborium::from_reader(bytes).ok()
+}
+
+/// Encode a [`LegacyQuadObject`] (Quad-compat index leaf value) as CBOR.
+fn enc_object(o: &LegacyQuadObject) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = ciborium::into_writer(o, &mut buf);
+    buf
+}
+
+/// Canonical AVET value key for a query/stored object — the **same keycodec
+/// encoding** the hot `pos` index and the cold Prolly AVET keys use, so query
+/// keys match stored keys and value order is numeric + type-segregated
+/// (ADR-2606022150 D2 / P2b). Both the hot point lookup and the cold scan prefix
+/// route through this.
+fn avet_value_key(object: &LegacyQuadObject) -> Vec<u8> {
+    kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::from(object.clone()))
+}
+
+/// Type a SPARQL literal value string into a `LegacyQuadObject` exactly as the
+/// **store** does (`sparql_term_to_quad_object`): `i64` → Integer, `f64` →
+/// Float, `true`/`false` → Bool, else Text. The AVET query path MUST type a
+/// literal the same way the value was stored, or the canonical keys won't match
+/// (a `"100"` stored as Integer would never be found by a Text-typed query).
+fn typed_literal_object(v: &str) -> LegacyQuadObject {
+    if let Ok(i) = v.parse::<i64>() {
+        LegacyQuadObject::Integer(i)
+    } else if let Ok(f) = v.parse::<f64>() {
+        LegacyQuadObject::Float(f)
+    } else if v == "true" || v == "false" {
+        LegacyQuadObject::Bool(v == "true")
+    } else {
+        LegacyQuadObject::Text(v.to_string())
+    }
+}
+
+/// Decode a CBOR-encoded [`LegacyQuadObject`]; empty-text fallback on error.
+fn dec_object(bytes: &[u8]) -> LegacyQuadObject {
+    ciborium::from_reader(bytes).unwrap_or(LegacyQuadObject::Text(String::new()))
+}
+
 fn current_datoms(history: Vec<Datom>) -> Vec<Datom> {
     let mut seen = std::collections::HashSet::<Vec<u8>>::new();
     let mut out = Vec::new();
@@ -4001,13 +4169,66 @@ fn current_datoms(history: Vec<Datom>) -> Vec<Datom> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_kqe::quad::LegacyQuadObject;
     // The test bodies refer to the object enum by its short name `QuadObject`
     // (the lib historically re-exported it under that alias). Keep the alias so
     // the test module compiles against the renamed `LegacyQuadObject`.
     use kotoba_kqe::quad::LegacyQuadObject as QuadObject;
     use kotoba_kse::Journal;
     use kotoba_store::MemoryBlockStore;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A `BlockStore` decorator that counts the bytes returned by `get()` — used
+    /// to prove that `commit()` reads work proportional to the transaction
+    /// *delta*, not to the accumulated history (the metric that decides cold-tier
+    /// / IPFS latency).
+    struct CountingBlockStore {
+        inner: MemoryBlockStore,
+        bytes_read: AtomicU64,
+    }
+    impl CountingBlockStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBlockStore::new(),
+                bytes_read: AtomicU64::new(0),
+            }
+        }
+        fn reset(&self) {
+            self.bytes_read.store(0, Ordering::SeqCst);
+        }
+        fn bytes(&self) -> u64 {
+            self.bytes_read.load(Ordering::SeqCst)
+        }
+    }
+    impl BlockStore for CountingBlockStore {
+        fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+            self.inner.put(cid, data)
+        }
+        fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
+            let r = self.inner.get(cid)?;
+            if let Some(b) = &r {
+                self.bytes_read.fetch_add(b.len() as u64, Ordering::SeqCst);
+            }
+            Ok(r)
+        }
+        fn has(&self, cid: &KotobaCid) -> bool {
+            self.inner.has(cid)
+        }
+        fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+            self.inner.delete(cid)
+        }
+        fn pin(&self, cid: &KotobaCid) {
+            self.inner.pin(cid)
+        }
+        fn unpin(&self, cid: &KotobaCid) {
+            self.inner.unpin(cid)
+        }
+        fn is_pinned(&self, cid: &KotobaCid) -> bool {
+            self.inner.is_pinned(cid)
+        }
+        fn all_cids(&self) -> Vec<KotobaCid> {
+            self.inner.all_cids()
+        }
+    }
 
     fn make_quad(g: &str, s: &str, p: &str, o: &str) -> Quad {
         Quad {
@@ -4070,6 +4291,219 @@ mod tests {
             );
         }
         assert!(block_store.has(head.index_roots.get("tea").unwrap()));
+    }
+
+    /// The incremental commit path (path-copy onto the previous commit's index
+    /// roots, no full-history cold re-read) must produce Datom-native index roots
+    /// that are **bit-for-bit identical** to a from-scratch rebuild of the
+    /// cumulative datom history.  Exercises asserts, retracts, current-view
+    /// representative replacement (retract+re-assert), and ref (VAET) values
+    /// across a multi-commit chain.
+    /// The headline guarantee of the incremental commit path: a fixed-size
+    /// transaction reads roughly the **same** number of bytes from the block
+    /// store whether it lands on a small graph or a large one — i.e. commit cost
+    /// is independent of accumulated history.  The old `history_datoms_cold()`
+    /// full re-read made this scale linearly with total datoms; eliminating it
+    /// makes it scale with the delta.  A regression that reintroduces a
+    /// full-history scan would blow the bound (and read ≫ the history).
+    #[tokio::test]
+    async fn commit_reads_scale_with_delta_not_history() {
+        // Commit `delta` fresh datoms onto a graph pre-seeded with `base` datoms,
+        // returning the bytes read from the block store during that commit only.
+        async fn measure_commit(base: u64, delta: u64) -> u64 {
+            let journal = Arc::new(Journal::new());
+            let store = Arc::new(CountingBlockStore::new());
+            let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&store) as _);
+            let graph = KotobaCid::from_bytes(b"delta-scale-graph");
+
+            for i in 0..base {
+                qs.assert(make_quad(
+                    "delta-scale-graph",
+                    &format!("s{i}"),
+                    "p",
+                    &format!("v{i}"),
+                ))
+                .await;
+            }
+            qs.commit("did:test", graph.clone(), 1).await.unwrap();
+            qs.reset_arrangement(&graph).await;
+
+            // Measured commit: a small, fixed-size delta of brand-new datoms.
+            for i in 0..delta {
+                qs.assert(make_quad(
+                    "delta-scale-graph",
+                    &format!("d{base}_{i}"),
+                    "p",
+                    &format!("w{i}"),
+                ))
+                .await;
+            }
+            store.reset();
+            qs.commit("did:test", graph.clone(), 2).await.unwrap();
+            store.bytes()
+        }
+
+        // Scaling curve.  Fixed delta, growing base.  In the small regime
+        // (delta ≳ #leaves) a content-hashed delta scatters across *every* leaf,
+        // so reads grow with the base.  Once the tree is large enough that
+        // #leaves ≫ delta, a scattered delta touches only ~delta leaves and the
+        // per-commit read **plateaus** — the O(delta) behaviour that proves the
+        // full-history re-read is gone.  We assert the plateau between the two
+        // largest bases (a true-O(N) re-read would keep scaling ~4×).
+        let delta = 30u64;
+        let b_small = measure_commit(2_000, delta).await;
+        let b_mid = measure_commit(8_000, delta).await;
+        let b_large = measure_commit(32_000, delta).await;
+
+        eprintln!(
+            "commit-read bytes for a {delta}-datom delta: base=2k -> {b_small} B, \
+             base=8k -> {b_mid} B, base=32k -> {b_large} B \
+             (ratios 8k/2k={:.2}, 32k/8k={:.2})",
+            b_mid as f64 / b_small.max(1) as f64,
+            b_large as f64 / b_mid.max(1) as f64,
+        );
+
+        // 4× more history between base=8k and base=32k; an O(history) re-read
+        // would read ~4× more.  Incremental should be near-flat (plateau).
+        assert!(
+            b_large < b_mid * 2,
+            "commit reads did not plateau: base=8k read {b_mid} B, base=32k read {b_large} B \
+             (4× the history; expected < 2× for O(delta), got {:.2}×)",
+            b_large as f64 / b_mid.max(1) as f64,
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_commit_datom_roots_match_full_rebuild() {
+        let journal = Arc::new(Journal::new());
+        let block_store = Arc::new(MemoryBlockStore::new());
+        let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
+        let graph = KotobaCid::from_bytes(b"incr-eq-graph");
+        let alice = KotobaCid::from_bytes(b"alice");
+        let bob = KotobaCid::from_bytes(b"bob-entity");
+
+        let carol = KotobaCid::from_bytes(b"carol");
+        let ref_quad = |obj: KotobaCid| Quad {
+            graph: graph.clone(),
+            subject: alice.clone(),
+            predicate: ":knows".into(),
+            object: QuadObject::Cid(obj),
+        };
+
+        // Test-side model of the current view, keyed by (e,a,v) → representative
+        // Datom (op=true, asserting tx).  Updated chronologically per commit so it
+        // stays correct regardless of tx-hash ordering.  `None` value = retract.
+        let mut model: std::collections::BTreeMap<Vec<u8>, Datom> =
+            std::collections::BTreeMap::new();
+
+        // Verify the committed datom index roots.  Append-only trees
+        // (datom_eavt/aevt/tea) are rebuilt from the cold full history (a unique-
+        // key set, so order-independent).  Current-view trees (datom_avet/vaet)
+        // are rebuilt from the chronologically-correct `model`.
+        async fn check(
+            qs: &QuadStore,
+            block_store: &MemoryBlockStore,
+            graph: &KotobaCid,
+            model: &std::collections::BTreeMap<Vec<u8>, Datom>,
+            label: &str,
+        ) {
+            let head = qs.head_commit(graph).await.unwrap();
+            let history = qs.history_datoms_cold(graph).await.unwrap();
+            let enc = enc_datom;
+            let bs: &dyn BlockStore = block_store;
+
+            let exp_eavt = ProllyTree::build_tree(
+                history.iter().map(|d| (d.eavt_key(), enc(d))).collect(),
+                bs,
+            )
+            .unwrap();
+            let exp_aevt = ProllyTree::build_tree(
+                history.iter().map(|d| (d.aevt_key(), enc(d))).collect(),
+                bs,
+            )
+            .unwrap();
+            let exp_tea = ProllyTree::build_tree(
+                history.iter().map(|d| (d.tea_key(), enc(d))).collect(),
+                bs,
+            )
+            .unwrap();
+            let exp_avet = ProllyTree::build_tree(
+                model.values().map(|d| (d.avet_key(), enc(d))).collect(),
+                bs,
+            )
+            .unwrap();
+            let exp_vaet = ProllyTree::build_tree(
+                model
+                    .values()
+                    .filter_map(|d| d.vaet_key().map(|k| (k, enc(d))))
+                    .collect(),
+                bs,
+            )
+            .unwrap();
+
+            assert_eq!(
+                head.index_roots.get("datom_eavt"),
+                Some(&exp_eavt),
+                "{label}: datom_eavt root mismatch"
+            );
+            assert_eq!(
+                head.index_roots.get("datom_aevt"),
+                Some(&exp_aevt),
+                "{label}: datom_aevt root mismatch"
+            );
+            assert_eq!(
+                head.index_roots.get("tea"),
+                Some(&exp_tea),
+                "{label}: tea root mismatch"
+            );
+            assert_eq!(
+                head.index_roots.get("datom_avet"),
+                Some(&exp_avet),
+                "{label}: datom_avet root mismatch"
+            );
+            assert_eq!(
+                head.index_roots.get("datom_vaet"),
+                Some(&exp_vaet),
+                "{label}: datom_vaet root mismatch"
+            );
+        }
+
+        // commit 1 — two asserts, one of them a ref (VAET).
+        qs.assert(make_quad("incr-eq-graph", "alice", "name", "Alice"))
+            .await;
+        qs.assert(ref_quad(bob.clone())).await;
+        qs.commit("did:test", graph.clone(), 1).await.unwrap();
+        let t1 = qs.head_commit(&graph).await.unwrap().tx_cid;
+        let d_name_alice = Datom::assert(alice.clone(), "name".into(), Value::Text("Alice".into()), t1.clone());
+        let d_knows_bob = Datom::assert(alice.clone(), ":knows".into(), Value::Cid(bob.clone()), t1.clone());
+        model.insert(d_name_alice.avet_prefix(), d_name_alice);
+        model.insert(d_knows_bob.avet_prefix(), d_knows_bob);
+        check(&qs, &block_store, &graph, &model, "after commit 1").await;
+
+        // commit 2 — retract + re-assert (current-view representative changes tx).
+        qs.retract(make_quad("incr-eq-graph", "alice", "name", "Alice"))
+            .await;
+        qs.assert(make_quad("incr-eq-graph", "alice", "name", "Alicia"))
+            .await;
+        qs.commit("did:test", graph.clone(), 2).await.unwrap();
+        let t2 = qs.head_commit(&graph).await.unwrap().tx_cid;
+        let alice_alice = Datom::assert(alice.clone(), "name".into(), Value::Text("Alice".into()), t2.clone());
+        model.remove(&alice_alice.avet_prefix());
+        let d_name_alicia = Datom::assert(alice.clone(), "name".into(), Value::Text("Alicia".into()), t2.clone());
+        model.insert(d_name_alicia.avet_prefix(), d_name_alicia);
+        check(&qs, &block_store, &graph, &model, "after commit 2").await;
+
+        // commit 3 — retract the ref (VAET delete) + add an unrelated assert.
+        qs.retract(ref_quad(bob.clone())).await;
+        qs.assert(make_quad("incr-eq-graph", "carol", "name", "Carol"))
+            .await;
+        qs.commit("did:test", graph.clone(), 3).await.unwrap();
+        let t3 = qs.head_commit(&graph).await.unwrap().tx_cid;
+        let knows_bob3 = Datom::assert(alice.clone(), ":knows".into(), Value::Cid(bob.clone()), t3.clone());
+        model.remove(&knows_bob3.avet_prefix());
+        let d_carol = Datom::assert(carol.clone(), "name".into(), Value::Text("Carol".into()), t3.clone());
+        model.insert(d_carol.avet_prefix(), d_carol);
+        check(&qs, &block_store, &graph, &model, "after commit 3").await;
     }
 
     #[tokio::test]
@@ -4414,7 +4848,7 @@ mod tests {
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"no-graph");
-        assert_eq!(qs.count_by_attribute_prefix(&unknown, "ai.gftd/").await, 0);
+        assert_eq!(qs.count_by_attribute_prefix(&unknown, "com.etzhayyim/").await, 0);
     }
 
     #[tokio::test]
@@ -4664,8 +5098,9 @@ mod tests {
         let (qs, graph, _) =
             setup_committed_qs("cacao-avet-g", "cacao-avet-s", "role", "admin").await;
         let chain = DelegationChain::new_for_test("wrong-graph", "datom:read");
+        let admin_vk = avet_value_key(&LegacyQuadObject::Text("admin".into()));
         let result = qs
-            .lookup_subject_by_po_cold_authed(&graph, "role", "admin", &chain)
+            .lookup_subject_by_po_cold_authed(&graph, "role", &admin_vk, &chain)
             .await;
         assert!(result.is_err());
     }
@@ -6201,6 +6636,44 @@ mod tests {
             "?".into()
         };
         assert_eq!(role, "admin");
+    }
+
+    /// Regression (ADR-2606022150 P2b): a numeric literal is stored as `Integer`
+    /// by the SPARQL writer, so the AVET query path must type the query literal
+    /// the same way — otherwise `keycodec(Integer 100) != keycodec(Text "100")`
+    /// and the value is never found. (The old String `value_key` matched by
+    /// stringification; the canonical codec must not regress this.)
+    #[tokio::test]
+    async fn sparql_insert_numeric_then_select_by_literal_matches() {
+        let qs = QuadStore::new(
+            Arc::new(Journal::new()),
+            Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
+        );
+        let graph = KotobaCid::from_bytes(b"numeric-avet-graph");
+        let a = KotobaCid::from_bytes(b"ent-a").to_multibase();
+        let b = KotobaCid::from_bytes(b"ent-b").to_multibase();
+        qs.sparql_update(
+            &graph,
+            &format!(r#"INSERT DATA {{ <cid:{a}> <score> "100" . <cid:{b}> <score> "20" }}"#),
+        )
+        .await
+        .unwrap();
+
+        // SELECT ?s <score> "100" must find exactly ent-a (numeric match, not "20").
+        let hits = qs
+            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <score> "100" }"#)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "numeric literal 100 must match its entity");
+        assert_eq!(hits[0].subject, KotobaCid::from_multibase(&a).unwrap());
+
+        // "20" matches its own entity, not 100's — no cross-collision.
+        let hits20 = qs
+            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <score> "20" }"#)
+            .await
+            .unwrap();
+        assert_eq!(hits20.len(), 1);
+        assert_eq!(hits20[0].subject, KotobaCid::from_multibase(&b).unwrap());
     }
 
     #[tokio::test]
@@ -7778,7 +8251,8 @@ mod tests {
             .arrangements
             .get(&graph.to_multibase())
             .expect("hot arrangement present");
-        let editors: Vec<_> = arr_ref.get_entities_by_attribute_value("role", "editor");
+        let editors: Vec<_> =
+            arr_ref.get_entities_by_attribute_value("role", &kotoba_kqe::Value::Text("editor".into()));
         assert_eq!(editors.len(), 1, "uncommitted WAL editor quad must be hot");
         drop(arr_ref);
 

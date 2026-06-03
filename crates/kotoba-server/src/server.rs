@@ -313,6 +313,10 @@ pub struct KotobaState {
     /// Replay-prevention registry for CACAO nonces (CAIP-74 §8).
     /// Tracks each nonce until the corresponding CACAO expires.
     pub nonce_store: Arc<crate::nonce_store::NonceStore>,
+    // ── Write-cost economy (ADR-2606013400) ───────────────────────────────────
+    /// Per-DID mKOTO balance ledger. `datomic.transact` debits the writer here;
+    /// the operator is exempt/unlimited. See `crate::econ::Econ`.
+    pub econ: Arc<crate::econ::Econ>,
     // ── Outbound HTTP ─────────────────────────────────────────────────────────
     /// Shared HTTP client — used for did:web DID document resolution and other
     /// outbound fetches.  10-second timeout; connection pool reused across requests.
@@ -502,19 +506,48 @@ impl KotobaState {
             }
         };
 
-        let raw_ipns_registry: Arc<dyn IpnsRegistry> = match std::env::var("KOTOBA_IPNS") {
-            Ok(mode) if mode.eq_ignore_ascii_case("kubo") => {
+        // IPNS registry = the mutable-name boundary holding each datomic graph's
+        // head (latest commit CID). Default is now **disk-persistent** so graph
+        // heads survive a restart (the in-memory registry loses them → datomic
+        // reads 404 after restart even though commit blocks are durable in the
+        // cold tier). Selection (KOTOBA_IPNS): `kubo` = Kubo IPNS (distributed);
+        // `memory` = ephemeral (explicit opt-out, tests); unset = persistent file
+        // under KOTOBA_STORE_PATH (falls back to in-memory only when no store
+        // path is configured). See ADR-2606013600.
+        let raw_ipns_registry: Arc<dyn IpnsRegistry> = match std::env::var("KOTOBA_IPNS")
+            .ok()
+            .as_deref()
+        {
+            Some(mode) if mode.eq_ignore_ascii_case("kubo") => {
                 tracing::info!(
                     "IPNS Registry: Kubo /api/v0/name publish/resolve enabled via KOTOBA_IPNS=kubo"
                 );
                 Arc::new(KuboIpnsRegistry::from_env())
             }
-            _ => {
-                tracing::info!(
-                    "IPNS Registry: in-memory graph heads (set KOTOBA_IPNS=kubo for Kubo name publish)"
+            Some(mode) if mode.eq_ignore_ascii_case("memory") => {
+                tracing::warn!(
+                    "IPNS Registry: in-memory graph heads (KOTOBA_IPNS=memory) — heads are LOST on restart"
                 );
                 Arc::new(InMemoryIpnsRegistry::new())
             }
+            _ => match std::env::var("KOTOBA_STORE_PATH") {
+                Ok(dir) if !dir.trim().is_empty() => {
+                    let path = std::path::Path::new(&dir).join("ipns-heads.json");
+                    let reg = kotoba_ipfs::PersistentIpnsRegistry::open(&path);
+                    tracing::info!(
+                        heads = reg.len(),
+                        path = %path.display(),
+                        "IPNS Registry: disk-persistent graph heads (durable across restart)"
+                    );
+                    Arc::new(reg)
+                }
+                _ => {
+                    tracing::warn!(
+                        "IPNS Registry: in-memory graph heads (no KOTOBA_STORE_PATH set) — heads are LOST on restart; set KOTOBA_STORE_PATH for persistence"
+                    );
+                    Arc::new(InMemoryIpnsRegistry::new())
+                }
+            },
         };
         let ipns_registry: Arc<dyn IpnsRegistry> = match std::env::var(
             "KOTOBA_IPNS_REQUIRE_SIGNATURE",
@@ -677,7 +710,7 @@ impl KotobaState {
         // Named graph registry — pre-populate well-known graphs.
         //
         // `kotobase-kg-v1` is the multi-tenant kotobase data plane (named graph
-        // backing ai.gftd.apps.kotobase.kg.*).  It is explicitly registered as
+        // backing com.etzhayyim.apps.kotobase.kg.*).  It is explicitly registered as
         // `Authenticated` (any valid Bearer JWT may read) so that tenant apps
         // can read back data they themselves wrote without provisioning a
         // depth-2 CACAO delegation chain.  Writes still require Bearer auth
@@ -717,6 +750,11 @@ impl KotobaState {
             // survives a pod restart for cold db_from_head reconstruction. Mirrors
             // the yukkuri-kg-v3 rationale above.
             let sh_g = NamedGraph::new("shinshi-kg-v1", GraphVisibility::Authenticated);
+            // yoro AppView social feed graph — public reads (ADR-2606013200).
+            // Holds :yoro.post/* :yoro.profile/* :yoro.follow/* Datoms, read by
+            // @etzhayyim/yoro-rw-free over datomic.datoms. Public so the feed
+            // serves without auth; every other graph on this node stays private.
+            let yoro_g = NamedGraph::new("yoro-social-v1", GraphVisibility::Public);
             map.insert(pub_g.cid.clone(), (pub_g.name.clone(), pub_g.visibility));
             map.insert(auth_g.cid.clone(), (auth_g.name.clone(), auth_g.visibility));
             map.insert(kg_g.cid.clone(), (kg_g.name.clone(), kg_g.visibility));
@@ -724,8 +762,12 @@ impl KotobaState {
             map.insert(yk_g2.cid.clone(), (yk_g2.name.clone(), yk_g2.visibility));
             map.insert(yk_g3.cid.clone(), (yk_g3.name.clone(), yk_g3.visibility));
             map.insert(sh_g.cid.clone(), (sh_g.name.clone(), sh_g.visibility));
+            map.insert(yoro_g.cid.clone(), (yoro_g.name.clone(), yoro_g.visibility));
             Arc::new(tokio::sync::RwLock::new(map))
         };
+
+        // Write-cost economy (ADR-2606013400) — operator-funded mKOTO ledger.
+        let econ = crate::econ::Econ::from_env(operator_did.clone());
 
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
@@ -760,6 +802,7 @@ impl KotobaState {
             media_embed_client,
             pre_key_registry: None,
             graph_registry,
+            econ,
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
             datomic_live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             datomic_cold_db_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -959,9 +1002,8 @@ impl KotobaState {
         &self,
         owner_did: &str,
     ) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
-        Ok(self
-            .crypto_required()?
-            .derive_wrapping_key(owner_did.as_bytes()))
+        let key = blake3::derive_key("kotoba-server-pre-wrapping-key", owner_did.as_bytes());
+        Ok(zeroize::Zeroizing::new(key))
     }
 
     /// Revoke a PRE re-key grant locally AND propagate the revocation to peers
@@ -977,12 +1019,11 @@ impl KotobaState {
         let Some(reg) = &self.pre_key_registry else {
             return Ok(());
         };
-        let (_evidence_cid, bytes) = reg
-            .revoke_emit_warrant_bytes(owner_did, accessor_did)
-            .await?;
+        let evidence_cid = reg.revoke_emit_warrant(owner_did, accessor_did).await?;
         // Channel carries raw KSE names (no "kotoba/" prefix); publish adds it.
         if let Some(tx) = &self.gossip_tx {
-            tx.try_send(("rekey/revoke".to_string(), bytes)).ok();
+            tx.try_send(("rekey/revoke".to_string(), evidence_cid.to_multibase().into_bytes()))
+                .ok();
         }
         Ok(())
     }
@@ -1422,6 +1463,16 @@ mod tests {
         ATTR_DID_CORE_ID, ATTR_DID_CORE_SERVICE, ATTR_DID_CORE_SERVICE_ENDPOINT, ATTR_RDF_TYPE,
     };
 
+    /// Serializes tests that mutate process-global env vars (`KOTOBA_*`). The test
+    /// runner executes tokio tests in parallel, so `set_var`/`remove_var` on the
+    /// same variable race; holding this guard for the set→build→assert→remove
+    /// window makes those tests mutually exclusive. Poison-tolerant so one failing
+    /// test does not cascade-poison the rest.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn node_role_from_env_defaults_to_both() {
         std::env::remove_var("KOTOBA_NODE_ROLES");
@@ -1470,11 +1521,13 @@ mod tests {
     fn kotoba_state_new_node_id_deterministic_in_ephemeral_mode() {
         // Two states created without env vars both derive NodeId from a freshly
         // generated ephemeral key — they should differ (each is random).
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
         std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_DID");
         let a = KotobaState::new(None).expect("a");
         let b = KotobaState::new(None).expect("b");
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
         // ephemeral → each call generates a fresh key → different NodeIds
         assert_ne!(
             a.local_node_id.0, b.local_node_id.0,
@@ -1484,8 +1537,17 @@ mod tests {
 
     #[tokio::test]
     async fn register_node_writes_distributed_datomic_head_and_quads() {
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS", "memory");
+        std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
+        std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
+        std::env::remove_var("KOTOBA_AGENT_DID");
         let state = KotobaState::new(None).expect("new");
         state.register_node().await;
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        std::env::remove_var("KOTOBA_IPNS");
 
         use kotoba_core::cid::KotobaCid;
         let graph_cid = KotobaCid::from_bytes(b"kotoba/network/nodes");
@@ -1530,6 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_did_document_advertises_kotoba_protocol_services() {
+        let _env = env_guard(); // serialize KOTOBA_ATPROTO_PDS_ENDPOINT mutation
         std::env::set_var("KOTOBA_ATPROTO_PDS_ENDPOINT", "https://pds.example.com");
         let state = KotobaState::new(None).expect("new");
         let doc = state.local_did_document().await;
@@ -1561,6 +1624,7 @@ mod tests {
 
     #[test]
     fn kotoba_state_did_resolver_falls_back_to_did_key_with_protocol_services() {
+        let _env = env_guard(); // serialize KOTOBA_ATPROTO_PDS_ENDPOINT mutation
         std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
         std::env::remove_var("KOTOBA_AGENT_DID");
         std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
@@ -1628,6 +1692,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
                 datoms: doc.to_datoms(tx_cid.clone()),
@@ -1737,6 +1802,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
                 datoms,
@@ -1841,12 +1907,18 @@ mod tests {
     async fn init_crypto_preserves_operator_did() {
         // Guard against the double-generation bug: init_crypto() must not call
         // AgentIdentity::from_env() again; it must reuse the Arc stored in new().
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS", "memory");
         std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
         std::env::remove_var("KOTOBA_AGENT_DID");
         let state = KotobaState::new(None).expect("new");
         let did_before = state.operator_did.clone();
         let state = state.init_crypto().await.expect("init_crypto");
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        std::env::remove_var("KOTOBA_IPNS");
         assert_eq!(
             state.operator_did, did_before,
             "operator_did must be unchanged after init_crypto"

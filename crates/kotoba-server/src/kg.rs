@@ -1,6 +1,6 @@
 //! yatabase KG entity lookup endpoint backed by kotoba Datom projection indexes.
 //!
-//! NSID: ai.gftd.apps.kotobase.kg.entity
+//! NSID: com.etzhayyim.apps.kotobase.kg.entity
 //! All KG quads live in the named graph `kotobase-kg-v1`.
 //!
 //! Predicate conventions (written by seed_kotoba.py):
@@ -77,18 +77,18 @@ fn require_kg_write_auth(headers: &HeaderMap) -> Result<(), (StatusCode, String)
     Ok(())
 }
 
-pub const NSID_KG_ENTITY: &str = "ai.gftd.apps.kotobase.kg.entity";
-pub const NSID_KG_CATALOG: &str = "ai.gftd.apps.kotobase.kg.catalog";
-pub const NSID_KG_EMBED: &str = "ai.gftd.apps.kotobase.kg.embed";
-pub const NSID_KG_SEARCH: &str = "ai.gftd.apps.kotobase.kg.search";
-pub const NSID_KG_QUERY: &str = "ai.gftd.apps.kotobase.kg.query";
-pub const NSID_KG_SPARQL: &str = "ai.gftd.apps.kotoba.graph.sparql";
+pub const NSID_KG_ENTITY: &str = "com.etzhayyim.apps.kotobase.kg.entity";
+pub const NSID_KG_CATALOG: &str = "com.etzhayyim.apps.kotobase.kg.catalog";
+pub const NSID_KG_EMBED: &str = "com.etzhayyim.apps.kotobase.kg.embed";
+pub const NSID_KG_SEARCH: &str = "com.etzhayyim.apps.kotobase.kg.search";
+pub const NSID_KG_QUERY: &str = "com.etzhayyim.apps.kotobase.kg.query";
+pub const NSID_KG_SPARQL: &str = "com.etzhayyim.apps.kotoba.graph.sparql";
 const QUERY_ENGINE_DATOMIC: &str = "datomic";
 const STORAGE_MODEL_IPLD_DAG_CBOR_PROLLY_TREE: &str = "ipld-dag-cbor-prolly-tree";
-pub const NSID_KG_INGEST: &str = "ai.gftd.apps.kotobase.kg.ingest";
-pub const NSID_KG_INGEST_BATCH: &str = "ai.gftd.apps.kotobase.kg.ingest_batch";
-pub const NSID_KG_DELETE: &str = "ai.gftd.apps.kotobase.kg.delete";
-pub const NSID_KG_COMMIT: &str = "ai.gftd.apps.kotobase.kg.commit";
+pub const NSID_KG_INGEST: &str = "com.etzhayyim.apps.kotobase.kg.ingest";
+pub const NSID_KG_INGEST_BATCH: &str = "com.etzhayyim.apps.kotobase.kg.ingest_batch";
+pub const NSID_KG_DELETE: &str = "com.etzhayyim.apps.kotobase.kg.delete";
+pub const NSID_KG_COMMIT: &str = "com.etzhayyim.apps.kotobase.kg.commit";
 
 /// All yatabase KG quads are written into this named graph.
 pub fn kg_graph_cid() -> KotobaCid {
@@ -455,8 +455,8 @@ pub struct KgEntityResp {
     pub elapsed_ms: u128,
 }
 
-/// GET /xrpc/ai.gftd.apps.kotobase.kg.entity?id=<nanoid>
-/// GET /xrpc/ai.gftd.apps.kotobase.kg.entity?qid=Q42
+/// GET /xrpc/com.etzhayyim.apps.kotobase.kg.entity?id=<nanoid>
+/// GET /xrpc/com.etzhayyim.apps.kotobase.kg.entity?qid=Q42
 pub async fn kg_entity(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,
@@ -622,7 +622,7 @@ pub struct KgCatalogQuery {
     pub cacao_b64: Option<String>,
 }
 
-/// GET /xrpc/ai.gftd.apps.kotobase.kg.catalog
+/// GET /xrpc/com.etzhayyim.apps.kotobase.kg.catalog
 /// Returns aggregate stats and source breakdown from the distributed Datomic DB.
 pub async fn kg_catalog(
     State(state): State<Arc<KotobaState>>,
@@ -707,7 +707,7 @@ pub struct KgEmbedResp {
     pub dims: usize,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotobase.kg.embed
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.embed
 /// Compute a blake3 pseudo-vector for `text` and store it as a `kg/label_vec`
 /// VectorF32 quad for the entity.  Uses the inference engine when available.
 pub async fn kg_embed(
@@ -728,6 +728,14 @@ pub async fn kg_embed(
         ));
     }
     let graph_cid = kg_graph_cid();
+    let tx_cid = kg_tx_cid("embed", &[&req.entity_id]);
+    let auth = authorize_kg_write(
+        &state,
+        &headers,
+        req.cacao_b64.as_deref(),
+        req.auth_presentation.as_ref(),
+        &tx_cid,
+    )?;
 
     let quads = current_graph_quads(&state, &graph_cid).await?;
     let subject =
@@ -760,14 +768,6 @@ pub async fn kg_embed(
 
     let dims = vector.len();
     let datom = kg_datom(&subject, "kg/label_vec", KqeValue::VectorF32(vector));
-    let tx_cid = kg_tx_cid("embed", &[&req.entity_id]);
-    let auth = authorize_kg_write(
-        &state,
-        &headers,
-        req.cacao_b64.as_deref(),
-        req.auth_presentation.as_ref(),
-        &tx_cid,
-    )?;
     commit_kg_datoms(
         &state,
         subject,
@@ -809,7 +809,7 @@ fn default_limit() -> usize {
     10
 }
 
-/// GET /xrpc/ai.gftd.apps.kotobase.kg.search?q=<text>&limit=10
+/// GET /xrpc/com.etzhayyim.apps.kotobase.kg.search?q=<text>&limit=10
 /// Cosine similarity search over `kg/label_vec` VectorF32 quads.
 pub async fn kg_search(
     State(state): State<Arc<KotobaState>>,
@@ -969,7 +969,7 @@ pub struct KgIngestResp {
     pub quad_count: usize,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotobase.kg.ingest
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.ingest
 ///
 /// Write a KG entity into the `kotobase-kg-v1` named graph. Each field becomes
 /// a quad with predicate conventions matching `kg_entity` lookups.
@@ -1235,7 +1235,7 @@ pub struct KgIngestBatchResp {
 /// Bounds per-request memory + amortises HTTP overhead.
 const MAX_KG_BATCH_SIZE: usize = 1_000;
 
-/// POST /xrpc/ai.gftd.apps.kotobase.kg.ingest_batch
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.ingest_batch
 ///
 /// Ingest up to `MAX_KG_BATCH_SIZE` entities in a single HTTP request.
 /// Validation is run once before any writes; if any entity fails the entire
@@ -1493,7 +1493,7 @@ pub struct KgCommitResp {
     pub elapsed_ms: u128,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotobase.kg.commit
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.commit
 ///
 /// Return the distributed Datomic/IPLD head for the KG graph.  New KG writes
 /// publish their own DAG-CBOR/ProllyTree commits through IPNS; this endpoint is
@@ -1598,7 +1598,7 @@ pub async fn kg_commit(
     }
 }
 
-/// POST /xrpc/ai.gftd.apps.kotobase.kg.delete
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.delete
 ///
 /// Retract all quads for the given entity from the `kotobase-kg-v1` graph.
 /// Publishes a retract event to the Journal for each quad (WAL + GossipSub).
@@ -1724,7 +1724,7 @@ pub struct KgQueryReq {
     pub limit: Option<usize>,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotobase.kg.query
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.query
 /// Execute a SPARQL SELECT, Cypher MATCH/RETURN, or enterprise SQL SELECT
 /// against the Datom projection. All compilers lower to a `DatalogProgram`.
 ///
@@ -1935,7 +1935,7 @@ pub struct SparqlReq {
     pub max_hops: usize,
 }
 
-/// POST /xrpc/ai.gftd.apps.kotoba.graph.sparql
+/// POST /xrpc/com.etzhayyim.apps.kotoba.graph.sparql
 ///
 /// Execute a SPARQL query directly against the distributed Datomic DB view.
 /// Supports all four query forms; result shape varies:
@@ -2143,6 +2143,7 @@ mod tests {
         let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
         let first = writer
             .commit_datoms(CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
                 datoms: vec![
@@ -2167,6 +2168,7 @@ mod tests {
             .unwrap();
         writer
             .commit_datoms(CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
                 datoms: vec![
@@ -2309,6 +2311,7 @@ mod tests {
         let alice = KotobaCid::from_bytes(b"kg-sparql-vp-private-alice");
         DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
             .commit_datoms(CommitDatomsRequest {
+                covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
                 datoms: vec![Datom::assert(

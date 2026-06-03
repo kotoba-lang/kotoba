@@ -134,16 +134,35 @@ impl Datom {
 
     /// AVET key: A + V + E + descending T + op.
     pub fn avet_key(&self) -> Vec<u8> {
+        let mut key = self.avet_prefix();
+        push_tx_desc_and_op(&mut key, &self.tx, self.op);
+        key
+    }
+
+    /// AVET key prefix (A + V + E) without the trailing T/op discriminator.
+    ///
+    /// In the current-view AVET index there is at most one datom per `(e, a, v)`
+    /// triple, so this prefix uniquely addresses that triple's representative —
+    /// used by incremental commit to locate (and retract) the prior
+    /// representative via a bounded `scan_prefix`.
+    pub fn avet_prefix(&self) -> Vec<u8> {
         let mut key = Vec::new();
         push_str(&mut key, &self.a);
         push_value(&mut key, &self.v);
         key.extend_from_slice(&self.e.0);
-        push_tx_desc_and_op(&mut key, &self.tx, self.op);
         key
     }
 
     /// VAET key: V + A + E + descending T + op. Only ref values have a key.
     pub fn vaet_key(&self) -> Option<Vec<u8>> {
+        let mut key = self.vaet_prefix()?;
+        push_tx_desc_and_op(&mut key, &self.tx, self.op);
+        Some(key)
+    }
+
+    /// VAET key prefix (V + A + E) without the trailing T/op discriminator.
+    /// `None` for non-ref values (only `Value::Cid` is indexed in VAET).
+    pub fn vaet_prefix(&self) -> Option<Vec<u8>> {
         if !matches!(self.v, Value::Cid(_)) {
             return None;
         }
@@ -151,7 +170,6 @@ impl Datom {
         push_value(&mut key, &self.v);
         push_str(&mut key, &self.a);
         key.extend_from_slice(&self.e.0);
-        push_tx_desc_and_op(&mut key, &self.tx, self.op);
         Some(key)
     }
 
@@ -474,54 +492,17 @@ fn push_tx_desc(key: &mut Vec<u8>, tx: &KotobaCid) {
     key.extend(tx.0.iter().map(|b| !b));
 }
 
+// Index-key segments delegate to the single canonical, order-preserving key
+// codec (ADR-2606022150 §key-encoding) so the cold Prolly keys here and the hot
+// AVET index in `arrangement` order identically. The codec fixes the classic
+// sort traps (signed-int sign bit, IEEE float order, NUL separator escaping)
+// that the previous inline encoding here did not.
 fn push_str(key: &mut Vec<u8>, value: &str) {
-    key.extend_from_slice(value.as_bytes());
-    key.push(0);
+    crate::keycodec::push_ordered_str(key, value);
 }
 
 fn push_value(key: &mut Vec<u8>, value: &Value) {
-    match value {
-        Value::Cid(cid) => {
-            key.push(0x01);
-            key.extend_from_slice(&cid.0);
-        }
-        Value::Integer(n) => {
-            key.push(0x02);
-            key.extend_from_slice(&n.to_be_bytes());
-        }
-        Value::Float(f) => {
-            key.push(0x03);
-            key.extend_from_slice(&f.to_bits().to_be_bytes());
-        }
-        Value::Text(s) => {
-            key.push(0x04);
-            push_str(key, s);
-        }
-        Value::Bool(b) => {
-            key.push(0x05);
-            key.push(u8::from(*b));
-        }
-        Value::Bytes(bytes) => {
-            key.push(0x06);
-            key.extend_from_slice(bytes);
-            key.push(0);
-        }
-        Value::VectorF32(vec) => {
-            key.push(0x07);
-            for f in vec {
-                key.extend_from_slice(&f.to_bits().to_be_bytes());
-            }
-            key.push(0);
-        }
-        Value::TensorCid { cid, .. } => {
-            key.push(0x08);
-            key.extend_from_slice(&cid.0);
-        }
-        Value::Encrypted { ct_cid, .. } => {
-            key.push(0x09);
-            key.extend_from_slice(&ct_cid.0);
-        }
-    }
+    crate::keycodec::push_value(key, value);
 }
 
 #[cfg(test)]

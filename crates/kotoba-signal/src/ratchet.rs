@@ -156,7 +156,12 @@ impl RatchetState {
 
     fn skip_message_keys(&mut self, until: u32) -> Result<(), SignalError> {
         if until.saturating_sub(self.recv_counter) > MAX_SKIP {
-            return Err(SignalError::CounterMismatch);
+            // Skip gap exceeds MAX_SKIP → DoS guard against unbounded skipped-key
+            // allocation. Use the purpose-built variant (distinct from a
+            // malformed-counter `CounterMismatch`) so callers can tell the
+            // skip-limit case apart. Previously this returned `CounterMismatch`,
+            // leaving `TooManySkippedKeys` dead.
+            return Err(SignalError::TooManySkippedKeys);
         }
         while let Some(ck) = self.recv_chain_key.as_mut() {
             if self.recv_counter >= until {
@@ -310,5 +315,66 @@ mod tests {
         // Deliver second before first — skipped-keys path
         assert_eq!(bob.decrypt(&m1).unwrap(), b"second");
         assert_eq!(bob.decrypt(&m0).unwrap(), b"first");
+    }
+
+    #[test]
+    fn too_many_skipped_keys_rejected() {
+        // DoS protection: a message whose counter is more than MAX_SKIP (1000)
+        // ahead of the receiver must be rejected rather than allocating unbounded
+        // skipped-key state.
+        let (mut alice, mut bob) = make_pair();
+        let _m0 = alice.encrypt(b"m0").unwrap(); // counter 0
+        let mut last = alice.encrypt(b"m").unwrap();
+        for _ in 0..1001 {
+            last = alice.encrypt(b"m").unwrap(); // advance well past MAX_SKIP
+        }
+        // bob is still at recv_counter 0; decrypting `last` would skip > 1000 keys.
+        let result = bob.decrypt(&last);
+        assert!(
+            matches!(result, Err(crate::SignalError::TooManySkippedKeys)),
+            "expected TooManySkippedKeys, got {result:?}"
+        );
+        // The bounded gap (out_of_order_delivery) still works, proving the limit is
+        // a ceiling, not a hard cap on any skipping.
+        let (mut a2, mut b2) = make_pair();
+        let first = a2.encrypt(b"a").unwrap();
+        let second = a2.encrypt(b"b").unwrap();
+        assert_eq!(b2.decrypt(&second).unwrap(), b"b");
+        assert_eq!(b2.decrypt(&first).unwrap(), b"a");
+    }
+
+    #[test]
+    fn skip_gap_at_exactly_max_is_accepted() {
+        // Boundary partner of `too_many_skipped_keys_rejected`: the skip limit is
+        // a CEILING (skip > MAX_SKIP rejected), so a gap of EXACTLY MAX_SKIP must
+        // still decrypt. This pins the off-by-one — an inclusive/exclusive slip in
+        // the guard would silently drop a legitimate gap-of-MAX_SKIP message
+        // (false-positive DoS rejection) or admit a gap-of-MAX_SKIP+1 (the test
+        // below).
+        let (mut alice, mut bob) = make_pair();
+        // alice m0 has counter 0; encrypt MAX_SKIP more so `last` has counter == MAX_SKIP.
+        let mut last = alice.encrypt(b"m0").unwrap(); // counter 0
+        for _ in 0..MAX_SKIP {
+            last = alice.encrypt(b"m").unwrap();
+        }
+        // bob is at recv_counter 0; decrypting `last` skips exactly MAX_SKIP keys.
+        let result = bob.decrypt(&last);
+        assert!(
+            result.is_ok(),
+            "a gap of exactly MAX_SKIP ({MAX_SKIP}) must be accepted, got {result:?}"
+        );
+        assert_eq!(result.unwrap(), b"m");
+
+        // One more (gap MAX_SKIP+1) must be rejected — confirms the boundary is
+        // tight, not merely "large gaps eventually fail".
+        let (mut a2, mut b2) = make_pair();
+        let mut last2 = a2.encrypt(b"m0").unwrap(); // counter 0
+        for _ in 0..(MAX_SKIP + 1) {
+            last2 = a2.encrypt(b"m").unwrap(); // last2 counter == MAX_SKIP + 1
+        }
+        assert!(
+            matches!(b2.decrypt(&last2), Err(crate::SignalError::TooManySkippedKeys)),
+            "a gap of MAX_SKIP+1 must be rejected"
+        );
     }
 }

@@ -6,8 +6,8 @@
 
 use crate::{
     current_datoms, edn_to_kqe_value, index_range_datoms, plan_datom_lookup_for_triple,
-    seek_datoms_index, Connection, Datom, DatomIndex, DatomicError, Db, Entity, LogEntry,
-    TransactReport, Value,
+    seek_datoms_index, Connection, Datom, DatomIndex, DatomIndexLookup, DatomicError, Db, Entity,
+    LogEntry, TransactReport, Value,
 };
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::prolly::ProllyTree;
@@ -94,15 +94,6 @@ pub struct CommitReport {
 pub struct DistributedTxRangeEntry {
     pub commit: DistributedDatomCommit,
     pub datoms: Vec<Datom>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DatomIndexLookup {
-    All,
-    Entity(KotobaCid),
-    EntityAttribute { entity: KotobaCid, attr: String },
-    Attribute(String),
-    AttributeValue { attr: String, value: Value },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2997,9 +2988,14 @@ fn derive_tx_cid(
 }
 
 fn attr_prefix(attr: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(attr.len() + 1);
-    out.extend_from_slice(attr.as_bytes());
-    out.push(0);
+    // Must match the attribute segment of the canonical index keys
+    // (`kqe::Datom::*_key` → `keycodec::push_ordered_str`): escape `0x00 → 0x00
+    // 0xFF` + `0x00 0x00` terminator (ADR-2606022150 §D1.1). Using a bare
+    // `attr + 0x00` here misaligns every 2+-component prefix scan by one byte
+    // (the second terminator), making EAVT/AEVT/VAET seeks silently return
+    // nothing.
+    let mut out = Vec::with_capacity(attr.len() + 2);
+    kotoba_kqe::keycodec::push_ordered_str(&mut out, attr);
     out
 }
 
@@ -3334,7 +3330,16 @@ fn vaet_prefix_for_parts(
         key.truncate(key.len().saturating_sub(36 + 36 + 1));
         key
     } else {
-        key.truncate(key.len().saturating_sub(1 + 36 + 36 + 1));
+        // Value-only: strip the (empty) attr segment + e + tx + op. The empty-attr
+        // segment length follows the canonical key codec (`push_ordered_str("")` =
+        // `0x00 0x00`, 2 bytes), NOT a hardcoded 1 — otherwise the VAET value-only
+        // prefix is one byte too long and the scan returns nothing (ADR-2606022150).
+        let empty_attr_len = {
+            let mut t = Vec::new();
+            kotoba_kqe::keycodec::push_ordered_str(&mut t, "");
+            t.len()
+        };
+        key.truncate(key.len().saturating_sub(empty_attr_len + 36 + 36 + 1));
         key
     }
 }
