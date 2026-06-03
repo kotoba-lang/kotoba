@@ -840,6 +840,13 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(state);
+
+    // Warm the resident `db_before` cache for every registered graph in the
+    // background, so the first `datomic.transact` after this (re)start is a cache
+    // HIT instead of an inline O(graph) cold `db_from_head` scan on the request
+    // path (ADR-2605302130 / kotoba#19). Spawned — never blocks serve.
+    tokio::spawn(Arc::clone(&state).warm_datomic_live_caches());
+
     let app = build_router(Arc::clone(&state));
 
     let port = std::env::var("KOTOBA_PORT")

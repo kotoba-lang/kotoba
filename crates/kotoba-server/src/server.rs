@@ -846,6 +846,71 @@ impl KotobaState {
             .clone()
     }
 
+    /// Warm the resident `db_before` cache for every registered named graph so
+    /// the FIRST `datomic.transact` after a (re)start is a cache HIT instead of
+    /// paying the O(graph) cold `db_from_head` ProllyTree/Kubo scan inline on the
+    /// request path. This closes the last gap in the ADR-2605302130 / kotoba#19
+    /// write-scaling fix: the resident `datomic_live` cache existed but was only
+    /// seeded lazily by the first transact, so every cold start (pod restart,
+    /// kubo sidecar restart) forced one multi-second-to-minute inline scan that
+    /// timed out heavy producers. Here we pay that scan ONCE, in the background,
+    /// off the request path — boot + `axum::serve` are never blocked.
+    ///
+    /// Each registered graph that has a committed IPNS head is scanned once and
+    /// its `db_before` seeded; the `datomic_cold_db_loads` counter is bumped per
+    /// scan for observability. Graphs with no committed head yet are skipped
+    /// (their first transact starts from the empty db, which is already cheap).
+    pub async fn warm_datomic_live_caches(self: Arc<Self>) {
+        let graphs: Vec<(KotobaCid, String)> = {
+            let reg = self.graph_registry.read().await;
+            reg.iter()
+                .map(|(cid, (name, _))| (cid.clone(), name.clone()))
+                .collect()
+        };
+        let mut seeded = 0usize;
+        for (graph_cid, name) in graphs {
+            let ipns_name = distributed_graph_ipns_name(&graph_cid);
+            let head = match self.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
+                Ok(record) => KotobaCid::from_multibase(&record.value),
+                Err(kotoba_ipfs::IpnsRegistryError::NotFound(_)) => None,
+                Err(err) => {
+                    tracing::warn!(graph = %name, error = %err, "warm: ipns resolve failed");
+                    None
+                }
+            };
+            let Some(head) = head else { continue };
+            let slot = self.datomic_live_slot(&graph_cid.to_multibase());
+            let mut guard = slot.lock().await;
+            if guard.as_ref().map(|live| live.head == head).unwrap_or(false) {
+                continue; // already warm at this head
+            }
+            self.datomic_cold_db_loads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            match DistributedDatomReader::new(&*self.block_store, &*self.ipns_registry)
+                .db_from_head(&head)
+            {
+                Ok(db) => {
+                    *guard = Some(LiveDatomicGraph {
+                        head: head.clone(),
+                        db,
+                    });
+                    seeded += 1;
+                    tracing::info!(
+                        graph = %name,
+                        head = %head.to_multibase(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "warm: resident db_before cache seeded"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(graph = %name, error = %err, "warm: db_from_head failed");
+                }
+            }
+        }
+        tracing::info!(seeded, "warm: datomic resident-cache warm-up complete");
+    }
+
     /// Attach a GossipSub outbound channel after construction.
     pub fn attach_gossip(mut self, tx: tokio::sync::mpsc::Sender<(String, Vec<u8>)>) -> Self {
         self.gossip_tx = Some(tx);
