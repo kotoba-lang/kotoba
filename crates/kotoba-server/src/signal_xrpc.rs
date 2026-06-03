@@ -1,16 +1,16 @@
 //! Signal Protocol XRPC endpoints.
-//! NSIDs: ai.gftd.signal.{register.prekeys, get.prekey.bundle, send.message, send.group.message}
+//! NSIDs: com.etzhayyim.signal.{register.prekeys, get.prekey.bundle, send.message, send.group.message}
 //!
 //! These endpoints make kotoba-server the SSoT for Signal Protocol E2E,
 //! superseding `@gftd/signal` (`10-protocol/signal/`).
 
-pub const NSID_SIGNAL_REGISTER_PREKEYS: &str = "ai.gftd.signal.register.prekeys";
-pub const NSID_SIGNAL_GET_PREKEY_BUNDLE: &str = "ai.gftd.signal.get.prekey.bundle";
-pub const NSID_SIGNAL_SEND_MESSAGE: &str = "ai.gftd.signal.send.message";
-pub const NSID_SIGNAL_SEND_GROUP_MESSAGE: &str = "ai.gftd.signal.send.group.message";
-pub const NSID_SIGNAL_DISTRIBUTE_SENDER_KEY: &str = "ai.gftd.signal.distribute.sender.key";
-pub const NSID_SIGNAL_PUBLISH_IDENTITY: &str = "ai.gftd.signal.publish.identity";
-pub const NSID_SIGNAL_RESOLVE_IDENTITY: &str = "ai.gftd.signal.resolve.identity";
+pub const NSID_SIGNAL_REGISTER_PREKEYS: &str = "com.etzhayyim.signal.register.prekeys";
+pub const NSID_SIGNAL_GET_PREKEY_BUNDLE: &str = "com.etzhayyim.signal.get.prekey.bundle";
+pub const NSID_SIGNAL_SEND_MESSAGE: &str = "com.etzhayyim.signal.send.message";
+pub const NSID_SIGNAL_SEND_GROUP_MESSAGE: &str = "com.etzhayyim.signal.send.group.message";
+pub const NSID_SIGNAL_DISTRIBUTE_SENDER_KEY: &str = "com.etzhayyim.signal.distribute.sender.key";
+pub const NSID_SIGNAL_PUBLISH_IDENTITY: &str = "com.etzhayyim.signal.publish.identity";
+pub const NSID_SIGNAL_RESOLVE_IDENTITY: &str = "com.etzhayyim.signal.resolve.identity";
 
 use axum::{
     extract::{Query, State},
@@ -669,8 +669,8 @@ mod tests {
     fn all_signal_nsids_have_correct_prefix() {
         for nsid in SIGNAL_NSIDS {
             assert!(
-                nsid.starts_with("ai.gftd.signal."),
-                "Signal NSID must start with ai.gftd.signal.: {nsid}"
+                nsid.starts_with("com.etzhayyim.signal."),
+                "Signal NSID must start with com.etzhayyim.signal.: {nsid}"
             );
         }
     }
@@ -756,7 +756,7 @@ mod tests {
     fn nsid_register_prekeys_exact_value() {
         assert_eq!(
             NSID_SIGNAL_REGISTER_PREKEYS,
-            "ai.gftd.signal.register.prekeys"
+            "com.etzhayyim.signal.register.prekeys"
         );
     }
 
@@ -764,20 +764,20 @@ mod tests {
     fn nsid_get_prekey_bundle_exact_value() {
         assert_eq!(
             NSID_SIGNAL_GET_PREKEY_BUNDLE,
-            "ai.gftd.signal.get.prekey.bundle"
+            "com.etzhayyim.signal.get.prekey.bundle"
         );
     }
 
     #[test]
     fn nsid_send_message_exact_value() {
-        assert_eq!(NSID_SIGNAL_SEND_MESSAGE, "ai.gftd.signal.send.message");
+        assert_eq!(NSID_SIGNAL_SEND_MESSAGE, "com.etzhayyim.signal.send.message");
     }
 
     #[test]
     fn nsid_send_group_message_exact_value() {
         assert_eq!(
             NSID_SIGNAL_SEND_GROUP_MESSAGE,
-            "ai.gftd.signal.send.group.message"
+            "com.etzhayyim.signal.send.group.message"
         );
     }
 
@@ -785,7 +785,7 @@ mod tests {
     fn nsid_distribute_sender_key_exact_value() {
         assert_eq!(
             NSID_SIGNAL_DISTRIBUTE_SENDER_KEY,
-            "ai.gftd.signal.distribute.sender.key"
+            "com.etzhayyim.signal.distribute.sender.key"
         );
     }
 
@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn new_identity_nsids_have_correct_prefix() {
         for nsid in [NSID_SIGNAL_PUBLISH_IDENTITY, NSID_SIGNAL_RESOLVE_IDENTITY] {
-            assert!(nsid.starts_with("ai.gftd.signal."), "{nsid}");
+            assert!(nsid.starts_with("com.etzhayyim.signal."), "{nsid}");
         }
     }
 }

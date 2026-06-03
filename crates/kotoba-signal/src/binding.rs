@@ -1,6 +1,6 @@
 //! DID ↔ Signal identity binding + Signal-as-key-wrap-transport (ADR-2606014000 D4).
 //!
-//! Implements the verification side of the `app.etzhayyim.encrypted.signalIdentity`
+//! Implements the verification side of the `com.etzhayyim.encrypted.signalIdentity`
 //! lexicon: an actor publishes, in their own repo, a signed assertion of which
 //! Signal `IdentityKey` is canonical for their DID. A peer MUST verify this
 //! binding against the DID document's signing key **before** establishing an
@@ -9,7 +9,7 @@
 //! enforced).
 //!
 //! Per-record symmetric keys are then wrapped under the *established Signal
-//! session* (`wrap_record_key`), so each `app.etzhayyim.encrypted.keyWrap`
+//! session* (`wrap_record_key`), so each `com.etzhayyim.encrypted.keyWrap`
 //! ciphertext inherits the Double Ratchet's forward secrecy and post-compromise
 //! security — not a static key.
 
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 const BINDING_DOMAIN: &[u8] = b"kotoba/signal-identity-binding/v1";
 
 /// A DID ↔ Signal identity binding (the verifiable core of
-/// `app.etzhayyim.encrypted.signalIdentity`).
+/// `com.etzhayyim.encrypted.signalIdentity`).
 ///
 /// Note on key model: the lexicon's single `signalIdentityKey` field follows the
 /// libsignal one-key model; kotoba's `IdentityKey` is a two-key pair (Ed25519
@@ -117,7 +117,7 @@ impl SignalBinding {
 }
 
 /// Wrap a 32-byte record key under an established Signal session — the ciphertext
-/// for an `app.etzhayyim.encrypted.keyWrap` record. Forward secrecy and
+/// for an `com.etzhayyim.encrypted.keyWrap` record. Forward secrecy and
 /// post-compromise security come from the underlying Double Ratchet
 /// (ADR-2606014000 D4): each wrap advances the ratchet, so compromising one
 /// wrap key does not expose past or future record keys.
@@ -184,6 +184,47 @@ mod tests {
         let mut tampered = binding.clone();
         tampered.signal_identity_key = IdentityKeyPair::generate().public_key().signing;
         assert!(!tampered.verify(&sig, &did_sk.verifying_key().to_bytes()));
+    }
+
+    #[test]
+    fn binding_verify_rejects_tampered_dh_key() {
+        // The X3DH MITM vector: an attacker keeps the Ed25519 *signing* half (so a
+        // naive check on it passes) but swaps the X25519 *dh* half — the key the
+        // shared secret is actually derived from. The binding signature covers the
+        // dh key (signing_payload pushes it), so verify must reject the swap.
+        // Sibling of `..._tampered_identity_key`, which only mutates the signing half.
+        let sig_ik = IdentityKeyPair::generate();
+        let did_sk = did_key();
+        let binding = SignalBinding::from_identity("did:web:dh", &sig_ik.public_key(), 1, "t");
+        let sig = binding.sign(&did_sk);
+
+        let mut tampered = binding.clone();
+        tampered.signal_dh_key = IdentityKeyPair::generate().public_key().dh;
+        // The signing half is untouched — proves the rejection is due to the dh key.
+        assert_eq!(tampered.signal_identity_key, binding.signal_identity_key);
+        assert_ne!(tampered.signal_dh_key, binding.signal_dh_key);
+        assert!(
+            !tampered.verify(&sig, &did_sk.verifying_key().to_bytes()),
+            "swapping the X25519 dh key must break the binding signature"
+        );
+    }
+
+    #[test]
+    fn binding_verify_rejects_tampered_did() {
+        // A malicious PDS that re-points a published binding to a different DID
+        // (while keeping the original signature) must not validate — the DID is
+        // part of the signed payload.
+        let sig_ik = IdentityKeyPair::generate();
+        let did_sk = did_key();
+        let binding = SignalBinding::from_identity("did:web:orig", &sig_ik.public_key(), 1, "t");
+        let sig = binding.sign(&did_sk);
+
+        let mut tampered = binding.clone();
+        tampered.did = "did:web:attacker".into();
+        assert!(
+            !tampered.verify(&sig, &did_sk.verifying_key().to_bytes()),
+            "re-pointing the binding to a different DID must break the signature"
+        );
     }
 
     #[test]

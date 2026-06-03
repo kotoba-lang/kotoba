@@ -1,19 +1,19 @@
 //! XRPC handlers for Common Crawl vector search and knowledge query.
 //!
 //! NSIDs:
-//!   ai.gftd.apps.kotoba.cc.search   — ANN vector search over CC chunks (GET)
-//!   ai.gftd.apps.kotoba.cc.rag      — RAG: search + LLM synthesis (POST)
-//!   ai.gftd.apps.kotoba.cc.ingest   — trigger CC parquet ingest job (POST)
-//!   ai.gftd.apps.kotoba.cc.status   — ingest / index status (GET)
-//!   ai.gftd.apps.kotoba.search.web  — hybrid web search (lexical + semantic +
+//!   com.etzhayyim.apps.kotoba.cc.search   — ANN vector search over CC chunks (GET)
+//!   com.etzhayyim.apps.kotoba.cc.rag      — RAG: search + LLM synthesis (POST)
+//!   com.etzhayyim.apps.kotoba.cc.ingest   — trigger CC parquet ingest job (POST)
+//!   com.etzhayyim.apps.kotoba.cc.status   — ingest / index status (GET)
+//!   com.etzhayyim.apps.kotoba.search.web  — hybrid web search (lexical + semantic +
 //!                                     authority, RRF-fused) over CC chunks (GET)
 
-pub const NSID_CC_SEARCH: &str = "ai.gftd.apps.kotoba.cc.search";
-pub const NSID_CC_RAG: &str = "ai.gftd.apps.kotoba.cc.rag";
-pub const NSID_CC_INGEST: &str = "ai.gftd.apps.kotoba.cc.ingest";
-pub const NSID_CC_STATUS: &str = "ai.gftd.apps.kotoba.cc.status";
-pub const NSID_WEB_SEARCH: &str = "ai.gftd.apps.kotoba.search.web";
-pub const NSID_SEARCH_REINDEX: &str = "ai.gftd.apps.kotoba.search.reindex";
+pub const NSID_CC_SEARCH: &str = "com.etzhayyim.apps.kotoba.cc.search";
+pub const NSID_CC_RAG: &str = "com.etzhayyim.apps.kotoba.cc.rag";
+pub const NSID_CC_INGEST: &str = "com.etzhayyim.apps.kotoba.cc.ingest";
+pub const NSID_CC_STATUS: &str = "com.etzhayyim.apps.kotoba.cc.status";
+pub const NSID_WEB_SEARCH: &str = "com.etzhayyim.apps.kotoba.search.web";
+pub const NSID_SEARCH_REINDEX: &str = "com.etzhayyim.apps.kotoba.search.reindex";
 
 use axum::{
     extract::{Query, State},
@@ -1204,7 +1204,7 @@ mod tests {
 
     #[test]
     fn nsid_constants_have_correct_prefix() {
-        let prefix = "ai.gftd.apps.kotoba.cc.";
+        let prefix = "com.etzhayyim.apps.kotoba.cc.";
         assert!(NSID_CC_SEARCH.starts_with(prefix));
         assert!(NSID_CC_RAG.starts_with(prefix));
         assert!(NSID_CC_INGEST.starts_with(prefix));

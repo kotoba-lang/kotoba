@@ -7,18 +7,18 @@
 //! similarity.
 //!
 //! NSIDs:
-//!   ai.gftd.apps.kotoba.media.search  — cross-modal vector search (GET)
-//!   ai.gftd.apps.kotoba.media.ingest  — ingest base64 assets (POST)
-//!   ai.gftd.apps.kotoba.media.status  — asset / index status (GET)
+//!   com.etzhayyim.apps.kotoba.media.search  — cross-modal vector search (GET)
+//!   com.etzhayyim.apps.kotoba.media.ingest  — ingest base64 assets (POST)
+//!   com.etzhayyim.apps.kotoba.media.status  — asset / index status (GET)
 //!
 //! The query is embedded as TEXT in the shared space, then ranked against the
 //! stored media embeddings; results carry the matched asset's modality, blob
 //! CID, title, and caption so a client can fetch the raw bytes via the Vault
-//! (`ai.gftd.apps.kotoba.vault.get`).
+//! (`com.etzhayyim.apps.kotoba.vault.get`).
 
-pub const NSID_MEDIA_SEARCH: &str = "ai.gftd.apps.kotoba.media.search";
-pub const NSID_MEDIA_INGEST: &str = "ai.gftd.apps.kotoba.media.ingest";
-pub const NSID_MEDIA_STATUS: &str = "ai.gftd.apps.kotoba.media.status";
+pub const NSID_MEDIA_SEARCH: &str = "com.etzhayyim.apps.kotoba.media.search";
+pub const NSID_MEDIA_INGEST: &str = "com.etzhayyim.apps.kotoba.media.ingest";
+pub const NSID_MEDIA_STATUS: &str = "com.etzhayyim.apps.kotoba.media.status";
 
 use axum::{
     extract::{Query, State},
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn nsids_have_kotoba_media_prefix() {
         for nsid in [NSID_MEDIA_SEARCH, NSID_MEDIA_INGEST, NSID_MEDIA_STATUS] {
-            assert!(nsid.starts_with("ai.gftd.apps.kotoba.media."));
+            assert!(nsid.starts_with("com.etzhayyim.apps.kotoba.media."));
             assert!(!nsid.ends_with('.'));
             assert!(nsid.chars().all(|c| c.is_ascii_lowercase() || c == '.'));
         }

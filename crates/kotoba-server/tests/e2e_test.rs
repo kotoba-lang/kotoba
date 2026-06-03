@@ -152,7 +152,7 @@ impl TestServer {
     ) -> (u16, Value) {
         let (_, cacao_b64) = build_ed25519_cacao(graph);
         self.post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({
                 "graph":     graph,
                 "subject":   subject,
@@ -173,7 +173,7 @@ impl TestServer {
     ) -> (u16, Value) {
         let (_, cacao_b64) = build_ed25519_cacao(graph);
         self.post(
-            "/xrpc/ai.gftd.apps.kotoba.datom.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.datom.create",
             json!({
                 "graph":     graph,
                 "subject":   subject,
@@ -216,7 +216,7 @@ async fn node_status_returns_node_id() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.node.status", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.node.status", &tok)
         .await;
     assert_eq!(status, 200);
     assert!(
@@ -228,7 +228,7 @@ async fn node_status_returns_node_id() {
 #[tokio::test]
 async fn node_status_without_auth_returns_401() {
     let s = TestServer::start(false).await;
-    let (status, _) = s.get("/xrpc/ai.gftd.apps.kotoba.node.status").await;
+    let (status, _) = s.get("/xrpc/com.etzhayyim.apps.kotoba.node.status").await;
     assert_eq!(status, 401);
 }
 
@@ -237,7 +237,7 @@ async fn node_status_non_operator_returns_401() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt("did:key:zNonOperator");
     let (status, body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.node.status", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.node.status", &tok)
         .await;
     assert_eq!(status, 401, "{body}");
 }
@@ -271,7 +271,7 @@ async fn graph_query_empty_graph_returns_zero() {
     // Unknown graphs default to Authenticated tier — send a Bearer token.
     let (status, body) = s
         .get_authed(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.graph.query?graph={cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.query?graph={cid}"
         ))
         .await;
     assert_eq!(status, 200, "{body}");
@@ -289,7 +289,7 @@ async fn graph_query_after_create_returns_quad() {
     // Unknown graphs default to Authenticated tier — send a Bearer token.
     let (status, body) = s
         .get_authed(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.graph.query?graph={graph_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.query?graph={graph_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{body}");
@@ -319,7 +319,7 @@ async fn graph_query_accepts_cacao_graph_query_operation_scope_on_private_graph(
     let r = s
         .client
         .get(format!(
-            "{}/xrpc/ai.gftd.apps.kotoba.graph.query",
+            "{}/xrpc/com.etzhayyim.apps.kotoba.graph.query",
             s.base_url
         ))
         .query(&[
@@ -348,7 +348,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/name "Alice" :person/age 30 :person/role :admin :person/friend "bob" :person/bio "Kotoba stores W3C credentials as Datoms. Kotoba queries run on IPLD." :atproto/uri "at://did:plc:alice/app.bsky.feed.post/r1"}
@@ -382,7 +382,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     let commit_cid = tx_body["commit_cid"].as_str().expect("commit cid");
     let (status, commit_block_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.block.get?cid={commit_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={commit_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{commit_block_body}");
@@ -412,20 +412,27 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
         let root_cid = index_roots[root].as_str().expect("root cid");
         let (status, root_block_body) = s
             .get(&format!(
-                "/xrpc/ai.gftd.apps.kotoba.block.get?cid={root_cid}"
+                "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={root_cid}"
             ))
             .await;
         assert_eq!(status, 200, "{root_block_body}");
-        let root_block_bytes = {
+        {
             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
             let data_b64 = root_block_body["data_b64"]
                 .as_str()
                 .expect("root block data_b64");
             assert!(!data_b64.is_empty(), "{root_block_body}");
-            B64.decode(data_b64).expect("root block base64")
-        };
-        let root_node: kotoba_core::prolly::ProllyNode =
-            ciborium::from_reader(root_block_bytes.as_slice()).expect("ProllyTree node DAG-CBOR");
+            // The block is genuine DAG-CBOR with tag-42 CID links and no inline
+            // self-CID (ADR-2606022150 D1) — decode via the public `load_node`
+            // rather than a hand-rolled struct decode coupled to the old format.
+            B64.decode(data_b64).expect("root block base64");
+        }
+        let root_cid_parsed =
+            kotoba_core::cid::KotobaCid::from_multibase(root_cid).expect("root cid parse");
+        let root_node =
+            kotoba_core::prolly::ProllyTree::load_node(&root_cid_parsed, &*s.state.block_store)
+                .expect("load ProllyTree node")
+                .expect("root ProllyTree node present");
         match root_node {
             kotoba_core::prolly::ProllyNode::Leaf { .. }
             | kotoba_core::prolly::ProllyNode::Internal { .. } => {}
@@ -464,7 +471,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, commit_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={graph}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={graph}"
         ))
         .await;
     assert_eq!(status, 200, "{commit_body}");
@@ -494,7 +501,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name] [?e :person/age ?age] [(> ?age 18)]]}"#
@@ -508,7 +515,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, fulltext_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?score]
@@ -531,7 +538,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, predicate_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?uri ?collection ?rkey ?splitCollection ?splitRkey ?nthCollection ?lastRkey ?joinedUri ?normalizedUri ?scheme ?trimmedScheme]
@@ -581,7 +588,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, get_function_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?type ?status ?verified ?score ?nextScore ?adjustedScore ?doubleScore ?quotScore ?remScore ?modScore ?negativeMod ?minScore ?maxScore ?firstTag ?tagCount ?subject ?firstRole ?generatedStatus ?summaryCount ?fallback ?nonEmptyTags]
@@ -721,7 +728,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     let alice = tx_body["tempids"]["alice"].as_str().unwrap();
     let (status, datoms_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":eavt",
@@ -746,7 +753,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, avet_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":avet",
@@ -762,7 +769,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     let stale_parent = kotoba_core::cid::KotobaCid::from_bytes(b"stale-parent").to_multibase();
     let (status, stale_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "expected_parent": stale_parent,
@@ -775,7 +782,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, stale_read_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#
@@ -793,7 +800,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     let first_tx = tx_body["tx_cid"].as_str().unwrap().to_string();
     let (status, second_tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "expected_parent": commit_cid,
@@ -809,7 +816,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, window_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name]
@@ -829,7 +836,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, expected_parent_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?parent]
@@ -850,7 +857,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, seek_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.seekDatoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.seekDatoms",
             json!({
                 "graph": graph,
                 "index": ":avet",
@@ -872,7 +879,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tea_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":tea",
@@ -907,7 +914,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, range_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexRange",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexRange",
             json!({
                 "graph": graph,
                 "attr_edn": ":person/age",
@@ -930,7 +937,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, index_pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexPull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexPull",
             json!({
                 "graph": graph,
                 "index": ":avet",
@@ -972,7 +979,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, ban_tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "bob" :person/ban-reason "spam"]]"#
@@ -987,7 +994,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tx_range_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.txRange",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.txRange",
             json!({
                 "graph": graph,
                 "limit": 10
@@ -1024,7 +1031,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tx_one_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.tx",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.tx",
             json!({
                 "graph": graph,
                 "tx": second_tx
@@ -1068,7 +1075,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
         let commit_cid = body["commit_cid"].as_str().expect("commit cid");
         let (status, block_body) = s
             .get(&format!(
-                "/xrpc/ai.gftd.apps.kotoba.block.get?cid={commit_cid}"
+                "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={commit_cid}"
             ))
             .await;
         assert_eq!(status, 200, "{block_body}");
@@ -1096,7 +1103,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, log_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.log",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.log",
             json!({
                 "graph": graph,
                 "limit": 10
@@ -1130,7 +1137,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tx_range_window_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.txRange",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.txRange",
             json!({
                 "graph": graph,
                 "start": second_tx,
@@ -1152,7 +1159,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, log_window_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.log",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.log",
             json!({
                 "graph": graph,
                 "start": second_tx,
@@ -1179,7 +1186,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, basis_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.basisT",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.basisT",
             json!({
                 "graph": graph
             }),
@@ -1191,7 +1198,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, stats_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.dbStats",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.dbStats",
             json!({
                 "graph": graph
             }),
@@ -1220,7 +1227,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, as_of_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -1239,7 +1246,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, as_of_datoms_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":avet",
@@ -1263,7 +1270,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, as_of_seek_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.seekDatoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.seekDatoms",
             json!({
                 "graph": graph,
                 "index": ":avet",
@@ -1283,7 +1290,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, as_of_range_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexRange",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexRange",
             json!({
                 "graph": graph,
                 "attr_edn": ":person/age",
@@ -1308,7 +1315,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, since_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -1323,7 +1330,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, since_datoms_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":avet",
@@ -1347,7 +1354,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, since_seek_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.seekDatoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.seekDatoms",
             json!({
                 "graph": graph,
                 "index": ":avet",
@@ -1364,7 +1371,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, since_range_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexRange",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexRange",
             json!({
                 "graph": graph,
                 "attr_edn": ":person/age",
@@ -1389,7 +1396,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, collection_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :in [$ [?role ...]] :where [[?e :person/role ?role] [?e :person/name ?name]]}"#,
@@ -1407,7 +1414,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, named_source_collection_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :in [$db [?role ...]] :where [[?e :person/role ?role] [?e :person/name ?name]]}"#,
@@ -1425,7 +1432,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, source_pattern_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name]
@@ -1446,7 +1453,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, vector_query_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"[:find ?name
@@ -1467,7 +1474,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tx_pattern_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"[:find ?name ?tx
@@ -1490,7 +1497,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, added_pattern_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"[:find ?name ?tx ?added
@@ -1514,7 +1521,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, find_collection_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ...] :where [[?e :person/name ?name]]}"#
@@ -1531,7 +1538,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, find_scalar_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name .]
@@ -1550,7 +1557,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, find_tuple_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [[?name ?role]] :where [[?e :person/name ?name] [?e :person/role ?role]]}"#
@@ -1567,7 +1574,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, keys_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?role]
@@ -1611,7 +1618,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, strs_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?role]
@@ -1643,7 +1650,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, syms_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?role]
@@ -1675,7 +1682,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, relation_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :in [$ [[?name ?role]]] :where [[?e :person/name ?name] [?e :person/role ?role]]}"#,
@@ -1693,7 +1700,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tuple_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :in [$ [?name ?role]] :where [[?e :person/name ?name] [?e :person/role ?role]]}"#,
@@ -1711,7 +1718,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, rules_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :in [$ %] :where [(eligible ?e) [?e :person/name ?name]]}"#,
@@ -1729,7 +1736,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, not_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name] (not [?e :person/role :guest])]}"#
@@ -1742,7 +1749,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, or_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name] (or [?e :person/role :admin] [?e :person/role :guest])]}"#
@@ -1759,7 +1766,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, not_join_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/role :guest] (not-join [?e] [?e :person/ban-reason ?reason]) [?e :person/name ?name]]}"#
@@ -1772,7 +1779,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, or_join_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name] (or-join [?e] [?e :person/role :admin] [?e :person/ban-reason "spam"])]}"#
@@ -1789,7 +1796,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, missing_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/role ?role] [(!= ?role :admin)] [(missing? $ ?e :person/ban-reason)] [?e :person/name ?name]]}"#
@@ -1802,7 +1809,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, function_binding_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?copy] :where [[(ground :guest) ?role] [?e :person/role ?role] [?e :person/name ?name] [(identity ?name) ?copy]]}"#
@@ -1819,7 +1826,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, name_function_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?roleName ?roleNamespace]
@@ -1840,7 +1847,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, str_keyword_function_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?resource ?rebuilt]
@@ -1862,7 +1869,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, tuple_function_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?pair ?name2 ?role2]
@@ -1884,7 +1891,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, get_function_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?role ?found] :where [[?e :person/name ?name] [(get-else $ ?e :person/role :guest) ?role] [(get-some $ ?e :person/ban-reason :person/name) ?found]]}"#
@@ -1904,7 +1911,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, named_source_get_function_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?role ?found]
@@ -1928,7 +1935,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, count_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?role (count ?e)]
@@ -1947,7 +1954,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, with_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?role (count ?name)] :with [?e] :where [[?e :person/role ?role] [?e :person/name ?name]]}"#
@@ -1964,7 +1971,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, count_distinct_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [(count-distinct ?role)] :where [[?e :person/role ?role]]}"#
@@ -1981,7 +1988,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, numeric_aggregate_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?role (sum ?age) (min ?age) (max ?age) (median ?age) (variance ?age) (stddev ?age)] :where [[?e :person/role ?role] [?e :person/age ?age]]}"#
@@ -2001,7 +2008,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, avg_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?role (avg ?age)] :where [[?e :person/role ?role] [?e :person/age ?age]]}"#
@@ -2018,7 +2025,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, q_pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [(pull ?e [:person/name {:person/friend [:person/name :person/role]}])] :where [[?e :person/name "Alice"]]}"#
@@ -2040,7 +2047,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     let alice = kotoba_core::cid::KotobaCid::from_bytes(b"alice").to_multibase();
     let (status, pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": alice,
@@ -2062,7 +2069,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, wildcard_pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": alice,
@@ -2089,7 +2096,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, option_pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": alice,
@@ -2115,7 +2122,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, xform_pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": alice,
@@ -2138,7 +2145,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     let bob = kotoba_core::cid::KotobaCid::from_bytes(b"bob").to_multibase();
     let (status, reverse_pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": bob,
@@ -2155,7 +2162,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, pull_many_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pullMany",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pullMany",
             json!({
                 "graph": graph,
                 "entities": [alice, bob],
@@ -2181,7 +2188,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, history_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.history",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.history",
             json!({
                 "graph": graph,
                 "limit": 20
@@ -2194,7 +2201,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, retract_tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/retract "bob" :person/ban-reason "spam"]]"#
@@ -2207,7 +2214,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, current_ban_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?reason] :where [[?e :person/name "Bob"] [?e :person/ban-reason ?reason]]}"#
@@ -2224,7 +2231,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, retract_history_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.history",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.history",
             json!({
                 "graph": graph,
                 "since": ban_tx_body["tx_cid"].as_str().unwrap(),
@@ -2251,7 +2258,7 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
 
     let (status, retract_history_q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "history": true,
@@ -2280,7 +2287,7 @@ async fn datomic_transact_uses_distributed_head_for_edn_value_cardinality_retrac
 
     let (status, first_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/profile [:alpha]}]"#
@@ -2293,7 +2300,7 @@ async fn datomic_transact_uses_distributed_head_for_edn_value_cardinality_retrac
 
     let (status, second_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/profile [:beta]]]"#
@@ -2305,7 +2312,7 @@ async fn datomic_transact_uses_distributed_head_for_edn_value_cardinality_retrac
 
     let (status, datoms_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":eavt",
@@ -2337,7 +2344,7 @@ async fn datomic_transact_expands_cardinality_many_entity_map_collections_on_dis
 
     let (status, schema_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -2353,7 +2360,7 @@ async fn datomic_transact_expands_cardinality_many_entity_map_collections_on_dis
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -2380,7 +2387,7 @@ async fn datomic_transact_expands_cardinality_many_entity_map_collections_on_dis
 
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?tag] :where [[?e :person/tag ?tag]]}"#
@@ -2397,7 +2404,7 @@ async fn datomic_transact_expands_cardinality_many_entity_map_collections_on_dis
 
     let (status, pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": alice,
@@ -2417,7 +2424,7 @@ async fn datomic_transact_expands_cardinality_many_entity_map_collections_on_dis
 
     let (status, limited_pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": alice,
@@ -2449,7 +2456,7 @@ async fn datomic_q_accepts_datom_read_cacao_on_private_distributed_head() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/name "Alice"}]"#
@@ -2468,7 +2475,7 @@ async fn datomic_q_accepts_datom_read_cacao_on_private_distributed_head() {
     );
     let (status, q_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -2491,7 +2498,7 @@ async fn datomic_with_applies_tx_without_publishing_distributed_head() {
 
     let (status, first_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/name "Alice"}]"#
@@ -2504,7 +2511,7 @@ async fn datomic_with_applies_tx_without_publishing_distributed_head() {
 
     let (status, with_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.with",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.with",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alicia"]]"#
@@ -2528,7 +2535,7 @@ async fn datomic_with_applies_tx_without_publishing_distributed_head() {
 
     let (status, basis_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.basisT",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.basisT",
             json!({ "graph": graph }),
             &tok,
         )
@@ -2538,7 +2545,7 @@ async fn datomic_with_applies_tx_without_publishing_distributed_head() {
 
     let (status, query_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#
@@ -2562,7 +2569,7 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
 
     let (status, first_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/name "Alice"}]"#
@@ -2575,7 +2582,7 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
 
     let (status, second_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "bob" :person/name "Bob"}]"#
@@ -2588,7 +2595,7 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
 
     let (status, sync_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.sync",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.sync",
             json!({ "graph": graph, "tx": first_tx }),
             &tok,
         )
@@ -2602,7 +2609,7 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
 
     let (status, as_of_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.asOf",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.asOf",
             json!({ "graph": graph, "tx": first_tx }),
             &tok,
         )
@@ -2614,7 +2621,7 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
 
     let (status, since_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.since",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.since",
             json!({ "graph": graph, "tx": first_tx }),
             &tok,
         )
@@ -2626,7 +2633,7 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
 
     let (status, as_of_q) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "as_of": first_tx,
@@ -2640,7 +2647,7 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
 
     let (status, since_q) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "since": first_tx,
@@ -2661,7 +2668,7 @@ async fn datomic_sync_reports_distributed_head_and_target_tx_reachability() {
 
     let (status, first_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/name "Alice"}]"#
@@ -2674,7 +2681,7 @@ async fn datomic_sync_reports_distributed_head_and_target_tx_reachability() {
 
     let (status, second_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "bob" :person/name "Bob"}]"#
@@ -2687,7 +2694,7 @@ async fn datomic_sync_reports_distributed_head_and_target_tx_reachability() {
 
     let (status, head_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.sync",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.sync",
             json!({ "graph": graph }),
             &tok,
         )
@@ -2703,7 +2710,7 @@ async fn datomic_sync_reports_distributed_head_and_target_tx_reachability() {
 
     let (status, reached_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.sync",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.sync",
             json!({ "graph": graph, "tx": first_tx }),
             &tok,
         )
@@ -2717,7 +2724,7 @@ async fn datomic_sync_reports_distributed_head_and_target_tx_reachability() {
         kotoba_core::cid::KotobaCid::from_bytes(b"datomic-sync-missing-tx").to_multibase();
     let (status, missing_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.sync",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.sync",
             json!({ "graph": graph, "tx": missing_tx }),
             &tok,
         )
@@ -2736,7 +2743,7 @@ async fn datomic_tx_returns_single_distributed_transaction_entry() {
 
     let (status, first_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/name "Alice"}]"#
@@ -2749,7 +2756,7 @@ async fn datomic_tx_returns_single_distributed_transaction_entry() {
 
     let (status, second_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "bob" :person/name "Bob"}]"#
@@ -2762,7 +2769,7 @@ async fn datomic_tx_returns_single_distributed_transaction_entry() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.tx",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.tx",
             json!({ "graph": graph, "tx": first_tx }),
             &tok,
         )
@@ -2792,7 +2799,7 @@ async fn datomic_tx_returns_single_distributed_transaction_entry() {
     let missing_tx = kotoba_core::cid::KotobaCid::from_bytes(b"datomic-tx-missing").to_multibase();
     let (status, missing_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.tx",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.tx",
             json!({ "graph": graph, "tx": missing_tx }),
             &tok,
         )
@@ -2809,7 +2816,7 @@ async fn datomic_transact_applies_schema_upsert_cas_and_retract_entity_on_distri
 
     let (status, schema_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -2825,7 +2832,7 @@ async fn datomic_transact_applies_schema_upsert_cas_and_retract_entity_on_distri
 
     let (status, first_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/email "a@example.com" :person/name "Alice" :person/age 30}]"#
@@ -2838,7 +2845,7 @@ async fn datomic_transact_applies_schema_upsert_cas_and_retract_entity_on_distri
 
     let (status, upsert_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "same-alice" :person/email "a@example.com" :person/name "Alicia"}]"#
@@ -2851,7 +2858,7 @@ async fn datomic_transact_applies_schema_upsert_cas_and_retract_entity_on_distri
 
     let (status, cas_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db.fn/cas [:person/email "a@example.com"] :person/age 30 31]]"#
@@ -2863,7 +2870,7 @@ async fn datomic_transact_applies_schema_upsert_cas_and_retract_entity_on_distri
 
     let (status, query_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?age] :where [[?e :person/email "a@example.com"] [?e :person/name ?name] [?e :person/age ?age]]}"#
@@ -2880,7 +2887,7 @@ async fn datomic_transact_applies_schema_upsert_cas_and_retract_entity_on_distri
 
     let (status, retract_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db.fn/retractEntity [:person/email "a@example.com"]]]"#
@@ -2892,7 +2899,7 @@ async fn datomic_transact_applies_schema_upsert_cas_and_retract_entity_on_distri
 
     let (status, after_retract_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/email "a@example.com"] [?e :person/name ?name]]}"#
@@ -2917,7 +2924,7 @@ async fn datomic_retract_entity_cascades_component_refs_on_distributed_head() {
 
     let (status, schema_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -2934,7 +2941,7 @@ async fn datomic_retract_entity_cascades_component_refs_on_distributed_head() {
 
     let (status, entity_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -2949,7 +2956,7 @@ async fn datomic_retract_entity_cascades_component_refs_on_distributed_head() {
 
     let (status, before_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name ?city] :where [[?e :person/name ?name] [?e :person/address ?addr] [?addr :address/city ?city]]}"#
@@ -2966,7 +2973,7 @@ async fn datomic_retract_entity_cascades_component_refs_on_distributed_head() {
 
     let (status, retract_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db.fn/retractEntity "alice"]]"#
@@ -2987,7 +2994,7 @@ async fn datomic_retract_entity_cascades_component_refs_on_distributed_head() {
 
     let (status, after_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?city] :where [[?addr :address/city ?city]]}"#
@@ -3008,7 +3015,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, schema_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -3024,7 +3031,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -3041,7 +3048,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, vaet_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":vaet",
@@ -3064,7 +3071,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, vaet_lookup_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":vaet",
@@ -3088,7 +3095,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, seek_lookup_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.seekDatoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.seekDatoms",
             json!({
                 "graph": graph,
                 "index": ":vaet",
@@ -3107,7 +3114,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, ref_range_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexRange",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexRange",
             json!({
                 "graph": graph,
                 "attr_edn": ":person/friend",
@@ -3130,7 +3137,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, pull_lookup_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({
                 "graph": graph,
                 "entity": r#"[:person/name "Alice"]"#
@@ -3146,7 +3153,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, pull_many_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pullMany",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pullMany",
             json!({
                 "graph": graph,
                 "entities": [":person/friend", r#"[:person/name "Bob"]"#]
@@ -3167,7 +3174,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, all_vaet_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.datoms",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms",
             json!({
                 "graph": graph,
                 "index": ":vaet",
@@ -3193,7 +3200,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, entity_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.entity",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.entity",
             json!({
                 "graph": graph,
                 "entity": alice
@@ -3210,7 +3217,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, entity_lookup_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.entity",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.entity",
             json!({
                 "graph": graph,
                 "entity": r#"[:person/name "Alice"]"#
@@ -3226,7 +3233,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, entity_ident_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.entity",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.entity",
             json!({
                 "graph": graph,
                 "entity": ":person/friend"
@@ -3242,7 +3249,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, ident_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.ident",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.ident",
             json!({
                 "graph": graph,
                 "entity": friend_attr
@@ -3255,7 +3262,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, entid_ident_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.entid",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.entid",
             json!({
                 "graph": graph,
                 "ident_edn": ":person/friend"
@@ -3271,7 +3278,7 @@ async fn datomic_datoms_vaet_scans_ref_values_from_distributed_head() {
 
     let (status, entid_lookup_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.entid",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.entid",
             json!({
                 "graph": graph,
                 "ident_edn": r#"[:person/name "Alice"]"#
@@ -3291,7 +3298,7 @@ async fn datomic_index_pull_pulls_entities_from_distributed_index() {
 
     let (status, first_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "alice" :person/name "Alice" :person/role :admin}]"#
@@ -3304,7 +3311,7 @@ async fn datomic_index_pull_pulls_entities_from_distributed_index() {
 
     let (status, second_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[{:db/id "bob" :person/name "Bob" :person/role :guest}]"#
@@ -3317,7 +3324,7 @@ async fn datomic_index_pull_pulls_entities_from_distributed_index() {
 
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexPull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexPull",
             json!({
                 "graph": graph,
                 "index": ":aevt",
@@ -3356,7 +3363,7 @@ async fn datomic_index_pull_pulls_entities_from_distributed_index() {
 
     let (status, as_of_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexPull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexPull",
             json!({
                 "graph": graph,
                 "index": ":aevt",
@@ -3377,7 +3384,7 @@ async fn datomic_index_pull_pulls_entities_from_distributed_index() {
 
     let (status, since_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.indexPull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.indexPull",
             json!({
                 "graph": graph,
                 "index": ":aevt",
@@ -3414,7 +3421,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#,
@@ -3432,7 +3439,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
         .to_string();
     let (status, proof_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.block.get?cid={proof_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={proof_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{proof_body}");
@@ -3440,7 +3447,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
 
     let (status, commit_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={graph}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={graph}"
         ))
         .await;
     assert_eq!(status, 200, "{commit_body}");
@@ -3514,7 +3521,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, query_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proof ?operation ?author ?ipns ?seq ?controller ?storage ?codec ?index]
@@ -3563,7 +3570,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
 
     let (status, index_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?root]
@@ -3590,7 +3597,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
 
     let (status, cap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proof ?controller ?action ?target]
@@ -3620,7 +3627,7 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
 
     let (status, resource_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?resource]
@@ -3661,7 +3668,7 @@ async fn datomic_transact_rejects_mismatched_cacao_tx_scope() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#,
@@ -3703,7 +3710,7 @@ async fn datomic_transact_accepts_matching_cacao_tx_scope_and_projects_capabilit
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": tx_edn,
@@ -3718,7 +3725,7 @@ async fn datomic_transact_accepts_matching_cacao_tx_scope_and_projects_capabilit
     let tok = tenant_jwt(&s.operator_did);
     let (status, cap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proof ?tx]
@@ -3746,7 +3753,7 @@ async fn graph_sparql_reads_datomic_distributed_datoms() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[
@@ -3761,7 +3768,7 @@ async fn graph_sparql_reads_datomic_distributed_datoms() {
 
     let (status, sparql_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?s <kotoba://attr/:person/name> "Alice" }"#,
@@ -3784,7 +3791,7 @@ async fn graph_sparql_reads_datomic_distributed_datoms() {
 
     let (status, retract_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "expected_parent": tx_body["commit_cid"],
@@ -3801,7 +3808,7 @@ async fn graph_sparql_reads_datomic_distributed_datoms() {
 
     let (status, old_name_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?s <kotoba://attr/:person/name> "Alice" }"#,
@@ -3819,7 +3826,7 @@ async fn graph_sparql_reads_datomic_distributed_datoms() {
 
     let (status, new_name_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?s <kotoba://attr/:person/name> "Alicia" }"#,
@@ -3838,7 +3845,7 @@ async fn graph_sparql_reads_datomic_distributed_datoms() {
 
     let (status, history_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "history": true,
@@ -3877,7 +3884,7 @@ async fn graph_sparql_accepts_cacao_graph_query_operation_scope_on_private_graph
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#
@@ -3896,7 +3903,7 @@ async fn graph_sparql_accepts_cacao_graph_query_operation_scope_on_private_graph
     );
     let (status, sparql_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?s <kotoba://attr/:person/name> "Alice" }"#,
@@ -3928,7 +3935,7 @@ async fn datomic_transact_accepts_vp_capability_and_persists_proof_block() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#,
@@ -3944,7 +3951,7 @@ async fn datomic_transact_accepts_vp_capability_and_persists_proof_block() {
         .to_string();
     let (status, proof_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.block.get?cid={proof_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={proof_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{proof_body}");
@@ -3960,7 +3967,7 @@ async fn datomic_transact_accepts_vp_capability_and_persists_proof_block() {
 
     let (status, commit_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={graph}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={graph}"
         ))
         .await;
     assert_eq!(status, 200, "{commit_body}");
@@ -3974,7 +3981,7 @@ async fn datomic_transact_accepts_vp_capability_and_persists_proof_block() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, cap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?action]
@@ -4001,7 +4008,7 @@ async fn datomic_transact_accepts_vp_capability_and_persists_proof_block() {
 
     let (status, zcap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?action]
@@ -4051,7 +4058,7 @@ async fn datomic_transact_accepts_matching_vp_tx_scope_and_projects_capability_t
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": tx_edn,
@@ -4066,7 +4073,7 @@ async fn datomic_transact_accepts_matching_vp_tx_scope_and_projects_capability_t
     let tok = tenant_jwt(&s.operator_did);
     let (status, cap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proof ?tx]
@@ -4105,7 +4112,7 @@ async fn datomic_transact_rejects_mismatched_vp_tx_scope() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#,
@@ -4137,7 +4144,7 @@ async fn datomic_q_accepts_cacao_graph_query_operation_scope_on_private_graph() 
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#
@@ -4155,7 +4162,7 @@ async fn datomic_q_accepts_cacao_graph_query_operation_scope_on_private_graph() 
     );
     let (status, q_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -4178,7 +4185,7 @@ async fn datomic_q_requires_matching_cacao_tx_scope_for_temporal_query_on_privat
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#
@@ -4200,7 +4207,7 @@ async fn datomic_q_requires_matching_cacao_tx_scope_for_temporal_query_on_privat
     );
     let (status, q_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -4227,7 +4234,7 @@ async fn datomic_q_requires_matching_cacao_tx_scope_for_temporal_query_on_privat
     );
     let (status, q_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -4258,7 +4265,7 @@ async fn datomic_q_accepts_vp_graph_query_capability_on_private_graph() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#
@@ -4270,7 +4277,7 @@ async fn datomic_q_accepts_vp_graph_query_capability_on_private_graph() {
 
     let (status, q_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -4301,7 +4308,7 @@ async fn datomic_q_accepts_vp_datom_read_capability_on_private_graph() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#
@@ -4313,7 +4320,7 @@ async fn datomic_q_accepts_vp_datom_read_capability_on_private_graph() {
 
     let (status, q_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -4343,7 +4350,7 @@ async fn datomic_q_rejects_tampered_vp_capability_signature() {
 
     let (status, tx_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#
@@ -4355,7 +4362,7 @@ async fn datomic_q_rejects_tampered_vp_capability_signature() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
@@ -4391,7 +4398,7 @@ async fn datomic_q_rejects_vp_with_forged_operator_capability_credential() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.transact",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
             json!({
                 "graph": graph,
                 "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#,
@@ -4417,7 +4424,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.vc.issue",
+            "/xrpc/com.etzhayyim.apps.kotoba.vc.issue",
             json!({
                 "graph": graph,
                 "credential": {
@@ -4459,7 +4466,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?id ?types ?issuer ?subject ?status ?proof]
@@ -4492,7 +4499,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, wire_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?cid ?wireFormat ?dataModel ?context]
@@ -4522,7 +4529,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, subject_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?role ?name ?region]
@@ -4548,7 +4555,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, normalized_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?statusId ?statusType ?proofType ?proofSuite ?proofPurpose ?proofVm ?proofCreated ?proofValue ?proofChallenge ?proofDomain]
@@ -4592,7 +4599,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, iri_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?id ?types ?issuer ?subject ?status ?proof]
@@ -4628,7 +4635,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, sparql_issuer_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": format!(r#"SELECT * WHERE {{ ?s <https://www.w3.org/2018/credentials#issuer> "{}" }}"#, s.operator_did),
@@ -4646,7 +4653,7 @@ async fn vc_issue_projects_credential_to_distributed_datoms() {
 
     let (status, sparql_subject_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?s <https://www.w3.org/2018/credentials#credentialSubject> ?subject }"#,
@@ -4679,7 +4686,7 @@ async fn vc_issue_accepts_cacao_vc_issue_operation_scope() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.vc.issue",
+            "/xrpc/com.etzhayyim.apps.kotoba.vc.issue",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -4724,7 +4731,7 @@ async fn vc_issue_accepts_vp_capability_and_persists_proof() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.vc.issue",
+            "/xrpc/com.etzhayyim.apps.kotoba.vc.issue",
             json!({
                 "graph": graph,
                 "auth_presentation": presentation,
@@ -4766,7 +4773,7 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.vc.present",
+            "/xrpc/com.etzhayyim.apps.kotoba.vc.present",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -4811,7 +4818,7 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?holder] :where [[?e :presentation/holder ?holder]]}"#
@@ -4824,7 +4831,7 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
 
     let (status, wire_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?cid ?wireFormat ?dataModel ?context]
@@ -4854,7 +4861,7 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
 
     let (status, proof_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proofType ?proofSuite ?proofPurpose ?proofVm ?proofCreated ?proofValue ?proofChallenge ?proofDomain]
@@ -4892,7 +4899,7 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
 
     let (status, iri_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?id ?types ?holder ?credential]
@@ -4924,7 +4931,7 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
 
     let (status, sparql_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?s <https://www.w3.org/2018/credentials#holder> "did:key:zAlice" }"#,
@@ -4942,7 +4949,7 @@ async fn vc_present_projects_presentation_to_distributed_datoms() {
 
     let (status, vc_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?id ?issuer ?subject]
@@ -4983,7 +4990,7 @@ async fn vc_present_accepts_vp_capability_and_persists_proof() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.vc.present",
+            "/xrpc/com.etzhayyim.apps.kotoba.vc.present",
             json!({
                 "graph": graph,
                 "auth_presentation": presentation,
@@ -5071,7 +5078,7 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.did.document.publish",
+            "/xrpc/com.etzhayyim.apps.kotoba.did.document.publish",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -5093,7 +5100,7 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
     let tok = tenant_jwt(&s.operator_did);
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?type] :where [[?e :did/service/type ?type]]}"#
@@ -5118,7 +5125,7 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
 
     let (status, w3c_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?service ?type ?endpoint]
@@ -5157,7 +5164,7 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
         kotoba_core::cid::KotobaCid::from_bytes("did:plc:kotobaagent".as_bytes()).to_multibase();
     let (status, entity_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.entity",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.entity",
             json!({
                 "graph": graph,
                 "entity": did_entity
@@ -5195,7 +5202,7 @@ async fn did_document_publish_projects_protocol_services_to_distributed_datoms()
     );
     let (status, protocol_endpoint_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?didcomm ?pds ?node ?membership]
@@ -5292,7 +5299,7 @@ async fn did_document_publish_rejects_missing_protocol_services() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.did.document.publish",
+            "/xrpc/com.etzhayyim.apps.kotoba.did.document.publish",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -5336,7 +5343,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.didcomm.send",
+            "/xrpc/com.etzhayyim.apps.kotoba.didcomm.send",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -5383,7 +5390,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, cap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?thread]
@@ -5405,7 +5412,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
 
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?protocol ?service ?thread]
@@ -5425,7 +5432,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
 
     let (status, cid_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?cid ?wireFormat]
@@ -5447,7 +5454,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
 
     let (status, body_field_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?content ?meta ?lang ?tags]
@@ -5480,7 +5487,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
 
     let (status, wire_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?thread ?body]
@@ -5504,7 +5511,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
 
     let (status, attachment_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?body ?attachment ?wireAttachment]
@@ -5538,7 +5545,7 @@ async fn didcomm_send_projects_message_to_distributed_datoms() {
 
     let (status, sparql_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?message <https://didcomm.org/basicmessage/2.0/message> ?body }"#,
@@ -5569,7 +5576,7 @@ async fn didcomm_send_rejects_cacao_without_thread_scope() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.didcomm.send",
+            "/xrpc/com.etzhayyim.apps.kotoba.didcomm.send",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -5612,7 +5619,7 @@ async fn didcomm_send_accepts_vp_thread_scope_and_persists_proof() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.didcomm.send",
+            "/xrpc/com.etzhayyim.apps.kotoba.didcomm.send",
             json!({
                 "graph": graph,
                 "auth_presentation": presentation,
@@ -5661,7 +5668,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.atproto.repo.write",
+            "/xrpc/com.etzhayyim.apps.kotoba.atproto.repo.write",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -5705,7 +5712,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, cap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?at]
@@ -5727,7 +5734,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?did ?collection ?nsid]
@@ -5751,7 +5758,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, cid_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?cid ?wireFormat]
@@ -5773,7 +5780,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, nsid_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?type ?record]
@@ -5797,7 +5804,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, record_field_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?text ?langs ?createdAt ?embedUri ?nsidText]
@@ -5829,7 +5836,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, sparql_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": r#"SELECT * WHERE { ?post <app.bsky.feed.post> ?record }"#,
@@ -5854,7 +5861,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
     );
     let (status, delete_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.atproto.repo.write",
+            "/xrpc/com.etzhayyim.apps.kotoba.atproto.repo.write",
             json!({
                 "graph": graph,
                 "cacao_b64": delete_cacao_b64,
@@ -5876,7 +5883,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, deleted_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?deleted ?operation]
@@ -5896,7 +5903,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, deleted_cid_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?cid ?wireFormat]
@@ -5922,7 +5929,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, deleted_text_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?text] :where [[?e :atproto/record/text ?text]]}"#
@@ -5939,7 +5946,7 @@ async fn atproto_repo_write_projects_record_to_distributed_datoms() {
 
     let (status, deleted_history_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "history": true,
@@ -5983,7 +5990,7 @@ async fn atproto_repo_write_rejects_cacao_without_at_uri_scope() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.atproto.repo.write",
+            "/xrpc/com.etzhayyim.apps.kotoba.atproto.repo.write",
             json!({
                 "graph": graph,
                 "cacao_b64": cacao_b64,
@@ -6024,7 +6031,7 @@ async fn atproto_repo_write_accepts_vp_at_uri_scope_and_persists_proof() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.atproto.repo.write",
+            "/xrpc/com.etzhayyim.apps.kotoba.atproto.repo.write",
             json!({
                 "graph": graph,
                 "auth_presentation": presentation,
@@ -6066,7 +6073,7 @@ async fn assert_protocol_auth_proof(
     let proof_cid = body["auth_proof_cid"].as_str().expect("auth_proof_cid");
     let (status, proof_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.block.get?cid={proof_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={proof_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{proof_body}");
@@ -6074,7 +6081,7 @@ async fn assert_protocol_auth_proof(
 
     let (status, commit_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={graph}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={graph}"
         ))
         .await;
     assert_eq!(status, 200, "{commit_body}");
@@ -6107,7 +6114,7 @@ async fn assert_protocol_vp_auth_proof(
     let proof_cid = body["auth_proof_cid"].as_str().expect("auth_proof_cid");
     let (status, proof_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.block.get?cid={proof_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={proof_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{proof_body}");
@@ -6122,7 +6129,7 @@ async fn assert_protocol_vp_auth_proof(
 
     let (status, commit_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={graph}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={graph}"
         ))
         .await;
     assert_eq!(status, 200, "{commit_body}");
@@ -6149,7 +6156,7 @@ async fn assert_protocol_commit_block_dag_cbor(
     let commit_cid = body["commit_cid"].as_str().expect("commit_cid");
     let (status, block_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.block.get?cid={commit_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={commit_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{block_body}");
@@ -6244,7 +6251,7 @@ async fn assert_protocol_tx_metadata(
     let tok = tenant_jwt(&s.operator_did);
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proof ?operation ?ipns ?seq ?controller ?instant ?storage ?codec ?index]
@@ -6290,7 +6297,7 @@ async fn assert_protocol_tx_metadata(
 
     let (status, cap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proof ?controller ?action ?target]
@@ -6318,7 +6325,7 @@ async fn assert_protocol_tx_metadata(
 
     let (status, zcap_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proof ?controller ?action ?target]
@@ -6346,7 +6353,7 @@ async fn assert_protocol_tx_metadata(
 
     let (status, sparql_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": format!(
@@ -6366,7 +6373,7 @@ async fn assert_protocol_tx_metadata(
 
     let (status, sparql_controller_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "graph": graph,
                 "query": format!(
@@ -6399,7 +6406,7 @@ async fn assert_capability_invocation_target(
     ] {
         let (status, body) = s
             .post_auth(
-                "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+                "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
                 json!({
                     "graph": graph,
                     "query_edn": format!(
@@ -6444,7 +6451,7 @@ async fn assert_capability_invocation_target(
     if let Some((attr, expected_value)) = typed_scope {
         let (status, body) = s
             .post_auth(
-                "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+                "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
                 json!({
                     "graph": graph,
                     "query_edn": format!(
@@ -6475,7 +6482,7 @@ async fn quad_retract_returns_ok() {
     let (_, cacao_b64) = build_ed25519_cacao("e2e");
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.retract",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.retract",
             json!({
                 "graph":     "e2e",
                 "subject":   "alice",
@@ -6494,7 +6501,7 @@ async fn quad_retract_without_cacao_returns_401() {
     let s = TestServer::start(false).await;
     let (status, _body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.retract",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.retract",
             json!({ "graph": "e2e", "subject": "alice", "predicate": "knows", "object": "bob" }),
         )
         .await;
@@ -6508,7 +6515,7 @@ async fn quad_retract_cacao_graph_mismatch_returns_401() {
     let (_, cacao_b64) = build_ed25519_cacao("other-graph");
     let (status, _body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.retract",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.retract",
             json!({
                 "graph":     "e2e",
                 "subject":   "alice",
@@ -6525,7 +6532,7 @@ async fn quad_retract_cacao_graph_mismatch_returns_401() {
 async fn block_get_invalid_cid_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get("/xrpc/ai.gftd.apps.kotoba.block.get?cid=not-a-valid-cid")
+        .get("/xrpc/com.etzhayyim.apps.kotoba.block.get?cid=not-a-valid-cid")
         .await;
     assert_eq!(status, 400, "{body}");
 }
@@ -6536,7 +6543,7 @@ async fn block_get_unknown_cid_returns_404() {
     let s = TestServer::start(false).await;
     let cid = KotobaCid::from_bytes(b"block-does-not-exist-xyz").to_multibase();
     let (status, body) = s
-        .get(&format!("/xrpc/ai.gftd.apps.kotoba.block.get?cid={cid}"))
+        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={cid}"))
         .await;
     assert_eq!(status, 404, "{body}");
 }
@@ -6545,7 +6552,7 @@ async fn block_get_unknown_cid_returns_404() {
 async fn commit_get_invalid_cid_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get("/xrpc/ai.gftd.apps.kotoba.commit.get?graph=not-a-cid")
+        .get("/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph=not-a-cid")
         .await;
     assert_eq!(status, 400, "{body}");
 }
@@ -6556,7 +6563,7 @@ async fn commit_get_unknown_graph_returns_404() {
     let s = TestServer::start(false).await;
     let cid = KotobaCid::from_bytes(b"graph-commit-does-not-exist").to_multibase();
     let (status, body) = s
-        .get(&format!("/xrpc/ai.gftd.apps.kotoba.commit.get?graph={cid}"))
+        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={cid}"))
         .await;
     assert_eq!(status, 404, "{body}");
 }
@@ -6570,7 +6577,7 @@ async fn block_put_and_get_roundtrip() {
     let payload = b"kotoba e2e block";
     let (status, put) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.block.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.block.put",
             json!({ "data_b64": B64.encode(payload) }),
             &tok,
         )
@@ -6579,7 +6586,7 @@ async fn block_put_and_get_roundtrip() {
     let cid = put["cid"].as_str().expect("cid");
 
     let (status2, get) = s
-        .get(&format!("/xrpc/ai.gftd.apps.kotoba.block.get?cid={cid}"))
+        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={cid}"))
         .await;
     assert_eq!(status2, 200, "{get}");
     let bytes = B64
@@ -6599,7 +6606,7 @@ async fn commit_store_and_get_roundtrip() {
     // CACAO must be built against the same graph string sent in the request (multibase CID)
     let (_, cacao_b64) = build_ed25519_cacao(&graph_cid);
     let (status, store) = s.post(
-        "/xrpc/ai.gftd.apps.kotoba.commit.store",
+        "/xrpc/com.etzhayyim.apps.kotoba.commit.store",
         json!({ "graph": graph_cid, "author": "did:plc:e2e", "seq": 1, "cacao_b64": cacao_b64 }),
     ).await;
     assert_eq!(status, 200, "{store}");
@@ -6607,7 +6614,7 @@ async fn commit_store_and_get_roundtrip() {
 
     let (status2, get) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={graph_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={graph_cid}"
         ))
         .await;
     assert_eq!(status2, 200, "{get}");
@@ -6623,7 +6630,7 @@ async fn commit_store_without_cacao_returns_401() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.commit.store",
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.store",
             json!({ "graph": graph_cid, "author": "did:plc:e2e", "seq": 1 }),
         )
         .await;
@@ -6639,7 +6646,7 @@ async fn embed_create_returns_quad_cid() {
     let graph_cid = graph.to_multibase();
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.embed.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.embed.create",
             json!({
                 "text": "hello kotoba",
                 "doc_cid": "doc1",
@@ -6697,7 +6704,7 @@ async fn embed_create_empty_text_returns_400() {
     let tok = tenant_jwt(&s.operator_did);
     let graph_cid = KotobaCid::from_bytes(b"embed-empty").to_multibase();
     let (status, body) = s.post_auth(
-        "/xrpc/ai.gftd.apps.kotoba.embed.create",
+        "/xrpc/com.etzhayyim.apps.kotoba.embed.create",
         json!({ "text": "", "doc_cid": "doc-empty", "model_cid": "model1", "graph": graph_cid }),
         &tok,
     ).await;
@@ -6710,7 +6717,7 @@ async fn infer_run_with_stub_engine() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.infer.run",
+            "/xrpc/com.etzhayyim.apps.kotoba.infer.run",
             json!({ "prompt": "what is kotoba?", "max_new_tokens": 32 }),
             &tok,
         )
@@ -6728,7 +6735,7 @@ async fn infer_run_without_auth_returns_401() {
     let s = TestServer::start(true).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.infer.run",
+            "/xrpc/com.etzhayyim.apps.kotoba.infer.run",
             json!({ "prompt": "hello" }),
         )
         .await;
@@ -6741,7 +6748,7 @@ async fn infer_run_without_engine_returns_503() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.infer.run",
+            "/xrpc/com.etzhayyim.apps.kotoba.infer.run",
             json!({ "prompt": "hello" }),
             &tok,
         )
@@ -6756,7 +6763,7 @@ async fn agent_run_with_stub_engine_completes() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.run",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.run",
             json!({ "task": "test: 2+2?", "max_steps": 3, "max_tokens": 64 }),
             &tok,
         )
@@ -6779,7 +6786,7 @@ async fn agent_run_without_engine_returns_503() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.run",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.run",
             json!({ "task": "x" }),
             &tok,
         )
@@ -7207,7 +7214,7 @@ async fn mcp_datalog_run_derives_and_flushes_royalty() {
     for (subj, pred, obj) in [("a", "edge", "b"), ("b", "edge", "c")] {
         let (st, _) = s
             .post(
-                "/xrpc/ai.gftd.apps.kotoba.quad.create",
+                "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
                 json!({
                     "graph":     graph,
                     "subject":   subj,
@@ -7378,7 +7385,7 @@ async fn invoke_run_wasm_guest_via_xrpc() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.invoke.run",
+            "/xrpc/com.etzhayyim.apps.kotoba.invoke.run",
             json!({
                 "program_cid":  "be2e_wasm_invoke",
                 "program_type": "wasm-node",
@@ -7418,7 +7425,7 @@ async fn invoke_run_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, _) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.invoke.run",
+            "/xrpc/com.etzhayyim.apps.kotoba.invoke.run",
             json!({ "program_cid": "x", "program_type": "datalog", "agent_did": "did:plc:x" }),
         )
         .await;
@@ -7436,7 +7443,7 @@ async fn agent_sync_open_creates_session() {
 
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
             json!({
                 "session_id": "sess-1",
                 "graph_cid":  graph_cid,
@@ -7458,7 +7465,7 @@ async fn agent_sync_open_without_auth_returns_401() {
     use kotoba_core::cid::KotobaCid;
     let graph_cid = KotobaCid::from_bytes(b"sync-graph-noauth").to_multibase();
     let (status, body) = s.post(
-        "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+        "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
         json!({ "session_id": "sess-noauth", "graph_cid": graph_cid, "since_seq": 0, "head_cid": null }),
     ).await;
     assert_eq!(status, 401, "{body}");
@@ -7473,14 +7480,14 @@ async fn agent_sync_advance_updates_watermark() {
     let tok = tenant_jwt(&s.operator_did);
 
     s.post_auth(
-        "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+        "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
         json!({ "session_id": "sess-adv", "graph_cid": graph_cid, "since_seq": 0, "head_cid": null }),
         &tok,
     ).await;
 
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncadvance",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncadvance",
             json!({ "session_id": "sess-adv", "new_head_cid": head_cid, "new_seq": 42 }),
             &tok,
         )
@@ -7498,14 +7505,14 @@ async fn agent_sync_close_removes_session() {
     let tok = tenant_jwt(&s.operator_did);
 
     s.post_auth(
-        "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+        "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
         json!({ "session_id": "sess-close", "graph_cid": graph_cid, "since_seq": 0, "head_cid": null }),
         &tok,
     ).await;
 
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncclose",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncclose",
             json!({ "session_id": "sess-close" }),
             &tok,
         )
@@ -7517,7 +7524,7 @@ async fn agent_sync_close_removes_session() {
     // Second close → 404 (session removed)
     let (status2, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncclose",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncclose",
             json!({ "session_id": "sess-close" }),
             &tok,
         )
@@ -7537,7 +7544,7 @@ async fn agent_sync_full_lifecycle() {
     // open
     let (st, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
             json!({ "session_id": "lc", "graph_cid": graph_cid, "since_seq": 0, "head_cid": null }),
             &tok,
         )
@@ -7547,7 +7554,7 @@ async fn agent_sync_full_lifecycle() {
     // advance × 2
     let (st, b) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncadvance",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncadvance",
             json!({ "session_id": "lc", "new_head_cid": head1, "new_seq": 10 }),
             &tok,
         )
@@ -7557,7 +7564,7 @@ async fn agent_sync_full_lifecycle() {
 
     let (st, b) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncadvance",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncadvance",
             json!({ "session_id": "lc", "new_head_cid": head2, "new_seq": 20 }),
             &tok,
         )
@@ -7568,7 +7575,7 @@ async fn agent_sync_full_lifecycle() {
     // close
     let (st, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncclose",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncclose",
             json!({ "session_id": "lc" }),
             &tok,
         )
@@ -7632,7 +7639,7 @@ async fn vault_put_returns_cid_and_size() {
     let data = b"hello vault";
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.vault.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.put",
             json!({ "data_b64": B64.encode(data) }),
             &tok,
         )
@@ -7652,7 +7659,7 @@ async fn vault_put_then_get_roundtrip() {
 
     let (status, put_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.vault.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.put",
             json!({ "data_b64": data_b64 }),
             &tok,
         )
@@ -7662,7 +7669,7 @@ async fn vault_put_then_get_roundtrip() {
 
     let (status, get_body) = s
         .get_with_auth(
-            &format!("/xrpc/ai.gftd.apps.kotoba.vault.get?cid={cid}"),
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.get?cid={cid}"),
             &tok,
         )
         .await;
@@ -7683,7 +7690,7 @@ async fn vault_get_without_auth_returns_401() {
     let zero_cid = format!("b{}", "a".repeat(58));
     let (status, _body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.vault.get?cid={zero_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.get?cid={zero_cid}"
         ))
         .await;
     assert_eq!(
@@ -7699,7 +7706,7 @@ async fn vault_get_unknown_cid_returns_404() {
     let zero_cid = kotoba_core::cid::KotobaCid::from_bytes(b"vault-missing-e2e").to_multibase();
     let (status, _body) = s
         .get_with_auth(
-            &format!("/xrpc/ai.gftd.apps.kotoba.vault.get?cid={zero_cid}"),
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.get?cid={zero_cid}"),
             &tok,
         )
         .await;
@@ -7711,7 +7718,7 @@ async fn vault_get_missing_cid_param_returns_400() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
     let (status, _body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.vault.get", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.vault.get", &tok)
         .await;
     assert_eq!(status, 400);
 }
@@ -7743,7 +7750,7 @@ async fn kg_entity_lookup_by_id_after_quad_create() {
 
     // Query by id — kg graph defaults to Authenticated tier.
     let (status, body) = s
-        .get_authed(&format!("/xrpc/ai.gftd.apps.kotobase.kg.entity?id={subj}"))
+        .get_authed(&format!("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id={subj}"))
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false), "ok false: {body}");
@@ -7775,7 +7782,7 @@ async fn kg_entity_lookup_by_qid() {
     }
 
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.entity?qid=Q42")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?qid=Q42")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false));
@@ -7787,7 +7794,7 @@ async fn kg_entity_lookup_by_qid() {
 async fn kg_entity_not_found_returns_ok_false() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.entity?id=no-such-entity")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id=no-such-entity")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
@@ -7801,7 +7808,7 @@ async fn kg_entity_not_found_returns_ok_false() {
 async fn kg_entity_missing_param_returns_400() {
     let s = TestServer::start(false).await;
     // Must pass auth first (authenticated tier), then the missing-param check fires.
-    let (status, _) = s.get_authed("/xrpc/ai.gftd.apps.kotobase.kg.entity").await;
+    let (status, _) = s.get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity").await;
     assert_eq!(status, 400);
 }
 
@@ -7812,7 +7819,7 @@ async fn kg_ingest_and_entity_roundtrip() {
 
     let (status, put) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":        "ingest-e2e-001",
                 "qid":       "Q100",
@@ -7845,7 +7852,7 @@ async fn kg_ingest_and_entity_roundtrip() {
 
     // Lookup via kg.entity — kg graph defaults to Authenticated tier.
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.entity?id=ingest-e2e-001")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id=ingest-e2e-001")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
@@ -7885,7 +7892,7 @@ async fn kg_commit_returns_distributed_datomic_head() {
 
     let (status, put) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":      "kg-commit-e2e-001",
                 "labelEn": "KG Commit E2E",
@@ -7899,7 +7906,7 @@ async fn kg_commit_returns_distributed_datomic_head() {
 
     let (status, commit) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.commit",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.commit",
             json!({ "author": s.operator_did }),
             &tok,
         )
@@ -7927,7 +7934,7 @@ async fn kg_commit_returns_distributed_datomic_head() {
 
     let (status, second) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.commit",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.commit",
             json!({ "author": s.operator_did }),
             &tok,
         )
@@ -7944,7 +7951,7 @@ async fn kg_ingest_with_relations() {
 
     // Ingest target entity first (needed for relation dst)
     s.post_auth(
-        "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+        "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
         json!({ "id": "rel-dst-001", "type": "City", "labelEn": "Tokyo" }),
         &tok,
     )
@@ -7953,7 +7960,7 @@ async fn kg_ingest_with_relations() {
     // Ingest source entity with relation to target
     let (status, put) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":      "rel-src-001",
                 "type":    "Person",
@@ -7970,7 +7977,7 @@ async fn kg_ingest_with_relations() {
 
     // Query source entity — kg graph defaults to Authenticated tier.
     let (st, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.entity?id=rel-src-001")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id=rel-src-001")
         .await;
     assert_eq!(st, 200, "{body}");
 
@@ -7992,7 +7999,7 @@ async fn kg_catalog_reflects_ingested_entities() {
     for (id, label) in &[("cat-e1", "EntityOne"), ("cat-e2", "EntityTwo")] {
         let (st, _) = s
             .post_auth(
-                "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+                "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
                 json!({ "id": id, "type": "Thing", "labelEn": label, "sourceId": "cat-test-src" }),
                 &tok,
             )
@@ -8001,7 +8008,7 @@ async fn kg_catalog_reflects_ingested_entities() {
     }
 
     // kg graph defaults to Authenticated tier — send a Bearer token.
-    let (status, body) = s.get_authed("/xrpc/ai.gftd.apps.kotobase.kg.catalog").await;
+    let (status, body) = s.get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.catalog").await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false));
     assert!(
@@ -8240,7 +8247,7 @@ async fn quad_create_without_cacao_returns_401() {
     let s = TestServer::start(false).await;
     let (status, _body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({ "graph": "public", "subject": "alice", "predicate": "knows", "object": "bob" }),
         )
         .await;
@@ -8255,7 +8262,7 @@ async fn quad_create_with_valid_ed25519_cacao_stores_author_did() {
 
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({
                 "graph":     graph,
                 "subject":   "alice",
@@ -8275,7 +8282,7 @@ async fn quad_create_with_valid_ed25519_cacao_stores_author_did() {
     // Verify meta/author quad was stored with the journal CID as subject
     let graph_cid = kotoba_core::cid::KotobaCid::from_bytes(graph.as_bytes()).to_multibase();
     let url = format!(
-        "/xrpc/ai.gftd.apps.kotoba.graph.query?graph={graph_cid}&subject={journal_cid}&predicate=meta%2Fauthor"
+        "/xrpc/com.etzhayyim.apps.kotoba.graph.query?graph={graph_cid}&subject={journal_cid}&predicate=meta%2Fauthor"
     );
     let (qstatus, qbody) = s.get_authed(&url).await;
     assert_eq!(qstatus, 200, "{qbody}");
@@ -8300,7 +8307,7 @@ async fn quad_create_cacao_graph_mismatch_returns_401() {
     // CACAO covers "other-graph" but request targets "my-graph"
     let (status, _body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({
                 "graph":     "my-graph",
                 "subject":   "s",
@@ -8318,7 +8325,7 @@ async fn quad_create_invalid_cacao_b64_returns_400() {
     let s = TestServer::start(false).await;
     let (status, _body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({
                 "graph": "private-graph",
                 "subject": "alice",
@@ -8338,7 +8345,7 @@ async fn quad_create_cacao_cbor_parse_error_returns_400() {
     // Valid base64 but not valid DAG-CBOR
     let (status, _body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({
                 "graph": "private-graph",
                 "subject": "alice",
@@ -8361,7 +8368,7 @@ async fn quad_create_oversized_graph_returns_400() {
     let (_, cacao_b64) = build_ed25519_cacao(&oversized_graph);
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({
                 "graph":     oversized_graph,
                 "subject":   "s",
@@ -8380,7 +8387,7 @@ async fn quad_create_oversized_object_returns_400() {
     let (_, cacao_b64) = build_ed25519_cacao("e2e");
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.quad.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.quad.create",
             json!({
                 "graph":     "e2e",
                 "subject":   "s",
@@ -8424,12 +8431,12 @@ async fn mcp_quad_create_oversized_field_returns_error() {
 
 // ── kotobase input validation tests ──────────────────────────────────────────
 
-const KOTOBASE_ACCOUNT_CREATE: &str = "/xrpc/ai.gftd.apps.kotobase.accountCreate";
-const KOTOBASE_ACCOUNT_STATUS: &str = "/xrpc/ai.gftd.apps.kotobase.accountStatus";
-const KOTOBASE_PIN_CREATE: &str = "/xrpc/ai.gftd.apps.kotobase.pinCreate";
-const KOTOBASE_PIN_DELETE: &str = "/xrpc/ai.gftd.apps.kotobase.pinDelete";
-const KOTOBASE_PIN_LIST: &str = "/xrpc/ai.gftd.apps.kotobase.pinList";
-const KOTOBASE_USAGE_GET: &str = "/xrpc/ai.gftd.apps.kotobase.usageGet";
+const KOTOBASE_ACCOUNT_CREATE: &str = "/xrpc/com.etzhayyim.apps.kotobase.accountCreate";
+const KOTOBASE_ACCOUNT_STATUS: &str = "/xrpc/com.etzhayyim.apps.kotobase.accountStatus";
+const KOTOBASE_PIN_CREATE: &str = "/xrpc/com.etzhayyim.apps.kotobase.pinCreate";
+const KOTOBASE_PIN_DELETE: &str = "/xrpc/com.etzhayyim.apps.kotobase.pinDelete";
+const KOTOBASE_PIN_LIST: &str = "/xrpc/com.etzhayyim.apps.kotobase.pinList";
+const KOTOBASE_USAGE_GET: &str = "/xrpc/com.etzhayyim.apps.kotobase.usageGet";
 
 /// Build a minimal JWT with `sub = did` and a far-future `exp`.
 /// Signature is intentionally fake — the server does not verify JWT signatures.
@@ -8873,7 +8880,7 @@ async fn mcp_graph_gc_non_operator_returns_auth_error() {
 async fn kg_catalog_empty_returns_zero_stats() {
     let s = TestServer::start(false).await;
     // KG graph defaults to Authenticated visibility — opaque Bearer token suffices
-    let (status, body) = s.get_authed("/xrpc/ai.gftd.apps.kotobase.kg.catalog").await;
+    let (status, body) = s.get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.catalog").await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false), "{body}");
     let stats = &body["stats"];
@@ -8885,7 +8892,7 @@ async fn kg_catalog_empty_returns_zero_stats() {
 #[tokio::test]
 async fn cc_status_without_auth_returns_401() {
     let s = TestServer::start(false).await;
-    let (status, _body) = s.get("/xrpc/ai.gftd.apps.kotoba.cc.status").await;
+    let (status, _body) = s.get("/xrpc/com.etzhayyim.apps.kotoba.cc.status").await;
     assert_eq!(
         status, 401,
         "cc_status must reject unauthenticated requests"
@@ -8897,7 +8904,7 @@ async fn cc_status_returns_index_counts() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.cc.status", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.cc.status", &tok)
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["chunks_indexed"].is_number(), "{body}");
@@ -8909,7 +8916,7 @@ async fn cc_status_returns_index_counts() {
 async fn email_list_xrpc_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get("/xrpc/ai.gftd.apps.kotoba.email.list?owner_did=did:key:zEmailXrpc1")
+        .get("/xrpc/com.etzhayyim.apps.kotoba.email.list?owner_did=did:key:zEmailXrpc1")
         .await;
     assert_eq!(status, 401, "{body}");
 }
@@ -8921,7 +8928,7 @@ async fn email_list_xrpc_unknown_owner_returns_empty() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .get_with_auth(
-            &format!("/xrpc/ai.gftd.apps.kotoba.email.list?owner_did={did}"),
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.email.list?owner_did={did}"),
             &tok,
         )
         .await;
@@ -8941,7 +8948,7 @@ async fn email_ingest_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.email.ingest",
+            "/xrpc/com.etzhayyim.apps.kotoba.email.ingest",
             json!({
                 "owner_did": "did:key:zEmailIngest1",
                 "raw_b64": "aGVsbG8=",
@@ -8957,7 +8964,7 @@ async fn email_ingest_empty_owner_did_returns_400() {
     let tok = tenant_jwt("did:key:zEmailOwner1");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.email.ingest",
+            "/xrpc/com.etzhayyim.apps.kotoba.email.ingest",
             json!({
                 "owner_did": "",
                 "raw_b64": "aGVsbG8=",
@@ -8981,7 +8988,7 @@ async fn weight_put_with_valid_cacao_returns_blob_cid() {
     let data = vec![0x3cu8];
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.weight.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.put",
             json!({
                 "model_cid":  "bafkreiabcdef",
                 "layer":      0,
@@ -9012,7 +9019,7 @@ async fn weight_put_without_cacao_returns_401() {
     let data = vec![0x3cu8];
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.weight.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.put",
             json!({
                 "model_cid": "bafkreiabcdef",
                 "layer":     0,
@@ -9038,7 +9045,7 @@ async fn lora_apply_with_valid_cacao_returns_adapter_cid() {
     let adapter = vec![0x01u8, 0x02u8, 0x03u8];
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.lora.apply",
+            "/xrpc/com.etzhayyim.apps.kotoba.lora.apply",
             json!({
                 "model_cid":   "bafkreiabcdef",
                 "rank":        4u32,
@@ -9066,7 +9073,7 @@ async fn lora_apply_without_cacao_returns_401() {
     let adapter = vec![0x01u8, 0x02u8, 0x03u8];
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.lora.apply",
+            "/xrpc/com.etzhayyim.apps.kotoba.lora.apply",
             json!({
                 "model_cid":   "bafkreiabcdef",
                 "rank":        4u32,
@@ -9240,7 +9247,7 @@ async fn weight_get_unknown_cid_returns_404() {
     // A well-formed multibase CID that does not exist in the store
     let cid = KotobaCid::from_bytes(b"nonexistent-weight-blob").to_multibase();
     let (status, _body) = s
-        .get(&format!("/xrpc/ai.gftd.apps.kotoba.weight.get?cid={cid}"))
+        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={cid}"))
         .await;
     assert_eq!(status, 404);
 }
@@ -9255,7 +9262,7 @@ async fn weight_put_then_get_roundtrip() {
     let data = vec![0x3cu8, 0x7fu8, 0x00u8];
     let (status, put_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.weight.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.put",
             json!({
                 "model_cid":  "bafkreiabcdef",
                 "layer":      1u32,
@@ -9273,7 +9280,7 @@ async fn weight_put_then_get_roundtrip() {
     // Now GET the blob back by its CID
     let (status, get_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.weight.get?cid={blob_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={blob_cid}"
         ))
         .await;
     assert_eq!(status, 200, "{get_body}");
@@ -9305,7 +9312,7 @@ async fn weight_put_param_key_and_u32_dtype() {
     let data = vec![0x01u8, 0x02u8, 0x03u8, 0x04u8];
     let (status, put_body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.weight.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.put",
             json!({
                 "model_cid":  model,
                 "layer":      3u32,
@@ -9323,7 +9330,7 @@ async fn weight_put_param_key_and_u32_dtype() {
 
     // blob round-trips
     let (status, get_body) = s
-        .get(&format!("/xrpc/ai.gftd.apps.kotoba.weight.get?cid={blob_cid}"))
+        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={blob_cid}"))
         .await;
     assert_eq!(status, 200, "{get_body}");
     assert_eq!(
@@ -9337,7 +9344,7 @@ async fn weight_put_param_key_and_u32_dtype() {
     // and the dtype serialized as `U32`.
     let (status, pull_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.pull",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.pull",
             json!({ "graph": graph, "entity": model, "pattern_edn": r#"[*]"# }),
             &tok,
         )
@@ -9358,7 +9365,7 @@ async fn kg_search_empty_returns_empty_results() {
     let s = TestServer::start(false).await;
     // KG graph defaults to Authenticated — send Bearer token
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.search?q=nonexistent+entity")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.search?q=nonexistent+entity")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["results"].is_array(), "expected results array: {body}");
@@ -9377,7 +9384,7 @@ async fn kg_search_after_ingest_returns_entity() {
     // Ingest an entity with a label so the search index has data
     let (status, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":      "ent-search-1",
                 "labelJa": "東京都",
@@ -9391,7 +9398,7 @@ async fn kg_search_after_ingest_returns_entity() {
 
     // Search for the entity (blake3 pseudo-vector fallback, no LLM needed)
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.search?q=Tokyo")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.search?q=Tokyo")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["results"].is_array(), "{body}");
@@ -9406,7 +9413,7 @@ async fn kg_embed_commits_vector_to_distributed_search_view() {
 
     let (status, ingest) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":      "ent-embed-search-1",
                 "labelEn": "Distributed Vector Entity",
@@ -9419,7 +9426,7 @@ async fn kg_embed_commits_vector_to_distributed_search_view() {
 
     let (status, embed) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.embed",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.embed",
             json!({
                 "entityId": "ent-embed-search-1",
                 "text":     "distributed vector entity",
@@ -9432,7 +9439,7 @@ async fn kg_embed_commits_vector_to_distributed_search_view() {
     assert!(embed["dims"].as_u64().unwrap_or(0) > 0, "{embed}");
 
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.search?q=distributed+vector+entity")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.search?q=distributed+vector+entity")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
@@ -9448,7 +9455,7 @@ async fn kg_query_sparql_empty_graph_returns_empty() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.query",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.query",
             json!({
                 "lang":  "sparql",
                 "query": "PREFIX k: <urn:kg:> SELECT ?s ?o WHERE { ?s k:id ?o }",
@@ -9479,7 +9486,7 @@ async fn kg_sparql_roundtrip_ingest_then_select_describe_ask() {
 
     let (status, put) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":        "sparql-roundtrip-001",
                 "qid":       "Q42",
@@ -9505,7 +9512,7 @@ async fn kg_sparql_roundtrip_ingest_then_select_describe_ask() {
     // so we match the exact stored predicate string.
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": r#"SELECT * WHERE { ?s <kg/claim/occupation> ?o }"#, "limit": 1000 }),
             "test-token",
         )
@@ -9521,7 +9528,7 @@ async fn kg_sparql_roundtrip_ingest_then_select_describe_ask() {
     // ASK with the predicate we just wrote
     let (status, ask) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": r#"ASK { ?s <kg/claim/occupation> "engineer" }"# }),
             "test-token",
         )
@@ -9536,7 +9543,7 @@ async fn kg_sparql_roundtrip_ingest_then_select_describe_ask() {
     // ASK with a value that was NOT written — must be false
     let (status, ask2) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": r#"ASK { ?s <kg/claim/occupation> "wizard" }"# }),
             "test-token",
         )
@@ -9556,7 +9563,7 @@ async fn kg_sparql_roundtrip_ingest_then_describe_subject() {
 
     let (status, put) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":        "sparql-describe-001",
                 "type":      "Person",
@@ -9581,7 +9588,7 @@ async fn kg_sparql_roundtrip_ingest_then_describe_subject() {
     // DESCRIBE the just-ingested subject → expects all its quads back
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": format!("DESCRIBE <cid:{subj_cid}>") }),
             "test-token",
         )
@@ -9611,7 +9618,7 @@ async fn kg_sparql_roundtrip_ingest_then_construct() {
 
     let (status, put) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":        "sparql-construct-001",
                 "type":      "Person",
@@ -9631,7 +9638,7 @@ async fn kg_sparql_roundtrip_ingest_then_construct() {
 
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "query": r#"CONSTRUCT { ?s <admin> "yes" } WHERE { ?s <kg/claim/role> "admin" }"#,
             }),
@@ -9656,7 +9663,7 @@ async fn kg_sparql_select_empty_graph_returns_select_form() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": r#"SELECT * WHERE { ?s <role> "admin" }"# }),
             "test-token",
         )
@@ -9672,7 +9679,7 @@ async fn kg_sparql_ask_empty_graph_returns_false() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": r#"ASK { ?s <role> "admin" }"# }),
             "test-token",
         )
@@ -9688,7 +9695,7 @@ async fn kg_sparql_describe_empty_returns_zero_quads() {
     let cid = kotoba_core::cid::KotobaCid::from_bytes(b"sparql-e2e-nobody");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": format!("DESCRIBE <cid:{}>", cid.to_multibase()) }),
             "test-token",
         )
@@ -9703,7 +9710,7 @@ async fn kg_sparql_construct_returns_construct_form() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": r#"CONSTRUCT { ?s <label> "ADMIN" } WHERE { ?s <role> "admin" }"# }),
             "test-token",
         )
@@ -9721,7 +9728,7 @@ async fn kg_sparql_unknown_form_returns_400() {
     let s = TestServer::start(false).await;
     let (status, _body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": "INSERT DATA { <a> <b> <c> }" }),
             "test-token",
         )
@@ -9734,7 +9741,7 @@ async fn kg_sparql_empty_query_returns_400() {
     let s = TestServer::start(false).await;
     let (status, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({ "query": "" }),
             "test-token",
         )
@@ -9747,7 +9754,7 @@ async fn kg_sparql_invalid_graph_cid_returns_400() {
     let s = TestServer::start(false).await;
     let (status, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+            "/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
             json!({
                 "query": r#"SELECT * WHERE { ?s ?p ?o }"#,
                 "graph": "not-a-real-multibase-cid",
@@ -9763,7 +9770,7 @@ async fn kg_query_unknown_lang_returns_400() {
     let s = TestServer::start(false).await;
     let (status, _body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.query",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.query",
             json!({ "lang": "sql", "query": "SELECT 1" }),
             "test-token",
         )
@@ -9777,7 +9784,7 @@ async fn kg_delete_nonexistent_entity_returns_ok_zero_retracted() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.delete",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.delete",
             json!({ "id": "ent-does-not-exist" }),
             &tok,
         )
@@ -9796,7 +9803,7 @@ async fn kg_ingest_then_delete_removes_entity() {
     // Ingest an entity (any bearer allowed)
     let (status, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({ "id": "ent-delete-me", "type": "Thing", "labelEn": "Delete Target" }),
             &write_tok,
         )
@@ -9805,7 +9812,7 @@ async fn kg_ingest_then_delete_removes_entity() {
 
     // Verify it's present
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.entity?id=ent-delete-me")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id=ent-delete-me")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
@@ -9816,7 +9823,7 @@ async fn kg_ingest_then_delete_removes_entity() {
     // Delete requires operator auth
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.delete",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.delete",
             json!({ "id": "ent-delete-me" }),
             &op_tok,
         )
@@ -9830,7 +9837,7 @@ async fn kg_ingest_then_delete_removes_entity() {
 
     // Entity should no longer be found
     let (status, body) = s
-        .get_authed("/xrpc/ai.gftd.apps.kotobase.kg.entity?id=ent-delete-me")
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id=ent-delete-me")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
@@ -9962,7 +9969,7 @@ async fn cc_search_without_auth_returns_401() {
     // Regression guard: cc_search calls the embed service per request — exposing
     // it without auth enables resource-exhaustion attacks on the embed backend.
     let s = TestServer::start(false).await;
-    let (status, _body) = s.get("/xrpc/ai.gftd.apps.kotoba.cc.search?q=test").await;
+    let (status, _body) = s.get("/xrpc/com.etzhayyim.apps.kotoba.cc.search?q=test").await;
     assert_eq!(
         status, 401,
         "cc_search must reject unauthenticated requests"
@@ -9976,7 +9983,7 @@ async fn cc_rag_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, _body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.cc.rag",
+            "/xrpc/com.etzhayyim.apps.kotoba.cc.rag",
             json!({ "query": "what is Rust?" }),
         )
         .await;
@@ -9990,7 +9997,7 @@ async fn cc_search_without_real_embed_endpoint_returns_error() {
     // The embed client initializes with default localhost:11434 but no server is running.
     // The request should return an error response (500 or 503) — not 200 with data.
     let (status, body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.cc.search?q=test", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.cc.search?q=test", &tok)
         .await;
     assert!(
         status == 500 || status == 503,
@@ -10008,7 +10015,7 @@ async fn cc_rag_without_real_embed_endpoint_returns_error() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.cc.rag",
+            "/xrpc/com.etzhayyim.apps.kotoba.cc.rag",
             json!({ "query": "what is Rust?" }),
             &tok,
         )
@@ -10031,7 +10038,7 @@ async fn cc_ingest_trigger_returns_started_job_id() {
     // and spawns the job asynchronously; the response must include job_id + status=started
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.cc.ingest",
+            "/xrpc/com.etzhayyim.apps.kotoba.cc.ingest",
             json!({ "parquetDir": "/tmp/no-such-dir", "mode": "chunks" }),
             &tok,
         )
@@ -10057,7 +10064,7 @@ async fn cc_ingest_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.cc.ingest",
+            "/xrpc/com.etzhayyim.apps.kotoba.cc.ingest",
             json!({ "parquetDir": "/tmp/test", "mode": "chunks" }),
         )
         .await;
@@ -10071,7 +10078,7 @@ async fn cc_ingest_with_non_operator_did_returns_401() {
     let tok = tenant_jwt("did:key:zNotTheOperator");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.cc.ingest",
+            "/xrpc/com.etzhayyim.apps.kotoba.cc.ingest",
             json!({ "parquetDir": "/tmp/test", "mode": "chunks" }),
             &tok,
         )
@@ -10085,7 +10092,7 @@ async fn cc_search_empty_query_returns_400() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.cc.search?q=", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.cc.search?q=", &tok)
         .await;
     assert_eq!(status, 400, "{body}");
     assert!(body["error"].as_str().is_some(), "{body}");
@@ -10097,7 +10104,7 @@ async fn cc_ingest_invalid_mode_returns_400() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.cc.ingest",
+            "/xrpc/com.etzhayyim.apps.kotoba.cc.ingest",
             json!({ "parquetDir": "/tmp/test", "mode": "invalid" }),
             &tok,
         )
@@ -10112,7 +10119,7 @@ async fn cc_rag_empty_query_returns_400() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.cc.rag",
+            "/xrpc/com.etzhayyim.apps.kotoba.cc.rag",
             json!({ "query": "" }),
             &tok,
         )
@@ -10128,7 +10135,7 @@ async fn agent_sync_open_empty_session_id_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
             json!({
                 "session_id": "",
                 "graph_cid":  "bafybeisync000000000000000000000000000000000000000",
@@ -10145,7 +10152,7 @@ async fn agent_sync_open_oversized_session_id_returns_400() {
     let long_id = "x".repeat(257); // > 256 bytes
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
             json!({
                 "session_id": long_id,
                 "graph_cid":  "bafybeisync000000000000000000000000000000000000000",
@@ -10164,7 +10171,7 @@ async fn kg_ingest_empty_id_returns_400() {
     let tok = tenant_jwt("did:key:zKgVal1");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id": "",
             }),
@@ -10180,7 +10187,7 @@ async fn kg_embed_empty_text_returns_400() {
     let tok = tenant_jwt("did:key:zKgVal2");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.embed",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.embed",
             json!({
                 "entityId": "ent-1",
                 "text": "",
@@ -10194,7 +10201,7 @@ async fn kg_embed_empty_text_returns_400() {
 #[tokio::test]
 async fn kg_search_empty_query_returns_400() {
     let s = TestServer::start(false).await;
-    let (status, body) = s.get("/xrpc/ai.gftd.apps.kotobase.kg.search?q=").await;
+    let (status, body) = s.get("/xrpc/com.etzhayyim.apps.kotobase.kg.search?q=").await;
     assert_eq!(status, 400, "{body}");
 }
 
@@ -10204,7 +10211,7 @@ async fn kg_delete_empty_id_returns_400() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.delete",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.delete",
             json!({
                 "id": "",
             }),
@@ -10219,7 +10226,7 @@ async fn kg_query_empty_query_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.query",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.query",
             json!({
                 "lang": "sparql", "query": "",
             }),
@@ -10238,7 +10245,7 @@ async fn kg_ingest_too_many_claims_returns_400() {
         .collect();
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id": "ent-overflow",
                 "claims": claims,
@@ -10254,7 +10261,7 @@ async fn agent_sync_open_non_ascii_session_id_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncopen",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
             json!({
                 "session_id": "セッション",  // non-ASCII
                 "graph_cid":  "bafybeisync000000000000000000000000000000000000000",
@@ -10273,7 +10280,7 @@ async fn agent_sync_advance_unknown_session_returns_404() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.agent.syncadvance",
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncadvance",
             json!({
                 "session_id":   "no-such-session",
                 "new_head_cid": head_cid,
@@ -10292,7 +10299,7 @@ async fn signal_register_prekeys_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.register.prekeys",
+            "/xrpc/com.etzhayyim.signal.register.prekeys",
             json!({
                 "did": "did:plc:test123",
                 "deviceId": "device-1",
@@ -10310,7 +10317,7 @@ async fn signal_register_prekeys_empty_did_returns_400() {
     // Use a token whose sub matches the empty DID (won't reach the check — empty DID is caught first)
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.signal.register.prekeys",
+            "/xrpc/com.etzhayyim.signal.register.prekeys",
             json!({
                 "did": "",
                 "deviceId": "device-1",
@@ -10330,7 +10337,7 @@ async fn signal_send_message_oversized_payload_returns_413() {
     let large_ciphertext = "x".repeat(300 * 1024);
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.send.message",
+            "/xrpc/com.etzhayyim.signal.send.message",
             json!({
                 "signalMessage": {
                     "recipientDid": "did:plc:recipient",
@@ -10347,7 +10354,7 @@ async fn signal_send_message_oversized_payload_returns_413() {
 #[tokio::test]
 async fn signal_get_prekey_bundle_empty_did_returns_400() {
     let s = TestServer::start(false).await;
-    let (status, body) = s.get("/xrpc/ai.gftd.signal.get.prekey.bundle?did=").await;
+    let (status, body) = s.get("/xrpc/com.etzhayyim.signal.get.prekey.bundle?did=").await;
     assert_eq!(status, 400, "{body}");
 }
 
@@ -10356,7 +10363,7 @@ async fn signal_send_group_message_empty_group_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.send.group.message",
+            "/xrpc/com.etzhayyim.signal.send.group.message",
             json!({
                 "groupId": "",
                 "senderDid": "did:plc:sender",
@@ -10374,7 +10381,7 @@ async fn attest_claim_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   "did:key:zEntity1",
                 "attester_did": "did:key:zAttester1",
@@ -10393,7 +10400,7 @@ async fn attest_claim_invalid_claim_type_returns_400() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   "did:key:zEntity2",
                 "attester_did": did,
@@ -10413,7 +10420,7 @@ async fn attest_claim_roundtrip() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   "did:key:zEntity3",
                 "attester_did": did,
@@ -10447,7 +10454,7 @@ async fn attest_claim_roundtrip() {
     let graph = kotoba_core::cid::KotobaCid::from_bytes(b"kotoba/attestation/v1").to_multibase();
     let (status, q_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?issuer ?types ?subjectId ?claimCid ?claimType ?attester ?stake ?status ?statusId ?statusType ?cid ?wireFormat ?dataModel ?context ?attestType]
@@ -10514,7 +10521,7 @@ async fn attest_claim_roundtrip() {
 
     let (status, iri_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?issuer ?types ?subject ?status]
@@ -10549,7 +10556,7 @@ async fn attest_claim_roundtrip() {
 
     let (status, proof_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?proofType ?proofPurpose ?proofVm ?proofValue ?proofDomain]
@@ -10582,7 +10589,7 @@ async fn attest_claim_roundtrip() {
 
     let (status, commit_body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={graph}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={graph}"
         ))
         .await;
     assert_eq!(status, 200, "{commit_body}");
@@ -10619,7 +10626,7 @@ async fn attest_claim_roundtrip() {
 
     let (status, tx_meta_body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.datomic.q",
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
             json!({
                 "graph": graph,
                 "query_edn": r#"{:find [?operation ?ipns ?seq ?controller ?storage ?codec ?index]
@@ -10658,7 +10665,7 @@ async fn attest_challenge_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.attest.challenge",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
             json!({
                 "claim_cid":      "bafybeifake000000000000000000000000000",
                 "challenger_did": "did:key:zChallenger1",
@@ -10676,7 +10683,7 @@ async fn attest_challenge_empty_reason_returns_400() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.challenge",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
             json!({
                 "claim_cid":      "bafybeifake000000000000000000000000000",
                 "challenger_did": did,
@@ -10695,7 +10702,7 @@ async fn kg_ingest_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id": "ent-noauth",
                 "labelEn": "Test Entity",
@@ -10711,7 +10718,7 @@ async fn kg_delete_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotobase.kg.delete",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.delete",
             json!({
                 "id": "ent-noauth-del",
             }),
@@ -10726,7 +10733,7 @@ async fn kg_embed_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotobase.kg.embed",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.embed",
             json!({
                 "entityId": "ent-embed-noauth",
                 "text": "some text",
@@ -10742,7 +10749,7 @@ async fn kg_ingest_with_auth_succeeds() {
     let tok = tenant_jwt("did:key:zKgWriter1");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":      "ent-auth-ok",
                 "labelEn": "Authenticated Entity",
@@ -10763,7 +10770,7 @@ async fn kg_delete_with_auth_on_missing_entity_returns_ok_zero() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.delete",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.delete",
             json!({
                 "id": "ent-does-not-exist-auth",
             }),
@@ -10781,7 +10788,7 @@ async fn kg_delete_non_operator_returns_401() {
     let tok = tenant_jwt("did:key:zNonOperatorDeleter");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.delete",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.delete",
             json!({
                 "id": "ent-non-op-del",
             }),
@@ -10799,7 +10806,7 @@ async fn kg_ingest_claim_pred_too_long_returns_400() {
     let long_pred = "x".repeat(300); // exceeds MAX_KG_ID_LEN=256
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":     "ent-claim-pred-len",
                 "claims": [{ "pred": long_pred, "value": "v" }],
@@ -10818,7 +10825,7 @@ async fn kg_ingest_relation_pred_too_long_returns_400() {
     let long_pred = "r".repeat(300);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":        "ent-rel-pred-len",
                 "relations": [{ "pred": long_pred, "dstId": "dst-ok" }],
@@ -10838,7 +10845,7 @@ async fn kg_ingest_label_vec_inf_returns_400() {
     let tok = tenant_jwt("did:key:zKgVecInf");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.ingest",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.ingest",
             json!({
                 "id":       "ent-vec-inf",
                 "labelVec": [1.0_f64, 1e40_f64],
@@ -10859,7 +10866,7 @@ async fn attest_challenge_roundtrip() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.challenge",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
             json!({
                 "claim_cid":      "bafybeifake000000000000000000000000000",
                 "challenger_did": did,
@@ -10880,7 +10887,7 @@ async fn attest_challenge_empty_claim_cid_returns_400() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.challenge",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
             json!({
                 "claim_cid":      "",
                 "challenger_did": did,
@@ -10898,7 +10905,7 @@ async fn attest_challenge_empty_claim_cid_returns_400() {
 async fn attest_query_returns_empty_list() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get("/xrpc/ai.gftd.apps.kotoba.attest.query?entity_did=did:key:zNobody")
+        .get("/xrpc/com.etzhayyim.apps.kotoba.attest.query?entity_did=did:key:zNobody")
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
@@ -10914,7 +10921,7 @@ async fn attest_query_oversized_entity_did_returns_400() {
     let big_did = "x".repeat(600);
     let (status, body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.attest.query?entity_did={big_did}"
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.query?entity_did={big_did}"
         ))
         .await;
     assert_eq!(status, 400, "{body}");
@@ -10930,7 +10937,7 @@ async fn attest_claim_insufficient_stake_self_returns_422() {
     // MIN_STAKE_SELF_ATTESTED = 1_000_000_000 mKOTO; send one less
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   did,
                 "attester_did": did,
@@ -10957,7 +10964,7 @@ async fn attest_claim_insufficient_stake_verified_entity_returns_422() {
     // MIN_STAKE_VERIFIED_ENTITY = 5_000_000_000 mKOTO; send exactly MIN_STAKE_SELF_ATTESTED
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   "did:key:zEntity1",
                 "attester_did": did,
@@ -10983,7 +10990,7 @@ async fn attest_claim_sufficient_stake_self_succeeds() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   did,
                 "attester_did": did,
@@ -11009,7 +11016,7 @@ async fn attest_query_returns_claim_after_submit() {
     // Submit a claim
     let (status, _) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   entity,
                 "attester_did": attester,
@@ -11024,7 +11031,7 @@ async fn attest_query_returns_claim_after_submit() {
     // Query by entity_did — should find the claim
     let (status, body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.attest.query?entity_did={entity}"
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.query?entity_did={entity}"
         ))
         .await;
     assert_eq!(status, 200, "{body}");
@@ -11051,7 +11058,7 @@ async fn attest_query_returns_claim_after_submit() {
     // Query by attester_did — same claim
     let (status, body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.attest.query?attester_did={attester}"
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.query?attester_did={attester}"
         ))
         .await;
     assert_eq!(status, 200, "{body}");
@@ -11063,7 +11070,7 @@ async fn attest_query_returns_claim_after_submit() {
 #[tokio::test]
 async fn attest_query_no_filter_returns_empty() {
     let s = TestServer::start(false).await;
-    let (status, body) = s.get("/xrpc/ai.gftd.apps.kotoba.attest.query").await;
+    let (status, body) = s.get("/xrpc/com.etzhayyim.apps.kotoba.attest.query").await;
     assert_eq!(status, 200, "{body}");
     let claims = body["claims"].as_array().expect("claims array");
     assert_eq!(claims.len(), 0, "no-filter must return empty: {body}");
@@ -11076,7 +11083,7 @@ async fn request_log_query_without_auth_returns_401() {
     // Regression guard: audit log must be operator-only — leaking it reveals
     // internal API usage patterns and DID activity timings to any caller.
     let s = TestServer::start(false).await;
-    let (status, _body) = s.get("/xrpc/ai.gftd.apps.kotoba.request.log").await;
+    let (status, _body) = s.get("/xrpc/com.etzhayyim.apps.kotoba.request.log").await;
     assert_eq!(
         status, 401,
         "request_log_query must reject unauthenticated requests"
@@ -11088,7 +11095,7 @@ async fn request_log_query_returns_empty_list() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.request.log", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.request.log", &tok)
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
@@ -11102,14 +11109,14 @@ async fn request_log_query_returns_entries_after_requests() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
     // Make a few requests so the fingerprint middleware writes audit quads.
-    s.get_with_auth("/xrpc/ai.gftd.apps.kotoba.request.log", &tok)
+    s.get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.request.log", &tok)
         .await;
-    s.get_with_auth("/xrpc/ai.gftd.apps.kotoba.request.log", &tok)
+    s.get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.request.log", &tok)
         .await;
     // Allow the fire-and-forget tokio tasks to complete (in-memory, µs).
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let (status, body) = s
-        .get_with_auth("/xrpc/ai.gftd.apps.kotoba.request.log", &tok)
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.request.log", &tok)
         .await;
     assert_eq!(status, 200, "{body}");
     let entries = body["entries"].as_array().expect("entries must be array");
@@ -11134,15 +11141,15 @@ async fn request_log_query_path_prefix_filter() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
     // Make distinct requests to two different endpoint families.
-    s.get_with_auth("/xrpc/ai.gftd.apps.kotoba.request.log", &tok)
+    s.get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.request.log", &tok)
         .await;
-    s.get("/xrpc/ai.gftd.apps.kotoba.attest.query?entity_did=did:key:zTest1")
+    s.get("/xrpc/com.etzhayyim.apps.kotoba.attest.query?entity_did=did:key:zTest1")
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     // Filter by exact prefix — should return only audit entries matching it.
     let (status, body) = s
         .get_with_auth(
-            "/xrpc/ai.gftd.apps.kotoba.request.log?path_prefix=/xrpc/ai.gftd.apps.kotoba.request.log",
+            "/xrpc/com.etzhayyim.apps.kotoba.request.log?path_prefix=/xrpc/com.etzhayyim.apps.kotoba.request.log",
             &tok,
         )
         .await;
@@ -11151,7 +11158,7 @@ async fn request_log_query_path_prefix_filter() {
     for e in entries {
         let path = e["path"].as_str().unwrap_or("");
         assert!(
-            path.starts_with("/xrpc/ai.gftd.apps.kotoba.request.log"),
+            path.starts_with("/xrpc/com.etzhayyim.apps.kotoba.request.log"),
             "entry path {path:?} does not match filter"
         );
     }
@@ -11165,7 +11172,7 @@ async fn signal_distribute_sender_key_ok() {
     let tok = tenant_jwt(&s.operator_did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.signal.distribute.sender.key",
+            "/xrpc/com.etzhayyim.signal.distribute.sender.key",
             json!({
                 "recipientDid":    "did:key:zRecipient1",
                 "recipientDevice": "device-1",
@@ -11184,7 +11191,7 @@ async fn signal_distribute_sender_key_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.distribute.sender.key",
+            "/xrpc/com.etzhayyim.signal.distribute.sender.key",
             json!({
                 "recipientDid":    "did:key:zRecipient1",
                 "recipientDevice": "device-1",
@@ -11200,7 +11207,7 @@ async fn signal_send_message_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.send.message",
+            "/xrpc/com.etzhayyim.signal.send.message",
             json!({
                 "signalMessage": {
                     "messageType":       "directMessage",
@@ -11221,7 +11228,7 @@ async fn signal_send_group_message_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.send.group.message",
+            "/xrpc/com.etzhayyim.signal.send.group.message",
             json!({
                 "groupId":          "grp-1",
                 "senderDid":        "did:key:zSender",
@@ -11237,7 +11244,7 @@ async fn signal_distribute_sender_key_empty_recipient_did_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.distribute.sender.key",
+            "/xrpc/com.etzhayyim.signal.distribute.sender.key",
             json!({
                 "recipientDid":    "",
                 "recipientDevice": "device-1",
@@ -11253,7 +11260,7 @@ async fn signal_distribute_sender_key_empty_device_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.distribute.sender.key",
+            "/xrpc/com.etzhayyim.signal.distribute.sender.key",
             json!({
                 "recipientDid":    "did:key:zRecipient2",
                 "recipientDevice": "",
@@ -11270,7 +11277,7 @@ async fn signal_distribute_sender_key_oversized_payload_returns_413() {
     let large = "x".repeat(300 * 1024);
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.distribute.sender.key",
+            "/xrpc/com.etzhayyim.signal.distribute.sender.key",
             json!({
                 "recipientDid":    "did:key:zRecipient3",
                 "recipientDevice": "device-1",
@@ -11290,7 +11297,7 @@ async fn attest_claim_expired_token_returns_401() {
     let tok = expired_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   "did:key:zEntity99",
                 "attester_did": did,
@@ -11310,7 +11317,7 @@ async fn attest_challenge_expired_token_returns_401() {
     let tok = expired_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.challenge",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
             json!({
                 "claim_cid":      "bafybeifake000000000000000000000000000",
                 "challenger_did": did,
@@ -11329,7 +11336,7 @@ async fn signal_register_prekeys_expired_token_returns_401() {
     let tok = expired_jwt(did);
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.signal.register.prekeys",
+            "/xrpc/com.etzhayyim.signal.register.prekeys",
             json!({
                 "did":          did,
                 "deviceId":     "device-x",
@@ -11350,7 +11357,7 @@ async fn operator_auth_expired_token_returns_401() {
     let graph_cid = KotobaCid::from_bytes(b"expired-test").to_multibase();
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.embed.create",
+            "/xrpc/com.etzhayyim.apps.kotoba.embed.create",
             json!({ "text": "hello", "doc_cid": "d1", "model_cid": "m1", "graph": graph_cid }),
             &tok,
         )
@@ -11366,7 +11373,7 @@ async fn signal_register_prekeys_invalid_did_prefix_returns_400() {
     let tok = tenant_jwt("not-a-did");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.signal.register.prekeys",
+            "/xrpc/com.etzhayyim.signal.register.prekeys",
             json!({
                 "did":          "not-a-did",
                 "deviceId":     "device-1",
@@ -11383,7 +11390,7 @@ async fn signal_register_prekeys_invalid_did_prefix_returns_400() {
 async fn signal_get_prekey_bundle_invalid_did_prefix_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get("/xrpc/ai.gftd.signal.get.prekey.bundle?did=not-a-did")
+        .get("/xrpc/com.etzhayyim.signal.get.prekey.bundle?did=not-a-did")
         .await;
     assert_eq!(status, 400, "{body}");
 }
@@ -11393,7 +11400,7 @@ async fn signal_send_group_message_invalid_sender_did_prefix_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.send.group.message",
+            "/xrpc/com.etzhayyim.signal.send.group.message",
             json!({
                 "groupId":          "grp-1",
                 "senderDid":        "not-a-did",
@@ -11409,7 +11416,7 @@ async fn signal_distribute_sender_key_invalid_recipient_did_prefix_returns_400()
     let s = TestServer::start(false).await;
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.signal.distribute.sender.key",
+            "/xrpc/com.etzhayyim.signal.distribute.sender.key",
             json!({
                 "recipientDid":    "not-a-did",
                 "recipientDevice": "device-1",
@@ -11426,7 +11433,7 @@ async fn signal_distribute_sender_key_invalid_recipient_did_prefix_returns_400()
 async fn email_list_invalid_did_prefix_returns_400() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get("/xrpc/ai.gftd.apps.kotoba.email.list?owner_did=not-a-did")
+        .get("/xrpc/com.etzhayyim.apps.kotoba.email.list?owner_did=not-a-did")
         .await;
     assert_eq!(status, 400, "{body}");
 }
@@ -11438,7 +11445,7 @@ async fn email_ingest_invalid_did_prefix_returns_400() {
     let tok = tenant_jwt("did:key:zOperator");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.email.ingest",
+            "/xrpc/com.etzhayyim.apps.kotoba.email.ingest",
             json!({
                 "owner_did": "not-a-did",
                 "raw_b64":   B64.encode(b"From: test@example.com\r\n\r\nBody"),
@@ -11455,7 +11462,7 @@ async fn attest_claim_invalid_entity_did_prefix_returns_400() {
     let tok = tenant_jwt("did:key:zAttester");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   "not-a-did",
                 "attester_did": "did:key:zAttester",
@@ -11474,7 +11481,7 @@ async fn attest_claim_invalid_attester_did_prefix_returns_400() {
     let tok = tenant_jwt("did:key:zSelf");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.claim",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.claim",
             json!({
                 "entity_did":   "did:key:zSelf",
                 "attester_did": "not-a-did",
@@ -11493,7 +11500,7 @@ async fn attest_challenge_invalid_challenger_did_prefix_returns_400() {
     let tok = tenant_jwt("not-a-did");
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotoba.attest.challenge",
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
             json!({
                 "claim_cid":      "bafybeifake000000000000000000000000000",
                 "challenger_did": "not-a-did",
@@ -11516,7 +11523,7 @@ async fn commit_store_oversized_author_returns_400() {
     let long_author = "a".repeat(513);
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.commit.store",
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.store",
             json!({
                 "graph":     graph,
                 "author":    long_author,
@@ -11539,7 +11546,7 @@ async fn weight_put_oversized_shape_returns_400() {
     let bad_shape: Vec<u32> = vec![1; 9];
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.weight.put",
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.put",
             json!({
                 "model_cid": "bafkreiabcdef",
                 "layer":     0,
@@ -11560,7 +11567,7 @@ async fn weight_put_oversized_shape_returns_400() {
 async fn email_read_without_auth_returns_401() {
     let s = TestServer::start(false).await;
     let (status, body) = s
-        .get("/xrpc/ai.gftd.apps.kotoba.email.read?owner_did=did:key:zReader&email_cid=fakecid")
+        .get("/xrpc/com.etzhayyim.apps.kotoba.email.read?owner_did=did:key:zReader&email_cid=fakecid")
         .await;
     assert_eq!(status, 401, "{body}");
 }
@@ -11571,7 +11578,7 @@ async fn email_read_invalid_did_returns_400() {
     let tok = tenant_jwt("did:key:zReader");
     let (status, body) = s
         .get_with_auth(
-            "/xrpc/ai.gftd.apps.kotoba.email.read?owner_did=not-a-did&email_cid=fakecid",
+            "/xrpc/com.etzhayyim.apps.kotoba.email.read?owner_did=not-a-did&email_cid=fakecid",
             &tok,
         )
         .await;
@@ -11585,7 +11592,7 @@ async fn email_read_empty_cid_returns_400() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .get_with_auth(
-            &format!("/xrpc/ai.gftd.apps.kotoba.email.read?owner_did={did}&email_cid="),
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.email.read?owner_did={did}&email_cid="),
             &tok,
         )
         .await;
@@ -11600,7 +11607,7 @@ async fn email_read_without_crypto_returns_503() {
     let tok = tenant_jwt(did);
     let (status, body) = s
         .get_with_auth(
-            &format!("/xrpc/ai.gftd.apps.kotoba.email.read?owner_did={did}&email_cid=fakecid"),
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.email.read?owner_did={did}&email_cid=fakecid"),
             &tok,
         )
         .await;
@@ -11619,7 +11626,7 @@ async fn block_get_oversized_cid_returns_400() {
     let oversized_cid = "b".repeat(513); // exceeds MAX_CID_LEN=512
     let (status, body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.block.get?cid={oversized_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={oversized_cid}"
         ))
         .await;
     assert_eq!(status, 400, "oversized cid must be rejected: {body}");
@@ -11631,7 +11638,7 @@ async fn weight_get_oversized_cid_returns_400() {
     let oversized_cid = "w".repeat(513);
     let (status, body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.weight.get?cid={oversized_cid}"
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={oversized_cid}"
         ))
         .await;
     assert_eq!(status, 400, "oversized cid must be rejected: {body}");
@@ -11643,7 +11650,7 @@ async fn commit_get_oversized_graph_returns_400() {
     let oversized_graph = "g".repeat(513);
     let (status, body) = s
         .get(&format!(
-            "/xrpc/ai.gftd.apps.kotoba.commit.get?graph={oversized_graph}"
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={oversized_graph}"
         ))
         .await;
     assert_eq!(status, 400, "oversized graph must be rejected: {body}");
@@ -11655,7 +11662,7 @@ async fn kg_query_oversized_lang_returns_400() {
     let oversized_lang = "x".repeat(17); // exceeds MAX_KG_LANG_LEN=16
     let (status, body) = s
         .post_auth(
-            "/xrpc/ai.gftd.apps.kotobase.kg.query",
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.query",
             json!({ "lang": oversized_lang, "query": "SELECT ?s ?o WHERE {}" }),
             "test-token",
         )
@@ -11670,7 +11677,7 @@ async fn commit_store_oversized_graph_returns_400() {
     let (_, cacao_b64) = build_ed25519_cacao("irrelevant-graph");
     let (status, body) = s
         .post(
-            "/xrpc/ai.gftd.apps.kotoba.commit.store",
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.store",
             json!({
                 "graph":     oversized_graph,
                 "author":    "did:key:zAuthor",

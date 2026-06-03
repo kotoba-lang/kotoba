@@ -199,7 +199,13 @@ impl Vault {
     }
 
     async fn reassemble(&self, manifest: &BlobManifest) -> Option<Bytes> {
-        let mut buf = Vec::with_capacity(manifest.total_size as usize);
+        // `total_size` is an untrusted hint from the manifest block (which may have
+        // been fetched from an arbitrary peer via the cold store). The buffer is
+        // actually filled from the fetched chunks, so a manifest claiming a huge
+        // total_size must not trigger an unbounded speculative allocation (OOM);
+        // cap the pre-allocation and let the Vec grow to the real chunk total.
+        const MAX_REASSEMBLE_PREALLOC: usize = 64 << 20; // 64 MiB
+        let mut buf = Vec::with_capacity((manifest.total_size as usize).min(MAX_REASSEMBLE_PREALLOC));
         for chunk_cid in &manifest.chunks {
             let chunk = self.get_raw(chunk_cid).await?;
             buf.extend_from_slice(&chunk);
@@ -412,5 +418,49 @@ mod tests {
         let vault = Vault::new();
         let unknown = KotobaCid::from_bytes(b"not-stored");
         assert!(vault.get(&unknown).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reassemble_huge_total_size_does_not_oom_and_returns_real_chunks() {
+        // A manifest fetched from an untrusted source can claim total_size = u64::MAX
+        // while pointing at a few small chunks. Before the pre-alloc cap, get() →
+        // reassemble() would `Vec::with_capacity(u64::MAX as usize)` and OOM/abort.
+        // It must now return the real (small) reassembled bytes without OOM.
+        let vault = Vault::new();
+        // Insert two small raw chunk blobs directly under their CIDs.
+        let c1 = KotobaCid::from_bytes(b"chunk-aaa");
+        let c2 = KotobaCid::from_bytes(b"chunk-bbb");
+        vault
+            .blobs
+            .write()
+            .await
+            .insert(c1.to_multibase(), Bytes::from_static(b"hello"));
+        vault
+            .blobs
+            .write()
+            .await
+            .insert(c2.to_multibase(), Bytes::from_static(b"world"));
+
+        // A manifest with a wildly inflated total_size but only the two small chunks.
+        let manifest = BlobManifest {
+            mime_type: "application/octet-stream".to_string(),
+            total_size: u64::MAX,
+            chunks: vec![c1, c2],
+        };
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&manifest, &mut cbor).unwrap();
+        let manifest_cid = KotobaCid::from_bytes(b"evil-manifest");
+        vault
+            .blobs
+            .write()
+            .await
+            .insert(manifest_cid.to_multibase(), Bytes::from(cbor));
+
+        let out = vault.get(&manifest_cid).await;
+        assert_eq!(
+            out.as_deref(),
+            Some(b"helloworld".as_ref()),
+            "must reassemble the real chunks, not OOM on the lying total_size"
+        );
     }
 }

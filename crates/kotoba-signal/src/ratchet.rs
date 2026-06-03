@@ -342,4 +342,39 @@ mod tests {
         assert_eq!(b2.decrypt(&second).unwrap(), b"b");
         assert_eq!(b2.decrypt(&first).unwrap(), b"a");
     }
+
+    #[test]
+    fn skip_gap_at_exactly_max_is_accepted() {
+        // Boundary partner of `too_many_skipped_keys_rejected`: the skip limit is
+        // a CEILING (skip > MAX_SKIP rejected), so a gap of EXACTLY MAX_SKIP must
+        // still decrypt. This pins the off-by-one — an inclusive/exclusive slip in
+        // the guard would silently drop a legitimate gap-of-MAX_SKIP message
+        // (false-positive DoS rejection) or admit a gap-of-MAX_SKIP+1 (the test
+        // below).
+        let (mut alice, mut bob) = make_pair();
+        // alice m0 has counter 0; encrypt MAX_SKIP more so `last` has counter == MAX_SKIP.
+        let mut last = alice.encrypt(b"m0").unwrap(); // counter 0
+        for _ in 0..MAX_SKIP {
+            last = alice.encrypt(b"m").unwrap();
+        }
+        // bob is at recv_counter 0; decrypting `last` skips exactly MAX_SKIP keys.
+        let result = bob.decrypt(&last);
+        assert!(
+            result.is_ok(),
+            "a gap of exactly MAX_SKIP ({MAX_SKIP}) must be accepted, got {result:?}"
+        );
+        assert_eq!(result.unwrap(), b"m");
+
+        // One more (gap MAX_SKIP+1) must be rejected — confirms the boundary is
+        // tight, not merely "large gaps eventually fail".
+        let (mut a2, mut b2) = make_pair();
+        let mut last2 = a2.encrypt(b"m0").unwrap(); // counter 0
+        for _ in 0..(MAX_SKIP + 1) {
+            last2 = a2.encrypt(b"m").unwrap(); // last2 counter == MAX_SKIP + 1
+        }
+        assert!(
+            matches!(b2.decrypt(&last2), Err(crate::SignalError::TooManySkippedKeys)),
+            "a gap of MAX_SKIP+1 must be rejected"
+        );
+    }
 }

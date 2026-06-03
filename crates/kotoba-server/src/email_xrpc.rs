@@ -1,10 +1,10 @@
 //! XRPC handlers for encrypted email storage and retrieval.
 //!
 //! NSIDs:
-//!   ai.gftd.apps.kotoba.email.list   — list email metadata (GET)
-//!   ai.gftd.apps.kotoba.email.read   — decrypt and return one email (GET)
-//!   ai.gftd.apps.kotoba.email.ingest — manually ingest a raw message (POST)
-//!   ai.gftd.apps.kotoba.email.send   — native E2E send via Signal (POST)
+//!   com.etzhayyim.apps.kotoba.email.list   — list email metadata (GET)
+//!   com.etzhayyim.apps.kotoba.email.read   — decrypt and return one email (GET)
+//!   com.etzhayyim.apps.kotoba.email.ingest — manually ingest a raw message (POST)
+//!   com.etzhayyim.apps.kotoba.email.send   — native E2E send via Signal (POST)
 //!
 //! Two encryption regimes share one inbox datom schema:
 //!   • Ingested mail (`email.ingest`, SMTP/Gmail bridge): body is sealed with the
@@ -16,10 +16,10 @@
 //!     `email/enc = "signal:v1"`; `email.read` returns the raw envelope for the
 //!     recipient to decrypt rather than attempting a server-side decrypt.
 
-pub const NSID_EMAIL_LIST: &str = "ai.gftd.apps.kotoba.email.list";
-pub const NSID_EMAIL_READ: &str = "ai.gftd.apps.kotoba.email.read";
-pub const NSID_EMAIL_INGEST: &str = "ai.gftd.apps.kotoba.email.ingest";
-pub const NSID_EMAIL_SEND: &str = "ai.gftd.apps.kotoba.email.send";
+pub const NSID_EMAIL_LIST: &str = "com.etzhayyim.apps.kotoba.email.list";
+pub const NSID_EMAIL_READ: &str = "com.etzhayyim.apps.kotoba.email.read";
+pub const NSID_EMAIL_INGEST: &str = "com.etzhayyim.apps.kotoba.email.ingest";
+pub const NSID_EMAIL_SEND: &str = "com.etzhayyim.apps.kotoba.email.send";
 
 /// Marks a body blob that is a client-sealed Signal envelope (zero-access).
 const ENC_SIGNAL_V1: &str = "signal:v1";
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn nsid_constants_have_correct_prefix() {
-        let prefix = "ai.gftd.apps.kotoba.email.";
+        let prefix = "com.etzhayyim.apps.kotoba.email.";
         assert!(NSID_EMAIL_LIST.starts_with(prefix));
         assert!(NSID_EMAIL_READ.starts_with(prefix));
         assert!(NSID_EMAIL_INGEST.starts_with(prefix));
@@ -751,22 +751,22 @@ mod tests {
 
     #[test]
     fn nsid_email_list_exact_value() {
-        assert_eq!(NSID_EMAIL_LIST, "ai.gftd.apps.kotoba.email.list");
+        assert_eq!(NSID_EMAIL_LIST, "com.etzhayyim.apps.kotoba.email.list");
     }
 
     #[test]
     fn nsid_email_read_exact_value() {
-        assert_eq!(NSID_EMAIL_READ, "ai.gftd.apps.kotoba.email.read");
+        assert_eq!(NSID_EMAIL_READ, "com.etzhayyim.apps.kotoba.email.read");
     }
 
     #[test]
     fn nsid_email_ingest_exact_value() {
-        assert_eq!(NSID_EMAIL_INGEST, "ai.gftd.apps.kotoba.email.ingest");
+        assert_eq!(NSID_EMAIL_INGEST, "com.etzhayyim.apps.kotoba.email.ingest");
     }
 
     #[test]
     fn nsid_email_send_exact_value() {
-        assert_eq!(NSID_EMAIL_SEND, "ai.gftd.apps.kotoba.email.send");
+        assert_eq!(NSID_EMAIL_SEND, "com.etzhayyim.apps.kotoba.email.send");
     }
 
     #[test]

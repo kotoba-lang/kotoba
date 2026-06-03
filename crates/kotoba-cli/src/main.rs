@@ -13,11 +13,11 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 // ── NSIDs (mirror kotoba-server::xrpc constants) ─────────────────────────────
-const NSID_BLOCK_PUT: &str = "ai.gftd.apps.kotoba.block.put";
-const NSID_BLOCK_GET: &str = "ai.gftd.apps.kotoba.block.get";
-const NSID_QUAD_CREATE: &str = "ai.gftd.apps.kotoba.quad.create";
-const NSID_QUAD_RETRACT: &str = "ai.gftd.apps.kotoba.quad.retract";
-const NSID_GRAPH_QUERY: &str = "ai.gftd.apps.kotoba.graph.query";
+const NSID_BLOCK_PUT: &str = "com.etzhayyim.apps.kotoba.block.put";
+const NSID_BLOCK_GET: &str = "com.etzhayyim.apps.kotoba.block.get";
+const NSID_QUAD_CREATE: &str = "com.etzhayyim.apps.kotoba.quad.create";
+const NSID_QUAD_RETRACT: &str = "com.etzhayyim.apps.kotoba.quad.retract";
+const NSID_GRAPH_QUERY: &str = "com.etzhayyim.apps.kotoba.graph.query";
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ enum Cmd {
 
     /// SPARQL query (SELECT / DESCRIBE / CONSTRUCT / ASK) over the running
     /// server's direct-SPARQL endpoint.  Auto-detects the form from the
-    /// query.  Goes to POST /xrpc/ai.gftd.apps.kotoba.graph.sparql which
+    /// query.  Goes to POST /xrpc/com.etzhayyim.apps.kotoba.graph.sparql which
     /// runs over IPFS-backed cold storage (DistributedBlockStore / Kubo HTTP).
     Sparql {
         /// SPARQL query string (max 64 KiB).
@@ -87,7 +87,7 @@ enum Cmd {
 
     /// Cross-modal search: a text query retrieves matching assets across ALL
     /// modalities (image / video / audio / document) from one shared embedding
-    /// space.  GET /xrpc/ai.gftd.apps.kotoba.media.search.  Uses operator auth
+    /// space.  GET /xrpc/com.etzhayyim.apps.kotoba.media.search.  Uses operator auth
     /// (built from the local `kotoba init` identity).
     MediaSearch {
         /// Free-text query (max 8 KiB).
@@ -101,7 +101,7 @@ enum Cmd {
     },
 
     /// Ingest one media file (image / video / audio / book / PDF) into the
-    /// shared search space.  POST /xrpc/ai.gftd.apps.kotoba.media.ingest.
+    /// shared search space.  POST /xrpc/com.etzhayyim.apps.kotoba.media.ingest.
     /// MIME is inferred from the file extension; the caption (if given) is the
     /// strongest cross-modal bridge to text queries.
     MediaIngest {
@@ -119,7 +119,7 @@ enum Cmd {
     },
 
     /// Show multimodal index status: asset count, embeddings, IVF centroids,
-    /// and a per-modality breakdown.  GET /xrpc/ai.gftd.apps.kotoba.media.status.
+    /// and a per-modality breakdown.  GET /xrpc/com.etzhayyim.apps.kotoba.media.status.
     MediaStatus,
 
     /// Ping the server's /health endpoint
@@ -152,7 +152,7 @@ enum Cmd {
     },
 
     /// Seal the running server's hot Arrangement into 4 ProllyTrees +
-    /// checkpoint via POST /xrpc/ai.gftd.apps.kotobase.kg.commit.
+    /// checkpoint via POST /xrpc/com.etzhayyim.apps.kotobase.kg.commit.
     /// Required by the operator to make ingested writes survive crash +
     /// restart.  Sends an operator JWT — by default constructs one from
     /// the local Keychain identity so the operator-auth check passes.
@@ -886,7 +886,7 @@ async fn run_bench(
     println!("→ benchmarking {iters} iters × concurrency {concurrency} ({mode}):");
     println!("    {query}");
 
-    let url = Arc::new(format!("{base}/xrpc/ai.gftd.apps.kotoba.graph.sparql"));
+    let url = Arc::new(format!("{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"));
     let token = Arc::new(token);
     let cacao_static = Arc::new(cacao);
     let signer = Arc::new(signer);
@@ -1032,7 +1032,7 @@ async fn run_demo(base_url: &str, token_in: &str) -> Result<()> {
     });
     let resp = bearer(
         client
-            .post(format!("{base}/xrpc/ai.gftd.apps.kotobase.kg.ingest"))
+            .post(format!("{base}/xrpc/com.etzhayyim.apps.kotobase.kg.ingest"))
             .json(&ingest_body),
     )
     .send()
@@ -1101,7 +1101,7 @@ async fn sparql_req(
     query: &str,
 ) -> Result<serde_json::Value> {
     let resp = client
-        .post(format!("{base}/xrpc/ai.gftd.apps.kotoba.graph.sparql"))
+        .post(format!("{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"))
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({ "query": query, "limit": 1000 }))
         .send()
@@ -1122,7 +1122,7 @@ async fn run_sparql(
     max_hops: usize,
 ) -> Result<()> {
     let url = format!(
-        "{}/xrpc/ai.gftd.apps.kotoba.graph.sparql",
+        "{}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql",
         base_url.trim_end_matches('/')
     );
     let client = build_client(token)?;
@@ -1149,7 +1149,7 @@ async fn run_sparql(
 }
 
 /// POST a SPARQL/Cypher query to the running server's
-/// `/xrpc/ai.gftd.apps.kotobase.kg.query` endpoint.  The server evaluates over
+/// `/xrpc/com.etzhayyim.apps.kotobase.kg.query` endpoint.  The server evaluates over
 /// IPFS-backed cold storage (Kubo HTTP via KOTOBA_IPFS_ENDPOINT or a
 /// DistributedBlockStore multi-peer setup).
 async fn run_kg_query(
@@ -1161,7 +1161,7 @@ async fn run_kg_query(
     cacao: Option<String>,
 ) -> Result<()> {
     let url = format!(
-        "{}/xrpc/ai.gftd.apps.kotobase.kg.query",
+        "{}/xrpc/com.etzhayyim.apps.kotobase.kg.query",
         base_url.trim_end_matches('/')
     );
     let client = build_client(token)?;
@@ -1217,7 +1217,7 @@ async fn run_media_search(
         params.push(("modality", m.clone()));
     }
     let url = format!(
-        "{}/xrpc/ai.gftd.apps.kotoba.media.search",
+        "{}/xrpc/com.etzhayyim.apps.kotoba.media.search",
         base_url.trim_end_matches('/')
     );
     let resp = reqwest::Client::new()
@@ -1259,7 +1259,7 @@ async fn run_media_ingest(
         "caption": caption,
     });
     let url = format!(
-        "{}/xrpc/ai.gftd.apps.kotoba.media.ingest",
+        "{}/xrpc/com.etzhayyim.apps.kotoba.media.ingest",
         base_url.trim_end_matches('/')
     );
     let resp = reqwest::Client::new()
@@ -1279,7 +1279,7 @@ async fn run_media_ingest(
 async fn run_media_status(base_url: &str) -> Result<()> {
     let token = operator_token()?;
     let url = format!(
-        "{}/xrpc/ai.gftd.apps.kotoba.media.status",
+        "{}/xrpc/com.etzhayyim.apps.kotoba.media.status",
         base_url.trim_end_matches('/')
     );
     let resp = reqwest::Client::new()
@@ -1353,7 +1353,7 @@ async fn run_commit(base_url: &str, author: Option<String>) -> Result<()> {
 
     let body = serde_json::json!({ "author": author });
     let url = format!(
-        "{}/xrpc/ai.gftd.apps.kotobase.kg.commit",
+        "{}/xrpc/com.etzhayyim.apps.kotobase.kg.commit",
         base_url.trim_end_matches('/')
     );
     let resp = reqwest::Client::new()

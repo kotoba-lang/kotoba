@@ -1118,4 +1118,61 @@ mod tests {
         let err = resolver.resolve("did:web:example.com").unwrap_err();
         assert!(matches!(err, DidResolverError::InvalidDid(_)));
     }
+
+    #[test]
+    fn composite_resolver_unknown_method_returns_unsupported() {
+        // A method with no registered resolver must fail with UnsupportedMethod,
+        // not silently resolve to anything.
+        let fetcher = Arc::new(InMemoryDidDocumentFetcher::new());
+        let resolver = CompositeDidResolver::with_default_methods(fetcher);
+        let err = resolver.resolve("did:example:nobody").unwrap_err();
+        assert!(
+            matches!(err, DidResolverError::UnsupportedMethod(m) if m == "example"),
+            "unknown method must return UnsupportedMethod"
+        );
+    }
+
+    #[test]
+    fn layered_resolver_fails_closed_on_hard_error_no_fallthrough() {
+        // SECURITY: LayeredDidResolver falls through to the next resolver ONLY on
+        // NotFound / UnsupportedMethod (soft "I don't have it"). A HARD error — here
+        // a did:web document whose `id` does not match the requested DID (InvalidDid,
+        // the anti-substitution check) — must short-circuit and propagate, NOT give a
+        // more-permissive fallback a chance to vouch. Otherwise an attacker who can
+        // poison the trusted first layer into a *rejected* doc could bypass it via a
+        // weaker fallback that happens to hold the DID.
+        let did = "did:web:example.com";
+
+        // First layer: did:web that fetches a mismatched-id doc → InvalidDid.
+        let fetcher = Arc::new(InMemoryDidDocumentFetcher::new());
+        fetcher.insert_json(
+            "https://example.com/.well-known/did.json",
+            make_json_doc("did:web:attacker.example"),
+        );
+        let first = Arc::new(CompositeDidResolver::with_default_methods(fetcher));
+
+        // Fallback: WOULD succeed for this DID — must never be consulted.
+        let fallback = InMemoryDidResolver::new();
+        fallback.insert(did, DidDocument::empty(did));
+
+        let layered = LayeredDidResolver::new(vec![first, Arc::new(fallback)]);
+        let err = layered.resolve(did).unwrap_err();
+        assert!(
+            matches!(err, DidResolverError::InvalidDid(_)),
+            "hard error must propagate (fail closed), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn layered_resolver_returns_last_soft_error_when_all_miss() {
+        // When every layer returns a soft (NotFound/Unsupported) error, the resolver
+        // reports a failure rather than a false success — complements the
+        // fall-through-on-NotFound success test.
+        let did = "did:plc:ghost";
+        let layered = LayeredDidResolver::new(vec![
+            Arc::new(DatomDidResolver::new(vec![])),
+            Arc::new(InMemoryDidResolver::new()),
+        ]);
+        assert!(layered.resolve(did).is_err());
+    }
 }

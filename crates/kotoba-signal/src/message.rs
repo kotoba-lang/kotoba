@@ -14,7 +14,7 @@ pub enum MessageType {
     Receipt,
 }
 
-/// Wire-format message envelope for `ai.gftd.signal.sendMessage`.
+/// Wire-format message envelope for `com.etzhayyim.signal.sendMessage`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SignalMessage {

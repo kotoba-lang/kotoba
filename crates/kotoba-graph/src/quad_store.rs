@@ -4824,7 +4824,7 @@ mod tests {
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"no-graph");
-        assert_eq!(qs.count_by_attribute_prefix(&unknown, "ai.gftd/").await, 0);
+        assert_eq!(qs.count_by_attribute_prefix(&unknown, "com.etzhayyim/").await, 0);
     }
 
     #[tokio::test]

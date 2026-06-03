@@ -710,7 +710,7 @@ impl KotobaState {
         // Named graph registry — pre-populate well-known graphs.
         //
         // `kotobase-kg-v1` is the multi-tenant kotobase data plane (named graph
-        // backing ai.gftd.apps.kotobase.kg.*).  It is explicitly registered as
+        // backing com.etzhayyim.apps.kotobase.kg.*).  It is explicitly registered as
         // `Authenticated` (any valid Bearer JWT may read) so that tenant apps
         // can read back data they themselves wrote without provisioning a
         // depth-2 CACAO delegation chain.  Writes still require Bearer auth

@@ -5,7 +5,7 @@
 //! Additional AT Protocol PDS endpoints (createSession/refreshSession/repo.*/
 //! sync.*) are ported in subsequent increments of the refactor.
 
-pub const NSID_PDS_SESSION_VERIFY: &str = "ai.gftd.pds.session.verify";
+pub const NSID_PDS_SESSION_VERIFY: &str = "com.etzhayyim.pds.session.verify";
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
@@ -61,6 +61,6 @@ mod tests {
 
     #[test]
     fn nsid_has_correct_prefix() {
-        assert!(NSID_PDS_SESSION_VERIFY.starts_with("ai.gftd.pds."));
+        assert!(NSID_PDS_SESSION_VERIFY.starts_with("com.etzhayyim.pds."));
     }
 }

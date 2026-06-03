@@ -236,6 +236,48 @@ mod tests {
     }
 
     #[test]
+    fn pop_valid_signature_by_wrong_key_rejected() {
+        // Impersonation / key-confusion: a token claims a VICTIM's did:key as `iss`
+        // but is signed by a DIFFERENT key with a perfectly valid Ed25519 signature.
+        // verify resolves the victim DID to the victim's key and checks against it,
+        // so the structurally-valid-but-wrong-signer signature must fail. Distinct
+        // from `tampered_payload_rejected`, which swaps to an *invalid* issuer that
+        // fails at resolution rather than at the signature check.
+        let victim_sk = SigningKey::from_bytes(&[7u8; 32]);
+        let victim_did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
+        let attacker_sk = SigningKey::from_bytes(&[8u8; 32]); // not the victim's key
+        let header = B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
+        let payload = B64U.encode(
+            serde_json::to_vec(&serde_json::json!({ "iss": victim_did, "exp": 1_750_003_600u64 })).unwrap(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        let sig = attacker_sk.sign(signing_input.as_bytes()); // valid sig, wrong signer
+        let token = format!("{signing_input}.{}", B64U.encode(sig.to_bytes()));
+
+        let v = verify_session_pop(&token, &didkey_resolver(), 1_750_000_100);
+        assert!(!v.valid, "a PoP signed by a non-DID key must not verify");
+        assert_eq!(v.did.as_deref(), Some(victim_did.as_str()), "iss still extracted");
+        assert_eq!(v.reason, "signature invalid");
+    }
+
+    #[test]
+    fn tampered_header_rejected() {
+        // The signing input is `header.payload`, so the header is integrity-protected
+        // by the signature. Mutating it after signing — even to a still-EdDSA header
+        // that passes the alg gate — must invalidate the signature. Complements
+        // `tampered_payload_rejected` (the other half of the signing input).
+        let (token, _) = make_pop(7, 1_750_003_600);
+        let mut parts: Vec<&str> = token.split('.').collect();
+        // Still alg=EdDSA (so it passes the alg check and reaches signature verify),
+        // but a different byte sequence than what was signed.
+        let new_header = B64U.encode(b"{\"alg\":\"EdDSA\",\"extra\":\"x\"}");
+        parts[0] = &new_header;
+        let v = verify_session_pop(&parts.join("."), &didkey_resolver(), 1_750_000_100);
+        assert!(!v.valid, "tampered header must be rejected");
+        assert_eq!(v.reason, "signature invalid");
+    }
+
+    #[test]
     fn doc_without_ed25519_method_not_vouched() {
         use kotoba_auth::did_document::DidDocument;
         let did = "did:web:etzhayyim.com:actor:nokeys";

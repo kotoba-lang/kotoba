@@ -4,11 +4,11 @@
 //! Two read-only endpoints, both keyed by the Journal's monotonic `seq` (the
 //! cursor) so a consumer can resume exactly where it left off:
 //!
-//!   * `ai.gftd.apps.kotoba.sync.subscribe` — Server-Sent Events live-tail.
+//!   * `com.etzhayyim.apps.kotoba.sync.subscribe` — Server-Sent Events live-tail.
 //!     Backfills `read_since(cursor+1)` then streams new entries as they are
 //!     published.  Each SSE frame carries `id: <seq>`; on reconnect the client
 //!     sends the last id back as `?cursor=` (or `Last-Event-ID`) to resume.
-//!   * `ai.gftd.apps.kotoba.sync.events` — plain JSON cursor paging / long-poll.
+//!   * `com.etzhayyim.apps.kotoba.sync.events` — plain JSON cursor paging / long-poll.
 //!     `?cursor=N&limit=K` returns the next batch; usable through any proxy or
 //!     CF Worker without WebSocket/SSE support.
 //!
@@ -45,9 +45,9 @@ use crate::graph_auth::{check_read_access, AccessDenied};
 use crate::server::KotobaState;
 
 /// SSE live-tail firehose.
-pub const NSID_SYNC_SUBSCRIBE: &str = "ai.gftd.apps.kotoba.sync.subscribe";
+pub const NSID_SYNC_SUBSCRIBE: &str = "com.etzhayyim.apps.kotoba.sync.subscribe";
 /// JSON cursor paging / long-poll firehose.
-pub const NSID_SYNC_EVENTS: &str = "ai.gftd.apps.kotoba.sync.events";
+pub const NSID_SYNC_EVENTS: &str = "com.etzhayyim.apps.kotoba.sync.events";
 
 /// Hard cap on a single paging response so a huge cold backfill can't OOM the node.
 const MAX_PAGE_LIMIT: usize = 1000;
@@ -149,7 +149,7 @@ struct SseState {
     prefix: Option<String>,
 }
 
-/// `GET /xrpc/ai.gftd.apps.kotoba.sync.subscribe?cursor=N&topic_prefix=...`
+/// `GET /xrpc/com.etzhayyim.apps.kotoba.sync.subscribe?cursor=N&topic_prefix=...`
 pub async fn subscribe(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,
@@ -218,7 +218,7 @@ pub async fn subscribe(
 
 // ── JSON cursor paging / long-poll ───────────────────────────────────────────
 
-/// `GET /xrpc/ai.gftd.apps.kotoba.sync.events?cursor=N&limit=K&topic_prefix=...`
+/// `GET /xrpc/com.etzhayyim.apps.kotoba.sync.events?cursor=N&limit=K&topic_prefix=...`
 pub async fn events(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,

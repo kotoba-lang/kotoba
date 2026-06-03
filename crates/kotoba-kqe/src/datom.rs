@@ -492,54 +492,17 @@ fn push_tx_desc(key: &mut Vec<u8>, tx: &KotobaCid) {
     key.extend(tx.0.iter().map(|b| !b));
 }
 
+// Index-key segments delegate to the single canonical, order-preserving key
+// codec (ADR-2606022150 §key-encoding) so the cold Prolly keys here and the hot
+// AVET index in `arrangement` order identically. The codec fixes the classic
+// sort traps (signed-int sign bit, IEEE float order, NUL separator escaping)
+// that the previous inline encoding here did not.
 fn push_str(key: &mut Vec<u8>, value: &str) {
-    key.extend_from_slice(value.as_bytes());
-    key.push(0);
+    crate::keycodec::push_ordered_str(key, value);
 }
 
 fn push_value(key: &mut Vec<u8>, value: &Value) {
-    match value {
-        Value::Cid(cid) => {
-            key.push(0x01);
-            key.extend_from_slice(&cid.0);
-        }
-        Value::Integer(n) => {
-            key.push(0x02);
-            key.extend_from_slice(&n.to_be_bytes());
-        }
-        Value::Float(f) => {
-            key.push(0x03);
-            key.extend_from_slice(&f.to_bits().to_be_bytes());
-        }
-        Value::Text(s) => {
-            key.push(0x04);
-            push_str(key, s);
-        }
-        Value::Bool(b) => {
-            key.push(0x05);
-            key.push(u8::from(*b));
-        }
-        Value::Bytes(bytes) => {
-            key.push(0x06);
-            key.extend_from_slice(bytes);
-            key.push(0);
-        }
-        Value::VectorF32(vec) => {
-            key.push(0x07);
-            for f in vec {
-                key.extend_from_slice(&f.to_bits().to_be_bytes());
-            }
-            key.push(0);
-        }
-        Value::TensorCid { cid, .. } => {
-            key.push(0x08);
-            key.extend_from_slice(&cid.0);
-        }
-        Value::Encrypted { ct_cid, .. } => {
-            key.push(0x09);
-            key.extend_from_slice(&ct_cid.0);
-        }
-    }
+    crate::keycodec::push_value(key, value);
 }
 
 #[cfg(test)]

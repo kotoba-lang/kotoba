@@ -185,4 +185,30 @@ mod tests {
             "map must not exceed MAX_NONCES after hard-cap rejection"
         );
     }
+
+    #[test]
+    fn concurrent_same_nonce_exactly_one_wins() {
+        use std::sync::Arc;
+        use std::thread;
+        // The replay guard's whole point is concurrent safety: if N requests
+        // present the SAME nonce simultaneously, EXACTLY ONE may be accepted —
+        // otherwise a racing replay bypasses CACAO single-use protection.
+        let store = Arc::new(NonceStore::new());
+        let exp = now_secs() + 3600;
+        let handles: Vec<_> = (0..64)
+            .map(|_| {
+                let s = Arc::clone(&store);
+                thread::spawn(move || s.check_and_register("race-nonce", exp))
+            })
+            .collect();
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|&accepted| accepted)
+            .count();
+        assert_eq!(
+            wins, 1,
+            "exactly one concurrent registration of the same nonce must win (no replay-bypass)"
+        );
+    }
 }

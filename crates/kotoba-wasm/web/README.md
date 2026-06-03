@@ -63,23 +63,64 @@ KQE and Datomic engines. Re-point it at runtime:
 navigator.serviceWorker.controller.postMessage({ type: 'config', remote: 'https://…', graph: 'bafy…' });
 ```
 
+## Persistence & durability (P1 IndexedDB + P2 OPFS journal)
+
+The node is no longer a reseed-every-boot cache. Two small glue modules give it
+durable, offline-first state:
+
+- **`kotoba-idb.js`** — IndexedDB snapshot store. One row per graph holding the
+  node's canonical content-addressed snapshot (`node.snapshot()` →
+  `[{e,a,v_edn}]` JSON) + its head CID (`node.snapshotCid()`). On boot the SW
+  loads this **before any network**, so `/search` works offline.
+- **`kotoba-opfs.js`** — OPFS append-only tx journal (one `transact` batch per
+  NDJSON line), with an IndexedDB fallback where OPFS sync handles are
+  unavailable. On boot the SW replays it on top of the snapshot
+  (`node.replayJournal(text)`) to recover any un-compacted write.
+
+**Write-through compaction** (SW, per write): `transact` → `appendTx` (durability
+point) → `putSnapshot` (snapshot now includes the write) → `resetJournal`. A crash
+between the durability point and journal truncation is safe — boot replays the
+journal and the node's **resolved-entity-CID dedup** collapses the snapshot⊕journal
+overlap, so re-sync/replay is idempotent (no duplicate rows in the kqe vectors).
+
 ## Scope (what runs locally vs. falls through)
 
 - **Local (wasm)**: `app.bsky.actor.searchActors` /
-  `com.etzhayyim.yoro.actor.searchActors` and current-graph
-  `com.etzhayyim.apps.kotoba.datomic.q`.
-- **Network fallback (hybrid)**: every other `/xrpc/*` and any local error —
-  `event.respondWith(fetch(request))`. Posts/follows/writes stay on the network
-  until P2 (`transact` + OPFS) and the wider reader surface land.
+  `com.etzhayyim.yoro.actor.searchActors`; current-graph
+  `com.etzhayyim.apps.kotoba.datomic.q`; **`…datomic.transact`** (P2 local write);
+  **`…node.status`** (datom count + head CID + journal backend).
+- **Network fallback (hybrid)**: every other `/xrpc/*`, time-travel/history/remote
+  reads, cross-graph requests, and any local error —
+  `event.respondWith(fetch(request))`. A background `datomic.datoms` **delta**
+  refresh folds server state in idempotently and re-persists.
+
+## Verify
+
+- **Core logic (native):** `cargo test -p kotoba-wasm` — idempotent reload,
+  deterministic snapshot CID, cold-restart journal replay without dupes.
+- **JS↔wasm boundary:** `node web/integration.test.mjs` — drives the real wasm
+  bindings through the exact P1/P2 call sequence the SW performs (snapshot ⇄
+  reload ⇄ journal replay ⇄ compaction). 16 assertions.
+- **Real browser:** serve `web/`, open `demo.html`, click **transact**, then
+  **reload WITHOUT reseeding** — the write is still there (IndexedDB snapshot +
+  OPFS journal), served `x-kotoba-sw: local-wasm` with no network.
 
 ## Phase status (ADR-2606013600)
 
 - **P0 ✅** kqe read engine on wasm32 (`cargo test -p kotoba-wasm`).
-- **P1 ✅ (this)** `datomic.sync`/`datomic.datoms` hydration from the server's
-  IPFS-backed Datomic head + Service-Worker transparent `/xrpc` shim +
-  wasm-pack web bundle.
+- **P1 ✅** `datomic.sync`/`datomic.datoms` hydration + transparent `/xrpc` SW
+  shim + wasm-pack bundle + **IndexedDB snapshot persistence** (reseed-free
+  reload) + idempotent background **delta** refresh.
 - **P1.5 ✅** browser-local Datomic `q` over hydrated datoms.
-- **P1 remaining** IdbBlockStore persistence (survive reload without reseed) +
-  delta sync from block/CID manifests.
-- **P2** local `transact` + OPFS journal.
-- **P3** `BrowserComponentRuntime` (jco) for in-browser Pregel/UDF guests.
+- **P2 ✅** local **`transact`** + **OPFS append-only journal** + write-through
+  compaction (write survives cold restart; verified native + JS↔wasm).
+- **P3 ✅ (Prolly traversal)** the browser reads the **canonical content-addressed
+  Datom log**, not a JSON snapshot: a **CID-verifying `BlockCache`** + the same
+  `ProllyTree::scan_prefix` the server uses + a `missingBlockCids` BFS driver.
+  `kotoba-blocks.js` syncs blocks (`block.get` → IndexedDB, CID re-verified on
+  ingest) then `hydrateFromProlly(root)`. Bindings: `ingestBlock` /
+  `hydrateFromProlly` / `missingBlockCids` / `blockCount`. Verified native (incl.
+  multi-level block-sync + tamper rejection) + JS↔wasm. (ADR-2606013600 D5 /
+  ADR-2606022150 P3.)
+- **P3 (guests, next)** `BrowserComponentRuntime` (jco) for in-browser Pregel/UDF
+  guests (spikes under `web/p3-*`).

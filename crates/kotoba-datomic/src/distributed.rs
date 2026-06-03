@@ -2879,9 +2879,14 @@ fn derive_tx_cid(
 }
 
 fn attr_prefix(attr: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(attr.len() + 1);
-    out.extend_from_slice(attr.as_bytes());
-    out.push(0);
+    // Must match the attribute segment of the canonical index keys
+    // (`kqe::Datom::*_key` → `keycodec::push_ordered_str`): escape `0x00 → 0x00
+    // 0xFF` + `0x00 0x00` terminator (ADR-2606022150 §D1.1). Using a bare
+    // `attr + 0x00` here misaligns every 2+-component prefix scan by one byte
+    // (the second terminator), making EAVT/AEVT/VAET seeks silently return
+    // nothing.
+    let mut out = Vec::with_capacity(attr.len() + 2);
+    kotoba_kqe::keycodec::push_ordered_str(&mut out, attr);
     out
 }
 

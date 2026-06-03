@@ -5,6 +5,7 @@ pub mod datalog;
 pub mod datom;
 pub mod delta;
 pub mod enterprise;
+pub mod keycodec;
 pub mod mv;
 pub mod quad;
 pub mod schema;

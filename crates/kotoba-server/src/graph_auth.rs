@@ -290,6 +290,17 @@ pub(crate) fn validate_did(
             format!("{field} must not contain whitespace"),
         ));
     }
+    // A *bare* DID contains none of the DID-URL delimiters: '/' (path), '?' (query),
+    // '#' (fragment). Rejecting them is spec-correct and also prevents a DID from
+    // escaping its segment when used as a storage-key component (e.g.
+    // `signal/bundle/{did}/…`, `account/ark-wrap/{did}/…`) — the same key-namespace
+    // protection `validate_path_component` already gives the sibling device_id.
+    if let Some(bad) = did.chars().find(|c| matches!(c, '/' | '?' | '#')) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{field} is not a bare DID (must not contain {bad:?})"),
+        ));
+    }
     // DID spec requires did:{method}:{identifier} — at minimum two colons and
     // non-empty method + identifier segments.
     let after_did = did.strip_prefix("did:").ok_or_else(|| {
@@ -708,6 +719,38 @@ mod tests {
     fn validate_did_rejects_tab_whitespace() {
         let err = validate_did("did:plc:\tabc", "entity_did", 512).unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_did_rejects_did_url_delimiters() {
+        // The DID is used as a storage-key component (signal/bundle/{did}/…,
+        // account/ark-wrap/{did}/…). A bare DID per W3C syntax contains none of the
+        // DID-URL delimiters '/', '?', '#'; allowing them would let a DID escape its
+        // key segment / pollute the namespace. Each must be rejected (400).
+        for bad in [
+            "did:web:evil.com/../../account/ark-wrap/victim/cred", // path traversal into another namespace
+            "did:plc:abc/extra",                                   // bare slash
+            "did:plc:abc?query=1",                                 // query delimiter
+            "did:key:z6Mk#fragment",                               // fragment delimiter
+        ] {
+            let err = validate_did(bad, "did", 512).unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{bad:?} must be rejected");
+            assert!(
+                err.1.contains("bare DID"),
+                "{bad:?} should fail the bare-DID check, got: {}",
+                err.1
+            );
+        }
+    }
+
+    #[test]
+    fn validate_did_still_accepts_colon_delimited_did_web() {
+        // Regression guard for the tightening above: legitimate did:web with
+        // colon-delimited path segments (the spec-correct encoding) must still pass.
+        assert!(
+            validate_did("did:web:etzhayyim.com:actor:alice", "did", 512).is_ok(),
+            "colon-delimited did:web must remain valid"
+        );
     }
 
     // ── require_any_bearer_auth ───────────────────────────────────────────────

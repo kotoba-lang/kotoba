@@ -252,7 +252,13 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let mut pos = 0;
     let _src_size = read_size_varint(delta, &mut pos)?;
     let dst_size = read_size_varint(delta, &mut pos)? as usize;
-    let mut out = Vec::with_capacity(dst_size);
+    // `dst_size` is an untrusted delta-header hint. The output is built purely from
+    // the copy/insert ops below and its final length is validated against dst_size
+    // afterwards, so pre-allocation is only an optimisation — cap it so a hostile
+    // delta claiming a huge dst_size cannot trigger an unbounded speculative
+    // allocation (OOM) before any op runs. Legit larger outputs simply grow.
+    const MAX_DELTA_PREALLOC: usize = 16 << 20; // 16 MiB
+    let mut out = Vec::with_capacity(dst_size.min(MAX_DELTA_PREALLOC));
 
     while pos < delta.len() {
         let op = delta[pos];
@@ -344,6 +350,22 @@ mod tests {
         ];
         let out = apply_delta(base, &delta).unwrap();
         assert_eq!(out, b"hello!!");
+    }
+
+    #[test]
+    fn apply_delta_huge_dst_size_does_not_oom() {
+        // A hostile delta: src_size=0, then a dst_size varint claiming ~2^56 bytes,
+        // and no ops. Before the pre-alloc cap, `Vec::with_capacity(dst_size)` would
+        // attempt a multi-petabyte allocation (OOM/abort). It must instead return a
+        // clean Err (the empty output won't match the claimed dst_size) without OOM.
+        // Encode dst_size as a git size-varint of 0x00 (src) + 8 continuation bytes.
+        let delta = [
+            0x00, // src_size = 0
+            // dst_size: 8 bytes of 0xFF (continuation) + 0x7F terminator → ~2^63
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,
+        ];
+        let result = apply_delta(b"", &delta);
+        assert!(result.is_err(), "huge dst_size must be rejected, not OOM");
     }
 
     #[test]

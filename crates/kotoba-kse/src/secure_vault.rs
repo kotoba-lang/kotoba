@@ -332,4 +332,57 @@ mod tests {
         let got = sv.get(&key, &blob_ref).await.unwrap().unwrap();
         assert_eq!(got.len(), 0);
     }
+
+    // ── Cross-method binding: the slot-AAD cannot be stripped by switching getters ──
+
+    #[tokio::test]
+    async fn bound_blob_not_readable_by_plain_get() {
+        // A blob sealed for a logical slot (non-empty AAD) must NOT be decryptable
+        // via the unbound `get`, which uses an empty AAD. Otherwise a caller could
+        // strip the slot-binding simply by calling the wrong getter — defeating the
+        // D2 binding even with the correct key.
+        let sv = SecureVault::new();
+        let key = random_key();
+        let blob_ref = sv
+            .put_bound(&key, Bytes::from_static(b"personal record"), b"slot-A")
+            .await
+            .unwrap();
+        assert!(
+            sv.get(&key, &blob_ref).await.is_err(),
+            "slot-bound blob must not decrypt under the unbound (empty-AAD) getter"
+        );
+        // The correctly-bound read still works (not a vacuous rejection).
+        assert_eq!(
+            sv.get_bound(&key, &blob_ref, b"slot-A").await.unwrap().unwrap(),
+            Bytes::from_static(b"personal record")
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_blob_not_readable_by_get_bound_with_nonempty_aad() {
+        // The converse: a plain (unbound) blob must not decrypt under a non-empty
+        // slot AAD — a caller can't retroactively claim it belongs to a slot.
+        let sv = SecureVault::new();
+        let key = random_key();
+        let blob_ref = sv.put(&key, Bytes::from_static(b"loose")).await.unwrap();
+        assert!(
+            sv.get_bound(&key, &blob_ref, b"slot-A").await.is_err(),
+            "unbound blob must not decrypt under a non-empty slot AAD"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_blob_readable_by_get_bound_empty_aad() {
+        // Consistency boundary: empty AAD is the identity, so a plain blob is exactly
+        // a slot-bound blob with the empty slot. get_bound(b"") must equal plain get.
+        // This pins the equivalence the two methods rely on at the vault layer.
+        let sv = SecureVault::new();
+        let key = random_key();
+        let blob_ref = sv.put(&key, Bytes::from_static(b"loose")).await.unwrap();
+        assert_eq!(
+            sv.get_bound(&key, &blob_ref, b"").await.unwrap().unwrap(),
+            Bytes::from_static(b"loose"),
+            "empty-AAD bound read must match the plain read"
+        );
+    }
 }

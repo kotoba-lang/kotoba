@@ -144,7 +144,18 @@ pub fn parse_index(car: &[u8]) -> Result<(KotobaCid, Vec<IndexEntry>)> {
     root.copy_from_slice(&car[24..60]);
     let root_cid = KotobaCid(root);
 
-    if car.len() < index_offset + block_count * INDEX_ENTRY {
+    // The index section size (index_offset + block_count*INDEX_ENTRY) is derived
+    // from untrusted header bytes; compute it with checked arithmetic so a hostile
+    // block_count/index_offset cannot wrap the bound and then panic (or OOM the
+    // Vec::with_capacity below) on a CAR fetched from an untrusted peer.
+    let index_section_end = match block_count
+        .checked_mul(INDEX_ENTRY)
+        .and_then(|n| index_offset.checked_add(n))
+    {
+        Some(end) => end,
+        None => bail!("car index section size overflows usize (block_count={block_count})"),
+    };
+    if car.len() < index_section_end {
         bail!("car truncated: index section incomplete");
     }
 
@@ -165,7 +176,12 @@ pub fn parse_index(car: &[u8]) -> Result<(KotobaCid, Vec<IndexEntry>)> {
 /// Extract a single block from a CAR byte buffer using a pre-parsed index entry.
 pub fn extract_block(car: &[u8], abs_offset: u64, data_len: u32) -> Result<Bytes> {
     let start = abs_offset as usize;
-    let end = start + data_len as usize;
+    // abs_offset/data_len come from the (untrusted) index; checked_add so a wrapped
+    // `end` can't slip past the bound check and panic at `car[start..end]`.
+    let end = match start.checked_add(data_len as usize) {
+        Some(e) => e,
+        None => bail!("block offset+len overflows usize: start={start}, len={data_len}"),
+    };
     if end > car.len() {
         bail!(
             "block out of range: car {} bytes, want [{start}..{end}]",
@@ -243,6 +259,42 @@ mod tests {
             assert_eq!(block.as_ref(), fake_data(i as u64 + 1, 128).as_slice());
             // Also verify against pre-computed index
             assert_eq!(idx[i].1, *off);
+        }
+    }
+
+    #[test]
+    fn roundtrip_variable_sizes_including_empty_block() {
+        // roundtrip_small uses uniform 128-byte blocks, which can mask a cumulative-
+        // offset bug (a fixed-stride error would still extract correctly). Variable
+        // sizes — including a zero-length block — force each block's offset to be the
+        // running sum of all preceding *different* lengths, and exercise the len=0
+        // boundary (an empty block shares its offset with its neighbour's edge).
+        let root = fake_cid(0);
+        let sizes = [1usize, 1000, 7, 0, 333, 64, 0, 2];
+        let mut w = CarBundleWriter::new(root.clone());
+        for (i, &sz) in sizes.iter().enumerate() {
+            w.append(&fake_cid(i as u64 + 1), &fake_data(i as u64 + 1, sz));
+        }
+        let (car, idx) = w.finish();
+        let (parsed_root, parsed_idx) = parse_index(&car).unwrap();
+        assert_eq!(parsed_root, root);
+        assert_eq!(parsed_idx.len(), sizes.len());
+
+        // Offsets must be strictly the cumulative sum (a 0-length block does not
+        // advance the offset, so it coincides with the following block's offset).
+        let mut expected_off = HEADER_LEN as u64;
+        for (i, (cid, off, len)) in parsed_idx.iter().enumerate() {
+            assert_eq!(*cid, fake_cid(i as u64 + 1));
+            assert_eq!(*len as usize, sizes[i], "length mismatch at block {i}");
+            assert_eq!(*off, expected_off, "offset arithmetic wrong at block {i}");
+            let block = extract_block(&car, *off, *len).unwrap();
+            assert_eq!(
+                block.as_ref(),
+                fake_data(i as u64 + 1, sizes[i]).as_slice(),
+                "byte mismatch at block {i}"
+            );
+            assert_eq!(idx[i].1, *off, "finish() index disagrees with parsed index");
+            expected_off += sizes[i] as u64;
         }
     }
 
@@ -355,6 +407,33 @@ mod tests {
         let result = extract_block(&car, 90, 20); // 90+20=110 > 100
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn extract_block_rejects_overflowing_offset_len_without_panicking() {
+        // abs_offset/data_len come from an untrusted index. start + data_len must use
+        // checked arithmetic. With start = usize::MAX and a SMALL data_len, the sum
+        // wraps to a small `end` (≤ buffer): in release it slips past `end > len` and
+        // panics at `car[huge..small]`; in debug it overflows the add. Either way it
+        // must now be Err, never a panic.
+        let car = vec![0u8; 100];
+        let result = extract_block(&car, u64::MAX, 50);
+        assert!(result.is_err(), "overflowing offset/len must be rejected, not panic");
+    }
+
+    #[test]
+    fn parse_index_rejects_overflowing_block_count_without_panicking() {
+        // A CAR from an untrusted peer can claim an enormous block_count. The index-
+        // section size computation must not overflow (and must not OOM via
+        // Vec::with_capacity). Hand-craft a valid header with block_count = u64::MAX.
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(MAGIC);
+        car[4..8].copy_from_slice(&1u32.to_le_bytes()); // version
+        car[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // block_count
+        car[16..24].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes()); // index_offset
+        // root cid bytes [24..60] left zero; reserved [60..72] zero.
+        let result = parse_index(&car);
+        assert!(result.is_err(), "overflowing block_count must be rejected, not panic/OOM");
     }
 
     // ── CarBlockIndex ─────────────────────────────────────────────────────────
