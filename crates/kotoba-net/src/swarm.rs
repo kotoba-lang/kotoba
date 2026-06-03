@@ -25,11 +25,27 @@ pub type KotobaSwarmType = Swarm<KotobaBehaviour>;
 /// let DCUtR upgrade relayed links to direct hole-punched connections. Only a
 /// publicly reachable fleet node should set `relay_server = true` so it can
 /// relay for others — a relay is just another peer (no central master).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct NatConfig {
     /// Run the Circuit Relay v2 *server*. Enable only on publicly reachable
     /// nodes (public IP or port-forward). Off by default.
     pub relay_server: bool,
+}
+
+/// Build a stable libp2p Ed25519 identity from a 32-byte hex seed (e.g. the
+/// `KOTOBA_P2P_ED25519_HEX` env var) so a node keeps the same `PeerId` — and
+/// therefore the same relay reservations and addresses — across restarts.
+///
+/// Kept deliberately separate from the CACAO/DID *agent* key: the networking
+/// identity and the signing identity are different roles.
+pub fn ed25519_keypair_from_hex(seed_hex: &str) -> Result<Keypair> {
+    let mut bytes = hex::decode(seed_hex.trim())
+        .map_err(|e| anyhow::anyhow!("p2p ed25519 seed: invalid hex: {e}"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("p2p ed25519 seed: expected 32 bytes, got {}", bytes.len());
+    }
+    Keypair::ed25519_from_bytes(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("p2p ed25519 seed: {e}"))
 }
 
 /// High-level wrapper around the libp2p Swarm.
@@ -153,6 +169,7 @@ impl KotobaSwarm {
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic()
+            .with_dns()?
             .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
             .with_behaviour(move |_keypair, relay_client| {
                 Ok(KotobaBehaviour {
@@ -198,6 +215,17 @@ impl KotobaSwarm {
         let circuit = relay_addr.with(Protocol::P2pCircuit);
         self.swarm.listen_on(circuit)?;
         Ok(())
+    }
+
+    /// Convenience over [`KotobaSwarm::reserve_relay`] for the `peerid@multiaddr`
+    /// config form (e.g. `KOTOBA_RELAY_PEERS`): appends the relay's
+    /// `/p2p/<peer>` to a bare transport multiaddr before reserving.
+    pub fn reserve_relay_with_peer(
+        &mut self,
+        relay_peer: PeerId,
+        relay_addr: Multiaddr,
+    ) -> Result<()> {
+        self.reserve_relay(relay_addr.with(Protocol::P2p(relay_peer)))
     }
 
     /// Dial `target` through a relay. Once the relayed connection is up, DCUtR
@@ -698,5 +726,24 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn ed25519_keypair_from_hex_is_deterministic() {
+        // Same 32-byte seed → same PeerId (stable identity across restarts).
+        let seed = "11".repeat(32); // 32 bytes
+        let a = ed25519_keypair_from_hex(&seed).expect("valid seed");
+        let b = ed25519_keypair_from_hex(&seed).expect("valid seed");
+        assert_eq!(
+            PeerId::from_public_key(&a.public()),
+            PeerId::from_public_key(&b.public()),
+            "same seed must yield the same PeerId"
+        );
+    }
+
+    #[test]
+    fn ed25519_keypair_from_hex_rejects_bad_input() {
+        assert!(ed25519_keypair_from_hex("deadbeef").is_err(), "too short");
+        assert!(ed25519_keypair_from_hex(&"zz".repeat(32)).is_err(), "non-hex");
     }
 }

@@ -10,5 +10,5 @@ pub use bitswap::{BitswapCodec, BitswapRequest, BitswapResponse, BITSWAP_PROTOCO
 pub use libp2p::{Multiaddr, PeerId};
 pub use pregel_msg::{PregelNetMessage, PREGEL_GOSSIP_TOPIC};
 pub use protocol::{KOTOBA_BITSWAP_PROTOCOL, KOTOBA_SYNC_PROTOCOL};
-pub use swarm::{KotobaNetEvent, KotobaSwarm, NatConfig};
+pub use swarm::{ed25519_keypair_from_hex, KotobaNetEvent, KotobaSwarm, NatConfig};
 pub use transport::{default_listen_addr, quic_addr};

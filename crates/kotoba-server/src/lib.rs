@@ -1361,7 +1361,22 @@ pub async fn run() -> anyhow::Result<()> {
             .any(|r| matches!(r, server::NodeRole::Relay));
         let nat_cfg = kotoba_net::NatConfig { relay_server };
 
-        match KotobaSwarm::new_with_config(listen_addr, nat_cfg).await {
+        // Persistent libp2p identity: a 32-byte hex seed in KOTOBA_P2P_ED25519_HEX
+        // pins the PeerId (and relay reservations / addresses) across restarts.
+        // Kept separate from the CACAO/DID agent key by design. Absent/invalid →
+        // ephemeral per-boot identity (previous behaviour).
+        let swarm_result = match std::env::var("KOTOBA_P2P_ED25519_HEX") {
+            Ok(seed_hex) => match kotoba_net::ed25519_keypair_from_hex(&seed_hex) {
+                Ok(kp) => KotobaSwarm::with_config(kp, listen_addr, nat_cfg).await,
+                Err(e) => {
+                    tracing::warn!("KOTOBA_P2P_ED25519_HEX invalid ({e}); using ephemeral identity");
+                    KotobaSwarm::new_with_config(listen_addr, nat_cfg).await
+                }
+            },
+            Err(_) => KotobaSwarm::new_with_config(listen_addr, nat_cfg).await,
+        };
+
+        match swarm_result {
             Ok(mut swarm) => {
                 if let Ok(peers_str) = std::env::var("KOTOBA_BOOTSTRAP_PEERS") {
                     let mut bootstrapped = false;
@@ -1388,6 +1403,40 @@ pub async fn run() -> anyhow::Result<()> {
                     if bootstrapped {
                         swarm.bootstrap().ok();
                         tracing::info!("Kademlia bootstrap triggered");
+                    }
+                }
+
+                // Edge/NAT'd nodes: take a Circuit Relay v2 reservation on each
+                // configured relay (`peerid@multiaddr`, comma-separated) so peers
+                // can reach us via the relay; DCUtR then upgrades to a direct link.
+                if let Ok(relays_str) = std::env::var("KOTOBA_RELAY_PEERS") {
+                    for entry in relays_str.split(',') {
+                        let entry = entry.trim();
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        if let Some((pid_str, addr_str)) = entry.split_once('@') {
+                            match (
+                                pid_str.trim().parse::<kotoba_net::PeerId>(),
+                                addr_str.trim().parse::<kotoba_net::Multiaddr>(),
+                            ) {
+                                (Ok(peer_id), Ok(addr)) => {
+                                    swarm.add_peer(peer_id, addr.clone());
+                                    match swarm.reserve_relay_with_peer(peer_id, addr.clone()) {
+                                        Ok(()) => tracing::info!(
+                                            %peer_id, %addr,
+                                            "reserving Circuit Relay v2 slot"
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            %peer_id, %addr,
+                                            "relay reservation failed: {e}"
+                                        ),
+                                    }
+                                }
+                                (Err(e), _) => tracing::warn!("invalid relay peer_id: {e}"),
+                                (_, Err(e)) => tracing::warn!("invalid relay multiaddr: {e}"),
+                            }
+                        }
                     }
                 }
 
