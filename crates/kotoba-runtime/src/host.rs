@@ -307,6 +307,7 @@ impl KotobaLinker {
         bind_llm(&mut self.0)?;
         bind_chain(&mut self.0)?;
         bind_evm(&mut self.0)?;
+        bind_btc(&mut self.0)?;
         bind_http(&mut self.0)?;
         Ok(())
     }
@@ -1052,6 +1053,175 @@ fn bind_evm(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
+// ── kotoba:kais/btc — Bitcoin chain observation (Esplora REST) ──────────────
+// Read-only sibling of the EVM bridge. Observation ONLY: no `POST /tx`
+// broadcast is exposed (signing/sending is the member's self-custody wallet,
+// etzhayyim-exclusive per ADR-2605231525). CALL_FOREIGN class = 1000 gas each.
+
+/// Join an Esplora base URL with a path, tolerating a trailing slash on base.
+fn btc_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// GET a URL and return the response body as a string (raw JSON / plain text).
+fn btc_get_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    agent
+        .get(url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())
+}
+
+/// GET a URL and parse the body as JSON.
+fn btc_get_json(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value, String> {
+    agent
+        .get(url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_json()
+        .map_err(|e| e.to_string())
+}
+
+/// Confirmed balance (sats) from an Esplora `/address/:addr` JSON body:
+/// `chain_stats.funded_txo_sum - chain_stats.spent_txo_sum`. Pure — unit-tested.
+fn btc_confirmed_balance_sat(info: &serde_json::Value) -> Result<i64, String> {
+    let cs = info
+        .get("chain_stats")
+        .ok_or_else(|| "missing chain_stats".to_string())?;
+    let funded = cs
+        .get("funded_txo_sum")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "missing funded_txo_sum".to_string())?;
+    let spent = cs
+        .get("spent_txo_sum")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "missing spent_txo_sum".to_string())?;
+    Ok(funded - spent)
+}
+
+/// Confirmations from an Esplora `/tx/:txid` JSON body and the current tip
+/// height: `tip - block_height + 1`, or 0 when unconfirmed. Pure — unit-tested.
+fn btc_confirmations(tx: &serde_json::Value, tip: u64) -> u32 {
+    let status = match tx.get("status") {
+        Some(s) => s,
+        None => return 0,
+    };
+    if status.get("confirmed").and_then(|v| v.as_bool()) != Some(true) {
+        return 0;
+    }
+    match status.get("block_height").and_then(|v| v.as_u64()) {
+        Some(h) if tip >= h => (tip - h + 1) as u32,
+        _ => 0,
+    }
+}
+
+fn bind_btc(linker: &mut Linker<HostState>) -> Result<()> {
+    use std::time::Duration;
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build();
+    let a_tip = agent.clone();
+    let a_info = agent.clone();
+    let a_utxo = agent.clone();
+    let a_bal = agent.clone();
+    let a_tx = agent.clone();
+    let a_conf = agent;
+
+    let mut inst = linker.instance("kotoba:kais/btc@0.1.0")?;
+
+    // tip-height: GET /blocks/tip/height (plain integer text)
+    inst.func_wrap(
+        "tip-height",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (base_url,): (String,)|
+              -> Result<(Result<u64, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<u64, String> {
+                let text = btc_get_text(&a_tip, &btc_url(&base_url, "blocks/tip/height"))?;
+                text.trim().parse::<u64>().map_err(|e| e.to_string())
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // address-info: GET /address/:addr (raw JSON)
+    inst.func_wrap(
+        "address-info",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (base_url, address): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let url = btc_url(&base_url, &format!("address/{address}"));
+            Ok((btc_get_text(&a_info, &url),))
+        },
+    )?;
+
+    // address-utxos: GET /address/:addr/utxo (raw JSON array)
+    inst.func_wrap(
+        "address-utxos",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (base_url, address): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let url = btc_url(&base_url, &format!("address/{address}/utxo"));
+            Ok((btc_get_text(&a_utxo, &url),))
+        },
+    )?;
+
+    // address-balance-sat: composed (confirmed funded - spent)
+    inst.func_wrap(
+        "address-balance-sat",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (base_url, address): (String, String)|
+              -> Result<(Result<i64, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<i64, String> {
+                let url = btc_url(&base_url, &format!("address/{address}"));
+                let info = btc_get_json(&a_bal, &url)?;
+                btc_confirmed_balance_sat(&info)
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    // tx: GET /tx/:txid (raw JSON)
+    inst.func_wrap(
+        "tx",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (base_url, txid): (String, String)|
+              -> Result<(Result<String, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let url = btc_url(&base_url, &format!("tx/{txid}"));
+            Ok((btc_get_text(&a_tx, &url),))
+        },
+    )?;
+
+    // tx-confirmations: composed (/tx + tip height)
+    inst.func_wrap(
+        "tx-confirmations",
+        move |mut ctx: wasmtime::StoreContextMut<HostState>,
+              (base_url, txid): (String, String)|
+              -> Result<(Result<u32, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            let result = (|| -> Result<u32, String> {
+                let tx = btc_get_json(&a_conf, &btc_url(&base_url, &format!("tx/{txid}")))?;
+                let tip_text = btc_get_text(&a_conf, &btc_url(&base_url, "blocks/tip/height"))?;
+                let tip = tip_text.trim().parse::<u64>().map_err(|e| e.to_string())?;
+                Ok(btc_confirmations(&tx, tip))
+            })();
+            Ok((result,))
+        },
+    )?;
+
+    Ok(())
+}
+
 // ── kotoba:kais/egress ─────────────────────────────────────────────────────
 // Generic outbound HTTP for guests. The runtime already does host-side HTTP for
 // `evm` (ureq JSON-RPC); this exposes it generically so componentize-py guests —
@@ -1115,4 +1285,57 @@ fn bind_http(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod btc_tests {
+    use super::{btc_confirmations, btc_confirmed_balance_sat, btc_url};
+    use serde_json::json;
+
+    #[test]
+    fn url_join_tolerates_trailing_slash() {
+        assert_eq!(
+            btc_url("https://blockstream.info/api", "blocks/tip/height"),
+            "https://blockstream.info/api/blocks/tip/height"
+        );
+        assert_eq!(
+            btc_url("https://blockstream.info/api/", "/address/abc"),
+            "https://blockstream.info/api/address/abc"
+        );
+    }
+
+    #[test]
+    fn confirmed_balance_subtracts_spent_from_funded() {
+        let info = json!({
+            "address": "bc1q...",
+            "chain_stats": { "funded_txo_sum": 1_500_000_i64, "spent_txo_sum": 500_000_i64 },
+            "mempool_stats": { "funded_txo_sum": 9_999_i64, "spent_txo_sum": 0_i64 }
+        });
+        // Confirmed only — mempool not counted.
+        assert_eq!(btc_confirmed_balance_sat(&info).unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn confirmed_balance_errors_on_missing_stats() {
+        assert!(btc_confirmed_balance_sat(&json!({"address": "x"})).is_err());
+    }
+
+    #[test]
+    fn confirmations_for_confirmed_tx() {
+        let tx = json!({ "status": { "confirmed": true, "block_height": 800_000_u64 } });
+        // tip == height → 1 confirmation; tip ahead by 5 → 6.
+        assert_eq!(btc_confirmations(&tx, 800_000), 1);
+        assert_eq!(btc_confirmations(&tx, 800_005), 6);
+    }
+
+    #[test]
+    fn confirmations_zero_for_unconfirmed_or_unknown() {
+        let unconfirmed = json!({ "status": { "confirmed": false } });
+        assert_eq!(btc_confirmations(&unconfirmed, 800_000), 0);
+        // No status field at all.
+        assert_eq!(btc_confirmations(&json!({}), 800_000), 0);
+        // Reorg edge: tip behind the claimed block height → 0, no underflow.
+        let future = json!({ "status": { "confirmed": true, "block_height": 800_010_u64 } });
+        assert_eq!(btc_confirmations(&future, 800_000), 0);
+    }
 }

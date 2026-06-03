@@ -1,3 +1,4 @@
+pub mod btc;
 pub mod cacao;
 pub mod delegation;
 pub mod did_document;
@@ -6,6 +7,10 @@ pub mod eth;
 pub mod passkey;
 pub mod resolver;
 
+pub use btc::{
+    hash160, hash256, parse_btc_address_from_did, recover_pubkey_from_message, sha256,
+    signed_message_hash, verify_message, AddressKind, BtcAddress, BtcError, BtcNetwork,
+};
 pub use cacao::{Cacao, CacaoError, CacaoHeader, CacaoPayload, CacaoSig};
 pub use delegation::{DelegationChain, DelegationError};
 pub use did_document::{
