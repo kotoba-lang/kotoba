@@ -2606,6 +2606,14 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
     assert_eq!(sync_body["reached"], true, "{sync_body}");
     assert_eq!(sync_body["ipns_sequence"], 2, "{sync_body}");
     assert!(sync_body["commit_cid"].as_str().is_some(), "{sync_body}");
+    // P3: sync exposes the covering ProllyTree index roots so a browser node can
+    // traverse the canonical tree over CID-verified blocks (ADR-2606013600 P3).
+    let eavt_root = sync_body["index_roots"]["eavt"].as_str();
+    assert!(eavt_root.is_some(), "sync must expose the eavt index root: {sync_body}");
+    assert!(
+        kotoba_core::cid::KotobaCid::from_multibase(eavt_root.unwrap()).is_some(),
+        "eavt root must be a valid CID: {sync_body}"
+    );
 
     let (status, as_of_body) = s
         .post_auth(

@@ -22,6 +22,7 @@
 import init, { KotobaNode } from "./pkg/kotoba_wasm.js";
 import { getSnapshot, putSnapshot } from "./kotoba-idb.js";
 import { appendTx, readJournal, resetJournal, journalBackend } from "./kotoba-opfs.js";
+import { hydrateViaBlocks } from "./kotoba-blocks.js";
 
 // Remote peer to seed/delta the local arrangement from (P1 sync source).
 let REMOTE = "https://kotoba.etzhayyim.com";
@@ -49,14 +50,39 @@ async function persist() {
   await resetJournal(GRAPH);
 }
 
-// Background delta sync from the remote peer — never blocks `ready`.
+// Background sync from the remote peer — never blocks `ready`.
+// P3: prefer the **block path** (traverse the canonical Prolly tree over
+// CID-verified blocks, the same read engine as the server); fall back to the P1
+// JSON-snapshot delta if the peer doesn't expose index roots or block fetch fails.
 async function deltaSync() {
   try {
-    await fetch(`${REMOTE}/xrpc/com.etzhayyim.apps.kotoba.datomic.sync`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ graph: GRAPH }),
-    }).catch(() => null);
+    // datomic.sync now returns the covering ProllyTree index roots.
+    let sync = null;
+    try {
+      const sr = await fetch(`${REMOTE}/xrpc/com.etzhayyim.apps.kotoba.datomic.sync`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ graph: GRAPH }),
+      });
+      if (sr.ok) sync = await sr.json();
+    } catch {
+      /* offline — keep local state */
+    }
+
+    // ── Block path (P3) ──────────────────────────────────────────────────
+    const eavtRoot = sync && sync.index_roots && sync.index_roots.eavt;
+    if (eavtRoot) {
+      try {
+        const applied = await hydrateViaBlocks(node, eavtRoot, { remote: REMOTE });
+        console.log(`[kotoba-sw] block-sync hydrated ${applied} datoms from Prolly root ${eavtRoot.slice(0, 12)}… (${node.blockCount()} blocks)`);
+        if (applied > 0) await persist();
+        return;
+      } catch (e) {
+        console.warn("[kotoba-sw] block path failed — falling back to JSON delta", e);
+      }
+    }
+
+    // ── JSON snapshot fallback (P1) ──────────────────────────────────────
     const r = await fetch(`${REMOTE}/xrpc/com.etzhayyim.apps.kotoba.datomic.datoms`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -68,10 +94,10 @@ async function deltaSync() {
     }
     const j = await r.json();
     const applied = node.loadDatoms(JSON.stringify(j.datoms || [])); // idempotent
-    console.log(`[kotoba-sw] delta merged ${applied} new datoms (head ${node.snapshotCid().slice(0, 12)}…)`);
+    console.log(`[kotoba-sw] JSON delta merged ${applied} new datoms (head ${node.snapshotCid().slice(0, 12)}…)`);
     if (applied > 0) await persist();
   } catch (e) {
-    console.warn("[kotoba-sw] delta sync failed (offline?) — local state intact", e);
+    console.warn("[kotoba-sw] sync failed (offline?) — local state intact", e);
   }
 }
 

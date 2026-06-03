@@ -640,6 +640,11 @@ pub struct DatomicSyncResp {
     pub target_tx: Option<String>,
     pub reached: bool,
     pub synced_block_count: usize,
+    /// Covering ProllyTree index roots (`eavt`/`aevt`/`avet`/`vaet`/`tea`) → CID.
+    /// Lets a browser node (ADR-2606013600 P3) traverse the canonical tree over
+    /// CID-verified blocks pulled via `block.get`, instead of a JSON snapshot.
+    #[serde(default)]
+    pub index_roots: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4307,6 +4312,11 @@ where
         target_tx: target.map(|tx| tx.to_multibase()),
         reached,
         synced_block_count,
+        index_roots: head
+            .index_roots
+            .iter()
+            .map(|(name, cid)| (name.clone(), cid.to_multibase()))
+            .collect(),
     }))
 }
 

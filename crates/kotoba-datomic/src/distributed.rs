@@ -3221,7 +3221,16 @@ fn vaet_prefix_for_parts(
         key.truncate(key.len().saturating_sub(36 + 36 + 1));
         key
     } else {
-        key.truncate(key.len().saturating_sub(1 + 36 + 36 + 1));
+        // Value-only: strip the (empty) attr segment + e + tx + op. The empty-attr
+        // segment length follows the canonical key codec (`push_ordered_str("")` =
+        // `0x00 0x00`, 2 bytes), NOT a hardcoded 1 — otherwise the VAET value-only
+        // prefix is one byte too long and the scan returns nothing (ADR-2606022150).
+        let empty_attr_len = {
+            let mut t = Vec::new();
+            kotoba_kqe::keycodec::push_ordered_str(&mut t, "");
+            t.len()
+        };
+        key.truncate(key.len().saturating_sub(empty_attr_len + 36 + 36 + 1));
         key
     }
 }
