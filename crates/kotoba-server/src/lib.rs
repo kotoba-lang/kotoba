@@ -1378,6 +1378,28 @@ pub async fn run() -> anyhow::Result<()> {
 
         match swarm_result {
             Ok(mut swarm) => {
+                // Advertise externally reachable address(es) (comma-separated
+                // multiaddrs). REQUIRED for a relay-server node to be usable: a
+                // relay only includes addresses in its reservation responses if
+                // it has confirmed external addresses, otherwise clients reject
+                // the reservation with `NoAddressesInReservation`. Where AutoNAT
+                // cannot confirm (e.g. a known public IP / port-forward), set this.
+                if let Ok(ext_str) = std::env::var("KOTOBA_P2P_EXTERNAL_ADDR") {
+                    for entry in ext_str.split(',') {
+                        let entry = entry.trim();
+                        if entry.is_empty() {
+                            continue;
+                        }
+                        match entry.parse::<kotoba_net::Multiaddr>() {
+                            Ok(addr) => {
+                                swarm.add_external_address(addr.clone());
+                                tracing::info!(%addr, "advertising external address");
+                            }
+                            Err(e) => tracing::warn!("invalid external multiaddr: {e}"),
+                        }
+                    }
+                }
+
                 if let Ok(peers_str) = std::env::var("KOTOBA_BOOTSTRAP_PEERS") {
                     let mut bootstrapped = false;
                     for entry in peers_str.split(',') {
