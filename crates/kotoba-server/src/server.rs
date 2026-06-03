@@ -707,12 +707,23 @@ impl KotobaState {
             // reconstruct the head. Authenticated so the lg pod's Bearer token reads
             // back without a CACAO delegation chain.
             let yk_g3 = NamedGraph::new("yukkuri-kg-v3", GraphVisibility::Authenticated);
+            // Per-app data-plane graph for shinshi (ai-gftd-project-shinshi lg
+            // pipeline, RW→kotoba datomic migration). Registered Authenticated so
+            // the lg-shinshi pod's Bearer JWT (sub=operator) reads back without a
+            // CACAO delegation chain — same auth the transact write path already
+            // uses. Fresh per-app graph (not shared kotobase-kg-v1, which OOM'd the
+            // pod under accumulated history) on the commit-block durability-fixed
+            // path (put_durable + recursive head pin), so every commit's head
+            // survives a pod restart for cold db_from_head reconstruction. Mirrors
+            // the yukkuri-kg-v3 rationale above.
+            let sh_g = NamedGraph::new("shinshi-kg-v1", GraphVisibility::Authenticated);
             map.insert(pub_g.cid.clone(), (pub_g.name.clone(), pub_g.visibility));
             map.insert(auth_g.cid.clone(), (auth_g.name.clone(), auth_g.visibility));
             map.insert(kg_g.cid.clone(), (kg_g.name.clone(), kg_g.visibility));
             map.insert(yk_g.cid.clone(), (yk_g.name.clone(), yk_g.visibility));
             map.insert(yk_g2.cid.clone(), (yk_g2.name.clone(), yk_g2.visibility));
             map.insert(yk_g3.cid.clone(), (yk_g3.name.clone(), yk_g3.visibility));
+            map.insert(sh_g.cid.clone(), (sh_g.name.clone(), sh_g.visibility));
             Arc::new(tokio::sync::RwLock::new(map))
         };
 
