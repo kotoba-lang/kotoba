@@ -18,8 +18,20 @@
 
 use crate::b2_client::{b2_spawn, B2Client, B2Config};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
+
+/// Process-global CAR export queue. Set once at startup by [`CarExportQueue::start`]
+/// so every commit path (`QuadStore::commit`, the distributed
+/// `DistributedCommitWriter::commit_datoms`, …) can reach it without threading
+/// it through each call site. `None` (default) keeps export disabled.
+static GLOBAL: OnceLock<Arc<CarExportQueue>> = OnceLock::new();
+
+/// The installed global export queue, if any. Commit paths call this and
+/// enqueue their CAR when it returns `Some`.
+pub fn global() -> Option<&'static CarExportQueue> {
+    GLOBAL.get().map(|a| a.as_ref())
+}
 
 /// Sender half held by `QuadStore`. Staging dir + bounded channel.
 #[derive(Clone)]
@@ -61,8 +73,10 @@ impl CarExportQueue {
         let bucket = client.bucket().to_string();
         reconcile(&dir, &queue.tx);
         b2_spawn(run_exporter(rx, client, dir));
+        let arc = Arc::new(queue);
+        let _ = GLOBAL.set(Arc::clone(&arc)); // first install wins (one per process)
         tracing::info!(bucket, "CAR-on-B2 cold export enabled");
-        Some(Arc::new(queue))
+        Some(arc)
     }
 
     fn staged_path(&self, car_key: &str) -> PathBuf {
