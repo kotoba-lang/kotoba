@@ -261,4 +261,26 @@ mod tests {
         assert_eq!(s.all_cids().len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn tiered_over_fs_is_durable() {
+        use crate::{BudgetedBlockStore, MemoryBlockStore, TieredBlockStore};
+        let root = tmp_root("tiered");
+        let data = b"tiered durable block";
+        let c = KotobaCid::from_bytes(data);
+        {
+            // hot = in-memory cache, durable tier = FsBlockStore (ADR-2606041151 A shape)
+            let hot = BudgetedBlockStore::new(MemoryBlockStore::new(), 1 << 20);
+            let fs = FsBlockStore::open(&root).unwrap();
+            let tiered = TieredBlockStore::new(hot, fs);
+            tiered.put_durable(&c, data).unwrap();
+            assert_eq!(tiered.get(&c).unwrap().unwrap().as_ref(), data);
+        }
+        // a fresh FsBlockStore on the same root sees the block — durability is on
+        // disk, independent of the in-memory cache (no Kubo / no HTTP involved).
+        let fs2 = FsBlockStore::open(&root).unwrap();
+        assert!(fs2.has(&c), "put_durable must land the block on the FS tier");
+        assert_eq!(fs2.get(&c).unwrap().unwrap().as_ref(), data);
+        let _ = fs::remove_dir_all(&root);
+    }
 }
