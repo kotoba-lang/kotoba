@@ -281,6 +281,14 @@ pub struct KotobaState {
     /// Maintained on every kg commit (`commit_kg_datoms`); registered + read via
     /// `kg.mv.register` / `kg.mv.result`.
     pub mv_registry: Arc<tokio::sync::RwLock<kotoba_kqe::mv::MvRegistry>>,
+    // ── Journal WAL (ADR-2606041151 A) ───────────────────────────────────────
+    /// When `false` (`KOTOBA_JOURNAL_WAL=off`), the per-datom Journal WAL
+    /// block-write is skipped on the commit path. The synchronous
+    /// DistributedCommitWriter commit is already durable (ProllyTree + IPNS
+    /// head), so the WAL is a redundant double-write; the hot-arrangement update
+    /// (`apply_journaled_datom`) always runs regardless. Default `true`
+    /// (unchanged behaviour: fast restart via journal replay).
+    pub journal_wal_enabled: bool,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
     /// Optional kotobase.gftd.ai XRPC pin client (KOTOBA_PIN_TOKEN).
     pub ipfs_pin: Arc<IpfsPinClient>,
@@ -381,6 +389,22 @@ impl KotobaState {
         // Persistence: KuboBlockStore cold tier (Kubo/IPFS HTTP, SHA2-256 dual-CID) if KOTOBA_STORE_PATH is set.
         // All KSE components (Journal, Vault, SecureVault) share the same store.
         let store_path: Option<String> = std::env::var("KOTOBA_STORE_PATH").ok();
+
+        // ADR-2606041151 A — Journal WAL opt-out. Default on (unchanged). When
+        // off, the per-datom WAL double-write is skipped on the commit path; the
+        // synchronous CommitDag commit is already durable.
+        let journal_wal_enabled = !std::env::var("KOTOBA_JOURNAL_WAL")
+            .map(|v| v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if !journal_wal_enabled {
+            tracing::warn!(
+                "Journal WAL DISABLED (KOTOBA_JOURNAL_WAL=off) — per-datom WAL \
+                 double-write skipped; durability = synchronous CommitDag commit + \
+                 cold ProllyTree. Restart no longer replays the WAL; rely on \
+                 KOTOBA_DATOMIC_WARM_GRAPHS / cold-path for hot-arrangement warmup \
+                 (ADR-2606041151 A, experimental)"
+            );
+        }
 
         const DEFAULT_HOT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
         let hot_cache_bytes: usize = std::env::var("KOTOBA_HOT_CACHE_BYTES")
@@ -808,6 +832,7 @@ impl KotobaState {
             mv_registry: Arc::new(tokio::sync::RwLock::new(
                 kotoba_kqe::mv::MvRegistry::new(),
             )),
+            journal_wal_enabled,
             operator_did,
             node_roles,
             identity,
