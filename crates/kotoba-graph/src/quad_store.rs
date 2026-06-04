@@ -39,7 +39,7 @@ use kotoba_kqe::quad::LegacyQuad as Quad;
 use kotoba_kqe::quad::LegacyQuadObject;
 use kotoba_kse::journal::Journal;
 use kotoba_kse::topic::Topic;
-use kotoba_store::{CapturingBlockStore, CarBundleWriter};
+use kotoba_store::{CapturingBlockStore, CarBundleWriter, CarExportQueue};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -75,6 +75,10 @@ pub struct QuadStore {
     /// keeps retract tombstones so the next commit can persist full Datomic
     /// `(E,A,V,T,Added)` history into the Datom-native ProllyTree indexes.
     pending_datoms: Arc<DashMap<String, Vec<Datom>>>,
+    /// Optional CAR-on-B2 cold-export queue.  When set, every commit's CAR
+    /// bundle is staged + uploaded to B2 off the hot path (ADR: kotobase B2
+    /// cold pin).  `None` (default) keeps behaviour unchanged.
+    car_export: Option<Arc<CarExportQueue>>,
 }
 
 /// Datom-native graph store facade.
@@ -91,6 +95,12 @@ impl DatomGraphStore {
         Self {
             inner: QuadStore::new(journal, block_store),
         }
+    }
+
+    /// Attach a CAR-on-B2 cold-export queue (forwards to the inner QuadStore).
+    pub fn with_car_export(mut self, queue: Arc<CarExportQueue>) -> Self {
+        self.inner = self.inner.with_car_export(queue);
+        self
     }
 
     pub fn legacy_quad_store(&self) -> &QuadStore {
@@ -200,7 +210,15 @@ impl QuadStore {
             committed_seq: Arc::new(RwLock::new(0)),
             hot_covers_all: Arc::new(DashMap::new()),
             pending_datoms: Arc::new(DashMap::new()),
+            car_export: None,
         }
+    }
+
+    /// Attach a CAR-on-B2 cold-export queue. Builder form so existing
+    /// `QuadStore::new` call sites stay source-compatible.
+    pub fn with_car_export(mut self, queue: Arc<CarExportQueue>) -> Self {
+        self.car_export = Some(queue);
+        self
     }
 
     fn record_pending_datom(&self, graph_key: &str, quad: Quad, op: bool) {
@@ -3515,9 +3533,19 @@ impl QuadStore {
         // can upload it as one batched PUT instead of N individual PUTs.
         {
             let mut writer = CarBundleWriter::new(cid.clone());
+            // Include the commit block itself so the CAR is self-restorable: a
+            // restore from B2 alone can rebuild the CommitDag. `persist()` just
+            // wrote it under `cid`, so read it back byte-exact (no re-encode).
+            match self.block_store.get(&cid) {
+                Ok(Some(commit_bytes)) => {
+                    writer.append(&cid, &commit_bytes);
+                }
+                _ => tracing::warn!(%cid, "commit block missing for CAR; CAR will not be self-restorable"),
+            }
             for (bcid, data) in &all_blocks {
                 writer.append(bcid, data);
             }
+            let car_block_count = writer.block_count();
             let (car_bytes, _idx) = writer.finish();
             let car_cid = KotobaCid::from_bytes(&car_bytes);
             if let Err(e) = self.block_store.put(&car_cid, &car_bytes) {
@@ -3525,6 +3553,14 @@ impl QuadStore {
             } else {
                 tracing::debug!(%cid, car_blocks = all_blocks.len(),
                     car_bytes = car_bytes.len(), "CAR bundle stored");
+            }
+            // CAR-on-B2 cold export (off the hot path). car_key = commit CID
+            // multibase → idempotent, content-addressed overwrite. Staged on
+            // disk + enqueued; the exporter task uploads to B2.
+            if let Some(q) = &self.car_export {
+                if car_block_count > 0 {
+                    q.enqueue(&cid.to_multibase(), &car_bytes);
+                }
             }
         }
 
