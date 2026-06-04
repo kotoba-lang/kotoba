@@ -1736,6 +1736,11 @@ pub struct KgQueryReq {
     pub cacao_b64: Option<String>,
     /// Maximum results to return (1–10000; default 1000).
     pub limit: Option<usize>,
+    /// ADR-2606041151 B — when set to a `kg.mv.register`'d view name, serve the
+    /// incrementally-maintained result instead of evaluating `query` from
+    /// scratch. `lang`/`query` are still validated but not re-evaluated.
+    #[serde(default)]
+    pub mv_name: Option<String>,
 }
 
 /// POST /xrpc/com.etzhayyim.apps.kotobase.kg.query
@@ -1915,6 +1920,31 @@ pub async fn kg_query(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+
+    // ADR-2606041151 B — route through a maintained MaterializedView when the
+    // caller names one. Serves the incrementally-maintained result (read from the
+    // registry, maintained on every commit) instead of the per-request
+    // from-scratch evaluation below — first-tier Datomic-Datalog.
+    if let Some(mv_name) = req.mv_name.as_deref() {
+        let reg = state.mv_registry.read().await;
+        let arr = reg
+            .result(mv_name)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no maintained view '{mv_name}'")))?;
+        let rows: Vec<serde_json::Value> = arr
+            .current_datoms()
+            .into_iter()
+            .take(result_limit)
+            .map(|d| serde_json::json!({ "a": d.e.to_multibase(), "b": readable_value(&d.v) }))
+            .collect();
+        return Ok(Json(serde_json::json!({
+            "lang":      req.lang,
+            "count":     rows.len(),
+            "results":   rows,
+            "source":    "mv",
+            "view":      mv_name,
+            "elapsedMs": t0.elapsed().as_millis(),
+        })));
+    }
 
     // Load the current graph projection first — enterprise SQL builds its EAV
     // schema from the live predicate set.
