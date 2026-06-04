@@ -26,6 +26,75 @@ impl MaterializedView {
     }
 }
 
+/// `MvRegistry` — named, incrementally-maintained MaterializedViews.
+///
+/// The foundation for serving Datalog queries first-tier (ADR-2606041151 B):
+/// register a program once, feed every commit's Δ through [`maintain`], and read
+/// the accumulated derived facts from [`result`] instead of re-evaluating the
+/// program from scratch on each request (which is what `kg.query` does today).
+///
+/// [`maintain`]: MvRegistry::maintain
+/// [`result`]: MvRegistry::result
+#[derive(Default)]
+pub struct MvRegistry {
+    views: std::collections::HashMap<String, MaterializedView>,
+    /// Accumulated derived (IDB) facts per view, advanced by every `maintain`.
+    results: std::collections::HashMap<String, Arrangement>,
+}
+
+impl MvRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register (or replace) a view by name. Returns `true` when newly added,
+    /// `false` when it replaced an existing view of the same name.
+    pub fn register(&mut self, name: impl Into<String>, program: DatalogProgram) -> bool {
+        let name = name.into();
+        let is_new = !self.views.contains_key(&name);
+        self.views
+            .insert(name.clone(), MaterializedView::new(name.clone(), program));
+        self.results.entry(name).or_insert_with(Arrangement::new);
+        is_new
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.views.contains_key(name)
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.views.keys().cloned().collect()
+    }
+
+    /// Incrementally maintain every registered view with a commit's deltas,
+    /// accumulating each view's derived output into its result arrangement.
+    /// Call once per committed transaction with that transaction's `Delta`s.
+    pub fn maintain(&mut self, deltas: &[Delta]) {
+        let names: Vec<String> = self.views.keys().cloned().collect();
+        for name in names {
+            let derived = self
+                .views
+                .get_mut(&name)
+                .expect("view present")
+                .apply(deltas);
+            self.results
+                .entry(name)
+                .or_insert_with(Arrangement::new)
+                .apply(&derived);
+        }
+    }
+
+    /// The accumulated derived facts of a registered view (the maintained query
+    /// result), or `None` if the view is not registered.
+    pub fn result(&self, name: &str) -> Option<&Arrangement> {
+        self.results.get(name)
+    }
+
+    pub fn view(&self, name: &str) -> Option<&MaterializedView> {
+        self.views.get(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +355,49 @@ mod tests {
             mv.apply(&[edge_assert(&format!("from{i}"), &format!("to{i}"))]);
             assert_eq!(mv.state.len(), (i as usize) + 1);
         }
+    }
+
+    // ── MvRegistry (ADR-2606041151 B) ─────────────────────────────────────
+
+    fn reachable_prog() -> DatalogProgram {
+        let mut prog = DatalogProgram::new();
+        prog.add_rule(make_rule("reachable", "edge"));
+        prog
+    }
+
+    #[test]
+    fn registry_register_and_query() {
+        let mut reg = MvRegistry::new();
+        assert!(reg.register("reachable", reachable_prog()), "newly added");
+        assert!(reg.contains("reachable"));
+        assert_eq!(reg.names(), vec!["reachable".to_string()]);
+        // re-register same name = replace → false
+        assert!(!reg.register("reachable", reachable_prog()));
+    }
+
+    #[test]
+    fn registry_maintains_incrementally_across_commits() {
+        let mut reg = MvRegistry::new();
+        reg.register("reachable", reachable_prog());
+
+        // commit 1: two edges → two derived reachable facts
+        reg.maintain(&[edge_assert("a", "b"), edge_assert("b", "c")]);
+        assert_eq!(reg.result("reachable").unwrap().len(), 2);
+
+        // commit 2: one more edge → accumulates, no full re-eval
+        reg.maintain(&[edge_assert("c", "d")]);
+        assert_eq!(
+            reg.result("reachable").unwrap().len(),
+            3,
+            "derived facts accumulate across commits (incremental maintenance)"
+        );
+    }
+
+    #[test]
+    fn registry_unknown_view_is_none() {
+        let reg = MvRegistry::new();
+        assert!(reg.result("nope").is_none());
+        assert!(reg.view("nope").is_none());
+        assert!(!reg.contains("nope"));
     }
 }
