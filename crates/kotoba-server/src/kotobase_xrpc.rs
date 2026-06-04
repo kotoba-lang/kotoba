@@ -848,6 +848,12 @@ pub async fn handle_pin_create(
     let pin_g = format!("kotobase/pins/{}", req.tenant_did);
 
     let pin_quads = vec![
+        // Store the nanoid `pin_id` explicitly so pin.list returns the SAME id
+        // that pin.create returns and pin.delete consumes (delete derives the
+        // record subject via `cid(pin_id)`). Without this, list returned the
+        // subject CID — irreversible — so a pin discovered via list could not be
+        // deleted, breaking the IPFS Pinning Service API rm-by-cid flow.
+        text_quad(&pin_g, &pin_id, "kotobase/pin/id", &pin_id),
         text_quad(&pin_g, &pin_id, "kotobase/pin/cid", &resolved_cid),
         text_quad(&pin_g, &pin_id, "kotobase/pin/name", &req.name),
         text_quad(&pin_g, &pin_id, "kotobase/pin/status", "pinning"),
@@ -927,7 +933,10 @@ pub async fn handle_pin_list(
     let records: Vec<PinRecord> = pin_subjects
         .iter()
         .filter_map(|subj_cid| {
-            let pin_id = subj_cid.to_multibase();
+            // Return the stored nanoid (== what create returns / delete consumes);
+            // fall back to the subject CID for pins written before this field.
+            let pin_id = text_for_subject(&datoms, subj_cid, "kotobase/pin/id")
+                .unwrap_or_else(|| subj_cid.to_multibase());
             let cid_val = text_for_subject(&datoms, subj_cid, "kotobase/pin/cid")?;
             let name = text_for_subject(&datoms, subj_cid, "kotobase/pin/name").unwrap_or_default();
             let status = text_for_subject(&datoms, subj_cid, "kotobase/pin/status")
