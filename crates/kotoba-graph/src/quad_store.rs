@@ -8098,6 +8098,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_recovery_without_journal_replay_via_commit_dag() {
+        // ADR-2606041151 A — validates the journal-removal safety gate: with the
+        // Journal WAL OFF (KOTOBA_JOURNAL_WAL=off), committed data is fully
+        // recoverable on restart from the CommitDag ALONE. The synchronous commit
+        // seals a ProllyTree whose commit CID (= the durable IPNS head in
+        // production) is enough to rebuild the queryable graph WITHOUT
+        // replay_from_journal.
+        let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(MemoryBlockStore::new());
+
+        let graph = KotobaCid::from_bytes(b"nowal-recovery-graph");
+        let alice = KotobaCid::from_bytes(b"nowal-alice");
+        let bob = KotobaCid::from_bytes(b"nowal-bob");
+
+        // --- Instance A: insert + commit, capture the commit CID (durable head).
+        // Ephemeral Journal::new() = no persisted WAL head, modelling WAL=off
+        // where the per-datom WAL block-write is skipped.
+        let commit_cid = {
+            let qs_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&block_store));
+            qs_a.assert(Quad {
+                graph: graph.clone(),
+                subject: alice.clone(),
+                predicate: "name".into(),
+                object: QuadObject::Text("Alice".into()),
+            })
+            .await;
+            qs_a.assert(Quad {
+                graph: graph.clone(),
+                subject: alice.clone(),
+                predicate: "role".into(),
+                object: QuadObject::Text("admin".into()),
+            })
+            .await;
+            qs_a.assert(Quad {
+                graph: graph.clone(),
+                subject: bob.clone(),
+                predicate: "role".into(),
+                object: QuadObject::Text("user".into()),
+            })
+            .await;
+            let cid = qs_a.commit("did:test", graph.clone(), 1).await.unwrap();
+            // A drops — process crash AFTER commit, with no WAL to replay.
+            cid
+        };
+
+        // --- Instance B: reopen against the SAME block store, NO journal replay.
+        let qs_b = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&block_store));
+        assert!(
+            qs_b.head_commit(&graph).await.is_none(),
+            "fresh instance has no head before import"
+        );
+        // Recover purely from the committed CommitDag (production: IPNS head → import).
+        let imported = qs_b.import_commit(&commit_cid).await.unwrap();
+        assert!(imported, "commit block durable in the shared store");
+
+        // Committed data is fully queryable via the cold ProllyTree — no journal.
+        let quads = qs_b
+            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <role> ?r }"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            quads.len(),
+            2,
+            "2 role quads recovered from the CommitDag WITHOUT the WAL, got {}",
+            quads.len()
+        );
+
+        let alice_quads = qs_b.get_entity_quads_cold(&graph, &alice).await.unwrap();
+        assert_eq!(
+            alice_quads.len(),
+            2,
+            "Alice name+role recovered WITHOUT the WAL, got {}",
+            alice_quads.len()
+        );
+    }
+
+    #[tokio::test]
     async fn crash_recovery_uncommitted_writes_recovered_from_wal() {
         // Scenario: assert quads WITHOUT commit, drop instance, reopen.
         // Replay should restore hot-path arrangement from journal entries.
