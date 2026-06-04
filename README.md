@@ -135,6 +135,50 @@ exactly how to silence or fix it.
 - **Datomic/Datalog primary, SPARQL auxiliary** — the distributed Datom DB is the source of truth; SPARQL 1.1 reads the same projection for RDF-compatible query and federation
 - **CACAO-native authz** — depth-2 delegation chains, multi-graph grants, anti-replay nonce
 
+## Architecture
+
+How a write becomes content-addressed blocks, how a read serves from the hot
+arrangement or the cold ProllyTree, and how the Datom log is tiered across
+memory → IPFS → off-host B2:
+
+![kotoba Datomic-over-IPFS architecture](docs/kotoba-datomic-architecture.svg)
+
+**① Insert** — `kg.ingest`/`transact` → `QuadStore::assert_datom`
+(`kotoba-graph/src/quad_store.rs`) updates the hot **Arrangement** (4 in-memory
+indexes EAVT/AEVT/AVET/VAET, `kotoba-kqe`) and records the exact 5-tuple
+`Datom{e,a,v,t,added}` in `pending_datoms`; the **Journal** WAL
+(`kotoba-kse/src/journal.rs`) appends a Merkle-chained `JournalEntry{seq,cid,prev}`
+to the block store for crash recovery.
+
+**③ Commit** — `QuadStore::commit()` builds the EAVT/AEVT/AVET/VAET (+ `datom_*`
++ append-only TEA) **ProllyTrees** in parallel (`kotoba-core/src/prolly.rs`):
+probabilistic chunking (`blake3(key)&0xFF==0`, ~1/256) + path-copy so each commit
+writes only the delta. Nodes are **DAG-CBOR/IPLD** (`Leaf [(k,v)]` /
+`Internal [(k, child-CID)]` with tag-42 CID links), each addressed by
+`sha2-256(dag-cbor) → CIDv1`. All blocks pack into one **CARv1** bundle; a
+`Commit{root,index_roots,prev,author,seq}` block (CID = `blake3(cbor)`) is added
+to the **CommitDag** heads, and `committed_seq` is checkpointed so restart
+replays the delta only.
+
+**④ Block store** — `TieredBlockStore<BudgetedMemory, KuboIpfs>`
+(`kotoba-store`): a HOT LRU memory tier (µs) over a COLD **Kubo IPFS** tier
+(`/api/v0/block`, multihash-keyed, flatfs repo). `put_many_durable` writes hot
+synchronously and batches cold. An **off-host cold pin to Backblaze B2**
+(`50-infra/kotoba-b2-pin`, DataLad + git-annex S3) mirrors every block for
+disaster recovery — `restore` re-imports via `ipfs block put`.
+
+**② Query** — `kg.query`/`kg.sparql` compile (SPARQL/Cypher/SQL) to a
+`DatalogProgram` evaluated **semi-naive** over the hot Arrangement (µs–ms); the
+cold path scans the ProllyTree (`scan_prefix`, index-selected EAVT/AEVT/AVET/VAET)
+fetching blocks from the tiered store, with `db_before`/TEA giving Datomic-style
+`as-of` time travel.
+
+**⑤ Anchors** — the **Datom log is the canonical state**
+([ADR-2605312345](../../90-docs/adr/2605312345-kotoba-datom-first-class-canonical-state.md));
+IPNS signed heads pin per-graph roots (durable across restart), Base L2 anchors
+the commit-DAG root for tamper-evidence, and AT-Proto MST is the ingress/interop
+wire that materializes the log.
+
 ## Query Surfaces
 
 Primary query/write semantics are Datomic-style Datom APIs and Datalog over
