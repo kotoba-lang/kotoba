@@ -137,43 +137,50 @@ exactly how to silence or fix it.
 
 ## Architecture
 
-How a write becomes content-addressed blocks, how a read serves from the hot
-arrangement or the cold ProllyTree, and how the Datom log is tiered across
-memory → IPFS → off-host B2:
+The canonical spine is one content-addressed chain — **Datom log → ProllyTree
+indexes → CommitDag → blocks** — with IPFS and B2 as export tiers, not the
+system of record:
 
 ![kotoba Datomic-over-IPFS architecture](docs/kotoba-datomic-architecture.svg)
 
-**① Insert** — `kg.ingest`/`transact` → `QuadStore::assert_datom`
-(`kotoba-graph/src/quad_store.rs`) updates the hot **Arrangement** (4 in-memory
-indexes EAVT/AEVT/AVET/VAET, `kotoba-kqe`) and records the exact 5-tuple
-`Datom{e,a,v,t,added}` in `pending_datoms`; the **Journal** WAL
-(`kotoba-kse/src/journal.rs`) appends a Merkle-chained `JournalEntry{seq,cid,prev}`
-to the block store for crash recovery.
+**① Canonical write path** — `kg.ingest`/`transact` →
+`QuadStore::assert_datom` (`kotoba-graph/src/quad_store.rs`) records the exact
+5-tuple `Datom{e,a,v,t,added}` in `pending_datoms`; a short window later
+`commit()` builds the EAVT/AEVT/AVET/VAET (+ `datom_*` + append-only **TEA**)
+**ProllyTrees** (`kotoba-core/src/prolly.rs`) — probabilistic chunking
+(`blake3(key)&0xFF==0`) + path-copy so each commit writes only the delta; nodes
+are **DAG-CBOR/IPLD** (`Internal [(k, child-CID)]` tag-42 links) addressed by
+`sha2-256(dag-cbor) → CIDv1`. Blocks pack into one **CARv1** bundle and a
+`Commit{root,index_roots,prev,seq}` block is appended to the **CommitDag**.
+**The CommitDag is the write-ahead log** — an immutable, parent-linked,
+content-addressed chain whose durability boundary is the atomic head-ref update
+(git / Datomic semantics); restart loads the head + checkpoint and walks commits
+since, no second-log replay.
+> Pruned (per [ADR-2606041151](../../90-docs/adr/2606041151-kotoba-commitdag-as-wal-and-incremental-query-tier.md)):
+> the old per-assert **Journal WAL** (4-topic double-write) and **Kubo-as-durable-tier**
+> — the CommitDag already is the WAL; the Journal was a redundant double-write and the
+> ~30 s startup-replay bottleneck.
 
-**③ Commit** — `QuadStore::commit()` builds the EAVT/AEVT/AVET/VAET (+ `datom_*`
-+ append-only TEA) **ProllyTrees** in parallel (`kotoba-core/src/prolly.rs`):
-probabilistic chunking (`blake3(key)&0xFF==0`, ~1/256) + path-copy so each commit
-writes only the delta. Nodes are **DAG-CBOR/IPLD** (`Leaf [(k,v)]` /
-`Internal [(k, child-CID)]` with tag-42 CID links), each addressed by
-`sha2-256(dag-cbor) → CIDv1`. All blocks pack into one **CARv1** bundle; a
-`Commit{root,index_roots,prev,author,seq}` block (CID = `blake3(cbor)`) is added
-to the **CommitDag** heads, and `committed_seq` is checkpointed so restart
-replays the delta only.
+**② Query — Datomic first-tier** — the 4-index model is tier-1: BGP routing does
+direct index scans (EAVT point lookup ~180 ns, AVET, VAET reverse) over the
+ProllyTree, and an incremental **MaterializedView** (`kotoba-kqe/src/mv.rs`,
+maintained per commit Δ) serves recurring/Datalog queries without re-evaluating
+from scratch. `kg.sparql` (SELECT/ASK/DESCRIBE/CONSTRUCT/UPDATE/SERVICE) is the
+auxiliary RDF surface over the same indexes; `db_before`/TEA give Datomic-style
+`as-of` time travel. All queries run over the IPFS-backed substrate — the hot
+Arrangement is only an optimisation (cache).
 
-**④ Block store** — `TieredBlockStore<BudgetedMemory, KuboIpfs>`
-(`kotoba-store`): a HOT LRU memory tier (µs) over a COLD **Kubo IPFS** tier
-(`/api/v0/block`, multihash-keyed, flatfs repo). `put_many_durable` writes hot
-synchronously and batches cold. An **off-host cold pin to Backblaze B2**
-(`50-infra/kotoba-b2-pin`, DataLad + git-annex S3) mirrors every block for
-disaster recovery — `restore` re-imports via `ipfs block put`.
+**③ Block store — kotoba is its own IPFS block store + pinner** — the durable hot
+tier is an embedded, in-process store (direct disk, µs–ms) and kotoba holds pins
+itself (a flag in its own store, no `pin/add` RPC), removing the HTTP-RPC hop
+(~35× ingest). Sealed commits **export asynchronously**, off the hot path:
+**Kubo IPFS** (bitswap + DHT; optionally a networked pin service for the donated
+mesh) and an **off-host cold pin to Backblaze B2**
+(`50-infra/kotoba-b2-pin`, DataLad + git-annex S3 — mirrors every block,
+`restore` re-imports via `ipfs block put`,
+[ADR-2606041130](../../90-docs/adr/2606041130-kotoba-b2-blockstore-cold-pin.md)).
 
-**② Query** — `kg.query`/`kg.sparql` compile (SPARQL/Cypher/SQL) to a
-`DatalogProgram` evaluated **semi-naive** over the hot Arrangement (µs–ms); the
-cold path scans the ProllyTree (`scan_prefix`, index-selected EAVT/AEVT/AVET/VAET)
-fetching blocks from the tiered store, with `db_before`/TEA giving Datomic-style
-`as-of` time travel.
-
-**⑤ Anchors** — the **Datom log is the canonical state**
+**④ Anchors** — the **Datom log is the canonical state**
 ([ADR-2605312345](../../90-docs/adr/2605312345-kotoba-datom-first-class-canonical-state.md));
 IPNS signed heads pin per-graph roots (durable across restart), Base L2 anchors
 the commit-DAG root for tamper-evidence, and AT-Proto MST is the ingress/interop
