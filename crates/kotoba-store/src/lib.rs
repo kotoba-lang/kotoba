@@ -1,3 +1,4 @@
+pub mod b2_car_store;
 pub mod b2_client;
 pub mod b2_export;
 pub mod b2_restore;
@@ -5,6 +6,7 @@ pub mod block_store;
 pub mod budgeted_store;
 pub mod capturing_store;
 pub mod car_bundle;
+pub mod car_index;
 pub mod distributed_store;
 pub mod fs_store;
 pub mod ipfs_pin;
@@ -12,8 +14,10 @@ pub mod kubo_store;
 pub mod memory_store;
 pub mod tiered_store;
 
+pub use b2_car_store::B2CarBlockStore;
 pub use b2_client::{b2_block_on, B2Client, B2Config};
 pub use b2_export::{run_exporter, CarExportQueue};
+pub use car_index::CarIndex;
 pub use block_store::{put_verified, BlockStore, StoreError};
 pub use budgeted_store::BudgetedBlockStore;
 pub use capturing_store::CapturingBlockStore;

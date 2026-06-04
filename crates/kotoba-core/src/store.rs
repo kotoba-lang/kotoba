@@ -65,3 +65,40 @@ pub trait BlockStore: Send + Sync {
         vec![]
     }
 }
+
+/// Blanket impl so an `Arc<dyn BlockStore>` (the type the server threads around)
+/// can itself be a `BlockStore` tier — e.g. nesting an existing store under a
+/// new cold tier via `TieredBlockStore::new(existing_arc, cold)`. Delegates
+/// every method to the inner store, preserving overridden behaviour.
+impl<T: BlockStore + ?Sized> BlockStore for std::sync::Arc<T> {
+    fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        (**self).put(cid, data)
+    }
+    fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
+        (**self).get(cid)
+    }
+    fn has(&self, cid: &KotobaCid) -> bool {
+        (**self).has(cid)
+    }
+    fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        (**self).put_durable(cid, data)
+    }
+    fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> anyhow::Result<()> {
+        (**self).put_many_durable(blocks)
+    }
+    fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+        (**self).delete(cid)
+    }
+    fn pin(&self, cid: &KotobaCid) {
+        (**self).pin(cid)
+    }
+    fn unpin(&self, cid: &KotobaCid) {
+        (**self).unpin(cid)
+    }
+    fn is_pinned(&self, cid: &KotobaCid) -> bool {
+        (**self).is_pinned(cid)
+    }
+    fn all_cids(&self) -> Vec<KotobaCid> {
+        (**self).all_cids()
+    }
+}

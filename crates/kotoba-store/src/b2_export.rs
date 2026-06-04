@@ -16,7 +16,10 @@
 //! `car_key` is the commit CID's multibase string, so re-uploads are idempotent
 //! (same content-addressed bytes overwrite the same key).
 
+use crate::b2_car_store::B2CarBlockStore;
 use crate::b2_client::{b2_spawn, B2Client, B2Config};
+use crate::car_bundle::parse_index;
+use crate::car_index::CarIndex;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
@@ -50,33 +53,41 @@ impl CarExportQueue {
         Ok((Self { tx, dir }, rx))
     }
 
-    /// Self-contained startup: enable the CAR-on-B2 exporter iff B2 is
-    /// configured (`KOTOBA_B2_*`) and a persistent `store_path` is available
-    /// for crash-durable staging. Spawns the exporter on the dedicated `b2-io`
-    /// runtime and reconciles any CARs staged before a previous crash. Returns
-    /// the queue to attach via `QuadStore::with_car_export`, or `None` (disabled).
-    pub fn start(store_path: Option<&str>) -> Option<Arc<Self>> {
+    /// Self-contained startup: enable the CAR-on-B2 tier iff B2 is configured
+    /// (`KOTOBA_B2_*`) and a persistent `store_path` is available for
+    /// crash-durable staging + the read index. Installs the global export queue
+    /// (consulted by the commit paths), spawns the exporter on the dedicated
+    /// `b2-io` runtime, reconciles crash-staged CARs, and returns the
+    /// [`B2CarBlockStore`] **read tier** for the server to nest as the coldest
+    /// tier. `None` when disabled.
+    pub fn start(store_path: Option<&str>) -> Option<Arc<B2CarBlockStore>> {
         let cfg = B2Config::from_env()?;
         let Some(base) = store_path else {
-            tracing::warn!("KOTOBA_B2_* set but KOTOBA_STORE_PATH absent — CAR-on-B2 export disabled (needs persistent staging dir)");
+            tracing::warn!("KOTOBA_B2_* set but KOTOBA_STORE_PATH absent — CAR-on-B2 disabled (needs persistent staging + index dir)");
             return None;
         };
         let dir = PathBuf::from(base).join("car_export_pending");
         let (queue, rx) = match Self::new(&dir, 1024) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("CAR-on-B2 export disabled — staging dir {dir:?}: {e}");
+                tracing::warn!("CAR-on-B2 disabled — staging dir {dir:?}: {e}");
                 return None;
             }
         };
-        let client = B2Client::new(cfg);
+        let index = match CarIndex::open(PathBuf::from(base).join("carindex")) {
+            Ok(i) => Arc::new(i),
+            Err(e) => {
+                tracing::warn!("CAR-on-B2 disabled — index dir: {e}");
+                return None;
+            }
+        };
+        let client = Arc::new(B2Client::new(cfg));
         let bucket = client.bucket().to_string();
         reconcile(&dir, &queue.tx);
-        b2_spawn(run_exporter(rx, client, dir));
-        let arc = Arc::new(queue);
-        let _ = GLOBAL.set(Arc::clone(&arc)); // first install wins (one per process)
-        tracing::info!(bucket, "CAR-on-B2 cold export enabled");
-        Some(arc)
+        b2_spawn(run_exporter(rx, Arc::clone(&client), dir, Arc::clone(&index)));
+        let _ = GLOBAL.set(Arc::new(queue)); // first install wins (one per process)
+        tracing::info!(bucket, "CAR-on-B2 cold export + serve enabled");
+        Some(Arc::new(B2CarBlockStore::new(client, index)))
     }
 
     fn staged_path(&self, car_key: &str) -> PathBuf {
@@ -142,11 +153,16 @@ pub fn reconcile(dir: &Path, tx: &mpsc::Sender<String>) -> usize {
     n
 }
 
-/// The exporter task: drain the channel, upload staged CARs to B2, delete on
-/// success. Runs on the caller's async runtime (typically the server's); the
-/// B2 HTTP itself uses the client's own `b2-io` runtime via `b2_block_on` only
-/// when called from sync code — here we `await` the async client directly.
-pub async fn run_exporter(mut rx: mpsc::Receiver<String>, client: B2Client, dir: PathBuf) {
+/// The exporter task: drain the channel, upload staged CARs to B2, populate the
+/// read [`CarIndex`] from the confirmed-uploaded CAR, then delete the staging
+/// file. Indexing only after a successful PUT guarantees every index entry
+/// points at a CAR that is actually in B2.
+pub async fn run_exporter(
+    mut rx: mpsc::Receiver<String>,
+    client: Arc<B2Client>,
+    dir: PathBuf,
+    index: Arc<CarIndex>,
+) {
     tracing::info!(bucket = client.bucket(), dir = %dir.display(), "b2 CAR exporter started");
     while let Some(car_key) = rx.recv().await {
         let path = dir.join(&car_key);
@@ -156,8 +172,19 @@ pub async fn run_exporter(mut rx: mpsc::Receiver<String>, client: B2Client, dir:
         };
         match client.put_object(&car_key, &bytes).await {
             Ok(()) => {
+                // Index every block in this CAR for the serve-from-B2 read path.
+                match parse_index(&bytes) {
+                    Ok((_root, entries)) => {
+                        for (bcid, off, len) in entries {
+                            if let Err(e) = index.put(&bcid, &car_key, off, len) {
+                                tracing::warn!(car_key, "car index write failed: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(car_key, "uploaded CAR did not parse for indexing: {e}"),
+                }
                 let _ = std::fs::remove_file(&path);
-                tracing::debug!(car_key, bytes = bytes.len(), "b2 CAR uploaded");
+                tracing::debug!(car_key, bytes = bytes.len(), "b2 CAR uploaded + indexed");
             }
             Err(e) => {
                 // Leave the staged file; reconcile retries on next startup.
