@@ -89,6 +89,8 @@ pub const NSID_KG_INGEST: &str = "com.etzhayyim.apps.kotobase.kg.ingest";
 pub const NSID_KG_INGEST_BATCH: &str = "com.etzhayyim.apps.kotobase.kg.ingest_batch";
 pub const NSID_KG_DELETE: &str = "com.etzhayyim.apps.kotobase.kg.delete";
 pub const NSID_KG_COMMIT: &str = "com.etzhayyim.apps.kotobase.kg.commit";
+pub const NSID_KG_MV_REGISTER: &str = "com.etzhayyim.apps.kotobase.kg.mv.register";
+pub const NSID_KG_MV_RESULT: &str = "com.etzhayyim.apps.kotobase.kg.mv.result";
 
 /// All yatabase KG quads are written into this named graph.
 pub fn kg_graph_cid() -> KotobaCid {
@@ -194,7 +196,15 @@ async fn commit_kg_datoms(
     for datom in &mut datoms {
         datom.tx = tx_cid.clone();
     }
-    crate::xrpc::commit_protocol_datoms(
+    // ADR-2606041151 B — capture this commit's datoms as assert-deltas so the
+    // MaterializedView registry can be incrementally maintained after a
+    // successful commit (kg ingest is assert-only; no-op when no views exist).
+    let mv_deltas: Vec<kotoba_kqe::delta::Delta> = datoms
+        .iter()
+        .cloned()
+        .map(kotoba_kqe::delta::Delta::assert_datom)
+        .collect();
+    let resp = crate::xrpc::commit_protocol_datoms(
         state,
         graph.clone(),
         graph.to_multibase(),
@@ -209,7 +219,11 @@ async fn commit_kg_datoms(
         auth_proof_cid,
         auth_capability,
     )
-    .await
+    .await;
+    if resp.is_ok() {
+        state.mv_registry.write().await.maintain(&mv_deltas);
+    }
+    resp
 }
 
 fn kg_legacy_write_auth(
@@ -1734,6 +1748,119 @@ pub struct KgQueryReq {
 /// SQL dialects, `LIMIT`/`OFFSET` are honoured (`ORDER BY` is not — output is
 /// opaque content-addressed CID pairs).
 const MAX_KG_QUERY_PROG_LEN: usize = 65_536; // 64 KiB — SPARQL/Cypher compile DoS guard
+
+// ── kg.mv — MaterializedView registry (ADR-2606041151 B) ─────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct MvRegisterReq {
+    /// View name — also the output relation of the compiled program.
+    pub name: String,
+    /// "sparql" | "cypher".
+    pub lang: String,
+    /// The query whose maintained result becomes the view.
+    pub query: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct MvRegisterResp {
+    pub name: String,
+    pub newly_registered: bool,
+}
+
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.mv.register
+///
+/// Register (or replace) a Datalog MaterializedView compiled from a SPARQL or
+/// Cypher query (ADR-2606041151 B). Once registered, the view is incrementally
+/// maintained on every kg commit (`commit_kg_datoms` → `MvRegistry::maintain`)
+/// and read via `kg.mv.result` — Datomic-Datalog served first-tier, without the
+/// per-request from-scratch re-evaluation `kg.query` does today.
+pub async fn kg_mv_register(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Json(req): Json<MvRegisterReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kotoba_graph::sparql::SparqlCompiler;
+    use kotoba_kqe::cypher::CypherCompiler;
+    require_kg_write_auth(&headers)?;
+    if req.name.is_empty() || req.name.len() > 128 {
+        return Err((StatusCode::BAD_REQUEST, "name must be 1–128 bytes".into()));
+    }
+    if req.query.len() > MAX_KG_QUERY_PROG_LEN {
+        return Err((StatusCode::BAD_REQUEST, "query too large".into()));
+    }
+    let program = match req.lang.as_str() {
+        "sparql" => SparqlCompiler::compile(&req.query, &req.name)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("SPARQL compile: {e}")))?
+            .program,
+        "cypher" => CypherCompiler::compile(&req.query, &req.name)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Cypher compile: {e}")))?
+            .program,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("lang must be 'sparql' or 'cypher' (got '{other}')"),
+            ))
+        }
+    };
+    let newly_registered = state
+        .mv_registry
+        .write()
+        .await
+        .register(req.name.clone(), program);
+    Ok(Json(MvRegisterResp {
+        name: req.name,
+        newly_registered,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct MvResultReq {
+    pub name: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct MvResultRow {
+    pub s: String,
+    pub a: String,
+    pub v: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct MvResultResp {
+    pub name: String,
+    pub count: usize,
+    pub rows: Vec<MvResultRow>,
+}
+
+/// POST /xrpc/com.etzhayyim.apps.kotobase.kg.mv.result
+///
+/// Read the maintained derived facts of a registered MaterializedView — the
+/// accumulated, incrementally-maintained result (not a from-scratch eval).
+pub async fn kg_mv_result(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Json(req): Json<MvResultReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    require_kg_write_auth(&headers)?;
+    let reg = state.mv_registry.read().await;
+    let arr = reg
+        .result(&req.name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no view '{}'", req.name)))?;
+    let rows: Vec<MvResultRow> = arr
+        .current_datoms()
+        .into_iter()
+        .map(|d| MvResultRow {
+            s: d.e.to_multibase(),
+            a: d.a.clone(),
+            v: readable_value(&d.v),
+        })
+        .collect();
+    Ok(Json(MvResultResp {
+        name: req.name,
+        count: rows.len(),
+        rows,
+    }))
+}
 
 pub async fn kg_query(
     State(state): State<Arc<KotobaState>>,
