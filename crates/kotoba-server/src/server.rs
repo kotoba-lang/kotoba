@@ -689,16 +689,17 @@ impl KotobaState {
         let ipfs_pin = IpfsPinClient::from_env();
         tracing::info!("IPFS pin client ready (KOTOBA_IPFS_ENDPOINT)");
 
+        // CAR-on-B2 cold export — install the process-global export queue when
+        // KOTOBA_B2_* + KOTOBA_STORE_PATH are set. All commit paths
+        // (QuadStore::commit + the distributed DistributedCommitWriter) consult
+        // `kotoba_store::b2_export::global()`; no per-store threading needed.
+        let _car_export = kotoba_store::CarExportQueue::start(store_path.as_deref());
+
         // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path.
-        // When KOTOBA_B2_* is configured, attach the CAR-on-B2 cold-export queue
-        // so each commit's CAR bundle is archived off-site in B2 (one PUT/commit).
-        let quad_store = {
-            let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store));
-            match kotoba_store::CarExportQueue::start(store_path.as_deref()) {
-                Some(q) => Arc::new(qs.with_car_export(q)),
-                None => Arc::new(qs),
-            }
-        };
+        let quad_store = Arc::new(QuadStore::new(
+            Arc::clone(&journal),
+            Arc::clone(&block_store),
+        ));
 
         // Vault — content-addressed private blob store; backed by block_store.
         let vault = Arc::new(if store_path.is_some() {

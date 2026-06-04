@@ -39,7 +39,7 @@ use kotoba_kqe::quad::LegacyQuad as Quad;
 use kotoba_kqe::quad::LegacyQuadObject;
 use kotoba_kse::journal::Journal;
 use kotoba_kse::topic::Topic;
-use kotoba_store::{CapturingBlockStore, CarBundleWriter, CarExportQueue};
+use kotoba_store::{CapturingBlockStore, CarBundleWriter};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -75,10 +75,6 @@ pub struct QuadStore {
     /// keeps retract tombstones so the next commit can persist full Datomic
     /// `(E,A,V,T,Added)` history into the Datom-native ProllyTree indexes.
     pending_datoms: Arc<DashMap<String, Vec<Datom>>>,
-    /// Optional CAR-on-B2 cold-export queue.  When set, every commit's CAR
-    /// bundle is staged + uploaded to B2 off the hot path (ADR: kotobase B2
-    /// cold pin).  `None` (default) keeps behaviour unchanged.
-    car_export: Option<Arc<CarExportQueue>>,
 }
 
 /// Datom-native graph store facade.
@@ -95,12 +91,6 @@ impl DatomGraphStore {
         Self {
             inner: QuadStore::new(journal, block_store),
         }
-    }
-
-    /// Attach a CAR-on-B2 cold-export queue (forwards to the inner QuadStore).
-    pub fn with_car_export(mut self, queue: Arc<CarExportQueue>) -> Self {
-        self.inner = self.inner.with_car_export(queue);
-        self
     }
 
     pub fn legacy_quad_store(&self) -> &QuadStore {
@@ -210,15 +200,7 @@ impl QuadStore {
             committed_seq: Arc::new(RwLock::new(0)),
             hot_covers_all: Arc::new(DashMap::new()),
             pending_datoms: Arc::new(DashMap::new()),
-            car_export: None,
         }
-    }
-
-    /// Attach a CAR-on-B2 cold-export queue. Builder form so existing
-    /// `QuadStore::new` call sites stay source-compatible.
-    pub fn with_car_export(mut self, queue: Arc<CarExportQueue>) -> Self {
-        self.car_export = Some(queue);
-        self
     }
 
     fn record_pending_datom(&self, graph_key: &str, quad: Quad, op: bool) {
@@ -3556,9 +3538,10 @@ impl QuadStore {
             }
             // CAR-on-B2 cold export (off the hot path). car_key = commit CID
             // multibase → idempotent, content-addressed overwrite. Staged on
-            // disk + enqueued; the exporter task uploads to B2.
-            if let Some(q) = &self.car_export {
-                if car_block_count > 0 {
+            // disk + enqueued; the exporter task uploads to B2. Uses the global
+            // queue installed at startup (None unless KOTOBA_B2_* configured).
+            if car_block_count > 0 {
+                if let Some(q) = kotoba_store::b2_export::global() {
                     q.enqueue(&cid.to_multibase(), &car_bytes);
                 }
             }

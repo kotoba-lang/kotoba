@@ -2424,6 +2424,23 @@ where
         self.store.pin(&commit.cid);
         let pin_ms = t_pin.elapsed().as_millis();
 
+        // CAR-on-B2 cold export (durability-first: after the local durable flush
+        // + pin). `captured` already holds every block of this commit including
+        // the commit block (`commit.persist(&cap)`), so the CAR is
+        // self-restorable. Pack into one CAR keyed by the commit CID (idempotent,
+        // content-addressed) and enqueue for the global B2 exporter — a no-op
+        // unless KOTOBA_B2_* is configured. Off the hot path.
+        if let Some(q) = kotoba_store::b2_export::global() {
+            if !captured.is_empty() {
+                let mut car = kotoba_store::CarBundleWriter::new(commit.cid.clone());
+                for (bcid, data) in &captured {
+                    car.append(bcid, data);
+                }
+                let (car_bytes, _idx) = car.finish();
+                q.enqueue(&commit.cid.to_multibase(), &car_bytes);
+            }
+        }
+
         let commit_ipfs_cid = kotoba_ipfs::parse_cid(&commit.cid.to_multibase())
             .map_err(|e| DistributedCommitError::InvalidCommitCid(e.to_string()))?;
         let mut ipns_record = IpnsRecord::new(
