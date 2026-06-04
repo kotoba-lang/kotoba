@@ -276,6 +276,11 @@ pub struct KotobaState {
     // ── QuadStore ────────────────────────────────────────────────────────────
     /// Legacy graph projection write/read with Datom-native ProllyTree commit.
     pub quad_store: Arc<QuadStore>,
+    // ── MaterializedView registry (ADR-2606041151 B) ─────────────────────────
+    /// Registered, incrementally-maintained Datalog MaterializedViews.
+    /// Maintained on every kg commit (`commit_kg_datoms`); registered + read via
+    /// `kg.mv.register` / `kg.mv.result`.
+    pub mv_registry: Arc<tokio::sync::RwLock<kotoba_kqe::mv::MvRegistry>>,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
     /// Optional kotobase.gftd.ai XRPC pin client (KOTOBA_PIN_TOKEN).
     pub ipfs_pin: Arc<IpfsPinClient>,
@@ -800,6 +805,9 @@ impl KotobaState {
 
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
+            mv_registry: Arc::new(tokio::sync::RwLock::new(
+                kotoba_kqe::mv::MvRegistry::new(),
+            )),
             operator_did,
             node_roles,
             identity,
