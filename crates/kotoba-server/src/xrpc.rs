@@ -2653,25 +2653,27 @@ pub(crate) async fn commit_protocol_datoms(
             ),
         })?;
 
+    // ADR-2606041151 A — the synchronous DistributedCommitWriter commit above is
+    // already durable (ProllyTree + IPNS head), so the per-datom Journal WAL
+    // block-write is a redundant double-write. Kept by default (fast restart via
+    // journal replay); opt out with KOTOBA_JOURNAL_WAL=off to drop the double
+    // write. The hot-arrangement update (`apply_journaled_datom`) ALWAYS runs —
+    // it serves hot reads and is independent of the WAL block-write.
     let mut journal_cids = Vec::with_capacity(datoms.len());
     for datom in &datoms {
-        let quad = datom_to_projection_quad(datom, &graph_cid);
-        let journal_cid = if datom.added {
-            let cid = state.journal_assert(&quad).await;
-            state
-                .quad_store
-                .apply_journaled_datom(graph_cid.clone(), datom_to_projection_kqe(datom))
-                .await;
-            cid
-        } else {
-            let cid = state.journal_retract(&quad).await;
-            state
-                .quad_store
-                .apply_journaled_datom(graph_cid.clone(), datom_to_projection_kqe(datom))
-                .await;
-            cid
-        };
-        journal_cids.push(journal_cid);
+        if state.journal_wal_enabled {
+            let quad = datom_to_projection_quad(datom, &graph_cid);
+            let cid = if datom.added {
+                state.journal_assert(&quad).await
+            } else {
+                state.journal_retract(&quad).await
+            };
+            journal_cids.push(cid);
+        }
+        state
+            .quad_store
+            .apply_journaled_datom(graph_cid.clone(), datom_to_projection_kqe(datom))
+            .await;
     }
 
     let assert_count = datoms.iter().filter(|datom| datom.added).count();
