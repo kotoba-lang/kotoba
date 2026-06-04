@@ -397,7 +397,36 @@ impl KotobaState {
                     v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false")
                 })
                 .unwrap_or(false);
-            if !ipfs_off {
+            // ADR-2606041151 A — embedded durable local tier. When
+            // KOTOBA_FS_BLOCKS_DIR (or KOTOBA_FS_BLOCKS=1 + KOTOBA_STORE_PATH) is
+            // set, kotoba is its own durable block store + pinner: blocks are
+            // written to local disk directly (no Kubo-over-HTTP round-trip),
+            // the enabler for cheap micro-batch synchronous commit. Kubo / B2
+            // then become async export of sealed commits, off the hot write path.
+            let fs_blocks_dir = std::env::var("KOTOBA_FS_BLOCKS_DIR").ok().or_else(|| {
+                let on = std::env::var("KOTOBA_FS_BLOCKS")
+                    .map(|v| {
+                        v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true")
+                    })
+                    .unwrap_or(false);
+                if on {
+                    std::env::var("KOTOBA_STORE_PATH")
+                        .ok()
+                        .map(|p| format!("{p}/fsblocks"))
+                } else {
+                    None
+                }
+            });
+            if let Some(dir) = fs_blocks_dir {
+                let fs = kotoba_store::FsBlockStore::open(&dir)?;
+                let tiered = kotoba_store::TieredBlockStore::new(hot, fs);
+                tracing::info!(
+                    hot_cache_mib = hot_cache_bytes / (1024 * 1024),
+                    dir = %dir,
+                    "BlockStore: TieredBlockStore<BudgetedMemory, FsBlockStore> — embedded durable local tier (ADR-2606041151 A); Kubo/B2 = async export"
+                );
+                Arc::new(tiered) as Arc<dyn BlockStore + Send + Sync>
+            } else if !ipfs_off {
                 let cold = kotoba_store::KuboBlockStore::from_env();
                 // F-3: attach the kotobase remote-pin client if configured so
                 // every local recursive pin/add also lands on kotobase.gftd.ai.
