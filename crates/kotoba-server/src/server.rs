@@ -564,6 +564,20 @@ impl KotobaState {
             }
         };
 
+        // CAR-on-B2 — installs the global export queue (consulted by the commit
+        // paths) and, when enabled, returns a B2CarBlockStore read tier. Nest it
+        // as the COLDEST tier so any block absent locally is served from its CAR
+        // in B2 via one ranged GET (Phase 2 serve-from-B2). No-op unless
+        // KOTOBA_B2_* + KOTOBA_STORE_PATH are set.
+        let block_store: Arc<dyn BlockStore + Send + Sync> =
+            match kotoba_store::CarExportQueue::start(store_path.as_deref()) {
+                Some(b2_tier) => {
+                    tracing::info!("BlockStore: CAR-on-B2 read tier nested as coldest fallback");
+                    Arc::new(kotoba_store::TieredBlockStore::new(block_store, b2_tier))
+                }
+                None => block_store,
+            };
+
         // IPNS registry = the mutable-name boundary holding each datomic graph's
         // head (latest commit CID). Default is now **disk-persistent** so graph
         // heads survive a restart (the in-memory registry loses them → datomic
@@ -688,12 +702,6 @@ impl KotobaState {
         // IPFS pin client — always initialised; pins against KOTOBA_IPFS_ENDPOINT (default localhost:5001)
         let ipfs_pin = IpfsPinClient::from_env();
         tracing::info!("IPFS pin client ready (KOTOBA_IPFS_ENDPOINT)");
-
-        // CAR-on-B2 cold export — install the process-global export queue when
-        // KOTOBA_B2_* + KOTOBA_STORE_PATH are set. All commit paths
-        // (QuadStore::commit + the distributed DistributedCommitWriter) consult
-        // `kotoba_store::b2_export::global()`; no per-store threading needed.
-        let _car_export = kotoba_store::CarExportQueue::start(store_path.as_deref());
 
         // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path.
         let quad_store = Arc::new(QuadStore::new(
