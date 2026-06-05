@@ -3905,31 +3905,80 @@ where
     Ok(Some((basis_t, rows)))
 }
 
-fn parse_remote_peer_socket(remote_peer: &str) -> Result<SocketAddr, (StatusCode, String)> {
-    if let Ok(socket) = remote_peer.parse::<SocketAddr>() {
-        return Ok(socket);
+/// Reject SSRF-prone destinations for caller-supplied `remote_peer`: loopback,
+/// private (RFC1918), link-local (incl. 169.254.169.254 cloud metadata),
+/// unspecified/broadcast, IPv6 ULA (fc00::/7) and link-local (fe80::/10), and
+/// IPv4-mapped forms of all of the above. `SocketAddr::from_str` only accepts
+/// numeric IPs (no DNS), so this fully bounds the destination set.
+fn peer_ip_disallowed(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0 // 0.0.0.0/8
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return peer_ip_disallowed(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (s[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
     }
-    let segments = remote_peer.split('/').collect::<Vec<_>>();
-    if segments.len() > 1 {
+}
+
+fn parse_remote_peer_socket(remote_peer: &str) -> Result<SocketAddr, (StatusCode, String)> {
+    let socket = if let Ok(socket) = remote_peer.parse::<SocketAddr>() {
+        socket
+    } else {
+        let segments = remote_peer.split('/').collect::<Vec<_>>();
         let ip = segments
             .windows(2)
             .find_map(|window| (window[0] == "ip4").then_some(window[1]));
         let port = segments
             .windows(2)
             .find_map(|window| (window[0] == "tcp").then_some(window[1]));
-        if let (Some(ip), Some(port)) = (ip, port) {
-            return format!("{ip}:{port}").parse::<SocketAddr>().map_err(|e| {
-                (
+        match (ip, port) {
+            (Some(ip), Some(port)) => {
+                format!("{ip}:{port}").parse::<SocketAddr>().map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("invalid remote_peer multiaddr: {e}"),
+                    )
+                })?
+            }
+            _ => {
+                return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("invalid remote_peer multiaddr: {e}"),
-                )
-            });
+                    "remote_peer must be host:port or /ip4/<addr>/tcp/<port>".to_string(),
+                ))
+            }
         }
+    };
+    // Block SSRF-prone private/loopback/metadata destinations for caller-supplied
+    // remote_peer. Opt out with KOTOBA_ALLOW_PRIVATE_PEERS=1 for a trusted
+    // internal mesh / dev (where loopback or RFC1918 peers are legitimate).
+    let allow_private = std::env::var("KOTOBA_ALLOW_PRIVATE_PEERS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
+    if !allow_private && peer_ip_disallowed(socket.ip()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "remote_peer {} is a disallowed (private/loopback/link-local/metadata) address; \
+                 set KOTOBA_ALLOW_PRIVATE_PEERS=1 for a trusted internal mesh",
+                socket.ip()
+            ),
+        ));
     }
-    Err((
-        StatusCode::BAD_REQUEST,
-        "remote_peer must be host:port or /ip4/<addr>/tcp/<port>".to_string(),
-    ))
+    Ok(socket)
 }
 
 fn distributed_datomic_datoms(
@@ -8819,6 +8868,30 @@ pub async fn agent_sync_close(
 }
 
 #[cfg(test)]
+mod ssrf_guard_tests {
+    use super::peer_ip_disallowed;
+
+    #[test]
+    fn rejects_private_loopback_metadata() {
+        for ip in [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+            "0.0.0.0", "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+        ] {
+            assert!(peer_ip_disallowed(ip.parse().unwrap()), "{ip} must be disallowed");
+        }
+        // public IPs are allowed
+        for ip in ["1.1.1.1", "8.8.8.8", "203.0.113.5", "2606:4700::1111"] {
+            assert!(!peer_ip_disallowed(ip.parse().unwrap()), "{ip} must be allowed");
+        }
+    }
+
+    // NOTE: parse_remote_peer_socket() reads KOTOBA_ALLOW_PRIVATE_PEERS, which
+    // other (parallel) tests may set process-wide; the pure classifier
+    // `peer_ip_disallowed` above is the env-independent unit under test.
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         append_auth_capability_datoms, atproto_repo_delete_datoms, atproto_repo_record_entity_cid,
@@ -10899,6 +10972,8 @@ mod tests {
     async fn datomic_q_xrpc_reads_remote_ipfs_ipns_dag_cbor_prolly_head() {
         std::env::set_var("KOTOBA_IPFS", "off");
         std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        // This test fetches from a loopback peer; allow it past the SSRF guard.
+        std::env::set_var("KOTOBA_ALLOW_PRIVATE_PEERS", "1");
 
         let remote_node = IpfsConfig::new()
             .with_listen("/ip4/127.0.0.1/tcp/0".parse().unwrap())

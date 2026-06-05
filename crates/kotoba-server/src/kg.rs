@@ -3041,6 +3041,7 @@ mod tests {
                 query: "SELECT t.s, t.o FROM role t".into(),
                 cacao_b64: None,
                 limit: None,
+                mv_name: None,
             }),
         )
         .await;
@@ -3079,6 +3080,7 @@ mod tests {
                 query: "SELECT t.s, t.o FROM role t".into(),
                 cacao_b64: None,
                 limit: None,
+                mv_name: None,
             }),
         )
         .await

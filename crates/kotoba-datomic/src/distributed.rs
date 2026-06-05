@@ -209,8 +209,14 @@ fn fetch_remote_block(socket: SocketAddr, cid: &KotobaCid) -> anyhow::Result<Opt
     if len == u64::MAX {
         return Ok(None);
     }
-    if len > usize::MAX as u64 {
-        return Err(anyhow::anyhow!("remote block too large: {len}"));
+    // Cap the length a (possibly malicious / SSRF-reached) peer can make us
+    // allocate. 64 MiB ≫ any real content-addressed block; the old
+    // `len > usize::MAX` guard was a no-op on 64-bit and allowed OOM.
+    const MAX_REMOTE_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+    if len > MAX_REMOTE_BLOCK_BYTES {
+        return Err(anyhow::anyhow!(
+            "remote block too large: {len} > {MAX_REMOTE_BLOCK_BYTES}"
+        ));
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf)?;
@@ -240,9 +246,12 @@ fn fetch_remote_ipns_record(
     if len == u64::MAX {
         return Err(IpnsRegistryError::NotFound(name.0.clone()));
     }
-    if len > usize::MAX as u64 {
+    // Cap allocation from a (possibly malicious) peer. IPNS records are tiny;
+    // 1 MiB is generous. The old `len > usize::MAX` guard was a no-op on 64-bit.
+    const MAX_REMOTE_IPNS_RECORD_BYTES: u64 = 1024 * 1024;
+    if len > MAX_REMOTE_IPNS_RECORD_BYTES {
         return Err(IpnsRegistryError::Kubo(format!(
-            "remote IPNS record too large: {len}"
+            "remote IPNS record too large: {len} > {MAX_REMOTE_IPNS_RECORD_BYTES}"
         )));
     }
     let mut buf = vec![0u8; len as usize];

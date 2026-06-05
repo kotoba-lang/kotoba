@@ -189,16 +189,58 @@ pub(crate) fn verify_cacao_graph_operation(
     Ok(payload)
 }
 
+/// Constant-time byte compare (length is allowed to leak — the secret is fixed).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Defense-in-depth gate closing the "pod reachable directly → forge a JWT"
+/// hole: JWT signatures are NOT verified here (the edge BFF is the signature
+/// trust boundary), so a request that reaches the pod directly can forge any
+/// `sub`. When `KOTOBA_INTERNAL_SECRET` is configured, every `sub`-trusting
+/// request MUST arrive through the trusted edge Worker, which forwards
+/// `x-internal-trust: <secret>`. No-op when the env is unset (dev / back-compat).
+/// CACAO-authed paths are unaffected (their signatures are cryptographically verified).
+pub fn require_internal_trust(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    let secret = match std::env::var("KOTOBA_INTERNAL_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Ok(()),
+    };
+    let got = headers
+        .get("x-internal-trust")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct_eq(got.as_bytes(), secret.as_bytes()) {
+        Ok(())
+    } else {
+        tracing::warn!("internal-trust gate: missing/invalid x-internal-trust (direct pod access?)");
+        Err((
+            StatusCode::UNAUTHORIZED,
+            "request must arrive through the trusted edge (x-internal-trust)".to_string(),
+        ))
+    }
+}
+
 /// Require that the request carries a Bearer JWT whose `sub` matches `operator_did`.
 ///
 /// Used by unauthenticated-write endpoints (`kg_ingest`, `kg_delete`, `kg_embed`,
 /// `embed_create`, `agent_run`, `block_put`, `vault_put`) to prevent storage/compute abuse.
 /// JWT signature is NOT re-verified — the edge BFF is the trust boundary; we only check
-/// that the token is not expired and that the `sub` claim names the operator.
+/// that the token is not expired and that the `sub` claim names the operator. When
+/// `KOTOBA_INTERNAL_SECRET` is set, `x-internal-trust` is additionally required so a
+/// directly-reachable pod cannot be impersonated with a forged operator JWT.
 pub fn require_operator_auth(
     headers: &HeaderMap,
     operator_did: &str,
 ) -> Result<(), (StatusCode, String)> {
+    require_internal_trust(headers)?;
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
