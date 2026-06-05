@@ -55,6 +55,10 @@ fn require_did_ownership(
     tenant_did: &str,
     operator_did: &str,
 ) -> Result<(), (StatusCode, String)> {
+    // Defense-in-depth: when KOTOBA_INTERNAL_SECRET is set, only requests through
+    // the trusted edge Worker (which forwards x-internal-trust) are accepted, so a
+    // directly-reachable pod cannot be impersonated with a forged tenant JWT.
+    crate::graph_auth::require_internal_trust(headers)?;
     let token = bearer_token(headers).ok_or_else(|| {
         tracing::warn!("kotobase auth: missing Bearer token");
         (

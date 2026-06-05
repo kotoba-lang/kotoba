@@ -915,7 +915,9 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         )
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_Q),
-            post(xrpc::datomic_q),
+            // Explicit 1 MiB cap on query bodies (tighter than the 2 MiB axum
+            // default) — query_edn/inputs are small; bounds parse/alloc cost.
+            post(xrpc::datomic_q).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_WITH),
@@ -1037,7 +1039,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         )
         .route(&format!("/xrpc/{}", kg::NSID_KG_EMBED), post(kg::kg_embed))
         .route(&format!("/xrpc/{}", kg::NSID_KG_SEARCH), get(kg::kg_search))
-        .route(&format!("/xrpc/{}", kg::NSID_KG_QUERY), post(kg::kg_query))
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_QUERY),
+            post(kg::kg_query).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route(
             &format!("/xrpc/{}", kg::NSID_KG_MV_REGISTER),
             post(kg::kg_mv_register),
