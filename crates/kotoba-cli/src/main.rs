@@ -76,6 +76,28 @@ enum Cmd {
         max_hops: usize,
     },
 
+    /// Datomic Datalog query (`[:find … :where …]`) over the running server's
+    /// distributed Datom graph. POST /xrpc/com.etzhayyim.apps.kotoba.datomic.q.
+    /// With --emit-cid the response also carries content-addressed provenance
+    /// (query_spec_cid / query_job_cid / result_cid) — the resultCid is fetchable
+    /// via `block.get` for Public graphs.
+    Q {
+        /// Datomic Datalog query EDN, e.g. `[:find ?e :where [?e :a ?v]]`.
+        query: String,
+        /// Target graph CID (multibase) — required for datomic.q.
+        #[arg(long)]
+        graph: String,
+        /// Emit content-addressed provenance CIDs alongside the rows.
+        #[arg(long)]
+        emit_cid: bool,
+        /// Optional as-of transaction CID (reproducible time-travel read).
+        #[arg(long)]
+        as_of: Option<String>,
+        /// CACAO chain (base64 DAG-CBOR) for private graphs.
+        #[arg(long, env = "KOTOBA_CACAO_B64")]
+        cacao: Option<String>,
+    },
+
     /// Cypher MATCH/RETURN over the running server (same endpoint, lang=cypher).
     Cypher {
         query: String,
@@ -332,6 +354,16 @@ async fn main() -> Result<()> {
             max_hops,
         } => {
             run_sparql(&cli.url, &cli.token, &query, limit, cacao, graph, max_hops).await?;
+        }
+
+        Cmd::Q {
+            query,
+            graph,
+            emit_cid,
+            as_of,
+            cacao,
+        } => {
+            run_datomic_q(&cli.url, &cli.token, &query, &graph, emit_cid, as_of, cacao).await?;
         }
 
         Cmd::Cypher {
@@ -1112,6 +1144,44 @@ async fn sparql_req(
 }
 
 /// POST a SPARQL query (any form) to the direct-SPARQL endpoint.
+/// POST a Datomic Datalog query to the running server's `datomic.q` endpoint.
+/// With `emit_cid`, the response carries content-addressed provenance CIDs
+/// (query_spec_cid / query_job_cid / result_cid) — for Public graphs the result
+/// envelope is fetchable via `kotoba block-get <result_cid>`.
+async fn run_datomic_q(
+    base_url: &str,
+    token: &Option<String>,
+    query_edn: &str,
+    graph: &str,
+    emit_cid: bool,
+    as_of: Option<String>,
+    cacao: Option<String>,
+) -> Result<()> {
+    let url = format!(
+        "{}/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
+        base_url.trim_end_matches('/')
+    );
+    let client = build_client(token)?;
+    // datomic.q uses snake_case field names (unlike the camelCase graph.sparql).
+    let body = serde_json::json!({
+        "graph":     graph,
+        "query_edn": query_edn,
+        "emit_cid":  emit_cid,
+        "as_of":     as_of,
+        "cacao_b64": cacao,
+    });
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .context("POST kotoba.datomic.q failed")?;
+    check_status(&resp)?;
+    let v: serde_json::Value = resp.json().await.context("decode kotoba.datomic.q JSON")?;
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    Ok(())
+}
+
 async fn run_sparql(
     base_url: &str,
     token: &Option<String>,
