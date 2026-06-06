@@ -4384,10 +4384,19 @@ mod tests {
 
         // 4× more history between base=8k and base=32k; an O(history) re-read
         // would read ~4× more.  Incremental should be near-flat (plateau).
+        //
+        // Threshold is 3×, not 2×: the measured byte count carries run-to-run
+        // noise — commit builds the 4 covering indexes on parallel threads, so the
+        // block-read interleaving (and thus the CountingBlockStore tally) varies.
+        // Observed plateau ratios cluster ~1.6–1.8 but occasionally spike toward
+        // ~2.0 on an unlucky b_mid dip, which made the old 2× bound flaky (~1 in 3).
+        // 3× stays comfortably below the ~4× an O(history) re-read would produce,
+        // so it still catches a real full-history regression while tolerating the
+        // measurement noise.
         assert!(
-            b_large < b_mid * 2,
+            b_large < b_mid * 3,
             "commit reads did not plateau: base=8k read {b_mid} B, base=32k read {b_large} B \
-             (4× the history; expected < 2× for O(delta), got {:.2}×)",
+             (4× the history; expected < 3× for O(delta), got {:.2}×)",
             b_large as f64 / b_mid.max(1) as f64,
         );
     }

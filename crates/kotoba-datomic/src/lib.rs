@@ -3542,9 +3542,9 @@ fn query_partition_value(op: &str, args: Vec<EdnValue>) -> Result<EdnValue> {
     while start < values.len() {
         let end = (start + n).min(values.len());
         let mut chunk = values[start..end].to_vec();
-        if chunk.len() == n {
-            out.push(EdnValue::Vector(chunk));
-        } else if op == "partition-all" {
+        // A full chunk is always emitted; a short trailing chunk is emitted only
+        // for `partition-all` (Clojure `partition` drops it unless padded).
+        if chunk.len() == n || op == "partition-all" {
             out.push(EdnValue::Vector(chunk));
         } else if let Some(pad) = &pad {
             chunk.extend(pad.iter().take(n - chunk.len()).cloned());
