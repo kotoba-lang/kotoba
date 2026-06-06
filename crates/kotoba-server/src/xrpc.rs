@@ -9233,6 +9233,129 @@ mod tests {
     }
     use serde_json::json;
 
+    // End-to-end public vs private READ authorization through the real datomic.q
+    // handler. The tier logic (graph_auth) and CACAO crypto are unit-tested, but
+    // nothing wires a Private graph through datomic_q — this closes that gap.
+    // Small scale: 2 datoms, 1 query, 3 access scenarios.
+    #[tokio::test]
+    async fn datomic_q_public_allows_anon_private_requires_cacao() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        const Q: &str =
+            r#"[:find ?name ?role :where [?e :person/name ?name] [?e :person/role ?role]]"#;
+
+        // Seed Alice/admin into a graph in this node's own store (reads are
+        // visibility-gated; writes are operator-gated, so the same seed serves
+        // both a public and a private graph).
+        fn seed(state: &KotobaState, graph: &KotobaCid, marker: &[u8]) {
+            let tx = KotobaCid::from_bytes(marker);
+            let e = KotobaCid::from_bytes(b"pp-alice");
+            DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
+                .commit_datoms(CommitDatomsRequest {
+                    ipns_name: distributed_graph_ipns_name(graph),
+                    graph: graph.clone(),
+                    covering_datoms: None,
+                    datoms: vec![
+                        Datom::assert(e.clone(), ":person/name".into(), EdnValue::string("Alice"), tx.clone()),
+                        Datom::assert(e, ":person/role".into(), EdnValue::string("admin"), tx.clone()),
+                    ],
+                    expected_parent: None,
+                    tx_cid: Some(tx),
+                    author: "did:key:zSeedAuthor".into(),
+                    seq: 1,
+                    valid_until: "2030-01-01T00:00:00Z".into(),
+                    ttl_secs: Some(60),
+                    cacao_proof_cid: None,
+                    ipns_controller_did: None,
+                    ipns_signing_key: None,
+                })
+                .unwrap();
+        }
+        fn req(graph_mb: &str, cacao: Option<String>) -> DatomicQReq {
+            DatomicQReq {
+                graph: graph_mb.into(),
+                query_edn: Q.into(),
+                inputs_edn: vec![],
+                as_of: None,
+                since: None,
+                history: false,
+                emit_cid: false,
+                remote_peer: None,
+                remote_ipns_name: None,
+                cacao_b64: cacao,
+                presentation: None,
+            }
+        }
+        async fn rows(resp: axum::response::Response) -> serde_json::Value {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["rows_edn"].clone()
+        }
+        let expected = json!([[r#""Alice""#, r#""admin""#]]);
+
+        // ── Public graph: anonymous read is allowed and returns the rows. ──
+        let g_pub = KotobaCid::from_bytes(b"pp-public-graph");
+        seed(&state, &g_pub, b"pp-pub-tx");
+        state.graph_registry.write().await.insert(g_pub.clone(), ("pub".into(), GraphVisibility::Public));
+        let resp = datomic_q(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(req(&g_pub.to_multibase(), None)),
+        )
+        .await
+        .expect("public read must be allowed anonymously")
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(rows(resp).await, expected, "public read returns the seeded rows");
+
+        // ── Private graph owned by the signed_cacao_b64 issuer (key [42u8;32]). ──
+        let owner_did = kotoba_auth::ed25519_pubkey_to_did_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]).verifying_key().to_bytes(),
+        );
+        let g_priv = KotobaCid::from_bytes(b"pp-private-graph");
+        seed(&state, &g_priv, b"pp-priv-tx");
+        state.graph_registry.write().await.insert(
+            g_priv.clone(),
+            ("priv".into(), GraphVisibility::Private { owner_did: owner_did.clone() }),
+        );
+        let g_priv_mb = g_priv.to_multibase();
+
+        // (a) no CACAO → denied 401, and for the RIGHT reason (the CACAO gate),
+        //     so the deny is not vacuous.
+        let denied = match datomic_q(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(req(&g_priv_mb, None)),
+        )
+        .await
+        {
+            Ok(_) => panic!("private read without cacao must be denied"),
+            Err(e) => e,
+        };
+        assert_eq!(denied.0, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(denied.1.to_lowercase().contains("cacao"), "deny must be the CACAO gate, got: {}", denied.1);
+
+        // (b) valid CACAO (datom:read on private/{owner}, fresh nonce) → OK + rows.
+        let cacao = signed_cacao_b64(
+            &state,
+            &format!("private/{owner_did}"),
+            kotoba_auth::CacaoPayload::OP_DATOM_READ,
+            "pp-nonce-1",
+            Vec::<String>::new(),
+        );
+        let resp = datomic_q(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(req(&g_priv_mb, Some(cacao))),
+        )
+        .await
+        .expect("private read WITH a valid cacao must be allowed")
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(rows(resp).await, expected, "authorized private read returns the seeded rows");
+    }
+
     #[test]
     fn datomic_range_tx_scope_requires_requested_start_and_end_scopes() {
         let start = KotobaCid::from_bytes(b"range-start").to_multibase();
