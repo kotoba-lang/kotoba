@@ -3,10 +3,16 @@
 //! (Native run of the same Node API the wasm KotobaNode wraps.)
 use kotoba_wasm::Node;
 
-const JSON: &str = include_str!(concat!(
+// The kabuto seed lives in the parent monorepo (`20-actors/kabuto/viz/`) and is
+// absent in a standalone kotoba checkout. Reference it by path and load at
+// RUNTIME (with a graceful skip) rather than `include_str!` — a compile-time
+// include of a sometimes-absent file breaks `cargo test` for the whole crate,
+// and a missing-fixture skip can't be expressed as `#[ignore]` on an
+// `include_str!`. See the kotoba split (net-kotobase, 2026-06-04).
+const CONTRACT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../../20-actors/kabuto/viz/supply-datoms.json"
-));
+);
 
 fn rows(n: &Node, q: &str) -> Vec<Vec<String>> {
     let out = n.datomic_q(q, "[]").unwrap();
@@ -27,9 +33,15 @@ fn rows(n: &Node, q: &str) -> Vec<Vec<String>> {
 
 #[test]
 fn kabuto_supply_graph_drives_the_viewer() {
+    // Skip when the kabuto seed isn't checked out alongside (standalone kotoba).
+    let Ok(json) = std::fs::read_to_string(CONTRACT_PATH) else {
+        eprintln!("skipping kabuto_supply_graph: fixture not present at {CONTRACT_PATH}");
+        return;
+    };
+    let json = json.as_str();
     // Expected counts are derived from the embedded contract itself, so the
     // test stays correct as the kabuto seed grows each /loop iteration.
-    let contract: Vec<serde_json::Value> = serde_json::from_str(JSON).unwrap();
+    let contract: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
     let want_companies = contract.iter().filter(|d| d["a"] == ":company/id").count();
     let want_edges = contract
         .iter()
@@ -38,7 +50,7 @@ fn kabuto_supply_graph_drives_the_viewer() {
     assert!(want_companies > 100, "non-trivial seed");
 
     let mut n = Node::new();
-    let loaded = n.load_server_datoms(JSON).unwrap();
+    let loaded = n.load_server_datoms(json).unwrap();
     assert_eq!(loaded, contract.len(), "every contract datom loaded");
 
     // id query → CID-token ↔ id-string map the viewer joins on
