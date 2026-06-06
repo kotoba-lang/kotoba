@@ -5857,12 +5857,23 @@ fn datomic_q_emit_cids(
 /// dag-cbor encode `value`, derive its IPFS-compatible (CIDv1 dag-cbor sha2-256)
 /// CID, PUT the block best-effort (un-pinned), and return the multibase CID.
 fn put_envelope<T: Serialize>(state: &KotobaState, value: &T) -> String {
+    // Bound the best-effort write a read can trigger. `emit_cid` lets an
+    // authenticated reader persist 3 envelope blocks per query, including the
+    // full result set; capping the PUT keeps a churn of large-result reads from
+    // growing the block store unboundedly. The CID is content-derived and always
+    // returned regardless — an oversized envelope is simply not persisted, and a
+    // verifier rebuilds it from the (already-returned) rows to recompute the CID.
+    // 1 MiB matches the datomic.q request body limit; spec/job envelopes are tiny,
+    // so this only ever gates a pathologically large result envelope.
+    const MAX_ENVELOPE_PUT_BYTES: usize = 1 << 20;
+
     let (cid, bytes) = kotoba_ipfs::dag_cbor_block(value).expect("envelope is serializable");
     let kcid = kotoba_core::cid::KotobaCid::from_standard_cid(&cid)
         .expect("dag-cbor sha2-256 cid is kotoba-compatible");
-    // A failed PUT must not fail the query — the CID is still returned and the
-    // envelope can be rebuilt from the response to verify.
-    let _ = state.block_store.put(&kcid, &bytes);
+    // A failed (or skipped) PUT must not fail the query — the CID still stands.
+    if bytes.len() <= MAX_ENVELOPE_PUT_BYTES {
+        let _ = state.block_store.put(&kcid, &bytes);
+    }
     kcid.to_multibase()
 }
 
@@ -9116,16 +9127,57 @@ mod tests {
         // 4. Canonicalization: formatting-only differences collapse to one spec CID.
         assert_eq!(spec1, emit(&query_spaced, "tx-basis-1", &rows).0, "whitespace must not move query_spec_cid");
 
-        // 5. Verify-by-CID: every envelope was PUT, is fetchable by its CID, and
-        //    is IPFS-compatible (CIDv1 dag-cbor sha2-256).
+        // 5. Verify-by-CID: every envelope was PUT, is IPFS-compatible (CIDv1
+        //    dag-cbor sha2-256), and the stored bytes hash back to that exact CID
+        //    (closes the loop — proves the block IS the content the CID names).
         for cid_mb in [&spec1, &job1, &result1] {
             let kcid = KotobaCid::from_multibase(cid_mb).expect("multibase CID parses");
             assert!(kcid.is_ipfs_compatible(), "envelope CID must be IPFS-compatible");
-            assert!(
-                state.block_store.get(&kcid).unwrap().is_some(),
-                "envelope block must be fetchable by CID: {cid_mb}"
+            let bytes = state
+                .block_store
+                .get(&kcid)
+                .unwrap()
+                .unwrap_or_else(|| panic!("envelope block must be fetchable by CID: {cid_mb}"));
+            assert_eq!(
+                KotobaCid::from_bytes(&bytes),
+                kcid,
+                "stored block must hash back to its CID: {cid_mb}"
             );
         }
+    }
+
+    // N1 hardening: emit_cid bounds the best-effort write a read can trigger. An
+    // oversized result envelope still yields its (content-derived) CID, but the
+    // block is NOT persisted — so a churn of huge-result reads can't grow the
+    // block store unboundedly. Small spec/job envelopes are still persisted.
+    #[tokio::test]
+    async fn datomic_q_emit_cid_skips_put_for_oversized_result_envelope() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = KotobaState::new(None).unwrap();
+        let query = kotoba_edn::parse(r#"[:find ?x :where [?e :a ?x]]"#).unwrap();
+        let inputs: Vec<EdnValue> = vec![];
+        // One cell past the 1 MiB PUT cap → the result envelope exceeds it.
+        let rows = vec![vec!["x".repeat(1_100_000)]];
+
+        let (spec, job, result) =
+            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows);
+
+        // CIDs are returned regardless of persistence (content-derived).
+        assert!(!spec.is_empty() && !job.is_empty() && !result.is_empty());
+        // Small spec/job envelopes were persisted…
+        for cid in [&spec, &job] {
+            let kcid = KotobaCid::from_multibase(cid).unwrap();
+            assert!(
+                state.block_store.get(&kcid).unwrap().is_some(),
+                "small envelope must be persisted: {cid}"
+            );
+        }
+        // …but the oversized result envelope was NOT (PUT skipped by the cap).
+        let rcid = KotobaCid::from_multibase(&result).unwrap();
+        assert!(
+            state.block_store.get(&rcid).unwrap().is_none(),
+            "oversized result envelope must not be persisted"
+        );
     }
 
     // First-tier `datomic.datoms` AVET ordering must be numeric, not the
