@@ -312,6 +312,12 @@ pub struct DatomicQReq {
     /// the fifth datom `added` component.
     #[serde(default)]
     pub history: bool,
+    /// Emit a content-addressed provenance envelope for this read. When true the
+    /// response carries `query_spec_cid` / `query_job_cid` / `result_cid` over a
+    /// canonical DAG-CBOR envelope (IPFS-compatible sha2-256); each envelope
+    /// block is PUT best-effort (un-pinned) so a verifier can re-fetch it by CID.
+    #[serde(default)]
+    pub emit_cid: bool,
     /// Optional `host:port` for a remote `kotoba-ipfs/1` peer. When present,
     /// the query resolves the graph IPNS head and DAG-CBOR/Prolly blocks from
     /// that peer instead of this node's local block store.
@@ -616,6 +622,19 @@ pub struct DatomicQResp {
     pub rows_map_edn: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows_map_json: Option<Vec<std::collections::BTreeMap<String, String>>>,
+    /// CID of the canonical `kotoba.queryspec.v1` envelope (normalized query +
+    /// inputs). Present only when the request set `emit_cid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_spec_cid: Option<String>,
+    /// CID of the canonical `kotoba.queryjob.v1` envelope (query_spec + basis +
+    /// params + engine). Stable cache key. Present only when `emit_cid` was set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_job_cid: Option<String>,
+    /// CID of the canonical `kotoba.result.v1` envelope — content-derived over
+    /// the canonical rows, so any row change changes this CID. Re-fetch the block
+    /// by CID to verify (NOT a hash of this JSON). Present only when `emit_cid`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_cid: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5707,20 +5726,144 @@ pub async fn datomic_q(
         .ok_or_else(|| missing_distributed_datomic_head(&graph_cid))?,
     };
     let rows_map = datomic_q_rows_map(&query, &rows)?;
+    let rows_edn: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(kotoba_edn::to_string).collect())
+        .collect();
+
+    // Optional content-addressed provenance (emit_cid). result_cid is derived
+    // from the canonical rows, so it is tamper-evident; envelope blocks are PUT
+    // best-effort and never auto-pinned.
+    let (query_spec_cid, query_job_cid, result_cid) = if req.emit_cid {
+        let (spec, job, result) = datomic_q_emit_cids(
+            &state,
+            &query,
+            &inputs,
+            basis_t.as_deref(),
+            req.as_of.as_deref(),
+            req.since.as_deref(),
+            req.history,
+            &rows_edn,
+        );
+        (Some(spec), Some(job), Some(result))
+    } else {
+        (None, None, None)
+    };
 
     Ok((
         StatusCode::OK,
         Json(DatomicQResp {
             graph: req.graph,
             basis_t,
-            rows_edn: rows
-                .into_iter()
-                .map(|row| row.into_iter().map(|v| kotoba_edn::to_string(&v)).collect())
-                .collect(),
+            rows_edn,
             rows_map_edn: rows_map.as_ref().map(|rows| rows.edn.clone()),
             rows_map_json: rows_map.map(|rows| rows.json),
+            query_spec_cid,
+            query_job_cid,
+            result_cid,
         }),
     ))
+}
+
+/// `kotoba.queryspec.v1` — the query, normalized free of source-text formatting.
+#[derive(Serialize)]
+struct KotobaQuerySpecEnvelope {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    lang: &'static str,
+    query: String,
+    inputs: Vec<String>,
+}
+
+/// `kotoba.queryjob.v1` — query bound to a basis transaction + params + engine.
+#[derive(Serialize)]
+struct KotobaQueryJobEnvelope {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    query_spec: String,
+    basis_t: Option<String>,
+    as_of: Option<String>,
+    since: Option<String>,
+    history: bool,
+    engine: &'static str,
+}
+
+/// `kotoba.result.v1` — the verifiable, content-derived result envelope.
+#[derive(Serialize)]
+struct KotobaResultEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    query_job: String,
+    basis_t: Option<String>,
+    engine: &'static str,
+    rows_edn: &'a [Vec<String>],
+}
+
+/// Build the `datomic.q` provenance envelopes and return
+/// `(query_spec_cid, query_job_cid, result_cid)` as multibase strings.
+///
+/// `result_cid` is the CID of the canonical DAG-CBOR result envelope and is thus
+/// content-derived (tamper-evident): change any row and the CID changes. Each
+/// envelope block is PUT best-effort so a verifier can re-fetch it by CID; the
+/// blocks are NOT pinned — durable retention stays an explicit `pin*` decision.
+///
+/// Canonicalization (R0): query / inputs / rows are normalized via the canonical
+/// EDN writer (`kotoba_edn::to_string` — sorted maps/sets, no extra whitespace),
+/// so formatting-only differences collapse to the same CID. Datalog variable
+/// alpha-renaming is not yet normalized (deferred).
+fn datomic_q_emit_cids(
+    state: &KotobaState,
+    query: &kotoba_edn::EdnValue,
+    inputs: &[kotoba_edn::EdnValue],
+    basis_t: Option<&str>,
+    as_of: Option<&str>,
+    since: Option<&str>,
+    history: bool,
+    rows_edn: &[Vec<String>],
+) -> (String, String, String) {
+    const ENGINE: &str = concat!("kotoba-server/", env!("CARGO_PKG_VERSION"));
+
+    let spec = KotobaQuerySpecEnvelope {
+        kind: "kotoba.queryspec.v1",
+        lang: "datalog",
+        query: kotoba_edn::to_string(query),
+        inputs: inputs.iter().map(kotoba_edn::to_string).collect(),
+    };
+    let query_spec_cid = put_envelope(state, &spec);
+
+    let job = KotobaQueryJobEnvelope {
+        kind: "kotoba.queryjob.v1",
+        query_spec: query_spec_cid.clone(),
+        basis_t: basis_t.map(str::to_string),
+        as_of: as_of.map(str::to_string),
+        since: since.map(str::to_string),
+        history,
+        engine: ENGINE,
+    };
+    let query_job_cid = put_envelope(state, &job);
+
+    let result = KotobaResultEnvelope {
+        kind: "kotoba.result.v1",
+        query_job: query_job_cid.clone(),
+        basis_t: basis_t.map(str::to_string),
+        engine: ENGINE,
+        rows_edn,
+    };
+    let result_cid = put_envelope(state, &result);
+
+    (query_spec_cid, query_job_cid, result_cid)
+}
+
+/// dag-cbor encode `value`, derive its IPFS-compatible (CIDv1 dag-cbor sha2-256)
+/// CID, PUT the block best-effort (un-pinned), and return the multibase CID.
+fn put_envelope<T: Serialize>(state: &KotobaState, value: &T) -> String {
+    let (cid, bytes) = kotoba_ipfs::dag_cbor_block(value).expect("envelope is serializable");
+    let kcid = kotoba_core::cid::KotobaCid::from_standard_cid(&cid)
+        .expect("dag-cbor sha2-256 cid is kotoba-compatible");
+    // A failed PUT must not fail the query — the CID is still returned and the
+    // envelope can be rebuilt from the response to verify.
+    let _ = state.block_store.put(&kcid, &bytes);
+    kcid.to_multibase()
 }
 
 #[derive(Clone, Copy)]
@@ -8899,7 +9042,8 @@ mod tests {
         datomic_datoms_sort_values, datomic_db_stats, datomic_entid, datomic_entity,
         datomic_history, datomic_ident, datomic_index_pull, datomic_index_range, datomic_log,
         datomic_pull, datomic_pull_many, DatomicDatomsIndex,
-        datomic_q, datomic_seek_datoms, datomic_sync, datomic_transact, datomic_tx_range,
+        datomic_q, datomic_q_emit_cids, datomic_seek_datoms, datomic_sync, datomic_transact,
+        datomic_tx_range,
         datomic_with, did_document_publish, didcomm_send, distributed_graph_ipns_name,
         enforce_datomic_range_tx_scope, is_did_web_ip_host, protocol_payload_tx_cid,
         warm_datomic_resident_cache, vc_issue, vp_capability_projection, AtprotoRepoWriteReq,
@@ -8930,6 +9074,59 @@ mod tests {
     use kotoba_ipfs::{InMemoryIpnsRegistry, IpfsConfig};
     use kotoba_store::MemoryBlockStore;
     use std::sync::Arc;
+
+    // `emit_cid` provenance: result_cid is content-derived (tamper-evident),
+    // deterministic, basis-sensitive, formatting-invariant on the query, PUT and
+    // fetchable by CID, and IPFS-compatible. Exercises the real emit path.
+    #[tokio::test]
+    async fn datomic_q_emit_cid_envelopes_are_content_addressed_and_verifiable() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = KotobaState::new(None).unwrap();
+
+        let query = kotoba_edn::parse(r#"[:find ?name :where [?e :person/name ?name]]"#).unwrap();
+        // Same query, only whitespace/formatting differs.
+        let query_spaced =
+            kotoba_edn::parse("[:find   ?name\n  :where  [?e :person/name ?name]]").unwrap();
+        let inputs: Vec<EdnValue> = vec![];
+        let rows = vec![
+            vec![r#""Alice""#.to_string()],
+            vec![r#""Bob""#.to_string()],
+        ];
+        let emit = |q: &EdnValue, basis: &str, rows: &[Vec<String>]| {
+            datomic_q_emit_cids(&state, q, &inputs, Some(basis), None, None, false, rows)
+        };
+
+        let (spec1, job1, result1) = emit(&query, "tx-basis-1", &rows);
+
+        // 1. Deterministic: identical inputs reproduce identical CIDs.
+        assert_eq!((spec1.clone(), job1.clone(), result1.clone()), emit(&query, "tx-basis-1", &rows));
+
+        // 2. Tamper-evident: changing a single row changes result_cid.
+        let tampered = vec![
+            vec![r#""Alice""#.to_string()],
+            vec![r#""Mallory""#.to_string()],
+        ];
+        assert_ne!(result1, emit(&query, "tx-basis-1", &tampered).2, "row edit must move result_cid");
+
+        // 3. Basis-sensitive: a different basis transaction changes job + result.
+        let (_, job_b2, result_b2) = emit(&query, "tx-basis-2", &rows);
+        assert_ne!(job1, job_b2);
+        assert_ne!(result1, result_b2);
+
+        // 4. Canonicalization: formatting-only differences collapse to one spec CID.
+        assert_eq!(spec1, emit(&query_spaced, "tx-basis-1", &rows).0, "whitespace must not move query_spec_cid");
+
+        // 5. Verify-by-CID: every envelope was PUT, is fetchable by its CID, and
+        //    is IPFS-compatible (CIDv1 dag-cbor sha2-256).
+        for cid_mb in [&spec1, &job1, &result1] {
+            let kcid = KotobaCid::from_multibase(cid_mb).expect("multibase CID parses");
+            assert!(kcid.is_ipfs_compatible(), "envelope CID must be IPFS-compatible");
+            assert!(
+                state.block_store.get(&kcid).unwrap().is_some(),
+                "envelope block must be fetchable by CID: {cid_mb}"
+            );
+        }
+    }
 
     // First-tier `datomic.datoms` AVET ordering must be numeric, not the
     // lexicographic "100" < "20" trap, and type-segregated. This sorts via
@@ -9288,6 +9485,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: false,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: None,
                 cacao_b64: None,
@@ -9419,6 +9617,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: false,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: None,
                 cacao_b64: None,
@@ -10639,6 +10838,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: false,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: None,
                 cacao_b64: None,
@@ -10670,6 +10870,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: true,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: None,
                 cacao_b64: None,
@@ -10723,6 +10924,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: true,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: None,
                 cacao_b64: None,
@@ -10775,6 +10977,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: true,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: None,
                 cacao_b64: None,
@@ -11099,6 +11302,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: false,
+                emit_cid: false,
                 remote_peer: Some(remote_peer.clone()),
                 remote_ipns_name: Some(ipns_name.clone()),
                 cacao_b64: None,
@@ -11133,6 +11337,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: false,
+                emit_cid: false,
                 remote_peer: Some(remote_peer.clone()),
                 remote_ipns_name: Some(ipns_name.clone()),
                 cacao_b64: None,
@@ -11622,6 +11827,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: false,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: Some(ipns_name.clone()),
                 cacao_b64: None,
@@ -11677,6 +11883,7 @@ mod tests {
                 as_of: None,
                 since: None,
                 history: false,
+                emit_cid: false,
                 remote_peer: None,
                 remote_ipns_name: Some(ipns_name.clone()),
                 cacao_b64: None,
