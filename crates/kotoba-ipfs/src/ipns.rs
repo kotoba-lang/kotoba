@@ -7,10 +7,8 @@
 //! preserving the same record semantics.
 
 use crate::cid::{dag_cbor_block, parse_cid};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ipld_core::cid::Cid as IpldCid;
-use multibase::Base;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -21,174 +19,10 @@ const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KUBO_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const KUBO_POOL_MAX_IDLE_PER_HOST: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct IpnsName(pub String);
-
-impl IpnsName {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A Kotoba IPNS record.
-///
-/// `value` is the CID string of the latest DAG-CBOR commit block.  `sequence`
-/// is monotonically increasing per name; stale records are rejected by
-/// [`InMemoryIpnsRegistry`].  `valid_until` uses strict UTC text so the record
-/// is stable in DAG-CBOR and JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IpnsRecord {
-    pub name: IpnsName,
-    pub value: String,
-    pub sequence: u64,
-    pub valid_until: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_secs: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub controller_did: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_key_multibase: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature_multibase: Option<String>,
-}
-
-impl IpnsRecord {
-    pub fn new(
-        name: impl Into<String>,
-        value: &IpldCid,
-        sequence: u64,
-        valid_until: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: IpnsName::new(name),
-            value: value.to_string(),
-            sequence,
-            valid_until: valid_until.into(),
-            ttl_secs: None,
-            controller_did: None,
-            public_key_multibase: None,
-            signature_multibase: None,
-        }
-    }
-
-    pub fn value_cid(&self) -> Result<IpldCid, IpnsRegistryError> {
-        parse_cid(&self.value).map_err(|e| IpnsRegistryError::InvalidCid(e.to_string()))
-    }
-
-    pub fn signing_payload(&self) -> Result<Vec<u8>, IpnsRegistryError> {
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            name: &'a IpnsName,
-            value: &'a str,
-            sequence: u64,
-            valid_until: &'a str,
-            ttl_secs: Option<u64>,
-            controller_did: Option<&'a str>,
-            public_key_multibase: Option<&'a str>,
-        }
-
-        let payload = Payload {
-            name: &self.name,
-            value: &self.value,
-            sequence: self.sequence,
-            valid_until: &self.valid_until,
-            ttl_secs: self.ttl_secs,
-            controller_did: self.controller_did.as_deref(),
-            public_key_multibase: self.public_key_multibase.as_deref(),
-        };
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&payload, &mut bytes)
-            .map_err(|e| IpnsRegistryError::Signature(e.to_string()))?;
-        Ok(bytes)
-    }
-
-    pub fn sign_ed25519(&mut self, signing_key: &SigningKey) -> Result<(), IpnsRegistryError> {
-        self.public_key_multibase = Some(multibase::encode(
-            Base::Base58Btc,
-            signing_key.verifying_key().as_bytes(),
-        ));
-        let payload = self.signing_payload()?;
-        let signature = signing_key.sign(&payload);
-        self.signature_multibase = Some(multibase::encode(Base::Base58Btc, signature.to_bytes()));
-        Ok(())
-    }
-
-    pub fn verify_ed25519_signature(&self) -> Result<(), IpnsRegistryError> {
-        let public_key_multibase = self
-            .public_key_multibase
-            .as_deref()
-            .ok_or(IpnsRegistryError::MissingPublicKey)?;
-        let signature_multibase = self
-            .signature_multibase
-            .as_deref()
-            .ok_or(IpnsRegistryError::MissingSignature)?;
-        let (_, public_key_bytes) = multibase::decode(public_key_multibase)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        let verifying_key = VerifyingKey::from_bytes(
-            public_key_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| IpnsRegistryError::InvalidPublicKey(public_key_bytes.len()))?,
-        )
-        .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        let (_, signature_bytes) = multibase::decode(signature_multibase)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        let signature = Signature::from_slice(&signature_bytes)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        verifying_key
-            .verify_strict(&self.signing_payload()?, &signature)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))
-    }
-
-    pub fn signature_verified(&self) -> bool {
-        self.verify_ed25519_signature().is_ok()
-    }
-
-    pub fn verify_signature_if_present(&self) -> Result<(), IpnsRegistryError> {
-        match (&self.public_key_multibase, &self.signature_multibase) {
-            (None, None) => Ok(()),
-            _ => self.verify_ed25519_signature(),
-        }
-    }
-
-    pub fn require_verified_signature(&self) -> Result<(), IpnsRegistryError> {
-        self.verify_ed25519_signature()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum IpnsRegistryError {
-    #[error("IPNS name not found: {0}")]
-    NotFound(String),
-    #[error("stale IPNS record for {name}: current sequence {current}, incoming {incoming}")]
-    StaleRecord {
-        name: String,
-        current: u64,
-        incoming: u64,
-    },
-    #[error("invalid CID in IPNS value: {0}")]
-    InvalidCid(String),
-    #[error("missing IPNS public key")]
-    MissingPublicKey,
-    #[error("invalid IPNS public key length: {0}")]
-    InvalidPublicKey(usize),
-    #[error("missing IPNS signature")]
-    MissingSignature,
-    #[error("invalid IPNS signature: {0}")]
-    InvalidSignature(String),
-    #[error("IPNS signature payload: {0}")]
-    Signature(String),
-    #[error("kubo IPNS HTTP: {0}")]
-    Kubo(String),
-    #[error("registry lock poisoned")]
-    LockPoisoned,
-    #[error("persistent IPNS store io: {0}")]
-    Io(String),
-}
+// IpnsName / IpnsRecord / IpnsRegistryError moved to the wasm-safe kotoba-ipns-record
+// crate (ADR-2606066000) and re-exported here so the native registries below + every
+// downstream `kotoba_ipfs::Ipns*` user are unchanged.
+pub use kotoba_ipns_record::{IpnsName, IpnsRecord, IpnsRegistryError};
 
 pub trait IpnsRegistry: Send + Sync {
     fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError>;
@@ -959,6 +793,8 @@ impl IpnsRegistry for KuboIpnsRegistry {
 mod tests {
     use super::*;
     use crate::raw_cid;
+    use ed25519_dalek::SigningKey;
+    use multibase::Base;
 
     #[test]
     fn publish_and_resolve_roundtrip() {

@@ -51,6 +51,7 @@
 
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
+use kotoba_ipns_record::IpnsRecord;
 use kotoba_core::prolly::ProllyTree;
 use kotoba_core::store::BlockStore;
 use kotoba_kqe::{Arrangement, Datom, Value};
@@ -659,6 +660,26 @@ impl WriteCrypto {
         hex::encode(self.signing_key.sign(msg).to_bytes())
     }
 
+    /// Build + Ed25519-sign a canonical kotoba IPNS **head record** (ADR-2606066000):
+    /// the member-signed, self-verifying mutable head pointer whose `value` is the
+    /// committed root CID (multibase). `name` is the DID-derived IPNS name and
+    /// `sequence` is the monotonic CAS / stale-guard. The record is built with the
+    /// shared `kotoba-ipns-record` type and signed with the member key, so it
+    /// verifies **byte-identically** under `kotoba-ipfs`'s verifier — no parallel
+    /// head format (ADR-2605262130).
+    pub fn sign_ipns_head(
+        &self,
+        name: String,
+        value_multibase: String,
+        sequence: u64,
+        valid_until: String,
+    ) -> Result<IpnsRecord, String> {
+        let mut rec = IpnsRecord::with_value_string(name, value_multibase, sequence, valid_until);
+        rec.controller_did = Some(self.did());
+        rec.sign_ed25519(&self.signing_key).map_err(|e| e.to_string())?;
+        Ok(rec)
+    }
+
     /// Encrypt plaintext under the vault key → `signal:v1:<hex(nonce||ct)>`.
     /// The server/IndexedDB only ever sees this ciphertext.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, String> {
@@ -890,6 +911,30 @@ mod wasm {
                 "root": root.to_multibase(), "did": did, "sig": sig,
             }))
             .map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        /// `commit()` + emit a member-signed **kotoba IPNS head record**
+        /// (ADR-2606066000) — the content-addressed, self-verifying head pointer
+        /// that supersedes the apex `{root,did,sig}` shim + the trusted KV `kroot:`
+        /// value. `value` = the committed root CID; the IPNS name is DID-derived;
+        /// `sequence` is the monotonic CAS guard the publisher passes (the head it
+        /// rebased on + 1). The returned JSON is a canonical `IpnsRecord` that the
+        /// apex relays untrusted and any reader verifies (no-server-key).
+        #[wasm_bindgen(js_name = commitHeadSigned)]
+        pub fn commit_head_signed(
+            &mut self,
+            sequence: u64,
+            valid_until: String,
+        ) -> Result<String, JsValue> {
+            let root = self.inner.commit();
+            let c = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("no identity — call useIdentity first"))?;
+            let rec = c
+                .sign_ipns_head(c.did(), root.to_multibase(), sequence, valid_until)
+                .map_err(|e| JsValue::from_str(&e))?;
+            serde_json::to_string(&rec).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
         /// Write one fact (entity, attr, value). In-memory read engine + the
