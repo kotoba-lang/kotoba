@@ -5856,7 +5856,7 @@ fn datomic_q_emit_cids(
 
 /// dag-cbor encode `value`, derive its IPFS-compatible (CIDv1 dag-cbor sha2-256)
 /// CID, PUT the block best-effort (un-pinned), and return the multibase CID.
-fn put_envelope<T: Serialize>(state: &KotobaState, value: &T) -> String {
+pub(crate) fn put_envelope<T: Serialize>(state: &KotobaState, value: &T) -> String {
     // Bound the best-effort write a read can trigger. `emit_cid` lets an
     // authenticated reader persist 3 envelope blocks per query, including the
     // full result set; capping the PUT keeps a churn of large-result reads from

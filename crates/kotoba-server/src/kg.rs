@@ -2090,6 +2090,12 @@ pub struct SparqlReq {
     /// Useful for "multi-pop" social-graph / citation-chain expansion.
     #[serde(default)]
     pub max_hops: usize,
+    /// Emit a content-addressed provenance envelope (querySpecCid / queryJobCid /
+    /// resultCid) over canonical DAG-CBOR. The result envelope hashes the
+    /// **canonically-sorted** quads, so resultCid is stable despite SPARQL's
+    /// unordered bag semantics. Fields absent when false. Default false.
+    #[serde(default)]
+    pub emit_cid: bool,
 }
 
 /// POST /xrpc/com.etzhayyim.apps.kotoba.graph.sparql
@@ -2157,7 +2163,7 @@ pub async fn kg_sparql(
     )
     .await?;
 
-    let response = if upper.starts_with("ASK") {
+    let mut response = if upper.starts_with("ASK") {
         let result = qs
             .sparql_ask(&graph_cid, &req.query)
             .await
@@ -2241,7 +2247,121 @@ pub async fn kg_sparql(
             "query must start with SELECT, DESCRIBE, CONSTRUCT, or ASK".to_string(),
         ));
     };
+
+    // Optional content-addressed provenance. resultCid hashes the canonically
+    // SORTED result (SPARQL is an unordered bag), so it is stable across runs.
+    if req.emit_cid {
+        let canonical = sparql_canonical_result(&response);
+        let basis = response
+            .get("basisT")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let (spec, job, result_cid) = sparql_emit_cids(
+            &state,
+            &req.query,
+            basis.as_deref(),
+            req.as_of.as_deref(),
+            req.since.as_deref(),
+            &canonical,
+        );
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
+            obj.insert("queryJobCid".to_string(), serde_json::Value::String(job));
+            obj.insert("resultCid".to_string(), serde_json::Value::String(result_cid));
+        }
+    }
     Ok(Json(response))
+}
+
+#[derive(Serialize)]
+struct SparqlQuerySpecEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    lang: &'a str,
+    query: String,
+}
+
+#[derive(Serialize)]
+struct SparqlQueryJobEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    query_spec: String,
+    basis_t: Option<String>,
+    as_of: Option<String>,
+    since: Option<String>,
+    engine: &'a str,
+}
+
+#[derive(Serialize)]
+struct SparqlResultEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    query_job: String,
+    basis_t: Option<String>,
+    engine: &'a str,
+    result: &'a [String],
+}
+
+/// Canonical, deterministic representation of a SPARQL response for content-
+/// addressing: the ASK boolean, or the materialised quads **sorted** by their
+/// serialized form. SPARQL SELECT/DESCRIBE/CONSTRUCT are unordered bags (no
+/// `ORDER BY`), so the sort is what makes `resultCid` stable across runs.
+fn sparql_canonical_result(response: &serde_json::Value) -> Vec<String> {
+    if let Some(b) = response.get("result") {
+        return vec![format!("ask:{b}")];
+    }
+    if let Some(arr) = response.get("quads").and_then(|q| q.as_array()) {
+        let mut rows: Vec<String> = arr.iter().map(|q| q.to_string()).collect();
+        rows.sort();
+        return rows;
+    }
+    Vec::new()
+}
+
+/// Build the SPARQL provenance envelopes → `(querySpecCid, queryJobCid,
+/// resultCid)`. `resultCid` is content-derived over the canonically-sorted
+/// result, so it is stable and tamper-evident. Blocks are PUT best-effort
+/// (size-capped, un-pinned) via the shared `put_envelope`. Canonicalization
+/// (R0): the query is whitespace-normalized — weaker than the datomic EDN-AST
+/// path; full SPARQL algebra normalization is deferred.
+fn sparql_emit_cids(
+    state: &KotobaState,
+    query: &str,
+    basis_t: Option<&str>,
+    as_of: Option<&str>,
+    since: Option<&str>,
+    canonical_result: &[String],
+) -> (String, String, String) {
+    const ENGINE: &str = concat!("kotoba-server/", env!("CARGO_PKG_VERSION"));
+    let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let spec = SparqlQuerySpecEnvelope {
+        kind: "kotoba.queryspec.v1",
+        lang: "sparql",
+        query: normalized,
+    };
+    let query_spec = crate::xrpc::put_envelope(state, &spec);
+
+    let job = SparqlQueryJobEnvelope {
+        kind: "kotoba.queryjob.v1",
+        query_spec: query_spec.clone(),
+        basis_t: basis_t.map(str::to_string),
+        as_of: as_of.map(str::to_string),
+        since: since.map(str::to_string),
+        engine: ENGINE,
+    };
+    let query_job = crate::xrpc::put_envelope(state, &job);
+
+    let result = SparqlResultEnvelope {
+        kind: "kotoba.result.v1",
+        query_job: query_job.clone(),
+        basis_t: basis_t.map(str::to_string),
+        engine: ENGINE,
+        result: canonical_result,
+    };
+    let result_cid = crate::xrpc::put_envelope(state, &result);
+
+    (query_spec, query_job, result_cid)
 }
 
 fn quad_to_json(q: kotoba_kqe::quad::LegacyQuad) -> serde_json::Value {
@@ -2368,6 +2488,7 @@ mod tests {
                 presentation: None,
                 limit: None,
                 max_hops: 0,
+                emit_cid: false,
             }),
         )
         .await
@@ -2404,6 +2525,7 @@ mod tests {
                 presentation: None,
                 limit: None,
                 max_hops: 0,
+                emit_cid: false,
             }),
         )
         .await
@@ -2431,6 +2553,7 @@ mod tests {
                 presentation: None,
                 limit: None,
                 max_hops: 0,
+                emit_cid: false,
             }),
         )
         .await
@@ -2503,6 +2626,7 @@ mod tests {
                 presentation: None,
                 limit: None,
                 max_hops: 0,
+                emit_cid: false,
             }),
         )
         .await;
@@ -2530,6 +2654,7 @@ mod tests {
                 )),
                 limit: None,
                 max_hops: 0,
+                emit_cid: false,
             }),
         )
         .await
@@ -3266,5 +3391,55 @@ mod tests {
             Some("42"),
             "integer object CID must resolve back to its decimal string"
         );
+    }
+
+    // SPARQL resultCid must be order-independent (the canonical sort handles the
+    // unordered-bag semantics): the same quads in different order → the same
+    // resultCid; a changed quad → different; whitespace-only query edits don't
+    // move querySpecCid; and every envelope is persisted (verify-by-CID).
+    #[tokio::test]
+    async fn sparql_emit_cid_result_is_order_independent_and_tamper_evident() {
+        use kotoba_core::store::BlockStore as _;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = KotobaState::new(None).unwrap();
+
+        let q1 = serde_json::json!({"subject": "a", "predicate": "p", "object": {"text": "1"}});
+        let q2 = serde_json::json!({"subject": "b", "predicate": "p", "object": {"text": "2"}});
+        let resp_ab = serde_json::json!({"form": "select", "basisT": "tx1", "quads": [q1.clone(), q2.clone()]});
+        let resp_ba = serde_json::json!({"form": "select", "basisT": "tx1", "quads": [q2.clone(), q1.clone()]});
+
+        // Canonical result is identical regardless of quad order.
+        assert_eq!(sparql_canonical_result(&resp_ab), sparql_canonical_result(&resp_ba));
+
+        let sparql = "SELECT ?s WHERE { ?s ?p ?o }";
+        let emit = |resp: &serde_json::Value| {
+            sparql_emit_cids(&state, sparql, Some("tx1"), None, None, &sparql_canonical_result(resp))
+        };
+        let (spec_ab, job_ab, result_ab) = emit(&resp_ab);
+        let (_, _, result_ba) = emit(&resp_ba);
+        // 1. Order-independence: a reordered bag yields the SAME resultCid.
+        assert_eq!(result_ab, result_ba, "reordered SPARQL bag must yield the same resultCid");
+
+        // 2. Tamper-evidence: a changed object moves resultCid.
+        let q2b = serde_json::json!({"subject": "b", "predicate": "p", "object": {"text": "999"}});
+        let resp_t = serde_json::json!({"form": "select", "basisT": "tx1", "quads": [q1, q2b]});
+        assert_ne!(result_ab, emit(&resp_t).2, "changed quad must move resultCid");
+
+        // 3. Canonicalization: whitespace-only query edits don't move querySpecCid.
+        let (spec_spaced, _, _) = sparql_emit_cids(
+            &state,
+            "SELECT   ?s\n  WHERE { ?s ?p ?o }",
+            Some("tx1"),
+            None,
+            None,
+            &sparql_canonical_result(&resp_ab),
+        );
+        assert_eq!(spec_ab, spec_spaced, "whitespace must not move querySpecCid");
+
+        // 4. Verify-by-CID: every envelope was persisted.
+        for cid in [&spec_ab, &job_ab, &result_ab] {
+            let kcid = kotoba_core::cid::KotobaCid::from_multibase(cid).unwrap();
+            assert!(state.block_store.get(&kcid).unwrap().is_some(), "envelope persisted: {cid}");
+        }
     }
 }
