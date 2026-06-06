@@ -937,6 +937,21 @@ mod wasm {
             serde_json::to_string(&rec).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
+        /// Reader-side verification of a canonical kotoba IPNS head record's
+        /// Ed25519 signature (ADR-2606066000): the consumer checks the record
+        /// itself, so the apex / any gateway serving it is NOT trusted (no-server-
+        /// key). `json` is the record as emitted by `commitHeadSigned`. Returns
+        /// true iff a signature + public key are present and verify over the
+        /// canonical ciborium-CBOR payload. A static method:
+        /// `KotobaNode.verifyIpnsRecord(json)`.
+        #[wasm_bindgen(js_name = verifyIpnsRecord)]
+        pub fn verify_ipns_record(json: String) -> bool {
+            match serde_json::from_str::<IpnsRecord>(&json) {
+                Ok(rec) => rec.require_verified_signature().is_ok(),
+                Err(_) => false,
+            }
+        }
+
         /// Write one fact (entity, attr, value). In-memory read engine + the
         /// write-set behind `commit`. (was the read-only PoC `assert`.)
         pub fn assert(&mut self, entity: &str, attr: &str, value: &str) {

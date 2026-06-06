@@ -278,6 +278,28 @@ mod tests {
         assert_eq!(rec.value, HEAD_CID);
     }
 
+    // The exact path the kotoba-wasm `verifyIpnsRecord` binding takes: sign →
+    // serde_json to_string → from_str → verify. Proves the signature survives the
+    // JSON round-trip the browser/apex use as the wire form (ADR-2606066000 — the
+    // TS↔Rust interop vector: a Rust-signed record verifies after JSON transport).
+    #[test]
+    fn json_roundtrip_verifies() {
+        let mut rec =
+            IpnsRecord::with_value_string("did:key:zfeed", HEAD_CID, 9, "2030-01-01T00:00:00Z");
+        rec.controller_did = Some("did:key:zfeed".into());
+        rec.sign_ed25519(&key()).unwrap();
+        let json = serde_json::to_string(&rec).unwrap();
+        let parsed: IpnsRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, rec); // lossless wire round-trip
+        parsed
+            .require_verified_signature()
+            .expect("Rust-signed record verifies after JSON round-trip (wasm verifyIpnsRecord path)");
+        // A flipped field in the transported JSON must fail verification.
+        let tampered = json.replace("\"sequence\":9", "\"sequence\":10");
+        let bad: IpnsRecord = serde_json::from_str(&tampered).unwrap();
+        assert!(bad.require_verified_signature().is_err());
+    }
+
     // Tiny local hex (test-only) to avoid a dev-dep just for the did string.
     mod hex {
         pub fn encode_upper(bytes: impl AsRef<[u8]>) -> String {
