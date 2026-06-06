@@ -470,6 +470,13 @@ impl CacaoPayload {
     pub const OP_VC_PRESENT: &'static str = "vc:present";
     pub const OP_DIDCOMM_SEND: &'static str = "didcomm:send";
     pub const OP_ATPROTO_REPO_WRITE: &'static str = "atproto:repo.write";
+    /// Self-sovereign capability for the kotobase pin/account/usage SaaS
+    /// surface. A CACAO granting this (scoped to the holder's own DID as the
+    /// graph) proves ownership of `tenant_did` cryptographically, so the
+    /// kotobase endpoints accept it in place of a gftd-issued JWT `sub`. It is
+    /// deliberately distinct from `datom:transact`/`graph:query` so a CACAO
+    /// minted for graph access cannot be replayed as pin authorization.
+    pub const OP_KOTOBASE_PIN: &'static str = "kotobase:pin";
 
     pub fn graph_cid(&self) -> Option<&str> {
         self.resources
