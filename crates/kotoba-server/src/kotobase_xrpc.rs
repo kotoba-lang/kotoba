@@ -41,20 +41,74 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     v.strip_prefix("Bearer ")
 }
 
-/// Verify that the caller's JWT `sub` matches `tenant_did` OR `operator_did`.
+/// Read a self-sovereign CACAO from the request, if present.
 ///
-/// Returns `Err(401)` when:
-/// - No `Authorization: Bearer <token>` header is present.
-/// - The token `exp` claim is in the past.
-/// - The token has no `sub` claim.
-/// - `sub` is neither `tenant_did` nor `operator_did`.
+/// Two equivalent carriers are accepted: an `Authorization: CACAO <b64>` scheme
+/// (what the edge Worker forwards verbatim) and an explicit `x-kotoba-cacao`
+/// header (for clients that hit the pod directly). The value is DAG-CBOR,
+/// base64-encoded.
+fn cacao_b64_from_headers(headers: &HeaderMap) -> Option<&str> {
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(rest) = auth.strip_prefix("CACAO ").or_else(|| auth.strip_prefix("cacao ")) {
+            return Some(rest.trim());
+        }
+    }
+    headers
+        .get("x-kotoba-cacao")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+}
+
+/// Verify that the caller owns `tenant_did` (or is the operator).
 ///
-/// Signature is NOT verified here — the edge BFF is the trust boundary.
+/// Two authentication modes, tried in order:
+///
+/// 1. **Self-sovereign CACAO** (no gftd webauth) — when a CACAO is present
+///    (`Authorization: CACAO <b64>` or `x-kotoba-cacao`), its signature is
+///    *cryptographically verified* (SIWE/EIP-191, Ed25519/did:key, EIP-1271,
+///    BIP-322), the `kotobase:pin` capability is required, and the verified
+///    issuer must equal `tenant_did` (or `operator_did`). Because the signature
+///    is real, this path does NOT require `x-internal-trust` — a client holding
+///    its own key can authorize directly.
+/// 2. **Edge JWT `sub`** (back-compat) — the token `sub` must match
+///    `tenant_did`/`operator_did`. The signature is NOT verified here (the edge
+///    BFF is the trust boundary), so when `KOTOBA_INTERNAL_SECRET` is set the
+///    request must arrive through the trusted Worker (`x-internal-trust`).
+///
+/// Returns `Err(401)` when neither mode authorizes the request.
 fn require_did_ownership(
     headers: &HeaderMap,
     tenant_did: &str,
     operator_did: &str,
+    nonce_store: &crate::nonce_store::NonceStore,
 ) -> Result<(), (StatusCode, String)> {
+    // ── Mode 1: self-sovereign CACAO ─────────────────────────────────────────
+    if let Some(cacao_b64) = cacao_b64_from_headers(headers) {
+        // Scope the capability to the holder's own DID (graph == tenant_did) so a
+        // graph:query / datom:transact CACAO cannot be replayed as pin auth.
+        let payload = crate::graph_auth::verify_cacao_graph_operation(
+            cacao_b64,
+            tenant_did,
+            kotoba_auth::CacaoPayload::OP_KOTOBASE_PIN,
+            None,
+            Some(nonce_store),
+        )
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "kotobase auth: CACAO verification failed");
+            (StatusCode::UNAUTHORIZED, format!("CACAO verification failed: {e:?}"))
+        })?;
+        // The verified issuer is authoritative; it must own the requested tenant.
+        if payload.iss == tenant_did || payload.iss == operator_did {
+            return Ok(());
+        }
+        tracing::warn!(iss = %payload.iss, tenant_did = %tenant_did, "kotobase auth: CACAO issuer mismatch");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("CACAO issuer {:?} does not match tenant_did {tenant_did:?}", payload.iss),
+        ));
+    }
+
+    // ── Mode 2: edge-issued JWT `sub` (back-compat) ──────────────────────────
     // Defense-in-depth: when KOTOBA_INTERNAL_SECRET is set, only requests through
     // the trusted edge Worker (which forwards x-internal-trust) are accepted, so a
     // directly-reachable pod cannot be impersonated with a forged tenant JWT.
@@ -554,7 +608,7 @@ pub async fn handle_pre_revoke(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
     crate::graph_auth::validate_did(&req.accessor_did, "accessor_did", MAX_DID_LEN)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(&headers, &req.tenant_did, &state.operator_did, &state.nonce_store)?;
 
     state
         .revoke_pre_key_grant(&req.tenant_did, &req.accessor_did)
@@ -577,7 +631,7 @@ pub async fn handle_account_create(
     Json(req): Json<AccountCreateReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(&headers, &req.tenant_did, &state.operator_did, &state.nonce_store)?;
 
     let tier_raw = req.tier.as_deref().unwrap_or("free");
     if tier_raw.len() > MAX_TIER_LEN {
@@ -617,7 +671,7 @@ pub async fn handle_account_status(
     Json(req): Json<AccountStatusReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(&headers, &req.tenant_did, &state.operator_did, &state.nonce_store)?;
     let tier = read_tier(&state, &req.tenant_did).await;
     let (quota_pins, quota_bytes) = quota_for_tier(&tier);
     let (used_pins, used_bytes) = count_pins(&state, &req.tenant_did, None).await;
@@ -661,7 +715,7 @@ pub async fn handle_pin_create(
         );
     }
     if let Err((status, msg)) =
-        require_did_ownership(&headers, &req.tenant_did, &state.operator_did)
+        require_did_ownership(&headers, &req.tenant_did, &state.operator_did, &state.nonce_store)
     {
         return (
             status,
@@ -921,7 +975,7 @@ pub async fn handle_pin_list(
     Json(req): Json<PinListReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(&headers, &req.tenant_did, &state.operator_did, &state.nonce_store)?;
     let limit = req.limit.unwrap_or(20).min(100);
     let offset = req.offset.unwrap_or(0);
     let g = format!("kotobase/pins/{}", req.tenant_did);
@@ -1008,7 +1062,7 @@ pub async fn handle_pin_delete(
     Json(req): Json<PinDeleteReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(&headers, &req.tenant_did, &state.operator_did, &state.nonce_store)?;
     if req.pin_id.is_empty() || req.pin_id.len() > MAX_PIN_ID_LEN {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1049,7 +1103,7 @@ pub async fn handle_usage_get(
     Json(req): Json<UsageGetReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(&headers, &req.tenant_did, &state.operator_did, &state.nonce_store)?;
     let tier = read_tier(&state, &req.tenant_did).await;
     let (quota_pins, quota_bytes) = quota_for_tier(&tier);
     let (pin_count, total_bytes) = count_pins(&state, &req.tenant_did, None).await;
@@ -1102,6 +1156,7 @@ pub const ALL_NSIDS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kotoba_auth::CacaoPayload;
 
     // ── preRevoke endpoint (ADR §23.7 / §28.5) ──────────────────────────────────
 
@@ -1390,5 +1445,88 @@ mod tests {
         let too_long = "x".repeat(MAX_OBJECT_LEN + 1);
         let t = triple("did:key:zSub", "pred/path", &too_long);
         assert!(validate_triple(&t).is_err());
+    }
+
+    // ── Self-sovereign CACAO auth (no gftd webauth) ─────────────────────────────
+
+    /// Build `(issuer_did, base64(DAG-CBOR) CACAO)` signed by `seed`, mirroring
+    /// exactly what `kotoba cacao-sign --graph <did> --capability <cap>` emits:
+    /// an Ed25519 `did:key` issuer, `kotoba://graph/<graph>` + `kotoba://can/<cap>`
+    /// resources, and an EdDSA signature over the SIWE plaintext. When `graph`
+    /// is empty the CACAO self-scopes to the issuer's own DID (the pin flow).
+    fn cli_cacao(seed: [u8; 32], graph: &str, capability: &str, nonce: &str) -> (String, String) {
+        use base64::{
+            engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
+            Engine as _,
+        };
+        use ed25519_dalek::{Signer as _, SigningKey};
+        let sk = SigningKey::from_bytes(&seed);
+        let did = kotoba_auth::ed25519_pubkey_to_did_key(&sk.verifying_key().to_bytes());
+        let graph_scope = if graph.is_empty() { did.clone() } else { graph.to_string() };
+        let mut cacao = kotoba_auth::Cacao {
+            h: kotoba_auth::CacaoHeader { t: "caip122".into() },
+            p: kotoba_auth::CacaoPayload {
+                iss: did.clone(),
+                aud: did.clone(),
+                issued_at: "2026-05-26T00:00:00Z".into(),
+                expiry: Some("2099-01-01T00:00:00Z".into()),
+                nonce: nonce.into(),
+                domain: "kotoba.cli".into(),
+                statement: None,
+                version: "1".into(),
+                resources: vec![
+                    format!("kotoba://graph/{graph_scope}"),
+                    format!("kotoba://can/{capability}"),
+                ],
+            },
+            s: kotoba_auth::CacaoSig { t: "EdDSA".into(), s: String::new() },
+        };
+        let sig = sk.sign(cacao.siwe_message().as_bytes());
+        cacao.s.s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&cacao, &mut cbor).expect("cacao cbor");
+        (did, B64.encode(cbor))
+    }
+
+    fn cacao_headers(cacao_b64: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-kotoba-cacao", cacao_b64.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn cli_cacao_authorizes_own_did_without_jwt() {
+        let ns = crate::nonce_store::NonceStore::new();
+        // A CACAO straight from `kotoba cacao-sign`, self-scoped, kotobase:pin cap.
+        let (did, cacao) = cli_cacao([7u8; 32], "", CacaoPayload::OP_KOTOBASE_PIN, "nonce-pin");
+        let res = require_did_ownership(&cacao_headers(&cacao), &did, "did:key:zOp", &ns);
+        assert!(res.is_ok(), "self-signed kotobase:pin CACAO must authorize its own DID: {res:?}");
+    }
+
+    #[test]
+    fn cacao_for_wrong_tenant_is_rejected() {
+        let ns = crate::nonce_store::NonceStore::new();
+        // Holder signs for their own DID but claims a different tenant_did.
+        let (_did, cacao) = cli_cacao([8u8; 32], "", CacaoPayload::OP_KOTOBASE_PIN, "nonce-wrong");
+        let res = require_did_ownership(&cacao_headers(&cacao), "did:key:zSomeoneElse", "did:key:zOp", &ns);
+        assert!(res.is_err(), "CACAO must not authorize a tenant_did it does not own");
+    }
+
+    #[test]
+    fn graph_query_cacao_cannot_be_replayed_as_pin_auth() {
+        let ns = crate::nonce_store::NonceStore::new();
+        // A CACAO minted for graph:query (not kotobase:pin) must NOT pass the pin gate.
+        let (did, cacao) = cli_cacao([9u8; 32], "", CacaoPayload::OP_GRAPH_QUERY, "nonce-q");
+        let res = require_did_ownership(&cacao_headers(&cacao), &did, "did:key:zOp", &ns);
+        assert!(res.is_err(), "a graph:query CACAO must not authorize pin operations");
+    }
+
+    #[test]
+    fn replayed_cacao_nonce_is_rejected() {
+        let ns = crate::nonce_store::NonceStore::new();
+        let (did, cacao) = cli_cacao([10u8; 32], "", CacaoPayload::OP_KOTOBASE_PIN, "nonce-replay");
+        assert!(require_did_ownership(&cacao_headers(&cacao), &did, "did:key:zOp", &ns).is_ok());
+        // Same CACAO (same nonce) a second time → replay rejected.
+        assert!(require_did_ownership(&cacao_headers(&cacao), &did, "did:key:zOp", &ns).is_err());
     }
 }
