@@ -896,6 +896,14 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     // game snapshots are content-addressed into the block store + announced on
     // the KSE Journal. Idempotent; per-frame traffic never touches either.
     realtime::install_cold_lane(state.block_store.clone(), state.journal.clone());
+    // Optionally run a real kotoba:kge component as the room sim (room swap).
+    #[cfg(feature = "realtime-wasm")]
+    if let Ok(path) = std::env::var("KOTOBA_RT_KGE_COMPONENT") {
+        match std::fs::read(&path) {
+            Ok(bytes) => realtime::install_kge_component(bytes),
+            Err(e) => tracing::warn!(path, error = %e, "KOTOBA_RT_KGE_COMPONENT unreadable"),
+        }
+    }
     Router::new()
         .route("/_app/meta", get(xrpc::health))
         .route("/health", get(xrpc::health))
