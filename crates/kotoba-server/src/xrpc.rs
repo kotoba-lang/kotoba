@@ -5735,6 +5735,13 @@ pub async fn datomic_q(
     // from the canonical rows, so it is tamper-evident; envelope blocks are PUT
     // best-effort and never auto-pinned.
     let (query_spec_cid, query_job_cid, result_cid) = if req.emit_cid {
+        // Only persist envelope blocks for Public graphs — block.get is
+        // unauthenticated, so a private/authenticated result must not be left
+        // retrievable bearer-by-CID. The CIDs are returned regardless.
+        let persist = matches!(
+            state.graph_visibility(&graph_cid).await,
+            kotoba_core::named_graph::GraphVisibility::Public
+        );
         let (spec, job, result) = datomic_q_emit_cids(
             &state,
             &query,
@@ -5744,6 +5751,7 @@ pub async fn datomic_q(
             req.since.as_deref(),
             req.history,
             &rows_edn,
+            persist,
         );
         (Some(spec), Some(job), Some(result))
     } else {
@@ -5820,6 +5828,7 @@ fn datomic_q_emit_cids(
     since: Option<&str>,
     history: bool,
     rows_edn: &[Vec<String>],
+    persist: bool,
 ) -> (String, String, String) {
     const ENGINE: &str = concat!("kotoba-server/", env!("CARGO_PKG_VERSION"));
 
@@ -5829,7 +5838,7 @@ fn datomic_q_emit_cids(
         query: kotoba_edn::to_string(query),
         inputs: inputs.iter().map(kotoba_edn::to_string).collect(),
     };
-    let query_spec_cid = put_envelope(state, &spec);
+    let query_spec_cid = put_envelope(state, &spec, persist);
 
     let job = KotobaQueryJobEnvelope {
         kind: "kotoba.queryjob.v1",
@@ -5840,7 +5849,7 @@ fn datomic_q_emit_cids(
         history,
         engine: ENGINE,
     };
-    let query_job_cid = put_envelope(state, &job);
+    let query_job_cid = put_envelope(state, &job, persist);
 
     let result = KotobaResultEnvelope {
         kind: "kotoba.result.v1",
@@ -5849,29 +5858,31 @@ fn datomic_q_emit_cids(
         engine: ENGINE,
         rows_edn,
     };
-    let result_cid = put_envelope(state, &result);
+    let result_cid = put_envelope(state, &result, persist);
 
     (query_spec_cid, query_job_cid, result_cid)
 }
 
 /// dag-cbor encode `value`, derive its IPFS-compatible (CIDv1 dag-cbor sha2-256)
 /// CID, PUT the block best-effort (un-pinned), and return the multibase CID.
-pub(crate) fn put_envelope<T: Serialize>(state: &KotobaState, value: &T) -> String {
-    // Bound the best-effort write a read can trigger. `emit_cid` lets an
-    // authenticated reader persist 3 envelope blocks per query, including the
-    // full result set; capping the PUT keeps a churn of large-result reads from
-    // growing the block store unboundedly. The CID is content-derived and always
-    // returned regardless — an oversized envelope is simply not persisted, and a
-    // verifier rebuilds it from the (already-returned) rows to recompute the CID.
-    // 1 MiB matches the datomic.q request body limit; spec/job envelopes are tiny,
-    // so this only ever gates a pathologically large result envelope.
+pub(crate) fn put_envelope<T: Serialize>(state: &KotobaState, value: &T, persist: bool) -> String {
+    // The CID is content-derived and ALWAYS returned. The block is PUT only when:
+    //
+    //  • `persist` — the graph is Public. Blocks are retrievable by CID via the
+    //    UNAUTHENTICATED `block.get`, so persisting a private/authenticated
+    //    result envelope would expose it bearer-by-CID and bypass the read gate.
+    //    For non-public graphs the caller still gets the CID and can rebuild the
+    //    envelope from the (already-returned) rows to verify — no public copy.
+    //  • under the size cap — bound the best-effort write a read can trigger so a
+    //    churn of large-result reads can't grow the block store unboundedly. The
+    //    1 MiB cap matches the datomic.q body limit; spec/job envelopes are tiny.
     const MAX_ENVELOPE_PUT_BYTES: usize = 1 << 20;
 
     let (cid, bytes) = kotoba_ipfs::dag_cbor_block(value).expect("envelope is serializable");
     let kcid = kotoba_core::cid::KotobaCid::from_standard_cid(&cid)
         .expect("dag-cbor sha2-256 cid is kotoba-compatible");
     // A failed (or skipped) PUT must not fail the query — the CID still stands.
-    if bytes.len() <= MAX_ENVELOPE_PUT_BYTES {
+    if persist && bytes.len() <= MAX_ENVELOPE_PUT_BYTES {
         let _ = state.block_store.put(&kcid, &bytes);
     }
     kcid.to_multibase()
@@ -9104,7 +9115,7 @@ mod tests {
             vec![r#""Bob""#.to_string()],
         ];
         let emit = |q: &EdnValue, basis: &str, rows: &[Vec<String>]| {
-            datomic_q_emit_cids(&state, q, &inputs, Some(basis), None, None, false, rows)
+            datomic_q_emit_cids(&state, q, &inputs, Some(basis), None, None, false, rows, true)
         };
 
         let (spec1, job1, result1) = emit(&query, "tx-basis-1", &rows);
@@ -9160,7 +9171,7 @@ mod tests {
         let rows = vec![vec!["x".repeat(1_100_000)]];
 
         let (spec, job, result) =
-            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows);
+            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, true);
 
         // CIDs are returned regardless of persistence (content-derived).
         assert!(!spec.is_empty() && !job.is_empty() && !result.is_empty());
@@ -9177,6 +9188,40 @@ mod tests {
         assert!(
             state.block_store.get(&rcid).unwrap().is_none(),
             "oversized result envelope must not be persisted"
+        );
+    }
+
+    // Security: emit_cid on a non-public graph (persist=false) must return the
+    // content-derived CIDs but NOT persist the envelopes — block.get is
+    // unauthenticated, so a persisted private result would be retrievable
+    // bearer-by-CID. The CID itself is identical regardless of persist.
+    #[tokio::test]
+    async fn datomic_q_emit_cid_persist_false_returns_cids_without_storing() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = KotobaState::new(None).unwrap();
+        let query = kotoba_edn::parse(r#"[:find ?x :where [?e :a ?x]]"#).unwrap();
+        let inputs: Vec<EdnValue> = vec![];
+        let rows = vec![vec![r#""secret""#.to_string()]];
+
+        // persist=false (private/authenticated graph): CIDs returned, nothing stored.
+        let (spec, job, result) =
+            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, false);
+        assert!(!spec.is_empty() && !job.is_empty() && !result.is_empty(), "CIDs still returned");
+        for cid in [&spec, &job, &result] {
+            let kcid = KotobaCid::from_multibase(cid).unwrap();
+            assert!(
+                state.block_store.get(&kcid).unwrap().is_none(),
+                "non-public envelope must NOT be persisted: {cid}"
+            );
+        }
+
+        // persist=true (public) DOES store — and yields the SAME CID (content-derived).
+        let (spec_pub, _, _) =
+            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, true);
+        assert_eq!(spec, spec_pub, "persist must not change the content-derived CID");
+        assert!(
+            state.block_store.get(&KotobaCid::from_multibase(&spec_pub).unwrap()).unwrap().is_some(),
+            "public envelope must be persisted"
         );
     }
 

@@ -1927,6 +1927,9 @@ pub async fn kg_query(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // Persist emit_cid envelopes only for Public graphs (block.get is
+    // unauthenticated — see put_envelope).
+    let kg_persist = matches!(visibility, kotoba_core::named_graph::GraphVisibility::Public);
 
     // ADR-2606041151 B — route through a maintained MaterializedView when the
     // caller names one. Serves the incrementally-maintained result (read from the
@@ -1959,7 +1962,7 @@ pub async fn kg_query(
                 .unwrap_or("")
                 .to_string();
             let (spec, job, result_cid) =
-                query_emit_cids(&state, &lang, &req.query, None, None, None, &canonical);
+                query_emit_cids(&state, &lang, &req.query, None, None, None, &canonical, kg_persist);
             if let Some(obj) = response.as_object_mut() {
                 obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
                 obj.insert("queryJobCid".to_string(), serde_json::Value::String(job));
@@ -2088,7 +2091,7 @@ pub async fn kg_query(
             .unwrap_or("")
             .to_string();
         let (spec, job, result_cid) =
-            query_emit_cids(&state, &lang, &req.query, None, None, None, &canonical);
+            query_emit_cids(&state, &lang, &req.query, None, None, None, &canonical, kg_persist);
         if let Some(obj) = response.as_object_mut() {
             obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
             obj.insert("queryJobCid".to_string(), serde_json::Value::String(job));
@@ -2298,6 +2301,11 @@ pub async fn kg_sparql(
             .get("basisT")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // Persist only for Public graphs (block.get is unauthenticated).
+        let persist = matches!(
+            state.graph_visibility(&graph_cid).await,
+            kotoba_core::named_graph::GraphVisibility::Public
+        );
         let (spec, job, result_cid) = query_emit_cids(
             &state,
             "sparql",
@@ -2306,6 +2314,7 @@ pub async fn kg_sparql(
             req.as_of.as_deref(),
             req.since.as_deref(),
             &canonical,
+            persist,
         );
         if let Some(obj) = response.as_object_mut() {
             obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
@@ -2378,6 +2387,7 @@ fn query_emit_cids(
     as_of: Option<&str>,
     since: Option<&str>,
     canonical_result: &[String],
+    persist: bool,
 ) -> (String, String, String) {
     const ENGINE: &str = concat!("kotoba-server/", env!("CARGO_PKG_VERSION"));
     let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2387,7 +2397,10 @@ fn query_emit_cids(
         lang,
         query: normalized,
     };
-    let query_spec = crate::xrpc::put_envelope(state, &spec);
+    // `persist` is true only for Public graphs — block.get is unauthenticated, so
+    // a private/authenticated result envelope must not be left retrievable
+    // bearer-by-CID. CIDs are returned regardless (caller can rebuild to verify).
+    let query_spec = crate::xrpc::put_envelope(state, &spec, persist);
 
     let job = SparqlQueryJobEnvelope {
         kind: "kotoba.queryjob.v1",
@@ -2397,7 +2410,7 @@ fn query_emit_cids(
         since: since.map(str::to_string),
         engine: ENGINE,
     };
-    let query_job = crate::xrpc::put_envelope(state, &job);
+    let query_job = crate::xrpc::put_envelope(state, &job, persist);
 
     let result = SparqlResultEnvelope {
         kind: "kotoba.result.v1",
@@ -2406,7 +2419,7 @@ fn query_emit_cids(
         engine: ENGINE,
         result: canonical_result,
     };
-    let result_cid = crate::xrpc::put_envelope(state, &result);
+    let result_cid = crate::xrpc::put_envelope(state, &result, persist);
 
     (query_spec, query_job, result_cid)
 }
@@ -3462,7 +3475,7 @@ mod tests {
 
         let sparql = "SELECT ?s WHERE { ?s ?p ?o }";
         let emit = |resp: &serde_json::Value| {
-            query_emit_cids(&state, "sparql", sparql, Some("tx1"), None, None, &query_canonical_result(resp))
+            query_emit_cids(&state, "sparql", sparql, Some("tx1"), None, None, &query_canonical_result(resp), true)
         };
         let (spec_ab, job_ab, result_ab) = emit(&resp_ab);
         let (_, _, result_ba) = emit(&resp_ba);
@@ -3483,6 +3496,7 @@ mod tests {
             None,
             None,
             &query_canonical_result(&resp_ab),
+            true,
         );
         assert_eq!(spec_ab, spec_spaced, "whitespace must not move querySpecCid");
 
@@ -3511,8 +3525,8 @@ mod tests {
 
         // lang is part of querySpec → same query text, different dialect → different CID.
         let q = "SELECT a, b FROM t";
-        let (spec_sql, _, _) = query_emit_cids(&state, "sql", q, None, None, None, &canon);
-        let (spec_cypher, _, _) = query_emit_cids(&state, "cypher", q, None, None, None, &canon);
+        let (spec_sql, _, _) = query_emit_cids(&state, "sql", q, None, None, None, &canon, true);
+        let (spec_cypher, _, _) = query_emit_cids(&state, "cypher", q, None, None, None, &canon, true);
         assert_ne!(spec_sql, spec_cypher, "lang must be part of querySpecCid");
     }
 }
