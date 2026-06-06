@@ -519,42 +519,70 @@ impl BlockStore for KuboBlockStore {
         let token = self.token.clone();
         let inflight = Arc::clone(&self.inflight);
         let cid_mb = cid.to_multibase();
-        // Skip the HTTP round-trip when called outside a Tokio runtime (e.g.
-        // sync unit tests) — the in-memory pin set above is already updated.
-        let pin_result = match tokio::runtime::Handle::try_current() {
-            Err(_) => Ok::<(), anyhow::Error>(()),
-            Ok(_) => kubo_block_on(async move {
-                    let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
-                    let rb = client.post(&url);
-                    let rb = match &token {
-                        Some(t) => rb.bearer_auth(t),
-                        None => rb,
-                    };
-                    let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/add: {e}"))?;
-                    if !resp.status().is_success() {
-                        let st = resp.status();
-                        let tx = resp.text().await.unwrap_or_default();
-                        return Err(anyhow!("kubo pin/add {st}: {tx}"));
-                    }
-                    Ok::<(), anyhow::Error>(())
-            }),
-        };
-        if let Err(e) = pin_result {
-            tracing::warn!(cid = %cid_mb, err = %e, "kubo pin/add failed");
-            if e.to_string().contains("connect") {
-                self.mark_unavailable();
+
+        // The pin/add HTTP call as a Send + 'static future.
+        let pin_future = {
+            let cid_mb = cid_mb.clone();
+            async move {
+                let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
+                let rb = client.post(&url);
+                let rb = match &token {
+                    Some(t) => rb.bearer_auth(t),
+                    None => rb,
+                };
+                let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/add: {e}"))?;
+                if !resp.status().is_success() {
+                    let st = resp.status();
+                    let tx = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("kubo pin/add {st}: {tx}"));
+                }
+                tracing::debug!(cid = %cid_mb, "kubo cid pinned");
+                Ok::<(), anyhow::Error>(())
             }
-        } else {
-            tracing::debug!(cid = %cid_mb, "kubo cid pinned recursively");
-            // F-3: fan the pin out to kotobase (or any KOTOBA_IPFS_PIN_ENDPOINT)
-            // — fire-and-forget; failures are logged but never block kotoba.
-            if let Some(remote) = &self.remote_pin {
-                let remote = Arc::clone(remote);
-                let cid_for_remote = cid_mb.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move { remote.pin(&cid_for_remote).await });
+        };
+
+        // Result handler (mark-unavailable on connect failure; fan out the
+        // pin to the remote pin service on success). Pulled out so both the
+        // sync and the opt-in async path share it.
+        let remote_pin = self.remote_pin.clone();
+        let failed_at = Arc::clone(&self.failed_at_unix);
+        let handle_result = move |res: Result<(), anyhow::Error>| match res {
+            Err(e) => {
+                tracing::warn!(cid = %cid_mb, err = %e, "kubo pin/add failed");
+                if e.to_string().contains("connect") {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    failed_at.store(now, Ordering::Relaxed);
                 }
             }
+            Ok(()) => {
+                if let Some(remote) = &remote_pin {
+                    let remote = Arc::clone(remote);
+                    let cid_for_remote = cid_mb.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move { remote.pin(&cid_for_remote).await });
+                    }
+                }
+            }
+        };
+
+        // Opt-in async pin (KOTOBA_ASYNC_PIN): keep the commit hot path off the
+        // pin/add round-trip (prod pin_ms ~4–10s). Blocks are already durable via
+        // put_many_durable before pin is called; pin only protects from kubo GC,
+        // so deferring it is safe when kubo GC is not aggressive. Default keeps
+        // the synchronous behaviour. Outside any runtime (sync tests) the
+        // in-memory pin set above is already updated and the HTTP call is skipped.
+        let async_pin = std::env::var("KOTOBA_ASYNC_PIN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        match tokio::runtime::Handle::try_current() {
+            Err(_) => {}
+            Ok(_) if async_pin => {
+                kubo_runtime().spawn(async move { handle_result(pin_future.await) });
+            }
+            Ok(_) => handle_result(kubo_block_on(pin_future)),
         }
     }
 

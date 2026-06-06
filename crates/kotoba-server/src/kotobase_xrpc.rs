@@ -934,21 +934,37 @@ pub async fn handle_pin_list(
         .collect::<Vec<_>>();
     pin_subjects.sort_by_key(|cid| cid.to_multibase());
     pin_subjects.dedup();
+    // Group datoms by subject once (O(datoms)) so per-pin attribute lookups are
+    // O(attrs-per-pin) instead of a full O(datoms) linear scan each — turning the
+    // overall cost from O(pins × datoms) into O(datoms + pins).
+    let mut by_subject: std::collections::HashMap<[u8; 36], Vec<&kotoba_datomic::Datom>> =
+        std::collections::HashMap::with_capacity(pin_subjects.len());
+    for d in &datoms {
+        by_subject.entry(d.e.0).or_default().push(d);
+    }
+    let empty: Vec<&kotoba_datomic::Datom> = Vec::new();
+    let text = |rows: &[&kotoba_datomic::Datom], pred: &str| -> Option<String> {
+        rows.iter().find(|d| d.a == pred).and_then(|d| datom_text(&d.v))
+    };
+    let int = |rows: &[&kotoba_datomic::Datom], pred: &str| -> i64 {
+        rows.iter()
+            .find(|d| d.a == pred)
+            .and_then(|d| datom_int(&d.v))
+            .unwrap_or(0)
+    };
     let records: Vec<PinRecord> = pin_subjects
         .iter()
         .filter_map(|subj_cid| {
+            let rows = by_subject.get(&subj_cid.0).unwrap_or(&empty);
             // Return the stored nanoid (== what create returns / delete consumes);
             // fall back to the subject CID for pins written before this field.
-            let pin_id = text_for_subject(&datoms, subj_cid, "kotobase/pin/id")
-                .unwrap_or_else(|| subj_cid.to_multibase());
-            let cid_val = text_for_subject(&datoms, subj_cid, "kotobase/pin/cid")?;
-            let name = text_for_subject(&datoms, subj_cid, "kotobase/pin/name").unwrap_or_default();
-            let status = text_for_subject(&datoms, subj_cid, "kotobase/pin/status")
-                .unwrap_or_else(|| "pinning".into());
-            let ipfs_status = text_for_subject(&datoms, subj_cid, "kotobase/pin/ipfs_status");
-            let size_bytes = int_for_subject(&datoms, subj_cid, "kotobase/pin/size_bytes");
-            let created_at =
-                text_for_subject(&datoms, subj_cid, "kotobase/pin/created_at").unwrap_or_default();
+            let pin_id = text(rows, "kotobase/pin/id").unwrap_or_else(|| subj_cid.to_multibase());
+            let cid_val = text(rows, "kotobase/pin/cid")?;
+            let name = text(rows, "kotobase/pin/name").unwrap_or_default();
+            let status = text(rows, "kotobase/pin/status").unwrap_or_else(|| "pinning".into());
+            let ipfs_status = text(rows, "kotobase/pin/ipfs_status");
+            let size_bytes = int(rows, "kotobase/pin/size_bytes");
+            let created_at = text(rows, "kotobase/pin/created_at").unwrap_or_default();
 
             if let Some(sf) = req.status.as_deref() {
                 if status != sf {
