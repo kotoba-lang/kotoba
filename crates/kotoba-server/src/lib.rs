@@ -18,6 +18,7 @@ pub mod account_xrpc;
 pub mod pds_session;
 pub mod pds_xrpc;
 pub mod pre_proxy;
+pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
 pub mod xrpc;
@@ -242,6 +243,73 @@ mod tests {
         // Since we provided empty body, we expect a 400 Bad Request or 401 Unauthorized,
         // but definitely NOT a 404 Not Found (which means no route matched)
         assert_ne!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// HTTP-level emit_cid: the feature flows through the REAL router (routing +
+    /// body parse + handler + JSON serialization), and the returned result_cid is
+    /// fetchable from the node's block store. Stronger than the direct-handler
+    /// unit tests, which bypass routing and middleware.
+    #[tokio::test]
+    async fn datomic_q_emit_cid_round_trips_over_http() {
+        use kotoba_core::store::BlockStore as _;
+        use tower::ServiceExt;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        type Cid = kotoba_core::cid::KotobaCid;
+
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+
+        // Seed Alice/admin into a public graph in the node's own store.
+        let graph = Cid::from_bytes(b"http-emit-cid-graph");
+        let tx = Cid::from_bytes(b"http-emit-cid-tx");
+        let e = Cid::from_bytes(b"http-alice");
+        kotoba_datomic::distributed::DistributedCommitWriter::new(
+            &*state.block_store,
+            &*state.ipns_registry,
+        )
+        .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+            ipns_name: distributed_graph_ipns_name(&graph),
+            graph: graph.clone(),
+            covering_datoms: None,
+            datoms: vec![
+                kotoba_datomic::Datom::assert(e.clone(), ":person/name".into(), kotoba_edn::EdnValue::string("Alice"), tx.clone()),
+                kotoba_datomic::Datom::assert(e, ":person/role".into(), kotoba_edn::EdnValue::string("admin"), tx.clone()),
+            ],
+            expected_parent: None,
+            tx_cid: Some(tx),
+            author: "did:key:zHttpSeed".into(),
+            seq: 1,
+            valid_until: "2030-01-01T00:00:00Z".into(),
+            ttl_secs: Some(60),
+            cacao_proof_cid: None,
+            ipns_controller_did: None,
+            ipns_signing_key: None,
+        })
+        .unwrap();
+        state.graph_registry.write().await.insert(
+            graph.clone(),
+            ("http".into(), kotoba_core::named_graph::GraphVisibility::Public),
+        );
+
+        let app = super::build_router(std::sync::Arc::clone(&state));
+        let uri = format!("/xrpc/{}", NSID_DATOMIC_Q);
+        let body = serde_json::json!({
+            "graph": graph.to_multibase(),
+            "query_edn": "[:find ?name ?role :where [?e :person/name ?name] [?e :person/role ?role]]",
+            "emit_cid": true,
+        });
+        let resp = app.oneshot(post_json(&uri, body)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let v = body_json(resp).await;
+        // Rows came through the full stack…
+        assert_eq!(v["rows_edn"], serde_json::json!([[r#""Alice""#, r#""admin""#]]), "body={v}");
+        // …and result_cid is present and fetchable from the block store by CID.
+        let result_cid = v["result_cid"].as_str().expect("result_cid present in HTTP response");
+        let kcid = Cid::from_multibase(result_cid).expect("multibase CID");
+        assert!(
+            state.block_store.get(&kcid).unwrap().is_some(),
+            "result envelope must be fetchable by CID after an HTTP emit_cid query"
+        );
     }
 
     // ── HTTP integration: PDS session PoP + zero-access endpoints (ADR-2606015000) ──
@@ -824,6 +892,10 @@ mod tests {
 }
 
 pub fn build_router(state: Arc<KotobaState>) -> Router {
+    // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
+    // game snapshots are content-addressed into the block store + announced on
+    // the KSE Journal. Idempotent; per-frame traffic never touches either.
+    realtime::install_cold_lane(state.block_store.clone(), state.journal.clone());
     Router::new()
         .route("/_app/meta", get(xrpc::health))
         .route("/health", get(xrpc::health))
@@ -1233,6 +1305,12 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS),
             get(firehose::events),
+        )
+        // ── Realtime ingress (ADR-2606060001): bidirectional WebSocket (T1) ──
+        // The bus is per-room and isolated from the firehose/gossip above.
+        .route(
+            &format!("/xrpc/{}", realtime::NSID_SYNC_CONNECT),
+            get(realtime::ws_connect),
         )
         // ── Generic XRPC dispatch ──────────────────────────────────────────
         .route(
