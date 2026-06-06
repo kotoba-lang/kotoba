@@ -7360,6 +7360,14 @@ pub async fn block_put(
 }
 
 /// GET /xrpc/com.etzhayyim.apps.kotoba.block.get?cid=<multibase>
+///
+/// SECURITY INVARIANT: this endpoint is intentionally UNAUTHENTICATED — blocks
+/// are content-addressed (IPFS-style), so the CID itself is the capability
+/// (unguessable, since it's the SHA2-256 of the content). Consequence for every
+/// `block_store.put` site: never persist a block whose mere disclosure-by-CID
+/// would breach a tenant's read gate. Anything PUT here is retrievable by anyone
+/// holding the CID, regardless of graph visibility. (emit_cid honors this by
+/// persisting envelopes only for Public graphs — see put_envelope.)
 pub async fn block_get(
     State(state): State<Arc<KotobaState>>,
     axum::extract::Query(req): axum::extract::Query<BlockGetReq>,
