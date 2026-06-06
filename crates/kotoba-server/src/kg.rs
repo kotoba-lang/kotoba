@@ -1744,8 +1744,8 @@ pub struct KgQueryReq {
     /// Emit a content-addressed provenance envelope (querySpecCid / queryJobCid /
     /// resultCid) over canonical DAG-CBOR. resultCid hashes the canonically-sorted
     /// results, so it is stable despite kg.query's unordered CID-pair output.
-    /// Applies to the from-scratch evaluation path (not the materialized-view
-    /// fast path). Absent when false. Default false.
+    /// Applies to both the from-scratch and materialized-view paths. Absent when
+    /// false. Default false.
     #[serde(default)]
     pub emit_cid: bool,
 }
@@ -1943,14 +1943,30 @@ pub async fn kg_query(
             .take(result_limit)
             .map(|d| serde_json::json!({ "a": d.e.to_multibase(), "b": readable_value(&d.v) }))
             .collect();
-        return Ok(Json(serde_json::json!({
+        let mut response = serde_json::json!({
             "lang":      req.lang,
             "count":     rows.len(),
             "results":   rows,
             "source":    "mv",
             "view":      mv_name,
             "elapsedMs": t0.elapsed().as_millis(),
-        })));
+        });
+        if req.emit_cid {
+            let canonical = query_canonical_result(&response);
+            let lang = response
+                .get("lang")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (spec, job, result_cid) =
+                query_emit_cids(&state, &lang, &req.query, None, None, None, &canonical);
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
+                obj.insert("queryJobCid".to_string(), serde_json::Value::String(job));
+                obj.insert("resultCid".to_string(), serde_json::Value::String(result_cid));
+            }
+        }
+        return Ok(Json(response));
     }
 
     // Load the current graph projection first — enterprise SQL builds its EAV
@@ -2063,7 +2079,7 @@ pub async fn kg_query(
     });
     // Optional content-addressed provenance over the canonically-SORTED results
     // (kg.query output is unordered CID pairs), so resultCid is stable. The
-    // materialized-view fast path above does not emit (documented on emit_cid).
+    // materialized-view fast path above emits the same envelopes.
     if req.emit_cid {
         let canonical = query_canonical_result(&response);
         let lang = response
