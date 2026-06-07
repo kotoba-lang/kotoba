@@ -77,10 +77,36 @@ pub struct DistributedDatomCommit {
     pub author: String,
     pub seq: u64,
     pub ts: u64,
+    /// Hybrid Logical Clock (ms·2^16 + counter) — monotonic per node, never goes
+    /// backwards under wall-clock skew. The causal/total ordering key for the
+    /// cross-graph firehose and the merge tiebreak (ADR-001). `#[serde(default)]`
+    /// so pre-HLC commits still decode (hlc = 0).
+    #[serde(default)]
+    pub hlc: u64,
     /// Covering ProllyTree roots: eavt/aevt/avet/vaet/tea.
     pub index_roots: HashMap<String, KotobaCid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cacao_proof_cid: Option<KotobaCid>,
+}
+
+/// Process Hybrid Logical Clock. Packs `physical_ms << 16 | counter`; advances to
+/// `max(physical, last+1)` so it is monotonic even if the wall clock jumps back.
+/// The cross-graph ordering key + merge tiebreak (ADR-001). Single-node variant
+/// (a multi-node deployment also merges observed peer HLCs on read — later phase).
+pub(crate) fn next_hlc(phys_ms: u64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static HLC: AtomicU64 = AtomicU64::new(0);
+    let phys = phys_ms << 16;
+    loop {
+        let last = HLC.load(Ordering::Relaxed);
+        let next = if phys > last { phys } else { last + 1 };
+        if HLC
+            .compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2746,10 +2772,11 @@ impl DistributedDatomCommit {
         index_roots: HashMap<String, KotobaCid>,
         cacao_proof_cid: Option<KotobaCid>,
     ) -> Result<Self, DistributedCommitError> {
-        let ts = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            .unwrap_or_default();
+        let ts = now.as_secs();
+        let hlc = next_hlc(now.as_millis() as u64);
         let mut commit = Self {
             cid: KotobaCid::default(),
             graph,
@@ -2758,6 +2785,7 @@ impl DistributedDatomCommit {
             author,
             seq,
             ts,
+            hlc,
             index_roots,
             cacao_proof_cid,
         };
@@ -8648,5 +8676,30 @@ mod tests {
         // idempotent
         let again = gc_history(&c2.cid, 1, &store).unwrap();
         assert_eq!(again.deleted_blocks, 0);
+    }
+
+    #[test]
+    fn next_hlc_is_monotonic_under_clock_skew() {
+        // Advancing physical time bumps the high bits.
+        let a = next_hlc(1_000);
+        let b = next_hlc(2_000);
+        assert!(b > a, "HLC must advance with physical time");
+        // A wall-clock JUMP BACKWARDS must NOT produce a smaller HLC.
+        let c = next_hlc(500);
+        assert!(c > b, "HLC must stay monotonic when the clock goes backwards");
+        // Same-millisecond calls still strictly increase (logical counter).
+        let d = next_hlc(2_000);
+        let e = next_hlc(2_000);
+        assert!(e > d, "HLC must strictly increase within the same millisecond");
+    }
+
+    #[test]
+    fn seal_stamps_a_nonzero_hlc() {
+        let graph = KotobaCid::from_bytes(b"hlc-seal");
+        let c = DistributedDatomCommit::seal(
+            graph.clone(), KotobaCid::from_bytes(b"tx"), None,
+            "did:key:t".into(), 1, std::collections::HashMap::new(), None,
+        ).unwrap();
+        assert!(c.hlc > 0, "seal must stamp a Hybrid Logical Clock");
     }
 }

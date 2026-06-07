@@ -119,6 +119,10 @@ async fn gate(
 pub struct FirehoseEvent {
     pub seq: u64,
     pub ts: u64,
+    /// Hybrid Logical Clock of the source commit (ADR-001) — the skew-resistant
+    /// cross-graph ordering key. 0 for journal-sourced (non-datomic) events.
+    #[serde(default)]
+    pub hlc: u64,
     pub topic: String,
     pub cid: String,
     pub payload: serde_json::Value,
@@ -134,6 +138,7 @@ impl FirehoseEvent {
         graph_cid: &KotobaCid,
         seq: u64,
         ts: u64,
+        hlc: u64,
     ) -> Self {
         let quad = crate::xrpc::datom_to_projection_quad(datom, graph_cid);
         let topic = if datom.added {
@@ -158,6 +163,7 @@ impl FirehoseEvent {
         FirehoseEvent {
             seq,
             ts,
+            hlc,
             topic,
             cid,
             payload,
@@ -172,6 +178,7 @@ impl FirehoseEvent {
         FirehoseEvent {
             seq: e.seq,
             ts: e.ts,
+            hlc: 0, // journal (non-datomic) events carry no commit HLC
             topic: e.topic.clone(),
             cid: e.cid.to_multibase(),
             payload,
@@ -354,6 +361,7 @@ fn firehose_events_from_commitdag(
                 &graph_cid,
                 seq,
                 entry.commit.ts,
+                entry.commit.hlc,
             ));
         }
     }
@@ -406,11 +414,12 @@ pub struct AllGraphsParams {
 
 /// Merge every registered graph's CommitDag change feed into one whole-node feed.
 ///
-/// Ordering is `(commit.ts, graph, per-graph seq)`. NOTE: `commit.ts` is whole
-/// seconds, so cross-graph order is timestamp-*approximate* — within a single
-/// graph it is exact. The returned `seq` is a global 1-based index over the
-/// merged order; it is stable for append-only growth (new commits sort to the
-/// tail) and serves as the resume cursor.
+/// Ordering is `(commit.hlc, graph, per-graph seq)` (ADR-001). The Hybrid Logical
+/// Clock is monotonic per node and skew-resistant, so cross-graph order is stable
+/// and not at the mercy of wall-clock jumps; within a single graph it is exact.
+/// The returned `seq` is a global 1-based index over the merged order; it is
+/// stable for append-only growth (new commits sort to the tail) and serves as the
+/// resume cursor.
 fn firehose_events_all_graphs(
     state: &KotobaState,
 ) -> Result<Vec<FirehoseEvent>, (StatusCode, String)> {
@@ -421,7 +430,7 @@ fn firehose_events_all_graphs(
         };
         let per_graph = firehose_events_from_commitdag(state, graph_mb)?;
         for ev in per_graph {
-            merged.push((ev.ts, graph_mb.to_string(), ev.seq, ev));
+            merged.push((ev.hlc, graph_mb.to_string(), ev.seq, ev));
         }
     }
     // (ts, graph, per-graph seq) — deterministic merge across graphs.
