@@ -1040,6 +1040,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             post(xrpc::datomic_db_stats),
         )
         .route(
+            &format!("/xrpc/{}", xrpc::NSID_DATOMIC_GC),
+            post(xrpc::datomic_gc),
+        )
+        .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_ENTITY),
             post(xrpc::datomic_entity),
         )
