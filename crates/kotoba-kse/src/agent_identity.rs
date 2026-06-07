@@ -46,11 +46,11 @@ impl AgentIdentity {
     }
 
     /// Try device-local secret storage first (macOS Keychain or
-    /// `~/.gftd/kotoba.env`), then fall back to env vars, then ephemeral.
+    /// `~/.etzhayyim/kotoba.env`), then fall back to env vars, then ephemeral.
     ///
     /// Discovery order:
     ///   1. `crate::keychain::read_identity()` — Keychain on macOS,
-    ///      `~/.gftd/kotoba.env` on Linux/other
+    ///      `~/.etzhayyim/kotoba.env` on Linux/other
     ///   2. `KOTOBA_AGENT_ED25519_HEX` + `KOTOBA_AGENT_X25519_HEX` +
     ///      `KOTOBA_AGENT_DID` env vars
     ///   3. ephemeral keypair (DID changes on restart)
@@ -158,7 +158,7 @@ impl AgentIdentity {
     }
 
     /// Persist this identity's private material to the device-local backend
-    /// (macOS Keychain or `~/.gftd/kotoba.env`).  Refuses ephemeral identities
+    /// (macOS Keychain or `~/.etzhayyim/kotoba.env`).  Refuses ephemeral identities
     /// — `kotoba init` should generate a fresh non-ephemeral one before calling.
     pub fn persist_to_keychain(&self) -> anyhow::Result<()> {
         if self.ephemeral {

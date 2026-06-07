@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn private_graph_encodes_did() {
-        let did = "did:erc725:gftd:260425:0xdeadbeef";
+        let did = "did:erc725:etzhayyim:260425:0xdeadbeef";
         let g = NamedGraph::private_for(did);
         assert_eq!(g.name, format!("kotoba://graph/private/{did}"));
         assert!(matches!(g.visibility, GraphVisibility::Private { owner_did } if owner_did == did));
@@ -101,7 +101,7 @@ mod tests {
 
     #[test]
     fn classify_private() {
-        let did = "did:erc725:gftd:260425:0xabc123";
+        let did = "did:erc725:etzhayyim:260425:0xabc123";
         let name = format!("kotoba://graph/private/{did}");
         assert_eq!(
             classify(&name),

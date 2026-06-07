@@ -1,6 +1,6 @@
 """kotoba-langgraph-aria — ARIA actor as a kotoba WASM LangGraph component.
 
-Flagship port of magatama's ARIA actor onto the WASM-native ``kotoba_langgraph``
+Flagship port of kotodama's ARIA actor onto the WASM-native ``kotoba_langgraph``
 API so it compiles to a kotoba-node component (`componentize-py`) and runs
 in-WASM on a live kotoba server (`:8077`) via invoke.run / kotoba_wasm_run.
 

@@ -170,11 +170,11 @@ pub fn recover_eth_address(hash: &[u8; 32], sig: &[u8]) -> Result<[u8; 20], EthE
 /// Parse ETH address bytes from a DID string.
 /// Accepts:
 ///   `did:pkh:eip155:N:0x<hex>`   — standard CAIP-74
-///   `did:erc725:gftd:N:0x<hex>`  — gftd-internal
+///   `did:erc725:etzhayyim:N:0x<hex>`  — etzhayyim-internal
 pub fn parse_eth_address_from_did(iss: &str) -> Result<[u8; 20], EthError> {
     let parts: Vec<&str> = iss.split(':').collect();
     // did:pkh:eip155:1:0x...  → parts[4]
-    // did:erc725:gftd:N:0x... → parts[4]
+    // did:erc725:etzhayyim:N:0x... → parts[4]
     let hex_addr = parts
         .last()
         .ok_or_else(|| EthError::Did(iss.to_string()))?
@@ -191,10 +191,10 @@ pub fn parse_eth_address_from_did(iss: &str) -> Result<[u8; 20], EthError> {
     Ok(addr)
 }
 
-/// Convert a raw 20-byte ETH address to a gftd ERC-725 DID.
-/// Format: `did:erc725:gftd:260425:0x{hex}`
+/// Convert a raw 20-byte ETH address to a etzhayyim ERC-725 DID.
+/// Format: `did:erc725:etzhayyim:260425:0x{hex}`
 pub fn eth_address_to_erc725_did(addr: &[u8; 20]) -> String {
-    format!("did:erc725:gftd:260425:0x{}", hex::encode(addr))
+    format!("did:erc725:etzhayyim:260425:0x{}", hex::encode(addr))
 }
 
 #[cfg(test)]
@@ -207,8 +207,8 @@ mod tests {
     fn erc725_did_format() {
         let addr = [0x00u8; 20];
         let did = eth_address_to_erc725_did(&addr);
-        assert!(did.starts_with("did:erc725:gftd:260425:0x"));
-        assert_eq!(did.len(), "did:erc725:gftd:260425:0x".len() + 40);
+        assert!(did.starts_with("did:erc725:etzhayyim:260425:0x"));
+        assert_eq!(did.len(), "did:erc725:etzhayyim:260425:0x".len() + 40);
     }
 
     #[test]
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn parse_erc725_did() {
-        let did = "did:erc725:gftd:260425:0xabcdef1234567890abcdef1234567890abcdef12";
+        let did = "did:erc725:etzhayyim:260425:0xabcdef1234567890abcdef1234567890abcdef12";
         let addr = parse_eth_address_from_did(did).unwrap();
         assert_eq!(addr[0], 0xab);
     }

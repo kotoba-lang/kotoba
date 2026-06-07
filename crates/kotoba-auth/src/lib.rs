@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn parse_eth_address_erc725() {
-        let did = "did:erc725:gftd:260425:0xab16a96d359ec26a11e2c2b3d8f8b8942d5bfcdb";
+        let did = "did:erc725:etzhayyim:260425:0xab16a96d359ec26a11e2c2b3d8f8b8942d5bfcdb";
         let addr = eth::parse_eth_address_from_did(did).expect("valid did:erc725");
         assert_eq!(
             hex::encode(addr),
@@ -91,7 +91,7 @@ mod tests {
             0xb8, 0x94, 0x2d, 0x5b, 0xfc, 0xdb,
         ];
         let did = eth_address_to_erc725_did(&addr);
-        assert!(did.starts_with("did:erc725:gftd:260425:0x"));
+        assert!(did.starts_with("did:erc725:etzhayyim:260425:0x"));
         assert!(did.contains("ab16a96d359ec26a11e2c2b3d8f8b8942d5bfcdb"));
     }
 
@@ -571,7 +571,7 @@ mod tests {
     fn test_did_doc() -> DidDocument {
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".into()],
-            id: "did:erc725:gftd:260425:0xtest".into(),
+            id: "did:erc725:etzhayyim:260425:0xtest".into(),
             verification_method: vec![],
             authentication: vec![],
             assertion_method: vec![],

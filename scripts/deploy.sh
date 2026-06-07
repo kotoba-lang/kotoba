@@ -39,7 +39,7 @@ fi
 
 # ── build & push (optional) ───────────────────────────────────────────────────
 if $BUILD; then
-  echo "Building & pushing ghcr.io/gftdcojp/kotoba:${TAG}..."
+  echo "Building & pushing ghcr.io/etzhayyim/kotoba:${TAG}..."
   "${SCRIPT_DIR}/build-push.sh" "${TAG}"
 fi
 
@@ -51,7 +51,7 @@ if ! kubectl get secret ghcr-pull-secret -n kotoba &>/dev/null; then
   kubectl create namespace kotoba --dry-run=client -o yaml | kubectl apply -f -
   kubectl create secret docker-registry ghcr-pull-secret \
     --docker-server=ghcr.io \
-    --docker-username="${GHCR_USER:-gftdcojp}" \
+    --docker-username="${GHCR_USER:-etzhayyim}" \
     --docker-password="${GHCR_TOKEN:?set GHCR_TOKEN env var}" \
     --namespace=kotoba
 fi
@@ -65,7 +65,7 @@ kubectl apply -f "${DEPLOY_DIR}/configmap.yaml"
 
 # ── 3. Deployment (patch image tag if not latest) ─────────────────────────────
 if [[ "${TAG}" != "latest" ]]; then
-  sed "s|ghcr.io/gftdcojp/kotoba:latest|ghcr.io/gftdcojp/kotoba:${TAG}|g" \
+  sed "s|ghcr.io/etzhayyim/kotoba:latest|ghcr.io/etzhayyim/kotoba:${TAG}|g" \
     "${DEPLOY_DIR}/deployment.yaml" | kubectl apply -f -
 else
   kubectl apply -f "${DEPLOY_DIR}/deployment.yaml"

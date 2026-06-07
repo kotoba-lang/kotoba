@@ -63,7 +63,7 @@ fn cacao_b64_from_headers(headers: &HeaderMap) -> Option<&str> {
 ///
 /// Two authentication modes, tried in order:
 ///
-/// 1. **Self-sovereign CACAO** (no gftd webauth) — when a CACAO is present
+/// 1. **Self-sovereign CACAO** (no etzhayyim webauth) — when a CACAO is present
 ///    (`Authorization: CACAO <b64>` or `x-kotoba-cacao`), its signature is
 ///    *cryptographically verified* (SIWE/EIP-191, Ed25519/did:key, EIP-1271,
 ///    BIP-322), the `kotobase:pin` capability is required, and the verified
@@ -1447,7 +1447,7 @@ mod tests {
         assert!(validate_triple(&t).is_err());
     }
 
-    // ── Self-sovereign CACAO auth (no gftd webauth) ─────────────────────────────
+    // ── Self-sovereign CACAO auth (no etzhayyim webauth) ─────────────────────────────
 
     /// Build `(issuer_did, base64(DAG-CBOR) CACAO)` signed by `seed`, mirroring
     /// exactly what `kotoba cacao-sign --graph <did> --capability <cap>` emits:

@@ -231,7 +231,7 @@ impl MediaIngestor {
             .unwrap_or_default()
             .as_secs();
         self.quad_store
-            .commit("did:web:kotoba.gftd.ai", graph.clone(), commit_seq)
+            .commit("did:web:kotoba.etzhayyim.com", graph.clone(), commit_seq)
             .await?;
         self.quad_store.reset_arrangement(graph).await;
 

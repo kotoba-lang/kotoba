@@ -1,11 +1,11 @@
 //! Device-local secret storage for `AgentIdentity` material.
 //!
 //! Per root CLAUDE.md (`Local Secret Storage` rule):
-//!   service = `gftd.kotoba`, account = `agent-ed25519` / `agent-x25519` / `agent-did`
+//!   service = `etzhayyim.kotoba`, account = `agent-ed25519` / `agent-x25519` / `agent-did`
 //!
 //! Backends:
 //!   - **macOS**: shells out to `/usr/bin/security` (generic-password items)
-//!   - **Linux/other**: read/write `~/.gftd/kotoba.env` with chmod 600
+//!   - **Linux/other**: read/write `~/.etzhayyim/kotoba.env` with chmod 600
 //!
 //! All read/write paths are no-ops on missing items, returning `Ok(None)` so
 //! the caller can fall through to env vars or ephemeral generation.
@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-const SERVICE: &str = "gftd.kotoba";
+const SERVICE: &str = "etzhayyim.kotoba";
 const ACCOUNT_ED25519: &str = "agent-ed25519";
 const ACCOUNT_X25519: &str = "agent-x25519";
 const ACCOUNT_DID: &str = "agent-did";
@@ -105,11 +105,11 @@ fn write_macos(_account: &str, _value: &str) -> anyhow::Result<()> {
     anyhow::bail!("macOS Keychain backend not available on this OS")
 }
 
-// ── Linux/other: ~/.gftd/kotoba.env file backend ──────────────────────────────
+// ── Linux/other: ~/.etzhayyim/kotoba.env file backend ──────────────────────────────
 
 fn env_file_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".gftd").join("kotoba.env"))
+    Some(PathBuf::from(home).join(".etzhayyim").join("kotoba.env"))
 }
 
 fn read_file_backend() -> Option<StoredIdentity> {
@@ -162,7 +162,7 @@ mod tests {
     fn env_file_path_uses_home() {
         std::env::set_var("HOME", "/tmp/kotoba-keychain-test");
         let path = env_file_path().unwrap();
-        assert!(path.ends_with(".gftd/kotoba.env"));
+        assert!(path.ends_with(".etzhayyim/kotoba.env"));
     }
 
     #[test]

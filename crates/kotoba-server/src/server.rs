@@ -290,7 +290,7 @@ pub struct KotobaState {
     /// (unchanged behaviour: fast restart via journal replay).
     pub journal_wal_enabled: bool,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
-    /// Optional kotobase.gftd.ai XRPC pin client (KOTOBA_PIN_TOKEN).
+    /// Optional kotobase.etzhayyim.com XRPC pin client (KOTOBA_PIN_TOKEN).
     pub ipfs_pin: Arc<IpfsPinClient>,
     // ── Email E2E Storage ────────────────────────────────────────────────────
     /// AES-256-GCM encrypted vault for email body blobs (legacy; kept for compat).
@@ -458,7 +458,7 @@ impl KotobaState {
             } else if !ipfs_off {
                 let cold = kotoba_store::KuboBlockStore::from_env();
                 // F-3: attach the kotobase remote-pin client if configured so
-                // every local recursive pin/add also lands on kotobase.gftd.ai.
+                // every local recursive pin/add also lands on kotobase.etzhayyim.com.
                 // Falls back to a single-pin (local only) when the env vars
                 // are absent — preserves dev / local-Kubo workflows.
                 let cold = match kotoba_store::IpfsPinClient::from_pin_env() {
@@ -792,7 +792,7 @@ impl KotobaState {
             let pub_g = NamedGraph::public();
             let auth_g = NamedGraph::authenticated();
             let kg_g = NamedGraph::new("kotobase-kg-v1", GraphVisibility::Authenticated);
-            // Per-app data-plane graph for yukkuri (ai-gftd-project-yukkuri lg
+            // Per-app data-plane graph for yukkuri (etzhayyim-project-yukkuri lg
             // pipeline). Registered Authenticated so the lg pod's Bearer token is
             // accepted for reads, and — being a fresh low-history graph — keeps
             // Datomic db_before reconstruction cheap (the shared kotobase-kg-v1
@@ -812,7 +812,7 @@ impl KotobaState {
             // reconstruct the head. Authenticated so the lg pod's Bearer token reads
             // back without a CACAO delegation chain.
             let yk_g3 = NamedGraph::new("yukkuri-kg-v3", GraphVisibility::Authenticated);
-            // Per-app data-plane graph for shinshi (ai-gftd-project-shinshi lg
+            // Per-app data-plane graph for shinshi (etzhayyim-project-shinshi lg
             // pipeline, RW→kotoba datomic migration). Registered Authenticated so
             // the lg-shinshi pod's Bearer JWT (sub=operator) reads back without a
             // CACAO delegation chain — same auth the transact write path already

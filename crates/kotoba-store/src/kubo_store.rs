@@ -63,7 +63,7 @@ pub struct KuboBlockStore {
     /// a permit before touching the socket; the rest of the burst queues here
     /// instead of opening fresh connections.
     inflight: Arc<tokio::sync::Semaphore>,
-    /// Optional remote pin client (kotobase.gftd.ai).  When set, every
+    /// Optional remote pin client (kotobase.etzhayyim.com).  When set, every
     /// successful local `pin/add` is fanned out asynchronously to the remote
     /// endpoint so commit roots / vault keys / IPNS records replicate beyond
     /// the pod-local PVC.  Mirrors the F-3 "kotoba IPFS only / kotobase pins
@@ -234,7 +234,7 @@ impl Clone for KuboBlockStore {
 }
 
 impl KuboBlockStore {
-    /// Attach a remote pin client (kotobase.gftd.ai) so every successful
+    /// Attach a remote pin client (kotobase.etzhayyim.com) so every successful
     /// local `pin/add` is also fanned out to the remote endpoint.
     pub fn with_remote_pin(mut self, remote: Arc<crate::ipfs_pin::IpfsPinClient>) -> Self {
         self.remote_pin = Some(remote);

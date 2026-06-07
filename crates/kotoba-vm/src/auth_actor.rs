@@ -19,7 +19,7 @@ use std::sync::Arc;
 pub struct Actor {
     /// Content-addressed vertex ID (= subject CID in the Quad store).
     pub vertex_cid: KotobaCid,
-    /// DID of this actor (e.g. `did:erc725:gftd:260425:0x...`).
+    /// DID of this actor (e.g. `did:erc725:etzhayyim:260425:0x...`).
     pub did: String,
     /// X25519 public key — used by the PRE proxy to HPKE-seal replies to this actor.
     pub public_key: [u8; 32],

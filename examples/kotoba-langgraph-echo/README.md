@@ -2,8 +2,8 @@
 
 Smallest possible **kotoba WASM LangGraph actor** — returns the input `prompt`
 verbatim. Deterministic liveness probe / canonical clean example of the
-actor-as-kotoba-WASM pattern. Port of magatama's
-`20-actors/magatama/py/src/pymagatama/langgraph_graphs/echo.py`.
+actor-as-kotoba-WASM pattern. Port of kotodama's
+`40-engine/kotoba/crates/kotoba-kotodama/py/src/kotodama/langgraph_graphs/echo.py`.
 
 ## Graph
 ```

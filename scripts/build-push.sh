@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build kotoba image via remote BuildKit (gftd-vke) and push to GHCR.
+# Build kotoba image via remote BuildKit (etzhayyim-vke) and push to GHCR.
 # Usage: ./scripts/build-push.sh [tag]
 set -euo pipefail
 
 TAG="${1:-latest}"
-IMAGE="ghcr.io/gftdcojp/kotoba:${TAG}"
+IMAGE="ghcr.io/etzhayyim/kotoba:${TAG}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 KOTOBA_DIR="${REPO_ROOT}/40-engine/kotoba"
 
@@ -16,8 +16,8 @@ echo "Context: ${KOTOBA_DIR}"
 
 docker buildx build \
     --platform linux/amd64 \
-    --cache-from type=registry,ref=ghcr.io/gftdcojp/build-cache:kotoba \
-    --cache-to   type=registry,ref=ghcr.io/gftdcojp/build-cache:kotoba,mode=max \
+    --cache-from type=registry,ref=ghcr.io/etzhayyim/build-cache:kotoba \
+    --cache-to   type=registry,ref=ghcr.io/etzhayyim/build-cache:kotoba,mode=max \
     --build-arg GIT_SHA="${GIT_SHA}" \
     --build-arg BUILD_DATE="${BUILD_DATE}" \
     --tag "${IMAGE}" \

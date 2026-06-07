@@ -2,7 +2,7 @@
 //! NSIDs: com.etzhayyim.signal.{register.prekeys, get.prekey.bundle, send.message, send.group.message}
 //!
 //! These endpoints make kotoba-server the SSoT for Signal Protocol E2E,
-//! superseding `@gftd/signal` (`10-protocol/signal/`).
+//! superseding `@etzhayyim/signal` (`10-protocol/signal/`).
 
 pub const NSID_SIGNAL_REGISTER_PREKEYS: &str = "com.etzhayyim.signal.register.prekeys";
 pub const NSID_SIGNAL_GET_PREKEY_BUNDLE: &str = "com.etzhayyim.signal.get.prekey.bundle";

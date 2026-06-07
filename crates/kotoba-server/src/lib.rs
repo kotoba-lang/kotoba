@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn all_nsids_start_with_ai_gftd_apps() {
+    fn all_nsids_start_with_ai_etzhayyim_apps() {
         for nsid in ALL_NSIDS {
             assert!(
                 nsid.starts_with("com.etzhayyim.apps."),

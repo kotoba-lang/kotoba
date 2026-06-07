@@ -4,7 +4,7 @@
 /// a local or remote Kubo-compatible daemon so that pinned CIDs survive GC
 /// and are reachable via the IPFS network.  Up to 1 GB of content is pinned
 /// for free by kotoba itself; extended durability beyond that is the
-/// responsibility of kotobase.gftd.ai (called separately, not here).
+/// responsibility of kotobase.etzhayyim.com (called separately, not here).
 ///
 /// API surface used:
 ///   POST /api/v0/pin/add?arg={cid}&recursive=true   — pin a CID
@@ -58,7 +58,7 @@ impl IpfsPinClient {
     /// `KOTOBA_IPFS_PIN_JWT`.  Returns `None` when neither secret is set, so
     /// the caller can no-op when kotobase pinning is intentionally disabled
     /// (e.g. local dev).  Used to dispatch every recursive pin to
-    /// kotobase.gftd.ai (or any Kubo-compatible service) in addition to the
+    /// kotobase.etzhayyim.com (or any Kubo-compatible service) in addition to the
     /// pod-local sidecar — the F-3 pin chain wiring.
     pub fn from_pin_env() -> Option<Arc<Self>> {
         let endpoint = std::env::var("KOTOBA_IPFS_PIN_ENDPOINT").ok()?;

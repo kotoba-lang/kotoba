@@ -148,7 +148,7 @@ enum Cmd {
     Health,
 
     /// Initialise device-local identity (Ed25519 + X25519 + DID) and persist to
-    /// macOS Keychain (or ~/.gftd/kotoba.env on Linux/other).  Subsequent
+    /// macOS Keychain (or ~/.etzhayyim/kotoba.env on Linux/other).  Subsequent
     /// `kotoba serve` invocations will load these automatically and the DID
     /// remains stable across restarts.
     Init {
@@ -166,7 +166,7 @@ enum Cmd {
 
     /// Check whether `etzhayyim/kotoba` main branch is newer than this
     /// binary's build commit.  Hits GitHub's REST API once and caches the
-    /// result for 24 h in `~/.gftd/kotoba-update.json`.
+    /// result for 24 h in `~/.etzhayyim/kotoba-update.json`.
     UpdateCheck {
         /// Re-fetch even if the cache is fresh.
         #[arg(long)]
@@ -408,7 +408,7 @@ async fn main() -> Result<()> {
             }
             let id = kotoba_kse::AgentIdentity::generate_persistent();
             id.persist_to_keychain().context("persisting identity")?;
-            println!("Persisted identity to macOS Keychain (or ~/.gftd/kotoba.env).");
+            println!("Persisted identity to macOS Keychain (or ~/.etzhayyim/kotoba.env).");
             println!("DID: {}", id.did);
             if show {
                 println!(
@@ -1469,7 +1469,7 @@ fn update_cache_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(
         std::path::PathBuf::from(home)
-            .join(".gftd")
+            .join(".etzhayyim")
             .join("kotoba-update.json"),
     )
 }

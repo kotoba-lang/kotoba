@@ -12744,7 +12744,7 @@ mod tests {
     fn domain_names_allowed() {
         // Normal domain names must NOT be flagged
         assert!(!is_did_web_ip_host("example.com"));
-        assert!(!is_did_web_ip_host("gftd.ai"));
+        assert!(!is_did_web_ip_host("etzhayyim.com"));
         assert!(!is_did_web_ip_host("example.com:path"));
         assert!(!is_did_web_ip_host("sub.domain.example.org"));
     }
@@ -14645,7 +14645,7 @@ pub async fn generic_invoke(
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
 
     let parts: Vec<&str> = nsid.split('.').collect();
-    if parts.len() < 5 || parts[0..3] != ["ai", "gftd", "apps"] {
+    if parts.len() < 5 || parts[0..3] != ["ai", "etzhayyim", "apps"] {
         return Err((StatusCode::BAD_REQUEST, "invalid generic nsid".into()));
     }
     let app = parts[3];
@@ -14668,7 +14668,7 @@ pub async fn generic_invoke(
         for q in &node_quads {
             if q.predicate == "node/did" {
                 if let LegacyQuadObject::Text(s) = &q.object {
-                    if s == app || s.ends_with(&format!("{app}.gftd.co.jp")) {
+                    if s == app || s.ends_with(&format!("{app}.etzhayyim.com")) {
                         if let Some(ep) = node_quads
                             .iter()
                             .find(|d| d.subject == q.subject && d.predicate == "node/endpoint")
@@ -14697,7 +14697,7 @@ pub async fn generic_invoke(
             for datom in db.datoms() {
                 if datom.a == "node/did" {
                     if let kotoba_datomic::Value::String(s) = &datom.v {
-                        if s == app || s.ends_with(&format!("{app}.gftd.co.jp")) {
+                        if s == app || s.ends_with(&format!("{app}.etzhayyim.com")) {
                             if let Some(endpoint) = db.datoms().iter().find(|d| d.e == datom.e && d.a == "node/endpoint") {
                                 if let kotoba_datomic::Value::String(ep) = &endpoint.v {
                                     program_cid = ep.to_string();

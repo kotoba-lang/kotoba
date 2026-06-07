@@ -50,7 +50,7 @@ query surface, runs as four single-shot commands:
 
 ```bash
 # 1. One-time: generate Ed25519 + X25519 + DID, persist to macOS Keychain
-#    (or ~/.gftd/kotoba.env on Linux/other, chmod 600).
+#    (or ~/.etzhayyim/kotoba.env on Linux/other, chmod 600).
 kotoba init
 
 # 2. Start the server. IPFS cold tier + CACAO Private-default are ON by
@@ -93,7 +93,7 @@ kotoba cacao-sign <seed> --graph <cid> \
 | IPFS endpoint              | `http://localhost:5001`                                  | `KOTOBA_IPFS_ENDPOINT=…`       |
 | Multi-peer federation      | none (single-node)                                        | `KOTOBA_PEERS="http://… http://…"` |
 | Default graph visibility   | `Private { owner_did = operator_did }` (CACAO required)  | `KOTOBA_DEFAULT_VISIBILITY=authenticated\|public\|private` |
-| Agent identity             | macOS Keychain → `~/.gftd/kotoba.env` → env → ephemeral  | `kotoba init`                   |
+| Agent identity             | macOS Keychain → `~/.etzhayyim/kotoba.env` → env → ephemeral  | `kotoba init`                   |
 
 `kotoba serve` boots with a clear startup probe: if `ipfs daemon` is not
 reachable on `KOTOBA_IPFS_ENDPOINT`, you get a single WARN line telling you
@@ -261,7 +261,7 @@ cargo build --release -p kotoba-cli     # final `kotoba` binary
 ## ADR
 
 Design decisions live in
-[`90-docs/adr/2605240001-kotoba-cleanroom-architecture.md`](https://github.com/gftdcojp/ai-gftd-apps-gftdcojp/blob/main/90-docs/adr/2605240001-kotoba-cleanroom-architecture.md)
+[`90-docs/adr/2605240001-kotoba-cleanroom-architecture.md`](https://github.com/etzhayyim/etzhayyim-apps-etzhayyim/blob/main/90-docs/adr/2605240001-kotoba-cleanroom-architecture.md)
 of the parent monorepo.  Section §27 captures the current SPARQL surface,
 HTTP loadtest matrix, and operator-UX defaults.
 

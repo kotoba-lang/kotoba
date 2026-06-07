@@ -1,0 +1,12 @@
+# tsukuroi_pr_submission — tsukuroi (R0 scaffold)
+
+open a fork-and-PR (or emit a signed patch bundle) to the authorized target using the owner-delegated, least-privilege, expiring, fork-PR-only credential; PROPOSE-ONLY — never merge/deploy.
+
+Per ADR-2605291500. R0 scaffold — `cell.py` raises at import time until R1
+(Council Lv6+ ≥3 ratify, post 2026-06-19).
+
+- **Actor**: tsukuroi (繕い) — `did:web:tsukuroi.etzhayyim.com` (akuma's constructive sibling)
+- **Murakumo node (proposed)**: levi
+- **Gates**: G4 (propose-only / no autonomous merge) + G8 (no platform-held key) + G12 (rate limit)
+- **Output Lexicon(s)**: com.etzhayyim.tsukuroi.patchProposal
+- **Ceiling**: PROPOSE-ONLY (no merge/deploy) · NO PROBING (akuma finding_cid input only) · DEFENSIVE-ONLY (no exploit/PoC, §2(a)) · NO PLATFORM-HELD KEY (ADR-2605231525) · Murakumo-only inference (ADR-2605215000)

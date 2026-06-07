@@ -1,7 +1,7 @@
 """kotoba-langgraph-echo — minimal LangGraph actor compiled to a kotoba WASM component.
 
-Faithful port of magatama's `echo` actor
-(`20-actors/magatama/py/src/pymagatama/langgraph_graphs/echo.py`) onto the
+Faithful port of kotodama's `echo` actor
+(`40-engine/kotoba/crates/kotoba-kotodama/py/src/kotodama/langgraph_graphs/echo.py`) onto the
 WASM-native `kotoba_langgraph` API. Smallest possible graph — returns the input
 `prompt` verbatim — used as a deterministic liveness probe for the
 actor-as-kotoba-WASM pattern.

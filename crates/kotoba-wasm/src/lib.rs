@@ -347,7 +347,7 @@ impl Node {
     }
 
     /// A durable snapshot of the write-set in the SAME JSON shape that
-    /// `load_server_datoms` / `ai.gftd.apps.kotoba.datomic.datoms` use, so a
+    /// `load_server_datoms` / `ai.etzhayyim.apps.kotoba.datomic.datoms` use, so a
     /// reload (or a peer) can rehydrate via the existing read path.
     pub fn export_snapshot_json(&self) -> String {
         let arr: Vec<serde_json::Value> = self
