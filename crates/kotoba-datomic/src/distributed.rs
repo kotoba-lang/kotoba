@@ -2800,6 +2800,92 @@ impl DistributedDatomCommit {
     }
 }
 
+/// Outcome of [`gc_history`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Commits retained (newest `keep_last_n`, plus any tail shorter than that).
+    pub kept_commits: usize,
+    /// Older commits whose blocks became eligible for deletion.
+    pub dropped_commits: usize,
+    /// Blocks actually deleted (reachable only from dropped commits).
+    pub deleted_blocks: usize,
+}
+
+/// Prune Datomic history for one graph: keep the newest `keep_last_n` commits
+/// reachable from `head` and delete the ProllyTree / commit blocks reachable
+/// **only** from older (dropped) commits.
+///
+/// Why this is the safe shape of GC for kotoba's shared content-addressed store:
+/// the durable `BlockStore` is also home to KSE-journal, vault and other
+/// subsystems' blocks, and a naive "sweep everything not reachable from the
+/// latest head" would delete all of them. This routine instead computes
+/// `reachable(dropped) − reachable(kept)`, so a block is removed **iff** some
+/// dropped commit referenced it and **no** kept commit does. Blocks that no
+/// Datomic commit references (journal, vault, …) are never in either set and are
+/// therefore never touched. The current DB value and the last `keep_last_n`
+/// transactions stay fully readable; only deep `as-of`/history past the cutoff
+/// is pruned (Datomic-style history truncation).
+///
+/// `keep_last_n` is clamped to ≥1, so the live head is always preserved.
+pub fn gc_history(
+    head: &KotobaCid,
+    keep_last_n: usize,
+    store: &dyn BlockStore,
+) -> Result<GcReport, DistributedCommitError> {
+    use std::collections::HashSet;
+
+    // Walk the commit chain newest → oldest.
+    let mut chain: Vec<DistributedDatomCommit> = Vec::new();
+    let mut cur = Some(head.clone());
+    while let Some(cid) = cur {
+        let Some(commit) = DistributedDatomCommit::load(&cid, store)? else {
+            break;
+        };
+        cur = commit.prev.clone();
+        chain.push(commit);
+    }
+
+    let keep_last_n = keep_last_n.max(1);
+    if chain.len() <= keep_last_n {
+        return Ok(GcReport {
+            kept_commits: chain.len(),
+            dropped_commits: 0,
+            deleted_blocks: 0,
+        });
+    }
+    let (kept, dropped) = chain.split_at(keep_last_n);
+
+    // Collect every block CID reachable from a set of commits: the commit blocks
+    // themselves plus all nodes of each covering ProllyTree index.
+    let reachable = |commits: &[DistributedDatomCommit]| -> Result<HashSet<[u8; 36]>, DistributedCommitError> {
+        let mut set = HashSet::new();
+        for c in commits {
+            set.insert(c.cid.0);
+            for root in c.index_roots.values() {
+                for cid in ProllyTree::walk_all_cids(root, store)? {
+                    set.insert(cid.0);
+                }
+            }
+        }
+        Ok(set)
+    };
+
+    let keep_set = reachable(kept)?;
+    let drop_set = reachable(dropped)?;
+
+    let mut deleted = 0usize;
+    for raw in drop_set.difference(&keep_set) {
+        store.delete(&KotobaCid(*raw))?;
+        deleted += 1;
+    }
+
+    Ok(GcReport {
+        kept_commits: kept.len(),
+        dropped_commits: dropped.len(),
+        deleted_blocks: deleted,
+    })
+}
+
 /// Wraps a `BlockStore`, forwarding every `put` to the inner store at NORMAL
 /// speed (hot + fire-and-forget async cold) while RECORDING each (cid, data).
 ///
@@ -8503,5 +8589,64 @@ mod tests {
                 "N={state_len:>7}  seed={seed_ms:>6}ms  from_datoms={from_datoms_ms:>5}ms  ceavt_build={ceavt_ms:>5}ms  WARM_2datom_transact={warm_tx_ms:>6}ms"
             );
         }
+    }
+
+    #[test]
+    fn gc_history_prunes_old_commits_keeps_current() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let graph = KotobaCid::from_bytes(b"gc-test-graph");
+
+        // Commit 1: a small covering tree.
+        let v1: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..50u32).map(|i| (format!("k{i:04}").into_bytes(), b"v1".to_vec())).collect();
+        let root1 = ProllyTree::build_tree(v1, &store).unwrap();
+        let mut roots1 = std::collections::HashMap::new();
+        roots1.insert(ROOT_EAVT.to_string(), root1.clone());
+        let c1 = DistributedDatomCommit::seal(
+            graph.clone(), KotobaCid::from_bytes(b"tx1"), None,
+            "did:key:test".into(), 1, roots1, None,
+        ).unwrap();
+        c1.persist(&store).unwrap();
+
+        // Commit 2: a DIFFERENT, larger tree (distinct blocks) chained on c1.
+        let v2: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..2000u32).map(|i| (format!("k{i:04}").into_bytes(), b"v2-larger-value".to_vec())).collect();
+        let root2 = ProllyTree::build_tree(v2, &store).unwrap();
+        let mut roots2 = std::collections::HashMap::new();
+        roots2.insert(ROOT_EAVT.to_string(), root2.clone());
+        let c2 = DistributedDatomCommit::seal(
+            graph, KotobaCid::from_bytes(b"tx2"), Some(c1.cid.clone()),
+            "did:key:test".into(), 2, roots2, None,
+        ).unwrap();
+        c2.persist(&store).unwrap();
+
+        // Blocks reachable only from the dropped commit c1 (its tree + commit block).
+        let c1_only: Vec<_> = {
+            use std::collections::HashSet;
+            let keep: HashSet<[u8; 36]> = ProllyTree::walk_all_cids(&root2, &store)
+                .unwrap().into_iter().map(|c| c.0).chain(std::iter::once(c2.cid.0)).collect();
+            ProllyTree::walk_all_cids(&root1, &store).unwrap().into_iter()
+                .chain(std::iter::once(c1.cid.clone()))
+                .filter(|c| !keep.contains(&c.0)).collect()
+        };
+        assert!(!c1_only.is_empty(), "test needs c1-exclusive blocks");
+
+        let report = gc_history(&c2.cid, 1, &store).unwrap();
+        assert_eq!(report.kept_commits, 1);
+        assert_eq!(report.dropped_commits, 1);
+        assert_eq!(report.deleted_blocks, c1_only.len());
+
+        // current commit + its whole tree survive (DB value readable)
+        assert!(store.get(&c2.cid).unwrap().is_some());
+        for cid in ProllyTree::walk_all_cids(&root2, &store).unwrap() {
+            assert!(store.get(&cid).unwrap().is_some(), "current tree block deleted!");
+        }
+        // dropped-only blocks are gone
+        for cid in &c1_only {
+            assert!(store.get(cid).unwrap().is_none(), "stale block survived gc");
+        }
+        // idempotent
+        let again = gc_history(&c2.cid, 1, &store).unwrap();
+        assert_eq!(again.deleted_blocks, 0);
     }
 }

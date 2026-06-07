@@ -22,6 +22,7 @@ pub const NSID_DATOMIC_TX_RANGE: &str = "com.etzhayyim.apps.kotoba.datomic.txRan
 pub const NSID_DATOMIC_LOG: &str = "com.etzhayyim.apps.kotoba.datomic.log";
 pub const NSID_DATOMIC_BASIS_T: &str = "com.etzhayyim.apps.kotoba.datomic.basisT";
 pub const NSID_DATOMIC_DB_STATS: &str = "com.etzhayyim.apps.kotoba.datomic.dbStats";
+pub const NSID_DATOMIC_GC: &str = "com.etzhayyim.apps.kotoba.datomic.gc";
 pub const NSID_DATOMIC_ENTITY: &str = "com.etzhayyim.apps.kotoba.datomic.entity";
 pub const NSID_DATOMIC_IDENT: &str = "com.etzhayyim.apps.kotoba.datomic.ident";
 pub const NSID_DATOMIC_ENTID: &str = "com.etzhayyim.apps.kotoba.datomic.entid";
@@ -55,8 +56,8 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use ed25519_dalek::Signer;
 use kotoba_datomic::distributed::{
-    CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter, DistributedDatomCommit,
-    DistributedDatomReader, DistributedTransactRequest, RemoteIpfsBlockStore,
+    gc_history, CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter,
+    DistributedDatomCommit, DistributedDatomReader, DistributedTransactRequest, RemoteIpfsBlockStore,
     RemoteIpfsIpnsRegistry, ROOT_AEVT, ROOT_AVET, ROOT_EAVT, ROOT_TEA, ROOT_VAET,
 };
 use kotoba_ipfs::{IpnsName, IpnsRegistry, IpnsRegistryError};
@@ -6289,6 +6290,56 @@ pub async fn datomic_basis_t(
             graph: req.graph,
             basis_t: basis_t_resp(&db),
         }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DatomicGcReq {
+    pub graph: String,
+    /// Number of most-recent commits to retain (clamped to ≥1). Older commits'
+    /// history blocks that no kept commit references are deleted.
+    #[serde(default = "default_gc_keep")]
+    pub keep_last_n: usize,
+}
+fn default_gc_keep() -> usize {
+    1
+}
+
+/// POST /xrpc/com.etzhayyim.apps.kotoba.datomic.gc
+///
+/// Operator-only. Prunes deep Datomic history for `graph`, keeping the newest
+/// `keep_last_n` commits and deleting ProllyTree/commit blocks reachable only
+/// from older ones. Safe on the shared block store: KSE-journal / vault blocks
+/// are never referenced by Datomic commits, so they are never deleted.
+pub async fn datomic_gc(
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DatomicGcReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+    let graph_cid = parse_graph_cid(&req.graph)?;
+    let ipns_name = distributed_graph_ipns_name(&graph_cid);
+    let head = match state.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
+        Ok(record) => kotoba_core::cid::KotobaCid::from_multibase(&record.value),
+        Err(IpnsRegistryError::NotFound(_)) => None,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("ipns: {e}"))),
+    };
+    let Some(head) = head else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no distributed Datomic/IPNS head for graph {}", req.graph),
+        ));
+    };
+    let report = gc_history(&head, req.keep_last_n, &*state.block_store)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("gc: {e}")))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "graph": req.graph,
+            "keptCommits": report.kept_commits,
+            "droppedCommits": report.dropped_commits,
+            "deletedBlocks": report.deleted_blocks,
+        })),
     ))
 }
 
