@@ -54,6 +54,11 @@ pub const NSID_SYNC_EVENTS: &str = "com.etzhayyim.apps.kotoba.sync.events";
 /// Datomic commit chain (no Journal) — journal-independent durable replay.
 pub const NSID_SYNC_EVENTS_FROM_COMMITS: &str =
     "com.etzhayyim.apps.kotoba.sync.eventsFromCommits";
+/// Cross-graph CommitDag firehose: merge every registered graph's commit feed,
+/// ordered by `(ts, graph, per-graph seq)`. The whole-node datomic change feed
+/// without a journal.
+pub const NSID_SYNC_EVENTS_ALL_GRAPHS: &str =
+    "com.etzhayyim.apps.kotoba.sync.eventsAllGraphs";
 
 /// Hard cap on a single paging response so a huge cold backfill can't OOM the node.
 const MAX_PAGE_LIMIT: usize = 1000;
@@ -110,7 +115,7 @@ async fn gate(
 /// One firehose event in JSON form. `payload` is decoded as JSON when the
 /// Journal payload is valid JSON (the common case — quads/records are JSON),
 /// otherwise it is a base64 string of the raw bytes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FirehoseEvent {
     pub seq: u64,
     pub ts: u64,
@@ -120,6 +125,45 @@ pub struct FirehoseEvent {
 }
 
 impl FirehoseEvent {
+    /// Build a firehose event from a Datom — the single source of the `{topic,
+    /// payload}` shape, shared by the CommitDag reconstruction and the live
+    /// in-memory publish on the commit path. Matches the legacy Journal
+    /// projection (assert → `Topic::quad_spo`, retract → `kotoba/retract/...`).
+    pub fn from_datom(
+        datom: &kotoba_datomic::Datom,
+        graph_cid: &KotobaCid,
+        seq: u64,
+        ts: u64,
+    ) -> Self {
+        let quad = crate::xrpc::datom_to_projection_quad(datom, graph_cid);
+        let topic = if datom.added {
+            Topic::quad_spo(
+                &quad.graph.to_multibase(),
+                &quad.subject.to_multibase(),
+                &quad.predicate,
+                &format!("{:?}", quad.object),
+            )
+            .0
+        } else {
+            format!(
+                "kotoba/retract/{}/{}/{}",
+                quad.graph, quad.subject, quad.predicate
+            )
+        };
+        let payload = serde_json::to_value(&quad).unwrap_or(serde_json::Value::Null);
+        let cid = KotobaCid::from_bytes(
+            &serde_json::to_vec(&quad).unwrap_or_default(),
+        )
+        .to_multibase();
+        FirehoseEvent {
+            seq,
+            ts,
+            topic,
+            cid,
+            payload,
+        }
+    }
+
     fn from_entry(e: &JournalEntry) -> Self {
         let payload = match serde_json::from_slice::<serde_json::Value>(&e.payload) {
             Ok(v) => v,
@@ -305,32 +349,12 @@ fn firehose_events_from_commitdag(
     for entry in &range {
         for datom in &entry.datoms {
             seq += 1;
-            let quad = crate::xrpc::datom_to_projection_quad(datom, &graph_cid);
-            // Topic byte-for-byte matching the Journal projection (journal_assert
-            // → Topic::quad_spo; journal_retract → kotoba/retract/{g}/{s}/{p}).
-            let topic = if datom.added {
-                Topic::quad_spo(
-                    &quad.graph.to_multibase(),
-                    &quad.subject.to_multibase(),
-                    &quad.predicate,
-                    &format!("{:?}", quad.object),
-                )
-                .0
-            } else {
-                format!(
-                    "kotoba/retract/{}/{}/{}",
-                    quad.graph, quad.subject, quad.predicate
-                )
-            };
-            let payload =
-                serde_json::to_value(&quad).unwrap_or(serde_json::Value::Null);
-            events.push(FirehoseEvent {
+            events.push(FirehoseEvent::from_datom(
+                datom,
+                &graph_cid,
                 seq,
-                ts: entry.commit.ts,
-                topic,
-                cid: entry.commit.tx_cid.to_multibase(),
-                payload,
-            });
+                entry.commit.ts,
+            ));
         }
     }
     Ok(events)
@@ -350,6 +374,78 @@ pub async fn events_from_commits(
     gate(&state, &headers, params.cacao_b64.as_deref()).await?;
 
     let all = firehose_events_from_commitdag(&state, &params.graph)?;
+    let current_seq = all.last().map(|e| e.seq).unwrap_or(0);
+
+    let from = params.cursor.unwrap_or(0);
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
+    let mut events: Vec<FirehoseEvent> = all.into_iter().filter(|e| e.seq > from).collect();
+    if let Some(prefix) = &params.topic_prefix {
+        events.retain(|e| e.topic.starts_with(prefix.as_str()));
+    }
+    let has_more = events.len() > limit;
+    events.truncate(limit);
+    let cursor = events.last().map(|e| e.seq).or(params.cursor).unwrap_or(0);
+
+    Ok(Json(EventsResponse {
+        events,
+        cursor,
+        current_seq,
+        has_more,
+    }))
+}
+
+// ── Cross-graph CommitDag firehose ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct AllGraphsParams {
+    pub cursor: Option<u64>,
+    pub limit: Option<usize>,
+    pub topic_prefix: Option<String>,
+    pub cacao_b64: Option<String>,
+}
+
+/// Merge every registered graph's CommitDag change feed into one whole-node feed.
+///
+/// Ordering is `(commit.ts, graph, per-graph seq)`. NOTE: `commit.ts` is whole
+/// seconds, so cross-graph order is timestamp-*approximate* — within a single
+/// graph it is exact. The returned `seq` is a global 1-based index over the
+/// merged order; it is stable for append-only growth (new commits sort to the
+/// tail) and serves as the resume cursor.
+fn firehose_events_all_graphs(
+    state: &KotobaState,
+) -> Result<Vec<FirehoseEvent>, (StatusCode, String)> {
+    let mut merged: Vec<(u64, String, u64, FirehoseEvent)> = Vec::new();
+    for record in state.ipns_registry.list() {
+        let Some(graph_mb) = record.name.0.strip_prefix("k51-kotoba-") else {
+            continue;
+        };
+        let per_graph = firehose_events_from_commitdag(state, graph_mb)?;
+        for ev in per_graph {
+            merged.push((ev.ts, graph_mb.to_string(), ev.seq, ev));
+        }
+    }
+    // (ts, graph, per-graph seq) — deterministic merge across graphs.
+    merged.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    let mut out = Vec::with_capacity(merged.len());
+    for (i, (_, _, _, mut ev)) in merged.into_iter().enumerate() {
+        ev.seq = (i as u64) + 1;
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+/// `GET /xrpc/com.etzhayyim.apps.kotoba.sync.eventsAllGraphs?cursor=N&limit=K&topic_prefix=...`
+///
+/// Whole-node datomic firehose reconstructed from every graph's CommitDag — the
+/// cross-graph equivalent of the per-datom Journal stream, with no journal.
+pub async fn events_all_graphs(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Query(params): Query<AllGraphsParams>,
+) -> Result<Json<EventsResponse>, (StatusCode, String)> {
+    gate(&state, &headers, params.cacao_b64.as_deref()).await?;
+
+    let all = firehose_events_all_graphs(&state)?;
     let current_seq = all.last().map(|e| e.seq).unwrap_or(0);
 
     let from = params.cursor.unwrap_or(0);

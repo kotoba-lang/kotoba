@@ -1322,6 +1322,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS_FROM_COMMITS),
             get(firehose::events_from_commits),
         )
+        .route(
+            &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS_ALL_GRAPHS),
+            get(firehose::events_all_graphs),
+        )
         // ── Realtime ingress (ADR-2606060001): bidirectional WebSocket (T1) ──
         // The bus is per-room and isolated from the firehose/gossip above.
         .route(
