@@ -60,11 +60,6 @@ pub struct QuadStore {
     block_store: Arc<dyn BlockStore + Send + Sync>,
     arrangements: Arc<DashMap<String, Arrangement>>, // graph_cid → Arrangement
     commit_dag: Arc<RwLock<CommitDag>>,
-    /// seq of the last successful commit — persisted as a checkpoint in the Journal store.
-    /// On startup this is loaded from the checkpoint before Journal replay so that
-    /// `replay_from_journal` only processes entries written *after* the last commit,
-    /// not the full WAL history.
-    committed_seq: Arc<RwLock<u64>>,
     /// Per-graph flag: `true` iff the hot arrangement is a SUPERSET of the committed
     /// cold ProllyTree (or there is no committed state).  In that case, query paths
     /// may short-circuit and return from hot alone.  Set to `false` after WAL replay
@@ -197,7 +192,6 @@ impl QuadStore {
             block_store,
             arrangements: Arc::new(DashMap::new()),
             commit_dag: Arc::new(RwLock::new(CommitDag::new())),
-            committed_seq: Arc::new(RwLock::new(0)),
             hot_covers_all: Arc::new(DashMap::new()),
             pending_datoms: Arc::new(DashMap::new()),
         }
@@ -525,128 +519,6 @@ impl QuadStore {
         self.record_exact_pending_datom(&graph_key, datom);
     }
 
-    /// Restore state from Journal on startup.
-    ///
-    /// Reads the checkpoint written by the last `commit()` call to find
-    /// `committed_seq`, then replays only Journal entries **after** that seq.
-    /// This ensures startup cost is O(uncommitted delta) regardless of total
-    /// data history — 1B quads committed = < 1s startup vs ~83 minutes previously.
-    ///
-    /// First-run (no checkpoint): falls back to replaying from seq=1.
-    pub async fn replay_from_journal(&self) {
-        // Load checkpoint; extract committed_seq and restore CommitDag heads.
-        let committed = if let Some(raw) = self.journal.read_checkpoint().await {
-            let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
-            let seq = value
-                .as_ref()
-                .and_then(|v| v["committed_seq"].as_u64())
-                .unwrap_or(0);
-            *self.committed_seq.write().await = seq;
-            tracing::info!(
-                committed_seq = seq,
-                "QuadStore: checkpoint found, replaying delta only"
-            );
-
-            // Restore CommitDag from checkpoint heads map.
-            if let Some(heads) = value.as_ref().and_then(|v| v["heads"].as_object()) {
-                let mut restored = 0usize;
-                for (_graph_mb, commit_mb) in heads {
-                    if let Some(commit_mb_str) = commit_mb.as_str() {
-                        if let Some(commit_cid) = KotobaCid::from_multibase(commit_mb_str) {
-                            match crate::commit::Commit::load(&commit_cid, &*self.block_store) {
-                                Ok(Some(commit)) => {
-                                    self.commit_dag.write().await.add(commit);
-                                    restored += 1;
-                                }
-                                Ok(None) => {
-                                    tracing::warn!(
-                                        commit_cid = %commit_cid,
-                                        "CommitDag restore: commit block not found in BlockStore"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        commit_cid = %commit_cid,
-                                        "CommitDag restore: failed to load commit: {e}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                tracing::info!(graphs = restored, "CommitDag restored from checkpoint");
-            }
-
-            seq
-        } else {
-            tracing::info!("QuadStore: no checkpoint, full WAL replay (first run)");
-            0
-        };
-
-        // Only load entries written after the last committed seq.
-        let entries = self.journal.read_since(committed + 1).await;
-        if entries.is_empty() {
-            return;
-        }
-
-        // (seq, journal entry CID as tx, is_assert, quad projection)
-        let mut ordered: Vec<(u64, KotobaCid, bool, Quad)> = Vec::new();
-
-        for entry in &entries {
-            let t = entry.topic.as_str();
-            // SPO assert topics: "/kotoba/quad/{graph}/..."
-            let is_assert = t.starts_with("/kotoba/quad/");
-            // Retract topics may appear with or without the normalized leading slash.
-            let is_retract = t.starts_with("kotoba/retract/") || t.starts_with("/kotoba/retract/");
-
-            if is_assert || is_retract {
-                if let Ok(quad) = serde_json::from_slice::<Quad>(&entry.payload) {
-                    ordered.push((entry.seq, entry.cid.clone(), is_assert, quad));
-                }
-            }
-        }
-
-        ordered.sort_unstable_by_key(|(seq, _, _, _)| *seq);
-        let total = ordered.len();
-
-        // Track which graphs the replay touched so we can re-evaluate their
-        // `hot_covers_all` flag once the full WAL has been loaded.
-        let mut replayed_graphs: std::collections::HashMap<String, KotobaCid> =
-            std::collections::HashMap::new();
-
-        for (_, tx_cid, is_assert, quad) in ordered {
-            let graph_cid = quad.graph.clone();
-            replayed_graphs
-                .entry(graph_cid.to_multibase())
-                .or_insert_with(|| graph_cid.clone());
-            let mut datom = Datom::from_legacy_quad(quad, is_assert);
-            datom.tx = tx_cid;
-            if is_assert {
-                self.assert_datom_silent(graph_cid, datom).await;
-            } else {
-                self.retract_datom_silent(graph_cid, datom).await;
-            }
-        }
-
-        // `assert_datom_silent`/`retract_datom_silent` conservatively mark
-        // `hot_covers_all = false` (replay may load only post-checkpoint delta on
-        // top of committed cold state). But when a graph has NO CommitDag head,
-        // the in-memory Arrangement is the *sole* source of its committed state —
-        // there is no cold ProllyTree to fall through to. In that case hot truly
-        // covers all committed datoms, so reads MUST (and may safely) be served
-        // from the hot index. Flip the flag to `true` for those graphs so the
-        // SPARQL hot-path activates instead of cold-scanning an empty/absent tree.
-        {
-            let dag = self.commit_dag.read().await;
-            for (key, graph_cid) in &replayed_graphs {
-                if dag.head(graph_cid).is_none() {
-                    self.hot_covers_all.insert(key.clone(), true);
-                }
-            }
-        }
-
-        tracing::info!(entries = total, "QuadStore WAL replay complete");
-    }
 
     pub async fn arrangement(&self, graph_cid: &KotobaCid) -> Option<Arrangement> {
         self.arrangements
@@ -3551,22 +3423,9 @@ impl QuadStore {
         self.commit_dag.write().await.add(commit);
         self.pending_datoms.remove(&graph_key);
 
-        // ── Checkpoint ────────────────────────────────────────────────────────────
-        // Record committed_seq (the JOURNAL's current seq, not the user-provided
-        // commit-seq) + CommitDag heads as a tiny JSON blob in the Journal store.
-        // On the next startup replay_from_journal() will skip all Journal entries
-        // ≤ this seq — reducing startup cost from O(all history) to O(delta) and
-        // preventing already-committed quads from being re-loaded into the hot
-        // arrangement (which would shadow the ProllyTree cold path).
+        // Trim the live-tail ring buffer (in-process memory free). Durable state
+        // is the CommitDag; there is no checkpoint/WAL to record.
         let journal_seq = self.journal.current_seq().await;
-        *self.committed_seq.write().await = journal_seq;
-        {
-            let heads = self.commit_dag.read().await.heads_as_map();
-            let cp = serde_json::json!({ "committed_seq": journal_seq, "heads": heads });
-            let bytes = bytes::Bytes::from(cp.to_string().into_bytes());
-            self.journal.write_checkpoint(bytes).await;
-        }
-        // Trim ring buffer (in-process memory free).
         self.journal.trim_before(journal_seq).await;
         // Trim persistent seq-index in B2 (fire-and-forget; old seq keys deleted).
         {

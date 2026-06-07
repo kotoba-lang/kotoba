@@ -18,11 +18,9 @@ pub struct JournalEntry {
     pub topic: String,
     pub payload: Vec<u8>,
     pub cid: KotobaCid, // IPFS-compatible CID of the payload bytes
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev: Option<KotobaCid>, // block CID of the previous entry (Merkle chain)
 }
 
-/// Cursor — consumer position in a Journal
+/// Cursor — consumer position in the live bus.
 pub struct Cursor {
     pub id: String,
     pub position: u64,
@@ -34,8 +32,6 @@ impl Cursor {
         self.rx.recv().await.ok()
     }
 }
-
-pub struct CursorAck;
 
 /// LiveBus (historically "Journal") — a purely **in-memory** ordered event bus.
 ///
@@ -88,7 +84,6 @@ impl Journal {
             topic: topic.0,
             payload: payload.to_vec(),
             cid,
-            prev: None,
         };
         let _ = self.tx.send(entry.clone());
 
@@ -145,14 +140,6 @@ impl Journal {
 
     /// No-op: the bus has no persistent backlog to trim.
     pub async fn trim_persistent_before(&self, _before: u64) {}
-
-    /// Checkpointing is gone with persistence — durable state is the CommitDag;
-    /// restart rebuilds the resident caches from it (`warm_datomic_live_caches`).
-    pub async fn write_checkpoint(&self, _data: Bytes) {}
-
-    pub async fn read_checkpoint(&self) -> Option<Bytes> {
-        None
-    }
 }
 
 impl Default for Journal {
@@ -324,17 +311,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_and_read_checkpoint_without_store_are_noops() {
-        let journal = Journal::new(); // no head_path → no-op
-        journal.write_checkpoint(Bytes::from_static(b"ckpt")).await;
-        let result = journal.read_checkpoint().await;
-        assert!(
-            result.is_none(),
-            "read_checkpoint without store must return None"
-        );
-    }
-
-    #[tokio::test]
     async fn read_since_all_from_zero_returns_everything() {
         let journal = Journal::new();
         let t = Topic::new("all/entries");
@@ -343,24 +319,6 @@ mod tests {
         journal.publish(t.clone(), Bytes::from_static(b"3")).await;
         let all = journal.read_since(1).await;
         assert_eq!(all.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn merkle_prev_links_form_chain() {
-        let journal = Journal::new();
-        let t = Topic::new("merkle/chain");
-        let e1 = journal
-            .publish(t.clone(), Bytes::from_static(b"first"))
-            .await;
-        let e2 = journal
-            .publish(t.clone(), Bytes::from_static(b"second"))
-            .await;
-        // First entry has no prev; second entry's prev should match something or be None
-        // (in-memory journal without block store: prev is always None at entry level, but
-        //  the head CID IS tracked in self.head for block-store journals)
-        assert!(e1.prev.is_none(), "first entry should have no prev");
-        // For an in-memory journal without block store, prev is also None (no CBOR blocks)
-        let _ = e2; // just ensure it was created without panic
     }
 }
 

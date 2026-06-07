@@ -907,15 +907,6 @@ impl KotobaState {
         self.identity.signing_key.clone()
     }
 
-    /// Replay Journal WAL into the in-memory QuadStore Arrangement.
-    ///
-    /// Must be called once after `KotobaState::new()` and before serving
-    /// requests.  When the Journal is backed by B2 this recovers all quads
-    /// written in previous runs; with in-memory-only Journal it is a no-op.
-    pub async fn replay_wal(&self) {
-        self.quad_store.replay_from_journal().await;
-    }
-
     /// Get-or-create the per-graph serialisation lock + resident `db_before`
     /// slot for `datomic.transact` (ADR-2605302130). The returned async Mutex is
     /// held across a transact so db_before read + commit + cache refresh are

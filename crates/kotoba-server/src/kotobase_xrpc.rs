@@ -403,24 +403,7 @@ async fn count_pins(
     (count, bytes)
 }
 
-fn text_for_subject(
-    datoms: &[kotoba_datomic::Datom],
-    subject: &KotobaCid,
-    predicate: &str,
-) -> Option<String> {
-    datoms
-        .iter()
-        .find(|datom| datom.e == *subject && datom.a == predicate)
-        .and_then(|datom| datom_text(&datom.v))
-}
 
-fn int_for_subject(datoms: &[kotoba_datomic::Datom], subject: &KotobaCid, predicate: &str) -> i64 {
-    datoms
-        .iter()
-        .find(|datom| datom.e == *subject && datom.a == predicate)
-        .and_then(|datom| datom_int(&datom.v))
-        .unwrap_or(0)
-}
 
 fn now_unix_str() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -1440,13 +1440,6 @@ pub async fn run() -> anyhow::Result<()> {
 
     state.register_node().await;
 
-    {
-        let quad_store = Arc::clone(&state.quad_store);
-        tokio::spawn(async move {
-            quad_store.replay_from_journal().await;
-        });
-    }
-
     #[cfg(feature = "p2p")]
     let state = if std::env::var("KOTOBA_NO_SWARM").is_err() {
         use kotoba_net::KotobaSwarm;
