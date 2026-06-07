@@ -478,7 +478,6 @@ mod tests {
             topic: topic.to_string(),
             payload: payload.to_vec(),
             cid: KotobaCid::from_bytes(payload),
-            prev: None,
         }
     }
 
