@@ -39,7 +39,9 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kse::{Cursor, Journal, JournalEntry};
+use kotoba_datomic::distributed::DistributedDatomReader;
+use kotoba_ipfs::{IpnsName, IpnsRegistryError};
+use kotoba_kse::{Cursor, Journal, JournalEntry, Topic};
 
 use crate::graph_auth::{check_read_access, AccessDenied};
 use crate::server::KotobaState;
@@ -48,6 +50,10 @@ use crate::server::KotobaState;
 pub const NSID_SYNC_SUBSCRIBE: &str = "com.etzhayyim.apps.kotoba.sync.subscribe";
 /// JSON cursor paging / long-poll firehose.
 pub const NSID_SYNC_EVENTS: &str = "com.etzhayyim.apps.kotoba.sync.events";
+/// CommitDag-derived firehose: reconstruct one graph's change feed from the
+/// Datomic commit chain (no Journal) — journal-independent durable replay.
+pub const NSID_SYNC_EVENTS_FROM_COMMITS: &str =
+    "com.etzhayyim.apps.kotoba.sync.eventsFromCommits";
 
 /// Hard cap on a single paging response so a huge cold backfill can't OOM the node.
 const MAX_PAGE_LIMIT: usize = 1000;
@@ -247,6 +253,114 @@ pub async fn events(
         .unwrap_or(0);
 
     let events = entries.iter().map(FirehoseEvent::from_entry).collect();
+
+    Ok(Json(EventsResponse {
+        events,
+        cursor,
+        current_seq,
+        has_more,
+    }))
+}
+
+// ── CommitDag-derived firehose (journal-free) ────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CommitEventsParams {
+    /// Graph CID (multibase) to reconstruct the change feed for.
+    pub graph: String,
+    pub cursor: Option<u64>,
+    pub limit: Option<usize>,
+    pub topic_prefix: Option<String>,
+    pub cacao_b64: Option<String>,
+}
+
+/// Build the ordered firehose events for one graph straight from its Datomic
+/// commit chain — the same `{topic,payload}` a Journal entry would carry, but
+/// derived from `tx_range_from_head` instead of a persisted per-datom log. The
+/// `seq` is a stable 1-based index in commit order (older commits keep their seq
+/// as new ones append), so it works as a resumable cursor.
+fn firehose_events_from_commitdag(
+    state: &KotobaState,
+    graph_mb: &str,
+) -> Result<Vec<FirehoseEvent>, (StatusCode, String)> {
+    let graph_cid = KotobaCid::from_multibase(graph_mb)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid graph CID".to_string()))?;
+    let ipns_name = crate::xrpc::distributed_graph_ipns_name(&graph_cid);
+    let head = match state.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
+        Ok(record) => KotobaCid::from_multibase(&record.value),
+        Err(IpnsRegistryError::NotFound(_)) => None,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("ipns: {e}"))),
+    };
+    let Some(head) = head else {
+        return Ok(Vec::new());
+    };
+
+    let reader = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry);
+    let range = reader
+        .tx_range_from_head(&head, None, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tx_range: {e}")))?;
+
+    let mut events = Vec::new();
+    let mut seq = 0u64;
+    for entry in &range {
+        for datom in &entry.datoms {
+            seq += 1;
+            let quad = crate::xrpc::datom_to_projection_quad(datom, &graph_cid);
+            // Topic byte-for-byte matching the Journal projection (journal_assert
+            // → Topic::quad_spo; journal_retract → kotoba/retract/{g}/{s}/{p}).
+            let topic = if datom.added {
+                Topic::quad_spo(
+                    &quad.graph.to_multibase(),
+                    &quad.subject.to_multibase(),
+                    &quad.predicate,
+                    &format!("{:?}", quad.object),
+                )
+                .0
+            } else {
+                format!(
+                    "kotoba/retract/{}/{}/{}",
+                    quad.graph, quad.subject, quad.predicate
+                )
+            };
+            let payload =
+                serde_json::to_value(&quad).unwrap_or(serde_json::Value::Null);
+            events.push(FirehoseEvent {
+                seq,
+                ts: entry.commit.ts,
+                topic,
+                cid: entry.commit.tx_cid.to_multibase(),
+                payload,
+            });
+        }
+    }
+    Ok(events)
+}
+
+/// `GET /xrpc/com.etzhayyim.apps.kotoba.sync.eventsFromCommits?graph=&cursor=N&limit=K&topic_prefix=...`
+///
+/// Journal-free firehose backfill: reconstructs one graph's change feed from the
+/// CommitDag. Identical `{topic,payload}` to the Journal-backed `sync.events`,
+/// so a consumer can replay durable history even when `KOTOBA_JOURNAL_WAL=off`
+/// has dropped the per-datom journal blocks.
+pub async fn events_from_commits(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Query(params): Query<CommitEventsParams>,
+) -> Result<Json<EventsResponse>, (StatusCode, String)> {
+    gate(&state, &headers, params.cacao_b64.as_deref()).await?;
+
+    let all = firehose_events_from_commitdag(&state, &params.graph)?;
+    let current_seq = all.last().map(|e| e.seq).unwrap_or(0);
+
+    let from = params.cursor.unwrap_or(0);
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
+    let mut events: Vec<FirehoseEvent> = all.into_iter().filter(|e| e.seq > from).collect();
+    if let Some(prefix) = &params.topic_prefix {
+        events.retain(|e| e.topic.starts_with(prefix.as_str()));
+    }
+    let has_more = events.len() > limit;
+    events.truncate(limit);
+    let cursor = events.last().map(|e| e.seq).or(params.cursor).unwrap_or(0);
 
     Ok(Json(EventsResponse {
         events,
