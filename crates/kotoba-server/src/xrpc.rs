@@ -2679,17 +2679,17 @@ pub(crate) async fn commit_protocol_datoms(
     // journal replay); opt out with KOTOBA_JOURNAL_WAL=off to drop the double
     // write. The hot-arrangement update (`apply_journaled_datom`) ALWAYS runs —
     // it serves hot reads and is independent of the WAL block-write.
+    // Datomic firehose: ephemeral live-tail broadcast, no Journal block persist
+    // (the CommitDag is the durable record; sync.eventsFromCommits replays it).
     let mut journal_cids = Vec::with_capacity(datoms.len());
     for datom in &datoms {
-        if state.journal_wal_enabled {
-            let quad = datom_to_projection_quad(datom, &graph_cid);
-            let cid = if datom.added {
-                state.journal_assert(&quad).await
-            } else {
-                state.journal_retract(&quad).await
-            };
-            journal_cids.push(cid);
-        }
+        let quad = datom_to_projection_quad(datom, &graph_cid);
+        let cid = if datom.added {
+            state.journal_assert_ephemeral(&quad).await
+        } else {
+            state.journal_retract_ephemeral(&quad).await
+        };
+        journal_cids.push(cid);
         state
             .quad_store
             .apply_journaled_datom(graph_cid.clone(), datom_to_projection_kqe(datom))
@@ -4896,25 +4896,24 @@ pub async fn datomic_transact(
     let distributed_commit = distributed.commit;
     let tx_datoms = distributed.datoms;
 
+    // Datomic firehose: broadcast each datom to the live-tail (ephemeral — NO
+    // Journal block persist), since the commit is already durable in the CommitDag
+    // and replayable via sync.eventsFromCommits / eventsAllGraphs. This removes the
+    // redundant per-datom Journal copy entirely (the Journal now persists only
+    // non-datomic topics: signal / realtime / kse pub-sub).
     let mut journal_cids = Vec::with_capacity(tx_datoms.len());
     for datom in &tx_datoms {
         let quad = datom_to_projection_quad(datom, &graph_cid);
-        let journal_cid = if datom.added {
-            let cid = state.journal_assert(&quad).await;
-            state
-                .quad_store
-                .apply_journaled_datom(graph_cid.clone(), datom_to_projection_kqe(datom))
-                .await;
-            cid
+        let cid = if datom.added {
+            state.journal_assert_ephemeral(&quad).await
         } else {
-            let cid = state.journal_retract(&quad).await;
-            state
-                .quad_store
-                .apply_journaled_datom(graph_cid.clone(), datom_to_projection_kqe(datom))
-                .await;
-            cid
+            state.journal_retract_ephemeral(&quad).await
         };
-        journal_cids.push(journal_cid);
+        state
+            .quad_store
+            .apply_journaled_datom(graph_cid.clone(), datom_to_projection_kqe(datom))
+            .await;
+        journal_cids.push(cid);
     }
 
     // Refresh the resident db_before cache from the actual committed datoms
