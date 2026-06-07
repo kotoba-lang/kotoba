@@ -62,9 +62,15 @@ rejected (the only place "reject" survives).
 1. **HLC clock** — add `hlc` to commits; cross-graph firehose orders by HLC
    instead of wall-clock `ts`. Foundation for both causal ordering and the merge
    tiebreak. *(this PR)*
-2. **Multi-parent DAG + Merkle-CRDT merge** — `parents: Vec<KotobaCid>`;
-   `StaleParent` → auto-merge with the resolution above; convergence test
-   (two writers, independent commits, identical root CID after merge).
+2. **Multi-parent DAG + Merkle-CRDT merge**
+   - **2a (done)** — `parents: Vec<KotobaCid>` on commits (true multi-parent DAG;
+     `seal_merge`); pure `merge_live_sets` (HLC-LWW / OR-set) +
+     `gather_concurrent_ops`; property tests prove commutativity, idempotence and
+     two-writer convergence to one live set.
+   - **2b** — wire into the live transact CAS: `StaleParent` → auto-merge (gather
+     `(base,theirs]`, merge, `seal_merge`, CAS-retry loop), behind
+     `KOTOBA_MERGE_ON_CONFLICT` until a concurrent-transact integration test
+     lands; default stays reject.
 3. **Validation hook** — `:db.validate/*` + optional WASM validator on transact
    and on merge results.
 4. **Declared replication** — per-graph replication policy enforced by the DHT
