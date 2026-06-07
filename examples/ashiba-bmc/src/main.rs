@@ -391,15 +391,9 @@ async fn main() -> Result<()> {
     let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(tiered);
     println!("BlockStore: TieredBlockStore<BudgetedMemory(64MiB), KuboIpfs>");
 
-    // 2. Journal — Merkle WAL backed by block_store; head pointer in a sibling JSON file.
-    let store_path =
-        std::env::var("KOTOBA_STORE_PATH").unwrap_or_else(|_| "/tmp/ashiba-bmc-kse".into());
-    let head_path = format!("{store_path}.journal-head.json");
-    let journal = Arc::new(Journal::with_block_store(
-        Arc::clone(&block_store),
-        head_path,
-    ));
-    println!("Journal:    Merkle WAL on block_store (head={store_path}.journal-head.json)");
+    // 2. LiveBus — in-memory ephemeral event bus (durable state = CommitDag).
+    let journal = Arc::new(Journal::new());
+    println!("LiveBus:    in-memory (durable replay via CommitDag)");
 
     // 3. Datom projection store — wraps Journal + BlockStore; provides Arrangement + ProllyTree commit.
     let quad_store = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store));
