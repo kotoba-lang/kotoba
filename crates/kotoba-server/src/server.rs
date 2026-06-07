@@ -641,15 +641,22 @@ impl KotobaState {
         };
 
         // Journal — Merkle WAL backed by block_store; head pointer in a sibling JSON file.
-        let journal = Arc::new(match &store_path {
-            Some(path) => {
+        //
+        // With `KOTOBA_JOURNAL_WAL=off` the per-entry block persistence is dropped:
+        // the Journal stays an in-memory broadcast + ring (firehose live-tail and the
+        // gossip relay keep working), while durable firehose replay is served from the
+        // CommitDag (`sync.eventsFromCommits` → tx_range_from_head). The CommitDag is
+        // already the durable WAL (ADR-2606041151), so the per-datom journal blocks
+        // were a redundant second copy of every change.
+        let journal = Arc::new(match (&store_path, journal_wal_enabled) {
+            (Some(path), true) => {
                 let head_path = format!("{path}.journal-head.json");
                 tracing::info!("KSE Journal: block-store persistence enabled");
                 Journal::with_block_store(Arc::clone(&block_store), head_path)
             }
-            None => {
+            _ => {
                 tracing::info!(
-                    "KSE Journal: in-memory only (set KOTOBA_STORE_PATH for persistence)"
+                    "KSE Journal: in-memory only (live-tail via broadcast; durable replay via CommitDag)"
                 );
                 Journal::new()
             }

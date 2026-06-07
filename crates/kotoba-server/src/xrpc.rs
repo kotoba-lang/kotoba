@@ -2274,7 +2274,7 @@ fn did_document_ipns_name(did: &str) -> String {
     crate::server::did_document_ipns_name(did)
 }
 
-fn datom_to_projection_quad(
+pub(crate) fn datom_to_projection_quad(
     datom: &kotoba_datomic::Datom,
     graph_cid: &kotoba_core::cid::KotobaCid,
 ) -> kotoba_kqe::quad::LegacyQuad {
