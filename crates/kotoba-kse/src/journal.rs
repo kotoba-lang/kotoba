@@ -108,6 +108,23 @@ impl Journal {
     }
 
     pub async fn publish(&self, topic: Topic, payload: Bytes) -> JournalEntry {
+        self.publish_inner(topic, payload, true).await
+    }
+
+    /// Broadcast + ring-buffer an entry **without** persisting a block.
+    ///
+    /// Used for the datomic firehose: every committed datom is already durable in
+    /// the CommitDag (ProllyTree + IPNS head), so persisting a second copy in the
+    /// Journal's Merkle chain is pure redundancy. The ephemeral publish keeps the
+    /// unified live-tail (broadcast) and short backlog (ring) — durable replay of
+    /// datomic comes from the CommitDag (`sync.eventsFromCommits` /
+    /// `eventsAllGraphs`) — so the per-datom Journal blocks drop to zero
+    /// regardless of `KOTOBA_JOURNAL_WAL`.
+    pub async fn publish_ephemeral(&self, topic: Topic, payload: Bytes) -> JournalEntry {
+        self.publish_inner(topic, payload, false).await
+    }
+
+    async fn publish_inner(&self, topic: Topic, payload: Bytes, persist: bool) -> JournalEntry {
         let mut seq_guard = self.seq.write().await;
         *seq_guard += 1;
         let seq = *seq_guard;
@@ -140,8 +157,8 @@ impl Journal {
             }
         }
 
-        // Persist to block store as a Merkle chain entry
-        if let Some(store) = &self.store {
+        // Persist to block store as a Merkle chain entry (skipped for ephemeral).
+        if let (true, Some(store)) = (persist, &self.store) {
             let mut cbor = Vec::new();
             if ciborium::into_writer(&entry, &mut cbor).is_ok() {
                 let block_cid = KotobaCid::from_bytes(&cbor);

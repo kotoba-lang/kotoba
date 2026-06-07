@@ -1343,7 +1343,9 @@ impl KotobaState {
             if let Some(tx_cid) = &tx_cid {
                 datom.tx = tx_cid.clone();
             }
-            self.journal_assert_datom(&graph_cid, &datom).await;
+            // Already committed to the CommitDag above (commit_datoms) — announce
+            // to the live-tail without a redundant Journal block.
+            self.journal_assert_datom_ephemeral(&graph_cid, &datom).await;
             self.quad_store
                 .apply_journaled_datom(graph_cid.clone(), datom)
                 .await;
@@ -1398,6 +1400,17 @@ impl KotobaState {
     ///
     /// Returns the JournalEntry CID string.
     pub async fn journal_assert(&self, quad: &Quad) -> String {
+        self.journal_assert_with(quad, true).await
+    }
+
+    /// Ephemeral assert: broadcast + ring (live-tail) but **no** block persist.
+    /// Used by the datomic commit path — the datom is already durable in the
+    /// CommitDag, so the Journal must not keep a redundant second copy.
+    pub async fn journal_assert_ephemeral(&self, quad: &Quad) -> String {
+        self.journal_assert_with(quad, false).await
+    }
+
+    async fn journal_assert_with(&self, quad: &Quad, persist: bool) -> String {
         let object_str = format!("{:?}", quad.object);
         let topic = Topic::quad_spo(
             &quad.graph.to_multibase(),
@@ -1417,7 +1430,11 @@ impl KotobaState {
                 .ok();
         }
 
-        let entry = self.journal.publish(topic, Bytes::from(payload)).await;
+        let entry = if persist {
+            self.journal.publish(topic, Bytes::from(payload)).await
+        } else {
+            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+        };
         entry.cid.to_multibase()
     }
 
@@ -1428,6 +1445,18 @@ impl KotobaState {
     /// back to Quad at the call site.
     pub async fn journal_assert_datom(&self, graph_cid: &KotobaCid, datom: &KqeDatom) -> String {
         self.journal_assert(&datom_journal_quad(graph_cid, datom))
+            .await
+    }
+
+    /// Ephemeral datom assert — live-tail broadcast only, no Journal block.
+    /// For callers whose datoms are already durable in the CommitDag (e.g. node
+    /// self-registration commits then announces), so the Journal copy is redundant.
+    pub async fn journal_assert_datom_ephemeral(
+        &self,
+        graph_cid: &KotobaCid,
+        datom: &KqeDatom,
+    ) -> String {
+        self.journal_assert_ephemeral(&datom_journal_quad(graph_cid, datom))
             .await
     }
 
@@ -1471,6 +1500,15 @@ impl KotobaState {
 
     /// Publish a Quad retract to the KSE Journal.
     pub async fn journal_retract(&self, quad: &Quad) -> String {
+        self.journal_retract_with(quad, true).await
+    }
+
+    /// Ephemeral retract: broadcast + ring (live-tail) but **no** block persist.
+    pub async fn journal_retract_ephemeral(&self, quad: &Quad) -> String {
+        self.journal_retract_with(quad, false).await
+    }
+
+    async fn journal_retract_with(&self, quad: &Quad, persist: bool) -> String {
         let topic = Topic(format!(
             "kotoba/retract/{}/{}/{}",
             quad.graph, quad.subject, quad.predicate
@@ -1485,7 +1523,11 @@ impl KotobaState {
                 .ok();
         }
 
-        let entry = self.journal.publish(topic, Bytes::from(payload)).await;
+        let entry = if persist {
+            self.journal.publish(topic, Bytes::from(payload)).await
+        } else {
+            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+        };
         entry.cid.to_multibase()
     }
 
