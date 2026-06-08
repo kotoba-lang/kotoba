@@ -213,6 +213,33 @@ def register_rule(rule_cls):  # type: ignore[no-untyped-def]
 # ── Built-in rules (six per ADR-2605240200) ───────────────────────────
 
 
+def _next_pow2_up(n: int) -> int:
+    """Smallest power of two strictly greater than ``n`` (min 2)."""
+    p = 1
+    while p <= n:
+        p <<= 1
+    return max(p, 2)
+
+
+def _pow2_at_least(n: int) -> int:
+    """Smallest power of two >= ``n`` (min 1)."""
+    p = 1
+    while p < n:
+        p <<= 1
+    return p
+
+
+def _lru_patch_hint(cur_capacity: int, new_value: int) -> str:
+    """Auto-applicable patch hint for the daemonset LRU_MAX env value.
+
+    Emits the ``'old' -> 'new'`` form the Kaizen PR agent applies directly
+    (literal first-occurrence replace), so an Observer proposal flows to a
+    real PR without a human translating the hint. Targets the k8s env value
+    line ``value: "<N>"`` where N == current LRU_MAX (== warm_capacity).
+    """
+    return f"'value: \"{cur_capacity}\"' -> 'value: \"{new_value}\"'"
+
+
 @register_rule
 class SweepLatencyP95Rule:
     rule_id = "sweep-latency-p95"
@@ -258,9 +285,13 @@ class SweepLatencyP95Rule:
                         target_files=[
                             f"50-infra/k8s/unispsc-organism-fleet/shard-{shard.shard}/daemonset.yaml"
                         ],
+                        # Auto-applicable: bump LRU_MAX to the next power of two
+                        # so the PR agent can patch + open a PR without a human
+                        # translating the hint. warm_capacity == current LRU_MAX.
                         patch_hint=(
-                            "env UNISPSC_ORGANISM_LRU_MAX → next power-of-two up; "
-                            "verify against limits.memory."
+                            _lru_patch_hint(shard.warm_capacity, _next_pow2_up(shard.warm_capacity))
+                            if shard.warm_capacity > 0
+                            else "env UNISPSC_ORGANISM_LRU_MAX → next power-of-two up; verify against limits.memory."
                         ),
                         test_plan=[
                             "kubectl apply -k 50-infra/k8s/unispsc-organism-fleet/",
@@ -317,8 +348,10 @@ class LruSaturationRule:
                         target_files=[
                             f"50-infra/k8s/unispsc-organism-fleet/shard-{shard.shard}/daemonset.yaml"
                         ],
-                        patch_hint=(
-                            f"UNISPSC_ORGANISM_LRU_MAX → {shard.owned_count} (own all codes)"
+                        # Auto-applicable: size LRU_MAX to the next power of two
+                        # >= owned_count so warm cache can hold all owned codes.
+                        patch_hint=_lru_patch_hint(
+                            shard.warm_capacity, _pow2_at_least(shard.owned_count)
                         ),
                         test_plan=[
                             "Apply and observe warmCount == ownedCount after warmup",
