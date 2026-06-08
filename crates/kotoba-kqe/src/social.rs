@@ -31,7 +31,7 @@
 //! [`SocialCapitalView`] MaterializedView reducer and the [`SocialCapitalLedger`]
 //! share one decay primitive; `kotoba-server::social` re-exports this module.
 
-use crate::datom::Value;
+use crate::datom::{Datom, Value};
 use crate::delta::Delta;
 use kotoba_core::cid::KotobaCid;
 use std::collections::HashMap;
@@ -130,6 +130,194 @@ pub fn step_social_capital(prev_smic: i64, mint_smic: i64, burn_smic: i64, lambd
 #[inline]
 pub fn points_to_smic(points: i64) -> i64 {
     points.saturating_mul(SCALE)
+}
+
+// ── Mint engine (the upstream of the loop, ADR-2606082100 §3/§4) ──────────────
+//
+// Turns *validated* value-acts into `social/mint|burn` Datoms. Validation is
+// enforced by the type system: a `Validated*` value cannot be constructed from an
+// unvalidated act (spec §7 — "minting on assertion alone is prohibited"). The
+// actual I/O that produces these inputs (anchor-chain `eth_getLogs` for terminal
+// ClaimStakeEscrow state, CitationLedger hits, KaizenObserver wellbecoming-Δ) is a
+// thin server-side job (follow-up); the deterministic weighing + Datom emission
+// lives here so it is testable and replay-stable.
+
+#[inline]
+fn sat_i64(x: i128) -> i64 {
+    if x > i64::MAX as i128 {
+        i64::MAX
+    } else if x < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        x as i64
+    }
+}
+
+/// Economic params — the `social/capital/params/active` blob (spec §1). Weights
+/// are integer **milli-weights** (×1000) so all minting math is deterministic
+/// integer (no persisted floats). Council-attested + method-versioned in production.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MintParams {
+    pub half_life_epochs: u64,
+    /// points per validated disclosure (1000 = 1.0).
+    pub w_disclosure_milli: i64,
+    /// points per unit wellbecoming-Δ (2000 = 2.0; long-term > disclosure).
+    pub w_wellbecoming_milli: i64,
+    /// extra disclosure points per CitationLedger hit (100 = 0.1).
+    pub citation_bonus_milli: i64,
+    /// burn > original mint for falsified disclosure (1500 = 1.5 — asymmetric downside).
+    pub burn_falsified_mult_milli: i64,
+}
+
+impl Default for MintParams {
+    fn default() -> Self {
+        // spec §1 reference defaults.
+        Self {
+            half_life_epochs: HALF_LIFE_EPOCHS,
+            w_disclosure_milli: 1_000,
+            w_wellbecoming_milli: 2_000,
+            citation_bonus_milli: 100,
+            burn_falsified_mult_milli: 1_500,
+        }
+    }
+}
+
+/// A disclosure that PASSED validation — terminal honest ClaimStakeEscrow state
+/// (`Refunded`/`Upheld`) AND witness quorum met. Cannot be constructed otherwise
+/// (spec §7). Holds the validated count + CitationLedger hits for weighing.
+#[derive(Clone, Debug)]
+pub struct ValidatedDisclosure {
+    pub did: KotobaCid,
+    pub epoch: u64,
+    pub n_validated: i64,
+    pub citation_hits: i64,
+}
+
+impl ValidatedDisclosure {
+    /// Returns `None` unless the disclosure reached a terminal honest on-chain
+    /// state, the witness quorum was met, and there is ≥1 validated disclosure.
+    pub fn new(
+        did: KotobaCid,
+        epoch: u64,
+        n_validated: i64,
+        citation_hits: i64,
+        terminal_honest: bool,
+        witness_quorum_met: bool,
+    ) -> Option<Self> {
+        if terminal_honest && witness_quorum_met && n_validated > 0 && citation_hits >= 0 {
+            Some(Self { did, epoch, n_validated, citation_hits })
+        } else {
+            None
+        }
+    }
+
+    /// Mint smic = `SCALE·(w_disclosure·n_validated + citation_bonus·hits)` (spec §3a).
+    pub fn mint_smic(&self, p: &MintParams) -> i64 {
+        let units_milli = (p.w_disclosure_milli as i128) * (self.n_validated as i128)
+            + (p.citation_bonus_milli as i128) * (self.citation_hits as i128);
+        sat_i64((SCALE as i128) * units_milli / 1_000)
+    }
+
+    /// The `social/mint/disclosure/<epoch>` Datom to commit, or `None` if smic ≤ 0.
+    pub fn mint_datom(&self, p: &MintParams, graph: &KotobaCid) -> Option<Datom> {
+        let smic = self.mint_smic(p);
+        (smic > 0).then(|| {
+            Datom::assert(
+                self.did.clone(),
+                MintSource::Disclosure.mint_predicate(self.epoch),
+                Value::Integer(smic),
+                graph.clone(),
+            )
+        })
+    }
+}
+
+/// A Council Lv6+ ≥3 attested wellbecoming measurement (KaizenObserver Δ, ADR-0075).
+/// `delta` may be ±: positive mints, negative burns (Council-attested harm).
+/// Cannot be constructed without the attestation (spec §3b/§4).
+#[derive(Clone, Debug)]
+pub struct ValidatedWellbecoming {
+    pub did: KotobaCid,
+    pub epoch: u64,
+    pub delta: i64,
+}
+
+impl ValidatedWellbecoming {
+    pub fn new(did: KotobaCid, epoch: u64, delta: i64, council_attested: bool) -> Option<Self> {
+        council_attested.then_some(Self { did, epoch, delta })
+    }
+
+    /// Mint smic for `Δ > 0`: `SCALE·w_wellbecoming·Δ` (spec §3b). 0 if `Δ ≤ 0`.
+    pub fn mint_smic(&self, p: &MintParams) -> i64 {
+        if self.delta <= 0 {
+            return 0;
+        }
+        sat_i64((SCALE as i128) * (p.w_wellbecoming_milli as i128) * (self.delta as i128) / 1_000)
+    }
+
+    /// Burn smic for `Δ < 0`: `SCALE·w_wellbecoming·|Δ|` (spec §4). 0 if `Δ ≥ 0`.
+    pub fn burn_smic(&self, p: &MintParams) -> i64 {
+        if self.delta >= 0 {
+            return 0;
+        }
+        sat_i64(
+            (SCALE as i128) * (p.w_wellbecoming_milli as i128) * (self.delta.unsigned_abs() as i128)
+                / 1_000,
+        )
+    }
+
+    /// The `social/mint/wellbecoming/<e>` (Δ>0) or `social/burn/<e>` (Δ<0) Datom,
+    /// or `None` for Δ == 0.
+    pub fn datom(&self, p: &MintParams, graph: &KotobaCid) -> Option<Datom> {
+        use std::cmp::Ordering::*;
+        match self.delta.cmp(&0) {
+            Greater => Some(Datom::assert(
+                self.did.clone(),
+                MintSource::Wellbecoming.mint_predicate(self.epoch),
+                Value::Integer(self.mint_smic(p)),
+                graph.clone(),
+            )),
+            Less => Some(Datom::assert(
+                self.did.clone(),
+                burn_predicate(self.epoch),
+                Value::Integer(self.burn_smic(p)),
+                graph.clone(),
+            )),
+            Equal => None,
+        }
+    }
+}
+
+/// A disclosure later FALSIFIED (the agent's own claim lost a challenge =
+/// `Slashed` on the anchor chain). Drives the asymmetric "嘘で損" burn (spec §4).
+#[derive(Clone, Debug)]
+pub struct Falsification {
+    pub did: KotobaCid,
+    pub epoch: u64,
+    pub count: i64,
+}
+
+impl Falsification {
+    /// Burn smic = `SCALE·burn_falsified_mult·w_disclosure·count` (spec §4) —
+    /// more than the truth earned, so lying is net-negative.
+    pub fn burn_smic(&self, p: &MintParams) -> i64 {
+        let num = (p.burn_falsified_mult_milli as i128)
+            * (p.w_disclosure_milli as i128)
+            * (self.count as i128);
+        sat_i64((SCALE as i128) * num / 1_000_000) // two milli divisions
+    }
+
+    pub fn burn_datom(&self, p: &MintParams, graph: &KotobaCid) -> Option<Datom> {
+        let smic = self.burn_smic(p);
+        (smic > 0).then(|| {
+            Datom::assert(
+                self.did.clone(),
+                burn_predicate(self.epoch),
+                Value::Integer(smic),
+                graph.clone(),
+            )
+        })
+    }
 }
 
 /// An immutable, append-only social-capital fact. No monetary field exists by
@@ -636,5 +824,92 @@ mod tests {
     fn view_unknown_did_is_zero() {
         let v = SocialCapitalView::new();
         assert_eq!(v.capital(&did("did:key:nobody"), 100), 0);
+    }
+
+    // ── Mint engine (the upstream of the loop) ────────────────────────────
+
+    #[test]
+    fn mint_params_defaults_match_spec() {
+        let p = MintParams::default();
+        assert_eq!(p.half_life_epochs, 30);
+        assert_eq!(p.w_disclosure_milli, 1_000); // 1.0
+        assert_eq!(p.w_wellbecoming_milli, 2_000); // 2.0
+        assert_eq!(p.citation_bonus_milli, 100); // 0.1/hit
+        assert_eq!(p.burn_falsified_mult_milli, 1_500); // 1.5
+    }
+
+    #[test]
+    fn disclosure_validation_gate_enforced() {
+        let d = did("did:key:a");
+        // not terminal-honest → None (cannot mint from unvalidated disclosure)
+        assert!(ValidatedDisclosure::new(d.clone(), 0, 2, 5, false, true).is_none());
+        // quorum not met → None
+        assert!(ValidatedDisclosure::new(d.clone(), 0, 2, 5, true, false).is_none());
+        // n_validated 0 → None
+        assert!(ValidatedDisclosure::new(d.clone(), 0, 0, 5, true, true).is_none());
+        // valid → Some
+        assert!(ValidatedDisclosure::new(d, 0, 2, 5, true, true).is_some());
+    }
+
+    #[test]
+    fn disclosure_mint_smic_weighs_count_plus_citations() {
+        let p = MintParams::default();
+        // 2 validated + 5 citation hits → 1.0*2 + 0.1*5 = 2.5 points
+        let d = ValidatedDisclosure::new(did("did:key:a"), 0, 2, 5, true, true).unwrap();
+        assert_eq!(d.mint_smic(&p), 2_500_000); // 2.5 * SCALE
+    }
+
+    #[test]
+    fn wellbecoming_gate_and_sign_split() {
+        let p = MintParams::default();
+        let d = did("did:key:w");
+        // not council-attested → None
+        assert!(ValidatedWellbecoming::new(d.clone(), 0, 3, false).is_none());
+        // Δ>0 mints w*Δ = 2.0*3 = 6 points; burn 0
+        let pos = ValidatedWellbecoming::new(d.clone(), 0, 3, true).unwrap();
+        assert_eq!(pos.mint_smic(&p), 6 * SCALE);
+        assert_eq!(pos.burn_smic(&p), 0);
+        // Δ<0 burns w*|Δ| = 2.0*2 = 4 points; mint 0
+        let neg = ValidatedWellbecoming::new(d, 0, -2, true).unwrap();
+        assert_eq!(neg.mint_smic(&p), 0);
+        assert_eq!(neg.burn_smic(&p), 4 * SCALE);
+    }
+
+    #[test]
+    fn falsification_burn_is_asymmetric() {
+        let p = MintParams::default();
+        // 2 falsified → 1.5 * 1.0 * 2 = 3 points burned (> the 2 they'd have earned)
+        let f = Falsification { did: did("did:key:liar"), epoch: 0, count: 2 };
+        assert_eq!(f.burn_smic(&p), 3 * SCALE);
+    }
+
+    #[test]
+    fn mint_datoms_drive_the_view_end_to_end() {
+        // The loop closes: validated acts → Datoms → SocialCapitalView → capital.
+        let p = MintParams::default();
+        let g = did("g:social:2026");
+        let alice = did("did:key:alice");
+
+        let disc = ValidatedDisclosure::new(alice.clone(), 0, 2, 5, true, true).unwrap(); // 2.5
+        let wb = ValidatedWellbecoming::new(alice.clone(), 0, 3, true).unwrap(); // +6.0
+
+        let mut datoms = Vec::new();
+        datoms.extend(disc.mint_datom(&p, &g));
+        datoms.extend(wb.datom(&p, &g));
+        assert_eq!(datoms.len(), 2);
+
+        let deltas: Vec<Delta> = datoms.into_iter().map(Delta::assert_datom).collect();
+        let mut view = SocialCapitalView::new();
+        view.apply(&deltas);
+
+        // capital = 2.5 + 6.0 = 8.5 points
+        assert_eq!(view.capital(&alice, 0), 8_500_000);
+    }
+
+    #[test]
+    fn wellbecoming_zero_delta_emits_no_datom() {
+        let p = MintParams::default();
+        let w = ValidatedWellbecoming::new(did("did:key:z"), 0, 0, true).unwrap();
+        assert!(w.datom(&p, &did("g")).is_none());
     }
 }
