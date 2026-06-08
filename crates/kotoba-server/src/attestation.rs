@@ -1068,6 +1068,7 @@ mod tests {
 
         let commit = writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: "k51-attestation-vc-distributed".into(),
                 graph,
@@ -1146,6 +1147,7 @@ mod tests {
 
         let commit = writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: "k51-attestation-challenge-distributed".into(),
                 graph,

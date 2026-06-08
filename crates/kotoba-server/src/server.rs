@@ -1267,6 +1267,7 @@ impl KotobaState {
             .collect::<Vec<_>>();
         let distributed = DistributedCommitWriter::new(&*self.block_store, &*self.ipns_registry)
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph_cid.clone(),
                 datoms: distributed_datoms,
@@ -1769,6 +1770,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
@@ -1879,6 +1881,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,

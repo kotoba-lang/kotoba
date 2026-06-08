@@ -2649,6 +2649,7 @@ pub(crate) async fn commit_protocol_datoms(
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     let distributed = writer
         .commit_datoms(CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: ipns_name.clone(),
             graph: graph_cid.clone(),
             datoms: datoms.clone(),
@@ -2774,6 +2775,7 @@ fn commit_did_document_registry_datoms(
     }
     DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
         .commit_datoms(CommitDatomsRequest {
+            merge_parents: None,
             ipns_name,
             graph: graph_cid,
             datoms,
@@ -7727,6 +7729,7 @@ pub async fn commit_store(
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     let report = writer
         .commit_datoms(CommitDatomsRequest {
+            merge_parents: None,
             ipns_name,
             graph: graph_cid,
             datoms: db.datoms(),
@@ -9409,6 +9412,7 @@ mod tests {
             let e = KotobaCid::from_bytes(b"pp-alice");
             DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
                 .commit_datoms(CommitDatomsRequest {
+                    merge_parents: None,
                     ipns_name: distributed_graph_ipns_name(graph),
                     graph: graph.clone(),
                     covering_datoms: None,
@@ -9621,6 +9625,7 @@ mod tests {
 
         let report = writer
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 ipns_name: "k51-protocol-normalization".into(),
                 graph,
                 datoms,
@@ -10327,6 +10332,7 @@ mod tests {
 
         let report = writer
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 ipns_name: "k51-capability-scope".into(),
                 graph,
                 datoms,
@@ -11479,6 +11485,7 @@ mod tests {
         let tx = KotobaCid::from_bytes(b"xrpc-remote-datomic-q-tx");
         let report = writer
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
                 covering_datoms: None,
