@@ -278,6 +278,20 @@ class KaizenPrAgent:
                 pr_url = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "PR created"
             logging.info(f"PR result: {pr_url}")
 
+            # 5b. Record a pending PR outcome so the meta-reflector can later
+            # score this rule by whether the PR was merged or rejected (the loop
+            # learning from its own output). Only real PRs are trackable.
+            if not self.dry_run:
+                try:
+                    from kotodama.organism.kaizen.fitness import append_pending_outcome
+                    rule_id = proposal.get("ruleId", "?")
+                    outcomes_path = self.proposal_queue_path.parent / (
+                        self.proposal_queue_path.stem + ".outcomes.ndjson"
+                    )
+                    append_pending_outcome(outcomes_path, rule_id=rule_id, pr_url=pr_url, branch=branch_name)
+                except Exception as exc:  # noqa: BLE001 — outcome tracking is best-effort
+                    logging.warning("could not record PR outcome for meta-reflection: %s", exc)
+
             # 6. Update queue file
             self.proposal_queue_path.write_text("\n".join(remaining_lines) + "\n" if remaining_lines else "")
             logging.info("Proposal consumed and queue updated.")

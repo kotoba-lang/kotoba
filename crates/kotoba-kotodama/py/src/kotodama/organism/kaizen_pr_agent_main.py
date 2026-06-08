@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,39 @@ def _dry_run() -> bool:
     return os.environ.get("KAIZEN_PR_AGENT_DRY_RUN", "true").lower() not in ("0", "false", "no")
 
 
+def _resolve_meta_outcomes(proposal_path: Path, repo_root: Path) -> dict[str, int]:
+    """Resolve pending PR outcomes (via `gh pr view`) into the shared rule-fitness
+    ledger, so the observer can prune rules whose PRs keep getting rejected."""
+    outcomes_path = proposal_path.parent / (proposal_path.stem + ".outcomes.ndjson")
+    if not outcomes_path.exists():
+        return {"resolved": 0}
+    try:
+        from kotodama.organism.kaizen.fitness import RuleFitnessLedger, resolve_outcomes
+    except Exception:  # noqa: BLE001
+        return {"resolved": 0}
+    ledger = RuleFitnessLedger(proposal_path.parent / "rule-fitness.json")
+
+    def _state(rec: dict[str, Any]) -> str:
+        ref = rec.get("branch") or rec.get("prUrl")
+        if not ref:
+            return "unknown"
+        try:
+            out = subprocess.run(
+                ["gh", "pr", "view", str(ref), "--json", "state", "--jq", ".state"],
+                cwd=repo_root, capture_output=True, text=True, timeout=20,
+            )
+            s = (out.stdout or "").strip().upper()
+        except Exception:  # noqa: BLE001 — best-effort; leave pending on error
+            return "unknown"
+        return {"MERGED": "merged", "CLOSED": "closed", "OPEN": "open"}.get(s, "unknown")
+
+    try:
+        return resolve_outcomes(outcomes_path, ledger, _state)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("meta outcome resolution failed: %s", exc)
+        return {"resolved": 0}
+
+
 async def fire() -> dict[str, Any]:
     """One drain pass over the proposal queue. Returns a status dict.
 
@@ -76,10 +110,15 @@ async def fire() -> dict[str, Any]:
         except KaizenPrAgentAuthError as exc:
             logger.warning("PR agent auth not ready — skipping cycle: %s", exc)
             return {"ok": False, "reason": "auth", "consumed": 0, "urls": []}
-        if not proposal_path.exists() or proposal_path.stat().st_size == 0:
-            return {"ok": True, "consumed": 0, "urls": [], "dryRun": dry_run}
-        urls = agent.consume_all()
-        return {"ok": True, "consumed": len(urls), "urls": urls, "dryRun": dry_run}
+        urls = []
+        if proposal_path.exists() and proposal_path.stat().st_size != 0:
+            urls = agent.consume_all()
+        # Meta self-reflection: resolve any pending PR outcomes into the shared
+        # rule-fitness ledger (merged → accept, closed → reject). The observer
+        # reads the same ledger to prune rules humans keep rejecting — closing
+        # the loop's self-scoring + self-pruning across the two resident pods.
+        meta = _resolve_meta_outcomes(proposal_path, repo_root)
+        return {"ok": True, "consumed": len(urls), "urls": urls, "dryRun": dry_run, "meta": meta}
 
     status = await loop.run_in_executor(None, _drain)
     logger.info(
