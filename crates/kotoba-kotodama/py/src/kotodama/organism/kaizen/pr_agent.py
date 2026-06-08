@@ -28,11 +28,20 @@ class KaizenPrAgent:
     """
     Consumes Kaizen proposals, creates branches, applies patches, and opens GitHub PRs.
     """
-    def __init__(self, proposal_queue_path: Path, repo_root: Path, dry_run: bool = True):
+    def __init__(self, proposal_queue_path: Path, repo_root: Path, dry_run: bool = True,
+                 remote: "Any | None" = None):
         self.proposal_queue_path = proposal_queue_path
         self.repo_root = repo_root
         self.dry_run = dry_run
-        self._verify_gh_auth()
+        # Pluggable change target (GitRemote). Default = GitHub (back-compat);
+        # KotobaRemote makes the loop GitHub-independent (push to kotoba).
+        if remote is None:
+            from kotodama.organism.kaizen.git_remote import GithubRemote
+            remote = GithubRemote()
+        self.remote = remote
+        # gh auth is only required for the GitHub remote; kotoba needs none.
+        if getattr(self.remote, "name", "github") == "github":
+            self._verify_gh_auth()
 
     def _verify_gh_auth(self):
         """Verifies that the GitHub CLI is authenticated."""
@@ -248,35 +257,20 @@ class KaizenPrAgent:
                 ["git", "commit", "-m", pr_title], check=True, cwd=self.repo_root, capture_output=True
             )
 
-            # 6. Open the PR.
+            # 6. Open the change via the pluggable GitRemote.
             if self.dry_run:
                 # Validate locally only — patch applied + committed on the branch.
-                # No push, no `gh pr create` (which would require a remote branch),
-                # so a dry run has zero remote side effects.
-                logging.info("Dry-run: patched + committed on %s (no push/PR).", branch_name)
+                # No push / no change opened → zero remote side effects.
+                logging.info("Dry-run: patched + committed on %s (no push).", branch_name)
                 pr_url = "Dry run successful."
             else:
-                # Push the branch first — `gh pr create` opens the PR from the
-                # pushed head (non-interactive contexts require the branch on the
-                # remote; `--head` makes the head explicit).
-                logging.info("Pushing %s and creating GitHub PR.", branch_name)
-                # Configure git to authenticate pushes via the gh credential
-                # helper (uses GH_TOKEN). An anonymous clone of a public repo has
-                # no push credentials, so a bare `git push` fails with exit 128;
-                # `gh auth setup-git` wires github.com to gh's token.
-                subprocess.run(
-                    ["gh", "auth", "setup-git"], check=True, cwd=self.repo_root, capture_output=True
+                # GithubRemote → push + `gh pr create`; KotobaRemote → push the
+                # branch into kotoba's content-addressed Datom store (no GitHub).
+                pr_url = self.remote.open_change(
+                    repo_root=self.repo_root, branch=branch_name,
+                    title=pr_title, body=pr_body, labels=labels,
                 )
-                subprocess.run(
-                    ["git", "push", "-u", "origin", branch_name],
-                    check=True, cwd=self.repo_root, capture_output=True,
-                )
-                gh_command = ["gh", "pr", "create", "--head", branch_name, "--title", pr_title, "--body", pr_body]
-                for label in labels:
-                    gh_command.extend(["--label", label])
-                result = subprocess.run(gh_command, check=True, cwd=self.repo_root, capture_output=True, text=True)
-                pr_url = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "PR created"
-            logging.info(f"PR result: {pr_url}")
+            logging.info(f"change opened via {getattr(self.remote, 'name', '?')}: {pr_url}")
 
             # 5b. Record a pending PR outcome so the meta-reflector can later
             # score this rule by whether the PR was merged or rejected (the loop
