@@ -16,11 +16,12 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 ENV ETZ_REPO=/repo
 ARG WASMTIME_VERSION=44.0.0
 ARG FOUNDRY_VERSION=1.5.0
+ARG GH_VERSION=2.63.2
 ARG TARGETARCH
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash postgresql-client ca-certificates poppler-utils tesseract-ocr tesseract-ocr-jpn \
+ && apt-get install -y --no-install-recommends bash git postgresql-client ca-certificates poppler-utils tesseract-ocr tesseract-ocr-jpn \
  && rm -rf /var/lib/apt/lists/*
 
 ARG CACHE_BUST=1
@@ -38,6 +39,8 @@ RUN apt-get update \
     | tar -xJ --strip-components=1 -C /usr/local/bin "wasmtime-v${WASMTIME_VERSION}-${wasmtime_arch}/wasmtime" \
  && curl -fsSL "https://github.com/foundry-rs/foundry/releases/download/v${FOUNDRY_VERSION}/foundry_v${FOUNDRY_VERSION}_linux_${foundry_arch}.tar.gz" \
     | tar -xz -C /usr/local/bin cast \
+ && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${foundry_arch}.tar.gz" \
+    | tar -xz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION}_linux_${foundry_arch}/bin/gh" \
  && apt-get purge -y --auto-remove curl xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
