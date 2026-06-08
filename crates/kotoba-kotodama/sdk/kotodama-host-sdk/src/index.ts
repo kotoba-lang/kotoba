@@ -385,6 +385,10 @@ export type { ConsentHelper, ConsentSubmitInput, ConsentRequestRecord, ConsentVe
 export { createAgentLifecycle } from "./agent-lifecycle.js";
 export type { AgentLifecycle, AgentSpawnConfig, AgentRecord, AgentEvent, AgentStatus } from "./agent-lifecycle.js";
 
+// Generic S3-compatible blob helpers (provider-agnostic; B2 = one endpoint).
+export { s3Get, s3Put, s3Head, s3Delete } from "./s3.js";
+export type { S3Env, S3GetResult, S3PutOptions, S3HeadResult } from "./s3.js";
+// Backward-compat aliases — `b2*` re-exports the same s3 implementation.
 export { b2Get, b2Put, b2Head, b2Delete } from "./b2.js";
 export type { B2Env, B2GetResult, B2PutOptions, B2HeadResult } from "./b2.js";
 
