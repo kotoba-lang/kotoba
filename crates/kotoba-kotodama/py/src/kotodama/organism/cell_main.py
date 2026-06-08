@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 from kotodama.organism.inbox import InboundCommit
+from kotodama.organism.lifecycle import OrganismState
 from kotodama.organism.post_sink import resolve_post_sink
 from kotodama.organism.unispsc_organism import UnispscOrganism
 
@@ -48,11 +49,18 @@ def _ensure_organism() -> UnispscOrganism:
         level = os.environ.get("UNISPSC_ORGANISM_LOG_LEVEL", "INFO").upper()
         logging.basicConfig(level=getattr(logging, level, logging.INFO))
         _organism = _build_organism()
+        # Birth the organism so its lifecycle is ACTIVE — without this the
+        # tick gate (UnispscOrganism.tick early-returns a no-op dummy cadence
+        # while the lifecycle is INACTIVE) would make a fired cell never post.
+        # The cell-runner firing a cell IS the spawn event in production.
+        if _organism.lifecycle.state is OrganismState.INACTIVE:
+            _organism.lifecycle.handle_birth(_organism.actor_did)
         logger.info(
-            "organism initialized: code=%s did=%s title=%s",
+            "organism initialized: code=%s did=%s title=%s state=%s",
             _organism.code,
             _organism.actor_did,
             _organism.title,
+            _organism.lifecycle.state.value,
         )
     return _organism
 
