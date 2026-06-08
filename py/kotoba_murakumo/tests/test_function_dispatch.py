@@ -45,13 +45,13 @@ def test_remote_returns_string_through_litellm_gateway(monkeypatch, fleet_path) 
 
     app = App("smoke", fleet=fleet_path, did="did:web:test.etzhayyim.com")
 
-    @app.function(model="gemma3:4b")  # gpu=None → litellm-gateway
+    @app.function(model="gemma4:e4b")  # gpu=None → litellm-gateway
     def reply(text: str) -> str: ...
 
     out = reply.remote("hello")
     assert out == "echo:hello"
-    assert captured["url"] == "http://192.168.1.17:4000/v1/chat/completions"
-    assert captured["body"]["model"] == "gemma3:4b"
+    assert captured["url"] == "http://100.113.200.45:4000/v1/chat/completions"
+    assert captured["body"]["model"] == "gemma4:e4b"
 
 
 def test_remote_through_mac_mini_node_ollama(monkeypatch, fleet_path) -> None:
@@ -64,12 +64,11 @@ def test_remote_through_mac_mini_node_ollama(monkeypatch, fleet_path) -> None:
     _install_mock_clients(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(gpu=gpu.MacMini(node="judah"), model="gemma3:4b")
+    @app.function(gpu=gpu.MacMini(node="benjamin"), model="gemma4:e4b-it-qat")
     def f(x: str) -> str: ...
 
     assert f.remote("ping") == "own-node"
-    # judah ip_lan == 192.168.1.17, ollama at :11434
-    assert seen_urls[0] == "http://192.168.1.17:11434/v1/chat/completions"
+    assert seen_urls[0] == "http://100.75.169.8:11434/v1/chat/completions"
 
 
 def test_remote_through_evo_x2_litellm_uses_bearer(monkeypatch, fleet_path) -> None:
@@ -80,7 +79,7 @@ def test_remote_through_evo_x2_litellm_uses_bearer(monkeypatch, fleet_path) -> N
         return _ok("evo")
 
     _install_mock_clients(monkeypatch, handler)
-    monkeypatch.setenv("EVO_X2_LITELLM_KEY", "shh-secret")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "shh-secret")
     app = App("smoke", fleet=fleet_path)
 
     @app.function(gpu=gpu.EvoX2(), model="llama3.3:70b")
@@ -97,7 +96,7 @@ def test_remote_async_returns_string(monkeypatch, fleet_path) -> None:
     _install_mock_clients(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     out = asyncio.run(f.remote_async("hi"))
@@ -111,7 +110,7 @@ def test_spawn_returns_handle_and_get_blocks_for_result(monkeypatch, fleet_path)
     _install_mock_clients(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     handle = f.spawn("hi")
@@ -129,7 +128,7 @@ def test_map_returns_results_in_input_order(monkeypatch, fleet_path) -> None:
     _install_mock_clients(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     out = list(f.map(["a", "b", "c", "d"], concurrency=4, order_outputs=True))
@@ -150,7 +149,7 @@ def test_stream_yields_tokens(monkeypatch, fleet_path) -> None:
     _install_mock_clients(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     async def collect() -> list[str]:
@@ -175,7 +174,7 @@ def test_remote_writes_invocation_ndjson(monkeypatch, fleet_path, tmp_path) -> N
 
     app = App("smoke", fleet=fleet_path, did="did:web:caller.etzhayyim.com")
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     f.remote("PROMPT")
@@ -183,8 +182,8 @@ def test_remote_writes_invocation_ndjson(monkeypatch, fleet_path, tmp_path) -> N
     assert rec["app"] == "smoke"
     assert rec["fn"] == "f"
     assert rec["caller_did"] == "did:web:caller.etzhayyim.com"
-    assert rec["model"] == "gemma3:4b"
-    assert rec["endpoint"] == "http://192.168.1.17:4000"
+    assert rec["model"] == "gemma4:e4b"
+    assert rec["endpoint"] == "http://100.113.200.45:4000"
     assert rec["result_chars"] == len("RESULT")
     assert rec["phase"] == "sync"
     assert rec["charter_in"] == "clean"
@@ -198,7 +197,7 @@ def test_remote_http_error_becomes_fleet_unreachable(monkeypatch, fleet_path) ->
     _install_mock_clients(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     with pytest.raises(FleetUnreachable):

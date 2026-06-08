@@ -12,7 +12,7 @@ pub mod topic;
 pub mod vault;
 
 pub use agent_identity::AgentIdentity;
-pub use journal::{Cursor, CursorAck, Journal, JournalEntry};
+pub use journal::{Cursor, Journal, JournalEntry};
 pub use pre_key_registry::{
     PreKeyError, PreKeyRegistry, RekeyRevocationRecord, RULE_REKEY_REVOKED,
 };

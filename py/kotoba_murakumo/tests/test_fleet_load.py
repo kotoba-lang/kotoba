@@ -28,18 +28,21 @@ def test_load_canonical_fleet() -> None:
     # we require is that judah is present (LiteLLM gateway lives here).
     assert "judah" in fleet.nodes
     judah = fleet.node("judah")
-    assert judah.ip_lan == "192.168.1.17"
+    assert judah.ip_lan == "192.168.1.21"
 
-    # EVO-X2 endpoints declared by the SSoT.
+    # Fleet endpoints declared by the SSoT.
     litellm_ep = fleet.endpoint("evo-x2", "litellm")
-    assert litellm_ep.url == "http://192.168.1.70:4000"
-    assert litellm_ep.master_key_env == "EVO_X2_LITELLM_KEY"
+    assert litellm_ep.url == "http://100.113.200.45:4000"
+    assert litellm_ep.master_key_env == "LITELLM_MASTER_KEY"
 
     ollama_ep = fleet.endpoint("evo-x2", "ollama")
-    assert ollama_ep.url == "http://192.168.1.70:11434"
+    assert ollama_ep.url == "http://100.75.169.8:11434"
+
+    comfy_ep = fleet.endpoint("evo-x2", "comfyui")
+    assert comfy_ep.url == "http://100.75.169.8:8188"
 
     # Gateway URL is judah :4000 per CLAUDE.md.
-    assert fleet.litellm_gateway_url() == "http://192.168.1.17:4000"
+    assert fleet.litellm_gateway_url() == "http://100.113.200.45:4000"
 
 
 def test_missing_fleet_raises() -> None:
