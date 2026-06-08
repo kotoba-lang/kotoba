@@ -9,6 +9,7 @@ pub mod keycodec;
 pub mod mv;
 pub mod quad;
 pub mod schema;
+pub mod social;
 pub mod sql;
 
 pub use arrangement::Arrangement;
