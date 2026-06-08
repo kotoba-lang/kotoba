@@ -92,7 +92,9 @@ def test_lru_saturation_fires_when_at_capacity():
     assert len(proposals) == 1
     assert proposals[0].severity == "warn"
     assert proposals[0].suggested_action is not None
-    assert "4597" in proposals[0].suggested_action.patch_hint  # bump to own all
+    # Auto-applicable hint: bump LRU_MAX to the next power of two that holds
+    # all owned codes (>= 4597 → 8192), in the PR-agent's 'old' -> 'new' form.
+    assert proposals[0].suggested_action.patch_hint == "'value: \"4096\"' -> 'value: \"8192\"'"
 
 
 def test_lru_saturation_no_fire_when_owned_fits():
