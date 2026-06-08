@@ -48,7 +48,7 @@ def resolve(
         from ..gpu import from_modal_string
         gpu = from_modal_string(gpu)
 
-    resolved_model = model or "gemma3:4b"
+    resolved_model = model or "gemma4:e4b"
 
     if gpu is None or isinstance(gpu, AnyGpu):
         url = fleet.litellm_gateway_url(gateway_node=gateway_node)
@@ -71,7 +71,7 @@ def resolve(
     if isinstance(gpu, MacMini):
         node = fleet.node(gpu.node)
         return ResolvedRoute(
-            url=f"http://{node.ip_lan}:11434",
+            url=f"http://{node.stable_ip}:11434",
             model=resolved_model,
             backend=f"mac-mini/{node.name}",
             kind="ollama-native",

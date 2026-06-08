@@ -95,7 +95,7 @@ def test_remote_aborts_on_input_violation_when_enforce_on(
     _install_mock(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     with pytest.raises(CharterViolation):
@@ -115,7 +115,7 @@ def test_remote_aborts_on_output_violation_when_enforce_on(
     _install_mock(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     with pytest.raises(CharterViolation) as ei:
@@ -131,7 +131,7 @@ def test_remote_passes_through_when_enforce_off(monkeypatch, fleet_path) -> None
     _install_mock(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     # In advisory mode, the (Charter-violating) result is still returned.

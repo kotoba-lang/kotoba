@@ -5,7 +5,7 @@ Wire format mirrors ``kotoba-llm::http_infer`` (Rust): POST
 ``auth_bearer`` is provided.
 
 Sync, async, and streaming variants share the same request body. The endpoint
-URL passed in is the base (e.g. ``http://192.168.1.17:4000``); this module
+URL passed in is the base (e.g. ``http://100.113.200.45:4000``); this module
 appends ``/v1/chat/completions`` itself so the route resolver in
 :mod:`kotoba_murakumo._internal.routing` can keep talking in base-URL terms.
 """

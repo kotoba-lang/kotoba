@@ -22,9 +22,9 @@ def fleet():
 
 
 def test_none_routes_to_litellm_gateway(fleet) -> None:
-    r = resolve(None, "gemma3:4b", fleet)
+    r = resolve(None, "gemma4:e4b", fleet)
     assert r.backend == "litellm-gateway"
-    assert r.url == "http://192.168.1.17:4000"
+    assert r.url == "http://100.113.200.45:4000"
     assert r.kind == "openai-compatible"
     # The judah-hosted LiteLLM gateway requires bearer auth per
     # ADR-2605282400 §"Routing fix" (empirically verified 2026-05-28 —
@@ -33,28 +33,35 @@ def test_none_routes_to_litellm_gateway(fleet) -> None:
 
 
 def test_any_str_routes_to_litellm_gateway(fleet) -> None:
-    r = resolve("any", "gemma3:4b", fleet)
+    r = resolve("any", "gemma4:e4b", fleet)
     assert r.backend == "litellm-gateway"
 
 
 def test_mac_mini_routes_to_own_node_ollama(fleet) -> None:
-    r = resolve(gpu.MacMini(node="judah"), "gemma3:4b", fleet)
-    assert r.backend == "mac-mini/judah"
-    assert r.url == "http://192.168.1.17:11434"
+    r = resolve(gpu.MacMini(node="benjamin"), "gemma4:e4b-it-qat", fleet)
+    assert r.backend == "mac-mini/benjamin"
+    assert r.url == "http://100.75.169.8:11434"
     assert r.kind == "ollama-native"
 
 
 def test_evo_x2_default_prefers_litellm(fleet) -> None:
     r = resolve(gpu.EvoX2(), "llama3.3:70b", fleet)
     assert r.backend == "evo-x2"
-    assert r.url == "http://192.168.1.70:4000"
-    assert r.auth_bearer_env == "EVO_X2_LITELLM_KEY"
+    assert r.url == "http://100.113.200.45:4000"
+    assert r.auth_bearer_env == "LITELLM_MASTER_KEY"
 
 
 def test_evo_x2_prefer_ollama(fleet) -> None:
     r = resolve(gpu.EvoX2(prefer="ollama"), "llama3.2:3b", fleet)
-    assert r.url == "http://192.168.1.70:11434"
+    assert r.url == "http://100.75.169.8:11434"
     assert r.kind == "openai-compatible"  # ollama exposes OpenAI-compat
+
+
+def test_evo_x2_prefer_comfyui(fleet) -> None:
+    r = resolve(gpu.EvoX2(prefer="comfyui"), None, fleet)
+    assert r.backend == "evo-x2"
+    assert r.url == "http://100.75.169.8:8188"
+    assert r.kind == "comfyui-native"
 
 
 def test_modal_string_a100_routes_to_evo_x2(fleet) -> None:
@@ -70,4 +77,4 @@ def test_webgpu_lands_r2(fleet) -> None:
 
 def test_unknown_node_raises(fleet) -> None:
     with pytest.raises(FleetUnreachable):
-        resolve(gpu.MacMini(node="not-a-tribe"), "gemma3:4b", fleet)
+        resolve(gpu.MacMini(node="not-a-tribe"), "gemma4:e4b", fleet)
