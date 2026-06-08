@@ -595,6 +595,71 @@ impl SocialCapitalView {
     }
 }
 
+// ── Retainer allocation (the downstream of the loop, ADR-2606082100 §6) ───────
+//
+// Social capital is the DENOMINATOR of the donation pool: the epoch's
+// donation-funded retainer is split across pins proportional to the social
+// capital of each pin's originating agents. This is the precise sense in which
+// "how you generate social capital IS the economic system" — it literally decides
+// which rootCids the covenant pays to keep alive, and how much.
+
+/// One pin's origin set for retainer allocation (spec §6). `origin_dids` are the
+/// DIDs whose validated disclosure/wellbecoming produced the data under
+/// `root_cid` — sourced from `social/origin/<root_cid>` Datoms (an index built
+/// like [`SocialCapitalView`]; a follow-up). Here taken as input.
+#[derive(Clone, Debug)]
+pub struct PinOrigin {
+    pub pin_id: KotobaCid,
+    pub root_cid: KotobaCid,
+    pub origin_dids: Vec<KotobaCid>,
+}
+
+/// A pin's computed retainer share for an epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainerShare {
+    pub pin_id: KotobaCid,
+    /// `SC_root(root_cid, epoch)` in smic — Σ social capital of the pin's origin DIDs.
+    pub sc_root: i64,
+    /// mKOTO retainer = `pool · sc_root / Σ sc_root` (floor).
+    pub retainer_mkoto: i64,
+}
+
+/// Allocate the epoch's donation-funded retainer pool (`pool_mkoto`) across `pins`
+/// **proportional to the social capital of each pin's originating agents** (spec §6):
+///
+/// `retainer(pin) = pool · SC_root(pin) / Σ SC_root`,  `SC_root = Σ_{did∈origins} SC(did,e)`.
+///
+/// Returns `(shares, remainder)`. Floor division is **conserving**:
+/// `Σ shares + remainder == pool_mkoto`; the undistributed `remainder` (dust)
+/// rolls to the next epoch — never minted (no inflation). When total social
+/// capital is 0, nothing is funded and the whole pool rolls over: data with no
+/// validated social value is not paid to be kept alive.
+pub fn allocate_retainer(
+    pins: &[PinOrigin],
+    view: &SocialCapitalView,
+    now_epoch: u64,
+    pool_mkoto: i64,
+) -> (Vec<RetainerShare>, i64) {
+    let sc: Vec<i64> = pins
+        .iter()
+        .map(|p| view.capital_sum(p.origin_dids.iter(), now_epoch))
+        .collect();
+    let total: i128 = sc.iter().map(|&x| x as i128).sum();
+    let mut distributed: i128 = 0;
+    let mut shares = Vec::with_capacity(pins.len());
+    for (p, &sc_root) in pins.iter().zip(sc.iter()) {
+        let r = if total > 0 {
+            sat_i64((pool_mkoto as i128) * (sc_root as i128) / total)
+        } else {
+            0
+        };
+        distributed += r as i128;
+        shares.push(RetainerShare { pin_id: p.pin_id.clone(), sc_root, retainer_mkoto: r });
+    }
+    let remainder = sat_i64(pool_mkoto as i128 - distributed);
+    (shares, remainder)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,5 +976,98 @@ mod tests {
         let p = MintParams::default();
         let w = ValidatedWellbecoming::new(did("did:key:z"), 0, 0, true).unwrap();
         assert!(w.datom(&p, &did("g")).is_none());
+    }
+
+    // ── Retainer allocation (the downstream of the loop) ──────────────────
+
+    fn pin(id: &str, root: &str, origins: &[&KotobaCid]) -> PinOrigin {
+        PinOrigin {
+            pin_id: did(id),
+            root_cid: did(root),
+            origin_dids: origins.iter().map(|d| (*d).clone()).collect(),
+        }
+    }
+
+    #[test]
+    fn retainer_is_proportional_to_social_capital() {
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let mut v = SocialCapitalView::new();
+        v.apply(&[
+            mint_delta(&a, MintSource::Disclosure, 30 * SCALE, 0), // SC_root(pinA) = 30
+            mint_delta(&b, MintSource::Disclosure, 70 * SCALE, 0), // SC_root(pinB) = 70
+        ]);
+        let pins = [pin("pinA", "rootA", &[&a]), pin("pinB", "rootB", &[&b])];
+        let (shares, remainder) = allocate_retainer(&pins, &v, 0, 1_000);
+        assert_eq!(shares[0].retainer_mkoto, 300); // 1000 · 30/100
+        assert_eq!(shares[1].retainer_mkoto, 700); // 1000 · 70/100
+        assert_eq!(remainder, 0);
+    }
+
+    #[test]
+    fn retainer_conserves_pool() {
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let c = did("did:key:c");
+        let mut v = SocialCapitalView::new();
+        // 1/1/1 split of a pool not divisible by 3 → dust remainder, conserved.
+        v.apply(&[
+            mint_delta(&a, MintSource::Disclosure, 1 * SCALE, 0),
+            mint_delta(&b, MintSource::Disclosure, 1 * SCALE, 0),
+            mint_delta(&c, MintSource::Disclosure, 1 * SCALE, 0),
+        ]);
+        let pins = [
+            pin("p1", "r1", &[&a]),
+            pin("p2", "r2", &[&b]),
+            pin("p3", "r3", &[&c]),
+        ];
+        let pool = 1_000;
+        let (shares, remainder) = allocate_retainer(&pins, &v, 0, pool);
+        let sum: i64 = shares.iter().map(|s| s.retainer_mkoto).sum();
+        assert_eq!(sum + remainder, pool, "Σ shares + remainder == pool (conserving)");
+        assert_eq!(remainder, 1); // 1000 = 333+333+333 + 1 dust
+    }
+
+    #[test]
+    fn retainer_zero_capital_funds_nothing_and_rolls_over() {
+        let v = SocialCapitalView::new(); // no capital minted
+        let pins = [pin("p1", "r1", &[&did("did:key:a")])];
+        let (shares, remainder) = allocate_retainer(&pins, &v, 0, 5_000);
+        assert_eq!(shares[0].retainer_mkoto, 0);
+        assert_eq!(remainder, 5_000, "whole pool rolls over when no validated social value");
+    }
+
+    #[test]
+    fn retainer_root_sums_multiple_origin_dids() {
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let mut v = SocialCapitalView::new();
+        v.apply(&[
+            mint_delta(&a, MintSource::Disclosure, 20 * SCALE, 0),
+            mint_delta(&b, MintSource::Wellbecoming, 30 * SCALE, 0),
+        ]);
+        // one pin whose root was originated by BOTH a and b → SC_root = 50
+        let pins = [pin("p1", "r1", &[&a, &b])];
+        let (shares, _) = allocate_retainer(&pins, &v, 0, 999);
+        assert_eq!(shares[0].sc_root, 50 * SCALE);
+        assert_eq!(shares[0].retainer_mkoto, 999); // sole pin → whole pool
+    }
+
+    #[test]
+    fn retainer_tracks_decay_over_epochs() {
+        // As one agent's capital decays, its pin's share shrinks relative to a
+        // freshly-minting agent — the allocation re-weights toward current value.
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let mut v = SocialCapitalView::new();
+        v.apply(&[mint_delta(&a, MintSource::Disclosure, 100 * SCALE, 0)]);
+        v.apply(&[mint_delta(&b, MintSource::Disclosure, 100 * SCALE, 30)]); // b mints a half-life later
+        let pins = [pin("pa", "ra", &[&a]), pin("pb", "rb", &[&b])];
+        // at epoch 30: a decayed to ~50, b is 100 → b gets ~2x a's share.
+        let (shares, _) = allocate_retainer(&pins, &v, 30, 3_000);
+        assert!(shares[1].retainer_mkoto > shares[0].retainer_mkoto, "fresh b > decayed a");
+        // a ≈ 1000, b ≈ 2000 (±rounding from the ~50/100 split)
+        assert!((shares[0].retainer_mkoto - 1_000).abs() <= 20, "a={}", shares[0].retainer_mkoto);
+        assert!((shares[1].retainer_mkoto - 2_000).abs() <= 20, "b={}", shares[1].retainer_mkoto);
     }
 }
