@@ -22,6 +22,7 @@ pub mod pre_proxy;
 pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
+pub mod social;
 pub mod xrpc;
 
 use axum::{
