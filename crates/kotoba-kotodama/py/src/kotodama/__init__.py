@@ -54,7 +54,7 @@ try:
     from kotodama.langgraph_checkpoint_kotoba import KotobaCheckpointSaver
     from kotodama.langgraph_store_kotoba import KotobaStore
     _LG_RW_AVAILABLE = True
-except ImportError:  # pragma: no cover — langgraph is a [lg] optional dep
+except Exception:  # pragma: no cover — langgraph is a [lg] optional dep
     _LG_RW_AVAILABLE = False
     RisingWaveCheckpointSaver = None  # type: ignore[assignment]
     RisingWaveStore = None  # type: ignore[assignment]

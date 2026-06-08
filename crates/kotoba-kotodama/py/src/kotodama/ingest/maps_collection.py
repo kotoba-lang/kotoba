@@ -208,6 +208,58 @@ WIKIDATA_WORLD_TOTALS = {
     "bookshop": 10000, "prominentPlace": 50000,
 }
 
+PROPERTY_REGISTRY_COVERAGE_TARGETS = [
+    {
+        "sourceDid": "did:web:maps.etzhayyim.com:registry:wikidata:legal-entity",
+        "label": "LegalEntity",
+        "worldTotal": 500000,
+        "priorityWeight": 1.0,
+        "ttlHours": 720,
+    },
+    {
+        "sourceDid": "did:web:maps.etzhayyim.com:registry:wikidata:property-owner",
+        "label": "PropertyOwner",
+        "worldTotal": 500000,
+        "priorityWeight": 1.0,
+        "ttlHours": 720,
+    },
+    {
+        "sourceDid": "did:web:maps.etzhayyim.com:registry:wikidata:land-registry",
+        "label": "LandRegistry",
+        "worldTotal": 1000000,
+        "priorityWeight": 0.95,
+        "ttlHours": 720,
+    },
+    {
+        "sourceDid": "did:web:maps.etzhayyim.com:registry:wikidata:property-registry",
+        "label": "PropertyRegistry",
+        "worldTotal": 1000000,
+        "priorityWeight": 0.95,
+        "ttlHours": 720,
+    },
+    {
+        "sourceDid": "did:web:maps.etzhayyim.com:registry:wikidata:ownership",
+        "label": "OwnsProperty",
+        "worldTotal": 1000000,
+        "priorityWeight": 0.95,
+        "ttlHours": 720,
+    },
+    {
+        "sourceDid": "did:web:maps.etzhayyim.com:registry:wikidata:zoning",
+        "label": "ZoningRecord",
+        "worldTotal": 500000,
+        "priorityWeight": 0.7,
+        "ttlHours": 720,
+    },
+    {
+        "sourceDid": "did:web:maps.etzhayyim.com:registry:wikidata:construction-permit",
+        "label": "ConstructionPermit",
+        "worldTotal": 500000,
+        "priorityWeight": 0.7,
+        "ttlHours": 720,
+    },
+]
+
 OVERPASS_LABELS = [
     "Building", "Airport", "Station", "Port", "Road", "Railway", "AdminArea", "EvCharger",
     "InfraSegment", "Waterway", "River", "Mountain", "BusStop", "Parking", "PowerLine",
@@ -1796,6 +1848,8 @@ def seed_all_known_variations(dryRun: Any = False, **_: Any) -> dict[str, Any]:
             "ttlHours": 720,
             "kind": "wikidata",
         })
+    for target in PROPERTY_REGISTRY_COVERAGE_TARGETS:
+        candidates.append({**target, "kind": "propertyRegistry"})
     stac_world_totals = {"sentinel2": 5000000, "landsat": 2000000, "sentinel1": 1500000, "naip": 500000}
     for key, world_total in stac_world_totals.items():
         candidates.append({
@@ -1816,7 +1870,12 @@ def seed_all_known_variations(dryRun: Any = False, **_: Any) -> dict[str, Any]:
             "kind": "overpass",
         })
 
-    by_kind = {"wikidata": len(WIKIDATA_PROFILE_LABELS), "stac": len(stac_world_totals), "overpass": len(OVERPASS_LABELS)}
+    by_kind = {
+        "wikidata": len(WIKIDATA_PROFILE_LABELS),
+        "propertyRegistry": len(PROPERTY_REGISTRY_COVERAGE_TARGETS),
+        "stac": len(stac_world_totals),
+        "overpass": len(OVERPASS_LABELS),
+    }
     if bool(dryRun):
         return {"candidateCount": len(candidates), "inserted": 0, "skippedExisting": 0, "byKind": by_kind}
 
@@ -1825,7 +1884,7 @@ def seed_all_known_variations(dryRun: Any = False, **_: Any) -> dict[str, Any]:
     timestamp = now_iso()
     inserted = 0
     skipped = 0
-    inserted_by_kind = {"wikidata": 0, "stac": 0, "overpass": 0}
+    inserted_by_kind = {"wikidata": 0, "propertyRegistry": 0, "stac": 0, "overpass": 0}
     for candidate in candidates:
         source_did = _s(candidate["sourceDid"])
         label = _s(candidate["label"])
@@ -1948,7 +2007,18 @@ def refresh_coverage_stats(sourceDid: Any = None, label: Any = None, onlyZeroed:
 
 
 def _label_to_dataset_type(label: str) -> str:
-    if label in {"LegalEntity", "Operator", "PropertyOwner"}:
+    if label in {
+        "BusinessRegistry",
+        "ConstructionPermit",
+        "LandRegistry",
+        "LegalEntity",
+        "OperatingLicense",
+        "Operator",
+        "OwnsProperty",
+        "PropertyOwner",
+        "PropertyRegistry",
+        "ZoningRecord",
+    }:
         return "registry"
     if label == "SatelliteScene":
         return "raster"
