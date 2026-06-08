@@ -660,6 +660,63 @@ pub fn allocate_retainer(
     (shares, remainder)
 }
 
+// ── L6 settlement (RetainerShare → pinner mKOTO credit, ADR-2605260004 lander) ─
+//
+// The allocated retainer is paid to the PINNER (the agent keeping the data alive),
+// even though the SHARE is sized by the originating agents' social capital. mKOTO
+// is internal accounting — non-transferable, redeemable only for kotoba services;
+// settlement only CREDITS (adds to) a pinner's balance, never moves balance between
+// DIDs (§2(b)). The actual wallet write (kotoba-server `Econ`, async + persisted)
+// is a thin wrapper over these deterministic credits (follow-up).
+
+/// A retainer credit to one pinner's mKOTO balance. Multiple pins held by the same
+/// pinner aggregate into a single credit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainerCredit {
+    pub pinner_did: KotobaCid,
+    pub mkoto: i64,
+}
+
+/// L6 settlement: fold allocated [`RetainerShare`]s into per-pinner mKOTO credits.
+/// `pinner_of(pin_id)` resolves a pin to its pinner DID (from the MishmarBondEscrow
+/// `Pinned` event, observed read-only). Shares with no resolvable pinner or a
+/// non-positive amount are skipped (and excluded from `total`). Deterministic order
+/// (by pinner CID string). Conserving: `total == Σ credited ≤ Σ shares`.
+pub fn settle_retainer(
+    shares: &[RetainerShare],
+    pinner_of: impl Fn(&KotobaCid) -> Option<KotobaCid>,
+) -> (Vec<RetainerCredit>, i64) {
+    use std::collections::BTreeMap;
+    let mut by_pinner: BTreeMap<String, (KotobaCid, i64)> = BTreeMap::new();
+    let mut total: i64 = 0;
+    for s in shares {
+        if s.retainer_mkoto <= 0 {
+            continue;
+        }
+        let Some(pinner) = pinner_of(&s.pin_id) else {
+            continue;
+        };
+        let entry = by_pinner.entry(pinner.to_string()).or_insert((pinner, 0));
+        entry.1 = entry.1.saturating_add(s.retainer_mkoto);
+        total = total.saturating_add(s.retainer_mkoto);
+    }
+    let credits = by_pinner
+        .into_values()
+        .map(|(pinner_did, mkoto)| RetainerCredit { pinner_did, mkoto })
+        .collect();
+    (credits, total)
+}
+
+/// Apply retainer credits to an mKOTO balance map — **additive only** (the credit
+/// is non-transferable; there is no debit-from-another-DID path here). Mirrors the
+/// effect of crediting `kotoba-server::Econ` balances.
+pub fn apply_retainer_credits(balances: &mut HashMap<KotobaCid, i64>, credits: &[RetainerCredit]) {
+    for c in credits {
+        let b = balances.entry(c.pinner_did.clone()).or_insert(0);
+        *b = b.saturating_add(c.mkoto);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1108,82 @@ mod tests {
         let (shares, _) = allocate_retainer(&pins, &v, 0, 999);
         assert_eq!(shares[0].sc_root, 50 * SCALE);
         assert_eq!(shares[0].retainer_mkoto, 999); // sole pin → whole pool
+    }
+
+    // ── L6 settlement ─────────────────────────────────────────────────────
+
+    fn share(pin: &str, sc_root: i64, mkoto: i64) -> RetainerShare {
+        RetainerShare { pin_id: did(pin), sc_root, retainer_mkoto: mkoto }
+    }
+
+    #[test]
+    fn settlement_aggregates_per_pinner() {
+        // peggy holds pinA(300)+pinB(200); quinn holds pinC(500).
+        let peggy = did("did:key:peggy");
+        let quinn = did("did:key:quinn");
+        let shares = [share("pinA", 0, 300), share("pinB", 0, 200), share("pinC", 0, 500)];
+        let resolve = |pin: &KotobaCid| {
+            if *pin == did("pinA") || *pin == did("pinB") {
+                Some(peggy.clone())
+            } else if *pin == did("pinC") {
+                Some(quinn.clone())
+            } else {
+                None
+            }
+        };
+        let (credits, total) = settle_retainer(&shares, resolve);
+        assert_eq!(total, 1_000);
+        // deterministic order by pinner CID string; find each.
+        let peggy_c = credits.iter().find(|c| c.pinner_did == peggy).unwrap();
+        let quinn_c = credits.iter().find(|c| c.pinner_did == quinn).unwrap();
+        assert_eq!(peggy_c.mkoto, 500); // 300+200 aggregated
+        assert_eq!(quinn_c.mkoto, 500);
+    }
+
+    #[test]
+    fn settlement_skips_unresolved_pin_and_conserves() {
+        let peggy = did("did:key:peggy");
+        let shares = [share("pinA", 0, 300), share("orphan", 0, 999)];
+        let resolve = |pin: &KotobaCid| (*pin == did("pinA")).then(|| peggy.clone());
+        let (credits, total) = settle_retainer(&shares, resolve);
+        // orphan pin (no pinner) excluded → total counts only the resolved 300.
+        assert_eq!(total, 300);
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].mkoto, 300);
+    }
+
+    #[test]
+    fn settlement_apply_credits_is_additive_non_transferable() {
+        let peggy = did("did:key:peggy");
+        let credits = vec![RetainerCredit { pinner_did: peggy.clone(), mkoto: 500 }];
+        let mut balances: std::collections::HashMap<KotobaCid, i64> =
+            std::collections::HashMap::new();
+        balances.insert(peggy.clone(), 100); // existing balance
+        apply_retainer_credits(&mut balances, &credits);
+        assert_eq!(balances[&peggy], 600); // additive credit, no debit-from-other path
+        // a DID never named in credits is untouched (no transfer exists).
+        assert!(!balances.contains_key(&did("did:key:other")));
+    }
+
+    #[test]
+    fn settlement_end_to_end_from_allocation() {
+        // allocate → settle → apply: the full downstream.
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let mut v = SocialCapitalView::new();
+        v.apply(&[
+            mint_delta(&a, MintSource::Disclosure, 30 * SCALE, 0),
+            mint_delta(&b, MintSource::Disclosure, 70 * SCALE, 0),
+        ]);
+        let pins = [pin("pinA", "rootA", &[&a]), pin("pinB", "rootB", &[&b])];
+        let (shares, _) = allocate_retainer(&pins, &v, 0, 1_000); // 300 / 700
+        // both pins kept by the same pinner "zed" → aggregates to the full pool.
+        let zed = did("did:key:zed");
+        let (credits, total) = settle_retainer(&shares, |_pin| Some(zed.clone()));
+        assert_eq!(total, 1_000);
+        let mut balances = std::collections::HashMap::new();
+        apply_retainer_credits(&mut balances, &credits);
+        assert_eq!(balances[&zed], 1_000);
     }
 
     #[test]
