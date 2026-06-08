@@ -167,3 +167,61 @@ def test_issue_only_proposal_opens_issue_and_drains(tmp_path: Path):
     assert queue.read_text().strip() == ""  # drained, not stuck
     # No git branch was created for an issue-only proposal.
     assert not any("checkout" in a for a in calls if isinstance(a, list))
+
+
+def test_consume_all_quarantines_stuck_proposal_and_drains_rest(tmp_path: Path):
+    """A non-applicable proposal at the queue head must not block the rest:
+    consume_all quarantines it to <stem>.needs-human.ndjson and keeps going."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tgt = repo / "50-infra/k8s/unispsc-organism-fleet/shard-1/daemonset.yaml"
+    tgt.parent.mkdir(parents=True)
+    tgt.write_text('        - name: UNISPSC_ORGANISM_LRU_MAX\n          value: "4096"\n')
+
+    def _mk(rule, kind, edits, summary):
+        return {
+            "v": 1, "ts": 1, "kind": "kaizen-proposal", "ruleId": rule,
+            "category": "performance", "severity": "warn", "actorScope": "shard:1",
+            "summary": summary, "detail": "...",
+            "suggestedAction": {"kind": kind, "description": "d",
+                                "targetFiles": [e["file"] for e in edits],
+                                "patchHint": "", "testPlan": [], "patchEdits": edits},
+            "prAgentHint": {"branchPrefix": "kaizen/x-", "labels": ["kaizen"]},
+        }
+
+    applicable = _mk("sweep-latency-p95", "config-change",
+                     [{"file": "50-infra/k8s/unispsc-organism-fleet/shard-1/daemonset.yaml",
+                       "var": "UNISPSC_ORGANISM_LRU_MAX", "value": "8192"}],
+                     "applicable bump")
+    stuck = _mk("lru-saturation", "config-change",
+                [{"file": "50-infra/k8s/unispsc-organism-fleet/shard-99/daemonset.yaml",
+                  "var": "UNISPSC_ORGANISM_LRU_MAX", "value": "16384"}],
+                "stuck: file missing")
+    issue = {
+        "v": 1, "ts": 1, "kind": "kaizen-proposal", "ruleId": "error-rate",
+        "category": "reliability", "severity": "warn", "actorScope": "shard:1",
+        "summary": "error-rate issue", "detail": "...",
+        "suggestedAction": {"kind": "issue-only", "description": "d",
+                            "targetFiles": [], "patchHint": "", "testPlan": []},
+        "prAgentHint": {"branchPrefix": "kaizen/e-", "labels": ["kaizen"]},
+    }
+
+    queue = tmp_path / "observer.ndjson"
+    queue.write_text("\n".join(json.dumps(p) for p in [applicable, stuck, issue]) + "\n")
+
+    with patch("subprocess.check_output", return_value="main\n"), \
+         patch("subprocess.run", return_value=MagicMock(
+             check_returncode=lambda: None, stdout="Dry run successful.")):
+        agent = KaizenPrAgent(queue, repo, dry_run=True)
+        urls = agent.consume_all()
+
+    # applicable (PR) + issue-only (issue) both produced a result; stuck did not.
+    assert len(urls) == 2
+    # Queue fully drained, no infinite loop / blockage.
+    assert queue.read_text().strip() == ""
+    # The stuck proposal was preserved for human triage.
+    needs_human = tmp_path / "observer.needs-human.ndjson"
+    assert needs_human.is_file()
+    assert "stuck: file missing" in needs_human.read_text()
+    # Applicable patch really applied.
+    assert 'value: "8192"' in tgt.read_text()

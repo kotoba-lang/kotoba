@@ -276,17 +276,53 @@ class KaizenPrAgent:
             # Do not remove the proposal from the queue, so it can be retried
             raise
 
+    def _quarantine(self, proposal_ndjson: str) -> Path:
+        """Append a stuck proposal to a sibling needs-human queue.
+
+        Non-destructive: the proposal is preserved for human triage / retry,
+        but removed from the live queue so it stops blocking the rest.
+        """
+        qpath = self.proposal_queue_path.parent / (
+            self.proposal_queue_path.stem + ".needs-human.ndjson"
+        )
+        with open(qpath, "a", encoding="utf-8") as f:
+            f.write(proposal_ndjson + "\n")
+        logging.warning("Quarantined stuck proposal → %s", qpath)
+        return qpath
+
     def consume_all(self) -> List[str]:
         """
-        Consumes all proposals in the queue until it's empty.
-        Returns a list of created PR URLs.
+        Drain the queue, returning the created PR/issue URLs.
+
+        Robust to a proposal that cannot be applied: if consume_one returns
+        None while leaving the head in place (a stuck config/code-change patch),
+        the head is quarantined to ``<stem>.needs-human.ndjson`` so the loop
+        keeps making progress instead of blocking on it forever.
         """
         urls = []
         while True:
-            url = self.consume_one()
-            if url is None:
+            if not self.proposal_queue_path.exists():
                 break
-            urls.append(url)
+            lines = self.proposal_queue_path.read_text().splitlines()
+            if not lines:
+                break
+            head_before = lines[0]
+            url = self.consume_one()
+            if url is not None:
+                urls.append(url)
+                continue
+            # None: either the head was drained (handled next loop) or it is
+            # stuck. If the head is unchanged, quarantine it and move on.
+            lines_after = (
+                self.proposal_queue_path.read_text().splitlines()
+                if self.proposal_queue_path.exists()
+                else []
+            )
+            if lines_after and lines_after[0] == head_before:
+                self._quarantine(head_before)
+                self.proposal_queue_path.write_text(
+                    "\n".join(lines_after[1:]) + "\n" if lines_after[1:] else ""
+                )
         logging.info(f"Consumed {len(urls)} proposals.")
         return urls
 
