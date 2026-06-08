@@ -267,6 +267,7 @@ def test_organism_tick_with_inbound_commit_runs_classify():
         },
         post_sink=lambda text: captured.append(text),
     )
+    organism.lifecycle.handle_birth(organism.actor_did)
     organism.inbox.add_commit(
         InboundCommit(collection="x", repo="did:other", rkey="r1", time="t")
     )

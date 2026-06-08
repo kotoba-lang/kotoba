@@ -1,4 +1,5 @@
 
+import copy
 import json
 import subprocess
 from pathlib import Path
@@ -45,8 +46,7 @@ def repo_root(tmp_path: Path) -> Path:
     # Create initial file and commi
     src_dir = repo_path / "src"
     src_dir.mkdir()
-    (src_dir / "main.py").write_text("def old_function(): pass
-")
+    (src_dir / "main.py").write_text("def old_function(): pass\n")
     subprocess.run(["git", "add", "."], cwd=repo_path)
     subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_path, capture_output=True)
     return repo_path
@@ -55,8 +55,7 @@ def repo_root(tmp_path: Path) -> Path:
 def proposal_queue(tmp_path: Path) -> Path:
     """Creates a fake proposal queue file."""
     queue_path = tmp_path / "proposals.ndjson"
-    queue_path.write_text(json.dumps(FAKE_PROPOSAL) + "
-")
+    queue_path.write_text(json.dumps(FAKE_PROPOSAL) + "\n")
     return queue_path
 
 @pytest.fixture
@@ -77,7 +76,7 @@ def test_auth_success(mock_run, repo_root, proposal_queue):
     agent = KaizenPrAgent(proposal_queue, repo_root)
     mock_run.assert_called_once_with(
         ["gh", "auth", "status"],
-        capture_output=True, text=True, check=True, cwd=repo_roo
+        capture_output=True, text=True, check=True, cwd=repo_root
     )
 
 @patch('subprocess.run', side_effect=FileNotFoundError("gh not found"))
@@ -104,8 +103,7 @@ def test_empty_queue_returns_none(repo_root, empty_proposal_queue):
         result = agent.consume_one()
         assert result is None
 
-@patch('subprocess.check_output', return_value="main
-")
+@patch('subprocess.check_output', return_value="main\n")
 @patch('subprocess.run')
 def test_consume_one_dry_run(mock_run, mock_check_output, repo_root, proposal_queue):
     """Test the full dry-run consumption of a single proposal."""
@@ -124,13 +122,12 @@ def test_consume_one_dry_run(mock_run, mock_check_output, repo_root, proposal_qu
 
     # Verify file content was patched
     patched_file = repo_root / "src" / "main.py"
-    assert patched_file.read_text() == "def new_function(): pass
-"
+    assert patched_file.read_text() == "def new_function(): pass\n"
 
     # Verify subprocess calls
     assert mock_check_output.call_count == 1
 
-    calls = mock_run.call_args_lis
+    calls = mock_run.call_args_list
     # 1. gh auth status (in __init__)
     # 2. git checkout -b <branch>
     # 3. git add src/main.py
@@ -139,7 +136,7 @@ def test_consume_one_dry_run(mock_run, mock_check_output, repo_root, proposal_qu
     assert len(calls) == 5
 
     # Check git branch creation
-    assert call(["git", "checkout", "-b", mock_run.call_args_list[1].args[0][2]], check=True, cwd=repo_root, capture_output=True) in calls
+    assert call(["git", "checkout", "-b", mock_run.call_args_list[1].args[0][3]], check=True, cwd=repo_root, capture_output=True) in calls
     # Check git add
     assert call(["git", "add", "src/main.py"], check=True, cwd=repo_root) in calls
 
@@ -157,8 +154,7 @@ def test_consume_one_dry_run(mock_run, mock_check_output, repo_root, proposal_qu
     # Check git checkout main
     assert call(["git", "checkout", "main"], check=True, cwd=repo_root) in calls
 
-@patch('subprocess.check_output', return_value="main
-")
+@patch('subprocess.check_output', return_value="main\n")
 @patch('subprocess.run')
 def test_consume_one_real_run(mock_run, mock_check_output, repo_root, proposal_queue):
     """Test the real-run consumption of a single proposal."""
@@ -176,16 +172,16 @@ def test_consume_one_real_run(mock_run, mock_check_output, repo_root, proposal_q
     gh_call = mock_run.call_args_list[3]
     assert "--dry-run" not in gh_call.args[0]
 
-@patch('subprocess.check_output', return_value="main
-")
+@patch('subprocess.check_output', return_value="main\n")
 @patch('subprocess.run')
 def test_consume_all(mock_run, mock_check_output, repo_root, tmp_path):
     """Test that consume_all drains the queue."""
-    proposal_2 = FAKE_PROPOSAL.copy()
+    proposal_2 = copy.deepcopy(FAKE_PROPOSAL)
     proposal_2["summary"] = "Second proposal"
-    queue_content = json.dumps(FAKE_PROPOSAL) + "
-" + json.dumps(proposal_2) + "
-"
+    # proposal 1 rewrites old_function -> new_function; proposal 2 targets the
+    # post-patch text so both proposals apply against the shared repo fixture.
+    proposal_2["suggestedAction"]["patchHint"] = "'new_function()' -> 'final_function()'"
+    queue_content = json.dumps(FAKE_PROPOSAL) + "\n" + json.dumps(proposal_2) + "\n"
     queue_path = tmp_path / "multi_proposals.ndjson"
     queue_path.write_text(queue_content)
 
@@ -199,16 +195,14 @@ def test_consume_all(mock_run, mock_check_output, repo_root, tmp_path):
     # 1 auth, 2x (checkout, add, pr create, checkout) = 9 calls
     assert mock_run.call_count == 1 + (4 * 2)
 
-@patch('subprocess.check_output', return_value="main
-")
+@patch('subprocess.check_output', return_value="main\n")
 @patch('subprocess.run')
 def test_patch_fail_aborts_pr(mock_run, mock_check_output, repo_root, tmp_path):
     """Test that a failed patch cleans up and aborts the PR."""
-    bad_proposal = FAKE_PROPOSAL.copy()
+    bad_proposal = copy.deepcopy(FAKE_PROPOSAL)
     bad_proposal["suggestedAction"]["patchHint"] = "'non_existent_string' -> 'wont_work'"
     queue_path = tmp_path / "bad_proposal.ndjson"
-    queue_path.write_text(json.dumps(bad_proposal) + "
-")
+    queue_path.write_text(json.dumps(bad_proposal) + "\n")
 
     mock_run.return_value = MagicMock(check_returncode=lambda: None)
 
@@ -219,13 +213,13 @@ def test_patch_fail_aborts_pr(mock_run, mock_check_output, repo_root, tmp_path):
     assert queue_path.read_text() # Queue should NOT be empty
 
     # Check that the temp branch was deleted
-    calls = mock_run.call_args_lis
+    calls = mock_run.call_args_list
     # 1. auth
     # 2. git checkout -b <branch>
     # 3. git checkout main
     # 4. git branch -D <branch>
     assert len(calls) == 4
-    branch_name = calls[1].args[0][2]
+    branch_name = calls[1].args[0][3]
     assert call(["git", "branch", "-D", branch_name], check=True, cwd=repo_root) in calls
 
     # Check that gh pr create was NOT called

@@ -28,11 +28,15 @@ from kotodama.organism.unispsc_organism import UnispscOrganism
 
 
 def _make_organism(actor_did: str = "did:web:etzhayyim.com:actor:test"):
-    return UnispscOrganism(
+    org = UnispscOrganism(
         code="99999999",
         graph=MagicMock(),
         actor_did=actor_did,
     )
+    # Birth → ACTIVE so tick() runs its body (the lifecycle gate otherwise
+    # early-returns a no-op dummy cadence and never drains the TierGate).
+    org.lifecycle.handle_birth(actor_did)
+    return org
 
 
 def _tier_c_obs() -> SensorObservation:

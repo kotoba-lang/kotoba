@@ -2,12 +2,22 @@ import json
 import os
 from pathlib import Path
 
-def test_organism_lifecycle_schema_valid():
-    # Load the lexicon JSON
-    repo_root = Path(__file__).resolve().parent.parent.parent.parent.parent.parent
-    lexicon_path = repo_root / "00-contracts" / "lexicons" / "app" / "etzhayyim" / "organism" / "lifecycle.json"
+import pytest
 
-    assert lexicon_path.exists(), f"Lexicon not found at {lexicon_path}"
+
+def test_organism_lifecycle_schema_valid():
+    # The lexicon lives under the monorepo root's 00-contracts/ (canonical
+    # namespace com.etzhayyim.organism.lifecycle), which is several parents
+    # above the kotoba submodule. Walk up to find it so the test is robust
+    # to both the monorepo and a standalone kotoba checkout.
+    rel = Path("00-contracts") / "lexicons" / "com" / "etzhayyim" / "organism" / "lifecycle.json"
+    here = Path(__file__).resolve()
+    lexicon_path = next(
+        (p / rel for p in here.parents if (p / rel).is_file()),
+        None,
+    )
+    if lexicon_path is None:
+        pytest.skip("monorepo 00-contracts/ lexicon not present (standalone kotoba checkout)")
 
     with open(lexicon_path, "r", encoding="utf-8") as f:
         data = json.load(f)
