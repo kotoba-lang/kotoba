@@ -66,6 +66,9 @@ class TrainConfig:
     node: str = "judah"
     seed: int = 0
     trainer: Literal["modal-compat-local", "modal-compat-spawn"] = "modal-compat-local"
+    min_quality: float = 0.25
+    min_bench_delta: float = 0.0
+    require_improvement: bool = True
 
     def validate(self) -> None:
         if not self.model_id:
@@ -78,6 +81,41 @@ class TrainConfig:
             raise ValueError("checkpoint_every must be >= 1")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be > 0")
+        if not 0 <= self.min_quality <= 1:
+            raise ValueError("min_quality must be in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class QualityDecision:
+    """Quality evaluation for one training row."""
+
+    index: int
+    score: float
+    selected: bool
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DataSelectionReport:
+    """Summary of dataset scoring and filtering."""
+
+    input_count: int
+    selected_count: int
+    rejected_count: int
+    quality_mean: float
+    selected_quality_mean: float
+    decisions: tuple[QualityDecision, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BenchResult:
+    """Benchmark result for one train run."""
+
+    baseline_score: float
+    trained_score: float
+    delta: float
+    improved: bool
+    promoted: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +142,13 @@ class TrainRunResult:
     checkpoint_cids: tuple[str, ...]
     manifest_cid: str
     datom_count: int
+    selected_examples: int
+    rejected_examples: int
+    quality_mean: float
+    bench_baseline: float
+    bench_trained: float
+    bench_delta: float
+    promoted: bool
 
 
 class KotobaArtifactStore:
@@ -220,7 +265,73 @@ class KotobaArtifactStore:
         )
         return art
 
-    def persist_manifest(self, result: TrainRunResult, *, checkpoints: list[StoredArtifact]) -> StoredArtifact:
+    def persist_data_selection(
+        self,
+        *,
+        model_id: str,
+        run_id: str,
+        report: DataSelectionReport,
+    ) -> StoredArtifact:
+        payload = {
+            "model_id": model_id,
+            "run_id": run_id,
+            "report": asdict(report),
+        }
+        art = self.put_blob(
+            _json_bytes(payload),
+            kind="data-selection",
+            metadata={"model_id": model_id, "run_id": run_id},
+        )
+        self.append_datom(
+            graph="llm/data-quality",
+            subject=run_id,
+            predicate="data-selection",
+            obj={
+                "cid": art.cid,
+                "input_count": report.input_count,
+                "selected_count": report.selected_count,
+                "rejected_count": report.rejected_count,
+                "quality_mean": report.quality_mean,
+                "selected_quality_mean": report.selected_quality_mean,
+            },
+            tx=run_id,
+        )
+        return art
+
+    def persist_bench(
+        self,
+        *,
+        model_id: str,
+        run_id: str,
+        bench: BenchResult,
+    ) -> StoredArtifact:
+        payload = {
+            "model_id": model_id,
+            "run_id": run_id,
+            "bench": asdict(bench),
+        }
+        art = self.put_blob(
+            _json_bytes(payload),
+            kind="benchmark",
+            metadata={"model_id": model_id, "run_id": run_id},
+        )
+        self.append_datom(
+            graph="llm/benchmarks",
+            subject=run_id,
+            predicate="bench/micro",
+            obj={"cid": art.cid, **asdict(bench)},
+            tx=run_id,
+        )
+        return art
+
+    def persist_manifest(
+        self,
+        result: TrainRunResult,
+        *,
+        checkpoints: list[StoredArtifact],
+        data_selection: StoredArtifact,
+        bench: StoredArtifact,
+    ) -> StoredArtifact:
         payload = {
             "model_id": result.model_id,
             "run_id": result.run_id,
@@ -230,6 +341,17 @@ class KotobaArtifactStore:
             "final_weight_cid": result.final_weight_cid,
             "checkpoint_cids": list(result.checkpoint_cids),
             "checkpoints": [asdict(c) for c in checkpoints],
+            "data_selection_cid": data_selection.cid,
+            "bench_cid": bench.cid,
+            "selected_examples": result.selected_examples,
+            "rejected_examples": result.rejected_examples,
+            "quality_mean": result.quality_mean,
+            "bench": {
+                "baseline": result.bench_baseline,
+                "trained": result.bench_trained,
+                "delta": result.bench_delta,
+                "promoted": result.promoted,
+            },
         }
         data = _json_bytes(payload)
         art = self.put_blob(
@@ -273,6 +395,109 @@ def _apply_delta(weight: bytes, delta: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(weight, delta, strict=True))
 
 
+def score_training_example(ex: TrainingExample, *, index: int, seen: set[tuple[str, str]]) -> QualityDecision:
+    """Score one row and record why it should be kept or dropped.
+
+    The R0 scorer is deterministic and conservative: it combines the upstream
+    curation score with simple structural checks that catch empty, duplicate, or
+    trivially short examples before they affect the adapter update.
+    """
+    reasons: list[str] = []
+    score = max(0.0, min(1.0, ex.quality))
+    prompt = ex.prompt.strip()
+    target = ex.target.strip()
+    key = (prompt, target)
+    if not prompt:
+        score *= 0.0
+        reasons.append("empty-prompt")
+    if not target:
+        score *= 0.0
+        reasons.append("empty-target")
+    if len(prompt) < 4:
+        score *= 0.5
+        reasons.append("short-prompt")
+    if len(target) < 4:
+        score *= 0.5
+        reasons.append("short-target")
+    if key in seen:
+        score *= 0.25
+        reasons.append("duplicate")
+    else:
+        seen.add(key)
+    if ex.quality < 0:
+        reasons.append("quality-clamped-low")
+    if ex.quality > 1:
+        reasons.append("quality-clamped-high")
+    if not reasons:
+        reasons.append("accepted")
+    return QualityDecision(index=index, score=score, selected=False, reasons=tuple(reasons))
+
+
+def select_training_examples(
+    examples: list[TrainingExample],
+    *,
+    min_quality: float,
+) -> tuple[list[TrainingExample], DataSelectionReport]:
+    seen: set[tuple[str, str]] = set()
+    selected: list[TrainingExample] = []
+    decisions: list[QualityDecision] = []
+    for idx, ex in enumerate(examples):
+        scored = score_training_example(ex, index=idx, seen=seen)
+        keep = scored.score >= min_quality
+        if keep:
+            selected.append(ex)
+        decisions.append(
+            QualityDecision(
+                index=scored.index,
+                score=scored.score,
+                selected=keep,
+                reasons=scored.reasons,
+            )
+        )
+
+    quality_mean = sum(d.score for d in decisions) / len(decisions) if decisions else 0.0
+    selected_quality_mean = (
+        sum(d.score for d in decisions if d.selected) / len(selected) if selected else 0.0
+    )
+    return selected, DataSelectionReport(
+        input_count=len(examples),
+        selected_count=len(selected),
+        rejected_count=len(examples) - len(selected),
+        quality_mean=quality_mean,
+        selected_quality_mean=selected_quality_mean,
+        decisions=tuple(decisions),
+    )
+
+
+def run_microbench(
+    *,
+    config: TrainConfig,
+    selected_report: DataSelectionReport,
+) -> BenchResult:
+    """Deterministic R0 microbench.
+
+    A real M1 bench will execute prompt suites against the produced adapter.
+    R0 still needs a gate in the loop, so the score is derived from training
+    signal strength and records an explicit promotion decision.
+    """
+    baseline = 0.5
+    signal = selected_report.selected_quality_mean * min(1.0, config.steps / 10.0)
+    lr_factor = min(1.0, config.learning_rate / 1e-4)
+    trained = min(1.0, baseline + signal * lr_factor * 0.1)
+    delta = trained - baseline
+    improved = delta > 0
+    promoted = improved and delta >= config.min_bench_delta
+    if config.require_improvement:
+        promoted = promoted and improved
+    return BenchResult(
+        baseline_score=baseline,
+        trained_score=trained,
+        delta=delta,
+        improved=improved,
+        promoted=promoted,
+    )
+
+
 def train_step_loop(
     *,
     config: TrainConfig,
@@ -285,6 +510,17 @@ def train_step_loop(
         raise ValueError("at least one TrainingExample is required")
 
     store = KotobaArtifactStore(store_root)
+    selected_examples, selection_report = select_training_examples(
+        examples,
+        min_quality=config.min_quality,
+    )
+    if not selected_examples:
+        raise ValueError("all training examples were rejected by quality gate")
+    data_selection_artifact = store.persist_data_selection(
+        model_id=config.model_id,
+        run_id=config.run_id,
+        report=selection_report,
+    )
     weights = {
         "lora/adapter": _initial_weight_bytes(config, "lora/adapter"),
     }
@@ -292,7 +528,7 @@ def train_step_loop(
     checkpoint_artifacts: list[StoredArtifact] = []
 
     for step in range(1, config.steps + 1):
-        delta = _training_delta(examples, step=step, learning_rate=config.learning_rate)
+        delta = _training_delta(selected_examples, step=step, learning_rate=config.learning_rate)
         weights["lora/adapter"] = _apply_delta(weights["lora/adapter"], delta)
         latest_weight_artifacts["lora/adapter"] = store.persist_weight(
             model_id=config.model_id,
@@ -309,12 +545,21 @@ def train_step_loop(
                     step=step,
                     weights=latest_weight_artifacts,
                     metrics={
-                        "examples": len(examples),
-                        "quality_mean": sum(e.quality for e in examples) / len(examples),
+                        "examples": len(selected_examples),
+                        "input_examples": len(examples),
+                        "rejected_examples": selection_report.rejected_count,
+                        "quality_mean": selection_report.quality_mean,
+                        "selected_quality_mean": selection_report.selected_quality_mean,
                     },
                 )
             )
 
+    bench = run_microbench(config=config, selected_report=selection_report)
+    bench_artifact = store.persist_bench(
+        model_id=config.model_id,
+        run_id=config.run_id,
+        bench=bench,
+    )
     final_weight = latest_weight_artifacts["lora/adapter"]
     provisional = TrainRunResult(
         model_id=config.model_id,
@@ -326,8 +571,20 @@ def train_step_loop(
         checkpoint_cids=tuple(c.cid for c in checkpoint_artifacts),
         manifest_cid="",
         datom_count=store.datom_count(),
+        selected_examples=selection_report.selected_count,
+        rejected_examples=selection_report.rejected_count,
+        quality_mean=selection_report.quality_mean,
+        bench_baseline=bench.baseline_score,
+        bench_trained=bench.trained_score,
+        bench_delta=bench.delta,
+        promoted=bench.promoted,
     )
-    manifest = store.persist_manifest(provisional, checkpoints=checkpoint_artifacts)
+    manifest = store.persist_manifest(
+        provisional,
+        checkpoints=checkpoint_artifacts,
+        data_selection=data_selection_artifact,
+        bench=bench_artifact,
+    )
     return TrainRunResult(
         model_id=provisional.model_id,
         run_id=provisional.run_id,
@@ -338,6 +595,13 @@ def train_step_loop(
         checkpoint_cids=provisional.checkpoint_cids,
         manifest_cid=manifest.cid,
         datom_count=store.datom_count(),
+        selected_examples=provisional.selected_examples,
+        rejected_examples=provisional.rejected_examples,
+        quality_mean=provisional.quality_mean,
+        bench_baseline=provisional.bench_baseline,
+        bench_trained=provisional.bench_trained,
+        bench_delta=provisional.bench_delta,
+        promoted=provisional.promoted,
     )
 
 
@@ -391,6 +655,13 @@ class MurakumoModalTrainer:
             checkpoint_cids=tuple(raw["checkpoint_cids"]),
             manifest_cid=raw["manifest_cid"],
             datom_count=raw["datom_count"],
+            selected_examples=raw["selected_examples"],
+            rejected_examples=raw["rejected_examples"],
+            quality_mean=raw["quality_mean"],
+            bench_baseline=raw["bench_baseline"],
+            bench_trained=raw["bench_trained"],
+            bench_delta=raw["bench_delta"],
+            promoted=raw["promoted"],
         )
 
 
@@ -408,11 +679,17 @@ def train_with_modal_py(
 
 __all__ = [
     "KotobaArtifactStore",
+    "BenchResult",
+    "DataSelectionReport",
     "MurakumoModalTrainer",
+    "QualityDecision",
     "StoredArtifact",
     "TrainConfig",
     "TrainRunResult",
     "TrainingExample",
+    "run_microbench",
+    "score_training_example",
+    "select_training_examples",
     "train_step_loop",
     "train_with_modal_py",
 ]
