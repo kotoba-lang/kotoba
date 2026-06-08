@@ -29,7 +29,7 @@ class KaizenPrAgent:
     """
     def __init__(self, proposal_queue_path: Path, repo_root: Path, dry_run: bool = True):
         self.proposal_queue_path = proposal_queue_path
-        self.repo_root = repo_roo
+        self.repo_root = repo_root
         self.dry_run = dry_run
         self._verify_gh_auth()
 
@@ -40,7 +40,7 @@ class KaizenPrAgent:
             # Use --hostname github.com to be explici
             result = subprocess.run(
                 ["gh", "auth", "status"],
-                capture_output=True, text=True, check=True, cwd=self.repo_roo
+                capture_output=True, text=True, check=True, cwd=self.repo_root
             )
             logging.info("GitHub CLI is authenticated.")
         except FileNotFoundError:
@@ -72,11 +72,13 @@ class KaizenPrAgent:
 
         # This is a very basic interpretation for R1.0
         old_text, new_text = parts[0], parts[1]
-        # remove quotes if presen
-        if old_text.startswith('"') and old_text.endswith('"'):
-            old_text = old_text[1:-1]
-        if new_text.startswith('"') and new_text.endswith('"'):
-            new_text = new_text[1:-1]
+        # remove surrounding quotes if present (accept both ' and ")
+        def _unquote(s: str) -> str:
+            if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+                return s[1:-1]
+            return s
+        old_text = _unquote(old_text)
+        new_text = _unquote(new_text)
 
 
         modified_paths = []
