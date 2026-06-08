@@ -58,9 +58,10 @@ def _dry_run() -> bool:
     return os.environ.get("KAIZEN_PR_AGENT_DRY_RUN", "true").lower() not in ("0", "false", "no")
 
 
-def _resolve_meta_outcomes(proposal_path: Path, repo_root: Path) -> dict[str, int]:
-    """Resolve pending PR outcomes (via `gh pr view`) into the shared rule-fitness
-    ledger, so the observer can prune rules whose PRs keep getting rejected."""
+def _resolve_meta_outcomes(proposal_path: Path, repo_root: Path, remote: Any) -> dict[str, int]:
+    """Resolve pending change outcomes into the shared rule-fitness ledger via the
+    active GitRemote (GitHub PR state, or kotoba ref-approval), so the observer
+    can prune rules whose changes keep getting rejected."""
     outcomes_path = proposal_path.parent / (proposal_path.stem + ".outcomes.ndjson")
     if not outcomes_path.exists():
         return {"resolved": 0}
@@ -75,14 +76,9 @@ def _resolve_meta_outcomes(proposal_path: Path, repo_root: Path) -> dict[str, in
         if not ref:
             return "unknown"
         try:
-            out = subprocess.run(
-                ["gh", "pr", "view", str(ref), "--json", "state", "--jq", ".state"],
-                cwd=repo_root, capture_output=True, text=True, timeout=20,
-            )
-            s = (out.stdout or "").strip().upper()
+            return remote.change_state(str(ref), repo_root=repo_root)
         except Exception:  # noqa: BLE001 — best-effort; leave pending on error
             return "unknown"
-        return {"MERGED": "merged", "CLOSED": "closed", "OPEN": "open"}.get(s, "unknown")
 
     try:
         return resolve_outcomes(outcomes_path, ledger, _state)
@@ -104,21 +100,28 @@ async def fire() -> dict[str, Any]:
 
     loop = asyncio.get_running_loop()
 
+    # Pluggable publish target: GitHub PR (default) or kotoba content-addressed
+    # Datom store (KAIZEN_GIT_REMOTE=kotoba → GitHub-independent self-evolution).
+    from kotodama.organism.kaizen.git_remote import select_remote
+    remote = select_remote()
+
     def _drain() -> dict[str, Any]:
         try:
-            agent = KaizenPrAgent(proposal_path, repo_root, dry_run=dry_run)
+            agent = KaizenPrAgent(proposal_path, repo_root, dry_run=dry_run, remote=remote)
         except KaizenPrAgentAuthError as exc:
             logger.warning("PR agent auth not ready — skipping cycle: %s", exc)
             return {"ok": False, "reason": "auth", "consumed": 0, "urls": []}
         urls = []
         if proposal_path.exists() and proposal_path.stat().st_size != 0:
             urls = agent.consume_all()
-        # Meta self-reflection: resolve any pending PR outcomes into the shared
-        # rule-fitness ledger (merged → accept, closed → reject). The observer
-        # reads the same ledger to prune rules humans keep rejecting — closing
+        # Meta self-reflection: resolve any pending change outcomes into the shared
+        # rule-fitness ledger (merged → accept, closed → reject), via the active
+        # remote (GitHub PR state, or kotoba ref-approval). The observer reads the
+        # same ledger to prune rules whose changes keep getting rejected — closing
         # the loop's self-scoring + self-pruning across the two resident pods.
-        meta = _resolve_meta_outcomes(proposal_path, repo_root)
-        return {"ok": True, "consumed": len(urls), "urls": urls, "dryRun": dry_run, "meta": meta}
+        meta = _resolve_meta_outcomes(proposal_path, repo_root, remote)
+        return {"ok": True, "consumed": len(urls), "urls": urls, "dryRun": dry_run,
+                "remote": getattr(remote, "name", "?"), "meta": meta}
 
     status = await loop.run_in_executor(None, _drain)
     logger.info(
