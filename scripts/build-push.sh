@@ -4,7 +4,8 @@
 set -euo pipefail
 
 TAG="${1:-latest}"
-IMAGE="ghcr.io/etzhayyim/kotoba:${TAG}"
+IMAGE_REPO="${KOTOBA_IMAGE_REPO:-ghcr.io/etzhayyim/kotoba}"
+IMAGE="${IMAGE_REPO}:${TAG}"
 PLATFORMS="${KOTOBA_IMAGE_PLATFORMS:-linux/amd64,linux/arm64}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 KOTOBA_DIR="${REPO_ROOT}/40-engine/kotoba"
