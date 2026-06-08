@@ -123,17 +123,32 @@ class KotobaRemote:
         subprocess.run(cmd, check=True, cwd=repo_root, capture_output=True, text=True)
         return f"kotoba:{self.repo}/refs/heads/{branch}"
 
+    @staticmethod
+    def _branch_of(ref: str) -> str:
+        """Normalize either form to the bare branch name, so an operator marker
+        and the stored outcome match regardless of which form each carries:
+          kotoba:root/refs/heads/kaizen/x → kaizen/x
+          refs/heads/kaizen/x            → kaizen/x
+          kaizen/x                       → kaizen/x
+        """
+        s = ref.strip()
+        if ":" in s and "/refs/heads/" in s:  # kotoba:<repo>/refs/heads/<b>
+            s = s.split("/refs/heads/", 1)[1]
+        elif s.startswith("refs/heads/"):
+            s = s[len("refs/heads/"):]
+        return s
+
     def change_state(self, ref_or_branch: str, *, repo_root: Path) -> str:
         # A kotoba ref is "accepted" when an operator/Council marks it (a
-        # :git.ref/approved Datom). Until that approval surface lands, treat it
-        # as open (pending). No GitHub call.
-        marker = os.environ.get("KAIZEN_KOTOBA_APPROVED_REFS", "")
-        approved = {r.strip() for r in marker.split(",") if r.strip()}
-        rejected_marker = os.environ.get("KAIZEN_KOTOBA_REJECTED_REFS", "")
-        rejected = {r.strip() for r in rejected_marker.split(",") if r.strip()}
-        if ref_or_branch in approved:
+        # :git.ref/approved Datom — env-bridged here until that surface lands).
+        # Match on the normalized branch name so the marker can be the bare
+        # branch OR the full kotoba ref. No GitHub call.
+        target = self._branch_of(ref_or_branch)
+        approved = {self._branch_of(r) for r in os.environ.get("KAIZEN_KOTOBA_APPROVED_REFS", "").split(",") if r.strip()}
+        rejected = {self._branch_of(r) for r in os.environ.get("KAIZEN_KOTOBA_REJECTED_REFS", "").split(",") if r.strip()}
+        if target in approved:
             return "merged"
-        if ref_or_branch in rejected:
+        if target in rejected:
             return "closed"
         return "open"
 

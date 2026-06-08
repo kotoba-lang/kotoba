@@ -108,6 +108,24 @@ def test_kotoba_change_state_env_markers(mock_run, monkeypatch):
     mock_run.assert_not_called()
 
 
+def test_kotoba_change_state_normalizes_branch_vs_full_ref(monkeypatch):
+    """The outcome record stores the bare branch, but an operator may mark the
+    full kotoba ref (or vice-versa). Both must resolve to the same state —
+    regression guard for the pending-forever bug found in the live e2e run."""
+    r = KotobaRemote()
+    full = "kotoba:root/refs/heads/kaizen/x"
+    bare = "kaizen/x"
+    # marker is the full ref, lookup is the bare branch (the real ledger case):
+    monkeypatch.setenv("KAIZEN_KOTOBA_APPROVED_REFS", full)
+    monkeypatch.delenv("KAIZEN_KOTOBA_REJECTED_REFS", raising=False)
+    assert r.change_state(bare, repo_root=Path("/repo")) == "merged"
+    # and the reverse: marker is the bare branch, lookup is the full ref:
+    monkeypatch.setenv("KAIZEN_KOTOBA_APPROVED_REFS", bare)
+    assert r.change_state(full, repo_root=Path("/repo")) == "merged"
+    # refs/heads/<b> form also normalizes:
+    assert r.change_state("refs/heads/kaizen/x", repo_root=Path("/repo")) == "merged"
+
+
 @patch("subprocess.run")
 def test_pr_agent_kotoba_remote_needs_no_gh_auth(mock_run, tmp_path):
     """A KotobaRemote-backed agent must construct without `gh auth status`."""
