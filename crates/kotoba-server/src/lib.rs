@@ -268,6 +268,7 @@ mod tests {
             &*state.ipns_registry,
         )
         .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: distributed_graph_ipns_name(&graph),
             graph: graph.clone(),
             covering_datoms: None,

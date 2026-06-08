@@ -2442,15 +2442,27 @@ where
             roots.insert(ROOT_CEAVT.to_string(), ceavt_root);
         }
         let ceavt_ms = t_ceavt.elapsed().as_millis();
-        let commit = DistributedDatomCommit::seal(
-            req.graph,
-            tx_cid.clone(),
-            req.expected_parent,
-            req.author,
-            req.seq,
-            roots,
-            req.cacao_proof_cid,
-        )?;
+        let commit = match req.merge_parents {
+            Some((parents, parent_hlc_max)) => DistributedDatomCommit::seal_merge(
+                req.graph,
+                tx_cid.clone(),
+                parents,
+                parent_hlc_max,
+                req.author,
+                req.seq,
+                roots,
+                req.cacao_proof_cid,
+            )?,
+            None => DistributedDatomCommit::seal(
+                req.graph,
+                tx_cid.clone(),
+                req.expected_parent,
+                req.author,
+                req.seq,
+                roots,
+                req.cacao_proof_cid,
+            )?,
+        };
         commit.persist(&cap)?;
         // Durably flush this commit's captured blocks in ONE concurrent batch so the
         // head's reachable set is in the cold tier before we return.
@@ -2687,7 +2699,8 @@ where
             c.extend(datoms.iter().cloned());
             c
         };
-        let commit = self.commit_datoms(CommitDatomsRequest {
+        let commit = self.commit_datoms_merging(CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: req.ipns_name,
             graph: req.graph,
             datoms: datoms.clone(),
@@ -2720,8 +2733,106 @@ where
             context,
         })
     }
+
+    /// Commit with **automatic Merkle-CRDT merge on conflict** (ADR-001 phase 2b).
+    ///
+    /// Tries the normal CAS commit; on `StaleParent` (a concurrent writer won the
+    /// race) it does NOT reject — it 3-way merges its datoms with the concurrent
+    /// history and retries against the new head, looping until it lands. Gated by
+    /// `KOTOBA_MERGE_ON_CONFLICT` (default off ⇒ identical to `commit_datoms`,
+    /// i.e. reject), so the merge path is opt-in until proven in the field.
+    pub fn commit_datoms_merging(
+        &self,
+        req: CommitDatomsRequest,
+    ) -> Result<CommitReport, DistributedCommitError> {
+        let merge_enabled = std::env::var("KOTOBA_MERGE_ON_CONFLICT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        self.commit_datoms_merging_with(req, merge_enabled)
+    }
+
+    pub fn commit_datoms_merging_with(
+        &self,
+        mut req: CommitDatomsRequest,
+        merge_enabled: bool,
+    ) -> Result<CommitReport, DistributedCommitError> {
+        loop {
+            match self.commit_datoms(req.clone()) {
+                Ok(report) => return Ok(report),
+                Err(DistributedCommitError::StaleParent { current, .. }) if merge_enabled => {
+                    let Some(theirs) = current.as_deref().and_then(KotobaCid::from_multibase)
+                    else {
+                        return Err(DistributedCommitError::StaleParent {
+                            name: req.ipns_name.clone(),
+                            expected: req.expected_parent.as_ref().map(KotobaCid::to_multibase),
+                            current,
+                        });
+                    };
+                    let base = req.expected_parent.clone();
+                    let base_live = match &base {
+                        Some(b) => live_datoms_at(b, self.store)?,
+                        None => Vec::new(),
+                    };
+                    let mut ops = gather_concurrent_ops(base.as_ref(), &theirs, self.store)?;
+                    let theirs_commit = DistributedDatomCommit::load(&theirs, self.store)?
+                        .ok_or_else(|| {
+                            DistributedCommitError::MissingCommit(theirs.to_multibase())
+                        })?;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let mine_hlc = next_hlc(now_ms).max(theirs_commit.hlc + 1);
+                    for d in &req.datoms {
+                        ops.push(TaggedOp {
+                            hlc: mine_hlc,
+                            writer: req.author.clone(),
+                            datom: d.clone(),
+                        });
+                    }
+                    let merged = merge_live_sets(&base_live, &ops);
+                    let theirs_live = live_datoms_at(&theirs, self.store)?;
+                    let delta = delta_between(&theirs_live, &merged);
+                    let parents = match &base {
+                        Some(b) if b != &theirs => vec![theirs.clone(), b.clone()],
+                        _ => vec![theirs.clone()],
+                    };
+                    let parent_hlc_max = theirs_commit.hlc.max(mine_hlc);
+                    req.expected_parent = Some(theirs.clone());
+                    req.seq = theirs_commit.seq + 1;
+                    let seed_roots = build_datom_roots(&delta, self.store)?;
+                    let root_seed = seed_roots
+                        .get(ROOT_EAVT)
+                        .cloned()
+                        .unwrap_or_else(KotobaCid::default);
+                    let tx_cid = derive_tx_cid(
+                        &req.graph,
+                        &root_seed,
+                        req.expected_parent.as_ref(),
+                        req.seq,
+                    );
+                    let delta_with_tx = delta
+                        .iter()
+                        .cloned()
+                        .map(|mut datom| {
+                            datom.t = tx_cid.clone();
+                            datom
+                        })
+                        .collect::<Vec<_>>();
+                    let mut covering = theirs_live;
+                    covering.extend(delta_with_tx);
+                    req.datoms = delta;
+                    req.covering_datoms = Some(current_datoms(&covering));
+                    req.tx_cid = Some(tx_cid);
+                    req.merge_parents = Some((parents, parent_hlc_max));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
+#[derive(Clone)]
 pub struct CommitDatomsRequest {
     pub ipns_name: String,
     pub graph: KotobaCid,
@@ -2741,6 +2852,10 @@ pub struct CommitDatomsRequest {
     pub cacao_proof_cid: Option<KotobaCid>,
     pub ipns_controller_did: Option<String>,
     pub ipns_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// Merge commit marker (ADR-001 phase 2b): `Some((parents, parent_hlc_max))`
+    /// seals via `seal_merge` so the commit records all parents. `None` = normal
+    /// single-parent commit.
+    pub merge_parents: Option<(Vec<KotobaCid>, u64)>,
 }
 
 pub struct DistributedTransactRequest {
@@ -2934,18 +3049,19 @@ pub fn gc_history(
 
     // Collect every block CID reachable from a set of commits: the commit blocks
     // themselves plus all nodes of each covering ProllyTree index.
-    let reachable = |commits: &[DistributedDatomCommit]| -> Result<HashSet<[u8; 36]>, DistributedCommitError> {
-        let mut set = HashSet::new();
-        for c in commits {
-            set.insert(c.cid.0);
-            for root in c.index_roots.values() {
-                for cid in ProllyTree::walk_all_cids(root, store)? {
-                    set.insert(cid.0);
+    let reachable =
+        |commits: &[DistributedDatomCommit]| -> Result<HashSet<[u8; 36]>, DistributedCommitError> {
+            let mut set = HashSet::new();
+            for c in commits {
+                set.insert(c.cid.0);
+                for root in c.index_roots.values() {
+                    for cid in ProllyTree::walk_all_cids(root, store)? {
+                        set.insert(cid.0);
+                    }
                 }
             }
-        }
-        Ok(set)
-    };
+            Ok(set)
+        };
 
     let keep_set = reachable(kept)?;
     let drop_set = reachable(dropped)?;
@@ -3011,6 +3127,56 @@ pub fn merge_live_sets(base_live: &[Datom], concurrent_ops: &[TaggedOp]) -> Vec<
     let mut out: Vec<Datom> = live.into_values().collect();
     out.sort_by(|a, b| merge_key(a).cmp(&merge_key(b)));
     out
+}
+
+/// Live datom set at `head` via the covering `ceavt` index (the read fast path).
+/// Modern commits always carry `ceavt`; returns empty if absent (caller decides).
+pub fn live_datoms_at(
+    head: &KotobaCid,
+    store: &dyn BlockStore,
+) -> Result<Vec<Datom>, DistributedCommitError> {
+    if let Some(commit) = DistributedDatomCommit::load(head, store)? {
+        if let Some(ceavt_root) = commit.index_roots.get(ROOT_CEAVT) {
+            let entries = ProllyTree::scan_prefix(ceavt_root, &[], store)
+                .map_err(DistributedCommitError::Store)?;
+            return entries
+                .into_iter()
+                .map(|(_, value)| decode_stored_datom(&value))
+                .collect::<Result<Vec<_>, _>>();
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// The net change to go from one live set to another: assert everything in `to`
+/// not in `from`, retract everything in `from` not in `to` (keyed by `(e,a,v)`).
+/// This is the per-commit delta a merge commit records over its first parent.
+pub fn delta_between(from_live: &[Datom], to_live: &[Datom]) -> Vec<Datom> {
+    use std::collections::HashSet;
+    let from_keys: HashSet<_> = from_live.iter().map(merge_key).collect();
+    let to_keys: HashSet<_> = to_live.iter().map(merge_key).collect();
+    let mut delta = Vec::new();
+    for d in to_live {
+        if !from_keys.contains(&merge_key(d)) {
+            delta.push(Datom::assert(
+                d.e.clone(),
+                d.a.clone(),
+                d.v.clone(),
+                d.t.clone(),
+            ));
+        }
+    }
+    for d in from_live {
+        if !to_keys.contains(&merge_key(d)) {
+            delta.push(Datom::retract(
+                d.e.clone(),
+                d.a.clone(),
+                d.v.clone(),
+                d.t.clone(),
+            ));
+        }
+    }
+    delta
 }
 
 /// Collect the concurrent delta ops on the path `(base, theirs]` — every commit
@@ -4699,6 +4865,7 @@ mod tests {
 
     fn request(ipns_name: &str, graph: KotobaCid, datoms: Vec<Datom>) -> CommitDatomsRequest {
         CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: ipns_name.to_string(),
             graph,
             datoms,
@@ -4952,6 +5119,69 @@ mod tests {
 
         assert_eq!(second.commit.prev, Some(first.commit.cid));
         assert_eq!(second.ipns_record.sequence, 2);
+    }
+
+    #[test]
+    fn merge_on_conflict_is_gated_and_converges_live_datoms() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"graph");
+        let ipns_name = "k51-kotoba-db";
+
+        let base_datom = datom(b"alice", "person/name", "Alice", b"tx-base");
+        let mut base_req = request(ipns_name, graph.clone(), vec![base_datom.clone()]);
+        base_req.covering_datoms = Some(vec![base_datom.clone()]);
+        let base = writer.commit_datoms(base_req).unwrap();
+
+        let bob = datom(b"bob", "person/name", "Bob", b"tx-bob");
+        let mut winner_req = request(ipns_name, graph.clone(), vec![bob.clone()]);
+        winner_req.covering_datoms = Some(vec![base_datom.clone(), bob.clone()]);
+        winner_req.expected_parent = Some(base.commit.cid.clone());
+        winner_req.seq = 2;
+        let winner = writer.commit_datoms(winner_req).unwrap();
+
+        let carol = datom(b"carol", "person/name", "Carol", b"tx-carol");
+        let mut stale_req = request(ipns_name, graph, vec![carol]);
+        stale_req.expected_parent = Some(base.commit.cid.clone());
+        stale_req.seq = 2;
+        assert!(matches!(
+            writer
+                .commit_datoms_merging_with(stale_req.clone(), false)
+                .unwrap_err(),
+            DistributedCommitError::StaleParent { .. }
+        ));
+
+        let merged = writer
+            .commit_datoms_merging_with(stale_req, true)
+            .expect("merge-on-conflict should retry against the winning head");
+        assert_eq!(merged.commit.prev, Some(winner.commit.cid.clone()));
+        assert_eq!(
+            merged.commit.parents,
+            vec![winner.commit.cid.clone(), base.commit.cid.clone()]
+        );
+        assert_eq!(merged.ipns_record.sequence, 3);
+
+        let live = live_datoms_at(&merged.commit.cid, &store).unwrap();
+        for (entity, value) in [
+            (b"alice".as_slice(), "Alice"),
+            (b"bob", "Bob"),
+            (b"carol", "Carol"),
+        ] {
+            assert!(
+                live.iter().any(|d| {
+                    d.e == KotobaCid::from_bytes(entity)
+                        && d.a == "person/name"
+                        && d.v == EdnValue::string(value)
+                }),
+                "merged live set should contain {value}"
+            );
+        }
+        let carol = live
+            .iter()
+            .find(|d| d.e == KotobaCid::from_bytes(b"carol"))
+            .expect("carol datom");
+        assert_eq!(carol.t, merged.commit.tx_cid);
     }
 
     #[test]
@@ -8754,37 +8984,58 @@ mod tests {
         let graph = KotobaCid::from_bytes(b"gc-test-graph");
 
         // Commit 1: a small covering tree.
-        let v1: Vec<(Vec<u8>, Vec<u8>)> =
-            (0..50u32).map(|i| (format!("k{i:04}").into_bytes(), b"v1".to_vec())).collect();
+        let v1: Vec<(Vec<u8>, Vec<u8>)> = (0..50u32)
+            .map(|i| (format!("k{i:04}").into_bytes(), b"v1".to_vec()))
+            .collect();
         let root1 = ProllyTree::build_tree(v1, &store).unwrap();
         let mut roots1 = std::collections::HashMap::new();
         roots1.insert(ROOT_EAVT.to_string(), root1.clone());
         let c1 = DistributedDatomCommit::seal(
-            graph.clone(), KotobaCid::from_bytes(b"tx1"), None,
-            "did:key:test".into(), 1, roots1, None,
-        ).unwrap();
+            graph.clone(),
+            KotobaCid::from_bytes(b"tx1"),
+            None,
+            "did:key:test".into(),
+            1,
+            roots1,
+            None,
+        )
+        .unwrap();
         c1.persist(&store).unwrap();
 
         // Commit 2: a DIFFERENT, larger tree (distinct blocks) chained on c1.
-        let v2: Vec<(Vec<u8>, Vec<u8>)> =
-            (0..2000u32).map(|i| (format!("k{i:04}").into_bytes(), b"v2-larger-value".to_vec())).collect();
+        let v2: Vec<(Vec<u8>, Vec<u8>)> = (0..2000u32)
+            .map(|i| (format!("k{i:04}").into_bytes(), b"v2-larger-value".to_vec()))
+            .collect();
         let root2 = ProllyTree::build_tree(v2, &store).unwrap();
         let mut roots2 = std::collections::HashMap::new();
         roots2.insert(ROOT_EAVT.to_string(), root2.clone());
         let c2 = DistributedDatomCommit::seal(
-            graph, KotobaCid::from_bytes(b"tx2"), Some(c1.cid.clone()),
-            "did:key:test".into(), 2, roots2, None,
-        ).unwrap();
+            graph,
+            KotobaCid::from_bytes(b"tx2"),
+            Some(c1.cid.clone()),
+            "did:key:test".into(),
+            2,
+            roots2,
+            None,
+        )
+        .unwrap();
         c2.persist(&store).unwrap();
 
         // Blocks reachable only from the dropped commit c1 (its tree + commit block).
         let c1_only: Vec<_> = {
             use std::collections::HashSet;
             let keep: HashSet<[u8; 36]> = ProllyTree::walk_all_cids(&root2, &store)
-                .unwrap().into_iter().map(|c| c.0).chain(std::iter::once(c2.cid.0)).collect();
-            ProllyTree::walk_all_cids(&root1, &store).unwrap().into_iter()
+                .unwrap()
+                .into_iter()
+                .map(|c| c.0)
+                .chain(std::iter::once(c2.cid.0))
+                .collect();
+            ProllyTree::walk_all_cids(&root1, &store)
+                .unwrap()
+                .into_iter()
                 .chain(std::iter::once(c1.cid.clone()))
-                .filter(|c| !keep.contains(&c.0)).collect()
+                .filter(|c| !keep.contains(&c.0))
+                .collect()
         };
         assert!(!c1_only.is_empty(), "test needs c1-exclusive blocks");
 
@@ -8796,7 +9047,10 @@ mod tests {
         // current commit + its whole tree survive (DB value readable)
         assert!(store.get(&c2.cid).unwrap().is_some());
         for cid in ProllyTree::walk_all_cids(&root2, &store).unwrap() {
-            assert!(store.get(&cid).unwrap().is_some(), "current tree block deleted!");
+            assert!(
+                store.get(&cid).unwrap().is_some(),
+                "current tree block deleted!"
+            );
         }
         // dropped-only blocks are gone
         for cid in &c1_only {
@@ -8815,20 +9069,32 @@ mod tests {
         assert!(b > a, "HLC must advance with physical time");
         // A wall-clock JUMP BACKWARDS must NOT produce a smaller HLC.
         let c = next_hlc(500);
-        assert!(c > b, "HLC must stay monotonic when the clock goes backwards");
+        assert!(
+            c > b,
+            "HLC must stay monotonic when the clock goes backwards"
+        );
         // Same-millisecond calls still strictly increase (logical counter).
         let d = next_hlc(2_000);
         let e = next_hlc(2_000);
-        assert!(e > d, "HLC must strictly increase within the same millisecond");
+        assert!(
+            e > d,
+            "HLC must strictly increase within the same millisecond"
+        );
     }
 
     #[test]
     fn seal_stamps_a_nonzero_hlc() {
         let graph = KotobaCid::from_bytes(b"hlc-seal");
         let c = DistributedDatomCommit::seal(
-            graph.clone(), KotobaCid::from_bytes(b"tx"), None,
-            "did:key:t".into(), 1, std::collections::HashMap::new(), None,
-        ).unwrap();
+            graph.clone(),
+            KotobaCid::from_bytes(b"tx"),
+            None,
+            "did:key:t".into(),
+            1,
+            std::collections::HashMap::new(),
+            None,
+        )
+        .unwrap();
         assert!(c.hlc > 0, "seal must stamp a Hybrid Logical Clock");
     }
 
@@ -8852,7 +9118,11 @@ mod tests {
             Datom::retract(ent(e), a.into(), EdnValue::Integer(v), tx())
         }
         fn op(hlc: u64, w: &str, d: Datom) -> TaggedOp {
-            TaggedOp { hlc, writer: w.into(), datom: d }
+            TaggedOp {
+                hlc,
+                writer: w.into(),
+                datom: d,
+            }
         }
         /// canonical comparable signature of a live set
         fn sig(ds: &[Datom]) -> Vec<(String, String, String)> {
@@ -8882,7 +9152,11 @@ mod tests {
             let mut rev = ops.clone();
             rev.reverse();
             let backward = merge_live_sets(&base, &rev);
-            assert_eq!(sig(&forward), sig(&backward), "merge must be order-independent");
+            assert_eq!(
+                sig(&forward),
+                sig(&backward),
+                "merge must be order-independent"
+            );
         }
 
         #[test]
@@ -8891,13 +9165,19 @@ mod tests {
             // assert@10, retract@20 ⇒ gone
             let gone = merge_live_sets(
                 &base,
-                &[op(10, "w", assert_d("a", "x", 1)), op(20, "w", retract_d("a", "x", 1))],
+                &[
+                    op(10, "w", assert_d("a", "x", 1)),
+                    op(20, "w", retract_d("a", "x", 1)),
+                ],
             );
             assert!(sig(&gone).is_empty(), "later retract wins");
             // retract@10, assert@20 ⇒ present
             let present = merge_live_sets(
                 &base,
-                &[op(10, "w", retract_d("a", "x", 1)), op(20, "w", assert_d("a", "x", 1))],
+                &[
+                    op(10, "w", retract_d("a", "x", 1)),
+                    op(20, "w", assert_d("a", "x", 1)),
+                ],
             );
             assert_eq!(sig(&present).len(), 1, "later assert wins");
         }
@@ -8905,10 +9185,17 @@ mod tests {
         #[test]
         fn idempotent() {
             let base = vec![assert_d("a", "x", 0)];
-            let ops = vec![op(10, "w1", assert_d("a", "x", 1)), op(20, "w2", retract_d("z", "q", 7))];
+            let ops = vec![
+                op(10, "w1", assert_d("a", "x", 1)),
+                op(20, "w2", retract_d("z", "q", 7)),
+            ];
             let once = merge_live_sets(&base, &ops);
             let twice = merge_live_sets(&once, &ops);
-            assert_eq!(sig(&once), sig(&twice), "re-merging the same ops changes nothing");
+            assert_eq!(
+                sig(&once),
+                sig(&twice),
+                "re-merging the same ops changes nothing"
+            );
         }
 
         #[test]
@@ -8916,22 +9203,34 @@ mod tests {
             // Common ancestor.
             let base = vec![assert_d("u", "role", 0)];
             // Writer 1 (hlc 100) and Writer 2 (hlc 101) commit concurrently.
-            let w1 = vec![op(100, "did:w1", assert_d("u", "role", 1)), op(100, "did:w1", assert_d("p", "k", 5))];
-            let w2 = vec![op(101, "did:w2", assert_d("u", "role", 2)), op(101, "did:w2", retract_d("u", "role", 0))];
+            let w1 = vec![
+                op(100, "did:w1", assert_d("u", "role", 1)),
+                op(100, "did:w1", assert_d("p", "k", 5)),
+            ];
+            let w2 = vec![
+                op(101, "did:w2", assert_d("u", "role", 2)),
+                op(101, "did:w2", retract_d("u", "role", 0)),
+            ];
             // Node A merges as (w1 then w2); Node B as (w2 then w1).
             let a = merge_live_sets(&base, &[w1.clone(), w2.clone()].concat());
             let b = merge_live_sets(&base, &[w2, w1].concat());
-            assert_eq!(sig(&a), sig(&b), "both replicas converge to the same live set");
+            assert_eq!(
+                sig(&a),
+                sig(&b),
+                "both replicas converge to the same live set"
+            );
             // OR-set: both concurrent role values survive (no schema = no single-value LWW).
             let roles: Vec<_> = a.iter().filter(|d| d.a == "role").collect();
-            assert_eq!(roles.len(), 2, "concurrent distinct values kept as OR-set; role=0 retracted");
+            assert_eq!(
+                roles.len(),
+                2,
+                "concurrent distinct values kept as OR-set; role=0 retracted"
+            );
         }
 
         #[test]
         fn gather_concurrent_ops_walks_chain_and_tags_hlc() {
-            use super::super::{
-                build_datom_roots, gather_concurrent_ops, DistributedDatomCommit,
-            };
+            use super::super::{build_datom_roots, gather_concurrent_ops, DistributedDatomCommit};
             let store = kotoba_store::MemoryBlockStore::new();
             let g = KotobaCid::from_bytes(b"gather-g");
 
@@ -8939,16 +9238,30 @@ mod tests {
             let d0 = assert_d("a", "x", 0);
             let r0 = build_datom_roots(&[d0], &store).unwrap();
             let c0 = DistributedDatomCommit::seal(
-                g.clone(), KotobaCid::from_bytes(b"t0"), None, "w0".into(), 1, r0, None,
-            ).unwrap();
+                g.clone(),
+                KotobaCid::from_bytes(b"t0"),
+                None,
+                "w0".into(),
+                1,
+                r0,
+                None,
+            )
+            .unwrap();
             c0.persist(&store).unwrap();
 
             // concurrent commit on top (delta d1) — "theirs"
             let d1 = assert_d("b", "y", 1);
             let r1 = build_datom_roots(&[d1.clone()], &store).unwrap();
             let c1 = DistributedDatomCommit::seal(
-                g, KotobaCid::from_bytes(b"t1"), Some(c0.cid.clone()), "w1".into(), 2, r1, None,
-            ).unwrap();
+                g,
+                KotobaCid::from_bytes(b"t1"),
+                Some(c0.cid.clone()),
+                "w1".into(),
+                2,
+                r1,
+                None,
+            )
+            .unwrap();
             c1.persist(&store).unwrap();
 
             // gather (base, theirs] → exactly c1's delta, tagged with c1's hlc/author.
@@ -8958,7 +9271,11 @@ mod tests {
             assert_eq!(ops[0].writer, "w1");
             assert_eq!(ops[0].datom.a, "y");
             assert!(c1.hlc > c0.hlc, "later commit has a higher HLC");
-            assert_eq!(c1.parents, vec![c0.cid], "non-merge commit: parents == [prev]");
+            assert_eq!(
+                c1.parents,
+                vec![c0.cid],
+                "non-merge commit: parents == [prev]"
+            );
         }
     }
 }
