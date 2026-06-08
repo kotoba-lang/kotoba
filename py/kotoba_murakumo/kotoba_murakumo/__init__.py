@@ -29,6 +29,16 @@ from .exceptions import (
 )
 from .image import Image
 from .secret import Secret
+from .training import (
+    KotobaArtifactStore,
+    MurakumoModalTrainer,
+    StoredArtifact,
+    TrainConfig,
+    TrainRunResult,
+    TrainingExample,
+    train_step_loop,
+    train_with_modal_py,
+)
 from .volume import Volume
 
 __all__ = [
@@ -36,6 +46,14 @@ __all__ = [
     "Image",
     "Volume",
     "Secret",
+    "KotobaArtifactStore",
+    "MurakumoModalTrainer",
+    "StoredArtifact",
+    "TrainConfig",
+    "TrainRunResult",
+    "TrainingExample",
+    "train_step_loop",
+    "train_with_modal_py",
     "gpu",
     "economy",
     "enter",
