@@ -6,6 +6,7 @@ pub mod econ;
 pub mod email_xrpc;
 pub mod fingerprint;
 pub mod firehose;
+pub mod git_http;
 pub mod graph_auth;
 pub mod kg;
 pub mod kotobase_xrpc;
@@ -1332,6 +1333,18 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", realtime::NSID_SYNC_CONNECT),
             get(realtime::ws_connect),
+        )
+        // ── Git smart-HTTP (clone / fetch / push over datomic + IPFS) ───────
+        .route("/git/:repo/info/refs", get(git_http::info_refs))
+        .route(
+            "/git/:repo/git-upload-pack",
+            post(git_http::upload_pack)
+                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
+        )
+        .route(
+            "/git/:repo/git-receive-pack",
+            post(git_http::receive_pack)
+                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
         )
         // ── Generic XRPC dispatch ──────────────────────────────────────────
         .route(
