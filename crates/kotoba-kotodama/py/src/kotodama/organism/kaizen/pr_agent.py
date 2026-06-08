@@ -1,6 +1,7 @@
 
 import json
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -59,6 +60,13 @@ class KaizenPrAgent:
         target_files_str = suggested_action.get("targetFiles", [])
         patch_hint = suggested_action.get("patchHint", "")
 
+        # Prefer structured, machine-applicable edits when present — they target
+        # a file + selector unambiguously (no first-occurrence guessing, no hint
+        # string parsing). Falls through to patch_hint only when absent.
+        patch_edits = suggested_action.get("patchEdits") or []
+        if patch_edits:
+            return self._apply_structured_edits(patch_edits)
+
         if not target_files_str or not patch_hint:
             logging.warning("No target files or patch hint found in proposal. Skipping patch.")
             return []
@@ -100,6 +108,74 @@ class KaizenPrAgent:
 
         return modified_paths
 
+    def _apply_structured_edits(self, edits: List[Dict[str, str]]) -> List[Path]:
+        """Apply structured, machine-applicable edits (preferred path).
+
+        Each edit targets one file by an unambiguous selector:
+          - env-set ``{"file", "var", "value"}`` — set a k8s env var's value via
+            a named-var regex (no first-occurrence guessing across the file).
+          - literal ``{"file", "old", "new"}`` — first-occurrence str replace.
+        """
+        modified_paths: List[Path] = []
+        for edit in edits:
+            file_str = edit.get("file")
+            if not file_str:
+                logging.warning("Structured edit missing 'file'; skipping: %s", edit)
+                continue
+            target_path = self.repo_root / file_str
+            if not target_path.is_file():
+                logging.error(f"Target file {target_path} does not exist.")
+                continue
+            content = target_path.read_text()
+
+            if "var" in edit and "value" in edit:
+                var, value = edit["var"], edit["value"]
+                # Match `name: <VAR>` then the following `value: ...` line and
+                # replace only that var's value, preserving quote style.
+                pattern = re.compile(
+                    r'(name:\s*["\']?' + re.escape(var) + r'["\']?\s*\n\s*value:\s*)'
+                    r'(["\']?)[^"\'\n]*(["\']?)'
+                )
+                new_content, n = pattern.subn(rf'\g<1>\g<2>{value}\g<3>', content, count=1)
+                if n == 0:
+                    logging.warning(
+                        "env var %s not found in %s; skipping edit.", var, target_path
+                    )
+                    continue
+            elif "old" in edit and "new" in edit:
+                old, new = edit["old"], edit["new"]
+                if old not in content:
+                    logging.warning("literal '%s' not found in %s; skipping.", old, target_path)
+                    continue
+                new_content = content.replace(old, new, 1)
+            else:
+                logging.warning("Unrecognized structured edit shape; skipping: %s", edit)
+                continue
+
+            logging.info("Applied structured edit to %s", target_path)
+            target_path.write_text(new_content)
+            modified_paths.append(target_path)
+        return modified_paths
+
+    def _open_issue(self, proposal: Dict[str, Any], proposal_ndjson: str) -> str:
+        """Open an advisory GitHub issue for an issue-only proposal.
+
+        No branch/patch — the proposal is informational (error-rate,
+        fleet-unreachable, …). Returns the issue URL, or a dry-run message.
+        """
+        title = proposal.get("summary", "Kaizen Observation")
+        body = kaizen_proposal_to_pr_draft(proposal_ndjson) + HUMAN_IN_LOOP_BOILERPLATE
+        labels = (proposal.get("prAgentHint") or {}).get("labels", [])
+        if self.dry_run:
+            logging.info("[dry-run] would open issue: %s", title)
+            return "Dry run successful (issue)."
+        cmd = ["gh", "issue", "create", "--title", title, "--body", body]
+        for lb in labels:
+            cmd += ["--label", lb]
+        result = subprocess.run(cmd, check=True, cwd=self.repo_root, capture_output=True, text=True)
+        out = result.stdout.strip()
+        return out.splitlines()[-1] if out else "issue created"
+
     def consume_one(self) -> Optional[str]:
         """
         Consumes a single proposal from the queue.
@@ -120,6 +196,19 @@ class KaizenPrAgent:
             # Move malformed line to a quarantine file or just drop i
             self.proposal_queue_path.write_text("\n".join(remaining_lines) + "\n")
             return None
+
+        # issue-only proposals carry no code change (e.g. error-rate,
+        # fleet-unreachable). Open an advisory GitHub issue — no branch, no
+        # patch — and drain the proposal, instead of attempting a patch that
+        # finds nothing to change and leaves the proposal stuck in the queue.
+        kind = (proposal.get("suggestedAction") or {}).get("kind", "")
+        if kind == "issue-only":
+            url = self._open_issue(proposal, proposal_ndjson)
+            self.proposal_queue_path.write_text(
+                "\n".join(remaining_lines) + "\n" if remaining_lines else ""
+            )
+            logging.info("issue-only proposal consumed → %s", url)
+            return url
 
         # 1. Generate Branch Name
         pr_hint = proposal.get("prAgentHint", {})
@@ -187,17 +276,53 @@ class KaizenPrAgent:
             # Do not remove the proposal from the queue, so it can be retried
             raise
 
+    def _quarantine(self, proposal_ndjson: str) -> Path:
+        """Append a stuck proposal to a sibling needs-human queue.
+
+        Non-destructive: the proposal is preserved for human triage / retry,
+        but removed from the live queue so it stops blocking the rest.
+        """
+        qpath = self.proposal_queue_path.parent / (
+            self.proposal_queue_path.stem + ".needs-human.ndjson"
+        )
+        with open(qpath, "a", encoding="utf-8") as f:
+            f.write(proposal_ndjson + "\n")
+        logging.warning("Quarantined stuck proposal → %s", qpath)
+        return qpath
+
     def consume_all(self) -> List[str]:
         """
-        Consumes all proposals in the queue until it's empty.
-        Returns a list of created PR URLs.
+        Drain the queue, returning the created PR/issue URLs.
+
+        Robust to a proposal that cannot be applied: if consume_one returns
+        None while leaving the head in place (a stuck config/code-change patch),
+        the head is quarantined to ``<stem>.needs-human.ndjson`` so the loop
+        keeps making progress instead of blocking on it forever.
         """
         urls = []
         while True:
-            url = self.consume_one()
-            if url is None:
+            if not self.proposal_queue_path.exists():
                 break
-            urls.append(url)
+            lines = self.proposal_queue_path.read_text().splitlines()
+            if not lines:
+                break
+            head_before = lines[0]
+            url = self.consume_one()
+            if url is not None:
+                urls.append(url)
+                continue
+            # None: either the head was drained (handled next loop) or it is
+            # stuck. If the head is unchanged, quarantine it and move on.
+            lines_after = (
+                self.proposal_queue_path.read_text().splitlines()
+                if self.proposal_queue_path.exists()
+                else []
+            )
+            if lines_after and lines_after[0] == head_before:
+                self._quarantine(head_before)
+                self.proposal_queue_path.write_text(
+                    "\n".join(lines_after[1:]) + "\n" if lines_after[1:] else ""
+                )
         logging.info(f"Consumed {len(urls)} proposals.")
         return urls
 
