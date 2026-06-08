@@ -10,9 +10,10 @@
 use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::delta::Delta;
 use kotoba_kqe::social::{
-    allocate_retainer, Falsification, MintParams, PinOrigin, SocialCapitalView,
-    ValidatedDisclosure, ValidatedWellbecoming, SCALE,
+    allocate_retainer, apply_retainer_credits, settle_retainer, Falsification, MintParams,
+    PinOrigin, SocialCapitalView, ValidatedDisclosure, ValidatedWellbecoming, SCALE,
 };
+use std::collections::HashMap;
 
 fn did(s: &str) -> KotobaCid {
     KotobaCid::from_bytes(s.as_bytes())
@@ -128,6 +129,29 @@ fn main() {
         println!("  {root}…  SC_root={:>8}  → {:>7} mKOTO", pts(s.sc_root), s.retainer_mkoto);
     }
 
+    // ── 6. L6 settlement: RetainerShare → pinner mKOTO credit ──
+    // pinA & pinC are kept by pinner "peggy", pinB by "quinn" (from Pinned events).
+    let peggy = did("did:key:peggy");
+    let quinn = did("did:key:quinn");
+    let pinner_of = |pin: &KotobaCid| {
+        if *pin == did("pinA") || *pin == did("pinC") {
+            Some(peggy.clone())
+        } else if *pin == did("pinB") {
+            Some(quinn.clone())
+        } else {
+            None
+        }
+    };
+    let (credits, total) = settle_retainer(&shares, pinner_of);
+    let mut wallet: HashMap<KotobaCid, i64> = HashMap::new();
+    apply_retainer_credits(&mut wallet, &credits);
+    println!("\nL6 settlement @ epoch 0 — pinner mKOTO credits (peggy keeps pinA+pinC, quinn pinB):");
+    for c in &credits {
+        let who = if c.pinner_did == peggy { "peggy" } else { "quinn" };
+        println!("  {who:6} += {:>7} mKOTO", c.mkoto);
+    }
+    println!("  settled total = {total} mKOTO (aggregated; non-transferable, internal accounting)");
+
     // sanity: a falsification burns more than it earned (asymmetric 嘘で損)
     let f = Falsification { did: alice.clone(), epoch: 30, count: 2 };
     println!(
@@ -135,5 +159,5 @@ fn main() {
         pts(f.burn_smic(&params))
     );
 
-    println!("\n== loop verified: acts → mint → view → SC_root → retainer ==");
+    println!("\n== loop verified: acts → mint → view → SC_root → retainer → settle ==");
 }
