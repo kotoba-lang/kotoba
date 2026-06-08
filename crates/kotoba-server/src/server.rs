@@ -340,6 +340,14 @@ pub struct KotobaState {
     /// efficacy hook proving the resident cache actually serves steady-state
     /// transacts rather than silently falling through to a cold scan.
     pub datomic_cold_db_loads: Arc<std::sync::atomic::AtomicU64>,
+    // ── Git wire protocol (kotoba-git) ────────────────────────────────────────
+    /// Per-repo git **Datom projection** (the `oid↔cid` bridge + refs + queryable
+    /// commit DAG), keyed by repo name. The lossless object *bytes* live in
+    /// `block_store` (IPFS, content-addressed); this `Connection` is the datomic
+    /// projection over them. Lazily created with the `:git/*` schema installed on
+    /// first access — see `git_connection`.
+    pub git_repos:
+        Arc<tokio::sync::RwLock<HashMap<String, Arc<kotoba_datomic::Connection>>>>,
 }
 
 impl KotobaState {
@@ -850,6 +858,7 @@ impl KotobaState {
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
             datomic_live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             datomic_cold_db_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            git_repos: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -987,6 +996,97 @@ impl KotobaState {
             }
         }
         tracing::info!(seeded, "warm: datomic resident-cache warm-up complete");
+    }
+
+    /// Get (or lazily create) the git Datom projection [`Connection`] for `repo`.
+    ///
+    /// The `:git/*` schema is installed once on creation, and the projection is
+    /// **rehydrated** from the last durable snapshot if one exists (see
+    /// [`Self::git_persist`]). The returned `Connection` is paired with
+    /// [`Self::block_store`] to form a `kotoba_git::GitStore` — datomic
+    /// projection + IPFS blocks — by the `git_http` handlers.
+    pub async fn git_connection(&self, repo: &str) -> Arc<kotoba_datomic::Connection> {
+        if let Some(conn) = self.git_repos.read().await.get(repo) {
+            return Arc::clone(conn);
+        }
+        let mut repos = self.git_repos.write().await;
+        // Re-check under the write lock (another task may have created it).
+        if let Some(conn) = repos.get(repo) {
+            return Arc::clone(conn);
+        }
+        let conn = Arc::new(kotoba_datomic::Connection::new());
+        {
+            let git = kotoba_git::GitStore::new(&conn, &*self.block_store);
+            if let Err(e) = git.install_schema().await {
+                tracing::warn!(repo, error = %e, "git_connection: install_schema failed");
+            }
+            // Rehydrate the projection (oid↔cid index + refs) from the durable
+            // manifest, if this repo was persisted before. Objects come back
+            // from their content-addressed blocks (durable in IPFS/Kubo).
+            if let Some(cid) = self.git_head_cid(repo).await {
+                match git.rehydrate(&cid).await {
+                    Ok((restored, missing)) => tracing::info!(
+                        repo, restored, missing,
+                        "git: rehydrated repo projection from durable snapshot"
+                    ),
+                    Err(e) => tracing::warn!(repo, error = %e, "git: rehydrate failed"),
+                }
+            }
+        }
+        repos.insert(repo.to_string(), Arc::clone(&conn));
+        conn
+    }
+
+    /// Durable mutable pointer key for a repo's latest snapshot manifest CID.
+    fn git_repo_key(repo: &str) -> String {
+        let safe: String = repo
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("git/repo/{safe}/head")
+    }
+
+    /// Resolve the durable snapshot-manifest CID for `repo` from the `KseStore`
+    /// mutable boundary (`None` if no store is configured or none was persisted).
+    async fn git_head_cid(&self, repo: &str) -> Option<KotobaCid> {
+        let ks = self.kse_store.as_ref()?;
+        let bytes = ks.get(&Self::git_repo_key(repo)).await.ok()?;
+        let s = String::from_utf8(bytes.to_vec()).ok()?;
+        KotobaCid::from_multibase(s.trim())
+    }
+
+    /// Persist `repo`'s projection durably: write the snapshot manifest block
+    /// (content-addressed, into the IPFS-backed block store) and record its CID
+    /// in the `KseStore` mutable boundary. Combined with the already-durable
+    /// object blocks, this is the full durable form of the git repo. A no-op for
+    /// the mutable pointer when no `KseStore` is configured (dev / ephemeral),
+    /// though the manifest block is still written.
+    pub async fn git_persist(&self, repo: &str, git: &kotoba_git::GitStore<'_>) {
+        let cid = match git.snapshot_manifest() {
+            Ok(cid) => cid,
+            Err(e) => {
+                tracing::warn!(repo, error = %e, "git: snapshot_manifest failed");
+                return;
+            }
+        };
+        match self.kse_store.as_ref() {
+            Some(ks) => {
+                let key = Self::git_repo_key(repo);
+                if let Err(e) = ks.put(&key, Bytes::from(cid.to_multibase().into_bytes())).await {
+                    tracing::warn!(repo, error = %e, "git: persisting snapshot pointer failed");
+                }
+            }
+            None => tracing::debug!(
+                repo,
+                "git: no KseStore — snapshot block written but pointer is not durable"
+            ),
+        }
     }
 
     /// Attach a GossipSub outbound channel after construction.
