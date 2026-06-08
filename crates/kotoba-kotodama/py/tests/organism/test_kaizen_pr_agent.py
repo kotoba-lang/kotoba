@@ -128,10 +128,11 @@ def test_consume_one_dry_run(mock_run, mock_check_output, repo_root, proposal_qu
     assert mock_check_output.call_count == 1
 
     calls = mock_run.call_args_list
+    # Dry-run flow (no push, no `gh pr create` — local validation only):
     # 1. gh auth status (in __init__)
     # 2. git checkout -b <branch>
     # 3. git add src/main.py
-    # 4. gh pr create ... --dry-run
+    # 4. git commit -m <title>
     # 5. git checkout main
     assert len(calls) == 5
 
@@ -139,17 +140,13 @@ def test_consume_one_dry_run(mock_run, mock_check_output, repo_root, proposal_qu
     assert call(["git", "checkout", "-b", mock_run.call_args_list[1].args[0][3]], check=True, cwd=repo_root, capture_output=True) in calls
     # Check git add
     assert call(["git", "add", "src/main.py"], check=True, cwd=repo_root) in calls
+    # Check git commit (the change is committed before any PR step)
+    assert call(["git", "commit", "-m", FAKE_PROPOSAL["summary"]], check=True, cwd=repo_root, capture_output=True) in calls
 
-    # Check gh pr create call
-    gh_call = calls[3]
-    assert gh_call.args[0][0:4] == ["gh", "pr", "create", "--title"]
-    assert gh_call.args[0][4] == FAKE_PROPOSAL["summary"]
-
-    expected_body = kaizen_proposal_to_pr_draft(json.dumps(FAKE_PROPOSAL)) + HUMAN_IN_LOOP_BOILERPLATE
-    assert gh_call.args[0][6] == expected_body
-    assert "--label" in gh_call.args[0]
-    assert "kaizen" in gh_call.args[0]
-    assert "--dry-run" in gh_call.args[0]
+    # Dry-run must NOT push or open a PR (zero remote side effects).
+    flat = [c.args[0] for c in calls]
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd in flat)
+    assert not any(cmd[:2] == ["git", "push"] for cmd in flat)
 
     # Check git checkout main
     assert call(["git", "checkout", "main"], check=True, cwd=repo_root) in calls
@@ -169,8 +166,16 @@ def test_consume_one_real_run(mock_run, mock_check_output, repo_root, proposal_q
     result = agent.consume_one()
 
     assert result == pr_url
-    gh_call = mock_run.call_args_list[3]
-    assert "--dry-run" not in gh_call.args[0]
+    flat = [c.args[0] for c in mock_run.call_args_list]
+    # Real run must: commit the staged change, push the branch, then open the PR
+    # from the pushed head (regression guard — the actuator previously staged but
+    # never committed/pushed, so `gh pr create` failed on the live fleet).
+    assert any(cmd[:2] == ["git", "commit"] for cmd in flat), "must commit before PR"
+    assert any(cmd[:2] == ["git", "push"] for cmd in flat), "must push the branch"
+    gh_cmds = [cmd for cmd in flat if cmd[:3] == ["gh", "pr", "create"]]
+    assert gh_cmds, "must call gh pr create"
+    assert "--head" in gh_cmds[0]
+    assert "--dry-run" not in gh_cmds[0]
 
 @patch('subprocess.check_output', return_value="main\n")
 @patch('subprocess.run')

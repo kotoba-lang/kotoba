@@ -236,26 +236,39 @@ class KaizenPrAgent:
                 logging.info(f"Staging file: {relative_path}")
                 subprocess.run(["git", "add", str(relative_path)], check=True, cwd=self.repo_root)
 
-            # 5. Create PR
             pr_title = proposal.get("summary", "Kaizen Proposal")
             pr_body = kaizen_proposal_to_pr_draft(proposal_ndjson)
             pr_body += HUMAN_IN_LOOP_BOILERPLATE
-
             labels = pr_hint.get("labels", [])
 
-            gh_command = ["gh", "pr", "create", "--title", pr_title, "--body", pr_body]
-            for label in labels:
-                gh_command.extend(["--label", label])
+            # 5. Commit the staged change. `gh pr create` requires commits on the
+            # branch (staged-but-uncommitted changes are not PR-able), so a commit
+            # is mandatory on both the dry-run and real paths.
+            subprocess.run(
+                ["git", "commit", "-m", pr_title], check=True, cwd=self.repo_root, capture_output=True
+            )
 
+            # 6. Open the PR.
             if self.dry_run:
-                gh_command.append("--dry-run")
-                logging.info("Executing dry-run of 'gh pr create'.")
+                # Validate locally only — patch applied + committed on the branch.
+                # No push, no `gh pr create` (which would require a remote branch),
+                # so a dry run has zero remote side effects.
+                logging.info("Dry-run: patched + committed on %s (no push/PR).", branch_name)
+                pr_url = "Dry run successful."
             else:
-                logging.info("Creating GitHub PR.")
-
-            result = subprocess.run(gh_command, check=True, cwd=self.repo_root, capture_output=True, text=True)
-
-            pr_url = result.stdout.strip().splitlines()[-1] if not self.dry_run else "Dry run successful."
+                # Push the branch first — `gh pr create` opens the PR from the
+                # pushed head (non-interactive contexts require the branch on the
+                # remote; `--head` makes the head explicit).
+                logging.info("Pushing %s and creating GitHub PR.", branch_name)
+                subprocess.run(
+                    ["git", "push", "-u", "origin", branch_name],
+                    check=True, cwd=self.repo_root, capture_output=True,
+                )
+                gh_command = ["gh", "pr", "create", "--head", branch_name, "--title", pr_title, "--body", pr_body]
+                for label in labels:
+                    gh_command.extend(["--label", label])
+                result = subprocess.run(gh_command, check=True, cwd=self.repo_root, capture_output=True, text=True)
+                pr_url = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "PR created"
             logging.info(f"PR result: {pr_url}")
 
             # 6. Update queue file
