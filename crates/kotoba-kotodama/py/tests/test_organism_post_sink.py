@@ -140,6 +140,7 @@ def test_organism_emits_post_to_ndjson_queue(tmp_path: Path):
         },
         post_sink=sink,
     )
+    organism.lifecycle.handle_birth(organism.actor_did)
     organism.inbox.add_commit(
         InboundCommit(collection="x", repo="did:other", rkey="r1", time="t")
     )
@@ -167,6 +168,7 @@ def test_organism_legacy_text_sink_still_supported():
         },
         post_sink=lambda text: captured.append(text),
     )
+    organism.lifecycle.handle_birth(organism.actor_did)
     organism.inbox.add_commit(
         InboundCommit(collection="x", repo="did:other", rkey="r1", time="t")
     )

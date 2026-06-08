@@ -30,8 +30,9 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
-from aiohttp import web
-
+# aiohttp is imported lazily inside the HTTP-server functions (`_bind_handlers`
+# / `serve`) so the FleetState organism logic stays importable on hosts that do
+# not install the optional `aiohttp` server dependency (edge-target invariant).
 from kotodama.organism.followers import follower_score_provider
 from kotodama.organism.personality import joucho_personality_provider
 from kotodama.organism.post_sink import PostSink, resolve_post_sink
@@ -39,8 +40,33 @@ from kotodama.organism.unispsc_organism import UnispscOrganism
 
 logger = logging.getLogger("UnispscOrganismFleetCell")
 
-REPO_ROOT = Path(__file__).resolve().parents[6]
-REGISTRY_PATH = REPO_ROOT / "00-contracts" / "actor-registry" / "unispsc.json"
+_REGISTRY_REL = Path("00-contracts") / "actor-registry" / "unispsc.json"
+
+
+def _resolve_registry_path() -> Path:
+    """Locate the UNSPSC actor registry across deployment layouts.
+
+    Resolution order:
+      1. ``UNISPSC_ORGANISM_REGISTRY_PATH`` env override (operator-set).
+      2. Walk up from this file looking for ``00-contracts/actor-registry/
+         unispsc.json`` — `00-contracts/` lives at the monorepo root, which
+         is several parents above the kotoba submodule's own root.
+      3. Fall back to the historical ``parents[6]`` location (submodule root)
+         so a standalone kotoba checkout that ships its own copy still works.
+    """
+    env = os.environ.get("UNISPSC_ORGANISM_REGISTRY_PATH")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / _REGISTRY_REL
+        if candidate.is_file():
+            return candidate
+    return here.parents[6] / _REGISTRY_REL
+
+
+REGISTRY_PATH = _resolve_registry_path()
+REPO_ROOT = REGISTRY_PATH.parents[2]
 
 # Identical to UnispscAgentExecutorCell.SHARD_RANGES.
 SHARD_RANGES: dict[int, tuple[int, int]] = {
@@ -199,7 +225,9 @@ class FleetState:
         )
 
 
-def _bind_handlers(app: web.Application, state: FleetState) -> None:
+def _bind_handlers(app: "web.Application", state: FleetState) -> None:
+    from aiohttp import web
+
     app["state"] = state
 
     async def healthz(_request: web.Request) -> web.Response:
@@ -244,6 +272,8 @@ async def _heartbeat_loop(state: FleetState, stop_event: asyncio.Event, tick_int
 
 
 async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> None:
+    from aiohttp import web
+
     shard_index = _resolve_shard()
     lru_max = int(os.environ.get("UNISPSC_ORGANISM_LRU_MAX", "4096"))
     tick_interval_s = int(os.environ.get("UNISPSC_ORGANISM_TICK_INTERVAL_S", "300"))

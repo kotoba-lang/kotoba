@@ -26,10 +26,14 @@ def _make_stub_graph() -> Any:
 
 
 def _make_organism() -> UnispscOrganism:
-    return UnispscOrganism(
+    org = UnispscOrganism(
         code="stub",
         graph=_make_stub_graph(),
     )
+    # Birth → ACTIVE so tick() runs its body (else the lifecycle gate
+    # early-returns a no-op dummy cadence with default neutral joucho).
+    org.lifecycle.handle_birth(org.actor_did)
+    return org
 
 
 def test_multi_modal_tick_joucho_shift():
@@ -102,6 +106,7 @@ def test_internal_only_tier_c_no_leak():
         graph=_make_stub_graph(),
         post_sink=mock_sink,
     )
+    org.lifecycle.handle_birth(org.actor_did)
 
     # Push internal tier C observation
     org.inbox.push(
