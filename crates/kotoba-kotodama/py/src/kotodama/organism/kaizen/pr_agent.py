@@ -260,6 +260,13 @@ class KaizenPrAgent:
                 # pushed head (non-interactive contexts require the branch on the
                 # remote; `--head` makes the head explicit).
                 logging.info("Pushing %s and creating GitHub PR.", branch_name)
+                # Configure git to authenticate pushes via the gh credential
+                # helper (uses GH_TOKEN). An anonymous clone of a public repo has
+                # no push credentials, so a bare `git push` fails with exit 128;
+                # `gh auth setup-git` wires github.com to gh's token.
+                subprocess.run(
+                    ["gh", "auth", "setup-git"], check=True, cwd=self.repo_root, capture_output=True
+                )
                 subprocess.run(
                     ["git", "push", "-u", "origin", branch_name],
                     check=True, cwd=self.repo_root, capture_output=True,
