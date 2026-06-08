@@ -28,6 +28,19 @@ from .exceptions import (
     MurakumoCompatNotImplemented,
 )
 from .image import Image
+from .rsi import (
+    BonsaiPruneRule,
+    MutationCost,
+    MutationKind,
+    PruneReason,
+    RsiDecision,
+    RsiPolicy,
+    RsiTokenLedger,
+    SelfMutationProposal,
+    evaluate_training_rsi,
+    persist_rsi_decision,
+    proposal_from_training_result,
+)
 from .secret import Secret
 from .training import (
     BenchResult,
@@ -52,6 +65,17 @@ __all__ = [
     "Image",
     "Volume",
     "Secret",
+    "BonsaiPruneRule",
+    "MutationCost",
+    "MutationKind",
+    "PruneReason",
+    "RsiDecision",
+    "RsiPolicy",
+    "RsiTokenLedger",
+    "SelfMutationProposal",
+    "evaluate_training_rsi",
+    "persist_rsi_decision",
+    "proposal_from_training_result",
     "BenchResult",
     "DataSelectionReport",
     "KotobaArtifactStore",
