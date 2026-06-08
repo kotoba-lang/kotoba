@@ -6,10 +6,12 @@ the change and later reports its outcome:
 
   - GithubRemote: `gh auth setup-git` → `git push` → `gh pr create --head` (PR
     URL); outcome via `gh pr view --json state` (merged / closed / open).
-  - KotobaRemote: GitHub-INDEPENDENT. Pushes the committed branch into kotoba's
-    content-addressed Datom store via the kotoba-git write surface (the
-    `kotoba git import` CLI), so the loop self-evolves with NO GitHub / GHCR /
-    token dependency. The "change" is a kotoba ref; its outcome is a kotoba
+  - KotobaRemote: GitHub-INDEPENDENT. `git push`es the committed branch over the
+    kotoba server's git smart-HTTP endpoint (`POST /git/<repo>/git-receive-pack`,
+    kotoba-server::git_http → kotoba_git::wire::receive_pack), so every object
+    lands as an IPFS block + `:git/*` Datom projection on the running kotoba node
+    — NO GitHub / GHCR dependency, a real git-protocol push into the content-
+    addressed Datom log. The "change" is a kotoba ref; its outcome is a kotoba
     approval marker (Council / operator), not a GitHub merge.
 
 Selected by env ``KAIZEN_GIT_REMOTE`` (github | kotoba; default github).
@@ -75,33 +77,51 @@ class GithubRemote:
 
 
 class KotobaRemote:
-    """GitHub-independent: push the committed branch into kotoba's content-
-    addressed Datom store via the kotoba-git write surface (no GitHub).
+    """GitHub-independent: `git push` the committed branch into kotoba's content-
+    addressed Datom store over the kotoba server's git smart-HTTP endpoint.
 
-    Mechanism (per the kotoba-git write API — GitStore.import_repo / put_ref):
-    shells the kotoba CLI `kotoba git import <repo>/.git --graph <graph>`, which
-    ingests the branch's objects + refs as content-addressed `:git/*` Datoms.
-    The command is configurable via ``KAIZEN_KOTOBA_GIT_CMD`` (default
-    "kotoba git import") so the binary path / subcommand can be pointed at the
-    operator's kotoba build. Returns the kotoba ref (refs/heads/<branch>).
+    Mechanism — a *real git push* (no GitHub):
+      git push <KAIZEN_KOTOBA_GIT_URL>/git/<repo> refs/heads/<b>:refs/heads/<b>
+    hits `POST /git/<repo>/git-receive-pack` (kotoba-server::git_http), which runs
+    `kotoba_git::wire::receive_pack` → every object becomes an IPFS block + a
+    `:git/*` Datom projection, then `git_persist` snapshots the oid↔cid index +
+    refs. The push gate (`push_gate`) authenticates via an operator Bearer JWT
+    (``KAIZEN_KOTOBA_GIT_TOKEN``, operator-injected — no platform key, same model
+    as GH_TOKEN), or anonymously when the node runs KOTOBA_GIT_ALLOW_ANON_PUSH=1
+    (set ``KAIZEN_KOTOBA_GIT_ANON=1`` to skip the auth header).
+
+    Env:
+      KAIZEN_KOTOBA_GIT_URL    kotoba server base (default http://127.0.0.1:8080)
+      KAIZEN_KOTOBA_REPO       per-repo git Connection name (default "root")
+      KAIZEN_KOTOBA_GIT_TOKEN  operator Bearer JWT for the push gate
+      KAIZEN_KOTOBA_GIT_ANON   "1" → no auth header (node allows anon push)
+    Returns the kotoba ref `kotoba:<repo>/refs/heads/<branch>`.
     """
 
     name = "kotoba"
 
-    def __init__(self, *, graph: str | None = None, kotoba_cmd: str | None = None):
-        self.graph = graph or os.environ.get("KAIZEN_KOTOBA_GRAPH", "kaizen:self-evolution")
-        self.kotoba_cmd = (kotoba_cmd or os.environ.get("KAIZEN_KOTOBA_GIT_CMD", "kotoba git import")).split()
+    def __init__(self, *, base_url: str | None = None, repo: str | None = None):
+        self.base_url = (base_url or os.environ.get("KAIZEN_KOTOBA_GIT_URL", "http://127.0.0.1:8080")).rstrip("/")
+        self.repo = repo or os.environ.get("KAIZEN_KOTOBA_REPO", "root")
 
     def open_change(
         self, *, repo_root: Path, branch: str, title: str, body: str, labels: list[str]
     ) -> str:
-        git_dir = str(Path(repo_root) / ".git")
-        cmd = [*self.kotoba_cmd, git_dir, "--graph", self.graph, "--ref", f"refs/heads/{branch}"]
-        logger.info("kotoba push: %s", " ".join(cmd))
-        # No GitHub, no token, no network egress to github.com — the change lands
-        # in the kotoba content-addressed Datom log on the fleet.
+        remote_url = f"{self.base_url}/git/{self.repo}"
+        refspec = f"refs/heads/{branch}:refs/heads/{branch}"
+        cmd = ["git", "push", remote_url, refspec]
+        # Operator-injected Bearer JWT for the kotoba push gate (no platform key).
+        token = os.environ.get("KAIZEN_KOTOBA_GIT_TOKEN", "")
+        anon = os.environ.get("KAIZEN_KOTOBA_GIT_ANON", "") == "1"
+        if token and not anon:
+            # -c http.extraHeader injects the gate credential without writing it
+            # to disk; the URL carries no secret.
+            cmd = ["git", "-c", f"http.extraHeader=Authorization: Bearer {token}", *cmd[1:]]
+        logger.info("kotoba git push: %s %s", remote_url, refspec)
+        # No GitHub, no github.com egress — a real git-protocol push lands the
+        # branch in the kotoba content-addressed Datom log on the fleet.
         subprocess.run(cmd, check=True, cwd=repo_root, capture_output=True, text=True)
-        return f"kotoba:{self.graph}/refs/heads/{branch}"
+        return f"kotoba:{self.repo}/refs/heads/{branch}"
 
     def change_state(self, ref_or_branch: str, *, repo_root: Path) -> str:
         # A kotoba ref is "accepted" when an operator/Council marks it (a

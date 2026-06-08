@@ -52,23 +52,43 @@ def test_github_change_state_maps_merged(mock_run):
 
 
 @patch("subprocess.run")
-def test_kotoba_open_change_shells_kotoba_import_no_github(mock_run, monkeypatch):
-    monkeypatch.setenv("KAIZEN_KOTOBA_GIT_CMD", "kotoba git import")
-    monkeypatch.setenv("KAIZEN_KOTOBA_GRAPH", "kaizen:self-evolution")
+def test_kotoba_open_change_git_pushes_to_kotoba_endpoint_no_github(mock_run, monkeypatch):
+    monkeypatch.setenv("KAIZEN_KOTOBA_GIT_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("KAIZEN_KOTOBA_REPO", "root")
+    monkeypatch.setenv("KAIZEN_KOTOBA_GIT_TOKEN", "op.jwt.tok")
+    monkeypatch.delenv("KAIZEN_KOTOBA_GIT_ANON", raising=False)
     mock_run.return_value = MagicMock(stdout="", text=True)
     out = KotobaRemote().open_change(
         repo_root=Path("/repo"), branch="kaizen/x", title="t", body="b", labels=[]
     )
-    assert out == "kotoba:kaizen:self-evolution/refs/heads/kaizen/x"
+    assert out == "kotoba:root/refs/heads/kaizen/x"
     flat = [c.args[0] for c in mock_run.call_args_list]
-    # Exactly one shell-out: the kotoba import. No `gh`, no `git push`.
+    # Exactly one shell-out: a real `git push` to the kotoba smart-HTTP endpoint.
+    # No `gh`, no github.com.
     assert len(flat) == 1
     cmd = flat[0]
-    assert cmd[:3] == ["kotoba", "git", "import"]
-    assert "/repo/.git" in cmd
-    assert "--graph" in cmd and "kaizen:self-evolution" in cmd
-    assert "--ref" in cmd and "refs/heads/kaizen/x" in cmd
+    assert cmd[0] == "git" and "push" in cmd
+    # Operator Bearer JWT injected via -c http.extraHeader (no secret in URL/disk).
+    assert "-c" in cmd
+    assert any("http.extraHeader=Authorization: Bearer op.jwt.tok" == p for p in cmd)
+    assert "http://127.0.0.1:8080/git/root" in cmd
+    assert "refs/heads/kaizen/x:refs/heads/kaizen/x" in cmd
     assert not any("gh" == part for part in cmd)
+    assert not any("github.com" in str(part) for part in cmd)
+
+
+@patch("subprocess.run")
+def test_kotoba_open_change_anon_omits_auth_header(mock_run, monkeypatch):
+    monkeypatch.setenv("KAIZEN_KOTOBA_GIT_ANON", "1")
+    monkeypatch.setenv("KAIZEN_KOTOBA_GIT_TOKEN", "ignored.when.anon")
+    mock_run.return_value = MagicMock(stdout="", text=True)
+    KotobaRemote().open_change(
+        repo_root=Path("/repo"), branch="kaizen/y", title="t", body="b", labels=[]
+    )
+    cmd = mock_run.call_args_list[0].args[0]
+    # Anon push (node has KOTOBA_GIT_ALLOW_ANON_PUSH=1) → no Authorization header.
+    assert "-c" not in cmd
+    assert not any("Authorization" in str(p) for p in cmd)
 
 
 @patch("subprocess.run")
