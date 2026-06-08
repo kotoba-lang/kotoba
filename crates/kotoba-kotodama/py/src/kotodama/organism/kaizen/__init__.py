@@ -965,6 +965,7 @@ class KaizenObserver:
         history_size: int = 144,  # 24h at 10-min cadence
         dedup_window_s: int = 2 * 3600,
         http_get: Callable[[str, float], dict] | None = None,
+        meta_reflector: "Any | None" = None,
     ):
         self.shard_urls = list(shard_urls)
         self.queue_paths = [Path(q) for q in queue_paths]
@@ -972,6 +973,10 @@ class KaizenObserver:
         self.history_size = history_size
         self.dedup_window_s = dedup_window_s
         self.http_get = http_get
+        # Optional MetaReflector (kaizen.fitness): scores rules by PR-acceptance
+        # and prunes (disables) rules humans keep rejecting — the loop pruning
+        # itself. None → all rules active (back-compat).
+        self.meta_reflector = meta_reflector
         self._history: dict[int, list[float]] = {}
         self._last_emit: dict[tuple[str, str], int] = {}
         self._lock = threading.Lock()
@@ -1000,11 +1005,18 @@ class KaizenObserver:
 
     def run_rules(self, obs: Observation) -> list[KaizenProposal]:
         out: list[KaizenProposal] = []
+        disabled = self.meta_reflector.disabled_rules() if self.meta_reflector else set()
         for rule in RULE_REGISTRY.values():
+            rid = getattr(rule, "rule_id", "?")
+            if rid in disabled:
+                # Pruned by the meta-reflector — its proposals keep getting
+                # rejected, so the loop stops emitting from it.
+                logger.info("rule %s pruned (low PR-acceptance fitness); skipping", rid)
+                continue
             try:
                 out.extend(rule(obs))
             except Exception as exc:  # noqa: BLE001 — observer stays alive
-                logger.warning("rule %s failed: %s", getattr(rule, "rule_id", "?"), exc)
+                logger.warning("rule %s failed: %s", rid, exc)
         return out
 
     def _filter_dedup(self, proposals: list[KaizenProposal], now_ms: int) -> list[KaizenProposal]:
