@@ -225,3 +225,44 @@ def test_consume_all_quarantines_stuck_proposal_and_drains_rest(tmp_path: Path):
     assert "stuck: file missing" in needs_human.read_text()
     # Applicable patch really applied.
     assert 'value: "8192"' in tgt.read_text()
+
+
+def test_observer_tick_probe_to_emit_pipeline(tmp_path: Path):
+    """Observer half end-to-end through the real probe(): an injected http_get
+    returns synthetic /healthz, and observer.tick() runs probe → run_rules →
+    dedup → emit, writing real proposals to the NDJSON proposal file."""
+    healthz = {
+        "shard": 1, "ownedCount": 8541, "warmCount": 4096, "warmCapacity": 4096,
+        "tickCount": 100, "lastTickDurationMs": 8200.0,
+        "totalPosts": 12, "totalClassifications": 12, "totalErrors": 0, "uptimeS": 3600,
+    }
+
+    def fake_http_get(url: str, timeout_s: float) -> dict:
+        return dict(healthz)
+
+    proposal_path = tmp_path / "observer-proposals.ndjson"
+    observer = KaizenObserver(
+        shard_urls=["http://localhost:13050"],
+        queue_paths=[],
+        proposal_path=proposal_path,
+        http_get=fake_http_get,
+    )
+
+    base = 1_700_000_000_000
+    # Tick 1: lru-saturation fires immediately (warm==capacity, owned>capacity).
+    s1 = observer.tick(now_ms=base)
+    assert s1["reachable"] == 1
+    assert s1["proposalsWritten"] >= 1
+
+    # Accumulate history; by tick 6 sweep-latency-p95 has >= 6 samples and fires.
+    for i in range(1, 7):
+        observer.tick(now_ms=base + i * 600_000)  # 10-min cadence
+
+    written = [json.loads(line) for line in proposal_path.read_text().splitlines() if line.strip()]
+    rule_ids = {p["ruleId"] for p in written}
+    assert "lru-saturation" in rule_ids
+    assert "sweep-latency-p95" in rule_ids
+    # Every emitted record is a well-formed proposal with an actor scope.
+    for p in written:
+        assert p["kind"] == "kaizen-proposal"
+        assert p["actorScope"].startswith("shard:")
