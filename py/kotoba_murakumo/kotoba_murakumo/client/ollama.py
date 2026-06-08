@@ -5,7 +5,7 @@ the wire format is identical to :mod:`kotoba_murakumo.client.litellm`. We
 keep a separate module so R2 can wire Ollama-specific knobs (``num_ctx``,
 ``num_gpu``, ``keep_alive``) without touching the LiteLLM signature.
 
-Used for the own-node ``gemma3:4b`` fallback per ``fleet.toml``
+Used for the own-node ``gemma4:e4b`` fallback per ``fleet.toml``
 ``failover.on_unreachable``.
 """
 

@@ -21,15 +21,15 @@ app = App(
 )
 
 # LLM via LiteLLM gateway (judah :4000) — routes by model name
-@app.function(gpu=None, model="gemma3:4b")
+@app.function(gpu=None, model="gemma4:e4b")
 def summarize(text: str) -> str: ...
 
-# Heavy LLM via EVO-X2 ollama (192.168.1.70:11434)
+# Heavy LLM via EVO-X2 ollama (100.75.169.8:11434)
 @app.function(gpu=gpu.EvoX2(prefer="ollama"), model="llama3.3:70b")
 def deep_analyze(prompt: str) -> str: ...
 
-# Own-node ollama gemma3:4b (fast, local — picks a specific tribe)
-@app.function(gpu=gpu.MacMini(node="judah"), model="gemma3:4b")
+# Own-node ollama gemma4:e4b (fast, local — picks a specific tribe)
+@app.function(gpu=gpu.MacMini(node="judah"), model="gemma4:e4b")
 def quick_classify(text: str) -> str: ...
 
 # Live dispatch
@@ -93,8 +93,8 @@ Every dispatch appends one NDJSON line to
 
 ```json
 {"ts":"...","app":"my-inference","fn":"summarize","caller_did":"did:web:...",
- "endpoint":"http://192.168.1.17:4000","backend":"litellm-gateway",
- "model":"gemma3:4b","prompt_chars":42,"result_chars":138,"latency_ms":312,
+ "endpoint":"http://100.113.200.45:4000","backend":"litellm-gateway",
+ "model":"gemma4:e4b","prompt_chars":42,"result_chars":138,"latency_ms":312,
  "phase":"sync","charter_in":"clean","charter_out":"clean"}
 ```
 

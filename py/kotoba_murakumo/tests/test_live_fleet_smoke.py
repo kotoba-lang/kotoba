@@ -27,11 +27,11 @@ def _lan_reachable(host: str, port: int, *, timeout_s: float = 1.0) -> bool:
 
 
 def test_live_litellm_gateway_round_trip(fleet_path) -> None:
-    if not _lan_reachable("192.168.1.17", 4000):
+    if not _lan_reachable("100.113.200.45", 4000):
         pytest.skip("judah :4000 not reachable from this host")
     app = App("live-smoke", fleet=fleet_path, did="did:web:smoke.etzhayyim.com")
 
-    @app.function(model="gemma3:4b")  # routed to judah :4000
+    @app.function(model="gemma4-e4b")  # routed to judah :4000
     def echo(prompt: str) -> str: ...
 
     out = echo.remote("Reply with the single word: alive")
@@ -39,11 +39,11 @@ def test_live_litellm_gateway_round_trip(fleet_path) -> None:
 
 
 def test_live_evo_x2_ollama_round_trip(fleet_path) -> None:
-    if not _lan_reachable("192.168.1.70", 11434):
-        pytest.skip("evo-x2 :11434 not reachable from this host")
+    if not _lan_reachable("100.75.169.8", 11434):
+        pytest.skip("benjamin :11434 not reachable from this host")
     app = App("live-smoke", fleet=fleet_path)
 
-    @app.function(gpu=gpu.EvoX2(prefer="ollama"), model="llama3.2:3b")
+    @app.function(gpu=gpu.EvoX2(prefer="ollama"), model="gemma4:e4b-it-qat")
     def reply(prompt: str) -> str: ...
 
     out = reply.remote("Reply with one short word.")

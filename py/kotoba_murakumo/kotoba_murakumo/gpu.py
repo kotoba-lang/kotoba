@@ -26,7 +26,7 @@ class GpuSpec:
 
 @dataclass(frozen=True, slots=True)
 class EvoX2(GpuSpec):
-    """EVO-X2 Windows ROCm node (gfx1151, 32 GB VRAM, 192.168.1.70).
+    """EVO-X2 backend selector.
 
     Default endpoint: LiteLLM at :4000. Set ``prefer="ollama"`` for direct
     ollama :11434, or ``prefer="comfyui"`` for image gen :8188.
@@ -45,7 +45,7 @@ class EvoX2(GpuSpec):
 class MacMini(GpuSpec):
     """One Mac mini node, addressed by tribe name.
 
-    Uses the node's own-node Ollama (gemma3:4b default).
+    Uses the node's own-node Ollama (gemma4:e4b default).
     """
 
     node: str

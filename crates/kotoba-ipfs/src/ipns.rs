@@ -27,6 +27,12 @@ pub use kotoba_ipns_record::{IpnsName, IpnsRecord, IpnsRegistryError};
 pub trait IpnsRegistry: Send + Sync {
     fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError>;
     fn resolve(&self, name: &IpnsName) -> Result<IpnsRecord, IpnsRegistryError>;
+    /// Enumerate every locally-known head record. Backs the cross-graph firehose
+    /// (it merges each registered graph's CommitDag feed). Registries that cannot
+    /// enumerate (e.g. a DHT-backed Kubo registry) return an empty list.
+    fn list(&self) -> Vec<IpnsRecord> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone)]
@@ -50,6 +56,10 @@ impl IpnsRegistry for SignedIpnsRegistry {
         let record = self.inner.resolve(name)?;
         record.require_verified_signature()?;
         Ok(record)
+    }
+
+    fn list(&self) -> Vec<IpnsRecord> {
+        self.inner.list()
     }
 }
 
@@ -92,6 +102,13 @@ impl IpnsRegistry for InMemoryIpnsRegistry {
             .get(name)
             .cloned()
             .ok_or_else(|| IpnsRegistryError::NotFound(name.0.clone()))
+    }
+
+    fn list(&self) -> Vec<IpnsRecord> {
+        self.records
+            .read()
+            .map(|r| r.values().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -186,6 +203,13 @@ impl IpnsRegistry for PersistentIpnsRegistry {
             .get(name)
             .cloned()
             .ok_or_else(|| IpnsRegistryError::NotFound(name.0.clone()))
+    }
+
+    fn list(&self) -> Vec<IpnsRecord> {
+        self.records
+            .read()
+            .map(|r| r.values().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -803,6 +827,23 @@ mod tests {
         let record = IpnsRecord::new("k51-kotoba-test", &cid, 1, "2030-01-01T00:00:00Z");
         registry.publish(record.clone()).unwrap();
         assert_eq!(registry.resolve(&record.name).unwrap(), record);
+    }
+
+    #[test]
+    fn list_enumerates_all_heads_and_delegates_through_signed() {
+        let inner = InMemoryIpnsRegistry::new();
+        for (i, n) in ["k51-kotoba-a", "k51-kotoba-b", "k51-kotoba-c"].iter().enumerate() {
+            let cid = raw_cid(format!("head-{i}").as_bytes());
+            inner
+                .publish(IpnsRecord::new(*n, &cid, 1, "2030-01-01T00:00:00Z"))
+                .unwrap();
+        }
+        let mut names: Vec<String> = inner.list().into_iter().map(|r| r.name.0).collect();
+        names.sort();
+        assert_eq!(names, vec!["k51-kotoba-a", "k51-kotoba-b", "k51-kotoba-c"]);
+        // SignedIpnsRegistry must delegate list() to its inner registry.
+        let signed = SignedIpnsRegistry::new(Arc::new(inner));
+        assert_eq!(signed.list().len(), 3, "signed wrapper must enumerate inner heads");
     }
 
     /// ADR-2606012200 LEG-3 candidate (a): is the per-transact `ipns.resolve`

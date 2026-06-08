@@ -281,14 +281,6 @@ pub struct KotobaState {
     /// Maintained on every kg commit (`commit_kg_datoms`); registered + read via
     /// `kg.mv.register` / `kg.mv.result`.
     pub mv_registry: Arc<tokio::sync::RwLock<kotoba_kqe::mv::MvRegistry>>,
-    // ── Journal WAL (ADR-2606041151 A) ───────────────────────────────────────
-    /// When `false` (`KOTOBA_JOURNAL_WAL=off`), the per-datom Journal WAL
-    /// block-write is skipped on the commit path. The synchronous
-    /// DistributedCommitWriter commit is already durable (ProllyTree + IPNS
-    /// head), so the WAL is a redundant double-write; the hot-arrangement update
-    /// (`apply_journaled_datom`) always runs regardless. Default `true`
-    /// (unchanged behaviour: fast restart via journal replay).
-    pub journal_wal_enabled: bool,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
     /// Optional kotobase.etzhayyim.com XRPC pin client (KOTOBA_PIN_TOKEN).
     pub ipfs_pin: Arc<IpfsPinClient>,
@@ -389,22 +381,6 @@ impl KotobaState {
         // Persistence: KuboBlockStore cold tier (Kubo/IPFS HTTP, SHA2-256 dual-CID) if KOTOBA_STORE_PATH is set.
         // All KSE components (Journal, Vault, SecureVault) share the same store.
         let store_path: Option<String> = std::env::var("KOTOBA_STORE_PATH").ok();
-
-        // ADR-2606041151 A — Journal WAL opt-out. Default on (unchanged). When
-        // off, the per-datom WAL double-write is skipped on the commit path; the
-        // synchronous CommitDag commit is already durable.
-        let journal_wal_enabled = !std::env::var("KOTOBA_JOURNAL_WAL")
-            .map(|v| v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        if !journal_wal_enabled {
-            tracing::warn!(
-                "Journal WAL DISABLED (KOTOBA_JOURNAL_WAL=off) — per-datom WAL \
-                 double-write skipped; durability = synchronous CommitDag commit + \
-                 cold ProllyTree. Restart no longer replays the WAL; rely on \
-                 KOTOBA_DATOMIC_WARM_GRAPHS / cold-path for hot-arrangement warmup \
-                 (ADR-2606041151 A, experimental)"
-            );
-        }
 
         const DEFAULT_HOT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
         let hot_cache_bytes: usize = std::env::var("KOTOBA_HOT_CACHE_BYTES")
@@ -640,20 +616,13 @@ impl KotobaState {
             }
         };
 
-        // Journal — Merkle WAL backed by block_store; head pointer in a sibling JSON file.
-        let journal = Arc::new(match &store_path {
-            Some(path) => {
-                let head_path = format!("{path}.journal-head.json");
-                tracing::info!("KSE Journal: block-store persistence enabled");
-                Journal::with_block_store(Arc::clone(&block_store), head_path)
-            }
-            None => {
-                tracing::info!(
-                    "KSE Journal: in-memory only (set KOTOBA_STORE_PATH for persistence)"
-                );
-                Journal::new()
-            }
-        });
+        // LiveBus (formerly "Journal") — purely in-memory ephemeral event bus.
+        // No persistence at all: datomic durability/replay = CommitDag; non-datomic
+        // topics (signal / realtime / kse pub-sub) are live-only, and their durable
+        // data already lives in their own content-addressed stores (Shelf / block
+        // store snapshots). gossipsub-style best-effort live-tail.
+        tracing::info!("KSE LiveBus: in-memory only (live-tail; durable replay via CommitDag)");
+        let journal = Arc::new(Journal::new());
         let shelf = Arc::new(Shelf::new());
 
         // Agent identity — constructed once; reused in init_crypto() to avoid
@@ -846,7 +815,6 @@ impl KotobaState {
             mv_registry: Arc::new(tokio::sync::RwLock::new(
                 kotoba_kqe::mv::MvRegistry::new(),
             )),
-            journal_wal_enabled,
             operator_did,
             node_roles,
             identity,
@@ -937,15 +905,6 @@ impl KotobaState {
 
     pub fn ipns_signing_key(&self) -> ed25519_dalek::SigningKey {
         self.identity.signing_key.clone()
-    }
-
-    /// Replay Journal WAL into the in-memory QuadStore Arrangement.
-    ///
-    /// Must be called once after `KotobaState::new()` and before serving
-    /// requests.  When the Journal is backed by B2 this recovers all quads
-    /// written in previous runs; with in-memory-only Journal it is a no-op.
-    pub async fn replay_wal(&self) {
-        self.quad_store.replay_from_journal().await;
     }
 
     /// Get-or-create the per-graph serialisation lock + resident `db_before`
@@ -1336,7 +1295,9 @@ impl KotobaState {
             if let Some(tx_cid) = &tx_cid {
                 datom.tx = tx_cid.clone();
             }
-            self.journal_assert_datom(&graph_cid, &datom).await;
+            // Already committed to the CommitDag above (commit_datoms) — announce
+            // to the live-tail without a redundant Journal block.
+            self.journal_assert_datom_ephemeral(&graph_cid, &datom).await;
             self.quad_store
                 .apply_journaled_datom(graph_cid.clone(), datom)
                 .await;
@@ -1391,6 +1352,17 @@ impl KotobaState {
     ///
     /// Returns the JournalEntry CID string.
     pub async fn journal_assert(&self, quad: &Quad) -> String {
+        self.journal_assert_with(quad, true).await
+    }
+
+    /// Ephemeral assert: broadcast + ring (live-tail) but **no** block persist.
+    /// Used by the datomic commit path — the datom is already durable in the
+    /// CommitDag, so the Journal must not keep a redundant second copy.
+    pub async fn journal_assert_ephemeral(&self, quad: &Quad) -> String {
+        self.journal_assert_with(quad, false).await
+    }
+
+    async fn journal_assert_with(&self, quad: &Quad, persist: bool) -> String {
         let object_str = format!("{:?}", quad.object);
         let topic = Topic::quad_spo(
             &quad.graph.to_multibase(),
@@ -1410,7 +1382,11 @@ impl KotobaState {
                 .ok();
         }
 
-        let entry = self.journal.publish(topic, Bytes::from(payload)).await;
+        let entry = if persist {
+            self.journal.publish(topic, Bytes::from(payload)).await
+        } else {
+            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+        };
         entry.cid.to_multibase()
     }
 
@@ -1421,6 +1397,18 @@ impl KotobaState {
     /// back to Quad at the call site.
     pub async fn journal_assert_datom(&self, graph_cid: &KotobaCid, datom: &KqeDatom) -> String {
         self.journal_assert(&datom_journal_quad(graph_cid, datom))
+            .await
+    }
+
+    /// Ephemeral datom assert — live-tail broadcast only, no Journal block.
+    /// For callers whose datoms are already durable in the CommitDag (e.g. node
+    /// self-registration commits then announces), so the Journal copy is redundant.
+    pub async fn journal_assert_datom_ephemeral(
+        &self,
+        graph_cid: &KotobaCid,
+        datom: &KqeDatom,
+    ) -> String {
+        self.journal_assert_ephemeral(&datom_journal_quad(graph_cid, datom))
             .await
     }
 
@@ -1464,6 +1452,15 @@ impl KotobaState {
 
     /// Publish a Quad retract to the KSE Journal.
     pub async fn journal_retract(&self, quad: &Quad) -> String {
+        self.journal_retract_with(quad, true).await
+    }
+
+    /// Ephemeral retract: broadcast + ring (live-tail) but **no** block persist.
+    pub async fn journal_retract_ephemeral(&self, quad: &Quad) -> String {
+        self.journal_retract_with(quad, false).await
+    }
+
+    async fn journal_retract_with(&self, quad: &Quad, persist: bool) -> String {
         let topic = Topic(format!(
             "kotoba/retract/{}/{}/{}",
             quad.graph, quad.subject, quad.predicate
@@ -1478,7 +1475,11 @@ impl KotobaState {
                 .ok();
         }
 
-        let entry = self.journal.publish(topic, Bytes::from(payload)).await;
+        let entry = if persist {
+            self.journal.publish(topic, Bytes::from(payload)).await
+        } else {
+            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+        };
         entry.cid.to_multibase()
     }
 

@@ -144,7 +144,7 @@ def test_budget_exceeded_raises_before_http(monkeypatch, fleet_path) -> None:
     _install_mock(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b", max_cost_mkoto=1)  # cap 1 mKOTO
+    @app.function(model="gemma4:e4b", max_cost_mkoto=1)  # cap 1 mKOTO
     def f(x: str) -> str: ...
 
     with pytest.raises(BudgetExceeded) as ei:
@@ -172,7 +172,7 @@ def test_insufficient_credit_raises_before_http(monkeypatch, fleet_path) -> None
         balance_lookup=lambda did: 1,
     )
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     with pytest.raises(InsufficientCredit) as ei:
@@ -192,7 +192,7 @@ def test_unlimited_balance_default_does_not_raise(monkeypatch, fleet_path) -> No
     _install_mock(monkeypatch, handler)
     app = App("smoke", fleet=fleet_path)  # no balance_lookup
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     assert f.remote("anything") == "fine"
@@ -222,7 +222,7 @@ def test_remote_ndjson_carries_cost_and_tariff(monkeypatch, fleet_path, tmp_path
 
     app = App("smoke", fleet=fleet_path, did="did:web:c.etzhayyim.com")
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     f.remote("PROMPT")
@@ -261,7 +261,7 @@ def test_custom_tariff_injected_at_app_level(fleet_path) -> None:
     )
     app = App("smoke", fleet=fleet_path, tariff=custom)
 
-    @app.function(model="gemma3:4b")
+    @app.function(model="gemma4:e4b")
     def f(x: str) -> str: ...
 
     est_ = f.estimate("x")

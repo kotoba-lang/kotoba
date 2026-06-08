@@ -236,7 +236,7 @@ _EST_COMPLETION_TOKENS_DEFAULT: int = 256
 # Per-backend gpu-seconds-per-1k-tokens heuristic. Calibrated against the
 # observed throughputs in CLAUDE.md "Performance" + fleet.toml verified_perf:
 # llama3.2:3b @ evo-x2 = 83 tok/s → 12.05 ms/tok → 12.05 s/1k tok.
-# gemma3:4b @ mac-mini = ~50 tok/s estimate → 20 s/1k tok.
+# gemma4:e4b @ mac-mini = ~50 tok/s estimate → 20 s/1k tok.
 # llama3.3:70b @ evo-x2 = 1.18 tok/s → 847 ms/tok → 847 s/1k tok.
 _S_PER_1K_TOKENS_BY_BACKEND: dict[str, float] = {
     "litellm-gateway":  12.0,   # gateway routes to evo-x2 by default

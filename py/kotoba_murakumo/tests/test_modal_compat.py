@@ -77,13 +77,13 @@ def test_modal_remote_dispatches_via_litellm_gateway(monkeypatch) -> None:
 
     app = modal.App("smoke", fleet=fleet_path)
 
-    @app.function(model="gemma3:4b")  # gpu=None → LiteLLM gateway
+    @app.function(model="gemma4:e4b")  # gpu=None → LiteLLM gateway
     def f(x: str) -> str: ...
 
     out = f.remote("hello")
     assert out == "ok"
-    assert seen_url["url"] == "http://192.168.1.17:4000/v1/chat/completions"
-    assert seen_url["model"] == "gemma3:4b"
+    assert seen_url["url"] == "http://100.113.200.45:4000/v1/chat/completions"
+    assert seen_url["model"] == "gemma4:e4b"
 
 
 def test_modal_unsupported_surfaces_fail_loud() -> None:

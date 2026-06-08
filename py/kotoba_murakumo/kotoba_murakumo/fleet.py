@@ -21,8 +21,14 @@ class FleetNode:
     name: str
     hostname: str
     ip_lan: str
+    ip_tailscale: str
     role: str
     cells: tuple[str, ...]
+
+    @property
+    def stable_ip(self) -> str:
+        """Prefer tailnet reachability; keep LAN as a local fallback."""
+        return self.ip_tailscale or self.ip_lan
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,9 +75,9 @@ class FleetView:
     def litellm_gateway_url(self, *, gateway_node: str = "judah") -> str:
         """Resolve the LiteLLM gateway URL.
 
-        Per CLAUDE.md substrate boundary: the LiteLLM gateway lives on judah
-        (192.168.1.17:4000). The EVO-X2 LiteLLM at 192.168.1.70:4000 is a
-        backend, not the gateway — they are intentionally distinct.
+        Per CLAUDE.md substrate boundary: the LiteLLM gateway lives on judah.
+        Use the tailnet address when present because LAN addresses drift across
+        reboot/reconnect events.
         """
         try:
             node = self.node(gateway_node)
@@ -80,7 +86,7 @@ class FleetView:
                 f"LiteLLM gateway node {gateway_node!r} not in fleet",
                 attempted=e.attempted,
             ) from None
-        return f"http://{node.ip_lan}:4000"
+        return f"http://{node.stable_ip}:4000"
 
 
 def load(path: str | Path) -> FleetView:
@@ -109,6 +115,7 @@ def load(path: str | Path) -> FleetView:
             name=n["name"],
             hostname=n.get("hostname", ""),
             ip_lan=n.get("ip_lan", ""),
+            ip_tailscale=n.get("ip_tailscale", ""),
             role=n.get("role", ""),
             cells=tuple(n.get("cells", [])),
         )

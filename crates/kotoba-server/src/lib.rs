@@ -1040,6 +1040,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             post(xrpc::datomic_db_stats),
         )
         .route(
+            &format!("/xrpc/{}", xrpc::NSID_DATOMIC_GC),
+            post(xrpc::datomic_gc),
+        )
+        .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_ENTITY),
             post(xrpc::datomic_entity),
         )
@@ -1314,6 +1318,14 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS),
             get(firehose::events),
         )
+        .route(
+            &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS_FROM_COMMITS),
+            get(firehose::events_from_commits),
+        )
+        .route(
+            &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS_ALL_GRAPHS),
+            get(firehose::events_all_graphs),
+        )
         // ── Realtime ingress (ADR-2606060001): bidirectional WebSocket (T1) ──
         // The bus is per-room and isolated from the firehose/gossip above.
         .route(
@@ -1427,13 +1439,6 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     state.register_node().await;
-
-    {
-        let quad_store = Arc::clone(&state.quad_store);
-        tokio::spawn(async move {
-            quad_store.replay_from_journal().await;
-        });
-    }
 
     #[cfg(feature = "p2p")]
     let state = if std::env::var("KOTOBA_NO_SWARM").is_err() {
