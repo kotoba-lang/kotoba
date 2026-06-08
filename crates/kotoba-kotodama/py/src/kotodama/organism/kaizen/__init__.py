@@ -130,6 +130,13 @@ class SuggestedAction:
     target_files: list[str] = field(default_factory=list)
     patch_hint: str = ""
     test_plan: list[str] = field(default_factory=list)
+    # Structured, machine-applicable edits (preferred over patch_hint string
+    # parsing). Each edit targets one file by an unambiguous selector:
+    #   env-set:        {"file", "var", "value"}  — set a k8s env var's value
+    #   literal-replace:{"file", "old", "new"}    — first-occurrence str replace
+    # The Kaizen PR agent applies these deterministically; patch_hint remains
+    # the human-readable summary and the fallback path.
+    patch_edits: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -174,6 +181,7 @@ class KaizenProposal:
                 "targetFiles": sa.target_files,
                 "patchHint": sa.patch_hint,
                 "testPlan": sa.test_plan,
+                "patchEdits": sa.patch_edits,
             }
         if self.pr_agent_hint is not None:
             out["prAgentHint"] = {
@@ -293,6 +301,15 @@ class SweepLatencyP95Rule:
                             if shard.warm_capacity > 0
                             else "env UNISPSC_ORGANISM_LRU_MAX → next power-of-two up; verify against limits.memory."
                         ),
+                        patch_edits=(
+                            [{
+                                "file": f"50-infra/k8s/unispsc-organism-fleet/shard-{shard.shard}/daemonset.yaml",
+                                "var": "UNISPSC_ORGANISM_LRU_MAX",
+                                "value": str(_next_pow2_up(shard.warm_capacity)),
+                            }]
+                            if shard.warm_capacity > 0
+                            else []
+                        ),
                         test_plan=[
                             "kubectl apply -k 50-infra/k8s/unispsc-organism-fleet/",
                             "wait 30 min and probe /healthz: tickDurationMsP95 ≤ 1000",
@@ -353,6 +370,11 @@ class LruSaturationRule:
                         patch_hint=_lru_patch_hint(
                             shard.warm_capacity, _pow2_at_least(shard.owned_count)
                         ),
+                        patch_edits=[{
+                            "file": f"50-infra/k8s/unispsc-organism-fleet/shard-{shard.shard}/daemonset.yaml",
+                            "var": "UNISPSC_ORGANISM_LRU_MAX",
+                            "value": str(_pow2_at_least(shard.owned_count)),
+                        }],
                         test_plan=[
                             "Apply and observe warmCount == ownedCount after warmup",
                             "Memory headroom: kubectl top pod inside limits",

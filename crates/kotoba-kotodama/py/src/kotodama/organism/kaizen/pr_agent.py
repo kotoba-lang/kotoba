@@ -1,6 +1,7 @@
 
 import json
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -59,6 +60,13 @@ class KaizenPrAgent:
         target_files_str = suggested_action.get("targetFiles", [])
         patch_hint = suggested_action.get("patchHint", "")
 
+        # Prefer structured, machine-applicable edits when present — they target
+        # a file + selector unambiguously (no first-occurrence guessing, no hint
+        # string parsing). Falls through to patch_hint only when absent.
+        patch_edits = suggested_action.get("patchEdits") or []
+        if patch_edits:
+            return self._apply_structured_edits(patch_edits)
+
         if not target_files_str or not patch_hint:
             logging.warning("No target files or patch hint found in proposal. Skipping patch.")
             return []
@@ -98,6 +106,55 @@ class KaizenPrAgent:
             target_path.write_text(new_content)
             modified_paths.append(target_path)
 
+        return modified_paths
+
+    def _apply_structured_edits(self, edits: List[Dict[str, str]]) -> List[Path]:
+        """Apply structured, machine-applicable edits (preferred path).
+
+        Each edit targets one file by an unambiguous selector:
+          - env-set ``{"file", "var", "value"}`` — set a k8s env var's value via
+            a named-var regex (no first-occurrence guessing across the file).
+          - literal ``{"file", "old", "new"}`` — first-occurrence str replace.
+        """
+        modified_paths: List[Path] = []
+        for edit in edits:
+            file_str = edit.get("file")
+            if not file_str:
+                logging.warning("Structured edit missing 'file'; skipping: %s", edit)
+                continue
+            target_path = self.repo_root / file_str
+            if not target_path.is_file():
+                logging.error(f"Target file {target_path} does not exist.")
+                continue
+            content = target_path.read_text()
+
+            if "var" in edit and "value" in edit:
+                var, value = edit["var"], edit["value"]
+                # Match `name: <VAR>` then the following `value: ...` line and
+                # replace only that var's value, preserving quote style.
+                pattern = re.compile(
+                    r'(name:\s*["\']?' + re.escape(var) + r'["\']?\s*\n\s*value:\s*)'
+                    r'(["\']?)[^"\'\n]*(["\']?)'
+                )
+                new_content, n = pattern.subn(rf'\g<1>\g<2>{value}\g<3>', content, count=1)
+                if n == 0:
+                    logging.warning(
+                        "env var %s not found in %s; skipping edit.", var, target_path
+                    )
+                    continue
+            elif "old" in edit and "new" in edit:
+                old, new = edit["old"], edit["new"]
+                if old not in content:
+                    logging.warning("literal '%s' not found in %s; skipping.", old, target_path)
+                    continue
+                new_content = content.replace(old, new, 1)
+            else:
+                logging.warning("Unrecognized structured edit shape; skipping: %s", edit)
+                continue
+
+            logging.info("Applied structured edit to %s", target_path)
+            target_path.write_text(new_content)
+            modified_paths.append(target_path)
         return modified_paths
 
     def consume_one(self) -> Optional[str]:

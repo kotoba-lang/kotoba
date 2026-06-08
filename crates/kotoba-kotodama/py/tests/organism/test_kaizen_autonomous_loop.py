@@ -92,3 +92,45 @@ def test_observer_proposal_flows_to_pr_agent_patch(tmp_path: Path):
     assert 'value: "4096"' not in tgt.read_text()
     # Queue drained.
     assert queue.read_text().strip() == ""
+
+
+def test_structured_edit_targets_named_var_not_first_occurrence(tmp_path: Path):
+    """The structured env-set edit bumps LRU_MAX even when another env var
+    shares the same value — proving it targets the named var, not the first
+    `value: "4096"` occurrence in the file."""
+    obs = Observation(
+        ts=1_700_000_000_000,
+        shards=[ShardHealthz(shard=2, reachable=True, owned_count=8541,
+                             warm_count=4096, warm_capacity=4096,
+                             last_tick_duration_ms=8200.0)],
+        history={2: [8200.0] * 8},
+    )
+    observer = KaizenObserver(shard_urls=[], queue_paths=[], proposal_path=Path("/dev/null"))
+    sweep = {p.rule_id: p for p in observer.run_rules(obs)}["sweep-latency-p95"]
+    assert sweep.suggested_action.patch_edits  # structured edit present
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tgt = repo / "50-infra/k8s/unispsc-organism-fleet/shard-2/daemonset.yaml"
+    tgt.parent.mkdir(parents=True)
+    # TWO env vars share value "4096"; only LRU_MAX must change.
+    tgt.write_text(
+        "        - name: UNISPSC_ORGANISM_TICK_BUDGET\n"
+        '          value: "4096"\n'
+        "        - name: UNISPSC_ORGANISM_LRU_MAX\n"
+        '          value: "4096"\n'
+    )
+    queue = tmp_path / "observer.ndjson"
+    queue.write_text(json.dumps(sweep.to_ndjson_dict(ts_ms=obs.ts)) + "\n")
+
+    with patch("subprocess.check_output", return_value="main\n"), \
+         patch("subprocess.run", return_value=MagicMock(
+             check_returncode=lambda: None, stdout="Dry run successful.")):
+        agent = KaizenPrAgent(queue, repo, dry_run=True)
+        result = agent.consume_one()
+
+    assert result == "Dry run successful."
+    out = tgt.read_text()
+    # LRU_MAX bumped to 8192; the unrelated TICK_BUDGET value untouched.
+    assert 'name: UNISPSC_ORGANISM_LRU_MAX\n          value: "8192"' in out
+    assert 'name: UNISPSC_ORGANISM_TICK_BUDGET\n          value: "4096"' in out
