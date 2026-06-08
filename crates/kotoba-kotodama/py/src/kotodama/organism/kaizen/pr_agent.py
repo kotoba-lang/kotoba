@@ -157,6 +157,25 @@ class KaizenPrAgent:
             modified_paths.append(target_path)
         return modified_paths
 
+    def _open_issue(self, proposal: Dict[str, Any], proposal_ndjson: str) -> str:
+        """Open an advisory GitHub issue for an issue-only proposal.
+
+        No branch/patch — the proposal is informational (error-rate,
+        fleet-unreachable, …). Returns the issue URL, or a dry-run message.
+        """
+        title = proposal.get("summary", "Kaizen Observation")
+        body = kaizen_proposal_to_pr_draft(proposal_ndjson) + HUMAN_IN_LOOP_BOILERPLATE
+        labels = (proposal.get("prAgentHint") or {}).get("labels", [])
+        if self.dry_run:
+            logging.info("[dry-run] would open issue: %s", title)
+            return "Dry run successful (issue)."
+        cmd = ["gh", "issue", "create", "--title", title, "--body", body]
+        for lb in labels:
+            cmd += ["--label", lb]
+        result = subprocess.run(cmd, check=True, cwd=self.repo_root, capture_output=True, text=True)
+        out = result.stdout.strip()
+        return out.splitlines()[-1] if out else "issue created"
+
     def consume_one(self) -> Optional[str]:
         """
         Consumes a single proposal from the queue.
@@ -177,6 +196,19 @@ class KaizenPrAgent:
             # Move malformed line to a quarantine file or just drop i
             self.proposal_queue_path.write_text("\n".join(remaining_lines) + "\n")
             return None
+
+        # issue-only proposals carry no code change (e.g. error-rate,
+        # fleet-unreachable). Open an advisory GitHub issue — no branch, no
+        # patch — and drain the proposal, instead of attempting a patch that
+        # finds nothing to change and leaves the proposal stuck in the queue.
+        kind = (proposal.get("suggestedAction") or {}).get("kind", "")
+        if kind == "issue-only":
+            url = self._open_issue(proposal, proposal_ndjson)
+            self.proposal_queue_path.write_text(
+                "\n".join(remaining_lines) + "\n" if remaining_lines else ""
+            )
+            logging.info("issue-only proposal consumed → %s", url)
+            return url
 
         # 1. Generate Branch Name
         pr_hint = proposal.get("prAgentHint", {})

@@ -134,3 +134,36 @@ def test_structured_edit_targets_named_var_not_first_occurrence(tmp_path: Path):
     # LRU_MAX bumped to 8192; the unrelated TICK_BUDGET value untouched.
     assert 'name: UNISPSC_ORGANISM_LRU_MAX\n          value: "8192"' in out
     assert 'name: UNISPSC_ORGANISM_TICK_BUDGET\n          value: "4096"' in out
+
+
+def test_issue_only_proposal_opens_issue_and_drains(tmp_path: Path):
+    """An issue-only proposal (no code change) opens an advisory issue and is
+    drained from the queue — it must NOT create a branch, attempt a patch, or
+    stall the queue."""
+    proposal = {
+        "v": 1, "ts": 1, "kind": "kaizen-proposal", "ruleId": "error-rate",
+        "category": "reliability", "severity": "warn", "actorScope": "shard:1",
+        "summary": "shard-1 error rate 3% > 1% budget",
+        "detail": "Sustained error rate above the 1% budget.",
+        "suggestedAction": {"kind": "issue-only", "description": "Investigate shard-1 errors",
+                            "targetFiles": [], "patchHint": "", "testPlan": []},
+        "prAgentHint": {"branchPrefix": "kaizen/error-", "labels": ["kaizen", "reliability"]},
+    }
+    queue = tmp_path / "q.ndjson"
+    queue.write_text(json.dumps(proposal) + "\n")
+
+    calls = []
+
+    def _record(args, **kwargs):
+        calls.append(args)
+        return MagicMock(check_returncode=lambda: None, stdout="", stderr="")
+
+    with patch("subprocess.check_output", return_value="main\n"), \
+         patch("subprocess.run", side_effect=_record):
+        agent = KaizenPrAgent(queue, tmp_path, dry_run=True)
+        result = agent.consume_one()
+
+    assert result == "Dry run successful (issue)."
+    assert queue.read_text().strip() == ""  # drained, not stuck
+    # No git branch was created for an issue-only proposal.
+    assert not any("checkout" in a for a in calls if isinstance(a, list))
