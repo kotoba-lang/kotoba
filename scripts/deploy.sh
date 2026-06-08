@@ -8,7 +8,7 @@
 #
 # Prerequisites:
 #   - kubectl configured for vke-31d5f7dc-* context
-#   - ghcr-pull-secret in kotoba namespace (see step 0 below)
+#   - ghcr-creds in kotoba namespace (created from local docker credentials below)
 set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy" && pwd)"
@@ -44,12 +44,12 @@ if $BUILD; then
 fi
 
 # ── 0. Pull secret (idempotent — skip if exists) ──────────────────────────────
-# Creates ghcr-pull-secret from local docker credentials.
+# Creates ghcr-creds from local docker credentials.
 # Requires: docker login ghcr.io -u <github-user> -p <PAT>
-if ! kubectl get secret ghcr-pull-secret -n kotoba &>/dev/null; then
-  echo "Creating ghcr-pull-secret..."
+if ! kubectl get secret ghcr-creds -n kotoba &>/dev/null; then
+  echo "Creating ghcr-creds..."
   kubectl create namespace kotoba --dry-run=client -o yaml | kubectl apply -f -
-  kubectl create secret docker-registry ghcr-pull-secret \
+  kubectl create secret docker-registry ghcr-creds \
     --docker-server=ghcr.io \
     --docker-username="${GHCR_USER:-etzhayyim}" \
     --docker-password="${GHCR_TOKEN:?set GHCR_TOKEN env var}" \
@@ -79,7 +79,7 @@ echo "Waiting for rollout..."
 kubectl rollout status deployment/kotoba -n kotoba --timeout=120s
 
 # ── 6. Health check ───────────────────────────────────────────────────────────
-POD=$(kubectl get pods -n kotoba -l app=kotoba -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl get pods -n kotoba -l app.kubernetes.io/name=kotoba -o jsonpath='{.items[0].metadata.name}')
 echo ""
 echo "Pod: ${POD}"
 echo "Logs (last 20 lines):"
