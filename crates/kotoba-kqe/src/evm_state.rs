@@ -14,7 +14,7 @@
 //! |---------------------------------|----------------|----------------------------|
 //! | `evm/acct/nonce`                | Integer        | account nonce              |
 //! | `evm/acct/balance`              | Bytes(u256-be) | balance (wei)              |
-//! | `evm/acct/codehash`             | Cid            | keccak256(code) → code blob|
+//! | `evm/acct/codehash`             | Bytes(32)      | keccak256(code) (raw hash) |
 //! | `evm/code`                      | Bytes          | bytecode (on the codehash) |
 //! | `evm/storage/<slot-hex>`        | Bytes(32)      | storage slot value         |
 
@@ -86,7 +86,9 @@ pub fn account_datoms(
     ];
     if let Some((codehash, bytecode)) = code {
         let ch = codehash_cid(codehash);
-        out.push(Datom::assert(e, ACCT_CODEHASH_PRED.to_string(), Value::Cid(ch.clone()), graph.clone()));
+        // account points to code by the RAW keccak hash (recoverable for revm);
+        // the code blob is content-addressed under the codehash CID.
+        out.push(Datom::assert(e, ACCT_CODEHASH_PRED.to_string(), Value::Bytes(codehash.to_vec()), graph.clone()));
         out.push(Datom::assert(ch, CODE_PRED.to_string(), Value::Bytes(bytecode.to_vec()), graph.clone()));
     }
     out
@@ -103,7 +105,7 @@ pub fn storage_datom(addr: &[u8; 20], slot: &[u8; 32], value: &[u8; 32], graph: 
 pub struct EvmStateView {
     nonce: HashMap<KotobaCid, u64>,
     balance: HashMap<KotobaCid, [u8; 32]>,
-    codehash: HashMap<KotobaCid, KotobaCid>,
+    codehash: HashMap<KotobaCid, [u8; 32]>,
     code: HashMap<KotobaCid, Vec<u8>>,
     storage: HashMap<(KotobaCid, [u8; 32]), [u8; 32]>,
 }
@@ -134,8 +136,8 @@ impl EvmStateView {
                     }
                 }
                 ACCT_CODEHASH_PRED => {
-                    if let Value::Cid(ch) = &d.datom.v {
-                        self.codehash.insert(e, ch.clone());
+                    if let Some(ch) = bytes32(&d.datom.v) {
+                        self.codehash.insert(e, ch);
                     }
                 }
                 CODE_PRED => {
@@ -165,13 +167,29 @@ impl EvmStateView {
     pub fn code_of(&self, addr: &[u8; 20]) -> &[u8] {
         self.codehash
             .get(&addr_cid(addr))
-            .and_then(|ch| self.code.get(ch))
+            .and_then(|ch32| self.code.get(&codehash_cid(ch32)))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
     pub fn storage_of(&self, addr: &[u8; 20], slot: &[u8; 32]) -> [u8; 32] {
         self.storage.get(&(addr_cid(addr), *slot)).copied().unwrap_or([0u8; 32])
+    }
+
+    /// Bytecode by its keccak256 code hash (for revm `code_by_hash_ref`). Empty if absent.
+    pub fn code_by_hash(&self, codehash: &[u8; 32]) -> &[u8] {
+        self.code.get(&codehash_cid(codehash)).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The raw keccak code hash recorded for an account (for revm `AccountInfo.code_hash`).
+    /// `None` for EOAs / unknown accounts.
+    pub fn codehash_of(&self, addr: &[u8; 20]) -> Option<[u8; 32]> {
+        self.codehash.get(&addr_cid(addr)).copied()
+    }
+
+    /// True if any account/storage state is present (genesis loaded).
+    pub fn is_empty(&self) -> bool {
+        self.nonce.is_empty() && self.balance.is_empty() && self.storage.is_empty()
     }
 
     pub fn account_count(&self) -> usize {
