@@ -214,17 +214,28 @@ pub fn apply_raw_tx(
     graph: &KotobaCid,
 ) -> Result<(RecoveredTx, ExecOutcome), String> {
     let tx = decode_and_recover(raw)?;
-    let to = tx.to.ok_or_else(|| "contract creation not supported at R1b".to_string())?;
-    let out = crate::apply_call(
-        view,
-        tx.from,
-        to,
-        tx.value,
-        tx.input.clone(),
-        tx.nonce,
-        tx.gas_limit,
-        graph,
-    )?;
+    let out = match tx.to {
+        Some(to) => crate::apply_call(
+            view,
+            tx.from,
+            to,
+            tx.value,
+            tx.input.clone(),
+            tx.nonce,
+            tx.gas_limit,
+            graph,
+        )?,
+        // contract creation (`to` empty) → deploy init_code (R4 / forge create).
+        None => crate::apply_create(
+            view,
+            tx.from,
+            tx.value,
+            tx.input.clone(),
+            tx.nonce,
+            tx.gas_limit,
+            graph,
+        )?,
+    };
     Ok((tx, out))
 }
 

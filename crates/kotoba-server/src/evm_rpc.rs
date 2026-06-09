@@ -15,7 +15,10 @@ use tokio::sync::RwLock;
 
 use kotoba_auth::eth::keccak256;
 use kotoba_core::cid::KotobaCid;
-use kotoba_evm::{apply_call, tx::apply_raw_tx, RevmU256 as U256};
+use std::collections::HashMap;
+
+use kotoba_evm::logs::logs_bloom;
+use kotoba_evm::{apply_call, apply_create, tx::apply_raw_tx, RevmU256 as U256};
 use kotoba_kqe::delta::Delta;
 use kotoba_kqe::evm_state::{
     account_datoms, eth_chain_id, eth_get_balance, eth_get_code, eth_get_storage_at,
@@ -28,11 +31,13 @@ pub struct EvmNode {
     pub chain_id: u64,
     pub block_number: u64,
     graph: KotobaCid,
+    /// txhash → receipt JSON (so `forge` can poll `eth_getTransactionReceipt`).
+    receipts: HashMap<String, Value>,
 }
 
 impl EvmNode {
     pub fn new(chain_id: u64, graph: KotobaCid) -> Self {
-        Self { view: EvmStateView::new(), chain_id, block_number: 0, graph }
+        Self { view: EvmStateView::new(), chain_id, block_number: 0, graph, receipts: HashMap::new() }
     }
 
     pub fn default_node() -> Self {
@@ -62,6 +67,14 @@ fn parse_addr(v: &Value) -> Option<[u8; 20]> {
         a.copy_from_slice(&b);
         a
     })
+}
+
+/// A call object's calldata: accept both `input` (modern) and `data` (legacy alias).
+fn call_input(call: &Value) -> Vec<u8> {
+    call.get("input")
+        .or_else(|| call.get("data"))
+        .and_then(parse_hex_bytes)
+        .unwrap_or_default()
 }
 
 fn parse_hex_bytes(v: &Value) -> Option<Vec<u8>> {
@@ -116,7 +129,7 @@ pub fn dispatch(node: &mut EvmNode, method: &str, params: &Value) -> Result<Valu
             let to = parse_addr(call.get("to").unwrap_or(&Value::Null))
                 .ok_or_else(|| bad("eth_call: invalid 'to'"))?;
             let from = call.get("from").and_then(parse_addr).unwrap_or([0u8; 20]);
-            let data = call.get("data").and_then(parse_hex_bytes).unwrap_or_default();
+            let data = call_input(&call);
             let value = call
                 .get("value")
                 .and_then(parse_b32)
@@ -129,16 +142,104 @@ pub fn dispatch(node: &mut EvmNode, method: &str, params: &Value) -> Result<Valu
         }
         "eth_sendRawTransaction" => {
             let raw = parse_hex_bytes(&p(0)).ok_or_else(|| bad("invalid raw tx"))?;
-            let (_tx, out) =
+            let (tx, out) =
                 apply_raw_tx(&node.view, &raw, &node.graph).map_err(|e| (-32000, e))?;
             if !out.success {
-                return Err((-32000, "transaction reverted".into()));
+                return Err((
+                    -32000,
+                    format!(
+                        "tx failed (gas_used={}, gas_limit={}, output=0x{})",
+                        out.gas_used,
+                        tx.gas_limit,
+                        hex::encode(&out.output)
+                    ),
+                ));
             }
-            // persist the diff into the node state + advance the block number.
+            let txhash = format!("0x{}", hex::encode(keccak256(&raw)));
+            // persist the diff + advance the block; record a receipt for polling.
             node.apply(out.datoms);
             node.block_number += 1;
-            Ok(json!(format!("0x{}", hex::encode(keccak256(&raw))))) // tx hash
+            let block_number = node.block_number;
+            let log_json: Vec<Value> = out
+                .logs
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    json!({
+                        "address": format!("0x{}", hex::encode(l.address)),
+                        "topics": l.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                        "data": format!("0x{}", hex::encode(&l.data)),
+                        "blockNumber": format!("0x{block_number:x}"),
+                        "transactionHash": txhash,
+                        "logIndex": format!("0x{i:x}"),
+                    })
+                })
+                .collect();
+            let receipt = json!({
+                "transactionHash": txhash,
+                "transactionIndex": "0x0",
+                "blockNumber": format!("0x{block_number:x}"),
+                "blockHash": format!("0x{block_number:064x}"),
+                "from": format!("0x{}", hex::encode(tx.from)),
+                "to": tx.to.map(|a| format!("0x{}", hex::encode(a))),
+                "contractAddress": out.created.map(|a| format!("0x{}", hex::encode(a))),
+                "cumulativeGasUsed": format!("0x{:x}", out.gas_used),
+                "gasUsed": format!("0x{:x}", out.gas_used),
+                "effectiveGasPrice": "0x0",
+                "status": "0x1",
+                "type": "0x0",
+                "logs": log_json,
+                "logsBloom": format!("0x{}", hex::encode(logs_bloom(&out.logs))),
+            });
+            node.receipts.insert(txhash.clone(), receipt);
+            Ok(json!(txhash))
         }
+        "eth_getTransactionReceipt" => {
+            let h = p(0);
+            let key = h.as_str().unwrap_or("");
+            Ok(node.receipts.get(key).cloned().unwrap_or(Value::Null))
+        }
+        "eth_estimateGas" => {
+            let call = p(0);
+            let from = call.get("from").and_then(parse_addr).unwrap_or([0u8; 20]);
+            let data = call_input(&call);
+            let value = call.get("value").and_then(parse_b32).map(U256::from_be_bytes).unwrap_or(U256::ZERO);
+            let nonce = node.view.nonce_of(&from);
+            let gas = match parse_addr(call.get("to").unwrap_or(&Value::Null)) {
+                Some(to) => apply_call(&node.view, from, to, value, data, nonce, 30_000_000, &node.graph),
+                None => apply_create(&node.view, from, value, data, nonce, 30_000_000, &node.graph),
+            }
+            .map(|o| o.gas_used)
+            .unwrap_or(21_000);
+            // 25% headroom (forge uses the estimate as the gas limit).
+            Ok(json!(format!("0x{:x}", gas + gas / 4 + 21_000)))
+        }
+        "eth_getBlockByNumber" | "eth_getBlockByHash" => {
+            let n = node.block_number;
+            Ok(json!({
+                "number": format!("0x{n:x}"),
+                "hash": format!("0x{n:064x}"),
+                "parentHash": format!("0x{:064x}", n.saturating_sub(1)),
+                "timestamp": "0x0",
+                "gasLimit": "0x1c9c380",
+                "gasUsed": "0x0",
+                "baseFeePerGas": "0x0",
+                "miner": "0x0000000000000000000000000000000000000000",
+                "difficulty": "0x0",
+                "totalDifficulty": "0x0",
+                "transactions": [],
+                "uncles": [],
+            }))
+        }
+        "eth_maxPriorityFeePerGas" => Ok(json!("0x0")),
+        "eth_accounts" => Ok(json!([])),
+        "eth_syncing" => Ok(json!(false)),
+        "eth_feeHistory" => Ok(json!({
+            "oldestBlock": format!("0x{:x}", node.block_number),
+            "baseFeePerGas": ["0x0", "0x0"],
+            "gasUsedRatio": [0.0],
+            "reward": [["0x0"]],
+        })),
         other => Err((-32601, format!("method not found: {other}"))),
     }
 }

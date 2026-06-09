@@ -118,6 +118,8 @@ pub struct ExecOutcome {
     pub output: Vec<u8>,
     /// Event logs emitted (for receipts / `eth_getLogs`).
     pub logs: Vec<EvmLog>,
+    /// For a contract-creation tx: the deployed contract address.
+    pub created: Option<[u8; 20]>,
 }
 
 /// Execute a message call (`from` → `to`, `value`, `data`) against the
@@ -162,7 +164,55 @@ pub fn apply_call(
 
     let logs: Vec<EvmLog> = result.logs().iter().map(EvmLog::from_revm).collect();
     let datoms = state_to_datoms(&state, graph);
-    Ok(ExecOutcome { success, gas_used, datoms, output, logs })
+    Ok(ExecOutcome { success, gas_used, datoms, output, logs, created: None })
+}
+
+/// Execute a **contract-creation** tx (`from` deploys `init_code`) against the
+/// Datom state (the `eth_sendRawTransaction` CREATE path / `forge create`). Returns
+/// the deployed contract address in `ExecOutcome.created` + the `evm/*` state diff
+/// (which includes the new contract's code + the deployer's nonce/balance).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_create(
+    view: &EvmStateView,
+    from: [u8; 20],
+    value: U256,
+    init_code: Vec<u8>,
+    nonce: u64,
+    gas_limit: u64,
+    graph: &KotobaCid,
+) -> Result<ExecOutcome, String> {
+    let db = DatomDatabase::new(view);
+    let mut evm = Evm::builder()
+        .with_ref_db(db)
+        .modify_tx_env(|tx| {
+            tx.caller = Address::from(from);
+            tx.transact_to = TxKind::Create;
+            tx.value = value;
+            tx.data = Bytes::from(init_code);
+            tx.gas_limit = gas_limit;
+            tx.gas_price = U256::ZERO;
+            tx.nonce = Some(nonce);
+            tx.chain_id = None;
+        })
+        .build();
+
+    let ResultAndState { result, state } = evm.transact().map_err(|e| format!("{e:?}"))?;
+
+    let (success, gas_used, output, created) = match &result {
+        ExecutionResult::Success { gas_used, output, .. } => {
+            let created = match output {
+                revm::primitives::Output::Create(_, Some(a)) => Some(a.into_array()),
+                _ => None,
+            };
+            (true, *gas_used, output.data().to_vec(), created)
+        }
+        ExecutionResult::Revert { gas_used, output } => (false, *gas_used, output.to_vec(), None),
+        ExecutionResult::Halt { gas_used, .. } => (false, *gas_used, Vec::new(), None),
+    };
+
+    let logs: Vec<EvmLog> = result.logs().iter().map(EvmLog::from_revm).collect();
+    let datoms = state_to_datoms(&state, graph);
+    Ok(ExecOutcome { success, gas_used, datoms, output, logs, created })
 }
 
 /// Convert revm's post-execution state into `evm/*` Datoms (the block's state diff).
