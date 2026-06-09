@@ -595,6 +595,90 @@ impl SocialCapitalView {
     }
 }
 
+// ── Mint job (validate → weigh → emit; the I/O entry of the loop, §3/§4) ──────
+//
+// `SocialMintJob` is the deterministic pipeline a server-side job runs each epoch:
+// RAW observations → validation gates (Validated*) → mint engine → social/* Datoms.
+// Observations that fail validation (not terminal-honest, no quorum, not
+// Council-attested) are silently dropped — never minted (spec §7). The actual I/O
+// that produces these observations (anchor-chain `eth_getLogs` for terminal escrow
+// state + slashes, the CitationLedger, the KaizenObserver wellbecoming feed) is a
+// server wrapper that fills these structs and calls `run_epoch` (follow-up).
+
+/// A raw observed disclosure (pre-validation). `terminal_honest` =
+/// Refunded/Upheld on the anchor-chain ClaimStakeEscrow; `witness_quorum_met` =
+/// ≥K-of-N kotoba-datomic attestation.
+#[derive(Clone, Debug)]
+pub struct ObservedDisclosure {
+    pub did: KotobaCid,
+    pub epoch: u64,
+    pub n_validated: i64,
+    pub citation_hits: i64,
+    pub terminal_honest: bool,
+    pub witness_quorum_met: bool,
+}
+
+/// A raw observed wellbecoming measurement (KaizenObserver Δ, pre-validation).
+#[derive(Clone, Debug)]
+pub struct ObservedWellbecoming {
+    pub did: KotobaCid,
+    pub epoch: u64,
+    pub delta: i64,
+    pub council_attested: bool,
+}
+
+/// The per-epoch mint pipeline. Holds the economic params + the social graph CID
+/// the emitted Datoms are written under.
+pub struct SocialMintJob {
+    params: MintParams,
+    graph: KotobaCid,
+}
+
+impl SocialMintJob {
+    pub fn new(params: MintParams, graph: KotobaCid) -> Self {
+        Self { params, graph }
+    }
+
+    pub fn params(&self) -> &MintParams {
+        &self.params
+    }
+
+    /// Validate + weigh one epoch's observations → the `social/mint|burn` Datoms to
+    /// commit. Drops any observation that fails its validation gate (no minting on
+    /// assertion alone). Falsifications (`Slashed` on the anchor chain) burn directly.
+    pub fn run_epoch(
+        &self,
+        disclosures: &[ObservedDisclosure],
+        wellbecomings: &[ObservedWellbecoming],
+        falsifications: &[Falsification],
+    ) -> Vec<Datom> {
+        let mut out = Vec::new();
+        for d in disclosures {
+            if let Some(v) = ValidatedDisclosure::new(
+                d.did.clone(),
+                d.epoch,
+                d.n_validated,
+                d.citation_hits,
+                d.terminal_honest,
+                d.witness_quorum_met,
+            ) {
+                out.extend(v.mint_datom(&self.params, &self.graph));
+            }
+        }
+        for w in wellbecomings {
+            if let Some(v) =
+                ValidatedWellbecoming::new(w.did.clone(), w.epoch, w.delta, w.council_attested)
+            {
+                out.extend(v.datom(&self.params, &self.graph));
+            }
+        }
+        for f in falsifications {
+            out.extend(f.burn_datom(&self.params, &self.graph));
+        }
+        out
+    }
+}
+
 // ── Retainer allocation (the downstream of the loop, ADR-2606082100 §6) ───────
 //
 // Social capital is the DENOMINATOR of the donation pool: the epoch's
@@ -1033,6 +1117,59 @@ mod tests {
         let p = MintParams::default();
         let w = ValidatedWellbecoming::new(did("did:key:z"), 0, 0, true).unwrap();
         assert!(w.datom(&p, &did("g")).is_none());
+    }
+
+    // ── Mint job (validate → weigh → emit) ───────────────────────────────
+
+    #[test]
+    fn job_emits_datoms_for_valid_observations_only() {
+        let job = SocialMintJob::new(MintParams::default(), did("g:social"));
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let disclosures = vec![
+            // valid: 2 validated + 5 hits = 2.5 pts
+            ObservedDisclosure {
+                did: a.clone(), epoch: 0, n_validated: 2, citation_hits: 5,
+                terminal_honest: true, witness_quorum_met: true,
+            },
+            // INVALID: no witness quorum → dropped
+            ObservedDisclosure {
+                did: b.clone(), epoch: 0, n_validated: 9, citation_hits: 9,
+                terminal_honest: true, witness_quorum_met: false,
+            },
+        ];
+        let wellbecomings = vec![
+            // valid +5 → 10 pts
+            ObservedWellbecoming { did: a.clone(), epoch: 0, delta: 5, council_attested: true },
+            // INVALID: not council-attested → dropped
+            ObservedWellbecoming { did: b.clone(), epoch: 0, delta: 99, council_attested: false },
+        ];
+        let datoms = job.run_epoch(&disclosures, &wellbecomings, &[]);
+        // only a's two valid acts emit (b dropped both)
+        assert_eq!(datoms.len(), 2);
+
+        let deltas: Vec<Delta> = datoms.into_iter().map(Delta::assert_datom).collect();
+        let mut v = SocialCapitalView::new();
+        v.apply(&deltas);
+        assert_eq!(v.capital(&a, 0), 12_500_000); // 2.5 + 10.0
+        assert_eq!(v.capital(&b, 0), 0); // all dropped
+    }
+
+    #[test]
+    fn job_falsification_burns() {
+        let job = SocialMintJob::new(MintParams::default(), did("g:social"));
+        let a = did("did:key:a");
+        // mint 5 pts then falsify 2 (burn 3) in the same epoch run
+        let disc = vec![ObservedDisclosure {
+            did: a.clone(), epoch: 0, n_validated: 5, citation_hits: 0,
+            terminal_honest: true, witness_quorum_met: true,
+        }];
+        let fals = vec![Falsification { did: a.clone(), epoch: 0, count: 2 }];
+        let datoms = job.run_epoch(&disc, &[], &fals);
+        let deltas: Vec<Delta> = datoms.into_iter().map(Delta::assert_datom).collect();
+        let mut v = SocialCapitalView::new();
+        v.apply(&deltas);
+        assert_eq!(v.capital(&a, 0), 2 * SCALE); // 5.0 minted − 3.0 burned
     }
 
     // ── Retainer allocation (the downstream of the loop) ──────────────────
