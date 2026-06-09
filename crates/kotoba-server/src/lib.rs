@@ -12,6 +12,7 @@ pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
 pub mod media_xrpc;
+pub mod mishmar_observe;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
