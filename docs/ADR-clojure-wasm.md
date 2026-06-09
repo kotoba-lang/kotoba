@@ -219,3 +219,149 @@ language — (1) iteration, (2) a mutable byte/string-builder backed by
 foundation everything else depends on. Production parity also wants
 `program_cid = CIDv1 blake3(wasm)` storage and gas accounting once guests call
 host fns (today's guests call none → zero gas).
+
+---
+
+## Step 4a — language growth: iteration + byte-building (DONE, 2026-06-09)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj` (`tests/loops_bytes.rs`, 13 tests).
+
+The "Next workstream" items (1) iteration and (2) a mutable byte-builder — the
+foundation step-4 CBOR decode depends on — are implemented. The value model is
+unchanged (still one `i64` per expression); no GC, no heap objects beyond the
+raw byte region. Added surface:
+
+| form | lowering |
+|------|----------|
+| `(loop [b v …] body…)` | wasm `loop (result i64)`; sequential-init bindings become a `recur` target |
+| `(recur args…)` | parallel rebind of the loop locals + `br` to the loop header (relative label = `ctrl_depth − loop_frame_depth`); must be in tail position |
+| `(cond t1 e1 … :else ed)` | right-nested `if`; `:else`/`true` = default; no match ⇒ `0` |
+| `(bytes-alloc cap)` | `cabi_realloc(0,0,16,cap+8)` → buffer handle (i64 ptr to an 8-byte header `[cap:i32@0, len:i32@4]` + data) |
+| `(byte-append! buf b)` | `mem[buf+8+len] = b & 0xFF; len++`; returns `buf` (threads through `recur`) |
+| `(bytes-len buf)` | `mem[buf+4]` |
+| `(bytes-finish buf)` | string handle `((buf+8) << 32) \| len` — readable by `str-len`/`byte-at` |
+
+Codegen mechanics: `FnCtx` gained `ctrl_depth` (count of open wasm control
+frames) and a `loop_targets` stack so `recur` computes its relative `br` index
+correctly through nested `if`/`cond`/`let`. `recur` is stack-polymorphic via
+`br`, so it type-checks in any `i64` result slot. A **buffer handle** (ptr to
+header) is deliberately distinct from a **string handle** (`ptr<<32|len`):
+builder ops take the former, readers the latter, `bytes-finish` converts. No
+capacity check yet (caller sizes via `bytes-alloc`); auto-grow is a later
+refinement.
+
+Verified end-to-end on wasmtime: Σ/gcd loops, `recur` nested inside
+`cond`/`let`/`if`, buffer build-in-loop → finish → re-read sum, and a direct
+linear-memory inspection confirming `bytes-finish` yields a real readable
+region (`🐍` U+1F40D bytes round-trip).
+
+## Direction: kotoba-clj → langgraph (Graph-as-data, staged)
+
+Decision (2026-06-09): target a **Graph-as-data** surface mirroring the existing
+kotoba `StateGraph` (ADR-2605250002), **running on kotoba-runtime**. Graph
+topology is declared as EDN; only node *bodies* are clj `defn`s; the state dict,
+reducers, edge routing, run-loop, and CBOR glue are emitted by the compiler / a
+fixed driver. This keeps language growth minimal vs. a full Clojure (no
+closures/GC needed to ship a working agent).
+
+```clojure
+(defgraph chatbot
+  :state {:messages add-messages}     ; reducer per channel
+  :nodes {:chat my-chat-fn}
+  :edges [[:start :chat] [:chat :end]])
+
+(defn my-chat-fn [state]              ; node body: pure-ish clj
+  (assoc state :messages (llm-infer model-cid (last-message state))))
+```
+
+Stages (A–D all done; each reuses the prior). A `defgraph` agent now decodes a
+CBOR ctx, runs a node/edge graph, calls the LLM, and returns output — entirely
+in compiled Clojure on kotoba-runtime:
+
+- **A ✅ language core** — `loop`/`recur`, `cond`, byte-builder (this section).
+- **B ✅ heap values** — growable `vector` + string-keyed `map`, enough for a
+  `state` map holding a `messages` vector and the `add_messages` (extend)
+  reducer. Implemented *in the language itself* (`PRELUDE`) on three new raw
+  builtins — `alloc` / `load64` / `store64!` (+ `load32`/`store32!`) — rather
+  than hand-emitted wasm: containers are readable clj, and the i64-only model is
+  preserved (handles are raw pointers; no GC, bump-only). `tests/heap_values.rs`
+  (8 tests) covers vector conj/count/nth, map assoc/get/overwrite with content-
+  compared string keys, the extend reducer, and a state-map-holds-messages-
+  vector round-trip.
+- **C  CBOR + host imports** — now feasible (loops+bytes+maps): decode the
+  `InvokeContext` `ctx-cbor` and encode `result<list<u8>,string>`; surface
+  `llm.infer` / `kqe.*` / `kse.*` as builtins lowering to the `kotoba-node` WIT
+  *imported* functions (the guest grows a real import section + gas).
+  - **C-1 ✅ host-import plumbing** — the guest now grows a real wasm **import
+    section** and calls a `kotoba:kais` host function. First builtin:
+    `(has-capability? resource ability)` → `auth.has-capability:
+    func(string,string)->bool`. Picked deliberately as the simplest Canonical
+    ABI shape: 4 flat i32 params, single i32 result, **no indirect return
+    area**. `compile_core` gained host-import collection + the function-index
+    shift (imports occupy `0..N`; every defined fn / `cabi_realloc` / `run`
+    wrapper offsets by `N`) — the one correctness-critical change. Each `string`
+    arg is unpacked to its `(ptr,len)` flat pair. Verified **end to end on the
+    real host**: `tests/host_import.rs` (3 tests) live-invokes through
+    `WasmExecutor` (which binds `auth.has-capability`) with the answer driven by
+    the `quad_snapshot` — `ComponentEncoder::…validate(true)` confirms the
+    hand-emitted import signature, and the live call confirms the wiring.
+  - **C-2 ✅ `llm.infer` (return-area imports)** — `infer: func(string,
+    list<u8>) -> result<list<u8>,string>` flattens to >1 result, so it lowers
+    with an indirect **return-area pointer**: the guest `cabi_realloc`s a 12-byte
+    area, appends its pointer as the trailing call param, and reads back the
+    variant `[tag@0, ptr@4, len@8]` — `ok` → output string handle, `err` → the
+    `0` nil sentinel (no exceptions in the i64 model). `(llm-infer model prompt)`
+    is the langgraph node primitive. Verified live: `tests/llm_infer.rs` (3
+    tests) drives `WasmExecutor::with_inference` (ok: lifts model text, incl. a
+    prompt-echo proving the guest lowered the prompt bytes) and the default
+    executor (err → "ERR"). **A compiled-Clojure guest now calls an LLM on
+    kotoba-runtime and gets text back.**
+  - **C-3 ✅ CBOR decode (in-guest)** — `CBOR_PRELUDE`: a CBOR reader written in
+    the language (Stage-A `loop`/`recur`+`byte-at`, Stage-B `str-eq?`), **no
+    bitwise ops** — a head byte splits as major `(/ b 32)` / info `(mod b 32)`,
+    multi-byte lengths assemble with `(* 256)`. Supports major 0/1/2/3/4/5 and
+    inline/1/2/4-byte lengths (8-byte / indefinite / tags / floats deferred). A
+    *reader* is a heap cell `[ctx-handle, pos]`; `cbor-text` slices a string
+    handle into the ctx; `cbor-map-seek` positions at a text key's value
+    (skipping others via recursive `cbor-skip`). **This closes the original
+    step-4 blocker.** `tests/cbor.rs` (10 tests): pure decode of uint
+    (inline/1/2/4-byte) / text / map-seek+skip built in-guest, **plus** a live
+    `decode_ctx_extract_prompt_call_llm` — `ciborium` (the runtime's own CBOR
+    lib) encodes `{"prompt":"ping"}`, the guest decodes it through
+    `WasmExecutor`, extracts the prompt, and calls `llm.infer` → `"echo:ping"`.
+    **A complete single-node agent: decode ctx → call model → return output.**
+    Remaining for full fidelity: decoding the 3-field `InvokeContext` wrapper
+    itself (same machinery; today tests pass the args map as the ctx).
+  - **C-4 ✅ CBOR encoder (in-guest)** — `CBOR_ENC_PRELUDE`, the symmetric
+    counterpart so an agent returns a *structured* `result` (map / array / text /
+    uint) instead of a raw byte string. Built on the Stage-A byte builder; a head
+    is `(major*32 + info)` and multi-byte lengths emit big-endian via `/`/`mod`.
+    `cbor-enc-uint!` / `-text!` / `-bytes!` / `-map-header!` / `-array-header!`.
+    `tests/cbor_encode.rs` (6 tests): in-guest encode→decode round-trips (uint /
+    text / map-seek / 2-byte length) **plus interop** — `ciborium` decodes a
+    guest-built `{"reply":"ok","n":7}` map and `[1,2,3]` array to exactly those
+    structures, proving the output is spec-conformant CBOR a host can read.
+- **D ✅ `defgraph` DSL** — `(defgraph name :entry :n0 :nodes {:n0 fn0 …} :edges
+  {:n0 :n1, :n2 (if-edge pred? :a :b)})` lowers (pure AST desugar, no new runtime)
+  to three generated `defn`s: `name-dispatch [nid state]` (cond → call node fn),
+  `name-next [nid state]` (cond → successor id; static edge or `(if-edge pred?
+  :then :else)` → `(if (pred? state) …)`), and `name [state]` (a `loop`/`recur`
+  that dispatches, advances from the new state, and runs to the `-1` END
+  terminator). Node keywords are compile-time-only (assigned int ids), so nothing
+  keyword-shaped exists at runtime; state is the Stage-B `map`. `tests/defgraph.rs`
+  (4 tests): static linear graph, an `if-edge` loop (tick-until-done), an
+  `if-edge` branch, **and the capstone** `live::cbor_ctx_through_defgraph_to_llm`
+  — a langgraph-shaped agent on `WasmExecutor` that decodes a `ciborium` CBOR ctx
+  (C-3), builds the state map (B), runs the graph (D), calls `llm.infer` (C-2),
+  and returns the reply. **The full A→D stack composes end-to-end.**
+  - **D-reducers ✅ automatic per-channel merge** — declaring `:state {:messages
+    add-messages :count :override}` switches on langgraph reducer semantics: a
+    node returns a *partial-update* map and the generated `name-merge [state
+    update]` folds it in — `add-messages` channels **extend** the running vector
+    (adopt on first write), others are last-write-wins `map-assoc!`. Opt-in:
+    without `:state`, nodes still return the full next state (no merge), so the
+    simpler graphs above are unchanged. `tests/defgraph.rs` +2:
+    `add_messages_reducer_extends_across_nodes` ([10]→[10,20,30]) and
+    `override_reducer_is_last_write_wins`.
+  Deferred refinement: `graph_def_cid` derivation from sorted topology (matching
+  the StateGraph rule) for content-addressed graph caching.
