@@ -33,11 +33,8 @@ import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
-
-import sqlite3
 
 from kotodama.ingest.core import (
     IngestArtifact,
@@ -111,32 +108,52 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-# ── Local SQLite (domain facts + resumable OAI checkpoint) ────────────────────
-@contextmanager
-def sync_cursor():
-    db_dir = os.environ.get("ORGANISM_SQLITE_DIR", "/var/lib/etzhayyim/organism")
-    os.makedirs(db_dir, exist_ok=True)
-    db_path = os.path.join(db_dir, "ingest_ndl.db")
-    with sqlite3.connect(db_path) as conn:
-        _res = client.q("PRAGMA journal_mode=WAL;")
-        _res = client.q(
-            """CREATE TABLE IF NOT EXISTS vertex_ndl_bib_item (
-                vertex_id TEXT PRIMARY KEY, created_date TEXT, sensitivity_ord INTEGER, owner_did TEXT,
-                ndl_id TEXT, provider_id TEXT, title TEXT, creator TEXT, publisher TEXT, issued TEXT,
-                language TEXT, material_type TEXT, content_license TEXT, source_url TEXT,
-                digital_pid TEXT, manifest_url TEXT, set_specs TEXT, record_xml_sha256 TEXT,
-                status TEXT, discovered_at TEXT, updated_at TEXT, actor_did TEXT, org_did TEXT
-            )"""
-        )
-        _res = client.q(
-            """CREATE TABLE IF NOT EXISTS vertex_ndl_oai_checkpoint (
-                vertex_id TEXT PRIMARY KEY, created_date TEXT, sensitivity_ord INTEGER, owner_did TEXT,
-                provider_id TEXT, set_group TEXT, metadata_prefix TEXT, window_start TEXT, window_end TEXT,
-                resumption_token TEXT, pages_seen INTEGER, records_seen INTEGER, items_inserted INTEGER,
-                status TEXT, error TEXT, updated_at TEXT
-            )"""
-        )
-        yield conn.cursor()
+# ── kotoba Datom persistence (domain facts + resumable OAI checkpoint) ─────────
+# ADR-2605302130 / ADR-2605262130 / ADR-2605312345: the canonical state home is
+# the kotoba Datom log — NOT RisingWave / SQLite. Each `vertex_*` row maps to a
+# Datom entity whose `vertex_id` carries `:db.unique/identity` (re-transact =
+# upsert, preserving the old "PK implicit overwrite" semantics). The column
+# manifests below are the projection shape callers read back through the
+# rw_sql-compatible client shims (`insert_rows` / `select_first_where` /
+# `aggregate_where`); only the identity attr is declared, every other column is
+# schemaless. The kotoba endpoint is reached via `get_kotoba_client()`
+# (KOTOBA_URL); set `KOTODAMA_KOTOBA_DRYRUN=1` to print + skip writes offline.
+BIB_ITEM_TABLE = "vertex_ndl_bib_item"
+BIB_ITEM_COLUMNS = (
+    "vertex_id", "created_date", "sensitivity_ord", "owner_did",
+    "ndl_id", "provider_id", "title", "creator", "publisher", "issued",
+    "language", "material_type", "content_license", "source_url",
+    "digital_pid", "manifest_url", "set_specs", "record_xml_sha256",
+    "status", "discovered_at", "updated_at", "actor_did", "org_did",
+)
+CHECKPOINT_TABLE = "vertex_ndl_oai_checkpoint"
+CHECKPOINT_COLUMNS = (
+    "vertex_id", "created_date", "sensitivity_ord", "owner_did",
+    "provider_id", "set_group", "metadata_prefix", "window_start", "window_end",
+    "resumption_token", "pages_seen", "records_seen", "items_inserted",
+    "status", "error", "updated_at",
+)
+
+_SCHEMA_READY = False
+
+
+def _ensure_schema(client: Any) -> None:
+    """Declare both tables' ``:db.unique/identity`` attribute once per process.
+
+    The datomic analog of the old ``CREATE TABLE IF NOT EXISTS`` — only the
+    identity attribute must be declared so a re-transact upserts; all other
+    columns are schemaless. Best-effort: under dry-run it prints + succeeds;
+    offline with no node it logs a warning and is retried on the next call.
+    """
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    try:
+        client.ensure_schema(BIB_ITEM_TABLE, BIB_ITEM_COLUMNS)
+        client.ensure_schema(CHECKPOINT_TABLE, CHECKPOINT_COLUMNS)
+        _SCHEMA_READY = True
+    except Exception as exc:  # noqa: BLE001 — schema declare is best-effort
+        _LOG.warning("ingest.ndl schema declare degraded: %s", str(exc)[:160])
 
 
 # ── PERSISTENCE SEAM (kotoba datomic refactor target — ADR-2605302130) ────────
@@ -146,33 +163,53 @@ def sync_cursor():
 # transact of the same `items` dicts (POST com.etzhayyim.apps.kotoba.datomic.transact,
 # one `:ndl/*` entity per item). No other code in this module writes domain
 # facts — keep the seam isolated here so the swap is a single, reviewable edit.
-def _persist_items(cur: Any, items: list[dict[str, Any]], now: str) -> int:
-    inserted = 0
+def _persist_items(client: Any, items: list[dict[str, Any]], now: str) -> int:
+    """Transact one ``:vertex.ndl-bib-item/*`` Datom entity per OAI record.
+
+    This is the single domain-fact write seam (ADR-2605312000): all bib-item
+    writes go through here so the RW→kotoba-datomic move was a one-function swap.
+    Rows upsert by ``vertex_id`` identity. ``None`` fields are dropped by
+    ``row_to_entity`` (no datom emitted) — so the bib-id-is-NOT-a-PID invariant
+    holds: a record with no genuine ``dl.ndl.go.jp/pid`` carries no
+    ``digital_pid`` / ``manifest_url`` attr rather than a synthesised one.
+    """
+    if not items:
+        return 0
+    rows: list[dict[str, Any]] = []
     for item in items:
         ndl_id = item["ndl_id"]
         vid = f"at://{ONLINE_PATH_DID}/com.etzhayyim.apps.ndl.bibItem/{ndl_id}"
-        try:
-            _res = client.q(
-                """INSERT OR REPLACE INTO vertex_ndl_bib_item (
-                    vertex_id, created_date, sensitivity_ord, owner_did,
-                    ndl_id, provider_id, title, creator, publisher, issued,
-                    language, material_type, content_license, source_url,
-                    digital_pid, manifest_url, set_specs, record_xml_sha256,
-                    status, discovered_at, updated_at, actor_did, org_did
-                ) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 'anon')""",
-                (
-                    vid, today_iso(), ONLINE_PATH_DID,
-                    ndl_id, item.get("provider_id"), item.get("title"), item.get("creator"),
-                    item.get("publisher"), item.get("issued"), item.get("language"),
-                    item.get("material_type"), item.get("content_license"), item.get("source_url"),
-                    item.get("digital_pid"), item.get("manifest_url"), item.get("set_specs"),
-                    item.get("record_xml_sha256"), now, now, ONLINE_PATH_DID,
-                ),
-            )
-            inserted += 1
-        except sqlite3.Error:
-            continue
-    return inserted
+        rows.append({
+            "vertex_id": vid,
+            "created_date": today_iso(),
+            "sensitivity_ord": 0,
+            "owner_did": ONLINE_PATH_DID,
+            "ndl_id": ndl_id,
+            "provider_id": item.get("provider_id"),
+            "title": item.get("title"),
+            "creator": item.get("creator"),
+            "publisher": item.get("publisher"),
+            "issued": item.get("issued"),
+            "language": item.get("language"),
+            "material_type": item.get("material_type"),
+            "content_license": item.get("content_license"),
+            "source_url": item.get("source_url"),
+            "digital_pid": item.get("digital_pid"),
+            "manifest_url": item.get("manifest_url"),
+            "set_specs": item.get("set_specs"),
+            "record_xml_sha256": item.get("record_xml_sha256"),
+            "status": "active",
+            "discovered_at": now,
+            "updated_at": now,
+            "actor_did": ONLINE_PATH_DID,
+            "org_did": "anon",
+        })
+    try:
+        client.insert_rows(BIB_ITEM_TABLE, rows)
+    except Exception as exc:  # noqa: BLE001 — surface as 0-inserted; caller records on checkpoint
+        _LOG.warning("ingest.ndl persist degraded (%d items): %s", len(rows), str(exc)[:160])
+        return 0
+    return len(rows)
 
 
 # ── OAI-PMH fetch + parse (substrate-independent, kept from vendor) ────────────
@@ -320,26 +357,24 @@ def _checkpoint_vid(provider_id: str, set_group: str, window_start: str, window_
     return f"at://{ACTOR_DID}/com.etzhayyim.apps.ndl.oaiCheckpoint/{key}"
 
 
-def _read_checkpoint(cur: Any, vid: str) -> dict[str, Any] | None:
-    _res = client.q(
-        "SELECT resumption_token, pages_seen, records_seen, items_inserted, status "
-        "FROM vertex_ndl_oai_checkpoint WHERE vertex_id = ?",
-        (vid,),
+def _read_checkpoint(client: Any, vid: str) -> dict[str, Any] | None:
+    row = client.select_first_where(
+        CHECKPOINT_TABLE, "vertex_id", vid,
+        ["resumption_token", "pages_seen", "records_seen", "items_inserted", "status"],
     )
-    row = (_res[0] if _res else None)
     if not row:
         return None
     return {
-        "resumption_token": row[0] or "",
-        "pages_seen": int(row[1] or 0),
-        "records_seen": int(row[2] or 0),
-        "items_inserted": int(row[3] or 0),
-        "status": row[4] or "",
+        "resumption_token": row.get("resumption_token") or "",
+        "pages_seen": int(row.get("pages_seen") or 0),
+        "records_seen": int(row.get("records_seen") or 0),
+        "items_inserted": int(row.get("items_inserted") or 0),
+        "status": row.get("status") or "",
     }
 
 
 def _write_checkpoint(
-    cur: Any,
+    client: Any,
     *,
     vid: str,
     provider_id: str,
@@ -354,18 +389,24 @@ def _write_checkpoint(
     status: str,
     error: str = "",
 ) -> None:
-    _res = client.q(
-        """INSERT OR REPLACE INTO vertex_ndl_oai_checkpoint (
-            vertex_id, created_date, sensitivity_ord, owner_did,
-            provider_id, set_group, metadata_prefix, window_start, window_end,
-            resumption_token, pages_seen, records_seen, items_inserted, status, error, updated_at
-        ) VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            vid, today_iso(), ACTOR_DID,
-            provider_id, set_group, metadata_prefix, window_start, window_end,
-            token, pages_seen, records_seen, items_inserted, status, error or None, now_iso(),
-        ),
-    )
+    client.insert_row(CHECKPOINT_TABLE, {
+        "vertex_id": vid,
+        "created_date": today_iso(),
+        "sensitivity_ord": 0,
+        "owner_did": ACTOR_DID,
+        "provider_id": provider_id,
+        "set_group": set_group,
+        "metadata_prefix": metadata_prefix,
+        "window_start": window_start,
+        "window_end": window_end,
+        "resumption_token": token,
+        "pages_seen": pages_seen,
+        "records_seen": records_seen,
+        "items_inserted": items_inserted,
+        "status": status,
+        "error": error or None,
+        "updated_at": now_iso(),
+    })
 
 
 # ── Zeebe tasks ───────────────────────────────────────────────────────────────
@@ -397,24 +438,24 @@ def _plan_windows(
 ) -> list[dict[str, Any]]:
     windows = _month_windows(start_year, start_month)
     shards: list[dict[str, Any]] = []
-    if True:
-        client = get_kotoba_client()
-        for win_start, win_end in windows:
-            vid = _checkpoint_vid(SOURCE_ID, set_group, win_start, win_end)
-            cp = _read_checkpoint(cur, vid)
-            if cp and cp["status"] == "completed":
-                continue  # already harvested this window
-            shards.append(
-                {
-                    "shardKey": f"{set_group}|{win_start}|{win_end}",
-                    "setGroup": set_group,
-                    "metadataPrefix": metadata_prefix,
-                    "windowStart": win_start,
-                    "windowEnd": win_end,
-                }
-            )
-            if len(shards) >= max(1, int(max_windows)):
-                break
+    client = get_kotoba_client()
+    _ensure_schema(client)
+    for win_start, win_end in windows:
+        vid = _checkpoint_vid(SOURCE_ID, set_group, win_start, win_end)
+        cp = _read_checkpoint(client, vid)
+        if cp and cp["status"] == "completed":
+            continue  # already harvested this window
+        shards.append(
+            {
+                "shardKey": f"{set_group}|{win_start}|{win_end}",
+                "setGroup": set_group,
+                "metadataPrefix": metadata_prefix,
+                "windowStart": win_start,
+                "windowEnd": win_end,
+            }
+        )
+        if len(shards) >= max(1, int(max_windows)):
+            break
     return shards
 
 
@@ -475,7 +516,8 @@ def _fetch_window_blocking(
     vid = _checkpoint_vid(SOURCE_ID, set_group, window_start, window_end)
     if True:
         client = get_kotoba_client()
-        cp = _read_checkpoint(cur, vid) or {
+        _ensure_schema(client)
+        cp = _read_checkpoint(client, vid) or {
             "resumption_token": "",
             "pages_seen": 0,
             "records_seen": 0,
@@ -500,7 +542,7 @@ def _fetch_window_blocking(
                     provider_id=SOURCE_ID,
                 )
                 now = now_iso()
-                items_inserted += _persist_items(cur, items, now)
+                items_inserted += _persist_items(client, items, now)
                 records_seen += rec_count
                 pages_seen += 1
                 pages_this_run += 1
@@ -510,7 +552,7 @@ def _fetch_window_blocking(
                     status = "completed"
                     break
             _write_checkpoint(
-                cur,
+                client,
                 vid=vid,
                 provider_id=SOURCE_ID,
                 set_group=set_group,
@@ -526,7 +568,7 @@ def _fetch_window_blocking(
         except Exception as exc:  # noqa: BLE001 — record failure on the checkpoint, surface to BPMN
             error = str(exc)[:240]
             _write_checkpoint(
-                cur,
+                client,
                 vid=vid,
                 provider_id=SOURCE_ID,
                 set_group=set_group,
@@ -598,9 +640,11 @@ def _verify_blocking(set_group: str, window_start: str, window_end: str) -> dict
     vid = _checkpoint_vid(SOURCE_ID, set_group, window_start, window_end)
     if True:
         client = get_kotoba_client()
-        cp = _read_checkpoint(cur, vid)
-        _res = client.q("SELECT count(*) FROM vertex_ndl_bib_item WHERE provider_id = ?", (SOURCE_ID,))
-        item_total = int(((_res[0] if _res else None) or [0])[0] or 0)
+        _ensure_schema(client)
+        cp = _read_checkpoint(client, vid)
+        item_total = int(
+            client.aggregate_where(BIB_ITEM_TABLE, "count", "*", "provider_id", SOURCE_ID)
+        )
     verified = bool(cp and cp["status"] == "completed")
     return {
         "ok": True,
