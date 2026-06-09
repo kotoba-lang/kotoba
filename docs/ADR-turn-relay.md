@@ -1,9 +1,29 @@
 # ADR — Pure-Rust TURN relay for real-media calls (`kotoba-turn`)
 
-Status: **Proposed**
+Status: **Accepted — socket-free core implemented; listener shell pending**
 Context: 1:1 real-media WebRTC calling shipped as `@etzhayyim/kami-engine-sdk/call`
 (browser owns the media plane; `kotoba-rt` relays SDP/ICE). STUN alone is not
 enough for production — this ADR specifies the relay that closes the gap.
+
+## 0. Implementation status (2026-06-09)
+
+The entire socket-free core of `kotoba-turn` is implemented and unit-tested
+(`cargo test -p kotoba-turn` → 28 tests, pinned to RFC 2202 / RFC 5769 / CRC-32
+vectors):
+
+| Module | Status | Verified by |
+|---|---|---|
+| `lib.rs` — ephemeral-credential mint/verify (HMAC-SHA1) | ✅ done | RFC 2202 vector, shared byte-for-byte with the JS SDK |
+| `stun.rs` — header, attribute TLV, XOR-MAPPED-ADDRESS, MESSAGE-INTEGRITY, FINGERPRINT | ✅ done | RFC 5769 §2.2 + CRC-32 check value |
+| `allocation.rs` — 5-tuple allocations, permissions, channels, expiry/GC | ✅ done | state-machine unit tests |
+| `channel.rs` — ChannelData framing + STUN/ChannelData demux | ✅ done | round-trip + demux tests |
+| `server.rs` — datagram classify + method classify + auth gate | ✅ done | auth accept/reject/stale tests |
+| UDP/TCP listener shell + relay-port pool + packet forwarding | ⬜ pending | integration/manual (out of unit-test scope) |
+
+The JS client side (`mintTurnCredential` / `buildIceServers`) already consumes
+this scheme; the only work left to take 1:1 calls past STUN-only reachability is
+the thin async I/O shell that drives `server.rs` + `allocation.rs` over real
+sockets.
 
 ## 1. Problem
 
@@ -43,11 +63,16 @@ as such.
 ```
 crates/kotoba-turn/
   src/
-    stun.rs       # RFC 8489 message codec (types, attributes, MESSAGE-INTEGRITY, FINGERPRINT)
-    auth.rs       # long-term credential + ephemeral HMAC credential (RFC-7635 style)
-    allocation.rs # 5-tuple allocations, relay-address pool, permissions, channels
-    server.rs     # UDP + TCP listeners, allocation lifecycle, refresh/timeout
-    lib.rs
+    lib.rs        # ephemeral HMAC credential mint/verify (DONE)
+    stun.rs       # RFC 8489 header + attribute TLV + XOR-MAPPED-ADDRESS
+                  #   + MESSAGE-INTEGRITY (HMAC-SHA1) + FINGERPRINT (CRC-32) (DONE; RFC 5769/CRC vectors)
+    allocation.rs # 5-tuple allocations, permissions, channel bindings, expiry/GC (DONE; pure state machine)
+    channel.rs    # ChannelData framing (RFC 8656 §12.4) + STUN/ChannelData demux (DONE)
+    server.rs     # socket-free request core: datagram demux + method classify
+                  #   + ephemeral-credential authenticate gate (DONE)
+    # remaining:
+    # the thin socket shell: UDP/TCP recv loop + relay-port pool that drives
+    # server.rs's decisions and allocation.rs (integration-tested, not unit)
 ```
 
 Recommended base: build on the well-audited **`webrtc-rs/turn`** + `stun`

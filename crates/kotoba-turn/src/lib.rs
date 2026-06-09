@@ -17,6 +17,11 @@
 //! v0 scope: the auth core only. STUN/TURN message codec, allocations, and the
 //! UDP/TCP/TLS listeners are deferred to a later phase (see `docs/ADR-turn-relay.md`).
 
+pub mod allocation;
+pub mod channel;
+pub mod server;
+pub mod stun;
+
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
