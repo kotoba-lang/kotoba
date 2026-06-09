@@ -25,6 +25,7 @@ pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
 pub mod social;
+pub mod social_economy;
 pub mod social_xrpc;
 pub mod xrpc;
 
