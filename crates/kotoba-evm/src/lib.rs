@@ -11,6 +11,7 @@
 //! production / DA / L1 anchor are R1b/R2+ (ADR roadmap).
 
 pub mod block;
+pub mod chain;
 pub mod tx;
 
 use kotoba_core::cid::KotobaCid;
