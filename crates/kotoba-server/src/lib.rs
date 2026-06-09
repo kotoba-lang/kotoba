@@ -24,6 +24,7 @@ pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
 pub mod social;
+pub mod social_xrpc;
 pub mod xrpc;
 
 use axum::{
@@ -1194,6 +1195,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             post(kotobase_xrpc::handle_pre_revoke),
         )
         // ── Common Crawl vector search / RAG ───────────────────────────────
+        .route(
+            &format!("/xrpc/{}", social_xrpc::NSID_SOCIAL_CAPITAL),
+            get(social_xrpc::social_capital),
+        )
         .route(
             &format!("/xrpc/{}", cc_xrpc::NSID_CC_SEARCH),
             get(cc_xrpc::cc_search),
