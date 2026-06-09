@@ -192,6 +192,28 @@ impl EvmStateView {
         self.nonce.is_empty() && self.balance.is_empty() && self.storage.is_empty()
     }
 
+    /// Deterministic content-addressed **state root** over the full `evm/*`
+    /// world-state (sorted accounts + storage). This is the EVM block's `stateRoot`
+    /// commitment (ADR-2606091500 R2). R2 hashes a canonical serialization via the
+    /// kotoba CID (blake3); R3+ swaps to the ProllyTree root once the store is wired.
+    pub fn state_root(&self) -> KotobaCid {
+        let mut rows: Vec<String> = Vec::new();
+        for (e, v) in &self.nonce {
+            rows.push(format!("n|{}|{v}", e.to_multibase()));
+        }
+        for (e, v) in &self.balance {
+            rows.push(format!("b|{}|{}", e.to_multibase(), hex::encode(v)));
+        }
+        for (e, v) in &self.codehash {
+            rows.push(format!("c|{}|{}", e.to_multibase(), hex::encode(v)));
+        }
+        for ((e, slot), v) in &self.storage {
+            rows.push(format!("s|{}|{}|{}", e.to_multibase(), hex::encode(slot), hex::encode(v)));
+        }
+        rows.sort();
+        KotobaCid::from_bytes(rows.join("\n").as_bytes())
+    }
+
     pub fn account_count(&self) -> usize {
         self.balance.len().max(self.nonce.len())
     }
