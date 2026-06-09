@@ -31,12 +31,12 @@
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, Instruction, MemArg, MemorySection, MemoryType,
-    Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg, MemorySection,
+    MemoryType, Module, TypeSection, ValType,
 };
 
-use crate::ast::{Builtin, Expr, Program};
+use crate::ast::{Builtin, Expr, HostImport, Program};
 use crate::CljError;
 
 /// Byte offset where string/data literals begin. Low memory `[0, DATA_BASE)` is
@@ -87,12 +87,32 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     // ---- Pass 1: constants + function signatures ---------------------------
     let consts = eval_consts(program)?;
 
+    // ---- Host imports -------------------------------------------------------
+    // Any used host-call builtin (e.g. `has-capability?`) becomes a wasm import.
+    // Imports occupy function indices `0..num_imports`; every *defined* function
+    // index is therefore offset by `import_base`. Getting this offset right is
+    // the whole correctness story of import support.
+    let host_imports = collect_host_imports(program);
+    let import_base = host_imports.len() as u32;
+
+    let mut types = TypeSection::new();
+    let mut imports = ImportSection::new();
+    let mut import_index: HashMap<HostImport, u32> = HashMap::new();
+    for (i, imp) in host_imports.iter().enumerate() {
+        let (params, results) = host_import_sig(*imp);
+        let tidx = types.len();
+        types.ty().function(params, results);
+        let (module, field) = imp.module_field();
+        imports.import(module, field, EntityType::Function(tidx));
+        import_index.insert(*imp, i as u32);
+    }
+
     let mut fn_index: HashMap<String, (u32, usize)> = HashMap::new();
     for (i, f) in program.functions.iter().enumerate() {
         if fn_index.contains_key(&f.name) {
             return Err(CljError::Codegen(format!("function `{}` defined twice", f.name)));
         }
-        fn_index.insert(f.name.clone(), (i as u32, f.params.len()));
+        fn_index.insert(f.name.clone(), (import_base + i as u32, f.params.len()));
     }
 
     // Validate the entry point up front.
@@ -112,7 +132,6 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     };
 
     // Distinct function types, keyed by arity (params: arity×i64 → i64).
-    let mut types = TypeSection::new();
     let mut type_for_arity: HashMap<usize, u32> = HashMap::new();
     let mut funcs = FunctionSection::new();
     let mut exports = ExportSection::new();
@@ -129,7 +148,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         // In component mode the wrapper owns the export names; don't leak the
         // raw i64 functions (avoids a clash on the `run` name).
         if entry.is_none() {
-            exports.export(&f.name, ExportKind::Func, i as u32);
+            exports.export(&f.name, ExportKind::Func, import_base + i as u32);
         }
     }
 
@@ -139,7 +158,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
         [ValType::I32],
     );
-    let realloc_fn_index = program.functions.len() as u32;
+    let realloc_fn_index = import_base + program.functions.len() as u32;
     funcs.function(realloc_type);
     exports.export("cabi_realloc", ExportKind::Func, realloc_fn_index);
 
@@ -188,6 +207,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         let mut cg = FnCtx {
             consts: &consts,
             fn_index: &fn_index,
+            import_index: &import_index,
             literals: &literals,
             scope: f
                 .params
@@ -197,6 +217,9 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
                 .collect(),
             next_local: f.params.len() as u32,
             arity: f.params.len() as u32,
+            realloc_index: realloc_fn_index,
+            ctrl_depth: 0,
+            loop_targets: Vec::new(),
             out: Vec::new(),
         };
         compile_body(&mut cg, &f.body)?;
@@ -222,6 +245,9 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     // Sections must be emitted in ascending id order.
     let mut module = Module::new();
     module.section(&types); // 1
+    if import_base > 0 {
+        module.section(&imports); // 2
+    }
     module.section(&funcs); // 3
     module.section(&memories); // 5
     module.section(&globals); // 6
@@ -249,6 +275,75 @@ impl Literals {
         let abs = DATA_BASE + rel;
         Some(((abs as i64) << 32) | (bytes.len() as i64 & 0xFFFF_FFFF))
     }
+}
+
+/// The Canonical-ABI **core** signature a host import lowers to (params →
+/// results), as the Component encoder computes it from the WIT function type.
+///
+/// `has-capability: func(string, string) -> bool`:
+///   - each `string` flattens to `(ptr: i32, len: i32)` → 4 i32 params,
+///   - `bool` flattens to a single `i32` result (≤ MAX_FLAT_RESULTS, so it is
+///     returned directly — no indirect return area).
+fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
+    match imp {
+        HostImport::HasCapability => (
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![ValType::I32],
+        ),
+        // `infer: func(string, list<u8>) -> result<list<u8>, string>`:
+        //   - `string` and `list<u8>` each flatten to `(ptr,len)` → 4 i32 params,
+        //   - the result flattens to >1 value, so it is returned **indirectly**:
+        //     the caller appends a return-area pointer (5th i32 param) and the
+        //     core import returns nothing. The host writes the 12-byte variant
+        //     `[tag:u8 @0, ptr:i32 @4, len:i32 @8]` into that area.
+        HostImport::LlmInfer => (
+            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![],
+        ),
+    }
+}
+
+/// Collect the distinct host imports the program uses, in first-seen order
+/// (stable so emitted indices are deterministic).
+fn collect_host_imports(program: &Program) -> Vec<HostImport> {
+    let mut seen: Vec<HostImport> = Vec::new();
+    let mut note = |imp: HostImport| {
+        if !seen.contains(&imp) {
+            seen.push(imp);
+        }
+    };
+    fn walk(expr: &Expr, note: &mut impl FnMut(HostImport)) {
+        match expr {
+            Expr::Int(_) | Expr::Str(_) | Expr::Var(_) => {}
+            Expr::If { cond, then, els } => {
+                walk(cond, note);
+                walk(then, note);
+                walk(els, note);
+            }
+            Expr::Let { bindings, body } | Expr::Loop { bindings, body } => {
+                bindings.iter().for_each(|(_, v)| walk(v, note));
+                body.iter().for_each(|e| walk(e, note));
+            }
+            Expr::Recur(es) | Expr::Do(es) | Expr::Call { args: es, .. } => {
+                es.iter().for_each(|e| walk(e, note));
+            }
+            Expr::Builtin { op, args } => {
+                if let Some(imp) = op.host_import() {
+                    note(imp);
+                }
+                args.iter().for_each(|e| walk(e, note));
+            }
+        }
+    }
+    for d in &program.defs {
+        walk(&d.value, &mut note);
+    }
+    for f in &program.functions {
+        for e in &f.body {
+            walk(e, &mut note);
+        }
+    }
+    seen
 }
 
 fn collect_literals(program: &Program) -> Literals {
@@ -280,13 +375,16 @@ fn walk_strings(expr: &Expr, f: &mut impl FnMut(&[u8])) {
             walk_strings(then, f);
             walk_strings(els, f);
         }
-        Expr::Let { bindings, body } => {
+        Expr::Let { bindings, body } | Expr::Loop { bindings, body } => {
             for (_, v) in bindings {
                 walk_strings(v, f);
             }
             body.iter().for_each(|e| walk_strings(e, f));
         }
-        Expr::Do(es) | Expr::Builtin { args: es, .. } | Expr::Call { args: es, .. } => {
+        Expr::Recur(es)
+        | Expr::Do(es)
+        | Expr::Builtin { args: es, .. }
+        | Expr::Call { args: es, .. } => {
             es.iter().for_each(|e| walk_strings(e, f));
         }
     }
@@ -425,15 +523,33 @@ fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Fu
     f
 }
 
+/// A live `loop` target: the local slots holding its bindings, and the wasm
+/// control depth at the point just inside its `loop` block. A `recur` rebinds
+/// these locals and `br`s by `current_depth - frame_depth`.
+struct LoopTarget {
+    locals: Vec<u32>,
+    frame_depth: u32,
+}
+
 /// Per-function compilation context.
 struct FnCtx<'a> {
     consts: &'a HashMap<String, i64>,
     fn_index: &'a HashMap<String, (u32, usize)>,
+    /// Host-import → wasm function index (imports occupy `0..num_imports`).
+    import_index: &'a HashMap<HostImport, u32>,
     literals: &'a Literals,
     /// (name, local-index) pairs; latest binding shadows earlier ones.
     scope: Vec<(String, u32)>,
     next_local: u32,
     arity: u32,
+    /// Function index of the module's `cabi_realloc`, so `bytes-alloc` can call
+    /// it to obtain heap space for a byte buffer.
+    realloc_index: u32,
+    /// Count of currently-open wasm control frames (`if`/`loop`). Used to turn
+    /// an enclosing loop's recorded depth into a relative `br` label index.
+    ctrl_depth: u32,
+    /// Stack of enclosing `loop` targets (innermost last).
+    loop_targets: Vec<LoopTarget>,
     out: Vec<Instruction<'a>>,
 }
 
@@ -449,6 +565,16 @@ impl<'a> FnCtx<'a> {
         self.next_local += 1;
         i
     }
+    /// Emit a control-frame opener (`if`/`loop`) and account for its depth.
+    fn open_frame(&mut self, ins: Instruction<'a>) {
+        self.emit(ins);
+        self.ctrl_depth += 1;
+    }
+    /// Emit the matching `end` and pop the control-frame depth.
+    fn close_frame(&mut self) {
+        self.emit(Instruction::End);
+        self.ctrl_depth -= 1;
+    }
 }
 
 /// Compile a body (implicit `do`): all-but-last are dropped, last is the value.
@@ -461,6 +587,69 @@ fn compile_body(cg: &mut FnCtx, body: &[Expr]) -> Result<(), CljError> {
         cg.emit(Instruction::Drop);
     }
     compile_expr(cg, last)
+}
+
+/// `(loop [b v …] body…)` — sequential-init bindings (like `let`) that double as
+/// a `recur` target. Lowers to a wasm `loop (result i64)`: the body either
+/// leaves an `i64` (the exit value, taken as the loop's result) or `recur`s
+/// (rebind the binding locals, then `br` back to the top).
+fn compile_loop(
+    cg: &mut FnCtx,
+    bindings: &[(String, Expr)],
+    body: &[Expr],
+) -> Result<(), CljError> {
+    let saved_scope = cg.scope.len();
+    // Sequential init: each binding sees the previous ones (identical to `let`).
+    let mut locals = Vec::with_capacity(bindings.len());
+    for (name, val) in bindings {
+        compile_expr(cg, val)?;
+        let idx = cg.alloc_local();
+        cg.emit(Instruction::LocalSet(idx));
+        cg.scope.push((name.clone(), idx));
+        locals.push(idx);
+    }
+
+    cg.open_frame(Instruction::Loop(BlockType::Result(ValType::I64)));
+    cg.loop_targets.push(LoopTarget {
+        locals,
+        frame_depth: cg.ctrl_depth, // depth as seen from just inside the loop
+    });
+    compile_body(cg, body)?;
+    cg.loop_targets.pop();
+    cg.close_frame();
+
+    cg.scope.truncate(saved_scope); // loop bindings leave scope; slots stay
+    Ok(())
+}
+
+/// `(recur args…)` — rebind the innermost enclosing `loop` and jump to its top.
+/// All args are evaluated first (reading the *old* bindings), then written back,
+/// so the rebind is parallel. The trailing `br` makes the code after it
+/// unreachable, which polymorphically satisfies the surrounding `i64` slot.
+fn compile_recur(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
+    let (frame_depth, locals) = match cg.loop_targets.last() {
+        Some(t) => (t.frame_depth, t.locals.clone()),
+        None => return Err(CljError::Codegen("`recur` used outside of a `loop`".into())),
+    };
+    if args.len() != locals.len() {
+        return Err(CljError::Codegen(format!(
+            "`recur` expects {} value(s) to match the loop bindings, got {}",
+            locals.len(),
+            args.len()
+        )));
+    }
+    // Evaluate every new value first (they read the current binding locals).
+    for a in args {
+        compile_expr(cg, a)?;
+    }
+    // Pop into the binding locals in reverse (stack top is the last arg).
+    for &idx in locals.iter().rev() {
+        cg.emit(Instruction::LocalSet(idx));
+    }
+    // Relative label: how many frames between here and the loop header.
+    let label = cg.ctrl_depth - frame_depth;
+    cg.emit(Instruction::Br(label));
+    Ok(())
 }
 
 /// Compile an expression, leaving exactly one `i64` on the stack.
@@ -488,11 +677,11 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
 
         Expr::If { cond, then, els } => {
             compile_truthy_i32(cg, cond)?;
-            cg.emit(Instruction::If(BlockType::Result(ValType::I64)));
+            cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
             compile_expr(cg, then)?;
             cg.emit(Instruction::Else);
             compile_expr(cg, els)?;
-            cg.emit(Instruction::End);
+            cg.close_frame();
         }
 
         Expr::Let { bindings, body } => {
@@ -506,6 +695,10 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
             compile_body(cg, body)?;
             cg.scope.truncate(saved); // bindings leave scope; local slots stay allocated
         }
+
+        Expr::Loop { bindings, body } => compile_loop(cg, bindings, body)?,
+
+        Expr::Recur(args) => compile_recur(cg, args)?,
 
         Expr::Do(exprs) => compile_body(cg, exprs)?,
 
@@ -596,15 +789,286 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
             compile_expr(cg, &args[1])?; // index (i64)
             cg.emit(Instruction::I64Add); // address (i64)
             cg.emit(Instruction::I32WrapI64); // address (i32)
-            cg.emit(Instruction::I32Load8U(MemArg {
-                offset: 0,
-                align: 0,
-                memory_index: 0,
-            }));
+            cg.emit(Instruction::I32Load8U(mem8(0)));
             cg.emit(Instruction::I64ExtendI32U);
             Ok(())
         }
+
+        Builtin::BytesAlloc => compile_bytes_alloc(cg, &args[0]),
+        Builtin::ByteAppend => compile_byte_append(cg, &args[0], &args[1]),
+        // len = mem[buf + 4]  (the header's length field)
+        Builtin::BytesLen => {
+            compile_expr(cg, &args[0])?; // buf header ptr (i64)
+            cg.emit(Instruction::I32WrapI64);
+            cg.emit(Instruction::I32Load(mem32(4)));
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        Builtin::BytesFinish => compile_bytes_finish(cg, &args[0]),
+
+        // raw memory substrate (the dynamic-container prelude builds on these)
+        Builtin::Alloc => {
+            cg.emit(Instruction::I32Const(0));
+            cg.emit(Instruction::I32Const(0));
+            cg.emit(Instruction::I32Const(HEAP_ALIGN as i32));
+            compile_expr(cg, &args[0])?; // n
+            cg.emit(Instruction::I32WrapI64);
+            let realloc = cg.realloc_index;
+            cg.emit(Instruction::Call(realloc));
+            cg.emit(Instruction::I64ExtendI32U); // ptr → i64
+            Ok(())
+        }
+        Builtin::Load64 => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I32WrapI64);
+            cg.emit(Instruction::I64Load(mem64(0)));
+            Ok(())
+        }
+        Builtin::Load32 => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I32WrapI64);
+            cg.emit(Instruction::I32Load(mem32(0)));
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        Builtin::Store64 => compile_store(cg, &args[0], &args[1], /*word32=*/ false),
+        Builtin::Store32 => compile_store(cg, &args[0], &args[1], /*word32=*/ true),
+
+        Builtin::HasCapability => compile_host_call(cg, HostImport::HasCapability, args),
+        Builtin::LlmInfer => compile_llm_infer(cg, &args[0], &args[1]),
     }
+}
+
+/// Lower `(llm-infer model-cid prompt)` — a host import whose
+/// `result<list<u8>, string>` return uses the indirect **return-area** ABI:
+///   1. `cabi_realloc` a 12-byte area (align 4),
+///   2. push `model (ptr,len)`, `prompt (ptr,len)`, then the area pointer,
+///   3. `call` the import (no core result),
+///   4. read `tag = mem[area]`; on `ok` (tag 0) rebuild the output string handle
+///      `(mem[area+4] << 32) | mem[area+8]`, on `err` yield `0`.
+fn compile_llm_infer(cg: &mut FnCtx, model: &Expr, prompt: &Expr) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&HostImport::LlmInfer)
+        .ok_or_else(|| CljError::Codegen("host import LlmInfer not registered".into()))?;
+    let realloc = cg.realloc_index;
+    let area = cg.alloc_local(); // i64 local holding the area pointer (extended)
+
+    // area = cabi_realloc(0, 0, 4, 12)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(4));
+    cg.emit(Instruction::I32Const(12));
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(area));
+
+    // model (ptr,len), prompt (ptr,len)
+    lower_string_arg_to_ptr_len(cg, model)?;
+    lower_string_arg_to_ptr_len(cg, prompt)?;
+    // return-area pointer (i32)
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    // call — returns nothing; the host populated the return area
+    cg.emit(Instruction::Call(idx));
+
+    // tag == 0 ? ok : err
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load8U(mem8(0)));
+    cg.emit(Instruction::I32Eqz); // 1 if tag == 0 (ok)
+    cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+    // ok: handle = (mem[area+4] << 32) | mem[area+8]
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Const(32));
+    cg.emit(Instruction::I64Shl);
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(8)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Or);
+    cg.emit(Instruction::Else);
+    // err: nil-ish 0 (an empty string handle: ptr 0, len 0)
+    cg.emit(Instruction::I64Const(0));
+    cg.close_frame();
+    Ok(())
+}
+
+/// Lower a host-import call. Each string-handle argument is unpacked into its
+/// `(ptr: i32, len: i32)` pair (the Canonical-ABI lowering of `string`), pushed
+/// left-to-right, then the imported function is `call`ed. The single i32 result
+/// (a `bool`) is zero-extended back to the uniform i64 value model.
+fn compile_host_call(cg: &mut FnCtx, imp: HostImport, args: &[Expr]) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&imp)
+        .ok_or_else(|| CljError::Codegen(format!("host import {imp:?} not registered")))?;
+    for a in args {
+        lower_string_arg_to_ptr_len(cg, a)?;
+    }
+    cg.emit(Instruction::Call(idx));
+    cg.emit(Instruction::I64ExtendI32U); // bool i32 → i64
+    Ok(())
+}
+
+/// Push a string handle's `(ptr: i32, len: i32)` as two stack operands, in that
+/// order — the flattened form a `string` lowers to when passed to a host call.
+fn lower_string_arg_to_ptr_len(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
+    let h = cg.alloc_local();
+    compile_expr(cg, expr)?; // i64 handle
+    cg.emit(Instruction::LocalSet(h));
+    // ptr = handle >>> 32
+    cg.emit(Instruction::LocalGet(h));
+    cg.emit(Instruction::I64Const(32));
+    cg.emit(Instruction::I64ShrU);
+    cg.emit(Instruction::I32WrapI64);
+    // len = handle & 0xFFFF_FFFF
+    cg.emit(Instruction::LocalGet(h));
+    cg.emit(Instruction::I64Const(0xFFFF_FFFF));
+    cg.emit(Instruction::I64And);
+    cg.emit(Instruction::I32WrapI64);
+    Ok(())
+}
+
+/// `(store64!/store32! addr val)` — write `val` at `addr`, then leave `val` on
+/// the stack so the write threads through `do`/`recur`.
+fn compile_store(cg: &mut FnCtx, addr: &Expr, val: &Expr, word32: bool) -> Result<(), CljError> {
+    let val_l = cg.alloc_local();
+    compile_expr(cg, val)?;
+    cg.emit(Instruction::LocalSet(val_l));
+    compile_expr(cg, addr)?;
+    cg.emit(Instruction::I32WrapI64); // addr (i32)
+    cg.emit(Instruction::LocalGet(val_l));
+    if word32 {
+        cg.emit(Instruction::I32WrapI64);
+        cg.emit(Instruction::I32Store(mem32(0)));
+    } else {
+        cg.emit(Instruction::I64Store(mem64(0)));
+    }
+    cg.emit(Instruction::LocalGet(val_l)); // → val
+    Ok(())
+}
+
+/// A 4-byte-aligned i32 access MemArg at `offset`.
+fn mem32(offset: u64) -> MemArg {
+    MemArg { offset, align: 2, memory_index: 0 }
+}
+/// An unaligned single-byte access MemArg at `offset`.
+fn mem8(offset: u64) -> MemArg {
+    MemArg { offset, align: 0, memory_index: 0 }
+}
+/// An 8-byte-aligned i64 access MemArg at `offset`.
+fn mem64(offset: u64) -> MemArg {
+    MemArg { offset, align: 3, memory_index: 0 }
+}
+
+/// A byte buffer is an 8-byte header `[cap:i32 @0, len:i32 @4]` followed by
+/// `cap` data bytes; its *handle* is the i64 value of the header pointer. This
+/// is deliberately distinct from a string handle (which packs `ptr<<32|len`):
+/// builder ops take buffer handles, `str-len`/`byte-at` take string handles,
+/// and `bytes-finish` converts the former to the latter.
+const BUF_HEADER: i32 = 8;
+
+/// `(bytes-alloc cap)` → `cabi_realloc(0,0,16, cap+8)`, write `[cap, 0]`, return
+/// the header pointer as an i64 buffer handle.
+fn compile_bytes_alloc(cg: &mut FnCtx, cap_expr: &Expr) -> Result<(), CljError> {
+    let cap_l = cg.alloc_local();
+    let ptr_l = cg.alloc_local();
+
+    compile_expr(cg, cap_expr)?; // i64 cap
+    cg.emit(Instruction::LocalSet(cap_l));
+
+    // ptr = cabi_realloc(old=0, old_sz=0, align=16, new_sz=cap+8)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(HEAP_ALIGN as i32));
+    cg.emit(Instruction::LocalGet(cap_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Const(BUF_HEADER));
+    cg.emit(Instruction::I32Add); // new_sz = cap + 8
+    let realloc = cg.realloc_index;
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(ptr_l)); // ptr_l = header ptr (i64)
+
+    // header[0] = cap
+    cg.emit(Instruction::LocalGet(ptr_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::LocalGet(cap_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Store(mem32(0)));
+    // header[4] = 0 (len)
+    cg.emit(Instruction::LocalGet(ptr_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Store(mem32(4)));
+
+    cg.emit(Instruction::LocalGet(ptr_l)); // → buffer handle
+    Ok(())
+}
+
+/// `(byte-append! buf b)` — write `b & 0xFF` at `buf+8+len`, bump `len`, return
+/// `buf`. No capacity check in this phase (the caller sizes via `bytes-alloc`).
+fn compile_byte_append(cg: &mut FnCtx, buf_expr: &Expr, b_expr: &Expr) -> Result<(), CljError> {
+    let buf_l = cg.alloc_local();
+    let val_l = cg.alloc_local();
+
+    compile_expr(cg, buf_expr)?;
+    cg.emit(Instruction::LocalSet(buf_l));
+    compile_expr(cg, b_expr)?;
+    cg.emit(Instruction::LocalSet(val_l));
+
+    // data address = (buf as i32) + 8 + len  ; len = mem[buf+4]
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Const(BUF_HEADER));
+    cg.emit(Instruction::I32Add);
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4))); // len
+    cg.emit(Instruction::I32Add); // addr = buf+8+len
+    // value byte
+    cg.emit(Instruction::LocalGet(val_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Store8(mem8(0))); // mem[addr] = b
+
+    // mem[buf+4] = len + 1
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4)));
+    cg.emit(Instruction::I32Const(1));
+    cg.emit(Instruction::I32Add);
+    cg.emit(Instruction::I32Store(mem32(4)));
+
+    cg.emit(Instruction::LocalGet(buf_l)); // → buffer handle (unchanged)
+    Ok(())
+}
+
+/// `(bytes-finish buf)` → string handle `((buf+8) << 32) | len` so the data
+/// region reads back through `str-len`/`byte-at`.
+fn compile_bytes_finish(cg: &mut FnCtx, buf_expr: &Expr) -> Result<(), CljError> {
+    let buf_l = cg.alloc_local();
+    compile_expr(cg, buf_expr)?;
+    cg.emit(Instruction::LocalSet(buf_l));
+
+    // (data_ptr << 32) where data_ptr = buf + 8
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I64Const(BUF_HEADER as i64));
+    cg.emit(Instruction::I64Add);
+    cg.emit(Instruction::I64Const(32));
+    cg.emit(Instruction::I64Shl);
+    // | len   (len = mem[buf+4], zero-extended)
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Or);
+    Ok(())
 }
 
 /// Left-fold a non-empty arg list with a binary instruction.
@@ -639,11 +1103,11 @@ fn compile_and(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
         return compile_truthy_i64(cg, &args[0]);
     }
     compile_truthy_i32(cg, &args[0])?;
-    cg.emit(Instruction::If(BlockType::Result(ValType::I64)));
+    cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
     compile_and(cg, &args[1..])?;
     cg.emit(Instruction::Else);
     cg.emit(Instruction::I64Const(0));
-    cg.emit(Instruction::End);
+    cg.close_frame();
     Ok(())
 }
 
@@ -653,11 +1117,11 @@ fn compile_or(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
         return compile_truthy_i64(cg, &args[0]);
     }
     compile_truthy_i32(cg, &args[0])?;
-    cg.emit(Instruction::If(BlockType::Result(ValType::I64)));
+    cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
     cg.emit(Instruction::I64Const(1));
     cg.emit(Instruction::Else);
     compile_or(cg, &args[1..])?;
-    cg.emit(Instruction::End);
+    cg.close_frame();
     Ok(())
 }
 
@@ -703,6 +1167,11 @@ fn eval_const(expr: &Expr, consts: &HashMap<String, i64>) -> Result<i64, CljErro
                 "`let` is not supported in a `def` initialiser".into(),
             ))
         }
+        Expr::Loop { .. } | Expr::Recur(_) => {
+            return Err(CljError::Codegen(
+                "`loop`/`recur` are not supported in a `def` initialiser".into(),
+            ))
+        }
         Expr::Call { name, .. } => {
             return Err(CljError::Codegen(format!(
                 "`def` initialiser cannot call function `{name}` (must be a compile-time constant)"
@@ -732,9 +1201,24 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Not => b(v[0] == 0),
         Builtin::And => b(v.iter().all(|x| *x != 0)),
         Builtin::Or => b(v.iter().any(|x| *x != 0)),
-        Builtin::StrLen | Builtin::ByteAt => {
+        Builtin::StrLen
+        | Builtin::ByteAt
+        | Builtin::BytesAlloc
+        | Builtin::ByteAppend
+        | Builtin::BytesLen
+        | Builtin::BytesFinish
+        | Builtin::Alloc
+        | Builtin::Load64
+        | Builtin::Store64
+        | Builtin::Load32
+        | Builtin::Store32 => {
             return Err(CljError::Codegen(
-                "string operations are not allowed in a `def` initialiser".into(),
+                "string/bytes/memory operations are not allowed in a `def` initialiser".into(),
+            ))
+        }
+        Builtin::HasCapability | Builtin::LlmInfer => {
+            return Err(CljError::Codegen(
+                "host calls are not allowed in a `def` initialiser".into(),
             ))
         }
     })
