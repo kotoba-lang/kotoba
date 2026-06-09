@@ -10,8 +10,10 @@
 //! diff. Signed-tx RLP decode + sender recovery (`eth_sendRawTransaction`) and block
 //! production / DA / L1 anchor are R1b/R2+ (ADR roadmap).
 
+pub mod anchor;
 pub mod block;
 pub mod chain;
+pub mod logs;
 pub mod tx;
 
 use kotoba_core::cid::KotobaCid;
@@ -84,6 +86,24 @@ impl<'a> DatabaseRef for DatomDatabase<'a> {
     }
 }
 
+/// An EVM event log emitted during execution (for receipts / `eth_getLogs`, R3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvmLog {
+    pub address: [u8; 20],
+    pub topics: Vec<[u8; 32]>,
+    pub data: Vec<u8>,
+}
+
+impl EvmLog {
+    fn from_revm(log: &revm::primitives::Log) -> Self {
+        Self {
+            address: log.address.into_array(),
+            topics: log.data.topics().iter().map(|t| (*t).into()).collect(),
+            data: log.data.data.to_vec(),
+        }
+    }
+}
+
 /// Outcome of executing one message-call transaction over the Datom state.
 pub struct ExecOutcome {
     pub success: bool,
@@ -92,6 +112,8 @@ pub struct ExecOutcome {
     pub datoms: Vec<Datom>,
     /// Return data (for `eth_call`).
     pub output: Vec<u8>,
+    /// Event logs emitted (for receipts / `eth_getLogs`).
+    pub logs: Vec<EvmLog>,
 }
 
 /// Execute a message call (`from` → `to`, `value`, `data`) against the
@@ -134,8 +156,9 @@ pub fn apply_call(
         ExecutionResult::Halt { gas_used, .. } => (false, *gas_used, Vec::new()),
     };
 
+    let logs: Vec<EvmLog> = result.logs().iter().map(EvmLog::from_revm).collect();
     let datoms = state_to_datoms(&state, graph);
-    Ok(ExecOutcome { success, gas_used, datoms, output })
+    Ok(ExecOutcome { success, gas_used, datoms, output, logs })
 }
 
 /// Convert revm's post-execution state into `evm/*` Datoms (the block's state diff).
@@ -252,5 +275,25 @@ mod tests {
         assert_eq!(info.balance, U256::from(500u64));
         // unknown account → None
         assert!(db.basic_ref(Address::from(addr(0x99))).unwrap().is_none());
+    }
+
+    #[test]
+    fn contract_call_captures_logs() {
+        // bytecode: PUSH1 0x00, PUSH1 0x00, LOG0, STOP — emits one empty log.
+        let code = vec![0x60, 0x00, 0x60, 0x00, 0xa0, 0x00];
+        let codehash = kotoba_auth::eth::keccak256(&code);
+        let c = addr(0xC0);
+        let caller = addr(0xAA);
+
+        let mut datoms = mk_account(&caller, 0, &u256(1_000_000), None, &graph());
+        datoms.extend(mk_account(&c, 1, &u256(0), Some((&codehash, &code)), &graph()));
+        let view = view_with(datoms);
+
+        let out = apply_call(&view, caller, c, U256::ZERO, vec![], 0, 100_000, &graph())
+            .expect("contract call");
+        assert!(out.success, "LOG0 contract call should succeed");
+        assert_eq!(out.logs.len(), 1, "LOG0 emits exactly one log");
+        assert_eq!(out.logs[0].address, c, "log emitted by the contract");
+        assert!(out.logs[0].topics.is_empty(), "LOG0 → no topics");
     }
 }
