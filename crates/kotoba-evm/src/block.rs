@@ -14,7 +14,9 @@ use kotoba_kqe::datom::Datom;
 use kotoba_kqe::delta::Delta;
 use kotoba_kqe::evm_state::EvmStateView;
 
+use crate::logs::logs_bloom;
 use crate::tx::apply_raw_tx;
+use crate::EvmLog;
 
 /// An EVM block header (content-addressed; `block_cid` is the block hash).
 #[derive(Debug, Clone)]
@@ -34,6 +36,10 @@ pub struct EvmBlock {
 pub struct ProducedBlock {
     pub block: EvmBlock,
     pub datoms: Vec<Datom>,
+    /// event logs emitted across the block's txs (for receipts / `eth_getLogs`).
+    pub logs: Vec<EvmLog>,
+    /// 2048-bit bloom over `logs` (block-level).
+    pub logs_bloom: [u8; 256],
     /// (index, reason) for each tx that failed to decode/execute (excluded).
     pub rejected: Vec<(usize, String)>,
 }
@@ -57,6 +63,7 @@ pub fn produce_block(
     );
 
     let mut diff: Vec<Datom> = Vec::new();
+    let mut logs: Vec<EvmLog> = Vec::new();
     let mut rejected: Vec<(usize, String)> = Vec::new();
     let mut applied = 0usize;
 
@@ -66,12 +73,14 @@ pub fn produce_block(
                 // fold this tx's diff into the evolving view so the next tx sees it.
                 view.apply(&out.datoms.iter().cloned().map(Delta::assert_datom).collect::<Vec<_>>());
                 diff.extend(out.datoms);
+                logs.extend(out.logs);
                 applied += 1;
             }
             Ok((_tx, out)) => rejected.push((i, format!("reverted (gas {})", out.gas_used))),
             Err(e) => rejected.push((i, e)),
         }
     }
+    let bloom = logs_bloom(&logs);
 
     let state_root = view.state_root();
     let parent_tag = parent.as_ref().map(|c| c.to_multibase()).unwrap_or_default();
@@ -84,6 +93,8 @@ pub fn produce_block(
     ProducedBlock {
         block: EvmBlock { number, parent, timestamp, tx_count: applied, state_root, block_cid },
         datoms: diff,
+        logs,
+        logs_bloom: bloom,
         rejected,
     }
 }
