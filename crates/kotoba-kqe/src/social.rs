@@ -801,6 +801,121 @@ pub fn apply_retainer_credits(balances: &mut HashMap<KotobaCid, i64>, credits: &
     }
 }
 
+// ── Observation indexes (feed retainer/settlement with real data, §5/§6) ──────
+//
+// Two incremental reducers (siblings of SocialCapitalView) that project the
+// observed anchor-chain `Pinned` events + `social/origin` Datoms into the lookups
+// the downstream needs: pin→pinner (for settle_retainer) and rootCid→origin-DIDs
+// (for allocate_retainer's SC_root). Pure, deterministic, no external dep — the
+// Datoms are produced by the kotoba-side observation projection (read+verify).
+
+/// Predicate: a pin's pinner DID. `Datom{ e: pinId, a: PIN_PINNER_PRED, v: Cid(pinner) }`.
+pub const PIN_PINNER_PRED: &str = "mishmar/pin/pinner";
+/// Predicate: a pin's rootCid. `Datom{ e: pinId, a: PIN_ROOT_PRED, v: Cid(rootCid) }`.
+pub const PIN_ROOT_PRED: &str = "mishmar/pin/root";
+/// Predicate: a root's originating DID (many per root). `Datom{ e: rootCid, a: ORIGIN_PRED, v: Cid(did) }`.
+pub const ORIGIN_PRED: &str = "social/origin";
+
+/// pin → (pinner, rootCid), projected from observed `Pinned` events. Feeds
+/// [`settle_retainer`] (`pinner_of`) and [`build_pin_origins`] (`root_of`).
+#[derive(Default)]
+pub struct PinIndex {
+    pinner: HashMap<KotobaCid, KotobaCid>,
+    root: HashMap<KotobaCid, KotobaCid>,
+}
+
+impl PinIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn apply(&mut self, deltas: &[Delta]) {
+        for d in deltas {
+            if !d.is_assert() {
+                continue;
+            }
+            let Value::Cid(target) = &d.datom.v else {
+                continue;
+            };
+            match d.attribute() {
+                PIN_PINNER_PRED => {
+                    self.pinner.insert(d.entity().clone(), target.clone());
+                }
+                PIN_ROOT_PRED => {
+                    self.root.insert(d.entity().clone(), target.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn pinner_of(&self, pin_id: &KotobaCid) -> Option<KotobaCid> {
+        self.pinner.get(pin_id).cloned()
+    }
+
+    pub fn root_of(&self, pin_id: &KotobaCid) -> Option<KotobaCid> {
+        self.root.get(pin_id).cloned()
+    }
+
+    /// Pins with a known root (eligible for retainer allocation).
+    pub fn pin_ids(&self) -> Vec<KotobaCid> {
+        self.root.keys().cloned().collect()
+    }
+}
+
+/// rootCid → originating DIDs (deduped, insertion order), projected from
+/// `social/origin` Datoms. Feeds [`allocate_retainer`]'s `SC_root`.
+#[derive(Default)]
+pub struct OriginIndex {
+    origins: HashMap<KotobaCid, Vec<KotobaCid>>,
+}
+
+impl OriginIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn apply(&mut self, deltas: &[Delta]) {
+        for d in deltas {
+            if !d.is_assert() || d.attribute() != ORIGIN_PRED {
+                continue;
+            }
+            let Value::Cid(did) = &d.datom.v else {
+                continue;
+            };
+            let v = self.origins.entry(d.entity().clone()).or_default();
+            if !v.contains(did) {
+                v.push(did.clone());
+            }
+        }
+    }
+
+    pub fn origins_of(&self, root: &KotobaCid) -> &[KotobaCid] {
+        self.origins.get(root).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+/// Build [`PinOrigin`] records (for [`allocate_retainer`]) from the two indexes:
+/// each pin's origins = `OriginIndex::origins_of(PinIndex::root_of(pin))`. Pins
+/// with no known root are dropped.
+pub fn build_pin_origins(
+    pin_ids: &[KotobaCid],
+    pins: &PinIndex,
+    origins: &OriginIndex,
+) -> Vec<PinOrigin> {
+    pin_ids
+        .iter()
+        .filter_map(|pid| {
+            let root = pins.root_of(pid)?;
+            Some(PinOrigin {
+                pin_id: pid.clone(),
+                root_cid: root.clone(),
+                origin_dids: origins.origins_of(&root).to_vec(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1145,85 @@ mod tests {
     fn view_unknown_did_is_zero() {
         let v = SocialCapitalView::new();
         assert_eq!(v.capital(&did("did:key:nobody"), 100), 0);
+    }
+
+    // ── Observation indexes (pin→pinner, social/origin) ───────────────────
+
+    fn cid_datom(e: &KotobaCid, attr: &str, v: &KotobaCid) -> Delta {
+        Delta::assert_datom(Datom::assert(e.clone(), attr.to_string(), Value::Cid(v.clone()), did("g")))
+    }
+
+    #[test]
+    fn pin_index_maps_pinner_and_root() {
+        let pin = did("pinA");
+        let pinner = did("did:key:peggy");
+        let root = did("rootA");
+        let mut idx = PinIndex::new();
+        idx.apply(&[
+            cid_datom(&pin, PIN_PINNER_PRED, &pinner),
+            cid_datom(&pin, PIN_ROOT_PRED, &root),
+        ]);
+        assert_eq!(idx.pinner_of(&pin), Some(pinner));
+        assert_eq!(idx.root_of(&pin), Some(root));
+        assert_eq!(idx.pinner_of(&did("unknown")), None);
+        assert_eq!(idx.pin_ids(), vec![pin]);
+    }
+
+    #[test]
+    fn origin_index_collects_dedups_dids() {
+        let root = did("rootA");
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let mut idx = OriginIndex::new();
+        idx.apply(&[
+            cid_datom(&root, ORIGIN_PRED, &a),
+            cid_datom(&root, ORIGIN_PRED, &b),
+            cid_datom(&root, ORIGIN_PRED, &a), // dup ignored
+        ]);
+        assert_eq!(idx.origins_of(&root), &[a, b]);
+        assert_eq!(idx.origins_of(&did("rootless")), &[] as &[KotobaCid]);
+    }
+
+    #[test]
+    fn indexes_feed_allocation_and_settlement_end_to_end() {
+        // observed Pinned + origin Datoms → indexes → PinOrigin → allocate → settle.
+        let a = did("did:key:a");
+        let b = did("did:key:b");
+        let peggy = did("did:key:peggy");
+        let rootA = did("rootA");
+        let rootB = did("rootB");
+        let pinA = did("pinA");
+        let pinB = did("pinB");
+
+        let mut pins = PinIndex::new();
+        pins.apply(&[
+            cid_datom(&pinA, PIN_PINNER_PRED, &peggy),
+            cid_datom(&pinA, PIN_ROOT_PRED, &rootA),
+            cid_datom(&pinB, PIN_PINNER_PRED, &peggy),
+            cid_datom(&pinB, PIN_ROOT_PRED, &rootB),
+        ]);
+        let mut origins = OriginIndex::new();
+        origins.apply(&[
+            cid_datom(&rootA, ORIGIN_PRED, &a),
+            cid_datom(&rootB, ORIGIN_PRED, &b),
+        ]);
+
+        // social capital: a=30, b=70
+        let mut view = SocialCapitalView::new();
+        view.apply(&[
+            mint_delta(&a, MintSource::Disclosure, 30 * SCALE, 0),
+            mint_delta(&b, MintSource::Disclosure, 70 * SCALE, 0),
+        ]);
+
+        let pin_origins = build_pin_origins(&[pinA.clone(), pinB.clone()], &pins, &origins);
+        assert_eq!(pin_origins.len(), 2);
+        let (shares, _) = allocate_retainer(&pin_origins, &view, 0, 1_000); // 300 / 700
+        // settle via the PinIndex pinner resolver — both pins → peggy → 1000 total.
+        let (credits, total) = settle_retainer(&shares, |pin| pins.pinner_of(pin));
+        assert_eq!(total, 1_000);
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].pinner_did, peggy);
+        assert_eq!(credits[0].mkoto, 1_000);
     }
 
     // ── Mint engine (the upstream of the loop) ────────────────────────────
