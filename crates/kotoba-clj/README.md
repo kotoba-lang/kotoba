@@ -57,12 +57,19 @@ export, which needs memory + an allocator + byte/string values first:
 
 1. ✅ linear memory + `cabi_realloc`
 2. ✅ Str/Bytes values (`str-len`, `byte-at`)
-3. ⬜ `list<u8>` in/out Component export via `wit-component`
-4. ⬜ CBOR-decode `InvokeContext` in-guest
+3. ✅ `list<u8>` in/out Component export via `wit-component`
+4. ⬜ CBOR-decode `InvokeContext` in-guest — *blocked on language growth (loops + byte-building)*
 5. ⬜ emit `kotoba-node` `run`; load via `WasmExecutor`
 
-Today (steps 1–2) the crate emits a **core wasm module** run on a standalone
-`wasmtime` engine — not yet a Component on the `kotoba:kais` world. See
+A `(defn run [input] …)` program compiles to a real Component today:
+
+```rust
+let comp = kotoba_clj::component::compile_component_str("(defn run [input] input)")?;
+let out  = kotoba_clj::component::run_component(&comp, b"hello")?;   // b"hello"
+```
+
+Binding to the actual `kotoba:kais` `kotoba-node` world (and meaningfully
+reading `ctx`) is steps 4–5. See
 [`docs/ADR-clojure-wasm.md`](../../docs/ADR-clojure-wasm.md).
 
 ## Test

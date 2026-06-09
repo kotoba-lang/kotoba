@@ -46,8 +46,24 @@ const DATA_BASE: u32 = 1024;
 const HEAP_ALIGN: u32 = 16;
 const WASM_PAGE: u32 = 65536;
 
-/// Compile a parsed [`Program`] into WebAssembly bytes.
+/// Compile a parsed [`Program`] into WebAssembly bytes (core module; every
+/// `defn` exported by name).
 pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
+    compile_core(program, None)
+}
+
+/// Compile a [`Program`] into a core module, optionally adding a Canonical-ABI
+/// entry wrapper.
+///
+/// When `entry` is `Some(name)`, the named arity-1 `defn` is wrapped by an
+/// exported `run(in_ptr: i32, in_len: i32) -> ret_area: i32` function that
+/// realises the `func(list<u8>) -> list<u8>` Canonical ABI: it packs the input
+/// `(ptr,len)` into a string handle, calls the user function, then writes the
+/// returned handle's `(ptr,len)` into an 8-byte return area allocated via
+/// `cabi_realloc` and returns that area's pointer. In this mode the user `defn`s
+/// are not exported by name (only `run`, `memory`, `cabi_realloc` are), so the
+/// wrapper owns the `run` export name unambiguously.
+pub fn compile_core(program: &Program, entry: Option<&str>) -> Result<Vec<u8>, CljError> {
     // ---- Pass 0: collect string literals into one data blob ----------------
     let literals = collect_literals(program);
 
@@ -61,6 +77,22 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
         }
         fn_index.insert(f.name.clone(), (i as u32, f.params.len()));
     }
+
+    // Validate the entry point up front.
+    let entry_target = match entry {
+        Some(name) => {
+            let (idx, arity) = fn_index.get(name).copied().ok_or_else(|| {
+                CljError::Codegen(format!("component entry `(defn {name} [input] …)` not found"))
+            })?;
+            if arity != 1 {
+                return Err(CljError::Codegen(format!(
+                    "component entry `{name}` must take exactly 1 argument (the input bytes), got {arity}"
+                )));
+            }
+            Some(idx)
+        }
+        None => None,
+    };
 
     // Distinct function types, keyed by arity (params: arity×i64 → i64).
     let mut types = TypeSection::new();
@@ -77,7 +109,11 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
             idx
         });
         funcs.function(type_idx);
-        exports.export(&f.name, ExportKind::Func, i as u32);
+        // In component mode the wrapper owns the export names; don't leak the
+        // raw i64 functions (avoids a clash on the `run` name).
+        if entry.is_none() {
+            exports.export(&f.name, ExportKind::Func, i as u32);
+        }
     }
 
     // cabi_realloc: (old:i32, old_sz:i32, align:i32, new_sz:i32) -> i32
@@ -89,6 +125,19 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
     let realloc_fn_index = program.functions.len() as u32;
     funcs.function(realloc_type);
     exports.export("cabi_realloc", ExportKind::Func, realloc_fn_index);
+
+    // Canonical-ABI `run` wrapper (only in component mode).
+    if let Some(user_idx) = entry_target {
+        let wrapper_type = types.len();
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I32]);
+        funcs.function(wrapper_type);
+        let wrapper_index = realloc_fn_index + 1;
+        exports.export("run", ExportKind::Func, wrapper_index);
+        // user_idx / realloc_fn_index captured for the code section below.
+        debug_assert!(user_idx < realloc_fn_index);
+    }
 
     // ---- Memory + heap global ----------------------------------------------
     let heap_start = align_up(DATA_BASE + literals.blob.len() as u32, HEAP_ALIGN);
@@ -143,6 +192,9 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
         code.function(&func);
     }
     code.function(&cabi_realloc_fn(HEAP_GLOBAL));
+    if let Some(user_idx) = entry_target {
+        code.function(&entry_wrapper_fn(user_idx, realloc_fn_index));
+    }
 
     // ---- Data segment -------------------------------------------------------
     let mut data = DataSection::new();
@@ -273,6 +325,65 @@ fn cabi_realloc_fn(heap_global: u32) -> Function {
     f.instruction(&Instruction::LocalGet(5));
     f.instruction(&Instruction::GlobalSet(heap_global));
     f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// The Canonical-ABI `run` wrapper for `func(list<u8>) -> list<u8>`.
+///
+/// Core signature `(in_ptr: i32, in_len: i32) -> ret_area: i32`:
+///   1. pack the input `(ptr,len)` into a string handle `(ptr<<32)|len`,
+///   2. call the user entry function (handle → handle),
+///   3. allocate an 8-byte return area via `cabi_realloc`,
+///   4. store `[out_ptr, out_len]` (i32 each) from the returned handle,
+///   5. return the area pointer (the Canonical-ABI return-area convention).
+fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32) -> Function {
+    // params: 0=in_ptr 1=in_len ; locals: 2=ret_handle(i64) 3=area(i32)
+    let mut f = Function::new([(1, ValType::I64), (1, ValType::I32)]);
+    let store32 = |offset: u64| MemArg {
+        offset,
+        align: 2,
+        memory_index: 0,
+    };
+
+    // handle = (in_ptr as u64 << 32) | (in_len as u64)
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Const(32));
+    f.instruction(&Instruction::I64Shl);
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Or);
+    // ret_handle = user_fn(handle)
+    f.instruction(&Instruction::Call(user_fn_index));
+    f.instruction(&Instruction::LocalSet(2));
+
+    // area = cabi_realloc(0, 0, align=4, new_sz=8)
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Const(8));
+    f.instruction(&Instruction::Call(realloc_index));
+    f.instruction(&Instruction::LocalSet(3));
+
+    // area[0] = out_ptr = ret_handle >>> 32
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I64Const(32));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(0)));
+
+    // area[4] = out_len = ret_handle & 0xFFFF_FFFF
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I64Const(0xFFFF_FFFF));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(4)));
+
+    // return area
+    f.instruction(&Instruction::LocalGet(3));
     f.instruction(&Instruction::End);
     f
 }

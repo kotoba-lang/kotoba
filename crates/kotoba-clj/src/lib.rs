@@ -43,17 +43,22 @@
 //!
 //! 1. ✅ **memory + `cabi_realloc`** (this crate) — exported by every module.
 //! 2. ✅ **string/bytes values** — `(ptr,len)` handles, `str-len`/`byte-at`.
-//! 3. ⬜ **`list<u8>` in/out Component export** via `wit-component` (the
-//!    Canonical-ABI list machinery kotoba:kais reuses).
-//! 4. ⬜ **CBOR-decode `InvokeContext`** in-guest.
+//! 3. ✅ **`list<u8>` in/out Component export** via `wit-component`
+//!    ([`component`]) — `(defn run [input] …)` → `run: func(list<u8>) ->
+//!    list<u8>`, instantiated + invoked through `wasmtime::component`.
+//! 4. ⬜ **CBOR-decode `InvokeContext`** in-guest — *blocked on the language
+//!    growing loops + byte-building*; a separate, larger workstream.
 //! 5. ⬜ **emit the `kotoba-node` `run` export**; load via `WasmExecutor`.
 //!
-//! Today (steps 1–2) the crate emits a **core wasm module** run on a plain
-//! `wasmtime::Engine` ([`run`]); it is not yet a Component bound to the
-//! `kotoba:kais` world. See `docs/ADR-clojure-wasm.md` for the full plan.
+//! Steps 1–3 are implemented. A program can compile to a real Component today
+//! ([`component::compile_component_str`]); binding to the actual `kotoba:kais`
+//! `kotoba-node` world (and meaningfully reading `ctx`) is steps 4–5. See
+//! `docs/ADR-clojure-wasm.md` for the full plan.
 
 pub mod ast;
 pub mod codegen;
+#[cfg(feature = "component")]
+pub mod component;
 #[cfg(feature = "run")]
 pub mod run;
 

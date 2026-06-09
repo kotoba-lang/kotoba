@@ -1,7 +1,7 @@
 # ADR — Clojure-on-WASM for kotoba (`kotoba-clj`)
 
-Status: **Accepted (steps 1–2 of the kais-binding workstream implemented)**
-Date: 2026-06-08
+Status: **Accepted (steps 1–3 of the kais-binding workstream implemented)**
+Date: 2026-06-08 (steps 1–2), 2026-06-09 (step 3)
 Crate: `crates/kotoba-clj`
 
 ## Context
@@ -112,17 +112,44 @@ real step order:
    non-overlap / growth).
 2. ✅ **Str/Bytes values** — strings as packed `(offset << 32) | len` handles
    into a data segment; builtins `str-len`, `byte-at`.
-3. ⬜ **`list<u8>` in/out Component export** via `wit-component`: generate a
-   WIT world, embed component metadata, encode the core module to a Component,
-   instantiate + invoke through `wasmtime::component`. This is exactly the
-   Canonical-ABI list machinery the kais `run` export reuses.
+3. ✅ **`list<u8>` in/out Component export** via `wit-component` (module
+   `component`): a `(defn run [input] …)` becomes a Component exporting
+   `run: func(list<u8>) -> list<u8>` on a self-owned `kotoba:clj-program` world,
+   instantiated + invoked through `wasmtime::component`. A hand-emitted
+   Canonical-ABI wrapper packs the input `(ptr,len)` into a string handle, calls
+   the user function, and writes the returned handle's `(ptr,len)` into a
+   `cabi_realloc`'d return area. This is exactly the list lift/lower machinery
+   the kais `run` export reuses. **De-risked first** with a scalar smoke test
+   (`examples/component_smoke.rs`) confirming `wit-component` 0.221 output
+   instantiates in the pinned wasmtime 22.
 4. ⬜ **CBOR-decode `InvokeContext`** `{ graph, session_cid, args_cbor }`
-   in-guest; CBOR-encode the output.
+   in-guest; CBOR-encode the output. **Blocked**: a CBOR decoder needs iteration
+   and byte-building, which the i64+strings language does not yet have. This is
+   a separate, larger language workstream (loops + a `bytes` builder), not a
+   codegen detail — see "Language-growth dependency" below.
 5. ⬜ **Emit the `kotoba-node` `run` export**; verify `ProgramStore` /
    `WasmExecutor` can load and invoke it. `program_cid = CIDv1 blake3(wasm)`,
    stored in Vault/Shelf like every other program. Then bind host imports
    (`kqe` assert/query, `kse` publish/drain, `auth`, `llm`) and honour the gas
-   model (assert=10, query=100, llm.infer=1000).
+   model (assert=10, query=100, llm.infer=1000). A *reduced* slice — emit a
+   `run(ctx)->result<list<u8>,string>` that **ignores ctx** and prove
+   kotoba-runtime can load it — proves the plumbing without the language growth;
+   a program that meaningfully reads ctx/args is gated on step 4.
+
+## Language-growth dependency (steps 4+)
+
+Everything through step 3 works because the program's I/O is "bytes in → a
+handle to bytes already in memory out" — no value needs to be *constructed* at
+runtime. The moment a program must **decode** CBOR (step 4) or **build** a CBOR
+reply, it needs:
+
+- **iteration** — `loop`/`recur` or a bounded `while`, to walk input bytes;
+- **byte-building** — a way to allocate (via `cabi_realloc`) and write bytes,
+  i.e. a mutable `bytes`/`string-builder` value, not just read-only handles.
+
+These are language features, not wrapper glue. Hand-emitting a CBOR parser as
+raw wasm would be the canonical-ABI-by-hand trap in a different costume, so it
+is explicitly **out of scope** until the language grows these primitives.
 
 ## Consequences
 
