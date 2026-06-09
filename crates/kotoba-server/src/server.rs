@@ -282,7 +282,7 @@ pub struct KotobaState {
     /// `kg.mv.register` / `kg.mv.result`.
     pub mv_registry: Arc<tokio::sync::RwLock<kotoba_kqe::mv::MvRegistry>>,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
-    /// Optional kotobase.etzhayyim.com XRPC pin client (KOTOBA_PIN_TOKEN).
+    /// Optional kotobase.net XRPC pin client (KOTOBA_PIN_TOKEN; ADR-2606091500).
     pub ipfs_pin: Arc<IpfsPinClient>,
     // ── Email E2E Storage ────────────────────────────────────────────────────
     /// AES-256-GCM encrypted vault for email body blobs (legacy; kept for compat).
@@ -441,15 +441,15 @@ impl KotobaState {
                 Arc::new(tiered) as Arc<dyn BlockStore + Send + Sync>
             } else if !ipfs_off {
                 let cold = kotoba_store::KuboBlockStore::from_env();
-                // F-3: attach the kotobase remote-pin client if configured so
-                // every local recursive pin/add also lands on kotobase.etzhayyim.com.
-                // Falls back to a single-pin (local only) when the env vars
-                // are absent — preserves dev / local-Kubo workflows.
+                // F-3: attach the canonical remote-pin client so every local
+                // recursive pin/add also lands on kotobase.net (ADR-2606091500).
+                // On by default (from_pin_env defaults to kotobase.net); opt out
+                // with KOTOBA_IPFS_PIN_ENDPOINT=off for dev / local-Kubo workflows.
                 let cold = match kotoba_store::IpfsPinClient::from_pin_env() {
                     Some(remote) => {
                         tracing::info!(
-                            "kotobase pin fanout enabled \
-                             (KOTOBA_IPFS_PIN_ENDPOINT)"
+                            "kotobase.net pin fanout enabled \
+                             (KOTOBA_IPFS_PIN_ENDPOINT; default kotobase.net)"
                         );
                         cold.with_remote_pin(remote)
                     }
