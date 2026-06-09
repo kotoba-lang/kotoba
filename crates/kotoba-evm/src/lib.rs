@@ -25,6 +25,10 @@ use revm::primitives::{
 };
 use revm::{DatabaseRef, Evm};
 
+/// Re-export revm's `U256` so downstream crates (kotoba-server RPC) need not depend
+/// on revm directly.
+pub use revm::primitives::U256 as RevmU256;
+
 /// revm `DatabaseRef` reading the EVM world-state from a `EvmStateView`
 /// (Datom-projected). Read-only — execution produces a diff that the caller
 /// commits as new `evm/*` Datoms.
