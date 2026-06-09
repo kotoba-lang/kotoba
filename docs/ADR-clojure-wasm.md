@@ -1,7 +1,7 @@
 # ADR — Clojure-on-WASM for kotoba (`kotoba-clj`)
 
-Status: **Accepted (steps 1–3 done; step 5 proven at load level)**
-Date: 2026-06-08 (steps 1–2), 2026-06-09 (step 3 + step-5 load-proof)
+Status: **Accepted (steps 1–3 + 5 done; runs on kotoba-runtime. Only step 4 left)**
+Date: 2026-06-08 (steps 1–2), 2026-06-09 (steps 3 + 5, incl. live invoke)
 Crate: `crates/kotoba-clj`
 
 ## Context
@@ -127,18 +127,39 @@ real step order:
    and byte-building, which the i64+strings language does not yet have. This is
    a separate, larger language workstream (loops + a `bytes` builder), not a
    codegen detail — see "Language-growth dependency" below.
-5. ◐ **Emit the `kotoba-node` `run` export** — **load-proof done.**
+5. ✅ **Emit the `kotoba-node` `run` export — and run it on kotoba-runtime.**
    `compile_kais_component_str` targets the real `kotoba-node` world from
    `kotoba-runtime/wit` (resolved via `Resolve::push_dir`, deps incl. wasi:http)
    and emits `run: func(ctx-cbor: list<u8>) -> result<list<u8>, string>` (the
    `ok` case: 12-byte return area `[tag:u8=0, ptr, len]`). `assert_loads`
-   confirms `wasmtime::component::Component::new` accepts it — the same compile
-   path `ProgramStore::get_or_compile` uses, so kotoba-runtime can **load** the
-   artifact. **Remaining**: live invoke through `WasmExecutor` needs a linker
-   satisfying the world's 14 host imports (`kqe`/`kse`/`auth`/`llm`/…) +
-   `program_cid = CIDv1 blake3(wasm)` storage + the gas model (assert=10,
-   query=100, llm.infer=1000). And the wrapper passes raw `ctx-cbor` to the
-   program without decoding — meaningfully reading ctx/args is gated on step 4.
+   confirms `Component::new` accepts it (the `ProgramStore::get_or_compile`
+   path). **`tests/kais_invoke.rs` then drives the runtime's own `WasmExecutor`**
+   (a dev-dependency) which binds every `kotoba:kais` interface, instantiates the
+   component, calls `run(ctx)` and lifts the `result<list<u8>, string>` — proving
+   compiled Clojure runs end-to-end on kotoba-runtime, and validating the
+   hand-emitted variant layout at runtime (a mis-layout would trap the lift).
+   **Remaining for full production parity** (not blocking the milestone):
+   `program_cid = CIDv1 blake3(wasm)` storage in Vault/Shelf and honouring the
+   gas model (assert=10, query=100, llm.infer=1000) when the guest calls host
+   fns — our guest calls none, so it consumes no gas. And the wrapper passes raw
+   `ctx-cbor` to the program **undecoded**: meaningfully reading ctx/args is
+   gated on step 4.
+
+## Two capability boundaries (what "runs on kotoba-runtime" does and does not mean)
+
+The live invoke proves the *plumbing*, not a functional node program. Be precise:
+
+> Compiled Clojure **computes over bytes and returns bytes, on the real
+> runtime.** It cannot yet (a) **read** its `ctx`/`args` — the wrapper hands the
+> program the raw `ctx-cbor` undecoded; nor (b) **call** any kotoba host service
+> — the emitted guest has *no import section*, so `kqe`/`kse`/`auth`/`llm` are
+> bound by the linker but unreachable from Clojure (no builtin lowers to a WIT
+> import).
+
+Both gaps are language-growth, not codegen: (a) needs a CBOR decoder (loops +
+byte-building); (b) needs builtins that lower to the `kotoba:kais` imports
+(e.g. `(kqe/assert …)` emitting an imported-function call). Until then the test
+suite's green is plumbing-green, not reachable-surface-green.
 
 ## Language-growth dependency (steps 4+)
 

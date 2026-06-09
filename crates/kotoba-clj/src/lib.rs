@@ -48,18 +48,19 @@
 //!    list<u8>`, instantiated + invoked through `wasmtime::component`.
 //! 4. ⬜ **CBOR-decode `InvokeContext`** in-guest — *blocked on the language
 //!    growing loops + byte-building*; a separate, larger workstream.
-//! 5. ◐ **emit the `kotoba-node` `run` export** — done as a *load-proof*:
+//! 5. ✅ **emit the `kotoba-node` `run` export + run it on kotoba-runtime.**
 //!    [`component::compile_kais_component_str`] targets the real `kotoba-node`
-//!    world (`run: func(list<u8>) -> result<list<u8>, string>`) and
-//!    [`component::assert_loads`] confirms it compiles under wasmtime's
-//!    Component Model (the `ProgramStore` path). Live invoke through
-//!    `WasmExecutor` (satisfying the world's 14 host imports) is the remaining
-//!    stretch; meaningfully reading `ctx` is gated on step 4.
+//!    world (`run: func(list<u8>) -> result<list<u8>, string>`).
+//!    [`component::assert_loads`] confirms it compiles under the Component Model
+//!    (the `ProgramStore` path), and — verified in `tests/kais_invoke.rs` — the
+//!    runtime's own `WasmExecutor` (binding all `kotoba:kais` host imports)
+//!    instantiates it and invokes `run(ctx)` end-to-end, lifting the result.
 //!
-//! Steps 1–3 are implemented and step 5 is proven at the load level. A program
-//! compiles to a real Component today ([`component::compile_component_str`]);
-//! the `kotoba-node` component loads in kotoba-runtime, but does not yet read
-//! `ctx`. See `docs/ADR-clojure-wasm.md` for the full plan.
+//! Steps 1–3 and 5 are implemented: a Clojure program compiles to a Component
+//! that **runs on kotoba-runtime's `WasmExecutor`**. The one boundary left is
+//! step 4 — the wrapper passes raw `ctx-cbor` to the program undecoded, so a
+//! program that *meaningfully reads* `ctx`/`args` needs the language to grow
+//! loops + byte-building (CBOR decode). See `docs/ADR-clojure-wasm.md`.
 
 pub mod ast;
 pub mod codegen;
