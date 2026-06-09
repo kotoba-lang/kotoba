@@ -10,6 +10,9 @@
 //! diff. Signed-tx RLP decode + sender recovery (`eth_sendRawTransaction`) and block
 //! production / DA / L1 anchor are R1b/R2+ (ADR roadmap).
 
+pub mod block;
+pub mod tx;
+
 use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::datom::Datom;
 use kotoba_kqe::evm_state::{account_datoms, storage_datom, EvmStateView};
