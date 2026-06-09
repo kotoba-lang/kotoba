@@ -187,3 +187,35 @@ is explicitly **out of scope** until the language grows these primitives.
   the recursive ones — a flat `(+ a b)` proves almost nothing about codegen.
 - The Component-Model gap is documented rather than hidden, so the next
   increment has a clear, bounded scope.
+
+## Closing (2026-06-09)
+
+Steps **1, 2, 3, 5** are implemented and verified; **step 4** is the single
+remaining item and is deliberately deferred. As of this ADR:
+
+- A Clojure-subset program compiles to a real WASM **Component** and, via the
+  runtime's own `WasmExecutor`, **runs end-to-end on kotoba-runtime** —
+  computing over bytes and returning bytes through the actual `kotoba-node`
+  `run: func(list<u8>) -> result<list<u8>, string>` export.
+- 27 tests + doctest green; `cargo check --workspace` clean. The live invoke
+  (`tests/kais_invoke.rs`) is the dispositive proof — it exercises the
+  hand-emitted Canonical-ABI variant layout at runtime, which a compile-only
+  load check could not.
+
+**What "runs on kotoba-runtime" does *not* yet mean** — two boundaries remain,
+both **language-growth, not codegen**:
+
+1. **Reads nothing.** The wrapper hands the program the raw `ctx-cbor`
+   undecoded; a program that meaningfully reads `ctx`/`args` needs a CBOR
+   decoder = iteration + byte-building (step 4).
+2. **Calls nothing.** The emitted guest has *no import section*, so
+   `kqe`/`kse`/`auth`/`llm` are bound by the host linker but unreachable from
+   Clojure; calling a host service needs builtins that lower to the
+   `kotoba:kais` imports (e.g. `(kqe/assert …)`).
+
+**Next workstream (not started — needs an explicit go-ahead):** grow the
+language — (1) iteration, (2) a mutable byte/string-builder backed by
+`cabi_realloc`, (3) a CBOR decoder, (4) host-call builtins. (1)+(2) are the
+foundation everything else depends on. Production parity also wants
+`program_cid = CIDv1 blake3(wasm)` storage and gas accounting once guests call
+host fns (today's guests call none → zero gas).
