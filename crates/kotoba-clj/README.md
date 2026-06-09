@@ -59,7 +59,7 @@ export, which needs memory + an allocator + byte/string values first:
 2. ✅ Str/Bytes values (`str-len`, `byte-at`)
 3. ✅ `list<u8>` in/out Component export via `wit-component`
 4. ⬜ CBOR-decode `InvokeContext` in-guest — *blocked on language growth (loops + byte-building)*
-5. ⬜ emit `kotoba-node` `run`; load via `WasmExecutor`
+5. ◐ emit `kotoba-node` `run` — **loads** in kotoba-runtime (`compile_kais_component_str` + `assert_loads`); live invoke via `WasmExecutor` (14 host imports) is the remaining stretch
 
 A `(defn run [input] …)` program compiles to a real Component today:
 

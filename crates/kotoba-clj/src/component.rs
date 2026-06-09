@@ -13,6 +13,7 @@
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::Resolve;
 
+use crate::codegen::{Entry, EntryAbi};
 use crate::CljError;
 
 /// The WIT world every kotoba-clj program component targets.
@@ -28,7 +29,13 @@ world program {
 /// `run(list<u8>) -> list<u8>`. Requires a `(defn run [input] …)`.
 pub fn compile_component_str(src: &str) -> Result<Vec<u8>, CljError> {
     let program = crate::ast::parse_program(src)?;
-    let core = crate::codegen::compile_core(&program, Some("run"))?;
+    let core = crate::codegen::compile_core(
+        &program,
+        Some(Entry {
+            name: "run",
+            abi: EntryAbi::BytesToBytes,
+        }),
+    )?;
     encode_component(core)
 }
 
@@ -85,4 +92,64 @@ pub fn run_component(component_bytes: &[u8], input: &[u8]) -> Result<Vec<u8>, Cl
 pub fn compile_and_run_component(src: &str, input: &[u8]) -> Result<Vec<u8>, CljError> {
     let component = compile_component_str(src)?;
     run_component(&component, input)
+}
+
+// ---- Step 5 (reduced): the real kotoba:kais `kotoba-node` world -------------
+
+/// Compile Clojure-subset source into a Component targeting the **actual**
+/// `kotoba:kais` `kotoba-node` world from `kotoba-runtime/wit` — exporting
+/// `run: func(ctx-cbor: list<u8>) -> result<list<u8>, string>`.
+///
+/// `wit_dir` is the path to `crates/kotoba-runtime/wit` (with its `deps/` tree).
+///
+/// **Scope (honest):** the generated wrapper passes the raw `ctx-cbor` bytes to
+/// `(defn run [ctx] …)` and returns its output as `ok`. It does **not** decode
+/// the CBOR `InvokeContext` — that needs the language to grow loops +
+/// byte-building (step 4). So this proves the *plumbing*: a valid `kotoba-node`
+/// component that `kotoba-runtime` can load. It does not make a program that
+/// meaningfully reads `ctx`/`args`.
+pub fn compile_kais_component_str(src: &str, wit_dir: &str) -> Result<Vec<u8>, CljError> {
+    let program = crate::ast::parse_program(src)?;
+    let core = crate::codegen::compile_core(
+        &program,
+        Some(Entry {
+            name: "run",
+            abi: EntryAbi::BytesToResultBytes,
+        }),
+    )?;
+
+    let mut resolve = Resolve::new();
+    let (pkg, _src) = resolve
+        .push_dir(wit_dir)
+        .map_err(|e| CljError::Codegen(format!("WIT push_dir({wit_dir}): {e}")))?;
+    let world = resolve
+        .select_world(pkg, Some("kotoba-node"))
+        .map_err(|e| CljError::Codegen(format!("select kotoba-node world: {e}")))?;
+
+    let mut module = core;
+    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+        .map_err(|e| CljError::Codegen(format!("embed kotoba-node metadata: {e}")))?;
+    ComponentEncoder::default()
+        .module(&module)
+        .map_err(|e| CljError::Codegen(format!("kotoba-node encode (module): {e}")))?
+        .validate(true)
+        .encode()
+        .map_err(|e| CljError::Codegen(format!("kotoba-node encode: {e}")))
+}
+
+/// Load-proof: does this component compile under wasmtime's Component Model
+/// (the same path `kotoba-runtime`'s `ProgramStore::get_or_compile` uses)?
+/// Returns `Ok(())` if `Component::new` accepts the bytes. Does **not**
+/// instantiate — the `kotoba-node` world's 14 host imports would need a full
+/// linker (the live-invoke stretch, deferred).
+pub fn assert_loads(component_bytes: &[u8]) -> Result<(), CljError> {
+    use wasmtime::component::Component;
+    use wasmtime::{Config, Engine};
+
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    let engine = Engine::new(&config).map_err(|e| CljError::Run(e.to_string()))?;
+    Component::new(&engine, component_bytes)
+        .map(|_| ())
+        .map_err(|e| CljError::Run(format!("component failed to load: {e}")))
 }

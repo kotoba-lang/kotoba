@@ -52,18 +52,35 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
     compile_core(program, None)
 }
 
+/// The Canonical-ABI shape of the generated `run` entry wrapper's return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAbi {
+    /// `run: func(list<u8>) -> list<u8>` — 8-byte return area `[ptr, len]`.
+    BytesToBytes,
+    /// `run: func(list<u8>) -> result<list<u8>, string>` — always `ok`; 12-byte
+    /// return area `[tag:u8 @0, ptr:i32 @4, len:i32 @8]` (the kotoba-node shape).
+    BytesToResultBytes,
+}
+
+/// A component entry point: the user `defn` to wrap and the ABI of its export.
+#[derive(Debug, Clone, Copy)]
+pub struct Entry<'a> {
+    pub name: &'a str,
+    pub abi: EntryAbi,
+}
+
 /// Compile a [`Program`] into a core module, optionally adding a Canonical-ABI
 /// entry wrapper.
 ///
-/// When `entry` is `Some(name)`, the named arity-1 `defn` is wrapped by an
-/// exported `run(in_ptr: i32, in_len: i32) -> ret_area: i32` function that
-/// realises the `func(list<u8>) -> list<u8>` Canonical ABI: it packs the input
-/// `(ptr,len)` into a string handle, calls the user function, then writes the
-/// returned handle's `(ptr,len)` into an 8-byte return area allocated via
-/// `cabi_realloc` and returns that area's pointer. In this mode the user `defn`s
-/// are not exported by name (only `run`, `memory`, `cabi_realloc` are), so the
-/// wrapper owns the `run` export name unambiguously.
-pub fn compile_core(program: &Program, entry: Option<&str>) -> Result<Vec<u8>, CljError> {
+/// When `entry` is `Some`, the named arity-1 `defn` is wrapped by an exported
+/// `run(in_ptr: i32, in_len: i32) -> ret_area: i32` function that realises the
+/// Canonical ABI for the chosen [`EntryAbi`]: it packs the input `(ptr,len)`
+/// into a string handle, calls the user function, then writes the returned
+/// handle's `(ptr,len)` into a `cabi_realloc`'d return area and returns that
+/// area's pointer. In this mode the user `defn`s are not exported by name (only
+/// `run`, `memory`, `cabi_realloc` are), so the wrapper owns the `run` export
+/// name unambiguously.
+pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, CljError> {
     // ---- Pass 0: collect string literals into one data blob ----------------
     let literals = collect_literals(program);
 
@@ -80,7 +97,7 @@ pub fn compile_core(program: &Program, entry: Option<&str>) -> Result<Vec<u8>, C
 
     // Validate the entry point up front.
     let entry_target = match entry {
-        Some(name) => {
+        Some(Entry { name, abi }) => {
             let (idx, arity) = fn_index.get(name).copied().ok_or_else(|| {
                 CljError::Codegen(format!("component entry `(defn {name} [input] …)` not found"))
             })?;
@@ -89,7 +106,7 @@ pub fn compile_core(program: &Program, entry: Option<&str>) -> Result<Vec<u8>, C
                     "component entry `{name}` must take exactly 1 argument (the input bytes), got {arity}"
                 )));
             }
-            Some(idx)
+            Some((idx, abi))
         }
         None => None,
     };
@@ -127,7 +144,7 @@ pub fn compile_core(program: &Program, entry: Option<&str>) -> Result<Vec<u8>, C
     exports.export("cabi_realloc", ExportKind::Func, realloc_fn_index);
 
     // Canonical-ABI `run` wrapper (only in component mode).
-    if let Some(user_idx) = entry_target {
+    if let Some((user_idx, _abi)) = entry_target {
         let wrapper_type = types.len();
         types
             .ty()
@@ -141,7 +158,7 @@ pub fn compile_core(program: &Program, entry: Option<&str>) -> Result<Vec<u8>, C
 
     // ---- Memory + heap global ----------------------------------------------
     let heap_start = align_up(DATA_BASE + literals.blob.len() as u32, HEAP_ALIGN);
-    let min_pages = ((heap_start + WASM_PAGE - 1) / WASM_PAGE).max(1) as u64;
+    let min_pages = heap_start.div_ceil(WASM_PAGE).max(1) as u64;
 
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
@@ -192,8 +209,8 @@ pub fn compile_core(program: &Program, entry: Option<&str>) -> Result<Vec<u8>, C
         code.function(&func);
     }
     code.function(&cabi_realloc_fn(HEAP_GLOBAL));
-    if let Some(user_idx) = entry_target {
-        code.function(&entry_wrapper_fn(user_idx, realloc_fn_index));
+    if let Some((user_idx, abi)) = entry_target {
+        code.function(&entry_wrapper_fn(user_idx, realloc_fn_index, abi));
     }
 
     // ---- Data segment -------------------------------------------------------
@@ -329,21 +346,34 @@ fn cabi_realloc_fn(heap_global: u32) -> Function {
     f
 }
 
-/// The Canonical-ABI `run` wrapper for `func(list<u8>) -> list<u8>`.
+/// The Canonical-ABI `run` wrapper.
 ///
 /// Core signature `(in_ptr: i32, in_len: i32) -> ret_area: i32`:
 ///   1. pack the input `(ptr,len)` into a string handle `(ptr<<32)|len`,
 ///   2. call the user entry function (handle → handle),
-///   3. allocate an 8-byte return area via `cabi_realloc`,
-///   4. store `[out_ptr, out_len]` (i32 each) from the returned handle,
-///   5. return the area pointer (the Canonical-ABI return-area convention).
-fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32) -> Function {
+///   3. allocate the return area via `cabi_realloc` and populate it per `abi`,
+///   4. return the area pointer (the Canonical-ABI return-area convention).
+///
+/// - [`EntryAbi::BytesToBytes`]: 8-byte area `[out_ptr @0, out_len @4]`.
+/// - [`EntryAbi::BytesToResultBytes`]: 12-byte area for `result<list<u8>,string>`
+///   in the `ok` case — `[tag:u8=0 @0, out_ptr:i32 @4, out_len:i32 @8]`.
+fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Function {
     // params: 0=in_ptr 1=in_len ; locals: 2=ret_handle(i64) 3=area(i32)
     let mut f = Function::new([(1, ValType::I64), (1, ValType::I32)]);
     let store32 = |offset: u64| MemArg {
         offset,
         align: 2,
         memory_index: 0,
+    };
+    let store8 = |offset: u64| MemArg {
+        offset,
+        align: 0,
+        memory_index: 0,
+    };
+    // (ptr_off, len_off, area_size) for each ABI; result<> reserves a tag byte.
+    let (ptr_off, len_off, area_size) = match abi {
+        EntryAbi::BytesToBytes => (0u64, 4u64, 8i32),
+        EntryAbi::BytesToResultBytes => (4u64, 8u64, 12i32),
     };
 
     // handle = (in_ptr as u64 << 32) | (in_len as u64)
@@ -358,29 +388,36 @@ fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32) -> Function {
     f.instruction(&Instruction::Call(user_fn_index));
     f.instruction(&Instruction::LocalSet(2));
 
-    // area = cabi_realloc(0, 0, align=4, new_sz=8)
+    // area = cabi_realloc(0, 0, align=4, new_sz=area_size)
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::I32Const(4));
-    f.instruction(&Instruction::I32Const(8));
+    f.instruction(&Instruction::I32Const(area_size));
     f.instruction(&Instruction::Call(realloc_index));
     f.instruction(&Instruction::LocalSet(3));
 
-    // area[0] = out_ptr = ret_handle >>> 32
+    // result<> ok-discriminant: area[0] = 0u8
+    if matches!(abi, EntryAbi::BytesToResultBytes) {
+        f.instruction(&Instruction::LocalGet(3));
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::I32Store8(store8(0)));
+    }
+
+    // area[ptr_off] = out_ptr = ret_handle >>> 32
     f.instruction(&Instruction::LocalGet(3));
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I64Const(32));
     f.instruction(&Instruction::I64ShrU);
     f.instruction(&Instruction::I32WrapI64);
-    f.instruction(&Instruction::I32Store(store32(0)));
+    f.instruction(&Instruction::I32Store(store32(ptr_off)));
 
-    // area[4] = out_len = ret_handle & 0xFFFF_FFFF
+    // area[len_off] = out_len = ret_handle & 0xFFFF_FFFF
     f.instruction(&Instruction::LocalGet(3));
     f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::I64Const(0xFFFF_FFFF));
     f.instruction(&Instruction::I64And);
     f.instruction(&Instruction::I32WrapI64);
-    f.instruction(&Instruction::I32Store(store32(4)));
+    f.instruction(&Instruction::I32Store(store32(len_off)));
 
     // return area
     f.instruction(&Instruction::LocalGet(3));

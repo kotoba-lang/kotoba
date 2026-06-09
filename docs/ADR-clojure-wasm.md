@@ -1,7 +1,7 @@
 # ADR — Clojure-on-WASM for kotoba (`kotoba-clj`)
 
-Status: **Accepted (steps 1–3 of the kais-binding workstream implemented)**
-Date: 2026-06-08 (steps 1–2), 2026-06-09 (step 3)
+Status: **Accepted (steps 1–3 done; step 5 proven at load level)**
+Date: 2026-06-08 (steps 1–2), 2026-06-09 (step 3 + step-5 load-proof)
 Crate: `crates/kotoba-clj`
 
 ## Context
@@ -127,14 +127,18 @@ real step order:
    and byte-building, which the i64+strings language does not yet have. This is
    a separate, larger language workstream (loops + a `bytes` builder), not a
    codegen detail — see "Language-growth dependency" below.
-5. ⬜ **Emit the `kotoba-node` `run` export**; verify `ProgramStore` /
-   `WasmExecutor` can load and invoke it. `program_cid = CIDv1 blake3(wasm)`,
-   stored in Vault/Shelf like every other program. Then bind host imports
-   (`kqe` assert/query, `kse` publish/drain, `auth`, `llm`) and honour the gas
-   model (assert=10, query=100, llm.infer=1000). A *reduced* slice — emit a
-   `run(ctx)->result<list<u8>,string>` that **ignores ctx** and prove
-   kotoba-runtime can load it — proves the plumbing without the language growth;
-   a program that meaningfully reads ctx/args is gated on step 4.
+5. ◐ **Emit the `kotoba-node` `run` export** — **load-proof done.**
+   `compile_kais_component_str` targets the real `kotoba-node` world from
+   `kotoba-runtime/wit` (resolved via `Resolve::push_dir`, deps incl. wasi:http)
+   and emits `run: func(ctx-cbor: list<u8>) -> result<list<u8>, string>` (the
+   `ok` case: 12-byte return area `[tag:u8=0, ptr, len]`). `assert_loads`
+   confirms `wasmtime::component::Component::new` accepts it — the same compile
+   path `ProgramStore::get_or_compile` uses, so kotoba-runtime can **load** the
+   artifact. **Remaining**: live invoke through `WasmExecutor` needs a linker
+   satisfying the world's 14 host imports (`kqe`/`kse`/`auth`/`llm`/…) +
+   `program_cid = CIDv1 blake3(wasm)` storage + the gas model (assert=10,
+   query=100, llm.infer=1000). And the wrapper passes raw `ctx-cbor` to the
+   program without decoding — meaningfully reading ctx/args is gated on step 4.
 
 ## Language-growth dependency (steps 4+)
 

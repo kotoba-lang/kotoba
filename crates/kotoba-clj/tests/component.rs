@@ -61,3 +61,29 @@ fn run_must_be_arity_one() {
     let err = compile_component_str("(defn run [a b] (+ a b))").unwrap_err();
     assert!(matches!(err, CljError::Codegen(_)), "got: {err:?}");
 }
+
+// ---- Step 5 (reduced): the real kotoba:kais `kotoba-node` world -------------
+
+use kotoba_clj::component::{assert_loads, compile_kais_component_str};
+
+const KAIS_WIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../kotoba-runtime/wit");
+
+#[test]
+fn kais_kotoba_node_component_loads_in_wasmtime() {
+    // `(defn run [ctx] …)` → a Component on the *actual* kotoba-node world
+    // (run: func(ctx-cbor: list<u8>) -> result<list<u8>, string>). We don't
+    // decode ctx (step 4); this proves kotoba-runtime can *load* the artifact —
+    // the same wasmtime Component compile path ProgramStore uses.
+    let component = compile_kais_component_str(r#"(defn run [ctx] "hello")"#, KAIS_WIT_DIR)
+        .expect("compile against kotoba-node world");
+    assert_eq!(&component[..4], b"\0asm");
+    assert_loads(&component).expect("kotoba-node component must load under wasmtime component model");
+}
+
+#[test]
+fn kais_entry_can_echo_raw_ctx() {
+    // The raw ctx-cbor bytes are handed to the program as its input handle, so
+    // an echo program is well-typed against the result<list<u8>,string> ABI.
+    let component = compile_kais_component_str("(defn run [ctx] ctx)", KAIS_WIT_DIR).unwrap();
+    assert_loads(&component).unwrap();
+}
