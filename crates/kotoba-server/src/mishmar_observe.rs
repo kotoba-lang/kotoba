@@ -145,11 +145,133 @@ pub fn decode_slash_logs(logs: &serde_json::Value) -> Vec<ObservedSlash> {
     out
 }
 
+// ── Live observation sources (transport-injected; only the socket is external) ─
+//
+// `JsonRpcTransport` is the one genuinely-external seam: a real impl POSTs to a
+// running EVM JSON-RPC endpoint (geth-private / Base L2). Everything above it —
+// request construction, response decoding, Datom projection — is pure + tested.
+
+/// Minimal EVM JSON-RPC transport. The reqwest impl is the live socket; tests
+/// inject a fake. `params` is the JSON-RPC `params` array; returns `result`.
+pub trait JsonRpcTransport {
+    fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String>;
+}
+
+/// reqwest-backed transport against an EVM JSON-RPC endpoint. Uses the blocking
+/// client, so call it off the async hot path (e.g. from a background job /
+/// `spawn_blocking`). Read-only methods only (kotoba stays read+verify).
+pub struct ReqwestRpc {
+    pub url: String,
+}
+
+impl JsonRpcTransport for ReqwestRpc {
+    fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let resp: serde_json::Value = reqwest::blocking::Client::new()
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("rpc send: {e}"))?
+            .json()
+            .map_err(|e| format!("rpc decode: {e}"))?;
+        if let Some(err) = resp.get("error") {
+            return Err(format!("rpc error: {err}"));
+        }
+        Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    }
+}
+
+/// `eth_getLogs` observation source for MishmarBondEscrow pin events, over an
+/// injected transport. The only external dependency is `transport.call`'s socket;
+/// the filter build + decode (`decode_pinned_logs`/`decode_slash_logs`) are tested.
+pub struct EvmLogObservationSource<T: JsonRpcTransport> {
+    transport: T,
+    escrow_address: String,
+    graph: KotobaCid,
+}
+
+impl<T: JsonRpcTransport> EvmLogObservationSource<T> {
+    pub fn new(transport: T, escrow_address: impl Into<String>, graph: KotobaCid) -> Self {
+        Self { transport, escrow_address: escrow_address.into(), graph }
+    }
+
+    fn fetch_logs(&self, from_block: &str, to_block: &str) -> Result<serde_json::Value, String> {
+        let filter = serde_json::json!({
+            "address": self.escrow_address,
+            "fromBlock": from_block,
+            "toBlock": to_block,
+        });
+        self.transport.call("eth_getLogs", serde_json::json!([filter]))
+    }
+
+    /// Fetch + decode `Pinned` logs → `mishmar/pin/{pinner,root}` Datoms (feed PinIndex).
+    pub fn pin_datoms(&self, from_block: &str, to_block: &str) -> Result<Vec<Datom>, String> {
+        let logs = self.fetch_logs(from_block, to_block)?;
+        Ok(decode_pinned_logs(&logs, &self.graph))
+    }
+
+    /// Fetch + decode `Slashed` logs → availability-failure observations.
+    pub fn slashes(&self, from_block: &str, to_block: &str) -> Result<Vec<ObservedSlash>, String> {
+        let logs = self.fetch_logs(from_block, to_block)?;
+        Ok(decode_slash_logs(&logs))
+    }
+}
+
+/// **Provisional (R0)** parser for a KaizenObserver wellbecoming-Δ feed. The real
+/// KaizenObserver output schema is not yet pinned (ADR-2605240200) — this parses a
+/// documented expected shape and MUST be reconciled against the live feed:
+///
+/// ```json
+/// [ { "did": "did:web:…", "epoch": 12, "delta": 5, "council_attested": true }, … ]
+/// ```
+///
+/// `did` is mapped to the social entity CID via [`crate::did_bridge::did_to_cid`].
+/// Entries missing required fields are skipped.
+pub fn parse_kaizen_wellbecoming(
+    feed: &serde_json::Value,
+) -> Vec<kotoba_kqe::social::ObservedWellbecoming> {
+    let mut out = Vec::new();
+    let Some(arr) = feed.as_array() else {
+        return out;
+    };
+    for e in arr {
+        let (Some(did), Some(epoch), Some(delta)) = (
+            e.get("did").and_then(|v| v.as_str()),
+            e.get("epoch").and_then(|v| v.as_u64()),
+            e.get("delta").and_then(|v| v.as_i64()),
+        ) else {
+            continue;
+        };
+        let council_attested = e
+            .get("council_attested")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        out.push(kotoba_kqe::social::ObservedWellbecoming {
+            did: crate::did_bridge::did_to_cid(did),
+            epoch,
+            delta,
+            council_attested,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kotoba_kqe::social::PinIndex;
     use serde_json::json;
+
+    /// Fake transport returning a canned logs array for eth_getLogs.
+    struct FakeRpc {
+        logs: serde_json::Value,
+    }
+    impl JsonRpcTransport for FakeRpc {
+        fn call(&self, method: &str, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+            assert_eq!(method, "eth_getLogs");
+            Ok(self.logs.clone())
+        }
+    }
 
     fn topic_str(bytes: &[u8; 32]) -> String {
         format!("0x{}", hex::encode(bytes))
@@ -228,5 +350,41 @@ mod tests {
         let graph = KotobaCid::from_bytes(b"g");
         assert!(decode_pinned_logs(&json!({}), &graph).is_empty());
         assert!(decode_slash_logs(&json!(null)).is_empty());
+    }
+
+    #[test]
+    fn evm_source_fetches_and_decodes_pin_datoms() {
+        let graph = KotobaCid::from_bytes(b"g:social");
+        let pin = b32(0x11);
+        let root = b32(0x22);
+        let mut pinner_topic = [0u8; 32];
+        pinner_topic[31] = 0x33;
+        let logs = json!([{
+            "topics": [ topic0_hex(PINNED_SIG), topic_str(&pin), topic_str(&root), topic_str(&pinner_topic) ],
+            "data": "0x"
+        }]);
+        let src = EvmLogObservationSource::new(FakeRpc { logs }, "0xescrow", graph);
+        let datoms = src.pin_datoms("0x0", "latest").expect("fetch ok");
+        assert_eq!(datoms.len(), 2);
+        // decoded Datoms drive PinIndex identically to the direct decoder.
+        let mut idx = PinIndex::new();
+        idx.apply(&datoms.into_iter().map(kotoba_kqe::delta::Delta::assert_datom).collect::<Vec<_>>());
+        assert_eq!(idx.root_of(&KotobaCid::from_bytes(&pin)), Some(KotobaCid::from_bytes(&root)));
+    }
+
+    #[test]
+    fn kaizen_parser_maps_did_and_skips_malformed() {
+        let feed = json!([
+            { "did": "did:web:alice", "epoch": 3, "delta": 5, "council_attested": true },
+            { "did": "did:web:bob", "epoch": 3, "delta": -2 }, // council_attested defaults false
+            { "epoch": 3, "delta": 1 } // missing did → skipped
+        ]);
+        let obs = parse_kaizen_wellbecoming(&feed);
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].did, crate::did_bridge::did_to_cid("did:web:alice"));
+        assert_eq!(obs[0].delta, 5);
+        assert!(obs[0].council_attested);
+        assert_eq!(obs[1].delta, -2);
+        assert!(!obs[1].council_attested); // defaulted
     }
 }
