@@ -5,9 +5,11 @@
 //! - [`protocol`] — R3b custodian protocol core: the verify-then-release
 //!   decision and requester-side recombination, transport-agnostic.
 
+pub mod audit;
 pub mod protocol;
 pub mod shares;
 
+pub use audit::{audit_grant, AuditVerdict, ReceiptRecord};
 pub use protocol::{
     combine_granted, handle_key_share_request, GrantedShare, KeyShareRequest, KeyShareResponse,
     ProtocolError,

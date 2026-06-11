@@ -944,6 +944,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", key_share::NSID_KEY_CUSTODIAN_INFO),
             get(key_share::key_custodian_info),
         )
+        .route(
+            &format!("/xrpc/{}", key_share::NSID_KEY_REPORT_RELEASE),
+            post(key_share::key_report_unreceipted_release),
+        )
         .route("/health", get(xrpc::health))
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOM_CREATE),
