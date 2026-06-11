@@ -19,12 +19,12 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-const OBJ_COMMIT: u8 = 1;
-const OBJ_TREE: u8 = 2;
-const OBJ_BLOB: u8 = 3;
-const OBJ_TAG: u8 = 4;
-const OBJ_OFS_DELTA: u8 = 6;
-const OBJ_REF_DELTA: u8 = 7;
+pub(crate) const OBJ_COMMIT: u8 = 1;
+pub(crate) const OBJ_TREE: u8 = 2;
+pub(crate) const OBJ_BLOB: u8 = 3;
+pub(crate) const OBJ_TAG: u8 = 4;
+pub(crate) const OBJ_OFS_DELTA: u8 = 6;
+pub(crate) const OBJ_REF_DELTA: u8 = 7;
 
 struct Pack {
     data: Vec<u8>,
@@ -184,7 +184,7 @@ impl PackSet {
     }
 }
 
-fn pack_type_to_kind(t: u8) -> Result<GitObjectKind> {
+pub(crate) fn pack_type_to_kind(t: u8) -> Result<GitObjectKind> {
     Ok(match t {
         OBJ_COMMIT => GitObjectKind::Commit,
         OBJ_TREE => GitObjectKind::Tree,
@@ -201,8 +201,24 @@ fn pack_type_to_kind(t: u8) -> Result<GitObjectKind> {
 /// generous enough for legitimately large blobs, but not unbounded.
 const MAX_INFLATE: u64 = 1 << 30; // 1 GiB
 
-fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
     inflate_capped(buf, MAX_INFLATE)
+}
+
+/// Inflate a zlib stream at the start of `buf`, returning the decompressed bytes
+/// **and** the number of compressed input bytes consumed. The streaming pack
+/// reader needs the consumed length to advance to the next object, which the
+/// on-disk reader (driven by idx offsets) never needed.
+pub(crate) fn inflate_counted(buf: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let mut decoder = ZlibDecoder::new(buf).take(MAX_INFLATE.saturating_add(1));
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).map_err(GitError::Io)?;
+    if out.len() as u64 > MAX_INFLATE {
+        return Err(GitError::MalformedHeader);
+    }
+    // total_in() counts the compressed bytes the decoder actually read from `buf`.
+    let consumed = decoder.get_ref().total_in() as usize;
+    Ok((out, consumed))
 }
 
 /// Inflate `buf`, refusing to materialise more than `max` decompressed bytes.
@@ -257,7 +273,7 @@ fn parse_idx(idx: &[u8]) -> Result<HashMap<GitOid, u64>> {
 }
 
 /// OFS_DELTA base-offset varint (big-endian, with the `+1` continuation trick).
-fn read_ofs_varint(buf: &[u8]) -> Result<(u64, usize)> {
+pub(crate) fn read_ofs_varint(buf: &[u8]) -> Result<(u64, usize)> {
     let mut i = 0;
     let mut b = *buf.get(i).ok_or(GitError::MalformedHeader)?;
     i += 1;
@@ -287,7 +303,7 @@ fn read_size_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
 }
 
 /// Apply a git delta (`base` + `delta` → result).
-fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     let mut pos = 0;
     let _src_size = read_size_varint(delta, &mut pos)?;
     let dst_size = read_size_varint(delta, &mut pos)? as usize;

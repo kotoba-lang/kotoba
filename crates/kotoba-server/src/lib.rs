@@ -2,16 +2,22 @@ pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
 pub mod dht_transport;
+pub mod did_bridge;
 pub mod dna_integrity;
 pub mod econ;
 pub mod email_xrpc;
+pub mod evm_rpc;
+pub mod access_receipt;
+pub mod key_share;
 pub mod fingerprint;
 pub mod firehose;
+pub mod git_http;
 pub mod graph_auth;
 pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
 pub mod media_xrpc;
+pub mod mishmar_observe;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
@@ -22,6 +28,9 @@ pub mod pre_proxy;
 pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
+pub mod social;
+pub mod social_economy;
+pub mod social_xrpc;
 pub mod xrpc;
 
 use axum::{
@@ -269,6 +278,7 @@ mod tests {
             &*state.ipns_registry,
         )
         .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: distributed_graph_ipns_name(&graph),
             graph: graph.clone(),
             covering_datoms: None,
@@ -893,6 +903,9 @@ mod tests {
 }
 
 pub fn build_router(state: Arc<KotobaState>) -> Router {
+    // Access-receipt writer (ADR-sealed-cold-tier R1): single background task
+    // batching read receipts into audit-graph commits. Idempotent.
+    access_receipt::spawn_receipt_writer(Arc::clone(&state));
     // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
     // game snapshots are content-addressed into the block store + announced on
     // the KSE Journal. Idempotent; per-frame traffic never touches either.
@@ -907,6 +920,30 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     }
     Router::new()
         .route("/_app/meta", get(xrpc::health))
+        .route(
+            &format!("/xrpc/{}", access_receipt::NSID_AUDIT_LIST),
+            get(access_receipt::audit_list_receipts),
+        )
+        .route(
+            &format!("/xrpc/{}", access_receipt::NSID_AUDIT_ANCHOR),
+            get(access_receipt::audit_anchor_payload),
+        )
+        .route(
+            &format!("/xrpc/{}", access_receipt::NSID_AUDIT_VERIFY),
+            get(access_receipt::audit_verify_chain),
+        )
+        .route(
+            &format!("/xrpc/{}", key_share::NSID_KEY_REQUEST_SHARE),
+            post(key_share::key_request_share),
+        )
+        .route(
+            &format!("/xrpc/{}", key_share::NSID_KEY_DEPOSIT_SHARE),
+            post(key_share::key_deposit_share),
+        )
+        .route(
+            &format!("/xrpc/{}", key_share::NSID_KEY_CUSTODIAN_INFO),
+            get(key_share::key_custodian_info),
+        )
         .route("/health", get(xrpc::health))
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOM_CREATE),
@@ -1039,6 +1076,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_DB_STATS),
             post(xrpc::datomic_db_stats),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_DATOMIC_GC),
+            post(xrpc::datomic_gc),
         )
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_ENTITY),
@@ -1188,6 +1229,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         )
         // ── Common Crawl vector search / RAG ───────────────────────────────
         .route(
+            &format!("/xrpc/{}", social_xrpc::NSID_SOCIAL_CAPITAL),
+            get(social_xrpc::social_capital),
+        )
+        .route(
             &format!("/xrpc/{}", cc_xrpc::NSID_CC_SEARCH),
             get(cc_xrpc::cc_search),
         )
@@ -1315,11 +1360,31 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS),
             get(firehose::events),
         )
+        .route(
+            &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS_FROM_COMMITS),
+            get(firehose::events_from_commits),
+        )
+        .route(
+            &format!("/xrpc/{}", firehose::NSID_SYNC_EVENTS_ALL_GRAPHS),
+            get(firehose::events_all_graphs),
+        )
         // ── Realtime ingress (ADR-2606060001): bidirectional WebSocket (T1) ──
         // The bus is per-room and isolated from the firehose/gossip above.
         .route(
             &format!("/xrpc/{}", realtime::NSID_SYNC_CONNECT),
             get(realtime::ws_connect),
+        )
+        // ── Git smart-HTTP (clone / fetch / push over datomic + IPFS) ───────
+        .route("/git/:repo/info/refs", get(git_http::info_refs))
+        .route(
+            "/git/:repo/git-upload-pack",
+            post(git_http::upload_pack)
+                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
+        )
+        .route(
+            "/git/:repo/git-receive-pack",
+            post(git_http::receive_pack)
+                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
         )
         // ── Generic XRPC dispatch ──────────────────────────────────────────
         .route(
@@ -1428,13 +1493,6 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     state.register_node().await;
-
-    {
-        let quad_store = Arc::clone(&state.quad_store);
-        tokio::spawn(async move {
-            quad_store.replay_from_journal().await;
-        });
-    }
 
     #[cfg(feature = "p2p")]
     let state = if std::env::var("KOTOBA_NO_SWARM").is_err() {

@@ -182,7 +182,10 @@ def test_organism_legacy_text_sink_still_supported():
 
 
 def test_fleet_state_organisms_share_post_sink(tmp_path: Path):
-    from kotodama.organism.fleet_cell_main import FleetState
+    from kotodama.organism.fleet_cell_main import FleetState, REGISTRY_PATH
+
+    if not REGISTRY_PATH.is_file():
+        pytest.skip("monorepo 00-contracts/actor-registry not present (standalone kotoba checkout)")
 
     queue = tmp_path / "fleet.ndjson"
     sink = NdjsonQueuePostSink(queue)

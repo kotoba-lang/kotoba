@@ -11704,3 +11704,280 @@ async fn commit_store_oversized_graph_returns_400() {
         "oversized graph must be rejected before CACAO: {body}"
     );
 }
+
+// ── Access receipts (ADR-sealed-cold-tier R1) ────────────────────────────────
+
+/// Full loop: an authenticated kg read with a declared purpose produces a
+/// receipt in the audit graph, listable via audit.listReceipts (operator-gated).
+#[tokio::test]
+async fn access_receipt_recorded_and_listable() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zReceiptReader");
+
+    // Authenticated-tier read (KOTOBA_DEFAULT_VISIBILITY=authenticated in
+    // TestServer) with a declared purpose.
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: verify receipt loop")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200, "kg.catalog read must succeed");
+
+    // The background writer flushes within ~50ms; poll the audit endpoint.
+    let op_tok = tenant_jwt(&s.operator_did);
+    let mut receipts = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = s
+            .get_with_auth(
+                "/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts?accessor=did:key:zReceiptReader",
+                &op_tok,
+            )
+            .await;
+        assert_eq!(status, 200, "audit.listReceipts: {body}");
+        if body["count"].as_u64().unwrap_or(0) >= 1 {
+            receipts = body;
+            break;
+        }
+    }
+    let list = receipts["receipts"].as_array().expect("receipt recorded within 4s");
+    let r0 = &list[0];
+    assert_eq!(r0["accessorDid"], "did:key:zReceiptReader");
+    assert_eq!(r0["operation"], "kg:catalog");
+    assert_eq!(r0["purpose"], "e2e: verify receipt loop");
+    assert!(r0["graph"].as_str().is_some());
+    assert!(r0["tsUnix"].as_i64().unwrap_or(0) > 1_700_000_000);
+}
+
+/// audit.listReceipts is operator-only: a non-operator JWT is rejected.
+#[tokio::test]
+async fn audit_list_receipts_rejects_non_operator() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zSomeoneElse");
+    let (status, _) = s
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts", &tok)
+        .await;
+    assert_eq!(status, 401);
+}
+
+/// R2a: after a receipted read, audit.anchorPayload returns commitRoot calldata
+/// for the audit-graph head; before any receipt it 404s.
+#[tokio::test]
+async fn audit_anchor_payload_after_receipted_read() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+
+    // Fresh server: nothing to anchor yet.
+    let (status, _) = s
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload", &op_tok)
+        .await;
+    assert_eq!(status, 404, "no receipts yet → 404");
+
+    // One receipted read…
+    let tok = tenant_jwt("did:key:zAnchorReader");
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: anchor")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200);
+
+    // …flushes into an audit commit, which becomes anchorable.
+    let mut body = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, b) = s
+            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload", &op_tok)
+            .await;
+        if status == 200 {
+            body = b;
+            break;
+        }
+    }
+    assert_eq!(body["ok"], true, "anchor payload within 4s: {body}");
+    assert_eq!(body["function"], "commitRoot(bytes32,bytes,uint64)");
+    assert!(body["seq"].as_u64().unwrap_or(0) >= 1);
+    let calldata = body["calldataHex"].as_str().expect("calldataHex");
+    assert!(calldata.len() > 8, "non-trivial calldata");
+    let head = body["headCid"].as_str().expect("headCid");
+    assert!(head.starts_with('b'), "multibase head CID");
+}
+
+/// R2b: audit.verifyChain reports a fully-valid signed receipt chain over HTTP.
+#[tokio::test]
+async fn audit_verify_chain_reports_valid() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+
+    // One receipted read to create the audit chain.
+    let tok = tenant_jwt("did:key:zVerifyReader");
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: verify chain")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200);
+
+    let mut body = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, b) = s
+            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.verifyChain", &op_tok)
+            .await;
+        if status == 200 {
+            body = b;
+            break;
+        }
+    }
+    assert_eq!(body["ok"], true, "chain must verify: {body}");
+    assert!(body["depth"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(body["invalid"].as_array().map(|a| a.len()), Some(0));
+    // The node's commits are signed; with a did:key operator they are Valid.
+    let valid = body["valid"].as_u64().unwrap_or(0);
+    let unverifiable = body["unverifiable"].as_u64().unwrap_or(0);
+    assert!(valid + unverifiable >= 1, "signed commits counted: {body}");
+}
+
+/// R3b: deposit a custodian share, then a CACAO-authorized requester gets it
+/// re-wrapped to their key; an unauthorized request is denied with no share.
+#[tokio::test]
+async fn key_request_share_full_custodian_flow() {
+    use base64::Engine as _;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3b-custody-graph").to_multibase();
+
+    // Fetch THIS node's custodian X25519 pubkey, then deal a 2-of-3 set where
+    // custodian #1 is the node (share[0] is sealed to its real key, so the node
+    // can open it) and #2/#3 are throwaway keys.
+    let (st, info) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
+        .await;
+    assert_eq!(st, 200, "{info}");
+    let node_pk_hex = info["x25519PubkeyHex"].as_str().expect("node pubkey").to_string();
+    let node_pk = {
+        let b = hex::decode(&node_pk_hex).unwrap();
+        let arr: [u8; 32] = b.try_into().unwrap();
+        PublicKey::from(arr)
+    };
+    let block_key = [77u8; 32];
+    let pubs: Vec<(String, PublicKey)> = vec![
+        (info["did"].as_str().unwrap().to_string(), node_pk),
+        ("did:key:zCust2".into(), PublicKey::from(&StaticSecret::from([2u8; 32]))),
+        ("did:key:zCust3".into(), PublicKey::from(&StaticSecret::from([3u8; 32]))),
+    ];
+    let shares = kotoba_custody::split_key(&block_key, 2, &pubs).unwrap();
+    let share_json = serde_json::to_value(&shares[0]).unwrap();
+
+    // Deposit (operator-gated): a non-operator is rejected.
+    let (status, _) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": share_json}),
+            &tenant_jwt("did:key:zNotOperator"),
+        )
+        .await;
+    assert_eq!(status, 401, "deposit must be operator-gated");
+
+    let (status, dep) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": share_json}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{dep}");
+
+    let requester_sk = StaticSecret::from([0x99u8; 32]);
+    let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
+
+    // Unauthorized: Private graph, no CACAO → denied, no share material.
+    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
+    let (status, denied) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "nonce": "r3b-no-cacao",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{denied}");
+    assert_eq!(denied["ok"], false, "no CACAO must be denied: {denied}");
+    assert!(denied["sealedShareHex"].is_null(), "denial leaks no share");
+
+    // Authorized: valid datom:read CACAO for the graph.
+    let cacao_b64 = build_ed25519_cacao_for_operation(
+        &graph,
+        &s.operator_did,
+        kotoba_auth::CacaoPayload::OP_DATOM_READ,
+        "r3b-authorized-nonce",
+    );
+    let (status, granted) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "cacao_b64": cacao_b64,
+                "purpose": "e2e custody",
+                "nonce": "r3b-authorized-nonce",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
+    assert_eq!(status, 200, "{granted}");
+    assert_eq!(granted["ok"], true, "valid CACAO must grant: {granted}");
+    assert_eq!(granted["threshold"], 2);
+    let sealed_hex = granted["sealedShareHex"].as_str().expect("sealed share");
+    // The requester opens the re-wrapped share and it matches the dealt commitment.
+    let sealed = hex::decode(sealed_hex).unwrap();
+    let opened = kotoba_crypto::hpke_open(&requester_sk, &sealed).unwrap();
+    let mut h = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut h, &opened);
+    let commitment: [u8; 32] = sha2::Digest::finalize(h).into();
+    assert_eq!(commitment, shares[0].commitment, "released share matches the deal");
+    let _ = base64::engine::general_purpose::STANDARD; // keep import used
+
+    // The release wrote an access receipt (operation = key:requestShare).
+    let mut found = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (st, body) = s
+            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts", &op_tok)
+            .await;
+        assert_eq!(st, 200);
+        if let Some(arr) = body["receipts"].as_array() {
+            if arr.iter().any(|r| r["operation"] == "key:requestShare") {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "key release must leave a receipt");
+}

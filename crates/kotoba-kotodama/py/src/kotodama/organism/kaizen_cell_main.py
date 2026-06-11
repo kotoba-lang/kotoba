@@ -57,12 +57,34 @@ def _default_proposal_path() -> Path:
     return home / "observer.ndjson"
 
 
+def _fitness_path() -> Path:
+    explicit = os.environ.get("KAIZEN_FITNESS_PATH")
+    if explicit:
+        return Path(explicit)
+    # Sibling of the proposal queue (same shared hostPath the pr-agent updates).
+    pp = _default_proposal_path()
+    return pp.parent / "rule-fitness.json"
+
+
 def _build_observer() -> KaizenObserver:
+    # Meta self-reflection: prune rules whose PRs humans keep rejecting. The
+    # pr-agent resolves PR outcomes into this ledger; the observer reads it to
+    # skip pruned rules. Disabled with KAIZEN_META_REFLECT=0.
+    meta_reflector = None
+    if os.environ.get("KAIZEN_META_REFLECT", "1").lower() not in ("0", "false", "no"):
+        from kotodama.organism.kaizen.fitness import RuleFitnessLedger, MetaReflector
+        ledger = RuleFitnessLedger(_fitness_path())
+        meta_reflector = MetaReflector(
+            ledger,
+            min_samples=int(os.environ.get("KAIZEN_PRUNE_MIN_SAMPLES", "5")),
+            prune_below=float(os.environ.get("KAIZEN_PRUNE_BELOW", "0.34")),
+        )
     return KaizenObserver(
         shard_urls=_default_shard_urls(),
         queue_paths=_default_queue_paths(),
         proposal_path=_default_proposal_path(),
         dedup_window_s=int(os.environ.get("KAIZEN_DEDUP_WINDOW_S", "7200")),
+        meta_reflector=meta_reflector,
     )
 
 

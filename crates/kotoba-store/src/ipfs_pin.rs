@@ -4,7 +4,8 @@
 /// a local or remote Kubo-compatible daemon so that pinned CIDs survive GC
 /// and are reachable via the IPFS network.  Up to 1 GB of content is pinned
 /// for free by kotoba itself; extended durability beyond that is the
-/// responsibility of kotobase.etzhayyim.com (called separately, not here).
+/// responsibility of the canonical remote pin service kotobase.net
+/// (ADR-2606091500; called separately, not here).
 ///
 /// API surface used:
 ///   POST /api/v0/pin/add?arg={cid}&recursive=true   — pin a CID
@@ -16,6 +17,11 @@
 ///   KOTOBA_IPFS_TOKEN     — optional Bearer JWT for authenticated gateways
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
+
+/// Canonical remote IPFS pin service (ADR-2606091500). `from_pin_env` defaults
+/// to this when `KOTOBA_IPFS_PIN_ENDPOINT` is unset, so the kotobase pin fanout
+/// is on by default repo-wide; opt out with `KOTOBA_IPFS_PIN_ENDPOINT=off`.
+pub const DEFAULT_REMOTE_PIN_ENDPOINT: &str = "https://kotobase.net";
 
 #[derive(Clone)]
 pub struct IpfsPinClient {
@@ -54,17 +60,28 @@ impl IpfsPinClient {
         })
     }
 
-    /// Build a remote pin client from `KOTOBA_IPFS_PIN_ENDPOINT` +
-    /// `KOTOBA_IPFS_PIN_JWT`.  Returns `None` when neither secret is set, so
-    /// the caller can no-op when kotobase pinning is intentionally disabled
-    /// (e.g. local dev).  Used to dispatch every recursive pin to
-    /// kotobase.etzhayyim.com (or any Kubo-compatible service) in addition to the
-    /// pod-local sidecar — the F-3 pin chain wiring.
+    /// Build the canonical remote pin client (ADR-2606091500).  Defaults to
+    /// `kotobase.net` (`DEFAULT_REMOTE_PIN_ENDPOINT`) so the kotobase pin fanout
+    /// is **on by default** repo-wide — every recursive pin is dispatched to
+    /// kotobase.net in addition to the pod-local sidecar (the F-3 pin chain).
+    /// Overridable via `KOTOBA_IPFS_PIN_ENDPOINT`; explicitly opt out (e.g. local
+    /// dev / tests) by setting it to `off` / `none` / `disabled`, which returns
+    /// `None` so the caller does a local-only pin.  `KOTOBA_IPFS_PIN_JWT` is the
+    /// optional Bearer token for the remote service.
     pub fn from_pin_env() -> Option<Arc<Self>> {
-        let endpoint = std::env::var("KOTOBA_IPFS_PIN_ENDPOINT").ok()?;
-        if endpoint.trim().is_empty() {
+        let raw = std::env::var("KOTOBA_IPFS_PIN_ENDPOINT").unwrap_or_default();
+        let trimmed = raw.trim();
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "off" | "none" | "disabled" | "0" | "false"
+        ) {
             return None;
         }
+        let endpoint = if trimmed.is_empty() {
+            DEFAULT_REMOTE_PIN_ENDPOINT.to_string()
+        } else {
+            trimmed.to_string()
+        };
         let token = std::env::var("KOTOBA_IPFS_PIN_JWT").ok();
         Some(Arc::new(Self {
             client: reqwest::Client::new(),

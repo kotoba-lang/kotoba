@@ -1,3 +1,12 @@
+//! # kotoba-vm — **KVM = Kotoba Virtual Machine**
+//!
+//! Execution hosts of KOTOBA on the Pregel BSP substrate: [`pregel`]
+//! (deterministic single-node BSP engine with Merkle-chained checkpoints),
+//! [`wasm_pregel`] (`WasmPregelRunner` — WASM Component programs as BSP
+//! vertices), [`distributed`] (`DistributedPregelRunner` — cross-node BSP via
+//! GossipSub), [`executor`] (`KotobaVm` — Datalog programs on BSP),
+//! [`state_graph`] (LangGraph-compatible `StateGraph`, ADR-2605250002),
+//! [`agent`] (ReAct runners), and [`foreign`] (CALL_FOREIGN 0xF bridge).
 pub mod agent;
 pub mod auth_actor;
 pub mod distributed;

@@ -281,16 +281,8 @@ pub struct KotobaState {
     /// Maintained on every kg commit (`commit_kg_datoms`); registered + read via
     /// `kg.mv.register` / `kg.mv.result`.
     pub mv_registry: Arc<tokio::sync::RwLock<kotoba_kqe::mv::MvRegistry>>,
-    // ── Journal WAL (ADR-2606041151 A) ───────────────────────────────────────
-    /// When `false` (`KOTOBA_JOURNAL_WAL=off`), the per-datom Journal WAL
-    /// block-write is skipped on the commit path. The synchronous
-    /// DistributedCommitWriter commit is already durable (ProllyTree + IPNS
-    /// head), so the WAL is a redundant double-write; the hot-arrangement update
-    /// (`apply_journaled_datom`) always runs regardless. Default `true`
-    /// (unchanged behaviour: fast restart via journal replay).
-    pub journal_wal_enabled: bool,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
-    /// Optional kotobase.etzhayyim.com XRPC pin client (KOTOBA_PIN_TOKEN).
+    /// Optional kotobase.net XRPC pin client (KOTOBA_PIN_TOKEN; ADR-2606091500).
     pub ipfs_pin: Arc<IpfsPinClient>,
     // ── Email E2E Storage ────────────────────────────────────────────────────
     /// AES-256-GCM encrypted vault for email body blobs (legacy; kept for compat).
@@ -326,6 +318,19 @@ pub struct KotobaState {
     /// Replay-prevention registry for CACAO nonces (CAIP-74 §8).
     /// Tracks each nonce until the corresponding CACAO expires.
     pub nonce_store: Arc<crate::nonce_store::NonceStore>,
+    // ── Access receipts (ADR-sealed-cold-tier R1) ─────────────────────────────
+    /// Read handlers enqueue receipts here; ONE background writer batches them
+    /// into audit-graph commits (`access_receipt::spawn_receipt_writer`).
+    pub receipt_tx: tokio::sync::mpsc::UnboundedSender<crate::access_receipt::AccessReceipt>,
+    /// Receiver parked until `spawn_receipt_writer` takes it (once).
+    pub receipt_rx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::access_receipt::AccessReceipt>>,
+    >,
+    // ── Key custody (ADR-sealed-cold-tier R3b) ────────────────────────────────
+    /// This node's custodian shares, keyed by graph multibase CID. Installed
+    /// via `key.depositShare` (operator-gated); consulted by `key.requestShare`.
+    pub custody_shares:
+        Arc<tokio::sync::RwLock<HashMap<String, kotoba_custody::CustodianShare>>>,
     // ── Write-cost economy (ADR-2606013400) ───────────────────────────────────
     /// Per-DID mKOTO balance ledger. `datomic.transact` debits the writer here;
     /// the operator is exempt/unlimited. See `crate::econ::Econ`.
@@ -348,6 +353,14 @@ pub struct KotobaState {
     /// efficacy hook proving the resident cache actually serves steady-state
     /// transacts rather than silently falling through to a cold scan.
     pub datomic_cold_db_loads: Arc<std::sync::atomic::AtomicU64>,
+    // ── Git wire protocol (kotoba-git) ────────────────────────────────────────
+    /// Per-repo git **Datom projection** (the `oid↔cid` bridge + refs + queryable
+    /// commit DAG), keyed by repo name. The lossless object *bytes* live in
+    /// `block_store` (IPFS, content-addressed); this `Connection` is the datomic
+    /// projection over them. Lazily created with the `:git/*` schema installed on
+    /// first access — see `git_connection`.
+    pub git_repos:
+        Arc<tokio::sync::RwLock<HashMap<String, Arc<kotoba_datomic::Connection>>>>,
 }
 
 impl KotobaState {
@@ -389,22 +402,6 @@ impl KotobaState {
         // Persistence: KuboBlockStore cold tier (Kubo/IPFS HTTP, SHA2-256 dual-CID) if KOTOBA_STORE_PATH is set.
         // All KSE components (Journal, Vault, SecureVault) share the same store.
         let store_path: Option<String> = std::env::var("KOTOBA_STORE_PATH").ok();
-
-        // ADR-2606041151 A — Journal WAL opt-out. Default on (unchanged). When
-        // off, the per-datom WAL double-write is skipped on the commit path; the
-        // synchronous CommitDag commit is already durable.
-        let journal_wal_enabled = !std::env::var("KOTOBA_JOURNAL_WAL")
-            .map(|v| v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
-            .unwrap_or(false);
-        if !journal_wal_enabled {
-            tracing::warn!(
-                "Journal WAL DISABLED (KOTOBA_JOURNAL_WAL=off) — per-datom WAL \
-                 double-write skipped; durability = synchronous CommitDag commit + \
-                 cold ProllyTree. Restart no longer replays the WAL; rely on \
-                 KOTOBA_DATOMIC_WARM_GRAPHS / cold-path for hot-arrangement warmup \
-                 (ADR-2606041151 A, experimental)"
-            );
-        }
 
         const DEFAULT_HOT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
         let hot_cache_bytes: usize = std::env::var("KOTOBA_HOT_CACHE_BYTES")
@@ -457,15 +454,15 @@ impl KotobaState {
                 Arc::new(tiered) as Arc<dyn BlockStore + Send + Sync>
             } else if !ipfs_off {
                 let cold = kotoba_store::KuboBlockStore::from_env();
-                // F-3: attach the kotobase remote-pin client if configured so
-                // every local recursive pin/add also lands on kotobase.etzhayyim.com.
-                // Falls back to a single-pin (local only) when the env vars
-                // are absent — preserves dev / local-Kubo workflows.
+                // F-3: attach the canonical remote-pin client so every local
+                // recursive pin/add also lands on kotobase.net (ADR-2606091500).
+                // On by default (from_pin_env defaults to kotobase.net); opt out
+                // with KOTOBA_IPFS_PIN_ENDPOINT=off for dev / local-Kubo workflows.
                 let cold = match kotoba_store::IpfsPinClient::from_pin_env() {
                     Some(remote) => {
                         tracing::info!(
-                            "kotobase pin fanout enabled \
-                             (KOTOBA_IPFS_PIN_ENDPOINT)"
+                            "kotobase.net pin fanout enabled \
+                             (KOTOBA_IPFS_PIN_ENDPOINT; default kotobase.net)"
                         );
                         cold.with_remote_pin(remote)
                     }
@@ -473,6 +470,41 @@ impl KotobaState {
                 };
                 let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
                     .unwrap_or_else(|_| "http://localhost:5001".into());
+                // ADR-2606112200 — sealed cold tier. When KOTOBA_BLOCK_KEY (or
+                // KOTOBA_BLOCK_KEY_FILE) is set, every block leaving for Kubo
+                // (and from there bitswap/DHT + the kotobase.net pin fanout) is
+                // an AES-256-GCM envelope; the network only ever replicates
+                // ciphertext. Unset = current plaintext behaviour, with a loud
+                // warning because the kotobase pin fanout is on by default.
+                let cold: Arc<dyn BlockStore + Send + Sync> =
+                    match kotoba_store::SealedKeyConfig::from_env()? {
+                        Some(cfg) => {
+                            let index_path = store_path.as_ref().map(|p| {
+                                std::path::Path::new(p).join(kotoba_store::SEALED_INDEX_FILE)
+                            });
+                            if index_path.is_none() {
+                                tracing::warn!(
+                                    "sealed cold tier: no KOTOBA_STORE_PATH — plaintext→sealed \
+                                     CID index is in-memory only (rebuilt by re-put after restart)"
+                                );
+                            }
+                            let sealed =
+                                kotoba_store::SealedBlockStore::new(cold, cfg, index_path)?;
+                            tracing::info!(
+                                index_entries = sealed.index_len(),
+                                "cold tier SEALED — AES-256-GCM block envelopes (KOTOBA_BLOCK_KEY, ADR-2606112200)"
+                            );
+                            Arc::new(sealed)
+                        }
+                        None => {
+                            tracing::warn!(
+                                "cold tier UNSEALED — blocks replicate beyond this node in \
+                                 PLAINTEXT (Kubo bitswap + kotobase.net pin fanout). Set \
+                                 KOTOBA_BLOCK_KEY to seal (ADR-2606112200)."
+                            );
+                            Arc::new(cold)
+                        }
+                    };
                 let tiered = kotoba_store::TieredBlockStore::new(hot, cold);
 
                 let peers_str = std::env::var("KOTOBA_PEERS").unwrap_or_default();
@@ -640,20 +672,13 @@ impl KotobaState {
             }
         };
 
-        // Journal — Merkle WAL backed by block_store; head pointer in a sibling JSON file.
-        let journal = Arc::new(match &store_path {
-            Some(path) => {
-                let head_path = format!("{path}.journal-head.json");
-                tracing::info!("KSE Journal: block-store persistence enabled");
-                Journal::with_block_store(Arc::clone(&block_store), head_path)
-            }
-            None => {
-                tracing::info!(
-                    "KSE Journal: in-memory only (set KOTOBA_STORE_PATH for persistence)"
-                );
-                Journal::new()
-            }
-        });
+        // LiveBus (formerly "Journal") — purely in-memory ephemeral event bus.
+        // No persistence at all: datomic durability/replay = CommitDag; non-datomic
+        // topics (signal / realtime / kse pub-sub) are live-only, and their durable
+        // data already lives in their own content-addressed stores (Shelf / block
+        // store snapshots). gossipsub-style best-effort live-tail.
+        tracing::info!("KSE LiveBus: in-memory only (live-tail; durable replay via CommitDag)");
+        let journal = Arc::new(Journal::new());
         let shelf = Arc::new(Shelf::new());
 
         // Agent identity — constructed once; reused in init_crypto() to avoid
@@ -841,12 +866,12 @@ impl KotobaState {
         // Write-cost economy (ADR-2606013400) — operator-funded mKOTO ledger.
         let econ = crate::econ::Econ::from_env(operator_did.clone());
 
+        let (receipt_tx, receipt_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
             mv_registry: Arc::new(tokio::sync::RwLock::new(
                 kotoba_kqe::mv::MvRegistry::new(),
             )),
-            journal_wal_enabled,
             operator_did,
             node_roles,
             identity,
@@ -880,8 +905,12 @@ impl KotobaState {
             graph_registry,
             econ,
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
+            receipt_tx,
+            receipt_rx: std::sync::Mutex::new(Some(receipt_rx)),
+            custody_shares: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             datomic_live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             datomic_cold_db_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            git_repos: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -937,15 +966,6 @@ impl KotobaState {
 
     pub fn ipns_signing_key(&self) -> ed25519_dalek::SigningKey {
         self.identity.signing_key.clone()
-    }
-
-    /// Replay Journal WAL into the in-memory QuadStore Arrangement.
-    ///
-    /// Must be called once after `KotobaState::new()` and before serving
-    /// requests.  When the Journal is backed by B2 this recovers all quads
-    /// written in previous runs; with in-memory-only Journal it is a no-op.
-    pub async fn replay_wal(&self) {
-        self.quad_store.replay_from_journal().await;
     }
 
     /// Get-or-create the per-graph serialisation lock + resident `db_before`
@@ -1028,6 +1048,97 @@ impl KotobaState {
             }
         }
         tracing::info!(seeded, "warm: datomic resident-cache warm-up complete");
+    }
+
+    /// Get (or lazily create) the git Datom projection [`Connection`] for `repo`.
+    ///
+    /// The `:git/*` schema is installed once on creation, and the projection is
+    /// **rehydrated** from the last durable snapshot if one exists (see
+    /// [`Self::git_persist`]). The returned `Connection` is paired with
+    /// [`Self::block_store`] to form a `kotoba_git::GitStore` — datomic
+    /// projection + IPFS blocks — by the `git_http` handlers.
+    pub async fn git_connection(&self, repo: &str) -> Arc<kotoba_datomic::Connection> {
+        if let Some(conn) = self.git_repos.read().await.get(repo) {
+            return Arc::clone(conn);
+        }
+        let mut repos = self.git_repos.write().await;
+        // Re-check under the write lock (another task may have created it).
+        if let Some(conn) = repos.get(repo) {
+            return Arc::clone(conn);
+        }
+        let conn = Arc::new(kotoba_datomic::Connection::new());
+        {
+            let git = kotoba_git::GitStore::new(&conn, &*self.block_store);
+            if let Err(e) = git.install_schema().await {
+                tracing::warn!(repo, error = %e, "git_connection: install_schema failed");
+            }
+            // Rehydrate the projection (oid↔cid index + refs) from the durable
+            // manifest, if this repo was persisted before. Objects come back
+            // from their content-addressed blocks (durable in IPFS/Kubo).
+            if let Some(cid) = self.git_head_cid(repo).await {
+                match git.rehydrate(&cid).await {
+                    Ok((restored, missing)) => tracing::info!(
+                        repo, restored, missing,
+                        "git: rehydrated repo projection from durable snapshot"
+                    ),
+                    Err(e) => tracing::warn!(repo, error = %e, "git: rehydrate failed"),
+                }
+            }
+        }
+        repos.insert(repo.to_string(), Arc::clone(&conn));
+        conn
+    }
+
+    /// Durable mutable pointer key for a repo's latest snapshot manifest CID.
+    fn git_repo_key(repo: &str) -> String {
+        let safe: String = repo
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("git/repo/{safe}/head")
+    }
+
+    /// Resolve the durable snapshot-manifest CID for `repo` from the `KseStore`
+    /// mutable boundary (`None` if no store is configured or none was persisted).
+    async fn git_head_cid(&self, repo: &str) -> Option<KotobaCid> {
+        let ks = self.kse_store.as_ref()?;
+        let bytes = ks.get(&Self::git_repo_key(repo)).await.ok()?;
+        let s = String::from_utf8(bytes.to_vec()).ok()?;
+        KotobaCid::from_multibase(s.trim())
+    }
+
+    /// Persist `repo`'s projection durably: write the snapshot manifest block
+    /// (content-addressed, into the IPFS-backed block store) and record its CID
+    /// in the `KseStore` mutable boundary. Combined with the already-durable
+    /// object blocks, this is the full durable form of the git repo. A no-op for
+    /// the mutable pointer when no `KseStore` is configured (dev / ephemeral),
+    /// though the manifest block is still written.
+    pub async fn git_persist(&self, repo: &str, git: &kotoba_git::GitStore<'_>) {
+        let cid = match git.snapshot_manifest() {
+            Ok(cid) => cid,
+            Err(e) => {
+                tracing::warn!(repo, error = %e, "git: snapshot_manifest failed");
+                return;
+            }
+        };
+        match self.kse_store.as_ref() {
+            Some(ks) => {
+                let key = Self::git_repo_key(repo);
+                if let Err(e) = ks.put(&key, Bytes::from(cid.to_multibase().into_bytes())).await {
+                    tracing::warn!(repo, error = %e, "git: persisting snapshot pointer failed");
+                }
+            }
+            None => tracing::debug!(
+                repo,
+                "git: no KseStore — snapshot block written but pointer is not durable"
+            ),
+        }
     }
 
     /// Attach a GossipSub outbound channel after construction.
@@ -1114,6 +1225,25 @@ impl KotobaState {
     ///
     /// The DEFAULT is `private` so CACAO is the canonical authentication path
     /// out-of-the-box.
+    /// Operator Ed25519 signing key — author-signs CommitDag commits the node
+    /// itself authors (R2b non-repudiation, ADR-sealed-cold-tier).
+    pub(crate) fn operator_signing_key(&self) -> ed25519_dalek::SigningKey {
+        self.identity.signing_key.clone()
+    }
+
+    /// Operator X25519 secret — this node's custodian key for opening the key
+    /// shares HPKE-wrapped to it (R3b `/kotoba/key/1`).
+    pub(crate) fn custodian_x25519_secret(&self) -> x25519_dalek::StaticSecret {
+        self.identity.dh_secret.clone()
+    }
+
+    /// This node's custodian X25519 PUBLIC key (hex) — operators dealing key
+    /// shares wrap this node's share to it (R3b). Public by design.
+    pub(crate) fn custodian_x25519_pubkey_hex(&self) -> String {
+        let pk = x25519_dalek::PublicKey::from(&self.identity.dh_secret);
+        hex::encode(pk.as_bytes())
+    }
+
     pub async fn graph_visibility(&self, cid: &KotobaCid) -> GraphVisibility {
         let registry = self.graph_registry.read().await;
         if let Some((_, v)) = registry.get(cid) {
@@ -1308,6 +1438,7 @@ impl KotobaState {
             .collect::<Vec<_>>();
         let distributed = DistributedCommitWriter::new(&*self.block_store, &*self.ipns_registry)
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph_cid.clone(),
                 datoms: distributed_datoms,
@@ -1336,7 +1467,9 @@ impl KotobaState {
             if let Some(tx_cid) = &tx_cid {
                 datom.tx = tx_cid.clone();
             }
-            self.journal_assert_datom(&graph_cid, &datom).await;
+            // Already committed to the CommitDag above (commit_datoms) — announce
+            // to the live-tail without a redundant Journal block.
+            self.journal_assert_datom_ephemeral(&graph_cid, &datom).await;
             self.quad_store
                 .apply_journaled_datom(graph_cid.clone(), datom)
                 .await;
@@ -1391,6 +1524,17 @@ impl KotobaState {
     ///
     /// Returns the JournalEntry CID string.
     pub async fn journal_assert(&self, quad: &Quad) -> String {
+        self.journal_assert_with(quad, true).await
+    }
+
+    /// Ephemeral assert: broadcast + ring (live-tail) but **no** block persist.
+    /// Used by the datomic commit path — the datom is already durable in the
+    /// CommitDag, so the Journal must not keep a redundant second copy.
+    pub async fn journal_assert_ephemeral(&self, quad: &Quad) -> String {
+        self.journal_assert_with(quad, false).await
+    }
+
+    async fn journal_assert_with(&self, quad: &Quad, persist: bool) -> String {
         let object_str = format!("{:?}", quad.object);
         let topic = Topic::quad_spo(
             &quad.graph.to_multibase(),
@@ -1410,7 +1554,11 @@ impl KotobaState {
                 .ok();
         }
 
-        let entry = self.journal.publish(topic, Bytes::from(payload)).await;
+        let entry = if persist {
+            self.journal.publish(topic, Bytes::from(payload)).await
+        } else {
+            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+        };
         entry.cid.to_multibase()
     }
 
@@ -1421,6 +1569,18 @@ impl KotobaState {
     /// back to Quad at the call site.
     pub async fn journal_assert_datom(&self, graph_cid: &KotobaCid, datom: &KqeDatom) -> String {
         self.journal_assert(&datom_journal_quad(graph_cid, datom))
+            .await
+    }
+
+    /// Ephemeral datom assert — live-tail broadcast only, no Journal block.
+    /// For callers whose datoms are already durable in the CommitDag (e.g. node
+    /// self-registration commits then announces), so the Journal copy is redundant.
+    pub async fn journal_assert_datom_ephemeral(
+        &self,
+        graph_cid: &KotobaCid,
+        datom: &KqeDatom,
+    ) -> String {
+        self.journal_assert_ephemeral(&datom_journal_quad(graph_cid, datom))
             .await
     }
 
@@ -1464,6 +1624,15 @@ impl KotobaState {
 
     /// Publish a Quad retract to the KSE Journal.
     pub async fn journal_retract(&self, quad: &Quad) -> String {
+        self.journal_retract_with(quad, true).await
+    }
+
+    /// Ephemeral retract: broadcast + ring (live-tail) but **no** block persist.
+    pub async fn journal_retract_ephemeral(&self, quad: &Quad) -> String {
+        self.journal_retract_with(quad, false).await
+    }
+
+    async fn journal_retract_with(&self, quad: &Quad, persist: bool) -> String {
         let topic = Topic(format!(
             "kotoba/retract/{}/{}/{}",
             quad.graph, quad.subject, quad.predicate
@@ -1478,7 +1647,11 @@ impl KotobaState {
                 .ok();
         }
 
-        let entry = self.journal.publish(topic, Bytes::from(payload)).await;
+        let entry = if persist {
+            self.journal.publish(topic, Bytes::from(payload)).await
+        } else {
+            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+        };
         entry.cid.to_multibase()
     }
 
@@ -1768,6 +1941,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,
@@ -1878,6 +2052,7 @@ mod tests {
         let writer = kotoba_datomic::distributed::DistributedCommitWriter::new(&*store, &*ipns);
         writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph,

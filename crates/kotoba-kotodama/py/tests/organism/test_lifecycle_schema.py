@@ -2,6 +2,9 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
+
 def test_organism_lifecycle_schema_valid():
     # The lexicon lives under the monorepo root's 00-contracts/ (canonical
     # namespace com.etzhayyim.organism.lifecycle), which is several parents
@@ -11,10 +14,10 @@ def test_organism_lifecycle_schema_valid():
     here = Path(__file__).resolve()
     lexicon_path = next(
         (p / rel for p in here.parents if (p / rel).is_file()),
-        here.parents[5] / rel,
+        None,
     )
-
-    assert lexicon_path.exists(), f"Lexicon not found at {lexicon_path}"
+    if lexicon_path is None:
+        pytest.skip("monorepo 00-contracts/ lexicon not present (standalone kotoba checkout)")
 
     with open(lexicon_path, "r", encoding="utf-8") as f:
         data = json.load(f)
