@@ -232,7 +232,7 @@ class KotobaDatomicClient:
     def q(self, query_edn: str, args: Sequence[Any] = (), *, graph: str | None = None) -> list[Any]:
         """Run a Datalog query (EDN ``[:find … :where …]``). Returns result rows."""
         g = graph or self.graph
-        st, body = self._post(NSID_Q, {"graph": g, "query": query_edn, "args": list(args)})
+        st, body = self._post(NSID_Q, {"graph": g, "query_edn": query_edn, "inputs_edn": [edn_val(a) for a in args]})
         if st != 200:
             raise KotobaTransactError(f"query failed: {st} {body}")
         return body.get("result", body.get("rows", []))
@@ -240,7 +240,7 @@ class KotobaDatomicClient:
     def pull(self, selector: str, eid: Any, *, graph: str | None = None) -> dict[str, Any]:
         """Pull an entity tree by selector + entity id (or lookup-ref)."""
         g = graph or self.graph
-        st, body = self._post(NSID_PULL, {"graph": g, "selector": selector, "eid": edn_val(eid)})
+        st, body = self._post(NSID_PULL, {"graph": g, "entity": str(eid), "pattern_edn": selector})
         if st != 200:
             raise KotobaTransactError(f"pull failed: {st} {body}")
         return body.get("entity", body)
