@@ -11811,3 +11811,45 @@ async fn audit_anchor_payload_after_receipted_read() {
     let head = body["headCid"].as_str().expect("headCid");
     assert!(head.starts_with('b'), "multibase head CID");
 }
+
+/// R2b: audit.verifyChain reports a fully-valid signed receipt chain over HTTP.
+#[tokio::test]
+async fn audit_verify_chain_reports_valid() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+
+    // One receipted read to create the audit chain.
+    let tok = tenant_jwt("did:key:zVerifyReader");
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: verify chain")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200);
+
+    let mut body = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, b) = s
+            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.verifyChain", &op_tok)
+            .await;
+        if status == 200 {
+            body = b;
+            break;
+        }
+    }
+    assert_eq!(body["ok"], true, "chain must verify: {body}");
+    assert!(body["depth"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(body["invalid"].as_array().map(|a| a.len()), Some(0));
+    // The node's commits are signed; with a did:key operator they are Valid.
+    let valid = body["valid"].as_u64().unwrap_or(0);
+    let unverifiable = body["unverifiable"].as_u64().unwrap_or(0);
+    assert!(valid + unverifiable >= 1, "signed commits counted: {body}");
+}

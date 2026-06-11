@@ -44,6 +44,8 @@ pub enum DistributedCommitError {
     Edn(String),
     #[error("block store: {0}")]
     Store(#[from] anyhow::Error),
+    #[error("import rejected: {0}")]
+    ImportRejected(String),
     #[error("ipns: {0}")]
     Ipns(#[from] IpnsRegistryError),
     #[error("ipns signature: {0}")]
@@ -2357,7 +2359,16 @@ where
     ipns: &'a R,
     /// When set, every commit this writer seals is author-signed (R2b).
     author_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// When set, a FOREIGN head adopted by the merge path must pass this check
+    /// (author-signature verification lives above this crate — kotoba-auth
+    /// resolves did:key — so it is injected as a callback). `Err(reason)` ⇒
+    /// the merge is refused with `ImportRejected`.
+    import_check: Option<ImportCheck>,
 }
+
+/// Callback verifying a foreign commit before the merge path adopts it.
+pub type ImportCheck =
+    std::sync::Arc<dyn Fn(&DistributedDatomCommit) -> Result<(), String> + Send + Sync>;
 
 impl<'a, R> DistributedCommitWriter<'a, R>
 where
@@ -2368,12 +2379,19 @@ where
             store,
             ipns,
             author_signing_key: None,
+            import_check: None,
         }
     }
 
     /// Author-sign every commit this writer seals (R2b non-repudiation).
     pub fn with_author_signing_key(mut self, key: Option<ed25519_dalek::SigningKey>) -> Self {
         self.author_signing_key = key;
+        self
+    }
+
+    /// Gate foreign heads adopted by the merge path (R2b import enforcement).
+    pub fn with_import_check(mut self, check: Option<ImportCheck>) -> Self {
+        self.import_check = check;
         self
     }
 
@@ -2801,6 +2819,16 @@ where
                         .ok_or_else(|| {
                             DistributedCommitError::MissingCommit(theirs.to_multibase())
                         })?;
+                    // R2b import enforcement: a foreign head must pass the
+                    // injected signature check before we merge on top of it.
+                    if let Some(check) = &self.import_check {
+                        check(&theirs_commit).map_err(|reason| {
+                            DistributedCommitError::ImportRejected(format!(
+                                "foreign head {}: {reason}",
+                                theirs.to_multibase()
+                            ))
+                        })?;
+                    }
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -9448,6 +9476,52 @@ mod author_sig_tests {
         let loaded = DistributedDatomCommit::load(&cid, &store).unwrap().unwrap();
         assert_eq!(loaded.author_sig, None);
         assert_eq!(loaded.cid, c.cid, "unsigned encoding unchanged (no field emitted)");
+    }
+
+    #[test]
+    fn merge_path_rejects_foreign_head_failing_import_check() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let ipns = kotoba_ipfs::InMemoryIpnsRegistry::new();
+        let req = |seq: u64, parent: Option<KotobaCid>| CommitDatomsRequest {
+            merge_parents: None,
+            covering_datoms: None,
+            ipns_name: "k51-import-gate-test".into(),
+            graph: KotobaCid::from_bytes(b"import-gate-graph"),
+            datoms: vec![Datom::assert(
+                KotobaCid::from_bytes(b"e"),
+                "a/b".into(),
+                kotoba_edn::EdnValue::string("v"),
+                KotobaCid::from_bytes(b"t"),
+            )],
+            expected_parent: parent,
+            tx_cid: Some(KotobaCid::from_bytes(b"t")),
+            author: "did:key:zForeign".into(),
+            seq,
+            valid_until: "2099-01-01T00:00:00Z".into(),
+            ttl_secs: Some(60),
+            cacao_proof_cid: None,
+            ipns_controller_did: None,
+            ipns_signing_key: None,
+        };
+        // Concurrent writer lands first → our CAS will see StaleParent.
+        DistributedCommitWriter::new(&store, &ipns)
+            .commit_datoms(req(1, None))
+            .unwrap();
+        // Our writer gates foreign heads with a reject-all check: the merge
+        // path must surface ImportRejected instead of merging on top.
+        let gated = DistributedCommitWriter::new(&store, &ipns).with_import_check(Some(
+            std::sync::Arc::new(|_: &DistributedDatomCommit| Err("rejected by test".into())),
+        ));
+        let err = gated
+            .commit_datoms_merging_with(req(1, None), true)
+            .unwrap_err();
+        assert!(
+            matches!(err, DistributedCommitError::ImportRejected(_)),
+            "got {err:?}"
+        );
+        // Without the gate, the same merge succeeds.
+        let open = DistributedCommitWriter::new(&store, &ipns);
+        open.commit_datoms_merging_with(req(1, None), true).unwrap();
     }
 
     #[test]

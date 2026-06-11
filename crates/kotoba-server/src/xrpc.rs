@@ -2668,8 +2668,12 @@ pub(crate) async fn commit_protocol_datoms(
     // R2b: author-sign commits the node itself authors. Client-authored
     // writes carry their own non-repudiation via cacao_proof_cid.
     let author_key = (author == state.operator_did).then(|| state.operator_signing_key());
+    let require_signed = std::env::var("KOTOBA_REQUIRE_SIGNED_COMMITS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
-        .with_author_signing_key(author_key);
+        .with_author_signing_key(author_key)
+        .with_import_check(Some(kotoba_auth::commit_import_check(require_signed)));
     let distributed = writer
         .commit_datoms(CommitDatomsRequest {
             merge_parents: None,
