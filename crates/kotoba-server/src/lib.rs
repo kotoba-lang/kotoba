@@ -7,6 +7,7 @@ pub mod dna_integrity;
 pub mod econ;
 pub mod email_xrpc;
 pub mod evm_rpc;
+pub mod access_receipt;
 pub mod fingerprint;
 pub mod firehose;
 pub mod git_http;
@@ -901,6 +902,9 @@ mod tests {
 }
 
 pub fn build_router(state: Arc<KotobaState>) -> Router {
+    // Access-receipt writer (ADR-sealed-cold-tier R1): single background task
+    // batching read receipts into audit-graph commits. Idempotent.
+    access_receipt::spawn_receipt_writer(Arc::clone(&state));
     // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
     // game snapshots are content-addressed into the block store + announced on
     // the KSE Journal. Idempotent; per-frame traffic never touches either.
@@ -915,6 +919,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     }
     Router::new()
         .route("/_app/meta", get(xrpc::health))
+        .route(
+            &format!("/xrpc/{}", access_receipt::NSID_AUDIT_LIST),
+            get(access_receipt::audit_list_receipts),
+        )
         .route("/health", get(xrpc::health))
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOM_CREATE),

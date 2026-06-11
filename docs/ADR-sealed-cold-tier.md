@@ -70,3 +70,41 @@ single key broker (CACAO + purpose, receipt datoms) → R2 per-DID signed
 Journal chains + receipt anchoring via `AnchorBridge.commitRoot` (kotoba-EVM
 R3) → R3 t-of-N custodians (VSS + MLS) + warrants/slashing via
 MishmarBondEscrow + read-side DNA policy.
+
+---
+
+## R1 — Access receipts (2026-06-11, same day)
+
+Status: **Accepted** (implemented)
+
+The accountability half of the X-Road statement. Instrumented read seams —
+`require_datomic_read{,_any_operation,_tx_range}` (covers every `datomic.*`
+read XRPC) and the four `kotobase.kg.*` read endpoints — now emit an
+**access receipt** for every authorized Authenticated/Private read:
+
+- Receipt datoms in the named graph `kotoba/audit/access-receipts/v1`
+  (`access/graph`, `access/accessor-did`, `access/operation`,
+  `access/purpose`, `access/ts-unix`) — immutable, time-travel queryable,
+  and on the same distributed-commit path as all data (R2 anchors them).
+- **Accessor identity**: presented CACAO's leaf `iss` (the delegate), else
+  Bearer JWT `sub`. Public reads are not receipted (no identity; Estonia's
+  tracker covers personal data, not open data).
+- **Purpose**: the `x-kotoba-purpose` request header (≤256 chars). Recorded
+  always; REQUIRED for Private-graph reads only when `KOTOBA_REQUIRE_PURPOSE`
+  is truthy — observe-first rollout so existing CACAO clients don't break.
+- **Write path**: handlers enqueue on an unbounded channel; one background
+  writer batches (`KOTOBA_RECEIPT_FLUSH_MS`, default 1000 ms, max 256/batch)
+  into a single `commit_protocol_datoms` tx per flush. Keeps the read hot
+  path at a channel send, serialises audit-graph commits (no IPNS head
+  races), and amortises commit cost — the lesson from the request-fingerprint
+  middleware's per-request commit pileup.
+- **Query surface**: `GET /xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts`
+  (`graph` / `accessor` filters, `limit`), operator-gated in R1. The
+  owner-facing CACAO gate (citizen Data Tracker analog) lands with per-graph
+  keys, where owner ≠ operator becomes the common case.
+
+R1 limitations (follow-ups): receipts are best-effort (fire-and-forget batch;
+fail-closed "no receipt, no read" arrives with the R2 signed journal);
+firehose / realtime / git-http read gates not yet instrumented; purpose is
+free text (Estonia-style coded purposes + legal-basis references when
+enforcement turns on).

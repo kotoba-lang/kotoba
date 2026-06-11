@@ -1453,36 +1453,49 @@ async fn require_datomic_read_any_operation(
     use crate::graph_auth::{check_read_access, AccessDenied};
 
     let graph_scope = graph.to_multibase();
-    if cacao_b64.is_some() {
-        if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
-            state,
-            &graph_scope,
-            cacao_b64,
-            operations,
-        ) {
-            enforce_datomic_temporal_tx_scope(&payload, as_of, since)?;
-            return Ok(());
-        }
-    }
-    if let Some(presentation) = presentation {
-        verify_vc_presentation_capability_any_operation(
-            state,
-            &graph_scope,
-            presentation,
-            operations,
-        )?;
-        return Ok(());
-    }
-
     let visibility = state.graph_visibility(graph).await;
-    check_read_access(
-        &visibility,
+    // Authorize via one of: CACAO operation grant, VC presentation, or the
+    // graph-visibility fallback gate.
+    'authorized: {
+        if cacao_b64.is_some() {
+            if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
+                state,
+                &graph_scope,
+                cacao_b64,
+                operations,
+            ) {
+                enforce_datomic_temporal_tx_scope(&payload, as_of, since)?;
+                break 'authorized;
+            }
+        }
+        if let Some(presentation) = presentation {
+            verify_vc_presentation_capability_any_operation(
+                state,
+                &graph_scope,
+                presentation,
+                operations,
+            )?;
+            break 'authorized;
+        }
+        check_read_access(
+            &visibility,
+            headers,
+            cacao_b64,
+            Some(state.operator_did.as_str()),
+            None,
+        )
+        .map_err(AccessDenied::into_response)?;
+    }
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt for every
+    // authorized non-public datomic read, regardless of which gate passed.
+    crate::access_receipt::enforce_and_record(
+        state,
         headers,
         cacao_b64,
-        Some(state.operator_did.as_str()),
-        None,
+        graph,
+        &visibility,
+        operations.first().copied().unwrap_or("datom:read"),
     )
-    .map_err(AccessDenied::into_response)
 }
 
 async fn require_datomic_read_tx_range(
@@ -1498,46 +1511,57 @@ async fn require_datomic_read_tx_range(
     use crate::graph_auth::{check_read_access, AccessDenied};
 
     let graph_scope = graph.to_multibase();
-    if cacao_b64.is_some() {
-        if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
-            state,
-            &graph_scope,
-            cacao_b64,
-            operations,
-        ) {
-            enforce_datomic_range_tx_scope(&payload, start, end)?;
-            return Ok(());
+    let visibility = state.graph_visibility(graph).await;
+    'authorized: {
+        if cacao_b64.is_some() {
+            if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
+                state,
+                &graph_scope,
+                cacao_b64,
+                operations,
+            ) {
+                enforce_datomic_range_tx_scope(&payload, start, end)?;
+                break 'authorized;
+            }
         }
-    }
-    if let Some(presentation) = presentation {
-        verify_vc_presentation_capability_any_operation(
-            state,
-            &graph_scope,
-            presentation,
-            operations,
-        )?;
-        if vc_presentation_declares_tx_scope(presentation) {
-            enforce_vc_presentation_range_tx_scope(
+        if let Some(presentation) = presentation {
+            verify_vc_presentation_capability_any_operation(
                 state,
                 &graph_scope,
                 presentation,
                 operations,
-                start,
-                end,
             )?;
+            if vc_presentation_declares_tx_scope(presentation) {
+                enforce_vc_presentation_range_tx_scope(
+                    state,
+                    &graph_scope,
+                    presentation,
+                    operations,
+                    start,
+                    end,
+                )?;
+            }
+            break 'authorized;
         }
-        return Ok(());
+        check_read_access(
+            &visibility,
+            headers,
+            cacao_b64,
+            Some(state.operator_did.as_str()),
+            None,
+        )
+        .map_err(AccessDenied::into_response)?;
     }
-
-    let visibility = state.graph_visibility(graph).await;
-    check_read_access(
-        &visibility,
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt (see
+    // require_datomic_read_any_operation).
+    crate::access_receipt::enforce_and_record(
+        state,
         headers,
         cacao_b64,
-        Some(state.operator_did.as_str()),
-        None,
+        graph,
+        &visibility,
+        operations.first().copied().unwrap_or("datom:read"),
     )
-    .map_err(AccessDenied::into_response)
 }
 
 fn enforce_datomic_temporal_tx_scope(

@@ -318,6 +318,14 @@ pub struct KotobaState {
     /// Replay-prevention registry for CACAO nonces (CAIP-74 §8).
     /// Tracks each nonce until the corresponding CACAO expires.
     pub nonce_store: Arc<crate::nonce_store::NonceStore>,
+    // ── Access receipts (ADR-sealed-cold-tier R1) ─────────────────────────────
+    /// Read handlers enqueue receipts here; ONE background writer batches them
+    /// into audit-graph commits (`access_receipt::spawn_receipt_writer`).
+    pub receipt_tx: tokio::sync::mpsc::UnboundedSender<crate::access_receipt::AccessReceipt>,
+    /// Receiver parked until `spawn_receipt_writer` takes it (once).
+    pub receipt_rx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::access_receipt::AccessReceipt>>,
+    >,
     // ── Write-cost economy (ADR-2606013400) ───────────────────────────────────
     /// Per-DID mKOTO balance ledger. `datomic.transact` debits the writer here;
     /// the operator is exempt/unlimited. See `crate::econ::Econ`.
@@ -853,6 +861,7 @@ impl KotobaState {
         // Write-cost economy (ADR-2606013400) — operator-funded mKOTO ledger.
         let econ = crate::econ::Econ::from_env(operator_did.clone());
 
+        let (receipt_tx, receipt_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
             mv_registry: Arc::new(tokio::sync::RwLock::new(
@@ -891,6 +900,8 @@ impl KotobaState {
             graph_registry,
             econ,
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
+            receipt_tx,
+            receipt_rx: std::sync::Mutex::new(Some(receipt_rx)),
             datomic_live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             datomic_cold_db_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             git_repos: Arc::new(tokio::sync::RwLock::new(HashMap::new())),

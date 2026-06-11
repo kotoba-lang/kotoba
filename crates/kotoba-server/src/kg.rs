@@ -490,6 +490,15 @@ pub async fn kg_entity(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        q.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:entity",
+    )?;
 
     let (lookup_pred, lookup_val) = match (&q.id, &q.qid) {
         (Some(id), _) => {
@@ -657,6 +666,15 @@ pub async fn kg_catalog(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        q.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:catalog",
+    )?;
 
     let quads = current_graph_quads(&state, &graph_cid).await?;
     let entity_count = quads
@@ -851,6 +869,15 @@ pub async fn kg_search(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        q.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:search",
+    )?;
 
     // Use inference engine for query embedding when available, matching kg_embed semantics.
     // Falls back to blake3 pseudo-vector so search works without an LLM.
@@ -1928,6 +1955,15 @@ pub async fn kg_query(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        req.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:query",
+    )?;
     // Persist emit_cid envelopes only for Public graphs (block.get is
     // unauthenticated — see put_envelope).
     let kg_persist = matches!(visibility, kotoba_core::named_graph::GraphVisibility::Public);

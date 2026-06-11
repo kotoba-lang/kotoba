@@ -11699,3 +11699,65 @@ async fn commit_store_oversized_graph_returns_400() {
         "oversized graph must be rejected before CACAO: {body}"
     );
 }
+
+// ── Access receipts (ADR-sealed-cold-tier R1) ────────────────────────────────
+
+/// Full loop: an authenticated kg read with a declared purpose produces a
+/// receipt in the audit graph, listable via audit.listReceipts (operator-gated).
+#[tokio::test]
+async fn access_receipt_recorded_and_listable() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zReceiptReader");
+
+    // Authenticated-tier read (KOTOBA_DEFAULT_VISIBILITY=authenticated in
+    // TestServer) with a declared purpose.
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: verify receipt loop")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200, "kg.catalog read must succeed");
+
+    // The background writer flushes within ~50ms; poll the audit endpoint.
+    let op_tok = tenant_jwt(&s.operator_did);
+    let mut receipts = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = s
+            .get_with_auth(
+                "/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts?accessor=did:key:zReceiptReader",
+                &op_tok,
+            )
+            .await;
+        assert_eq!(status, 200, "audit.listReceipts: {body}");
+        if body["count"].as_u64().unwrap_or(0) >= 1 {
+            receipts = body;
+            break;
+        }
+    }
+    let list = receipts["receipts"].as_array().expect("receipt recorded within 4s");
+    let r0 = &list[0];
+    assert_eq!(r0["accessorDid"], "did:key:zReceiptReader");
+    assert_eq!(r0["operation"], "kg:catalog");
+    assert_eq!(r0["purpose"], "e2e: verify receipt loop");
+    assert!(r0["graph"].as_str().is_some());
+    assert!(r0["tsUnix"].as_i64().unwrap_or(0) > 1_700_000_000);
+}
+
+/// audit.listReceipts is operator-only: a non-operator JWT is rejected.
+#[tokio::test]
+async fn audit_list_receipts_rejects_non_operator() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zSomeoneElse");
+    let (status, _) = s
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts", &tok)
+        .await;
+    assert_eq!(status, 401);
+}
