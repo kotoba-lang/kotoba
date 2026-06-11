@@ -229,3 +229,30 @@ the operator — who already knows the key; Feldman closes the gap when
 re-dealing moves to custodians in R3c). No network surface yet. Mixed-dealing
 shares combine to garbage, not an error (commitments are per-dealing;
 quorum tooling in R3b tags dealings with a deal-id).
+
+### R3b — custodian protocol core (`/kotoba/key/1`), 2026-06-11
+
+Status: **core implemented** (transport shell deferred, like kotoba-turn #102)
+
+`kotoba-custody::protocol` carries the wire types + the load-bearing
+invariant, transport-agnostic:
+
+- `KeyShareRequest { graph_cid_mb, cacao_b64, purpose, nonce,
+  requester_x25519_pk }` → `KeyShareResponse::{Granted(GrantedShare), Denied}`.
+- `handle_key_share_request(req, my_share, my_sk, authorize)` — the custodian
+  calls the injected `authorize` closure FIRST (CACAO chain + purpose policy +
+  nonce + **receipt write** all happen there); only on `Ok` does it open its
+  at-rest share and re-wrap it (HPKE) to the requester's ephemeral pubkey.
+  **"no receipt, no key" is control-flow-enforced** — a denied request never
+  touches share material (test-pinned), and the authorize hook fires even when
+  it denies (so the receipt precedes any release).
+- `combine_granted(t, grants, requester_sk)` — requester opens t re-wrapped
+  shares and recombines the key locally; t−1 grants cannot.
+- Authorization is injected (server layer resolves CACAO via kotoba-auth +
+  writes the receipt via access_receipt), keeping kotoba-custody a leaf crate
+  — same seam discipline as the R2c import check.
+
+A share in flight is sealed to the requester's key, so an eavesdropper or a
+different requester cannot read it (test-pinned). The libp2p request-response
+Behaviour (PeerID = did:key at Noise) is the remaining thin shell; R3c
+(Feldman VSS + MLS epochs) and R3d (bonds/warrants) follow.
