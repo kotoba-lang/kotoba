@@ -96,6 +96,31 @@ pub enum Builtin {
     /// handle, or `0` (the nil-ish sentinel) on the `err` variant — the i64
     /// value model has no exceptions, so a failed inference reads as empty.
     LlmInfer,
+    /// `(kqe-assert! graph subject predicate object-cbor)` — host call into the
+    /// `kotoba:kais` `kqe` interface (`assert-quad: func(quad) -> result<_,
+    /// string>`). All four arguments are string handles — the WIT record's
+    /// fields each flatten to a `(ptr,len)` pair, and `object-cbor` is the
+    /// CBOR-encoded QuadObject (buildable with the CBOR encoder prelude).
+    /// Returns `1` on ok, `0` on the err variant. **This is the Datom write
+    /// surface**: each call buffers an assertion the host commits after `run`
+    /// returns (`HostState::pending_asserts`, 10 gas).
+    KqeAssert,
+    /// `(kqe-retract! graph subject predicate object-cbor)` — `retract-quad`,
+    /// the tombstone twin of [`Builtin::KqeAssert`]. Same shape; returns 1/0.
+    KqeRetract,
+    /// `(kqe-get-objects graph subject predicate)` — SPO point lookup
+    /// (`get-objects: func(string,string,string) -> list<list<u8>>`, 5 gas).
+    /// Returns a packed **list handle** `(ptr << 32) | count` over the lifted
+    /// element array (8 bytes per element: `[ptr:i32, len:i32]`). Read it with
+    /// the [`crate::KQE_PRELUDE`] accessors `kqe-count` / `kqe-obj-nth`.
+    KqeGetObjects,
+    /// `(kqe-query predicate-filter)` — snapshot query (`query: func(string) ->
+    /// result<list<quad>, string>`, 100 gas; empty filter = all quads). Returns
+    /// a packed list handle `(ptr << 32) | count` over the lifted quad array
+    /// (32 bytes per quad: 4 × `[ptr,len]` for graph/subject/predicate/
+    /// object-cbor), or `0` on err. Read with `kqe-count` /
+    /// `kqe-quad-{graph,subject,predicate,object}`.
+    KqeQuery,
 }
 
 impl Builtin {
@@ -106,6 +131,10 @@ impl Builtin {
         match self {
             Builtin::HasCapability => Some(HostImport::HasCapability),
             Builtin::LlmInfer => Some(HostImport::LlmInfer),
+            Builtin::KqeAssert => Some(HostImport::KqeAssertQuad),
+            Builtin::KqeRetract => Some(HostImport::KqeRetractQuad),
+            Builtin::KqeGetObjects => Some(HostImport::KqeGetObjects),
+            Builtin::KqeQuery => Some(HostImport::KqeQuery),
             _ => None,
         }
     }
@@ -123,6 +152,21 @@ pub enum HostImport {
     /// result<list<u8>, string>`. Indirect result: lowers with a trailing
     /// return-area pointer the guest allocates.
     LlmInfer,
+    /// `kotoba:kais/kqe@0.1.0` → `assert-quad: func(quad) -> result<_,
+    /// string>`. The `quad` record flattens to 8 i32 params (4 × `(ptr,len)`);
+    /// the result is indirect (12-byte return area: `[tag:u8 @0, err-ptr @4,
+    /// err-len @8]`).
+    KqeAssertQuad,
+    /// `kotoba:kais/kqe@0.1.0` → `retract-quad` — same core shape as
+    /// [`HostImport::KqeAssertQuad`].
+    KqeRetractQuad,
+    /// `kotoba:kais/kqe@0.1.0` → `get-objects: func(string,string,string) ->
+    /// list<list<u8>>`. Indirect result (8-byte return area: `[ptr @0, len @4]`).
+    KqeGetObjects,
+    /// `kotoba:kais/kqe@0.1.0` → `query: func(string) -> result<list<quad>,
+    /// string>`. Indirect result (12-byte return area, same variant layout as
+    /// `llm.infer`).
+    KqeQuery,
 }
 
 impl HostImport {
@@ -132,6 +176,10 @@ impl HostImport {
         match self {
             HostImport::HasCapability => ("kotoba:kais/auth@0.1.0", "has-capability"),
             HostImport::LlmInfer => ("kotoba:kais/llm@0.1.0", "infer"),
+            HostImport::KqeAssertQuad => ("kotoba:kais/kqe@0.1.0", "assert-quad"),
+            HostImport::KqeRetractQuad => ("kotoba:kais/kqe@0.1.0", "retract-quad"),
+            HostImport::KqeGetObjects => ("kotoba:kais/kqe@0.1.0", "get-objects"),
+            HostImport::KqeQuery => ("kotoba:kais/kqe@0.1.0", "query"),
         }
     }
 }
@@ -165,6 +213,10 @@ impl Builtin {
             "store32!" => Builtin::Store32,
             "has-capability?" => Builtin::HasCapability,
             "llm-infer" => Builtin::LlmInfer,
+            "kqe-assert!" => Builtin::KqeAssert,
+            "kqe-retract!" => Builtin::KqeRetract,
+            "kqe-get-objects" => Builtin::KqeGetObjects,
+            "kqe-query" => Builtin::KqeQuery,
             _ => return None,
         })
     }
@@ -751,6 +803,9 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,
         Builtin::Div | Builtin::Mod | Builtin::ByteAt | Builtin::ByteAppend => n == 2,
         Builtin::Eq | Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n == 2,
+        Builtin::KqeAssert | Builtin::KqeRetract => n == 4,
+        Builtin::KqeGetObjects => n == 3,
+        Builtin::KqeQuery => n == 1,
     };
     if ok {
         Ok(())
