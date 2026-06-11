@@ -214,8 +214,10 @@ impl<C: BlockStore + 'static> SealedBlockStore<C> {
             rec[..36].copy_from_slice(&cid.0);
             rec[36..].copy_from_slice(&sealed.0);
             let mut f = f.lock().unwrap();
+            // Page-cache durability is sufficient (no fsync): the mapping is
+            // deterministically rebuildable by re-sealing the plaintext, so a
+            // crash-lost record costs one re-put, not data.
             f.write_all(&rec).context("append sealed index")?;
-            f.flush().context("flush sealed index")?;
         }
         Ok(())
     }
@@ -516,6 +518,22 @@ mod tests {
         assert!(store.is_pinned(&cid), "wrapper view stays plaintext-keyed");
         store.unpin(&cid);
         assert!(!store.is_pinned(&cid));
+    }
+
+    #[test]
+    fn stale_index_entry_falls_back_and_returns_none() {
+        // Mapping exists but the sealed block vanished from the inner store
+        // (e.g. cold-tier GC) and there is no legacy plaintext block either:
+        // get must degrade to Ok(None), not error.
+        let store = sealed_mem();
+        let data = b"stale mapping";
+        let cid = KotobaCid::from_bytes(data);
+        store.put(&cid, data).unwrap();
+        let sealed = store.sealed_cid(&cid).unwrap();
+        store.inner().delete(&sealed).unwrap();
+        assert!(store.sealed_cid(&cid).is_some(), "mapping intentionally stale");
+        assert!(store.get(&cid).unwrap().is_none());
+        assert!(!store.has(&cid));
     }
 
     #[test]
