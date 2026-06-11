@@ -256,3 +256,28 @@ A share in flight is sealed to the requester's key, so an eavesdropper or a
 different requester cannot read it (test-pinned). The libp2p request-response
 Behaviour (PeerID = did:key at Noise) is the remaining thin shell; R3c
 (Feldman VSS + MLS epochs) and R3d (bonds/warrants) follow.
+
+### R3b (server wiring) — `key.{requestShare,depositShare,custodianInfo}` XRPC, 2026-06-11
+
+The custodian protocol core (kotoba-custody) is now reachable over XRPC; this
+node acts as one custodian:
+
+- **`key.custodianInfo`** (GET, public) — returns this node's DID + X25519
+  pubkey so an operator dealing shares can wrap this node's share to it.
+- **`key.depositShare`** (POST, operator-gated) — installs a `CustodianShare`
+  for a graph into the in-memory `custody_shares` registry.
+- **`key.requestShare`** (POST) — the release path. Builds the `authorize`
+  closure injected into `handle_key_share_request`: for a Private graph it
+  verifies a CACAO `datom:read` capability (issuer/aud/replay via
+  `verify_cacao_graph_operation`), applies the purpose policy, and writes an
+  `operation = key:requestShare` access receipt — THEN the protocol core opens
+  this node's share and re-wraps it to the requester's ephemeral X25519 key.
+  A denied request returns `{ok:false}` with no share material; the receipt is
+  written before any release (the "no receipt, no key" invariant, now spanning
+  the network boundary). The requester collects `threshold` grants from
+  distinct custodian nodes and recombines locally (`combine_granted`).
+
+Remaining R3: a libp2p request-response transport (the XRPC surface proves the
+semantics; libp2p is the production carrier), per-graph key actually SPLIT to
+custodians at seal time (today the operator deals manually), R3c VSS+MLS, R3d
+bonds/warrants.
