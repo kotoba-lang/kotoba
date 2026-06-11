@@ -11142,6 +11142,11 @@ async fn request_log_query_returns_entries_after_requests() {
         "method missing: {entry}"
     );
     assert!(entry["path"].as_str().is_some(), "path missing: {entry}");
+    assert_eq!(
+        entry["principal_did"].as_str(),
+        Some(s.operator_did.as_str()),
+        "principal_did must be decoded from bearer JWT sub: {entry}"
+    );
 }
 
 #[tokio::test]
