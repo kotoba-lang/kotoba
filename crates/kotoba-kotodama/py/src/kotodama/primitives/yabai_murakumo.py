@@ -162,16 +162,20 @@ def _strip(ent: Any, ns: str) -> dict[str, Any]:
 
 
 def _pull_by_attr(ns: str, attr: str, value: str) -> str:
-    return f"[:find (pull ?e [*]) :where [?e :{ns}/{attr} {edn_str(value)}]]"
+    return f"{{:find [?e] :where [[?e :{ns}/{attr} {edn_str(value)}]]}}"
 
 
 def _all_jobs_query() -> str:
-    return f"[:find (pull ?e [*]) :where [?e :{NS_JOB}/id _]]"
+    return f"{{:find [?e] :where [[?e :{NS_JOB}/id ?id]]}}"
 
 
 def _entity(item: Any, ns: str) -> dict[str, Any]:
     ent = item[0] if isinstance(item, (list, tuple)) and item else item
     return _strip(ent, ns)
+
+
+def _pull_entity(client: KotobaDatomicClient, eid: str, ns: str) -> dict[str, Any]:
+    return _strip(client.pull("[*]", eid, graph=QUEUE_GRAPH), ns)
 
 
 def enqueue_job(
@@ -216,7 +220,7 @@ def _checkpoint(client: KotobaDatomicClient, job_id: str, step: str, status: str
 
 def _load_job(client: KotobaDatomicClient, job_id: str) -> dict[str, Any] | None:
     rows = client.q(_pull_by_attr(NS_JOB, "id", job_id), graph=QUEUE_GRAPH)
-    jobs = [_entity(row, NS_JOB) for row in rows]
+    jobs = [_pull_entity(client, str(row[0]), NS_JOB) for row in rows if row]
     jobs = [job for job in jobs if job]
     if not jobs:
         return None
@@ -226,7 +230,7 @@ def _load_job(client: KotobaDatomicClient, job_id: str) -> dict[str, Any] | None
 
 def _ready_jobs(client: KotobaDatomicClient) -> list[dict[str, Any]]:
     rows = client.q(_all_jobs_query(), graph=QUEUE_GRAPH)
-    jobs = [_entity(row, NS_JOB) for row in rows]
+    jobs = [_pull_entity(client, str(row[0]), NS_JOB) for row in rows if row]
     jobs = [job for job in jobs if job.get("status") == "pending"]
     jobs.sort(key=lambda job: (int(job.get("priority") or 100), int(job.get("created_at") or 0)))
     return jobs
@@ -236,14 +240,14 @@ def _job_counts(client: KotobaDatomicClient) -> dict[str, int]:
     rows = client.q(_all_jobs_query(), graph=QUEUE_GRAPH)
     counts: dict[str, int] = {}
     for row in rows:
-        status = str(_entity(row, NS_JOB).get("status") or "unknown")
+        status = str(_pull_entity(client, str(row[0]), NS_JOB).get("status") or "unknown")
         counts[status] = counts.get(status, 0) + 1
     return counts
 
 
 def _latest_jobs(client: KotobaDatomicClient, limit: int = 20) -> list[dict[str, Any]]:
     rows = client.q(_all_jobs_query(), graph=QUEUE_GRAPH)
-    jobs = [_entity(row, NS_JOB) for row in rows]
+    jobs = [_pull_entity(client, str(row[0]), NS_JOB) for row in rows if row]
     jobs = [job for job in jobs if job]
     jobs.sort(key=lambda job: int(job.get("updated_at") or 0), reverse=True)
     return jobs[:limit]
