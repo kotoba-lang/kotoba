@@ -62,6 +62,10 @@ pub struct AccessReceipt {
     pub operation: String,
     pub purpose: Option<String>,
     pub ts_unix: u64,
+    /// CID of the presented CACAO's CBOR bytes (pinned to the block store) —
+    /// the requester-signed half of the two-party evidence (R2b): the receipt
+    /// commit is operator-signed (author_sig), the CACAO is requester-signed.
+    pub cacao_cid: Option<String>,
 }
 
 /// Extract + sanitise the declared purpose from `x-kotoba-purpose`.
@@ -146,6 +150,18 @@ pub(crate) fn enforce_and_record(
             ),
         ));
     }
+    // Pin the presented CACAO bytes as requester-signed evidence (only when
+    // they actually parse — garbage would not have passed a Private gate).
+    let cacao_cid = cacao_b64
+        .and_then(|b64| B64.decode(b64).ok())
+        .filter(|cbor| kotoba_auth::Cacao::from_cbor(cbor).is_ok())
+        .map(|cbor| {
+            let cid = KotobaCid::from_bytes(&cbor);
+            if let Err(e) = state.block_store.put(&cid, &cbor) {
+                tracing::warn!(err = %e, "cacao evidence block put failed");
+            }
+            cid.to_multibase()
+        });
     let receipt = AccessReceipt {
         graph_mb: graph.to_multibase(),
         accessor_did: accessor_from_request(headers, cacao_b64, visibility),
@@ -155,6 +171,7 @@ pub(crate) fn enforce_and_record(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        cacao_cid,
     };
     if state.receipt_tx.send(receipt).is_err() {
         // Writer task gone (shutdown or never spawned outside a runtime):
@@ -218,6 +235,14 @@ pub(crate) fn build_receipt_datoms(
             subject.clone(),
             "access/purpose".to_string(),
             kotoba_edn::EdnValue::string(purpose),
+            tx_cid.clone(),
+        ));
+    }
+    if let Some(cacao_cid) = &r.cacao_cid {
+        datoms.push(kotoba_datomic::Datom::assert(
+            subject.clone(),
+            "access/cacao-cid".to_string(),
+            kotoba_edn::EdnValue::string(cacao_cid),
             tx_cid.clone(),
         ));
     }
@@ -371,6 +396,7 @@ pub async fn audit_list_receipts(
             "access/accessor-did" => "accessorDid",
             "access/operation" => "operation",
             "access/purpose" => "purpose",
+            "access/cacao-cid" => "cacaoCid",
             "access/ts-unix" => "tsUnix",
             _ => continue,
         };
@@ -418,6 +444,7 @@ mod tests {
             operation: "datom:q".into(),
             purpose: Some("billing-dispute #42".into()),
             ts_unix: 1_780_000_000,
+            cacao_cid: None,
         }
     }
 
@@ -482,7 +509,8 @@ mod tests {
 
     #[test]
     fn receipt_datoms_carry_all_fields() {
-        let r = receipt();
+        let mut r = receipt();
+        r.cacao_cid = Some("bcacaoevidence".into());
         let subject = receipt_cid(&r, 1);
         let tx = KotobaCid::from_bytes(b"tx");
         let datoms = build_receipt_datoms(&r, &subject, &tx);
@@ -494,7 +522,8 @@ mod tests {
                 "access/operation",
                 "access/ts-unix",
                 "access/accessor-did",
-                "access/purpose"
+                "access/purpose",
+                "access/cacao-cid"
             ]
         );
         assert!(datoms.iter().all(|d| d.t == tx && d.added));
@@ -534,6 +563,7 @@ mod write_path_tests {
             operation: "datom:q".into(),
             purpose: Some("unit".into()),
             ts_unix: 1_780_000_123,
+            cacao_cid: None,
         };
         write_receipt_batch(&state, vec![r]).await;
         let quads = state
@@ -574,6 +604,7 @@ mod writer_task_tests {
                 operation: "kg:catalog".into(),
                 purpose: Some("ct".into()),
                 ts_unix: 1_780_000_456,
+                cacao_cid: None,
             })
             .expect("send");
         for _ in 0..50 {
@@ -711,6 +742,7 @@ mod anchor_tests {
                 operation: "datom:q".into(),
                 purpose: Some("anchor-test".into()),
                 ts_unix: 1_780_000_789,
+                cacao_cid: None,
             }],
         )
         .await;
@@ -731,5 +763,53 @@ mod anchor_tests {
         assert!(calldata
             .windows(mb.len())
             .any(|w| w == mb.as_bytes()));
+    }
+}
+
+#[cfg(test)]
+mod signed_commit_tests {
+    use super::*;
+
+    /// R2b: the audit-graph head commit is author-signed by the operator and
+    /// verifiable from the author DID alone (did:key → pubkey → verify).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn receipt_commit_is_author_signed_and_did_verifiable() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = crate::server::KotobaState::new(None).expect("state");
+        write_receipt_batch(
+            &state,
+            vec![AccessReceipt {
+                graph_mb: "btarget".into(),
+                accessor_did: Some("did:key:zR2b".into()),
+                operation: "datom:q".into(),
+                purpose: Some("sig-test".into()),
+                ts_unix: 1_780_001_000,
+                cacao_cid: None,
+            }],
+        )
+        .await;
+        let ipns = crate::xrpc::distributed_graph_ipns_name(&receipts_graph_cid());
+        let record = state
+            .ipns_registry
+            .resolve(&kotoba_ipfs::IpnsName::new(ipns))
+            .expect("audit head");
+        let head = KotobaCid::from_multibase(&record.value).expect("head CID");
+        let commit = kotoba_datomic::distributed::DistributedDatomCommit::load(
+            &head,
+            &*state.block_store,
+        )
+        .expect("load")
+        .expect("commit block");
+        assert_eq!(commit.author, state.operator_did);
+        assert!(commit.author_sig.is_some(), "audit commit must be signed");
+        // Verify with the node key…
+        let vk = state.operator_signing_key().verifying_key();
+        assert!(commit.verify_author_sig(&vk).unwrap());
+        // …and via the author DID alone (what a third-party verifier does).
+        if commit.author.starts_with("did:key:") {
+            let pk = kotoba_auth::parse_ed25519_did_key(&commit.author).expect("did:key");
+            let vk2 = ed25519_dalek::VerifyingKey::from_bytes(&pk).expect("pubkey");
+            assert!(commit.verify_author_sig(&vk2).unwrap());
+        }
     }
 }

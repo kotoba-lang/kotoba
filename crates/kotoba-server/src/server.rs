@@ -1219,6 +1219,12 @@ impl KotobaState {
     ///
     /// The DEFAULT is `private` so CACAO is the canonical authentication path
     /// out-of-the-box.
+    /// Operator Ed25519 signing key — author-signs CommitDag commits the node
+    /// itself authors (R2b non-repudiation, ADR-sealed-cold-tier).
+    pub(crate) fn operator_signing_key(&self) -> ed25519_dalek::SigningKey {
+        self.identity.signing_key.clone()
+    }
+
     pub async fn graph_visibility(&self, cid: &KotobaCid) -> GraphVisibility {
         let registry = self.graph_registry.read().await;
         if let Some((_, v)) = registry.get(cid) {

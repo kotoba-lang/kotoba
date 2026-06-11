@@ -2665,7 +2665,11 @@ pub(crate) async fn commit_protocol_datoms(
     if let Some(auth_capability) = &auth_capability {
         append_auth_capability_datoms(&mut datoms, &tx_cid, auth_capability);
     }
-    let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
+    // R2b: author-sign commits the node itself authors. Client-authored
+    // writes carry their own non-repudiation via cacao_proof_cid.
+    let author_key = (author == state.operator_did).then(|| state.operator_signing_key());
+    let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
+        .with_author_signing_key(author_key);
     let distributed = writer
         .commit_datoms(CommitDatomsRequest {
             merge_parents: None,

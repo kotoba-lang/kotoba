@@ -128,3 +128,37 @@ operator cannot silently rewrite or drop receipts committed before the anchor.
 Remaining for full R2: per-DID signed Journal chains (requester
 countersignature → non-repudiation), scheduled relayer submits, and an anchor
 verification endpoint (head CID ↔ on-chain root cross-check).
+
+---
+
+## R2b — Author-signed CommitDag + requester evidence (2026-06-11)
+
+Status: **Accepted** (implemented). Substrate decision: the **CommitDag, not
+the KSE Journal** (deprecated, [knowledge.journal-deprecation]) — the commit
+chain already had content addressing, `parents` hash-chaining, author DIDs,
+IPNS heads and Base anchoring; the only missing piece was a signature.
+
+- **`DistributedDatomCommit.author_sig`** — Ed25519 over `signed_payload()`,
+  a CANONICAL encoding of all signed fields (`index_roots` as a sorted
+  BTreeMap — HashMap order is instance-dependent, so re-encoding a loaded
+  commit would not be byte-identical). Git-style embedded signature: the
+  commit CID covers the signature. `#[serde(skip_serializing_if)]` ⇒ pre-R2b
+  blocks decode unchanged with `author_sig = None`.
+- **Signing**: `DistributedCommitWriter::with_author_signing_key` signs every
+  sealed commit. `commit_protocol_datoms` passes the operator's AgentIdentity
+  key when `author == operator_did` — so audit-graph receipt commits (and all
+  node-authored protocol commits) are now operator-signed. Client-authored
+  writes keep their own non-repudiation via `cacao_proof_cid`.
+- **Verification**: `verify_author_sig(verifying_key)`; key resolution from
+  the author DID stays above kotoba-datomic (kotoba-auth depends on it) —
+  `parse_ed25519_did_key(author)` at the caller. Third-party verification
+  needs only the commit block + the author DID.
+- **Requester half**: receipts now carry `access/cacao-cid` — the presented
+  CACAO's CBOR pinned to the block store. Receipt commit (operator-signed) +
+  CACAO (requester-signed, nonce-bound) = two-party non-repudiation without a
+  new countersignature protocol.
+
+Anchored (R2a) + author-signed (R2b) ⇒ the audit chain is now tamper-evident
+against the operator AND attributable: 誰も「書いてない/読んでない」と言えない.
+Remaining: import-time signature enforcement on peer sync, signed IPNS heads
+default-on, scheduled relayer submits, anchor verification endpoint.

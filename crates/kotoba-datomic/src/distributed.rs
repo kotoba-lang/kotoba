@@ -96,6 +96,13 @@ pub struct DistributedDatomCommit {
     pub index_roots: HashMap<String, KotobaCid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cacao_proof_cid: Option<KotobaCid>,
+    /// Ed25519 signature by `author` over `signed_payload()` — the canonical
+    /// DAG-CBOR encoding of this commit with THIS FIELD ABSENT (git-style
+    /// embedded signature; the commit CID then covers the signature too).
+    /// `None` = unsigned; pre-R2b commit blocks decode unchanged
+    /// (ADR-sealed-cold-tier R2b / [knowledge.journal-deprecation]).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub author_sig: Option<Vec<u8>>,
 }
 
 /// Process Hybrid Logical Clock. Packs `physical_ms << 16 | counter`; advances to
@@ -2348,6 +2355,8 @@ where
 {
     store: &'a dyn BlockStore,
     ipns: &'a R,
+    /// When set, every commit this writer seals is author-signed (R2b).
+    author_signing_key: Option<ed25519_dalek::SigningKey>,
 }
 
 impl<'a, R> DistributedCommitWriter<'a, R>
@@ -2355,7 +2364,17 @@ where
     R: IpnsRegistry + ?Sized,
 {
     pub fn new(store: &'a dyn BlockStore, ipns: &'a R) -> Self {
-        Self { store, ipns }
+        Self {
+            store,
+            ipns,
+            author_signing_key: None,
+        }
+    }
+
+    /// Author-sign every commit this writer seals (R2b non-repudiation).
+    pub fn with_author_signing_key(mut self, key: Option<ed25519_dalek::SigningKey>) -> Self {
+        self.author_signing_key = key;
+        self
     }
 
     pub fn commit_datoms(
@@ -2463,6 +2482,10 @@ where
                 req.cacao_proof_cid,
             )?,
         };
+        let mut commit = commit;
+        if let Some(key) = &self.author_signing_key {
+            commit.sign(key)?;
+        }
         commit.persist(&cap)?;
         // Durably flush this commit's captured blocks in ONE concurrent batch so the
         // head's reachable set is in the cold tier before we return.
@@ -2914,6 +2937,7 @@ impl DistributedDatomCommit {
             hlc,
             index_roots,
             cacao_proof_cid,
+            author_sig: None,
         };
         commit.cid = commit.derived_cid()?;
         Ok(commit)
@@ -2952,6 +2976,7 @@ impl DistributedDatomCommit {
             hlc,
             index_roots,
             cacao_proof_cid,
+            author_sig: None,
         };
         commit.cid = commit.derived_cid()?;
         Ok(commit)
@@ -2962,6 +2987,81 @@ impl DistributedDatomCommit {
         ciborium::into_writer(self, &mut bytes)
             .map_err(|e| DistributedCommitError::Cbor(e.to_string()))?;
         Ok(KotobaCid::from_bytes(&bytes))
+    }
+
+    /// The bytes the author signature covers: a CANONICAL encoding of every
+    /// signed field — `index_roots` as a BTreeMap (sorted) because HashMap
+    /// serialization order is instance-dependent, so re-encoding a LOADED
+    /// commit would not be byte-identical to what was signed. `author_sig`
+    /// itself and `cid` are excluded.
+    pub fn signed_payload(&self) -> Result<Vec<u8>, DistributedCommitError> {
+        #[derive(Serialize)]
+        struct CanonicalCommitPayload<'a> {
+            graph: &'a KotobaCid,
+            tx_cid: &'a KotobaCid,
+            prev: &'a Option<KotobaCid>,
+            parents: &'a Vec<KotobaCid>,
+            author: &'a str,
+            seq: u64,
+            ts: u64,
+            hlc: u64,
+            index_roots: std::collections::BTreeMap<&'a str, &'a KotobaCid>,
+            cacao_proof_cid: &'a Option<KotobaCid>,
+        }
+        let payload = CanonicalCommitPayload {
+            graph: &self.graph,
+            tx_cid: &self.tx_cid,
+            prev: &self.prev,
+            parents: &self.parents,
+            author: &self.author,
+            seq: self.seq,
+            ts: self.ts,
+            hlc: self.hlc,
+            index_roots: self
+                .index_roots
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect(),
+            cacao_proof_cid: &self.cacao_proof_cid,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes)
+            .map_err(|e| DistributedCommitError::Cbor(e.to_string()))?;
+        Ok(bytes)
+    }
+
+    /// Embed the author's Ed25519 signature (git-style) and re-derive the CID.
+    /// Call BEFORE `persist`. The key MUST belong to the `author` DID —
+    /// verifiers resolve the pubkey from `author` (did:key), so a mismatched
+    /// key just yields a commit whose signature never verifies.
+    pub fn sign(
+        &mut self,
+        key: &ed25519_dalek::SigningKey,
+    ) -> Result<(), DistributedCommitError> {
+        use ed25519_dalek::Signer;
+        let payload = self.signed_payload()?;
+        self.author_sig = Some(key.sign(&payload).to_bytes().to_vec());
+        self.cid = self.derived_cid()?;
+        Ok(())
+    }
+
+    /// Verify the embedded author signature against `verifying_key` (the
+    /// caller resolves it from `author`, e.g. did:key via kotoba-auth, which
+    /// sits ABOVE this crate). Returns `Ok(false)` for unsigned commits.
+    pub fn verify_author_sig(
+        &self,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<bool, DistributedCommitError> {
+        use ed25519_dalek::Verifier;
+        let Some(sig_bytes) = &self.author_sig else {
+            return Ok(false);
+        };
+        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+            DistributedCommitError::Cbor(format!("author_sig length {}", sig_bytes.len()))
+        })?;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        let payload = self.signed_payload()?;
+        Ok(verifying_key.verify(&payload, &sig).is_ok())
     }
 
     pub fn persist(&self, store: &dyn BlockStore) -> Result<KotobaCid, DistributedCommitError> {
@@ -9277,5 +9377,116 @@ mod tests {
                 "non-merge commit: parents == [prev]"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod author_sig_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_commit(author: &str) -> DistributedDatomCommit {
+        DistributedDatomCommit::seal(
+            KotobaCid::from_bytes(b"sig-test-graph"),
+            KotobaCid::from_bytes(b"sig-test-tx"),
+            None,
+            author.to_string(),
+            1,
+            HashMap::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sign_verify_roundtrip_and_cid_covers_sig() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let vk = key.verifying_key();
+        let mut c = test_commit("did:key:zAuthor");
+        let unsigned_cid = c.cid.clone();
+        assert!(!c.verify_author_sig(&vk).unwrap(), "unsigned → false");
+        c.sign(&key).unwrap();
+        assert!(c.verify_author_sig(&vk).unwrap(), "signed → true");
+        assert_ne!(c.cid, unsigned_cid, "CID must cover the signature");
+        // Wrong key must not verify.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]).verifying_key();
+        assert!(!c.verify_author_sig(&other).unwrap());
+    }
+
+    #[test]
+    fn tampered_field_breaks_signature() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut c = test_commit("did:key:zAuthor");
+        c.sign(&key).unwrap();
+        c.author = "did:key:zImpostor".to_string();
+        assert!(
+            !c.verify_author_sig(&key.verifying_key()).unwrap(),
+            "changing any signed field must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn signed_commit_persists_and_loads_with_sig() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let store = kotoba_store::MemoryBlockStore::new();
+        let mut c = test_commit("did:key:zAuthor");
+        c.sign(&key).unwrap();
+        let cid = c.persist(&store).unwrap();
+        let loaded = DistributedDatomCommit::load(&cid, &store).unwrap().unwrap();
+        assert_eq!(loaded.author_sig, c.author_sig);
+        assert!(loaded.verify_author_sig(&key.verifying_key()).unwrap());
+    }
+
+    #[test]
+    fn pre_r2b_unsigned_commit_decodes_unchanged() {
+        // A commit encoded WITHOUT the author_sig field (pre-R2b block) must
+        // decode with author_sig = None and keep its original CID.
+        let c = test_commit("did:key:zLegacy");
+        assert!(c.author_sig.is_none());
+        let store = kotoba_store::MemoryBlockStore::new();
+        let cid = c.persist(&store).unwrap();
+        let loaded = DistributedDatomCommit::load(&cid, &store).unwrap().unwrap();
+        assert_eq!(loaded.author_sig, None);
+        assert_eq!(loaded.cid, c.cid, "unsigned encoding unchanged (no field emitted)");
+    }
+
+    #[test]
+    fn writer_with_signing_key_signs_every_commit() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let vk = key.verifying_key();
+        let store = kotoba_store::MemoryBlockStore::new();
+        let ipns = kotoba_ipfs::InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns)
+            .with_author_signing_key(Some(key));
+        let commit = writer
+            .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
+                covering_datoms: None,
+                ipns_name: "k51-author-sig-test".into(),
+                graph: KotobaCid::from_bytes(b"sig-writer-graph"),
+                datoms: vec![Datom::assert(
+                    KotobaCid::from_bytes(b"e"),
+                    "a/b".into(),
+                    kotoba_edn::EdnValue::string("v"),
+                    KotobaCid::from_bytes(b"t"),
+                )],
+                expected_parent: None,
+                tx_cid: Some(KotobaCid::from_bytes(b"t")),
+                author: "did:key:zWriterAuthor".into(),
+                seq: 1,
+                valid_until: "2099-01-01T00:00:00Z".into(),
+                ttl_secs: Some(60),
+                cacao_proof_cid: None,
+                ipns_controller_did: None,
+                ipns_signing_key: None,
+            })
+            .unwrap();
+        assert!(commit.commit.author_sig.is_some(), "writer must sign");
+        assert!(commit.commit.verify_author_sig(&vk).unwrap());
+        // And the persisted block round-trips with a valid signature.
+        let loaded = DistributedDatomCommit::load(&commit.commit.cid, &store)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.verify_author_sig(&vk).unwrap());
     }
 }
