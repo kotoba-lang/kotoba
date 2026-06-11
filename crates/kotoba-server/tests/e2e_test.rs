@@ -11853,3 +11853,126 @@ async fn audit_verify_chain_reports_valid() {
     let unverifiable = body["unverifiable"].as_u64().unwrap_or(0);
     assert!(valid + unverifiable >= 1, "signed commits counted: {body}");
 }
+
+/// R3b: deposit a custodian share, then a CACAO-authorized requester gets it
+/// re-wrapped to their key; an unauthorized request is denied with no share.
+#[tokio::test]
+async fn key_request_share_full_custodian_flow() {
+    use base64::Engine as _;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3b-custody-graph").to_multibase();
+
+    // Fetch THIS node's custodian X25519 pubkey, then deal a 2-of-3 set where
+    // custodian #1 is the node (share[0] is sealed to its real key, so the node
+    // can open it) and #2/#3 are throwaway keys.
+    let (st, info) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
+        .await;
+    assert_eq!(st, 200, "{info}");
+    let node_pk_hex = info["x25519PubkeyHex"].as_str().expect("node pubkey").to_string();
+    let node_pk = {
+        let b = hex::decode(&node_pk_hex).unwrap();
+        let arr: [u8; 32] = b.try_into().unwrap();
+        PublicKey::from(arr)
+    };
+    let block_key = [77u8; 32];
+    let pubs: Vec<(String, PublicKey)> = vec![
+        (info["did"].as_str().unwrap().to_string(), node_pk),
+        ("did:key:zCust2".into(), PublicKey::from(&StaticSecret::from([2u8; 32]))),
+        ("did:key:zCust3".into(), PublicKey::from(&StaticSecret::from([3u8; 32]))),
+    ];
+    let shares = kotoba_custody::split_key(&block_key, 2, &pubs).unwrap();
+    let share_json = serde_json::to_value(&shares[0]).unwrap();
+
+    // Deposit (operator-gated): a non-operator is rejected.
+    let (status, _) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": share_json}),
+            &tenant_jwt("did:key:zNotOperator"),
+        )
+        .await;
+    assert_eq!(status, 401, "deposit must be operator-gated");
+
+    let (status, dep) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": share_json}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{dep}");
+
+    let requester_sk = StaticSecret::from([0x99u8; 32]);
+    let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
+
+    // Unauthorized: Private graph, no CACAO → denied, no share material.
+    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
+    let (status, denied) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "nonce": "r3b-no-cacao",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{denied}");
+    assert_eq!(denied["ok"], false, "no CACAO must be denied: {denied}");
+    assert!(denied["sealedShareHex"].is_null(), "denial leaks no share");
+
+    // Authorized: valid datom:read CACAO for the graph.
+    let cacao_b64 = build_ed25519_cacao_for_operation(
+        &graph,
+        &s.operator_did,
+        kotoba_auth::CacaoPayload::OP_DATOM_READ,
+        "r3b-authorized-nonce",
+    );
+    let (status, granted) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "cacao_b64": cacao_b64,
+                "purpose": "e2e custody",
+                "nonce": "r3b-authorized-nonce",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
+    assert_eq!(status, 200, "{granted}");
+    assert_eq!(granted["ok"], true, "valid CACAO must grant: {granted}");
+    assert_eq!(granted["threshold"], 2);
+    let sealed_hex = granted["sealedShareHex"].as_str().expect("sealed share");
+    // The requester opens the re-wrapped share and it matches the dealt commitment.
+    let sealed = hex::decode(sealed_hex).unwrap();
+    let opened = kotoba_crypto::hpke_open(&requester_sk, &sealed).unwrap();
+    let mut h = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut h, &opened);
+    let commitment: [u8; 32] = sha2::Digest::finalize(h).into();
+    assert_eq!(commitment, shares[0].commitment, "released share matches the deal");
+    let _ = base64::engine::general_purpose::STANDARD; // keep import used
+
+    // The release wrote an access receipt (operation = key:requestShare).
+    let mut found = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (st, body) = s
+            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts", &op_tok)
+            .await;
+        assert_eq!(st, 200);
+        if let Some(arr) = body["receipts"].as_array() {
+            if arr.iter().any(|r| r["operation"] == "key:requestShare") {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "key release must leave a receipt");
+}

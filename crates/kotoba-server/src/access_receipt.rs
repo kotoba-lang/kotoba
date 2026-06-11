@@ -181,6 +181,31 @@ pub(crate) fn enforce_and_record(
     Ok(())
 }
 
+/// Enqueue a pre-built receipt (used by seams that aren't a plain HTTP read —
+/// e.g. the custodian key-share protocol builds its own AccessReceipt with the
+/// CACAO already verified). Best-effort, same as `enforce_and_record`.
+pub(crate) fn record_receipt(state: &KotobaState, receipt: AccessReceipt) {
+    let op = receipt.operation.clone();
+    if state.receipt_tx.send(receipt).is_err() {
+        tracing::warn!(operation = %op, "access receipt DROPPED — writer unavailable");
+    }
+}
+
+/// Pin presented CACAO bytes to the block store, returning their CID multibase
+/// (the requester-signed evidence half). `None` if absent or unparseable.
+pub(crate) fn pin_cacao_evidence(state: &KotobaState, cacao_b64: Option<&str>) -> Option<String> {
+    cacao_b64
+        .and_then(|b64| B64.decode(b64).ok())
+        .filter(|cbor| kotoba_auth::Cacao::from_cbor(cbor).is_ok())
+        .map(|cbor| {
+            let cid = KotobaCid::from_bytes(&cbor);
+            if let Err(e) = state.block_store.put(&cid, &cbor) {
+                tracing::warn!(err = %e, "cacao evidence block put failed");
+            }
+            cid.to_multibase()
+        })
+}
+
 /// Unique receipt subject CID: content fields + a process-monotonic counter so
 /// two reads in the same second never collide.
 fn receipt_cid(r: &AccessReceipt, seq: u64) -> KotobaCid {
