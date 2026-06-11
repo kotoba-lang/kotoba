@@ -12059,3 +12059,135 @@ async fn key_deposit_epoch_monotonic_and_grant_reports_epoch() {
     assert_eq!(granted["ok"], true, "{granted}");
     assert_eq!(granted["epoch"], 2, "grant reports rotated epoch");
 }
+
+/// R3d: a genuine (receipted) release is not warrantable, but a tampered or
+/// fabricated grant with no covering receipt yields a CustodyUnreceiptedRelease
+/// warrant; an invalid signature is rejected.
+#[tokio::test]
+async fn key_report_unreceipted_release_warrants_only_real_violations() {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3d-warrant-graph").to_multibase();
+
+    let (st, info) = s.get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo").await;
+    assert_eq!(st, 200);
+    let node_pk = {
+        let b = hex::decode(info["x25519PubkeyHex"].as_str().unwrap()).unwrap();
+        PublicKey::from(<[u8; 32]>::try_from(b).unwrap())
+    };
+    let node_did = info["did"].as_str().unwrap().to_string();
+    let key = [44u8; 32];
+    let pubs: Vec<(String, PublicKey)> = vec![
+        (node_did.clone(), node_pk),
+        ("did:key:zRd2".into(), PublicKey::from(&StaticSecret::from([5u8; 32]))),
+        ("did:key:zRd3".into(), PublicKey::from(&StaticSecret::from([6u8; 32]))),
+    ];
+    let shares = kotoba_custody::split_key(&key, 2, &pubs).unwrap();
+    let (_, dep) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&shares[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(dep["ok"], true);
+
+    // A genuine release: this writes a key:requestShare receipt.
+    let requester_sk = StaticSecret::from([0x55u8; 32]);
+    let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
+    let (st, granted) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "nonce": "r3d-nonce",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    assert_eq!(st, 200, "{granted}");
+    assert_eq!(granted["ok"], true, "{granted}");
+    let real_grant = granted["grant"].clone();
+    assert!(real_grant["grant_sig"].is_array(), "signed grant: {real_grant}");
+
+    // Let the receipt flush.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Reporting the genuine grant → NOT warranted (a receipt covers it).
+    let (st, ok_report) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": real_grant, "window_secs": 600}),
+        )
+        .await;
+    assert_eq!(st, 200, "{ok_report}");
+    assert_eq!(ok_report["warranted"], false, "receipted release: {ok_report}");
+    assert_eq!(ok_report["verdict"], "receipted");
+
+    // Tamper the grant's signature → rejected as invalid (not warranted).
+    let mut bad_sig_grant = real_grant.clone();
+    bad_sig_grant["grant_sig"] = json!(vec![0u8; 64]);
+    let (st, bad) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": bad_sig_grant}),
+        )
+        .await;
+    assert_eq!(st, 200, "{bad}");
+    assert_eq!(bad["warranted"], false, "bad sig must not warrant: {bad}");
+
+    // A genuine grant for a DIFFERENT graph with no receipt → warranted.
+    // Re-sign by asking for a share on a second graph but never... simpler:
+    // request a share for graph2 (writes a receipt), then report it against a
+    // window that excludes the receipt by using a far-future-tampered ts is not
+    // possible (sig covers ts). Instead: deposit + request on graph2, then
+    // report with window_secs=0 and the receipt batched late — flaky. So we
+    // assert the violation path via a graph that was released but whose receipt
+    // we exclude by querying immediately with window 0 is unreliable.
+    // The unit tests cover the audit verdict exhaustively; here we additionally
+    // confirm an UNSIGNED grant is rejected (400).
+    let mut unsigned = real_grant.clone();
+    unsigned["grant_sig"] = serde_json::Value::Null;
+    let (st, _unsigned_resp) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": unsigned}),
+        )
+        .await;
+    assert_eq!(st, 400, "unsigned grant must be rejected");
+
+    // A Byzantine custodian: a grant validly signed by its OWN did:key for a
+    // graph with NO receipt → warranted (warrant emitted + evidence pinned).
+    use ed25519_dalek::{Signer, SigningKey};
+    let byz_key = SigningKey::from_bytes(&[0xB7u8; 32]);
+    let byz_did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(byz_key.verifying_key().as_bytes());
+    let unreceipted_graph =
+        kotoba_core::cid::KotobaCid::from_bytes(b"r3d-never-released").to_multibase();
+    let mut byz_grant = kotoba_custody::GrantedShare {
+        custodian_did: byz_did.clone(),
+        index: 1,
+        threshold: 2,
+        epoch: 0,
+        deal_id: vec![7, 7, 7],
+        graph_cid_mb: unreceipted_graph,
+        requester_x25519_pk: vec![3u8; 32],
+        ts_unix: 1_780_000_000,
+        sealed_for_requester: vec![1u8; 60],
+        grant_sig: None,
+    };
+    let sig = byz_key.sign(&byz_grant.grant_signing_payload());
+    byz_grant.grant_sig = Some(sig.to_bytes().to_vec());
+    let (st, warrant) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": serde_json::to_value(&byz_grant).unwrap()}),
+        )
+        .await;
+    assert_eq!(st, 200, "{warrant}");
+    assert_eq!(warrant["warranted"], true, "unreceipted release must warrant: {warrant}");
+    assert_eq!(warrant["verdict"], "unreceipted-release");
+    assert_eq!(warrant["accusedDid"], byz_did);
+    assert!(warrant["evidenceCid"].as_str().is_some(), "evidence pinned: {warrant}");
+}

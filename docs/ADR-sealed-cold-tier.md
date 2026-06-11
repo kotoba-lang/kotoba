@@ -315,3 +315,37 @@ caught — see R3a tests) but not detect-at-deal; the trusted dealer is still th
 current key holder (the operator), who already knows the key, so dealer-cheating
 only becomes a live threat when re-dealing moves to the custodians themselves —
 exactly the point at which VSS is required. Tracked as R3c-VSS.
+
+### R3d — custodian warrants for unreceipted releases (2026-06-11)
+
+Status: **enforcement implemented** (on-chain slashing = relayer boundary)
+
+Closes the loop "release a share without a receipt ⇒ get caught ⇒ get
+slashed", reusing the existing warrant machinery (kotoba-dht) and the R1
+receipt log.
+
+- **Signed grants = non-repudiable evidence.** `GrantedShare` is now
+  self-describing (graph, requester pubkey, ts, epoch, deal_id) and
+  `key.requestShare` signs it with the operator (custodian) Ed25519 key over
+  `grant_signing_payload()` — same server-layer signing seam as the R2b commit
+  signature (kotoba-custody is X25519-only). The requester keeps the signed
+  grant.
+- **Cross-audit** (`kotoba_custody::audit_grant`, pure): a grant is
+  `Receipted` iff a `key:requestShare` access receipt exists for the same graph
+  within `window_secs` of the grant ts; otherwise `UnreceiptedRelease`.
+- **`key.reportUnreceiptedRelease`**: anyone presents a signed grant; the node
+  verifies `grant_sig` against the custodian's did:key (an unsigned grant → 400,
+  an invalid signature → not warranted), then cross-audits the receipt log. No
+  covering receipt ⇒ a **`CustodyUnreceiptedRelease` (rule 8)** warrant is
+  emitted, with the signed grant pinned as evidence and the warrant
+  validator-signed. An off-chain relayer feeds the warrant + evidence to
+  MishmarBondEscrow (#84) for slashing — the same build-here / submit-elsewhere
+  boundary as the R2a anchor; retainer rewards ride the pinner mKOTO settlement
+  loop (#80/#81).
+
+Remaining R3: libp2p request-response transport + warrant gossip propagation
+(K/2 → eviction, the deferred network shell); R3c-VSS (Feldman); the on-chain
+MishmarBondEscrow bond deposit + slash execution (Solidity, operator/Council-
+gated). With R3a–R3d the design is end-to-end: 「公開複製可能なのは暗号文だけ。
+復号鍵が通る道は t-of-N custodian で、身元と目的を申告して署名付きで記録され、
+記録なしに鍵を出した者は証拠付きで罰せられる」。

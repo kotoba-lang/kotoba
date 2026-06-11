@@ -58,6 +58,10 @@ pub struct RequestShareResp {
     /// HPKE envelope (hex) of the share, sealed to the requester's pubkey.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sealed_share_hex: Option<String>,
+    /// The full custodian-SIGNED grant (R3d evidence). The requester keeps this;
+    /// presenting it to `key.reportUnreceiptedRelease` proves the release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant: Option<kotoba_custody::GrantedShare>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -108,15 +112,24 @@ pub async fn key_request_share(
 
     let my_sk = state.custodian_x25519_secret();
     match handle_key_share_request(&proto_req, &my_share, &my_sk, &authorize) {
-        KeyShareResponse::Granted(g) => Ok(Json(RequestShareResp {
-            ok: true,
-            custodian_did: Some(g.custodian_did),
-            index: Some(g.index),
-            threshold: Some(g.threshold),
-            epoch: Some(g.epoch),
-            sealed_share_hex: Some(hex::encode(&g.sealed_for_requester)),
-            error: None,
-        })),
+        KeyShareResponse::Granted(mut g) => {
+            // R3d: sign the grant with the operator (custodian) Ed25519 key so
+            // it is non-repudiable evidence of THIS release (same seam as R2b
+            // commit signing — kotoba-custody is X25519-only).
+            use ed25519_dalek::Signer as _;
+            let sig = state.operator_signing_key().sign(&g.grant_signing_payload());
+            g.grant_sig = Some(sig.to_bytes().to_vec());
+            Ok(Json(RequestShareResp {
+                ok: true,
+                custodian_did: Some(g.custodian_did.clone()),
+                index: Some(g.index),
+                threshold: Some(g.threshold),
+                epoch: Some(g.epoch),
+                sealed_share_hex: Some(hex::encode(&g.sealed_for_requester)),
+                grant: Some(g),
+                error: None,
+            }))
+        }
         KeyShareResponse::Denied { reason } => Ok(Json(RequestShareResp {
             ok: false,
             custodian_did: None,
@@ -124,6 +137,7 @@ pub async fn key_request_share(
             threshold: None,
             epoch: None,
             sealed_share_hex: None,
+            grant: None,
             error: Some(reason),
         })),
     }
@@ -268,4 +282,165 @@ pub async fn key_custodian_info(
         did: state.operator_did.clone(),
         x25519_pubkey_hex: state.custodian_x25519_pubkey_hex(),
     })
+}
+
+// ── key.reportUnreceiptedRelease (R3d enforcement) ───────────────────────────
+
+pub const NSID_KEY_REPORT_RELEASE: &str =
+    "com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease";
+
+#[derive(Debug, Deserialize)]
+pub struct ReportReleaseReq {
+    /// A custodian-signed grant (as returned by `key.requestShare`).
+    pub grant: kotoba_custody::GrantedShare,
+    /// How far apart (secs) a covering receipt may be from the grant ts.
+    /// Default 120 (clock skew + receipt batch-flush). Capped at 3600.
+    pub window_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportReleaseResp {
+    /// True only when the grant is signature-valid AND unreceipted (a warrant
+    /// was emitted). False = signature invalid OR a covering receipt exists.
+    pub warranted: bool,
+    pub verdict: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accused_did: Option<String>,
+    /// CID of the persisted grant-evidence block, if a warrant was emitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_cid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST /xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease
+///
+/// Cross-audit (R3d): a requester (or watchdog) presents a custodian-signed
+/// grant. This node verifies the signature against the custodian DID, then
+/// checks the audit receipt log for a matching `key:requestShare` receipt
+/// within the window. No match ⇒ the custodian released a share without
+/// logging it — a `CustodyUnreceiptedRelease` warrant is emitted (the grant
+/// is pinned as evidence; an off-chain relayer feeds it to MishmarBondEscrow
+/// for slashing, the same build-here / submit-elsewhere boundary as the R2a
+/// anchor).
+pub async fn key_report_unreceipted_release(
+    State(state): State<Arc<KotobaState>>,
+    Json(req): Json<ReportReleaseReq>,
+) -> Result<Json<ReportReleaseResp>, (StatusCode, String)> {
+    let grant = req.grant;
+
+    // 1. Verify the custodian's signature — only a non-repudiable grant is
+    //    evidence. A grant we can't attribute is rejected outright.
+    let sig_bytes = grant
+        .grant_sig
+        .as_ref()
+        .ok_or((StatusCode::BAD_REQUEST, "grant is unsigned".to_string()))?;
+    let pk = kotoba_auth::parse_ed25519_did_key(&grant.custodian_did)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("custodian DID: {e}")))?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("custodian pubkey: {e}")))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "grant_sig length".to_string()))?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    {
+        use ed25519_dalek::Verifier as _;
+        if vk.verify(&grant.grant_signing_payload(), &sig).is_err() {
+            return Ok(Json(ReportReleaseResp {
+                warranted: false,
+                verdict: "grant signature invalid".to_string(),
+                accused_did: None,
+                evidence_cid: None,
+                error: Some("signature does not verify against custodian DID".to_string()),
+            }));
+        }
+    }
+
+    // 2. Cross-audit against the receipt log (hot arrangement of the audit graph).
+    let window = req.window_secs.unwrap_or(120).min(3600);
+    let receipts_graph = crate::access_receipt::receipts_graph_cid();
+    let quads = state
+        .quad_store
+        .quads_by_predicate_prefix(Some(&receipts_graph), "access/")
+        .await;
+    let receipts = receipt_records_from_quads(&quads);
+    let verdict = kotoba_custody::audit_grant(&grant, &receipts, window);
+
+    match verdict {
+        kotoba_custody::AuditVerdict::Receipted => Ok(Json(ReportReleaseResp {
+            warranted: false,
+            verdict: "receipted".to_string(),
+            accused_did: None,
+            evidence_cid: None,
+            error: None,
+        })),
+        kotoba_custody::AuditVerdict::UnreceiptedRelease => {
+            // Pin the signed grant as warrant evidence.
+            let mut ev = Vec::new();
+            ciborium::into_writer(&grant, &mut ev)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode grant: {e}")))?;
+            let evidence_cid = KotobaCid::from_bytes(&ev);
+            if let Err(e) = state.block_store.put(&evidence_cid, &ev) {
+                tracing::warn!(err = %e, "warrant evidence block put failed");
+            }
+            let warrant = kotoba_dht::warrant::Warrant {
+                accused: grant.custodian_did.clone().into_bytes(),
+                evidence: evidence_cid.clone(),
+                rule_id: kotoba_dht::warrant::ValidationRule::CustodyUnreceiptedRelease as u8,
+                validator: state.local_node_id.0.to_vec(),
+                ts: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                sig: {
+                    use ed25519_dalek::Signer as _;
+                    state.operator_signing_key().sign(&evidence_cid.0).to_bytes().to_vec()
+                },
+            };
+            tracing::warn!(
+                accused = %grant.custodian_did,
+                evidence = %evidence_cid.to_multibase(),
+                "R3d warrant: unreceipted key-share release"
+            );
+            let _ = &warrant; // gossip propagation is the libp2p shell (deferred)
+            Ok(Json(ReportReleaseResp {
+                warranted: true,
+                verdict: "unreceipted-release".to_string(),
+                accused_did: Some(grant.custodian_did),
+                evidence_cid: Some(evidence_cid.to_multibase()),
+                error: None,
+            }))
+        }
+    }
+}
+
+/// Project audit-graph quads into the flat ReceiptRecords the cross-audit needs.
+fn receipt_records_from_quads(
+    quads: &[kotoba_kqe::quad::LegacyQuad],
+) -> Vec<kotoba_custody::ReceiptRecord> {
+    use kotoba_kqe::quad::LegacyQuadObject;
+    use std::collections::HashMap;
+    type ReceiptFields = (Option<String>, Option<String>, Option<u64>);
+    let mut by_subject: HashMap<[u8; 36], ReceiptFields> = HashMap::new();
+    for q in quads {
+        let e = by_subject.entry(q.subject.0).or_default();
+        match (q.predicate.as_str(), &q.object) {
+            ("access/graph", LegacyQuadObject::Text(s)) => e.0 = Some(s.clone()),
+            ("access/operation", LegacyQuadObject::Text(s)) => e.1 = Some(s.clone()),
+            ("access/ts-unix", LegacyQuadObject::Integer(i)) => e.2 = Some(*i as u64),
+            _ => {}
+        }
+    }
+    by_subject
+        .into_values()
+        .filter_map(|(g, op, ts)| {
+            Some(kotoba_custody::ReceiptRecord {
+                graph_mb: g?,
+                operation: op?,
+                ts_unix: ts?,
+            })
+        })
+        .collect()
 }

@@ -23,6 +23,10 @@ pub enum ValidationRule {
     MaxStepsExceeded = 6,
     /// PRE re-key grant revoked by owner — peers must drop cached grant.
     RekeyRevoked = 7,
+    /// Custodian released a key share without committing an access receipt
+    /// (R3d): a custodian-signed grant exists with no matching key:requestShare
+    /// receipt in the audit log within the window. Evidence = the signed grant.
+    CustodyUnreceiptedRelease = 8,
 }
 
 #[cfg(test)]
@@ -58,6 +62,7 @@ mod tests {
         assert_eq!(ValidationRule::ProllyInconsistent as u8, 5);
         assert_eq!(ValidationRule::MaxStepsExceeded as u8, 6);
         assert_eq!(ValidationRule::RekeyRevoked as u8, 7);
+        assert_eq!(ValidationRule::CustodyUnreceiptedRelease as u8, 8);
     }
 
     #[test]

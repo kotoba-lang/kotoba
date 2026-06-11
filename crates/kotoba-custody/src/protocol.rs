@@ -70,9 +70,52 @@ pub struct GrantedShare {
     /// mixed-epoch quorum is rejected.
     #[serde(default, with = "serde_bytes")]
     pub deal_id: Vec<u8>,
+    /// Graph this grant is for (multibase CID) — self-describing so the grant
+    /// stands alone as evidence (R3d).
+    #[serde(default)]
+    pub graph_cid_mb: String,
+    /// Requester this share was re-wrapped to (X25519 pubkey) — binds the grant
+    /// to one requester so it can't be replayed as evidence against a different
+    /// release.
+    #[serde(default, with = "serde_bytes")]
+    pub requester_x25519_pk: Vec<u8>,
+    /// Release timestamp (unix secs) — the window anchor for receipt matching.
+    #[serde(default)]
+    pub ts_unix: u64,
     /// HPKE envelope of the share bytes, sealed to the requester's pubkey.
     #[serde(with = "serde_bytes")]
     pub sealed_for_requester: Vec<u8>,
+    /// Custodian Ed25519 signature over `grant_signing_payload()` (R3d). Makes
+    /// the grant NON-REPUDIABLE: a custodian-signed grant with no matching
+    /// receipt is proof of an unreceipted release. `None` = unsigned (the
+    /// signature is applied at the server layer, which holds the Ed25519 key —
+    /// kotoba-custody is X25519-only, same seam as the R2b commit signing).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub grant_sig: Option<Vec<u8>>,
+}
+
+impl GrantedShare {
+    /// Canonical bytes the custodian signs: everything that identifies the
+    /// release, EXCLUDING the signature itself. A verifier rebuilds these from
+    /// the presented grant and checks `grant_sig` against the custodian DID.
+    pub fn grant_signing_payload(&self) -> Vec<u8> {
+        let mut h = sha2::Sha256::new();
+        use sha2::Digest as _;
+        let field = |h: &mut sha2::Sha256, b: &[u8]| {
+            h.update((b.len() as u32).to_le_bytes());
+            h.update(b);
+        };
+        field(&mut h, self.custodian_did.as_bytes());
+        h.update([self.index]);
+        h.update([self.threshold]);
+        h.update(self.epoch.to_le_bytes());
+        field(&mut h, &self.deal_id);
+        field(&mut h, self.graph_cid_mb.as_bytes());
+        field(&mut h, &self.requester_x25519_pk);
+        h.update(self.ts_unix.to_le_bytes());
+        field(&mut h, &self.sealed_for_requester);
+        h.finalize().to_vec()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +158,10 @@ pub fn handle_key_share_request(
         }
     };
     let requester_pk = PublicKey::from(pk_arr);
+    let ts_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     match kotoba_crypto::hpke_seal(&requester_pk, &recovered.bytes) {
         Ok(sealed) => KeyShareResponse::Granted(GrantedShare {
             custodian_did: my_share.recipient_did.clone(),
@@ -122,7 +169,11 @@ pub fn handle_key_share_request(
             threshold: my_share.threshold,
             epoch: my_share.epoch,
             deal_id: my_share.deal_id.clone(),
+            graph_cid_mb: req.graph_cid_mb.clone(),
+            requester_x25519_pk: req.requester_x25519_pk.clone(),
+            ts_unix,
             sealed_for_requester: sealed,
+            grant_sig: None,
         }),
         Err(e) => KeyShareResponse::Denied {
             reason: format!("re-wrap failed: {e}"),
