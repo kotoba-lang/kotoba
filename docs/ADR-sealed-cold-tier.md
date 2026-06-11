@@ -178,3 +178,54 @@ default-on, scheduled relayer submits, anchor verification endpoint.
 
 Remaining: signed IPNS heads default-on; scheduled relayer submits; live
 merge-path adoption (`commit_datoms_merging` is still env-gated opt-in).
+
+---
+
+## R3 — t-of-N custodians: design + R3a share plane (2026-06-11)
+
+Status: design **Accepted**; R3a **implemented**
+
+### The trust-model upgrade
+
+R0–R2c make the operator ACCOUNTABLE (sealed storage, receipts, anchors,
+signatures) but still TRUSTED: one node holds KOTOBA_BLOCK_KEY, so one
+operator can read everything silently. R3 removes that: the block key is
+Shamir-split across N custodians; a meaningful read requires t of them, each
+independently verifying CACAO + purpose and writing a receipt BEFORE
+releasing its share. 「ログを書かずに鍵を出す」 then requires t colluders,
+not one operator — the X-Road security server, decentralised. (Prior art:
+NuCypher/TACo threshold access control; conditions = CACAO + purpose here.)
+
+### Phases
+
+- **R3a (this change) — share plane**: `kotoba-custody` crate.
+  `split_key(key, t, custodians) → Vec<CustodianShare>` (Shamir GF(2^8) via
+  the audited `sharks` crate — not hand-rolled), each share HPKE-wrapped
+  (`ephemeral_pk || nonce || AES-256-GCM`, kotoba-crypto) to a custodian's
+  X25519 key, with a SHA-256 share commitment checked at `open_share`;
+  `combine_key(t, shares)` reconstructs. Immediate operational value even
+  pre-protocol: KOTOBA_BLOCK_KEY backup/recovery without any single key file
+  (deal 3-of-5 to operator devices / council members; lose any two).
+- **R3b — `/kotoba/key/1` protocol**: custodian nodes hold their share and
+  answer `KeyShareRequest { graph, cacao_b64, purpose, nonce }` over
+  libp2p request-response (PeerID = did:key at the Noise layer). Each
+  custodian: verify CACAO chain + purpose policy (reuse kotoba-auth +
+  access_receipt policy) → write receipt datom + countersign → release the
+  share HPKE-wrapped to the REQUESTER. Client combines t shares locally.
+- **R3c — verifiable + rotatable**: Feldman VSS (curve commitments replace
+  SHA-256 — custodians can verify their share against public commitments at
+  deal time, not just at open time) + MLS-epoch key rotation (custodian
+  set changes ⇒ new epoch ⇒ re-deal; revocation granularity = epoch).
+- **R3d — enforcement economics**: custodian bonds via MishmarBondEscrow
+  (#84); a custodian releasing without a receipt (detected by receipt-chain
+  cross-audit within a time window) is warranted (kotoba-dht warrant
+  machinery) and slashed; retainer rewards ride the pinner mKOTO settlement
+  loop (#80/#81).
+
+### R3a non-goals (explicit)
+
+No dealer-cheating protection yet (the dealer is the current key holder —
+the operator — who already knows the key; Feldman closes the gap when
+re-dealing moves to custodians in R3c). No network surface yet. Mixed-dealing
+shares combine to garbage, not an error (commitments are per-dealing;
+quorum tooling in R3b tags dealings with a deal-id).
