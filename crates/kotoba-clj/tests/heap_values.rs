@@ -51,6 +51,18 @@ fn vector_sum_via_loop() {
 }
 
 #[test]
+fn clojure_core_vector_aliases() {
+    let v = eval(
+        "(let [v (vec-make 8)]
+           (conj! v 11)
+           (conj! v 22)
+           (conj! v 33)
+           (+ (count v) (first v) (nth v 1) (last v)))",
+    );
+    assert_eq!(v, 69);
+}
+
+#[test]
 fn add_messages_extend_reducer() {
     // vec-extend! is the add_messages reducer: a=[1,2], extend by b=[3,4,5]
     // → a=[1,2,3,4,5]; assert count + a[4] = 5 + 5 = 10
@@ -97,6 +109,20 @@ fn map_assoc_overwrites_existing_key() {
     );
     // one entry (overwrite, not append) → count=1, value=42 → 142
     assert_eq!(v, 142);
+}
+
+#[test]
+fn clojure_core_map_aliases() {
+    let v = eval(
+        "(let [m (map-make 4)]
+           (assoc! m \"k\" 41)
+           (assoc! m \"k\" 42)
+           (+ (count m)
+              (get m \"k\")
+              (contains-key? m \"k\")
+              (empty? (map-make 1))))",
+    );
+    assert_eq!(v, 45);
 }
 
 // ---- the langgraph state substrate -----------------------------------------

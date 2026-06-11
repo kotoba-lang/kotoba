@@ -9068,6 +9068,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn q_accepts_clojure_core_qualified_collection_functions() {
+        let conn = Connection::new();
+        let query = parse(
+            r#"{:find [?n ?first ?last ?nth ?conj ?assoc ?dissoc]
+                :where [[(clojure.core/vector 1 2 3) ?v]
+                        [(clojure.core/count ?v) ?n]
+                        [(clojure.core/first ?v) ?first]
+                        [(clojure.core/last ?v) ?last]
+                        [(clojure.core/nth ?v 1) ?nth]
+                        [(clojure.core/conj ?v 4) ?conj]
+                        [(clojure.core/hash-map :a 1 :b 2) ?m]
+                        [(clojure.core/assoc ?m :c 3) ?assoc]
+                        [(clojure.core/dissoc ?assoc :b) ?dissoc]]}"#,
+        )
+        .unwrap();
+        let rows = q(query, &conn.db(), &[]).unwrap();
+        let mut assoc = BTreeMap::new();
+        assoc.insert(EdnValue::Keyword(Keyword::parse("a")), EdnValue::Integer(1));
+        assoc.insert(EdnValue::Keyword(Keyword::parse("b")), EdnValue::Integer(2));
+        assoc.insert(EdnValue::Keyword(Keyword::parse("c")), EdnValue::Integer(3));
+        let mut dissoc = assoc.clone();
+        dissoc.remove(&EdnValue::Keyword(Keyword::parse("b")));
+        assert_eq!(
+            rows,
+            vec![vec![
+                EdnValue::Integer(3),
+                EdnValue::Integer(1),
+                EdnValue::Integer(3),
+                EdnValue::Integer(2),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(4),
+                ]),
+                EdnValue::Map(assoc),
+                EdnValue::Map(dissoc),
+            ]]
+        );
+    }
+
+    #[tokio::test]
     async fn q_supports_abs_even_and_odd_function_bindings() {
         let conn = Connection::new();
         conn.transact(

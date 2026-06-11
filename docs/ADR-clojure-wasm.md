@@ -396,3 +396,46 @@ in compiled Clojure on kotoba-runtime:
   a 1-superstep immediate halt; and the `max_supersteps` cap stopping a
   continue-loop at the BSP boundary. **A langgraph-shaped compiled-Clojure
   agent runs on Pregel BSP, writing Datoms every superstep.**
+
+---
+
+## R1 — `.kotoba` source files and Clojure-core compatibility (DONE, 2026-06-11)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj`.
+
+`kotoba-clj` now has a file runner for Clojure-subset source files using the
+`.kotoba` extension, matching the operational shape of `clj` / `bb` scripts:
+
+```clojure
+#!/usr/bin/env kotoba-clj
+(defn main [x]
+  (clojure.core/inc x))
+```
+
+```text
+kotoba-clj app.kotoba 41
+kotoba-clj --func fact math.kotoba 5
+kotoba-clj --wasm-out app.wasm app.kotoba
+```
+
+The runner strips a leading Unix shebang before the EDN reader sees the source,
+prepends the kotoba-clj prelude by default, validates the `.kotoba` extension
+unless `--allow-any-ext` is passed, and invokes exported `main` unless
+`--func` selects another exported function. `compile_file` and
+`compile_file_with_prelude` expose the same behavior to Rust callers.
+
+The supported Clojure-core compatibility surface also grew:
+
+- `clojure.core/`-qualified supported builtins resolve to their unqualified
+  names.
+- Numeric aliases and predicates: `quot`, `rem`, `inc`, `dec`, `abs`, `zero?`,
+  `pos?`, `neg?`.
+- Clojure-style n-ary comparisons: `=`, `not=`, `<`, `>`, `<=`, `>=`.
+- Prelude container aliases over the existing vector/map heap representation:
+  `count`, `empty?`, `nth`, `first`, `last`, `conj!`, `get`, `assoc!`,
+  `contains-key?`.
+
+Verification: `cargo test -p kotoba-clj` passed, including `.kotoba` file
+execution and shebang tests. Datomic query compatibility gained a regression
+test for `clojure.core/`-qualified collection functions in
+`kotoba-datomic::q`.

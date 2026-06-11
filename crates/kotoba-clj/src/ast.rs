@@ -46,11 +46,18 @@ pub enum Builtin {
     Mul,
     Div,
     Mod,
+    Inc,
+    Dec,
+    Abs,
     Eq,
+    NotEq,
     Lt,
     Gt,
     Le,
     Ge,
+    Zero,
+    Pos,
+    Neg,
     And,
     Or,
     Not,
@@ -186,17 +193,25 @@ impl HostImport {
 
 impl Builtin {
     fn from_name(s: &str) -> Option<Builtin> {
+        let s = s.strip_prefix("clojure.core/").unwrap_or(s);
         Some(match s {
             "+" => Builtin::Add,
             "-" => Builtin::Sub,
             "*" => Builtin::Mul,
-            "/" => Builtin::Div,
+            "/" | "quot" => Builtin::Div,
             "mod" | "rem" => Builtin::Mod,
+            "inc" => Builtin::Inc,
+            "dec" => Builtin::Dec,
+            "abs" => Builtin::Abs,
             "=" => Builtin::Eq,
+            "!=" | "not=" => Builtin::NotEq,
             "<" => Builtin::Lt,
             ">" => Builtin::Gt,
             "<=" => Builtin::Le,
             ">=" => Builtin::Ge,
+            "zero?" => Builtin::Zero,
+            "pos?" => Builtin::Pos,
+            "neg?" => Builtin::Neg,
             "and" => Builtin::And,
             "or" => Builtin::Or,
             "not" => Builtin::Not,
@@ -311,7 +326,9 @@ fn list_head_symbol(items: &[EdnValue]) -> Result<&Symbol, CljError> {
 fn lower_def(items: &[EdnValue]) -> Result<Def, CljError> {
     // (def name value)
     if items.len() != 3 {
-        return Err(CljError::Lower("def takes exactly: (def name value)".into()));
+        return Err(CljError::Lower(
+            "def takes exactly: (def name value)".into(),
+        ));
     }
     let name = sym_name(&items[1], "def name")?;
     let value = lower_expr(&items[2])?;
@@ -360,7 +377,13 @@ fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
 fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
     let head = list_head_symbol(items)?;
     let args = &items[1..];
-    match head.name.as_str() {
+    let special = head
+        .namespace
+        .as_deref()
+        .filter(|ns| *ns == "clojure.core")
+        .map(|_| head.name.as_str())
+        .unwrap_or(head.name.as_str());
+    match special {
         "if" => lower_if(args),
         "when" => lower_when(args),
         "let" => lower_let(args),
@@ -419,7 +442,11 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
     // (let [b v b v …] body…)
     let binding_vec = match args.first() {
         Some(EdnValue::Vector(v)) => v,
-        _ => return Err(CljError::Lower("let requires a binding vector: (let [b v …] …)".into())),
+        _ => {
+            return Err(CljError::Lower(
+                "let requires a binding vector: (let [b v …] …)".into(),
+            ))
+        }
     };
     if binding_vec.len() % 2 != 0 {
         return Err(CljError::Lower(
@@ -436,7 +463,9 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
     if body.is_empty() {
-        return Err(CljError::Lower("let requires at least one body expression".into()));
+        return Err(CljError::Lower(
+            "let requires at least one body expression".into(),
+        ));
     }
     Ok(Expr::Let { bindings, body })
 }
@@ -482,7 +511,11 @@ fn is_else_test(v: &EdnValue) -> bool {
 fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
     let binding_vec = match args.first() {
         Some(EdnValue::Vector(v)) => v,
-        _ => return Err(CljError::Lower("loop requires a binding vector: (loop [b v …] …)".into())),
+        _ => {
+            return Err(CljError::Lower(
+                "loop requires a binding vector: (loop [b v …] …)".into(),
+            ))
+        }
     };
     if binding_vec.len() % 2 != 0 {
         return Err(CljError::Lower(
@@ -499,7 +532,9 @@ fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
     if body.is_empty() {
-        return Err(CljError::Lower("loop requires at least one body expression".into()));
+        return Err(CljError::Lower(
+            "loop requires at least one body expression".into(),
+        ));
     }
     Ok(Expr::Loop { bindings, body })
 }
@@ -528,7 +563,11 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     // (defgraph name :k v :k v …)
     let name = match items.get(1) {
         Some(EdnValue::Symbol(s)) => s.to_qualified(),
-        _ => return Err(CljError::Lower("defgraph requires a name: (defgraph name …)".into())),
+        _ => {
+            return Err(CljError::Lower(
+                "defgraph requires a name: (defgraph name …)".into(),
+            ))
+        }
     };
     let kwargs = &items[2..];
     if kwargs.len() % 2 != 0 {
@@ -544,14 +583,22 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
         let key = match k {
             EdnValue::Keyword(kw) => kw.name().to_string(),
-            other => return Err(CljError::Lower(format!("defgraph option key must be a keyword, found {other:?}"))),
+            other => {
+                return Err(CljError::Lower(format!(
+                    "defgraph option key must be a keyword, found {other:?}"
+                )))
+            }
         };
         match key.as_str() {
             "entry" => entry = Some(kw_name(v, "defgraph :entry")?),
             "nodes" => nodes = Some(as_map(v, "defgraph :nodes")?),
             "edges" => edges = Some(as_map(v, "defgraph :edges")?),
             "state" => state_decl = Some(as_map(v, "defgraph :state")?),
-            other => return Err(CljError::Lower(format!("unknown defgraph option `:{other}`"))),
+            other => {
+                return Err(CljError::Lower(format!(
+                    "unknown defgraph option `:{other}`"
+                )))
+            }
         }
     }
     let nodes = nodes.ok_or_else(|| CljError::Lower("defgraph requires :nodes".into()))?;
@@ -567,7 +614,11 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         let kw = kw_name(k, "defgraph node key")?;
         let func = match v {
             EdnValue::Symbol(s) => s.to_qualified(),
-            other => return Err(CljError::Lower(format!("defgraph node `{kw}` must map to a fn symbol, found {other:?}"))),
+            other => {
+                return Err(CljError::Lower(format!(
+                    "defgraph node `{kw}` must map to a fn symbol, found {other:?}"
+                )))
+            }
         };
         id_of.insert(kw.clone(), node_order.len() as i64);
         node_order.push((kw, func));
@@ -738,7 +789,9 @@ fn parse_one_defn(src: &str) -> Result<Function, CljError> {
     let forms = kotoba_edn::parse_all(src).map_err(|e| CljError::Read(e.to_string()))?;
     match forms.first() {
         Some(EdnValue::List(items)) => lower_defn(items),
-        _ => Err(CljError::Lower("generated merge fn did not parse as a defn".into())),
+        _ => Err(CljError::Lower(
+            "generated merge fn did not parse as a defn".into(),
+        )),
     }
 }
 
@@ -761,7 +814,11 @@ fn lower_if_edge(
     }
     let pred = match &parts[1] {
         EdnValue::Symbol(s) => s.to_qualified(),
-        other => return Err(CljError::Lower(format!("if-edge predicate must be a fn symbol, found {other:?}"))),
+        other => {
+            return Err(CljError::Lower(format!(
+                "if-edge predicate must be a fn symbol, found {other:?}"
+            )))
+        }
     };
     let then_id = resolve_id(&kw_name(&parts[2], "if-edge :then")?)?;
     let else_id = resolve_id(&kw_name(&parts[3], "if-edge :else")?)?;
@@ -779,7 +836,9 @@ fn lower_if_edge(
 fn kw_name(v: &EdnValue, ctx: &str) -> Result<String, CljError> {
     match v {
         EdnValue::Keyword(k) => Ok(k.name().to_string()),
-        other => Err(CljError::Lower(format!("{ctx} must be a keyword, found {other:?}"))),
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a keyword, found {other:?}"
+        ))),
     }
 }
 
@@ -789,20 +848,30 @@ fn as_map<'a>(
 ) -> Result<&'a std::collections::BTreeMap<EdnValue, EdnValue>, CljError> {
     match v {
         EdnValue::Map(m) => Ok(m),
-        other => Err(CljError::Lower(format!("{ctx} must be a map `{{…}}`, found {other:?}"))),
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a map `{{…}}`, found {other:?}"
+        ))),
     }
 }
 
 fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
     let ok = match op {
-        Builtin::Not | Builtin::StrLen => n == 1,
+        Builtin::Not
+        | Builtin::Inc
+        | Builtin::Dec
+        | Builtin::Abs
+        | Builtin::Zero
+        | Builtin::Pos
+        | Builtin::Neg
+        | Builtin::StrLen => n == 1,
         Builtin::BytesAlloc | Builtin::BytesLen | Builtin::BytesFinish => n == 1,
         Builtin::Alloc | Builtin::Load64 | Builtin::Load32 => n == 1,
         Builtin::Store64 | Builtin::Store32 | Builtin::HasCapability | Builtin::LlmInfer => n == 2,
         Builtin::Sub => n >= 1, // unary negate or n-ary subtract
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,
         Builtin::Div | Builtin::Mod | Builtin::ByteAt | Builtin::ByteAppend => n == 2,
-        Builtin::Eq | Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n == 2,
+        Builtin::Eq | Builtin::NotEq => n >= 1,
+        Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n >= 1,
         Builtin::KqeAssert | Builtin::KqeRetract => n == 4,
         Builtin::KqeGetObjects => n == 3,
         Builtin::KqeQuery => n == 1,
@@ -819,6 +888,8 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
 fn sym_name(v: &EdnValue, ctx: &str) -> Result<String, CljError> {
     match v {
         EdnValue::Symbol(s) => Ok(s.to_qualified()),
-        other => Err(CljError::Lower(format!("{ctx} must be a symbol, found {other:?}"))),
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a symbol, found {other:?}"
+        ))),
     }
 }

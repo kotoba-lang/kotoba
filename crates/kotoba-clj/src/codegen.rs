@@ -31,9 +31,9 @@
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg, MemorySection,
-    MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::ast::{Builtin, Expr, HostImport, Program};
@@ -110,7 +110,10 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     let mut fn_index: HashMap<String, (u32, usize)> = HashMap::new();
     for (i, f) in program.functions.iter().enumerate() {
         if fn_index.contains_key(&f.name) {
-            return Err(CljError::Codegen(format!("function `{}` defined twice", f.name)));
+            return Err(CljError::Codegen(format!(
+                "function `{}` defined twice",
+                f.name
+            )));
         }
         fn_index.insert(f.name.clone(), (import_base + i as u32, f.params.len()));
     }
@@ -119,7 +122,9 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     let entry_target = match entry {
         Some(Entry { name, abi }) => {
             let (idx, arity) = fn_index.get(name).copied().ok_or_else(|| {
-                CljError::Codegen(format!("component entry `(defn {name} [input] …)` not found"))
+                CljError::Codegen(format!(
+                    "component entry `(defn {name} [input] …)` not found"
+                ))
             })?;
             if arity != 1 {
                 return Err(CljError::Codegen(format!(
@@ -239,7 +244,11 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     // ---- Data segment -------------------------------------------------------
     let mut data = DataSection::new();
     if !literals.blob.is_empty() {
-        data.active(0, &ConstExpr::i32_const(DATA_BASE as i32), literals.blob.iter().copied());
+        data.active(
+            0,
+            &ConstExpr::i32_const(DATA_BASE as i32),
+            literals.blob.iter().copied(),
+        );
     }
 
     // Sections must be emitted in ascending id order.
@@ -297,7 +306,13 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
         //     core import returns nothing. The host writes the 12-byte variant
         //     `[tag:u8 @0, ptr:i32 @4, len:i32 @8]` into that area.
         HostImport::LlmInfer => (
-            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
             vec![],
         ),
         // `assert-quad` / `retract-quad: func(q: quad) -> result<_, string>`:
@@ -577,7 +592,11 @@ impl<'a> FnCtx<'a> {
         self.out.push(ins);
     }
     fn resolve(&self, name: &str) -> Option<u32> {
-        self.scope.iter().rev().find(|(n, _)| n == name).map(|(_, i)| *i)
+        self.scope
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, i)| *i)
     }
     fn alloc_local(&mut self) -> u32 {
         let i = self.next_local;
@@ -724,11 +743,10 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
         Expr::Builtin { op, args } => compile_builtin(cg, *op, args)?,
 
         Expr::Call { name, args } => {
-            let (idx, arity) = cg
-                .fn_index
-                .get(name)
-                .copied()
-                .ok_or_else(|| CljError::Codegen(format!("call to unknown function `{name}`")))?;
+            let (idx, arity) =
+                cg.fn_index.get(name).copied().ok_or_else(|| {
+                    CljError::Codegen(format!("call to unknown function `{name}`"))
+                })?;
             if args.len() != arity {
                 return Err(CljError::Codegen(format!(
                     "`{name}` expects {arity} args, got {}",
@@ -777,12 +795,61 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         }
         Builtin::Div => binop(cg, args, Instruction::I64DivS),
         Builtin::Mod => binop(cg, args, Instruction::I64RemS),
+        Builtin::Inc => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(1));
+            cg.emit(Instruction::I64Add);
+            Ok(())
+        }
+        Builtin::Dec => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(1));
+            cg.emit(Instruction::I64Sub);
+            Ok(())
+        }
+        Builtin::Abs => {
+            compile_expr(cg, &args[0])?;
+            let value = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(value));
+            cg.emit(Instruction::LocalGet(value));
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64LtS);
+            cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::LocalGet(value));
+            cg.emit(Instruction::I64Sub);
+            cg.emit(Instruction::Else);
+            cg.emit(Instruction::LocalGet(value));
+            cg.close_frame();
+            Ok(())
+        }
 
-        Builtin::Eq => cmp(cg, args, Instruction::I64Eq),
-        Builtin::Lt => cmp(cg, args, Instruction::I64LtS),
-        Builtin::Gt => cmp(cg, args, Instruction::I64GtS),
-        Builtin::Le => cmp(cg, args, Instruction::I64LeS),
-        Builtin::Ge => cmp(cg, args, Instruction::I64GeS),
+        Builtin::Eq => pairwise_cmp(cg, args, Instruction::I64Eq),
+        Builtin::NotEq => compile_not_eq(cg, args),
+        Builtin::Lt => pairwise_cmp(cg, args, Instruction::I64LtS),
+        Builtin::Gt => pairwise_cmp(cg, args, Instruction::I64GtS),
+        Builtin::Le => pairwise_cmp(cg, args, Instruction::I64LeS),
+        Builtin::Ge => pairwise_cmp(cg, args, Instruction::I64GeS),
+        Builtin::Zero => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Eqz);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        Builtin::Pos => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64GtS);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        Builtin::Neg => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64LtS);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
 
         Builtin::Not => {
             compile_expr(cg, &args[0])?;
@@ -1113,15 +1180,27 @@ fn compile_store(cg: &mut FnCtx, addr: &Expr, val: &Expr, word32: bool) -> Resul
 
 /// A 4-byte-aligned i32 access MemArg at `offset`.
 fn mem32(offset: u64) -> MemArg {
-    MemArg { offset, align: 2, memory_index: 0 }
+    MemArg {
+        offset,
+        align: 2,
+        memory_index: 0,
+    }
 }
 /// An unaligned single-byte access MemArg at `offset`.
 fn mem8(offset: u64) -> MemArg {
-    MemArg { offset, align: 0, memory_index: 0 }
+    MemArg {
+        offset,
+        align: 0,
+        memory_index: 0,
+    }
 }
 /// An 8-byte-aligned i64 access MemArg at `offset`.
 fn mem64(offset: u64) -> MemArg {
-    MemArg { offset, align: 3, memory_index: 0 }
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
 }
 
 /// A byte buffer is an 8-byte header `[cap:i32 @0, len:i32 @4]` followed by
@@ -1189,7 +1268,7 @@ fn compile_byte_append(cg: &mut FnCtx, buf_expr: &Expr, b_expr: &Expr) -> Result
     cg.emit(Instruction::I32WrapI64);
     cg.emit(Instruction::I32Load(mem32(4))); // len
     cg.emit(Instruction::I32Add); // addr = buf+8+len
-    // value byte
+                                  // value byte
     cg.emit(Instruction::LocalGet(val_l));
     cg.emit(Instruction::I32WrapI64);
     cg.emit(Instruction::I32Store8(mem8(0))); // mem[addr] = b
@@ -1253,6 +1332,90 @@ fn cmp(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), C
     compile_expr(cg, &args[1])?;
     cg.emit(ins);
     cg.emit(Instruction::I64ExtendI32U);
+    Ok(())
+}
+
+/// Clojure-style n-ary comparisons. A single operand is vacuously true; with
+/// more operands every adjacent pair must satisfy the comparison.
+fn pairwise_cmp(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), CljError> {
+    if args.len() == 1 {
+        cg.emit(Instruction::I64Const(1));
+        return Ok(());
+    }
+    if args.len() == 2 {
+        return cmp(cg, args, ins);
+    }
+
+    let prev = cg.alloc_local();
+    let cur = cg.alloc_local();
+    let acc = cg.alloc_local();
+    compile_expr(cg, &args[0])?;
+    cg.emit(Instruction::LocalSet(prev));
+    cg.emit(Instruction::I64Const(1));
+    cg.emit(Instruction::LocalSet(acc));
+
+    for arg in &args[1..] {
+        compile_expr(cg, arg)?;
+        cg.emit(Instruction::LocalSet(cur));
+
+        cg.emit(Instruction::LocalGet(acc));
+        cg.emit(Instruction::I64Const(0));
+        cg.emit(Instruction::I64Ne);
+        cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+        cg.emit(Instruction::LocalGet(prev));
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(ins.clone());
+        cg.emit(Instruction::I64ExtendI32U);
+        cg.emit(Instruction::Else);
+        cg.emit(Instruction::I64Const(0));
+        cg.close_frame();
+        cg.emit(Instruction::LocalSet(acc));
+
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::LocalSet(prev));
+    }
+
+    cg.emit(Instruction::LocalGet(acc));
+    Ok(())
+}
+
+/// Clojure `not=` means pairwise distinct for all operands.
+fn compile_not_eq(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
+    if args.len() == 1 {
+        cg.emit(Instruction::I64Const(1));
+        return Ok(());
+    }
+    let values = args
+        .iter()
+        .map(|arg| {
+            compile_expr(cg, arg)?;
+            let local = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(local));
+            Ok(local)
+        })
+        .collect::<Result<Vec<_>, CljError>>()?;
+    let acc = cg.alloc_local();
+    cg.emit(Instruction::I64Const(1));
+    cg.emit(Instruction::LocalSet(acc));
+
+    for i in 0..values.len() {
+        for j in (i + 1)..values.len() {
+            cg.emit(Instruction::LocalGet(acc));
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64Ne);
+            cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+            cg.emit(Instruction::LocalGet(values[i]));
+            cg.emit(Instruction::LocalGet(values[j]));
+            cg.emit(Instruction::I64Ne);
+            cg.emit(Instruction::I64ExtendI32U);
+            cg.emit(Instruction::Else);
+            cg.emit(Instruction::I64Const(0));
+            cg.close_frame();
+            cg.emit(Instruction::LocalSet(acc));
+        }
+    }
+
+    cg.emit(Instruction::LocalGet(acc));
     Ok(())
 }
 
@@ -1352,11 +1515,21 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Mod => v[0]
             .checked_rem(v[1])
             .ok_or_else(|| CljError::Codegen("rem by zero in const".into()))?,
-        Builtin::Eq => b(v[0] == v[1]),
-        Builtin::Lt => b(v[0] < v[1]),
-        Builtin::Gt => b(v[0] > v[1]),
-        Builtin::Le => b(v[0] <= v[1]),
-        Builtin::Ge => b(v[0] >= v[1]),
+        Builtin::Inc => v[0] + 1,
+        Builtin::Dec => v[0] - 1,
+        Builtin::Abs => v[0].abs(),
+        Builtin::Eq => b(v.windows(2).all(|pair| pair[0] == pair[1])),
+        Builtin::NotEq => b(v
+            .iter()
+            .enumerate()
+            .all(|(i, x)| v.iter().skip(i + 1).all(|y| x != y))),
+        Builtin::Lt => b(v.windows(2).all(|pair| pair[0] < pair[1])),
+        Builtin::Gt => b(v.windows(2).all(|pair| pair[0] > pair[1])),
+        Builtin::Le => b(v.windows(2).all(|pair| pair[0] <= pair[1])),
+        Builtin::Ge => b(v.windows(2).all(|pair| pair[0] >= pair[1])),
+        Builtin::Zero => b(v[0] == 0),
+        Builtin::Pos => b(v[0] > 0),
+        Builtin::Neg => b(v[0] < 0),
         Builtin::Not => b(v[0] == 0),
         Builtin::And => b(v.iter().all(|x| *x != 0)),
         Builtin::Or => b(v.iter().any(|x| *x != 0)),

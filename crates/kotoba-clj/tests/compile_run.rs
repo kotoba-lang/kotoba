@@ -15,27 +15,103 @@ fn wasm_magic_header() {
 
 #[test]
 fn arithmetic_and_nary() {
-    assert_eq!(compile_and_run("(defn add [a b] (+ a b))", "add", &[2, 3]).unwrap(), 5);
-    assert_eq!(compile_and_run("(defn s4 [a b c d] (+ a b c d))", "s4", &[1, 2, 3, 4]).unwrap(), 10);
-    assert_eq!(compile_and_run("(defn neg [x] (- x))", "neg", &[7]).unwrap(), -7);
-    assert_eq!(compile_and_run("(defn d [a b] (- a b))", "d", &[10, 3]).unwrap(), 7);
-    assert_eq!(compile_and_run("(defn m [a b] (* a b))", "m", &[6, 7]).unwrap(), 42);
-    assert_eq!(compile_and_run("(defn q [a b] (/ a b))", "q", &[20, 6]).unwrap(), 3);
-    assert_eq!(compile_and_run("(defn r [a b] (mod a b))", "r", &[20, 6]).unwrap(), 2);
+    assert_eq!(
+        compile_and_run("(defn add [a b] (+ a b))", "add", &[2, 3]).unwrap(),
+        5
+    );
+    assert_eq!(
+        compile_and_run("(defn s4 [a b c d] (+ a b c d))", "s4", &[1, 2, 3, 4]).unwrap(),
+        10
+    );
+    assert_eq!(
+        compile_and_run("(defn neg [x] (- x))", "neg", &[7]).unwrap(),
+        -7
+    );
+    assert_eq!(
+        compile_and_run("(defn d [a b] (- a b))", "d", &[10, 3]).unwrap(),
+        7
+    );
+    assert_eq!(
+        compile_and_run("(defn m [a b] (* a b))", "m", &[6, 7]).unwrap(),
+        42
+    );
+    assert_eq!(
+        compile_and_run("(defn q [a b] (/ a b))", "q", &[20, 6]).unwrap(),
+        3
+    );
+    assert_eq!(
+        compile_and_run("(defn r [a b] (mod a b))", "r", &[20, 6]).unwrap(),
+        2
+    );
 }
 
 #[test]
 fn comparisons_and_logic() {
-    assert_eq!(compile_and_run("(defn lt [a b] (< a b))", "lt", &[1, 2]).unwrap(), 1);
-    assert_eq!(compile_and_run("(defn lt [a b] (< a b))", "lt", &[2, 1]).unwrap(), 0);
-    assert_eq!(compile_and_run("(defn ge [a b] (>= a b))", "ge", &[2, 2]).unwrap(), 1);
-    assert_eq!(compile_and_run("(defn eq [a b] (= a b))", "eq", &[5, 5]).unwrap(), 1);
-    assert_eq!(compile_and_run("(defn nt [x] (not x))", "nt", &[0]).unwrap(), 1);
-    assert_eq!(compile_and_run("(defn nt [x] (not x))", "nt", &[9]).unwrap(), 0);
-    assert_eq!(compile_and_run("(defn a [x y] (and x y))", "a", &[1, 0]).unwrap(), 0);
-    assert_eq!(compile_and_run("(defn a [x y] (and x y))", "a", &[3, 4]).unwrap(), 1);
-    assert_eq!(compile_and_run("(defn o [x y] (or x y))", "o", &[0, 0]).unwrap(), 0);
-    assert_eq!(compile_and_run("(defn o [x y] (or x y))", "o", &[0, 7]).unwrap(), 1);
+    assert_eq!(
+        compile_and_run("(defn lt [a b] (< a b))", "lt", &[1, 2]).unwrap(),
+        1
+    );
+    assert_eq!(
+        compile_and_run("(defn lt [a b] (< a b))", "lt", &[2, 1]).unwrap(),
+        0
+    );
+    assert_eq!(
+        compile_and_run("(defn ge [a b] (>= a b))", "ge", &[2, 2]).unwrap(),
+        1
+    );
+    assert_eq!(
+        compile_and_run("(defn eq [a b] (= a b))", "eq", &[5, 5]).unwrap(),
+        1
+    );
+    assert_eq!(
+        compile_and_run("(defn nt [x] (not x))", "nt", &[0]).unwrap(),
+        1
+    );
+    assert_eq!(
+        compile_and_run("(defn nt [x] (not x))", "nt", &[9]).unwrap(),
+        0
+    );
+    assert_eq!(
+        compile_and_run("(defn a [x y] (and x y))", "a", &[1, 0]).unwrap(),
+        0
+    );
+    assert_eq!(
+        compile_and_run("(defn a [x y] (and x y))", "a", &[3, 4]).unwrap(),
+        1
+    );
+    assert_eq!(
+        compile_and_run("(defn o [x y] (or x y))", "o", &[0, 0]).unwrap(),
+        0
+    );
+    assert_eq!(
+        compile_and_run("(defn o [x y] (or x y))", "o", &[0, 7]).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn clojure_core_qualified_numeric_builtins_work() {
+    let src = r#"
+        (defn arithmetic [x]
+          (+ (clojure.core/inc x)
+             (clojure.core/dec x)
+             (clojure.core/abs -3)
+             (clojure.core/quot 9 2)))
+        (defn predicates []
+          (and (clojure.core/zero? 0)
+               (clojure.core/pos? 4)
+               (clojure.core/neg? -1)
+               (clojure.core/not= 1 2 3)))
+        (defn nary []
+          (and (= 1 1 1) (< 1 2 3) (<= 1 1 2) (> 3 2 1) (>= 3 3 2)))
+    "#;
+    let wasm = compile_str(src).unwrap();
+    assert_eq!(
+        kotoba_clj::run::run(&wasm, "arithmetic", &[10]).unwrap(),
+        27
+    );
+    assert_eq!(kotoba_clj::run::run(&wasm, "predicates", &[]).unwrap(), 1);
+    assert_eq!(kotoba_clj::run::run(&wasm, "nary", &[]).unwrap(), 1);
 }
 
 #[test]
@@ -111,24 +187,42 @@ fn realloc_grows_memory_past_initial_page() {
     // probe writes+reads every region, so success proves growth (no trap) and
     // that the grown region is real, writable memory.
     let ptrs = alloc_probe(&wasm, &[(16, 100_000), (16, 100_000)]).unwrap();
-    assert!(ptrs[1] >= ptrs[0] + 100_000, "second region must be disjoint");
+    assert!(
+        ptrs[1] >= ptrs[0] + 100_000,
+        "second region must be disjoint"
+    );
 }
 
 // ---- Step 2: Str/Bytes values backed by (ptr,len) ---------------------------
 
 #[test]
 fn string_length() {
-    assert_eq!(compile_and_run("(defn n [] (str-len \"hello\"))", "n", &[]).unwrap(), 5);
-    assert_eq!(compile_and_run("(defn n [] (str-len \"\"))", "n", &[]).unwrap(), 0);
+    assert_eq!(
+        compile_and_run("(defn n [] (str-len \"hello\"))", "n", &[]).unwrap(),
+        5
+    );
+    assert_eq!(
+        compile_and_run("(defn n [] (str-len \"\"))", "n", &[]).unwrap(),
+        0
+    );
     // multi-byte UTF-8: "あ" is 3 bytes.
-    assert_eq!(compile_and_run("(defn n [] (str-len \"あ\"))", "n", &[]).unwrap(), 3);
+    assert_eq!(
+        compile_and_run("(defn n [] (str-len \"あ\"))", "n", &[]).unwrap(),
+        3
+    );
 }
 
 #[test]
 fn byte_access() {
     // "ABC" → bytes 65,66,67
-    assert_eq!(compile_and_run("(defn b [] (byte-at \"ABC\" 0))", "b", &[]).unwrap(), 65);
-    assert_eq!(compile_and_run("(defn b [] (byte-at \"ABC\" 2))", "b", &[]).unwrap(), 67);
+    assert_eq!(
+        compile_and_run("(defn b [] (byte-at \"ABC\" 0))", "b", &[]).unwrap(),
+        65
+    );
+    assert_eq!(
+        compile_and_run("(defn b [] (byte-at \"ABC\" 2))", "b", &[]).unwrap(),
+        67
+    );
 }
 
 #[test]
@@ -146,7 +240,16 @@ fn strings_are_interned_and_usable_in_logic() {
 
 #[test]
 fn errors_are_reported() {
-    assert!(matches!(compile_str("(defn f [x] (g x))"), Err(CljError::Codegen(_))));
-    assert!(matches!(compile_str("(defn f [x] y)"), Err(CljError::Codegen(_))));
-    assert!(matches!(compile_str("(frobnicate)"), Err(CljError::Lower(_))));
+    assert!(matches!(
+        compile_str("(defn f [x] (g x))"),
+        Err(CljError::Codegen(_))
+    ));
+    assert!(matches!(
+        compile_str("(defn f [x] y)"),
+        Err(CljError::Codegen(_))
+    ));
+    assert!(matches!(
+        compile_str("(frobnicate)"),
+        Err(CljError::Lower(_))
+    ));
 }
