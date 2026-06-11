@@ -162,3 +162,19 @@ Anchored (R2a) + author-signed (R2b) ⇒ the audit chain is now tamper-evident
 against the operator AND attributable: 誰も「書いてない/読んでない」と言えない.
 Remaining: import-time signature enforcement on peer sync, signed IPNS heads
 default-on, scheduled relayer submits, anchor verification endpoint.
+
+### R2c — Import enforcement + chain verification (2026-06-11)
+
+- **Merge-path gate**: `DistributedCommitWriter::with_import_check` — a
+  foreign head adopted by the Merkle-CRDT merge path must pass the injected
+  verifier (`kotoba_auth::commit_import_check`): `Invalid` signatures ALWAYS
+  reject (tampering evidence); `Unsigned`/`Unverifiable` reject only under
+  `KOTOBA_REQUIRE_SIGNED_COMMITS` (observe-first rollout). Injection keeps the
+  dependency direction clean (kotoba-auth → kotoba-datomic, not vice versa).
+- **`audit.verifyChain` XRPC** (operator-gated): walks the audit graph's
+  CommitDag from the IPNS head, verifying every commit's `author_sig` against
+  its author DID — one call answers "has anyone rewritten the receipt log?";
+  pair with `audit.anchorPayload` for the on-chain half.
+
+Remaining: signed IPNS heads default-on; scheduled relayer submits; live
+merge-path adoption (`commit_datoms_merging` is still env-gated opt-in).

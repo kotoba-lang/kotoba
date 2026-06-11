@@ -433,6 +433,83 @@ pub async fn audit_list_receipts(
     })))
 }
 
+// ── audit.verifyChain XRPC (R2b — operator-side tamper check) ────────────────
+
+pub const NSID_AUDIT_VERIFY: &str = "com.etzhayyim.apps.kotoba.audit.verifyChain";
+
+#[derive(Debug, Deserialize)]
+pub struct AuditVerifyQuery {
+    /// Max commits to walk back from the head (default 100, cap 10_000).
+    pub limit: Option<usize>,
+}
+
+/// GET /xrpc/com.etzhayyim.apps.kotoba.audit.verifyChain
+///
+/// Walks the audit graph's CommitDag from the IPNS head along `prev`,
+/// verifying each commit's `author_sig` against its author DID. One call
+/// answers "has anyone rewritten the receipt log?" — pair with the on-chain
+/// anchor (audit.anchorPayload) for the operator-can't-cheat half.
+pub async fn audit_verify_chain(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Query(q): Query<AuditVerifyQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+
+    let limit = q.limit.unwrap_or(100).min(10_000);
+    let graph = receipts_graph_cid();
+    let ipns_name = crate::xrpc::distributed_graph_ipns_name(&graph);
+    let record = state
+        .ipns_registry
+        .resolve(&kotoba_ipfs::IpnsName::new(ipns_name))
+        .map_err(|e| match e {
+            kotoba_ipfs::IpnsRegistryError::NotFound(_) => (
+                StatusCode::NOT_FOUND,
+                "no receipts committed yet — nothing to verify".to_string(),
+            ),
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ipns resolve: {other}"),
+            ),
+        })?;
+    let mut cursor = KotobaCid::from_multibase(&record.value);
+
+    let (mut depth, mut valid, mut unsigned, mut unverifiable) = (0usize, 0usize, 0usize, 0usize);
+    let mut invalid: Vec<String> = Vec::new();
+    while let Some(cid) = cursor.take() {
+        if depth >= limit {
+            break;
+        }
+        let commit = kotoba_datomic::distributed::DistributedDatomCommit::load(
+            &cid,
+            &*state.block_store,
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("commit load: {e}")))?
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("commit block missing: {}", cid.to_multibase()),
+        ))?;
+        match kotoba_auth::verify_commit_author_sig(&commit) {
+            kotoba_auth::CommitSigVerdict::Valid => valid += 1,
+            kotoba_auth::CommitSigVerdict::Unsigned => unsigned += 1,
+            kotoba_auth::CommitSigVerdict::Unverifiable(_) => unverifiable += 1,
+            kotoba_auth::CommitSigVerdict::Invalid => invalid.push(cid.to_multibase()),
+        }
+        depth += 1;
+        cursor = commit.prev.clone();
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": invalid.is_empty(),
+        "graph": graph.to_multibase(),
+        "depth": depth,
+        "valid": valid,
+        "unsigned": unsigned,
+        "unverifiable": unverifiable,
+        "invalid": invalid,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,5 +888,55 @@ mod signed_commit_tests {
             let vk2 = ed25519_dalek::VerifyingKey::from_bytes(&pk).expect("pubkey");
             assert!(commit.verify_author_sig(&vk2).unwrap());
         }
+    }
+
+    /// R2b: verify_commit_author_sig over the whole audit chain — two batches
+    /// → two commits, both Valid when the operator DID is did:key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn audit_chain_walk_verifies_every_commit() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = crate::server::KotobaState::new(None).expect("state");
+        for i in 0..2u64 {
+            write_receipt_batch(
+                &state,
+                vec![AccessReceipt {
+                    graph_mb: "btarget".into(),
+                    accessor_did: Some(format!("did:key:zWalk{i}")),
+                    operation: "datom:q".into(),
+                    purpose: None,
+                    ts_unix: 1_780_002_000 + i,
+                    cacao_cid: None,
+                }],
+            )
+            .await;
+        }
+        let ipns = crate::xrpc::distributed_graph_ipns_name(&receipts_graph_cid());
+        let record = state
+            .ipns_registry
+            .resolve(&kotoba_ipfs::IpnsName::new(ipns))
+            .expect("head");
+        let mut cursor = KotobaCid::from_multibase(&record.value);
+        let mut depth = 0;
+        let did_key_operator = state.operator_did.starts_with("did:key:");
+        while let Some(cid) = cursor.take() {
+            let commit = kotoba_datomic::distributed::DistributedDatomCommit::load(
+                &cid,
+                &*state.block_store,
+            )
+            .unwrap()
+            .unwrap();
+            let verdict = kotoba_auth::verify_commit_author_sig(&commit);
+            if did_key_operator {
+                assert_eq!(verdict, kotoba_auth::CommitSigVerdict::Valid, "depth {depth}");
+            } else {
+                assert!(matches!(
+                    verdict,
+                    kotoba_auth::CommitSigVerdict::Unverifiable(_)
+                ));
+            }
+            depth += 1;
+            cursor = commit.prev.clone();
+        }
+        assert_eq!(depth, 2, "two batches → two commits");
     }
 }
