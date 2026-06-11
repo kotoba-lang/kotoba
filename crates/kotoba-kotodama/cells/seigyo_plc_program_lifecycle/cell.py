@@ -21,8 +21,17 @@ Charter Rider §2(a)(c): HIGH (controls physical actuation logic).
 
 from __future__ import annotations
 
-COUNCIL_FLEET_ATTESTATION_TX_HASH: str | None = None
-SILEN_SEIGYO_BASELINE_REVIEW_CID: str | None = None
+# Provisional gate values per etzhayyim-root CLAUDE.md operational premise
+# (2026-06-11): Council attestation = PR review; merged-PR merge commits
+# stand in for on-chain tx hash / IPFS CID until Base testnet migration.
+#   charter + R1 ADRs ratified: etzhayyim/root#1635
+#   baseline review (verdict: approved): etzhayyim/root#1641
+COUNCIL_FLEET_ATTESTATION_TX_HASH: str | None = (
+    "pr:etzhayyim/root#1635@9144cf64434402678a23dbbc4d885ada98c3cef0"
+)
+SILEN_SEIGYO_BASELINE_REVIEW_CID: str | None = (
+    "pr:etzhayyim/root#1641@d3060afbb2f90213caf905afc781db163848b96a"
+)
 CONTROLS_ENGINEER_REGISTRY_CID: str | None = None  # ADR-2606111100 §3 SME gate
 
 if (
@@ -31,7 +40,8 @@ if (
     or CONTROLS_ENGINEER_REGISTRY_CID is None
 ):
     raise RuntimeError(
-        "seigyo_plc_program_lifecycle cell scaffold-only — HIGH risk category. "
-        "Council fleet.toml + silen-seigyo baseline + controls-engineer SME "
-        "not attested per ADR-2606111000 §6 + ADR-2606111100 §2-§3."
+        "seigyo_plc_program_lifecycle cell R1-gated — controls-engineer SME "
+        "(CONTROLS_ENGINEER_REGISTRY_CID) not registered per "
+        "ADR-2606111100 §3. Council + baseline gates satisfied "
+        "provisionally via PR review (root#1635 / root#1641)."
     )
