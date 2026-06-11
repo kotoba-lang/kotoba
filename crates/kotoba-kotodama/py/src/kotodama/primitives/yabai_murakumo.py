@@ -186,6 +186,7 @@ def enqueue_job(
     now = _now()
     jid = job_id or f"yabai-{now}-{uuid.uuid4().hex[:12]}"
     _tx(c, [{
+        ":db/id": jid,
         f":{NS_JOB}/id": jid,
         f":{NS_JOB}/kind": kind,
         f":{NS_JOB}/payload-json": json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
@@ -201,8 +202,10 @@ def enqueue_job(
 
 def _checkpoint(client: KotobaDatomicClient, job_id: str, step: str, status: str, detail: dict[str, Any]) -> None:
     ts = time.time_ns()
+    cid = f"{job_id}:{step}:{ts}"
     _tx(client, [{
-        f":{NS_CP}/id": f"{job_id}:{step}:{ts}",
+        ":db/id": cid,
+        f":{NS_CP}/id": cid,
         f":{NS_CP}/job-id": job_id,
         f":{NS_CP}/step": step,
         f":{NS_CP}/status": status,
@@ -255,6 +258,7 @@ def _set_job_status(
     last_error: str | None = None,
 ) -> None:
     ent: dict[str, Any] = {
+        ":db/id": job_id,
         f":{NS_JOB}/id": job_id,
         f":{NS_JOB}/status": status,
         f":{NS_JOB}/updated-at": _now(),
