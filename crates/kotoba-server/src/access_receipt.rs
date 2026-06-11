@@ -631,3 +631,105 @@ mod attribution_tests {
         assert_eq!(got.as_deref(), Some("did:key:zFallback"));
     }
 }
+
+// ── audit.anchorPayload XRPC (R2a — receipt-root anchoring) ──────────────────
+
+pub const NSID_AUDIT_ANCHOR: &str = "com.etzhayyim.apps.kotoba.audit.anchorPayload";
+
+/// GET /xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload
+///
+/// The Estonia-KSI analog: returns the `AnchorBridge.commitRoot(bytes32,bytes,
+/// uint64)` calldata committing the audit graph's CURRENT head commit CID to
+/// Base. kotoba builds the payload; the relayer signs + submits (the same
+/// read+verify boundary as kotoba-EVM R3, ADR-2606091500 / PR #96). Once the
+/// root is on-chain, not even the node operator can silently rewrite or drop
+/// receipts committed before the anchor.
+///
+/// `rootHash` = low 32 bytes of the head commit CID; `ipfsCid` = the head CID
+/// multibase (anyone can fetch + replay the audit DAG from IPFS and check it
+/// hashes to the anchored root); `batchSize` = the IPNS sequence (monotonic
+/// commit count for the audit graph).
+pub async fn audit_anchor_payload(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+
+    let graph = receipts_graph_cid();
+    let ipns_name = crate::xrpc::distributed_graph_ipns_name(&graph);
+    let record = state
+        .ipns_registry
+        .resolve(&kotoba_ipfs::IpnsName::new(ipns_name))
+        .map_err(|e| match e {
+            kotoba_ipfs::IpnsRegistryError::NotFound(_) => (
+                StatusCode::NOT_FOUND,
+                "no receipts committed yet — nothing to anchor".to_string(),
+            ),
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ipns resolve: {other}"),
+            ),
+        })?;
+    let head = KotobaCid::from_multibase(&record.value).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("audit head is not a CID: {}", record.value),
+    ))?;
+    let calldata = kotoba_evm::anchor::anchor_block_calldata(&head, &head, record.sequence);
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "graph": graph.to_multibase(),
+        "headCid": head.to_multibase(),
+        "seq": record.sequence,
+        "function": "commitRoot(bytes32,bytes,uint64)",
+        "calldataHex": hex::encode(&calldata),
+    })))
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anchor_payload_encodes_committed_audit_head() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = crate::server::KotobaState::new(None).expect("state");
+
+        // Before any receipt: head missing.
+        let ipns = crate::xrpc::distributed_graph_ipns_name(&receipts_graph_cid());
+        assert!(state
+            .ipns_registry
+            .resolve(&kotoba_ipfs::IpnsName::new(ipns.clone()))
+            .is_err());
+
+        // Commit one receipt batch → audit head exists.
+        write_receipt_batch(
+            &state,
+            vec![AccessReceipt {
+                graph_mb: "btarget".into(),
+                accessor_did: Some("did:key:zA".into()),
+                operation: "datom:q".into(),
+                purpose: Some("anchor-test".into()),
+                ts_unix: 1_780_000_789,
+            }],
+        )
+        .await;
+        let record = state
+            .ipns_registry
+            .resolve(&kotoba_ipfs::IpnsName::new(ipns))
+            .expect("audit head after first batch");
+        let head = KotobaCid::from_multibase(&record.value).expect("head CID");
+
+        // The calldata layout matches kotoba-evm's pinned ABI: selector, then
+        // rootHash = low 32 bytes of the head CID.
+        let calldata =
+            kotoba_evm::anchor::anchor_block_calldata(&head, &head, record.sequence);
+        assert_eq!(&calldata[..4], &kotoba_evm::anchor::commit_root_selector());
+        assert_eq!(&calldata[4..36], &head.0[4..36]);
+        // dynamic tail carries the multibase CID string.
+        let mb = head.to_multibase();
+        assert!(calldata
+            .windows(mb.len())
+            .any(|w| w == mb.as_bytes()));
+    }
+}

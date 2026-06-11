@@ -11761,3 +11761,53 @@ async fn audit_list_receipts_rejects_non_operator() {
         .await;
     assert_eq!(status, 401);
 }
+
+/// R2a: after a receipted read, audit.anchorPayload returns commitRoot calldata
+/// for the audit-graph head; before any receipt it 404s.
+#[tokio::test]
+async fn audit_anchor_payload_after_receipted_read() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+
+    // Fresh server: nothing to anchor yet.
+    let (status, _) = s
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload", &op_tok)
+        .await;
+    assert_eq!(status, 404, "no receipts yet → 404");
+
+    // One receipted read…
+    let tok = tenant_jwt("did:key:zAnchorReader");
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: anchor")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200);
+
+    // …flushes into an audit commit, which becomes anchorable.
+    let mut body = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, b) = s
+            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload", &op_tok)
+            .await;
+        if status == 200 {
+            body = b;
+            break;
+        }
+    }
+    assert_eq!(body["ok"], true, "anchor payload within 4s: {body}");
+    assert_eq!(body["function"], "commitRoot(bytes32,bytes,uint64)");
+    assert!(body["seq"].as_u64().unwrap_or(0) >= 1);
+    let calldata = body["calldataHex"].as_str().expect("calldataHex");
+    assert!(calldata.len() > 8, "non-trivial calldata");
+    let head = body["headCid"].as_str().expect("headCid");
+    assert!(head.starts_with('b'), "multibase head CID");
+}

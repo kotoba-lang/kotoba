@@ -108,3 +108,23 @@ fail-closed "no receipt, no read" arrives with the R2 signed journal);
 firehose / realtime / git-http read gates not yet instrumented; purpose is
 free text (Estonia-style coded purposes + legal-basis references when
 enforcement turns on).
+
+---
+
+## R2a — Receipt-root anchoring payload (2026-06-11)
+
+Status: **Accepted** (implemented)
+
+The KSI analog: `GET /xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload`
+(operator-gated) returns `AnchorBridge.commitRoot(bytes32,bytes,uint64)`
+calldata committing the audit graph's current head commit CID to Base —
+`rootHash` = low 32 bytes of the head CID, `ipfsCid` = the head multibase
+(anyone can fetch + replay the audit DAG and check it hashes to the anchored
+root), `batchSize` = the audit graph's IPNS sequence. kotoba builds the
+payload; the relayer signs + submits (same permissionless-commit +
+off-chain-relayer boundary as kotoba-EVM R3 / PR #96). Once anchored, the
+operator cannot silently rewrite or drop receipts committed before the anchor.
+
+Remaining for full R2: per-DID signed Journal chains (requester
+countersignature → non-repudiation), scheduled relayer submits, and an anchor
+verification endpoint (head CID ↔ on-chain root cross-check).
