@@ -86,6 +86,7 @@ pub mod component;
 #[cfg(feature = "run")]
 pub mod run;
 
+use std::path::Path;
 use thiserror::Error;
 
 /// Errors across the read → lower → codegen → run pipeline.
@@ -111,6 +112,38 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, CljError> {
     codegen::compile(&program)
 }
 
+/// Compile a `.kotoba` source file into WebAssembly bytes.
+///
+/// A leading Unix shebang (`#!...`) is stripped before the EDN/Clojure reader
+/// sees the source, so executable scripts can start with:
+///
+/// ```text
+/// #!/usr/bin/env kotoba-clj
+/// ```
+pub fn compile_file(path: impl AsRef<Path>) -> Result<Vec<u8>, CljError> {
+    let src = std::fs::read_to_string(path.as_ref())
+        .map_err(|e| CljError::Read(format!("read {}: {e}", path.as_ref().display())))?;
+    compile_str(strip_shebang(&src))
+}
+
+/// Compile a source file with the container + CBOR prelude.
+pub fn compile_file_with_prelude(path: impl AsRef<Path>) -> Result<Vec<u8>, CljError> {
+    let src = std::fs::read_to_string(path.as_ref())
+        .map_err(|e| CljError::Read(format!("read {}: {e}", path.as_ref().display())))?;
+    compile_str_with_prelude(strip_shebang(&src))
+}
+
+fn strip_shebang(src: &str) -> &str {
+    if let Some(rest) = src.strip_prefix("#!") {
+        match rest.find('\n') {
+            Some(i) => &rest[i + 1..],
+            None => "",
+        }
+    } else {
+        src
+    }
+}
+
 /// A dynamic-container prelude written in the kotoba-clj subset **itself**:
 /// growable `vector` and string-keyed `map`, built on the raw-memory builtins
 /// (`alloc`/`load64`/`store64!`) and Stage-A `loop`/`recur`. This is the heap
@@ -124,7 +157,9 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, CljError> {
 ///
 /// Prepend it with [`compile_str_with_prelude`]. Names: `vec-make` `vec-count`
 /// `vec-nth` `vec-conj!` `vec-extend!` (the `add_messages` reducer), `map-make`
-/// `map-count` `map-get` `map-assoc!`, and `str-eq?`.
+/// `map-count` `map-get` `map-assoc!`, and `str-eq?`. It also exposes a small
+/// Clojure-core compatibility layer: `count`, `empty?`, `nth`, `first`, `last`,
+/// `conj!`, `get`, `assoc!`, and `contains-key?`.
 pub const PRELUDE: &str = r#"
 ;; ---- vector: [len, cap, e0, e1, …] ----------------------------------------
 (defn vec-make [cap]
@@ -192,6 +227,19 @@ pub const PRELUDE: &str = r#"
         (store64! m (+ n 1))
         m)
       (do (store64! (+ m (+ 24 (* 16 idx))) v) m))))
+
+;; ---- Clojure-core-ish compatibility aliases -------------------------------
+;; These are intentionally thin: vectors and maps both store their count at
+;; offset 0, while nth/conj! are vector-oriented and get/assoc! are map-oriented.
+(defn count [x] (load64 x))
+(defn empty? [x] (= (count x) 0))
+(defn nth [v i] (vec-nth v i))
+(defn first [v] (vec-nth v 0))
+(defn last [v] (vec-nth v (- (vec-count v) 1)))
+(defn conj! [v x] (vec-conj! v x))
+(defn get [m k] (map-get m k))
+(defn assoc! [m k v] (map-assoc! m k v))
+(defn contains-key? [m k] (>= (map-find m k) 0))
 "#;
 
 /// An **in-guest CBOR decoder** (subset) written in the kotoba-clj language,
@@ -314,7 +362,9 @@ pub const CBOR_ENC_PRELUDE: &str = r#"
 /// [`CBOR_PRELUDE`], and the CBOR encoder [`CBOR_ENC_PRELUDE`] prepended, so the
 /// program can use `vec-*` / `map-*` / `cbor-*` directly.
 pub fn compile_str_with_prelude(src: &str) -> Result<Vec<u8>, CljError> {
-    compile_str(&format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{src}"))
+    compile_str(&format!(
+        "{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{src}"
+    ))
 }
 
 /// The combined prelude text (containers + CBOR decode + CBOR encode), for
