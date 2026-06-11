@@ -82,22 +82,32 @@ pub(crate) fn purpose_from_headers(headers: &HeaderMap) -> Option<String> {
     }
 }
 
-/// Who is reading: the presented CACAO's leaf `iss` (the delegate actually
-/// holding the capability), else the Bearer JWT `sub`. `None` only when the
-/// caller is anonymous (Public tier, which is not receipt-instrumented).
-pub(crate) fn accessor_from_request(headers: &HeaderMap, cacao_b64: Option<&str>) -> Option<String> {
-    if let Some(b64) = cacao_b64 {
-        if let Ok(cbor) = B64.decode(b64) {
-            if let Ok(cacao) = kotoba_auth::Cacao::from_cbor(&cbor) {
-                return Some(cacao.p.iss);
-            }
-        }
+/// Who is reading. Attribution follows the credential the gate actually
+/// verified for this visibility tier: Private → the CACAO's leaf `iss` (its
+/// signature chain was verified), falling back to the Bearer `sub`;
+/// Authenticated → the Bearer `sub` FIRST, so a decorative (unverified) CACAO
+/// attached to a Bearer-authed request cannot blame a third-party DID.
+/// `None` only when the caller is anonymous.
+pub(crate) fn accessor_from_request(
+    headers: &HeaderMap,
+    cacao_b64: Option<&str>,
+    visibility: &GraphVisibility,
+) -> Option<String> {
+    let cacao_iss = || {
+        let cbor = B64.decode(cacao_b64?).ok()?;
+        kotoba_auth::Cacao::from_cbor(&cbor).ok().map(|c| c.p.iss)
+    };
+    let bearer_sub = || {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(crate::graph_auth::jwt_sub)
+    };
+    match visibility {
+        GraphVisibility::Private { .. } => cacao_iss().or_else(bearer_sub),
+        _ => bearer_sub().or_else(cacao_iss),
     }
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .and_then(crate::graph_auth::jwt_sub)
 }
 
 fn require_purpose_enabled() -> bool {
@@ -138,7 +148,7 @@ pub(crate) fn enforce_and_record(
     }
     let receipt = AccessReceipt {
         graph_mb: graph.to_multibase(),
-        accessor_did: accessor_from_request(headers, cacao_b64),
+        accessor_did: accessor_from_request(headers, cacao_b64, visibility),
         operation: operation.to_string(),
         purpose,
         ts_unix: SystemTime::now()
@@ -282,21 +292,31 @@ pub fn spawn_receipt_writer(state: Arc<KotobaState>) {
             // Block until the first receipt of a batch arrives…
             let Some(first) = rx.recv().await else { break };
             let mut batch = vec![first];
-            // …then collect followers for one flush window (or MAX_BATCH).
-            let deadline = tokio::time::sleep(std::time::Duration::from_millis(flush_ms));
-            tokio::pin!(deadline);
-            loop {
-                tokio::select! {
-                    _ = &mut deadline => break,
-                    more = rx.recv() => match more {
-                        Some(r) => {
-                            batch.push(r);
-                            if batch.len() >= MAX_BATCH {
-                                break;
+            // …drain whatever is already queued (no waiting) so a backlog from
+            // a slow commit clears at full speed instead of MAX_BATCH/window…
+            while batch.len() < MAX_BATCH {
+                match rx.try_recv() {
+                    Ok(r) => batch.push(r),
+                    Err(_) => break,
+                }
+            }
+            // …then, if there is room, collect stragglers for one flush window.
+            if batch.len() < MAX_BATCH {
+                let deadline = tokio::time::sleep(std::time::Duration::from_millis(flush_ms));
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        _ = &mut deadline => break,
+                        more = rx.recv() => match more {
+                            Some(r) => {
+                                batch.push(r);
+                                if batch.len() >= MAX_BATCH {
+                                    break;
+                                }
                             }
-                        }
-                        None => break,
-                    },
+                            None => break,
+                        },
+                    }
                 }
             }
             write_receipt_batch(&state, batch).await;
@@ -440,11 +460,12 @@ mod tests {
             axum::http::header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
+        let auth_tier = GraphVisibility::Authenticated;
         assert_eq!(
-            accessor_from_request(&h, None).as_deref(),
+            accessor_from_request(&h, None, &auth_tier).as_deref(),
             Some("did:key:zJwtCaller")
         );
-        assert_eq!(accessor_from_request(&HeaderMap::new(), None), None);
+        assert_eq!(accessor_from_request(&HeaderMap::new(), None, &auth_tier), None);
     }
 
     #[test]
@@ -566,5 +587,47 @@ mod writer_task_tests {
             }
         }
         panic!("receipt never flushed on current_thread runtime");
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    fn bearer(did: &str) -> HeaderMap {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload =
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{did}","exp":9999999999}}"#).as_bytes());
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer eyJhbGciOiJub25lIn0.{payload}.sig")
+                .parse()
+                .unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn authenticated_tier_prefers_bearer_over_decorative_cacao() {
+        // An unverified CACAO attached to a Bearer-authed read must not be able
+        // to attribute the access to a third-party DID.
+        let h = bearer("did:key:zRealCaller");
+        let bogus_cacao = base64::engine::general_purpose::STANDARD.encode(b"not-a-real-cacao");
+        let got = accessor_from_request(&h, Some(&bogus_cacao), &GraphVisibility::Authenticated);
+        assert_eq!(got.as_deref(), Some("did:key:zRealCaller"));
+    }
+
+    #[test]
+    fn private_tier_falls_back_to_bearer_when_cacao_unparseable() {
+        let h = bearer("did:key:zFallback");
+        let got = accessor_from_request(
+            &h,
+            Some("%%%not-base64%%%"),
+            &GraphVisibility::Private {
+                owner_did: "did:key:zOwner".into(),
+            },
+        );
+        assert_eq!(got.as_deref(), Some("did:key:zFallback"));
     }
 }
