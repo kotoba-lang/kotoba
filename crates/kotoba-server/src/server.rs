@@ -457,6 +457,41 @@ impl KotobaState {
                 };
                 let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
                     .unwrap_or_else(|_| "http://localhost:5001".into());
+                // ADR-2606112200 — sealed cold tier. When KOTOBA_BLOCK_KEY (or
+                // KOTOBA_BLOCK_KEY_FILE) is set, every block leaving for Kubo
+                // (and from there bitswap/DHT + the kotobase.net pin fanout) is
+                // an AES-256-GCM envelope; the network only ever replicates
+                // ciphertext. Unset = current plaintext behaviour, with a loud
+                // warning because the kotobase pin fanout is on by default.
+                let cold: Arc<dyn BlockStore + Send + Sync> =
+                    match kotoba_store::SealedKeyConfig::from_env()? {
+                        Some(cfg) => {
+                            let index_path = store_path.as_ref().map(|p| {
+                                std::path::Path::new(p).join(kotoba_store::SEALED_INDEX_FILE)
+                            });
+                            if index_path.is_none() {
+                                tracing::warn!(
+                                    "sealed cold tier: no KOTOBA_STORE_PATH — plaintext→sealed \
+                                     CID index is in-memory only (rebuilt by re-put after restart)"
+                                );
+                            }
+                            let sealed =
+                                kotoba_store::SealedBlockStore::new(cold, cfg, index_path)?;
+                            tracing::info!(
+                                index_entries = sealed.index_len(),
+                                "cold tier SEALED — AES-256-GCM block envelopes (KOTOBA_BLOCK_KEY, ADR-2606112200)"
+                            );
+                            Arc::new(sealed)
+                        }
+                        None => {
+                            tracing::warn!(
+                                "cold tier UNSEALED — blocks replicate beyond this node in \
+                                 PLAINTEXT (Kubo bitswap + kotobase.net pin fanout). Set \
+                                 KOTOBA_BLOCK_KEY to seal (ADR-2606112200)."
+                            );
+                            Arc::new(cold)
+                        }
+                    };
                 let tiered = kotoba_store::TieredBlockStore::new(hot, cold);
 
                 let peers_str = std::env::var("KOTOBA_PEERS").unwrap_or_default();
