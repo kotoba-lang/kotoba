@@ -2,15 +2,19 @@ pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
 pub mod dht_transport;
+pub mod did_bridge;
 pub mod econ;
 pub mod email_xrpc;
+pub mod evm_rpc;
 pub mod fingerprint;
 pub mod firehose;
+pub mod git_http;
 pub mod graph_auth;
 pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
 pub mod media_xrpc;
+pub mod mishmar_observe;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
@@ -21,6 +25,9 @@ pub mod pre_proxy;
 pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
+pub mod social;
+pub mod social_economy;
+pub mod social_xrpc;
 pub mod xrpc;
 
 use axum::{
@@ -268,6 +275,7 @@ mod tests {
             &*state.ipns_registry,
         )
         .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: distributed_graph_ipns_name(&graph),
             graph: graph.clone(),
             covering_datoms: None,
@@ -1191,6 +1199,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         )
         // ── Common Crawl vector search / RAG ───────────────────────────────
         .route(
+            &format!("/xrpc/{}", social_xrpc::NSID_SOCIAL_CAPITAL),
+            get(social_xrpc::social_capital),
+        )
+        .route(
             &format!("/xrpc/{}", cc_xrpc::NSID_CC_SEARCH),
             get(cc_xrpc::cc_search),
         )
@@ -1331,6 +1343,18 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", realtime::NSID_SYNC_CONNECT),
             get(realtime::ws_connect),
+        )
+        // ── Git smart-HTTP (clone / fetch / push over datomic + IPFS) ───────
+        .route("/git/:repo/info/refs", get(git_http::info_refs))
+        .route(
+            "/git/:repo/git-upload-pack",
+            post(git_http::upload_pack)
+                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
+        )
+        .route(
+            "/git/:repo/git-receive-pack",
+            post(git_http::receive_pack)
+                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
         )
         // ── Generic XRPC dispatch ──────────────────────────────────────────
         .route(

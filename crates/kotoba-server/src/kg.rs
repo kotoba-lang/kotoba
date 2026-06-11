@@ -1572,6 +1572,7 @@ pub async fn kg_commit(
     };
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     match writer.commit_datoms(CommitDatomsRequest {
+        merge_parents: None,
         ipns_name: ipns_name.clone(),
         graph: graph.clone(),
         datoms: db.datoms(),
@@ -2480,6 +2481,7 @@ mod tests {
         let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
         let first = writer
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
@@ -2505,6 +2507,7 @@ mod tests {
             .unwrap();
         writer
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
@@ -2651,6 +2654,7 @@ mod tests {
         let alice = KotobaCid::from_bytes(b"kg-sparql-vp-private-alice");
         DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
