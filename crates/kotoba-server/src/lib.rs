@@ -8,6 +8,7 @@ pub mod econ;
 pub mod email_xrpc;
 pub mod evm_rpc;
 pub mod access_receipt;
+pub mod key_share;
 pub mod fingerprint;
 pub mod firehose;
 pub mod git_http;
@@ -926,6 +927,22 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", access_receipt::NSID_AUDIT_ANCHOR),
             get(access_receipt::audit_anchor_payload),
+        )
+        .route(
+            &format!("/xrpc/{}", access_receipt::NSID_AUDIT_VERIFY),
+            get(access_receipt::audit_verify_chain),
+        )
+        .route(
+            &format!("/xrpc/{}", key_share::NSID_KEY_REQUEST_SHARE),
+            post(key_share::key_request_share),
+        )
+        .route(
+            &format!("/xrpc/{}", key_share::NSID_KEY_DEPOSIT_SHARE),
+            post(key_share::key_deposit_share),
+        )
+        .route(
+            &format!("/xrpc/{}", key_share::NSID_KEY_CUSTODIAN_INFO),
+            get(key_share::key_custodian_info),
         )
         .route("/health", get(xrpc::health))
         .route(

@@ -315,6 +315,25 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
             ],
             vec![],
         ),
+        // `assert-quad` / `retract-quad: func(q: quad) -> result<_, string>`:
+        //   - the `quad` record flattens to its fields: 3 × `string` + 1 ×
+        //     `list<u8>`, each a `(ptr,len)` pair → 8 i32 params,
+        //   - `result<_, string>` flattens to >1 value (tag + err string) → the
+        //     caller appends a return-area pointer (9th i32) and the core import
+        //     returns nothing. Area: `[tag:u8 @0, err-ptr @4, err-len @8]`.
+        HostImport::KqeAssertQuad | HostImport::KqeRetractQuad => {
+            (vec![ValType::I32; 9], vec![])
+        }
+        // `get-objects: func(string,string,string) -> list<list<u8>>`:
+        //   - 3 strings → 6 i32 params,
+        //   - a bare `list` result flattens to `(ptr,len)` = 2 values > 1 → an
+        //     8-byte return area `[ptr @0, len @4]` (7th i32 param).
+        HostImport::KqeGetObjects => (vec![ValType::I32; 7], vec![]),
+        // `query: func(string) -> result<list<quad>, string>`:
+        //   - 1 string → 2 i32 params,
+        //   - indirect 12-byte return area `[tag:u8 @0, ptr @4, len @8]` (the
+        //     same variant layout as `llm.infer`).
+        HostImport::KqeQuery => (vec![ValType::I32; 3], vec![]),
     }
 }
 
@@ -903,7 +922,147 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
 
         Builtin::HasCapability => compile_host_call(cg, HostImport::HasCapability, args),
         Builtin::LlmInfer => compile_llm_infer(cg, &args[0], &args[1]),
+        Builtin::KqeAssert => compile_kqe_mutate(cg, HostImport::KqeAssertQuad, args),
+        Builtin::KqeRetract => compile_kqe_mutate(cg, HostImport::KqeRetractQuad, args),
+        Builtin::KqeGetObjects => compile_kqe_get_objects(cg, args),
+        Builtin::KqeQuery => compile_kqe_query(cg, &args[0]),
     }
+}
+
+/// Lower `(kqe-assert!/kqe-retract! graph subject predicate object-cbor)` — a
+/// host import taking the flattened `quad` record (4 × `(ptr,len)`) whose
+/// `result<_, string>` return uses the indirect return-area ABI:
+///   1. `cabi_realloc` a 12-byte area (align 4),
+///   2. push the four fields as `(ptr,len)` pairs, then the area pointer,
+///   3. `call` the import (no core result),
+///   4. read `tag = mem[area]` → `1` on ok (tag 0), `0` on err.
+fn compile_kqe_mutate(cg: &mut FnCtx, imp: HostImport, args: &[Expr]) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&imp)
+        .ok_or_else(|| CljError::Codegen(format!("host import {imp:?} not registered")))?;
+    let realloc = cg.realloc_index;
+    let area = cg.alloc_local();
+
+    // area = cabi_realloc(0, 0, 4, 12)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(4));
+    cg.emit(Instruction::I32Const(12));
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(area));
+
+    // graph, subject, predicate, object-cbor — each as (ptr,len)
+    for a in args {
+        lower_string_arg_to_ptr_len(cg, a)?;
+    }
+    // return-area pointer (i32)
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::Call(idx));
+
+    // tag == 0 (ok) → 1, else (err) → 0
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load8U(mem8(0)));
+    cg.emit(Instruction::I32Eqz);
+    cg.emit(Instruction::I64ExtendI32U);
+    Ok(())
+}
+
+/// Lower `(kqe-get-objects graph subject predicate)` — the host lifts a
+/// `list<list<u8>>` into guest memory (via our exported `cabi_realloc`) and
+/// writes `[ptr @0, len @4]` into an 8-byte return area. The builtin yields a
+/// packed list handle `(ptr << 32) | count`; elements (8 bytes each:
+/// `[ptr,len]`) are read in-language via `load32` (see `KQE_PRELUDE`).
+fn compile_kqe_get_objects(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&HostImport::KqeGetObjects)
+        .ok_or_else(|| CljError::Codegen("host import KqeGetObjects not registered".into()))?;
+    let realloc = cg.realloc_index;
+    let area = cg.alloc_local();
+
+    // area = cabi_realloc(0, 0, 4, 8)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(4));
+    cg.emit(Instruction::I32Const(8));
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(area));
+
+    // graph, subject, predicate — each as (ptr,len)
+    for a in args {
+        lower_string_arg_to_ptr_len(cg, a)?;
+    }
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::Call(idx));
+
+    // handle = (mem[area] << 32) | mem[area+4]   (element-array ptr | count)
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(0)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Const(32));
+    cg.emit(Instruction::I64Shl);
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Or);
+    Ok(())
+}
+
+/// Lower `(kqe-query predicate-filter)` — same indirect `result<list<…>,
+/// string>` tail as `llm.infer`, but the ok payload is a `list<quad>`: the
+/// handle packs `(quad-array-ptr << 32) | count`, 32 bytes per quad (4 ×
+/// `[ptr,len]` fields, read in-language via `load32`). `0` on err.
+fn compile_kqe_query(cg: &mut FnCtx, filter: &Expr) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&HostImport::KqeQuery)
+        .ok_or_else(|| CljError::Codegen("host import KqeQuery not registered".into()))?;
+    let realloc = cg.realloc_index;
+    let area = cg.alloc_local();
+
+    // area = cabi_realloc(0, 0, 4, 12)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(4));
+    cg.emit(Instruction::I32Const(12));
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(area));
+
+    lower_string_arg_to_ptr_len(cg, filter)?;
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::Call(idx));
+
+    // tag == 0 ? (ptr << 32) | count : 0
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load8U(mem8(0)));
+    cg.emit(Instruction::I32Eqz);
+    cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Const(32));
+    cg.emit(Instruction::I64Shl);
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(8)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Or);
+    cg.emit(Instruction::Else);
+    cg.emit(Instruction::I64Const(0));
+    cg.close_frame();
+    Ok(())
 }
 
 /// Lower `(llm-infer model-cid prompt)` — a host import whose
@@ -1389,7 +1548,12 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
                 "string/bytes/memory operations are not allowed in a `def` initialiser".into(),
             ))
         }
-        Builtin::HasCapability | Builtin::LlmInfer => {
+        Builtin::HasCapability
+        | Builtin::LlmInfer
+        | Builtin::KqeAssert
+        | Builtin::KqeRetract
+        | Builtin::KqeGetObjects
+        | Builtin::KqeQuery => {
             return Err(CljError::Codegen(
                 "host calls are not allowed in a `def` initialiser".into(),
             ))

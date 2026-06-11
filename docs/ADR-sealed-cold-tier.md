@@ -162,3 +162,122 @@ Anchored (R2a) + author-signed (R2b) ⇒ the audit chain is now tamper-evident
 against the operator AND attributable: 誰も「書いてない/読んでない」と言えない.
 Remaining: import-time signature enforcement on peer sync, signed IPNS heads
 default-on, scheduled relayer submits, anchor verification endpoint.
+
+### R2c — Import enforcement + chain verification (2026-06-11)
+
+- **Merge-path gate**: `DistributedCommitWriter::with_import_check` — a
+  foreign head adopted by the Merkle-CRDT merge path must pass the injected
+  verifier (`kotoba_auth::commit_import_check`): `Invalid` signatures ALWAYS
+  reject (tampering evidence); `Unsigned`/`Unverifiable` reject only under
+  `KOTOBA_REQUIRE_SIGNED_COMMITS` (observe-first rollout). Injection keeps the
+  dependency direction clean (kotoba-auth → kotoba-datomic, not vice versa).
+- **`audit.verifyChain` XRPC** (operator-gated): walks the audit graph's
+  CommitDag from the IPNS head, verifying every commit's `author_sig` against
+  its author DID — one call answers "has anyone rewritten the receipt log?";
+  pair with `audit.anchorPayload` for the on-chain half.
+
+Remaining: signed IPNS heads default-on; scheduled relayer submits; live
+merge-path adoption (`commit_datoms_merging` is still env-gated opt-in).
+
+---
+
+## R3 — t-of-N custodians: design + R3a share plane (2026-06-11)
+
+Status: design **Accepted**; R3a **implemented**
+
+### The trust-model upgrade
+
+R0–R2c make the operator ACCOUNTABLE (sealed storage, receipts, anchors,
+signatures) but still TRUSTED: one node holds KOTOBA_BLOCK_KEY, so one
+operator can read everything silently. R3 removes that: the block key is
+Shamir-split across N custodians; a meaningful read requires t of them, each
+independently verifying CACAO + purpose and writing a receipt BEFORE
+releasing its share. 「ログを書かずに鍵を出す」 then requires t colluders,
+not one operator — the X-Road security server, decentralised. (Prior art:
+NuCypher/TACo threshold access control; conditions = CACAO + purpose here.)
+
+### Phases
+
+- **R3a (this change) — share plane**: `kotoba-custody` crate.
+  `split_key(key, t, custodians) → Vec<CustodianShare>` (Shamir GF(2^8) via
+  the audited `sharks` crate — not hand-rolled), each share HPKE-wrapped
+  (`ephemeral_pk || nonce || AES-256-GCM`, kotoba-crypto) to a custodian's
+  X25519 key, with a SHA-256 share commitment checked at `open_share`;
+  `combine_key(t, shares)` reconstructs. Immediate operational value even
+  pre-protocol: KOTOBA_BLOCK_KEY backup/recovery without any single key file
+  (deal 3-of-5 to operator devices / council members; lose any two).
+- **R3b — `/kotoba/key/1` protocol**: custodian nodes hold their share and
+  answer `KeyShareRequest { graph, cacao_b64, purpose, nonce }` over
+  libp2p request-response (PeerID = did:key at the Noise layer). Each
+  custodian: verify CACAO chain + purpose policy (reuse kotoba-auth +
+  access_receipt policy) → write receipt datom + countersign → release the
+  share HPKE-wrapped to the REQUESTER. Client combines t shares locally.
+- **R3c — verifiable + rotatable**: Feldman VSS (curve commitments replace
+  SHA-256 — custodians can verify their share against public commitments at
+  deal time, not just at open time) + MLS-epoch key rotation (custodian
+  set changes ⇒ new epoch ⇒ re-deal; revocation granularity = epoch).
+- **R3d — enforcement economics**: custodian bonds via MishmarBondEscrow
+  (#84); a custodian releasing without a receipt (detected by receipt-chain
+  cross-audit within a time window) is warranted (kotoba-dht warrant
+  machinery) and slashed; retainer rewards ride the pinner mKOTO settlement
+  loop (#80/#81).
+
+### R3a non-goals (explicit)
+
+No dealer-cheating protection yet (the dealer is the current key holder —
+the operator — who already knows the key; Feldman closes the gap when
+re-dealing moves to custodians in R3c). No network surface yet. Mixed-dealing
+shares combine to garbage, not an error (commitments are per-dealing;
+quorum tooling in R3b tags dealings with a deal-id).
+
+### R3b — custodian protocol core (`/kotoba/key/1`), 2026-06-11
+
+Status: **core implemented** (transport shell deferred, like kotoba-turn #102)
+
+`kotoba-custody::protocol` carries the wire types + the load-bearing
+invariant, transport-agnostic:
+
+- `KeyShareRequest { graph_cid_mb, cacao_b64, purpose, nonce,
+  requester_x25519_pk }` → `KeyShareResponse::{Granted(GrantedShare), Denied}`.
+- `handle_key_share_request(req, my_share, my_sk, authorize)` — the custodian
+  calls the injected `authorize` closure FIRST (CACAO chain + purpose policy +
+  nonce + **receipt write** all happen there); only on `Ok` does it open its
+  at-rest share and re-wrap it (HPKE) to the requester's ephemeral pubkey.
+  **"no receipt, no key" is control-flow-enforced** — a denied request never
+  touches share material (test-pinned), and the authorize hook fires even when
+  it denies (so the receipt precedes any release).
+- `combine_granted(t, grants, requester_sk)` — requester opens t re-wrapped
+  shares and recombines the key locally; t−1 grants cannot.
+- Authorization is injected (server layer resolves CACAO via kotoba-auth +
+  writes the receipt via access_receipt), keeping kotoba-custody a leaf crate
+  — same seam discipline as the R2c import check.
+
+A share in flight is sealed to the requester's key, so an eavesdropper or a
+different requester cannot read it (test-pinned). The libp2p request-response
+Behaviour (PeerID = did:key at Noise) is the remaining thin shell; R3c
+(Feldman VSS + MLS epochs) and R3d (bonds/warrants) follow.
+
+### R3b (server wiring) — `key.{requestShare,depositShare,custodianInfo}` XRPC, 2026-06-11
+
+The custodian protocol core (kotoba-custody) is now reachable over XRPC; this
+node acts as one custodian:
+
+- **`key.custodianInfo`** (GET, public) — returns this node's DID + X25519
+  pubkey so an operator dealing shares can wrap this node's share to it.
+- **`key.depositShare`** (POST, operator-gated) — installs a `CustodianShare`
+  for a graph into the in-memory `custody_shares` registry.
+- **`key.requestShare`** (POST) — the release path. Builds the `authorize`
+  closure injected into `handle_key_share_request`: for a Private graph it
+  verifies a CACAO `datom:read` capability (issuer/aud/replay via
+  `verify_cacao_graph_operation`), applies the purpose policy, and writes an
+  `operation = key:requestShare` access receipt — THEN the protocol core opens
+  this node's share and re-wraps it to the requester's ephemeral X25519 key.
+  A denied request returns `{ok:false}` with no share material; the receipt is
+  written before any release (the "no receipt, no key" invariant, now spanning
+  the network boundary). The requester collects `threshold` grants from
+  distinct custodian nodes and recombines locally (`combine_granted`).
+
+Remaining R3: a libp2p request-response transport (the XRPC surface proves the
+semantics; libp2p is the production carrier), per-graph key actually SPLIT to
+custodians at seal time (today the operator deals manually), R3c VSS+MLS, R3d
+bonds/warrants.

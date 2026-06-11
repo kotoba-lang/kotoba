@@ -34,7 +34,10 @@
 //! - raw memory: `(alloc n)`, `(load64 a)`, `(store64! a v)`, `(load32 a)`,
 //!   `(store32! a v)` — the substrate the [`PRELUDE`] vector/map build on
 //! - host calls: `(has-capability? resource ability)` → `auth.has-capability`;
-//!   `(llm-infer model prompt)` → `llm.infer` (ok → output handle, err → `0`).
+//!   `(llm-infer model prompt)` → `llm.infer` (ok → output handle, err → `0`);
+//!   `(kqe-assert! g s p obj-cbor)` / `(kqe-retract! …)` → `kqe.assert-quad` /
+//!   `retract-quad` (the **Datom write surface**, 1/0); `(kqe-get-objects g s
+//!   p)` / `(kqe-query filter)` → packed list handles read via [`KQE_PRELUDE`].
 //!   These grow a real wasm import section wired to the `kotoba:kais` world.
 //! - in-guest CBOR decode via [`CBOR_PRELUDE`] (`cbor-reader`, `cbor-uint`,
 //!   `cbor-text`, `cbor-map-seek`, …) — decode a `run(ctx-cbor)` payload
@@ -358,18 +361,46 @@ pub const CBOR_ENC_PRELUDE: &str = r#"
 (defn cbor-enc-bytes! [buf s] (cbor-enc--str! buf 2 s))
 "#;
 
+/// Accessors for the packed list handles the **kqe host builtins** return —
+/// written in the language itself on `load32` (the host lifts results into
+/// guest memory via `cabi_realloc`; the Canonical-ABI layouts are flat arrays).
+///
+/// A kqe list handle packs `(element-array-ptr << 32) | count`:
+/// - `kqe-get-objects` elements are `list<u8>`: 8 bytes each, `[ptr:i32, len:i32]`.
+/// - `kqe-query` elements are `quad` records: 32 bytes each — 4 × `[ptr,len]`
+///   fields in WIT order graph(0) / subject(1) / predicate(2) / object-cbor(3).
+///
+/// Every accessor yields a normal **string handle** `(ptr << 32) | len`, so the
+/// results read back through `str-len` / `byte-at` / `str-eq?` / `cbor-reader`.
+pub const KQE_PRELUDE: &str = r#"
+;; ---- kqe packed-list accessors ---------------------------------------------
+(defn kqe-count [h] (str-len h))
+(defn kqe--ptr [h] (/ h 4294967296))
+;; read the [ptr:i32, len:i32] pair at address e into a string handle
+(defn kqe--handle-at [e] (+ (* (load32 e) 4294967296) (load32 (+ e 4))))
+;; i-th object of a (kqe-get-objects …) result → string handle of the CBOR bytes
+(defn kqe-obj-nth [h i] (kqe--handle-at (+ (kqe--ptr h) (* 8 i))))
+;; field f (0=graph 1=subject 2=predicate 3=object-cbor) of the i-th quad
+(defn kqe-quad-field [h i f] (kqe--handle-at (+ (+ (kqe--ptr h) (* 32 i)) (* 8 f))))
+(defn kqe-quad-graph [h i] (kqe-quad-field h i 0))
+(defn kqe-quad-subject [h i] (kqe-quad-field h i 1))
+(defn kqe-quad-predicate [h i] (kqe-quad-field h i 2))
+(defn kqe-quad-object [h i] (kqe-quad-field h i 3))
+"#;
+
 /// Compile `src` with the container [`PRELUDE`], the CBOR decoder
-/// [`CBOR_PRELUDE`], and the CBOR encoder [`CBOR_ENC_PRELUDE`] prepended, so the
-/// program can use `vec-*` / `map-*` / `cbor-*` directly.
+/// [`CBOR_PRELUDE`], the CBOR encoder [`CBOR_ENC_PRELUDE`], and the kqe
+/// accessors [`KQE_PRELUDE`] prepended, so the program can use `vec-*` /
+/// `map-*` / `cbor-*` / `kqe-*` directly.
 pub fn compile_str_with_prelude(src: &str) -> Result<Vec<u8>, CljError> {
     compile_str(&format!(
-        "{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{src}"
+        "{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}\n{src}"
     ))
 }
 
-/// The combined prelude text (containers + CBOR decode + CBOR encode), for
-/// callers that compile via the component/kais path and need to prepend it to
-/// their own `(defn run …)`.
+/// The combined prelude text (containers + CBOR decode + CBOR encode + kqe
+/// accessors), for callers that compile via the component/kais path and need to
+/// prepend it to their own `(defn run …)`.
 pub fn prelude() -> String {
-    format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}")
+    format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}")
 }
