@@ -22,8 +22,17 @@ Charter Rider §2(a)(c): MEDIUM (setpoint writes within attested envelopes).
 
 from __future__ import annotations
 
-COUNCIL_FLEET_ATTESTATION_TX_HASH: str | None = None
-SILEN_SEIGYO_BASELINE_REVIEW_CID: str | None = None
+# Provisional gate values per etzhayyim-root CLAUDE.md operational premise
+# (2026-06-11): Council attestation = PR review; merged-PR merge commits
+# stand in for on-chain tx hash / IPFS CID until Base testnet migration.
+#   charter + R1 ADRs ratified: etzhayyim/root#1635
+#   baseline review (verdict: approved): etzhayyim/root#1641
+COUNCIL_FLEET_ATTESTATION_TX_HASH: str | None = (
+    "pr:etzhayyim/root#1635@9144cf64434402678a23dbbc4d885ada98c3cef0"
+)
+SILEN_SEIGYO_BASELINE_REVIEW_CID: str | None = (
+    "pr:etzhayyim/root#1641@d3060afbb2f90213caf905afc781db163848b96a"
+)
 
 if (
     COUNCIL_FLEET_ATTESTATION_TX_HASH is None
