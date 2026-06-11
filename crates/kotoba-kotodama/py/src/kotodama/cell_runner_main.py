@@ -44,7 +44,7 @@ except ImportError:
 # In-container Pods set FLEET_TOML + ETZ_REPO via the fleet-to-kustomize
 # generator (per ADR-2605232100). On a developer laptop the env vars are
 # absent and we fall back to repo-relative resolution from __file__.
-_ENV_REPO = os.environ.get("ETZ_REPO")
+_ENV_REPO = os.environ.get("ETZ_REPO") or os.environ.get("ETZHAYYIM_REPO")
 REPO_ROOT = Path(_ENV_REPO) if _ENV_REPO else Path(__file__).resolve().parents[5]
 FLEET_TOML = Path(os.environ.get("FLEET_TOML") or (REPO_ROOT / "50-infra" / "murakumo" / "fleet.toml"))
 CELLS_TOML = REPO_ROOT / "50-infra" / "cluster" / "murakumo" / "cell-runner" / "cells.toml"
