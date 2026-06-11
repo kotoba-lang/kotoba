@@ -1,8 +1,7 @@
 """Murakumo cell for the yabai Tor/Torrent CTI persistence path.
 
-The cell runs as a LAN API worker with a local durable SQLite queue. Jobs are
-processed immediately when enqueued, each step is checkpointed, and the legacy
-one-shot entry remains available for manual repair.
+The cell runs as a LAN API worker backed by Kotoba Datomic. Jobs and per-step
+checkpoints are datoms in a dedicated graph; there is no local SQLite queue.
 """
 
 from __future__ import annotations
@@ -12,20 +11,29 @@ import json
 import os
 import pathlib
 import shutil
-import sqlite3
 import subprocess
 import sys
 import time
 import uuid
 from typing import Any
 
+from kotodama.kotoba_datomic import (
+    KotobaDatomicClient,
+    KotobaTransactError,
+    edn_str,
+    get_kotoba_client,
+    to_tx_edn,
+)
+
 ACTOR_DID = "did:web:etzhayyim.com:actor:yabai"
 CELL_NAME = "YabaiTorTorrentCtiPersistenceCell"
-STALE_LEASE_S = 600
+QUEUE_GRAPH = os.environ.get("YABAI_QUEUE_GRAPH", "etzhayyim/yabai/cti-persistence-queue")
+NS_JOB = "yabai.job"
+NS_CP = "yabai.checkpoint"
 
 
 def _repo_root() -> pathlib.Path:
-    configured = os.environ.get("ETZHAYYIM_ROOT") or os.environ.get("ETZ_REPO")
+    configured = os.environ.get("ETZHAYYIM_ROOT") or os.environ.get("ETZ_REPO") or os.environ.get("ETZHAYYIM_REPO")
     if configured:
         return pathlib.Path(configured).expanduser().resolve()
     here = pathlib.Path(__file__).resolve()
@@ -85,56 +93,41 @@ def _append_marker(path: pathlib.Path, record: dict[str, Any]) -> None:
         fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _db_path(repo: pathlib.Path) -> pathlib.Path:
-    return _state_dir(repo) / "cti-correlator-queue.sqlite3"
+def _now() -> int:
+    return int(time.time())
 
 
-def _connect(db_path: pathlib.Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS jobs (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            status TEXT NOT NULL,
-            priority INTEGER NOT NULL DEFAULT 100,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            max_attempts INTEGER NOT NULL DEFAULT 5,
-            next_run_at INTEGER NOT NULL,
-            leased_until INTEGER,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            last_error TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS checkpoints (
-            job_id TEXT NOT NULL,
-            step TEXT NOT NULL,
-            status TEXT NOT NULL,
-            ts INTEGER NOT NULL,
-            detail_json TEXT NOT NULL,
-            PRIMARY KEY (job_id, step, ts)
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ready ON jobs(status, next_run_at, priority)")
-    conn.commit()
-    return conn
+def _client() -> KotobaDatomicClient:
+    return get_kotoba_client()
 
 
-def _checkpoint(conn: sqlite3.Connection, job_id: str, step: str, status: str, detail: dict[str, Any]) -> None:
-    conn.execute(
-        "INSERT INTO checkpoints(job_id, step, status, ts, detail_json) VALUES (?, ?, ?, ?, ?)",
-        (job_id, step, status, time.time_ns(), json.dumps(detail, ensure_ascii=False, sort_keys=True)),
-    )
-    conn.commit()
+def _tx(client: KotobaDatomicClient, entities: list[dict[str, Any]], note: str) -> None:
+    client.transact(to_tx_edn(entities, [note]), graph=QUEUE_GRAPH)
+
+
+def _strip(ent: Any, ns: str) -> dict[str, Any]:
+    if not isinstance(ent, dict):
+        return {}
+    prefix = f":{ns}/"
+    out = {}
+    for key, val in ent.items():
+        k = str(key)
+        col = k[len(prefix):] if k.startswith(prefix) else k.lstrip(":")
+        out[col.replace("-", "_")] = val
+    return out
+
+
+def _pull_by_attr(ns: str, attr: str, value: str) -> str:
+    return f"[:find (pull ?e [*]) :where [?e :{ns}/{attr} {edn_str(value)}]]"
+
+
+def _all_jobs_query() -> str:
+    return f"[:find (pull ?e [*]) :where [?e :{NS_JOB}/id _]]"
+
+
+def _entity(item: Any, ns: str) -> dict[str, Any]:
+    ent = item[0] if isinstance(item, (list, tuple)) and item else item
+    return _strip(ent, ns)
 
 
 def enqueue_job(
@@ -143,77 +136,93 @@ def enqueue_job(
     payload: dict[str, Any] | None = None,
     priority: int = 100,
     job_id: str | None = None,
+    client: KotobaDatomicClient | None = None,
 ) -> str:
-    repo = _repo_root()
-    now = int(time.time())
+    c = client or _client()
+    now = _now()
     jid = job_id or f"yabai-{now}-{uuid.uuid4().hex[:12]}"
-    with _connect(_db_path(repo)) as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO jobs(
-                id, kind, payload_json, status, priority, attempts, max_attempts,
-                next_run_at, leased_until, created_at, updated_at, last_error
-            ) VALUES (?, ?, ?, 'pending', ?, 0, 5, ?, NULL, ?, ?, NULL)
-            """,
-            (jid, kind, json.dumps(payload or {}, ensure_ascii=False, sort_keys=True), priority, now, now, now),
-        )
-        conn.commit()
+    _tx(c, [{
+        f":{NS_JOB}/id": jid,
+        f":{NS_JOB}/kind": kind,
+        f":{NS_JOB}/payload-json": json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+        f":{NS_JOB}/status": "pending",
+        f":{NS_JOB}/priority": int(priority),
+        f":{NS_JOB}/attempts": 0,
+        f":{NS_JOB}/max-attempts": 5,
+        f":{NS_JOB}/created-at": now,
+        f":{NS_JOB}/updated-at": now,
+    }], f"enqueue {jid}")
     return jid
 
 
-def _lease_next(conn: sqlite3.Connection) -> sqlite3.Row | None:
-    now = int(time.time())
-    conn.execute(
-        """
-        UPDATE jobs
-        SET status='pending', leased_until=NULL, updated_at=?
-        WHERE status='running' AND leased_until IS NOT NULL AND leased_until < ?
-        """,
-        (now, now),
-    )
-    row = conn.execute(
-        """
-        SELECT * FROM jobs
-        WHERE status='pending' AND next_run_at <= ?
-        ORDER BY priority ASC, created_at ASC
-        LIMIT 1
-        """,
-        (now,),
-    ).fetchone()
-    if row is None:
-        conn.commit()
+def _checkpoint(client: KotobaDatomicClient, job_id: str, step: str, status: str, detail: dict[str, Any]) -> None:
+    ts = time.time_ns()
+    _tx(client, [{
+        f":{NS_CP}/id": f"{job_id}:{step}:{ts}",
+        f":{NS_CP}/job-id": job_id,
+        f":{NS_CP}/step": step,
+        f":{NS_CP}/status": status,
+        f":{NS_CP}/ts": ts,
+        f":{NS_CP}/detail-json": json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str),
+    }], f"checkpoint {job_id}/{step}/{status}")
+
+
+def _load_job(client: KotobaDatomicClient, job_id: str) -> dict[str, Any] | None:
+    rows = client.q(_pull_by_attr(NS_JOB, "id", job_id), graph=QUEUE_GRAPH)
+    jobs = [_entity(row, NS_JOB) for row in rows]
+    jobs = [job for job in jobs if job]
+    if not jobs:
         return None
-    conn.execute(
-        """
-        UPDATE jobs
-        SET status='running', attempts=attempts + 1, leased_until=?, updated_at=?
-        WHERE id=? AND status='pending'
-        """,
-        (now + STALE_LEASE_S, now, row["id"]),
-    )
-    conn.commit()
-    return conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
+    jobs.sort(key=lambda job: int(job.get("updated_at") or 0), reverse=True)
+    return jobs[0]
 
 
-def _job_counts(conn: sqlite3.Connection) -> dict[str, int]:
-    rows = conn.execute("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status").fetchall()
-    return {str(row["status"]): int(row["n"]) for row in rows}
+def _ready_jobs(client: KotobaDatomicClient) -> list[dict[str, Any]]:
+    rows = client.q(_all_jobs_query(), graph=QUEUE_GRAPH)
+    jobs = [_entity(row, NS_JOB) for row in rows]
+    jobs = [job for job in jobs if job.get("status") == "pending"]
+    jobs.sort(key=lambda job: (int(job.get("priority") or 100), int(job.get("created_at") or 0)))
+    return jobs
 
 
-def _latest_jobs(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT id, kind, status, attempts, created_at, updated_at, last_error
-        FROM jobs
-        ORDER BY updated_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    return [dict(row) for row in rows]
+def _job_counts(client: KotobaDatomicClient) -> dict[str, int]:
+    rows = client.q(_all_jobs_query(), graph=QUEUE_GRAPH)
+    counts: dict[str, int] = {}
+    for row in rows:
+        status = str(_entity(row, NS_JOB).get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
-async def _run_pipeline(job_id: str, payload: dict[str, Any], conn: sqlite3.Connection) -> dict[str, Any]:
+def _latest_jobs(client: KotobaDatomicClient, limit: int = 20) -> list[dict[str, Any]]:
+    rows = client.q(_all_jobs_query(), graph=QUEUE_GRAPH)
+    jobs = [_entity(row, NS_JOB) for row in rows]
+    jobs = [job for job in jobs if job]
+    jobs.sort(key=lambda job: int(job.get("updated_at") or 0), reverse=True)
+    return jobs[:limit]
+
+
+def _set_job_status(
+    client: KotobaDatomicClient,
+    job_id: str,
+    status: str,
+    *,
+    attempts: int | None = None,
+    last_error: str | None = None,
+) -> None:
+    ent: dict[str, Any] = {
+        f":{NS_JOB}/id": job_id,
+        f":{NS_JOB}/status": status,
+        f":{NS_JOB}/updated-at": _now(),
+    }
+    if attempts is not None:
+        ent[f":{NS_JOB}/attempts"] = attempts
+    if last_error is not None:
+        ent[f":{NS_JOB}/last-error"] = last_error
+    _tx(client, [ent], f"job {job_id} -> {status}")
+
+
+async def _run_pipeline(job_id: str, payload: dict[str, Any], client: KotobaDatomicClient) -> dict[str, Any]:
     _guardrails()
     repo = _repo_root()
     actor = repo / "20-actors" / "yabai"
@@ -225,7 +234,7 @@ async def _run_pipeline(job_id: str, payload: dict[str, Any], conn: sqlite3.Conn
     env.setdefault("KOTOBA_AUDIT_STRICT", "1")
     env.setdefault("PYTHONUTF8", "1")
 
-    started = int(time.time())
+    started = _now()
     record: dict[str, Any] = {
         "ts": started,
         "job_id": job_id,
@@ -234,6 +243,7 @@ async def _run_pipeline(job_id: str, payload: dict[str, Any], conn: sqlite3.Conn
         "node": os.environ.get("ETZHAYYIM_NODE_NAME") or os.environ.get("ETZHAYYIM_NODE"),
         "mode": "live" if (env.get("YABAI_GRAPH_CID") and (env.get("KOTOBA_TOKEN") or env.get("KOTOBA_CACAO_B64"))) else "dry-run",
         "payload": payload,
+        "checkpoint_graph": QUEUE_GRAPH,
         "boundary": "public Tor-exit indicators + case-bound BitTorrent evidence only; no de-anonymization",
     }
 
@@ -244,10 +254,10 @@ async def _run_pipeline(job_id: str, payload: dict[str, Any], conn: sqlite3.Conn
     ]
     results = []
     for step_name, step_cmd in steps:
-        _checkpoint(conn, job_id, step_name, "started", {"cmd": step_cmd})
+        _checkpoint(client, job_id, step_name, "started", {"cmd": step_cmd})
         result = await _run(step_cmd, actor, env)
         results.append(result)
-        _checkpoint(conn, job_id, step_name, "ok" if result["returncode"] == 0 else "failed", result)
+        _checkpoint(client, job_id, step_name, "ok" if result["returncode"] == 0 else "failed", result)
         if result["returncode"] != 0:
             record.update({"ok": False, "failed_step": step_name, "results": results})
             _append_marker(marker_path, record)
@@ -258,88 +268,91 @@ async def _run_pipeline(job_id: str, payload: dict[str, Any], conn: sqlite3.Conn
         _append_marker(marker_path, record)
         raise RuntimeError("YABAI_REQUIRE_LIVE=1 but no graph/auth credentials were present")
 
-    record.update({"ok": True, "duration_s": int(time.time()) - started, "results": results})
-    _checkpoint(conn, job_id, "complete", "ok", {"duration_s": record["duration_s"], "mode": record["mode"]})
+    record.update({"ok": True, "duration_s": _now() - started, "results": results})
+    _checkpoint(client, job_id, "complete", "ok", {"duration_s": record["duration_s"], "mode": record["mode"]})
     _append_marker(marker_path, record)
     return record
 
 
-async def _worker_loop(stop_event: asyncio.Event, wake_event: asyncio.Event, db_path: pathlib.Path) -> None:
-    with _connect(db_path) as conn:
-        while not stop_event.is_set():
-            job = _lease_next(conn)
-            if job is None:
-                try:
-                    await asyncio.wait_for(wake_event.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass
-                wake_event.clear()
-                continue
-
-            job_id = str(job["id"])
-            payload = json.loads(job["payload_json"] or "{}")
+async def _worker_loop(stop_event: asyncio.Event, wake_event: asyncio.Event, client: KotobaDatomicClient) -> None:
+    while not stop_event.is_set():
+        jobs = await asyncio.to_thread(_ready_jobs, client)
+        if not jobs:
             try:
-                result = await _run_pipeline(job_id, payload, conn)
-                status = "done" if result.get("ok") else "failed"
-                conn.execute(
-                    "UPDATE jobs SET status=?, leased_until=NULL, updated_at=?, last_error=? WHERE id=?",
-                    (status, int(time.time()), None if result.get("ok") else json.dumps(result, ensure_ascii=False), job_id),
-                )
-            except Exception as caught:
-                now = int(time.time())
-                retry_at = now + min(3600, 60 * int(job["attempts"] or 1))
-                status = "failed" if int(job["attempts"]) >= int(job["max_attempts"]) else "pending"
-                conn.execute(
-                    "UPDATE jobs SET status=?, leased_until=NULL, next_run_at=?, updated_at=?, last_error=? WHERE id=?",
-                    (status, retry_at, now, str(caught), job_id),
-                )
-                _checkpoint(conn, job_id, "error", status, {"error": str(caught)})
-            conn.commit()
+                await asyncio.wait_for(wake_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+            wake_event.clear()
+            continue
+
+        job = jobs[0]
+        job_id = str(job["id"])
+        payload = json.loads(job.get("payload_json") or "{}")
+        attempts = int(job.get("attempts") or 0) + 1
+        try:
+            await asyncio.to_thread(_set_job_status, client, job_id, "running", attempts=attempts)
+            result = await _run_pipeline(job_id, payload, client)
+            status = "done" if result.get("ok") else "failed"
+            await asyncio.to_thread(
+                _set_job_status,
+                client,
+                job_id,
+                status,
+                last_error=None if result.get("ok") else json.dumps(result, ensure_ascii=False, default=str),
+            )
+        except Exception as caught:
+            max_attempts = int(job.get("max_attempts") or 5)
+            status = "failed" if attempts >= max_attempts else "pending"
+            await asyncio.to_thread(_checkpoint, client, job_id, "error", status, {"error": str(caught)})
+            await asyncio.to_thread(_set_job_status, client, job_id, status, attempts=attempts, last_error=str(caught))
 
 
 async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> None:
-    """Run Yabai as a durable queue worker.
-
-    Endpoints:
-      GET  /healthz
-      GET  /jobs
-      POST /enqueue {"kind":"persist","payload":{...},"priority":100}
-    """
+    """Run Yabai as a Kotoba Datomic-backed queue worker."""
     from aiohttp import web
 
-    repo = _repo_root()
-    db_path = _db_path(repo)
+    client = _client()
     wake_event = asyncio.Event()
 
-    with _connect(db_path) as conn:
-        pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'running')").fetchone()[0]
-        if int(pending) == 0:
-            enqueue_job(kind="persist", payload={"source": "boot"}, priority=50, job_id="yabai-boot")
+    try:
+        if _load_job(client, "yabai-boot") is None:
+            enqueue_job(kind="persist", payload={"source": "boot"}, priority=50, job_id="yabai-boot", client=client)
+    except KotobaTransactError as caught:
+        raise RuntimeError(f"Kotoba Datomic queue unavailable: {caught}") from caught
 
     async def healthz(_request: web.Request) -> web.Response:
-        with _connect(db_path) as conn:
+        try:
+            counts = await asyncio.to_thread(_job_counts, client)
             return web.json_response({
                 "ok": True,
                 "service": CELL_NAME,
                 "actor_did": ACTOR_DID,
-                "queue": _job_counts(conn),
-                "db_path": str(db_path),
+                "queue": counts,
+                "graph": QUEUE_GRAPH,
+                "store": "kotoba-datomic",
             })
+        except Exception as caught:
+            return web.json_response({"ok": False, "error": str(caught), "store": "kotoba-datomic"}, status=503)
 
     async def jobs(request: web.Request) -> web.Response:
         limit = int(request.query.get("limit", "20"))
-        with _connect(db_path) as conn:
-            return web.json_response({"jobs": _latest_jobs(conn, max(1, min(limit, 100)))})
+        rows = await asyncio.to_thread(_latest_jobs, client, max(1, min(limit, 100)))
+        return web.json_response({"jobs": rows, "graph": QUEUE_GRAPH})
 
     async def enqueue(request: web.Request) -> web.Response:
         body = await request.json() if request.can_read_body else {}
-        jid = enqueue_job(
-            kind=str(body.get("kind") or "persist"),
-            payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
-            priority=int(body.get("priority") or 100),
-        )
+        try:
+            jid = await asyncio.to_thread(
+                enqueue_job,
+                kind=str(body.get("kind") or "persist"),
+                payload=body.get("payload") if isinstance(body.get("payload"), dict) else {},
+                priority=int(body.get("priority") or 100),
+                client=client,
+            )
+        except Exception as caught:
+            return web.json_response({"ok": False, "error": str(caught)}, status=503)
         wake_event.set()
-        return web.json_response({"ok": True, "job_id": jid}, status=202)
+        return web.json_response({"ok": True, "job_id": jid, "graph": QUEUE_GRAPH}, status=202)
 
     app = web.Application()
     app.router.add_get("/healthz", healthz)
@@ -355,7 +368,7 @@ async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> 
     for site in sites:
         await site.start()
 
-    worker = asyncio.create_task(_worker_loop(stop_event, wake_event, db_path))
+    worker = asyncio.create_task(_worker_loop(stop_event, wake_event, client))
     wake_event.set()
     try:
         await stop_event.wait()
@@ -369,14 +382,8 @@ async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> 
 
 
 async def yabai_tor_torrent_persistence_cell() -> dict[str, Any]:
-    repo = _repo_root()
-    db_path = _db_path(repo)
-    job_id = enqueue_job(kind="persist", payload={"source": "manual-one-shot"}, priority=10)
-    with _connect(db_path) as conn:
-        result = await _run_pipeline(job_id, {"source": "manual-one-shot"}, conn)
-        conn.execute(
-            "UPDATE jobs SET status=?, leased_until=NULL, updated_at=?, last_error=? WHERE id=?",
-            ("done" if result.get("ok") else "failed", int(time.time()), None if result.get("ok") else json.dumps(result), job_id),
-        )
-        conn.commit()
+    client = _client()
+    job_id = enqueue_job(kind="persist", payload={"source": "manual-one-shot"}, priority=10, client=client)
+    result = await _run_pipeline(job_id, {"source": "manual-one-shot"}, client)
+    await asyncio.to_thread(_set_job_status, client, job_id, "done" if result.get("ok") else "failed")
     return result
