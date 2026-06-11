@@ -13,14 +13,14 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 
 | crate | 役割 |
 |---|---|
-| kotoba-core | CIDv1 blake3, KAIS 8-bit frame, Prolly Tree |
-| kotoba-kse | Journal (Merkle WAL on Arc<dyn BlockStore>, head JSON, Merkle chain cold-path), Vault (file-type chunking: Single/FixedLen 512KB/CDC gear-hash/CodecAware CBOR-item; BlobManifest CID; flush_as_car() CAR v1 batch), SecureVault, Topic, Shelf, chunker.rs **[IPLD-only 2026-05-26]**; **AgentIdentity** (Ed25519+X25519 keypair, from_env/generate_ephemeral); **SovereignCrypto** (AgentCrypto impl: vault key gen→HPKE wrap→BlockStore; load_or_genesis; rotate; key-ref JSON pointer in KseStore) **[2026-05-26]** |
-| kotoba-kqe | Datalog engine, Arrangement, Delta, MV (KQE) |
-| kotoba-dht | Source Chain, Warrant, Neighborhood (KDHT) |
+| kotoba-core | CIDv1 blake3, KAIS 8-bit frame (**KAIS = Kotoba Instruction Set Architecture**), Prolly Tree |
+| kotoba-kse | **KSE = Kotoba Stream Engine**. **⚠ Journal DEPRECATED as canonical chain (2026-06-11, #115 — `[knowledge.journal-deprecation]`)**: canonical/accountability chain = **CommitDag** (kotoba-datomic `DistributedDatomCommit`); Journal の残存役割は ephemeral live-tail (`publish_ephemeral` — broadcast+ring, block 永続なし) のみ、durable replay は `sync.eventsFromCommits`; startup WAL replay 撤去済み・double-write は ephemeral 化済み; **Vault/SecureVault/Shelf/PreKeyRegistry は deprecated 対象外**。 Journal (Merkle WAL on Arc<dyn BlockStore>, head JSON, Merkle chain cold-path — legacy replay only), Vault (file-type chunking: Single/FixedLen 512KB/CDC gear-hash/CodecAware CBOR-item; BlobManifest CID; flush_as_car() CAR v1 batch), SecureVault, Topic, Shelf, chunker.rs **[IPLD-only 2026-05-26]**; **AgentIdentity** (Ed25519+X25519 keypair, from_env/generate_ephemeral); **SovereignCrypto** (AgentCrypto impl: vault key gen→HPKE wrap→BlockStore; load_or_genesis; rotate; key-ref JSON pointer in KseStore) **[2026-05-26]** |
+| kotoba-kqe | **KQE = Kotoba Query Engine** — Datalog engine, Arrangement (4-index EAVT/AEVT/AVET/VAET), Delta, MV |
+| kotoba-dht | **KDHT = Kotoba Distributed Hash Table** — Source Chain, Warrant, Neighborhood |
 | kotoba-net | libp2p QUIC/Noise/GossipSub |
 | kotoba-auth | CACAO chain verification, DID Document; **EVM read+verify surface** (`eth.rs` + `eth/{abi,token,caip,eip1271}.rs`, 2026-05-30); **Bitcoin read+verify surface** (`btc.rs` + `btc/{address,caip,bip322}.rs`, BIP-122/CAIP-2/10/19 + Base58Check/bech32/bech32m + legacy signmessage verify, 2026-06-03, ADR-2606035800) |
 | kotoba-graph | Quad API, SPARQL→Datalog, Commit DAG |
-| kotoba-vm | Invoke/Result ChainEntry, CALL_FOREIGN bridge (KVM) |
+| kotoba-vm | **KVM = Kotoba Virtual Machine** — Invoke/Result ChainEntry, CALL_FOREIGN bridge, Pregel BSP hosts |
 | kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference, WebGPU training (embed+lm_head), WebGPU inference (full transformer, Gemma 4 E2B/E4B) |
 | kotoba-runtime | WASM Component Model host: WasmExecutor + UdfExecutor + WIT bindings |
 | kotoba-clj | **Clojure/EDN-subset → WebAssembly compiler** (ADR `docs/ADR-clojure-wasm.md`, 2026-06-08). Reuses `kotoba-edn` as reader → typed AST → two-pass codegen via `wasm-encoder` → real core wasm module; `run` feature instantiates on workspace-pinned wasmtime. Subset: `def`/`defn`/`ns`, `if`/`when`/`let`/`do`, `+ - * / mod`, `= < > <= >=`, `and or not`, **string literals + `str-len`/`byte-at`** (strings = packed `(off<<32)\|len` handles), user-fn calls incl. (mutual) recursion; each `defn` exported by name; `def` const-folded + inlined. Every module also exports linear `memory` + `cabi_realloc` bump allocator. **kais-binding workstream** (5 steps): ✅1 memory+realloc ✅2 str/bytes values ✅3 `list<u8>` in/out **Component** export via `wit-component` (`(defn run [input] …)` → `run: func(list<u8>)->list<u8>`, hand-emitted canonical-ABI wrapper, instantiated via `wasmtime::component`; smoke-tested wit-component 0.221 ↔ wasmtime 22) ⬜4 CBOR-decode `InvokeContext` — **blocked on language growth (loops + byte-building)** ✅5 emit `kotoba-node` `run` — **runs on kotoba-runtime**: `compile_kais_component_str` targets the REAL `kotoba-node` world (`run: func(list<u8>)->result<list<u8>,string>`, 12-byte ok-variant return area) via `Resolve::push_dir` over `kotoba-runtime/wit`; `assert_loads` confirms the `ProgramStore` compile path, and `tests/kais_invoke.rs` drives the runtime's own `WasmExecutor` (binds all kotoba:kais imports) to invoke `run(ctx)` end-to-end + lift the result (validates the hand-emitted variant layout at runtime). **Phase boundary**: compiled Clojure runs on kotoba-runtime, but the wrapper passes raw ctx-cbor **undecoded** → meaningfully reading ctx/args is gated on step 4 (loops + bytes). Tests (27+doctest): factorial/fib/mutual-rec/const-inline + str-len/byte-at/UTF-8 + allocator(align/monotonic/non-overlap/growth) + component(echo/binary/empty/data-seg-literal/len-branch) + kais-load + kais-invoke(WasmExecutor: fixed/ctx-echo/len-branch) all green. **langgraph workstream (A–E)**: ✅A `loop`/`recur`+`cond`+byte-builder ✅B heap vector/map prelude ✅C-1 host-import plumbing (`has-capability?`) ✅C-2 `llm-infer` (return-area ABI) ✅C-3/C-4 in-guest CBOR decode/encode (closes step 4) ✅D `defgraph` DSL + add-messages/override reducers ✅**C-5 kqe host builtins (2026-06-11)** — `kqe-assert!`/`kqe-retract!`/`kqe-get-objects`/`kqe-query` lower to `kotoba:kais/kqe` imports (flattened quad record + indirect results; host lifts lists via guest `cabi_realloc`); `KQE_PRELUDE` reads lifted arrays in-language (`kqe-count`/`kqe-obj-nth`/`kqe-quad-*`); `tests/kqe.rs` 9 live WasmExecutor tests incl. read-modify-write agent + **Datomic loop** (agent-asserted quads → `kotoba_kqe::Datom` → `kotoba_datomic::Datom::from_kqe` → `Db::from_datoms` → queried back as EDN) ✅**E Pregel/BSP (2026-06-11)** — `tests/pregel.rs` drives the compiled `defgraph` agent through `kotoba-vm::WasmPregelRunner`: CBOR ctx → defgraph node asserts a Datom + bumps counter → `{"status":"continue"\|"done"}` self-loop; 4 supersteps / 4 Datoms / gas accumulation / `max_supersteps` cap verified. **Compiled Clojure agent = langgraph defgraph × kqe Datom writes × Pregel BSP, end-to-end** |
@@ -173,7 +173,7 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
 - `CommitDag::Commit` に `index_roots: HashMap<String, KotobaCid>` 追加 (`serde(default, skip_serializing_if)` で旧 commit CID 安定)
 - `QuadStore::commit()` は EAVT/AEVT/AVET/VAET を **4 並列 64MB スタックスレッド** で同時ビルド (各スレッドは `CapturingBlockStore` でブロックを記録); 完了後 `CarBundleWriter` で全ブロックを単一 CAR ファイルにパック → ブロックストアに 1 PUT。実測: 3.1–3.8s/1Mquad commit (serial 4.7s → **28% 高速化**; MemoryBlockStore, M4 Mac)
 - `QuadStore::get_entity_quads_cold()`: hot Arrangement clear 後の cold 読み取り。ProllyTree `scan_prefix(subject_bytes)` → EAVT エントリ再構成。実測コスト: kubo LAN (1ms/GET) 3.1ms / kubo WAN (80ms/GET) 169ms / S3 same-AZ (2ms/GET) 5.9ms (1K entries, 2 tree levels)
-- Journal: 4 トピック SPO + PSO + POS + OSP に publish
+- Journal: 4 トピック SPO + PSO + POS + OSP に publish **[Journal deprecated 2026-06-11 — live-tail broadcast のみ; durable record は CommitDag]**
 
 ## TieredBlockStore / KuboBlockStore
 
@@ -604,7 +604,7 @@ CAR bundle: **total 7–9s で S3 flush 完了保証**。
 - `advance(new_head, seq, store)` → 旧 head アンピン → 新 head ピン
 - `unpin_from(store)` → セッション終了時に解放
 
-### Journal Selective Replay (persistent fallback 含む)
+### Journal Selective Replay (persistent fallback 含む) **[DEPRECATED 2026-06-11 #115 — legacy データの replay 専用; 新規 durable replay は CommitDag `sync.eventsFromCommits`]**
 - `Journal::read_since(seq)` → ring buffer から `seq` 以降を返す。`seq < oldest_ring_seq` かつ store が Some なら `seq/{seq:020}` seq-index で persistent fallback
 - `Journal::trim_before(seq)` → ring buffer の古いエントリを解放
 - `Journal::with_capacity(n)` → ring buffer サイズをカスタマイズ (デフォルト 65,536)
@@ -783,6 +783,8 @@ EVM `bind_evm` の鏡写し。read-only **Esplora REST** (Blockstream / mempool.
 **honest R0**: full BIP-322 (P2TR/script 所有) 未 / chain 観測は Esplora REST 依存で SPV-trustless ではない / client-side BTC wallet 連携は ADR design-only。詳細 ADR-2606035800。
 
 ## Firehose Egress — D+E federation surface (2026-05-30)
+
+> **⚠ Journal deprecation (2026-06-11, #115)**: 本セクションの Journal ベース設計 (cursor == Journal seq) は **legacy live-tail surface**。durable replay は CommitDag ベースの `GET /xrpc/com.etzhayyim.apps.kotoba.sync.eventsFromCommits` が正 (CommitDag tx feed — `KOTOBA_JOURNAL_WAL=off` 状態でも完全な履歴を再生可能)。Journal への新機能追加は禁止。
 
 KSE Journal (seq 順序ログ + broadcast `subscribe()` + `read_since()` cold-fallback) を「同一 cursor の 2 シンク」に開く。cursor == Journal `seq`。
 
