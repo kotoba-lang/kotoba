@@ -46,6 +46,11 @@ enum Cmd {
     /// Start the kotoba server
     Serve,
 
+    /// t-of-N key custody operations (ADR-sealed-cold-tier R3): deal a block
+    /// key into custodian shares, recombine grants, generate custodian keys.
+    #[command(subcommand)]
+    Key(KeyCmd),
+
     /// Raw block operations
     #[command(subcommand)]
     Block(BlockCmd),
@@ -323,6 +328,48 @@ enum QuadCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Generate an X25519 custodian/requester keypair (hex). The PUBLIC key is
+    /// what an operator deals shares to; keep the secret offline.
+    GenKey,
+
+    /// Split a 32-byte block key into t-of-N custodian shares, offline. Each
+    /// `--custodian DID:PUBKEY_HEX` gets one HPKE-wrapped share; any `t` of them
+    /// recombine. Prints the share JSONs (deposit each to its custodian via
+    /// `key.depositShare`).
+    Deal {
+        /// Block key as 64 hex chars (KOTOBA_BLOCK_KEY).
+        #[arg(long, env = "KOTOBA_BLOCK_KEY")]
+        key_hex: String,
+        /// Recombination threshold (2..=N).
+        #[arg(long)]
+        threshold: u8,
+        /// Custodian as `DID:X25519_PUBKEY_HEX`, repeatable.
+        #[arg(long = "custodian", required = true)]
+        custodians: Vec<String>,
+        /// Rotation epoch (R3c); bump when re-dealing to a changed set.
+        #[arg(long, default_value = "0")]
+        epoch: u64,
+    },
+
+    /// Recombine `threshold` granted shares (as returned by `key.requestShare`)
+    /// back into the block key, offline. `--grant` is a path to a grant JSON,
+    /// repeatable; `--requester-sk-hex` is the X25519 secret the shares were
+    /// re-wrapped to.
+    Combine {
+        /// Path to a grant JSON file, repeatable (need >= threshold).
+        #[arg(long = "grant", required = true)]
+        grants: Vec<std::path::PathBuf>,
+        /// Requester X25519 secret (64 hex chars).
+        #[arg(long, env = "KOTOBA_REQUESTER_SK")]
+        requester_sk_hex: String,
+        /// Threshold the deal used.
+        #[arg(long)]
+        threshold: u8,
+    },
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -345,6 +392,8 @@ async fn main() -> Result<()> {
             }
             kotoba_server::run().await?;
         }
+
+        Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,
 
         Cmd::Sparql {
             query,
@@ -1551,4 +1600,145 @@ fn notify(upstream_sha: &str) -> Option<String> {
         upstream = upstream_sha,
         local = BUILD_COMMIT,
     ))
+}
+
+// ── Key custody (R3) ─────────────────────────────────────────────────────────
+
+fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32]> {
+    let b = hex::decode(s.trim()).with_context(|| format!("{what}: invalid hex"))?;
+    b.try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("{what}: need 32 bytes, got {}", v.len()))
+}
+
+/// Parse `DID:PUBKEY_HEX` into (did, X25519 pubkey).
+fn parse_custodian(spec: &str) -> Result<(String, x25519_dalek::PublicKey)> {
+    // did:key:... contains colons, so split on the LAST colon.
+    let (did, pk_hex) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("custodian must be DID:PUBKEY_HEX: {spec}"))?;
+    let pk = parse_hex32(pk_hex, "custodian pubkey")?;
+    Ok((did.to_string(), x25519_dalek::PublicKey::from(pk)))
+}
+
+fn run_key_cmd(cmd: KeyCmd) -> Result<()> {
+    match cmd {
+        KeyCmd::GenKey => {
+            let sk = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+            let pk = x25519_dalek::PublicKey::from(&sk);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "x25519_secret_hex": hex::encode(sk.to_bytes()),
+                    "x25519_pubkey_hex": hex::encode(pk.as_bytes()),
+                })
+            );
+            Ok(())
+        }
+
+        KeyCmd::Deal {
+            key_hex,
+            threshold,
+            custodians,
+            epoch,
+        } => {
+            let key = parse_hex32(&key_hex, "key_hex")?;
+            let parsed: Vec<(String, x25519_dalek::PublicKey)> = custodians
+                .iter()
+                .map(|c| parse_custodian(c))
+                .collect::<Result<_>>()?;
+            let shares = kotoba_custody::split_key_epoch(&key, threshold, &parsed, epoch)
+                .map_err(|e| anyhow::anyhow!("split_key: {e}"))?;
+            // One JSON object per line: { custodian, share } — feed each to
+            // key.depositShare on that custodian.
+            for (spec, share) in custodians.iter().zip(&shares) {
+                let did = spec.rsplit_once(':').map(|(d, _)| d).unwrap_or(spec);
+                println!(
+                    "{}",
+                    serde_json::json!({ "custodian": did, "share": share })
+                );
+            }
+            eprintln!(
+                "dealt {} shares (threshold {threshold}, epoch {epoch}); deposit each to its custodian via key.depositShare",
+                shares.len()
+            );
+            Ok(())
+        }
+
+        KeyCmd::Combine {
+            grants,
+            requester_sk_hex,
+            threshold,
+        } => {
+            let sk = x25519_dalek::StaticSecret::from(parse_hex32(&requester_sk_hex, "requester_sk_hex")?);
+            let mut parsed = Vec::with_capacity(grants.len());
+            for path in &grants {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("read grant {}", path.display()))?;
+                let grant: kotoba_custody::GrantedShare = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse grant {}", path.display()))?;
+                parsed.push(grant);
+            }
+            let key = kotoba_custody::combine_granted(threshold, &parsed, &sk)
+                .map_err(|e| anyhow::anyhow!("combine: {e}"))?;
+            println!("{}", hex::encode(*key));
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_custody_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parse_custodian_handles_did_key_colons() {
+        let pk_hex = hex::encode([7u8; 32]);
+        let spec = format!("did:key:z6Mkabc:{pk_hex}");
+        let (did, pk) = parse_custodian(&spec).unwrap();
+        assert_eq!(did, "did:key:z6Mkabc");
+        assert_eq!(pk.as_bytes(), &[7u8; 32]);
+    }
+
+    #[test]
+    fn deal_then_combine_roundtrip_offline() {
+        // Three custodian keypairs.
+        let custs: Vec<(String, x25519_dalek::StaticSecret, x25519_dalek::PublicKey)> = (1u8..=3)
+            .map(|i| {
+                let sk = x25519_dalek::StaticSecret::from([i; 32]);
+                let pk = x25519_dalek::PublicKey::from(&sk);
+                (format!("did:key:zC{i}"), sk, pk)
+            })
+            .collect();
+        let pubs: Vec<(String, x25519_dalek::PublicKey)> =
+            custs.iter().map(|(d, _, p)| (d.clone(), *p)).collect();
+        let key = [0x5Au8; 32];
+        let shares = kotoba_custody::split_key_epoch(&key, 2, &pubs, 0).unwrap();
+
+        // Each custodian opens its share; a requester would normally get them
+        // re-wrapped, but the CLI combine path takes GrantedShares. Simulate the
+        // custodian handler re-wrapping to a requester key.
+        let req_sk = x25519_dalek::StaticSecret::from([0x99u8; 32]);
+        let req_pk = x25519_dalek::PublicKey::from(&req_sk);
+        let grants: Vec<kotoba_custody::GrantedShare> = [0usize, 2]
+            .iter()
+            .map(|&i| {
+                let opened = kotoba_custody::open_share(&shares[i], &custs[i].1).unwrap();
+                let sealed = kotoba_crypto::hpke_seal(&req_pk, &opened.bytes).unwrap();
+                kotoba_custody::GrantedShare {
+                    custodian_did: shares[i].recipient_did.clone(),
+                    index: shares[i].index,
+                    threshold: shares[i].threshold,
+                    epoch: shares[i].epoch,
+                    deal_id: shares[i].deal_id.clone(),
+                    graph_cid_mb: "bg".into(),
+                    requester_x25519_pk: req_pk.as_bytes().to_vec(),
+                    ts_unix: 1,
+                    sealed_for_requester: sealed,
+                    grant_sig: None,
+                }
+            })
+            .collect();
+        let recovered = kotoba_custody::combine_granted(2, &grants, &req_sk).unwrap();
+        assert_eq!(*recovered, key, "CLI deal→grant→combine reconstructs the key");
+    }
 }

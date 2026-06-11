@@ -349,3 +349,22 @@ MishmarBondEscrow bond deposit + slash execution (Solidity, operator/Council-
 gated). With R3a–R3d the design is end-to-end: 「公開複製可能なのは暗号文だけ。
 復号鍵が通る道は t-of-N custodian で、身元と目的を申告して署名付きで記録され、
 記録なしに鍵を出した者は証拠付きで罰せられる」。
+
+### R3 operator tooling — kotoba key {gen-key,deal,combine} (2026-06-11)
+
+Status: implemented
+
+Turns the R3 custody primitives into an operable feature, all offline:
+
+- `kotoba key gen-key` — generate an X25519 custodian/requester keypair (hex).
+- `kotoba key deal --key-hex K --threshold T --custodian DID:PUBKEY_HEX … [--epoch N]`
+  — split KOTOBA_BLOCK_KEY into t-of-N HPKE-wrapped shares (one JSON line per
+  custodian), each ready to POST to that custodian's key.depositShare.
+- `kotoba key combine --grant FILE … --requester-sk-hex SK --threshold T`
+  — recombine key.requestShare grants into the block key locally; the
+  requester's X25519 secret never leaves the machine.
+
+The operator's path to running R3 (deal across council devices, rotate by
+re-dealing at a higher epoch, recover by combining any t grants) with no
+single key file ever existing. libp2p transport + on-chain bond/slash remain
+the deferred shells.
