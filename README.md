@@ -258,6 +258,17 @@ cargo test --workspace                  # ~1184 tests pass
 cargo build --release -p kotoba-cli     # final `kotoba` binary
 ```
 
+## Coverage
+
+```bash
+./scripts/coverage.sh        # per-crate + total line/region coverage (lib tests)
+./scripts/coverage.sh html   # browsable report at target/llvm-cov/html/index.html
+./scripts/coverage.sh lcov   # lcov.info for CI / codecov upload
+```
+
+Requires `cargo install cargo-llvm-cov` and a rustup toolchain (the script pins
+to `rustup run stable` because Homebrew rust ships no `llvm-tools`).
+
 ## ADR
 
 Design decisions live in
