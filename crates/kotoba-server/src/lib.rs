@@ -3,6 +3,7 @@ pub mod availability_xrpc;
 pub mod cc_xrpc;
 pub mod dht_transport;
 pub mod did_bridge;
+pub mod dna_integrity;
 pub mod econ;
 pub mod email_xrpc;
 pub mod evm_rpc;

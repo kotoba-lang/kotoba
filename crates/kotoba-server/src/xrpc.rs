@@ -4734,6 +4734,14 @@ pub async fn datomic_transact(
 
     let tx_data = kotoba_edn::parse(&req.tx_edn)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("tx_edn parse: {e}")))?;
+    // Engine-tier DNA integrity (ADR-2606112000): if this graph has a registered Actor DNA
+    // integrity ruleset (node config KOTOBA_DNA_RULES), validate the incoming datoms BEFORE
+    // commit — so a peer's writes are checked too, not just a well-behaved actor's. No-op when
+    // no ruleset is registered for the graph (backward-compatible).
+    if let Some(ruleset) = crate::dna_integrity::ruleset_for(&graph_cid.to_multibase()) {
+        crate::dna_integrity::validate_tx(&tx_data, ruleset)
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("dna integrity: {e}")))?;
+    }
     let ipns_name = datomic_write_ipns_name(&graph_cid, req.ipns_name.as_deref())?;
     let current_head = match state
         .ipns_registry
