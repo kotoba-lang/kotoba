@@ -923,6 +923,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", access_receipt::NSID_AUDIT_LIST),
             get(access_receipt::audit_list_receipts),
         )
+        .route(
+            &format!("/xrpc/{}", access_receipt::NSID_AUDIT_ANCHOR),
+            get(access_receipt::audit_anchor_payload),
+        )
         .route("/health", get(xrpc::health))
         .route(
             &format!("/xrpc/{}", xrpc::NSID_DATOM_CREATE),
