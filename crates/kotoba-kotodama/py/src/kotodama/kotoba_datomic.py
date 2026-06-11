@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Iterable, Mapping, Sequence
@@ -161,6 +162,28 @@ class KotobaTransactError(RuntimeError):
     pass
 
 
+def _edn_scalar(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if s.startswith('"') and s.endswith('"'):
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            return s[1:-1]
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        return float(s)
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    if s == "nil":
+        return None
+    return s
+
+
 class KotobaDatomicClient:
     """Synchronous kotoba Datomic client (urllib, stdlib only).
 
@@ -232,17 +255,28 @@ class KotobaDatomicClient:
     def q(self, query_edn: str, args: Sequence[Any] = (), *, graph: str | None = None) -> list[Any]:
         """Run a Datalog query (EDN ``[:find … :where …]``). Returns result rows."""
         g = graph or self.graph
-        st, body = self._post(NSID_Q, {"graph": g, "query": query_edn, "args": list(args)})
+        st, body = self._post(NSID_Q, {"graph": g, "query_edn": query_edn, "inputs_edn": [edn_val(a) for a in args]})
         if st != 200:
             raise KotobaTransactError(f"query failed: {st} {body}")
+        if "rows_edn" in body:
+            return [[_edn_scalar(cell) for cell in row] for row in body.get("rows_edn", [])]
         return body.get("result", body.get("rows", []))
 
     def pull(self, selector: str, eid: Any, *, graph: str | None = None) -> dict[str, Any]:
         """Pull an entity tree by selector + entity id (or lookup-ref)."""
         g = graph or self.graph
-        st, body = self._post(NSID_PULL, {"graph": g, "selector": selector, "eid": edn_val(eid)})
+        st, body = self._post(NSID_PULL, {"graph": g, "entity": str(eid), "pattern_edn": selector})
         if st != 200:
             raise KotobaTransactError(f"pull failed: {st} {body}")
+        if "datoms" in body:
+            ent: dict[str, Any] = {}
+            for datom in body.get("datoms", []):
+                attr = datom.get("a")
+                if not attr:
+                    continue
+                ent[attr] = _edn_scalar(datom.get("v_edn"))
+            ent[":db/id"] = body.get("entity")
+            return ent
         return body.get("entity", body)
 
     # -- rw_sql-compatible shims (low-friction caller migration) --

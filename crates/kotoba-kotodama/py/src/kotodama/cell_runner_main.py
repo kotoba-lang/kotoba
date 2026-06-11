@@ -44,7 +44,7 @@ except ImportError:
 # In-container Pods set FLEET_TOML + ETZ_REPO via the fleet-to-kustomize
 # generator (per ADR-2605232100). On a developer laptop the env vars are
 # absent and we fall back to repo-relative resolution from __file__.
-_ENV_REPO = os.environ.get("ETZ_REPO")
+_ENV_REPO = os.environ.get("ETZ_REPO") or os.environ.get("ETZHAYYIM_REPO")
 REPO_ROOT = Path(_ENV_REPO) if _ENV_REPO else Path(__file__).resolve().parents[5]
 FLEET_TOML = Path(os.environ.get("FLEET_TOML") or (REPO_ROOT / "50-infra" / "murakumo" / "fleet.toml"))
 CELLS_TOML = REPO_ROOT / "50-infra" / "cluster" / "murakumo" / "cell-runner" / "cells.toml"
@@ -338,7 +338,7 @@ async def _cell_runner_healthz(request: Any) -> Any:
     })
 
 
-async def _cell_runner_kotoba-datomic_attest(request: Any) -> Any:
+async def _cell_runner_kotoba_datomic_attest(request: Any) -> Any:
     """kotoba-datomic witness endpoint. Receives a WitnessRequest from the
     orchestrator (`@etzhayyim/sdk/kotoba-datomic`), produces a signed
     attestation against this node's hosted cells, and writes the
@@ -366,11 +366,11 @@ async def _cell_runner_kotoba-datomic_attest(request: Any) -> Any:
     Per ADR-2605231400 §"Implementation plan" #2 + kotoba-datomic SPEC §5.
     """
     from aiohttp import web as _web
-    from .kotoba-datomic import (
-        WitnessRequest,
-        make_cell_signer,
-        produce_attestation,
-    )
+
+    datomic_mod = importlib.import_module("kotodama.kotoba-datomic")
+    WitnessRequest = datomic_mod.WitnessRequest
+    make_cell_signer = datomic_mod.make_cell_signer
+    produce_attestation = datomic_mod.produce_attestation
 
     try:
         body = await request.json()
@@ -493,7 +493,7 @@ async def _start_healthz_server(port: int) -> None:
     bind = os.environ.get("ETZ_HEALTHZ_BIND", "127.0.0.1")
     app = _web.Application()
     app.router.add_get("/healthz", _cell_runner_healthz)
-    app.router.add_post("/kotoba-datomic/attest", _cell_runner_kotoba-datomic_attest)
+    app.router.add_post("/kotoba-datomic/attest", _cell_runner_kotoba_datomic_attest)
     runner = _web.AppRunner(app)
     await runner.setup()
     site = _web.TCPSite(runner, bind, port)
