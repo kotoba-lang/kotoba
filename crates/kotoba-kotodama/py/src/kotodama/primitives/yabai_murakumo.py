@@ -19,7 +19,6 @@ from typing import Any
 
 from kotodama.kotoba_datomic import (
     KotobaDatomicClient,
-    KotobaTransactError,
     edn_str,
     get_kotoba_client,
     to_tx_edn,
@@ -99,6 +98,18 @@ def _now() -> int:
 
 def _client() -> KotobaDatomicClient:
     return get_kotoba_client()
+
+
+def _has_write_credential() -> bool:
+    return bool(os.environ.get("KOTOBA_TOKEN") or os.environ.get("KOTOBA_SESSION_POP"))
+
+
+def _queue_unavailable_error(client: KotobaDatomicClient, caught: Exception) -> RuntimeError:
+    return RuntimeError(
+        "Kotoba Datomic queue unavailable "
+        f"(url={client.url}, graph={QUEUE_GRAPH}); set KOTOBA_URL and "
+        f"KOTOBA_TOKEN or KOTOBA_SESSION_POP: {caught}"
+    )
 
 
 def _tx(client: KotobaDatomicClient, entities: list[dict[str, Any]], note: str) -> None:
@@ -241,7 +252,7 @@ async def _run_pipeline(job_id: str, payload: dict[str, Any], client: KotobaDato
         "cell": CELL_NAME,
         "actor_did": ACTOR_DID,
         "node": os.environ.get("ETZHAYYIM_NODE_NAME") or os.environ.get("ETZHAYYIM_NODE"),
-        "mode": "live" if (env.get("YABAI_GRAPH_CID") and (env.get("KOTOBA_TOKEN") or env.get("KOTOBA_CACAO_B64"))) else "dry-run",
+        "mode": "live" if (env.get("YABAI_GRAPH_CID") and _has_write_credential()) else "dry-run",
         "payload": payload,
         "checkpoint_graph": QUEUE_GRAPH,
         "boundary": "public Tor-exit indicators + case-bound BitTorrent evidence only; no de-anonymization",
@@ -317,8 +328,8 @@ async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> 
     try:
         if _load_job(client, "yabai-boot") is None:
             enqueue_job(kind="persist", payload={"source": "boot"}, priority=50, job_id="yabai-boot", client=client)
-    except KotobaTransactError as caught:
-        raise RuntimeError(f"Kotoba Datomic queue unavailable: {caught}") from caught
+    except Exception as caught:
+        raise _queue_unavailable_error(client, caught) from caught
 
     async def healthz(_request: web.Request) -> web.Response:
         try:
