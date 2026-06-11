@@ -26,7 +26,8 @@ from kotodama.kotoba_datomic import (
 
 ACTOR_DID = "did:web:etzhayyim.com:actor:yabai"
 CELL_NAME = "YabaiTorTorrentCtiPersistenceCell"
-QUEUE_GRAPH = os.environ.get("YABAI_QUEUE_GRAPH", "etzhayyim/yabai/cti-persistence-queue")
+DEFAULT_QUEUE_GRAPH = "bafyreibecj2jpykhim5loq4q3qcfottu6v2xqziktv5kdqxvq5rslqtvei"
+QUEUE_GRAPH = os.environ.get("YABAI_QUEUE_GRAPH", DEFAULT_QUEUE_GRAPH)
 NS_JOB = "yabai.job"
 NS_CP = "yabai.checkpoint"
 
@@ -114,6 +115,38 @@ def _queue_unavailable_error(client: KotobaDatomicClient, caught: Exception) -> 
 
 def _tx(client: KotobaDatomicClient, entities: list[dict[str, Any]], note: str) -> None:
     client.transact(to_tx_edn(entities, [note]), graph=QUEUE_GRAPH)
+
+
+def _ensure_queue_schema(client: KotobaDatomicClient) -> None:
+    attrs = [
+        (NS_JOB, "id", True),
+        (NS_JOB, "kind", False),
+        (NS_JOB, "payload-json", False),
+        (NS_JOB, "status", False),
+        (NS_JOB, "priority", False),
+        (NS_JOB, "attempts", False),
+        (NS_JOB, "max-attempts", False),
+        (NS_JOB, "created-at", False),
+        (NS_JOB, "updated-at", False),
+        (NS_JOB, "last-error", False),
+        (NS_CP, "id", True),
+        (NS_CP, "job-id", False),
+        (NS_CP, "step", False),
+        (NS_CP, "status", False),
+        (NS_CP, "ts", False),
+        (NS_CP, "detail-json", False),
+    ]
+    entities = []
+    for ns, attr, unique in attrs:
+        ent = {
+            ":db/id": f"{ns}.{attr}",
+            ":db/ident": f":{ns}/{attr}",
+            ":db/cardinality": ":db.cardinality/one",
+        }
+        if unique:
+            ent[":db/unique"] = ":db.unique/identity"
+        entities.append(ent)
+    _tx(client, entities, "install yabai queue schema")
 
 
 def _strip(ent: Any, ns: str) -> dict[str, Any]:
@@ -326,6 +359,7 @@ async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> 
     wake_event = asyncio.Event()
 
     try:
+        _ensure_queue_schema(client)
         if _load_job(client, "yabai-boot") is None:
             enqueue_job(kind="persist", payload={"source": "boot"}, priority=50, job_id="yabai-boot", client=client)
     except Exception as caught:
