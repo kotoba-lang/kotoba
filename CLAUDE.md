@@ -804,6 +804,17 @@ KSE Journal (seq 順序ログ + broadcast `subscribe()` + `read_since()` cold-fa
 
 NSID は kotoba namespace（`com.etzhayyim.apps.kotoba.sync.*`）— 非 spec body を `com.atproto.sync.subscribeRepos` path に squat しない。
 
+## worktree cleanup(定例指示, 2026-06-12)
+
+ユーザーが「worktree cleanup」と指示したら、以下の定例手順として実行する:
+
+1. `git fetch --all --prune` → 全 remote/local ブランチと PR 状態(`gh pr list --state all`)を突き合わせる
+2. **PR が無いブランチ**(ローカル main の未 push commit も branch 化して含める)→ 一時 worktree で `origin/main` を merge し衝突解決 → 影響 crate の test/check を実行 → PR 作成 → review → main へ squash merge
+3. **PR が MERGED/CLOSED 済みのブランチ → 削除**。ただし tip が PR merge 時刻より後に push されている場合(タイムゾーン正規化して比較)は `git merge-tree --write-tree origin/main <branch>` の結果 tree を `origin/main^{tree}` と比較し、新規内容ゼロ(または main からの回帰のみ = superseded)を確認してから削除。真の新規内容があれば 2 に回す
+4. ローカル main を `origin/main` に reset(取り込み済み commit のみ破棄)、一時 worktree を `git worktree remove`、削除済みブランチを `git fetch --prune`
+
+注意: squash-merge 運用のためコミット ID では merge 判定できない — 必ず PR 状態 + content diff で判定する。他エージェントが並行作業中の checkout の dirty tree には触れない(committed 分のみ branch 化して回収)。
+
 ## 禁止
 
 - 中央マスターノード (DHT 分散)
