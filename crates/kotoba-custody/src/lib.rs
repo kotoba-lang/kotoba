@@ -13,5 +13,6 @@ pub use protocol::{
     ProtocolError,
 };
 pub use shares::{
-    combine_key, open_share, split_key, CustodianShare, CustodyError, RecoveredShare, KEY_LEN,
+    combine_key, open_share, rotate_key, split_key, split_key_epoch, CustodianShare, CustodyError,
+    RecoveredShare, KEY_LEN,
 };
