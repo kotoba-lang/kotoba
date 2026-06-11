@@ -11976,3 +11976,81 @@ async fn key_request_share_full_custodian_flow() {
     }
     assert!(found, "key release must leave a receipt");
 }
+
+/// R3c: depositShare enforces epoch monotonicity (a stale dealing can't replace
+/// a rotated one), and the grant surfaces the epoch.
+#[tokio::test]
+async fn key_deposit_epoch_monotonic_and_grant_reports_epoch() {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3c-epoch-graph").to_multibase();
+
+    let (st, info) = s.get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo").await;
+    assert_eq!(st, 200);
+    let node_pk = {
+        let b = hex::decode(info["x25519PubkeyHex"].as_str().unwrap()).unwrap();
+        PublicKey::from(<[u8; 32]>::try_from(b).unwrap())
+    };
+    let node_did = info["did"].as_str().unwrap().to_string();
+    let key = [88u8; 32];
+    let pubs = |extra: &str| -> Vec<(String, PublicKey)> {
+        vec![
+            (node_did.clone(), node_pk),
+            (format!("did:key:zE{extra}A"), PublicKey::from(&StaticSecret::from([20u8; 32]))),
+            (format!("did:key:zE{extra}B"), PublicKey::from(&StaticSecret::from([21u8; 32]))),
+        ]
+    };
+
+    // Deal epoch 1, deposit.
+    let e1 = kotoba_custody::shares::split_key_epoch(&key, 2, &pubs("1"), 1).unwrap();
+    let (st, dep) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&e1[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(st, 200, "{dep}");
+    assert_eq!(dep["epoch"], 1);
+
+    // Deal epoch 2 (rotation), deposit replaces.
+    let e2 = kotoba_custody::shares::split_key_epoch(&key, 2, &pubs("2"), 2).unwrap();
+    let (st, dep2) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&e2[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(st, 200, "{dep2}");
+    assert_eq!(dep2["epoch"], 2);
+
+    // Re-depositing the stale epoch-1 share is rejected (409).
+    let (st, conflict) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&e1[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(st, 409, "stale epoch must be rejected: {conflict}");
+
+    // A grant on an Authenticated graph (default) reports the current epoch 2.
+    let requester_sk = StaticSecret::from([0x77u8; 32]);
+    let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
+    let (st, granted) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "nonce": "r3c-epoch-nonce",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    assert_eq!(st, 200, "{granted}");
+    assert_eq!(granted["ok"], true, "{granted}");
+    assert_eq!(granted["epoch"], 2, "grant reports rotated epoch");
+}

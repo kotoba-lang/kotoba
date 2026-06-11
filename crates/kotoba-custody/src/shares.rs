@@ -45,6 +45,8 @@ pub enum CustodyError {
     Combine(String),
     #[error("combined secret has wrong length {0} (expected 32)")]
     BadSecretLen(usize),
+    #[error("shares come from different dealings (mixed epoch/custodian-set) — refusing to combine")]
+    MixedDealing,
 }
 
 /// One custodian's wrapped share. Safe to store/replicate anywhere: the share
@@ -66,12 +68,26 @@ pub struct CustodianShare {
     /// Threshold this share set was dealt with (every share carries it so a
     /// quorum knows when it is complete).
     pub threshold: u8,
+    /// Rotation epoch (R3c). Bumped each time the key is re-dealt to a new
+    /// custodian set; revocation granularity = epoch. `#[serde(default)]` so
+    /// pre-R3c deposited shares decode as epoch 0.
+    #[serde(default)]
+    pub epoch: u64,
+    /// Binds this share to ONE dealing: sha256(epoch || t || sorted recipient
+    /// DIDs). Shares from different dealings have different deal_ids, so
+    /// `combine_key` rejects a mixed-epoch quorum instead of silently
+    /// reconstructing garbage (the R3a non-goal, now an explicit error).
+    #[serde(default, with = "serde_bytes")]
+    pub deal_id: Vec<u8>,
 }
 
 /// An opened (decrypted, commitment-checked) share, ready for `combine_key`.
 pub struct RecoveredShare {
     pub recipient_did: String,
     pub bytes: Zeroizing<Vec<u8>>,
+    /// The dealing this share belongs to (R3c) — `combine_key` requires all
+    /// shares to agree, so a mixed-epoch quorum is rejected.
+    pub deal_id: Vec<u8>,
 }
 
 fn share_commitment(bytes: &[u8]) -> [u8; 32] {
@@ -80,12 +96,42 @@ fn share_commitment(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Split `key` into one share per custodian; any `threshold` of them combine
-/// back to the key, fewer learn nothing.
+/// Bind a dealing: sha256(epoch || threshold || sorted commitments). Including
+/// the per-share SHA-256 commitments — which derive from the random Shamir
+/// polynomial — makes the id distinct not only across epochs / custodian sets
+/// but across SEPARATE re-deals of the same parameters (a fresh polynomial ⇒
+/// fresh commitments ⇒ fresh deal_id). All shares of one dealing share it; a
+/// custodian just stores the dealer-assigned value (it cannot recompute it
+/// without the other commitments, which is fine — combine only needs equality).
+fn compute_deal_id(epoch: u64, threshold: u8, commitments: &[[u8; 32]]) -> Vec<u8> {
+    let mut sorted: Vec<[u8; 32]> = commitments.to_vec();
+    sorted.sort_unstable();
+    let mut h = Sha256::new();
+    h.update(epoch.to_le_bytes());
+    h.update([threshold]);
+    for c in sorted {
+        h.update(c);
+    }
+    h.finalize().to_vec()
+}
+
+/// Split `key` into one share per custodian at epoch 0 (compat wrapper).
 pub fn split_key(
     key: &[u8; KEY_LEN],
     threshold: u8,
     custodians: &[(String, PublicKey)],
+) -> Result<Vec<CustodianShare>, CustodyError> {
+    split_key_epoch(key, threshold, custodians, 0)
+}
+
+/// Split `key` into one share per custodian for a given rotation `epoch` (R3c);
+/// any `threshold` of them combine back to the key, fewer learn nothing.
+/// Every share carries the `epoch` and a `deal_id` binding it to THIS dealing.
+pub fn split_key_epoch(
+    key: &[u8; KEY_LEN],
+    threshold: u8,
+    custodians: &[(String, PublicKey)],
+    epoch: u64,
 ) -> Result<Vec<CustodianShare>, CustodyError> {
     let n = custodians.len();
     if n > 255 {
@@ -95,21 +141,54 @@ pub fn split_key(
         return Err(CustodyError::BadThreshold { t: threshold, n });
     }
     let sharks = Sharks(threshold);
-    let dealer = sharks.dealer(key);
-    let mut out = Vec::with_capacity(n);
-    for (i, ((did, pk), share)) in custodians.iter().zip(dealer).enumerate() {
+    // Pass 1: deal + seal + commit; collect commitments to bind the deal_id.
+    struct Dealt {
+        index: u8,
+        did: String,
+        sealed: Vec<u8>,
+        commitment: [u8; 32],
+    }
+    let mut dealt = Vec::with_capacity(n);
+    for (i, ((did, pk), share)) in custodians.iter().zip(sharks.dealer(key)).enumerate() {
         let share_bytes: Vec<u8> = (&share).into();
         let sealed = kotoba_crypto::hpke_seal(pk, &share_bytes)
             .map_err(|e| CustodyError::Hpke(e.to_string()))?;
-        out.push(CustodianShare {
+        dealt.push(Dealt {
             index: (i + 1) as u8,
-            recipient_did: did.clone(),
-            sealed_share: sealed,
+            did: did.clone(),
+            sealed,
             commitment: share_commitment(&share_bytes),
-            threshold,
         });
     }
+    let commitments: Vec<[u8; 32]> = dealt.iter().map(|d| d.commitment).collect();
+    let deal_id = compute_deal_id(epoch, threshold, &commitments);
+    // Pass 2: stamp every share with the shared deal_id.
+    let out = dealt
+        .into_iter()
+        .map(|d| CustodianShare {
+            index: d.index,
+            recipient_did: d.did,
+            sealed_share: d.sealed,
+            commitment: d.commitment,
+            threshold,
+            epoch,
+            deal_id: deal_id.clone(),
+        })
+        .collect();
     Ok(out)
+}
+
+/// Re-deal `key` to a NEW custodian set at `new_epoch` (R3c rotation). The
+/// returned shares carry a fresh `deal_id`, so old-epoch shares can no longer
+/// be combined with these — revocation granularity = epoch. `new_epoch` MUST
+/// strictly exceed the current epoch (callers enforce monotonicity).
+pub fn rotate_key(
+    key: &[u8; KEY_LEN],
+    threshold: u8,
+    new_custodians: &[(String, PublicKey)],
+    new_epoch: u64,
+) -> Result<Vec<CustodianShare>, CustodyError> {
+    split_key_epoch(key, threshold, new_custodians, new_epoch)
 }
 
 /// Decrypt and commitment-check one custodian's share with their X25519 secret.
@@ -127,6 +206,7 @@ pub fn open_share(
     Ok(RecoveredShare {
         recipient_did: share.recipient_did.clone(),
         bytes: Zeroizing::new(bytes.to_vec()),
+        deal_id: share.deal_id.clone(),
     })
 }
 
@@ -140,6 +220,14 @@ pub fn combine_key(
             t: threshold,
             got: shares.len(),
         });
+    }
+    // R3c: all shares must belong to ONE dealing — a mixed-epoch quorum (e.g. a
+    // revoked custodian's old share alongside post-rotation shares) is rejected
+    // instead of silently reconstructing the wrong/garbage secret.
+    if let Some(first) = shares.first() {
+        if shares.iter().any(|s| s.deal_id != first.deal_id) {
+            return Err(CustodyError::MixedDealing);
+        }
     }
     let parsed: Vec<Share> = shares
         .iter()
@@ -268,9 +356,54 @@ mod tests {
             open_share(&a[0], &fleet[0].1).unwrap(),
             open_share(&b[1], &fleet[1].1).unwrap(),
         ];
-        if let Ok(recovered) = combine_key(2, &opened) {
-            assert_ne!(*recovered, key, "cross-dealing combine must not yield the key");
-        }
+        // R3c: cross-dealing combine is now an EXPLICIT error, not silent garbage.
+        assert!(matches!(
+            combine_key(2, &opened),
+            Err(CustodyError::MixedDealing)
+        ));
+    }
+
+    #[test]
+    fn rotation_changes_deal_id_and_revokes_old_shares() {
+        let key = [71u8; 32];
+        let fleet_a = fleet(3);
+        let pubs_a: Vec<(String, PublicKey)> =
+            fleet_a.iter().map(|(d, _, p)| (d.clone(), *p)).collect();
+        let e0 = split_key_epoch(&key, 2, &pubs_a, 0).unwrap();
+
+        // Rotate to a NEW custodian set at epoch 1 (custodian #1 removed,
+        // #4 added) — same key, fresh deal_id.
+        let fleet_b = vec![custodian(2), custodian(3), custodian(4)];
+        let pubs_b: Vec<(String, PublicKey)> =
+            fleet_b.iter().map(|(d, _, p)| (d.clone(), *p)).collect();
+        let e1 = rotate_key(&key, 2, &pubs_b, 1).unwrap();
+
+        assert_eq!(e0[0].epoch, 0);
+        assert_eq!(e1[0].epoch, 1);
+        assert_ne!(e0[0].deal_id, e1[0].deal_id, "rotation = fresh dealing");
+
+        // New epoch still recovers the key.
+        let opened_new: Vec<RecoveredShare> = (0..2)
+            .map(|i| open_share(&e1[i], &fleet_b[i].1).unwrap())
+            .collect();
+        assert_eq!(*combine_key(2, &opened_new).unwrap(), key);
+
+        // A revoked (epoch-0) share cannot be mixed into an epoch-1 quorum.
+        let revoked = open_share(&e0[1], &fleet_a[1].1).unwrap(); // custodian #2 held both
+        let one_new = open_share(&e1[0], &fleet_b[0].1).unwrap();
+        assert!(matches!(
+            combine_key(2, &[revoked, one_new]),
+            Err(CustodyError::MixedDealing)
+        ));
+    }
+
+    #[test]
+    fn pre_r3c_share_decodes_with_epoch_zero() {
+        // A share JSON without epoch/deal_id (pre-R3c deposit) must decode.
+        let legacy = r#"{"index":1,"recipient_did":"did:key:zL","sealed_share":[1,2,3],"commitment":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"threshold":2}"#;
+        let share: CustodianShare = serde_json::from_str(legacy).unwrap();
+        assert_eq!(share.epoch, 0);
+        assert!(share.deal_id.is_empty());
     }
 
     #[test]

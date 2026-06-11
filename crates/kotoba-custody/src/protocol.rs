@@ -63,6 +63,13 @@ pub struct GrantedShare {
     pub custodian_did: String,
     pub index: u8,
     pub threshold: u8,
+    /// Rotation epoch this share belongs to (R3c).
+    #[serde(default)]
+    pub epoch: u64,
+    /// Dealing binding — `combine_granted` requires all grants to agree, so a
+    /// mixed-epoch quorum is rejected.
+    #[serde(default, with = "serde_bytes")]
+    pub deal_id: Vec<u8>,
     /// HPKE envelope of the share bytes, sealed to the requester's pubkey.
     #[serde(with = "serde_bytes")]
     pub sealed_for_requester: Vec<u8>,
@@ -113,6 +120,8 @@ pub fn handle_key_share_request(
             custodian_did: my_share.recipient_did.clone(),
             index: my_share.index,
             threshold: my_share.threshold,
+            epoch: my_share.epoch,
+            deal_id: my_share.deal_id.clone(),
             sealed_for_requester: sealed,
         }),
         Err(e) => KeyShareResponse::Denied {
@@ -141,6 +150,7 @@ pub fn combine_granted(
         recovered.push(crate::shares::RecoveredShare {
             recipient_did: g.custodian_did.clone(),
             bytes: Zeroizing::new(bytes.to_vec()),
+            deal_id: g.deal_id.clone(),
         });
     }
     crate::shares::combine_key(threshold, &recovered).map_err(Into::into)

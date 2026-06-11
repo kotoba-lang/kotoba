@@ -281,3 +281,37 @@ Remaining R3: a libp2p request-response transport (the XRPC surface proves the
 semantics; libp2p is the production carrier), per-graph key actually SPLIT to
 custodians at seal time (today the operator deals manually), R3c VSS+MLS, R3d
 bonds/warrants.
+
+### R3c — epoch rotation + dealing binding (2026-06-11); Feldman VSS deferred
+
+Status: **rotation/revocation implemented**; verifiable-secret-sharing deferred.
+
+Two halves of R3c; we ship the operationally-load-bearing half (rotation) and
+defer the cryptographic upgrade (VSS) with an honest rationale.
+
+**Rotation + dealing binding (implemented).** Every `CustodianShare` now carries
+an `epoch: u64` and a `deal_id = sha256(epoch || threshold || sorted share
+commitments)`. Because the commitments derive from the random Shamir
+polynomial, the deal_id is distinct not only across epochs and custodian sets
+but across *any* separate re-deal — so `combine_key` now REJECTS a mixed-deal
+quorum (`CustodyError::MixedDealing`) instead of silently reconstructing
+garbage (closing the R3a non-goal). `rotate_key(key, t, new_custodians,
+new_epoch)` re-deals to a changed set; `split_key_epoch` is the general dealer.
+Server: `key.depositShare` enforces epoch monotonicity (a stale, revoked
+dealing cannot be replayed over a newer one → 409); `key.requestShare`
+surfaces the `epoch`. **Revocation granularity = epoch**: rotate, and a removed
+custodian's old share can no longer participate in any quorum. `#[serde(default)]`
+keeps pre-R3c deposited shares decoding at epoch 0.
+
+**Feldman VSS (deferred, R3c-VSS).** True verifiable secret sharing — each
+custodian checks its share against PUBLIC polynomial commitments `C_j = g^{a_j}`
+at deal time, so a cheating dealer is caught immediately — requires moving the
+secret sharing from the `sharks` crate's GF(2^8) field to a prime field matching
+a curve's scalar order, with curve-point commitments. That is a real
+cryptographic migration, not a wrapper, and the R0 review rule ("use an audited
+crate, don't hand-roll") applies most sharply here. Until it lands, the
+SHA-256 share commitments give detect-at-open integrity (a substituted share is
+caught — see R3a tests) but not detect-at-deal; the trusted dealer is still the
+current key holder (the operator), who already knows the key, so dealer-cheating
+only becomes a live threat when re-dealing moves to the custodians themselves —
+exactly the point at which VSS is required. Tracked as R3c-VSS.

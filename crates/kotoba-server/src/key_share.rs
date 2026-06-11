@@ -53,6 +53,8 @@ pub struct RequestShareResp {
     pub index: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub threshold: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
     /// HPKE envelope (hex) of the share, sealed to the requester's pubkey.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sealed_share_hex: Option<String>,
@@ -111,6 +113,7 @@ pub async fn key_request_share(
             custodian_did: Some(g.custodian_did),
             index: Some(g.index),
             threshold: Some(g.threshold),
+            epoch: Some(g.epoch),
             sealed_share_hex: Some(hex::encode(&g.sealed_for_requester)),
             error: None,
         })),
@@ -119,6 +122,7 @@ pub async fn key_request_share(
             custodian_did: None,
             index: None,
             threshold: None,
+            epoch: None,
             sealed_share_hex: None,
             error: Some(reason),
         })),
@@ -208,6 +212,7 @@ pub struct DepositShareReq {
 pub struct DepositShareResp {
     pub ok: bool,
     pub graph: String,
+    pub epoch: u64,
 }
 
 /// POST /xrpc/com.etzhayyim.apps.kotoba.key.depositShare (operator-gated)
@@ -219,14 +224,27 @@ pub async fn key_deposit_share(
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     KotobaCid::from_multibase(&req.graph)
         .ok_or((StatusCode::BAD_REQUEST, "invalid graph CID".to_string()))?;
-    state
-        .custody_shares
-        .write()
-        .await
-        .insert(req.graph.clone(), req.share);
+    let mut shares = state.custody_shares.write().await;
+    // Rotation monotonicity: a deposit may only install a share whose epoch is
+    // >= the one already held, so a stale (revoked) dealing can't be replayed
+    // back in over a newer one.
+    if let Some(existing) = shares.get(&req.graph) {
+        if req.share.epoch < existing.epoch {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "stale share epoch {} < held epoch {} for that graph",
+                    req.share.epoch, existing.epoch
+                ),
+            ));
+        }
+    }
+    let epoch = req.share.epoch;
+    shares.insert(req.graph.clone(), req.share);
     Ok(Json(DepositShareResp {
         ok: true,
         graph: req.graph,
+        epoch,
     }))
 }
 
