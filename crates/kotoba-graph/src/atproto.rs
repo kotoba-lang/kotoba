@@ -10,7 +10,7 @@
 
 use kotoba_core::cid::KotobaCid;
 use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::topic::Topic;
+use kotoba_vault::topic::Topic;
 
 // ── KotobaCid helpers ─────────────────────────────────────────────────────────
 

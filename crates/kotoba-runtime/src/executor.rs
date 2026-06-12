@@ -25,7 +25,7 @@ pub struct InvokeResult {
     /// Datom projection writes to apply after successful execution
     pub assert_quads: Vec<SerializedQuad>,
     pub retract_quads: Vec<SerializedQuad>,
-    /// kse.publish calls made by the guest — caller routes to KSE Journal
+    /// kse.publish calls made by the guest — caller routes to KSE LiveBus
     pub pending_publishes: Vec<(String, Vec<u8>)>,
     /// chain.append-infer calls made by the guest — caller appends to SourceChain
     pub pending_chain_entries: Vec<(String, String, String)>,

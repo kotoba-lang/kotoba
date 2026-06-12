@@ -5,7 +5,7 @@ use kotoba_auth::delegation::DelegationChain;
 use kotoba_core::{cid::KotobaCid, prolly::ProllyTree, store::BlockStore};
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::journal::Journal;
+use kotoba_vault::live_bus::LiveBus;
 use kotoba_store::MemoryBlockStore;
 /// QuadStore insert + query benchmarks.
 ///
@@ -65,7 +65,7 @@ fn make_quads(n: u64) -> Vec<Quad> {
 }
 
 fn make_store() -> QuadStore {
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     QuadStore::new(journal, block_store)
@@ -336,7 +336,7 @@ async fn make_committed_qs_latency(
         put_rtt,
     };
     let store = Arc::new(inner) as Arc<dyn BlockStore + Send + Sync>;
-    let qs = QuadStore::new(Arc::new(Journal::new()), store);
+    let qs = QuadStore::new(Arc::new(LiveBus::new()), store);
     let graph = make_cid(1);
     let quads: Vec<Quad> = (0..n_entities)
         .flat_map(|i| {

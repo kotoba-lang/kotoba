@@ -1,6 +1,6 @@
 //! Durability: a pushed repo survives the loss of its in-memory projection.
 //!
-//! With a `KseStore` configured (`KOTOBA_STORE_PATH`), a push persists the
+//! With a `VaultStore` configured (`KOTOBA_STORE_PATH`), a push persists the
 //! repo's snapshot-manifest pointer durably and the manifest + object blocks
 //! live in the block store. We then **drop the resident `Connection`** (the
 //! datomic projection) — exactly what a process restart loses — and clone
@@ -43,7 +43,7 @@ async fn pushed_repo_survives_projection_loss() {
         return;
     }
 
-    // The server roots its KseStore at parent(KOTOBA_STORE_PATH), so give the
+    // The server roots its VaultStore at parent(KOTOBA_STORE_PATH), so give the
     // store path a *unique* parent dir to isolate this run's durable pointers.
     let base = std::env::temp_dir().join(format!(
         "kotoba-git-durable-{}-{}",
@@ -56,7 +56,7 @@ async fn pushed_repo_survives_projection_loss() {
     let store_path = base.join("store");
     std::fs::create_dir_all(&store_path).unwrap();
 
-    // KseStore (mutable pointer boundary) → file-backed so the snapshot pointer
+    // VaultStore (mutable pointer boundary) → file-backed so the snapshot pointer
     // is durable. Reads public, push anonymous.
     std::env::set_var("KOTOBA_STORE_PATH", &store_path);
     std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "public");
@@ -65,7 +65,7 @@ async fn pushed_repo_survives_projection_loss() {
     let state = Arc::new(KotobaState::new(None).expect("KotobaState::new"));
     assert!(
         state.kse_store.is_some(),
-        "KOTOBA_STORE_PATH should yield a KseStore (durable pointer boundary)"
+        "KOTOBA_STORE_PATH should yield a VaultStore (durable pointer boundary)"
     );
     let probe = Arc::clone(&state);
     let router = build_router(Arc::clone(&state));

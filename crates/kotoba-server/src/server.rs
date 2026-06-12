@@ -23,9 +23,9 @@ use kotoba_ipfs::{
     InMemoryIpnsRegistry, IpnsName, IpnsRecord, IpnsRegistry, KuboIpnsRegistry, SignedIpnsRegistry,
 };
 use kotoba_query::{quad::LegacyQuad as Quad, Datom as KqeDatom, Value as KqeValue};
-use kotoba_kse::SecureVault;
-use kotoba_kse::{
-    sync_window::SyncWindow, AgentIdentity, Journal, KseStore, PreKeyRegistry, Shelf, Topic, Vault,
+use kotoba_vault::SecureVault;
+use kotoba_vault::{
+    sync_window::SyncWindow, AgentIdentity, LiveBus, VaultStore, PreKeyRegistry, Shelf, Topic, Vault,
 };
 #[cfg(feature = "wasm-runtime")]
 use kotoba_runtime::{UdfExecutor, WasmExecutor};
@@ -42,7 +42,7 @@ pub enum NodeRole {
     Pin,
     /// Execution provider — earns gas/consumed_mkoto Quad per WASM superstep.
     Compute,
-    /// Firehose relay — bridges the local KSE Journal onto the libp2p `firehose`
+    /// Firehose relay — bridges the local KSE LiveBus onto the libp2p `firehose`
     /// gossip topic and forwards peers' firehose entries (the mesh half of the
     /// D+E federation surface, 2026-05-30). Opt-in: not in the default set.
     Relay,
@@ -238,7 +238,7 @@ pub struct KotobaState {
     /// `init_crypto()` to prevent double-generation in ephemeral mode.
     identity: Arc<AgentIdentity>,
     // ── KSE ──────────────────────────────────────────────────────────────
-    pub journal: Arc<Journal>,
+    pub journal: Arc<LiveBus>,
     pub shelf: Arc<Shelf>,
     /// Content-addressed private blob vault (no GossipSub, no CACAO required).
     pub vault: Arc<Vault>,
@@ -292,8 +292,8 @@ pub struct KotobaState {
     /// Initialised via `init_crypto()` after construction; starts as `None`.
     pub crypto: Option<Arc<dyn AgentCrypto>>,
     // ── KSE Key-Ref Store ────────────────────────────────────────────────────
-    /// KseStore for agent key-ref pointer persistence (backed by LocalFileSystem or B2).
-    pub kse_store: Option<KseStore>,
+    /// VaultStore for agent key-ref pointer persistence (backed by LocalFileSystem or B2).
+    pub kse_store: Option<VaultStore>,
     // ── Agent Sessions ───────────────────────────────────────────────────────
     /// Active SyncWindow sessions keyed by session_id.
     pub agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, SyncWindow>>>,
@@ -400,7 +400,7 @@ impl KotobaState {
         // Capacity: KOTOBA_HOT_CACHE_BYTES (default 256 MiB) or
         //           KOTOBA_STORAGE_BUDGET_BYTES (legacy alias, same meaning).
         // Persistence: KuboBlockStore cold tier (Kubo/IPFS HTTP, SHA2-256 dual-CID) if KOTOBA_STORE_PATH is set.
-        // All KSE components (Journal, Vault, SecureVault) share the same store.
+        // All KSE components (LiveBus, Vault, SecureVault) share the same store.
         let store_path: Option<String> = std::env::var("KOTOBA_STORE_PATH").ok();
 
         const DEFAULT_HOT_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
@@ -672,13 +672,13 @@ impl KotobaState {
             }
         };
 
-        // LiveBus (formerly "Journal") — purely in-memory ephemeral event bus.
+        // LiveBus (formerly "LiveBus") — purely in-memory ephemeral event bus.
         // No persistence at all: datomic durability/replay = CommitDag; non-datomic
         // topics (signal / realtime / kse pub-sub) are live-only, and their durable
         // data already lives in their own content-addressed stores (Shelf / block
         // store snapshots). gossipsub-style best-effort live-tail.
         tracing::info!("KSE LiveBus: in-memory only (live-tail; durable replay via CommitDag)");
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let shelf = Arc::new(Shelf::new());
 
         // Agent identity — constructed once; reused in init_crypto() to avoid
@@ -728,7 +728,7 @@ impl KotobaState {
         let ipfs_pin = IpfsPinClient::from_env();
         tracing::info!("IPFS pin client ready (KOTOBA_IPFS_ENDPOINT)");
 
-        // QuadStore — wraps Journal + BlockStore; provides ProllyTree commit path.
+        // QuadStore — wraps LiveBus + BlockStore; provides ProllyTree commit path.
         let quad_store = Arc::new(QuadStore::new(
             Arc::clone(&journal),
             Arc::clone(&block_store),
@@ -751,17 +751,17 @@ impl KotobaState {
             SecureVault::new()
         });
 
-        // KseStore — for agent key-ref pointer storage; backed by LocalFileSystem if
+        // VaultStore — for agent key-ref pointer storage; backed by LocalFileSystem if
         // KOTOBA_STORE_PATH is set, otherwise None (crypto will be ephemeral).
-        let kse_store: Option<KseStore> = store_path.as_ref().and_then(|path| {
+        let kse_store: Option<VaultStore> = store_path.as_ref().and_then(|path| {
             let dir = std::path::Path::new(path.as_str())
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
             std::fs::create_dir_all(&dir).ok()?;
             let fs = object_store::local::LocalFileSystem::new_with_prefix(&dir).ok()?;
-            tracing::info!(?dir, "KseStore: LocalFileSystem key-ref store enabled");
-            Some(KseStore::new(Arc::new(fs), "kse/"))
+            tracing::info!(?dir, "VaultStore: LocalFileSystem key-ref store enabled");
+            Some(VaultStore::new(Arc::new(fs), "kse/"))
         });
 
         // CC embed client — optional; enables vector search over Common Crawl data
@@ -923,20 +923,20 @@ impl KotobaState {
     /// Must be called once from the async context (e.g. `main.rs`) after
     /// `KotobaState::new()`. Loads or generates the vault key via HPKE.
     pub async fn init_crypto(mut self) -> anyhow::Result<Self> {
-        use kotoba_kse::SovereignCrypto;
+        use kotoba_vault::SovereignCrypto;
 
         // Reuse the identity constructed in new() — do NOT call from_env() again,
         // as each ephemeral call generates a different random keypair/DID.
         let identity = Arc::clone(&self.identity);
         tracing::info!(did = %identity.did, ephemeral = identity.ephemeral, "agent-sovereign crypto initialising");
 
-        // Build a temporary in-memory KseStore if no persistent one is available
+        // Build a temporary in-memory VaultStore if no persistent one is available
         let sc: SovereignCrypto = if let Some(ref ks) = self.kse_store {
             SovereignCrypto::load_or_genesis(&identity, ks, &self.block_store).await?
         } else {
-            // No persistent KseStore — generate ephemeral key in a temp KseStore
+            // No persistent VaultStore — generate ephemeral key in a temp VaultStore
             let fs = object_store::memory::InMemory::new();
-            let tmp_ks = KseStore::new(Arc::new(fs), "kse/");
+            let tmp_ks = VaultStore::new(Arc::new(fs), "kse/");
             SovereignCrypto::load_or_genesis(&identity, &tmp_ks, &self.block_store).await?
         };
 
@@ -1104,7 +1104,7 @@ impl KotobaState {
         format!("git/repo/{safe}/head")
     }
 
-    /// Resolve the durable snapshot-manifest CID for `repo` from the `KseStore`
+    /// Resolve the durable snapshot-manifest CID for `repo` from the `VaultStore`
     /// mutable boundary (`None` if no store is configured or none was persisted).
     async fn git_head_cid(&self, repo: &str) -> Option<KotobaCid> {
         let ks = self.kse_store.as_ref()?;
@@ -1115,9 +1115,9 @@ impl KotobaState {
 
     /// Persist `repo`'s projection durably: write the snapshot manifest block
     /// (content-addressed, into the IPFS-backed block store) and record its CID
-    /// in the `KseStore` mutable boundary. Combined with the already-durable
+    /// in the `VaultStore` mutable boundary. Combined with the already-durable
     /// object blocks, this is the full durable form of the git repo. A no-op for
-    /// the mutable pointer when no `KseStore` is configured (dev / ephemeral),
+    /// the mutable pointer when no `VaultStore` is configured (dev / ephemeral),
     /// though the manifest block is still written.
     pub async fn git_persist(&self, repo: &str, git: &kotoba_git::GitStore<'_>) {
         let cid = match git.snapshot_manifest() {
@@ -1136,7 +1136,7 @@ impl KotobaState {
             }
             None => tracing::debug!(
                 repo,
-                "git: no KseStore — snapshot block written but pointer is not durable"
+                "git: no VaultStore — snapshot block written but pointer is not durable"
             ),
         }
     }
@@ -1468,7 +1468,7 @@ impl KotobaState {
                 datom.tx = tx_cid.clone();
             }
             // Already committed to the CommitDag above (commit_datoms) — announce
-            // to the live-tail without a redundant Journal block.
+            // to the live-tail without a redundant LiveBus block.
             self.journal_assert_datom_ephemeral(&graph_cid, &datom).await;
             self.quad_store
                 .apply_journaled_datom(graph_cid.clone(), datom)
@@ -1517,19 +1517,19 @@ impl KotobaState {
         tracing::info!(app = %app, program_cid = %program_cid, "registered external wasm node");
     }
 
-    /// Publish a Quad assert to the KSE Journal (fine SPO topic) and,
+    /// Publish a Quad assert to the KSE LiveBus (fine SPO topic) and,
     /// if the swarm is active, also propagate via GossipSub on the coarse
     /// `"quad/assert"` topic so peers can ingest without subscribing to
     /// every specific SPO address.
     ///
-    /// Returns the JournalEntry CID string.
+    /// Returns the LiveBusEntry CID string.
     pub async fn journal_assert(&self, quad: &Quad) -> String {
         self.journal_assert_with(quad, true).await
     }
 
     /// Ephemeral assert: broadcast + ring (live-tail) but **no** block persist.
     /// Used by the datomic commit path — the datom is already durable in the
-    /// CommitDag, so the Journal must not keep a redundant second copy.
+    /// CommitDag, so the LiveBus must not keep a redundant second copy.
     pub async fn journal_assert_ephemeral(&self, quad: &Quad) -> String {
         self.journal_assert_with(quad, false).await
     }
@@ -1572,9 +1572,9 @@ impl KotobaState {
             .await
     }
 
-    /// Ephemeral datom assert — live-tail broadcast only, no Journal block.
+    /// Ephemeral datom assert — live-tail broadcast only, no LiveBus block.
     /// For callers whose datoms are already durable in the CommitDag (e.g. node
-    /// self-registration commits then announces), so the Journal copy is redundant.
+    /// self-registration commits then announces), so the LiveBus copy is redundant.
     pub async fn journal_assert_datom_ephemeral(
         &self,
         graph_cid: &KotobaCid,
@@ -1599,8 +1599,8 @@ impl KotobaState {
 
     /// Compatibility write for legacy Quad API callers.
     ///
-    /// The Journal still receives the Quad wire payload, while the graph store
-    /// receives a Datom whose transaction is the Journal entry CID.
+    /// The LiveBus still receives the Quad wire payload, while the graph store
+    /// receives a Datom whose transaction is the LiveBus entry CID.
     pub async fn assert_quad_compat(&self, quad: Quad) -> String {
         let graph_cid = quad.graph.clone();
         let journal_cid = self.journal_assert(&quad).await;
@@ -1622,7 +1622,7 @@ impl KotobaState {
         self.quad_store.assert_datom(graph_cid, datom).await;
     }
 
-    /// Publish a Quad retract to the KSE Journal.
+    /// Publish a Quad retract to the KSE LiveBus.
     pub async fn journal_retract(&self, quad: &Quad) -> String {
         self.journal_retract_with(quad, true).await
     }

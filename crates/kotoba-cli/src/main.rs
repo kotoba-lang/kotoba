@@ -447,7 +447,7 @@ async fn main() -> Result<()> {
         Cmd::Init { force, show } => {
             // Refuse to overwrite an existing identity unless --force.
             if !force {
-                if let Some(existing) = kotoba_kse::AgentIdentity::from_keychain() {
+                if let Some(existing) = kotoba_vault::AgentIdentity::from_keychain() {
                     anyhow::bail!(
                         "device-local identity already exists (DID={}). \
                          Use --force to overwrite.",
@@ -455,7 +455,7 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            let id = kotoba_kse::AgentIdentity::generate_persistent();
+            let id = kotoba_vault::AgentIdentity::generate_persistent();
             id.persist_to_keychain().context("persisting identity")?;
             println!("Persisted identity to macOS Keychain (or ~/.etzhayyim/kotoba.env).");
             println!("DID: {}", id.did);
@@ -604,10 +604,10 @@ async fn main() -> Result<()> {
 
         Cmd::Whoami => {
             // Resolve identity (keychain → env → ephemeral)
-            let id = kotoba_kse::AgentIdentity::from_env();
+            let id = kotoba_vault::AgentIdentity::from_env();
             let source = if id.ephemeral {
                 "ephemeral (no keychain, no env)"
-            } else if kotoba_kse::AgentIdentity::from_keychain().is_some() {
+            } else if kotoba_vault::AgentIdentity::from_keychain().is_some() {
                 "keychain"
             } else {
                 "env"
@@ -1309,7 +1309,7 @@ async fn run_kg_query(
 /// run on this machine with the same identity `kotoba serve` uses.
 fn operator_token() -> Result<String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    let id = kotoba_kse::AgentIdentity::from_env();
+    let id = kotoba_vault::AgentIdentity::from_env();
     if id.ephemeral {
         anyhow::bail!(
             "no persisted identity — media commands need a stable operator DID. \
@@ -1458,7 +1458,7 @@ fn mime_for_path(path: &str) -> String {
 async fn run_commit(base_url: &str, author: Option<String>) -> Result<()> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
-    let id = kotoba_kse::AgentIdentity::from_env();
+    let id = kotoba_vault::AgentIdentity::from_env();
     if id.ephemeral {
         anyhow::bail!(
             "no persisted identity — `kotoba commit` needs a stable operator DID. \

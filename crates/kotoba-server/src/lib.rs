@@ -908,7 +908,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     access_receipt::spawn_receipt_writer(Arc::clone(&state));
     // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
     // game snapshots are content-addressed into the block store + announced on
-    // the KSE Journal. Idempotent; per-frame traffic never touches either.
+    // the KSE LiveBus. Idempotent; per-frame traffic never touches either.
     realtime::install_cold_lane(state.block_store.clone(), state.journal.clone());
     // Optionally run a real kotoba:kge component as the room sim (room swap).
     #[cfg(feature = "realtime-wasm")]
@@ -1355,7 +1355,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", attestation::NSID_REQUEST_LOG),
             get(attestation::request_log_query),
         )
-        // ── Firehose egress (D): SSE live-tail + JSON cursor paging over Journal ──
+        // ── Firehose egress (D): SSE live-tail + JSON cursor paging over LiveBus ──
         .route(
             &format!("/xrpc/{}", firehose::NSID_SYNC_SUBSCRIBE),
             get(firehose::subscribe),
@@ -1493,7 +1493,7 @@ pub async fn run() -> anyhow::Result<()> {
         version  = state.version,
         node_id  = %hex::encode(state.local_node_id.0),
         did      = %state.operator_did,
-        "KSE Journal + Shelf + KDHT Neighborhood ready"
+        "KSE LiveBus + Shelf + KDHT Neighborhood ready"
     );
 
     state.register_node().await;

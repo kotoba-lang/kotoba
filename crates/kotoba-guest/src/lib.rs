@@ -5,7 +5,7 @@
 ///
 /// The guest demonstrates the full KOTOBA host ABI:
 ///   kqe.assert-quad  — persist a quad into the Arrangement
-///   kse.publish      — emit an event into the KSE Journal
+///   kse.publish      — emit an event into the KSE LiveBus
 ///   auth.current-did — read the executing agent DID
 ///   chain.append-infer (skipped — no model loaded in tests)
 ///

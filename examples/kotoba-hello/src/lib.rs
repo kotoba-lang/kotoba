@@ -34,7 +34,7 @@ impl Guest for KotobaHello {
             object_cbor: addr_cbor,
         })?;
 
-        // Publish to KSE Journal
+        // Publish to KSE LiveBus
         kse::publish("kotoba/evm/hello", did.as_bytes())
             .map_err(|e| format!("publish failed: {e}"))?;
 

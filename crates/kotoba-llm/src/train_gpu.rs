@@ -12,7 +12,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use kotoba_query::delta::Delta;
-use kotoba_kse::vault::Vault;
+use kotoba_vault::vault::Vault;
 
 use crate::gpu_common::{
     bytes_to_f32_slice, cpu_matmul, dequantize_fp8_e4m3, f32_slice_to_bytes,

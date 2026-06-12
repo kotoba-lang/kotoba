@@ -1,15 +1,15 @@
-//! KSE Journal — topic pub/sub event stream (Merkle WAL).
+//! LiveBus — a purely **in-memory** topic pub/sub event bus (broadcast +
+//! bounded ring buffer). Historically the **KSE Journal** (a block-persisting
+//! Merkle WAL); deprecated as a canonical chain 2026-06-11 (etzhayyim/kotoba
+//! #115), persistence physically removed, and renamed to match reality
+//! 2026-06-12.
 //!
-//! ## ⚠ DEPRECATED as a canonical chain (2026-06-11, etzhayyim/kotoba#115)
-//!
-//! Accountability / signed chains live on the **CommitDag**
-//! (`kotoba-datomic` `DistributedDatomCommit`), not here. Do not build new
-//! features on the Journal. Sanctioned remaining use: the **ephemeral
-//! live-tail** ([`Journal::publish_ephemeral`] — broadcast + ring buffer, no
-//! block persist) feeding the firehose SSE tap; durable history replays from
-//! the CommitDag (`sync.eventsFromCommits`). The block-persisting
-//! [`Journal::publish`] path and `read_since` cold-fallback remain only for
-//! legacy replay of pre-deprecation data.
+//! There is **no persistence here**: durable, replayable history lives in the
+//! CommitDag (`kotoba-datomic` `DistributedDatomCommit` — content-addressed,
+//! parent hash-chain, author DID, signed IPNS heads, anchorable), replayed via
+//! `sync.eventsFromCommits` / `eventsAllGraphs`. The LiveBus only feeds the
+//! firehose SSE live-tail and in-process subscribers (gossipsub semantics:
+//! best-effort, ephemeral). Do not build durable features on it.
 
 use crate::topic::Topic;
 use bytes::Bytes;
@@ -22,10 +22,10 @@ use tokio::sync::{broadcast, RwLock};
 /// Default number of entries kept in the in-process ring buffer.
 const DEFAULT_LOG_CAP: usize = 65_536;
 
-/// Journal entry — one ordered record in a Topic's log.
+/// LiveBus entry — one ordered record in a Topic's log.
 /// `prev` links to the previous entry's block CID, forming a Merkle chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalEntry {
+pub struct LiveBusEntry {
     pub seq: u64,
     pub ts: u64, // unix ms
     pub topic: String,
@@ -37,16 +37,16 @@ pub struct JournalEntry {
 pub struct Cursor {
     pub id: String,
     pub position: u64,
-    rx: broadcast::Receiver<JournalEntry>,
+    rx: broadcast::Receiver<LiveBusEntry>,
 }
 
 impl Cursor {
-    pub async fn next(&mut self) -> Option<JournalEntry> {
+    pub async fn next(&mut self) -> Option<LiveBusEntry> {
         self.rx.recv().await.ok()
     }
 }
 
-/// LiveBus (historically "Journal") — a purely **in-memory** ordered event bus.
+/// LiveBus (historically "LiveBus") — a purely **in-memory** ordered event bus.
 ///
 /// Entries are broadcast to live subscribers and kept in a bounded ring for a
 /// short live-tail backlog. There is **no persistence**: durable, replayable
@@ -54,14 +54,14 @@ impl Cursor {
 /// `eventsAllGraphs`) and in each subsystem's own content-addressed store
 /// (signal → Shelf, realtime → block-store snapshots). This mirrors libp2p
 /// gossipsub (best-effort, ephemeral) — see ADR on journal removal.
-pub struct Journal {
+pub struct LiveBus {
     seq: Arc<RwLock<u64>>,
-    tx: broadcast::Sender<JournalEntry>,
-    log: Arc<RwLock<VecDeque<JournalEntry>>>,
+    tx: broadcast::Sender<LiveBusEntry>,
+    log: Arc<RwLock<VecDeque<LiveBusEntry>>>,
     log_cap: usize,
 }
 
-impl Journal {
+impl LiveBus {
     /// In-memory only — no persistence.
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_LOG_CAP)
@@ -83,7 +83,7 @@ impl Journal {
     /// (datomic) or each subsystem's own content-addressed store (signal → Shelf,
     /// realtime → block store snapshots); the firehose replays datomic from the
     /// CommitDag (`sync.eventsFromCommits` / `eventsAllGraphs`).
-    pub async fn publish(&self, topic: Topic, payload: Bytes) -> JournalEntry {
+    pub async fn publish(&self, topic: Topic, payload: Bytes) -> LiveBusEntry {
         let mut seq_guard = self.seq.write().await;
         *seq_guard += 1;
         let seq = *seq_guard;
@@ -91,7 +91,7 @@ impl Journal {
 
         let cid = KotobaCid::from_bytes(&payload);
 
-        let entry = JournalEntry {
+        let entry = LiveBusEntry {
             seq,
             ts: now_ms(),
             topic: topic.0,
@@ -113,7 +113,7 @@ impl Journal {
     }
 
     /// Back-compat alias — every publish is now ephemeral (in-memory only).
-    pub async fn publish_ephemeral(&self, topic: Topic, payload: Bytes) -> JournalEntry {
+    pub async fn publish_ephemeral(&self, topic: Topic, payload: Bytes) -> LiveBusEntry {
         self.publish(topic, payload).await
     }
 
@@ -130,7 +130,7 @@ impl Journal {
     /// There is no cold/persistent history: deep replay of datomic changes comes
     /// from the CommitDag (`sync.eventsFromCommits` / `eventsAllGraphs`), not from
     /// this bus.
-    pub async fn read_since(&self, since: u64) -> Vec<JournalEntry> {
+    pub async fn read_since(&self, since: u64) -> Vec<LiveBusEntry> {
         let log = self.log.read().await;
         log.iter().filter(|e| e.seq >= since).cloned().collect()
     }
@@ -155,7 +155,7 @@ impl Journal {
     pub async fn trim_persistent_before(&self, _before: u64) {}
 }
 
-impl Default for Journal {
+impl Default for LiveBus {
     fn default() -> Self {
         Self::new()
     }
@@ -169,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_increments_seq() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("test/seq");
         let e1 = journal.publish(t.clone(), Bytes::from_static(b"a")).await;
         let e2 = journal.publish(t.clone(), Bytes::from_static(b"b")).await;
@@ -181,7 +181,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_cid_is_deterministic() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("test/cid");
         let payload = Bytes::from_static(b"hello kotoba");
         let e1 = journal.publish(t.clone(), payload.clone()).await;
@@ -191,7 +191,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_returns_correct_topic_and_payload() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let topic_str = "kotoba/test/entry";
         let payload = Bytes::from(vec![1u8, 2, 3, 4]);
         let entry = journal
@@ -203,7 +203,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_cursor_receives_published_entry() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let mut cursor = journal.subscribe();
         let topic = Topic::new("test/subscribe");
         let payload = Bytes::from_static(b"broadcast me");
@@ -216,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_since_returns_only_entries_after_watermark() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("window/test");
         journal
             .publish(t.clone(), Bytes::from_static(b"seq1"))
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn trim_before_removes_old_entries() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("trim/test");
         for i in 0..10u8 {
             journal.publish(t.clone(), Bytes::from(vec![i])).await;
@@ -258,7 +258,7 @@ mod tests {
 
     #[tokio::test]
     async fn ring_buffer_evicts_oldest_when_at_cap() {
-        let journal = Journal::with_capacity(3);
+        let journal = LiveBus::with_capacity(3);
         let t = Topic::new("cap/test");
         journal.publish(t.clone(), Bytes::from_static(b"a")).await; // seq 1
         journal.publish(t.clone(), Bytes::from_static(b"b")).await; // seq 2
@@ -277,13 +277,13 @@ mod tests {
 
     #[tokio::test]
     async fn current_seq_is_zero_before_any_publish() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         assert_eq!(journal.current_seq().await, 0);
     }
 
     #[tokio::test]
     async fn current_seq_matches_last_entry_seq() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("seq-check");
         journal.publish(t.clone(), Bytes::from_static(b"x")).await;
         journal.publish(t.clone(), Bytes::from_static(b"y")).await;
@@ -292,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_creates_functional_journal() {
-        let journal = Journal::default();
+        let journal = LiveBus::default();
         let e = journal
             .publish(Topic::new("default/test"), Bytes::from_static(b"hi"))
             .await;
@@ -301,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn trim_before_zero_is_noop() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("noop/trim");
         journal.publish(t.clone(), Bytes::from_static(b"a")).await;
         journal.publish(t.clone(), Bytes::from_static(b"b")).await;
@@ -316,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn trim_persistent_before_is_noop() {
         // Verify no panic and no side-effects
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("persist/noop");
         journal.publish(t.clone(), Bytes::from_static(b"z")).await;
         journal.trim_persistent_before(9999).await; // must not remove in-memory entries
@@ -325,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_since_all_from_zero_returns_everything() {
-        let journal = Journal::new();
+        let journal = LiveBus::new();
         let t = Topic::new("all/entries");
         journal.publish(t.clone(), Bytes::from_static(b"1")).await;
         journal.publish(t.clone(), Bytes::from_static(b"2")).await;

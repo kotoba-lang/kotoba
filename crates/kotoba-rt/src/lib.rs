@@ -10,7 +10,7 @@
 //!   - [`rollback`] — [`rollback::RollbackEngine`]: predict → rollback → re-sim.
 //!   - [`room`]     — [`room::RoomActor`]: the per-room authority + its OWN
 //!     `tokio::broadcast` bus. Per-frame traffic NEVER enters the global KSE
-//!     Journal / firehose / gossip; only the periodic durable snapshot does.
+//!     LiveBus / firehose / gossip; only the periodic durable snapshot does.
 //!
 //! What is intentionally NOT here yet (server wiring, P1→P4):
 //!   - the axum `sync.connect` WebSocket route (kotoba-server),
