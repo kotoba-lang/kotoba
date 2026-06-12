@@ -2,7 +2,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_graph::QuadStore;
 use kotoba_query::{quad::LegacyQuad as Quad, Datom};
-use kotoba_kse::JournalEntry;
+use kotoba_vault::LiveBusEntry;
 use kotoba_net::{KotobaNetEvent, KotobaSwarm, PREGEL_GOSSIP_TOPIC};
 use kotoba_vm::distributed::DistributedMessage;
 use std::collections::{HashSet, VecDeque};
@@ -19,7 +19,7 @@ const MAX_DELTA_COMMITS_PER_GRAPH: usize = 1_000;
 /// Total serialised byte cap across all delta_commits in one response (8 MiB).
 const MAX_DELTA_COMMITS_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
-/// GossipSub topic carrying the full KSE Journal firehose (E: relay role).
+/// GossipSub topic carrying the full KSE LiveBus firehose (E: relay role).
 const FIREHOSE_TOPIC: &str = "firehose";
 /// GossipSub topic carrying PRE re-key revocation warrants (ADR §23.7 wire).
 /// Payload = serialized `RekeyRevocationRecord` (applied without a block fetch).
@@ -28,7 +28,7 @@ const REKEY_REVOKE_TOPIC: &str = "rekey/revoke";
 const FIREHOSE_SEEN_CAP: usize = 8192;
 
 /// Bounded content-CID de-dup guard. A relay receives a firehose entry, re-logs
-/// it to its own Journal (re-sequenced), and that local Journal entry would
+/// it to its own LiveBus (re-sequenced), and that local LiveBus entry would
 /// otherwise be picked up by the relay's own firehose cursor and gossiped back —
 /// looping forever and inflating seq. Recording the entry's content CID (stable
 /// blake3 of the payload, identical across nodes) lets the cursor skip the echo.
@@ -68,29 +68,29 @@ impl FirehoseSeen {
 /// Four-way fan-out via `tokio::select!`:
 ///   1. `publish_rx`         — KSE outbound → `swarm.publish`
 ///   2. `pregel_outbound_rx` — Pregel runner outbound → `swarm.send_pregel_message`
-///   3. `swarm.next_event`   — inbound events → Bitswap serving, KSE Journal, or Pregel channel
+///   3. `swarm.next_event`   — inbound events → Bitswap serving, KSE LiveBus, or Pregel channel
 ///
 /// GossipSub topics managed here:
 ///   "kotoba/quad/assert"  / "kotoba/quad/retract" — KSE quad propagation
 ///   "kotoba/pregel/messages"                       — Distributed Pregel BSP messages
-///   "kotoba/firehose"                              — full Journal relay (relay role)
+///   "kotoba/firehose"                              — full LiveBus relay (relay role)
 ///
 /// Bug fix: after `journal.publish()` for "quad/assert" or "quad/retract" topics,
 /// also deserialize the data as the legacy Quad wire projection and apply it to
-/// the local graph store as a Datom whose transaction is the Journal entry CID.
+/// the local graph store as a Datom whose transaction is the LiveBus entry CID.
 ///
 /// When `relay` is true (NodeRole::Relay), the node additionally bridges its
-/// full KSE Journal onto the `firehose` gossip topic and re-logs peers' firehose
+/// full KSE LiveBus onto the `firehose` gossip topic and re-logs peers' firehose
 /// entries — the mesh half of the D+E federation surface (2026-05-30).
 pub async fn run(
     mut swarm: KotobaSwarm,
     mut publish_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
-    journal: Arc<kotoba_kse::Journal>,
+    journal: Arc<kotoba_vault::LiveBus>,
     pregel_inbound_tx: tokio::sync::mpsc::Sender<DistributedMessage>,
     mut pregel_out_rx: tokio::sync::mpsc::Receiver<DistributedMessage>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
     quad_store: Arc<QuadStore>,
-    pre_key_registry: Option<Arc<kotoba_kse::PreKeyRegistry>>,
+    pre_key_registry: Option<Arc<kotoba_vault::PreKeyRegistry>>,
     relay: bool,
 ) {
     swarm.subscribe("quad/assert").ok();
@@ -101,12 +101,12 @@ pub async fn run(
     // Full gossip topic string as published by KotobaSwarm (has "kotoba/" prefix)
     let pregel_full_topic = format!("kotoba/{PREGEL_GOSSIP_TOPIC}");
 
-    // ── Relay role (E): bridge the local Journal onto the gossip firehose ──
+    // ── Relay role (E): bridge the local LiveBus onto the gossip firehose ──
     let mut firehose_cursor = journal.subscribe();
     let mut firehose_seen = FirehoseSeen::new(FIREHOSE_SEEN_CAP);
     if relay {
         swarm.subscribe(FIREHOSE_TOPIC).ok();
-        tracing::info!("net_actor: relay role active — bridging KSE Journal ↔ gossip firehose");
+        tracing::info!("net_actor: relay role active — bridging KSE LiveBus ↔ gossip firehose");
     }
 
     loop {
@@ -125,7 +125,7 @@ pub async fn run(
                     .ok();
             }
 
-            // ── Relay: bridge local Journal entries onto the gossip firehose ──
+            // ── Relay: bridge local LiveBus entries onto the gossip firehose ──
             jentry = firehose_cursor.next(), if relay => {
                 if let Some(entry) = jentry {
                     // Quad mutations + Pregel control already have dedicated
@@ -143,7 +143,7 @@ pub async fn run(
                 }
             }
 
-            // ── Inbound: peer events → Bitswap / KSE Journal / Pregel ───
+            // ── Inbound: peer events → Bitswap / KSE LiveBus / Pregel ───
             event = swarm.next_event() => {
                 let Some(event) = event else { break };
                 match event {
@@ -243,22 +243,22 @@ pub async fn run(
                                 .to_string();
 
                             if kse_name == FIREHOSE_TOPIC {
-                                // Relay inbound: decode the JournalEntry envelope
+                                // Relay inbound: decode the LiveBusEntry envelope
                                 // and re-log it locally (re-sequenced) for
                                 // durability + HTTP-tap (D) visibility + onward
                                 // gossip forwarding. Record its content CID so
                                 // our own firehose cursor doesn't echo it back.
-                                match ciborium::from_reader::<JournalEntry, _>(&data[..]) {
+                                match ciborium::from_reader::<LiveBusEntry, _>(&data[..]) {
                                     Ok(fe) => {
                                         firehose_seen.insert(fe.cid.clone());
                                         journal
                                             .publish(
-                                                kotoba_kse::Topic(fe.topic),
+                                                kotoba_vault::Topic(fe.topic),
                                                 bytes::Bytes::from(fe.payload),
                                             )
                                             .await;
                                     }
-                                    Err(e) => tracing::warn!(err = %e, "firehose: bad JournalEntry envelope — skipped"),
+                                    Err(e) => tracing::warn!(err = %e, "firehose: bad LiveBusEntry envelope — skipped"),
                                 }
                             } else if kse_name == REKEY_REVOKE_TOPIC {
                                 // PRE re-key revocation warrant (§23.7 wire):
@@ -276,7 +276,7 @@ pub async fn run(
                                 } else {
                                     None
                                 };
-                                let kse_topic = kotoba_kse::Topic(kse_name);
+                                let kse_topic = kotoba_vault::Topic(kse_name);
                                 let entry = journal.publish(kse_topic, bytes::Bytes::from(data)).await;
                                 if let Some((quad, op)) = maybe_quad_op {
                                     let graph_cid = quad.graph.clone();

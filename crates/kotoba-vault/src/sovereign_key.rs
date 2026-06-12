@@ -4,14 +4,14 @@
 //!   1. Generated randomly at genesis,
 //!   2. Wrapped (ECIES) with the agent's X25519 public key,
 //!   3. Stored as a block in the `BlockStore`,
-//!   4. A key-ref JSON `{ cid, version }` is written to `KseStore`.
+//!   4. A key-ref JSON `{ cid, version }` is written to `VaultStore`.
 //!
 //! The agent can encrypt/decrypt but **never** exposes raw key bytes.
 //!
 //! ## Key Pointer Storage
 //! ```text
-//! KseStore key: "agent/crypto/{did_slug}/current.json"
-//! KseStore key: "agent/crypto/{did_slug}/v{N}.json"
+//! VaultStore key: "agent/crypto/{did_slug}/current.json"
+//! VaultStore key: "agent/crypto/{did_slug}/v{N}.json"
 //! ```
 //!
 //! Each pointer JSON: `{ "cid": "<multibase>", "version": N }`
@@ -35,7 +35,7 @@ use kotoba_crypto::hpke::{hpke_open, hpke_seal};
 use kotoba_crypto::{AgentCrypto, CryptoError, VaultKeyedCrypto};
 
 use crate::agent_identity::AgentIdentity;
-use crate::store::KseStore;
+use crate::store::VaultStore;
 
 // ── Key pointer JSON ──────────────────────────────────────────────────────────
 
@@ -50,7 +50,7 @@ struct KeyRef {
 /// Agent-sovereign crypto engine.
 ///
 /// Wraps a `VaultKeyedCrypto` and manages key lifecycle (genesis, load,
-/// rotation) against a `BlockStore` + `KseStore`.
+/// rotation) against a `BlockStore` + `VaultStore`.
 pub struct SovereignCrypto {
     inner: VaultKeyedCrypto,
 }
@@ -61,12 +61,12 @@ impl SovereignCrypto {
     /// Load the current vault key from storage, or generate a new one (genesis).
     ///
     /// Algorithm:
-    ///   1. Check KseStore for `agent/crypto/{slug}/current.json`
+    ///   1. Check VaultStore for `agent/crypto/{slug}/current.json`
     ///   2. If present: load wrapped blob from BlockStore, HPKE-unwrap with agent sk
     ///   3. If absent: generate random key, wrap, store, write pointer
     pub async fn load_or_genesis(
         identity: &AgentIdentity,
-        kse_store: &KseStore,
+        kse_store: &VaultStore,
         block_store: &Arc<dyn BlockStore + Send + Sync>,
     ) -> Result<Self> {
         let slug = identity.did_slug();
@@ -75,7 +75,7 @@ impl SovereignCrypto {
         if kse_store.exists(&cur_key).await {
             // Bootstrap: try to load existing key.  If the referenced block is
             // gone (e.g. backing IPFS daemon was wiped between runs but the
-            // KseStore pointer file survived), fall through to genesis instead
+            // VaultStore pointer file survived), fall through to genesis instead
             // of bricking the startup.
             // Returns `Ok(Some(_))` on success, `Ok(None)` ONLY when the wrapped
             // block is *confirmed missing* (store reachable, block absent), and
@@ -167,7 +167,7 @@ impl SovereignCrypto {
     /// backoff for up to ~30 s before giving up.
     async fn genesis(
         identity: &AgentIdentity,
-        kse_store: &KseStore,
+        kse_store: &VaultStore,
         block_store: &Arc<dyn BlockStore + Send + Sync>,
     ) -> Result<Self> {
         // Generate 32-byte random vault key
@@ -216,7 +216,7 @@ impl SovereignCrypto {
     pub async fn rotate(
         &self,
         identity: &AgentIdentity,
-        kse_store: &KseStore,
+        kse_store: &VaultStore,
         block_store: &Arc<dyn BlockStore + Send + Sync>,
     ) -> Result<Self> {
         let slug = identity.did_slug();
@@ -315,7 +315,7 @@ impl AgentCrypto for SovereignCrypto {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Write a `KeyRef` as `current.json` (always overwrites).
-async fn write_key_ref(kse_store: &KseStore, slug: &str, key_ref: &KeyRef) -> Result<()> {
+async fn write_key_ref(kse_store: &VaultStore, slug: &str, key_ref: &KeyRef) -> Result<()> {
     let json = serde_json::to_vec(key_ref).context("serialize key-ref")?;
     let cur_key = format!("agent/crypto/{slug}/current.json");
     kse_store
@@ -462,9 +462,9 @@ mod tests {
         dir
     }
 
-    fn make_stores(dir: &std::path::Path) -> (KseStore, Arc<dyn BlockStore + Send + Sync>) {
+    fn make_stores(dir: &std::path::Path) -> (VaultStore, Arc<dyn BlockStore + Send + Sync>) {
         let fs = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
-        let kse = KseStore::new(fs, "");
+        let kse = VaultStore::new(fs, "");
         let blk = Arc::new(BudgetedBlockStore::new(
             MemoryBlockStore::new(),
             64 * 1024 * 1024,

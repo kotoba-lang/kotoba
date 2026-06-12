@@ -2,16 +2,16 @@ use bytes::Bytes;
 use object_store::path::Path;
 use std::sync::Arc;
 
-/// KseStore — thin wrapper around an ObjectStore with a fixed key prefix.
+/// VaultStore — thin wrapper around an ObjectStore with a fixed key prefix.
 ///
 /// In production: wraps an `AmazonS3` (B2 S3-compat) instance.
 /// In dev/test: wraps `LocalFileSystem`.
-pub struct KseStore {
+pub struct VaultStore {
     inner: Arc<dyn object_store::ObjectStore>,
     prefix: String,
 }
 
-impl KseStore {
+impl VaultStore {
     /// Construct from any ObjectStore implementation.
     pub fn new(store: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
         Self {
@@ -87,7 +87,7 @@ mod tests {
     async fn kse_store_put_get_roundtrip() {
         let dir = tmp_dir("kse");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "test/");
+        let store = VaultStore::new(fs, "test/");
         store
             .put("hello", Bytes::from_static(b"world"))
             .await
@@ -100,7 +100,7 @@ mod tests {
     async fn kse_store_exists_and_delete() {
         let dir = tmp_dir("kse-del");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "test/");
+        let store = VaultStore::new(fs, "test/");
         assert!(!store.exists("key").await);
         store.put("key", Bytes::from_static(b"val")).await.unwrap();
         assert!(store.exists("key").await);
@@ -112,7 +112,7 @@ mod tests {
     async fn kse_store_list_prefix_no_matches_returns_empty() {
         let dir = tmp_dir("kse-list-empty");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "pfx/");
+        let store = VaultStore::new(fs, "pfx/");
         let keys = store.list_prefix("seq/").await;
         assert!(keys.is_empty(), "no objects → empty list");
     }
@@ -121,7 +121,7 @@ mod tests {
     async fn kse_store_list_prefix_returns_relative_keys() {
         let dir = tmp_dir("kse-list-keys");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "j/");
+        let store = VaultStore::new(fs, "j/");
         store
             .put("seq/0001", Bytes::from_static(b"a"))
             .await
@@ -148,7 +148,7 @@ mod tests {
     async fn kse_store_binary_data_roundtrip() {
         let dir = tmp_dir("kse-binary");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "bin/");
+        let store = VaultStore::new(fs, "bin/");
         let data: Vec<u8> = (0u8..=255).collect();
         store
             .put("blob", Bytes::copy_from_slice(&data))
@@ -162,7 +162,7 @@ mod tests {
     async fn kse_store_overwrite_returns_new_value() {
         let dir = tmp_dir("kse-overwrite");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "ow/");
+        let store = VaultStore::new(fs, "ow/");
         store.put("k", Bytes::from_static(b"v1")).await.unwrap();
         store.put("k", Bytes::from_static(b"v2")).await.unwrap();
         let got = store.get("k").await.unwrap();
@@ -173,7 +173,7 @@ mod tests {
     async fn kse_store_get_nonexistent_returns_error() {
         let dir = tmp_dir("kse-get-err");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "pfx/");
+        let store = VaultStore::new(fs, "pfx/");
         let result = store.get("nonexistent-key").await;
         assert!(result.is_err(), "getting nonexistent key should return Err");
     }
@@ -182,7 +182,7 @@ mod tests {
     async fn kse_store_delete_nonexistent_returns_error() {
         let dir = tmp_dir("kse-del-err");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "pfx/");
+        let store = VaultStore::new(fs, "pfx/");
         let result = store.delete_key("phantom").await;
         assert!(
             result.is_err(),
@@ -194,7 +194,7 @@ mod tests {
     async fn kse_store_empty_value_roundtrip() {
         let dir = tmp_dir("kse-empty-val");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "e/");
+        let store = VaultStore::new(fs, "e/");
         store.put("empty", Bytes::new()).await.unwrap();
         let got = store.get("empty").await.unwrap();
         assert_eq!(got.len(), 0, "empty value should round-trip as empty bytes");
@@ -207,8 +207,8 @@ mod tests {
         let dir = tmp_dir("kse-prefix-isolation");
         let fs: Arc<dyn object_store::ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store_a = KseStore::new(Arc::clone(&fs), "ns-a/");
-        let store_b = KseStore::new(Arc::clone(&fs), "ns-b/");
+        let store_a = VaultStore::new(Arc::clone(&fs), "ns-a/");
+        let store_b = VaultStore::new(Arc::clone(&fs), "ns-b/");
 
         store_a
             .put("key", Bytes::from_static(b"data-a"))
@@ -226,7 +226,7 @@ mod tests {
     async fn kse_store_list_prefix_all_objects_returned() {
         let dir = tmp_dir("kse-list-all");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "root/");
+        let store = VaultStore::new(fs, "root/");
         for i in 0..5u8 {
             store
                 .put(&format!("items/{i:03}"), Bytes::from(vec![i]))
@@ -244,7 +244,7 @@ mod tests {
     async fn kse_store_exists_false_after_delete() {
         let dir = tmp_dir("kse-exists-after-del");
         let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
-        let store = KseStore::new(fs, "x/");
+        let store = VaultStore::new(fs, "x/");
         store
             .put("the-key", Bytes::from_static(b"value"))
             .await

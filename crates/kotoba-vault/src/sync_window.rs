@@ -6,7 +6,7 @@ use kotoba_core::store::BlockStore;
 /// An agent creates a `SyncWindow` on startup from its last persisted state.
 /// It then:
 /// 1. Calls `pin_into(store)` to protect anchor CIDs from eviction.
-/// 2. Calls `Journal::read_since(self.since_seq)` to replay missed entries.
+/// 2. Calls `LiveBus::read_since(self.since_seq)` to replay missed entries.
 /// 3. Calls `QuadStore::commits_since(graph_cid, self.head_cid.as_ref())`
 ///    to fetch only the delta commits it hasn't processed yet.
 /// 4. Calls `advance(new_head, new_seq, store)` after each processed commit.
@@ -18,7 +18,7 @@ use kotoba_core::store::BlockStore;
 pub struct SyncWindow {
     /// Named graph being tracked.
     pub graph_cid: KotobaCid,
-    /// Journal sequence watermark — only entries ≥ since_seq are needed.
+    /// LiveBus sequence watermark — only entries ≥ since_seq are needed.
     pub since_seq: u64,
     /// Last commit head the agent has already processed.
     /// `None` = fresh agent with no prior state.
@@ -36,7 +36,7 @@ impl SyncWindow {
     }
 
     /// Fresh window — subscribe from the current tip only.
-    /// Pass `current_seq` from `Journal::current_seq()`.
+    /// Pass `current_seq` from `LiveBus::current_seq()`.
     pub fn head_only(graph_cid: KotobaCid, current_seq: u64) -> Self {
         Self {
             graph_cid,

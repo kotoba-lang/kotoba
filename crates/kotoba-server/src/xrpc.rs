@@ -785,7 +785,7 @@ pub struct InvokeRunResp {
     pub output_b64: String,
     pub assert_count: usize,
     pub retract_count: usize,
-    /// CIDs of Journal entries created for each asserted quad
+    /// CIDs of LiveBus entries created for each asserted quad
     pub journal_cids: Vec<String>,
 }
 
@@ -1063,7 +1063,7 @@ async fn resolve_and_verify_did_web(
 
 /// POST /xrpc/com.etzhayyim.apps.kotoba.datom.create
 /// POST /xrpc/com.etzhayyim.apps.kotoba.quad.create
-/// Publish a Datom-compatible atomic fact to the KSE Journal.
+/// Publish a Datom-compatible atomic fact to the KSE LiveBus.
 ///
 /// `cacao_b64` is required. The CACAO is verified before the write:
 /// - Signature must be valid (EdDSA or eip191)
@@ -2702,12 +2702,12 @@ pub(crate) async fn commit_protocol_datoms(
         })?;
 
     // ADR-2606041151 A — the synchronous DistributedCommitWriter commit above is
-    // already durable (ProllyTree + IPNS head), so the per-datom Journal WAL
+    // already durable (ProllyTree + IPNS head), so the per-datom LiveBus WAL
     // block-write is a redundant double-write. Kept by default (fast restart via
     // journal replay); opt out with KOTOBA_JOURNAL_WAL=off to drop the double
     // write. The hot-arrangement update (`apply_journaled_datom`) ALWAYS runs —
     // it serves hot reads and is independent of the WAL block-write.
-    // Datomic firehose: ephemeral live-tail broadcast, no Journal block persist
+    // Datomic firehose: ephemeral live-tail broadcast, no LiveBus block persist
     // (the CommitDag is the durable record; sync.eventsFromCommits replays it).
     let mut journal_cids = Vec::with_capacity(datoms.len());
     for datom in &datoms {
@@ -4987,9 +4987,9 @@ pub async fn datomic_transact(
     let tx_datoms = distributed.datoms;
 
     // Datomic firehose: broadcast each datom to the live-tail (ephemeral — NO
-    // Journal block persist), since the commit is already durable in the CommitDag
+    // LiveBus block persist), since the commit is already durable in the CommitDag
     // and replayable via sync.eventsFromCommits / eventsAllGraphs. This removes the
-    // redundant per-datom Journal copy entirely (the Journal now persists only
+    // redundant per-datom LiveBus copy entirely (the LiveBus now persists only
     // non-datomic topics: signal / realtime / kse pub-sub).
     let mut journal_cids = Vec::with_capacity(tx_datoms.len());
     for datom in &tx_datoms {
@@ -7092,7 +7092,7 @@ pub async fn node_status(
 }
 
 /// POST /xrpc/com.etzhayyim.apps.kotoba.invoke.run
-/// Execute a WASM component or Datalog program, then publish resulting quads to Journal.
+/// Execute a WASM component or Datalog program, then publish resulting quads to LiveBus.
 #[cfg(feature = "wasm-runtime")]
 pub async fn invoke_run(
     State(state): State<Arc<KotobaState>>,
@@ -7367,7 +7367,7 @@ pub async fn invoke_run(
             }
             // Apply kse.publish calls buffered by guest WASM
             for (topic, payload) in &r.pending_publishes {
-                use kotoba_kse::Topic;
+                use kotoba_vault::Topic;
                 state
                     .journal
                     .publish(Topic(topic.clone()), bytes::Bytes::from(payload.clone()))
@@ -7381,7 +7381,7 @@ pub async fn invoke_run(
                 retracts    = r.retract_quads.len(),
                 kse_publishes = r.pending_publishes.len(),
                 chain_entries = r.pending_chain_entries.len(),
-                "invoke.run → Journal published"
+                "invoke.run → LiveBus published"
             );
 
             Ok(Json(InvokeRunResp {
@@ -8350,7 +8350,7 @@ pub async fn quad_retract(
         subject   = %req.subject,
         predicate = %req.predicate,
         cid       = %journal_cid,
-        "quad.retract → Journal + QuadStore"
+        "quad.retract → LiveBus + QuadStore"
     );
 
     Ok((
@@ -8852,7 +8852,7 @@ pub async fn agent_run(
     let (session, superstep_results) = tokio::task::spawn_blocking(move || {
         use kotoba_vm::agent::{Tool, ToolOutput};
 
-        // Override the default no-op kse.publish with a real Journal write.
+        // Override the default no-op kse.publish with a real LiveBus write.
         let journal2 = Arc::clone(&journal);
         let kse_publish_tool = Tool::from_fn(
             "kse.publish",
@@ -8866,7 +8866,7 @@ pub async fn agent_run(
                 let topic_str2 = topic_str.clone();
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async move {
-                        j.publish(kotoba_kse::Topic(topic_str2), bytes::Bytes::from(msg))
+                        j.publish(kotoba_vault::Topic(topic_str2), bytes::Bytes::from(msg))
                             .await;
                     });
                 });
@@ -8896,7 +8896,7 @@ pub async fn agent_run(
     });
 
     // Store session steps through the Datomic/IPLD commit path.  The legacy
-    // Journal/QuadStore projection is still updated inside commit_protocol_datoms.
+    // LiveBus/QuadStore projection is still updated inside commit_protocol_datoms.
     let session_cid = session.session_cid.clone();
     let tx_cid = KotobaCid::from_bytes(
         format!(
@@ -8972,7 +8972,7 @@ pub struct AgentSyncOpenReq {
     pub session_id: String,
     /// Named graph CID to sync (multibase).
     pub graph_cid: String,
-    /// Journal sequence watermark — the agent has already processed all entries before this.
+    /// LiveBus sequence watermark — the agent has already processed all entries before this.
     pub since_seq: u64,
     /// Last commit head the agent has processed. `None` = fresh agent.
     pub head_cid: Option<String>,
@@ -8995,7 +8995,7 @@ pub async fn agent_sync_open(
     Json(req): Json<AgentSyncOpenReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kse::sync_window::SyncWindow;
+    use kotoba_vault::sync_window::SyncWindow;
 
     // Validate session_id: non-empty, ≤256 bytes, printable ASCII.
     const MAX_SESSION_ID_LEN: usize = 256;
@@ -15104,7 +15104,7 @@ pub async fn generic_invoke(
                 .await?;
             }
             for (topic, payload) in &r.pending_publishes {
-                use kotoba_kse::Topic;
+                use kotoba_vault::Topic;
                 state
                     .journal
                     .publish(Topic(topic.clone()), bytes::Bytes::from(payload.clone()))

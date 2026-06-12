@@ -875,12 +875,12 @@ impl IngestStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_kse::Journal;
+    use kotoba_vault::LiveBus;
     use kotoba_store::MemoryBlockStore;
     use std::sync::Arc;
 
     fn make_store() -> Arc<QuadStore> {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new())
             as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
         Arc::new(QuadStore::new(journal, block_store))

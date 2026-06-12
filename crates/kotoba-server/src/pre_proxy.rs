@@ -13,7 +13,7 @@ use kotoba_auth::delegation::DelegationChain;
 use kotoba_auth::resolver::{DidDocumentResolver, DidResolverError};
 use kotoba_crypto::aead::CryptoError;
 use kotoba_crypto::hpke::hpke_seal;
-use kotoba_kse::{PreKeyError, PreKeyRegistry};
+use kotoba_vault::{PreKeyError, PreKeyRegistry};
 use subtle::ConstantTimeEq;
 use x25519_dalek::PublicKey;
 
@@ -84,7 +84,7 @@ mod tests {
         did_document::ServiceEndpointValue, DidDocument, InMemoryDidResolver, ServiceEndpoint,
         VerificationMethod,
     };
-    use kotoba_kse::PreKeyRegistry;
+    use kotoba_vault::PreKeyRegistry;
     use kotoba_store::MemoryBlockStore;
 
     fn make_doc_with_x25519(did: &str, key: [u8; 32]) -> DidDocument {

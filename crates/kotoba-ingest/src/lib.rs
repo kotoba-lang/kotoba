@@ -21,7 +21,7 @@ pub use media_embed::{
 
 use kotoba_crypto::AgentCrypto;
 use kotoba_graph::QuadStore;
-use kotoba_kse::Vault;
+use kotoba_vault::Vault;
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -279,7 +279,7 @@ pub async fn send_message(
     }
 
     let topic_name = format!("signal/inbox/{}/{}", msg.recipient_did, msg.device_id);
-    let topic = kotoba_kse::topic::Topic(format!("kotoba/{topic_name}"));
+    let topic = kotoba_vault::topic::Topic(format!("kotoba/{topic_name}"));
     let payload_vec = match serde_json::to_vec(&req.signal_message) {
         Ok(v) => v,
         Err(e) => {
@@ -337,7 +337,7 @@ pub async fn send_group_message(
         ).into_response();
     }
 
-    let topic = kotoba_kse::topic::Topic(format!("kotoba/signal/group/{}", req.group_id));
+    let topic = kotoba_vault::topic::Topic(format!("kotoba/signal/group/{}", req.group_id));
     let payload_vec =
         match serde_json::to_vec(&req.sender_key_message) {
             Ok(v) => v,
@@ -401,7 +401,7 @@ pub async fn distribute_sender_key(
         return (code, Json(serde_json::json!({ "error": err_msg }))).into_response();
     }
 
-    let topic = kotoba_kse::topic::Topic(format!(
+    let topic = kotoba_vault::topic::Topic(format!(
         "kotoba/signal/inbox/{}/{}",
         req.recipient_did, req.recipient_device
     ));
