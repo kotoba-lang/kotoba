@@ -174,8 +174,8 @@ mod tests {
         let genesis = account_datoms(&from, 9, &u256(2_000_000_000_000_000_000), None, &graph());
         let raw = hex::decode(EIP155_RAW).unwrap();
 
-        let b1 = produce_block(&genesis, &[raw.clone()], None, 1, 100, &graph());
-        let b1again = produce_block(&genesis, &[raw.clone()], None, 1, 100, &graph());
+        let b1 = produce_block(&genesis, std::slice::from_ref(&raw), None, 1, 100, &graph());
+        let b1again = produce_block(&genesis, std::slice::from_ref(&raw), None, 1, 100, &graph());
         assert_eq!(
             b1.block.block_cid, b1again.block.block_cid,
             "deterministic block hash"

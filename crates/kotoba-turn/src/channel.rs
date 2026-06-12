@@ -53,7 +53,7 @@ pub fn encode(channel: u16, data: &[u8], pad: bool) -> Result<Vec<u8>, ChannelEr
     out.extend_from_slice(data);
     if pad {
         let rem = (4 - (data.len() % 4)) % 4;
-        out.extend(std::iter::repeat(0u8).take(rem));
+        out.extend(std::iter::repeat_n(0u8, rem));
     }
     Ok(out)
 }

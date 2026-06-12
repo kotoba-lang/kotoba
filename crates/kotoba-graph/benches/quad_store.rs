@@ -37,6 +37,8 @@ use kotoba_vault::live_bus::LiveBus;
 ///   cargo bench -p kotoba-graph --bench quad_store
 use std::{sync::Arc, time::Duration};
 
+type ScenarioFactory = (&'static str, fn() -> SimulatedLatencyBlockStore);
+
 fn make_cid(n: u64) -> KotobaCid {
     KotobaCid::from_bytes(&n.to_le_bytes())
 }
@@ -301,7 +303,7 @@ fn bench_query_cold_prolly(c: &mut Criterion) {
         .collect();
     let lookup_key = 500u64.to_le_bytes().to_vec();
 
-    let scenarios: &[(&str, fn() -> SimulatedLatencyBlockStore)] = &[
+    let scenarios: &[ScenarioFactory] = &[
         ("kubo_lan_1ms_get", SimulatedLatencyBlockStore::kubo_lan),
         ("kubo_wan_80ms_get", SimulatedLatencyBlockStore::kubo_wan),
         ("s3_same_az_2ms_get", SimulatedLatencyBlockStore::s3_same_az),

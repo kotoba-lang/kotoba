@@ -1,3 +1,5 @@
+#![allow(clippy::items_after_test_module)]
+
 pub mod b2_car_store;
 pub mod b2_client;
 pub mod b2_export;

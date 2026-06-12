@@ -374,7 +374,7 @@ mod tests {
 
         // Rotate to a NEW custodian set at epoch 1 (custodian #1 removed,
         // #4 added) — same key, fresh deal_id.
-        let fleet_b = vec![custodian(2), custodian(3), custodian(4)];
+        let fleet_b = [custodian(2), custodian(3), custodian(4)];
         let pubs_b: Vec<(String, PublicKey)> =
             fleet_b.iter().map(|(d, _, p)| (d.clone(), *p)).collect();
         let e1 = rotate_key(&key, 2, &pubs_b, 1).unwrap();

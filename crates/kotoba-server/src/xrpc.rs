@@ -4805,8 +4805,8 @@ pub async fn datomic_transact(
             .holder
             .clone()
             .unwrap_or_else(|| state.operator_did.clone());
-    } else if let Err(operator_err) = operator_auth {
-        return Err(operator_err);
+    } else {
+        operator_auth?;
     }
 
     let tx_data = kotoba_edn::parse(&req.tx_edn)
@@ -5271,7 +5271,7 @@ pub async fn datomic_datoms(
         req.remote_peer.as_deref(),
         req.remote_ipns_name.as_deref(),
     )? {
-        let limit = req.limit.unwrap_or(1000).min(10_000) as usize;
+        let limit = req.limit.unwrap_or(1000).min(10_000);
         datoms.retain(|datom| datomic_datoms_value_matches_index(datom, index));
         let mut fallback_datoms = db.datoms();
         fallback_datoms.sort_by_key(|datom| datomic_datoms_sort_key(datom, index));
@@ -6155,9 +6155,8 @@ pub async fn datomic_history(
         .history()
         .datoms()
         .iter()
-        .cloned()
-        .into_iter()
         .take(limit)
+        .cloned()
         .map(datomic_datom_resp)
         .collect::<Vec<_>>();
 

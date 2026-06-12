@@ -1,4 +1,5 @@
 //! # kotoba-vault — blob + key custody layer of KOTOBA
+#![allow(clippy::items_after_test_module)]
 //!
 //! Renamed from `kotoba-kse` (KSE = Kotoba Stream Engine) on 2026-06-12: the
 //! stream-engine half (the block-persisting Journal/Merkle-WAL) was deprecated

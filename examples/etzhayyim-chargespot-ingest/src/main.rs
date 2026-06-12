@@ -1,4 +1,9 @@
 //! etzhayyim: Chargespot BMA — kotoba-server ingest client
+#![allow(
+    clippy::manual_is_multiple_of,
+    clippy::needless_borrows_for_generic_args,
+    clippy::vec_init_then_push
+)]
 //!
 //! Generates an ephemeral Ed25519 keypair, builds a self-signed CACAO with
 //! `datom:write` capability, and ingests all Chargespot BMA Datom projections into a

@@ -93,7 +93,7 @@ mod tests {
         assert_eq!(&pack[0..4], b"PACK");
         assert_eq!(&pack[4..8], &2u32.to_be_bytes()); // version 2
         assert_eq!(&pack[8..12], &1u32.to_be_bytes()); // 1 object
-        assert_eq!(pack.len() >= 12 + 20, true); // header + at least the trailer
+        assert!(pack.len() >= 12 + 20); // header + at least the trailer
     }
 
     #[test]
@@ -102,7 +102,8 @@ mod tests {
         let (body, trailer) = pack.split_at(pack.len() - 20);
         let mut h = Sha1::new();
         h.update(body);
-        assert_eq!(trailer, h.finalize().as_slice());
+        let digest = h.finalize();
+        assert_eq!(trailer, &digest[..]);
     }
 
     #[test]

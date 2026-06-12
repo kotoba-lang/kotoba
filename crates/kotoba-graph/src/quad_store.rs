@@ -264,7 +264,7 @@ impl QuadStore {
         let delta = Delta::assert_datom(Datom::from_legacy_quad(quad.clone(), true));
         self.arrangements
             .entry(g.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .insert(&quad);
         self.record_pending_datom(&g, quad, true);
         // Normal write: hot remains a superset of (committed ∪ pending uncommitted).
@@ -283,7 +283,7 @@ impl QuadStore {
         self.publish_legacy_quad_assert(&quad).await;
         self.arrangements
             .entry(graph_key.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .insert_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         self.hot_covers_all.entry(graph_key).or_insert(true);
@@ -370,7 +370,7 @@ impl QuadStore {
         let g = quad.graph.to_multibase();
         self.arrangements
             .entry(g.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .remove(&quad);
         self.record_pending_datom(&g, quad.clone(), false);
         Delta::retract_datom(Datom::from_legacy_quad(quad, false))
@@ -382,7 +382,7 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .remove_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         Delta::from_datom(datom)
@@ -416,7 +416,7 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .insert_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         self.hot_covers_all.entry(graph_key).or_insert(true);
@@ -428,7 +428,7 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .remove_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         Delta::from_datom(datom)
@@ -443,7 +443,7 @@ impl QuadStore {
         let g = quad.graph.to_multibase();
         self.arrangements
             .entry(g.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .insert(&quad);
         self.record_pending_datom(&g, quad, true);
         // Hot is now a strict subset of (committed ∪ uncommitted) — cold must also be consulted.
@@ -455,7 +455,7 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .insert_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom);
         self.hot_covers_all.insert(graph_key, false);
@@ -470,10 +470,7 @@ impl QuadStore {
             return;
         }
         let graph_key = graph_cid.to_multibase();
-        let mut arrangement = self
-            .arrangements
-            .entry(graph_key.clone())
-            .or_insert_with(Arrangement::new);
+        let mut arrangement = self.arrangements.entry(graph_key.clone()).or_default();
         let mut pending = self.pending_datoms.entry(graph_key.clone()).or_default();
         for mut datom in datoms {
             datom.op = true;
@@ -491,10 +488,7 @@ impl QuadStore {
         }
         for quad in &quads {
             let g = quad.graph.to_multibase();
-            self.arrangements
-                .entry(g.clone())
-                .or_insert_with(Arrangement::new)
-                .insert(quad);
+            self.arrangements.entry(g.clone()).or_default().insert(quad);
             self.record_pending_datom(&g, quad.clone(), true);
         }
     }
@@ -504,7 +498,7 @@ impl QuadStore {
         let g = quad.graph.to_multibase();
         self.arrangements
             .entry(g.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .remove(&quad);
         self.record_pending_datom(&g, quad, false);
     }
@@ -514,7 +508,7 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_insert_with(Arrangement::new)
+            .or_default()
             .remove_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom);
     }
@@ -1219,7 +1213,7 @@ impl QuadStore {
     /// looks it up in the BlockStore, and:
     ///   - hit  → deserialise and return cached `Vec<Quad>` (≈ µs, no compute)
     ///   - miss → run query, serialise result via dag-cbor, `put` under the
-    ///            computed CID, return live result
+    ///     computed CID, return live result
     ///
     /// This turns repeated identical queries against a sealed graph commit into
     /// content-addressed lookups — the same query against the same commit
@@ -1757,9 +1751,8 @@ impl QuadStore {
                 let mut results = left_quads;
                 for q in right_quads {
                     if left_subjects.contains(&q.subject.to_multibase()) {
-                        let passes_expr = expression
-                            .as_ref()
-                            .map_or(true, |e| eval_filter_expr(e, &q));
+                        let passes_expr =
+                            expression.as_ref().is_none_or(|e| eval_filter_expr(e, &q));
                         if passes_expr && !results.iter().any(|r| quad_eq(r, &q)) {
                             results.push(q);
                         }
@@ -1813,10 +1806,8 @@ impl QuadStore {
                     let mut all_allowed: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     for row in bindings {
-                        for val_opt in row {
-                            if let Some(gt) = val_opt {
-                                all_allowed.insert(ground_term_to_str(gt));
-                            }
+                        for gt in row.iter().flatten() {
+                            all_allowed.insert(ground_term_to_str(gt));
                         }
                     }
                     let right_inner = unwrap_bgp_pattern(*right.clone());
@@ -2526,11 +2517,11 @@ impl QuadStore {
                                 .filter(|q| match &q.object {
                                     kotoba_query::quad::LegacyQuadObject::Text(t) => t == v,
                                     kotoba_query::quad::LegacyQuadObject::Integer(i) => {
-                                        v.parse::<i64>().map_or(false, |n| *i == n)
+                                        v.parse::<i64>() == Ok(*i)
                                     }
                                     kotoba_query::quad::LegacyQuadObject::Float(f) => v
                                         .parse::<f64>()
-                                        .map_or(false, |n| (*f - n).abs() < f64::EPSILON),
+                                        .is_ok_and(|n| (*f - n).abs() < f64::EPSILON),
                                     kotoba_query::quad::LegacyQuadObject::Bool(b) => {
                                         v == "true" && *b || v == "false" && !b
                                     }
@@ -3348,7 +3339,7 @@ impl QuadStore {
             all_blocks.extend(blocks);
         }
         let mut roots_by_name = std::collections::HashMap::new();
-        for (name, root) in input_names.into_iter().zip(roots.into_iter()) {
+        for (name, root) in input_names.into_iter().zip(roots) {
             roots_by_name.insert(name.to_string(), root);
         }
         let root_eavt = roots_by_name
@@ -3575,17 +3566,6 @@ fn quad_eq(a: &Quad, b: &Quad) -> bool {
         }
 }
 
-/// Evaluate a SPARQL FILTER expression against a single Quad.
-///
-/// The expression operates on the quad's `object` field as the bound variable value.
-/// Supported expression types:
-///   - `Not(expr)`                        → `!eval(expr, quad)`
-///   - `Equal(Variable(_), Literal(v))`   → `quad.object.as_text() == v`
-///   - `NotEqual(...)`                    → `quad.object.as_text() != v`
-///   - `Or(a, b)`                         → `eval(a) || eval(b)`
-///   - `And(a, b)`                        → `eval(a) && eval(b)`
-///   - `FunctionCall(Contains, [_, lit])` → `quad.object.as_text().contains(v)`
-///   - `Exists` / other                   → `true` (pass through)
 // ── SPARQL UPDATE helpers ────────────────────────────────────────────────────
 
 fn sparql_graph_name_to_cid(
@@ -3656,6 +3636,17 @@ fn sparql_term_to_quad_object_ground(
     }
 }
 
+/// Evaluate a SPARQL FILTER expression against a single Quad.
+///
+/// The expression operates on the quad's `object` field as the bound variable value.
+/// Supported expression types:
+///   - `Not(expr)`                        → `!eval(expr, quad)`
+///   - `Equal(Variable(_), Literal(v))`   → `quad.object.as_text() == v`
+///   - `NotEqual(...)`                    → `quad.object.as_text() != v`
+///   - `Or(a, b)`                         → `eval(a) || eval(b)`
+///   - `And(a, b)`                        → `eval(a) && eval(b)`
+///   - `FunctionCall(Contains, [_, lit])` → `quad.object.as_text().contains(v)`
+///   - `Exists` / other                   → `true` (pass through)
 fn eval_filter_expr(expr: &spargebra::algebra::Expression, quad: &Quad) -> bool {
     use spargebra::algebra::Expression;
     use spargebra::algebra::Function;
@@ -3672,7 +3663,7 @@ fn eval_filter_expr(expr: &spargebra::algebra::Expression, quad: &Quad) -> bool 
 
         Expression::Equal(left, right) => extract_literal_from_expr(left, right)
             .or_else(|| extract_literal_from_expr(right, left))
-            .map_or(true, |v| obj_text.map_or(false, |t| t == v.as_str())),
+            .is_none_or(|v| obj_text == Some(v.as_str())),
         Expression::Greater(left, right) => {
             if let (Some(obj), Some(v)) = (
                 obj_text,
@@ -3723,16 +3714,14 @@ fn eval_filter_expr(expr: &spargebra::algebra::Expression, quad: &Quad) -> bool 
                 Expression::Literal(lit) => Some(lit.value().to_string()),
                 _ => None,
             };
-            substring.map_or(true, |v| obj_text.map_or(false, |t| t.contains(v.as_str())))
+            substring.is_none_or(|v| obj_text.is_some_and(|t| t.contains(v.as_str())))
         }
         Expression::FunctionCall(Function::StrStarts, args) if args.len() == 2 => {
             let prefix = match &args[1] {
                 Expression::Literal(lit) => Some(lit.value().to_string()),
                 _ => None,
             };
-            prefix.map_or(true, |v| {
-                obj_text.map_or(false, |t| t.starts_with(v.as_str()))
-            })
+            prefix.is_none_or(|v| obj_text.is_some_and(|t| t.starts_with(v.as_str())))
         }
 
         // Unknown / unsupported expressions: pass-through (don't discard results)
@@ -6686,7 +6675,7 @@ mod tests {
         let alice = KotobaCid::from_bytes(b"alice");
         let alice_mb = alice.to_multibase();
 
-        let sparql = format!(r#"INSERT {{ ?s <verified> "yes" }} WHERE {{ ?s <role> "admin" }}"#);
+        let sparql = r#"INSERT { ?s <verified> "yes" } WHERE { ?s <role> "admin" }"#.to_string();
         let count = qs.sparql_update(&graph, &sparql).await.unwrap();
         assert_eq!(count, 2, "2 admin subjects → 2 inserts");
 

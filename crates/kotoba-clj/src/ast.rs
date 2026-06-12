@@ -474,7 +474,7 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
 /// literal `true`) test marks the default clause; with no default the value is
 /// `0` (nil-ish) when every test fails.
 fn lower_cond(args: &[EdnValue]) -> Result<Expr, CljError> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(CljError::Lower(
             "cond requires an even number of test/expr forms".into(),
         ));
@@ -570,7 +570,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         }
     };
     let kwargs = &items[2..];
-    if kwargs.len() % 2 != 0 {
+    if !kwargs.len().is_multiple_of(2) {
         return Err(CljError::Lower(
             "defgraph options must be :key value pairs".into(),
         ));

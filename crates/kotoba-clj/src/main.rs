@@ -9,7 +9,7 @@ fn main() {
 
 fn real_main() -> Result<(), String> {
     let opts = Options::parse(std::env::args().skip(1).collect())?;
-    if !opts.path.extension().is_some_and(|ext| ext == "kotoba") && !opts.allow_any_ext {
+    if opts.path.extension().is_none_or(|ext| ext != "kotoba") && !opts.allow_any_ext {
         return Err(format!(
             "expected a .kotoba file (got {}). Use --allow-any-ext to run anyway.",
             opts.path.display()

@@ -3,6 +3,20 @@ pub fn gossipsub_topic(kotoba_topic: &str) -> String {
     format!("kotoba/{}", kotoba_topic.trim_start_matches('/'))
 }
 
+pub fn checked_gossipsub_topic(kotoba_topic: &str) -> Result<String, String> {
+    let topic = gossipsub_topic(kotoba_topic);
+    if topic == "kotoba/" {
+        return Err("gossipsub topic must not be empty".to_string());
+    }
+    if topic.len() > 256 {
+        return Err("gossipsub topic is too long".to_string());
+    }
+    if !topic.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err("gossipsub topic must be visible ASCII".to_string());
+    }
+    Ok(topic)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

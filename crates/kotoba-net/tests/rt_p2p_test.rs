@@ -22,9 +22,8 @@ use tokio::time::{sleep, timeout, Instant};
 async fn get_listen_addr(swarm: &mut KotobaSwarm) -> Option<Multiaddr> {
     timeout(Duration::from_secs(5), async {
         loop {
-            match swarm.next_event().await? {
-                KotobaNetEvent::ListenAddr(a) => return Some(a),
-                _ => {}
+            if let KotobaNetEvent::ListenAddr(a) = swarm.next_event().await? {
+                return Some(a);
             }
         }
     })

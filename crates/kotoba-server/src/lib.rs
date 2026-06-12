@@ -1,3 +1,16 @@
+#![allow(
+    clippy::approx_constant,
+    clippy::assertions_on_constants,
+    clippy::await_holding_lock,
+    clippy::items_after_test_module,
+    clippy::needless_borrows_for_generic_args,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_literal_unwrap,
+    clippy::unnecessary_min_or_max,
+    clippy::useless_vec
+)]
+
 pub mod access_receipt;
 pub mod account_xrpc;
 pub mod attestation;

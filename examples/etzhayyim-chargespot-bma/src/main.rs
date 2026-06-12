@@ -1,4 +1,5 @@
 //! etzhayyim: Chargespot-type business model — global competitor analysis
+#![allow(clippy::vec_init_then_push)]
 //!
 //! ビジネスモデル: モバイルバッテリーシェアリング (キオスク設置・別店舗返却)
 //! namespace: etzhayyim

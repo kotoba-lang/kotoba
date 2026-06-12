@@ -8852,7 +8852,7 @@ async fn vault_envelope_current_rejects_invalid_current_manifest_body() {
     s.state
         .shelf
         .put(
-            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            kotoba_vault::shelf::BUCKET_VAULT_ENVELOPES,
             ct_cid.to_string(),
             bytes::Bytes::from(corrupt_cid.to_multibase()),
         )
@@ -8938,7 +8938,7 @@ async fn vault_envelope_current_rejects_manifest_for_different_ciphertext() {
     s.state
         .shelf
         .put(
-            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            kotoba_vault::shelf::BUCKET_VAULT_ENVELOPES,
             first_ct_cid.to_string(),
             bytes::Bytes::from(second_manifest_cid.to_string()),
         )
@@ -9042,7 +9042,7 @@ async fn vault_envelope_inspect_hides_missing_current_manifest_pointer() {
     s.state
         .shelf
         .put(
-            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            kotoba_vault::shelf::BUCKET_VAULT_ENVELOPES,
             ct_cid.to_string(),
             bytes::Bytes::from(missing_current_cid.clone()),
         )
@@ -9098,7 +9098,7 @@ async fn vault_envelope_inspect_tolerates_malformed_current_manifest_pointer() {
     s.state
         .shelf
         .put(
-            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            kotoba_vault::shelf::BUCKET_VAULT_ENVELOPES,
             ct_cid.to_string(),
             bytes::Bytes::from_static(b"not-a-cid"),
         )
@@ -9145,7 +9145,7 @@ async fn vault_envelope_current_get_grant_revoke_fail_closed_on_malformed_curren
     s.state
         .shelf
         .put(
-            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            kotoba_vault::shelf::BUCKET_VAULT_ENVELOPES,
             ct_cid.to_string(),
             bytes::Bytes::from_static(b"not-a-manifest-cid"),
         )
@@ -9227,7 +9227,7 @@ async fn vault_envelope_get_grant_revoke_fail_closed_without_current_pointer() {
     assert!(
         s.state
             .shelf
-            .delete(kotoba_kse::BUCKET_VAULT_ENVELOPES, ct_cid)
+            .delete(kotoba_vault::shelf::BUCKET_VAULT_ENVELOPES, ct_cid)
             .await,
         "test setup must remove current pointer"
     );
@@ -9367,7 +9367,7 @@ async fn vault_envelope_rejects_policy_manifest_ct_mismatch() {
     assert!(
         s.state
             .shelf
-            .delete(kotoba_kse::BUCKET_VAULT_ENVELOPES, ct_cid)
+            .delete(kotoba_vault::shelf::BUCKET_VAULT_ENVELOPES, ct_cid)
             .await,
         "test setup must remove current pointer"
     );
@@ -13757,7 +13757,6 @@ async fn audit_verify_chain_reports_valid() {
 /// re-wrapped to their key; an unauthorized request is denied with no share.
 #[tokio::test]
 async fn key_request_share_full_custodian_flow() {
-    use base64::Engine as _;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");

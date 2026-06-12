@@ -2,7 +2,7 @@
 //!
 //! A **word** is the minimal callable unit: `NSID + typed input/output schema
 //! + executor + capability requirements`. A **root** is where words are
-//! planted: registry + runtime + capability boundary + projections.
+//!   planted: registry + runtime + capability boundary + projections.
 //!
 //! SSOT model (S2', see docs/ADR-kotoba-word.md): the *authoring* source of
 //! truth is a typed Rust closure (`Fn(I, Ctx) -> O` where `I: JsonSchema +

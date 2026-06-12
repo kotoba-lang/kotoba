@@ -55,10 +55,10 @@ async fn drive_until_gossip(
             ev2 = swarm2.next_event() => {
                 match ev2 {
                     None => return None,
-                    Some(KotobaNetEvent::GossipMessage { topic, data, .. }) => {
-                        if topic.contains(topic_suffix) {
-                            return Some(data);
-                        }
+                    Some(KotobaNetEvent::GossipMessage { topic, data, .. })
+                        if topic.contains(topic_suffix) =>
+                    {
+                        return Some(data);
                     }
                     _ => {}
                 }

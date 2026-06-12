@@ -11,6 +11,7 @@
 //! Set Architecture. Sibling engines: KSE (Kotoba Stream Engine,
 //! `kotoba-vault`), KDHT (Kotoba DHT, `kotoba-dht`), KVM (Kotoba VM,
 //! `kotoba-vm`).
+#![allow(non_snake_case, clippy::identity_op)]
 pub mod arrangement;
 pub mod citation;
 pub mod cypher;

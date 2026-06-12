@@ -3297,7 +3297,7 @@ pub fn merge_live_sets(base_live: &[Datom], concurrent_ops: &[TaggedOp]) -> Vec<
         }
     }
     let mut out: Vec<Datom> = live.into_values().collect();
-    out.sort_by(|a, b| merge_key(a).cmp(&merge_key(b)));
+    out.sort_by_key(merge_key);
     out
 }
 
@@ -9549,7 +9549,7 @@ mod tests {
 
             // concurrent commit on top (delta d1) — "theirs"
             let d1 = assert_d("b", "y", 1);
-            let r1 = build_datom_roots(&[d1.clone()], &store).unwrap();
+            let r1 = build_datom_roots(std::slice::from_ref(&d1), &store).unwrap();
             let c1 = DistributedDatomCommit::seal(
                 g,
                 KotobaCid::from_bytes(b"t1"),

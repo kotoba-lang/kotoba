@@ -358,8 +358,8 @@ mod tests {
         let got = parse_pack(&pack, |_| Ok(None)).unwrap();
         let blobs: std::collections::HashSet<Vec<u8>> =
             got.into_iter().map(|(o, _)| o.body).collect();
-        assert!(blobs.contains(&b"hello world".to_vec()));
-        assert!(blobs.contains(&b"hello!!".to_vec()));
+        assert!(blobs.contains(b"hello world".as_slice()));
+        assert!(blobs.contains(b"hello!!".as_slice()));
     }
 
     #[test]
@@ -375,7 +375,7 @@ mod tests {
         let blobs: std::collections::HashSet<Vec<u8>> =
             got.into_iter().map(|(o, _)| o.body).collect();
         assert!(
-            blobs.contains(&b"hello!!".to_vec()),
+            blobs.contains(b"hello!!".as_slice()),
             "out-of-order base must resolve"
         );
     }

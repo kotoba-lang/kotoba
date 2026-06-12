@@ -148,7 +148,7 @@ mod tests {
         msg.extend_from_slice(&stun::ATTR_USERNAME.to_be_bytes());
         msg.extend_from_slice(&(u.len() as u16).to_be_bytes());
         msg.extend_from_slice(u);
-        while (msg.len() - 20) % 4 != 0 {
+        while !(msg.len() - 20).is_multiple_of(4) {
             msg.push(0);
         }
         let attr_len = (msg.len() - 20) as u16;

@@ -1641,7 +1641,6 @@ async fn call_tool(
 
             // Write WASM-asserted quads into the store (capped to prevent runaway writes).
             {
-                use kotoba_core::cid::KotobaCid;
                 use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
                 const MAX_ASSERT_QUADS: usize = 10_000;
                 if result.assert_quads.len() > MAX_ASSERT_QUADS {

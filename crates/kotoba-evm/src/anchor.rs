@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(&data[4..36], &sr.0[4..36]);
         // ipfsCid tail = the block CID multibase bytes.
         let mb = blk.to_multibase();
-        let len = mb.as_bytes().len();
+        let len = mb.len();
         assert_eq!(data[4 + 32 * 3 + 31] as usize, len);
         assert_eq!(&data[4 + 32 * 4..4 + 32 * 4 + len], mb.as_bytes());
     }

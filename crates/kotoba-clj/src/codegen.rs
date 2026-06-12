@@ -21,7 +21,7 @@
 //! Every emitted module exports:
 //!   - `memory`        — a single linear memory.
 //!   - `cabi_realloc`  — the Canonical-ABI bump allocator the Component Model
-//!                       host calls to place lowered values into guest memory.
+//!     host calls to place lowered values into guest memory.
 //!
 //! String literals are laid out in an active data segment starting at
 //! [`DATA_BASE`]; the bump heap starts immediately above them. This is the
@@ -146,7 +146,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
             let idx = types.len();
             types
                 .ty()
-                .function(std::iter::repeat(ValType::I64).take(arity), [ValType::I64]);
+                .function(std::iter::repeat_n(ValType::I64, arity), [ValType::I64]);
             idx
         });
         funcs.function(type_idx);
