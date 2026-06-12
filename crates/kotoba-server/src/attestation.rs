@@ -33,6 +33,66 @@ const MAX_ATTEST_CLAIM_TYPE: usize = 64;
 const MAX_ATTEST_EVIDENCE_LEN: usize = 2_048;
 const MAX_ATTEST_REASON_LEN: usize = 4_096;
 const MAX_ATTEST_CID_LEN: usize = 256;
+const MAX_REQUEST_PATH_PREFIX_LEN: usize = 1_024;
+
+fn validate_attest_text_field(
+    label: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), (StatusCode, String)> {
+    if value.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} must not be empty"),
+        ));
+    }
+    if value.len() > max_len {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} exceeds {max_len} bytes"),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} must not contain control characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attest_optional_text_field(
+    label: &str,
+    value: Option<&str>,
+    max_len: usize,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(value) = value {
+        validate_attest_text_field(label, value, max_len)?;
+    }
+    Ok(())
+}
+
+fn validate_attest_cid_like(label: &str, value: &str) -> Result<(), (StatusCode, String)> {
+    validate_attest_text_field(label, value, MAX_ATTEST_CID_LEN)?;
+    if !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} must be visible ASCII"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attest_query_did(label: &str, value: Option<&str>) -> Result<(), (StatusCode, String)> {
+    if let Some(value) = value {
+        crate::graph_auth::validate_did(value, label, MAX_ATTEST_DID_LEN)?;
+    }
+    Ok(())
+}
+
+fn validate_request_path_prefix(value: Option<&str>) -> Result<(), (StatusCode, String)> {
+    validate_attest_optional_text_field("path_prefix", value, MAX_REQUEST_PATH_PREFIX_LEN)
+}
 
 fn require_attester_auth(
     headers: &HeaderMap,
@@ -531,11 +591,12 @@ pub async fn attest_claim(
         return (StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "claim_type must be 'self', 'verified_entity', or 'delegation'" }))).into_response();
     }
-    if let Some(ev) = &req.evidence {
-        if ev.len() > MAX_ATTEST_EVIDENCE_LEN {
-            return (StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("evidence exceeds {MAX_ATTEST_EVIDENCE_LEN} bytes") }))).into_response();
-        }
+    if let Err((code, msg)) = validate_attest_optional_text_field(
+        "evidence",
+        req.evidence.as_deref(),
+        MAX_ATTEST_EVIDENCE_LEN,
+    ) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     // Reject stake values that exceed i64::MAX to prevent silent truncation when
     // stored as Datom EDN Integer(i64). Real stakes are at most ~10^10 mKOTO,
@@ -695,18 +756,18 @@ pub async fn attest_challenge(
     headers: HeaderMap,
     Json(req): Json<AttestChallengeReq>,
 ) -> impl IntoResponse {
-    if req.claim_cid.is_empty() || req.claim_cid.len() > MAX_ATTEST_CID_LEN {
-        return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("claim_cid must be 1–{MAX_ATTEST_CID_LEN} bytes") }))).into_response();
+    if let Err((code, msg)) = validate_attest_cid_like("claim_cid", &req.claim_cid) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     if let Err((code, msg)) =
         crate::graph_auth::validate_did(&req.challenger_did, "challenger_did", MAX_ATTEST_DID_LEN)
     {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
-    if req.reason.is_empty() || req.reason.len() > MAX_ATTEST_REASON_LEN {
-        return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("reason must be 1–{MAX_ATTEST_REASON_LEN} bytes") }))).into_response();
+    if let Err((code, msg)) =
+        validate_attest_text_field("reason", &req.reason, MAX_ATTEST_REASON_LEN)
+    {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     // Decode the claim CID from multibase (base32lower 'b' prefix).
     let claim_cid = match KotobaCid::from_multibase(&req.claim_cid) {
@@ -799,23 +860,14 @@ pub async fn attest_query(
     State(state): State<Arc<KotobaState>>,
     Query(params): Query<AttestQueryParams>,
 ) -> impl IntoResponse {
-    if params
-        .entity_did
-        .as_deref()
-        .map(|s| s.len() > MAX_ATTEST_DID_LEN)
-        .unwrap_or(false)
+    if let Err((code, msg)) = validate_attest_query_did("entity_did", params.entity_did.as_deref())
     {
-        return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("entity_did exceeds {MAX_ATTEST_DID_LEN} bytes") }))).into_response();
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
-    if params
-        .attester_did
-        .as_deref()
-        .map(|s| s.len() > MAX_ATTEST_DID_LEN)
-        .unwrap_or(false)
+    if let Err((code, msg)) =
+        validate_attest_query_did("attester_did", params.attester_did.as_deref())
     {
-        return (StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("attester_did exceeds {MAX_ATTEST_DID_LEN} bytes") }))).into_response();
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
     let limit = params.limit.unwrap_or(20).min(100);
     let graph = attest_graph_cid();
@@ -914,6 +966,9 @@ pub async fn request_log_query(
     {
         return (code, Json(serde_json::json!({ "error": msg }))).into_response();
     }
+    if let Err((code, msg)) = validate_request_path_prefix(params.path_prefix.as_deref()) {
+        return (code, Json(serde_json::json!({ "error": msg }))).into_response();
+    }
     let limit = params.limit.unwrap_or(20).min(100);
     let graph = audit_graph_cid();
     let db = match crate::xrpc::current_db_for_graph(&state, &graph).await {
@@ -965,7 +1020,7 @@ pub async fn request_log_query(
                 .is_none_or(|pfx| e.path.starts_with(pfx))
         })
         .collect();
-    entries.sort_by(|a, b| b.ts_unix.cmp(&a.ts_unix));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.ts_unix));
     entries.truncate(limit);
 
     let total = entries.len();
@@ -1026,6 +1081,39 @@ mod tests {
         assert_ne!(
             attest.0, audit.0,
             "attestation and audit graphs must have different CIDs"
+        );
+    }
+
+    #[test]
+    fn attest_text_validation_rejects_empty_control_and_oversized_values() {
+        assert!(validate_attest_text_field("reason", "counter-evidence", 32).is_ok());
+        assert!(validate_attest_text_field("reason", "   ", 32).is_err());
+        assert!(validate_attest_text_field("reason", "bad\nreason", 32).is_err());
+        assert!(validate_attest_text_field("reason", &"x".repeat(33), 32).is_err());
+    }
+
+    #[test]
+    fn attest_cid_like_validation_rejects_empty_control_and_oversized_values() {
+        assert!(validate_attest_cid_like("claim_cid", "bafybeifake").is_ok());
+        assert!(validate_attest_cid_like("claim_cid", "legacy-claim-id").is_ok());
+        assert!(validate_attest_cid_like("claim_cid", "").is_err());
+        assert!(validate_attest_cid_like("claim_cid", "bad\tcid").is_err());
+        assert!(validate_attest_cid_like("claim_cid", "bad cid").is_err());
+        assert!(validate_attest_cid_like("claim_cid", "bad例cid").is_err());
+        assert!(
+            validate_attest_cid_like("claim_cid", &"b".repeat(MAX_ATTEST_CID_LEN + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn request_path_prefix_validation_rejects_empty_control_and_oversized_values() {
+        assert!(validate_request_path_prefix(Some("/xrpc/com.etzhayyim.apps.kotoba")).is_ok());
+        assert!(validate_request_path_prefix(None).is_ok());
+        assert!(validate_request_path_prefix(Some("   ")).is_err());
+        assert!(validate_request_path_prefix(Some("/xrpc\nbad")).is_err());
+        assert!(
+            validate_request_path_prefix(Some(&"/".repeat(MAX_REQUEST_PATH_PREFIX_LEN + 1)))
+                .is_err()
         );
     }
 
@@ -1290,6 +1378,11 @@ mod tests {
                 include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/query.json"),
                 "query",
             ),
+            (
+                NSID_REQUEST_LOG,
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/request/log.json"),
+                "query",
+            ),
         ];
         for (expected_id, src, expected_type) in lexicons {
             let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
@@ -1323,9 +1416,50 @@ mod tests {
             &["entity_did", "claim_type", "attester_did", "stake_mkoto"],
             &["evidence", "cacao_b64", "auth_presentation"],
         );
+        let claim_value: serde_json::Value =
+            serde_json::from_str(claim).expect("attest.claim lexicon JSON");
+        let claim_props = &claim_value["defs"]["main"]["input"]["schema"]["properties"];
+        assert_eq!(
+            claim_props["entity_did"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_DID_LEN as u64)
+        );
+        assert_eq!(
+            claim_props["attester_did"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_DID_LEN as u64)
+        );
+        assert_eq!(
+            claim_props["claim_type"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_CLAIM_TYPE as u64)
+        );
+        let claim_type_values = claim_props["claim_type"]["knownValues"]
+            .as_array()
+            .expect("claim_type knownValues");
+        for claim_type in ["self", "verified_entity", "delegation"] {
+            assert!(
+                claim_type_values
+                    .iter()
+                    .any(|value| value.as_str() == Some(claim_type)),
+                "claim_type knownValues must advertise {claim_type}"
+            );
+        }
+        assert_eq!(
+            claim_props["stake_mkoto"]["maximum"].as_u64(),
+            Some(i64::MAX as u64)
+        );
+        assert_eq!(
+            claim_props["evidence"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_EVIDENCE_LEN as u64)
+        );
+        assert!(
+            claim_props["evidence"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("control characters")),
+            "evidence description must disclose control-character rejection"
+        );
         assert_lexicon_input_presentation_schema(claim, "auth_presentation");
 
-        let challenge = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/challenge.json");
+        let challenge =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/challenge.json");
         assert_lexicon_output_fields(
             challenge,
             &[
@@ -1342,10 +1476,48 @@ mod tests {
             &["claim_cid", "challenger_did", "reason"],
             &["cacao_b64", "auth_presentation"],
         );
+        let challenge_value: serde_json::Value =
+            serde_json::from_str(challenge).expect("attest.challenge lexicon JSON");
+        let challenge_props = &challenge_value["defs"]["main"]["input"]["schema"]["properties"];
+        assert_eq!(
+            challenge_props["claim_cid"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_CID_LEN as u64)
+        );
+        assert!(
+            challenge_props["claim_cid"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Visible ASCII")),
+            "claim_cid description must disclose visible ASCII constraint"
+        );
+        assert_eq!(
+            challenge_props["challenger_did"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_DID_LEN as u64)
+        );
+        assert_eq!(
+            challenge_props["reason"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_REASON_LEN as u64)
+        );
+        assert!(
+            challenge_props["reason"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("control characters")),
+            "reason description must disclose control-character rejection"
+        );
         assert_lexicon_input_presentation_schema(challenge, "auth_presentation");
 
         let query = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/attest/query.json");
         assert_lexicon_output_fields(query, &["claims", "total"], &[]);
+        let query_value: serde_json::Value =
+            serde_json::from_str(query).expect("attest.query lexicon JSON");
+        let query_props = &query_value["defs"]["main"]["parameters"]["properties"];
+        assert_eq!(
+            query_props["entity_did"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_DID_LEN as u64)
+        );
+        assert_eq!(
+            query_props["attester_did"]["maxLength"].as_u64(),
+            Some(MAX_ATTEST_DID_LEN as u64)
+        );
         assert_lexicon_array_item_fields(
             query,
             "claims",
@@ -1363,6 +1535,30 @@ mod tests {
                 "stake_mkoto",
                 "ts_unix",
             ],
+        );
+
+        let request_log =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/request/log.json");
+        assert_lexicon_output_fields(request_log, &["entries", "total"], &[]);
+        let request_log_value: serde_json::Value =
+            serde_json::from_str(request_log).expect("request.log lexicon JSON");
+        let request_log_params = &request_log_value["defs"]["main"]["parameters"]["properties"];
+        assert_eq!(
+            request_log_params["path_prefix"]["maxLength"].as_u64(),
+            Some(MAX_REQUEST_PATH_PREFIX_LEN as u64)
+        );
+        assert!(
+            request_log_params["path_prefix"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("control characters")),
+            "request.log path_prefix description must disclose control-character rejection"
+        );
+        assert_eq!(request_log_params["limit"]["minimum"].as_u64(), Some(1));
+        assert_eq!(request_log_params["limit"]["maximum"].as_u64(), Some(100));
+        assert_lexicon_array_item_fields(
+            request_log,
+            "entries",
+            &["request_cid", "method", "path", "ts_unix"],
         );
     }
 

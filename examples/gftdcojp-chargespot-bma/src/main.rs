@@ -215,39 +215,39 @@ fn quad(subject: &str, predicate: &str, object: QuadObject) -> Quad {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn build_facts() -> Vec<Delta> {
-    let mut d = Vec::new();
-
-    // analysis root
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/namespace",
-        QuadObject::Text("gftdcojp".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/subject",
-        QuadObject::Text("モバイルバッテリーシェアリング競合分析".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/model_type",
-        QuadObject::Text("mobile-battery-sharing".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/date",
-        QuadObject::Text("2026-05-27".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/version",
-        QuadObject::Text("v1".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/reference",
-        QuadObject::Text("chargespot.jp".into()),
-    )));
+    let mut d = vec![
+        // analysis root
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/namespace",
+            QuadObject::Text("gftdcojp".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/subject",
+            QuadObject::Text("モバイルバッテリーシェアリング競合分析".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/model_type",
+            QuadObject::Text("mobile-battery-sharing".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/date",
+            QuadObject::Text("2026-05-27".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/version",
+            QuadObject::Text("v1".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/reference",
+            QuadObject::Text("chargespot.jp".into()),
+        )),
+    ];
 
     // competitors
     for (id, region, name, status, notes) in COMPETITORS {

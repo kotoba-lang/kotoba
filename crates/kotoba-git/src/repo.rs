@@ -80,7 +80,9 @@ pub fn iter_loose_oids(git_dir: &Path) -> Result<Vec<GitOid>> {
     };
     for shard in top.flatten() {
         let name = shard.file_name();
-        let Some(prefix) = name.to_str() else { continue };
+        let Some(prefix) = name.to_str() else {
+            continue;
+        };
         // shard dirs are exactly 2 hex chars; skip "pack", "info", etc.
         if prefix.len() != 2 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
             continue;
@@ -241,7 +243,11 @@ async fn import_refs(git_dir: &Path, git: &GitStore<'_>) -> Result<usize> {
 
 /// Export every projected object as a loose object and write refs to `git_dir`.
 /// Verifies each object's SHA-1 on the way out (via [`GitStore::materialize_object`]).
-pub async fn export_repo(db: &kotoba_datomic::Db, git: &GitStore<'_>, git_dir: &Path) -> Result<usize> {
+pub async fn export_repo(
+    db: &kotoba_datomic::Db,
+    git: &GitStore<'_>,
+    git_dir: &Path,
+) -> Result<usize> {
     let mut written = 0;
     for (oid, _cid) in crate::all_objects(db) {
         let obj = git.materialize_object(db, oid)?;
@@ -277,11 +283,8 @@ mod tests {
     impl TempGitDir {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let dir = std::env::temp_dir().join(format!(
-                "kotoba-git-test-{}-{}",
-                std::process::id(),
-                n
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("kotoba-git-test-{}-{}", std::process::id(), n));
             std::fs::create_dir_all(dir.join("objects")).unwrap();
             std::fs::create_dir_all(dir.join("refs").join("heads")).unwrap();
             Self(dir)

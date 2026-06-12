@@ -1,6 +1,6 @@
 //! Pregel BSP (Bulk Synchronous Parallel) engine for KOTOBA.
 //!
-//! KOTOBA definition: KOTOBA ≝ ... × Pregel[BSP] × Datalog[Δ] × ...
+//! KOTOBA definition: KOTOBA ≝ ... × `Pregel[BSP]` × `Datalog[Δ]` × ...
 //!
 //! Each superstep:
 //!   1. All active vertices execute `compute(vertex, inbox)` — produces outgoing messages

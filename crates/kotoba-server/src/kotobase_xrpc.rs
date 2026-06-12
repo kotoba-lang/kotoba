@@ -27,6 +27,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use kotoba_auth::{Cacao, DelegationChain};
 use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use serde::{Deserialize, Serialize};
@@ -41,20 +43,70 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     v.strip_prefix("Bearer ")
 }
 
-/// Verify that the caller's JWT `sub` matches `tenant_did` OR `operator_did`.
+/// Extract CACAO token string from `Authorization: CACAO <base64-cbor>` or
+/// `x-kotoba-cacao: <base64-cbor>`.
+fn cacao_token(headers: &HeaderMap) -> Option<&str> {
+    if let Some(v) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("CACAO "))
+    {
+        return Some(v);
+    }
+    headers.get("x-kotoba-cacao").and_then(|v| v.to_str().ok())
+}
+
+/// Verify that the caller owns `tenant_did`.
 ///
-/// Returns `Err(401)` when:
-/// - No `Authorization: Bearer <token>` header is present.
-/// - The token `exp` claim is in the past.
-/// - The token has no `sub` claim.
-/// - `sub` is neither `tenant_did` nor `operator_did`.
-///
-/// Signature is NOT verified here — the edge BFF is the trust boundary.
+/// JWT mode trusts the edge BFF: Bearer `sub` must match `tenant_did` or
+/// `operator_did`, and `x-internal-trust` is required when configured.
+/// CACAO mode is self-sovereign: the pod verifies the signature, requires
+/// `kotobase:pin`, and accepts only if the verified issuer is `tenant_did` or
+/// `operator_did`. The tenant DID is used as the CACAO graph scope, matching
+/// `kotoba cacao-sign --graph <did> --capability kotobase:pin`.
 fn require_did_ownership(
     headers: &HeaderMap,
     tenant_did: &str,
     operator_did: &str,
+    nonce_store: &crate::nonce_store::NonceStore,
 ) -> Result<(), (StatusCode, String)> {
+    if let Some(cacao_b64) = cacao_token(headers) {
+        let _payload = crate::graph_auth::verify_cacao_graph_operation(
+            cacao_b64,
+            tenant_did,
+            kotoba_auth::CacaoPayload::OP_KOTOBASE_PIN,
+            None,
+            Some(nonce_store),
+        )
+        .map_err(|e| e.into_response())?;
+
+        let cbor = B64.decode(cacao_b64).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("cacao_b64 base64 decode error: {e}"),
+            )
+        })?;
+        let cacao = Cacao::from_cbor(&cbor)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao parse error: {e}")))?;
+        let issuer = DelegationChain::new(cacao)
+            .verify(tenant_did, kotoba_auth::CacaoPayload::OP_KOTOBASE_PIN)
+            .map_err(|e| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    format!("cacao delegation error: {e}"),
+                )
+            })?;
+
+        if issuer == tenant_did || issuer == operator_did {
+            return Ok(());
+        }
+        tracing::warn!(issuer = %issuer, tenant_did = %tenant_did, "kotobase auth: CACAO issuer mismatch");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            format!("CACAO issuer {issuer:?} does not match tenant_did {tenant_did:?}"),
+        ));
+    }
+
     // Defense-in-depth: when KOTOBA_INTERNAL_SECRET is set, only requests through
     // the trusted edge Worker (which forwards x-internal-trust) are accepted, so a
     // directly-reachable pod cannot be impersonated with a forged tenant JWT.
@@ -554,12 +606,22 @@ pub async fn handle_pre_revoke(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
     crate::graph_auth::validate_did(&req.accessor_did, "accessor_did", MAX_DID_LEN)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(
+        &headers,
+        &req.tenant_did,
+        &state.operator_did,
+        &state.nonce_store,
+    )?;
 
     state
         .revoke_pre_key_grant(&req.tenant_did, &req.accessor_did)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("revoke failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("revoke failed: {e}"),
+            )
+        })?;
 
     Ok((
         StatusCode::OK,
@@ -577,7 +639,12 @@ pub async fn handle_account_create(
     Json(req): Json<AccountCreateReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(
+        &headers,
+        &req.tenant_did,
+        &state.operator_did,
+        &state.nonce_store,
+    )?;
 
     let tier_raw = req.tier.as_deref().unwrap_or("free");
     if tier_raw.len() > MAX_TIER_LEN {
@@ -617,7 +684,12 @@ pub async fn handle_account_status(
     Json(req): Json<AccountStatusReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(
+        &headers,
+        &req.tenant_did,
+        &state.operator_did,
+        &state.nonce_store,
+    )?;
     let tier = read_tier(&state, &req.tenant_did).await;
     let (quota_pins, quota_bytes) = quota_for_tier(&tier);
     let (used_pins, used_bytes) = count_pins(&state, &req.tenant_did, None).await;
@@ -660,9 +732,12 @@ pub async fn handle_pin_create(
             }),
         );
     }
-    if let Err((status, msg)) =
-        require_did_ownership(&headers, &req.tenant_did, &state.operator_did)
-    {
+    if let Err((status, msg)) = require_did_ownership(
+        &headers,
+        &req.tenant_did,
+        &state.operator_did,
+        &state.nonce_store,
+    ) {
         return (
             status,
             Json(PinCreateResp {
@@ -921,7 +996,12 @@ pub async fn handle_pin_list(
     Json(req): Json<PinListReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(
+        &headers,
+        &req.tenant_did,
+        &state.operator_did,
+        &state.nonce_store,
+    )?;
     let limit = req.limit.unwrap_or(20).min(100);
     let offset = req.offset.unwrap_or(0);
     let g = format!("kotobase/pins/{}", req.tenant_did);
@@ -992,7 +1072,12 @@ pub async fn handle_pin_delete(
     Json(req): Json<PinDeleteReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(
+        &headers,
+        &req.tenant_did,
+        &state.operator_did,
+        &state.nonce_store,
+    )?;
     if req.pin_id.is_empty() || req.pin_id.len() > MAX_PIN_ID_LEN {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1033,7 +1118,12 @@ pub async fn handle_usage_get(
     Json(req): Json<UsageGetReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_did(&req.tenant_did)?;
-    require_did_ownership(&headers, &req.tenant_did, &state.operator_did)?;
+    require_did_ownership(
+        &headers,
+        &req.tenant_did,
+        &state.operator_did,
+        &state.nonce_store,
+    )?;
     let tier = read_tier(&state, &req.tenant_did).await;
     let (quota_pins, quota_bytes) = quota_for_tier(&tier);
     let (pin_count, total_bytes) = count_pins(&state, &req.tenant_did, None).await;
@@ -1087,6 +1177,119 @@ pub const ALL_NSIDS: &[&str] = &[
 mod tests {
     use super::*;
 
+    fn signed_kotobase_cacao(graph: &str, operation: &str, nonce: &str) -> (String, String) {
+        use base64::{
+            engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD},
+            Engine as _,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+        use kotoba_auth::did_key::ed25519_pubkey_to_did_key;
+
+        let sk = SigningKey::from_bytes(&[44u8; 32]);
+        let did = ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes());
+        let mut cacao = kotoba_auth::Cacao {
+            h: kotoba_auth::CacaoHeader {
+                t: "caip122".into(),
+            },
+            p: kotoba_auth::CacaoPayload {
+                iss: did.clone(),
+                aud: "kotoba://node/test".into(),
+                issued_at: "2026-06-10T00:00:00Z".into(),
+                expiry: Some("2030-01-01T00:00:00Z".into()),
+                nonce: nonce.to_string(),
+                domain: "kotoba.test".into(),
+                statement: Some(format!("Authorize {operation}")),
+                version: "1".into(),
+                resources: vec![
+                    format!("kotoba://graph/{graph}"),
+                    format!("kotoba://op/{operation}"),
+                ],
+            },
+            s: kotoba_auth::CacaoSig {
+                t: "EdDSA".into(),
+                s: String::new(),
+            },
+        };
+        let sig: ed25519_dalek::Signature = sk.sign(cacao.siwe_message().as_bytes());
+        cacao.s.s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&cacao, &mut cbor).expect("cacao cbor");
+        (did, B64.encode(cbor))
+    }
+
+    fn cacao_headers(cacao_b64: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("CACAO {cacao_b64}").parse().unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn require_did_ownership_accepts_self_sovereign_kotobase_pin_cacao() {
+        let (did, _cacao_b64) = signed_kotobase_cacao(
+            "placeholder",
+            kotoba_auth::CacaoPayload::OP_KOTOBASE_PIN,
+            "nonce-kotobase-pin-ok",
+        );
+        let (_unused, cacao_b64) = signed_kotobase_cacao(
+            &did,
+            kotoba_auth::CacaoPayload::OP_KOTOBASE_PIN,
+            "nonce-kotobase-pin-ok-tenant",
+        );
+        let nonce_store = crate::nonce_store::NonceStore::new();
+        assert!(require_did_ownership(
+            &cacao_headers(&cacao_b64),
+            &did,
+            "did:web:operator.test",
+            &nonce_store,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn require_did_ownership_rejects_cacao_for_different_tenant() {
+        let (did, cacao_b64) = signed_kotobase_cacao(
+            "did:key:zSomeoneElse",
+            kotoba_auth::CacaoPayload::OP_KOTOBASE_PIN,
+            "nonce-kotobase-pin-wrong-tenant",
+        );
+        let nonce_store = crate::nonce_store::NonceStore::new();
+        let err = require_did_ownership(
+            &cacao_headers(&cacao_b64),
+            &did,
+            "did:web:operator.test",
+            &nonce_store,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_did_ownership_rejects_cacao_without_pin_capability() {
+        let (did, _cacao_b64) = signed_kotobase_cacao(
+            "placeholder",
+            kotoba_auth::CacaoPayload::OP_GRAPH_QUERY,
+            "nonce-kotobase-pin-wrong-cap",
+        );
+        let (_unused, cacao_b64) = signed_kotobase_cacao(
+            &did,
+            kotoba_auth::CacaoPayload::OP_GRAPH_QUERY,
+            "nonce-kotobase-pin-wrong-cap-tenant",
+        );
+        let nonce_store = crate::nonce_store::NonceStore::new();
+        let err = require_did_ownership(
+            &cacao_headers(&cacao_b64),
+            &did,
+            "did:web:operator.test",
+            &nonce_store,
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
     // ── preRevoke endpoint (ADR §23.7 / §28.5) ──────────────────────────────────
 
     #[tokio::test]
@@ -1112,7 +1315,8 @@ mod tests {
         };
 
         // No Bearer token → 401, grant untouched.
-        let unauth = handle_pre_revoke(State(Arc::clone(&state)), HeaderMap::new(), Json(req())).await;
+        let unauth =
+            handle_pre_revoke(State(Arc::clone(&state)), HeaderMap::new(), Json(req())).await;
         assert!(unauth.is_err(), "missing auth must be rejected");
         assert_eq!(reg.list_accessors(&owner).await.len(), 1);
 
@@ -1268,12 +1472,18 @@ mod tests {
 
     #[test]
     fn nsid_account_create_exact_value() {
-        assert_eq!(NSID_ACCOUNT_CREATE, "com.etzhayyim.apps.kotobase.accountCreate");
+        assert_eq!(
+            NSID_ACCOUNT_CREATE,
+            "com.etzhayyim.apps.kotobase.accountCreate"
+        );
     }
 
     #[test]
     fn nsid_account_status_exact_value() {
-        assert_eq!(NSID_ACCOUNT_STATUS, "com.etzhayyim.apps.kotobase.accountStatus");
+        assert_eq!(
+            NSID_ACCOUNT_STATUS,
+            "com.etzhayyim.apps.kotobase.accountStatus"
+        );
     }
 
     #[test]

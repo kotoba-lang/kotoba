@@ -17,7 +17,7 @@ pub use pre_key_registry::{
     PreKeyError, PreKeyRegistry, RekeyRevocationRecord, RULE_REKEY_REVOKED,
 };
 pub use secure_vault::SecureVault;
-pub use shelf::{Shelf, ShelfBucket};
+pub use shelf::{Shelf, ShelfBucket, BUCKET_VAULT_ENVELOPES, BUCKET_VAULT_ENVELOPE_TOMBSTONES};
 pub use sovereign_key::SovereignCrypto;
 pub use store::KseStore;
 pub use sync_window::SyncWindow;

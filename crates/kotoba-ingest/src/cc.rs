@@ -356,9 +356,10 @@ impl CcPageIngestor {
 
         let mut datoms = Vec::new();
         for path in &files {
-            datoms.extend(quads_to_datoms(self.read_page_links(path).with_context(
-                || format!("read_page_links {}", path.display()),
-            )?));
+            datoms
+                .extend(quads_to_datoms(self.read_page_links(path).with_context(
+                    || format!("read_page_links {}", path.display()),
+                )?));
         }
         Ok((files.len(), datoms))
     }

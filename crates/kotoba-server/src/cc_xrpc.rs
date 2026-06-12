@@ -276,8 +276,81 @@ const MAX_SYSTEM_LEN: usize = 4_096;
 const MAX_TOP_K: usize = 100;
 const MAX_CONTEXT_K: usize = 20; // cap RAG context chunks before LLM prompt construction
 const MAX_NPROBE: usize = 256; // cap IVF probe count to prevent brute-force fallback DoS
+const MAX_OWNER_DID_LEN: usize = 512;
 #[cfg(feature = "cc-parquet")]
 const MAX_PARQUET_DIR: usize = 1_024;
+
+fn validate_cc_query_field(label: &str, value: &str) -> Result<(), (StatusCode, String)> {
+    if value.trim().is_empty() || value.len() > MAX_QUERY_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} must be 1–{MAX_QUERY_LEN} bytes"),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{label} contains control characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cc_lang(lang: Option<&str>) -> Result<(), (StatusCode, String)> {
+    let Some(lang) = lang else {
+        return Ok(());
+    };
+    if lang.trim().is_empty() || lang.len() > MAX_LANG_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("lang must be 1–{MAX_LANG_LEN} characters"),
+        ));
+    }
+    if lang.chars().any(char::is_control) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "lang contains control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cc_nprobe(nprobe: usize) -> Result<(), (StatusCode, String)> {
+    if nprobe > MAX_NPROBE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("nprobe must not exceed {MAX_NPROBE}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cc-parquet")]
+fn validate_cc_parquet_dir(parquet_dir: &str) -> Result<(), (StatusCode, String)> {
+    if parquet_dir.trim().is_empty() || parquet_dir.len() > MAX_PARQUET_DIR {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("parquetDir must be 1–{MAX_PARQUET_DIR} bytes"),
+        ));
+    }
+    if parquet_dir.chars().any(char::is_control) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "parquetDir contains control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cc_mode(mode: &str) -> Result<(), (StatusCode, String)> {
+    if !matches!(mode, "chunks" | "pages" | "both") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "mode must be 'chunks', 'pages', or 'both'".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 // Commit a batch of CC datoms to a graph's distributed head.  Un-gated so the
 // reindex / search-index build path works without the `cc-parquet` feature.
@@ -344,28 +417,14 @@ pub async fn cc_search(
     {
         return (code, Json(json!({"error": msg}))).into_response();
     }
-    if q.q.is_empty() || q.q.len() > MAX_QUERY_LEN {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("q must be 1–{MAX_QUERY_LEN} bytes")})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_query_field("q", &q.q) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
-    if let Some(ref lang) = q.lang {
-        if lang.len() > MAX_LANG_LEN {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("lang exceeds {MAX_LANG_LEN} characters")})),
-            )
-                .into_response();
-        }
+    if let Err((code, msg)) = validate_cc_lang(q.lang.as_deref()) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
-    if q.nprobe > MAX_NPROBE {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("nprobe must not exceed {MAX_NPROBE}")})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_nprobe(q.nprobe) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
     let embed_client = match state.cc_embed_client.as_ref() {
         Some(c) => Arc::clone(c),
@@ -513,28 +572,14 @@ pub async fn web_search(
     {
         return (code, Json(json!({"error": msg}))).into_response();
     }
-    if q.q.is_empty() || q.q.len() > MAX_QUERY_LEN {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("q must be 1–{MAX_QUERY_LEN} bytes")})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_query_field("q", &q.q) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
-    if let Some(ref lang) = q.lang {
-        if lang.len() > MAX_LANG_LEN {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("lang exceeds {MAX_LANG_LEN} characters")})),
-            )
-                .into_response();
-        }
+    if let Err((code, msg)) = validate_cc_lang(q.lang.as_deref()) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
-    if q.nprobe > MAX_NPROBE {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("nprobe must not exceed {MAX_NPROBE}")})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_nprobe(q.nprobe) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
 
     let top_k = q.top_k.min(MAX_TOP_K);
@@ -594,9 +639,9 @@ pub async fn web_search(
                 texts
                     .iter()
                     .filter_map(|(chunk_cid, _)| {
-                        chunk_pages.get(&chunk_cid.to_multibase()).map(|page| {
-                            (chunk_cid.clone(), pr.normalized_score(page) as f32)
-                        })
+                        chunk_pages
+                            .get(&chunk_cid.to_multibase())
+                            .map(|page| (chunk_cid.clone(), pr.normalized_score(page) as f32))
                     })
                     .filter(|(_, s)| *s > 0.0)
                     .collect()
@@ -609,13 +654,25 @@ pub async fn web_search(
     // ── fuse (RRF) ──
     let mut signals: Vec<Signal<'_>> = Vec::new();
     if !lex_ranking.is_empty() {
-        signals.push(Signal { name: "lex", weight: q.w_lex.max(0.0), ranking: &lex_ranking });
+        signals.push(Signal {
+            name: "lex",
+            weight: q.w_lex.max(0.0),
+            ranking: &lex_ranking,
+        });
     }
     if !sem_ranking.is_empty() {
-        signals.push(Signal { name: "sem", weight: q.w_sem.max(0.0), ranking: &sem_ranking });
+        signals.push(Signal {
+            name: "sem",
+            weight: q.w_sem.max(0.0),
+            ranking: &sem_ranking,
+        });
     }
     if !auth_ranking.is_empty() {
-        signals.push(Signal { name: "auth", weight: q.w_auth.max(0.0), ranking: &auth_ranking });
+        signals.push(Signal {
+            name: "auth",
+            weight: q.w_auth.max(0.0),
+            ranking: &auth_ranking,
+        });
     }
 
     let fused = reciprocal_rank_fusion(&signals, RRF_K, top_k.max(1) * 2);
@@ -673,6 +730,11 @@ pub async fn search_reindex(
     {
         return (code, Json(json!({"error": msg}))).into_response();
     }
+    if let Err((code, msg)) =
+        crate::graph_auth::validate_did(&body.owner_did, "owner_did", MAX_OWNER_DID_LEN)
+    {
+        return (code, Json(json!({"error": msg}))).into_response();
+    }
     match rebuild_search_indexes(&state, &body.owner_did).await {
         Ok((bm25_n, pr_n, edge_n)) => Json(json!({
             "status":          "ok",
@@ -713,12 +775,11 @@ pub async fn cc_rag(
     {
         return (code, Json(json!({"error": msg}))).into_response();
     }
-    if body.query.is_empty() || body.query.len() > MAX_QUERY_LEN {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("query must be 1–{MAX_QUERY_LEN} bytes")})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_query_field("query", &body.query) {
+        return (code, Json(json!({"error": msg}))).into_response();
+    }
+    if let Err((code, msg)) = validate_cc_lang(body.lang.as_deref()) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
     if let Some(ref sys) = body.system {
         if sys.len() > MAX_SYSTEM_LEN {
@@ -731,12 +792,8 @@ pub async fn cc_rag(
                 .into_response();
         }
     }
-    if body.nprobe > MAX_NPROBE {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("nprobe must not exceed {MAX_NPROBE}")})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_nprobe(body.nprobe) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
     let embed_client = match state.cc_embed_client.as_ref() {
         Some(c) => Arc::clone(c),
@@ -863,19 +920,16 @@ pub async fn cc_ingest(
         return (code, Json(json!({"error": msg}))).into_response();
     }
 
-    if body.parquet_dir.is_empty() || body.parquet_dir.len() > MAX_PARQUET_DIR {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("parquetDir must be 1–{MAX_PARQUET_DIR} bytes")})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_parquet_dir(&body.parquet_dir) {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
-    if !matches!(body.mode.as_str(), "chunks" | "pages" | "both") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "mode must be 'chunks', 'pages', or 'both'"})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_mode(&body.mode) {
+        return (code, Json(json!({"error": msg}))).into_response();
+    }
+    if let Err((code, msg)) =
+        crate::graph_auth::validate_did(&body.owner_did, "owner_did", MAX_OWNER_DID_LEN)
+    {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
 
     let quad_store = Arc::clone(&state.quad_store);
@@ -944,7 +998,9 @@ pub async fn cc_ingest(
                         }
                     }
                 }
-                Ok(_) => tracing::info!("CC links: no outlink edges in dataset (authority signal absent)"),
+                Ok(_) => tracing::info!(
+                    "CC links: no outlink edges in dataset (authority signal absent)"
+                ),
                 Err(e) => tracing::error!(err = %e, "CC links ingest failed"),
             }
         }
@@ -1015,12 +1071,13 @@ pub async fn cc_ingest(
     {
         return (code, Json(json!({"error": msg}))).into_response();
     }
-    if !matches!(body.mode.as_str(), "chunks" | "pages" | "both") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "mode must be 'chunks', 'pages', or 'both'"})),
-        )
-            .into_response();
+    if let Err((code, msg)) = validate_cc_mode(&body.mode) {
+        return (code, Json(json!({"error": msg}))).into_response();
+    }
+    if let Err((code, msg)) =
+        crate::graph_auth::validate_did(&body.owner_did, "owner_did", MAX_OWNER_DID_LEN)
+    {
+        return (code, Json(json!({"error": msg}))).into_response();
     }
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1079,7 +1136,10 @@ pub async fn cc_status(
     let (link_edges, pagerank_nodes) = match current_cc_graph_datoms(&state, &links_graph).await {
         Ok(link_datoms) => (
             link_datoms.iter().filter(|d| d.a == "cc/link/to").count(),
-            link_datoms.iter().filter(|d| d.a == "cc/rank/score").count(),
+            link_datoms
+                .iter()
+                .filter(|d| d.a == "cc/rank/score")
+                .count(),
         ),
         Err(_) => (0, 0),
     };
@@ -1216,6 +1276,7 @@ mod tests {
         assert!(MAX_QUERY_LEN >= 1_024);
         assert!(MAX_TOP_K >= 10);
         assert!(MAX_CONTEXT_K <= MAX_TOP_K);
+        assert_eq!(MAX_OWNER_DID_LEN, 512);
         assert!(
             MAX_NPROBE >= 10,
             "MAX_NPROBE should allow reasonable IVF probing"
@@ -1226,6 +1287,52 @@ mod tests {
         );
         #[cfg(feature = "cc-parquet")]
         assert!(MAX_PARQUET_DIR >= 10);
+    }
+
+    #[test]
+    fn cc_query_and_lang_validation_rejects_empty_control_and_oversized_values() {
+        assert!(validate_cc_query_field("q", "rust search").is_ok());
+        assert!(validate_cc_lang(Some("ja")).is_ok());
+        assert!(validate_cc_lang(None).is_ok());
+
+        for value in ["", "   ", "bad\nquery"] {
+            assert!(
+                validate_cc_query_field("q", value).is_err(),
+                "query should be rejected: {value:?}"
+            );
+        }
+        let oversized_query = "q".repeat(MAX_QUERY_LEN + 1);
+        assert!(validate_cc_query_field("q", &oversized_query).is_err());
+
+        for lang in ["", "   ", "ja\n"] {
+            assert!(
+                validate_cc_lang(Some(lang)).is_err(),
+                "lang should be rejected: {lang:?}"
+            );
+        }
+        let oversized_lang = "x".repeat(MAX_LANG_LEN + 1);
+        assert!(validate_cc_lang(Some(&oversized_lang)).is_err());
+    }
+
+    #[test]
+    fn cc_mode_and_nprobe_validation_reject_invalid_values() {
+        for mode in ["chunks", "pages", "both"] {
+            assert!(validate_cc_mode(mode).is_ok());
+        }
+        assert!(validate_cc_mode("invalid").is_err());
+        assert!(validate_cc_nprobe(MAX_NPROBE).is_ok());
+        assert!(validate_cc_nprobe(MAX_NPROBE + 1).is_err());
+    }
+
+    #[cfg(feature = "cc-parquet")]
+    #[test]
+    fn cc_parquet_dir_validation_rejects_empty_control_and_oversized_values() {
+        assert!(validate_cc_parquet_dir("/tmp/cc").is_ok());
+        for value in ["", "   ", "/tmp/cc\nbad"] {
+            assert!(validate_cc_parquet_dir(value).is_err());
+        }
+        let oversized = "p".repeat(MAX_PARQUET_DIR + 1);
+        assert!(validate_cc_parquet_dir(&oversized).is_err());
     }
 
     #[test]
@@ -1269,7 +1376,12 @@ mod tests {
         KqeDatom::assert(e.clone(), a.to_string(), KqeValue::Integer(v), tx())
     }
     fn d_text(e: &KotobaCid, a: &str, v: &str) -> KqeDatom {
-        KqeDatom::assert(e.clone(), a.to_string(), KqeValue::Text(v.to_string()), tx())
+        KqeDatom::assert(
+            e.clone(),
+            a.to_string(),
+            KqeValue::Text(v.to_string()),
+            tx(),
+        )
     }
     fn d_cid(e: &KotobaCid, a: &str, v: &KotobaCid) -> KqeDatom {
         KqeDatom::assert(e.clone(), a.to_string(), KqeValue::Cid(v.clone()), tx())

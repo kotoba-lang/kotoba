@@ -373,7 +373,10 @@ mod tests {
             last2 = a2.encrypt(b"m").unwrap(); // last2 counter == MAX_SKIP + 1
         }
         assert!(
-            matches!(b2.decrypt(&last2), Err(crate::SignalError::TooManySkippedKeys)),
+            matches!(
+                b2.decrypt(&last2),
+                Err(crate::SignalError::TooManySkippedKeys)
+            ),
             "a gap of MAX_SKIP+1 must be rejected"
         );
     }

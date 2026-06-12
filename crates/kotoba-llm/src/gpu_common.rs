@@ -5,7 +5,7 @@
 
 // ── WGSL shared shaders ───────────────────────────────────────────────────────
 
-/// Matrix multiply: C[m,k] = A[m,n] × B[n,k]
+/// Matrix multiply: `C[m,k] = A[m,n] × B[n,k]`
 /// Bindings: 0=A, 1=B, 2=C(out), 3=dims(m,n,k)
 pub const MATMUL_WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read>       a    : array<f32>;
@@ -83,7 +83,7 @@ pub fn quantize_f32_to_fp8_e4m3(vals: &[f32]) -> Vec<u8> {
 
 // ── CPU kernels ───────────────────────────────────────────────────────────────
 
-/// C[m,k] = A[m,n] × B[n,k]
+/// `C[m,k] = A[m,n] × B[n,k]`
 pub fn cpu_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
     for row in 0..m {
         for col in 0..k {
@@ -183,7 +183,11 @@ mod tests {
         // to 0. A sign bug here would corrupt half of every overflowing weight tensor.
         let enc = quantize_f32_to_fp8_e4m3(&[-1000.0f32]);
         let dec = dequantize_fp8_e4m3(&enc);
-        assert!(dec[0] < 0.0, "negative overflow must keep its sign, got {}", dec[0]);
+        assert!(
+            dec[0] < 0.0,
+            "negative overflow must keep its sign, got {}",
+            dec[0]
+        );
         assert!(dec[0] >= -448.0 - 1.0, "must clamp to −max, got {}", dec[0]);
         assert!(
             (dec[0] - (-448.0)).abs() < 1.0,

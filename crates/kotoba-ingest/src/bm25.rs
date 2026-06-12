@@ -45,7 +45,7 @@ fn is_cjk(c: char) -> bool {
         0x3400..=0x4DBF |   // CJK Ext A
         0x4E00..=0x9FFF |   // CJK Unified Ideographs
         0xF900..=0xFAFF |   // CJK Compatibility Ideographs
-        0x20000..=0x2A6DF)  // CJK Ext B
+        0x20000..=0x2A6DF) // CJK Ext B
 }
 
 /// CJK-aware tokenizer.
@@ -211,7 +211,8 @@ impl Bm25Index {
             }
             for &(doc_id, tf) in plist {
                 let dl = self.doc_lens[doc_id] as f64;
-                let denom = tf as f64 + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl.max(1e-9));
+                let denom =
+                    tf as f64 + self.k1 * (1.0 - self.b + self.b * dl / self.avgdl.max(1e-9));
                 let contrib = idf * (tf as f64 * (self.k1 + 1.0)) / denom.max(1e-9);
                 *scores.entry(doc_id).or_insert(0.0) += contrib;
             }
@@ -499,7 +500,10 @@ mod tests {
 
     fn corpus() -> Vec<(KotobaCid, String)> {
         vec![
-            (cid("d0"), "the quick brown fox jumps over the lazy dog".into()),
+            (
+                cid("d0"),
+                "the quick brown fox jumps over the lazy dog".into(),
+            ),
             (cid("d1"), "a fast brown fox leaps".into()),
             (cid("d2"), "lazy dogs sleep all day in the sun".into()),
             (cid("d3"), "quantum computing and machine learning".into()),
@@ -595,7 +599,10 @@ mod tests {
         let idx = Bm25Index::build(&corpus());
         let rare = idx.search("quantum", 1)[0].0;
         let common = idx.search("the", 1)[0].0;
-        assert!(rare > common, "rare term {rare} should outscore common {common}");
+        assert!(
+            rare > common,
+            "rare term {rare} should outscore common {common}"
+        );
     }
 
     #[test]
@@ -659,8 +666,8 @@ mod tests {
         // 10 occurrences and one with 1 — the 10× doc ranks higher but by FAR less
         // than 10× (with defaults the ratio is ≈1.96). A linear-TF bug would yield ~10×.
         let docs = vec![
-            (cid("many"), "x x x x x x x x x x".into()),  // tf=10, len 10
-            (cid("one"), "x a b c d e f g h i".into()),   // tf=1,  len 10 (same length)
+            (cid("many"), "x x x x x x x x x x".into()), // tf=10, len 10
+            (cid("one"), "x a b c d e f g h i".into()),  // tf=1,  len 10 (same length)
         ];
         let idx = Bm25Index::build(&docs);
         let r = idx.search("x", 10);
@@ -680,8 +687,8 @@ mod tests {
         // outranks a LONG one — a single match means more in a terse doc. A bug that
         // dropped length normalization (b=0 behaviour) would tie them.
         let docs = vec![
-            (cid("short"), "x a".into()),                  // tf=1, len 2
-            (cid("long"), "x a b c d e f g h i".into()),   // tf=1, len 10
+            (cid("short"), "x a".into()),                // tf=1, len 2
+            (cid("long"), "x a b c d e f g h i".into()), // tf=1, len 10
         ];
         let idx = Bm25Index::build(&docs);
         let r = idx.search("x", 10);

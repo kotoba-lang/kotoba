@@ -4,13 +4,10 @@ use kotoba_signal::{
     group::{GroupSession, SenderKeyState},
     identity::IdentityKeyPair,
     prekey::{PreKey, PreKeyBundle, SignedPreKey},
-    ratchet::RatchetState,
     session::Session,
     store::SignalStore,
-    x3dh::{x3dh_init_receiver, x3dh_init_sender},
 };
 use rand::rngs::OsRng;
-use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 

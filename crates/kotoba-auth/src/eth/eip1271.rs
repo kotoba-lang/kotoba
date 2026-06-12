@@ -53,7 +53,7 @@ pub fn is_valid_signature_calldata(hash: &[u8; 32], signature: &[u8]) -> Vec<u8>
     out.extend_from_slice(&len_word);
     out.extend_from_slice(signature);
     let pad = (WORD - (len % WORD)) % WORD;
-    out.extend(std::iter::repeat(0u8).take(pad));
+    out.extend(std::iter::repeat_n(0u8, pad));
 
     out
 }

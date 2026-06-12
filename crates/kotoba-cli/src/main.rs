@@ -292,14 +292,14 @@ enum BlockCmd {
 
 #[derive(Subcommand)]
 enum QuadCmd {
-    /// Assert a quad: <graph-cid> <subject> <predicate> <object>
+    /// Assert a quad: `<graph-cid> <subject> <predicate> <object>`
     Put {
         graph: String,
         subject: String,
         predicate: String,
         object: String,
     },
-    /// Retract a quad: <graph-cid> <subject> <predicate> <object>
+    /// Retract a quad: `<graph-cid> <subject> <predicate> <object>`
     Retract {
         graph: String,
         subject: String,
@@ -918,7 +918,9 @@ async fn run_bench(
     println!("→ benchmarking {iters} iters × concurrency {concurrency} ({mode}):");
     println!("    {query}");
 
-    let url = Arc::new(format!("{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"));
+    let url = Arc::new(format!(
+        "{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"
+    ));
     let token = Arc::new(token);
     let cacao_static = Arc::new(cacao);
     let signer = Arc::new(signer);
@@ -1133,7 +1135,9 @@ async fn sparql_req(
     query: &str,
 ) -> Result<serde_json::Value> {
     let resp = client
-        .post(format!("{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"))
+        .post(format!(
+            "{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"
+        ))
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({ "query": query, "limit": 1000 }))
         .send()

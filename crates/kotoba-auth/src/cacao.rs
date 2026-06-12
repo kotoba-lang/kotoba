@@ -207,13 +207,13 @@ impl Cacao {
     ///    (EIP-1271) and accept iff it returns the `0x1626ba7e` magic value.
     ///
     /// The `rpc` calls are injected so this crate stays I/O-free. For `EdDSA`
-    /// CACAOs this delegates to [`verify_signature`].
+    /// CACAOs this delegates to `verify_signature`.
     ///
     /// The hash passed to `isValidSignature` is the **EIP-191 personal_sign
     /// digest** of the SIWE message (matching the `eip191` CACAO type and the EOA
     /// branch), not an EIP-712 hash.
     ///
-    /// This is an **opt-in** method: the default [`verify_signature`] and
+    /// This is an **opt-in** method: the default `verify_signature` and
     /// `DelegationChain::verify` paths remain EOA-only and do not call it.
     /// Routing smart-account CACAOs here requires threading an [`EthRpc`] through
     /// those call sites — a separate increment.
@@ -470,6 +470,7 @@ impl CacaoPayload {
     pub const OP_VC_PRESENT: &'static str = "vc:present";
     pub const OP_DIDCOMM_SEND: &'static str = "didcomm:send";
     pub const OP_ATPROTO_REPO_WRITE: &'static str = "atproto:repo.write";
+    pub const OP_KOTOBASE_PIN: &'static str = "kotobase:pin";
 
     pub fn graph_cid(&self) -> Option<&str> {
         self.resources
@@ -510,9 +511,7 @@ impl CacaoPayload {
     }
 
     pub fn has_operation(&self, operation: &str) -> bool {
-        self.capabilities()
-            .iter()
-            .any(|granted| *granted == operation)
+        self.capabilities().contains(&operation)
     }
 
     pub fn tx_cid(&self) -> Option<&str> {

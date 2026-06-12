@@ -192,32 +192,33 @@ fn quad(subject: &str, predicate: &str, object: QuadObject) -> Quad {
 }
 
 fn build_facts() -> Vec<Delta> {
-    let mut d = Vec::new();
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/namespace",
-        QuadObject::Text("gftdcojp".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/subject",
-        QuadObject::Text("モバイルバッテリーシェアリング競合分析".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/model_type",
-        QuadObject::Text("mobile-battery-sharing".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/date",
-        QuadObject::Text("2026-05-27".into()),
-    )));
-    d.push(Delta::assert_legacy_quad(quad(
-        "gftdcojp:bma:chargespot",
-        "bma/version",
-        QuadObject::Text("v1".into()),
-    )));
+    let mut d = vec![
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/namespace",
+            QuadObject::Text("gftdcojp".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/subject",
+            QuadObject::Text("モバイルバッテリーシェアリング競合分析".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/model_type",
+            QuadObject::Text("mobile-battery-sharing".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/date",
+            QuadObject::Text("2026-05-27".into()),
+        )),
+        Delta::assert_legacy_quad(quad(
+            "gftdcojp:bma:chargespot",
+            "bma/version",
+            QuadObject::Text("v1".into()),
+        )),
+    ];
     for (id, region, name, status, notes) in COMPETITORS {
         let cid_str = format!("gftdcojp:bma:chargespot:competitor:{id}");
         d.push(Delta::assert_legacy_quad(quad(
@@ -431,7 +432,7 @@ fn object_to_string(obj: &QuadObject) -> String {
         QuadObject::Integer(i) => i.to_string(),
         QuadObject::Float(f) => f.to_string(),
         QuadObject::Bool(b) => b.to_string(),
-        QuadObject::Cid(c) => multibase::encode(multibase::Base::Base32Lower, &c.0),
+        QuadObject::Cid(c) => multibase::encode(multibase::Base::Base32Lower, c.0),
         _ => "<binary>".to_string(),
     }
 }
@@ -474,7 +475,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 // ── MCP JSON-RPC helper ───────────────────────────────────────────────────────
@@ -602,10 +603,10 @@ async fn main() -> Result<()> {
     println!("quads to ingest: {}", assert_quads.len());
 
     // 3. Ingest each Quad via XRPC quad.create
-    let graph_mb = multibase::encode(multibase::Base::Base32Lower, &graph_cid_val().0);
+    let graph_mb = multibase::encode(multibase::Base::Base32Lower, graph_cid_val().0);
     let mut ok = 0usize;
     for q in &assert_quads {
-        let subj_mb = multibase::encode(multibase::Base::Base32Lower, &q.subject.0);
+        let subj_mb = multibase::encode(multibase::Base::Base32Lower, q.subject.0);
         let obj_str = object_to_string(&q.object);
         xrpc_quad_create(
             &client,
@@ -618,7 +619,7 @@ async fn main() -> Result<()> {
         )
         .await?;
         ok += 1;
-        if ok % 20 == 0 {
+        if ok.is_multiple_of(20) {
             println!("  … {ok}/{} quads ingested", assert_quads.len());
         }
     }

@@ -9,7 +9,7 @@
 //!
 //! Receiver computes the symmetric counterpart.
 //!
-//! Reference: Signal specification https://signal.org/docs/specifications/x3dh/
+//! Reference: Signal specification <https://signal.org/docs/specifications/x3dh/>
 
 use crate::{
     identity::IdentityKeyPair,

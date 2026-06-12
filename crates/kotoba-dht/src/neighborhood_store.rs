@@ -371,7 +371,12 @@ mod tests {
             self.map.lock().unwrap().contains_key(&cid.0)
         }
         fn all_cids(&self) -> Vec<KotobaCid> {
-            self.map.lock().unwrap().keys().map(|k| KotobaCid(*k)).collect()
+            self.map
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|k| KotobaCid(*k))
+                .collect()
         }
     }
 
@@ -422,8 +427,8 @@ mod tests {
         let (local, id) = local_node(b"local");
         let p1 = MemPeer::new(b"peer-1");
         let p2 = MemPeer::new(b"peer-2");
-        let store = NeighborhoodBlockStore::new(local.clone(), id)
-            .with_peers(vec![p1.clone(), p2.clone()]);
+        let store =
+            NeighborhoodBlockStore::new(local.clone(), id).with_peers(vec![p1.clone(), p2.clone()]);
         let cid = KotobaCid::from_bytes(b"block-A");
         store.put(&cid, b"block-A").unwrap();
         assert!(local.has(&cid), "local must hold the block");
@@ -438,7 +443,10 @@ mod tests {
         let store = NeighborhoodBlockStore::new(local, id);
         let cid = KotobaCid::from_bytes(b"local-block");
         store.put(&cid, b"local-block").unwrap();
-        assert_eq!(store.get(&cid).unwrap().as_deref(), Some(b"local-block" as &[u8]));
+        assert_eq!(
+            store.get(&cid).unwrap().as_deref(),
+            Some(b"local-block" as &[u8])
+        );
     }
 
     #[test]
@@ -453,7 +461,10 @@ mod tests {
         let got = store.get(&cid).unwrap();
         assert_eq!(got.as_deref(), Some(b"remote-block" as &[u8]));
         // Promotion: a second get is now a local hit.
-        assert!(local.has(&cid), "block must be promoted to local after peer fetch");
+        assert!(
+            local.has(&cid),
+            "block must be promoted to local after peer fetch"
+        );
     }
 
     #[test]
@@ -495,10 +506,7 @@ mod tests {
             .with_min_replicas(2); // need 2, will only get 1 (local)
         let cid = KotobaCid::from_bytes(b"durable-fail");
         let err = store.put_durable(&cid, b"durable-fail").unwrap_err();
-        assert!(
-            err.to_string().contains("durability not met"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("durability not met"), "got: {err}");
     }
 
     #[test]
@@ -553,7 +561,10 @@ mod tests {
         let cid = KotobaCid::from_bytes(b"wide");
         store.put(&cid, b"wide").unwrap();
         // At most K peers should hold a replica.
-        assert!(store.replica_count(&cid) <= K + 1, "local + at most K peers");
+        assert!(
+            store.replica_count(&cid) <= K + 1,
+            "local + at most K peers"
+        );
     }
 
     #[test]
@@ -607,8 +618,7 @@ mod tests {
     async fn put_fire_and_forget_eventually_replicates() {
         let (local, id) = local_node(b"local");
         let p1 = MemPeer::new(b"peer-1");
-        let store =
-            NeighborhoodBlockStore::new(local.clone(), id).with_peers(vec![p1.clone()]);
+        let store = NeighborhoodBlockStore::new(local.clone(), id).with_peers(vec![p1.clone()]);
         let cid = KotobaCid::from_bytes(b"ff-block");
         store.put(&cid, b"ff-block").unwrap();
         assert!(local.has(&cid), "local write is synchronous");

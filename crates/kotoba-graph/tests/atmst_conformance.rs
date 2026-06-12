@@ -1,8 +1,8 @@
 //! AT MST conformance — integration target (compiles against the public API only,
 //! independent of in-crate unit tests). A2 increment, ADR-2605302300.
 
-use kotoba_graph::atmst::{common_prefix_len, is_valid_repo_path, key_depth, MstNode, TreeEntry};
 use kotoba_core::cid::KotobaCid;
+use kotoba_graph::atmst::{common_prefix_len, is_valid_repo_path, key_depth, MstNode, TreeEntry};
 
 /// The four worked depth examples published in the AT Protocol repository spec
 /// (atproto.com/specs/repository). This is the conformance anchor for the MST

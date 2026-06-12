@@ -589,9 +589,8 @@ pub(crate) fn cpu_gqa_attention(
 
         // Weighted sum of V
         let out_off = h * hd;
-        for s in 0..seq_len {
+        for (s, &w) in scores.iter().enumerate().take(seq_len) {
             let v_off = (s * n_kv + kv_h) * hd;
-            let w = scores[s];
             for d in 0..hd {
                 out[out_off + d] += w * v_cache[v_off + d];
             }
@@ -764,7 +763,7 @@ mod tests {
         assert_eq!(cfg.n_layers, 26);
         assert_eq!(cfg.hidden_dim, 2048);
         assert!(
-            cfg.n_heads % cfg.n_kv_heads == 0,
+            cfg.n_heads.is_multiple_of(cfg.n_kv_heads),
             "GQA: n_heads must be divisible by n_kv_heads"
         );
     }
@@ -773,7 +772,7 @@ mod tests {
     fn config_gemma4_e4b_shape() {
         let cfg = WebGpuInferConfig::gemma4_e4b();
         assert_eq!(cfg.n_layers, 34);
-        assert!(cfg.n_heads % cfg.n_kv_heads == 0);
+        assert!(cfg.n_heads.is_multiple_of(cfg.n_kv_heads));
     }
 
     #[test]

@@ -68,12 +68,32 @@ impl FsBlockStore {
         self.root.join("pins").join(cid.to_multibase())
     }
 
-    fn write_atomic(&self, path: &Path, data: &[u8], sync: bool) -> anyhow::Result<()> {
+    fn write_atomic(
+        &self,
+        cid: &KotobaCid,
+        path: &Path,
+        data: &[u8],
+        sync: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            KotobaCid::from_bytes(data) == *cid,
+            "cid mismatch: expected {}, got {}",
+            cid.to_multibase(),
+            KotobaCid::from_bytes(data).to_multibase()
+        );
         let dir = path.parent().expect("block path has a parent");
         fs::create_dir_all(dir)?;
         // already present (content-addressed ⇒ identical bytes): nothing to do.
         if path.exists() {
-            return Ok(());
+            match fs::read(path) {
+                Ok(existing) if KotobaCid::from_bytes(&existing) == *cid => return Ok(()),
+                Ok(_) => {
+                    tracing::warn!(cid = %cid, path = %path.display(), "repairing corrupt fs block on put");
+                    let _ = fs::remove_file(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         let tmp = dir.join(format!(
             "{}.tmp",
@@ -103,23 +123,31 @@ impl FsBlockStore {
 
 impl BlockStore for FsBlockStore {
     fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-        self.write_atomic(&self.block_path(cid), data, false)
+        self.write_atomic(cid, &self.block_path(cid), data, false)
     }
 
     fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
-        self.write_atomic(&self.block_path(cid), data, true)
+        self.write_atomic(cid, &self.block_path(cid), data, true)
     }
 
     fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
-        match fs::read(self.block_path(cid)) {
-            Ok(v) => Ok(Some(Bytes::from(v))),
+        let path = self.block_path(cid);
+        match fs::read(&path) {
+            Ok(v) => {
+                if KotobaCid::from_bytes(&v) != *cid {
+                    tracing::warn!(cid = %cid, path = %path.display(), "fs block failed CID verification");
+                    let _ = fs::remove_file(path);
+                    return Ok(None);
+                }
+                Ok(Some(Bytes::from(v)))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
     fn has(&self, cid: &KotobaCid) -> bool {
-        self.block_path(cid).exists()
+        self.get(cid).ok().flatten().is_some()
     }
 
     fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
@@ -161,7 +189,9 @@ impl BlockStore for FsBlockStore {
                         continue;
                     }
                     if let Some(cid) = KotobaCid::from_multibase(name) {
-                        out.push(cid);
+                        if self.get(&cid).ok().flatten().is_some() {
+                            out.push(cid);
+                        }
                     }
                 }
             }
@@ -251,6 +281,28 @@ mod tests {
     }
 
     #[test]
+    fn all_cids_skips_and_removes_corrupted_block_file() {
+        let root = tmp_root("allcids-corrupt");
+        let s = FsBlockStore::open(&root).unwrap();
+        let good = b"valid fs block";
+        let good_cid = KotobaCid::from_bytes(good);
+        let corrupt_cid = KotobaCid::from_bytes(b"expected fs block");
+        s.put(&good_cid, good).unwrap();
+        let corrupt_path = s.block_path(&corrupt_cid);
+        fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        fs::write(&corrupt_path, b"corrupted fs block").unwrap();
+
+        let cids = s.all_cids();
+
+        assert_eq!(cids, vec![good_cid]);
+        assert!(
+            !corrupt_path.exists(),
+            "all_cids should remove files that fail CID verification"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn put_is_idempotent_for_same_content() {
         let root = tmp_root("idem");
         let s = FsBlockStore::open(&root).unwrap();
@@ -259,6 +311,104 @@ mod tests {
         s.put(&c, data).unwrap();
         s.put(&c, data).unwrap(); // must not error or duplicate
         assert_eq!(s.all_cids().len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_repairs_corrupt_existing_block_file() {
+        let root = tmp_root("put-repair");
+        let s = FsBlockStore::open(&root).unwrap();
+        let data = b"repair fs block";
+        let c = KotobaCid::from_bytes(data);
+        let path = s.block_path(&c);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"corrupted fs block").unwrap();
+
+        s.put(&c, data).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), data);
+        assert_eq!(s.get(&c).unwrap().unwrap().as_ref(), data);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_durable_repairs_corrupt_existing_block_file() {
+        let root = tmp_root("put-durable-repair");
+        let s = FsBlockStore::open(&root).unwrap();
+        let data = b"durable repair fs block";
+        let c = KotobaCid::from_bytes(data);
+        let path = s.block_path(&c);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"corrupted fs block").unwrap();
+
+        s.put_durable(&c, data).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), data);
+        assert_eq!(s.get(&c).unwrap().unwrap().as_ref(), data);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_rejects_mismatched_cid_without_writing_file() {
+        let root = tmp_root("put-mismatch");
+        let s = FsBlockStore::open(&root).unwrap();
+        let c = KotobaCid::from_bytes(b"expected fs block");
+
+        let err = s.put(&c, b"different fs block").unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
+        assert!(!s.block_path(&c).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn put_durable_rejects_mismatched_cid_without_writing_file() {
+        let root = tmp_root("put-durable-mismatch");
+        let s = FsBlockStore::open(&root).unwrap();
+        let c = KotobaCid::from_bytes(b"expected fs block");
+
+        let err = s.put_durable(&c, b"different fs block").unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
+        assert!(!s.block_path(&c).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn get_rejects_and_removes_corrupted_block_file() {
+        let root = tmp_root("corrupt");
+        let s = FsBlockStore::open(&root).unwrap();
+        let data = b"expected fs block";
+        let c = KotobaCid::from_bytes(data);
+        let path = s.block_path(&c);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"corrupted fs block").unwrap();
+
+        assert!(s.get(&c).unwrap().is_none());
+        assert!(
+            !path.exists(),
+            "corrupted block file should be removed after verification failure"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn has_rejects_corrupted_block_file() {
+        let root = tmp_root("corrupt-has");
+        let s = FsBlockStore::open(&root).unwrap();
+        let data = b"expected fs block";
+        let c = KotobaCid::from_bytes(data);
+        let path = s.block_path(&c);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"corrupted fs block").unwrap();
+
+        assert!(!s.has(&c));
+        assert!(
+            !path.exists(),
+            "has() should remove a block file that fails CID verification"
+        );
+
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -279,7 +429,10 @@ mod tests {
         // a fresh FsBlockStore on the same root sees the block — durability is on
         // disk, independent of the in-memory cache (no Kubo / no HTTP involved).
         let fs2 = FsBlockStore::open(&root).unwrap();
-        assert!(fs2.has(&c), "put_durable must land the block on the FS tier");
+        assert!(
+            fs2.has(&c),
+            "put_durable must land the block on the FS tier"
+        );
         assert_eq!(fs2.get(&c).unwrap().unwrap().as_ref(), data);
         let _ = fs::remove_dir_all(&root);
     }

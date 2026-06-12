@@ -71,8 +71,8 @@ mod tests {
     use super::*;
     use crate::MemoryBlockStore;
 
-    fn make_cid(tag: &[u8]) -> KotobaCid {
-        KotobaCid::from_bytes(tag)
+    fn make_cid(data: &[u8]) -> KotobaCid {
+        KotobaCid::from_bytes(data)
     }
 
     #[test]
@@ -80,8 +80,8 @@ mod tests {
         let inner = Arc::new(MemoryBlockStore::default());
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
 
-        let cid = make_cid(b"block-a");
         let data = b"hello";
+        let cid = make_cid(data);
         cs.put(&cid, data).unwrap();
 
         // Inner store received the block.
@@ -96,10 +96,12 @@ mod tests {
         let inner = Arc::new(MemoryBlockStore::default());
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
 
-        let c1 = make_cid(b"block-1");
-        let c2 = make_cid(b"block-2");
-        cs.put(&c1, b"data1").unwrap();
-        cs.put(&c2, b"data2").unwrap();
+        let d1 = b"data1";
+        let d2 = b"data2";
+        let c1 = make_cid(d1);
+        let c2 = make_cid(d2);
+        cs.put(&c1, d1).unwrap();
+        cs.put(&c2, d2).unwrap();
 
         let drained = cs.drain();
         assert_eq!(drained.len(), 2);
@@ -112,12 +114,13 @@ mod tests {
     #[test]
     fn get_and_has_delegate_to_inner() {
         let inner = Arc::new(MemoryBlockStore::default());
-        let cid = make_cid(b"get-test");
-        inner.put(&cid, b"value").unwrap();
+        let data = b"value";
+        let cid = make_cid(data);
+        inner.put(&cid, data).unwrap();
 
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
         assert!(cs.has(&cid));
-        assert_eq!(cs.get(&cid).unwrap().as_deref(), Some(b"value".as_slice()));
+        assert_eq!(cs.get(&cid).unwrap().as_deref(), Some(data.as_slice()));
         // A put-via-inner is NOT captured (only CapturingBlockStore::put is tracked).
         assert_eq!(cs.len(), 0);
     }
@@ -125,10 +128,11 @@ mod tests {
     #[test]
     fn delete_delegates_to_inner() {
         let inner = Arc::new(MemoryBlockStore::default());
-        let cid = make_cid(b"del-test");
+        let data = b"will-be-deleted";
+        let cid = make_cid(data);
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
 
-        cs.put(&cid, b"will-be-deleted").unwrap();
+        cs.put(&cid, data).unwrap();
         cs.delete(&cid).unwrap();
         assert!(!inner.has(&cid));
     }
@@ -138,8 +142,8 @@ mod tests {
         let inner = Arc::new(MemoryBlockStore::default());
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
 
-        let cid = make_cid(b"data-check");
         let data = b"exact payload bytes";
+        let cid = make_cid(data);
         cs.put(&cid, data).unwrap();
 
         let drained = cs.drain();
@@ -152,8 +156,9 @@ mod tests {
         let inner = Arc::new(MemoryBlockStore::default());
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
 
-        let cid = make_cid(b"cid-match");
-        cs.put(&cid, b"content").unwrap();
+        let data = b"content";
+        let cid = make_cid(data);
+        cs.put(&cid, data).unwrap();
 
         let drained = cs.drain();
         assert_eq!(drained[0].0, cid);
@@ -185,10 +190,11 @@ mod tests {
     #[test]
     fn pin_delegates_to_inner() {
         let inner = Arc::new(MemoryBlockStore::default());
-        let cid = make_cid(b"pin-test");
+        let data = b"pinned";
+        let cid = make_cid(data);
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
 
-        cs.put(&cid, b"pinned").unwrap();
+        cs.put(&cid, data).unwrap();
         cs.pin(&cid);
         assert!(cs.is_pinned(&cid));
         cs.unpin(&cid);
@@ -201,8 +207,9 @@ mod tests {
         let cs = CapturingBlockStore::new(Arc::clone(&inner) as _);
 
         for i in 0u8..5 {
-            let cid = make_cid(&[i; 4]);
-            cs.put(&cid, &[i; 8]).unwrap();
+            let data = [i; 8];
+            let cid = make_cid(&data);
+            cs.put(&cid, &data).unwrap();
         }
         assert_eq!(cs.len(), 5);
         let drained = cs.drain();

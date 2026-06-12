@@ -86,7 +86,10 @@ impl SignalBinding {
 
     /// Sign this binding with the actor's **DID** Ed25519 signing key (publisher side).
     pub fn sign(&self, did_signing_key: &SigningKey) -> Vec<u8> {
-        did_signing_key.sign(&self.signing_payload()).to_bytes().to_vec()
+        did_signing_key
+            .sign(&self.signing_payload())
+            .to_bytes()
+            .to_vec()
     }
 
     /// Verify the binding signature against the DID document's Ed25519 public key.
@@ -154,7 +157,8 @@ mod tests {
     fn binding_sign_verify_roundtrip() {
         let did = "did:web:etzhayyim.com:actor:alice";
         let sig_ik = IdentityKeyPair::generate();
-        let binding = SignalBinding::from_identity(did, &sig_ik.public_key(), 4242, "2026-06-01T00:00:00Z");
+        let binding =
+            SignalBinding::from_identity(did, &sig_ik.public_key(), 4242, "2026-06-01T00:00:00Z");
 
         let did_sk = did_key();
         let sig = binding.sign(&did_sk);
@@ -166,10 +170,17 @@ mod tests {
     #[test]
     fn binding_verify_rejects_wrong_did_key() {
         let sig_ik = IdentityKeyPair::generate();
-        let binding = SignalBinding::from_identity("did:web:b", &sig_ik.public_key(), 1, "2026-06-01T00:00:00Z");
+        let binding = SignalBinding::from_identity(
+            "did:web:b",
+            &sig_ik.public_key(),
+            1,
+            "2026-06-01T00:00:00Z",
+        );
         let sig = binding.sign(&did_key());
         // A different DID key (attacker / malicious PDS) must not validate.
-        let wrong_pub = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        let wrong_pub = SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .to_bytes();
         assert!(!binding.verify(&sig, &wrong_pub));
     }
 
@@ -278,7 +289,10 @@ mod tests {
         // Same signing key as the bundle, but a DIFFERENT dh key → must not match.
         let mut binding = SignalBinding::from_identity(did, &ik.public_key(), 1, "t");
         binding.signal_dh_key = IdentityKeyPair::generate().public_key().dh;
-        assert!(!binding.matches_bundle(&bundle), "dh mismatch must be rejected");
+        assert!(
+            !binding.matches_bundle(&bundle),
+            "dh mismatch must be rejected"
+        );
     }
 
     #[test]
@@ -298,12 +312,16 @@ mod tests {
         };
 
         let good = SignalBinding::from_identity(did, &bob_ik.public_key(), 1, "t");
-        assert!(good.matches_bundle(&bundle), "honest bundle must match binding");
+        assert!(
+            good.matches_bundle(&bundle),
+            "honest bundle must match binding"
+        );
 
         // Attacker substitutes a different identity key in the bundle.
         let evil_ik = IdentityKeyPair::generate();
         assert!(
-            !SignalBinding::from_identity(did, &evil_ik.public_key(), 1, "t").matches_bundle(&bundle),
+            !SignalBinding::from_identity(did, &evil_ik.public_key(), 1, "t")
+                .matches_bundle(&bundle),
             "substituted Signal identity must be rejected"
         );
     }
@@ -343,6 +361,9 @@ mod tests {
         let record_key = [0x5Au8; 32];
         let wrapped = wrap_record_key(&mut alice, &record_key).unwrap();
         let unwrapped = unwrap_record_key(&mut bob, &wrapped).unwrap();
-        assert_eq!(unwrapped, record_key, "record key survives the Signal wrap transport");
+        assert_eq!(
+            unwrapped, record_key,
+            "record key survives the Signal wrap transport"
+        );
     }
 }

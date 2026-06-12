@@ -127,7 +127,12 @@ impl Econ {
     /// the new balance. Callers must enforce operator auth before calling.
     pub async fn credit(&self, did: &str, amount: i64) -> i64 {
         let mut b = self.balances.write().await;
-        let bal = b.get(did).copied().unwrap_or(0).saturating_add(amount).max(0);
+        let bal = b
+            .get(did)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(amount)
+            .max(0);
         b.insert(did.to_string(), bal);
         let snapshot = Self::snapshot(&b, &self.operator_did);
         drop(b);

@@ -1,6 +1,8 @@
 //! Wire format for Pregel messages exchanged between KOTOBA nodes via GossipSub.
 //! Serialized as JSON for human-readability during dev; switch to CBOR in prod.
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
 /// Wire format for Pregel inter-node messages.
 /// Serialized as JSON for human-readability during dev; switch to CBOR in prod.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -16,6 +18,90 @@ pub struct PregelNetMessage {
 /// GossipSub topic key for Pregel inter-node messages.
 /// Passed to `KotobaSwarm::subscribe` / `publish` — the swarm prepends `kotoba/`.
 pub const PREGEL_GOSSIP_TOPIC: &str = "pregel/messages";
+
+pub const MAX_PREGEL_JSON_BYTES: usize = 256 * 1024;
+pub const MAX_PREGEL_ENDPOINT_BYTES: usize = 256;
+pub const MAX_PREGEL_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_PREGEL_PAYLOAD_B64_BYTES: usize = MAX_PREGEL_PAYLOAD_BYTES.div_ceil(3) * 4;
+
+impl PregelNetMessage {
+    pub fn new(
+        src: impl Into<String>,
+        dst: impl Into<String>,
+        payload: &[u8],
+    ) -> Result<Self, String> {
+        if payload.len() > MAX_PREGEL_PAYLOAD_BYTES {
+            return Err(format!(
+                "pregel payload exceeds {MAX_PREGEL_PAYLOAD_BYTES} byte limit"
+            ));
+        }
+        let msg = Self {
+            src: src.into(),
+            dst: dst.into(),
+            payload_b64: B64.encode(payload),
+        };
+        msg.validate()?;
+        Ok(msg)
+    }
+
+    pub fn to_json_vec(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_PREGEL_JSON_BYTES {
+            return Err(format!(
+                "pregel JSON exceeds {MAX_PREGEL_JSON_BYTES} byte limit"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() > MAX_PREGEL_JSON_BYTES {
+            return Err(format!(
+                "pregel JSON exceeds {MAX_PREGEL_JSON_BYTES} byte limit"
+            ));
+        }
+        let msg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        msg.validate()?;
+        Ok(msg)
+    }
+
+    pub fn payload_bytes(&self) -> Result<Vec<u8>, String> {
+        if self.payload_b64.len() > MAX_PREGEL_PAYLOAD_B64_BYTES {
+            return Err(format!(
+                "pregel payload_b64 exceeds {MAX_PREGEL_PAYLOAD_B64_BYTES} byte limit"
+            ));
+        }
+        let payload = B64.decode(&self.payload_b64).map_err(|e| e.to_string())?;
+        if payload.len() > MAX_PREGEL_PAYLOAD_BYTES {
+            return Err(format!(
+                "pregel payload exceeds {MAX_PREGEL_PAYLOAD_BYTES} byte limit"
+            ));
+        }
+        Ok(payload)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_endpoint("src", &self.src)?;
+        validate_endpoint("dst", &self.dst)?;
+        self.payload_bytes().map(|_| ())
+    }
+}
+
+fn validate_endpoint(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("pregel {field} must not be empty"));
+    }
+    if value.len() > MAX_PREGEL_ENDPOINT_BYTES {
+        return Err(format!(
+            "pregel {field} exceeds {MAX_PREGEL_ENDPOINT_BYTES} byte limit"
+        ));
+    }
+    if value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(format!("pregel {field} contains control byte"));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -81,6 +167,63 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let back: PregelNetMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.payload_b64, big);
+    }
+
+    #[test]
+    fn wire_helper_rejects_empty_endpoint() {
+        let msg = PregelNetMessage {
+            src: "".to_string(),
+            dst: "bdst".to_string(),
+            payload_b64: "aGVsbG8=".to_string(),
+        };
+
+        let err = msg.to_json_vec().unwrap_err();
+        assert!(
+            err.contains("src must not be empty"),
+            "error should mention src validation: {err}"
+        );
+    }
+
+    #[test]
+    fn wire_helper_rejects_invalid_base64() {
+        let json = br#"{"src":"bsrc","dst":"bdst","payload_b64":"not base64!"}"#;
+
+        let err = PregelNetMessage::from_json_slice(json).unwrap_err();
+        assert!(
+            err.contains("Invalid") || err.contains("invalid"),
+            "error should mention base64 validation: {err}"
+        );
+    }
+
+    #[test]
+    fn wire_helper_rejects_oversized_payload() {
+        let payload = vec![7u8; MAX_PREGEL_PAYLOAD_BYTES + 1];
+
+        let err = PregelNetMessage::new("bsrc", "bdst", &payload).unwrap_err();
+        assert!(
+            err.contains("payload exceeds"),
+            "error should mention payload cap: {err}"
+        );
+    }
+
+    #[test]
+    fn wire_helper_rejects_oversized_json_before_parse() {
+        let bytes = vec![b' '; MAX_PREGEL_JSON_BYTES + 1];
+
+        let err = PregelNetMessage::from_json_slice(&bytes).unwrap_err();
+        assert!(
+            err.contains("JSON exceeds"),
+            "error should mention JSON cap: {err}"
+        );
+    }
+
+    #[test]
+    fn wire_helper_decodes_payload_bytes() {
+        let msg = PregelNetMessage::new("bsrc", "bdst", b"hello").unwrap();
+        let json = msg.to_json_vec().unwrap();
+        let decoded = PregelNetMessage::from_json_slice(&json).unwrap();
+
+        assert_eq!(decoded.payload_bytes().unwrap(), b"hello");
     }
 
     #[test]

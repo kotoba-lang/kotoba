@@ -2,7 +2,7 @@
 //! converts events to KOTOBA Quads, and publishes them to the local Journal
 //! **and** asserts them into the QuadStore (Arrangement + ProllyTree).
 //!
-//! Jetstream docs: https://github.com/bluesky-social/jetstream
+//! Jetstream docs: <https://github.com/bluesky-social/jetstream>
 //! Default endpoint: wss://jetstream2.us-east.bsky.network/subscribe
 //!
 //! Env vars:

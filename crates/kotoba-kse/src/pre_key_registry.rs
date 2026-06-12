@@ -39,6 +39,11 @@ use zeroize::Zeroizing;
 
 /// Rule ID used in `ChainContent::Warrant` when a re-key grant is revoked.
 pub const RULE_REKEY_REVOKED: u8 = 7;
+pub const MAX_PRE_DID_BYTES: usize = 512;
+pub const MAX_PRE_REKEY_BYTES: usize = 64;
+pub const MAX_PRE_INDEX_ENTRIES: usize = 65_536;
+pub const MAX_PRE_PERSISTED_BYTES: usize = 1024 * 1024;
+pub const MAX_REKEY_REVOCATION_RECORD_BYTES: usize = 8 * 1024;
 
 /// Shelf key used to persist the grant index.
 const SHELF_INDEX_KEY: &str = "index";
@@ -63,6 +68,8 @@ pub enum PreKeyError {
     Store(String),
     #[error("serialization: {0}")]
     Serde(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 pub struct PreKeyRegistry {
@@ -111,6 +118,9 @@ impl PreKeyRegistry {
         re_key: &[u8],
         owner_enc_key: &[u8; 32],
     ) -> Result<KotobaCid, PreKeyError> {
+        validate_principal(owner_did, "owner_did")?;
+        validate_principal(accessor_did, "accessor_did")?;
+        validate_rekey(re_key)?;
         let aad = Self::aad(owner_did, accessor_did);
         let wrapped = wrap_key(owner_enc_key, re_key, aad.as_bytes())?;
         let cid = KotobaCid::from_bytes(&wrapped);
@@ -130,6 +140,7 @@ impl PreKeyRegistry {
                 .remove(&(owner_did.to_string(), accessor_did.to_string()));
         }
         self.persist_index().await;
+        self.persist_revoked_set().await;
         Ok(cid)
     }
 
@@ -196,6 +207,8 @@ impl PreKeyRegistry {
         owner_did: &str,
         accessor_did: &str,
     ) -> Result<(KotobaCid, Vec<u8>), PreKeyError> {
+        validate_principal(owner_did, "owner_did")?;
+        validate_principal(accessor_did, "accessor_did")?;
         self.revoke_inner(owner_did, accessor_did).await;
 
         let ts = SystemTime::now()
@@ -225,6 +238,9 @@ impl PreKeyRegistry {
         let Some(bytes) = self.store.get(evidence_cid).ok().flatten() else {
             return;
         };
+        if KotobaCid::from_bytes(&bytes) != *evidence_cid {
+            return;
+        }
         self.apply_revocation_warrant_bytes(&bytes).await;
     }
 
@@ -233,7 +249,7 @@ impl PreKeyRegistry {
     /// record, so no BlockStore fetch is needed (unlike `apply_revocation_warrant`).
     /// No-ops on malformed bytes or already-revoked pairs.
     pub async fn apply_revocation_warrant_bytes(&self, bytes: &[u8]) {
-        let Ok(record) = serde_json::from_slice::<RekeyRevocationRecord>(bytes) else {
+        let Ok(record) = decode_revocation_record(bytes) else {
             return;
         };
         self.revoke_inner(&record.owner_did, &record.accessor_did)
@@ -247,6 +263,9 @@ impl PreKeyRegistry {
 
     /// All accessors currently holding a re-key for `owner_did`.
     pub async fn list_accessors(&self, owner_did: &str) -> Vec<String> {
+        if validate_principal(owner_did, "owner_did").is_err() {
+            return Vec::new();
+        }
         self.index
             .read()
             .await
@@ -263,6 +282,11 @@ impl PreKeyRegistry {
     }
 
     async fn revoke_inner(&self, owner_did: &str, accessor_did: &str) {
+        if validate_principal(owner_did, "owner_did").is_err()
+            || validate_principal(accessor_did, "accessor_did").is_err()
+        {
+            return;
+        }
         let k = (owner_did.to_string(), accessor_did.to_string());
         if let Some(cid) = self.index.write().await.remove(&k) {
             let _ = self.store.delete(&cid);
@@ -289,10 +313,9 @@ impl PreKeyRegistry {
             })?;
 
         let wrapped = self
-            .store
-            .get(&cid)
+            .get_verified_block(&cid)
             .map_err(|e| PreKeyError::Store(e.to_string()))?
-            .ok_or_else(|| PreKeyError::Store("re-key block missing from store".into()))?;
+            .ok_or_else(|| PreKeyError::Store("re-key block missing or CID-invalid".into()))?;
 
         let aad = Self::aad(owner_did, accessor_did);
         Ok(unwrap_key(owner_enc_key, &wrapped, aad.as_bytes())?)
@@ -335,11 +358,22 @@ impl PreKeyRegistry {
         let Some(bytes) = shelf.get(BUCKET_PRE_KEYS, SHELF_INDEX_KEY).await else {
             return;
         };
+        if bytes.len() > MAX_PRE_PERSISTED_BYTES {
+            return;
+        }
         let Ok(entries) = serde_json::from_slice::<Vec<[String; 3]>>(&bytes) else {
             return;
         };
+        if entries.len() > MAX_PRE_INDEX_ENTRIES {
+            return;
+        }
         let mut idx = self.index.write().await;
         for [owner, accessor, cid_mb] in entries {
+            if validate_principal(&owner, "owner_did").is_err()
+                || validate_principal(&accessor, "accessor_did").is_err()
+            {
+                continue;
+            }
             let Some(cid) = KotobaCid::from_multibase(&cid_mb) else {
                 continue;
             };
@@ -361,11 +395,22 @@ impl PreKeyRegistry {
         let Some(bytes) = shelf.get(BUCKET_PRE_KEYS, "_revoked").await else {
             return;
         };
+        if bytes.len() > MAX_PRE_PERSISTED_BYTES {
+            return;
+        }
         let Ok(list) = serde_json::from_slice::<Vec<[String; 2]>>(&bytes) else {
             return;
         };
+        if list.len() > MAX_PRE_INDEX_ENTRIES {
+            return;
+        }
         let mut rev = self.revoked.write().await;
         for [owner, accessor] in list {
+            if validate_principal(&owner, "owner_did").is_err()
+                || validate_principal(&accessor, "accessor_did").is_err()
+            {
+                continue;
+            }
             rev.insert((owner, accessor));
         }
         tracing::info!(
@@ -395,12 +440,75 @@ impl PreKeyRegistry {
             .put(BUCKET_PRE_KEYS, "_revoked".to_string(), Bytes::from(json))
             .await;
     }
+
+    fn get_verified_block(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
+        let Some(bytes) = self.store.get(cid)? else {
+            return Ok(None);
+        };
+        if KotobaCid::from_bytes(&bytes) != *cid {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+}
+
+fn validate_principal(value: &str, field: &str) -> Result<(), PreKeyError> {
+    if value.is_empty() {
+        return Err(PreKeyError::InvalidInput(format!("{field} is empty")));
+    }
+    if value.len() > MAX_PRE_DID_BYTES {
+        return Err(PreKeyError::InvalidInput(format!(
+            "{field} too large: {} bytes > {}",
+            value.len(),
+            MAX_PRE_DID_BYTES
+        )));
+    }
+    if !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(PreKeyError::InvalidInput(format!(
+            "{field} must be visible ASCII"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_rekey(re_key: &[u8]) -> Result<(), PreKeyError> {
+    if re_key.is_empty() {
+        return Err(PreKeyError::InvalidInput("re_key is empty".to_string()));
+    }
+    if re_key.len() > MAX_PRE_REKEY_BYTES {
+        return Err(PreKeyError::InvalidInput(format!(
+            "re_key too large: {} bytes > {}",
+            re_key.len(),
+            MAX_PRE_REKEY_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn decode_revocation_record(bytes: &[u8]) -> Result<RekeyRevocationRecord, PreKeyError> {
+    if bytes.len() > MAX_REKEY_REVOCATION_RECORD_BYTES {
+        return Err(PreKeyError::InvalidInput(
+            "revocation record too large".to_string(),
+        ));
+    }
+    let record: RekeyRevocationRecord =
+        serde_json::from_slice(bytes).map_err(|e| PreKeyError::Serde(e.to_string()))?;
+    validate_principal(&record.owner_did, "owner_did")?;
+    validate_principal(&record.accessor_did, "accessor_did")?;
+    if record.revoked_at == 0 {
+        return Err(PreKeyError::InvalidInput(
+            "revocation record timestamp is zero".to_string(),
+        ));
+    }
+    Ok(record)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use kotoba_store::MemoryBlockStore;
+    use std::collections::HashMap;
+    use std::sync::RwLock as StdRwLock;
 
     fn store() -> Arc<dyn BlockStore + Send + Sync> {
         Arc::new(MemoryBlockStore::default())
@@ -410,6 +518,54 @@ mod tests {
         let mut k = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut k);
         k
+    }
+
+    #[derive(Default)]
+    struct CorruptingStore {
+        inner: StdRwLock<HashMap<[u8; 36], Bytes>>,
+        corrupt_reads: StdRwLock<bool>,
+    }
+
+    impl CorruptingStore {
+        fn corrupt_reads(&self) {
+            *self.corrupt_reads.write().unwrap() = true;
+        }
+    }
+
+    impl BlockStore for CorruptingStore {
+        fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+            self.inner
+                .write()
+                .unwrap()
+                .insert(cid.0, Bytes::copy_from_slice(data));
+            Ok(())
+        }
+
+        fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
+            let Some(bytes) = self.inner.read().unwrap().get(&cid.0).cloned() else {
+                return Ok(None);
+            };
+            if *self.corrupt_reads.read().unwrap() {
+                Ok(Some(Bytes::from_static(b"tampered bytes")))
+            } else {
+                Ok(Some(bytes))
+            }
+        }
+
+        fn has(&self, cid: &KotobaCid) -> bool {
+            self.inner.read().unwrap().contains_key(&cid.0)
+        }
+
+        fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+            self.inner.write().unwrap().remove(&cid.0);
+            Ok(())
+        }
+
+        fn pin(&self, _: &KotobaCid) {}
+        fn unpin(&self, _: &KotobaCid) {}
+        fn is_pinned(&self, _: &KotobaCid) -> bool {
+            false
+        }
     }
 
     #[tokio::test]
@@ -428,6 +584,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered.as_slice(), re_key);
+    }
+
+    #[tokio::test]
+    async fn grant_rejects_invalid_principals_and_rekey_sizes() {
+        let reg = PreKeyRegistry::new(store());
+        let enc_key = rand_key();
+
+        assert!(matches!(
+            reg.grant("", "did:accessor", &[1u8; 32], &enc_key).await,
+            Err(PreKeyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            reg.grant("did:owner", "bad accessor", &[1u8; 32], &enc_key)
+                .await,
+            Err(PreKeyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            reg.grant("did:owner", "did:accessor", &[], &enc_key).await,
+            Err(PreKeyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            reg.grant(
+                "did:owner",
+                "did:accessor",
+                &[7u8; MAX_PRE_REKEY_BYTES + 1],
+                &enc_key
+            )
+            .await,
+            Err(PreKeyError::InvalidInput(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unwrap_rekey_rejects_cid_mismatched_store_block() {
+        let s = Arc::new(CorruptingStore::default());
+        let reg = PreKeyRegistry::new(s.clone());
+        let enc_key = rand_key();
+        reg.grant("did:owner", "did:accessor", &[3u8; 32], &enc_key)
+            .await
+            .unwrap();
+
+        s.corrupt_reads();
+        let err = reg
+            .unwrap_rekey("did:owner", "did:accessor", &enc_key)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PreKeyError::Store(_)));
     }
 
     #[tokio::test]
@@ -519,29 +722,70 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            reg.unwrap_rekey("did:owner", "did:bob", &enc_key).await.is_ok(),
+            reg.unwrap_rekey("did:owner", "did:bob", &enc_key)
+                .await
+                .is_ok(),
             "granted → access works"
         );
 
         reg.revoke("did:owner", "did:bob").await;
         assert!(
-            reg.unwrap_rekey("did:owner", "did:bob", &enc_key).await.is_err(),
+            reg.unwrap_rekey("did:owner", "did:bob", &enc_key)
+                .await
+                .is_err(),
             "revoked → access denied"
         );
-        assert!(reg.revoked.read().await.contains(&pair), "revoked set holds the pair");
+        assert!(
+            reg.revoked.read().await.contains(&pair),
+            "revoked set holds the pair"
+        );
 
         // Re-grant must restore access AND clear the revocation flag.
         reg.grant("did:owner", "did:bob", &rand_key(), &enc_key)
             .await
             .unwrap();
         assert!(
-            reg.unwrap_rekey("did:owner", "did:bob", &enc_key).await.is_ok(),
+            reg.unwrap_rekey("did:owner", "did:bob", &enc_key)
+                .await
+                .is_ok(),
             "re-grant restores access"
         );
         assert!(
             !reg.revoked.read().await.contains(&pair),
             "re-grant must clear the revocation (re-enrollment)"
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_regrant_clears_revocation_after_restart() {
+        let s = store();
+        let shelf = Arc::new(Shelf::new());
+        let enc_key = rand_key();
+
+        {
+            let reg = PreKeyRegistry::with_shelf(Arc::clone(&s), Arc::clone(&shelf)).await;
+            reg.grant("did:owner", "did:bob", &[1u8; 32], &enc_key)
+                .await
+                .unwrap();
+            reg.revoke("did:owner", "did:bob").await;
+            reg.grant("did:owner", "did:bob", &[2u8; 32], &enc_key)
+                .await
+                .unwrap();
+        }
+
+        let reg = PreKeyRegistry::with_shelf(Arc::clone(&s), Arc::clone(&shelf)).await;
+        assert!(
+            !reg.revoked
+                .read()
+                .await
+                .contains(&("did:owner".to_string(), "did:bob".to_string())),
+            "re-grant must persistently clear revoked set"
+        );
+        let recovered = reg
+            .unwrap_rekey("did:owner", "did:bob", &enc_key)
+            .await
+            .unwrap();
+        assert_eq!(recovered.as_slice(), &[2u8; 32]);
     }
 
     #[tokio::test]
@@ -596,6 +840,35 @@ mod tests {
             .read()
             .await
             .contains(&("did:alice".to_string(), "did:bob".to_string())));
+    }
+
+    #[tokio::test]
+    async fn apply_revocation_warrant_ignores_cid_mismatched_evidence() {
+        let s = Arc::new(CorruptingStore::default());
+        let enc_key = rand_key();
+        let node = PreKeyRegistry::new(s.clone());
+        node.grant("did:alice", "did:bob", &[9u8; 32], &enc_key)
+            .await
+            .unwrap();
+        let record = RekeyRevocationRecord {
+            owner_did: "did:alice".to_string(),
+            accessor_did: "did:bob".to_string(),
+            revoked_at: 1,
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let cid = KotobaCid::from_bytes(&bytes);
+        s.put(&cid, &bytes).unwrap();
+        s.corrupt_reads();
+
+        node.apply_revocation_warrant(&cid).await;
+        assert!(
+            !node
+                .revoked
+                .read()
+                .await
+                .contains(&("did:alice".to_string(), "did:bob".to_string())),
+            "CID-mismatched evidence must not revoke"
+        );
     }
 
     /// CACAO signed by accessor-A cannot be used to fetch accessor-B's re-key.
@@ -710,6 +983,81 @@ mod tests {
         );
         // Malformed bytes must be a safe no-op.
         node_b.apply_revocation_warrant_bytes(b"not-a-record").await;
+    }
+
+    #[tokio::test]
+    async fn revocation_warrant_bytes_reject_invalid_or_oversized_records() {
+        let node = PreKeyRegistry::new(store());
+        node.apply_revocation_warrant_bytes(&vec![b'{'; MAX_REKEY_REVOCATION_RECORD_BYTES + 1])
+            .await;
+        assert!(node.revoked.read().await.is_empty());
+
+        let invalid = serde_json::to_vec(&RekeyRevocationRecord {
+            owner_did: "did:bad owner".to_string(),
+            accessor_did: "did:bob".to_string(),
+            revoked_at: 1,
+        })
+        .unwrap();
+        node.apply_revocation_warrant_bytes(&invalid).await;
+        assert!(node.revoked.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persisted_index_and_revoked_skip_invalid_entries() {
+        let s = store();
+        let shelf = Arc::new(Shelf::new());
+        let valid_cid = KotobaCid::from_bytes(b"valid wrapped rekey placeholder");
+        let index = serde_json::to_vec(&vec![
+            [
+                "did:owner".to_string(),
+                "did:accessor".to_string(),
+                valid_cid.to_multibase(),
+            ],
+            [
+                "bad owner".to_string(),
+                "did:accessor".to_string(),
+                valid_cid.to_multibase(),
+            ],
+            [
+                "did:owner".to_string(),
+                "did:accessor2".to_string(),
+                "not-a-cid".to_string(),
+            ],
+        ])
+        .unwrap();
+        shelf
+            .put(
+                BUCKET_PRE_KEYS,
+                SHELF_INDEX_KEY.to_string(),
+                Bytes::from(index),
+            )
+            .await;
+        let revoked = serde_json::to_vec(&vec![
+            ["did:owner".to_string(), "did:revoked".to_string()],
+            ["did:owner".to_string(), "bad accessor".to_string()],
+        ])
+        .unwrap();
+        shelf
+            .put(
+                BUCKET_PRE_KEYS,
+                "_revoked".to_string(),
+                Bytes::from(revoked),
+            )
+            .await;
+
+        let reg = PreKeyRegistry::with_shelf(Arc::clone(&s), Arc::clone(&shelf)).await;
+        assert_eq!(reg.index.read().await.len(), 1);
+        assert!(reg
+            .index
+            .read()
+            .await
+            .contains_key(&("did:owner".to_string(), "did:accessor".to_string())));
+        assert_eq!(reg.revoked.read().await.len(), 1);
+        assert!(reg
+            .revoked
+            .read()
+            .await
+            .contains(&("did:owner".to_string(), "did:revoked".to_string())));
     }
 
     #[test]

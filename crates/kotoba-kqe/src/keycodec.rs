@@ -38,6 +38,7 @@ const T_BYTES: u8 = 0x06;
 const T_VECF32: u8 = 0x07;
 const T_TENSOR: u8 = 0x08;
 const T_ENC: u8 = 0x09;
+const T_ENV: u8 = 0x0A;
 
 const SIGN_BIT_64: u64 = 0x8000_0000_0000_0000;
 const SIGN_BIT_32: u32 = 0x8000_0000;
@@ -56,7 +57,11 @@ fn int_key(n: i64) -> [u8; 8] {
 fn float64_key(f: f64) -> [u8; 8] {
     let f = if f == 0.0 { 0.0 } else { f };
     let bits = f.to_bits();
-    let x = if bits & SIGN_BIT_64 != 0 { !bits } else { bits | SIGN_BIT_64 };
+    let x = if bits & SIGN_BIT_64 != 0 {
+        !bits
+    } else {
+        bits | SIGN_BIT_64
+    };
     x.to_be_bytes()
 }
 
@@ -64,7 +69,11 @@ fn float64_key(f: f64) -> [u8; 8] {
 fn float32_key(f: f32) -> [u8; 4] {
     let f = if f == 0.0 { 0.0 } else { f };
     let bits = f.to_bits();
-    let x = if bits & SIGN_BIT_32 != 0 { !bits } else { bits | SIGN_BIT_32 };
+    let x = if bits & SIGN_BIT_32 != 0 {
+        !bits
+    } else {
+        bits | SIGN_BIT_32
+    };
     x.to_be_bytes()
 }
 
@@ -133,6 +142,10 @@ pub fn push_value(buf: &mut Vec<u8>, value: &Value) {
         }
         Value::Encrypted { ct_cid, .. } => {
             buf.push(T_ENC);
+            buf.extend_from_slice(&ct_cid.0); // fixed 36 B
+        }
+        Value::Enveloped { ct_cid, .. } => {
+            buf.push(T_ENV);
             buf.extend_from_slice(&ct_cid.0); // fixed 36 B
         }
     }
@@ -260,7 +273,10 @@ mod tests {
         assert_lt(Value::Text("a".into()), Value::Text("a\u{0}b".into()));
         assert_lt(Value::Text("a\u{0}b".into()), Value::Text("ab".into()));
         // Distinct strings never collide.
-        assert_ne!(enc(&Value::Text("a\u{0}".into())), enc(&Value::Text("a".into())));
+        assert_ne!(
+            enc(&Value::Text("a\u{0}".into())),
+            enc(&Value::Text("a".into()))
+        );
     }
 
     #[test]
@@ -280,6 +296,24 @@ mod tests {
         // Previously everything-but-{cid,text,int,enc} collapsed to "?" — now distinct.
         assert_ne!(enc(&Value::Bool(true)), enc(&Value::Float(1.0)));
         assert_ne!(enc(&Value::Bool(false)), enc(&Value::Bytes(vec![])));
+    }
+
+    #[test]
+    fn encrypted_and_enveloped_keys_are_distinct_but_ct_stable() {
+        let ct = kotoba_core::KotobaCid::from_bytes(b"ct");
+        let policy = kotoba_core::KotobaCid::from_bytes(b"policy");
+        let manifest = kotoba_core::KotobaCid::from_bytes(b"manifest");
+        let encrypted = enc(&Value::Encrypted {
+            ct_cid: ct.clone(),
+            policy_cid: policy,
+        });
+        let enveloped = enc(&Value::Enveloped {
+            ct_cid: ct,
+            manifest_cid: manifest,
+        });
+        assert_ne!(encrypted, enveloped);
+        assert_eq!(encrypted.len(), 1 + 36);
+        assert_eq!(enveloped.len(), 1 + 36);
     }
 
     #[test]

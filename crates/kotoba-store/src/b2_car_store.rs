@@ -35,10 +35,19 @@ impl BlockStore for B2CarBlockStore {
         let Some((car_key, offset, len)) = self.index.get(cid) else {
             return Ok(None); // not indexed here — fall through (already coldest)
         };
+        if len == 0 {
+            return Ok(verify_range_bytes(cid, Bytes::new()));
+        }
         let client = Arc::clone(&self.client);
         let key = car_key.clone();
         match b2_block_on(async move { client.get_object_range(&key, offset, len as u64).await }) {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => match verify_range_bytes(cid, bytes) {
+                Some(bytes) => Ok(Some(bytes)),
+                None => {
+                    tracing::debug!(%cid, car_key, "b2 ranged GET CID mismatch");
+                    Ok(None)
+                }
+            },
             Err(e) => {
                 // A stale index entry (CAR not in B2 / range gone) is a miss, not
                 // a hard error — let the caller treat the block as absent.
@@ -67,11 +76,45 @@ impl BlockStore for B2CarBlockStore {
     }
 }
 
+fn verify_range_bytes(expected_cid: &KotobaCid, bytes: Bytes) -> Option<Bytes> {
+    (KotobaCid::from_bytes(&bytes) == *expected_cid).then_some(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::b2_client::B2Config;
     use crate::car_bundle::CarBundleWriter;
+
+    #[test]
+    fn verify_range_bytes_accepts_matching_cid() {
+        let bytes = Bytes::from_static(b"b2 range payload");
+        let cid = KotobaCid::from_bytes(&bytes);
+
+        let verified = verify_range_bytes(&cid, bytes.clone());
+
+        assert_eq!(verified.as_deref(), Some(bytes.as_ref()));
+    }
+
+    #[test]
+    fn verify_range_bytes_rejects_mismatched_cid() {
+        let bytes = Bytes::from_static(b"b2 range payload");
+        let wrong_cid = KotobaCid::from_bytes(b"different payload");
+
+        let verified = verify_range_bytes(&wrong_cid, bytes);
+
+        assert!(verified.is_none());
+    }
+
+    #[test]
+    fn verify_range_bytes_accepts_empty_block_cid() {
+        let bytes = Bytes::new();
+        let cid = KotobaCid::from_bytes(&bytes);
+
+        let verified = verify_range_bytes(&cid, bytes.clone());
+
+        assert_eq!(verified.as_deref(), Some(bytes.as_ref()));
+    }
 
     /// Live serve-from-B2: build a CAR of two blocks, PUT it, index it, then
     /// read each block back **through `B2CarBlockStore::get`** (one ranged GET
@@ -84,20 +127,25 @@ mod tests {
         let client = Arc::new(B2Client::new(cfg));
 
         let root = KotobaCid::from_bytes(b"phase2-serve-root");
-        let b1 = (KotobaCid::from_bytes(b"phase2-block-A"), b"AAAA-block-payload".to_vec());
-        let b2 = (KotobaCid::from_bytes(b"phase2-block-B"), vec![7u8; 999]);
+        let b1_payload = b"AAAA-block-payload".to_vec();
+        let b2_payload = vec![7u8; 999];
+        let b1 = (KotobaCid::from_bytes(&b1_payload), b1_payload);
+        let b2 = (KotobaCid::from_bytes(&b2_payload), b2_payload);
         let mut w = CarBundleWriter::new(root.clone());
         w.append(&b1.0, &b1.1);
         w.append(&b2.0, &b2.1);
         let (car_bytes, idx) = w.finish();
-        let car_key = "kotoba/cars/_phase2_serve_selftest.kcar";
+        let car_key = root.to_multibase();
 
-        client.put_object(car_key, &car_bytes).await.expect("PUT CAR");
+        client
+            .put_object(&car_key, &car_bytes)
+            .await
+            .expect("PUT CAR");
 
         let dir = std::env::temp_dir().join(format!("carindex_serve_{}", std::process::id()));
         let index = Arc::new(CarIndex::open(&dir).unwrap());
         for (cid, off, len) in &idx {
-            index.put(cid, car_key, *off, *len).unwrap();
+            index.put(cid, &car_key, *off, *len).unwrap();
         }
 
         let store = B2CarBlockStore::new(Arc::clone(&client), Arc::clone(&index));
@@ -111,7 +159,11 @@ mod tests {
         .await
         .unwrap()
         .expect("get b1");
-        assert_eq!(got1.as_deref(), Some(&b1.1[..]), "block A bytes via B2 ranged GET");
+        assert_eq!(
+            got1.as_deref(),
+            Some(&b1.1[..]),
+            "block A bytes via B2 ranged GET"
+        );
 
         assert!(store.has(&b2.0), "has() should hit the index");
         let missing = KotobaCid::from_bytes(b"not-indexed");

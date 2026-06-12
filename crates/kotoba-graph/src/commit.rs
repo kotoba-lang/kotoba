@@ -306,10 +306,26 @@ mod tests {
         let p = KotobaCid::from_bytes(b"prev");
 
         let base = Commit::derive_tx_cid(&g, &r, None, 0);
-        assert_eq!(base, Commit::derive_tx_cid(&g, &r, None, 0), "deterministic");
-        assert_ne!(base, Commit::derive_tx_cid(&g2, &r, None, 0), "graph is bound");
-        assert_ne!(base, Commit::derive_tx_cid(&g, &r2, None, 0), "root is bound");
-        assert_ne!(base, Commit::derive_tx_cid(&g, &r, Some(&p), 0), "prev presence is bound");
+        assert_eq!(
+            base,
+            Commit::derive_tx_cid(&g, &r, None, 0),
+            "deterministic"
+        );
+        assert_ne!(
+            base,
+            Commit::derive_tx_cid(&g2, &r, None, 0),
+            "graph is bound"
+        );
+        assert_ne!(
+            base,
+            Commit::derive_tx_cid(&g, &r2, None, 0),
+            "root is bound"
+        );
+        assert_ne!(
+            base,
+            Commit::derive_tx_cid(&g, &r, Some(&p), 0),
+            "prev presence is bound"
+        );
         assert_ne!(base, Commit::derive_tx_cid(&g, &r, None, 1), "seq is bound");
         assert_ne!(
             Commit::derive_tx_cid(&g, &r, Some(&p), 0),

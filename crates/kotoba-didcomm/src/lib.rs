@@ -534,11 +534,19 @@ mod tests {
         // groups a conversation, so a bug here (returning own id for a reply, or
         // mismatched scopes) would scatter messages that belong together.
         let root = msg("msg-root", None);
-        assert_eq!(root.thread_id(), "msg-root", "a starter's thread is its own id");
+        assert_eq!(
+            root.thread_id(),
+            "msg-root",
+            "a starter's thread is its own id"
+        );
         assert_eq!(root.thread_scope(), "didcomm://thread/msg-root");
 
         let reply = msg("msg-reply-1", Some("msg-root"));
-        assert_eq!(reply.thread_id(), "msg-root", "a reply joins its thread, not its own id");
+        assert_eq!(
+            reply.thread_id(),
+            "msg-root",
+            "a reply joins its thread, not its own id"
+        );
         assert_eq!(
             reply.thread_scope(),
             root.thread_scope(),
@@ -562,12 +570,24 @@ mod tests {
         // content, and changing any field changes it (so a tampered/edited message
         // can never masquerade as the original).
         let a = msg("m", Some("t"));
-        assert_eq!(a.cid().unwrap(), a.cid().unwrap(), "cid must be deterministic");
+        assert_eq!(
+            a.cid().unwrap(),
+            a.cid().unwrap(),
+            "cid must be deterministic"
+        );
         let mut b = a.clone();
         b.id = "m2".into();
-        assert_ne!(a.cid().unwrap(), b.cid().unwrap(), "changing id changes the cid");
+        assert_ne!(
+            a.cid().unwrap(),
+            b.cid().unwrap(),
+            "changing id changes the cid"
+        );
         let mut c = a.clone();
         c.body = json!({"x": 1});
-        assert_ne!(a.cid().unwrap(), c.cid().unwrap(), "changing body changes the cid");
+        assert_ne!(
+            a.cid().unwrap(),
+            c.cid().unwrap(),
+            "changing body changes the cid"
+        );
     }
 }

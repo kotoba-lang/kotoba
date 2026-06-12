@@ -55,7 +55,11 @@ fn kabuto_supply_graph_drives_the_viewer() {
 
     // id query → CID-token ↔ id-string map the viewer joins on
     let ids = rows(&n, "{:find [?e ?v] :where [[?e :company/id ?v]]}");
-    assert_eq!(ids.len(), want_companies, "all companies expose :company/id");
+    assert_eq!(
+        ids.len(),
+        want_companies,
+        "all companies expose :company/id"
+    );
 
     // names join on the SAME ?e token (stability the viewer depends on)
     let names = rows(&n, "{:find [?e ?v] :where [[?e :company/name ?v]]}");

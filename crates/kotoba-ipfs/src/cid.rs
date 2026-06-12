@@ -37,6 +37,8 @@ pub struct DagPbNode {
     pub links: Vec<DagPbLink>,
 }
 
+pub type UnixfsChunkedFileBlocks = (Cid, Vec<u8>, Vec<(Cid, Vec<u8>)>);
+
 /// Build a CIDv1 for an already-encoded IPFS block.
 pub fn cid_for_bytes(codec: u64, data: &[u8]) -> Cid {
     Cid::new_v1(codec, Code::Sha2_256.digest(data))
@@ -81,7 +83,7 @@ pub fn unixfs_file_block(data: &[u8]) -> (Cid, Vec<u8>) {
 pub fn unixfs_chunked_file_blocks(
     data: &[u8],
     chunk_size: usize,
-) -> Result<(Cid, Vec<u8>, Vec<(Cid, Vec<u8>)>), CidError> {
+) -> Result<UnixfsChunkedFileBlocks, CidError> {
     if chunk_size == 0 {
         return Err(CidError::Unixfs(
             "chunk size must be greater than zero".into(),
@@ -205,16 +207,16 @@ pub fn decode_unixfs_file_data(unixfs: &[u8]) -> Result<Vec<u8>, CidError> {
     let mut file_data = None;
     let mut filesize = None;
     while pos < unixfs.len() {
-        let (field, wire) = read_key(&unixfs, &mut pos)?;
+        let (field, wire) = read_key(unixfs, &mut pos)?;
         match (field, wire) {
-            (1, 0) => typ = Some(read_varint(&unixfs, &mut pos)?),
-            (2, 2) => file_data = Some(read_len_bytes(&unixfs, &mut pos)?.to_vec()),
-            (3, 0) => filesize = Some(read_varint(&unixfs, &mut pos)?),
+            (1, 0) => typ = Some(read_varint(unixfs, &mut pos)?),
+            (2, 2) => file_data = Some(read_len_bytes(unixfs, &mut pos)?.to_vec()),
+            (3, 0) => filesize = Some(read_varint(unixfs, &mut pos)?),
             (_, 0) => {
-                read_varint(&unixfs, &mut pos)?;
+                read_varint(unixfs, &mut pos)?;
             }
             (_, 2) => {
-                read_len_bytes(&unixfs, &mut pos)?;
+                read_len_bytes(unixfs, &mut pos)?;
             }
             _ => {
                 return Err(CidError::Unixfs(format!(

@@ -34,7 +34,10 @@ pub fn object_tx(obj: &GitObject, oid: GitOid, cid: &KotobaCid) -> EdnValue {
             kw(schema::OBJECT_CID),
             EdnValue::tagged("cid", EdnValue::string(cid.to_multibase())),
         ),
-        (kw(schema::OBJECT_SIZE), EdnValue::int(obj.body.len() as i64)),
+        (
+            kw(schema::OBJECT_SIZE),
+            EdnValue::int(obj.body.len() as i64),
+        ),
     ];
 
     match obj.kind {

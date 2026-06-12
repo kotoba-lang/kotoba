@@ -221,9 +221,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -242,11 +240,7 @@ mod tests {
 
     #[test]
     fn parse_framed_roundtrips() {
-        for body in [
-            b"hello\n".to_vec(),
-            Vec::new(),
-            vec![0u8, 1, 2, 255, 254],
-        ] {
+        for body in [b"hello\n".to_vec(), Vec::new(), vec![0u8, 1, 2, 255, 254]] {
             let obj = GitObject::blob(body);
             let framed = obj.framed();
             let parsed = GitObject::parse_framed(&framed).unwrap();

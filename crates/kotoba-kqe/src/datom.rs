@@ -36,6 +36,11 @@ pub enum Value {
         ct_cid: KotobaCid,
         policy_cid: KotobaCid,
     },
+    /// Envelope-encrypted value. VAET does not index this variant.
+    Enveloped {
+        ct_cid: KotobaCid,
+        manifest_cid: KotobaCid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,6 +235,13 @@ impl From<QuadObject> for Value {
                 dtype: dtype.into(),
             },
             QuadObject::Encrypted { ct_cid, policy_cid } => Self::Encrypted { ct_cid, policy_cid },
+            QuadObject::Enveloped {
+                ct_cid,
+                manifest_cid,
+            } => Self::Enveloped {
+                ct_cid,
+                manifest_cid,
+            },
         }
     }
 }
@@ -250,6 +262,13 @@ impl From<Value> for QuadObject {
                 dtype: dtype.into(),
             },
             Value::Encrypted { ct_cid, policy_cid } => Self::Encrypted { ct_cid, policy_cid },
+            Value::Enveloped {
+                ct_cid,
+                manifest_cid,
+            } => Self::Enveloped {
+                ct_cid,
+                manifest_cid,
+            },
         }
     }
 }
@@ -697,5 +716,38 @@ mod tests {
             )
             .expect_err("EAVT first component must be entity");
         assert!(err.contains("invalid kind"));
+    }
+
+    #[test]
+    fn enveloped_value_roundtrips_through_legacy_quad() {
+        let ct = cid(b"ct");
+        let manifest = cid(b"manifest");
+        let value = Value::Enveloped {
+            ct_cid: ct.clone(),
+            manifest_cid: manifest.clone(),
+        };
+        let quad_object: QuadObject = value.clone().into();
+        assert_eq!(
+            quad_object,
+            QuadObject::Enveloped {
+                ct_cid: ct,
+                manifest_cid: manifest,
+            }
+        );
+        assert_eq!(Value::from(quad_object), value);
+    }
+
+    #[test]
+    fn enveloped_value_is_not_indexed_in_vaet() {
+        let datom = Datom::assert(
+            cid(b"e"),
+            ":secret/body".into(),
+            Value::Enveloped {
+                ct_cid: cid(b"ct"),
+                manifest_cid: cid(b"manifest"),
+            },
+            cid(b"tx"),
+        );
+        assert!(datom.vaet_key().is_none());
     }
 }

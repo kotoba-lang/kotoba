@@ -264,7 +264,7 @@ pub struct KotobaState {
     /// Gemma 4 E2B inference engine, loaded at startup when `KOTOBA_LOAD_GEMMA` is set.
     pub inference_engine: Option<InferenceFn>,
     // ── BlockStore ───────────────────────────────────────────────────────
-    /// Content-addressed block store (BudgetedBlockStore<MemoryBlockStore> hot + optional B2 cold).
+    /// Content-addressed block store (`BudgetedBlockStore<MemoryBlockStore>` hot + optional B2 cold).
     pub block_store: Arc<dyn BlockStore + Send + Sync>,
     // ── Distributed Datomic Head Registry ─────────────────────────────────
     /// Mutable graph/database heads.  This is the IPNS boundary for ProllyTree
@@ -348,24 +348,61 @@ pub struct KotobaState {
     /// efficacy hook proving the resident cache actually serves steady-state
     /// transacts rather than silently falling through to a cold scan.
     pub datomic_cold_db_loads: Arc<std::sync::atomic::AtomicU64>,
+    /// Envelope manifest cleanup observability. These counters cover best-effort
+    /// deletion of stale/orphan envelope manifests after grant/revoke rotation or
+    /// failed current-pointer CAS updates.
+    pub envelope_manifest_cleanup_attempts: Arc<std::sync::atomic::AtomicU64>,
+    pub envelope_manifest_cleanup_successes: Arc<std::sync::atomic::AtomicU64>,
+    pub envelope_manifest_cleanup_failures: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl KotobaState {
+    const DEFAULT_PUBLIC_PORT: u16 = 8080;
+    const MAX_DID_SERVICE_ENDPOINT_LEN: usize = 2048;
+    const MAX_PRE_WRAPPING_OWNER_LEN: usize = 512;
+
+    fn service_endpoint_or_default(value: Option<String>, default: impl Into<String>) -> String {
+        let default = default.into();
+        let Some(value) = value else {
+            return default;
+        };
+        let value = value.trim();
+        if value.is_empty()
+            || value.len() > Self::MAX_DID_SERVICE_ENDPOINT_LEN
+            || value.chars().any(|ch| ch.is_control())
+        {
+            return default;
+        }
+        value.to_string()
+    }
+
+    fn public_port_from_env() -> u16 {
+        std::env::var("KOTOBA_PORT")
+            .ok()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(Self::DEFAULT_PUBLIC_PORT)
+    }
+
     fn public_http_endpoint_from_env() -> String {
-        std::env::var("KOTOBA_PUBLIC_ENDPOINT").unwrap_or_else(|_| {
-            let port = std::env::var("KOTOBA_PORT").unwrap_or_else(|_| "8080".into());
-            format!("http://localhost:{port}")
-        })
+        let default = format!("http://localhost:{}", Self::public_port_from_env());
+        Self::service_endpoint_or_default(std::env::var("KOTOBA_PUBLIC_ENDPOINT").ok(), default)
     }
 
     fn did_protocol_service_config() -> KotobaDidServiceConfig {
-        let kotoba_endpoint = std::env::var("KOTOBA_NODE_ENDPOINT")
-            .or_else(|_| std::env::var("KOTOBA_PUBLIC_ENDPOINT"))
-            .unwrap_or_else(|_| "/ip4/127.0.0.1/tcp/4001".to_string());
-        let didcomm_endpoint =
-            std::env::var("KOTOBA_DIDCOMM_ENDPOINT").unwrap_or_else(|_| "didcomm://{did}".into());
-        let atproto_pds_endpoint = std::env::var("KOTOBA_ATPROTO_PDS_ENDPOINT")
-            .unwrap_or_else(|_| Self::public_http_endpoint_from_env());
+        let kotoba_endpoint = Self::service_endpoint_or_default(
+            std::env::var("KOTOBA_NODE_ENDPOINT")
+                .or_else(|_| std::env::var("KOTOBA_PUBLIC_ENDPOINT"))
+                .ok(),
+            "/ip4/127.0.0.1/tcp/4001",
+        );
+        let didcomm_endpoint = Self::service_endpoint_or_default(
+            std::env::var("KOTOBA_DIDCOMM_ENDPOINT").ok(),
+            "didcomm://{did}",
+        );
+        let atproto_pds_endpoint = Self::service_endpoint_or_default(
+            std::env::var("KOTOBA_ATPROTO_PDS_ENDPOINT").ok(),
+            Self::public_http_endpoint_from_env(),
+        );
         let graph_memberships = [
             NamedGraph::public().cid,
             NamedGraph::authenticated().cid,
@@ -387,7 +424,9 @@ impl KotobaState {
         // Capacity: KOTOBA_HOT_CACHE_BYTES (default 256 MiB) or
         //           KOTOBA_STORAGE_BUDGET_BYTES (legacy alias, same meaning).
         // Persistence: KuboBlockStore cold tier (Kubo/IPFS HTTP, SHA2-256 dual-CID) if KOTOBA_STORE_PATH is set.
-        // All KSE components (Journal, Vault, SecureVault) share the same store.
+        // Public KSE/graph components use this store. Private vaults are wired to
+        // a separate local store below so unauthenticated block.get cannot read
+        // vault ciphertexts or envelope manifests by CID.
         let store_path: Option<String> = std::env::var("KOTOBA_STORE_PATH").ok();
 
         // ADR-2606041151 A — Journal WAL opt-out. Default on (unchanged). When
@@ -495,11 +534,12 @@ impl KotobaState {
                 if durability_dht {
                     let peers: Vec<Arc<dyn kotoba_dht::PeerTransport>> = peers_str
                         .split_whitespace()
-                        .map(|s| s.trim_end_matches('/'))
-                        .filter(|s| !s.is_empty())
-                        .map(|url| {
-                            Arc::new(crate::dht_transport::KuboPeerTransport::new(url))
-                                as Arc<dyn kotoba_dht::PeerTransport>
+                        .filter_map(|url| {
+                            let peer = crate::dht_transport::KuboPeerTransport::try_new(url);
+                            if peer.is_none() {
+                                tracing::warn!(peer = %url, "ignoring invalid KOTOBA_PEERS entry");
+                            }
+                            peer.map(|peer| Arc::new(peer) as Arc<dyn kotoba_dht::PeerTransport>)
                         })
                         .collect();
                     let peer_count = peers.len();
@@ -654,7 +694,20 @@ impl KotobaState {
                 Journal::new()
             }
         });
-        let shelf = Arc::new(Shelf::new());
+        let shelf = Arc::new(match &store_path {
+            Some(path) => {
+                let shelf_path = std::path::Path::new(path).join("shelf.json");
+                tracing::info!(
+                    path = %shelf_path.display(),
+                    "Shelf: JSON snapshot persistence enabled"
+                );
+                Shelf::persistent(shelf_path)
+            }
+            None => {
+                tracing::info!("Shelf: in-memory only (set KOTOBA_STORE_PATH for persistence)");
+                Shelf::new()
+            }
+        });
 
         // Agent identity — constructed once; reused in init_crypto() to avoid
         // double-generation of ephemeral keys (each call to generate_ephemeral()
@@ -709,21 +762,43 @@ impl KotobaState {
             Arc::clone(&block_store),
         ));
 
-        // Vault — content-addressed private blob store; backed by block_store.
-        let vault = Arc::new(if store_path.is_some() {
-            tracing::info!("Vault: block-store persistence enabled");
-            Vault::with_block_store(Arc::clone(&block_store))
-        } else {
-            tracing::info!("Vault: in-memory only");
-            Vault::new()
+        // Vault / SecureVault — private blob stores. Do not write these blocks
+        // into `block_store`: `/xrpc/...block.get` is unauthenticated bearer-by-CID.
+        // When persistence is configured, store private vault blocks in a sibling
+        // local FsBlockStore that is reachable only through authenticated vault APIs.
+        let private_vault_store: Option<Arc<dyn BlockStore + Send + Sync>> =
+            store_path.as_ref().and_then(|path| {
+                let dir = std::path::Path::new(path).join("vault-private-blocks");
+                match kotoba_store::FsBlockStore::open(&dir) {
+                    Ok(store) => {
+                        tracing::info!(
+                            path = %dir.display(),
+                            "Vault: private FsBlockStore persistence enabled"
+                        );
+                        Some(Arc::new(store) as Arc<dyn BlockStore + Send + Sync>)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %dir.display(),
+                            error = %err,
+                            "Vault: private persistence unavailable; falling back to memory"
+                        );
+                        None
+                    }
+                }
+            });
+
+        let vault = Arc::new(match &private_vault_store {
+            Some(store) => Vault::with_block_store(Arc::clone(store)),
+            None => {
+                tracing::info!("Vault: in-memory only");
+                Vault::new()
+            }
         });
 
-        // SecureVault — E2E encrypted blob store for email bodies; shares block_store.
-        let secure_vault = Arc::new(if store_path.is_some() {
-            tracing::info!("SecureVault: block-store persistence enabled");
-            SecureVault::with_vault(Vault::with_block_store(Arc::clone(&block_store)))
-        } else {
-            SecureVault::new()
+        let secure_vault = Arc::new(match &private_vault_store {
+            Some(store) => SecureVault::with_vault(Vault::with_block_store(Arc::clone(store))),
+            None => SecureVault::new(),
         });
 
         // KseStore — for agent key-ref pointer storage; backed by LocalFileSystem if
@@ -843,9 +918,7 @@ impl KotobaState {
 
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
-            mv_registry: Arc::new(tokio::sync::RwLock::new(
-                kotoba_kqe::mv::MvRegistry::new(),
-            )),
+            mv_registry: Arc::new(tokio::sync::RwLock::new(kotoba_kqe::mv::MvRegistry::new())),
             journal_wal_enabled,
             operator_did,
             node_roles,
@@ -882,6 +955,9 @@ impl KotobaState {
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
             datomic_live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             datomic_cold_db_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            envelope_manifest_cleanup_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            envelope_manifest_cleanup_successes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            envelope_manifest_cleanup_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -1000,7 +1076,11 @@ impl KotobaState {
             let Some(head) = head else { continue };
             let slot = self.datomic_live_slot(&graph_cid.to_multibase());
             let mut guard = slot.lock().await;
-            if guard.as_ref().map(|live| live.head == head).unwrap_or(false) {
+            if guard
+                .as_ref()
+                .map(|live| live.head == head)
+                .unwrap_or(false)
+            {
                 continue; // already warm at this head
             }
             self.datomic_cold_db_loads
@@ -1078,8 +1158,26 @@ impl KotobaState {
         &self,
         owner_did: &str,
     ) -> anyhow::Result<zeroize::Zeroizing<[u8; 32]>> {
-        let key = blake3::derive_key("kotoba-server-pre-wrapping-key", owner_did.as_bytes());
-        Ok(zeroize::Zeroizing::new(key))
+        let owner_did = Self::normalize_pre_wrapping_owner(owner_did)?;
+        Ok(self
+            .crypto_required()?
+            .derive_wrapping_key(owner_did.as_bytes()))
+    }
+
+    fn normalize_pre_wrapping_owner(owner_did: &str) -> anyhow::Result<&str> {
+        let owner_did = owner_did.trim();
+        anyhow::ensure!(!owner_did.is_empty(), "owner_did must not be empty");
+        anyhow::ensure!(
+            owner_did.len() <= Self::MAX_PRE_WRAPPING_OWNER_LEN,
+            "owner_did too long ({} bytes, limit {})",
+            owner_did.len(),
+            Self::MAX_PRE_WRAPPING_OWNER_LEN
+        );
+        anyhow::ensure!(
+            owner_did.bytes().all(|byte| (0x21..=0x7e).contains(&byte)),
+            "owner_did must be visible ASCII"
+        );
+        Ok(owner_did)
     }
 
     /// Revoke a PRE re-key grant locally AND propagate the revocation to peers
@@ -1098,8 +1196,11 @@ impl KotobaState {
         let evidence_cid = reg.revoke_emit_warrant(owner_did, accessor_did).await?;
         // Channel carries raw KSE names (no "kotoba/" prefix); publish adds it.
         if let Some(tx) = &self.gossip_tx {
-            tx.try_send(("rekey/revoke".to_string(), evidence_cid.to_multibase().into_bytes()))
-                .ok();
+            tx.try_send((
+                "rekey/revoke".to_string(),
+                evidence_cid.to_multibase().into_bytes(),
+            ))
+            .ok();
         }
         Ok(())
     }
@@ -1182,17 +1283,24 @@ impl KotobaState {
         let did = self.operator_did.clone();
         let mut doc = self.local_auth_did_document();
 
-        let kotoba_endpoint = std::env::var("KOTOBA_NODE_ENDPOINT")
-            .or_else(|_| std::env::var("KOTOBA_PUBLIC_ENDPOINT"))
-            .unwrap_or_else(|_| "/ip4/127.0.0.1/tcp/4001".to_string());
+        let kotoba_endpoint = Self::service_endpoint_or_default(
+            std::env::var("KOTOBA_NODE_ENDPOINT")
+                .or_else(|_| std::env::var("KOTOBA_PUBLIC_ENDPOINT"))
+                .ok(),
+            "/ip4/127.0.0.1/tcp/4001",
+        );
         doc.push_single_service("kotoba-node", KOTOBA_NODE_SERVICE, kotoba_endpoint);
 
-        let didcomm_endpoint = std::env::var("KOTOBA_DIDCOMM_ENDPOINT")
-            .unwrap_or_else(|_| format!("didcomm://{}", did));
+        let didcomm_endpoint = Self::service_endpoint_or_default(
+            std::env::var("KOTOBA_DIDCOMM_ENDPOINT").ok(),
+            format!("didcomm://{}", did),
+        );
         doc.push_single_service("didcomm", DIDCOMM_MESSAGING_SERVICE, didcomm_endpoint);
 
-        let atproto_pds_endpoint = std::env::var("KOTOBA_ATPROTO_PDS_ENDPOINT")
-            .unwrap_or_else(|_| Self::public_http_endpoint_from_env());
+        let atproto_pds_endpoint = Self::service_endpoint_or_default(
+            std::env::var("KOTOBA_ATPROTO_PDS_ENDPOINT").ok(),
+            Self::public_http_endpoint_from_env(),
+        );
         doc.push_single_service("atproto-pds", ATPROTO_PDS_SERVICE, atproto_pds_endpoint);
 
         let memberships = self
@@ -1669,6 +1777,10 @@ mod tests {
     #[tokio::test]
     async fn local_did_document_advertises_kotoba_protocol_services() {
         let _env = env_guard(); // serialize KOTOBA_ATPROTO_PDS_ENDPOINT mutation
+        std::env::remove_var("KOTOBA_PUBLIC_ENDPOINT");
+        std::env::remove_var("KOTOBA_NODE_ENDPOINT");
+        std::env::remove_var("KOTOBA_DIDCOMM_ENDPOINT");
+        std::env::remove_var("KOTOBA_PORT");
         std::env::set_var("KOTOBA_ATPROTO_PDS_ENDPOINT", "https://pds.example.com");
         let state = KotobaState::new(None).expect("new");
         let doc = state.local_did_document().await;
@@ -1696,6 +1808,52 @@ mod tests {
             doc.atproto_pds_endpoint(),
             Some("https://kotoba.example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn local_did_document_sanitizes_env_protocol_services() {
+        let _env = env_guard();
+        std::env::set_var("KOTOBA_PUBLIC_ENDPOINT", "https://bad.example\nheader");
+        std::env::set_var("KOTOBA_NODE_ENDPOINT", " /ip4/10.0.0.1/tcp/4101 ");
+        std::env::set_var("KOTOBA_DIDCOMM_ENDPOINT", "didcomm://bad\nheader");
+        std::env::set_var("KOTOBA_ATPROTO_PDS_ENDPOINT", "https://pds.example\nheader");
+        std::env::set_var("KOTOBA_PORT", "bad-port");
+
+        let state = KotobaState::new(None).expect("new");
+        let doc = state.local_did_document().await;
+        let expected_didcomm = format!("didcomm://{}", state.operator_did);
+
+        std::env::remove_var("KOTOBA_PUBLIC_ENDPOINT");
+        std::env::remove_var("KOTOBA_NODE_ENDPOINT");
+        std::env::remove_var("KOTOBA_DIDCOMM_ENDPOINT");
+        std::env::remove_var("KOTOBA_ATPROTO_PDS_ENDPOINT");
+        std::env::remove_var("KOTOBA_PORT");
+
+        assert_eq!(doc.kotoba_endpoint(), Some("/ip4/10.0.0.1/tcp/4101"));
+        assert_eq!(doc.didcomm_endpoint(), Some(expected_didcomm.as_str()));
+        assert_eq!(doc.atproto_pds_endpoint(), Some("http://localhost:8080"));
+    }
+
+    #[test]
+    fn did_protocol_service_config_sanitizes_env_protocol_services() {
+        let _env = env_guard();
+        std::env::set_var("KOTOBA_PUBLIC_ENDPOINT", "https://bad.example\r\nheader");
+        std::env::set_var("KOTOBA_NODE_ENDPOINT", "bad\nnode");
+        std::env::set_var("KOTOBA_DIDCOMM_ENDPOINT", "didcomm://bad\nheader");
+        std::env::set_var("KOTOBA_ATPROTO_PDS_ENDPOINT", "https://bad.example\nheader");
+        std::env::set_var("KOTOBA_PORT", "65536");
+
+        let cfg = KotobaState::did_protocol_service_config();
+
+        std::env::remove_var("KOTOBA_PUBLIC_ENDPOINT");
+        std::env::remove_var("KOTOBA_NODE_ENDPOINT");
+        std::env::remove_var("KOTOBA_DIDCOMM_ENDPOINT");
+        std::env::remove_var("KOTOBA_ATPROTO_PDS_ENDPOINT");
+        std::env::remove_var("KOTOBA_PORT");
+
+        assert_eq!(cfg.kotoba_node_endpoint, "/ip4/127.0.0.1/tcp/4001");
+        assert_eq!(cfg.didcomm_endpoint, "didcomm://{did}");
+        assert_eq!(cfg.atproto_pds_endpoint, "http://localhost:8080");
     }
 
     #[test]
@@ -2002,6 +2160,237 @@ mod tests {
         assert!(
             state.crypto_required().is_ok(),
             "crypto must be initialized"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_vault_uses_private_store_not_public_block_get_store() {
+        let _env = env_guard();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "kotoba-private-vault-store-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS", "memory");
+        std::env::set_var("KOTOBA_STORE_PATH", &dir);
+
+        let state = KotobaState::new(None).expect("new");
+        let blob = state
+            .vault
+            .put(bytes::Bytes::from_static(b"private vault block"))
+            .await;
+
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        std::env::remove_var("KOTOBA_IPNS");
+        std::env::remove_var("KOTOBA_STORE_PATH");
+
+        assert_eq!(
+            state.vault.get(&blob.cid).await.as_deref(),
+            Some(&b"private vault block"[..]),
+            "authenticated vault path must read its private store"
+        );
+        assert!(
+            state.block_store.get(&blob.cid).unwrap().is_none(),
+            "public block_store/block.get must not expose private vault blocks"
+        );
+
+        let wrapping_key = [7u8; 32];
+        let (encrypted_blob, manifest_cid, manifest) = state
+            .secure_vault
+            .put_enveloped(
+                &wrapping_key,
+                "did:example:alice",
+                bytes::Bytes::from_static(b"private envelope block"),
+                b"private-aad",
+            )
+            .await
+            .expect("put envelope");
+        assert_eq!(
+            state
+                .secure_vault
+                .get_enveloped(&manifest, &wrapping_key, "did:example:alice")
+                .await
+                .expect("get envelope")
+                .as_deref(),
+            Some(&b"private envelope block"[..]),
+            "authenticated secure vault path must read private envelope blocks"
+        );
+        assert!(
+            state
+                .block_store
+                .get(&encrypted_blob.cid)
+                .unwrap()
+                .is_none(),
+            "public block_store/block.get must not expose envelope ciphertext blocks"
+        );
+        assert!(
+            state.block_store.get(&manifest_cid).unwrap().is_none(),
+            "public block_store/block.get must not expose envelope manifests"
+        );
+
+        state
+            .shelf
+            .put(
+                kotoba_kse::BUCKET_VAULT_ENVELOPES,
+                encrypted_blob.cid.to_multibase(),
+                bytes::Bytes::from(manifest_cid.to_multibase()),
+            )
+            .await;
+        drop(state);
+
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS", "memory");
+        std::env::set_var("KOTOBA_STORE_PATH", &dir);
+        let reopened = KotobaState::new(None).expect("reopened");
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        std::env::remove_var("KOTOBA_IPNS");
+        std::env::remove_var("KOTOBA_STORE_PATH");
+
+        assert_eq!(
+            reopened.vault.get(&blob.cid).await.as_deref(),
+            Some(&b"private vault block"[..]),
+            "private vault block must survive KotobaState reopen"
+        );
+        let reopened_manifest = reopened
+            .secure_vault
+            .get_envelope_manifest(&manifest_cid)
+            .await
+            .expect("manifest read")
+            .expect("manifest exists after reopen");
+        assert_eq!(
+            reopened
+                .secure_vault
+                .get_enveloped(&reopened_manifest, &wrapping_key, "did:example:alice")
+                .await
+                .expect("get envelope after reopen")
+                .as_deref(),
+            Some(&b"private envelope block"[..]),
+            "private envelope must survive KotobaState reopen"
+        );
+        assert_eq!(
+            reopened
+                .shelf
+                .get(
+                    kotoba_kse::BUCKET_VAULT_ENVELOPES,
+                    &encrypted_blob.cid.to_multibase()
+                )
+                .await
+                .as_deref(),
+            Some(manifest_cid.to_multibase().as_bytes()),
+            "current envelope pointer must survive KotobaState reopen"
+        );
+        assert!(
+            reopened
+                .block_store
+                .get(&encrypted_blob.cid)
+                .unwrap()
+                .is_none(),
+            "reopened public block_store/block.get must still not expose envelope ciphertext"
+        );
+        assert!(
+            reopened.block_store.get(&manifest_cid).unwrap().is_none(),
+            "reopened public block_store/block.get must still not expose envelope manifest"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_wrapping_key_requires_crypto_initialization() {
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = KotobaState::new(None).expect("new");
+        let err = state
+            .pre_wrapping_key("did:example:alice")
+            .expect_err("pre_wrapping_key must require init_crypto");
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        assert!(
+            err.to_string().contains("crypto not initialised"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_wrapping_key_is_stable_and_bound_to_node_vault_key() {
+        std::env::set_var("KOTOBA_NO_KEYCHAIN", "1");
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS", "memory");
+        std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
+        std::env::remove_var("KOTOBA_AGENT_X25519_HEX");
+        std::env::remove_var("KOTOBA_AGENT_DID");
+
+        let owner_did = "did:example:owner";
+        let state_a = KotobaState::new(None)
+            .expect("state_a")
+            .init_crypto()
+            .await
+            .expect("init_crypto a");
+        let state_b = KotobaState::new(None)
+            .expect("state_b")
+            .init_crypto()
+            .await
+            .expect("init_crypto b");
+
+        let a1 = state_a.pre_wrapping_key(owner_did).expect("a1");
+        let a2 = state_a.pre_wrapping_key(owner_did).expect("a2");
+        let a3 = state_a
+            .pre_wrapping_key(&format!(" {owner_did}\n"))
+            .expect("trimmed owner");
+        let b = state_b.pre_wrapping_key(owner_did).expect("b");
+
+        std::env::remove_var("KOTOBA_NO_KEYCHAIN");
+        std::env::remove_var("KOTOBA_IPFS");
+        std::env::remove_var("KOTOBA_IPNS");
+
+        assert_eq!(a1.as_ref(), a2.as_ref(), "same node + owner is stable");
+        assert_eq!(
+            a1.as_ref(),
+            a3.as_ref(),
+            "outer whitespace is normalized before key derivation"
+        );
+        assert_ne!(
+            a1.as_ref(),
+            b.as_ref(),
+            "same owner on a different node vault key must derive a different wrapping key"
+        );
+    }
+
+    #[test]
+    fn pre_wrapping_owner_normalization_rejects_invalid_inputs() {
+        assert_eq!(
+            KotobaState::normalize_pre_wrapping_owner(" did:example:alice ").expect("trim"),
+            "did:example:alice"
+        );
+
+        for invalid in [
+            "",
+            "   ",
+            "did:example:alice bob",
+            "did:example:alice\nbob",
+            "did:example:alice\tbob",
+            "did:example:alice\u{7f}",
+            "did:example:alice\u{e9}",
+        ] {
+            assert!(
+                KotobaState::normalize_pre_wrapping_owner(invalid).is_err(),
+                "invalid owner_did should be rejected: {invalid:?}"
+            );
+        }
+
+        let oversized = "r".repeat(KotobaState::MAX_PRE_WRAPPING_OWNER_LEN + 1);
+        let err = KotobaState::normalize_pre_wrapping_owner(&oversized)
+            .expect_err("oversized owner_did must be rejected");
+        assert!(
+            err.to_string().contains("owner_did too long"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -57,7 +57,7 @@ impl From<PendingQuad> for SerializedQuad {
 /// Execution model (Kotoba Superstep):
 ///   1. Decode InvokeContext from Invoke.input (CBOR)
 ///   2. Load / compile program_cid → Component (via ProgramStore)
-///   3. Create Store<HostState> + bind all KOTOBA WIT host interfaces
+///   3. Create `Store<HostState>` + bind all KOTOBA WIT host interfaces
 ///   4. Instantiate Component → call guest export `run(ctx_cbor)`
 ///   5. Collect pending_asserts + pending_retracts from HostState
 ///   6. Return InvokeResult (caller appends to SourceChain + applies to Arrangement)

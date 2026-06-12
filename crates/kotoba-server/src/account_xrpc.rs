@@ -18,6 +18,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -52,6 +53,37 @@ fn validate_credential_id(id: &str) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
+fn validate_wrapped_ark(value: &str) -> Result<(), (StatusCode, String)> {
+    if value.is_empty() || value.len() > MAX_WRAP_B64_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("wrappedArk must be 1–{MAX_WRAP_B64_LEN} base64url chars"),
+        ));
+    }
+    if value.contains('=') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "wrappedArk must use unpadded base64url".to_string(),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "wrappedArk must contain only base64url characters [A-Za-z0-9_-]".to_string(),
+        ));
+    }
+    B64U.decode(value).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("wrappedArk base64url decode: {e}"),
+        )
+    })?;
+    Ok(())
+}
+
 /// Bearer JWT `sub` must be the account DID itself (or the operator). The wrap is
 /// opaque, but write/read is still gated to the owning member.
 fn require_owner_auth(
@@ -70,7 +102,10 @@ fn require_owner_auth(
             )
         })?;
     if crate::graph_auth::jwt_exp_elapsed(token) {
-        return Err((StatusCode::UNAUTHORIZED, "Bearer token has expired".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Bearer token has expired".to_string(),
+        ));
     }
     let sub = crate::graph_auth::jwt_sub(token).ok_or_else(|| {
         (
@@ -111,12 +146,7 @@ pub async fn put_wrapped_ark(
     validate_did(&req.did)?;
     validate_credential_id(&req.credential_id)?;
     require_owner_auth(&headers, &req.did, &state.operator_did)?;
-    if req.wrapped_ark.is_empty() || req.wrapped_ark.len() > MAX_WRAP_B64_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("wrappedArk must be 1–{MAX_WRAP_B64_LEN} base64url chars"),
-        ));
-    }
+    validate_wrapped_ark(&req.wrapped_ark)?;
 
     state
         .shelf
@@ -159,6 +189,12 @@ pub async fn get_wrapped_ark(
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("stored wrap malformed: {e}"),
+                )
+            })?;
+            validate_wrapped_ark(&wrapped).map_err(|(_, msg)| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("stored wrap malformed: {msg}"),
                 )
             })?;
             Ok(Json(serde_json::json!({
@@ -211,6 +247,29 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_ark_validation_accepts_base64url_no_pad() {
+        assert!(validate_wrapped_ark("AAAA").is_ok());
+        assert!(validate_wrapped_ark("YWJjZGVmZw").is_ok());
+        assert!(validate_wrapped_ark("AA-_").is_ok());
+    }
+
+    #[test]
+    fn wrapped_ark_validation_rejects_padding_and_non_urlsafe_chars() {
+        for bad in ["AAAA=", "AA+/", "AA AA", "AA\nAA"] {
+            assert!(
+                validate_wrapped_ark(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_ark_validation_rejects_empty_and_oversized() {
+        assert!(validate_wrapped_ark("").is_err());
+        assert!(validate_wrapped_ark(&"A".repeat(MAX_WRAP_B64_LEN + 1)).is_err());
+    }
+
+    #[test]
     fn credential_id_accepts_exactly_max_len() {
         assert!(validate_credential_id(&"a".repeat(MAX_CRED_ID_LEN)).is_ok());
     }
@@ -218,7 +277,10 @@ mod tests {
     #[test]
     fn credential_id_rejects_special_chars() {
         for bad in ["a b", "a/b", "a@b", "a#b", "a\u{0}b"] {
-            assert!(validate_credential_id(bad).is_err(), "{bad:?} should be rejected");
+            assert!(
+                validate_credential_id(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
         }
     }
 

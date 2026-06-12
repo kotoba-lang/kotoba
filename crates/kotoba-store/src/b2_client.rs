@@ -24,6 +24,16 @@ type HmacSha256 = Hmac<Sha256>;
 /// SHA-256 of the empty payload — the `x-amz-content-sha256` value for bodyless
 /// requests (GET / HEAD / LIST).
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const MAX_B2_ENDPOINT_LEN: usize = 2048;
+const MAX_B2_BUCKET_LEN: usize = 128;
+const MAX_B2_REGION_LEN: usize = 64;
+const MAX_B2_KEY_ID_LEN: usize = 256;
+const MAX_B2_APP_KEY_LEN: usize = 512;
+const MAX_B2_OBJECT_KEY_LEN: usize = 1024;
+const MAX_B2_LIST_PREFIX_LEN: usize = 1024;
+const MAX_B2_LIST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_B2_CONTINUATION_TOKEN_LEN: usize = 2048;
+const MAX_B2_LIST_PAGES: usize = 1_000_000;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -49,13 +59,7 @@ impl B2Config {
         let key_id = v("KOTOBA_B2_KEY_ID")?;
         let app_key = v("KOTOBA_B2_APP_KEY")?;
         let region = v("KOTOBA_B2_REGION").unwrap_or_else(|| region_from_endpoint(&endpoint));
-        Some(Self {
-            endpoint: endpoint.trim_end_matches('/').to_string(),
-            bucket,
-            region,
-            key_id,
-            app_key,
-        })
+        normalize_config(endpoint, bucket, region, key_id, app_key).ok()
     }
 
     fn host(&self) -> &str {
@@ -64,6 +68,213 @@ impl B2Config {
             .or_else(|| self.endpoint.strip_prefix("http://"))
             .unwrap_or(&self.endpoint)
     }
+}
+
+fn normalize_config(
+    endpoint: String,
+    bucket: String,
+    region: String,
+    key_id: String,
+    app_key: String,
+) -> Result<B2Config> {
+    Ok(B2Config {
+        endpoint: normalize_endpoint(&endpoint)?,
+        bucket: validate_plain_component("bucket", bucket, MAX_B2_BUCKET_LEN)?,
+        region: validate_plain_component("region", region, MAX_B2_REGION_LEN)?,
+        key_id: validate_plain_component("key_id", key_id, MAX_B2_KEY_ID_LEN)?,
+        app_key: validate_plain_component("app_key", app_key, MAX_B2_APP_KEY_LEN)?,
+    })
+}
+
+fn normalize_endpoint(endpoint: &str) -> Result<String> {
+    let endpoint = endpoint.trim();
+    anyhow::ensure!(!endpoint.is_empty(), "b2 endpoint must be non-empty");
+    anyhow::ensure!(
+        endpoint.len() <= MAX_B2_ENDPOINT_LEN,
+        "b2 endpoint too long: {} > {MAX_B2_ENDPOINT_LEN}",
+        endpoint.len()
+    );
+    anyhow::ensure!(
+        !has_control(endpoint),
+        "b2 endpoint must not contain control characters"
+    );
+    let parsed = reqwest::Url::parse(endpoint).context("invalid b2 endpoint URL")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "https" | "http"),
+        "b2 endpoint scheme must be http or https"
+    );
+    anyhow::ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "b2 endpoint must not contain userinfo"
+    );
+    anyhow::ensure!(
+        parsed.host_str().is_some(),
+        "b2 endpoint must include a host"
+    );
+    anyhow::ensure!(
+        matches!(parsed.path(), "" | "/")
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "b2 endpoint must not include path, query, or fragment"
+    );
+    let mut normalized = parsed;
+    normalized.set_path("");
+    normalized.set_query(None);
+    normalized.set_fragment(None);
+    Ok(normalized.as_str().trim_end_matches('/').to_string())
+}
+
+fn validate_plain_component(name: &str, value: String, max_len: usize) -> Result<String> {
+    let value = value.trim().to_string();
+    anyhow::ensure!(!value.is_empty(), "b2 {name} must be non-empty");
+    anyhow::ensure!(
+        value.len() <= max_len,
+        "b2 {name} too long: {} > {max_len}",
+        value.len()
+    );
+    anyhow::ensure!(
+        !has_control(&value),
+        "b2 {name} must not contain control characters"
+    );
+    Ok(value)
+}
+
+fn validate_object_key(key: &str) -> Result<()> {
+    anyhow::ensure!(!key.is_empty(), "b2 object key must be non-empty");
+    validate_pathish_component("object key", key, MAX_B2_OBJECT_KEY_LEN)
+}
+
+fn validate_list_prefix(prefix: &str) -> Result<()> {
+    validate_pathish_component("list prefix", prefix, MAX_B2_LIST_PREFIX_LEN)
+}
+
+fn validate_continuation_token(token: &str) -> Result<()> {
+    anyhow::ensure!(!token.is_empty(), "b2 continuation token must be non-empty");
+    anyhow::ensure!(
+        token.len() <= MAX_B2_CONTINUATION_TOKEN_LEN,
+        "b2 continuation token too long: {} > {MAX_B2_CONTINUATION_TOKEN_LEN}",
+        token.len()
+    );
+    anyhow::ensure!(
+        !has_control(token),
+        "b2 continuation token must not contain control characters"
+    );
+    Ok(())
+}
+
+fn validate_next_list_token(previous: Option<&str>, next: Option<&str>) -> Result<()> {
+    if let Some(token) = next {
+        validate_continuation_token(token)?;
+        anyhow::ensure!(
+            previous != Some(token),
+            "b2 LIST continuation token did not advance"
+        );
+    }
+    Ok(())
+}
+
+fn validate_pathish_component(name: &str, value: &str, max_len: usize) -> Result<()> {
+    anyhow::ensure!(
+        value.len() <= max_len,
+        "b2 {name} too long: {} > {max_len}",
+        value.len()
+    );
+    anyhow::ensure!(
+        !has_control(value),
+        "b2 {name} must not contain control characters"
+    );
+    anyhow::ensure!(!value.starts_with('/'), "b2 {name} must be relative");
+    Ok(())
+}
+
+fn has_control(value: &str) -> bool {
+    value.bytes().any(|b| b.is_ascii_control())
+}
+
+fn parse_list_objects_body(body: &str) -> Result<(Vec<String>, Option<String>)> {
+    anyhow::ensure!(
+        body.len() <= MAX_B2_LIST_RESPONSE_BYTES,
+        "b2 LIST response too large: {} > {MAX_B2_LIST_RESPONSE_BYTES}",
+        body.len()
+    );
+    let keys = extract_xml_tag_texts(body, "Key")?;
+    for key in &keys {
+        validate_object_key(key).with_context(|| format!("invalid b2 LIST object key: {key:?}"))?;
+    }
+    let truncated = extract_xml_tag_texts(body, "IsTruncated")?
+        .into_iter()
+        .any(|s| s.trim().eq_ignore_ascii_case("true"));
+    let token = if truncated {
+        let mut tokens = extract_xml_tag_texts(body, "NextContinuationToken")?;
+        anyhow::ensure!(
+            !tokens.is_empty(),
+            "b2 LIST response is truncated but has no NextContinuationToken"
+        );
+        let token = tokens.remove(0);
+        validate_continuation_token(&token)?;
+        Some(token)
+    } else {
+        None
+    };
+    Ok((keys, token))
+}
+
+fn extract_xml_tag_texts(body: &str, tag: &str) -> Result<Vec<String>> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&open) {
+        let after_open = &rest[start + open.len()..];
+        let Some(end) = after_open.find(&close) else {
+            anyhow::bail!("b2 LIST response has unterminated <{tag}> element");
+        };
+        values.push(decode_xml_text(&after_open[..end])?);
+        rest = &after_open[end + close.len()..];
+    }
+    Ok(values)
+}
+
+fn decode_xml_text(text: &str) -> Result<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos + 1..];
+        let Some(end) = rest.find(';') else {
+            anyhow::bail!("unterminated XML entity in b2 LIST response");
+        };
+        let entity = &rest[..end];
+        if entity == "amp" {
+            out.push('&');
+        } else if entity == "lt" {
+            out.push('<');
+        } else if entity == "gt" {
+            out.push('>');
+        } else if entity == "quot" {
+            out.push('"');
+        } else if entity == "apos" {
+            out.push('\'');
+        } else if let Some(hex) = entity.strip_prefix("#x") {
+            let code = u32::from_str_radix(hex, 16)
+                .with_context(|| format!("invalid XML hex entity: &{entity};"))?;
+            let ch =
+                char::from_u32(code).ok_or_else(|| anyhow!("invalid XML codepoint: &{entity};"))?;
+            out.push(ch);
+        } else if let Some(dec) = entity.strip_prefix('#') {
+            let code = dec
+                .parse::<u32>()
+                .with_context(|| format!("invalid XML decimal entity: &{entity};"))?;
+            let ch =
+                char::from_u32(code).ok_or_else(|| anyhow!("invalid XML codepoint: &{entity};"))?;
+            out.push(ch);
+        } else {
+            anyhow::bail!("unknown XML entity in b2 LIST response: &{entity};");
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// `https://s3.us-west-004.backblazeb2.com` → `us-west-004`. Falls back to
@@ -153,6 +364,14 @@ fn canonical_request(
     )
 }
 
+fn range_header(start: u64, len: u64) -> Result<String> {
+    anyhow::ensure!(len > 0, "b2 range length must be non-zero");
+    let end = start
+        .checked_add(len - 1)
+        .ok_or_else(|| anyhow!("b2 range end overflows u64: start={start}, len={len}"))?;
+    Ok(format!("bytes={start}-{end}"))
+}
+
 // ─── Timestamp (no chrono dep) ───────────────────────────────────────────────
 
 /// `(amzdate "YYYYMMDDTHHMMSSZ", datestamp "YYYYMMDD")` for a unix second count.
@@ -161,7 +380,11 @@ fn canonical_request(
 fn amz_timestamps(unix_secs: u64) -> (String, String) {
     let days = (unix_secs / 86_400) as i64;
     let secs_of_day = unix_secs % 86_400;
-    let (h, mi, s) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
+    let (h, mi, s) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
 
     // days since 1970-01-01 → civil (y, m, d). Hinnant, "chrono-Compatible Low-Level Date Algorithms".
     let z = days + 719_468;
@@ -235,9 +458,8 @@ impl B2Client {
             )
         };
         // Signed headers: host;x-amz-content-sha256;x-amz-date (alphabetical).
-        let canonical_headers = format!(
-            "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amzdate}\n"
-        );
+        let canonical_headers =
+            format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amzdate}\n");
         let signed_headers = "host;x-amz-content-sha256;x-amz-date";
         let creq = canonical_request(
             method,
@@ -274,7 +496,7 @@ impl B2Client {
             .header("x-amz-date", &amzdate)
             .header("authorization", authorization);
         if let Some((start, len)) = range {
-            rb = rb.header("range", format!("bytes={}-{}", start, start + len - 1));
+            rb = rb.header("range", range_header(start, len)?);
         }
         if let Some(b) = body {
             rb = rb.body(b.to_vec());
@@ -284,6 +506,7 @@ impl B2Client {
 
     /// PutObject — single PUT of `body` under `key`. `key` is the CAR object name.
     pub async fn put_object(&self, key: &str, body: &[u8]) -> Result<()> {
+        validate_object_key(key)?;
         let resp = self.send("PUT", key, "", None, Some(body)).await?;
         let status = resp.status();
         if !status.is_success() {
@@ -295,40 +518,49 @@ impl B2Client {
 
     /// GetObject — full object bytes.
     pub async fn get_object(&self, key: &str) -> Result<Bytes> {
+        validate_object_key(key)?;
         let resp = self.send("GET", key, "", None, None).await?;
         let status = resp.status();
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();
             return Err(anyhow!("b2 GET {key} → {status}: {txt}"));
         }
-        Ok(resp.bytes().await.context("b2 GET body")?)
+        resp.bytes().await.context("b2 GET body")
     }
 
     /// GetObject with a `Range: bytes=start-(start+len-1)` — the CAR ranged read.
     pub async fn get_object_range(&self, key: &str, start: u64, len: u64) -> Result<Bytes> {
-        let resp = self
-            .send("GET", key, "", Some((start, len)), None)
-            .await?;
+        validate_object_key(key)?;
+        let _ = range_header(start, len)?;
+        let resp = self.send("GET", key, "", Some((start, len)), None).await?;
         let status = resp.status();
         // 206 Partial Content on success; some gateways return 200 for full-range.
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();
             return Err(anyhow!("b2 GET-range {key} → {status}: {txt}"));
         }
-        Ok(resp.bytes().await.context("b2 GET-range body")?)
+        resp.bytes().await.context("b2 GET-range body")
     }
 
     /// HeadObject — `true` if the key exists (200), `false` on 404.
     pub async fn head_object(&self, key: &str) -> Result<bool> {
+        validate_object_key(key)?;
         let resp = self.send("HEAD", key, "", None, None).await?;
         Ok(resp.status().is_success())
     }
 
     /// ListObjectsV2 under `prefix` → all keys (follows continuation tokens).
     pub async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+        validate_list_prefix(prefix)?;
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
+        let mut pages = 0usize;
         loop {
+            pages += 1;
+            anyhow::ensure!(
+                pages <= MAX_B2_LIST_PAGES,
+                "b2 LIST exceeded page limit {MAX_B2_LIST_PAGES}"
+            );
             // Canonical query: params sorted by key, values uri-encoded (slash too).
             let mut params: Vec<(String, String)> = vec![("list-type".into(), "2".into())];
             if !prefix.is_empty() {
@@ -346,25 +578,20 @@ impl B2Client {
 
             let resp = self.send("GET", "", &query, None, None).await?;
             let status = resp.status();
-            let body = resp.text().await.context("b2 LIST body")?;
+            let body = resp.bytes().await.context("b2 LIST body")?;
+            anyhow::ensure!(
+                body.len() <= MAX_B2_LIST_RESPONSE_BYTES,
+                "b2 LIST response too large: {} > {MAX_B2_LIST_RESPONSE_BYTES}",
+                body.len()
+            );
+            let body = std::str::from_utf8(&body).context("b2 LIST body is not UTF-8")?;
             if !status.is_success() {
                 return Err(anyhow!("b2 LIST → {status}: {body}"));
             }
-            for cap in body.split("<Key>").skip(1) {
-                if let Some(end) = cap.find("</Key>") {
-                    keys.push(cap[..end].to_string());
-                }
-            }
-            // <IsTruncated>true</IsTruncated> + <NextContinuationToken>…</…>
-            let truncated = body.contains("<IsTruncated>true</IsTruncated>");
-            token = if truncated {
-                body.split("<NextContinuationToken>")
-                    .nth(1)
-                    .and_then(|s| s.split("</NextContinuationToken>").next())
-                    .map(|s| s.to_string())
-            } else {
-                None
-            };
+            let (page_keys, next_token) = parse_list_objects_body(body)?;
+            validate_next_list_token(token.as_deref(), next_token.as_deref())?;
+            keys.extend(page_keys);
+            token = next_token;
             if token.is_none() {
                 break;
             }
@@ -410,13 +637,21 @@ where
 {
     let rt = b2_runtime();
     match tokio::runtime::Handle::try_current() {
-        Ok(_) => {
+        Ok(handle) => {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             rt.spawn(async move {
                 let _ = tx.send(fut.await);
             });
-            tokio::task::block_in_place(|| rx.recv())
-                .expect("b2-io runtime dropped the in-flight result")
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                tokio::task::block_in_place(|| rx.recv())
+                    .expect("b2-io runtime dropped the in-flight result")
+            } else {
+                rx.recv()
+                    .expect("b2-io runtime dropped the in-flight result")
+            }
         }
         Err(_) => rt.block_on(fut),
     }
@@ -428,6 +663,11 @@ where
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn b2_block_on_works_inside_current_thread_runtime() {
+        assert_eq!(b2_block_on(async { 7usize }), 7);
+    }
+
     #[test]
     fn region_parsed_from_endpoint() {
         assert_eq!(
@@ -438,10 +678,221 @@ mod tests {
     }
 
     #[test]
+    fn normalize_endpoint_accepts_http_https_and_strips_trailing_slash() {
+        assert_eq!(
+            normalize_endpoint("https://s3.us-west-004.backblazeb2.com/").unwrap(),
+            "https://s3.us-west-004.backblazeb2.com"
+        );
+        assert_eq!(
+            normalize_endpoint("http://localhost:9000").unwrap(),
+            "http://localhost:9000"
+        );
+    }
+
+    #[test]
+    fn normalize_endpoint_rejects_ambiguous_or_header_unsafe_values() {
+        for endpoint in [
+            "ftp://s3.us-west-004.backblazeb2.com",
+            "https://user:pass@s3.us-west-004.backblazeb2.com",
+            "https://s3.us-west-004.backblazeb2.com/bucket",
+            "https://s3.us-west-004.backblazeb2.com?x=1",
+            "https://s3.us-west-004.backblazeb2.com#frag",
+            "https://s3.us-west-004.backblazeb2.com\r\nx: y",
+        ] {
+            assert!(
+                normalize_endpoint(endpoint).is_err(),
+                "endpoint should be rejected: {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_config_trims_and_rejects_control_characters_in_header_fields() {
+        let cfg = normalize_config(
+            " https://s3.us-west-004.backblazeb2.com/ ".to_string(),
+            " bucket-name ".to_string(),
+            " us-west-004 ".to_string(),
+            " key-id ".to_string(),
+            " app-key ".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.endpoint, "https://s3.us-west-004.backblazeb2.com");
+        assert_eq!(cfg.bucket, "bucket-name");
+        assert_eq!(cfg.region, "us-west-004");
+        assert_eq!(cfg.key_id, "key-id");
+        assert_eq!(cfg.app_key, "app-key");
+
+        assert!(
+            normalize_config(
+                "https://s3.us-west-004.backblazeb2.com".to_string(),
+                "bucket".to_string(),
+                "us-west-004\nx: y".to_string(),
+                "key-id".to_string(),
+                "app-key".to_string(),
+            )
+            .is_err(),
+            "region is embedded in Authorization and must be header-safe"
+        );
+        assert!(
+            normalize_config(
+                "https://s3.us-west-004.backblazeb2.com".to_string(),
+                "bucket".to_string(),
+                "us-west-004".to_string(),
+                "key-id\r\nx: y".to_string(),
+                "app-key".to_string(),
+            )
+            .is_err(),
+            "key_id is embedded in Authorization and must be header-safe"
+        );
+    }
+
+    #[test]
     fn uri_encode_rules() {
         assert_eq!(uri_encode("a/b c", false), "a/b%20c"); // path keeps slash
         assert_eq!(uri_encode("a/b c", true), "a%2Fb%20c"); // query encodes slash
         assert_eq!(uri_encode("Aa0-_.~", false), "Aa0-_.~"); // unreserved untouched
+    }
+
+    #[test]
+    fn object_key_validation_allows_relative_prefixes_but_rejects_unsafe_values() {
+        validate_object_key("kotoba/cars/object.kcar").unwrap();
+        assert!(validate_object_key("").is_err());
+        assert!(validate_object_key("/absolute").is_err());
+        assert!(validate_object_key("bad\nkey").is_err());
+        assert!(validate_object_key(&"x".repeat(MAX_B2_OBJECT_KEY_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn list_prefix_validation_allows_empty_prefix_but_rejects_unsafe_values() {
+        validate_list_prefix("").unwrap();
+        validate_list_prefix("kotoba/cars/").unwrap();
+        assert!(validate_list_prefix("/absolute").is_err());
+        assert!(validate_list_prefix("bad\rprefix").is_err());
+        assert!(validate_list_prefix(&"x".repeat(MAX_B2_LIST_PREFIX_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn parse_list_objects_body_decodes_keys_and_continuation_token() {
+        let body = r#"
+            <ListBucketResult>
+              <Contents><Key>kotoba/cars/a&amp;b.kcar</Key></Contents>
+              <Contents><Key>kotoba/cars/lt&#x2F;gt&#47;&lt;&gt;.kcar</Key></Contents>
+              <IsTruncated>true</IsTruncated>
+              <NextContinuationToken>tok&amp;en&#45;1</NextContinuationToken>
+            </ListBucketResult>
+        "#;
+
+        let (keys, token) = parse_list_objects_body(body).unwrap();
+
+        assert_eq!(
+            keys,
+            vec![
+                "kotoba/cars/a&b.kcar".to_string(),
+                "kotoba/cars/lt/gt/<>.kcar".to_string(),
+            ]
+        );
+        assert_eq!(token.as_deref(), Some("tok&en-1"));
+    }
+
+    #[test]
+    fn parse_list_objects_body_rejects_truncated_without_token() {
+        let err = parse_list_objects_body(
+            "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("NextContinuationToken"),
+            "truncated LIST pages must not be treated as complete: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_list_objects_body_rejects_invalid_returned_key() {
+        let err = parse_list_objects_body(
+            "<ListBucketResult><Contents><Key>/absolute</Key></Contents></ListBucketResult>",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("invalid b2 LIST object key"),
+            "LIST keys are fed into signed object requests and must be validated: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_list_objects_body_rejects_invalid_continuation_token() {
+        let body = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>bad&#10;token</NextContinuationToken></ListBucketResult>";
+
+        let err = parse_list_objects_body(body).unwrap_err();
+
+        assert!(
+            err.to_string().contains("continuation token"),
+            "continuation tokens become query params and must be bounded/header-safe: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_next_list_token_rejects_non_advancing_or_invalid_token() {
+        validate_next_list_token(None, None).unwrap();
+        validate_next_list_token(None, Some("page-1")).unwrap();
+        validate_next_list_token(Some("page-1"), Some("page-2")).unwrap();
+
+        let same = validate_next_list_token(Some("page-1"), Some("page-1")).unwrap_err();
+        assert!(
+            same.to_string().contains("did not advance"),
+            "same continuation token would loop forever: {same}"
+        );
+
+        let invalid = validate_next_list_token(Some("page-1"), Some("bad\ntoken")).unwrap_err();
+        assert!(
+            invalid.to_string().contains("continuation token"),
+            "next token should still pass token validation: {invalid}"
+        );
+    }
+
+    #[test]
+    fn parse_list_objects_body_rejects_oversized_response() {
+        let body = "x".repeat(MAX_B2_LIST_RESPONSE_BYTES + 1);
+
+        let err = parse_list_objects_body(&body).unwrap_err();
+
+        assert!(
+            err.to_string().contains("LIST response too large"),
+            "untrusted LIST responses must be bounded before parsing: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_xml_text_rejects_unknown_or_unterminated_entities() {
+        assert!(decode_xml_text("bad &bogus; entity").is_err());
+        assert!(decode_xml_text("bad &amp entity").is_err());
+    }
+
+    #[test]
+    fn range_header_rejects_zero_len() {
+        let err = range_header(72, 0).unwrap_err();
+
+        assert!(
+            err.to_string().contains("non-zero"),
+            "zero-length ranges must be handled before building an HTTP Range header: {err}"
+        );
+    }
+
+    #[test]
+    fn range_header_rejects_overflowing_end() {
+        let err = range_header(u64::MAX, 2).unwrap_err();
+
+        assert!(
+            err.to_string().contains("overflows"),
+            "range end arithmetic must not wrap: {err}"
+        );
+    }
+
+    #[test]
+    fn range_header_formats_inclusive_end() {
+        assert_eq!(range_header(72, 4).unwrap(), "bytes=72-75");
     }
 
     #[test]
@@ -529,13 +980,19 @@ mod tests {
         let body: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
 
         client.put_object(key, &body).await.expect("PUT");
-        assert!(client.head_object(key).await.expect("HEAD"), "object should exist");
+        assert!(
+            client.head_object(key).await.expect("HEAD"),
+            "object should exist"
+        );
 
         let full = client.get_object(key).await.expect("GET");
         assert_eq!(&full[..], &body[..], "full GET bytes mismatch");
 
         let (start, len) = (1000u64, 256u64);
-        let ranged = client.get_object_range(key, start, len).await.expect("GET range");
+        let ranged = client
+            .get_object_range(key, start, len)
+            .await
+            .expect("GET range");
         assert_eq!(
             &ranged[..],
             &body[start as usize..(start + len) as usize],
@@ -544,6 +1001,10 @@ mod tests {
 
         let keys = client.list_objects("kotoba/cars/").await.expect("LIST");
         assert!(keys.iter().any(|k| k == key), "LIST should contain the key");
-        println!("b2_live_roundtrip OK: bucket={} key={}", client.bucket(), key);
+        println!(
+            "b2_live_roundtrip OK: bucket={} key={}",
+            client.bucket(),
+            key
+        );
     }
 }

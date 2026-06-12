@@ -37,6 +37,10 @@ use kotoba_crypto::{AgentCrypto, CryptoError, VaultKeyedCrypto};
 use crate::agent_identity::AgentIdentity;
 use crate::store::KseStore;
 
+const MAX_KEY_REF_BYTES: usize = 1024;
+const MAX_WRAPPED_KEY_BLOCK_BYTES: usize = 64 * 1024;
+const MAX_KEY_VERSION: u64 = 1_000_000_000;
+
 // ── Key pointer JSON ──────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -83,14 +87,8 @@ impl SovereignCrypto {
             // unreachable, block present-but-corrupt, HPKE unwrap failed). Re-genesis
             // fires ONLY on `Ok(None)` — see the match below.
             let result: Result<Option<Self>> = (async {
-                let data = kse_store
-                    .get(&cur_key)
-                    .await
-                    .context("read key-ref pointer")?;
-                let key_ref: KeyRef =
-                    serde_json::from_slice(&data).context("parse key-ref JSON")?;
-                let cid = KotobaCid::from_multibase(&key_ref.cid)
-                    .ok_or_else(|| anyhow!("parse key ref CID: {}", key_ref.cid))?;
+                let key_ref = read_key_ref(kse_store, &cur_key).await?;
+                let cid = key_ref.cid()?;
                 // Symmetric retry with store_block_durable: the cold IPFS
                 // sidecar (Kubo) often isn't bound to localhost:5001 yet
                 // when init_crypto runs at t≈0.4s after process start.
@@ -108,8 +106,7 @@ impl SovereignCrypto {
                 // tampering, or a wrong-identity load — NOT a missing block. It must
                 // be a hard error so we never re-genesis OVER a recoverable key and
                 // orphan every blob encrypted under it.
-                let wrapped = decode_wrapped_block(&block)
-                    .context("decode wrapped key block")?;
+                let wrapped = decode_wrapped_block(&block).context("decode wrapped key block")?;
                 let vault_key_bytes =
                     hpke_open(&identity.dh_secret, &wrapped).context("HPKE unwrap vault key")?;
                 if vault_key_bytes.len() != 32 {
@@ -224,11 +221,10 @@ impl SovereignCrypto {
 
         // Read current pointer for archiving
         let current_version = if kse_store.exists(&cur_key).await {
-            let data = kse_store
-                .get(&cur_key)
+            let kr = read_key_ref(kse_store, &cur_key)
                 .await
                 .context("read current key-ref")?;
-            let kr: KeyRef = serde_json::from_slice(&data).context("parse current key-ref")?;
+            let data = encode_key_ref(&kr).context("serialize current key-ref for archive")?;
             // Archive as v{N}
             let archive_key = format!("agent/crypto/{slug}/v{}.json", kr.version);
             kse_store
@@ -247,12 +243,15 @@ impl SovereignCrypto {
         // Wrap and store
         let pk = identity.x25519_public_key();
         let wrapped = hpke_seal(&pk, raw_key.as_ref()).context("HPKE wrap rotated vault key")?;
-        let block = encode_wrapped_block(&wrapped)
-            .context("CBOR-encode rotated wrapped key block")?;
-        let cid = store_block(block_store, &block)?;
+        let block =
+            encode_wrapped_block(&wrapped).context("CBOR-encode rotated wrapped key block")?;
+        let cid = store_block_durable(block_store, &block).await?;
         let cid_mb = cid.to_multibase();
 
-        let new_version = current_version + 1;
+        let new_version = current_version
+            .checked_add(1)
+            .filter(|version| *version <= MAX_KEY_VERSION)
+            .ok_or_else(|| anyhow!("key-ref version overflow"))?;
         let key_ref = KeyRef {
             cid: cid_mb.clone(),
             version: new_version,
@@ -316,12 +315,68 @@ impl AgentCrypto for SovereignCrypto {
 
 /// Write a `KeyRef` as `current.json` (always overwrites).
 async fn write_key_ref(kse_store: &KseStore, slug: &str, key_ref: &KeyRef) -> Result<()> {
-    let json = serde_json::to_vec(key_ref).context("serialize key-ref")?;
+    validate_slug(slug)?;
+    let json = encode_key_ref(key_ref)?;
     let cur_key = format!("agent/crypto/{slug}/current.json");
     kse_store
-        .put(&cur_key, Bytes::from(json))
+        .put(&cur_key, json)
         .await
         .context("write key-ref pointer")?;
+    Ok(())
+}
+
+impl KeyRef {
+    fn validate(&self) -> Result<()> {
+        if self.version == 0 || self.version > MAX_KEY_VERSION {
+            return Err(anyhow!("invalid key-ref version: {}", self.version));
+        }
+        self.cid()?;
+        Ok(())
+    }
+
+    fn cid(&self) -> Result<KotobaCid> {
+        if self.cid.len() > 512 {
+            return Err(anyhow!("key-ref CID too long: {} bytes", self.cid.len()));
+        }
+        KotobaCid::from_multibase(&self.cid)
+            .ok_or_else(|| anyhow!("parse key ref CID: {}", self.cid))
+    }
+}
+
+fn encode_key_ref(key_ref: &KeyRef) -> Result<Bytes> {
+    key_ref.validate()?;
+    let json = serde_json::to_vec(key_ref).context("serialize key-ref")?;
+    if json.len() > MAX_KEY_REF_BYTES {
+        return Err(anyhow!(
+            "key-ref JSON too large: {} bytes > {}",
+            json.len(),
+            MAX_KEY_REF_BYTES
+        ));
+    }
+    Ok(Bytes::from(json))
+}
+
+async fn read_key_ref(kse_store: &KseStore, key: &str) -> Result<KeyRef> {
+    let data = kse_store.get(key).await.context("read key-ref pointer")?;
+    if data.len() > MAX_KEY_REF_BYTES {
+        return Err(anyhow!(
+            "key-ref JSON too large: {} bytes > {}",
+            data.len(),
+            MAX_KEY_REF_BYTES
+        ));
+    }
+    let key_ref: KeyRef = serde_json::from_slice(&data).context("parse key-ref JSON")?;
+    key_ref.validate()?;
+    Ok(key_ref)
+}
+
+fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty() || slug.len() > 64 {
+        return Err(anyhow!("invalid DID slug length: {}", slug.len()));
+    }
+    if !slug.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!("DID slug must be ASCII hex"));
+    }
     Ok(())
 }
 
@@ -346,6 +401,9 @@ async fn load_block_durable(
         }
         match block_store.get(cid) {
             Ok(Some(b)) => {
+                if KotobaCid::from_bytes(&b) != *cid {
+                    return Err(anyhow!("wrapped key block CID mismatch"));
+                }
                 if i > 0 {
                     tracing::info!(cid = %cid.to_multibase(), attempts = i + 1,
                         "load_block_durable: retrieved after retry");
@@ -371,9 +429,22 @@ async fn load_block_durable(
 /// key a single `bytes(...)` CBOR atom — parseable, no children, eligible
 /// for direct pinning.
 fn encode_wrapped_block(wrapped: &[u8]) -> Result<Vec<u8>> {
+    if wrapped.is_empty() || wrapped.len() > MAX_WRAPPED_KEY_BLOCK_BYTES {
+        return Err(anyhow!(
+            "wrapped key block payload has invalid size: {} bytes",
+            wrapped.len()
+        ));
+    }
     let mut buf = Vec::with_capacity(wrapped.len() + 16);
     ciborium::into_writer(&serde_bytes::Bytes::new(wrapped), &mut buf)
         .map_err(|e| anyhow!("cbor encode wrapped key block: {e}"))?;
+    if buf.len() > MAX_WRAPPED_KEY_BLOCK_BYTES {
+        return Err(anyhow!(
+            "wrapped key block too large: {} bytes > {}",
+            buf.len(),
+            MAX_WRAPPED_KEY_BLOCK_BYTES
+        ));
+    }
     Ok(buf)
 }
 
@@ -381,21 +452,26 @@ fn encode_wrapped_block(wrapped: &[u8]) -> Result<Vec<u8>> {
 /// verbatim when decoding fails so legacy blocks (written before the
 /// CBOR-wrapping fix) remain loadable across the upgrade.
 fn decode_wrapped_block(block: &[u8]) -> Result<Vec<u8>> {
+    if block.is_empty() || block.len() > MAX_WRAPPED_KEY_BLOCK_BYTES {
+        return Err(anyhow!(
+            "wrapped key block has invalid size: {} bytes",
+            block.len()
+        ));
+    }
     let decoded: Result<serde_bytes::ByteBuf, _> = ciborium::from_reader(block);
     match decoded {
-        Ok(buf) => Ok(buf.into_vec()),
+        Ok(buf) => {
+            let bytes = buf.into_vec();
+            if bytes.is_empty() || bytes.len() > MAX_WRAPPED_KEY_BLOCK_BYTES {
+                return Err(anyhow!(
+                    "decoded wrapped key payload has invalid size: {} bytes",
+                    bytes.len()
+                ));
+            }
+            Ok(bytes)
+        }
         Err(_) => Ok(block.to_vec()),
     }
-}
-
-/// Store raw bytes in the BlockStore and return the CID.
-fn store_block(block_store: &Arc<dyn BlockStore + Send + Sync>, data: &[u8]) -> Result<KotobaCid> {
-    // CID = IPFS-compatible content-address of the stored bytes.
-    let cid = KotobaCid::from_bytes(data);
-    block_store
-        .put(&cid, data)
-        .context("write wrapped key block")?;
-    Ok(cid)
 }
 
 /// Store raw bytes using the BlockStore's `put_durable` path (= synchronous
@@ -643,6 +719,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_key_ref_version_fails_loud_without_regenesis() {
+        let dir = tmp_dir("bad-key-ref-version");
+        let (kse, blk) = make_stores(&dir);
+        let id = AgentIdentity::generate_ephemeral();
+        let slug = id.did_slug();
+        let cur_key = format!("agent/crypto/{slug}/current.json");
+        let bad = KeyRef {
+            cid: KotobaCid::from_bytes(b"valid-looking wrapped key cid").to_multibase(),
+            version: 0,
+        };
+        kse.put(
+            &cur_key,
+            Bytes::from(serde_json::to_vec(&bad).expect("serialize bad pointer")),
+        )
+        .await
+        .unwrap();
+
+        let result = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await;
+        assert!(
+            result.is_err(),
+            "invalid existing pointer must fail loud, not re-genesis"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_key_ref_pointer_fails_loud_without_regenesis() {
+        let dir = tmp_dir("oversized-key-ref");
+        let (kse, blk) = make_stores(&dir);
+        let id = AgentIdentity::generate_ephemeral();
+        let slug = id.did_slug();
+        let cur_key = format!("agent/crypto/{slug}/current.json");
+        kse.put(&cur_key, Bytes::from(vec![b' '; MAX_KEY_REF_BYTES + 1]))
+            .await
+            .unwrap();
+
+        let result = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await;
+        assert!(
+            result.is_err(),
+            "oversized existing pointer must fail loud, not re-genesis"
+        );
+    }
+
+    #[test]
+    fn wrapped_key_block_size_limits_are_enforced() {
+        assert!(encode_wrapped_block(&[]).is_err());
+        assert!(encode_wrapped_block(&vec![0u8; MAX_WRAPPED_KEY_BLOCK_BYTES + 1]).is_err());
+        assert!(decode_wrapped_block(&[]).is_err());
+        assert!(decode_wrapped_block(&vec![0u8; MAX_WRAPPED_KEY_BLOCK_BYTES + 1]).is_err());
+    }
+
+    #[tokio::test]
     async fn two_independent_identities_have_isolated_keys() {
         let dir1 = tmp_dir("iso-1");
         let dir2 = tmp_dir("iso-2");
@@ -696,8 +823,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Resolve the wrapped-block CID from the pointer, then corrupt the block
-        // IN PLACE (overwrite at its CID with a flipped tag byte) — present, but bad.
+        // Resolve the wrapped-block CID from the pointer, then simulate a
+        // PRESENT-but-corrupt cold tier. BlockStore::put now rejects CID
+        // mismatches, so corruption has to be modeled on read rather than by
+        // writing mismatched bytes through the store API.
         let slug = id.did_slug();
         let cur_key = format!("agent/crypto/{slug}/current.json");
         let ptr = kse.get(&cur_key).await.expect("pointer present");
@@ -707,12 +836,38 @@ mod tests {
         let mut corrupt = block.to_vec();
         let n = corrupt.len();
         corrupt[n - 1] ^= 0xFF; // flip the AEAD tag region of the wrapped blob
-        blk.put(&cid, &corrupt).unwrap();
+        struct CorruptingStore {
+            inner: Arc<dyn BlockStore + Send + Sync>,
+            target: KotobaCid,
+            corrupt: Vec<u8>,
+        }
+        impl BlockStore for CorruptingStore {
+            fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+                self.inner.put(cid, data)
+            }
+            fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
+                if *cid == self.target {
+                    return Ok(Some(bytes::Bytes::from(self.corrupt.clone())));
+                }
+                self.inner.get(cid)
+            }
+            fn has(&self, cid: &KotobaCid) -> bool {
+                self.inner.has(cid)
+            }
+            fn put_durable(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+                self.inner.put_durable(cid, data)
+            }
+        }
+        let corrupt_blk = Arc::new(CorruptingStore {
+            inner: Arc::clone(&blk),
+            target: cid,
+            corrupt,
+        }) as Arc<dyn BlockStore + Send + Sync>;
 
         // A fresh load (simulating a restart) against a PRESENT-but-corrupt block
         // must FAIL — never silently re-genesis a new key (which would orphan every
         // blob previously encrypted under the recoverable one).
-        let reload = SovereignCrypto::load_or_genesis(&id, &kse, &blk).await;
+        let reload = SovereignCrypto::load_or_genesis(&id, &kse, &corrupt_blk).await;
         assert!(
             reload.is_err(),
             "corrupt-but-present wrapped key block must fail loud, not re-genesis"

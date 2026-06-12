@@ -132,7 +132,9 @@ impl SimHost for CounterSim {
             // (incl. NaN/Inf) can never reach state. This is what makes the sim
             // safe for cross-engine rollback.
             let axis_sum: i64 = input.quantized_axes().iter().map(|q| *q as i64).sum();
-            let delta = (input.buttons as i64).wrapping_add(axis_sum).wrapping_mul(weight);
+            let delta = (input.buttons as i64)
+                .wrapping_add(axis_sum)
+                .wrapping_mul(weight);
             self.acc[idx] = self.acc[idx].wrapping_add(delta);
         }
     }

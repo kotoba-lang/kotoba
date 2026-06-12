@@ -481,7 +481,7 @@ async fn phase3_cold_queries() {
             &kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".into())),
         )
         .await
-            .unwrap()
+        .unwrap()
     );
 
     // VAET: reverse lookup (all subjects referencing an object CID)

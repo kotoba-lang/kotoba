@@ -220,7 +220,7 @@ impl<'a> Parser<'a> {
                 _ => items.push(self.parse_value()?),
             }
         }
-        if items.len() % 2 != 0 {
+        if !items.len().is_multiple_of(2) {
             return Err(ParseError::OddMap { offset: start });
         }
         let mut m = BTreeMap::new();
@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(parse("false").unwrap(), EdnValue::Bool(false));
         assert_eq!(parse("42").unwrap(), EdnValue::Integer(42));
         assert_eq!(parse("-7").unwrap(), EdnValue::Integer(-7));
-        assert_eq!(parse("3.14").unwrap(), EdnValue::float(3.14));
+        assert_eq!(parse("2.5").unwrap(), EdnValue::float(2.5));
         assert_eq!(parse("\"hi\\n\"").unwrap(), EdnValue::String("hi\n".into()));
         assert_eq!(
             parse("\"テスト会社\"").unwrap(),
@@ -747,15 +747,15 @@ mod tests {
         // are unambiguous errors: unbalanced/unterminated collections, an
         // unterminated string, and stray close delimiters.
         for bad in [
-            "[1 2",            // unbalanced vector
-            "{:a 1",           // unterminated map
-            "#{1 2",           // unterminated set
-            "(a b",            // unterminated list
-            "\"unterminated",  // unterminated string
-            "]",               // stray close delimiter
+            "[1 2",           // unbalanced vector
+            "{:a 1",          // unterminated map
+            "#{1 2",          // unterminated set
+            "(a b",           // unterminated list
+            "\"unterminated", // unterminated string
+            "]",              // stray close delimiter
             "}",
             ")",
-            "[ ( ] )",         // crossed delimiters
+            "[ ( ] )", // crossed delimiters
         ] {
             let r = parse(bad);
             assert!(
@@ -798,6 +798,9 @@ mod tests {
         );
         // And a structure exactly at the cap still parses (boundary is inclusive).
         let at_cap = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
-        assert!(parse(&at_cap).is_ok(), "nesting at exactly MAX_DEPTH must parse");
+        assert!(
+            parse(&at_cap).is_ok(),
+            "nesting at exactly MAX_DEPTH must parse"
+        );
     }
 }

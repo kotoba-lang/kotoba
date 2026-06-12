@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
+use reqwest::Url;
 use serde::Deserialize;
 /// KuboBlockStore — IPFS cold block store backed by a Kubo HTTP node.
 ///
@@ -14,7 +15,6 @@ use serde::Deserialize;
 /// Kubo HTTP API used:
 ///   POST /api/v0/block/put?cid-codec=dag-cbor&mhtype=sha2-256 — store raw bytes
 ///   POST /api/v0/block/get?arg={cid}                          — retrieve raw bytes
-///   POST /api/v0/block/stat?arg={cid}                         — check existence
 ///   POST /api/v0/block/rm?arg={cid}&force=true                — delete
 ///
 /// Env vars:
@@ -25,6 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const DEFAULT_KUBO_ENDPOINT: &str = "http://localhost:5001";
+const DISABLED_KUBO_ENDPOINT: &str = "http://127.0.0.1:9";
+const MAX_KUBO_ENDPOINT_LEN: usize = 256;
 const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KUBO_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -73,6 +76,10 @@ pub struct KuboBlockStore {
 
 impl KuboBlockStore {
     pub fn new(endpoint: impl Into<String>) -> Self {
+        let endpoint = normalize_kubo_endpoint(&endpoint.into()).unwrap_or_else(|| {
+            tracing::warn!("invalid Kubo endpoint; disabling KuboBlockStore HTTP access");
+            DISABLED_KUBO_ENDPOINT.to_string()
+        });
         // 5 s connect timeout absorbs sidecar startup race; pool reuse + capped
         // idle keep the Kubo handler from leaking CLOSE_WAIT under burst commits
         // (observed 318 CLOSE_WAIT + 287 FIN_WAIT2 on Kubo 0.34.1 with the prior
@@ -80,7 +87,7 @@ impl KuboBlockStore {
         let client = kubo_http_client();
         Self {
             client,
-            endpoint: endpoint.into(),
+            endpoint,
             token: None,
             pinned: Arc::new(RwLock::new(HashSet::new())),
             failed_at_unix: Arc::new(AtomicU64::new(0)),
@@ -119,8 +126,12 @@ impl KuboBlockStore {
     }
 
     pub fn from_env() -> Self {
-        let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:5001".into());
+        let endpoint =
+            std::env::var("KOTOBA_IPFS_ENDPOINT").unwrap_or_else(|_| DEFAULT_KUBO_ENDPOINT.into());
+        let endpoint = normalize_kubo_endpoint(&endpoint).unwrap_or_else(|| {
+            tracing::warn!("invalid KOTOBA_IPFS_ENDPOINT; disabling KuboBlockStore HTTP access");
+            DISABLED_KUBO_ENDPOINT.to_string()
+        });
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
         let client = kubo_http_client();
         Self {
@@ -171,6 +182,30 @@ fn kubo_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+fn normalize_kubo_endpoint(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty()
+        || endpoint.len() > MAX_KUBO_ENDPOINT_LEN
+        || endpoint.chars().any(|ch| ch.is_control())
+    {
+        return None;
+    }
+    let url = Url::parse(endpoint).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
 /// Dedicated multi-thread runtime that drives Kubo HTTP I/O for the synchronous
 /// `BlockStore` trait. Keeping I/O off the *caller's* runtime is what prevents
 /// the deadlock: the previous `block_in_place(|| Handle::current().block_on(..))`
@@ -207,13 +242,21 @@ where
 {
     let rt = kubo_runtime();
     match tokio::runtime::Handle::try_current() {
-        Ok(_) => {
+        Ok(handle) => {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             rt.spawn(async move {
                 let _ = tx.send(fut.await);
             });
-            tokio::task::block_in_place(|| rx.recv())
-                .expect("kubo-io runtime dropped the in-flight result")
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                tokio::task::block_in_place(|| rx.recv())
+                    .expect("kubo-io runtime dropped the in-flight result")
+            } else {
+                rx.recv()
+                    .expect("kubo-io runtime dropped the in-flight result")
+            }
         }
         Err(_) => rt.block_on(fut),
     }
@@ -244,6 +287,7 @@ impl KuboBlockStore {
 
 impl BlockStore for KuboBlockStore {
     fn put(&self, cid: &KotobaCid, data: &[u8]) -> Result<()> {
+        ensure_block_matches_cid(cid, data)?;
         if !self.is_available() {
             return Ok(());
         }
@@ -259,34 +303,34 @@ impl BlockStore for KuboBlockStore {
         let inflight = Arc::clone(&self.inflight);
 
         let resp_key = kubo_block_on(async move {
-                // Wait for an in-flight permit before opening the socket.
-                // `acquire_owned` on a never-closed semaphore can only fail if
-                // the runtime is shutting down — bubble that up as an error.
-                let _permit = inflight
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/put permit: {e}"))?;
-                let part = reqwest::multipart::Part::bytes(body).file_name("blob");
-                let form = reqwest::multipart::Form::new().part("data", part);
-                let rb = client.post(&url).multipart(form);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                let resp = rb
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/put: {e}"))?;
-                if !resp.status().is_success() {
-                    let st = resp.status();
-                    let tx = resp.text().await.unwrap_or_default();
-                    return Err(anyhow!("kubo block/put {st}: {tx}"));
-                }
-                let parsed: BlockPutResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/put parse: {e}"))?;
-                Ok::<String, anyhow::Error>(parsed.key)
+            // Wait for an in-flight permit before opening the socket.
+            // `acquire_owned` on a never-closed semaphore can only fail if
+            // the runtime is shutting down — bubble that up as an error.
+            let _permit = inflight
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow!("kubo block/put permit: {e}"))?;
+            let part = reqwest::multipart::Part::bytes(body).file_name("blob");
+            let form = reqwest::multipart::Form::new().part("data", part);
+            let rb = client.post(&url).multipart(form);
+            let rb = match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            };
+            let resp = rb
+                .send()
+                .await
+                .map_err(|e| anyhow!("kubo block/put: {e}"))?;
+            if !resp.status().is_success() {
+                let st = resp.status();
+                let tx = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("kubo block/put {st}: {tx}"));
+            }
+            let parsed: BlockPutResponse = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("kubo block/put parse: {e}"))?;
+            Ok::<String, anyhow::Error>(parsed.key)
         });
 
         match resp_key {
@@ -310,6 +354,9 @@ impl BlockStore for KuboBlockStore {
     /// for the put_durable commit path (2026-06-02; ADR-2606012200). Fails if any
     /// block fails (surfaces the first error).
     fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> Result<()> {
+        for (cid, data) in blocks {
+            ensure_block_matches_cid(cid, data)?;
+        }
         if !self.is_available() || blocks.is_empty() {
             return Ok(());
         }
@@ -398,36 +445,36 @@ impl BlockStore for KuboBlockStore {
         let inflight = Arc::clone(&self.inflight);
 
         let result = kubo_block_on(async move {
-                let _permit = inflight
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/get permit: {e}"))?;
-                let rb = client.post(&url);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                let resp = rb
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/get: {e}"))?;
-                let status = resp.status();
-                if status == reqwest::StatusCode::NOT_FOUND || status.as_u16() == 500 {
-                    let text = resp.text().await.unwrap_or_default();
-                    if text.contains("block not found") || text.contains("not found") {
-                        return Ok::<Option<Bytes>, anyhow::Error>(None);
-                    }
-                    return Err(anyhow!("kubo block/get error: {text}"));
+            let _permit = inflight
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow!("kubo block/get permit: {e}"))?;
+            let rb = client.post(&url);
+            let rb = match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            };
+            let resp = rb
+                .send()
+                .await
+                .map_err(|e| anyhow!("kubo block/get: {e}"))?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND || status.as_u16() == 500 {
+                let text = resp.text().await.unwrap_or_default();
+                if text.contains("block not found") || text.contains("not found") {
+                    return Ok::<Option<Bytes>, anyhow::Error>(None);
                 }
-                if !status.is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(anyhow!("kubo block/get {status}: {text}"));
-                }
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/get body: {e}"))?;
-                Ok(Some(bytes))
+                return Err(anyhow!("kubo block/get error: {text}"));
+            }
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("kubo block/get {status}: {text}"));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| anyhow!("kubo block/get body: {e}"))?;
+            Ok(Some(bytes))
         });
 
         match result {
@@ -439,31 +486,22 @@ impl BlockStore for KuboBlockStore {
             }
             Ok(bytes) => {
                 self.mark_available();
-                Ok(bytes)
+                match bytes {
+                    Some(bytes) => {
+                        if !block_matches_cid(cid, &bytes) {
+                            tracing::warn!(cid = %cid, "kubo block/get failed CID verification");
+                            return Ok(None);
+                        }
+                        Ok(Some(bytes))
+                    }
+                    None => Ok(None),
+                }
             }
         }
     }
 
     fn has(&self, cid: &KotobaCid) -> bool {
-        if !self.is_available() {
-            return false;
-        }
-
-        let url = format!("{}?arg={}", self.api_url("block/stat"), cid.to_multibase());
-        let client = self.client.clone();
-        let token = self.token.clone();
-
-        kubo_block_on(async move {
-                let rb = client.post(&url);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                match rb.send().await {
-                    Ok(resp) => resp.status().is_success(),
-                    Err(_) => false,
-                }
-        })
+        self.get(cid).map(|block| block.is_some()).unwrap_or(false)
     }
 
     fn delete(&self, cid: &KotobaCid) -> Result<()> {
@@ -480,20 +518,20 @@ impl BlockStore for KuboBlockStore {
         let token = self.token.clone();
 
         kubo_block_on(async move {
-                let rb = client.post(&url);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                let resp = rb.send().await.map_err(|e| anyhow!("kubo block/rm: {e}"))?;
-                if !resp.status().is_success() {
-                    let st = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    if !text.contains("not found") {
-                        return Err(anyhow!("kubo block/rm {st}: {text}"));
-                    }
+            let rb = client.post(&url);
+            let rb = match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            };
+            let resp = rb.send().await.map_err(|e| anyhow!("kubo block/rm: {e}"))?;
+            if !resp.status().is_success() {
+                let st = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if !text.contains("not found") {
+                    return Err(anyhow!("kubo block/rm {st}: {text}"));
                 }
-                Ok::<_, anyhow::Error>(())
+            }
+            Ok::<_, anyhow::Error>(())
         })
     }
 
@@ -524,19 +562,19 @@ impl BlockStore for KuboBlockStore {
         let pin_result = match tokio::runtime::Handle::try_current() {
             Err(_) => Ok::<(), anyhow::Error>(()),
             Ok(_) => kubo_block_on(async move {
-                    let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
-                    let rb = client.post(&url);
-                    let rb = match &token {
-                        Some(t) => rb.bearer_auth(t),
-                        None => rb,
-                    };
-                    let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/add: {e}"))?;
-                    if !resp.status().is_success() {
-                        let st = resp.status();
-                        let tx = resp.text().await.unwrap_or_default();
-                        return Err(anyhow!("kubo pin/add {st}: {tx}"));
-                    }
-                    Ok::<(), anyhow::Error>(())
+                let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
+                let rb = client.post(&url);
+                let rb = match &token {
+                    Some(t) => rb.bearer_auth(t),
+                    None => rb,
+                };
+                let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/add: {e}"))?;
+                if !resp.status().is_success() {
+                    let st = resp.status();
+                    let tx = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!("kubo pin/add {st}: {tx}"));
+                }
+                Ok::<(), anyhow::Error>(())
             }),
         };
         if let Err(e) = pin_result {
@@ -572,24 +610,24 @@ impl BlockStore for KuboBlockStore {
         let unpin_result = match tokio::runtime::Handle::try_current() {
             Err(_) => Ok::<(), anyhow::Error>(()),
             Ok(_) => kubo_block_on(async move {
-                    let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
-                    let rb = client.post(&url);
-                    let rb = match &token {
-                        Some(t) => rb.bearer_auth(t),
-                        None => rb,
-                    };
-                    let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/rm: {e}"))?;
-                    let status = resp.status();
-                    if !status.is_success() {
-                        let tx = resp.text().await.unwrap_or_default();
-                        // "not pinned" is benign — the local pinned-set may have
-                        // tracked a CID Kubo never saw, e.g. across restarts.
-                        if tx.contains("not pinned") {
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                        return Err(anyhow!("kubo pin/rm {status}: {tx}"));
+                let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
+                let rb = client.post(&url);
+                let rb = match &token {
+                    Some(t) => rb.bearer_auth(t),
+                    None => rb,
+                };
+                let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/rm: {e}"))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let tx = resp.text().await.unwrap_or_default();
+                    // "not pinned" is benign — the local pinned-set may have
+                    // tracked a CID Kubo never saw, e.g. across restarts.
+                    if tx.contains("not pinned") {
+                        return Ok::<(), anyhow::Error>(());
                     }
-                    Ok(())
+                    return Err(anyhow!("kubo pin/rm {status}: {tx}"));
+                }
+                Ok(())
             }),
         };
         if let Err(e) = unpin_result {
@@ -600,6 +638,36 @@ impl BlockStore for KuboBlockStore {
     fn is_pinned(&self, cid: &KotobaCid) -> bool {
         self.pinned.read().unwrap().contains(&cid.0)
     }
+}
+
+/// Minimal JSON string-field extractor (avoids a serde_json dep).
+/// Looks for `"<key>":"<value>"` and returns the unescaped value.
+fn extract_json_string_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let i = body.find(&needle)?;
+    let rest = &body[i + needle.len()..];
+    let colon = rest.find(':')?;
+    let after_colon = rest[colon + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let val = &after_colon[1..];
+    let end = val.find('"')?;
+    Some(val[..end].to_string())
+}
+
+fn block_matches_cid(cid: &KotobaCid, data: &[u8]) -> bool {
+    KotobaCid::from_bytes(data) == *cid
+}
+
+fn ensure_block_matches_cid(cid: &KotobaCid, data: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        block_matches_cid(cid, data),
+        "cid mismatch: expected {}, got {}",
+        cid.to_multibase(),
+        KotobaCid::from_bytes(data).to_multibase()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -627,10 +695,92 @@ mod tests {
     }
 
     #[test]
+    fn normalize_kubo_endpoint_accepts_http_https_root_urls() {
+        assert_eq!(
+            normalize_kubo_endpoint(" http://localhost:5001/ ").unwrap(),
+            "http://localhost:5001"
+        );
+        assert_eq!(
+            normalize_kubo_endpoint("https://kubo.example.com").unwrap(),
+            "https://kubo.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_kubo_endpoint_rejects_ambiguous_or_header_unsafe_values() {
+        for endpoint in [
+            "",
+            "ftp://localhost:5001",
+            "https://user:pass@localhost:5001",
+            "http://localhost:5001/api",
+            "http://localhost:5001?x=1",
+            "http://localhost:5001#frag",
+            "http://localhost:5001/\nheader",
+            "not a url",
+        ] {
+            assert!(
+                normalize_kubo_endpoint(endpoint).is_none(),
+                "endpoint should be rejected: {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kubo_store_new_disables_invalid_endpoint() {
+        let store = KuboBlockStore::new("http://localhost:5001/api");
+
+        assert_eq!(store.endpoint, DISABLED_KUBO_ENDPOINT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn kubo_block_on_works_inside_current_thread_runtime() {
+        assert_eq!(kubo_block_on(async { 7usize }), 7);
+    }
+
+    #[test]
     fn different_data_different_cid() {
         let c1 = KotobaCid::from_bytes(b"block a");
         let c2 = KotobaCid::from_bytes(b"block b");
         assert_ne!(c1.to_multibase(), c2.to_multibase());
+    }
+
+    #[test]
+    fn block_matches_cid_accepts_matching_bytes() {
+        let data = b"kubo verified block";
+        let cid = KotobaCid::from_bytes(data);
+
+        assert!(block_matches_cid(&cid, data));
+    }
+
+    #[test]
+    fn block_matches_cid_rejects_mismatched_bytes() {
+        let cid = KotobaCid::from_bytes(b"kubo verified block");
+
+        assert!(!block_matches_cid(&cid, b"different block"));
+    }
+
+    #[test]
+    fn put_rejects_mismatched_cid_before_availability_check() {
+        let store = KuboBlockStore::new("http://localhost:5001");
+        store.mark_unavailable();
+        let bad_cid = KotobaCid::from_bytes(b"expected");
+
+        let err = store.put(&bad_cid, b"different").unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
+    }
+
+    #[test]
+    fn put_many_durable_rejects_mismatched_cid_before_availability_check() {
+        let store = KuboBlockStore::new("http://localhost:5001");
+        store.mark_unavailable();
+        let bad_cid = KotobaCid::from_bytes(b"expected");
+
+        let err = store
+            .put_many_durable(&[(bad_cid, b"different".to_vec())])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
     }
 
     #[test]
@@ -697,20 +847,4 @@ mod tests {
         );
         assert_eq!(extract_json_string_field(body, "Missing"), None);
     }
-}
-
-/// Minimal JSON string-field extractor (avoids a serde_json dep).
-/// Looks for `"<key>":"<value>"` and returns the unescaped value.
-fn extract_json_string_field(body: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let i = body.find(&needle)?;
-    let rest = &body[i + needle.len()..];
-    let colon = rest.find(':')?;
-    let after_colon = rest[colon + 1..].trim_start();
-    if !after_colon.starts_with('"') {
-        return None;
-    }
-    let val = &after_colon[1..];
-    let end = val.find('"')?;
-    Some(val[..end].to_string())
 }

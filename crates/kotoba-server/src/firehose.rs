@@ -52,6 +52,50 @@ pub const NSID_SYNC_EVENTS: &str = "com.etzhayyim.apps.kotoba.sync.events";
 /// Hard cap on a single paging response so a huge cold backfill can't OOM the node.
 const MAX_PAGE_LIMIT: usize = 1000;
 const DEFAULT_PAGE_LIMIT: usize = 100;
+const MAX_TOPIC_PREFIX_LEN: usize = 256;
+
+fn validate_cursor(cursor: Option<u64>) -> Result<(), (StatusCode, String)> {
+    if cursor == Some(u64::MAX) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "cursor must be less than u64::MAX".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_topic_prefix(prefix: Option<&str>) -> Result<(), (StatusCode, String)> {
+    let Some(prefix) = prefix else {
+        return Ok(());
+    };
+    if prefix.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "topic_prefix must not be empty".to_string(),
+        ));
+    }
+    if prefix.len() > MAX_TOPIC_PREFIX_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("topic_prefix exceeds {MAX_TOPIC_PREFIX_LEN} bytes"),
+        ));
+    }
+    if prefix.chars().any(char::is_control) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "topic_prefix must not contain control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_params(
+    cursor: Option<u64>,
+    topic_prefix: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    validate_cursor(cursor)?;
+    validate_topic_prefix(topic_prefix)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SubscribeParams {
@@ -155,6 +199,7 @@ pub async fn subscribe(
     headers: HeaderMap,
     Query(params): Query<SubscribeParams>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    validate_params(params.cursor, params.topic_prefix.as_deref())?;
     gate(&state, &headers, params.cacao_b64.as_deref()).await?;
 
     let journal: Arc<Journal> = Arc::clone(&state.journal);
@@ -224,13 +269,17 @@ pub async fn events(
     headers: HeaderMap,
     Query(params): Query<EventsParams>,
 ) -> Result<Json<EventsResponse>, (StatusCode, String)> {
+    validate_params(params.cursor, params.topic_prefix.as_deref())?;
     gate(&state, &headers, params.cacao_b64.as_deref()).await?;
 
     let journal = &state.journal;
     let current_seq = journal.current_seq().await;
 
     let from = params.cursor.map(|c| c + 1).unwrap_or(1);
-    let limit = params.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .min(MAX_PAGE_LIMIT);
 
     let mut entries = journal.read_since(from).await;
     if let Some(prefix) = &params.topic_prefix {
@@ -240,11 +289,7 @@ pub async fn events(
     let has_more = entries.len() > limit;
     entries.truncate(limit);
 
-    let cursor = entries
-        .last()
-        .map(|e| e.seq)
-        .or(params.cursor)
-        .unwrap_or(0);
+    let cursor = entries.last().map(|e| e.seq).or(params.cursor).unwrap_or(0);
 
     let events = entries.iter().map(FirehoseEvent::from_entry).collect();
 
@@ -287,7 +332,27 @@ mod tests {
         let raw = &[0xff, 0x00, 0x10, 0xab];
         let e = entry(3, "blob/raw", raw);
         let fe = FirehoseEvent::from_entry(&e);
-        let s = fe.payload.as_str().expect("non-JSON payload must be a base64 string");
+        let s = fe
+            .payload
+            .as_str()
+            .expect("non-JSON payload must be a base64 string");
         assert_eq!(B64.decode(s).unwrap(), raw);
+    }
+
+    #[test]
+    fn cursor_validation_rejects_overflow_sentinel() {
+        assert!(validate_cursor(None).is_ok());
+        assert!(validate_cursor(Some(0)).is_ok());
+        assert!(validate_cursor(Some(u64::MAX - 1)).is_ok());
+        assert!(validate_cursor(Some(u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn topic_prefix_validation_rejects_empty_control_and_oversized_values() {
+        assert!(validate_topic_prefix(None).is_ok());
+        assert!(validate_topic_prefix(Some("jetstream/")).is_ok());
+        assert!(validate_topic_prefix(Some("   ")).is_err());
+        assert!(validate_topic_prefix(Some("jetstream/\npost")).is_err());
+        assert!(validate_topic_prefix(Some(&"x".repeat(MAX_TOPIC_PREFIX_LEN + 1))).is_err());
     }
 }

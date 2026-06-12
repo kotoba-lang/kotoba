@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use kotoba_core::cid::KotobaCid;
 use libp2p::request_response;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -240,7 +241,9 @@ impl request_response::Codec for BitswapCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_cbor(io).await
+        let req = read_cbor(io).await?;
+        validate_request(&req)?;
+        Ok(req)
     }
 
     async fn read_response<T>(
@@ -251,7 +254,9 @@ impl request_response::Codec for BitswapCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_cbor(io).await
+        let resp = read_cbor(io).await?;
+        validate_response(&resp)?;
+        Ok(resp)
     }
 
     async fn write_request<T>(
@@ -263,6 +268,7 @@ impl request_response::Codec for BitswapCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
+        validate_request(&req)?;
         write_cbor(io, &req).await
     }
 
@@ -275,6 +281,7 @@ impl request_response::Codec for BitswapCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
+        validate_response(&resp)?;
         write_cbor(io, &resp).await
     }
 }
@@ -282,6 +289,70 @@ impl request_response::Codec for BitswapCodec {
 /// Maximum bitswap message size (32 MiB). A peer advertising a larger payload
 /// is either faulty or malicious — reject immediately to prevent OOM allocation.
 const MAX_BITSWAP_MSG_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BITSWAP_CIDS: usize = 16_384;
+const MAX_BITSWAP_BLOCKS: usize = 4_096;
+
+fn invalid_data(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn validate_request(req: &BitswapRequest) -> std::io::Result<()> {
+    if req.want_have.len() > MAX_BITSWAP_CIDS {
+        return Err(invalid_data(format!(
+            "bitswap want_have too large ({} entries, limit {MAX_BITSWAP_CIDS})",
+            req.want_have.len()
+        )));
+    }
+    if req.want_block.len() > MAX_BITSWAP_CIDS {
+        return Err(invalid_data(format!(
+            "bitswap want_block too large ({} entries, limit {MAX_BITSWAP_CIDS})",
+            req.want_block.len()
+        )));
+    }
+    if req.want_since.len() > MAX_BITSWAP_CIDS {
+        return Err(invalid_data(format!(
+            "bitswap want_since too large ({} entries, limit {MAX_BITSWAP_CIDS})",
+            req.want_since.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_response(resp: &BitswapResponse) -> std::io::Result<()> {
+    if resp.have.len() > MAX_BITSWAP_CIDS {
+        return Err(invalid_data(format!(
+            "bitswap have too large ({} entries, limit {MAX_BITSWAP_CIDS})",
+            resp.have.len()
+        )));
+    }
+    if resp.dont_have.len() > MAX_BITSWAP_CIDS {
+        return Err(invalid_data(format!(
+            "bitswap dont_have too large ({} entries, limit {MAX_BITSWAP_CIDS})",
+            resp.dont_have.len()
+        )));
+    }
+    validate_block_entries("blocks", &resp.blocks)?;
+    validate_block_entries("delta_commits", &resp.delta_commits)?;
+    Ok(())
+}
+
+fn validate_block_entries(kind: &str, blocks: &[BlockEntry]) -> std::io::Result<()> {
+    if blocks.len() > MAX_BITSWAP_BLOCKS {
+        return Err(invalid_data(format!(
+            "bitswap {kind} too large ({} entries, limit {MAX_BITSWAP_BLOCKS})",
+            blocks.len()
+        )));
+    }
+    for (index, (cid, data)) in blocks.iter().enumerate() {
+        let actual = KotobaCid::from_bytes(data);
+        if &actual.0 != cid {
+            return Err(invalid_data(format!(
+                "bitswap {kind}[{index}] CID does not match block bytes"
+            )));
+        }
+    }
+    Ok(())
+}
 
 async fn read_cbor<T: AsyncRead + Unpin + Send, D: serde::de::DeserializeOwned>(
     io: &mut T,
@@ -308,6 +379,12 @@ async fn write_cbor<T: AsyncWrite + Unpin + Send, S: Serialize>(
     let mut buf = Vec::new();
     ciborium::into_writer(value, &mut buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if buf.len() > MAX_BITSWAP_MSG_BYTES {
+        return Err(invalid_data(format!(
+            "bitswap message too large ({} bytes, limit {MAX_BITSWAP_MSG_BYTES})",
+            buf.len()
+        )));
+    }
     io.write_all(&(buf.len() as u32).to_be_bytes()).await?;
     io.write_all(&buf).await?;
     Ok(())
@@ -316,6 +393,7 @@ async fn write_cbor<T: AsyncWrite + Unpin + Send, S: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::request_response::Codec;
 
     #[tokio::test]
     async fn read_cbor_rejects_oversized_length_prefix() {
@@ -347,11 +425,101 @@ mod tests {
         let len_prefix = (encoded.len() as u32).to_be_bytes();
         let stream: Vec<u8> = [&len_prefix[..], &encoded].concat();
 
-        let result: std::io::Result<BitswapRequest> = read_cbor(&mut &*stream.as_slice()).await;
+        let result: std::io::Result<BitswapRequest> = read_cbor(&mut stream.as_slice()).await;
         assert!(
             result.is_ok(),
             "valid small request must be accepted: {result:?}"
         );
+    }
+
+    fn encode_frame<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        ciborium::into_writer(value, &mut encoded).unwrap();
+        let len_prefix = (encoded.len() as u32).to_be_bytes();
+        [&len_prefix[..], &encoded].concat()
+    }
+
+    #[tokio::test]
+    async fn read_response_rejects_block_cid_mismatch() {
+        let good_cid = KotobaCid::from_bytes(b"good").0;
+        let resp = BitswapResponse {
+            have: vec![],
+            dont_have: vec![],
+            blocks: vec![(good_cid, b"tampered".to_vec())],
+            delta_commits: vec![],
+        };
+        let frame = encode_frame(&resp);
+        let mut codec = BitswapCodec;
+
+        let err = codec
+            .read_response(&BITSWAP_PROTOCOL, &mut frame.as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("CID does not match"),
+            "error should mention CID mismatch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_response_accepts_matching_block_cids() {
+        let data = b"verified".to_vec();
+        let cid = KotobaCid::from_bytes(&data).0;
+        let resp = BitswapResponse {
+            have: vec![cid],
+            dont_have: vec![],
+            blocks: vec![(cid, data)],
+            delta_commits: vec![],
+        };
+        let frame = encode_frame(&resp);
+        let mut codec = BitswapCodec;
+
+        let decoded = codec
+            .read_response(&BITSWAP_PROTOCOL, &mut frame.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(decoded.blocks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_request_rejects_too_many_wants() {
+        let req = BitswapRequest {
+            want_have: vec![[0u8; 36]; MAX_BITSWAP_CIDS + 1],
+            want_block: vec![],
+            want_since: vec![],
+        };
+        let frame = encode_frame(&req);
+        let mut codec = BitswapCodec;
+
+        let err = codec
+            .read_request(&BITSWAP_PROTOCOL, &mut frame.as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("want_have too large"),
+            "error should mention capped field: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_response_rejects_block_cid_mismatch() {
+        let resp = BitswapResponse {
+            have: vec![],
+            dont_have: vec![],
+            blocks: vec![(KotobaCid::from_bytes(b"expected").0, b"actual".to_vec())],
+            delta_commits: vec![],
+        };
+        let mut codec = BitswapCodec;
+        let mut out = Vec::new();
+
+        let err = codec
+            .write_response(&BITSWAP_PROTOCOL, &mut out, resp)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(out.is_empty(), "invalid response must not be written");
     }
 
     #[test]

@@ -2,6 +2,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
+use std::collections::HashSet;
 /// TieredBlockStore<H, C> — hot/cold tiered block store.
 ///
 /// Writes land in hot immediately; a background task asynchronously copies to cold.
@@ -80,6 +81,14 @@ impl<H: BlockStore + 'static, C: BlockStore + 'static> BlockStore for TieredBloc
     /// durable without N serial cold round-trips (2026-06-02; ADR-2606012200).
     fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> Result<()> {
         for (cid, data) in blocks {
+            anyhow::ensure!(
+                verified_block(cid, data),
+                "cid mismatch: expected {}, got {}",
+                cid.to_multibase(),
+                KotobaCid::from_bytes(data).to_multibase()
+            );
+        }
+        for (cid, data) in blocks {
             self.hot.put(cid, data)?;
         }
         self.cold.put_many_durable(blocks)
@@ -88,10 +97,18 @@ impl<H: BlockStore + 'static, C: BlockStore + 'static> BlockStore for TieredBloc
     fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>> {
         // Fast path: hot hit
         if let Some(b) = self.hot.get(cid)? {
-            return Ok(Some(b));
+            if verified_block(cid, &b) {
+                return Ok(Some(b));
+            }
+            tracing::warn!(cid = %cid, "tiered hot block failed CID verification");
+            let _ = self.hot.delete(cid);
         }
         // Cold fallback + promote to hot
         if let Some(b) = self.cold.get(cid)? {
+            if !verified_block(cid, &b) {
+                tracing::warn!(cid = %cid, "tiered cold block failed CID verification");
+                return Ok(None);
+            }
             if let Err(e) = self.hot.put(cid, &b) {
                 tracing::warn!(cid = %cid, err = %e, "tiered hot-promote failed");
             }
@@ -128,6 +145,21 @@ impl<H: BlockStore + 'static, C: BlockStore + 'static> BlockStore for TieredBloc
     fn is_pinned(&self, cid: &KotobaCid) -> bool {
         self.hot.is_pinned(cid)
     }
+
+    fn all_cids(&self) -> Vec<KotobaCid> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for cid in self.hot.all_cids().into_iter().chain(self.cold.all_cids()) {
+            if seen.insert(cid.0) && self.get(&cid).ok().flatten().is_some() {
+                out.push(cid);
+            }
+        }
+        out
+    }
+}
+
+fn verified_block(cid: &KotobaCid, data: &[u8]) -> bool {
+    KotobaCid::from_bytes(data) == *cid
 }
 
 #[cfg(test)]
@@ -169,6 +201,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupted_hot_block_falls_through_to_verified_cold_block() {
+        let store = tiered();
+        let data = b"verified cold block";
+        let c = cid(data);
+        store.hot.insert_unchecked(&c, b"corrupted hot block");
+        store.cold.put(&c, data).unwrap();
+
+        let got = store.get(&c).unwrap().unwrap();
+
+        assert_eq!(got.as_ref(), data);
+        assert_eq!(store.hot.get(&c).unwrap().as_deref(), Some(data.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn corrupted_cold_block_is_not_returned_or_promoted() {
+        let store = tiered();
+        let data = b"expected block";
+        let c = cid(data);
+        store.cold.insert_unchecked(&c, b"corrupted cold block");
+
+        let got = store.get(&c).unwrap();
+
+        assert!(got.is_none());
+        assert!(
+            !store.hot.has(&c),
+            "corrupted cold block must not be promoted"
+        );
+    }
+
+    #[tokio::test]
     async fn put_goes_to_hot_immediately() {
         let store = tiered();
         let data = b"write test";
@@ -179,6 +241,25 @@ mod tests {
             "hot must have block immediately after put"
         );
         // Cold write is async — we don't assert it here
+    }
+
+    #[test]
+    fn put_many_durable_rejects_mismatch_before_writing_hot_or_cold() {
+        let store = tiered();
+        let good = b"good batch block".to_vec();
+        let good_cid = cid(&good);
+        let bad_cid = cid(b"expected batch block");
+        let bad = b"different batch block".to_vec();
+
+        let err = store
+            .put_many_durable(&[(good_cid.clone(), good), (bad_cid.clone(), bad)])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
+        assert!(!store.hot.has(&good_cid));
+        assert!(!store.cold.has(&good_cid));
+        assert!(!store.hot.has(&bad_cid));
+        assert!(!store.cold.has(&bad_cid));
     }
 
     #[test]
@@ -273,8 +354,9 @@ mod tests {
     #[test]
     fn unpin_after_pin_clears_is_pinned() {
         let store = tiered();
-        let c = cid(b"unpin-test");
-        store.hot().put(&c, b"data").unwrap();
+        let data = b"data";
+        let c = cid(data);
+        store.hot().put(&c, data).unwrap();
         store.pin(&c);
         assert!(store.is_pinned(&c));
         store.unpin(&c);
@@ -284,7 +366,7 @@ mod tests {
     #[test]
     fn put_empty_data_stored_in_hot() {
         let store = tiered();
-        let c = cid(b"empty-block-key");
+        let c = cid(b"");
         store.put(&c, b"").unwrap();
         assert!(store.hot().has(&c));
         let got = store.get(&c).unwrap().expect("should exist");
@@ -303,5 +385,35 @@ mod tests {
         assert_eq!(got.as_ref(), data);
         // Cold must still be empty after a hot-hit read.
         assert!(!store.cold().has(&c));
+    }
+
+    #[test]
+    fn all_cids_returns_verified_union_from_hot_and_cold() {
+        let store = tiered();
+        let hot_data = b"tiered hot listed";
+        let cold_data = b"tiered cold listed";
+        let duplicate_data = b"tiered duplicate listed";
+        let hot_cid = cid(hot_data);
+        let cold_cid = cid(cold_data);
+        let duplicate_cid = cid(duplicate_data);
+        let corrupt_cid = cid(b"tiered corrupt listed");
+        store.hot.put(&hot_cid, hot_data).unwrap();
+        store.cold.put(&cold_cid, cold_data).unwrap();
+        store.hot.put(&duplicate_cid, duplicate_data).unwrap();
+        store.cold.put(&duplicate_cid, duplicate_data).unwrap();
+        store
+            .hot
+            .insert_unchecked(&corrupt_cid, b"corrupt listed block");
+
+        let mut cids = store.all_cids();
+        cids.sort_by_key(|cid| cid.0);
+        let mut expected = vec![hot_cid, cold_cid, duplicate_cid];
+        expected.sort_by_key(|cid| cid.0);
+
+        assert_eq!(cids, expected);
+        assert!(
+            !store.hot.has(&corrupt_cid),
+            "all_cids should clean corrupt hot entries through get()"
+        );
     }
 }

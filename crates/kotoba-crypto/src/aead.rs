@@ -48,7 +48,13 @@ pub fn seal_with_aad(
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::SealFailed)?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ct = cipher
-        .encrypt(&nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::SealFailed)?;
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce);
@@ -305,7 +311,10 @@ mod tests {
         let aad = b"kotoba://graph/big";
         let pt: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
         let ct = seal_with_aad(&key, &pt, aad).unwrap();
-        assert_eq!(open_with_aad(&key, &ct, aad).unwrap().as_slice(), pt.as_slice());
+        assert_eq!(
+            open_with_aad(&key, &ct, aad).unwrap().as_slice(),
+            pt.as_slice()
+        );
     }
 
     #[test]

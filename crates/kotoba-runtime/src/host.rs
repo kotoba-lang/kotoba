@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 /// `(topic, payload)` pair drained from the KSE inbox.
 type KseInboxItem = (String, Vec<u8>);
+type HttpFetchArgs = (String, String, Vec<(String, String)>, Option<Vec<u8>>, u32);
+type HttpFetchResult = (Result<(u16, Vec<u8>), String>,);
 use kotoba_auth::delegation::DelegationChain;
 use kotoba_auth::eth::{abi, token::erc20};
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
@@ -229,8 +231,13 @@ impl WasiHttpView for HostState {
         config: wasmtime_wasi_http::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
         // Charge gas for outbound HTTP
-        if let Err(_) = self.charge_gas(1000) {
-            return Err(wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(Some("gas exhausted".to_string())).into());
+        if self.charge_gas(1000).is_err() {
+            return Err(
+                wasmtime_wasi_http::bindings::http::types::ErrorCode::InternalError(Some(
+                    "gas exhausted".to_string(),
+                ))
+                .into(),
+            );
         }
 
         // Check allow-list
@@ -245,11 +252,15 @@ impl WasiHttpView for HostState {
                 }
             });
             if !allowed {
-                return Err(wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied.into());
+                return Err(
+                    wasmtime_wasi_http::bindings::http::types::ErrorCode::HttpRequestDenied.into(),
+                );
             }
         }
 
-        Ok(wasmtime_wasi_http::types::default_send_request(request, config))
+        Ok(wasmtime_wasi_http::types::default_send_request(
+            request, config,
+        ))
     }
 }
 
@@ -1237,14 +1248,8 @@ fn bind_http(linker: &mut Linker<HostState>) -> Result<()> {
     inst.func_wrap(
         "fetch",
         move |mut ctx: wasmtime::StoreContextMut<HostState>,
-              (method, url, headers, body, timeout_ms): (
-            String,
-            String,
-            Vec<(String, String)>,
-            Option<Vec<u8>>,
-            u32,
-        )|
-              -> Result<(Result<(u16, Vec<u8>), String>,)> {
+              (method, url, headers, body, timeout_ms): HttpFetchArgs|
+              -> Result<HttpFetchResult> {
             ctx.data_mut().charge_gas(1000)?;
             let result = (|| -> Result<(u16, Vec<u8>), String> {
                 let agent = ureq::AgentBuilder::new()

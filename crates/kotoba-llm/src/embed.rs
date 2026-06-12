@@ -2,7 +2,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_kqe::datom::{Datom, TensorDtype, Value};
 use kotoba_kqe::delta::Delta;
 
-/// Embedding — vector<f32> stored as typed Datom value.
+/// Embedding — `vector<f32>` stored as typed Datom value.
 /// dim <= 1024: inline in Datom.v as VectorF32
 /// dim > 1024: Vault blob CID as TensorCid
 pub struct Embedding {

@@ -29,7 +29,7 @@ impl UdfExecutor {
         Ok(Self { engine, programs })
     }
 
-    /// Evaluate a UDF: input rows (CBOR list<list<u8>>) → output rows
+    /// Evaluate a UDF: input rows (CBOR `list<list<u8>>`) → output rows
     pub fn eval(
         &self,
         program_cid: &str,

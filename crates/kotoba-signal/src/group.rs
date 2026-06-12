@@ -365,17 +365,10 @@ mod tests {
         });
     }
 
-    #[test]
-    fn max_skipped_keys_constant_is_positive_and_bounded() {
-        assert!(
-            MAX_SKIPPED_KEYS >= 100,
-            "limit must allow normal out-of-order delivery"
-        );
-        assert!(
-            MAX_SKIPPED_KEYS <= 5_000,
-            "limit must cap memory to a sane ceiling"
-        );
-    }
+    const _: () = {
+        assert!(MAX_SKIPPED_KEYS >= 100);
+        assert!(MAX_SKIPPED_KEYS <= 5_000);
+    };
 
     #[test]
     fn large_sequence_gap_is_rejected() {

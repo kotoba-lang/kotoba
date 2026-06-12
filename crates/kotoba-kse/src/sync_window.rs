@@ -1,6 +1,24 @@
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncWindowError {
+    SequenceRollback { current: u64, requested: u64 },
+}
+
+impl std::fmt::Display for SyncWindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncWindowError::SequenceRollback { current, requested } => write!(
+                f,
+                "sync window sequence rollback: requested {requested}, current {current}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SyncWindowError {}
+
 /// Describes the subset of history an agent loop needs to operate.
 ///
 /// An agent creates a `SyncWindow` on startup from its last persisted state.
@@ -65,12 +83,33 @@ impl SyncWindow {
     ///
     /// Unpins the old head (so it can be evicted) and pins the new head.
     pub fn advance(&mut self, new_head: KotobaCid, new_seq: u64, store: &dyn BlockStore) {
-        if let Some(old) = &self.head_cid {
-            store.unpin(old);
+        let _ = self.try_advance(new_head, new_seq, store);
+    }
+
+    /// Checked variant of [`Self::advance`] that refuses to move the replay
+    /// watermark backwards.
+    pub fn try_advance(
+        &mut self,
+        new_head: KotobaCid,
+        new_seq: u64,
+        store: &dyn BlockStore,
+    ) -> Result<(), SyncWindowError> {
+        if new_seq < self.since_seq {
+            return Err(SyncWindowError::SequenceRollback {
+                current: self.since_seq,
+                requested: new_seq,
+            });
+        }
+
+        if self.head_cid.as_ref() != Some(&new_head) {
+            if let Some(old) = &self.head_cid {
+                store.unpin(old);
+            }
         }
         store.pin(&new_head);
         self.head_cid = Some(new_head);
         self.since_seq = new_seq;
+        Ok(())
     }
 }
 
@@ -210,6 +249,62 @@ mod tests {
         assert!(!store.is_pinned(&h2));
         assert!(store.is_pinned(&h3));
         assert_eq!(win.since_seq, 2);
+    }
+
+    #[test]
+    fn try_advance_rejects_sequence_rollback_without_pin_changes() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h1 = cid("head1");
+        let h2 = cid("head2");
+
+        let mut win = SyncWindow::new(g, 10, Some(h1.clone()));
+        win.pin_into(&store);
+
+        let err = win.try_advance(h2.clone(), 9, &store).unwrap_err();
+        assert_eq!(
+            err,
+            SyncWindowError::SequenceRollback {
+                current: 10,
+                requested: 9
+            }
+        );
+        assert!(store.is_pinned(&h1));
+        assert!(!store.is_pinned(&h2));
+        assert_eq!(win.since_seq, 10);
+        assert_eq!(win.head_cid, Some(h1));
+    }
+
+    #[test]
+    fn advance_ignores_sequence_rollback_without_pin_changes() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h1 = cid("head1");
+        let h2 = cid("head2");
+
+        let mut win = SyncWindow::new(g, 10, Some(h1.clone()));
+        win.pin_into(&store);
+
+        win.advance(h2.clone(), 9, &store);
+        assert!(store.is_pinned(&h1));
+        assert!(!store.is_pinned(&h2));
+        assert_eq!(win.since_seq, 10);
+        assert_eq!(win.head_cid, Some(h1));
+    }
+
+    #[test]
+    fn try_advance_same_head_keeps_pin_and_updates_watermark() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h = cid("head");
+
+        let mut win = SyncWindow::new(g, 10, Some(h.clone()));
+        win.pin_into(&store);
+
+        win.try_advance(h.clone(), 12, &store).unwrap();
+        assert!(store.is_pinned(&h));
+        assert_eq!(win.since_seq, 12);
+        assert_eq!(win.head_cid, Some(h));
     }
 
     #[test]

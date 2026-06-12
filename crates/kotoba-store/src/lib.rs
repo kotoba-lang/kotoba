@@ -17,11 +17,14 @@ pub mod tiered_store;
 pub use b2_car_store::B2CarBlockStore;
 pub use b2_client::{b2_block_on, B2Client, B2Config};
 pub use b2_export::{run_exporter, CarExportQueue};
-pub use car_index::CarIndex;
 pub use block_store::{put_verified, BlockStore, StoreError};
 pub use budgeted_store::BudgetedBlockStore;
 pub use capturing_store::CapturingBlockStore;
-pub use car_bundle::{extract_block, parse_index, CarBlockIndex, CarBundleWriter};
+pub use car_bundle::{
+    extract_block, extract_verified_block, parse_index, parse_verified_index, CarBlockIndex,
+    CarBundleWriter,
+};
+pub use car_index::CarIndex;
 pub use distributed_store::DistributedBlockStore;
 pub use fs_store::FsBlockStore;
 pub use ipfs_pin::IpfsPinClient;

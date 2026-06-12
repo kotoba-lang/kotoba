@@ -12,5 +12,5 @@ pub use cid::{CidError, KotobaCid};
 pub use foreign::{ForeignBridge, ForeignCall, ForeignCallType, ForeignError};
 pub use frame::{Frame, FrameFlags, FrameType};
 pub use named_graph::{classify as classify_graph_visibility, GraphVisibility, NamedGraph};
-pub use policy::DataPolicy;
+pub use policy::{DataPolicy, EnvelopeKeyWrap, EnvelopeManifest, EnvelopeManifestError};
 pub use prolly::{ProllyNode, ProllyTree};

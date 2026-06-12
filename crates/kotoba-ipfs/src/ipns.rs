@@ -10,12 +10,17 @@ use crate::cid::{dag_cbor_block, parse_cid};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ipld_core::cid::Cid as IpldCid;
 use multibase::Base;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+const DEFAULT_KUBO_ENDPOINT: &str = "http://localhost:5001";
+const DISABLED_KUBO_ENDPOINT: &str = "http://127.0.0.1:9";
+const MAX_KUBO_ENDPOINT_LEN: usize = 256;
 const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KUBO_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -287,7 +292,14 @@ impl PersistentIpnsRegistry {
         let records: HashMap<IpnsName, IpnsRecord> = std::fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Vec<IpnsRecord>>(&bytes).ok())
-            .map(|recs| recs.into_iter().map(|r| (r.name.clone(), r)).collect())
+            .map(|recs| {
+                recs.into_iter()
+                    .filter(|record| {
+                        record.value_cid().is_ok() && record.verify_signature_if_present().is_ok()
+                    })
+                    .map(|r| (r.name.clone(), r))
+                    .collect()
+            })
             .unwrap_or_default();
         Self {
             records: Arc::new(RwLock::new(records)),
@@ -304,10 +316,7 @@ impl PersistentIpnsRegistry {
         self.len() == 0
     }
 
-    fn persist(
-        &self,
-        records: &HashMap<IpnsName, IpnsRecord>,
-    ) -> Result<(), IpnsRegistryError> {
+    fn persist(&self, records: &HashMap<IpnsName, IpnsRecord>) -> Result<(), IpnsRegistryError> {
         let snapshot: Vec<&IpnsRecord> = records.values().collect();
         let json = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| IpnsRegistryError::Io(e.to_string()))?;
@@ -425,9 +434,13 @@ struct KuboKeyListResp {
 
 impl KuboIpnsRegistry {
     pub fn new(endpoint: impl Into<String>) -> Self {
+        let endpoint = normalize_kubo_endpoint(&endpoint.into()).unwrap_or_else(|| {
+            tracing::warn!("invalid Kubo IPNS endpoint; disabling KuboIpnsRegistry HTTP access");
+            DISABLED_KUBO_ENDPOINT.to_string()
+        });
         Self {
             client: kubo_http_client(),
-            endpoint: endpoint.into(),
+            endpoint,
             token: None,
             local: InMemoryIpnsRegistry::new(),
             persist_dir: None,
@@ -436,8 +449,12 @@ impl KuboIpnsRegistry {
     }
 
     pub fn from_env() -> Self {
-        let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:5001".into());
+        let endpoint =
+            std::env::var("KOTOBA_IPFS_ENDPOINT").unwrap_or_else(|_| DEFAULT_KUBO_ENDPOINT.into());
+        let endpoint = normalize_kubo_endpoint(&endpoint).unwrap_or_else(|| {
+            tracing::warn!("invalid KOTOBA_IPFS_ENDPOINT; disabling KuboIpnsRegistry HTTP access");
+            DISABLED_KUBO_ENDPOINT.to_string()
+        });
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
         let persist_dir = Self::persist_dir_from_env();
         let registry = Self {
@@ -544,9 +561,7 @@ impl KuboIpnsRegistry {
         };
         // Write to a temp file then rename for an atomic head swap.
         let tmp = path.with_extension("json.tmp");
-        if let Err(e) =
-            std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path))
-        {
+        if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path)) {
             tracing::warn!(err = %e, path = %path.display(), "ipns: head persist failed");
         }
     }
@@ -589,14 +604,13 @@ impl KuboIpnsRegistry {
     /// Called from `from_env` on startup; safe to call again at any time.
     pub fn bootstrap_aliases_from_kubo(&self) -> Result<(), IpnsRegistryError> {
         let url = format!("{}?ipns-base=base36", self.api_url("key/list"));
-        let resp = Self::wait(
-            "key/list send",
-            self.authed(self.client.post(url)).send(),
-        )?;
+        let resp = Self::wait("key/list send", self.authed(self.client.post(url)).send())?;
         let status = resp.status();
         if !status.is_success() {
             let text = Self::wait("key/list body", resp.text()).unwrap_or_default();
-            return Err(IpnsRegistryError::Kubo(format!("key/list {status}: {text}")));
+            return Err(IpnsRegistryError::Kubo(format!(
+                "key/list {status}: {text}"
+            )));
         }
         let parsed: KuboKeyListResp = Self::wait("key/list parse", resp.json())?;
         let mut map = self
@@ -681,18 +695,15 @@ impl KuboIpnsRegistry {
         }
     }
 
-    fn wait<T, E: std::fmt::Display>(
+    fn wait<T, E>(
         context: &str,
-        fut: impl std::future::Future<Output = Result<T, E>>,
-    ) -> Result<T, IpnsRegistryError> {
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| IpnsRegistryError::Kubo(format!("runtime build: {e}")))?
-                .block_on(fut),
-        };
+        fut: impl Future<Output = Result<T, E>> + Send + 'static,
+    ) -> Result<T, IpnsRegistryError>
+    where
+        T: Send + 'static,
+        E: std::fmt::Display + Send + 'static,
+    {
+        let result = ipns_block_on(fut);
         result.map_err(|e| IpnsRegistryError::Kubo(format!("{context}: {e}")))
     }
 
@@ -903,6 +914,69 @@ fn kubo_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+fn normalize_kubo_endpoint(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty()
+        || endpoint.len() > MAX_KUBO_ENDPOINT_LEN
+        || endpoint.chars().any(|ch| ch.is_control())
+    {
+        return None;
+    }
+    let url = Url::parse(endpoint).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn ipns_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("ipns-kubo-io")
+            .build()
+            .expect("build ipns-kubo-io runtime")
+    })
+}
+
+fn ipns_block_on<F>(fut: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let rt = ipns_runtime();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            rt.spawn(async move {
+                let _ = tx.send(fut.await);
+            });
+            if matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                tokio::task::block_in_place(|| rx.recv())
+                    .expect("ipns-kubo-io runtime dropped the in-flight result")
+            } else {
+                rx.recv()
+                    .expect("ipns-kubo-io runtime dropped the in-flight result")
+            }
+        }
+        Err(_) => rt.block_on(fut),
+    }
+}
+
 impl IpnsRegistry for KuboIpnsRegistry {
     fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError> {
         // Persist to the in-memory cache synchronously so subsequent
@@ -967,6 +1041,49 @@ mod tests {
         let record = IpnsRecord::new("k51-kotoba-test", &cid, 1, "2030-01-01T00:00:00Z");
         registry.publish(record.clone()).unwrap();
         assert_eq!(registry.resolve(&record.name).unwrap(), record);
+    }
+
+    #[test]
+    fn normalize_kubo_endpoint_accepts_http_https_root_urls() {
+        assert_eq!(
+            normalize_kubo_endpoint(" http://localhost:5001/ ").unwrap(),
+            "http://localhost:5001"
+        );
+        assert_eq!(
+            normalize_kubo_endpoint("https://kubo.example.com").unwrap(),
+            "https://kubo.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_kubo_endpoint_rejects_ambiguous_or_header_unsafe_values() {
+        for endpoint in [
+            "",
+            "ftp://localhost:5001",
+            "https://user:pass@localhost:5001",
+            "http://localhost:5001/api",
+            "http://localhost:5001?x=1",
+            "http://localhost:5001#frag",
+            "http://localhost:5001/\nheader",
+            "not a url",
+        ] {
+            assert!(
+                normalize_kubo_endpoint(endpoint).is_none(),
+                "endpoint should be rejected: {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kubo_ipns_registry_new_disables_invalid_endpoint() {
+        let registry = KuboIpnsRegistry::new("http://localhost:5001/api");
+
+        assert_eq!(registry.endpoint, DISABLED_KUBO_ENDPOINT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ipns_block_on_works_inside_current_thread_runtime() {
+        assert_eq!(ipns_block_on(async { 7usize }), 7);
     }
 
     /// ADR-2606012200 LEG-3 candidate (a): is the per-transact `ipns.resolve`
@@ -1058,8 +1175,8 @@ mod tests {
         // A head published into a PersistentIpnsRegistry must survive dropping
         // the registry (= a process restart) and reloading from the same file —
         // this is the durability the in-memory registry lacks.
-        let path = std::env::temp_dir()
-            .join(format!("kotoba-ipns-persist-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("kotoba-ipns-persist-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cid = raw_cid(b"commit-head");
         let name = "k51-kotoba-persist-test";
@@ -1094,6 +1211,43 @@ mod tests {
                 .sequence,
             2
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persistent_registry_skips_invalid_records_on_open() {
+        let path = std::env::temp_dir().join(format!(
+            "kotoba-ipns-persist-invalid-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let cid = raw_cid(b"valid-head");
+        let valid = IpnsRecord::new("k51-valid", &cid, 1, "2030-01-01T00:00:00Z");
+        let mut bad_cid = IpnsRecord::new("k51-bad-cid", &cid, 1, "2030-01-01T00:00:00Z");
+        bad_cid.value = "not-a-cid".to_string();
+        let mut partial_sig = IpnsRecord::new("k51-partial-sig", &cid, 1, "2030-01-01T00:00:00Z");
+        partial_sig.public_key_multibase = Some("znot-a-valid-key".to_string());
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![valid.clone(), bad_cid, partial_sig]).unwrap(),
+        )
+        .unwrap();
+
+        let registry = PersistentIpnsRegistry::open(&path);
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.resolve(&IpnsName::new("k51-valid")).unwrap(),
+            valid
+        );
+        assert!(matches!(
+            registry.resolve(&IpnsName::new("k51-bad-cid")),
+            Err(IpnsRegistryError::NotFound(_))
+        ));
+        assert!(matches!(
+            registry.resolve(&IpnsName::new("k51-partial-sig")),
+            Err(IpnsRegistryError::NotFound(_))
+        ));
         let _ = std::fs::remove_file(&path);
     }
 

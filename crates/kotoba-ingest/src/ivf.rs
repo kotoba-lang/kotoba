@@ -525,8 +525,10 @@ mod tests {
         // (10,0) (cosine 1.0 with the query), so the top-5 set is unambiguous.
         let pts = two_cluster_points(50);
         let idx = IvfIndex::build(&pts, 2, "test-model", 30);
-        let assigned: Vec<(usize, Vec<f32>)> =
-            pts.iter().map(|(_, v)| (idx.assign(v).0, v.clone())).collect();
+        let assigned: Vec<(usize, Vec<f32>)> = pts
+            .iter()
+            .map(|(_, v)| (idx.assign(v).0, v.clone()))
+            .collect();
         let cand: Vec<(usize, &[f32])> =
             assigned.iter().map(|(ci, v)| (*ci, v.as_slice())).collect();
         let query = vec![10.0f32, 0.0];
@@ -541,11 +543,17 @@ mod tests {
         let mut brute_top: Vec<usize> = brute.iter().take(5).map(|(_, i)| *i).collect();
         brute_top.sort_unstable();
 
-        let mut got: Vec<usize> =
-            idx.search(&query, &cand, 2, 5).into_iter().map(|(_, i)| i).collect();
+        let mut got: Vec<usize> = idx
+            .search(&query, &cand, 2, 5)
+            .into_iter()
+            .map(|(_, i)| i)
+            .collect();
         got.sort_unstable();
 
-        assert_eq!(got, brute_top, "full-probe IVF must equal brute-force top-k");
+        assert_eq!(
+            got, brute_top,
+            "full-probe IVF must equal brute-force top-k"
+        );
         // The 5 exact-(10,0) points are the even indices with i%5==0.
         assert_eq!(got, vec![0, 10, 20, 30, 40], "the true nearest points");
     }
@@ -557,8 +565,10 @@ mod tests {
         // them. A bug ignoring nprobe would return the same count for both.
         let pts = two_cluster_points(50); // 25 positive-cluster, 25 negative-cluster
         let idx = IvfIndex::build(&pts, 2, "test-model", 30);
-        let assigned: Vec<(usize, Vec<f32>)> =
-            pts.iter().map(|(_, v)| (idx.assign(v).0, v.clone())).collect();
+        let assigned: Vec<(usize, Vec<f32>)> = pts
+            .iter()
+            .map(|(_, v)| (idx.assign(v).0, v.clone()))
+            .collect();
         let cand: Vec<(usize, &[f32])> =
             assigned.iter().map(|(ci, v)| (*ci, v.as_slice())).collect();
         let query = vec![10.0f32, 0.0];
@@ -566,7 +576,10 @@ mod tests {
         let n_one = idx.search(&query, &cand, 1, 50).len();
         let n_all = idx.search(&query, &cand, 2, 50).len();
         assert_eq!(n_all, 50, "probing all clusters sees every candidate");
-        assert_eq!(n_one, 25, "probing one cluster sees only that cluster's candidates");
+        assert_eq!(
+            n_one, 25,
+            "probing one cluster sees only that cluster's candidates"
+        );
         assert!(n_one < n_all, "nprobe must restrict the candidate set");
     }
 

@@ -338,7 +338,10 @@ mod tests {
             oid: blob_oid,
         }]);
         let (tree_oid, _) = git.put_object(&tree).await.unwrap();
-        assert_eq!(tree_oid.to_hex(), "b4ed918248039b78f24383523fa4e51f80994fac");
+        assert_eq!(
+            tree_oid.to_hex(),
+            "b4ed918248039b78f24383523fa4e51f80994fac"
+        );
 
         let commit_body = b"tree b4ed918248039b78f24383523fa4e51f80994fac\n\
 author t <t@t> 1700000000 +0000\n\
@@ -354,7 +357,9 @@ first\n"
         );
 
         git.put_ref("refs/heads/main", commit_oid).await.unwrap();
-        git.put_symbolic_ref("HEAD", "refs/heads/main").await.unwrap();
+        git.put_symbolic_ref("HEAD", "refs/heads/main")
+            .await
+            .unwrap();
 
         let db = conn.db();
 

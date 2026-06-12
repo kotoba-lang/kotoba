@@ -11,13 +11,15 @@ pub mod warrant;
 
 pub use audit::{
     AuditAction, AuditScheduler, AvailabilityAuditor, InMemoryVerdictSink, PeerAudit,
-    PeerReputation, SettlementIntent, SettlementIntentSink, SettlementKind, ProofFetcher,
+    PeerReputation, ProofFetcher, SettlementIntent, SettlementIntentSink, SettlementKind,
     VerdictSink,
 };
 pub use commit_chain::CommitChain;
 pub use neighborhood::Neighborhood;
-pub use settlement::{SettlementBatch, SettlementLine, SettlementSchedule};
-pub use neighborhood_store::{cid_address, proof_from_store, NeighborhoodBlockStore, PeerTransport};
+pub use neighborhood_store::{
+    cid_address, proof_from_store, NeighborhoodBlockStore, PeerTransport,
+};
 pub use node_id::NodeId;
+pub use settlement::{SettlementBatch, SettlementLine, SettlementSchedule};
 pub use source_chain::{ChainContent, ChainEntry, SourceChain};
 pub use warrant::Warrant;

@@ -102,7 +102,10 @@ pub struct MstNode {
 impl MstNode {
     /// Empty node — `{ l: null, e: [] }`.
     pub fn empty() -> Self {
-        MstNode { l: None, e: Vec::new() }
+        MstNode {
+            l: None,
+            e: Vec::new(),
+        }
     }
 
     /// Structurally-correct CIDv1 dag-cbor sha2-256 CID of this node.
@@ -138,12 +141,18 @@ mod tests {
 
     #[test]
     fn key_depth_is_deterministic() {
-        assert_eq!(key_depth("app.bsky.feed.post/abc"), key_depth("app.bsky.feed.post/abc"));
+        assert_eq!(
+            key_depth("app.bsky.feed.post/abc"),
+            key_depth("app.bsky.feed.post/abc")
+        );
     }
 
     #[test]
     fn common_prefix_len_basics() {
-        assert_eq!(common_prefix_len("app.bsky.feed.post/a", "app.bsky.feed.post/b"), 19);
+        assert_eq!(
+            common_prefix_len("app.bsky.feed.post/a", "app.bsky.feed.post/b"),
+            19
+        );
         assert_eq!(common_prefix_len("abc", "abc"), 3);
         assert_eq!(common_prefix_len("abc", "xyz"), 0);
         assert_eq!(common_prefix_len("", "anything"), 0);
@@ -157,7 +166,10 @@ mod tests {
         assert!(!is_valid_repo_path("a/b/c"), "exactly one slash");
         assert!(!is_valid_repo_path("/rkey"), "empty collection");
         assert!(!is_valid_repo_path("coll/"), "empty rkey");
-        assert!(!is_valid_repo_path("coll/has space"), "space not in charset");
+        assert!(
+            !is_valid_repo_path("coll/has space"),
+            "space not in charset"
+        );
         assert!(!is_valid_repo_path(""), "empty");
     }
 

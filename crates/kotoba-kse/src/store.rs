@@ -2,6 +2,10 @@ use bytes::Bytes;
 use object_store::path::Path;
 use std::sync::Arc;
 
+pub const MAX_KSE_STORE_PREFIX_BYTES: usize = 512;
+pub const MAX_KSE_STORE_KEY_BYTES: usize = 1024;
+pub const MAX_KSE_STORE_VALUE_BYTES: usize = 8 * 1024 * 1024;
+
 /// KseStore — thin wrapper around an ObjectStore with a fixed key prefix.
 ///
 /// In production: wraps an `AmazonS3` (B2 S3-compat) instance.
@@ -14,35 +18,44 @@ pub struct KseStore {
 impl KseStore {
     /// Construct from any ObjectStore implementation.
     pub fn new(store: Arc<dyn object_store::ObjectStore>, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        if let Err(err) = validate_prefix(&prefix) {
+            panic!("invalid KseStore prefix: {err}");
+        }
         Self {
             inner: store,
-            prefix: prefix.into(),
+            prefix,
         }
     }
 
-    fn path(&self, key: &str) -> Path {
-        Path::from(format!("{}{}", self.prefix, key))
+    fn path(&self, key: &str) -> object_store::Result<Path> {
+        validate_key(key)?;
+        Ok(Path::from(format!("{}{}", self.prefix, key)))
     }
 
     /// Write bytes at `{prefix}{key}`.
     pub async fn put(&self, key: &str, data: Bytes) -> object_store::Result<()> {
-        self.inner.put(&self.path(key), data.into()).await?;
+        validate_value_len(data.len())?;
+        self.inner.put(&self.path(key)?, data.into()).await?;
         Ok(())
     }
 
     /// Read bytes at `{prefix}{key}`.
     pub async fn get(&self, key: &str) -> object_store::Result<Bytes> {
-        self.inner.get(&self.path(key)).await?.bytes().await
+        self.inner.get(&self.path(key)?).await?.bytes().await
     }
 
     /// Return true if the object exists.
     pub async fn exists(&self, key: &str) -> bool {
-        self.inner.head(&self.path(key)).await.is_ok()
+        let Ok(path) = self.path(key) else {
+            return false;
+        };
+        self.inner.head(&path).await.is_ok()
     }
 
     /// Delete the object at `{prefix}{key}`.
     pub async fn delete_key(&self, key: &str) -> object_store::Result<()> {
-        self.inner.delete(&self.path(key)).await
+        self.inner.delete(&self.path(key)?).await
     }
 
     /// List all keys under `{prefix}{sub_prefix}`, returning them relative to `self.prefix`.
@@ -51,6 +64,9 @@ impl KseStore {
     /// `"seq/00000000000000000001"`.
     pub async fn list_prefix(&self, sub_prefix: &str) -> Vec<String> {
         use tokio_stream::StreamExt as _;
+        if validate_sub_prefix(sub_prefix).is_err() {
+            return Vec::new();
+        }
         let full_prefix = format!("{}{}", self.prefix, sub_prefix);
         let prefix_path = Path::from(full_prefix.as_str());
         let mut stream = self.inner.list(Some(&prefix_path));
@@ -66,6 +82,74 @@ impl KseStore {
         }
         keys
     }
+}
+
+fn store_error(message: impl Into<String>) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "KseStore",
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message.into(),
+        )),
+    }
+}
+
+fn validate_prefix(prefix: &str) -> object_store::Result<()> {
+    if prefix.len() > MAX_KSE_STORE_PREFIX_BYTES {
+        return Err(store_error("prefix too large"));
+    }
+    validate_path_like(prefix, true)
+}
+
+fn validate_key(key: &str) -> object_store::Result<()> {
+    if key.is_empty() {
+        return Err(store_error("key must not be empty"));
+    }
+    if key.len() > MAX_KSE_STORE_KEY_BYTES {
+        return Err(store_error("key too large"));
+    }
+    validate_path_like(key, false)
+}
+
+fn validate_sub_prefix(prefix: &str) -> object_store::Result<()> {
+    if prefix.len() > MAX_KSE_STORE_KEY_BYTES {
+        return Err(store_error("list prefix too large"));
+    }
+    validate_path_like(prefix, true)
+}
+
+fn validate_path_like(value: &str, allow_empty: bool) -> object_store::Result<()> {
+    if value.is_empty() {
+        return if allow_empty {
+            Ok(())
+        } else {
+            Err(store_error("path must not be empty"))
+        };
+    }
+    if value.starts_with('/') || value.starts_with('\\') {
+        return Err(store_error("absolute paths are not allowed"));
+    }
+    if value
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b'\\')
+    {
+        return Err(store_error(
+            "control characters and backslashes are not allowed",
+        ));
+    }
+    for segment in value.split('/') {
+        if segment == "." || segment == ".." {
+            return Err(store_error("relative path segments are not allowed"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_value_len(len: usize) -> object_store::Result<()> {
+    if len > MAX_KSE_STORE_VALUE_BYTES {
+        return Err(store_error("value too large"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -255,5 +339,78 @@ mod tests {
             !store.exists("the-key").await,
             "key must not exist after deletion"
         );
+    }
+
+    #[tokio::test]
+    async fn kse_store_rejects_unsafe_keys() {
+        let dir = tmp_dir("kse-unsafe-key");
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = KseStore::new(fs, "safe/");
+
+        for key in [
+            "",
+            "/absolute",
+            "../escape",
+            "nested/../escape",
+            "has\\slash",
+        ] {
+            assert!(
+                store.put(key, Bytes::from_static(b"x")).await.is_err(),
+                "key must be rejected: {key:?}"
+            );
+            assert!(!store.exists(key).await);
+            assert!(store.get(key).await.is_err());
+            assert!(store.delete_key(key).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn kse_store_rejects_control_and_oversized_keys() {
+        let dir = tmp_dir("kse-key-caps");
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = KseStore::new(fs, "safe/");
+        let oversized_key = "k".repeat(MAX_KSE_STORE_KEY_BYTES + 1);
+
+        assert!(store
+            .put("bad\nkey", Bytes::from_static(b"x"))
+            .await
+            .is_err());
+        assert!(store
+            .put(&oversized_key, Bytes::from_static(b"x"))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn kse_store_rejects_oversized_values() {
+        let dir = tmp_dir("kse-value-cap");
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = KseStore::new(fs, "safe/");
+        let oversized = Bytes::from(vec![0u8; MAX_KSE_STORE_VALUE_BYTES + 1]);
+
+        assert!(store.put("large", oversized).await.is_err());
+        assert!(!store.exists("large").await);
+    }
+
+    #[tokio::test]
+    async fn kse_store_list_prefix_rejects_escape_prefix() {
+        let dir = tmp_dir("kse-list-escape");
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = KseStore::new(fs, "safe/");
+        store
+            .put("seq/0001", Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+
+        assert!(store.list_prefix("../").await.is_empty());
+        assert!(store.list_prefix("/").await.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid KseStore prefix")]
+    fn kse_store_rejects_unsafe_prefix() {
+        let dir = tmp_dir("kse-bad-prefix");
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let _ = KseStore::new(fs, "../escape/");
     }
 }

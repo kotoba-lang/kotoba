@@ -1,3 +1,12 @@
+#![allow(
+    clippy::assertions_on_constants,
+    clippy::await_holding_lock,
+    clippy::items_after_test_module,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
+pub mod account_xrpc;
 pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
@@ -14,7 +23,6 @@ pub mod media_xrpc;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
-pub mod account_xrpc;
 pub mod pds_session;
 pub mod pds_xrpc;
 pub mod pre_proxy;
@@ -73,6 +81,12 @@ mod tests {
         NSID_AGENT_SYNC_CLOSE,
         NSID_VAULT_PUT,
         NSID_VAULT_GET,
+        NSID_VAULT_ENVELOPE_PUT,
+        NSID_VAULT_ENVELOPE_GET,
+        NSID_VAULT_ENVELOPE_CURRENT,
+        NSID_VAULT_ENVELOPE_INSPECT,
+        NSID_VAULT_ENVELOPE_GRANT,
+        NSID_VAULT_ENVELOPE_REVOKE,
         // email
         super::email_xrpc::NSID_EMAIL_LIST,
         super::email_xrpc::NSID_EMAIL_READ,
@@ -116,11 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn all_nsids_lowercase_dotted() {
+    fn all_nsids_are_ascii_alnum_dotted() {
         for nsid in ALL_NSIDS {
             assert!(
-                nsid.chars().all(|c| c.is_ascii_lowercase() || c == '.'),
-                "NSID must be lowercase+dots: {nsid}"
+                nsid.chars().all(|c| c.is_ascii_alphanumeric() || c == '.'),
+                "NSID must contain only ASCII alphanumeric characters and dots: {nsid}"
             );
         }
     }
@@ -152,6 +166,380 @@ mod tests {
         let state = super::server::KotobaState::new(None)
             .expect("KotobaState::new should succeed in test env");
         let _router = super::build_router(std::sync::Arc::new(state));
+    }
+
+    #[test]
+    fn email_xrpc_routes_use_public_nsids_and_body_limits() {
+        let all_nsids: std::collections::HashSet<&str> = ALL_NSIDS.iter().copied().collect();
+        let routes = [
+            (super::email_xrpc::NSID_EMAIL_LIST, "GET", None),
+            (super::email_xrpc::NSID_EMAIL_READ, "GET", None),
+            (
+                super::email_xrpc::NSID_EMAIL_INGEST,
+                "POST",
+                Some(super::email_xrpc::EMAIL_INGEST_BODY_LIMIT),
+            ),
+            (
+                super::email_xrpc::NSID_EMAIL_SEND,
+                "POST",
+                Some(super::email_xrpc::EMAIL_SEND_BODY_LIMIT),
+            ),
+        ];
+
+        let expected_nsids: std::collections::BTreeSet<&str> =
+            super::email_xrpc::ALL_EMAIL_NSIDS.iter().copied().collect();
+        let route_nsids: std::collections::BTreeSet<&str> =
+            routes.iter().map(|(nsid, _, _)| *nsid).collect();
+        assert_eq!(
+            route_nsids, expected_nsids,
+            "email routes must enumerate every public email NSID"
+        );
+        assert_eq!(super::email_xrpc::EMAIL_INGEST_BODY_LIMIT, 36 * 1024 * 1024);
+        assert_eq!(super::email_xrpc::EMAIL_SEND_BODY_LIMIT, 300 * 1024 * 1024);
+        assert_eq!(routes.len(), 4);
+        for (nsid, method, body_limit) in routes {
+            assert!(
+                all_nsids.contains(nsid),
+                "email route NSID must be included in ALL_NSIDS: {nsid}"
+            );
+            assert!(
+                nsid.starts_with("com.etzhayyim.apps.kotoba.email."),
+                "email route NSID must use the email namespace: {nsid}"
+            );
+            match method {
+                "GET" => assert!(body_limit.is_none(), "GET route must not set body limit"),
+                "POST" => assert!(body_limit.is_some(), "POST route must set body limit"),
+                other => panic!("unexpected email route method: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn signal_xrpc_routes_use_public_nsids_and_body_limits() {
+        let routes = [
+            (
+                super::signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS,
+                "POST",
+                Some(super::signal_xrpc::SIGNAL_REGISTER_PREKEYS_BODY_LIMIT),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_GET_PREKEY_BUNDLE,
+                "GET",
+                None,
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_SEND_MESSAGE,
+                "POST",
+                Some(super::signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_SEND_GROUP_MESSAGE,
+                "POST",
+                Some(super::signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY,
+                "POST",
+                Some(super::signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY,
+                "POST",
+                Some(super::signal_xrpc::SIGNAL_PUBLISH_IDENTITY_BODY_LIMIT),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY,
+                "GET",
+                None,
+            ),
+        ];
+
+        let expected_nsids: std::collections::BTreeSet<&str> = super::signal_xrpc::ALL_SIGNAL_NSIDS
+            .iter()
+            .copied()
+            .collect();
+        let route_nsids: std::collections::BTreeSet<&str> =
+            routes.iter().map(|(nsid, _, _)| *nsid).collect();
+        assert_eq!(
+            route_nsids, expected_nsids,
+            "Signal routes must enumerate every public Signal NSID"
+        );
+        assert_eq!(
+            super::signal_xrpc::SIGNAL_REGISTER_PREKEYS_BODY_LIMIT,
+            256 * 1024
+        );
+        assert_eq!(super::signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT, 512 * 1024);
+        assert_eq!(
+            super::signal_xrpc::SIGNAL_PUBLISH_IDENTITY_BODY_LIMIT,
+            16 * 1024
+        );
+        assert_eq!(routes.len(), 7);
+        for (nsid, method, body_limit) in routes {
+            assert!(
+                nsid.starts_with("com.etzhayyim.signal."),
+                "Signal route NSID must use the Signal namespace: {nsid}"
+            );
+            assert!(
+                nsid.chars().all(|c| c.is_ascii_alphanumeric() || c == '.'),
+                "Signal NSID must contain only ASCII alphanumeric characters and dots: {nsid}"
+            );
+            match method {
+                "GET" => assert!(body_limit.is_none(), "GET route must not set body limit"),
+                "POST" => {
+                    if matches!(
+                        nsid,
+                        super::signal_xrpc::NSID_SIGNAL_SEND_MESSAGE
+                            | super::signal_xrpc::NSID_SIGNAL_SEND_GROUP_MESSAGE
+                            | super::signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY
+                            | super::signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS
+                            | super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY
+                    ) {
+                        assert!(
+                            body_limit.is_some(),
+                            "Signal payload route must set body limit"
+                        );
+                    }
+                }
+                other => panic!("unexpected Signal route method: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn email_xrpc_routes_are_registered_on_real_router() {
+        use axum::http::{header, Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+        let app = super::build_router(state);
+
+        for (nsid, method, body) in [
+            (
+                super::email_xrpc::NSID_EMAIL_LIST,
+                Method::GET,
+                axum::body::Body::empty(),
+            ),
+            (
+                super::email_xrpc::NSID_EMAIL_READ,
+                Method::GET,
+                axum::body::Body::empty(),
+            ),
+            (
+                super::email_xrpc::NSID_EMAIL_INGEST,
+                Method::POST,
+                axum::body::Body::from("{}"),
+            ),
+            (
+                super::email_xrpc::NSID_EMAIL_SEND,
+                Method::POST,
+                axum::body::Body::from("{}"),
+            ),
+        ] {
+            let builder = Request::builder()
+                .method(method)
+                .uri(format!("/xrpc/{nsid}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            let response = app
+                .clone()
+                .oneshot(builder.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "email XRPC route is not registered: {nsid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_xrpc_routes_are_registered_on_real_router() {
+        use axum::http::{header, Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+        let app = super::build_router(state);
+
+        for (nsid, method, body) in [
+            (
+                super::signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS,
+                Method::POST,
+                axum::body::Body::from("{}"),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_GET_PREKEY_BUNDLE,
+                Method::GET,
+                axum::body::Body::empty(),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_SEND_MESSAGE,
+                Method::POST,
+                axum::body::Body::from("{}"),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_SEND_GROUP_MESSAGE,
+                Method::POST,
+                axum::body::Body::from("{}"),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY,
+                Method::POST,
+                axum::body::Body::from("{}"),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY,
+                Method::POST,
+                axum::body::Body::from("{}"),
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY,
+                Method::GET,
+                axum::body::Body::empty(),
+            ),
+        ] {
+            let builder = Request::builder()
+                .method(method)
+                .uri(format!("/xrpc/{nsid}"))
+                .header(header::CONTENT_TYPE, "application/json");
+            let response = app
+                .clone()
+                .oneshot(builder.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "Signal XRPC route is not registered: {nsid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_payload_routes_enforce_body_limit_before_handler() {
+        use axum::http::{header, Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+        let app = super::build_router(state);
+        for (nsid, body_limit) in [
+            (
+                super::signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS,
+                super::signal_xrpc::SIGNAL_REGISTER_PREKEYS_BODY_LIMIT,
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_SEND_MESSAGE,
+                super::signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT,
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_SEND_GROUP_MESSAGE,
+                super::signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT,
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY,
+                super::signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT,
+            ),
+            (
+                super::signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY,
+                super::signal_xrpc::SIGNAL_PUBLISH_IDENTITY_BODY_LIMIT,
+            ),
+        ] {
+            let oversized = vec![b' '; body_limit + 1];
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/xrpc/{nsid}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(oversized))
+                .unwrap();
+
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Signal route did not enforce body limit: {nsid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn email_ingest_route_enforces_body_limit_before_handler() {
+        use axum::http::{header, Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+        let app = super::build_router(state);
+        let oversized = vec![b' '; super::email_xrpc::EMAIL_INGEST_BODY_LIMIT + 1];
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/xrpc/{}", super::email_xrpc::NSID_EMAIL_INGEST))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(oversized))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "email.ingest route did not enforce body limit before handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn email_send_route_enforces_body_limit_before_handler() {
+        use axum::{
+            extract::DefaultBodyLimit,
+            http::{header, Method, Request, StatusCode},
+            routing::post,
+            Router,
+        };
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+        let app = Router::new()
+            .route(
+                &format!("/xrpc/{}", super::email_xrpc::NSID_EMAIL_SEND),
+                post(super::email_xrpc::email_send).layer(DefaultBodyLimit::max(1)),
+            )
+            .with_state(state);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/xrpc/{}", super::email_xrpc::NSID_EMAIL_SEND))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "email.send route did not enforce body limit before handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_email_send_route_reaches_handler_for_small_body() {
+        use axum::http::{header, Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
+        let app = super::build_router(state);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/xrpc/{}", super::email_xrpc::NSID_EMAIL_SEND))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "email.send route is not registered"
+        );
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "real email.send route must not reject small bodies at the body-limit layer"
+        );
     }
 
     // ── NSID detailed format checks ───────────────────────────────────────
@@ -195,12 +583,17 @@ mod tests {
     }
 
     #[test]
-    fn all_nsids_no_uppercase() {
+    fn all_nsid_segments_start_lowercase() {
         for nsid in ALL_NSIDS {
-            assert!(
-                !nsid.chars().any(|c| c.is_uppercase()),
-                "NSID must not contain uppercase: {nsid}"
-            );
+            for segment in nsid.split('.') {
+                let Some(first) = segment.chars().next() else {
+                    panic!("NSID segment must not be empty: {nsid}");
+                };
+                assert!(
+                    first.is_ascii_lowercase(),
+                    "NSID segments must start lowercase: {nsid}"
+                );
+            }
         }
     }
 
@@ -229,16 +622,16 @@ mod tests {
     async fn generic_xrpc_dispatch_resolves() {
         use axum::http::Request;
         use tower::ServiceExt;
-        
+
         let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
         let app = super::build_router(state);
-        
+
         let req = Request::builder()
             .method("POST")
             .uri("/xrpc/com.etzhayyim.apps.yata.some_method")
             .body(axum::body::Body::empty())
             .unwrap();
-            
+
         let response = app.oneshot(req).await.unwrap();
         // Since we provided empty body, we expect a 400 Bad Request or 401 Unauthorized,
         // but definitely NOT a 404 Not Found (which means no route matched)
@@ -272,8 +665,18 @@ mod tests {
             graph: graph.clone(),
             covering_datoms: None,
             datoms: vec![
-                kotoba_datomic::Datom::assert(e.clone(), ":person/name".into(), kotoba_edn::EdnValue::string("Alice"), tx.clone()),
-                kotoba_datomic::Datom::assert(e, ":person/role".into(), kotoba_edn::EdnValue::string("admin"), tx.clone()),
+                kotoba_datomic::Datom::assert(
+                    e.clone(),
+                    ":person/name".into(),
+                    kotoba_edn::EdnValue::string("Alice"),
+                    tx.clone(),
+                ),
+                kotoba_datomic::Datom::assert(
+                    e,
+                    ":person/role".into(),
+                    kotoba_edn::EdnValue::string("admin"),
+                    tx.clone(),
+                ),
             ],
             expected_parent: None,
             tx_cid: Some(tx),
@@ -288,7 +691,10 @@ mod tests {
         .unwrap();
         state.graph_registry.write().await.insert(
             graph.clone(),
-            ("http".into(), kotoba_core::named_graph::GraphVisibility::Public),
+            (
+                "http".into(),
+                kotoba_core::named_graph::GraphVisibility::Public,
+            ),
         );
 
         let app = super::build_router(std::sync::Arc::clone(&state));
@@ -302,9 +708,15 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let v = body_json(resp).await;
         // Rows came through the full stack…
-        assert_eq!(v["rows_edn"], serde_json::json!([[r#""Alice""#, r#""admin""#]]), "body={v}");
+        assert_eq!(
+            v["rows_edn"],
+            serde_json::json!([[r#""Alice""#, r#""admin""#]]),
+            "body={v}"
+        );
         // …and result_cid is present and fetchable from the block store by CID.
-        let result_cid = v["result_cid"].as_str().expect("result_cid present in HTTP response");
+        let result_cid = v["result_cid"]
+            .as_str()
+            .expect("result_cid present in HTTP response");
         let kcid = Cid::from_multibase(result_cid).expect("multibase CID");
         assert!(
             state.block_store.get(&kcid).unwrap().is_some(),
@@ -315,7 +727,9 @@ mod tests {
     // ── HTTP integration: PDS session PoP + zero-access endpoints (ADR-2606015000) ──
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
@@ -349,7 +763,10 @@ mod tests {
         ));
         let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
         let resp = app
-            .oneshot(post_json(&uri, serde_json::json!({ "token": make_didkey_pop() })))
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({ "token": make_didkey_pop() }),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -370,7 +787,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
-        assert_eq!(body_json(resp).await["valid"], serde_json::Value::Bool(false));
+        assert_eq!(
+            body_json(resp).await["valid"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[tokio::test]
@@ -379,7 +799,10 @@ mod tests {
         let app = super::build_router(std::sync::Arc::new(
             super::server::KotobaState::new(None).expect("state"),
         ));
-        let uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         // No Authorization header → owner-auth must reject (not 404, not 200).
         let resp = app
             .oneshot(post_json(
@@ -451,18 +874,26 @@ mod tests {
         let wrapped = "QUFBQUFBQUFBQUFB"; // opaque wrap blob (server stores verbatim)
 
         // PUT — store the wrapped ARK.
-        let put_uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let put_uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         let put_req = axum::http::Request::builder()
             .method("POST")
             .uri(&put_uri)
             .header("content-type", "application/json")
             .header("authorization", &bearer)
             .body(axum::body::Body::from(
-                serde_json::json!({ "did": did, "credentialId": "cred-rt", "wrappedArk": wrapped }).to_string(),
+                serde_json::json!({ "did": did, "credentialId": "cred-rt", "wrappedArk": wrapped })
+                    .to_string(),
             ))
             .unwrap();
         let put_resp = app.clone().oneshot(put_req).await.unwrap();
-        assert_eq!(put_resp.status(), axum::http::StatusCode::OK, "put should succeed");
+        assert_eq!(
+            put_resp.status(),
+            axum::http::StatusCode::OK,
+            "put should succeed"
+        );
 
         // GET — same opaque blob comes back (shelf roundtrip through the same state).
         let get_uri = format!(
@@ -477,9 +908,16 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let get_resp = app.oneshot(get_req).await.unwrap();
-        assert_eq!(get_resp.status(), axum::http::StatusCode::OK, "get should succeed");
+        assert_eq!(
+            get_resp.status(),
+            axum::http::StatusCode::OK,
+            "get should succeed"
+        );
         let v = body_json(get_resp).await;
-        assert_eq!(v["wrappedArk"], serde_json::Value::String(wrapped.to_string()));
+        assert_eq!(
+            v["wrappedArk"],
+            serde_json::Value::String(wrapped.to_string())
+        );
         assert_eq!(v["did"], serde_json::Value::String(did.to_string()));
     }
 
@@ -524,13 +962,21 @@ mod tests {
 
         let bob = "did:web:etzhayyim.com:actor:bob";
         let alice = "did:web:etzhayyim.com:actor:alice";
-        let bob_bearer = format!("Bearer x.{}.x", B64U.encode(format!("{{\"sub\":\"{bob}\"}}").as_bytes()));
-        let alice_bearer =
-            format!("Bearer x.{}.x", B64U.encode(format!("{{\"sub\":\"{alice}\"}}").as_bytes()));
+        let bob_bearer = format!(
+            "Bearer x.{}.x",
+            B64U.encode(format!("{{\"sub\":\"{bob}\"}}").as_bytes())
+        );
+        let alice_bearer = format!(
+            "Bearer x.{}.x",
+            B64U.encode(format!("{{\"sub\":\"{alice}\"}}").as_bytes())
+        );
         let wrapped = "Qk9CX1dSQVA"; // bob's opaque wrap
 
         // Bob stores his own wrap (baseline).
-        let put_uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let put_uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         let put = app
             .clone()
             .oneshot(
@@ -659,8 +1105,15 @@ mod tests {
             ))
             .unwrap();
         let pub_resp = app.clone().oneshot(pub_req).await.unwrap();
-        assert_eq!(pub_resp.status(), axum::http::StatusCode::OK, "publish should succeed");
-        assert_eq!(body_json(pub_resp).await["verifiedOnPublish"], serde_json::Value::Bool(true));
+        assert_eq!(
+            pub_resp.status(),
+            axum::http::StatusCode::OK,
+            "publish should succeed"
+        );
+        assert_eq!(
+            body_json(pub_resp).await["verifiedOnPublish"],
+            serde_json::Value::Bool(true)
+        );
 
         // RESOLVE — the stored binding verifies against the did:key (trustless).
         let res_uri = format!(
@@ -674,7 +1127,11 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let res_resp = app.oneshot(res_req).await.unwrap();
-        assert_eq!(res_resp.status(), axum::http::StatusCode::OK, "resolve should succeed");
+        assert_eq!(
+            res_resp.status(),
+            axum::http::StatusCode::OK,
+            "resolve should succeed"
+        );
         let v = body_json(res_resp).await;
         assert_eq!(v["verified"], serde_json::Value::Bool(true), "body={v}");
         assert_eq!(v["did"], serde_json::Value::String(did));
@@ -694,6 +1151,40 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn pds_session_verify_control_token_returns_400() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({ "token": "aaa.b\nbb.ccc" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pds_session_verify_padded_segment_returns_400() {
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
+        let resp = app
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({ "token": "aaa.bbb.ccc=" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
     /// Build a compact EdDSA JWS session PoP for a did:key issuer (resolves with no
     /// network). `sign_sk` lets a test sign with a key other than the DID's, to drive
     /// the invalid branch.
@@ -704,10 +1195,13 @@ mod tests {
     ) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
         use ed25519_dalek::Signer;
-        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
-        let header = B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
-        let payload =
-            B64U.encode(serde_json::to_vec(&serde_json::json!({ "iss": did, "sub": did, "exp": exp })).unwrap());
+        let did =
+            kotoba_auth::did_key::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
+        let header =
+            B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
+        let payload = B64U.encode(
+            serde_json::to_vec(&serde_json::json!({ "iss": did, "sub": did, "exp": exp })).unwrap(),
+        );
         let signing_input = format!("{header}.{payload}");
         let sig = sign_sk.sign(signing_input.as_bytes());
         format!("{signing_input}.{}", B64U.encode(sig.to_bytes()))
@@ -732,7 +1226,11 @@ mod tests {
             .oneshot(post_json(&uri, serde_json::json!({ "token": token })))
             .await
             .unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::OK, "valid PoP must return 200");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "valid PoP must return 200"
+        );
         let v = body_json(resp).await;
         assert_eq!(v["valid"], serde_json::Value::Bool(true), "body={v}");
         assert_eq!(v["did"], serde_json::Value::String(did));
@@ -762,7 +1260,10 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED,
             "invalid PoP must return 401"
         );
-        assert_eq!(body_json(resp).await["valid"], serde_json::Value::Bool(false));
+        assert_eq!(
+            body_json(resp).await["valid"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[tokio::test]
@@ -776,7 +1277,10 @@ mod tests {
         let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
         let bearer = format!("Bearer x.{payload_b64}.x");
         // Authenticated, but credentialId has a path-traversal slash → 400 (validation).
-        let uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         let req = axum::http::Request::builder()
             .method("POST")
             .uri(&uri)
@@ -784,6 +1288,34 @@ mod tests {
             .header("authorization", &bearer)
             .body(axum::body::Body::from(
                 serde_json::json!({ "did": did, "credentialId": "bad/slash", "wrappedArk": "AAAA" }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn account_put_invalid_wrapped_ark_returns_400() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
+        use tower::ServiceExt;
+        let app = super::build_router(std::sync::Arc::new(
+            super::server::KotobaState::new(None).expect("state"),
+        ));
+        let did = "did:web:etzhayyim.com:actor:badwrap";
+        let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
+        let bearer = format!("Bearer x.{payload_b64}.x");
+        let uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .header("authorization", &bearer)
+            .body(axum::body::Body::from(
+                serde_json::json!({ "did": did, "credentialId": "cred-1", "wrappedArk": "AAAA=" })
+                    .to_string(),
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -830,7 +1362,11 @@ mod tests {
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "forged did:key binding must be rejected on publish");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "forged did:key binding must be rejected on publish"
+        );
     }
 
     #[tokio::test]
@@ -853,7 +1389,8 @@ mod tests {
             super::server::KotobaState::new(None).expect("state"),
         ));
         let victim_sk = SigningKey::from_bytes(&[7u8; 32]);
-        let victim_did = kotoba_auth::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
+        let victim_did =
+            kotoba_auth::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
         let attacker_sk = SigningKey::from_bytes(&[8u8; 32]); // a DIFFERENT key
         let signal = kotoba_signal::identity::IdentityKeyPair::generate().public_key();
         let binding = SignalBinding::from_identity(&victim_did, &signal, 1, "2026-06-02T00:00:00Z");
@@ -1112,6 +1649,30 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", xrpc::NSID_VAULT_GET),
             get(xrpc::vault_get),
         )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_ENVELOPE_PUT),
+            post(xrpc::vault_envelope_put),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_ENVELOPE_GET),
+            get(xrpc::vault_envelope_get),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_ENVELOPE_CURRENT),
+            get(xrpc::vault_envelope_current),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_ENVELOPE_INSPECT),
+            get(xrpc::vault_envelope_inspect),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_ENVELOPE_GRANT),
+            post(xrpc::vault_envelope_grant),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_VAULT_ENVELOPE_REVOKE),
+            post(xrpc::vault_envelope_revoke),
+        )
         .route(&format!("/xrpc/{}", kg::NSID_KG_ENTITY), get(kg::kg_entity))
         .route(
             &format!("/xrpc/{}", kg::NSID_KG_CATALOG),
@@ -1237,18 +1798,22 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", email_xrpc::NSID_EMAIL_INGEST),
             // 33 MiB raw email base64 + JSON framing overhead
-            post(email_xrpc::email_ingest).layer(DefaultBodyLimit::max(36 * 1024 * 1024)),
+            post(email_xrpc::email_ingest)
+                .layer(DefaultBodyLimit::max(email_xrpc::EMAIL_INGEST_BODY_LIMIT)),
         )
         .route(
             &format!("/xrpc/{}", email_xrpc::NSID_EMAIL_SEND),
             // up to 256 recipients × 1 MiB Signal envelope + JSON framing
-            post(email_xrpc::email_send).layer(DefaultBodyLimit::max(300 * 1024 * 1024)),
+            post(email_xrpc::email_send)
+                .layer(DefaultBodyLimit::max(email_xrpc::EMAIL_SEND_BODY_LIMIT)),
         )
         // ── Signal Protocol E2E (com.etzhayyim.signal.*) ─────────────────────────
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_REGISTER_PREKEYS),
             // 256 KiB: two 64 KiB bundles + DID/device_id fields + JSON framing
-            post(signal_xrpc::register_prekeys).layer(DefaultBodyLimit::max(256 * 1024)),
+            post(signal_xrpc::register_prekeys).layer(DefaultBodyLimit::max(
+                signal_xrpc::SIGNAL_REGISTER_PREKEYS_BODY_LIMIT,
+            )),
         )
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_GET_PREKEY_BUNDLE),
@@ -1256,19 +1821,27 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         )
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_SEND_MESSAGE),
-            post(signal_xrpc::send_message),
+            post(signal_xrpc::send_message).layer(DefaultBodyLimit::max(
+                signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT,
+            )),
         )
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_SEND_GROUP_MESSAGE),
-            post(signal_xrpc::send_group_message),
+            post(signal_xrpc::send_group_message).layer(DefaultBodyLimit::max(
+                signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT,
+            )),
         )
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_DISTRIBUTE_SENDER_KEY),
-            post(signal_xrpc::distribute_sender_key),
+            post(signal_xrpc::distribute_sender_key).layer(DefaultBodyLimit::max(
+                signal_xrpc::SIGNAL_MESSAGE_BODY_LIMIT,
+            )),
         )
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_PUBLISH_IDENTITY),
-            post(signal_xrpc::publish_signal_identity),
+            post(signal_xrpc::publish_signal_identity).layer(DefaultBodyLimit::max(
+                signal_xrpc::SIGNAL_PUBLISH_IDENTITY_BODY_LIMIT,
+            )),
         )
         .route(
             &format!("/xrpc/{}", signal_xrpc::NSID_SIGNAL_RESOLVE_IDENTITY),
@@ -1468,7 +2041,9 @@ pub async fn run() -> anyhow::Result<()> {
             Ok(seed_hex) => match kotoba_net::ed25519_keypair_from_hex(&seed_hex) {
                 Ok(kp) => KotobaSwarm::with_config(kp, listen_addr, nat_cfg).await,
                 Err(e) => {
-                    tracing::warn!("KOTOBA_P2P_ED25519_HEX invalid ({e}); using ephemeral identity");
+                    tracing::warn!(
+                        "KOTOBA_P2P_ED25519_HEX invalid ({e}); using ephemeral identity"
+                    );
                     KotobaSwarm::new_with_config(listen_addr, nat_cfg).await
                 }
             },

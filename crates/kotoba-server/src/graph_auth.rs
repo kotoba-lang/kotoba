@@ -220,7 +220,9 @@ pub fn require_internal_trust(headers: &HeaderMap) -> Result<(), (StatusCode, St
     if ct_eq(got.as_bytes(), secret.as_bytes()) {
         Ok(())
     } else {
-        tracing::warn!("internal-trust gate: missing/invalid x-internal-trust (direct pod access?)");
+        tracing::warn!(
+            "internal-trust gate: missing/invalid x-internal-trust (direct pod access?)"
+        );
         Err((
             StatusCode::UNAUTHORIZED,
             "request must arrive through the trusted edge (x-internal-trust)".to_string(),

@@ -88,7 +88,7 @@ mod tests {
     use kotoba_store::MemoryBlockStore;
 
     fn make_doc_with_x25519(did: &str, key: [u8; 32]) -> DidDocument {
-        let encoded = multibase::encode(multibase::Base::Base58Btc, &key);
+        let encoded = multibase::encode(multibase::Base::Base58Btc, key);
         let key_id = format!("{did}#key-x25519-1");
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".into()],
@@ -374,7 +374,7 @@ mod tests {
                 iss: accessor_did.clone(),
                 aud: "kotoba://test".into(),
                 issued_at: "2026-05-31T00:00:00Z".into(),
-                expiry: None,
+                expiry: Some("2099-12-31T23:59:59Z".into()),
                 nonce: "e2e-roundtrip-nonce".into(),
                 domain: "kotoba.test".into(),
                 statement: None,
@@ -424,7 +424,9 @@ mod tests {
         // ── Negative: a different node cannot derive the same owner_enc_key ──
         let other_node = VaultKeyedCrypto::new(Zeroizing::new([0x99u8; 32]));
         assert_ne!(
-            other_node.derive_wrapping_key(owner_did.as_bytes()).as_ref(),
+            other_node
+                .derive_wrapping_key(owner_did.as_bytes())
+                .as_ref(),
             owner_enc_key.as_ref(),
             "owner_enc_key must be bound to the originating node's vault key"
         );

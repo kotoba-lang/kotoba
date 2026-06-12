@@ -2,7 +2,7 @@
 
 This is a self-contained kotoba WASM component.  Build with:
 
-    ../../scripts/build-pywasm.sh agent.py -o agent.wasm
+    ../../scripts/build-pywasm.bb agent.py -o agent.wasm
 
 Then load agent.wasm with kotoba-runtime's WasmExecutor as any other
 kotoba-node component.

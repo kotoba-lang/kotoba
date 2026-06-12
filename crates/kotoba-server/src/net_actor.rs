@@ -218,10 +218,9 @@ pub async fn run(
                         {
                             // Decode Pregel gossip message and forward to runner
                             if let Ok(pnet) =
-                                serde_json::from_slice::<kotoba_net::PregelNetMessage>(&data)
+                                kotoba_net::PregelNetMessage::from_json_slice(&data)
                             {
-                                use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-                                match B64.decode(&pnet.payload_b64) {
+                                match pnet.payload_bytes() {
                                     Ok(payload) => {
                                         pregel_inbound_tx
                                             .try_send(DistributedMessage {
@@ -232,7 +231,7 @@ pub async fn run(
                                             .ok();
                                     }
                                     Err(e) => {
-                                        tracing::warn!(src = %pnet.src, err = %e, "pregel gossip: bad base64 payload — skipped");
+                                        tracing::warn!(src = %pnet.src, err = %e, "pregel gossip: invalid payload — skipped");
                                     }
                                 }
                             }
@@ -277,7 +276,11 @@ pub async fn run(
                                     None
                                 };
                                 let kse_topic = kotoba_kse::Topic(kse_name);
-                                let entry = journal.publish(kse_topic, bytes::Bytes::from(data)).await;
+                                let Ok(entry) =
+                                    journal.publish_checked(kse_topic, bytes::Bytes::from(data)).await
+                                else {
+                                    continue;
+                                };
                                 if let Some((quad, op)) = maybe_quad_op {
                                     let graph_cid = quad.graph.clone();
                                     let mut datom = Datom::from_legacy_quad(quad, op);

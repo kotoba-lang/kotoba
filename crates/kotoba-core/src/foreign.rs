@@ -10,7 +10,7 @@ pub enum ForeignCallType {
         session_cid: Option<KotobaCid>,
         max_tokens: u32,
     },
-    /// Compute embedding → vector<f32> QuadObject
+    /// Compute embedding → `vector<f32>` QuadObject
     Embed { model_cid: KotobaCid, text: String },
     /// Load FP8 weight tensor from Vault
     WeightLoad {

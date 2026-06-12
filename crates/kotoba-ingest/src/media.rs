@@ -5,7 +5,7 @@
 //! shared vector space via a [`MediaEmbedClient`], and projects the result as
 //! Datoms (+ an IVF index) into the `media:2026:assets` named graph.
 //!
-//! This is the multimodal sibling of [`crate::cc::CcChunkIngestor`].  Because
+//! This is the multimodal sibling of `CcChunkIngestor`.  Because
 //! text, image, video, and book embeddings all live in ONE space, a text query
 //! can retrieve any modality (Google-style cross-modal search) by ranking the
 //! `media/embed/*` vectors by cosine similarity.
@@ -55,7 +55,9 @@ pub fn media_assets_graph() -> KotobaCid {
 /// idempotent, while the same image used as distinct pages / sources stays
 /// distinct.
 fn subject_for(blob_cid: &KotobaCid, page: i64, source: &str) -> KotobaCid {
-    KotobaCid::from_bytes(format!("media:{}:{}:{}", blob_cid.to_multibase(), page, source).as_bytes())
+    KotobaCid::from_bytes(
+        format!("media:{}:{}:{}", blob_cid.to_multibase(), page, source).as_bytes(),
+    )
 }
 
 // ── Inputs / outputs ────────────────────────────────────────────────────────────
@@ -278,7 +280,12 @@ impl MediaIngestor {
             quads.push(text_quad(graph, &subj, "media/mime", &input.mime));
             quads.push(text_quad(graph, &subj, "media/modality", modality.as_str()));
             quads.push(cid_quad(graph, &subj, "media/blob", &blob.cid));
-            quads.push(int_quad(graph, &subj, "media/size", input.bytes.len() as i64));
+            quads.push(int_quad(
+                graph,
+                &subj,
+                "media/size",
+                input.bytes.len() as i64,
+            ));
             quads.push(int_quad(graph, &subj, "media/page", input.page));
             if let Some(t) = &input.title {
                 if !t.is_empty() {
@@ -356,19 +363,31 @@ impl MediaIngestor {
         if k > 0 {
             let t0 = std::time::Instant::now();
             let ivf = IvfIndex::build(&all_embeddings, k, &model_id, self.ivf_max_iter);
-            debug!(k, n = all_embeddings.len(), elapsed_ms = t0.elapsed().as_millis(), "media IVF built");
+            debug!(
+                k,
+                n = all_embeddings.len(),
+                elapsed_ms = t0.elapsed().as_millis(),
+                "media IVF built"
+            );
 
             let mut member_counts = vec![0usize; k];
             let mut assign_quads: Vec<Quad> = Vec::with_capacity(all_embeddings.len());
             for (subj, vec) in &all_embeddings {
                 let (centroid_id, _) = ivf.assign(vec);
                 member_counts[centroid_id] += 1;
-                assign_quads.push(int_quad(graph, subj, "media/ivf/cluster", centroid_id as i64));
+                assign_quads.push(int_quad(
+                    graph,
+                    subj,
+                    "media/ivf/cluster",
+                    centroid_id as i64,
+                ));
             }
             datoms.extend(quads_to_datoms(assign_quads));
-            datoms.extend(quads_to_datoms(
-                ivf.to_quads_ns(graph, &member_counts, MEDIA_NS),
-            ));
+            datoms.extend(quads_to_datoms(ivf.to_quads_ns(
+                graph,
+                &member_counts,
+                MEDIA_NS,
+            )));
             report.ivf_k = k;
         }
 
@@ -383,15 +402,14 @@ impl MediaIngestor {
     pub async fn ingest_paths(&self, paths: &[PathBuf]) -> Result<MediaIngestReport> {
         let mut inputs = Vec::with_capacity(paths.len());
         for path in paths {
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("read {}", path.display()))?;
+            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
             let mime = mime_for_path(path);
             let title = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_string());
-            let mut input = MediaInput::new(mime, Bytes::from(bytes))
-                .with_source(path.display().to_string());
+            let mut input =
+                MediaInput::new(mime, Bytes::from(bytes)).with_source(path.display().to_string());
             if let Some(t) = title {
                 input = input.with_title(t);
             }
@@ -464,7 +482,10 @@ mod tests {
     #[test]
     fn assets_graph_is_stable_and_distinct() {
         assert_eq!(media_assets_graph(), media_assets_graph());
-        assert_ne!(media_assets_graph(), KotobaCid::from_bytes(b"cc:2026-12:chunks"));
+        assert_ne!(
+            media_assets_graph(),
+            KotobaCid::from_bytes(b"cc:2026-12:chunks")
+        );
     }
 
     #[test]
@@ -559,7 +580,11 @@ mod tests {
                 Value::Text(t) => Some(t.clone()),
                 _ => None,
             });
-        assert_eq!(title.as_deref(), Some("apple"), "text query must retrieve the apple image");
+        assert_eq!(
+            title.as_deref(),
+            Some("apple"),
+            "text query must retrieve the apple image"
+        );
         assert!(ranked[0].0 > 0.999, "caption-bridged match should be ~1.0");
     }
 
@@ -622,7 +647,10 @@ mod tests {
         assert_eq!(mime_for_path(Path::new("a.mp3")), "audio/mpeg");
         assert_eq!(mime_for_path(Path::new("a.pdf")), "application/pdf");
         assert_eq!(mime_for_path(Path::new("a.epub")), "application/epub+zip");
-        assert_eq!(mime_for_path(Path::new("a.unknownext")), "application/octet-stream");
+        assert_eq!(
+            mime_for_path(Path::new("a.unknownext")),
+            "application/octet-stream"
+        );
     }
 
     #[test]

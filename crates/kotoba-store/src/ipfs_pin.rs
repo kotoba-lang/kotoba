@@ -14,8 +14,13 @@
 /// Env vars:
 ///   KOTOBA_IPFS_ENDPOINT  — base URL (default: http://localhost:5001)
 ///   KOTOBA_IPFS_TOKEN     — optional Bearer JWT for authenticated gateways
+use reqwest::Url;
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
+
+const DEFAULT_IPFS_PIN_ENDPOINT: &str = "http://localhost:5001";
+const DISABLED_IPFS_PIN_ENDPOINT: &str = "http://127.0.0.1:9";
+const MAX_IPFS_PIN_ENDPOINT_LEN: usize = 256;
 
 #[derive(Clone)]
 pub struct IpfsPinClient {
@@ -45,7 +50,11 @@ struct PinEntry {
 impl IpfsPinClient {
     pub fn from_env() -> Arc<Self> {
         let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:5001".into());
+            .unwrap_or_else(|_| DEFAULT_IPFS_PIN_ENDPOINT.into());
+        let endpoint = normalize_pin_endpoint(&endpoint).unwrap_or_else(|| {
+            tracing::warn!("invalid KOTOBA_IPFS_ENDPOINT; disabling IpfsPinClient HTTP access");
+            DISABLED_IPFS_PIN_ENDPOINT.to_string()
+        });
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
         Arc::new(Self {
             client: reqwest::Client::new(),
@@ -62,9 +71,7 @@ impl IpfsPinClient {
     /// pod-local sidecar — the F-3 pin chain wiring.
     pub fn from_pin_env() -> Option<Arc<Self>> {
         let endpoint = std::env::var("KOTOBA_IPFS_PIN_ENDPOINT").ok()?;
-        if endpoint.trim().is_empty() {
-            return None;
-        }
+        let endpoint = normalize_pin_endpoint(&endpoint)?;
         let token = std::env::var("KOTOBA_IPFS_PIN_JWT").ok();
         Some(Arc::new(Self {
             client: reqwest::Client::new(),
@@ -152,6 +159,30 @@ impl IpfsPinClient {
     }
 }
 
+fn normalize_pin_endpoint(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty()
+        || endpoint.len() > MAX_IPFS_PIN_ENDPOINT_LEN
+        || endpoint.chars().any(|ch| ch.is_control())
+    {
+        return None;
+    }
+    let url = Url::parse(endpoint).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +192,37 @@ mod tests {
             client: reqwest::Client::new(),
             endpoint: endpoint.into(),
             token: None,
+        }
+    }
+
+    #[test]
+    fn normalize_pin_endpoint_accepts_http_https_root_urls() {
+        assert_eq!(
+            normalize_pin_endpoint(" http://localhost:5001/ ").unwrap(),
+            "http://localhost:5001"
+        );
+        assert_eq!(
+            normalize_pin_endpoint("https://pin.example.com").unwrap(),
+            "https://pin.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_pin_endpoint_rejects_ambiguous_or_header_unsafe_values() {
+        for endpoint in [
+            "",
+            "ftp://localhost:5001",
+            "https://user:pass@localhost:5001",
+            "http://localhost:5001/api",
+            "http://localhost:5001?x=1",
+            "http://localhost:5001#frag",
+            "http://localhost:5001/\nheader",
+            "not a url",
+        ] {
+            assert!(
+                normalize_pin_endpoint(endpoint).is_none(),
+                "endpoint should be rejected: {endpoint:?}"
+            );
         }
     }
 
@@ -178,8 +240,14 @@ mod tests {
             "http://localhost:5001/api/v0/pin/add",
             "trailing slash must be normalized, not doubled"
         );
-        assert_eq!(client("http://h/").api_url("pin/ls"), "http://h/api/v0/pin/ls");
+        assert_eq!(
+            client("http://h/").api_url("pin/ls"),
+            "http://h/api/v0/pin/ls"
+        );
         // Multiple trailing slashes are all trimmed.
-        assert_eq!(client("http://h///").api_url("pin/rm"), "http://h/api/v0/pin/rm");
+        assert_eq!(
+            client("http://h///").api_url("pin/rm"),
+            "http://h/api/v0/pin/rm"
+        );
     }
 }

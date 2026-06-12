@@ -121,7 +121,11 @@ mod tests {
 
         let r2 = KotobaCid::from_bytes(b"root-2");
         cc.record_commit(g.clone(), r2.clone()).unwrap();
-        assert_eq!(cc.head_root(&g), Some(r2), "head advances to the latest root");
+        assert_eq!(
+            cc.head_root(&g),
+            Some(r2),
+            "head advances to the latest root"
+        );
         assert_eq!(cc.len(), 2);
     }
 
@@ -173,11 +177,16 @@ mod tests {
         let gb = KotobaCid::from_bytes(b"graph-B");
 
         // Interleaved commits, as a multi-graph QuadStore would emit them.
-        cc.record_commit(ga.clone(), KotobaCid::from_bytes(b"A-r1")).unwrap();
-        cc.record_commit(gb.clone(), KotobaCid::from_bytes(b"B-r1")).unwrap();
-        cc.record_commit(ga.clone(), KotobaCid::from_bytes(b"A-r2")).unwrap();
-        cc.record_commit(gb.clone(), KotobaCid::from_bytes(b"B-r2")).unwrap();
-        cc.record_commit(ga.clone(), KotobaCid::from_bytes(b"A-r3")).unwrap();
+        cc.record_commit(ga.clone(), KotobaCid::from_bytes(b"A-r1"))
+            .unwrap();
+        cc.record_commit(gb.clone(), KotobaCid::from_bytes(b"B-r1"))
+            .unwrap();
+        cc.record_commit(ga.clone(), KotobaCid::from_bytes(b"A-r2"))
+            .unwrap();
+        cc.record_commit(gb.clone(), KotobaCid::from_bytes(b"B-r2"))
+            .unwrap();
+        cc.record_commit(ga.clone(), KotobaCid::from_bytes(b"A-r3"))
+            .unwrap();
 
         // Each graph's head = its OWN latest root, despite interleaving.
         assert_eq!(cc.head_root(&ga), Some(KotobaCid::from_bytes(b"A-r3")));
@@ -196,10 +205,7 @@ mod tests {
         assert_eq!(cc.pubkey(), &id.verifying_key().to_bytes());
         assert_eq!(cc.did(), id.did);
         // A commit must succeed (signature verifies under the agent key).
-        cc.record_commit(
-            KotobaCid::from_bytes(b"g"),
-            KotobaCid::from_bytes(b"r"),
-        )
-        .expect("self-signed commit must verify and append");
+        cc.record_commit(KotobaCid::from_bytes(b"g"), KotobaCid::from_bytes(b"r"))
+            .expect("self-signed commit must verify and append");
     }
 }

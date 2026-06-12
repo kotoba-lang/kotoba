@@ -301,7 +301,8 @@ fn bench_query_cold_prolly(c: &mut Criterion) {
         .collect();
     let lookup_key = 500u64.to_le_bytes().to_vec();
 
-    let scenarios: &[(&str, fn() -> SimulatedLatencyBlockStore)] = &[
+    type LatencyScenario = (&'static str, fn() -> SimulatedLatencyBlockStore);
+    let scenarios: &[LatencyScenario] = &[
         ("kubo_lan_1ms_get", SimulatedLatencyBlockStore::kubo_lan),
         ("kubo_wan_80ms_get", SimulatedLatencyBlockStore::kubo_wan),
         ("s3_same_az_2ms_get", SimulatedLatencyBlockStore::s3_same_az),
@@ -436,7 +437,8 @@ fn bench_cold_avet(c: &mut Criterion) {
     ] {
         let (qs, graph_cid, _) = rt.block_on(make_committed_qs_latency(get_rtt, put_rtt, 1_000));
         group.bench_function(name, |b| {
-            let vk = kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".to_string()));
+            let vk =
+                kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".to_string()));
             b.to_async(&rt).iter(|| async {
                 qs.lookup_subject_by_po_cold(&graph_cid, "name", &vk)
                     .await
