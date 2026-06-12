@@ -259,34 +259,34 @@ impl BlockStore for KuboBlockStore {
         let inflight = Arc::clone(&self.inflight);
 
         let resp_key = kubo_block_on(async move {
-                // Wait for an in-flight permit before opening the socket.
-                // `acquire_owned` on a never-closed semaphore can only fail if
-                // the runtime is shutting down — bubble that up as an error.
-                let _permit = inflight
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/put permit: {e}"))?;
-                let part = reqwest::multipart::Part::bytes(body).file_name("blob");
-                let form = reqwest::multipart::Form::new().part("data", part);
-                let rb = client.post(&url).multipart(form);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                let resp = rb
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/put: {e}"))?;
-                if !resp.status().is_success() {
-                    let st = resp.status();
-                    let tx = resp.text().await.unwrap_or_default();
-                    return Err(anyhow!("kubo block/put {st}: {tx}"));
-                }
-                let parsed: BlockPutResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/put parse: {e}"))?;
-                Ok::<String, anyhow::Error>(parsed.key)
+            // Wait for an in-flight permit before opening the socket.
+            // `acquire_owned` on a never-closed semaphore can only fail if
+            // the runtime is shutting down — bubble that up as an error.
+            let _permit = inflight
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow!("kubo block/put permit: {e}"))?;
+            let part = reqwest::multipart::Part::bytes(body).file_name("blob");
+            let form = reqwest::multipart::Form::new().part("data", part);
+            let rb = client.post(&url).multipart(form);
+            let rb = match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            };
+            let resp = rb
+                .send()
+                .await
+                .map_err(|e| anyhow!("kubo block/put: {e}"))?;
+            if !resp.status().is_success() {
+                let st = resp.status();
+                let tx = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("kubo block/put {st}: {tx}"));
+            }
+            let parsed: BlockPutResponse = resp
+                .json()
+                .await
+                .map_err(|e| anyhow!("kubo block/put parse: {e}"))?;
+            Ok::<String, anyhow::Error>(parsed.key)
         });
 
         match resp_key {
@@ -398,36 +398,36 @@ impl BlockStore for KuboBlockStore {
         let inflight = Arc::clone(&self.inflight);
 
         let result = kubo_block_on(async move {
-                let _permit = inflight
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/get permit: {e}"))?;
-                let rb = client.post(&url);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                let resp = rb
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/get: {e}"))?;
-                let status = resp.status();
-                if status == reqwest::StatusCode::NOT_FOUND || status.as_u16() == 500 {
-                    let text = resp.text().await.unwrap_or_default();
-                    if text.contains("block not found") || text.contains("not found") {
-                        return Ok::<Option<Bytes>, anyhow::Error>(None);
-                    }
-                    return Err(anyhow!("kubo block/get error: {text}"));
+            let _permit = inflight
+                .acquire_owned()
+                .await
+                .map_err(|e| anyhow!("kubo block/get permit: {e}"))?;
+            let rb = client.post(&url);
+            let rb = match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            };
+            let resp = rb
+                .send()
+                .await
+                .map_err(|e| anyhow!("kubo block/get: {e}"))?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NOT_FOUND || status.as_u16() == 500 {
+                let text = resp.text().await.unwrap_or_default();
+                if text.contains("block not found") || text.contains("not found") {
+                    return Ok::<Option<Bytes>, anyhow::Error>(None);
                 }
-                if !status.is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(anyhow!("kubo block/get {status}: {text}"));
-                }
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| anyhow!("kubo block/get body: {e}"))?;
-                Ok(Some(bytes))
+                return Err(anyhow!("kubo block/get error: {text}"));
+            }
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("kubo block/get {status}: {text}"));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| anyhow!("kubo block/get body: {e}"))?;
+            Ok(Some(bytes))
         });
 
         match result {
@@ -454,15 +454,15 @@ impl BlockStore for KuboBlockStore {
         let token = self.token.clone();
 
         kubo_block_on(async move {
-                let rb = client.post(&url);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                match rb.send().await {
-                    Ok(resp) => resp.status().is_success(),
-                    Err(_) => false,
-                }
+            let rb = client.post(&url);
+            let rb = match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            };
+            match rb.send().await {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            }
         })
     }
 
@@ -480,20 +480,20 @@ impl BlockStore for KuboBlockStore {
         let token = self.token.clone();
 
         kubo_block_on(async move {
-                let rb = client.post(&url);
-                let rb = match &token {
-                    Some(t) => rb.bearer_auth(t),
-                    None => rb,
-                };
-                let resp = rb.send().await.map_err(|e| anyhow!("kubo block/rm: {e}"))?;
-                if !resp.status().is_success() {
-                    let st = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    if !text.contains("not found") {
-                        return Err(anyhow!("kubo block/rm {st}: {text}"));
-                    }
+            let rb = client.post(&url);
+            let rb = match &token {
+                Some(t) => rb.bearer_auth(t),
+                None => rb,
+            };
+            let resp = rb.send().await.map_err(|e| anyhow!("kubo block/rm: {e}"))?;
+            if !resp.status().is_success() {
+                let st = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if !text.contains("not found") {
+                    return Err(anyhow!("kubo block/rm {st}: {text}"));
                 }
-                Ok::<_, anyhow::Error>(())
+            }
+            Ok::<_, anyhow::Error>(())
         })
     }
 
@@ -600,24 +600,24 @@ impl BlockStore for KuboBlockStore {
         let unpin_result = match tokio::runtime::Handle::try_current() {
             Err(_) => Ok::<(), anyhow::Error>(()),
             Ok(_) => kubo_block_on(async move {
-                    let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
-                    let rb = client.post(&url);
-                    let rb = match &token {
-                        Some(t) => rb.bearer_auth(t),
-                        None => rb,
-                    };
-                    let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/rm: {e}"))?;
-                    let status = resp.status();
-                    if !status.is_success() {
-                        let tx = resp.text().await.unwrap_or_default();
-                        // "not pinned" is benign — the local pinned-set may have
-                        // tracked a CID Kubo never saw, e.g. across restarts.
-                        if tx.contains("not pinned") {
-                            return Ok::<(), anyhow::Error>(());
-                        }
-                        return Err(anyhow!("kubo pin/rm {status}: {tx}"));
+                let _permit = inflight.acquire_owned().await.map_err(|e| anyhow!(e))?;
+                let rb = client.post(&url);
+                let rb = match &token {
+                    Some(t) => rb.bearer_auth(t),
+                    None => rb,
+                };
+                let resp = rb.send().await.map_err(|e| anyhow!("kubo pin/rm: {e}"))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let tx = resp.text().await.unwrap_or_default();
+                    // "not pinned" is benign — the local pinned-set may have
+                    // tracked a CID Kubo never saw, e.g. across restarts.
+                    if tx.contains("not pinned") {
+                        return Ok::<(), anyhow::Error>(());
                     }
-                    Ok(())
+                    return Err(anyhow!("kubo pin/rm {status}: {tx}"));
+                }
+                Ok(())
             }),
         };
         if let Err(e) = unpin_result {

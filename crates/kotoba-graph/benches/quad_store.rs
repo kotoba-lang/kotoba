@@ -436,7 +436,8 @@ fn bench_cold_avet(c: &mut Criterion) {
     ] {
         let (qs, graph_cid, _) = rt.block_on(make_committed_qs_latency(get_rtt, put_rtt, 1_000));
         group.bench_function(name, |b| {
-            let vk = kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".to_string()));
+            let vk =
+                kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".to_string()));
             b.to_async(&rt).iter(|| async {
                 qs.lookup_subject_by_po_cold(&graph_cid, "name", &vk)
                     .await
