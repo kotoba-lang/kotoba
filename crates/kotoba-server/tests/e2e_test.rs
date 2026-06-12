@@ -199,6 +199,19 @@ impl TestServer {
         json_or_text(r).await
     }
 
+    async fn register_private_graph(&self, graph: &str) {
+        let cid = kotoba_core::cid::KotobaCid::from_multibase(graph).expect("graph cid");
+        self.state.graph_registry.write().await.insert(
+            cid,
+            (
+                format!("test-private:{graph}"),
+                kotoba_core::named_graph::GraphVisibility::Private {
+                    owner_did: self.operator_did.clone(),
+                },
+            ),
+        );
+    }
+
     async fn get_with_auth(&self, path: &str, token: &str) -> (u16, Value) {
         let r = self
             .client
@@ -496,7 +509,7 @@ async fn graph_query_accepts_cacao_graph_query_operation_scope_on_private_graph(
     let (status, create_body) = s.post_quad(graph, "x", "rel", "y").await;
     assert_eq!(status, 200, "{create_body}");
 
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
+    s.register_private_graph(&graph_cid).await;
     let cacao_b64 = build_ed25519_cacao_for_operation(
         &graph_cid,
         &s.operator_did,
@@ -518,8 +531,6 @@ async fn graph_query_accepts_cacao_graph_query_operation_scope_on_private_graph(
         .expect("GET graph.query with cacao");
     let status = r.status().as_u16();
     let body: Value = r.json().await.unwrap_or(Value::Null);
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
-
     assert_eq!(status, 200, "{body}");
     assert!(
         body["count"].as_u64().unwrap_or(0) >= 1,
@@ -2656,7 +2667,7 @@ async fn datomic_q_accepts_datom_read_cacao_on_private_distributed_head() {
         .await;
     assert_eq!(status, 200, "{tx_body}");
 
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
+    s.register_private_graph(&graph).await;
     let cacao_b64 = build_ed25519_cacao_for_operation(
         &graph,
         &s.operator_did,
@@ -2673,8 +2684,6 @@ async fn datomic_q_accepts_datom_read_cacao_on_private_distributed_head() {
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
-
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"], json!([["\"Alice\""]]), "{q_body}");
 }
@@ -4095,7 +4104,7 @@ async fn graph_sparql_accepts_cacao_graph_query_operation_scope_on_private_graph
         .await;
     assert_eq!(status, 200, "{tx_body}");
 
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
+    s.register_private_graph(&graph).await;
     let cacao_b64 = build_ed25519_cacao_for_operation(
         &graph,
         &s.operator_did,
@@ -4113,8 +4122,6 @@ async fn graph_sparql_accepts_cacao_graph_query_operation_scope_on_private_graph
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
-
     assert_eq!(status, 200, "{sparql_body}");
     assert_eq!(sparql_body["form"], "select", "{sparql_body}");
     assert_eq!(sparql_body["count"], 1, "{sparql_body}");
@@ -4339,9 +4346,9 @@ async fn datomic_transact_rejects_mismatched_vp_tx_scope() {
 #[tokio::test]
 async fn datomic_q_accepts_cacao_graph_query_operation_scope_on_private_graph() {
     let s = TestServer::start(false).await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
     let tok = tenant_jwt(&s.operator_did);
     let graph = kotoba_core::cid::KotobaCid::from_bytes(b"datomic-cacao-query-e2e").to_multibase();
+    s.register_private_graph(&graph).await;
 
     let (status, tx_body) = s
         .post_auth(
@@ -4371,7 +4378,6 @@ async fn datomic_q_accepts_cacao_graph_query_operation_scope_on_private_graph() 
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"][0][0], "\"Alice\"", "{q_body}");
 }
@@ -4379,10 +4385,10 @@ async fn datomic_q_accepts_cacao_graph_query_operation_scope_on_private_graph() 
 #[tokio::test]
 async fn datomic_q_requires_matching_cacao_tx_scope_for_temporal_query_on_private_graph() {
     let s = TestServer::start(false).await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
     let tok = tenant_jwt(&s.operator_did);
     let graph =
         kotoba_core::cid::KotobaCid::from_bytes(b"datomic-cacao-tx-scope-e2e").to_multibase();
+    s.register_private_graph(&graph).await;
 
     let (status, tx_body) = s
         .post_auth(
@@ -4444,7 +4450,6 @@ async fn datomic_q_requires_matching_cacao_tx_scope_for_temporal_query_on_privat
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"][0][0], "\"Alice\"", "{q_body}");
 }
@@ -4452,9 +4457,9 @@ async fn datomic_q_requires_matching_cacao_tx_scope_for_temporal_query_on_privat
 #[tokio::test]
 async fn datomic_q_accepts_vp_graph_query_capability_on_private_graph() {
     let s = TestServer::start(false).await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
     let tok = tenant_jwt(&s.operator_did);
     let graph = kotoba_core::cid::KotobaCid::from_bytes(b"datomic-vp-query-e2e").to_multibase();
+    s.register_private_graph(&graph).await;
     let presentation = build_vp_capability_presentation(
         &s.operator_did,
         &s.state.ipns_signing_key(),
@@ -4486,7 +4491,6 @@ async fn datomic_q_accepts_vp_graph_query_capability_on_private_graph() {
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"][0][0], "\"Alice\"", "{q_body}");
 }
@@ -4494,10 +4498,10 @@ async fn datomic_q_accepts_vp_graph_query_capability_on_private_graph() {
 #[tokio::test]
 async fn datomic_q_accepts_vp_datom_read_capability_on_private_graph() {
     let s = TestServer::start(false).await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
     let tok = tenant_jwt(&s.operator_did);
     let graph =
         kotoba_core::cid::KotobaCid::from_bytes(b"datomic-vp-datom-read-e2e").to_multibase();
+    s.register_private_graph(&graph).await;
     let presentation = build_vp_capability_presentation(
         &s.operator_did,
         &s.state.ipns_signing_key(),
@@ -4529,7 +4533,6 @@ async fn datomic_q_accepts_vp_datom_read_capability_on_private_graph() {
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"][0][0], "\"Alice\"", "{q_body}");
 }
@@ -4537,9 +4540,9 @@ async fn datomic_q_accepts_vp_datom_read_capability_on_private_graph() {
 #[tokio::test]
 async fn datomic_q_rejects_tampered_vp_capability_signature() {
     let s = TestServer::start(false).await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
     let tok = tenant_jwt(&s.operator_did);
     let graph = kotoba_core::cid::KotobaCid::from_bytes(b"datomic-vp-tamper-e2e").to_multibase();
+    s.register_private_graph(&graph).await;
     let presentation = build_vp_capability_presentation(
         &s.operator_did,
         &s.state.ipns_signing_key(),
@@ -4571,7 +4574,6 @@ async fn datomic_q_rejects_tampered_vp_capability_signature() {
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
     assert_eq!(status, 401, "{body}");
     let error = body.as_str().unwrap_or_default();
     assert!(
@@ -13836,7 +13838,7 @@ async fn key_request_share_full_custodian_flow() {
     let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
 
     // Unauthorized: Private graph, no CACAO → denied, no share material.
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
+    s.register_private_graph(&graph).await;
     let (status, denied) = s
         .post(
             "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
@@ -13870,7 +13872,6 @@ async fn key_request_share_full_custodian_flow() {
             }),
         )
         .await;
-    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
     assert_eq!(status, 200, "{granted}");
     assert_eq!(granted["ok"], true, "valid CACAO must grant: {granted}");
     assert_eq!(granted["threshold"], 2);
