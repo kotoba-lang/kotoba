@@ -60,22 +60,20 @@ impl<'a> EvmChain<'a> {
         self.height
     }
 
-    /// Persist a produced block: content-address its diff Datoms into the store +
-    /// a CARv1 bundle (root = block CID), store the header under the block CID, and
-    /// advance the head. Returns the block CID + the CAR bytes (the DA artifact).
+    /// Persist a produced block: content-address its diff Datoms and header into
+    /// the store + a CARv1 bundle (root = header CID), then advance the head.
+    /// Returns the persisted block CID + the CAR bytes (the DA artifact).
     pub fn commit_block(&mut self, produced: &ProducedBlock) -> anyhow::Result<CommittedBlock> {
-        let block_cid = produced.block.block_cid.clone();
-        let mut car = CarBundleWriter::new(block_cid.clone());
-
-        // 1. content-address each state-diff Datom → store + CAR.
+        // 1. content-address each state-diff Datom.
         let mut datom_cids = Vec::with_capacity(produced.datoms.len());
+        let mut datom_blocks = Vec::with_capacity(produced.datoms.len());
         for d in &produced.datoms {
             let mut bytes = Vec::new();
             ciborium::ser::into_writer(d, &mut bytes)
                 .map_err(|e| anyhow::anyhow!("datom enc: {e}"))?;
             let cid = KotobaCid::from_bytes(&bytes);
             put_verified(self.store, &cid, &bytes)?;
-            car.append(&cid, &bytes);
+            datom_blocks.push((cid.clone(), bytes));
             datom_cids.push(cid);
         }
 
@@ -91,8 +89,13 @@ impl<'a> EvmChain<'a> {
         let mut hbytes = Vec::new();
         ciborium::ser::into_writer(&header, &mut hbytes)
             .map_err(|e| anyhow::anyhow!("header enc: {e}"))?;
-        // header is keyed by the block CID (the chain-id digest), not its own hash.
+        let block_cid = KotobaCid::from_bytes(&hbytes);
         self.store.put(&block_cid, &hbytes)?;
+
+        let mut car = CarBundleWriter::new(block_cid.clone());
+        for (cid, bytes) in &datom_blocks {
+            car.append(cid, bytes);
+        }
         car.append(&block_cid, &hbytes);
 
         // 3. the CARv1 DA artifact (pin to IPFS in production).

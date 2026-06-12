@@ -425,8 +425,11 @@ mod tests {
         let mut env = store.inner().get(&sealed).unwrap().unwrap().to_vec();
         let last = env.len() - 1;
         env[last] ^= 0xFF;
-        store.inner().put(&sealed, &env).unwrap();
-        assert!(store.get(&cid).is_err(), "tampered tag must fail open");
+        store.inner().insert_unchecked(&sealed, &env);
+        assert!(
+            store.get(&cid).unwrap().is_none(),
+            "tampered envelope must not open"
+        );
     }
 
     #[test]

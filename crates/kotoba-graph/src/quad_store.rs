@@ -70,6 +70,9 @@ pub struct QuadStore {
     /// keeps retract tombstones so the next commit can persist full Datomic
     /// `(E,A,V,T,Added)` history into the Datom-native ProllyTree indexes.
     pending_datoms: Arc<DashMap<String, Vec<Datom>>>,
+    /// Materialized-view key CID -> content CID. BlockStore remains strictly
+    /// content-addressed; this in-process index is the mutable lookup layer.
+    materialized_views: Arc<DashMap<String, KotobaCid>>,
 }
 
 /// Datom-native graph store facade.
@@ -194,6 +197,7 @@ impl QuadStore {
             commit_dag: Arc::new(RwLock::new(CommitDag::new())),
             hot_covers_all: Arc::new(DashMap::new()),
             pending_datoms: Arc::new(DashMap::new()),
+            materialized_views: Arc::new(DashMap::new()),
         }
     }
 
@@ -1208,12 +1212,12 @@ impl QuadStore {
     /// ```
     /// CID-addressed materialised view of a SPARQL query result.
     ///
-    /// Computes a deterministic projector CID from
+    /// Computes a deterministic projector key CID from
     /// `("kotoba-mv:v1", commit_cid_for_graph, query_form, normalised_sparql)`,
-    /// looks it up in the BlockStore, and:
+    /// looks it up in the in-process MV index, and:
     ///   - hit  → deserialise and return cached `Vec<Quad>` (≈ µs, no compute)
     ///   - miss → run query, serialise result via dag-cbor, `put` under the
-    ///     computed CID, return live result
+    ///     content CID, index it by the key CID, return live result
     ///
     /// This turns repeated identical queries against a sealed graph commit into
     /// content-addressed lookups — the same query against the same commit
@@ -1241,11 +1245,14 @@ impl QuadStore {
             sparql.trim(),
         );
         let mv_cid = KotobaCid::from_bytes(key.as_bytes());
+        let mv_key = mv_cid.to_multibase();
 
         // Cache hit?
-        if let Some(blob) = self.block_store.get(&mv_cid)? {
-            if let Ok(quads) = ciborium::from_reader::<Vec<Quad>, _>(&blob[..]) {
-                return Ok((quads, mv_cid, true));
+        if let Some(content_cid) = self.materialized_views.get(&mv_key).map(|cid| cid.clone()) {
+            if let Some(blob) = self.block_store.get(&content_cid)? {
+                if let Ok(quads) = ciborium::from_reader::<Vec<Quad>, _>(&blob[..]) {
+                    return Ok((quads, mv_cid, true));
+                }
             }
         }
 
@@ -1254,7 +1261,9 @@ impl QuadStore {
         let mut bytes = Vec::new();
         ciborium::into_writer(&quads, &mut bytes)
             .map_err(|e| anyhow::anyhow!("MV serialise: {e}"))?;
-        self.block_store.put(&mv_cid, &bytes)?;
+        let content_cid = KotobaCid::from_bytes(&bytes);
+        self.block_store.put(&content_cid, &bytes)?;
+        self.materialized_views.insert(mv_key, content_cid);
         Ok((quads, mv_cid, false))
     }
 
@@ -1328,7 +1337,7 @@ impl QuadStore {
     /// Parallel to `cold_query_sparql_bgp_cached` but for derived Datalog
     /// facts.  Cache key:
     ///   `blake3("kotoba-datalog-mv:v1\n{head_commit_cid}\n{graph_cid}\n{ciborium(program)}")`
-    /// Value: ciborium-encoded `Vec<Delta>`.
+    /// Value: content-addressed ciborium-encoded `Vec<Delta>`.
     ///
     /// Behaviour mirrors SPARQL MV: deterministic mv_cid; new commit auto-
     /// invalidates (different head → different key); same program against
@@ -1355,10 +1364,13 @@ impl QuadStore {
         keymat.push(b'\n');
         keymat.extend_from_slice(&prog_cbor);
         let mv_cid = KotobaCid::from_bytes(&keymat);
+        let mv_key = mv_cid.to_multibase();
 
-        if let Some(blob) = self.block_store.get(&mv_cid)? {
-            if let Ok(deltas) = ciborium::from_reader::<Vec<Delta>, _>(&blob[..]) {
-                return Ok((deltas, mv_cid, true));
+        if let Some(content_cid) = self.materialized_views.get(&mv_key).map(|cid| cid.clone()) {
+            if let Some(blob) = self.block_store.get(&content_cid)? {
+                if let Ok(deltas) = ciborium::from_reader::<Vec<Delta>, _>(&blob[..]) {
+                    return Ok((deltas, mv_cid, true));
+                }
             }
         }
 
@@ -1366,7 +1378,9 @@ impl QuadStore {
         let mut bytes = Vec::new();
         ciborium::into_writer(&deltas, &mut bytes)
             .map_err(|e| anyhow::anyhow!("datalog MV serialise: {e}"))?;
-        self.block_store.put(&mv_cid, &bytes)?;
+        let content_cid = KotobaCid::from_bytes(&bytes);
+        self.block_store.put(&content_cid, &bytes)?;
+        self.materialized_views.insert(mv_key, content_cid);
         Ok((deltas, mv_cid, false))
     }
 
@@ -4659,8 +4673,9 @@ mod tests {
         let count_before_orphan = block_store.block_count();
 
         // Inject a truly orphaned block — not referenced by any commit or tree
-        let orphan_cid = KotobaCid::from_bytes(b"orphan-data");
-        block_store.put(&orphan_cid, b"orphan payload").unwrap();
+        let orphan_payload = b"orphan payload";
+        let orphan_cid = KotobaCid::from_bytes(orphan_payload);
+        block_store.put(&orphan_cid, orphan_payload).unwrap();
         assert_eq!(block_store.block_count(), count_before_orphan + 1);
 
         // GC: deletes our explicit orphan + the per-commit CAR bundles (also unreachable)

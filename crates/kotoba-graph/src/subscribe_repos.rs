@@ -35,14 +35,8 @@ use std::sync::Arc;
 /// Persist cursor every N committed events to avoid excessive BlockStore writes.
 const CURSOR_PERSIST_INTERVAL: u64 = 100;
 
-/// Fixed synthetic CID used as the named slot for cursor persistence.
-/// Not content-addressed — treated as a mutable named register in BlockStore.
-/// Bytes: CIDv1 prefix (4) + ASCII "subscribeRepos/cursor" (21) + padding (11).
-const CURSOR_SLOT_CID: KotobaCid = KotobaCid([
-    0x01, 0x71, 0x12, 0x20, // CIDv1 dag-cbor sha2-256 prefix
-    b's', b'u', b'b', b's', b'c', b'r', b'i', b'b', b'e', b'R', b'e', b'p', b'o', b's', b'/', b'c',
-    b'u', b'r', b's', b'o', b'r', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-]);
+const NO_CURSOR: u64 = u64::MAX;
+static CURSOR_SEQ: AtomicU64 = AtomicU64::new(NO_CURSOR);
 
 use bytes::Bytes;
 use ciborium::value::Value;
@@ -62,19 +56,18 @@ use crate::quad_store::QuadStore;
 // ── Cursor persistence helpers ────────────────────────────────────────────
 
 fn load_cursor(store: &dyn BlockStore) -> Option<u64> {
-    let bytes = store.get(&CURSOR_SLOT_CID).ok()??;
-    if bytes.len() >= 8 {
-        Some(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
-    } else {
+    let _ = store;
+    let seq = CURSOR_SEQ.load(Ordering::Relaxed);
+    if seq == NO_CURSOR {
         None
+    } else {
+        Some(seq)
     }
 }
 
 fn save_cursor(store: &dyn BlockStore, seq: u64) {
-    let bytes = seq.to_le_bytes();
-    if let Err(e) = store.put(&CURSOR_SLOT_CID, &bytes) {
-        warn!(err = %e, seq, "failed to persist subscribeRepos cursor");
-    }
+    let _ = store;
+    CURSOR_SEQ.store(seq, Ordering::Relaxed);
 }
 
 // ── Public entry point ────────────────────────────────────────────────────
@@ -92,7 +85,7 @@ pub async fn run_subscribe_repos(
     let base = std::env::var("KOTOBA_SUBSCRIBE_REPOS_URL")
         .unwrap_or_else(|_| "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos".into());
 
-    // Prefer env var cursor → then persisted cursor → then no cursor (full replay)
+    // Prefer env var cursor → then process-local cursor → then no cursor.
     let cursor_param = if let Ok(c) = std::env::var("KOTOBA_SUBSCRIBE_REPOS_CURSOR") {
         format!("?cursor={c}")
     } else if let Some(persisted) = load_cursor(&*block_store) {
@@ -525,35 +518,36 @@ mod tests {
     use super::*;
     use kotoba_store::MemoryBlockStore;
     use std::sync::Arc;
+    use std::sync::Mutex;
+
+    static CURSOR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn mem() -> Arc<MemoryBlockStore> {
         Arc::new(MemoryBlockStore::new())
     }
 
     #[test]
-    fn cursor_slot_cid_has_expected_prefix() {
-        assert_eq!(CURSOR_SLOT_CID.0[0], 0x01); // CIDv1
-        assert_eq!(CURSOR_SLOT_CID.0[1], 0x71); // dag-cbor
-        assert_eq!(CURSOR_SLOT_CID.0[2], 0x12); // sha2-256
-        assert_eq!(CURSOR_SLOT_CID.0[3], 0x20); // hash length 32
-    }
-
-    #[test]
     fn load_cursor_returns_none_when_empty() {
+        let _guard = CURSOR_TEST_LOCK.lock().unwrap();
         let store = mem();
+        CURSOR_SEQ.store(NO_CURSOR, Ordering::Relaxed);
         assert!(load_cursor(&*store).is_none());
     }
 
     #[test]
     fn save_and_load_cursor_roundtrip() {
+        let _guard = CURSOR_TEST_LOCK.lock().unwrap();
         let store = mem();
+        CURSOR_SEQ.store(NO_CURSOR, Ordering::Relaxed);
         save_cursor(&*store, 42_000);
         assert_eq!(load_cursor(&*store), Some(42_000));
     }
 
     #[test]
     fn save_cursor_overwrites_previous() {
+        let _guard = CURSOR_TEST_LOCK.lock().unwrap();
         let store = mem();
+        CURSOR_SEQ.store(NO_CURSOR, Ordering::Relaxed);
         save_cursor(&*store, 1);
         save_cursor(&*store, 9_999);
         assert_eq!(load_cursor(&*store), Some(9_999));

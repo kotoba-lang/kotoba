@@ -270,6 +270,17 @@ pub async fn send_message(
                 .into_response()
         }
     };
+    if let Err((code, err_msg)) = validate_signal_did(&msg.sender_did, "sender_did") {
+        return (code, Json(serde_json::json!({ "error": err_msg }))).into_response();
+    }
+    if let Err((code, err_msg)) = validate_signal_did(&msg.recipient_did, "recipient_did") {
+        return (code, Json(serde_json::json!({ "error": err_msg }))).into_response();
+    }
+    if let Err((code, err_msg)) =
+        validate_path_component(&msg.device_id, "device_id", MAX_DEVICE_ID_LEN)
+    {
+        return (code, Json(serde_json::json!({ "error": err_msg }))).into_response();
+    }
 
     // Require the caller to prove ownership of signal_message.sender_did.
     if let Err((code, err_msg)) =

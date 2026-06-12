@@ -449,7 +449,8 @@ mod tests {
     use super::*;
     use kotoba_store::{BudgetedBlockStore, MemoryBlockStore};
     use object_store::local::LocalFileSystem;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock as StdRwLock};
 
     fn tmp_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -469,6 +470,52 @@ mod tests {
             64 * 1024 * 1024,
         )) as Arc<dyn BlockStore + Send + Sync>;
         (kse, blk)
+    }
+
+    #[derive(Default)]
+    struct CorruptingStore {
+        blocks: StdRwLock<HashMap<[u8; 36], Bytes>>,
+        corrupt_reads: StdRwLock<bool>,
+    }
+
+    impl CorruptingStore {
+        fn corrupt_reads(&self) {
+            *self.corrupt_reads.write().unwrap() = true;
+        }
+    }
+
+    impl BlockStore for CorruptingStore {
+        fn put(&self, cid: &KotobaCid, data: &[u8]) -> Result<()> {
+            self.blocks
+                .write()
+                .unwrap()
+                .insert(cid.0, Bytes::copy_from_slice(data));
+            Ok(())
+        }
+
+        fn get(&self, cid: &KotobaCid) -> Result<Option<Bytes>> {
+            let Some(bytes) = self.blocks.read().unwrap().get(&cid.0).cloned() else {
+                return Ok(None);
+            };
+            if *self.corrupt_reads.read().unwrap() {
+                let mut corrupt = bytes.to_vec();
+                if let Some(last) = corrupt.last_mut() {
+                    *last ^= 0xFF;
+                }
+                Ok(Some(Bytes::from(corrupt)))
+            } else {
+                Ok(Some(bytes))
+            }
+        }
+
+        fn has(&self, cid: &KotobaCid) -> bool {
+            self.blocks.read().unwrap().contains_key(&cid.0)
+        }
+
+        fn delete(&self, cid: &KotobaCid) -> Result<()> {
+            self.blocks.write().unwrap().remove(&cid.0);
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -687,26 +734,17 @@ mod tests {
     #[tokio::test]
     async fn corrupt_wrapped_key_block_fails_loud_does_not_regenesis() {
         let dir = tmp_dir("corrupt");
-        let (kse, blk) = make_stores(&dir);
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let kse = VaultStore::new(fs, "");
+        let corrupting = Arc::new(CorruptingStore::default());
+        let blk = corrupting.clone() as Arc<dyn BlockStore + Send + Sync>;
         let id = AgentIdentity::generate_ephemeral();
 
         // Genesis writes the pointer + the HPKE-wrapped vault key block.
         SovereignCrypto::load_or_genesis(&id, &kse, &blk)
             .await
             .unwrap();
-
-        // Resolve the wrapped-block CID from the pointer, then corrupt the block
-        // IN PLACE (overwrite at its CID with a flipped tag byte) — present, but bad.
-        let slug = id.did_slug();
-        let cur_key = format!("agent/crypto/{slug}/current.json");
-        let ptr = kse.get(&cur_key).await.expect("pointer present");
-        let key_ref: KeyRef = serde_json::from_slice(&ptr).unwrap();
-        let cid = KotobaCid::from_multibase(&key_ref.cid).unwrap();
-        let block = blk.get(&cid).unwrap().expect("wrapped block present");
-        let mut corrupt = block.to_vec();
-        let n = corrupt.len();
-        corrupt[n - 1] ^= 0xFF; // flip the AEAD tag region of the wrapped blob
-        blk.put(&cid, &corrupt).unwrap();
+        corrupting.corrupt_reads();
 
         // A fresh load (simulating a restart) against a PRESENT-but-corrupt block
         // must FAIL — never silently re-genesis a new key (which would orphan every

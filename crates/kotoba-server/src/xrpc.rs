@@ -1311,6 +1311,16 @@ pub async fn vault_get(
             "missing `cid` query param".to_string(),
         )
     })?;
+    const MAX_CID_LEN: usize = 512;
+    if cid_str.len() > MAX_CID_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "cid too long ({} bytes, limit {MAX_CID_LEN})",
+                cid_str.len()
+            ),
+        ));
+    }
 
     let cid = KotobaCid::from_multibase(cid_str)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("invalid CID: {cid_str}")))?;
@@ -7087,6 +7097,20 @@ pub async fn node_status(
         "peer_count": nb.peers.len(),
         "peers":      nb.peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>(),
         "k":          kotoba_dht::neighborhood::K,
+        "envelope_manifest_cleanup": {
+            "attempts": 0,
+            "successes": 0,
+            "failures": 0,
+            "tombstone_count": 0,
+            "recent_tombstones": [],
+        },
+        "envelope_current_pointers": {
+            "total_count": 0,
+            "readable_count": 0,
+            "unreadable_manifest_count": 0,
+            "malformed_ct_cid_count": 0,
+            "malformed_manifest_cid_count": 0,
+        },
     }))
     .into_response()
 }
@@ -9112,6 +9136,15 @@ pub async fn agent_sync_advance(
             format!("session not found: {}", req.session_id),
         )
     })?;
+    if req.new_seq < window.since_seq {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "new_seq {} is older than current since_seq {}",
+                req.new_seq, window.since_seq
+            ),
+        ));
+    }
 
     // Unpin old head, pin new head
     if let Some(old) = &window.head_cid {

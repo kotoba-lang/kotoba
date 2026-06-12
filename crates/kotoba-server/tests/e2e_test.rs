@@ -101,6 +101,7 @@ impl TestServer {
         Self::start_inner(with_inference, true, None).await
     }
 
+    #[cfg(feature = "wasm-runtime")]
     async fn start_with_crypto_store_path(
         with_inference: bool,
         store_path: &std::path::Path,
@@ -8067,6 +8068,7 @@ async fn vault_get_missing_cid_param_returns_400() {
     assert_eq!(status, 400);
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_put_then_get_roundtrip() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -8125,6 +8127,7 @@ async fn vault_envelope_put_then_get_roundtrip() {
     }
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_put_without_auth_returns_401() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -8142,6 +8145,7 @@ async fn vault_envelope_put_without_auth_returns_401() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_put_rejects_oversized_metadata() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -8226,6 +8230,7 @@ async fn vault_envelope_put_rejects_oversized_metadata() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_grant_and_revoke_rotate_manifest_not_ciphertext() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -8552,6 +8557,7 @@ async fn vault_envelope_grant_and_revoke_rotate_manifest_not_ciphertext() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_current_requires_auth_and_pointer() {
     let s = TestServer::start_with_crypto(false).await;
@@ -8577,6 +8583,7 @@ async fn vault_envelope_current_requires_auth_and_pointer() {
     assert_eq!(status, 404, "{body}");
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_inspect_without_auth_returns_401() {
     let s = TestServer::start_with_crypto(false).await;
@@ -8594,6 +8601,7 @@ async fn vault_envelope_inspect_without_auth_returns_401() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_rotation_without_auth_returns_401() {
     let s = TestServer::start_with_crypto(false).await;
@@ -8629,6 +8637,7 @@ async fn vault_envelope_rotation_without_auth_returns_401() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_rejects_oversized_cid_inputs() {
     let s = TestServer::start_with_crypto(false).await;
@@ -8776,6 +8785,7 @@ async fn vault_envelope_rejects_oversized_cid_inputs() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_current_rejects_missing_current_manifest_body() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -8817,6 +8827,7 @@ async fn vault_envelope_current_rejects_missing_current_manifest_body() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_current_rejects_invalid_current_manifest_body() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -8904,6 +8915,7 @@ async fn vault_envelope_current_rejects_invalid_current_manifest_body() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_current_rejects_manifest_for_different_ciphertext() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -9020,6 +9032,7 @@ async fn vault_envelope_current_rejects_manifest_for_different_ciphertext() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_inspect_hides_missing_current_manifest_pointer() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -9078,6 +9091,7 @@ async fn vault_envelope_inspect_hides_missing_current_manifest_pointer() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_inspect_tolerates_malformed_current_manifest_pointer() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -9122,6 +9136,7 @@ async fn vault_envelope_inspect_tolerates_malformed_current_manifest_pointer() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_current_get_grant_revoke_fail_closed_on_malformed_current_pointer() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -9204,6 +9219,7 @@ async fn vault_envelope_current_get_grant_revoke_fail_closed_on_malformed_curren
     assert_eq!(status, 409, "{revoke_body}");
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_get_grant_revoke_fail_closed_without_current_pointer() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -9283,6 +9299,7 @@ async fn vault_envelope_get_grant_revoke_fail_closed_without_current_pointer() {
     assert_eq!(status, 409, "{revoke_body}");
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_rejects_policy_manifest_ct_mismatch() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -9421,6 +9438,7 @@ async fn vault_envelope_rejects_policy_manifest_ct_mismatch() {
     );
 }
 
+#[cfg(feature = "wasm-runtime")]
 #[tokio::test]
 async fn vault_envelope_get_without_auth_returns_401() {
     let s = TestServer::start(false).await;
