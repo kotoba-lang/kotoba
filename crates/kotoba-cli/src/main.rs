@@ -12,6 +12,8 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod word;
+
 // ── NSIDs (mirror kotoba-server::xrpc constants) ─────────────────────────────
 const NSID_BLOCK_PUT: &str = "com.etzhayyim.apps.kotoba.block.put";
 const NSID_BLOCK_GET: &str = "com.etzhayyim.apps.kotoba.block.get";
@@ -58,6 +60,10 @@ enum Cmd {
     /// Named-graph quad operations
     #[command(subcommand)]
     Quad(QuadCmd),
+
+    /// kotoba words — agent-callable units (list/invoke/manifest/lexicons/MCP)
+    #[command(subcommand)]
+    Word(word::WordCmd),
 
     /// SPARQL query (SELECT / DESCRIBE / CONSTRUCT / ASK) over the running
     /// server's direct-SPARQL endpoint.  Auto-detects the form from the
@@ -391,6 +397,10 @@ async fn main() -> Result<()> {
                 eprintln!("{msg}");
             }
             kotoba_server::run().await?;
+        }
+
+        Cmd::Word(cmd) => {
+            word::run(cmd).await?;
         }
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,
