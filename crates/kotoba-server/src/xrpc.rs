@@ -1075,7 +1075,7 @@ pub async fn quad_create(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
     // ── CACAO verification (required) ────────────────────────────────────
     let b64 = req.cacao_b64.as_deref().ok_or_else(|| {
@@ -2250,7 +2250,7 @@ pub(crate) fn authorize_protocol_datom_write(
     })
 }
 
-fn db_from_kqe_datoms(datoms: Vec<kotoba_kqe::Datom>) -> kotoba_datomic::Db {
+fn db_from_kqe_datoms(datoms: Vec<kotoba_query::Datom>) -> kotoba_datomic::Db {
     let basis_t = datoms.last().map(|d| d.tx.clone());
     let datoms = datoms
         .into_iter()
@@ -2296,9 +2296,9 @@ fn did_document_ipns_name(did: &str) -> String {
 pub(crate) fn datom_to_projection_quad(
     datom: &kotoba_datomic::Datom,
     graph_cid: &kotoba_core::cid::KotobaCid,
-) -> kotoba_kqe::quad::LegacyQuad {
+) -> kotoba_query::quad::LegacyQuad {
     let substrate = datom_to_projection_kqe(datom);
-    kotoba_kqe::quad::LegacyQuad {
+    kotoba_query::quad::LegacyQuad {
         graph: graph_cid.clone(),
         subject: substrate.e,
         predicate: substrate.a,
@@ -2306,11 +2306,11 @@ pub(crate) fn datom_to_projection_quad(
     }
 }
 
-fn datom_to_projection_kqe(datom: &kotoba_datomic::Datom) -> kotoba_kqe::Datom {
-    datom.to_kqe().unwrap_or_else(|_| kotoba_kqe::Datom {
+fn datom_to_projection_kqe(datom: &kotoba_datomic::Datom) -> kotoba_query::Datom {
+    datom.to_kqe().unwrap_or_else(|_| kotoba_query::Datom {
         e: datom.e.clone(),
         a: datom.a.clone(),
-        v: kotoba_kqe::Value::Text(kotoba_edn::to_string(&datom.v)),
+        v: kotoba_query::Value::Text(kotoba_edn::to_string(&datom.v)),
         tx: datom.t.clone(),
         op: datom.added,
     })
@@ -7196,7 +7196,7 @@ pub async fn invoke_run(
     };
 
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
     use kotoba_runtime::host::WitQuad;
     use kotoba_vm::DispatchResult;
 
@@ -7213,7 +7213,7 @@ pub async fn invoke_run(
                 .into_iter()
                 .filter_map(|datom| {
                     let substrate = datom.to_kqe().ok()?;
-                    let object: kotoba_kqe::quad::LegacyQuadObject = substrate.v.into();
+                    let object: kotoba_query::quad::LegacyQuadObject = substrate.v.into();
                     Some(WitQuad {
                         graph: gcid.to_multibase(),
                         subject: substrate.e.to_multibase(),
@@ -8024,7 +8024,7 @@ pub async fn weight_put(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
 
     // ── Input length guards ───────────────────────────────────────────────
     const MAX_GRAPH_LEN: usize = 512;
@@ -8258,7 +8258,7 @@ pub async fn quad_retract(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+    use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 
     // ── CACAO verification (required) ────────────────────────────────────
     let b64 = req.cacao_b64.as_deref().ok_or_else(|| {
@@ -8441,7 +8441,7 @@ pub async fn lora_apply(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
 
     // ── Input length guards ───────────────────────────────────────────────
     const MAX_GRAPH_LEN: usize = 512;
@@ -14889,7 +14889,7 @@ pub async fn generic_invoke(
     // app nodes — unlike the distributed IPNS head, which did not (ADR-2605312355).
     // Fall back to the distributed head for federation (an app hosted on a remote peer).
     {
-        use kotoba_kqe::quad::LegacyQuadObject;
+        use kotoba_query::quad::LegacyQuadObject;
         let node_quads = state
             .quad_store
             .quads_by_predicate_prefix(Some(&graph_cid), "node/")
@@ -14959,7 +14959,7 @@ pub async fn generic_invoke(
     // committed graph data (ADR-2605312355 Stage-3 persistence blocker). Absent
     // graph_cid → empty snapshot (write-only / read-nothing guests still work).
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
     use kotoba_runtime::host::WitQuad;
 
     let snapshot_graph_cid = req_body
@@ -14973,7 +14973,7 @@ pub async fn generic_invoke(
                 .into_iter()
                 .filter_map(|datom| {
                     let substrate = datom.to_kqe().ok()?;
-                    let object: kotoba_kqe::quad::LegacyQuadObject = substrate.v.into();
+                    let object: kotoba_query::quad::LegacyQuadObject = substrate.v.into();
                     Some(WitQuad {
                         graph: gcid.to_multibase(),
                         subject: substrate.e.to_multibase(),

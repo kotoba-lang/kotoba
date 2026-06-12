@@ -1,4 +1,4 @@
-//! # kotoba-kqe — **KQE = Kotoba Query Engine**
+//! # kotoba-query — **KQE = Kotoba Query Engine**
 //!
 //! The Datalog query layer of KOTOBA: semi-naive Datalog evaluation
 //! ([`datalog`]), the 4-index in-memory [`arrangement`] (EAVT/AEVT/AVET/VAET),

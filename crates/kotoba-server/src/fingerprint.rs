@@ -25,7 +25,7 @@ use axum::{
 };
 use kotoba_core::cid::KotobaCid;
 #[cfg(test)]
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 
 use crate::server::KotobaState;
 

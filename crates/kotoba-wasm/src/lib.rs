@@ -1,6 +1,6 @@
 //! kotoba browser node — P0–P2 (ADR-2606013600).
 //!
-//! Proves the **kotoba read engine runs in the browser**: the `kotoba-kqe`
+//! Proves the **kotoba read engine runs in the browser**: the `kotoba-query`
 //! `DatomArrangement` (EAVT/AEVT/AVET/VAET covering indexes) compiled to
 //! `wasm32-unknown-unknown` and driven from JavaScript through `wasm-bindgen`.
 //!
@@ -54,7 +54,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_ipns_record::IpnsRecord;
 use kotoba_core::prolly::ProllyTree;
 use kotoba_core::store::BlockStore;
-use kotoba_kqe::{Arrangement, Datom, Value};
+use kotoba_query::{Arrangement, Datom, Value};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1378,7 +1378,7 @@ mod tests {
     /// primitive the server uses — not a JSON snapshot.
     #[test]
     fn hydrate_from_prolly_reads_datoms_over_cid_verified_blocks() {
-        use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
         // Leaf value shape == kotoba_datomic StoredDatom == ServerDatom.
         #[derive(serde::Serialize)]
@@ -1449,7 +1449,7 @@ mod tests {
     /// the same loop the Service Worker runs against `block.get`.
     #[test]
     fn missing_cids_drives_block_sync_to_completion() {
-        use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
         #[derive(serde::Serialize)]
         struct StoredDatom {
             e: String,

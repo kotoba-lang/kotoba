@@ -31,12 +31,12 @@ enum TreeOp {
 use dashmap::DashMap;
 use kotoba_auth::delegation::{DelegationChain, DelegationError};
 use kotoba_core::prolly::ProllyTree;
-use kotoba_kqe::arrangement::Arrangement;
-use kotoba_kqe::datalog::DatalogProgram;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::delta::Delta;
-use kotoba_kqe::quad::LegacyQuad as Quad;
-use kotoba_kqe::quad::LegacyQuadObject;
+use kotoba_query::arrangement::Arrangement;
+use kotoba_query::datalog::DatalogProgram;
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::delta::Delta;
+use kotoba_query::quad::LegacyQuad as Quad;
+use kotoba_query::quad::LegacyQuadObject;
 use kotoba_kse::journal::Journal;
 use kotoba_kse::topic::Topic;
 use kotoba_store::{CapturingBlockStore, CarBundleWriter};
@@ -560,7 +560,7 @@ impl QuadStore {
                 .map(|arr| {
                     arr.get_subject_datoms(gcid, subject)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect()
                 })
                 .unwrap_or_default();
@@ -574,7 +574,7 @@ impl QuadStore {
             out.extend(
                 arr.get_subject_datoms(&gcid, subject)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad),
+                    .map(kotoba_query::Datom::into_legacy_quad),
             );
         }
         out
@@ -593,7 +593,7 @@ impl QuadStore {
                 .map(|arr| {
                     arr.datoms_with_attribute_prefix(gcid, prefix)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect()
                 })
                 .unwrap_or_default();
@@ -607,7 +607,7 @@ impl QuadStore {
             out.extend(
                 arr.datoms_with_attribute_prefix(&gcid, prefix)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad),
+                    .map(kotoba_query::Datom::into_legacy_quad),
             );
         }
         out
@@ -678,7 +678,7 @@ impl QuadStore {
                     return Ok(arr
                         .get_subject_datoms(graph_cid, subject)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect());
                 }
             }
@@ -731,7 +731,7 @@ impl QuadStore {
                 let hot_quads = arr
                     .get_subject_datoms(graph_cid, subject)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad);
+                    .map(kotoba_query::Datom::into_legacy_quad);
                 let mut seen: std::collections::HashSet<(String, Vec<u8>)> = quads
                     .iter()
                     .map(|q| {
@@ -903,7 +903,7 @@ impl QuadStore {
                     return Ok(arr
                         .datoms_with_attribute_prefix(graph_cid, predicate_prefix)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect());
                 }
             }
@@ -958,7 +958,7 @@ impl QuadStore {
                 let hot = arr
                     .datoms_with_attribute_prefix(graph_cid, predicate_prefix)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad);
+                    .map(kotoba_query::Datom::into_legacy_quad);
                 let mut seen: std::collections::HashSet<(KotobaCid, String, Vec<u8>)> = quads
                     .iter()
                     .map(|q| {
@@ -1146,7 +1146,7 @@ impl QuadStore {
             for node in &frontier {
                 let quads = self.get_entity_quads_cold(graph_cid, node).await?;
                 for q in quads {
-                    if let kotoba_kqe::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
+                    if let kotoba_query::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
                         if depth < max_hops && visited.insert(ref_cid.clone()) {
                             next_frontier.push(ref_cid.clone());
                         }
@@ -1618,7 +1618,7 @@ impl QuadStore {
         for _hop in 0..max_hops {
             let mut next: Vec<KotobaCid> = Vec::new();
             for q in &result {
-                if let kotoba_kqe::quad::LegacyQuadObject::Cid(ref c) = q.object {
+                if let kotoba_query::quad::LegacyQuadObject::Cid(ref c) = q.object {
                     if visited.insert(c.clone()) {
                         next.push(c.clone());
                     }
@@ -1828,7 +1828,7 @@ impl QuadStore {
                         .into_iter()
                         .filter(|q| {
                             match &q.object {
-                                kotoba_kqe::quad::LegacyQuadObject::Text(t) => {
+                                kotoba_query::quad::LegacyQuadObject::Text(t) => {
                                     all_allowed.contains(t.as_str())
                                 }
                                 // Non-text objects (CID references, etc.) are not constrained
@@ -1912,21 +1912,21 @@ impl QuadStore {
                         "*".to_string()
                     } else {
                         match &q.object {
-                            kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
-                            kotoba_kqe::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
-                            kotoba_kqe::quad::LegacyQuadObject::Integer(i) => i.to_string(),
-                            kotoba_kqe::quad::LegacyQuadObject::Float(f) => format!("{f}"),
-                            kotoba_kqe::quad::LegacyQuadObject::Bool(b) => b.to_string(),
-                            kotoba_kqe::quad::LegacyQuadObject::Bytes(v) => {
+                            kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
+                            kotoba_query::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
+                            kotoba_query::quad::LegacyQuadObject::Integer(i) => i.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Float(f) => format!("{f}"),
+                            kotoba_query::quad::LegacyQuadObject::Bool(b) => b.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Bytes(v) => {
                                 format!("bytes:{}", v.len())
                             }
-                            kotoba_kqe::quad::LegacyQuadObject::VectorF32(v) => {
+                            kotoba_query::quad::LegacyQuadObject::VectorF32(v) => {
                                 format!("vec:{}", v.len())
                             }
-                            kotoba_kqe::quad::LegacyQuadObject::TensorCid { cid, .. } => {
+                            kotoba_query::quad::LegacyQuadObject::TensorCid { cid, .. } => {
                                 cid.to_multibase()
                             }
-                            kotoba_kqe::quad::LegacyQuadObject::Encrypted { ct_cid, .. } => {
+                            kotoba_query::quad::LegacyQuadObject::Encrypted { ct_cid, .. } => {
                                 ct_cid.to_multibase()
                             }
                         }
@@ -1941,7 +1941,7 @@ impl QuadStore {
                     let text_vals: Vec<&str> = members
                         .iter()
                         .filter_map(|q| {
-                            if let kotoba_kqe::quad::LegacyQuadObject::Text(t) = &q.object {
+                            if let kotoba_query::quad::LegacyQuadObject::Text(t) = &q.object {
                                 Some(t.as_str())
                             } else {
                                 None
@@ -2015,17 +2015,17 @@ impl QuadStore {
                         graph: graph_cid.clone(),
                         subject: KotobaCid::from_bytes(key.as_bytes()),
                         predicate: agg_var.to_string(),
-                        object: kotoba_kqe::quad::LegacyQuadObject::Text(agg_str),
+                        object: kotoba_query::quad::LegacyQuadObject::Text(agg_str),
                     });
                 }
                 // Sort by numeric value descending for stable output (fallback to string order)
                 results.sort_by(|a, b| {
-                    let va = if let kotoba_kqe::quad::LegacyQuadObject::Text(t) = &a.object {
+                    let va = if let kotoba_query::quad::LegacyQuadObject::Text(t) = &a.object {
                         t.parse::<u64>().unwrap_or(0)
                     } else {
                         0
                     };
-                    let vb = if let kotoba_kqe::quad::LegacyQuadObject::Text(t) = &b.object {
+                    let vb = if let kotoba_query::quad::LegacyQuadObject::Text(t) = &b.object {
                         t.parse::<u64>().unwrap_or(0)
                     } else {
                         0
@@ -2083,7 +2083,7 @@ impl QuadStore {
                                 graph: graph_cid.clone(),
                                 subject: KotobaCid::from_bytes(val_str.as_bytes()),
                                 predicate: var.as_str().to_string(),
-                                object: kotoba_kqe::quad::LegacyQuadObject::Text(val_str),
+                                object: kotoba_query::quad::LegacyQuadObject::Text(val_str),
                             });
                         }
                     }
@@ -2103,11 +2103,11 @@ impl QuadStore {
                     .unwrap_or(false);
                 quads.sort_by(|a, b| {
                     let av = match &a.object {
-                        kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
+                        kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
                         _ => String::new(),
                     };
                     let bv = match &b.object {
-                        kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
+                        kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
                         _ => String::new(),
                     };
                     if descending {
@@ -2152,11 +2152,11 @@ impl QuadStore {
                     .into_iter()
                     .filter(|q| {
                         let obj_key = match &q.object {
-                            kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
-                            kotoba_kqe::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
-                            kotoba_kqe::quad::LegacyQuadObject::Integer(i) => i.to_string(),
-                            kotoba_kqe::quad::LegacyQuadObject::Float(f) => format!("{f}"),
-                            kotoba_kqe::quad::LegacyQuadObject::Bool(b) => b.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
+                            kotoba_query::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
+                            kotoba_query::quad::LegacyQuadObject::Integer(i) => i.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Float(f) => format!("{f}"),
+                            kotoba_query::quad::LegacyQuadObject::Bool(b) => b.to_string(),
                             _ => format!("__opaque_{}_{}", q.subject.to_multibase(), q.predicate),
                         };
                         seen.insert(format!(
@@ -2371,7 +2371,7 @@ impl QuadStore {
                     .into_iter()
                     .filter_map(|q| {
                         if q.predicate == pred_a {
-                            if let kotoba_kqe::quad::LegacyQuadObject::Cid(c) = q.object {
+                            if let kotoba_query::quad::LegacyQuadObject::Cid(c) = q.object {
                                 Some(c)
                             } else {
                                 None
@@ -2414,7 +2414,7 @@ impl QuadStore {
                 // Use AEVT scan with predicate prefix; filter by object == start_cid
                 let all = self.quads_by_predicate_prefix_cold(graph_cid, pred).await?;
                 Ok(all.into_iter().filter(|q| {
-                    matches!(&q.object, kotoba_kqe::quad::LegacyQuadObject::Cid(c) if *c == start_cid)
+                    matches!(&q.object, kotoba_query::quad::LegacyQuadObject::Cid(c) if *c == start_cid)
                 }).collect())
             }
 
@@ -2428,7 +2428,7 @@ impl QuadStore {
                 let mut results: Vec<Quad> = own.clone();
                 for q in &own {
                     if q.predicate == pred {
-                        if let kotoba_kqe::quad::LegacyQuadObject::Cid(target) = &q.object {
+                        if let kotoba_query::quad::LegacyQuadObject::Cid(target) = &q.object {
                             let hop = self.get_entity_quads_cold(graph_cid, target).await?;
                             for hq in hop {
                                 if !results.iter().any(|r| quad_eq(r, &hq)) {
@@ -2473,7 +2473,7 @@ impl QuadStore {
                     if q.predicate != predicate {
                         continue;
                     }
-                    if let kotoba_kqe::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
+                    if let kotoba_query::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
                         if visited.insert(ref_cid.clone()) {
                             next_frontier.push(ref_cid.clone());
                         }
@@ -2522,14 +2522,14 @@ impl QuadStore {
                             Ok(pred_filtered
                                 .into_iter()
                                 .filter(|q| match &q.object {
-                                    kotoba_kqe::quad::LegacyQuadObject::Text(t) => t == v,
-                                    kotoba_kqe::quad::LegacyQuadObject::Integer(i) => {
+                                    kotoba_query::quad::LegacyQuadObject::Text(t) => t == v,
+                                    kotoba_query::quad::LegacyQuadObject::Integer(i) => {
                                         v.parse::<i64>().map_or(false, |n| *i == n)
                                     }
-                                    kotoba_kqe::quad::LegacyQuadObject::Float(f) => v
+                                    kotoba_query::quad::LegacyQuadObject::Float(f) => v
                                         .parse::<f64>()
                                         .map_or(false, |n| (*f - n).abs() < f64::EPSILON),
-                                    kotoba_kqe::quad::LegacyQuadObject::Bool(b) => {
+                                    kotoba_query::quad::LegacyQuadObject::Bool(b) => {
                                         v == "true" && *b || v == "false" && !b
                                     }
                                     _ => false,
@@ -2540,12 +2540,12 @@ impl QuadStore {
                             let obj_iri = strip_bgp_base(obj_nn.as_str());
                             if let Some(obj_cid) = parse_cid_iri(obj_iri) {
                                 Ok(pred_filtered.into_iter().filter(|q| {
-                                    matches!(&q.object, kotoba_kqe::quad::LegacyQuadObject::Cid(c) if *c == obj_cid)
+                                    matches!(&q.object, kotoba_query::quad::LegacyQuadObject::Cid(c) if *c == obj_cid)
                                 }).collect())
                             } else {
                                 // Named node that's not a CID — compare as text
                                 Ok(pred_filtered.into_iter().filter(|q| {
-                                    matches!(&q.object, kotoba_kqe::quad::LegacyQuadObject::Text(t) if t == obj_iri)
+                                    matches!(&q.object, kotoba_query::quad::LegacyQuadObject::Text(t) if t == obj_iri)
                                 }).collect())
                             }
                         }
@@ -2584,7 +2584,7 @@ impl QuadStore {
                         let obj_iri = strip_bgp_base(obj_nn.as_str());
                         if let Some(obj_cid) = parse_cid_iri(obj_iri) {
                             // AVET: pred + cid-object
-                            let vk = avet_value_key(&kotoba_kqe::quad::LegacyQuadObject::Cid(
+                            let vk = avet_value_key(&kotoba_query::quad::LegacyQuadObject::Cid(
                                 obj_cid.clone(),
                             ));
                             let subjects = self
@@ -2596,7 +2596,7 @@ impl QuadStore {
                                     graph: graph_cid.clone(),
                                     subject: s,
                                     predicate: pred.clone(),
-                                    object: kotoba_kqe::quad::LegacyQuadObject::Cid(
+                                    object: kotoba_query::quad::LegacyQuadObject::Cid(
                                         obj_cid.clone(),
                                     ),
                                 })
@@ -2623,7 +2623,7 @@ impl QuadStore {
                             graph: graph_cid.clone(),
                             subject: subj,
                             predicate: pred,
-                            object: kotoba_kqe::quad::LegacyQuadObject::Cid(obj_cid.clone()),
+                            object: kotoba_query::quad::LegacyQuadObject::Cid(obj_cid.clone()),
                         })
                         .collect());
                 }
@@ -2648,13 +2648,13 @@ impl QuadStore {
                             graph: graph_cid.clone(),
                             subject: s.clone(),
                             predicate: pred1.clone(),
-                            object: kotoba_kqe::quad::LegacyQuadObject::Text(val1.clone()),
+                            object: kotoba_query::quad::LegacyQuadObject::Text(val1.clone()),
                         });
                         out.push(Quad {
                             graph: graph_cid.clone(),
                             subject: s,
                             predicate: pred2.clone(),
-                            object: kotoba_kqe::quad::LegacyQuadObject::Text(val2.clone()),
+                            object: kotoba_query::quad::LegacyQuadObject::Text(val2.clone()),
                         });
                     }
                     return Ok(out);
@@ -3572,12 +3572,12 @@ fn quad_eq(a: &Quad, b: &Quad) -> bool {
         && a.predicate == b.predicate
         && match (&a.object, &b.object) {
             (
-                kotoba_kqe::quad::LegacyQuadObject::Text(at),
-                kotoba_kqe::quad::LegacyQuadObject::Text(bt),
+                kotoba_query::quad::LegacyQuadObject::Text(at),
+                kotoba_query::quad::LegacyQuadObject::Text(bt),
             ) => at == bt,
             (
-                kotoba_kqe::quad::LegacyQuadObject::Cid(ac),
-                kotoba_kqe::quad::LegacyQuadObject::Cid(bc),
+                kotoba_query::quad::LegacyQuadObject::Cid(ac),
+                kotoba_query::quad::LegacyQuadObject::Cid(bc),
             ) => ac == bc,
             _ => false,
         }
@@ -3619,7 +3619,7 @@ fn sparql_named_node_to_cid(iri: &str) -> anyhow::Result<KotobaCid> {
 
 fn sparql_term_to_quad_object(
     term: &spargebra::term::Term,
-) -> anyhow::Result<kotoba_kqe::quad::LegacyQuadObject> {
+) -> anyhow::Result<kotoba_query::quad::LegacyQuadObject> {
     use spargebra::term::Term;
     match term {
         // Same typing as the AVET query path (`typed_literal_object`) so stored
@@ -3628,8 +3628,8 @@ fn sparql_term_to_quad_object(
         Term::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => Ok(kotoba_kqe::quad::LegacyQuadObject::Cid(c)),
-                None => Ok(kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string())),
+                Some(c) => Ok(kotoba_query::quad::LegacyQuadObject::Cid(c)),
+                None => Ok(kotoba_query::quad::LegacyQuadObject::Text(s.to_string())),
             }
         }
         Term::BlankNode(_) => anyhow::bail!("UPDATE: blank node objects are not supported"),
@@ -3638,27 +3638,27 @@ fn sparql_term_to_quad_object(
 
 fn sparql_term_to_quad_object_ground(
     term: &spargebra::term::GroundTerm,
-) -> anyhow::Result<kotoba_kqe::quad::LegacyQuadObject> {
+) -> anyhow::Result<kotoba_query::quad::LegacyQuadObject> {
     use spargebra::term::GroundTerm;
     match term {
         GroundTerm::Literal(lit) => {
             let v = lit.value();
             if let Ok(i) = v.parse::<i64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Integer(i));
+                return Ok(kotoba_query::quad::LegacyQuadObject::Integer(i));
             }
             if let Ok(f) = v.parse::<f64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Float(f));
+                return Ok(kotoba_query::quad::LegacyQuadObject::Float(f));
             }
             if v == "true" || v == "false" {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Bool(v == "true"));
+                return Ok(kotoba_query::quad::LegacyQuadObject::Bool(v == "true"));
             }
-            Ok(kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string()))
+            Ok(kotoba_query::quad::LegacyQuadObject::Text(v.to_string()))
         }
         GroundTerm::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => Ok(kotoba_kqe::quad::LegacyQuadObject::Cid(c)),
-                None => Ok(kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string())),
+                Some(c) => Ok(kotoba_query::quad::LegacyQuadObject::Cid(c)),
+                None => Ok(kotoba_query::quad::LegacyQuadObject::Text(s.to_string())),
             }
         }
     }
@@ -3669,7 +3669,7 @@ fn eval_filter_expr(expr: &spargebra::algebra::Expression, quad: &Quad) -> bool 
     use spargebra::algebra::Function;
 
     let obj_text = match &quad.object {
-        kotoba_kqe::quad::LegacyQuadObject::Text(t) => Some(t.as_str()),
+        kotoba_query::quad::LegacyQuadObject::Text(t) => Some(t.as_str()),
         _ => None,
     };
 
@@ -3869,22 +3869,22 @@ fn instantiate_quad_pattern(
         TermPattern::Literal(lit) => {
             let v = lit.value();
             if let Ok(i) = v.parse::<i64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Integer(i)
+                kotoba_query::quad::LegacyQuadObject::Integer(i)
             } else if let Ok(f) = v.parse::<f64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Float(f)
+                kotoba_query::quad::LegacyQuadObject::Float(f)
             } else if v == "true" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(true)
+                kotoba_query::quad::LegacyQuadObject::Bool(true)
             } else if v == "false" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(false)
+                kotoba_query::quad::LegacyQuadObject::Bool(false)
             } else {
-                kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string())
+                kotoba_query::quad::LegacyQuadObject::Text(v.to_string())
             }
         }
         TermPattern::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => kotoba_kqe::quad::LegacyQuadObject::Cid(c),
-                None => kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string()),
+                Some(c) => kotoba_query::quad::LegacyQuadObject::Cid(c),
+                None => kotoba_query::quad::LegacyQuadObject::Text(s.to_string()),
             }
         }
         _ => return None,
@@ -3921,22 +3921,22 @@ fn instantiate_ground_quad_pattern(
         GroundTermPattern::Literal(lit) => {
             let v = lit.value();
             if let Ok(i) = v.parse::<i64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Integer(i)
+                kotoba_query::quad::LegacyQuadObject::Integer(i)
             } else if let Ok(f) = v.parse::<f64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Float(f)
+                kotoba_query::quad::LegacyQuadObject::Float(f)
             } else if v == "true" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(true)
+                kotoba_query::quad::LegacyQuadObject::Bool(true)
             } else if v == "false" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(false)
+                kotoba_query::quad::LegacyQuadObject::Bool(false)
             } else {
-                kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string())
+                kotoba_query::quad::LegacyQuadObject::Text(v.to_string())
             }
         }
         GroundTermPattern::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => kotoba_kqe::quad::LegacyQuadObject::Cid(c),
-                None => kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string()),
+                Some(c) => kotoba_query::quad::LegacyQuadObject::Cid(c),
+                None => kotoba_query::quad::LegacyQuadObject::Text(s.to_string()),
             }
         }
         #[allow(unreachable_patterns)]
@@ -4000,7 +4000,7 @@ fn enc_object(o: &LegacyQuadObject) -> Vec<u8> {
 /// (ADR-2606022150 D2 / P2b). Both the hot point lookup and the cold scan prefix
 /// route through this.
 fn avet_value_key(object: &LegacyQuadObject) -> Vec<u8> {
-    kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::from(object.clone()))
+    kotoba_query::keycodec::value_key(&kotoba_query::Value::from(object.clone()))
 }
 
 /// Type a SPARQL literal value string into a `LegacyQuadObject` exactly as the
@@ -4050,7 +4050,7 @@ mod tests {
     // The test bodies refer to the object enum by its short name `QuadObject`
     // (the lib historically re-exported it under that alias). Keep the alias so
     // the test module compiles against the renamed `LegacyQuadObject`.
-    use kotoba_kqe::quad::LegacyQuadObject as QuadObject;
+    use kotoba_query::quad::LegacyQuadObject as QuadObject;
     use kotoba_kse::Journal;
     use kotoba_store::MemoryBlockStore;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7055,7 +7055,7 @@ mod tests {
         let bob_cid = KotobaCid::from_bytes(b"bob");
         assert_eq!(
             quads[0].object,
-            kotoba_kqe::quad::LegacyQuadObject::Cid(bob_cid),
+            kotoba_query::quad::LegacyQuadObject::Cid(bob_cid),
         );
     }
 
@@ -7996,7 +7996,7 @@ mod tests {
         // Datalog rule: transitive_closure(?x, ?z) :- knows(?x, ?y), knows(?y, ?z).
         // Set up a 2-hop knows chain, commit to ProllyTree (cold), then evaluate
         // the program — every join must be served by BlockStore-backed scans.
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
             Arc::new(Journal::new()),
@@ -8058,7 +8058,7 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_unions_hot_uncommitted_facts() {
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
             Arc::new(Journal::new()),
@@ -8117,7 +8117,7 @@ mod tests {
     async fn datalog_cold_cached_first_miss_second_hit() {
         // CID-MV cache for Datalog: same program against same commit → byte-stable
         // cache lookup on repeat.
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
             Arc::new(Journal::new()),
@@ -8176,7 +8176,7 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_cached_distinct_programs_distinct_cids() {
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let (qs, g, _people) = setup_chain_qs().await;
 
@@ -8218,7 +8218,7 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_authed_real_eddsa() {
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let (qs, g, _people) = setup_chain_qs().await;
         let chain = make_real_eddsa_cacao(&g.to_multibase(), "datom:read");
@@ -8255,7 +8255,7 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_authed_denied_wrong_graph() {
-        use kotoba_kqe::datalog::DatalogProgram;
+        use kotoba_query::datalog::DatalogProgram;
         let (qs, g, _people) = setup_chain_qs().await;
         let wrong = KotobaCid::from_bytes(b"datalog-wrong-graph");
         let chain = make_real_eddsa_cacao(&wrong.to_multibase(), "datom:read");

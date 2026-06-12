@@ -16,7 +16,7 @@
 
 use bytes::Bytes;
 use futures::StreamExt;
-use kotoba_kqe::datom::Datom;
+use kotoba_query::datom::Datom;
 use kotoba_kse::Journal;
 use std::sync::Arc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};

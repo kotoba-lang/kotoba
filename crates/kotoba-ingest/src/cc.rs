@@ -15,8 +15,8 @@ use std::{path::Path, sync::Arc};
 use anyhow::{Context, Result};
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use tracing::{debug, info};
 
 use crate::embed_client::EmbedClient;
@@ -627,7 +627,7 @@ impl CcChunkIngestor {
                     Value::TensorCid {
                         cid: tcid,
                         shape: vec![embedding.len() as u32],
-                        dtype: kotoba_kqe::datom::TensorDtype::F32,
+                        dtype: kotoba_query::datom::TensorDtype::F32,
                     }
                 };
 

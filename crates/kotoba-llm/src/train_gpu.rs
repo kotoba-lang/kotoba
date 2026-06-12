@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::delta::Delta;
+use kotoba_query::delta::Delta;
 use kotoba_kse::vault::Vault;
 
 use crate::gpu_common::{

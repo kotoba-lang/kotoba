@@ -43,7 +43,7 @@ pub use infer_gpu::{
 #[cfg(test)]
 mod tests {
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::datom::{TensorDtype, Value};
+    use kotoba_query::datom::{TensorDtype, Value};
 
     fn cid(seed: &[u8]) -> KotobaCid {
         KotobaCid::from_bytes(seed)
@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn weight_ref_embed_predicate() {
         use super::weight::{WeightKind, WeightRef};
-        use kotoba_kqe::quad::TensorDtype as LegacyTensorDtype;
+        use kotoba_query::quad::TensorDtype as LegacyTensorDtype;
 
         let model = cid(b"model");
         let blob = cid(b"blob");

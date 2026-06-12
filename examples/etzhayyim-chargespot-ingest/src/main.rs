@@ -15,7 +15,7 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use kotoba_auth::{did_key::ed25519_pubkey_to_did_key, Cacao, CacaoHeader, CacaoPayload, CacaoSig};
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::{
+use kotoba_query::{
     delta::Delta,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };

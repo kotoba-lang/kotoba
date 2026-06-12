@@ -1,6 +1,6 @@
 use anyhow::Result;
 use kotoba_dht::source_chain::ProgramType;
-use kotoba_kqe::{arrangement::Arrangement, datalog::DatalogProgram, delta::Delta};
+use kotoba_query::{arrangement::Arrangement, datalog::DatalogProgram, delta::Delta};
 use kotoba_runtime::{
     host::{InferenceFn, WitQuad},
     InvokeResult, UdfExecutor, WasmExecutor,
@@ -179,7 +179,7 @@ impl InvokeRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_kqe::{arrangement::Arrangement, datalog::DatalogProgram};
+    use kotoba_query::{arrangement::Arrangement, datalog::DatalogProgram};
 
     fn router() -> InvokeRouter {
         InvokeRouter::new(10_000, "http://localhost:9999").unwrap()

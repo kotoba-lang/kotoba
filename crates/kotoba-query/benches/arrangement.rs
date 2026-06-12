@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::{
+use kotoba_query::{
     arrangement::Arrangement,
     datom::Value,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},

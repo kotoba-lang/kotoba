@@ -308,7 +308,7 @@ impl Default for PregelGraph {
 // Datalog-on-Pregel bridge
 // ---------------------------------------------------------------------------
 
-use kotoba_kqe::{datalog::DatalogProgram, datom::Value, delta::Delta};
+use kotoba_query::{datalog::DatalogProgram, datom::Value, delta::Delta};
 
 /// Build a PregelGraph from a set of input Deltas.
 ///
@@ -753,8 +753,8 @@ mod tests {
     #[test]
     fn test_graph_from_deltas_creates_vertices_and_messages() {
         use kotoba_core::cid::KotobaCid;
-        use kotoba_kqe::datom::{Datom, Value};
-        use kotoba_kqe::delta::Delta;
+        use kotoba_query::datom::{Datom, Value};
+        use kotoba_query::delta::Delta;
 
         let subj_a = KotobaCid::from_bytes(b"subject-a");
         let subj_b = KotobaCid::from_bytes(b"subject-b");

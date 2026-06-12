@@ -1,6 +1,6 @@
 # tadori_attribution_join - tadori (R0 scaffold)
 
-cross-store join addr/cluster -> ip-obs/dns-obs/person via the kotoba-kqe VAET arrangement (2-hop, = yabai correlate-ip-activity). Person/IP/device objects are written under the com.etzhayyim.encrypted.* envelope, Signal-wrapped to case-members.
+cross-store join addr/cluster -> ip-obs/dns-obs/person via the kotoba-query VAET arrangement (2-hop, = yabai correlate-ip-activity). Person/IP/device objects are written under the com.etzhayyim.encrypted.* envelope, Signal-wrapped to case-members.
 
 Per ADR-2605301400. R0 scaffold - `cell.py` raises at import time until T1
 (Council Lv6+ >=3 ratify, post 2026-06-19).

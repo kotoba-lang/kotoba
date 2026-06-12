@@ -1,6 +1,6 @@
 //! kotoba-EVM R1 — `revm` execution over a Datom-backed state (ADR-2606091500).
 //!
-//! [`DatomDatabase`] implements revm's `DatabaseRef` over a `kotoba_kqe::evm_state::
+//! [`DatomDatabase`] implements revm's `DatabaseRef` over a `kotoba_query::evm_state::
 //! EvmStateView` (the EVM world-state projected from the canonical Datom log), so
 //! revm executes EVM transactions against kotoba's own state. [`apply_call`] runs a
 //! message-call transaction and returns the resulting state diff as `evm/*` Datoms
@@ -17,8 +17,8 @@ pub mod logs;
 pub mod tx;
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::Datom;
-use kotoba_kqe::evm_state::{account_datoms, storage_datom, EvmStateView};
+use kotoba_query::datom::Datom;
+use kotoba_query::evm_state::{account_datoms, storage_datom, EvmStateView};
 
 use revm::primitives::{
     AccountInfo, Address, Bytecode, Bytes, ExecutionResult, ResultAndState, TxKind, B256, U256,
@@ -257,8 +257,8 @@ pub fn state_to_datoms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_kqe::delta::Delta;
-    use kotoba_kqe::evm_state::account_datoms as mk_account;
+    use kotoba_query::delta::Delta;
+    use kotoba_query::evm_state::account_datoms as mk_account;
 
     fn graph() -> KotobaCid {
         KotobaCid::from_bytes(b"g:evm")

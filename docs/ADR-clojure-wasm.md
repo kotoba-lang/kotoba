@@ -381,7 +381,7 @@ in compiled Clojure on kotoba-runtime:
   each), a 5-datom `loop`/`recur` write burst, list lifts (count + element
   bytes + all four quad fields verified in-guest via `str-eq?`), a
   read-modify-write agent (read `kg/role` → assert derived `kg/verified`),
-  **and the Datomic loop**: agent-asserted quads → `kotoba_kqe::Datom` →
+  **and the Datomic loop**: agent-asserted quads → `kotoba_query::Datom` →
   `kotoba_datomic::Datom::from_kqe` → `Db::from_datoms` → `datoms()` returns
   the agent's facts as EDN (`kg/name = "Alice"`, `kg/role = "admin"`) —
   **compiled Clojure writes, the Datomic facade reads.**

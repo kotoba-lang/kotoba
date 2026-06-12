@@ -52,8 +52,8 @@ use tracing::{debug, info, warn};
 
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
-use kotoba_kqe::datom::Datom;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::datom::Datom;
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use kotoba_kse::Journal;
 
 use crate::atproto::{collection_to_cid, did_to_cid, jetstream_subject_to_topic};

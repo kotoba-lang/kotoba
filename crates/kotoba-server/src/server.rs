@@ -22,7 +22,7 @@ use kotoba_ingest::media_embed::{HttpMediaEmbedClient, MediaEmbedClient};
 use kotoba_ipfs::{
     InMemoryIpnsRegistry, IpnsName, IpnsRecord, IpnsRegistry, KuboIpnsRegistry, SignedIpnsRegistry,
 };
-use kotoba_kqe::{quad::LegacyQuad as Quad, Datom as KqeDatom, Value as KqeValue};
+use kotoba_query::{quad::LegacyQuad as Quad, Datom as KqeDatom, Value as KqeValue};
 use kotoba_kse::SecureVault;
 use kotoba_kse::{
     sync_window::SyncWindow, AgentIdentity, Journal, KseStore, PreKeyRegistry, Shelf, Topic, Vault,
@@ -280,7 +280,7 @@ pub struct KotobaState {
     /// Registered, incrementally-maintained Datalog MaterializedViews.
     /// Maintained on every kg commit (`commit_kg_datoms`); registered + read via
     /// `kg.mv.register` / `kg.mv.result`.
-    pub mv_registry: Arc<tokio::sync::RwLock<kotoba_kqe::mv::MvRegistry>>,
+    pub mv_registry: Arc<tokio::sync::RwLock<kotoba_query::mv::MvRegistry>>,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
     /// Optional kotobase.net XRPC pin client (KOTOBA_PIN_TOKEN; ADR-2606091500).
     pub ipfs_pin: Arc<IpfsPinClient>,
@@ -870,7 +870,7 @@ impl KotobaState {
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
             mv_registry: Arc::new(tokio::sync::RwLock::new(
-                kotoba_kqe::mv::MvRegistry::new(),
+                kotoba_query::mv::MvRegistry::new(),
             )),
             operator_did,
             node_roles,

@@ -1,4 +1,4 @@
-//! Cypher MATCH/RETURN → Datalog rule compiler for kotoba-kqe
+//! Cypher MATCH/RETURN → Datalog rule compiler for kotoba-query
 //!
 //! Supported subset:
 //!   MATCH (a)-[:RELATION]->(b)

@@ -9,7 +9,7 @@
 //!     guest walks the element array with the `KQE_PRELUDE` accessors.
 //!   - `(kqe-query filter)` lifts `list<quad>` (32-byte records) the same way.
 //!   - The **Datomic loop**: quads asserted by the compiled-Clojure agent are
-//!     converted to `kotoba_kqe::Datom` → `kotoba_datomic::Datom::from_kqe` →
+//!     converted to `kotoba_query::Datom` → `kotoba_datomic::Datom::from_kqe` →
 //!     a `Db`, and queried back — closing agent-writes → Datomic-reads.
 #![cfg(feature = "component")]
 
@@ -208,7 +208,7 @@ fn agent_asserts_flow_into_datomic_db() {
     assert_eq!(result.output_cbor, b"ok");
     assert_eq!(result.assert_quads.len(), 2);
 
-    // SerializedQuad → kotoba_kqe::Datom → kotoba_datomic::Datom (from_kqe)
+    // SerializedQuad → kotoba_query::Datom → kotoba_datomic::Datom (from_kqe)
     let tx = KotobaCid::from_bytes(b"tx-clj-agent");
     let datoms: Vec<kotoba_datomic::Datom> = result
         .assert_quads
@@ -216,8 +216,8 @@ fn agent_asserts_flow_into_datomic_db() {
         .map(|q| {
             let text: ciborium::Value =
                 ciborium::from_reader(q.object_cbor.as_slice()).expect("object cbor");
-            let v = kotoba_kqe::datom::Value::Text(text.as_text().expect("text").to_string());
-            kotoba_datomic::Datom::from_kqe(kotoba_kqe::datom::Datom {
+            let v = kotoba_query::datom::Value::Text(text.as_text().expect("text").to_string());
+            kotoba_datomic::Datom::from_kqe(kotoba_query::datom::Datom {
                 e: KotobaCid::from_bytes(q.subject.as_bytes()),
                 a: q.predicate.clone(),
                 v,

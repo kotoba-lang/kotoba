@@ -412,8 +412,8 @@ pub async fn audit_list_receipts(
     for quad in quads {
         let entry = by_subject.entry(quad.subject.to_multibase()).or_default();
         let value: serde_json::Value = match &quad.object {
-            kotoba_kqe::quad::LegacyQuadObject::Text(s) => s.clone().into(),
-            kotoba_kqe::quad::LegacyQuadObject::Integer(i) => (*i).into(),
+            kotoba_query::quad::LegacyQuadObject::Text(s) => s.clone().into(),
+            kotoba_query::quad::LegacyQuadObject::Integer(i) => (*i).into(),
             other => format!("{other:?}").into(),
         };
         let key = match quad.predicate.as_str() {

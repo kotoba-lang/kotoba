@@ -1,5 +1,5 @@
 //! Decode anchor-chain `MishmarBondEscrow` event logs (`eth_getLogs` JSON) into
-//! the projected Datoms that drive `kotoba_kqe::social::PinIndex`, plus `Slashed`
+//! the projected Datoms that drive `kotoba_query::social::PinIndex`, plus `Slashed`
 //! observations (ADR-2606082100; `docs/MISHMAR-OBSERVATION.md`).
 //!
 //! kotoba stays **read+verify**: this module only decodes logs the caller fetched
@@ -15,8 +15,8 @@
 
 use kotoba_auth::eth::keccak256;
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::social::{PIN_PINNER_PRED, PIN_ROOT_PRED};
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::social::{PIN_PINNER_PRED, PIN_ROOT_PRED};
 
 /// `event Pinned(bytes32 indexed pinId, bytes32 indexed rootCid, address indexed pinner, bytes32 didHash, uint256 bond, uint64 expiresAt)`
 const PINNED_SIG: &[u8] = b"Pinned(bytes32,bytes32,address,bytes32,uint256,uint64)";
@@ -229,7 +229,7 @@ impl<T: JsonRpcTransport> EvmLogObservationSource<T> {
 /// Entries missing required fields are skipped.
 pub fn parse_kaizen_wellbecoming(
     feed: &serde_json::Value,
-) -> Vec<kotoba_kqe::social::ObservedWellbecoming> {
+) -> Vec<kotoba_query::social::ObservedWellbecoming> {
     let mut out = Vec::new();
     let Some(arr) = feed.as_array() else {
         return out;
@@ -246,7 +246,7 @@ pub fn parse_kaizen_wellbecoming(
             .get("council_attested")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        out.push(kotoba_kqe::social::ObservedWellbecoming {
+        out.push(kotoba_query::social::ObservedWellbecoming {
             did: crate::did_bridge::did_to_cid(did),
             epoch,
             delta,
@@ -259,7 +259,7 @@ pub fn parse_kaizen_wellbecoming(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_kqe::social::PinIndex;
+    use kotoba_query::social::PinIndex;
     use serde_json::json;
 
     /// Fake transport returning a canned logs array for eth_getLogs.
@@ -304,7 +304,7 @@ mod tests {
 
         // feed PinIndex and confirm the mapping resolves to the from_bytes CIDs.
         let mut idx = PinIndex::new();
-        let deltas: Vec<_> = datoms.into_iter().map(kotoba_kqe::delta::Delta::assert_datom).collect();
+        let deltas: Vec<_> = datoms.into_iter().map(kotoba_query::delta::Delta::assert_datom).collect();
         idx.apply(&deltas);
         let pin_cid = KotobaCid::from_bytes(&pin);
         assert_eq!(idx.root_of(&pin_cid), Some(KotobaCid::from_bytes(&root)));
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(datoms.len(), 2);
         // decoded Datoms drive PinIndex identically to the direct decoder.
         let mut idx = PinIndex::new();
-        idx.apply(&datoms.into_iter().map(kotoba_kqe::delta::Delta::assert_datom).collect::<Vec<_>>());
+        idx.apply(&datoms.into_iter().map(kotoba_query::delta::Delta::assert_datom).collect::<Vec<_>>());
         assert_eq!(idx.root_of(&KotobaCid::from_bytes(&pin)), Some(KotobaCid::from_bytes(&root)));
     }
 

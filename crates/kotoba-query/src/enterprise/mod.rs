@@ -1,4 +1,4 @@
-//! Enterprise query dialect support for kotoba-kqe.
+//! Enterprise query dialect support for kotoba-query.
 //!
 //! Each dialect compiles its query language into a `DatalogProgram` +
 //! `PostProcess`.  `PostProcess` carries directives that Datalog cannot express

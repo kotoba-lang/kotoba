@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::{
+use kotoba_query::{
     datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term},
     delta::Delta,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},

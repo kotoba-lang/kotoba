@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use kotoba_core::cid::KotobaCid;
 use kotoba_ingest::{graph_cid_for, EmailIngestor};
-use kotoba_kqe::{quad::LegacyQuad, quad::LegacyQuadObject};
+use kotoba_query::{quad::LegacyQuad, quad::LegacyQuadObject};
 use kotoba_signal::message::SignalMessage;
 
 use crate::server::KotobaState;
@@ -685,10 +685,10 @@ pub async fn email_send(
         let commit_datoms: Vec<kotoba_datomic::Datom> = fields
             .iter()
             .map(|(predicate, object)| {
-                kotoba_datomic::Datom::from_kqe(kotoba_kqe::Datom::assert(
+                kotoba_datomic::Datom::from_kqe(kotoba_query::Datom::assert(
                     email_cid.clone(),
                     predicate.to_string(),
-                    kotoba_kqe::Value::Text(object.clone()),
+                    kotoba_query::Value::Text(object.clone()),
                     tx_cid.clone(),
                 ))
             })
@@ -841,10 +841,10 @@ mod tests {
                 .quad_store
                 .assert_datom(
                     graph_cid.clone(),
-                    kotoba_kqe::Datom::assert(
+                    kotoba_query::Datom::assert(
                         email_cid.clone(),
                         p.to_string(),
-                        kotoba_kqe::Value::Text(o),
+                        kotoba_query::Value::Text(o),
                         tx_cid.clone(),
                     ),
                 )
@@ -960,10 +960,10 @@ mod tests {
             .quad_store
             .assert_datom(
                 graph_cid.clone(),
-                kotoba_kqe::Datom::assert(
+                kotoba_query::Datom::assert(
                     email_cid.clone(),
                     "email/message_id".to_string(),
-                    kotoba_kqe::Value::Text("<bridge@example>".to_string()),
+                    kotoba_query::Value::Text("<bridge@example>".to_string()),
                     tx_cid.clone(),
                 ),
             )

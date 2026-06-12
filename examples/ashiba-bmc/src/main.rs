@@ -13,7 +13,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use kotoba_core::{cid::KotobaCid, store::BlockStore};
 use kotoba_graph::QuadStore;
-use kotoba_kqe::{
+use kotoba_query::{
     datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term},
     delta::Delta,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},

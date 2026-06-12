@@ -44,7 +44,7 @@
 //! depend on an initialised task prompt.
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::{
+use kotoba_query::{
     arrangement::Arrangement,
     datom::{Datom, Value as DatomValue},
     delta::Delta,

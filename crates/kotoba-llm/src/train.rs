@@ -6,8 +6,8 @@
 ///   adam  -> Datom(model_cid, "train/adam/m2/{kind.path()}",  TensorCid{f32}, tx, true)
 ///   weight update: retract(old) + assert(new) via kind.predicate() — atomic pair
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::{Datom, TensorDtype, Value};
-use kotoba_kqe::delta::Delta;
+use kotoba_query::datom::{Datom, TensorDtype, Value};
+use kotoba_query::delta::Delta;
 
 use crate::weight::WeightKind;
 
