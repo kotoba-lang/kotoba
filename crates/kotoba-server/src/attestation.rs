@@ -558,6 +558,9 @@ pub struct RequestLogEntry {
     pub method: String,
     pub path: String,
     pub ts_unix: u64,
+    pub principal_did: Option<String>,
+    pub peer_ip: Option<String>,
+    pub node_id: Option<String>,
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -995,6 +998,9 @@ pub async fn request_log_query(
                 method: String::new(),
                 path: String::new(),
                 ts_unix: 0,
+                principal_did: None,
+                peer_ip: None,
+                node_id: None,
             });
         match datom.a.as_str() {
             "request/method" => {
@@ -1005,6 +1011,15 @@ pub async fn request_log_query(
             }
             "request/ts_unix" => {
                 entry.ts_unix = datom_u64(&datom.v);
+            }
+            "request/principal_did" => {
+                entry.principal_did = Some(datom_text(&datom.v));
+            }
+            "request/peer_ip" => {
+                entry.peer_ip = Some(datom_text(&datom.v));
+            }
+            "request/node_id" => {
+                entry.node_id = Some(datom_text(&datom.v));
             }
             _ => {}
         }
@@ -1156,6 +1171,7 @@ mod tests {
 
         let commit = writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: "k51-attestation-vc-distributed".into(),
                 graph,
@@ -1234,6 +1250,7 @@ mod tests {
 
         let commit = writer
             .commit_datoms(kotoba_datomic::distributed::CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: "k51-attestation-challenge-distributed".into(),
                 graph,

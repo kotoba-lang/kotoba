@@ -4,9 +4,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use kotoba_auth::delegation::DelegationChain;
 use kotoba_core::{cid::KotobaCid, prolly::ProllyTree, store::BlockStore};
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::journal::Journal;
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use kotoba_store::MemoryBlockStore;
+use kotoba_vault::live_bus::LiveBus;
 /// QuadStore insert + query benchmarks.
 ///
 /// ## Scope
@@ -65,7 +65,7 @@ fn make_quads(n: u64) -> Vec<Quad> {
 }
 
 fn make_store() -> QuadStore {
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     QuadStore::new(journal, block_store)
@@ -218,7 +218,7 @@ fn bench_query_hot(c: &mut Criterion) {
     group.bench_function("lookup_by_predicate_object_avet", |b| {
         // AVET value lookups take a canonical keycodec-encoded value_key, the same
         // encoding the store writes — match it via `keycodec::value_key`.
-        let vk = kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("Alice".to_string()));
+        let vk = kotoba_query::keycodec::value_key(&kotoba_query::Value::Text("Alice".to_string()));
         b.to_async(&rt)
             .iter(|| async { qs.lookup_subject_by_po(Some(&graph), "name", &vk).await });
     });
@@ -336,7 +336,7 @@ async fn make_committed_qs_latency(
         put_rtt,
     };
     let store = Arc::new(inner) as Arc<dyn BlockStore + Send + Sync>;
-    let qs = QuadStore::new(Arc::new(Journal::new()), store);
+    let qs = QuadStore::new(Arc::new(LiveBus::new()), store);
     let graph = make_cid(1);
     let quads: Vec<Quad> = (0..n_entities)
         .flat_map(|i| {
@@ -436,8 +436,9 @@ fn bench_cold_avet(c: &mut Criterion) {
     ] {
         let (qs, graph_cid, _) = rt.block_on(make_committed_qs_latency(get_rtt, put_rtt, 1_000));
         group.bench_function(name, |b| {
-            let vk =
-                kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".to_string()));
+            let vk = kotoba_query::keycodec::value_key(&kotoba_query::Value::Text(
+                "entity-100".to_string(),
+            ));
             b.to_async(&rt).iter(|| async {
                 qs.lookup_subject_by_po_cold(&graph_cid, "name", &vk)
                     .await

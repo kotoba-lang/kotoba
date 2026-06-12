@@ -62,6 +62,41 @@ pub fn seal_with_aad(
     Ok(out)
 }
 
+/// AES-256-GCM seal with caller-supplied nonce + AAD.
+/// Returns `nonce || ciphertext_with_tag` (interoperates with `open_with_aad`).
+///
+/// SAFETY CONTRACT: the caller MUST guarantee that a `(key, nonce)` pair is
+/// never reused for two DIFFERENT plaintexts — reuse completely breaks AES-GCM
+/// confidentiality and integrity. The only sanctioned use is content-derived
+/// nonces over content-addressed blocks (`nonce = HKDF(key-derived, cid)` with
+/// `cid = sha2-256(plaintext)`), where a `(key, nonce)` collision implies the
+/// plaintexts are identical, so determinism is the worst-case leak
+/// (ADR-2606112200 sealed cold tier). Everything else MUST use `seal` /
+/// `seal_with_aad`, which draw a random nonce from OsRng.
+pub fn seal_with_aad_nonce(
+    key: &[u8; KEY_LEN],
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    use aes_gcm::aead::Payload;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::SealFailed)?;
+    let n = aes_gcm::Nonce::from(*nonce);
+    let ct = cipher
+        .encrypt(
+            &n,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| CryptoError::SealFailed)?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
 /// AES-256-GCM seal with explicit nonce (for deterministic tests only).
 /// Only available under `#[cfg(test)]` — production code MUST use `seal` which
 /// generates a random nonce via OsRng.  Nonce reuse under a fixed key completely
@@ -268,6 +303,22 @@ mod tests {
     }
 
     // ---- AAD binding (ADR-2606014000 D2) ---------------------------------
+
+    #[test]
+    fn seal_with_aad_nonce_is_deterministic_and_opens() {
+        let key = random_key();
+        let nonce = [0x42u8; NONCE_LEN];
+        let aad = b"kotoba/sealed-block/v1";
+        let ct1 = seal_with_aad_nonce(&key, &nonce, b"block bytes", aad).unwrap();
+        let ct2 = seal_with_aad_nonce(&key, &nonce, b"block bytes", aad).unwrap();
+        assert_eq!(ct1, ct2, "same key+nonce+pt+aad must be deterministic");
+        let pt = open_with_aad(&key, &ct1, aad).unwrap();
+        assert_eq!(pt.as_slice(), b"block bytes");
+        assert!(
+            open_with_aad(&key, &ct1, b"other-aad").is_err(),
+            "wrong AAD must fail"
+        );
+    }
 
     #[test]
     fn seal_with_aad_open_with_same_aad_roundtrips() {

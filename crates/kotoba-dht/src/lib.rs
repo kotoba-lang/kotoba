@@ -1,3 +1,10 @@
+//! # kotoba-dht — **KDHT = Kotoba Distributed Hash Table**
+//!
+//! Agent-centric integrity layer of KOTOBA: per-agent [`source_chain`]s,
+//! [`warrant`]s (signed misbehaviour evidence), [`neighborhood`] validator
+//! assignment, [`gossip`], [`commit_chain`], [`audit`], and [`settlement`].
+//! No central master node — validation authority is distributed across
+//! DHT neighborhoods.
 pub mod audit;
 pub mod availability_proof;
 pub mod commit_chain;

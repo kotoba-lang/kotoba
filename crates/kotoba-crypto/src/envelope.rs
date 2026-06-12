@@ -1,6 +1,6 @@
 use crate::aead::CryptoError;
 /// Wire format: `signal:v1:{base64url(nonce || ciphertext_with_tag)}`
-/// Compatible with the TypeScript `@gftd/signal` `signal:v1:` prefix convention.
+/// Compatible with the TypeScript `@etzhayyim/signal` `signal:v1:` prefix convention.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use zeroize::Zeroizing;
 

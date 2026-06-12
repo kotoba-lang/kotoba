@@ -17,7 +17,7 @@
 use crate::source_chain::{ChainContent, ChainEntry, ChainError, SourceChain};
 use ed25519_dalek::{Signer, SigningKey};
 use kotoba_core::cid::KotobaCid;
-use kotoba_kse::agent_identity::AgentIdentity;
+use kotoba_vault::agent_identity::AgentIdentity;
 use std::collections::HashMap;
 
 /// A per-agent signed commit log plus a materialized view of the current head

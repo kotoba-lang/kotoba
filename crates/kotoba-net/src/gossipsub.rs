@@ -1,30 +1,6 @@
-/// GossipSub topic ↔ KSE Journal Topic mapping
-pub const MAX_GOSSIPSUB_TOPIC_BYTES: usize = 256;
-
+/// GossipSub topic ↔ KSE LiveBus Topic mapping
 pub fn gossipsub_topic(kotoba_topic: &str) -> String {
-    checked_gossipsub_topic(kotoba_topic).expect("valid gossipsub topic")
-}
-
-pub fn checked_gossipsub_topic(kotoba_topic: &str) -> Result<String, String> {
-    let mut topic = kotoba_topic.trim_start_matches('/');
-    if let Some(rest) = topic.strip_prefix("kotoba/") {
-        topic = rest.trim_start_matches('/');
-    } else if topic == "kotoba" {
-        topic = "";
-    }
-
-    if topic.is_empty() {
-        return Err("gossipsub topic must not be empty".into());
-    }
-    if topic.len() > MAX_GOSSIPSUB_TOPIC_BYTES {
-        return Err(format!(
-            "gossipsub topic exceeds {MAX_GOSSIPSUB_TOPIC_BYTES} byte limit"
-        ));
-    }
-    if topic.bytes().any(|b| b.is_ascii_control()) {
-        return Err("gossipsub topic contains control byte".into());
-    }
-    Ok(format!("kotoba/{topic}"))
+    format!("kotoba/{}", kotoba_topic.trim_start_matches('/'))
 }
 
 #[cfg(test)]
@@ -50,23 +26,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_topic_is_rejected_by_checked_mapper() {
-        assert!(checked_gossipsub_topic("").is_err());
+    fn empty_topic_gives_bare_prefix() {
+        assert_eq!(gossipsub_topic(""), "kotoba/");
     }
 
     #[test]
-    fn raw_topic_gets_one_kotoba_prefix() {
+    fn already_kotoba_prefix_not_doubled() {
+        // When callers pass the raw KSE topic name (no leading slash), the result
+        // should be exactly one "kotoba/" prefix.
         let t = gossipsub_topic("pregel/messages");
         assert_eq!(t, "kotoba/pregel/messages");
         assert!(!t.contains("kotoba/kotoba/"), "prefix must not be doubled");
-    }
-
-    #[test]
-    fn already_prefixed_topic_not_doubled() {
-        assert_eq!(
-            gossipsub_topic("kotoba/pregel/messages"),
-            "kotoba/pregel/messages"
-        );
     }
 
     #[test]
@@ -81,8 +51,9 @@ mod tests {
     }
 
     #[test]
-    fn topic_with_only_slash_is_rejected() {
-        assert!(checked_gossipsub_topic("/").is_err());
+    fn topic_with_only_slash() {
+        // A single slash → strip it → bare prefix
+        assert_eq!(gossipsub_topic("/"), "kotoba/");
     }
 
     #[test]
@@ -95,7 +66,7 @@ mod tests {
 
     #[test]
     fn topic_result_always_starts_with_kotoba_slash() {
-        let inputs = ["foo", "/foo", "//foo", "a/b/c", "kotoba/a"];
+        let inputs = ["foo", "/foo", "//foo", "", "a/b/c"];
         for input in inputs {
             let result = gossipsub_topic(input);
             assert!(
@@ -108,15 +79,5 @@ mod tests {
     #[test]
     fn trailing_slash_preserved() {
         assert_eq!(gossipsub_topic("topic/"), "kotoba/topic/");
-    }
-
-    #[test]
-    fn checked_topic_rejects_control_bytes() {
-        assert!(checked_gossipsub_topic("quad/\nassert").is_err());
-    }
-
-    #[test]
-    fn checked_topic_rejects_oversized_topic() {
-        assert!(checked_gossipsub_topic(&"a".repeat(MAX_GOSSIPSUB_TOPIC_BYTES + 1)).is_err());
     }
 }

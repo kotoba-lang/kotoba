@@ -33,7 +33,7 @@ use std::sync::Arc;
 use kotoba_core::cid::KotobaCid;
 use kotoba_ingest::media::{media_assets_graph, rank_by_cosine};
 use kotoba_ingest::media_embed::{Blake3MediaEmbedClient, MediaEmbedClient, MediaItem};
-use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
 use crate::server::KotobaState;
 

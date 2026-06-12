@@ -1,5 +1,5 @@
 /// SignalStore — unified in-memory store for identity, pre-keys, sessions, sender keys.
-/// Acts as the local Signal Protocol state node (analogous to IndexedDB `gftd-signal-v1`).
+/// Acts as the local Signal Protocol state node (analogous to IndexedDB `etzhayyim-signal-v1`).
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;

@@ -1,0 +1,331 @@
+use kotoba_core::cid::KotobaCid;
+use kotoba_core::store::BlockStore;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncWindowError {
+    SequenceRollback { current: u64, requested: u64 },
+}
+
+impl std::fmt::Display for SyncWindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncWindowError::SequenceRollback { current, requested } => write!(
+                f,
+                "sync window sequence rollback: requested {requested}, current {current}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SyncWindowError {}
+
+/// Describes the subset of history an agent loop needs to operate.
+///
+/// An agent creates a `SyncWindow` on startup from its last persisted state.
+/// It then:
+/// 1. Calls `pin_into(store)` to protect anchor CIDs from eviction.
+/// 2. Calls `LiveBus::read_since(self.since_seq)` to replay missed entries.
+/// 3. Calls `QuadStore::commits_since(graph_cid, self.head_cid.as_ref())`
+///    to fetch only the delta commits it hasn't processed yet.
+/// 4. Calls `advance(new_head, new_seq, store)` after each processed commit.
+/// 5. Calls `unpin_from(store)` when the agent session ends.
+///
+/// This prevents full history replication: only the window's worth of data
+/// is fetched and kept alive in local storage.
+#[derive(Debug, Clone)]
+pub struct SyncWindow {
+    /// Named graph being tracked.
+    pub graph_cid: KotobaCid,
+    /// LiveBus sequence watermark — only entries ≥ since_seq are needed.
+    pub since_seq: u64,
+    /// Last commit head the agent has already processed.
+    /// `None` = fresh agent with no prior state.
+    pub head_cid: Option<KotobaCid>,
+}
+
+impl SyncWindow {
+    /// Create a window starting from a known position.
+    pub fn new(graph_cid: KotobaCid, since_seq: u64, head_cid: Option<KotobaCid>) -> Self {
+        Self {
+            graph_cid,
+            since_seq,
+            head_cid,
+        }
+    }
+
+    /// Fresh window — subscribe from the current tip only.
+    /// Pass `current_seq` from `LiveBus::current_seq()`.
+    pub fn head_only(graph_cid: KotobaCid, current_seq: u64) -> Self {
+        Self {
+            graph_cid,
+            since_seq: current_seq,
+            head_cid: None,
+        }
+    }
+
+    /// Pin the window's anchor CIDs into `store` so eviction never removes them.
+    pub fn pin_into(&self, store: &dyn BlockStore) {
+        store.pin(&self.graph_cid);
+        if let Some(head) = &self.head_cid {
+            store.pin(head);
+        }
+    }
+
+    /// Release the window's pin locks when the agent session ends.
+    pub fn unpin_from(&self, store: &dyn BlockStore) {
+        store.unpin(&self.graph_cid);
+        if let Some(head) = &self.head_cid {
+            store.unpin(head);
+        }
+    }
+
+    /// Advance the window after the agent successfully processes a new commit.
+    ///
+    /// Unpins the old head (so it can be evicted) and pins the new head.
+    pub fn advance(&mut self, new_head: KotobaCid, new_seq: u64, store: &dyn BlockStore) {
+        let _ = self.try_advance(new_head, new_seq, store);
+    }
+
+    /// Checked variant of [`Self::advance`] that refuses to move the replay
+    /// watermark backwards.
+    pub fn try_advance(
+        &mut self,
+        new_head: KotobaCid,
+        new_seq: u64,
+        store: &dyn BlockStore,
+    ) -> Result<(), SyncWindowError> {
+        if new_seq < self.since_seq {
+            return Err(SyncWindowError::SequenceRollback {
+                current: self.since_seq,
+                requested: new_seq,
+            });
+        }
+
+        if self.head_cid.as_ref() != Some(&new_head) {
+            if let Some(old) = &self.head_cid {
+                store.unpin(old);
+            }
+        }
+        store.pin(&new_head);
+        self.head_cid = Some(new_head);
+        self.since_seq = new_seq;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use kotoba_core::store::BlockStore;
+    use std::collections::HashSet;
+    use std::sync::{Arc, RwLock};
+
+    /// Minimal in-test BlockStore that tracks pins.
+    #[derive(Default)]
+    struct PinStore {
+        pinned: Arc<RwLock<HashSet<[u8; 36]>>>,
+    }
+    impl BlockStore for PinStore {
+        fn put(&self, _: &KotobaCid, _: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get(&self, _: &KotobaCid) -> anyhow::Result<Option<Bytes>> {
+            Ok(None)
+        }
+        fn has(&self, _: &KotobaCid) -> bool {
+            false
+        }
+        fn pin(&self, cid: &KotobaCid) {
+            self.pinned.write().unwrap().insert(cid.0);
+        }
+        fn unpin(&self, cid: &KotobaCid) {
+            self.pinned.write().unwrap().remove(&cid.0);
+        }
+        fn is_pinned(&self, cid: &KotobaCid) -> bool {
+            self.pinned.read().unwrap().contains(&cid.0)
+        }
+    }
+
+    fn cid(s: &str) -> KotobaCid {
+        KotobaCid::from_bytes(s.as_bytes())
+    }
+
+    #[test]
+    fn pin_into_pins_graph_and_head() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h = cid("head");
+        let win = SyncWindow::new(g.clone(), 0, Some(h.clone()));
+        win.pin_into(&store);
+        assert!(store.is_pinned(&g));
+        assert!(store.is_pinned(&h));
+    }
+
+    #[test]
+    fn unpin_from_releases_both() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h = cid("head");
+        let win = SyncWindow::new(g.clone(), 0, Some(h.clone()));
+        win.pin_into(&store);
+        win.unpin_from(&store);
+        assert!(!store.is_pinned(&g));
+        assert!(!store.is_pinned(&h));
+    }
+
+    #[test]
+    fn head_only_sets_none_head() {
+        let g = cid("graph");
+        let win = SyncWindow::head_only(g.clone(), 42);
+        assert_eq!(win.since_seq, 42);
+        assert!(win.head_cid.is_none());
+    }
+
+    #[test]
+    fn advance_moves_pin_to_new_head() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h1 = cid("head1");
+        let h2 = cid("head2");
+
+        let mut win = SyncWindow::new(g.clone(), 1, Some(h1.clone()));
+        win.pin_into(&store);
+
+        win.advance(h2.clone(), 5, &store);
+
+        assert!(!store.is_pinned(&h1), "old head must be unpinned");
+        assert!(store.is_pinned(&h2), "new head must be pinned");
+        assert_eq!(win.since_seq, 5);
+        assert_eq!(win.head_cid, Some(h2));
+    }
+
+    #[test]
+    fn pin_into_with_no_head_only_pins_graph() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let win = SyncWindow::head_only(g.clone(), 0);
+        win.pin_into(&store);
+        assert!(store.is_pinned(&g));
+    }
+
+    #[test]
+    fn new_stores_all_fields() {
+        let g = cid("g");
+        let h = cid("h");
+        let win = SyncWindow::new(g.clone(), 77, Some(h.clone()));
+        assert_eq!(win.graph_cid, g);
+        assert_eq!(win.since_seq, 77);
+        assert_eq!(win.head_cid, Some(h));
+    }
+
+    #[test]
+    fn advance_with_no_prior_head_pins_new_head() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h = cid("new_head");
+        let mut win = SyncWindow::head_only(g.clone(), 0);
+        win.pin_into(&store);
+        win.advance(h.clone(), 10, &store);
+        assert!(store.is_pinned(&h));
+        assert_eq!(win.since_seq, 10);
+    }
+
+    #[test]
+    fn advance_multiple_times_only_last_pinned() {
+        let store = PinStore::default();
+        let g = cid("g");
+        let h1 = cid("h1");
+        let h2 = cid("h2");
+        let h3 = cid("h3");
+
+        let mut win = SyncWindow::new(g.clone(), 0, Some(h1.clone()));
+        win.pin_into(&store);
+
+        win.advance(h2.clone(), 1, &store);
+        win.advance(h3.clone(), 2, &store);
+
+        assert!(!store.is_pinned(&h1));
+        assert!(!store.is_pinned(&h2));
+        assert!(store.is_pinned(&h3));
+        assert_eq!(win.since_seq, 2);
+    }
+
+    #[test]
+    fn try_advance_rejects_sequence_rollback_without_pin_changes() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h1 = cid("head1");
+        let h2 = cid("head2");
+
+        let mut win = SyncWindow::new(g, 10, Some(h1.clone()));
+        win.pin_into(&store);
+
+        let err = win.try_advance(h2.clone(), 9, &store).unwrap_err();
+        assert_eq!(
+            err,
+            SyncWindowError::SequenceRollback {
+                current: 10,
+                requested: 9
+            }
+        );
+        assert!(store.is_pinned(&h1));
+        assert!(!store.is_pinned(&h2));
+        assert_eq!(win.since_seq, 10);
+        assert_eq!(win.head_cid, Some(h1));
+    }
+
+    #[test]
+    fn advance_ignores_sequence_rollback_without_pin_changes() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h1 = cid("head1");
+        let h2 = cid("head2");
+
+        let mut win = SyncWindow::new(g, 10, Some(h1.clone()));
+        win.pin_into(&store);
+
+        win.advance(h2.clone(), 9, &store);
+        assert!(store.is_pinned(&h1));
+        assert!(!store.is_pinned(&h2));
+        assert_eq!(win.since_seq, 10);
+        assert_eq!(win.head_cid, Some(h1));
+    }
+
+    #[test]
+    fn try_advance_same_head_keeps_pin_and_updates_watermark() {
+        let store = PinStore::default();
+        let g = cid("graph");
+        let h = cid("head");
+
+        let mut win = SyncWindow::new(g, 10, Some(h.clone()));
+        win.pin_into(&store);
+
+        win.try_advance(h.clone(), 12, &store).unwrap();
+        assert!(store.is_pinned(&h));
+        assert_eq!(win.since_seq, 12);
+        assert_eq!(win.head_cid, Some(h));
+    }
+
+    #[test]
+    fn unpin_when_no_head_only_unpins_graph() {
+        let store = PinStore::default();
+        let g = cid("g");
+        let win = SyncWindow::head_only(g.clone(), 5);
+        win.pin_into(&store);
+        assert!(store.is_pinned(&g));
+        win.unpin_from(&store);
+        assert!(!store.is_pinned(&g));
+    }
+
+    #[test]
+    fn sync_window_clone_is_equal() {
+        let g = cid("g");
+        let h = cid("h");
+        let win = SyncWindow::new(g.clone(), 42, Some(h.clone()));
+        let cloned = win.clone();
+        assert_eq!(cloned.graph_cid, win.graph_cid);
+        assert_eq!(cloned.since_seq, win.since_seq);
+        assert_eq!(cloned.head_cid, win.head_cid);
+    }
+}

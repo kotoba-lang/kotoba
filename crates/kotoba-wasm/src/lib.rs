@@ -1,6 +1,6 @@
 //! kotoba browser node — P0–P2 (ADR-2606013600).
 //!
-//! Proves the **kotoba read engine runs in the browser**: the `kotoba-kqe`
+//! Proves the **kotoba read engine runs in the browser**: the `kotoba-query`
 //! `DatomArrangement` (EAVT/AEVT/AVET/VAET covering indexes) compiled to
 //! `wasm32-unknown-unknown` and driven from JavaScript through `wasm-bindgen`.
 //!
@@ -53,7 +53,8 @@ use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::prolly::ProllyTree;
 use kotoba_core::store::BlockStore;
-use kotoba_kqe::{Arrangement, Datom, Value};
+use kotoba_ipns_record::IpnsRecord;
+use kotoba_query::{Arrangement, Datom, Value};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -351,7 +352,7 @@ impl Node {
     }
 
     /// A durable snapshot of the write-set in the SAME JSON shape that
-    /// `load_server_datoms` / `ai.gftd.apps.kotoba.datomic.datoms` use, so a
+    /// `load_server_datoms` / `ai.etzhayyim.apps.kotoba.datomic.datoms` use, so a
     /// reload (or a peer) can rehydrate via the existing read path.
     pub fn export_snapshot_json(&self) -> String {
         let arr: Vec<serde_json::Value> = self
@@ -613,8 +614,8 @@ impl Node {
 }
 
 /// Client-side sovereign crypto for the browser node — the same model as
-/// `kotoba-kse::SovereignCrypto`/`AgentIdentity`, but self-contained and
-/// wasm32-clean (no Journal/Vault/tokio deps). The agent holds an Ed25519
+/// `kotoba-vault::SovereignCrypto`/`AgentIdentity`, but self-contained and
+/// wasm32-clean (no LiveBus/Vault/tokio deps). The agent holds an Ed25519
 /// identity (signs commits → authorship) and a 32-byte symmetric vault key
 /// (AES-256-GCM field encryption → the persisted ProllyTree/IndexedDB blocks
 /// hold ciphertext, never plaintext). Entropy comes from `getrandom`'s `js`
@@ -662,6 +663,27 @@ impl WriteCrypto {
     pub fn sign_hex(&self, msg: &[u8]) -> String {
         use ed25519_dalek::Signer;
         hex::encode(self.signing_key.sign(msg).to_bytes())
+    }
+
+    /// Build + Ed25519-sign a canonical kotoba IPNS **head record** (ADR-2606066000):
+    /// the member-signed, self-verifying mutable head pointer whose `value` is the
+    /// committed root CID (multibase). `name` is the DID-derived IPNS name and
+    /// `sequence` is the monotonic CAS / stale-guard. The record is built with the
+    /// shared `kotoba-ipns-record` type and signed with the member key, so it
+    /// verifies **byte-identically** under `kotoba-ipfs`'s verifier — no parallel
+    /// head format (ADR-2605262130).
+    pub fn sign_ipns_head(
+        &self,
+        name: String,
+        value_multibase: String,
+        sequence: u64,
+        valid_until: String,
+    ) -> Result<IpnsRecord, String> {
+        let mut rec = IpnsRecord::with_value_string(name, value_multibase, sequence, valid_until);
+        rec.controller_did = Some(self.did());
+        rec.sign_ed25519(&self.signing_key)
+            .map_err(|e| e.to_string())?;
+        Ok(rec)
     }
 
     /// Encrypt plaintext under the vault key → `signal:v1:<hex(nonce||ct)>`.
@@ -898,6 +920,45 @@ mod wasm {
                 "root": root.to_multibase(), "did": did, "sig": sig,
             }))
             .map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        /// `commit()` + emit a member-signed **kotoba IPNS head record**
+        /// (ADR-2606066000) — the content-addressed, self-verifying head pointer
+        /// that supersedes the apex `{root,did,sig}` shim + the trusted KV `kroot:`
+        /// value. `value` = the committed root CID; the IPNS name is DID-derived;
+        /// `sequence` is the monotonic CAS guard the publisher passes (the head it
+        /// rebased on + 1). The returned JSON is a canonical `IpnsRecord` that the
+        /// apex relays untrusted and any reader verifies (no-server-key).
+        #[wasm_bindgen(js_name = commitHeadSigned)]
+        pub fn commit_head_signed(
+            &mut self,
+            sequence: u64,
+            valid_until: String,
+        ) -> Result<String, JsValue> {
+            let root = self.inner.commit();
+            let c = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("no identity — call useIdentity first"))?;
+            let rec = c
+                .sign_ipns_head(c.did(), root.to_multibase(), sequence, valid_until)
+                .map_err(|e| JsValue::from_str(&e))?;
+            serde_json::to_string(&rec).map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        /// Reader-side verification of a canonical kotoba IPNS head record's
+        /// Ed25519 signature (ADR-2606066000): the consumer checks the record
+        /// itself, so the apex / any gateway serving it is NOT trusted (no-server-
+        /// key). `json` is the record as emitted by `commitHeadSigned`. Returns
+        /// true iff a signature + public key are present and verify over the
+        /// canonical ciborium-CBOR payload. A static method:
+        /// `KotobaNode.verifyIpnsRecord(json)`.
+        #[wasm_bindgen(js_name = verifyIpnsRecord)]
+        pub fn verify_ipns_record(json: String) -> bool {
+            match serde_json::from_str::<IpnsRecord>(&json) {
+                Ok(rec) => rec.require_verified_signature().is_ok(),
+                Err(_) => false,
+            }
         }
 
         /// Write one fact (entity, attr, value). In-memory read engine + the
@@ -1368,7 +1429,7 @@ mod tests {
     /// primitive the server uses — not a JSON snapshot.
     #[test]
     fn hydrate_from_prolly_reads_datoms_over_cid_verified_blocks() {
-        use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
         // Leaf value shape == kotoba_datomic StoredDatom == ServerDatom.
         #[derive(serde::Serialize)]
@@ -1441,7 +1502,7 @@ mod tests {
     /// the same loop the Service Worker runs against `block.get`.
     #[test]
     fn missing_cids_drives_block_sync_to_completion() {
-        use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
         #[derive(serde::Serialize)]
         struct StoredDatom {
             e: String,

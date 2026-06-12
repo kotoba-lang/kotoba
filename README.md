@@ -50,7 +50,7 @@ query surface, runs as four single-shot commands:
 
 ```bash
 # 1. One-time: generate Ed25519 + X25519 + DID, persist to macOS Keychain
-#    (or ~/.gftd/kotoba.env on Linux/other, chmod 600).
+#    (or ~/.etzhayyim/kotoba.env on Linux/other, chmod 600).
 kotoba init
 
 # 2. Start the server. IPFS cold tier + CACAO Private-default are ON by
@@ -93,7 +93,7 @@ kotoba cacao-sign <seed> --graph <cid> \
 | IPFS endpoint              | `http://localhost:5001`                                  | `KOTOBA_IPFS_ENDPOINT=…`       |
 | Multi-peer federation      | none (single-node)                                        | `KOTOBA_PEERS="http://… http://…"` |
 | Default graph visibility   | `Private { owner_did = operator_did }` (CACAO required)  | `KOTOBA_DEFAULT_VISIBILITY=authenticated\|public\|private` |
-| Agent identity             | macOS Keychain → `~/.gftd/kotoba.env` → env → ephemeral  | `kotoba init`                   |
+| Agent identity             | macOS Keychain → `~/.etzhayyim/kotoba.env` → env → ephemeral  | `kotoba init`                   |
 
 `kotoba serve` boots with a clear startup probe: if `ipfs daemon` is not
 reachable on `KOTOBA_IPFS_ENDPOINT`, you get a single WARN line telling you
@@ -105,7 +105,7 @@ exactly how to silence or fix it.
 |--------------------|----------------------------------------------------------------------------|
 | `kotoba-core`      | CIDv1 dag-cbor sha2-256, KAIS 8-bit frame, Prolly Tree                     |
 | `kotoba-kse`       | Journal (Merkle WAL), Vault (CDC chunker), Topic, Shelf, AgentIdentity     |
-| `kotoba-kqe`       | Datalog engine, Arrangement (EAVT/AEVT/AVET/VAET), Delta, MV               |
+| `kotoba-query`       | Datalog engine, Arrangement (EAVT/AEVT/AVET/VAET), Delta, MV               |
 | `kotoba-dht`       | Source Chain, Warrant, Neighborhood (DHT)                                  |
 | `kotoba-net`       | libp2p QUIC/Noise/GossipSub                                                |
 | `kotoba-auth`      | CACAO chain (depth-2), multi-graph grants, EdDSA verify, did:key, Passkey  |
@@ -134,6 +134,7 @@ exactly how to silence or fix it.
 - **E2E encryption** — Signal Protocol + CACAO auth for consent-gated data
 - **Datomic/Datalog primary, SPARQL auxiliary** — the distributed Datom DB is the source of truth; SPARQL 1.1 reads the same projection for RDF-compatible query and federation
 - **CACAO-native authz** — depth-2 delegation chains, multi-graph grants, anti-replay nonce
+- **X-Road-style accountability** — ciphertext-only replication, purpose-declared + signed + receipted key release via t-of-N custodians, anchored tamper-evident audit log, slashable unreceipted releases. See [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md)
 
 ## Architecture
 
@@ -163,7 +164,7 @@ since, no second-log replay.
 
 **② Query — Datomic first-tier** — the 4-index model is tier-1: BGP routing does
 direct index scans (EAVT point lookup ~180 ns, AVET, VAET reverse) over the
-ProllyTree, and an incremental **MaterializedView** (`kotoba-kqe/src/mv.rs`,
+ProllyTree, and an incremental **MaterializedView** (`kotoba-query/src/mv.rs`,
 maintained per commit Δ) serves recurring/Datalog queries without re-evaluating
 from scratch. `kg.sparql` (SELECT/ASK/DESCRIBE/CONSTRUCT/UPDATE/SERVICE) is the
 auxiliary RDF surface over the same indexes; `db_before`/TEA give Datomic-style
@@ -258,10 +259,21 @@ cargo test --workspace                  # ~1184 tests pass
 cargo build --release -p kotoba-cli     # final `kotoba` binary
 ```
 
+## Coverage
+
+```bash
+./scripts/coverage.sh        # per-crate + total line/region coverage (lib tests)
+./scripts/coverage.sh html   # browsable report at target/llvm-cov/html/index.html
+./scripts/coverage.sh lcov   # lcov.info for CI / codecov upload
+```
+
+Requires `cargo install cargo-llvm-cov` and a rustup toolchain (the script pins
+to `rustup run stable` because Homebrew rust ships no `llvm-tools`).
+
 ## ADR
 
 Design decisions live in
-[`90-docs/adr/2605240001-kotoba-cleanroom-architecture.md`](https://github.com/gftdcojp/ai-gftd-apps-gftdcojp/blob/main/90-docs/adr/2605240001-kotoba-cleanroom-architecture.md)
+[`90-docs/adr/2605240001-kotoba-cleanroom-architecture.md`](https://github.com/etzhayyim/etzhayyim-apps-etzhayyim/blob/main/90-docs/adr/2605240001-kotoba-cleanroom-architecture.md)
 of the parent monorepo.  Section §27 captures the current SPARQL surface,
 HTTP loadtest matrix, and operator-UX defaults.
 

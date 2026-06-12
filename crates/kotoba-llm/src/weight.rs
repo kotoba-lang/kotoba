@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject, TensorDtype};
-use kotoba_kse::vault::Vault;
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject, TensorDtype};
+use kotoba_vault::vault::Vault;
 
 /// Unified weight predicate scheme (ADR-2605250005).
 ///
@@ -224,7 +224,7 @@ mod tests {
         if let Value::TensorCid { cid, shape, dtype } = datom.v {
             assert_eq!(cid, blob_cid);
             assert_eq!(shape, vec![32000, 2048]);
-            assert_eq!(dtype, kotoba_kqe::datom::TensorDtype::F8E4M3);
+            assert_eq!(dtype, kotoba_query::datom::TensorDtype::F8E4M3);
         } else {
             panic!("expected TensorCid value");
         }

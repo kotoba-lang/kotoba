@@ -1,12 +1,12 @@
 use kotoba_auth::delegation::DelegationChain;
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::{
+use kotoba_query::{
     arrangement::Arrangement,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
-use kotoba_kse::journal::Journal;
 use kotoba_store::{DistributedBlockStore, MemoryBlockStore};
+use kotoba_vault::live_bus::LiveBus;
 /// Load test: legacy Arrangement + Datom-backed commit cycle + cold-path queries.
 ///
 /// Usage:
@@ -160,7 +160,7 @@ fn query_latencies(
         times.push(t.elapsed());
         // AVET
         let t = Instant::now();
-        let _ = arr.get_entities_by_attribute_value(p, &kotoba_kqe::Value::Text("Alice".into()));
+        let _ = arr.get_entities_by_attribute_value(p, &kotoba_query::Value::Text("Alice".into()));
         times.push(t.elapsed());
         // VAET
         let t = Instant::now();
@@ -318,7 +318,7 @@ async fn phase4_distributed_fetch() {
     // --- Node B: commits quads to its MemoryBlockStore ---
     let peer_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
-    let qs_b = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&peer_store));
+    let qs_b = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&peer_store));
     let graph = cid(2);
     let n = N_ENTITIES;
     for chunk_start in (0..n).step_by(5_000) {
@@ -356,7 +356,7 @@ async fn phase4_distributed_fetch() {
 
     // Node A: create QuadStore backed by dist_store (local_a already has all blocks).
     // Import the commit CID so the CommitDag knows the graph → ProllyTree roots mapping.
-    let qs_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&dist_store));
+    let qs_a = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&dist_store));
     let imported = qs_a.import_commit(&_commit_cid_b).await.unwrap();
     assert!(
         imported,
@@ -412,7 +412,7 @@ async fn phase3_cold_queries() {
         "query", "p50_ms", "p95_ms", "p99_ms"
     );
 
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     let qs = QuadStore::new(journal, block_store);
@@ -478,7 +478,7 @@ async fn phase3_cold_queries() {
         qs.lookup_subject_by_po_cold(
             &graph,
             "name",
-            &kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".into())),
+            &kotoba_query::keycodec::value_key(&kotoba_query::Value::Text("entity-100".into())),
         )
         .await
         .unwrap()
@@ -522,7 +522,7 @@ async fn phase2(total: u64, mem_limit_mb: f64) {
         "batch", "insert_ms", "total_quads", "commit_ms", "MB_growth", "ins_q/s", "cum_q/s"
     );
 
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     let qs = QuadStore::new(journal, block_store);
@@ -633,7 +633,7 @@ async fn phase5_sparql_multihop_cacao() {
         "query", "p50_ms", "p95_ms", "p99_ms", "result_n"
     );
 
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     let qs = QuadStore::new(journal, block_store);
@@ -803,7 +803,7 @@ async fn phase6_sparql_advanced() {
         "query", "p50_µs", "p95_µs", "p99_µs", "result_n"
     );
 
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     let qs = QuadStore::new(journal, block_store);
@@ -943,7 +943,7 @@ async fn phase7_set_ops_orderby() {
         "query", "p50_µs", "p95_µs", "p99_µs", "result_n"
     );
 
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     let qs = QuadStore::new(journal, block_store);
@@ -1093,7 +1093,7 @@ async fn phase7_set_ops_orderby() {
     // ── Distributed aggregate: node B commits, node A queries after import ────
     let bs_b =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
-    let qs_b = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&bs_b));
+    let qs_b = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&bs_b));
     let g_d = cid(17);
     let n_d: u64 = 1_000;
     for i in 0..n_d {
@@ -1123,7 +1123,7 @@ async fn phase7_set_ops_orderby() {
     }
     let dist_a = Arc::new(DistributedBlockStore::new(Arc::clone(&local_a), vec![]))
         as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
-    let qs_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&dist_a));
+    let qs_a = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&dist_a));
     qs_a.import_commit(&commit_cid).await.unwrap();
 
     bench_query!(
@@ -1178,7 +1178,7 @@ async fn phase8_n_triple_bgp() {
         "query", "p50_µs", "p95_µs", "p99_µs", "result_n"
     );
 
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     let qs = QuadStore::new(journal, block_store);
@@ -1358,7 +1358,7 @@ async fn phase9_named_graph() {
     );
 
     let qs = QuadStore::new(
-        Arc::new(Journal::new()),
+        Arc::new(LiveBus::new()),
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
     );
 
@@ -1482,7 +1482,7 @@ async fn phase10_aggregate_distinct() {
     );
 
     let qs = QuadStore::new(
-        Arc::new(Journal::new()),
+        Arc::new(LiveBus::new()),
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
     );
 
@@ -1678,7 +1678,7 @@ async fn phase11_describe_cacao() {
     );
 
     let qs = QuadStore::new(
-        Arc::new(Journal::new()),
+        Arc::new(LiveBus::new()),
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
     );
 
@@ -1899,7 +1899,7 @@ async fn phase12_service_federation() {
     );
 
     let qs = QuadStore::new(
-        Arc::new(Journal::new()),
+        Arc::new(LiveBus::new()),
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
     );
 
@@ -2085,7 +2085,7 @@ async fn phase13_nhop_describe() {
     );
 
     let qs = QuadStore::new(
-        Arc::new(Journal::new()),
+        Arc::new(LiveBus::new()),
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
     );
 

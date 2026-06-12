@@ -1,27 +1,27 @@
-//! ashiba.gftd.ai Lean BMC — kotoba Datomic-on-IPFS pipeline (Datom projection →
-//! Journal WAL → ProllyTree indexes → Kubo cold tier → AEAD summary → IPFS self-pin) + Datalog
+//! ashiba.etzhayyim.com Lean BMC — kotoba Datomic-on-IPFS pipeline (Datom projection →
+//! LiveBus WAL → ProllyTree indexes → Kubo cold tier → AEAD summary → IPFS self-pin) + Datalog
 //! coverage scoring.
 //!
-//! Data source:  `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v60.toml`
-//! Rules source: `60-apps/ai-gftd-project-jp-ashiba/docs/bmc/coverage.dl`
+//! Data source:  `60-apps/etzhayyim-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v60.toml`
+//! Rules source: `60-apps/etzhayyim-project-jp-ashiba/docs/bmc/coverage.dl`
 //!
 //! Requires a running Kubo daemon (default `http://localhost:5001`); override with
-//! `KOTOBA_IPFS_ENDPOINT`.  `KOTOBA_STORE_PATH` controls the on-disk Journal head
+//! `KOTOBA_IPFS_ENDPOINT`.  `KOTOBA_STORE_PATH` controls the on-disk LiveBus head
 //! pointer (default `/tmp/ashiba-bmc-kse`).
 
 use anyhow::Result;
 use bytes::Bytes;
 use kotoba_core::{cid::KotobaCid, store::BlockStore};
 use kotoba_graph::QuadStore;
-use kotoba_kqe::{
+use kotoba_query::{
     datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term},
     delta::Delta,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
-use kotoba_kse::{Journal, SecureVault, Vault};
 use kotoba_store::{
     BudgetedBlockStore, IpfsPinClient, KuboBlockStore, MemoryBlockStore, TieredBlockStore,
 };
+use kotoba_vault::{LiveBus, SecureVault, Vault};
 use std::sync::Arc;
 
 const BMC_BLOCKS: &[(&str, i64)] = &[
@@ -65,7 +65,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     ("uvp_v6_ai_ga",             "uvp",               "v6 AI GA 全市場 stable ✓ (精度 91%)", true),
     ("uvp_asean_multilingual",   "uvp",               "ASEAN 多言語 stable ✓", true),
     ("uvp_satellite_detection_poc", "uvp",            "衛星画像 工事現場検出 PoC (Q2 Month 1) — Sentinel-2 + Planet Labs / U-Net + temporal stack on Gad EVO-X2 / baseline 70%", true),
-    ("uvp_satellite_outbound_match","uvp",            "衛星 outbound マッチング (Q2 末) — 検出現場 → 施主 reverse → mailer.gftd.ai 経由 AI メール → 業者マッチング, conv 8%+", false),
+    ("uvp_satellite_outbound_match","uvp",            "衛星 outbound マッチング (Q2 末) — 検出現場 → 施主 reverse → mailer.etzhayyim.com 経由 AI メール → 業者マッチング, conv 8%+", false),
     ("uvp_satellite_detection_ga","uvp",              "衛星画像検出 GA (Q2 末) — 月次再検出 精度 85% / 月 500 lead", false),
     ("uvp_v7_ai_poc_start",      "uvp",               "v7 安全予測 AI PoC 開始 (Q2 Month 1) — 画像+IoT融合 baseline 65% on EVO-X2", true),
     ("uvp_v7_ai_poc",            "uvp",               "v7 PoC 完了 (Q2 末) — 精度 80% / 5社", false),
@@ -79,7 +79,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     ("sol_satellite_ingest",     "solution",          "衛星画像 ingestion (Q2 Month 1) — Sentinel-2 + Planet Labs → kotoba Vault CAR bundle / 国内 36ヶ月 7.2TB", true),
     ("sol_construction_detection_ml", "solution",     "工事現場検出 ML (Q2 Month 1) — U-Net + temporal stack on EVO-X2 local (320ms/画像) / baseline 70%", true),
     ("sol_owner_resolve",        "solution",          "施主 reverse-lookup (Q2 Month 1) — 国土地理院 + 法務局 + 建確 統合 / 識別率 75%+", true),
-    ("sol_mailer_outbound",      "solution",          "AI 営業メール送受信 (Q2 Month 1) — mailer.gftd.ai (Resend 送信 + CF Email Routing 受信) + Murakumo LLM + 業者 3社マッチング + 返信自動分類", false),
+    ("sol_mailer_outbound",      "solution",          "AI 営業メール送受信 (Q2 Month 1) — mailer.etzhayyim.com (Resend 送信 + CF Email Routing 受信) + Murakumo LLM + 業者 3社マッチング + 返信自動分類", false),
     ("sol_satellite_pipeline_ga","solution",          "衛星駆動 outbound pipeline GA (Q2 末) — 月次再検出 → reverse → mailer → match SLA 99%", false),
     ("sol_v7_safety_start",      "solution",          "v7 開発開始 (Q2 Month 1) — EVO-X2 画像+IoT融合 PoC アーキ baseline 65%", true),
     ("sol_iot_sensor_layer",     "solution",          "IoT センサ統合 PoC (Q2 Month 1) — LoRaWAN + 加速度 + 風速 / 5現場テスト", true),
@@ -91,7 +91,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     ("ch_asean_vietnam_stable",  "channels",          "ベトナム stable ✓", true),
     ("ch_asean_malaysia_stable", "channels",          "マレーシア stable ✓", true),
     ("ch_indonesia_beta",        "channels",          "インドネシア β stable ✓", true),
-    ("ch_q2_outbound_pilot",     "channels",          "衛星 outbound 営業 pilot (Q2 Month 1) — 国内 100現場 → mailer.gftd.ai 経由 300+メール → 30日 conv 計測", false),
+    ("ch_q2_outbound_pilot",     "channels",          "衛星 outbound 営業 pilot (Q2 Month 1) — 国内 100現場 → mailer.etzhayyim.com 経由 300+メール → 30日 conv 計測", false),
     ("ch_q2_jasindo_mou",        "channels",          "Jasindo MoU 締結 (Q2 Month 1) — 損保 ID trial", true),
     ("ch_q2_outbound_ga",        "channels",          "衛星 outbound GA (Q2 末) — 月 500 lead → conv 8%+ → 月 40社新規", false),
     ("ch_q2_insurance_id",       "channels",          "損保 ID パートナー (Q2 末) — Jasindo + Asuransi Astra", false),
@@ -110,7 +110,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     ("cs_indonesia_office",      "cost_structure",    "インドネシア BizDev 拠点 ¥350K/月 ✓", true),
     ("cs_evo_x2_capex",          "cost_structure",    "EVO-X2 capex ¥350K (one-shot) ✓ — Ryzen AI Max+ 395 / 24M償却 ¥14.6K + 電気 ¥3K = ¥18K/月", true),
     ("cs_satellite_pipeline",    "cost_structure",    "衛星 pipeline ¥600K/月 ✓ (Sentinel-2 無料 + Planet $5K + EVO-X2 ¥18K + ETL ¥80K) — 予算 ¥800K → ¥600K", true),
-    ("cs_mailer_resend",         "cost_structure",    "mailer.gftd.ai 送受信 ¥30K/月 ✓ (Resend $50 + CF Email Routing 無料 + email-relay + Murakumo token)", true),
+    ("cs_mailer_resend",         "cost_structure",    "mailer.etzhayyim.com 送受信 ¥30K/月 ✓ (Resend $50 + CF Email Routing 無料 + email-relay + Murakumo token)", true),
     // key_metrics (4/5)
     ("km_nrr_170",               "key_metrics",       "NRR 170% stable ✓", true),
     ("km_intl_45pct",            "key_metrics",       "海外 GMV 45% stable ✓", true),
@@ -138,14 +138,14 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     ("ua_did_35000",             "unfair_advantage",  "DID 3.5万件+ (Q2 末)", false),
     ("ua_jasindo_moat",          "unfair_advantage",  "Jasindo パートナーシップ Moat (Q2 末)", false),
     // === iter-43 reality-recalibration additions (2026-05-28 CF audit) ===
-    ("sol_mailer_infra_ok",      "solution",          "mailer.gftd.ai インフラ確認 ✓ (CF API audit 2026-05-28) — Email Routing enabled/ready, catch-all → ai-gftd-email-relay worker, MX route1-3 設定済, DKIM/SPF/DMARC OK", true),
+    ("sol_mailer_infra_ok",      "solution",          "mailer.etzhayyim.com インフラ確認 ✓ (CF API audit 2026-05-28) — Email Routing enabled/ready, catch-all → etzhayyim-email-relay worker, MX route1-3 設定済, DKIM/SPF/DMARC OK", true),
     ("sol_xrpc_fix",             "solution",          "XRPC 520 修復 (Q2 Month 1 残り) — BPMN dispatcher + Zeebe `mailer` worker profile 再起動 + listEmails/stats 復活", false),
     ("sol_resume_email_traffic", "solution", "送信トラフィック再開 ✓ (iter-45) — Resend probe → CF Email Routing +30min で 6 events 着弾確認、E2E 復活", true),
     ("ch_q2_5_7_burst_40emails", "channels",          "5/6-5/7 mailer pilot 40通受信実績 ✓ — CF Analytics で確認、E2E pipeline 1度成功、sample 不足で conv 推定不能", true),
     ("km_mailer_5_7_40emails",   "key_metrics",       "mailer 5/7 受信 40通 ✓ (CF Analytics evidence) — E2E pipeline 1度成功した実証データ", true),
     ("km_mailer_dormancy_20d",   "key_metrics",       "mailer 5/8 以降 20日 dormancy ✓ (CF Analytics 0通) — 修復までの SLA gap 計測", true),
     // === iter-44 live-probe evidence (2026-05-28 11:02 UTC, Resend → CF) ===
-    ("sol_live_probe_resend_2",  "solution",          "Live probe via Resend 実施 ✓ (iter-44, 2026-05-28 11:02 UTC) — 2発 (test-iter44@mailer.gftd.ai + apex test-iter44@gftd.ai) を ap-northeast-1 から送信、両方 last_event=sent 確認", true),
+    ("sol_live_probe_resend_2",  "solution",          "Live probe via Resend 実施 ✓ (iter-44, 2026-05-28 11:02 UTC) — 2発 (test-iter44@mailer.etzhayyim.com + apex test-iter44@etzhayyim.com) を ap-northeast-1 から送信、両方 last_event=sent 確認", true),
     ("sol_cf_silent_drop",       "solution",          "CF Email Routing 着信側 silent drop 観測 ✓ — probe +90s で emailRoutingAdaptiveGroups events=0、SMTP layer rejection or Analytics 遅延", true),
     ("sol_smtp_diag_resolved", "solution", "SMTP-layer 切り分け 完了 ✓ (iter-45) — +30min 後 CF Analytics events=6 確認、仮説 (b) Analytics 遅延 が真、SMTP rejection は falsified、propagation delay 2-17min", true),
     ("ch_q2_external_esp_probe_obsoleted", "channels", "外部 ESP probe 提案 obsoleted ✓ (iter-45) — SMTP rejection falsified で不要化", true),
@@ -158,7 +158,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     // === iter-46 LangGraph 4-actor wire-up (2026-05-28) ===
     ("sol_satellite_detector_wired", "solution",     "satellite_detector wire-up ✓ (iter-46) — State + 3 Nodes + route_by_confidence (≥0.7→dispatch, <0.3→discard, mid→retry) + build_graph + register_zeebe_tasks(_worker) + TASK_TYPE com.etzhayyim.apps.jp-ashiba.satellite-detector.detect + EVO_X2_INFER_URL", true),
     ("sol_owner_resolver_wired",     "solution",     "owner_resolver wire-up ✓ (iter-46) — 3 parallel Nodes (GSI 地番 + 法務局 登記 + 建確) + route_by_match_rate (≥0.75→dispatch, <0.4→discard) + DATA_SOURCES [gsi.go.jp, houmu.go.jp, kenchiku-permit.go.jp]", true),
-    ("sol_outbound_emailer_wired",   "solution",     "outbound_emailer wire-up ✓ (iter-46) — Nodes (Murakumo proposal + vendor matching + mailer XRPC send) + MAILER_SEND_XRPC + FROM ashiba@mailer.gftd.ai + route_by_send_status", true),
+    ("sol_outbound_emailer_wired",   "solution",     "outbound_emailer wire-up ✓ (iter-46) — Nodes (Murakumo proposal + vendor matching + mailer XRPC send) + MAILER_SEND_XRPC + FROM ashiba@mailer.etzhayyim.com + route_by_send_status", true),
     ("sol_safety_predictor_wired",   "solution",     "safety_predictor wire-up ✓ (iter-46) — fuse_image_iot_on_evo_x2 multimodal + route_by_risk (≥0.8 alert / ≥0.5 log) + EVO_X2 /v7/multimodal + LoRaWAN IoT sources + TARGET_PRECISION 0.80", true),
     // === iter-47 BPMN process_def + K8s Granian pod scaffold (2026-05-28) ===
     ("sol_bpmn_process_def",       "solution",      "BPMN process_def ✓ (iter-47) — site_detect_to_send.bpmn / 4 ServiceTask + 3 ExclusiveGateway + 4 EndEvent + Zeebe ioMapping + retries policy", true),
@@ -168,7 +168,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     ("sol_dockerfile_ready",       "solution",      "Dockerfile ✓ (iter-48) — python:3.12-slim + granian[uvloop] 1.6 + pyzeebe 4.5 + langgraph 0.2 + httpx 0.27 + kotoba-py 0.1 + HEALTHCHECK + Granian ASGI 8080 workers=2 uvloop", true),
     ("sol_granian_entrypoint",     "solution",      "Granian ASGI entrypoint ✓ (iter-48) — 20-actors/jp-ashiba/py/app.py / lifespan で Zeebe worker bootstrap + /health /metrics /actor-manifest / smoke OK", true),
     ("sol_datalog_evidence_counter","solution",     "Datalog evidence-counter rule ✓ (iter-48) — coverage.dl に real_inbound_count + evidence_gap + mailer_drift_alert (gap>20) 追加、claim vs CF/RW 自動突合", true),
-    ("sol_iter48_probe_resend",    "solution",      "iter-48 Resend probe ✓ — test-iter48@mailer.gftd.ai 送信 e43c95e6 / CF Analytics events=8 累計 / Analytics 遅延仮説 引き続き 真", true),
+    ("sol_iter48_probe_resend",    "solution",      "iter-48 Resend probe ✓ — test-iter48@mailer.etzhayyim.com 送信 e43c95e6 / CF Analytics events=8 累計 / Analytics 遅延仮説 引き続き 真", true),
     // === iter-49/50: kotoba-datomic 接続確認 + 4 actor 半分 refactor ===
     ("sol_datomic_rust_pipeline",      "solution",   "kotoba-datomic Rust pipeline ✓ (iter-49) — Connection.transact(EDN) → 2 tx / 371 datoms / 126 entities, Datalog q() で per-block validated count 9 行返却", true),
     ("sol_satellite_detector_datomic", "solution",   "satellite_detector Datomic-first refactor ✓ (iter-50) — slim Input/Output, conn.transact 6 Datoms, WRITTEN_ATTRIBUTES 公開", true),
@@ -195,7 +195,7 @@ const HYPOTHESES: &[(&str, &str, &str, bool)] = &[
     // === iter-57 2nd outbound pilot design ===
     ("sol_pilot_2_design",  "solution",  "PILOT-2-design.md ✓ (iter-57) — 100 sites / 4 weeks / 6 demoted hypotheses target table / KILL-PIVOT-SCALE decision criteria / 4 kotoba q() measurement plan / daily 09:00 JST snapshot discipline", true),
     // === iter-58 Security audit → sovereign migration plan ===
-    ("sol_security_audit_iter57",       "solution",          "Security audit ✓ (iter-57 conv) — 4 gaps: kotoba.gftd.ai 未deploy, SecureVault wrapper 0件, IPFS pin permanence, plaintext cache. Mac key OK", true),
+    ("sol_security_audit_iter57",       "solution",          "Security audit ✓ (iter-57 conv) — 4 gaps: kotoba.etzhayyim.com 未deploy, SecureVault wrapper 0件, IPFS pin permanence, plaintext cache. Mac key OK", true),
     ("sol_sovereign_migration_plan",    "solution",          "Sovereign migration plan ✓ (iter-58) — 7 step + cutover gate + 5 risk register, jp-ashiba only", true),
     ("ua_sovereign_data_stack",         "unfair_advantage",  "Sovereign stack design ✓ (iter-58) — SecureVault + Sovereign X25519 + CACAO + default-private + 12.7K QPS nonce, vendor Vultr 依存脱却", true),
     ("sol_sovereign_deploy_remaining",  "solution",          "Sovereign deploy 残り — kotoba server deploy, operator key, 4 CACAO chains, 21 attrs SecureVault, IPFS kill-switch, FileVault, 14-day shadow diff", false),
@@ -232,7 +232,7 @@ fn build_bmc_facts() -> Vec<Delta> {
     deltas.push(Delta::assert_legacy_quad(quad(
         "bmc:ashiba",
         "bmc/product",
-        QuadObject::Text("ashiba.gftd.ai".into()),
+        QuadObject::Text("ashiba.etzhayyim.com".into()),
     )));
     deltas.push(Delta::assert_legacy_quad(quad(
         "bmc:ashiba",
@@ -345,7 +345,7 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     let maturity_avg = maturity_sum as f64 / total as f64;
 
     println!("╔══════════════════════════════════════════════════════════╗");
-    println!("║     ashiba.gftd.ai Lean BMC — kotoba Scoring Report      ║");
+    println!("║     ashiba.etzhayyim.com Lean BMC — kotoba Scoring Report      ║");
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Iteration : 43 (2026-05-28) [iter-51 4 actor 全 Datomic-first]║");
     println!("║  Model     : Lean Canvas Hybrid (9 blocks)                ║");
@@ -367,7 +367,7 @@ fn print_score_report(derived_covered: usize, derived_at_risk: usize) {
     println!("║  Q2 中核戦略 (3 ユーザー確定ディレクティブ統合)            ║");
     println!("║  1. 衛星画像 outbound matching (Sentinel-2 + Planet Labs) ║");
     println!("║  2. Gad EVO-X2 (Ryzen AI Max+ 395) local 推論              ║");
-    println!("║  3. mailer.gftd.ai (Resend + CF Email Routing)            ║");
+    println!("║  3. mailer.etzhayyim.com (Resend + CF Email Routing)            ║");
     println!("║  + v7 安全予測 AI / Jasindo / インドネシア 8社            ║");
     println!("╠══════════════════════════════════════════════════════════╣");
     println!("║  Next (→ iter-42, Q2 Month 1 進捗 → ~4.9)                 ║");
@@ -391,17 +391,11 @@ async fn main() -> Result<()> {
     let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(tiered);
     println!("BlockStore: TieredBlockStore<BudgetedMemory(64MiB), KuboIpfs>");
 
-    // 2. Journal — Merkle WAL backed by block_store; head pointer in a sibling JSON file.
-    let store_path =
-        std::env::var("KOTOBA_STORE_PATH").unwrap_or_else(|_| "/tmp/ashiba-bmc-kse".into());
-    let head_path = format!("{store_path}.journal-head.json");
-    let journal = Arc::new(Journal::with_block_store(
-        Arc::clone(&block_store),
-        head_path,
-    ));
-    println!("Journal:    Merkle WAL on block_store (head={store_path}.journal-head.json)");
+    // 2. LiveBus — in-memory ephemeral event bus (durable state = CommitDag).
+    let journal = Arc::new(LiveBus::new());
+    println!("LiveBus:    in-memory (durable replay via CommitDag)");
 
-    // 3. Datom projection store — wraps Journal + BlockStore; provides Arrangement + ProllyTree commit.
+    // 3. Datom projection store — wraps LiveBus + BlockStore; provides Arrangement + ProllyTree commit.
     let quad_store = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store));
 
     // 4. SecureVault — AES-256-GCM-sealed blob store over the same block_store.
@@ -417,10 +411,10 @@ async fn main() -> Result<()> {
     println!("IPFS pin:   kotoba self-pin via Kubo (extended >1GB → kotobase out-of-band)");
     println!();
 
-    // 6. Ingest all BMC facts as real Quad writes (Journal-backed).
+    // 6. Ingest all BMC facts as real Quad writes (LiveBus-backed).
     let facts = build_bmc_facts();
     println!(
-        "Ingesting {} BMC quads → kotoba QuadStore (Journal WAL → Kubo)…",
+        "Ingesting {} BMC quads → kotoba QuadStore (LiveBus WAL → Kubo)…",
         facts.len()
     );
     let t0 = std::time::Instant::now();

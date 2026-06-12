@@ -1,4 +1,4 @@
-# ai-gftd-project-kotoba
+# etzhayyim-project-kotoba
 
 KOTOBA: Content-Addressed Distributed Datalog Database.
 
@@ -13,28 +13,32 @@ KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
 
 | crate | 役割 |
 |---|---|
-| kotoba-core | CIDv1 blake3, KAIS 8-bit frame, Prolly Tree |
-| kotoba-kse | Journal (Merkle WAL on Arc<dyn BlockStore>, head JSON, Merkle chain cold-path), Vault (file-type chunking: Single/FixedLen 512KB/CDC gear-hash/CodecAware CBOR-item; BlobManifest CID; flush_as_car() CAR v1 batch), SecureVault, Topic, Shelf, chunker.rs **[IPLD-only 2026-05-26]**; **AgentIdentity** (Ed25519+X25519 keypair, from_env/generate_ephemeral); **SovereignCrypto** (AgentCrypto impl: vault key gen→HPKE wrap→BlockStore; load_or_genesis; rotate; key-ref JSON pointer in KseStore) **[2026-05-26]** |
-| kotoba-kqe | Datalog engine, Arrangement, Delta, MV (KQE) |
-| kotoba-dht | Source Chain, Warrant, Neighborhood (KDHT) |
+| kotoba-core | CIDv1 blake3, KAIS 8-bit frame (**KAIS = Kotoba Instruction Set Architecture**), Prolly Tree |
+| kotoba-vault | **旧 `kotoba-kse`(KSE = Kotoba Stream Engine)、renamed 2026-06-12 — WIT interface `kotoba:kais/kse` は ABI のため不変。Journal 型は永続化撤去済みのため `LiveBus`(`live_bus.rs`)に改名、`KseStore` → `VaultStore`**. **⚠ Journal DEPRECATED as canonical chain (2026-06-11, #115 — `[knowledge.journal-deprecation]`)**: canonical/accountability chain = **CommitDag** (kotoba-datomic `DistributedDatomCommit`); Journal の残存役割は ephemeral live-tail (`publish_ephemeral` — broadcast+ring, block 永続なし) のみ、durable replay は `sync.eventsFromCommits`; startup WAL replay 撤去済み・double-write は ephemeral 化済み; **Vault/SecureVault/Shelf/PreKeyRegistry は deprecated 対象外**。 Journal (Merkle WAL on Arc<dyn BlockStore>, head JSON, Merkle chain cold-path — legacy replay only), Vault (file-type chunking: Single/FixedLen 512KB/CDC gear-hash/CodecAware CBOR-item; BlobManifest CID; flush_as_car() CAR v1 batch), SecureVault, Topic, Shelf, chunker.rs **[IPLD-only 2026-05-26]**; **AgentIdentity** (Ed25519+X25519 keypair, from_env/generate_ephemeral); **SovereignCrypto** (AgentCrypto impl: vault key gen→HPKE wrap→BlockStore; load_or_genesis; rotate; key-ref JSON pointer in KseStore) **[2026-05-26]** |
+| kotoba-query | **KQE = Kotoba Query Engine**(旧 `kotoba-kqe`、renamed 2026-06-12 — WIT interface 名 `kotoba:kais/kqe` は ABI のため不変)— Datalog engine, Arrangement (4-index EAVT/AEVT/AVET/VAET), Delta, MV |
+| kotoba-dht | **KDHT = Kotoba Distributed Hash Table** — Source Chain, Warrant, Neighborhood |
 | kotoba-net | libp2p QUIC/Noise/GossipSub |
 | kotoba-auth | CACAO chain verification, DID Document; **EVM read+verify surface** (`eth.rs` + `eth/{abi,token,caip,eip1271}.rs`, 2026-05-30); **Bitcoin read+verify surface** (`btc.rs` + `btc/{address,caip,bip322}.rs`, BIP-122/CAIP-2/10/19 + Base58Check/bech32/bech32m + legacy signmessage verify, 2026-06-03, ADR-2606035800) |
 | kotoba-graph | Quad API, SPARQL→Datalog, Commit DAG |
-| kotoba-vm | Invoke/Result ChainEntry, CALL_FOREIGN bridge (KVM) |
+| kotoba-vm | **KVM = Kotoba Virtual Machine** — Invoke/Result ChainEntry, CALL_FOREIGN bridge, Pregel BSP hosts |
 | kotoba-llm | Weight blob (FP8), LoRA Delta, KV-cache, inference, WebGPU training (embed+lm_head), WebGPU inference (full transformer, Gemma 4 E2B/E4B) |
 | kotoba-runtime | WASM Component Model host: WasmExecutor + UdfExecutor + WIT bindings |
+| kotoba-clj | **Clojure/EDN-subset → WebAssembly compiler** (ADR `docs/ADR-clojure-wasm.md`, 2026-06-08). Reuses `kotoba-edn` as reader → typed AST → two-pass codegen via `wasm-encoder` → real core wasm module; `run` feature instantiates on workspace-pinned wasmtime. Subset: `def`/`defn`/`ns`, `if`/`when`/`let`/`do`, `+ - * / mod`, `= < > <= >=`, `and or not`, **string literals + `str-len`/`byte-at`** (strings = packed `(off<<32)\|len` handles), user-fn calls incl. (mutual) recursion; each `defn` exported by name; `def` const-folded + inlined. Every module also exports linear `memory` + `cabi_realloc` bump allocator. **kais-binding workstream** (5 steps): ✅1 memory+realloc ✅2 str/bytes values ✅3 `list<u8>` in/out **Component** export via `wit-component` (`(defn run [input] …)` → `run: func(list<u8>)->list<u8>`, hand-emitted canonical-ABI wrapper, instantiated via `wasmtime::component`; smoke-tested wit-component 0.221 ↔ wasmtime 22) ⬜4 CBOR-decode `InvokeContext` — **blocked on language growth (loops + byte-building)** ✅5 emit `kotoba-node` `run` — **runs on kotoba-runtime**: `compile_kais_component_str` targets the REAL `kotoba-node` world (`run: func(list<u8>)->result<list<u8>,string>`, 12-byte ok-variant return area) via `Resolve::push_dir` over `kotoba-runtime/wit`; `assert_loads` confirms the `ProgramStore` compile path, and `tests/kais_invoke.rs` drives the runtime's own `WasmExecutor` (binds all kotoba:kais imports) to invoke `run(ctx)` end-to-end + lift the result (validates the hand-emitted variant layout at runtime). **Phase boundary**: compiled Clojure runs on kotoba-runtime, but the wrapper passes raw ctx-cbor **undecoded** → meaningfully reading ctx/args is gated on step 4 (loops + bytes). Tests (27+doctest): factorial/fib/mutual-rec/const-inline + str-len/byte-at/UTF-8 + allocator(align/monotonic/non-overlap/growth) + component(echo/binary/empty/data-seg-literal/len-branch) + kais-load + kais-invoke(WasmExecutor: fixed/ctx-echo/len-branch) all green. **langgraph workstream (A–E)**: ✅A `loop`/`recur`+`cond`+byte-builder ✅B heap vector/map prelude ✅C-1 host-import plumbing (`has-capability?`) ✅C-2 `llm-infer` (return-area ABI) ✅C-3/C-4 in-guest CBOR decode/encode (closes step 4) ✅D `defgraph` DSL + add-messages/override reducers ✅**C-5 kqe host builtins (2026-06-11)** — `kqe-assert!`/`kqe-retract!`/`kqe-get-objects`/`kqe-query` lower to `kotoba:kais/kqe` imports (flattened quad record + indirect results; host lifts lists via guest `cabi_realloc`); `KQE_PRELUDE` reads lifted arrays in-language (`kqe-count`/`kqe-obj-nth`/`kqe-quad-*`); `tests/kqe.rs` 9 live WasmExecutor tests incl. read-modify-write agent + **Datomic loop** (agent-asserted quads → `kotoba_query::Datom` → `kotoba_datomic::Datom::from_kqe` → `Db::from_datoms` → queried back as EDN) ✅**E Pregel/BSP (2026-06-11)** — `tests/pregel.rs` drives the compiled `defgraph` agent through `kotoba-vm::WasmPregelRunner`: CBOR ctx → defgraph node asserts a Datom + bumps counter → `{"status":"continue"\|"done"}` self-loop; 4 supersteps / 4 Datoms / gas accumulation / `max_supersteps` cap verified. **Compiled Clojure agent = langgraph defgraph × kqe Datom writes × Pregel BSP, end-to-end** |
 | kotoba-ingest | Gmail OAuth2 poll + RFC 2822 parse + E2E encrypt → QuadStore (ADR-2605252400); **EmailIngestor** now uses `Arc<dyn AgentCrypto>` + `Arc<Vault>` (raw vault_key removed 2026-05-26); **multimodal search 2026-05-30**: `media_embed` (`MediaEmbedClient` trait — `HttpMediaEmbedClient` CLIP/SigLIP/ImageBind shared-space encoder over HTTP + `Blake3MediaEmbedClient` caption-bridged offline client; `Modality` text/image/audio/video/document) + `media` (`MediaIngestor` → Vault blob + `media/*` datoms + `media/ivf/*` IVF into `media:2026:assets` graph; `rank_by_cosine` cross-modal retrieval). IVF persistence generalised: `IvfIndex::to_quads_ns(ns)` + namespace-agnostic `from_quads`/`from_datoms` (`cc/ivf/*` and `media/ivf/*`). **Hybrid web search 2026-06-01 (ADR-2606012300)**: `bm25` (Okapi BM25 lexical inverted index, CJK-aware bigram tokenizer, `cc/bm25/*` persistence) + `pagerank` (pure power-iteration link-authority, Σ=1, `cc/rank/score`) + `fusion` (Reciprocal Rank Fusion `RRF_K=60` + weighted-linear) — all pure-Rust, datom-native `to_quads`/`from_datoms`, no external engine. **Precompute** (2nd increment): `cc` page ingestor `ingest_links_dir_datoms`/`read_page_links` parse the optional `outlinks` `List<Utf8>` column → `cc/link/to` edges into `cc:2026-12:links` (self-loops dropped; scalar-`outlink_count`-only datasets → no edges) |
-| kotoba-server | XRPC / MCP endpoints; **media cross-modal search 2026-05-30**: `media_xrpc` (`media.search` text-query→any-modality cosine rank, `media.ingest` base64 assets, `media.status`); `KotobaState.media_embed_client` (Option, `KOTOBA_MM_EMBED_URL`; deterministic fallback when unset); **Firehose egress surface (D+E, 2026-05-30)** — see below; **hybrid web search 2026-06-01 (ADR-2606012300)**: `cc_xrpc::web_search` (`com.etzhayyim.apps.kotoba.search.web` GET) fuses BM25 + IVF/cosine semantic + PageRank authority via RRF (graceful degrade when embed backend / link graph absent); fixed dead IVF fallback in `cc_search` (now probes `nprobe` centroids via persisted `cc/ivf/cluster`); **precompute**: `search.reindex` POST + `rebuild_search_indexes` (corpus-global BM25 → `cc/bm25/*`, PageRank → `cc/rank/score`) auto-run at end of `cc.ingest`; `web_search` prefers persisted `cc/bm25/*`; `cc.status` reports `bm25_terms`/`link_edges`/`pagerank_nodes` |
-| kotoba-store | BlockStore implementations: Memory (hot); **KuboBlockStore** (Kubo HTTP cold tier, **Single-CID: SHA2-256 CIDv1 dag-cbor, IPFS-compatible** — dual-CID/blake3 index removed 2026-05-27); BudgetedBlockStore<S> LRU eviction; TieredBlockStore<H,C> hot/cold tiering; **CapturingBlockStore** (pass-through + recorder for CAR bundling); **CarBundleWriter / CarBlockIndex** (CARv1 format: 72B header + blocks + 48B/entry index, 3.8 GiB/s serialize); **IpfsPinClient** (Kubo-compatible HTTP RPC: pin/add, pin/rm, pin/ls — kotoba 自体が IPFS node として自前 pin; 1GB 超の extended pin は kotobase.gftd.ai が担当). S3BlockStore + LayeredBlockStore + KotobasePinClient + IrohBlockStore removed 2026-05-27. |
+| kotoba-server | XRPC / MCP endpoints; **media cross-modal search 2026-05-30**: `media_xrpc` (`media.search` text-query→any-modality cosine rank, `media.ingest` base64 assets, `media.status`); `KotobaState.media_embed_client` (Option, `KOTOBA_MM_EMBED_URL`; deterministic fallback when unset); **Firehose egress surface (D+E, 2026-05-30)** — see below; **hybrid web search 2026-06-01 (ADR-2606012300)**: `cc_xrpc::web_search` (`com.etzhayyim.apps.kotoba.search.web` GET) fuses BM25 + IVF/cosine semantic + PageRank authority via RRF (graceful degrade when embed backend / link graph absent); fixed dead IVF fallback in `cc_search` (now probes `nprobe` centroids via persisted `cc/ivf/cluster`); **precompute**: `search.reindex` POST + `rebuild_search_indexes` (corpus-global BM25 → `cc/bm25/*`, PageRank → `cc/rank/score`) auto-run at end of `cc.ingest`; `web_search` prefers persisted `cc/bm25/*`; `cc.status` reports `bm25_terms`/`link_edges`/`pagerank_nodes`; **access receipts R1 (2026-06-11, ADR-sealed-cold-tier)**: `access_receipt.rs` — datomic.*/kg.* reads emit who/which/what/why/when receipt datoms into `kotoba/audit/access-receipts/v1` (batched background writer, KOTOBA_RECEIPT_FLUSH_MS); `x-kotoba-purpose` header (KOTOBA_REQUIRE_PURPOSE で必須化); `audit.listReceipts` XRPC (operator-gated) |
+| kotoba-store | BlockStore implementations: Memory (hot); **KuboBlockStore** (Kubo HTTP cold tier, **Single-CID: SHA2-256 CIDv1 dag-cbor, IPFS-compatible** — dual-CID/blake3 index removed 2026-05-27); BudgetedBlockStore<S> LRU eviction; TieredBlockStore<H,C> hot/cold tiering; **CapturingBlockStore** (pass-through + recorder for CAR bundling); **CarBundleWriter / CarBlockIndex** (CARv1 format: 72B header + blocks + 48B/entry index, 3.8 GiB/s serialize); **IpfsPinClient** (Kubo-compatible HTTP RPC: pin/add, pin/rm, pin/ls — kotoba 自体が IPFS node として自前 pin; 1GB 超の extended pin は kotobase.etzhayyim.com が担当). S3BlockStore + LayeredBlockStore + KotobasePinClient + IrohBlockStore removed 2026-05-27. **SealedBlockStore<C>** (2026-06-11, ADR-2606112200): encrypt-at-rest cold-tier wrapper — AES-256-GCM KSB1 envelope, deterministic content-derived nonce, plaintext→sealed CID sidecar index (sealed_index.bin); enabled via KOTOBA_BLOCK_KEY; ネットワークに出るのは暗号文のみ. |
 | kotoba-store-web | Browser IndexedDB block store (wasm32), AsyncBlockStore trait |
+| kotoba-word | **word/root registry** (ADR `docs/ADR-kotoba-word.md`, 2026-06-10): word = NSID + typed schema (schemars 抽出 = closure 型署名が authoring SSOT) + executor (closure/process/http/wasm-udf) + caps (`proc:`/`net:`/`fs:` — Ctx 経由で enforce)。root = registry + cap 境界 + projection。manifest = interchange SSOT (`kotoba.words.json`, lockfile 方式, `kotoba word diff` が CI gate: exit 0/1/2=breaking)。projection: MCP (handrolled JSON-RPC, `kotoba word mcp` stdio server) + ATProto lexicon (`lexicons/com/etzhayyim/apps/kotoba/word/*` 自動生成; PDS publication は etzhayyim-exclusive)。wasm executor は kotoba-runtime UdfExecutor (JSON↔CBOR row, feature `wasm-udf`)。28 tests |
+| kotoba-custody | **t-of-N Shamir custody of the block key** (2026-06-11, ADR-sealed-cold-tier R3a): split_key/open_share/combine_key — sharks GF(2^8) + HPKE per-custodian wrap + sha256 share commitments; t−1 shares learn nothing; KOTOBA_BLOCK_KEY のバックアップ/復旧が単一鍵ファイル不要に. R3b: /kotoba/key/1 custodian protocol |
 | kotoba-git | git ↔ kotoba bridge (ADR-2606015000): git object DAG (blob/tree/commit/tag/ref) as content-addressed `KotobaCid` blocks (lossless framed-bytes anchor) + `:git/*` Datom projection (SHA↔CID bridge `:git/oid`↔`:git.object/cid`, queryable commit DAG/trees/refs). `GitStore` facade (`put_object`/`materialize_framed`/`materialize_object`) + `repo` disk import/export. **Pure-Rust packfile decoder** `pack.rs` (idx v2 + pack v2 + `OBJ_OFS_DELTA`/`OBJ_REF_DELTA` recursive resolution) → `import_repo` ingests loose **and** packed (cloned/`git gc`'d) repos. **Byte-exact round-trip** verified vs real `git hash-object`/`cat-file` vectors + `git` CLI loose+packed repos. R0: thin packs unsupported; sha2-256 CID side, SHA-1 git side |
+| kotoba-turn | **Pure-Rust TURN relay (RFC 8656)** for 1:1 real-media WebRTC calls (ADR `docs/ADR-turn-relay.md`, 2026-06-09) — closes the STUN-only reachability gap behind symmetric NAT; `kotoba-rt` relays SDP/ICE, browser owns the media plane. **Socket-free core DONE + unit-tested** (`cargo test -p kotoba-turn` → **28 passed / 0 failed**; RFC 2202 / RFC 5769 / CRC-32 vectors). `lib.rs` ephemeral-credential mint/verify (HMAC-SHA1, coturn use-auth-secret; byte-for-byte shared with the kami-engine-sdk JS `mintTurnCredential`); `stun.rs` RFC 8489 header + attr TLV + XOR-MAPPED-ADDRESS + MESSAGE-INTEGRITY + FINGERPRINT (CRC-32); `allocation.rs` 5-tuple allocations + permissions + channel bindings + expiry/GC (deterministic, `now`-injected); `channel.rs` ChannelData framing (§12.4) + STUN/ChannelData demux; `server.rs` socket-free request core (`classify_datagram` + method classify + `authenticate` gate). **Remaining**: thin async UDP/TCP listener shell (recv loop + relay-port pool + packet forwarding) — integration-tested, out of unit scope |
 
 ## 実装順序
 
 1. kotoba-core (CID + 8-bit frame + Prolly Tree PoC)
-2. kotoba-kse (Journal + Topic + Shelf)
+2. kotoba-vault (Journal + Topic + Shelf)
 3. kotoba-auth (CACAO chain verify)
-4. kotoba-kqe (Datalog + Arrangement + Delta)
+4. kotoba-query (Datalog + Arrangement + Delta)
 5. kotoba-dht (Source Chain + Warrant + Neighborhood)
 6. kotoba-vm (Invoke/Result + CALL_FOREIGN)
 7. kotoba-llm (weight, LoRA, KV-cache, inference, WebGPU training)
@@ -170,7 +174,7 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
 - `CommitDag::Commit` に `index_roots: HashMap<String, KotobaCid>` 追加 (`serde(default, skip_serializing_if)` で旧 commit CID 安定)
 - `QuadStore::commit()` は EAVT/AEVT/AVET/VAET を **4 並列 64MB スタックスレッド** で同時ビルド (各スレッドは `CapturingBlockStore` でブロックを記録); 完了後 `CarBundleWriter` で全ブロックを単一 CAR ファイルにパック → ブロックストアに 1 PUT。実測: 3.1–3.8s/1Mquad commit (serial 4.7s → **28% 高速化**; MemoryBlockStore, M4 Mac)
 - `QuadStore::get_entity_quads_cold()`: hot Arrangement clear 後の cold 読み取り。ProllyTree `scan_prefix(subject_bytes)` → EAVT エントリ再構成。実測コスト: kubo LAN (1ms/GET) 3.1ms / kubo WAN (80ms/GET) 169ms / S3 same-AZ (2ms/GET) 5.9ms (1K entries, 2 tree levels)
-- Journal: 4 トピック SPO + PSO + POS + OSP に publish
+- Journal: 4 トピック SPO + PSO + POS + OSP に publish **[Journal deprecated 2026-06-11 — live-tail broadcast のみ; durable record は CommitDag]**
 
 ## TieredBlockStore / KuboBlockStore
 
@@ -192,7 +196,7 @@ bytemuck = { version = "1",  features = ["derive"], optional = true }
 
 | ファイル | グループ | 内容 |
 |---|---|---|
-| `kotoba-kqe/benches/arrangement.rs` | `arrangement/insert` | Arrangement insert 1K/10K/100K |
+| `kotoba-query/benches/arrangement.rs` | `arrangement/insert` | Arrangement insert 1K/10K/100K |
 | | `arrangement/spo_lookup_eavt` | EAVT 点引き |
 | | `arrangement/pso_*_aevt` | AEVT subjects / by_predicate |
 | | `arrangement/pos_lookup_avet` | AVET 値引き |
@@ -412,7 +416,7 @@ MemoryBlockStore、10K entities × 4 quads (name/role/status/knows)。reset_arra
   Latency scales sub-linearly with reach (1700× quads → 500× latency) thanks to parallel per-layer `try_join_all`.  Concurrent dispatch additionally hides per-layer fan-out cost.  CLI now drives this end-to-end: `kotoba bench --max-hops N "DESCRIBE <cid:root>"`.
 - **WAL replay speedup with `kotoba commit` checkpoint (2026-05-28)**: rerun the persistence E2E now that `kotoba commit` writes a checkpoint after `kg.ingest_batch`. Server B startup log shows `QuadStore: checkpoint found, replaying delta only committed_seq=867` → **WAL replay completes in 280 ms for 11 post-checkpoint entries** (was ~30 s with no checkpoint = **≈100× speedup**). Total Server B startup is still ~40 s; the dominant cost is now `SovereignCrypto: genesis` against the fresh Kubo container (~30 s for HPKE wrap + `block/put` of the single wrapped key block) — that path is unrelated to WAL replay and is the next optimisation target.
 - **Persistence E2E vs real Kubo — Journal WAL replay is HTTP-RTT bound (2026-05-28)**: Live test: kotoba A ingests 5 entities (~20 quads, 7 Journal entries) → kotoba A killed → kotoba B restarts against same `KOTOBA_STORE_PATH` + same Kubo. `KSE Journal: block-store persistence enabled` confirms Journal WAL writes go through Kubo `block/put`. On B's startup, `QuadStore: no checkpoint, full WAL replay (first run)` fires; **measured 30 seconds to replay 7 journal entries** — each entry round-trips to Kubo `block/get` and the synchronous-fetch chain is the bottleneck. SovereignCrypto re-genesis path triggers cleanly when the pointer file survives but the wrapped-key block is gone in a fresh Kubo. Architectural takeaway: **journal-via-Kubo is durable but too slow for hot startup**. Should split: Journal WAL on local filesystem (fast replay), Kubo for durable archival export of sealed commits only. `kg.ingest_batch` should also call `commit()` to write a checkpoint so replay can short-circuit past WAL entries — currently the only checkpoint write path is an explicit `commit()` call. Documents the real persistence-cost picture against IPFS.
-- **SovereignCrypto re-genesis on missing wrapped-key block (2026-05-28)**: `SovereignCrypto::load_or_genesis()` previously bricked startup with `Error: load wrapped key block` whenever the KseStore pointer file (`agent/crypto/{slug}/current.json`) survived a backing IPFS / Kubo wipe. Wrapped the load path in an inner `async {}`; any failure (pointer parse, CID parse, missing block, HPKE unwrap) logs a WARN and falls through to `genesis()` instead of crashing. Surfaced while writing the persistence smoke test — without it, the "kotoba serve against a fresh Kubo container" path was completely broken for developers re-creating the Kubo daemon between runs. 9 sovereign_key tests + 135 kotoba-kse tests still pass.
+- **SovereignCrypto re-genesis on missing wrapped-key block (2026-05-28)**: `SovereignCrypto::load_or_genesis()` previously bricked startup with `Error: load wrapped key block` whenever the KseStore pointer file (`agent/crypto/{slug}/current.json`) survived a backing IPFS / Kubo wipe. Wrapped the load path in an inner `async {}`; any failure (pointer parse, CID parse, missing block, HPKE unwrap) logs a WARN and falls through to `genesis()` instead of crashing. Surfaced while writing the persistence smoke test — without it, the "kotoba serve against a fresh Kubo container" path was completely broken for developers re-creating the Kubo daemon between runs. 9 sovereign_key tests + 135 kotoba-vault tests still pass.
 - **Real Kubo daemon E2E — IPFS substrate verified end-to-end (2026-05-28)**: Kubo 0.41.0 via `docker run -p 5001 ipfs/kubo:latest`, `kotoba serve` with `KOTOBA_STORE_PATH=/tmp/kotoba-realipfs` (triggers TieredBlockStore<BudgetedMemory, KuboIpfs>). Startup probe logs `IPFS daemon reachable kubo_version=0.41.0 kubo_commit=d719fb8`. Measured (release, default `KOTOBA_IPFS_ENDPOINT=http://localhost:5001`):
   - ingest 100 entities (write-through to Kubo `block/put` per ProllyTree block): **142 entities/sec** (0.70s)
   - resulting Kubo state: **4045 blocks** stored, **1 recursive pin** (commit block — durable across Kubo restart)
@@ -501,7 +505,7 @@ loadtest Phase 4 (10K entities, MemoryBlockStore, 293 blocks replicated):
 | 3-triple `<role>=viewer + <name> + <knows>` | 60ms | 0 | viewer has no knows → empty intersection |
 | real EdDSA CACAO + 3-triple admin∩name∩knows | 386ms | 10002 | +50ms Ed25519 verify overhead |
 
-Run: `cargo bench -p kotoba-kqe --bench arrangement`  
+Run: `cargo bench -p kotoba-query --bench arrangement`  
 Run: `cargo bench -p kotoba-graph --bench quad_store`  
 Run: `cargo bench -p kotoba-store --bench tiered_store`  
 Run: `cargo bench -p kotoba-store --bench car_flush`  
@@ -595,13 +599,13 @@ CAR bundle: **total 7–9s で S3 flush 完了保証**。
 
 ## Selective Sync + Storage Budget 設計
 
-### SyncWindow (kotoba-kse)
+### SyncWindow (kotoba-vault)
 - エージェントが必要な履歴窓を宣言: `SyncWindow { graph_cid, since_seq, head_cid }`
 - `pin_into(store)` → anchor CID を BudgetedBlockStore の eviction から保護
 - `advance(new_head, seq, store)` → 旧 head アンピン → 新 head ピン
 - `unpin_from(store)` → セッション終了時に解放
 
-### Journal Selective Replay (persistent fallback 含む)
+### Journal Selective Replay (persistent fallback 含む) **[DEPRECATED 2026-06-11 #115 — legacy データの replay 専用; 新規 durable replay は CommitDag `sync.eventsFromCommits`]**
 - `Journal::read_since(seq)` → ring buffer から `seq` 以降を返す。`seq < oldest_ring_seq` かつ store が Some なら `seq/{seq:020}` seq-index で persistent fallback
 - `Journal::trim_before(seq)` → ring buffer の古いエントリを解放
 - `Journal::with_capacity(n)` → ring buffer サイズをカスタマイズ (デフォルト 65,536)
@@ -781,6 +785,8 @@ EVM `bind_evm` の鏡写し。read-only **Esplora REST** (Blockstream / mempool.
 
 ## Firehose Egress — D+E federation surface (2026-05-30)
 
+> **⚠ Journal deprecation (2026-06-11, #115)**: 本セクションの Journal ベース設計 (cursor == Journal seq) は **legacy live-tail surface**。durable replay は CommitDag ベースの `GET /xrpc/com.etzhayyim.apps.kotoba.sync.eventsFromCommits` が正 (CommitDag tx feed — `KOTOBA_JOURNAL_WAL=off` 状態でも完全な履歴を再生可能)。Journal への新機能追加は禁止。
+
 KSE Journal (seq 順序ログ + broadcast `subscribe()` + `read_since()` cold-fallback) を「同一 cursor の 2 シンク」に開く。cursor == Journal `seq`。
 
 **D — HTTP tap (`kotoba-server/src/firehose.rs`)**
@@ -798,6 +804,17 @@ KSE Journal (seq 順序ログ + broadcast `subscribe()` + `read_since()` cold-fa
 **A (faithful `com.atproto.sync.subscribeRepos`) を出さない理由**: kotoba は MST / 署名済み commit / CAR を持たず（record-log semantics）、quad projection が repo DID + collection NSID を一方向 hash 化（`did_to_cid`/`collection_to_cid` = blake3、逆 index 無し）→ AT commit 復元不能。AT-MST origination は **etzhayyim-exclusive**（operating-entity boundary; DID/on-chain origination と同類）なので、datomic ベースの origin-PDS 化は etzhayyim/root 側 ADR マター。
 
 NSID は kotoba namespace（`com.etzhayyim.apps.kotoba.sync.*`）— 非 spec body を `com.atproto.sync.subscribeRepos` path に squat しない。
+
+## worktree cleanup(定例指示, 2026-06-12)
+
+ユーザーが「worktree cleanup」と指示したら、以下の定例手順として実行する:
+
+1. `git fetch --all --prune` → 全 remote/local ブランチと PR 状態(`gh pr list --state all`)を突き合わせる
+2. **PR が無いブランチ**(ローカル main の未 push commit も branch 化して含める)→ 一時 worktree で `origin/main` を merge し衝突解決 → 影響 crate の test/check を実行 → PR 作成 → review → main へ squash merge
+3. **PR が MERGED/CLOSED 済みのブランチ → 削除**。ただし tip が PR merge 時刻より後に push されている場合(タイムゾーン正規化して比較)は `git merge-tree --write-tree origin/main <branch>` の結果 tree を `origin/main^{tree}` と比較し、新規内容ゼロ(または main からの回帰のみ = superseded)を確認してから削除。真の新規内容があれば 2 に回す
+4. ローカル main を `origin/main` に reset(取り込み済み commit のみ破棄)、一時 worktree を `git worktree remove`、削除済みブランチを `git fetch --prune`
+
+注意: squash-merge 運用のためコミット ID では merge 判定できない — 必ず PR 状態 + content diff で判定する。他エージェントが並行作業中の checkout の dirty tree には触れない(committed 分のみ branch 化して回収)。
 
 ## 禁止
 

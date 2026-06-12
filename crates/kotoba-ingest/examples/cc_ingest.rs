@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use kotoba_graph::QuadStore;
-use kotoba_kse::Journal;
 use kotoba_store::MemoryBlockStore;
+use kotoba_vault::LiveBus;
 
 use kotoba_ingest::cc::{CcChunkIngestor, CcPageIngestor};
 use kotoba_ingest::embed_client::{Blake3EmbedClient, EmbedClient, HttpEmbedClient};
@@ -57,7 +57,7 @@ async fn main() -> Result<()> {
 
     // In-memory store for this example (swap for SledBlockStore for persistence)
     let block_store = Arc::new(MemoryBlockStore::default());
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let quad_store = Arc::new(QuadStore::new(journal, block_store));
 
     let embed_client: Arc<dyn EmbedClient> = match HttpEmbedClient::from_env() {

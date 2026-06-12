@@ -2,7 +2,7 @@
 //!
 //! THE load-bearing isolation: each room owns its OWN `tokio::broadcast` bus.
 //! Per-frame input/bundles/confirms live only here. They never touch the global
-//! KSE Journal, firehose, or gossip mesh. Only the low-rate durable snapshot
+//! KSE LiveBus, firehose, or gossip mesh. Only the low-rate durable snapshot
 //! crosses into the cold/federated lane (the `take_durable_snapshot` hook the
 //! server wires to `block_store` + `journal` + pin).
 

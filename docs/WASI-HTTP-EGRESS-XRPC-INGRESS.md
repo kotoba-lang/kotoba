@@ -15,7 +15,7 @@ This document covers the implementation of WASI-HTTP egress for wasm guests in `
 ## Deliverable 2: Generic XRPC→wasm Ingress Dispatch
 1. Added `POST /xrpc/:nsid` as a fallback generic dispatch route inside `build_router` in `crates/kotoba-server/src/lib.rs`.
 2. Extracted the `app` identifier from `nsid` (`com.etzhayyim.apps.<app>.<method>`).
-3. Reused the `kotoba/network/nodes` Datomic graph (accessed via `state.ipns_registry` and `DistributedDatomReader`) to resolve the application's `program_cid`. The routing logic looks for `node/did` matching `<app>` or `<app>.gftd.co.jp`, then extracts the `node/endpoint` field as the `program_cid`. If not found, it falls back to using the `<app>` directly.
+3. Reused the `kotoba/network/nodes` Datomic graph (accessed via `state.ipns_registry` and `DistributedDatomReader`) to resolve the application's `program_cid`. The routing logic looks for `node/did` matching `<app>` or `<app>.etzhayyim.com`, then extracts the `node/endpoint` field as the `program_cid`. If not found, it falls back to using the `<app>` directly.
 4. Serialized the inbound JSON to CBOR and routed it through `state.router.dispatch_with_snapshot`.
 5. Added `generic_xrpc_dispatch_resolves` test in `kotoba-server/src/lib.rs` to verify that `POST /xrpc/com.etzhayyim.apps.yata.some_method` reaches the handler (asserts response is not 404).
 

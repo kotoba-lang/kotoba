@@ -276,7 +276,7 @@ impl TransformerWeights {
 
     /// Load from Vault blobs (FP8 → f32 dequantize).
     pub async fn load_from_vault(
-        vault: &kotoba_kse::vault::Vault,
+        vault: &kotoba_vault::vault::Vault,
         blobs: &TransformerBlobRefs,
     ) -> anyhow::Result<Self> {
         let load_cid = async |cid: kotoba_core::cid::KotobaCid| -> anyhow::Result<Vec<f32>> {

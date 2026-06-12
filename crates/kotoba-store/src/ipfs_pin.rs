@@ -4,7 +4,8 @@
 /// a local or remote Kubo-compatible daemon so that pinned CIDs survive GC
 /// and are reachable via the IPFS network.  Up to 1 GB of content is pinned
 /// for free by kotoba itself; extended durability beyond that is the
-/// responsibility of kotobase.gftd.ai (called separately, not here).
+/// responsibility of the canonical remote pin service kotobase.net
+/// (ADR-2606091500; called separately, not here).
 ///
 /// API surface used:
 ///   POST /api/v0/pin/add?arg={cid}&recursive=true   — pin a CID
@@ -14,13 +15,13 @@
 /// Env vars:
 ///   KOTOBA_IPFS_ENDPOINT  — base URL (default: http://localhost:5001)
 ///   KOTOBA_IPFS_TOKEN     — optional Bearer JWT for authenticated gateways
-use reqwest::Url;
 use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 
-const DEFAULT_IPFS_PIN_ENDPOINT: &str = "http://localhost:5001";
-const DISABLED_IPFS_PIN_ENDPOINT: &str = "http://127.0.0.1:9";
-const MAX_IPFS_PIN_ENDPOINT_LEN: usize = 256;
+/// Canonical remote IPFS pin service (ADR-2606091500). `from_pin_env` defaults
+/// to this when `KOTOBA_IPFS_PIN_ENDPOINT` is unset, so the kotobase pin fanout
+/// is on by default repo-wide; opt out with `KOTOBA_IPFS_PIN_ENDPOINT=off`.
+pub const DEFAULT_REMOTE_PIN_ENDPOINT: &str = "https://kotobase.net";
 
 #[derive(Clone)]
 pub struct IpfsPinClient {
@@ -50,11 +51,7 @@ struct PinEntry {
 impl IpfsPinClient {
     pub fn from_env() -> Arc<Self> {
         let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
-            .unwrap_or_else(|_| DEFAULT_IPFS_PIN_ENDPOINT.into());
-        let endpoint = normalize_pin_endpoint(&endpoint).unwrap_or_else(|| {
-            tracing::warn!("invalid KOTOBA_IPFS_ENDPOINT; disabling IpfsPinClient HTTP access");
-            DISABLED_IPFS_PIN_ENDPOINT.to_string()
-        });
+            .unwrap_or_else(|_| "http://localhost:5001".into());
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
         Arc::new(Self {
             client: reqwest::Client::new(),
@@ -63,15 +60,28 @@ impl IpfsPinClient {
         })
     }
 
-    /// Build a remote pin client from `KOTOBA_IPFS_PIN_ENDPOINT` +
-    /// `KOTOBA_IPFS_PIN_JWT`.  Returns `None` when neither secret is set, so
-    /// the caller can no-op when kotobase pinning is intentionally disabled
-    /// (e.g. local dev).  Used to dispatch every recursive pin to
-    /// kotobase.gftd.ai (or any Kubo-compatible service) in addition to the
-    /// pod-local sidecar — the F-3 pin chain wiring.
+    /// Build the canonical remote pin client (ADR-2606091500).  Defaults to
+    /// `kotobase.net` (`DEFAULT_REMOTE_PIN_ENDPOINT`) so the kotobase pin fanout
+    /// is **on by default** repo-wide — every recursive pin is dispatched to
+    /// kotobase.net in addition to the pod-local sidecar (the F-3 pin chain).
+    /// Overridable via `KOTOBA_IPFS_PIN_ENDPOINT`; explicitly opt out (e.g. local
+    /// dev / tests) by setting it to `off` / `none` / `disabled`, which returns
+    /// `None` so the caller does a local-only pin.  `KOTOBA_IPFS_PIN_JWT` is the
+    /// optional Bearer token for the remote service.
     pub fn from_pin_env() -> Option<Arc<Self>> {
-        let endpoint = std::env::var("KOTOBA_IPFS_PIN_ENDPOINT").ok()?;
-        let endpoint = normalize_pin_endpoint(&endpoint)?;
+        let raw = std::env::var("KOTOBA_IPFS_PIN_ENDPOINT").unwrap_or_default();
+        let trimmed = raw.trim();
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "off" | "none" | "disabled" | "0" | "false"
+        ) {
+            return None;
+        }
+        let endpoint = if trimmed.is_empty() {
+            DEFAULT_REMOTE_PIN_ENDPOINT.to_string()
+        } else {
+            trimmed.to_string()
+        };
         let token = std::env::var("KOTOBA_IPFS_PIN_JWT").ok();
         Some(Arc::new(Self {
             client: reqwest::Client::new(),
@@ -159,30 +169,6 @@ impl IpfsPinClient {
     }
 }
 
-fn normalize_pin_endpoint(endpoint: &str) -> Option<String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty()
-        || endpoint.len() > MAX_IPFS_PIN_ENDPOINT_LEN
-        || endpoint.chars().any(|ch| ch.is_control())
-    {
-        return None;
-    }
-    let url = Url::parse(endpoint).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return None;
-    }
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    Some(url.as_str().trim_end_matches('/').to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,37 +178,6 @@ mod tests {
             client: reqwest::Client::new(),
             endpoint: endpoint.into(),
             token: None,
-        }
-    }
-
-    #[test]
-    fn normalize_pin_endpoint_accepts_http_https_root_urls() {
-        assert_eq!(
-            normalize_pin_endpoint(" http://localhost:5001/ ").unwrap(),
-            "http://localhost:5001"
-        );
-        assert_eq!(
-            normalize_pin_endpoint("https://pin.example.com").unwrap(),
-            "https://pin.example.com"
-        );
-    }
-
-    #[test]
-    fn normalize_pin_endpoint_rejects_ambiguous_or_header_unsafe_values() {
-        for endpoint in [
-            "",
-            "ftp://localhost:5001",
-            "https://user:pass@localhost:5001",
-            "http://localhost:5001/api",
-            "http://localhost:5001?x=1",
-            "http://localhost:5001#frag",
-            "http://localhost:5001/\nheader",
-            "not a url",
-        ] {
-            assert!(
-                normalize_pin_endpoint(endpoint).is_none(),
-                "endpoint should be rejected: {endpoint:?}"
-            );
         }
     }
 

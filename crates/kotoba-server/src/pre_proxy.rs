@@ -13,7 +13,7 @@ use kotoba_auth::delegation::DelegationChain;
 use kotoba_auth::resolver::{DidDocumentResolver, DidResolverError};
 use kotoba_crypto::aead::CryptoError;
 use kotoba_crypto::hpke::hpke_seal;
-use kotoba_kse::{PreKeyError, PreKeyRegistry};
+use kotoba_vault::{PreKeyError, PreKeyRegistry};
 use subtle::ConstantTimeEq;
 use x25519_dalek::PublicKey;
 
@@ -84,11 +84,11 @@ mod tests {
         did_document::ServiceEndpointValue, DidDocument, InMemoryDidResolver, ServiceEndpoint,
         VerificationMethod,
     };
-    use kotoba_kse::PreKeyRegistry;
     use kotoba_store::MemoryBlockStore;
+    use kotoba_vault::PreKeyRegistry;
 
     fn make_doc_with_x25519(did: &str, key: [u8; 32]) -> DidDocument {
-        let encoded = multibase::encode(multibase::Base::Base58Btc, key);
+        let encoded = multibase::encode(multibase::Base::Base58Btc, &key);
         let key_id = format!("{did}#key-x25519-1");
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".into()],
@@ -374,6 +374,10 @@ mod tests {
                 iss: accessor_did.clone(),
                 aud: "kotoba://test".into(),
                 issued_at: "2026-05-31T00:00:00Z".into(),
+                // Explicit far-future expiry → DelegationChain::verify takes the
+                // `exp` branch and skips the `issued_at` 7-day max-age cap, same as
+                // the happy-path fixture above (was a date-rot time bomb: started
+                // failing 2026-06-07 once `now` passed issued_at + MAX_CACAO_AGE_SECS).
                 expiry: Some("2099-12-31T23:59:59Z".into()),
                 nonce: "e2e-roundtrip-nonce".into(),
                 domain: "kotoba.test".into(),

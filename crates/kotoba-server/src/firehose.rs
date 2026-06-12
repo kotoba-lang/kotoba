@@ -1,7 +1,7 @@
-//! HTTP egress over the KSE Journal — the "tap" half of the kotoba federation
+//! HTTP egress over the KSE LiveBus — the "tap" half of the kotoba federation
 //! surface (D in the D+E design, 2026-05-30).
 //!
-//! Two read-only endpoints, both keyed by the Journal's monotonic `seq` (the
+//! Two read-only endpoints, both keyed by the LiveBus's monotonic `seq` (the
 //! cursor) so a consumer can resume exactly where it left off:
 //!
 //!   * `com.etzhayyim.apps.kotoba.sync.subscribe` — Server-Sent Events live-tail.
@@ -12,7 +12,7 @@
 //!     `?cursor=N&limit=K` returns the next batch; usable through any proxy or
 //!     CF Worker without WebSocket/SSE support.
 //!
-//! This is the SAME ordered Journal that the libp2p gossip relay (E,
+//! This is the SAME ordered LiveBus that the libp2p gossip relay (E,
 //! `net_actor`) federates to the mesh — D and E share one cursor, so what you
 //! observe over HTTP is exactly what propagates over gossip.
 //!
@@ -39,7 +39,9 @@ use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kse::{Cursor, Journal, JournalEntry};
+use kotoba_datomic::distributed::DistributedDatomReader;
+use kotoba_ipfs::{IpnsName, IpnsRegistryError};
+use kotoba_vault::{Cursor, LiveBus, LiveBusEntry, Topic};
 
 use crate::graph_auth::{check_read_access, AccessDenied};
 use crate::server::KotobaState;
@@ -48,6 +50,13 @@ use crate::server::KotobaState;
 pub const NSID_SYNC_SUBSCRIBE: &str = "com.etzhayyim.apps.kotoba.sync.subscribe";
 /// JSON cursor paging / long-poll firehose.
 pub const NSID_SYNC_EVENTS: &str = "com.etzhayyim.apps.kotoba.sync.events";
+/// CommitDag-derived firehose: reconstruct one graph's change feed from the
+/// Datomic commit chain (no LiveBus) — journal-independent durable replay.
+pub const NSID_SYNC_EVENTS_FROM_COMMITS: &str = "com.etzhayyim.apps.kotoba.sync.eventsFromCommits";
+/// Cross-graph CommitDag firehose: merge every registered graph's commit feed,
+/// ordered by `(ts, graph, per-graph seq)`. The whole-node datomic change feed
+/// without a journal.
+pub const NSID_SYNC_EVENTS_ALL_GRAPHS: &str = "com.etzhayyim.apps.kotoba.sync.eventsAllGraphs";
 
 /// Hard cap on a single paging response so a huge cold backfill can't OOM the node.
 const MAX_PAGE_LIMIT: usize = 1000;
@@ -99,7 +108,7 @@ fn validate_params(
 
 #[derive(Debug, Deserialize)]
 pub struct SubscribeParams {
-    /// Resume after this Journal seq (exclusive). Omit = live-only from now.
+    /// Resume after this LiveBus seq (exclusive). Omit = live-only from now.
     pub cursor: Option<u64>,
     /// Only emit entries whose topic starts with this prefix (e.g. `jetstream/`).
     pub topic_prefix: Option<String>,
@@ -118,7 +127,7 @@ pub struct EventsParams {
 
 /// Read-access gate for the firehose.
 ///
-/// The firehose is a CROSS-graph, whole-Journal stream, so a per-graph
+/// The firehose is a CROSS-graph, whole-LiveBus stream, so a per-graph
 /// credential cannot bound it — we gate at the NODE level on
 /// `KOTOBA_DEFAULT_VISIBILITY` (default `private`):
 ///   * `public`        → open
@@ -146,19 +155,62 @@ async fn gate(
 }
 
 /// One firehose event in JSON form. `payload` is decoded as JSON when the
-/// Journal payload is valid JSON (the common case — quads/records are JSON),
+/// LiveBus payload is valid JSON (the common case — quads/records are JSON),
 /// otherwise it is a base64 string of the raw bytes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FirehoseEvent {
     pub seq: u64,
     pub ts: u64,
+    /// Hybrid Logical Clock of the source commit (ADR-001) — the skew-resistant
+    /// cross-graph ordering key. 0 for journal-sourced (non-datomic) events.
+    #[serde(default)]
+    pub hlc: u64,
     pub topic: String,
     pub cid: String,
     pub payload: serde_json::Value,
 }
 
 impl FirehoseEvent {
-    fn from_entry(e: &JournalEntry) -> Self {
+    /// Build a firehose event from a Datom — the single source of the `{topic,
+    /// payload}` shape, shared by the CommitDag reconstruction and the live
+    /// in-memory publish on the commit path. Matches the legacy LiveBus
+    /// projection (assert → `Topic::quad_spo`, retract → `kotoba/retract/...`).
+    pub fn from_datom(
+        datom: &kotoba_datomic::Datom,
+        graph_cid: &KotobaCid,
+        seq: u64,
+        ts: u64,
+        hlc: u64,
+    ) -> Self {
+        let quad = crate::xrpc::datom_to_projection_quad(datom, graph_cid);
+        let topic = if datom.added {
+            Topic::quad_spo(
+                &quad.graph.to_multibase(),
+                &quad.subject.to_multibase(),
+                &quad.predicate,
+                &format!("{:?}", quad.object),
+            )
+            .0
+        } else {
+            format!(
+                "kotoba/retract/{}/{}/{}",
+                quad.graph, quad.subject, quad.predicate
+            )
+        };
+        let payload = serde_json::to_value(&quad).unwrap_or(serde_json::Value::Null);
+        let cid =
+            KotobaCid::from_bytes(&serde_json::to_vec(&quad).unwrap_or_default()).to_multibase();
+        FirehoseEvent {
+            seq,
+            ts,
+            hlc,
+            topic,
+            cid,
+            payload,
+        }
+    }
+
+    fn from_entry(e: &LiveBusEntry) -> Self {
         let payload = match serde_json::from_slice::<serde_json::Value>(&e.payload) {
             Ok(v) => v,
             Err(_) => serde_json::Value::String(B64.encode(&e.payload)),
@@ -166,6 +218,7 @@ impl FirehoseEvent {
         FirehoseEvent {
             seq: e.seq,
             ts: e.ts,
+            hlc: 0, // journal (non-datomic) events carry no commit HLC
             topic: e.topic.clone(),
             cid: e.cid.to_multibase(),
             payload,
@@ -178,7 +231,7 @@ pub struct EventsResponse {
     pub events: Vec<FirehoseEvent>,
     /// Seq of the last event in this batch — pass back as `?cursor=` next time.
     pub cursor: u64,
-    /// Current head seq of the Journal (so callers know how far behind they are).
+    /// Current head seq of the LiveBus (so callers know how far behind they are).
     pub current_seq: u64,
     /// `limit` items returned but more are available past `cursor`.
     pub has_more: bool,
@@ -187,7 +240,7 @@ pub struct EventsResponse {
 // ── SSE live-tail ──────────────────────────────────────────────────────────
 
 struct SseState {
-    backlog: VecDeque<JournalEntry>,
+    backlog: VecDeque<LiveBusEntry>,
     live: Cursor,
     last_seq: u64,
     prefix: Option<String>,
@@ -202,7 +255,7 @@ pub async fn subscribe(
     validate_params(params.cursor, params.topic_prefix.as_deref())?;
     gate(&state, &headers, params.cacao_b64.as_deref()).await?;
 
-    let journal: Arc<Journal> = Arc::clone(&state.journal);
+    let journal: Arc<LiveBus> = Arc::clone(&state.journal);
 
     // Subscribe to the live broadcast FIRST so no entry slips through the gap
     // between reading the backlog and attaching the tail. Overlapping seqs are
@@ -301,19 +354,186 @@ pub async fn events(
     }))
 }
 
+// ── CommitDag-derived firehose (journal-free) ────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CommitEventsParams {
+    /// Graph CID (multibase) to reconstruct the change feed for.
+    pub graph: String,
+    pub cursor: Option<u64>,
+    pub limit: Option<usize>,
+    pub topic_prefix: Option<String>,
+    pub cacao_b64: Option<String>,
+}
+
+/// Build the ordered firehose events for one graph straight from its Datomic
+/// commit chain — the same `{topic,payload}` a LiveBus entry would carry, but
+/// derived from `tx_range_from_head` instead of a persisted per-datom log. The
+/// `seq` is a stable 1-based index in commit order (older commits keep their seq
+/// as new ones append), so it works as a resumable cursor.
+fn firehose_events_from_commitdag(
+    state: &KotobaState,
+    graph_mb: &str,
+) -> Result<Vec<FirehoseEvent>, (StatusCode, String)> {
+    let graph_cid = KotobaCid::from_multibase(graph_mb)
+        .ok_or((StatusCode::BAD_REQUEST, "invalid graph CID".to_string()))?;
+    let ipns_name = crate::xrpc::distributed_graph_ipns_name(&graph_cid);
+    let head = match state.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
+        Ok(record) => KotobaCid::from_multibase(&record.value),
+        Err(IpnsRegistryError::NotFound(_)) => None,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("ipns: {e}"))),
+    };
+    let Some(head) = head else {
+        return Ok(Vec::new());
+    };
+
+    let reader = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry);
+    let range = reader
+        .tx_range_from_head(&head, None, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tx_range: {e}")))?;
+
+    let mut events = Vec::new();
+    let mut seq = 0u64;
+    for entry in &range {
+        for datom in &entry.datoms {
+            seq += 1;
+            events.push(FirehoseEvent::from_datom(
+                datom,
+                &graph_cid,
+                seq,
+                entry.commit.ts,
+                entry.commit.hlc,
+            ));
+        }
+    }
+    Ok(events)
+}
+
+/// `GET /xrpc/com.etzhayyim.apps.kotoba.sync.eventsFromCommits?graph=&cursor=N&limit=K&topic_prefix=...`
+///
+/// LiveBus-free firehose backfill: reconstructs one graph's change feed from the
+/// CommitDag. Identical `{topic,payload}` to the LiveBus-backed `sync.events`,
+/// so a consumer can replay durable history even when `KOTOBA_JOURNAL_WAL=off`
+/// has dropped the per-datom journal blocks.
+pub async fn events_from_commits(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Query(params): Query<CommitEventsParams>,
+) -> Result<Json<EventsResponse>, (StatusCode, String)> {
+    gate(&state, &headers, params.cacao_b64.as_deref()).await?;
+
+    let all = firehose_events_from_commitdag(&state, &params.graph)?;
+    let current_seq = all.last().map(|e| e.seq).unwrap_or(0);
+
+    let from = params.cursor.unwrap_or(0);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .min(MAX_PAGE_LIMIT);
+    let mut events: Vec<FirehoseEvent> = all.into_iter().filter(|e| e.seq > from).collect();
+    if let Some(prefix) = &params.topic_prefix {
+        events.retain(|e| e.topic.starts_with(prefix.as_str()));
+    }
+    let has_more = events.len() > limit;
+    events.truncate(limit);
+    let cursor = events.last().map(|e| e.seq).or(params.cursor).unwrap_or(0);
+
+    Ok(Json(EventsResponse {
+        events,
+        cursor,
+        current_seq,
+        has_more,
+    }))
+}
+
+// ── Cross-graph CommitDag firehose ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct AllGraphsParams {
+    pub cursor: Option<u64>,
+    pub limit: Option<usize>,
+    pub topic_prefix: Option<String>,
+    pub cacao_b64: Option<String>,
+}
+
+/// Merge every registered graph's CommitDag change feed into one whole-node feed.
+///
+/// Ordering is `(commit.hlc, graph, per-graph seq)` (ADR-001). The Hybrid Logical
+/// Clock is monotonic per node and skew-resistant, so cross-graph order is stable
+/// and not at the mercy of wall-clock jumps; within a single graph it is exact.
+/// The returned `seq` is a global 1-based index over the merged order; it is
+/// stable for append-only growth (new commits sort to the tail) and serves as the
+/// resume cursor.
+fn firehose_events_all_graphs(
+    state: &KotobaState,
+) -> Result<Vec<FirehoseEvent>, (StatusCode, String)> {
+    let mut merged: Vec<(u64, String, u64, FirehoseEvent)> = Vec::new();
+    for record in state.ipns_registry.list() {
+        let Some(graph_mb) = record.name.0.strip_prefix("k51-kotoba-") else {
+            continue;
+        };
+        let per_graph = firehose_events_from_commitdag(state, graph_mb)?;
+        for ev in per_graph {
+            merged.push((ev.hlc, graph_mb.to_string(), ev.seq, ev));
+        }
+    }
+    // (ts, graph, per-graph seq) — deterministic merge across graphs.
+    merged.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+    let mut out = Vec::with_capacity(merged.len());
+    for (i, (_, _, _, mut ev)) in merged.into_iter().enumerate() {
+        ev.seq = (i as u64) + 1;
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+/// `GET /xrpc/com.etzhayyim.apps.kotoba.sync.eventsAllGraphs?cursor=N&limit=K&topic_prefix=...`
+///
+/// Whole-node datomic firehose reconstructed from every graph's CommitDag — the
+/// cross-graph equivalent of the per-datom LiveBus stream, with no journal.
+pub async fn events_all_graphs(
+    State(state): State<Arc<KotobaState>>,
+    headers: HeaderMap,
+    Query(params): Query<AllGraphsParams>,
+) -> Result<Json<EventsResponse>, (StatusCode, String)> {
+    gate(&state, &headers, params.cacao_b64.as_deref()).await?;
+
+    let all = firehose_events_all_graphs(&state)?;
+    let current_seq = all.last().map(|e| e.seq).unwrap_or(0);
+
+    let from = params.cursor.unwrap_or(0);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .min(MAX_PAGE_LIMIT);
+    let mut events: Vec<FirehoseEvent> = all.into_iter().filter(|e| e.seq > from).collect();
+    if let Some(prefix) = &params.topic_prefix {
+        events.retain(|e| e.topic.starts_with(prefix.as_str()));
+    }
+    let has_more = events.len() > limit;
+    events.truncate(limit);
+    let cursor = events.last().map(|e| e.seq).or(params.cursor).unwrap_or(0);
+
+    Ok(Json(EventsResponse {
+        events,
+        cursor,
+        current_seq,
+        has_more,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kotoba_core::cid::KotobaCid;
 
-    fn entry(seq: u64, topic: &str, payload: &[u8]) -> JournalEntry {
-        JournalEntry {
+    fn entry(seq: u64, topic: &str, payload: &[u8]) -> LiveBusEntry {
+        LiveBusEntry {
             seq,
             ts: 0,
             topic: topic.to_string(),
             payload: payload.to_vec(),
             cid: KotobaCid::from_bytes(payload),
-            prev: None,
         }
     }
 

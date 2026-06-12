@@ -1,0 +1,80 @@
+from typing import TypedDict
+from langgraph.graph import StateGraph, END
+
+class DetacherState(TypedDict):
+    model_id: str
+    compatibility_verified: bool
+    safety_check_passed: bool
+
+def check_compatibility(state: DetacherState):
+    state['compatibility_verified'] = state['model_id'].startswith('SEC-')
+    return state
+
+def verify_safety(state: DetacherState):
+    state['safety_check_passed'] = True
+    return state
+
+graph = StateGraph(DetacherState)
+graph.add_node('verify_compatibility', check_compatibility)
+graph.add_node('verify_safety', verify_safety)
+graph.set_entry_point('verify_compatibility')
+graph.add_edge('verify_compatibility', 'verify_safety')
+graph.add_edge('verify_safety', END)
+graph = graph.compile()
+
+# codemod-2605231330-defaults-wrapper
+_DEFAULTS_2605231330 = {
+    'model_id': "",
+    'compatibility_verified': False,
+    'safety_check_passed': False
+}
+
+
+class _DefaultsWrapper2605231330:
+    """Pre-fills missing TypedDict fields before delegating to the compiled graph."""
+
+    __slots__ = ("_inner", "_defaults")
+
+    def __init__(self, inner, defaults):
+        self._inner = inner
+        self._defaults = defaults
+
+    def _merge(self, input_state):
+        if not isinstance(input_state, dict):
+            return input_state
+        merged = dict(self._defaults)
+        merged.update(input_state)
+        return merged
+
+    def invoke(self, input_state, config=None, **kwargs):
+        merged = self._merge(input_state)
+        if config is None:
+            return self._inner.invoke(merged, **kwargs)
+        return self._inner.invoke(merged, config=config, **kwargs)
+
+    async def ainvoke(self, input_state, config=None, **kwargs):
+        merged = self._merge(input_state)
+        if config is None:
+            return await self._inner.ainvoke(merged, **kwargs)
+        return await self._inner.ainvoke(merged, config=config, **kwargs)
+
+    def stream(self, input_state, config=None, **kwargs):
+        merged = self._merge(input_state)
+        if config is None:
+            return self._inner.stream(merged, **kwargs)
+        return self._inner.stream(merged, config=config, **kwargs)
+
+    async def astream(self, input_state, config=None, **kwargs):
+        merged = self._merge(input_state)
+        if config is None:
+            async for chunk in self._inner.astream(merged, **kwargs):
+                yield chunk
+            return
+        async for chunk in self._inner.astream(merged, config=config, **kwargs):
+            yield chunk
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_inner"), name)
+
+
+graph = _DefaultsWrapper2605231330(graph, _DEFAULTS_2605231330)

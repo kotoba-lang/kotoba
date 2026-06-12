@@ -23,9 +23,9 @@ use kotoba_auth::{Cacao, CacaoHeader, CacaoPayload, CacaoSig};
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::journal::Journal;
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use kotoba_store::{DistributedBlockStore, MemoryBlockStore};
+use kotoba_vault::live_bus::LiveBus;
 
 fn print_header(s: &str) {
     println!("\n┌{:─<78}┐", "");
@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     print_header("Phase 0: Set up Node B (the publisher)");
 
     let peer_store = Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>;
-    let node_b = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&peer_store));
+    let node_b = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&peer_store));
     let graph = KotobaCid::from_bytes(b"e2e-demo-graph");
     println!("Node B QuadStore created");
     println!("Graph CID: {}", graph.to_multibase());
@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     let local_a = Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>;
     let dist_store = Arc::new(DistributedBlockStore::new(Arc::clone(&local_a), vec![]))
         as Arc<dyn BlockStore + Send + Sync>;
-    let node_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&dist_store));
+    let node_a = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&dist_store));
 
     println!("Node A local store: 0 blocks");
     println!("Node A peer list:   (in real deployment: Kubo HTTP URLs)");

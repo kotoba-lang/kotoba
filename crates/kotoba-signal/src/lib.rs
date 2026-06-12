@@ -1,5 +1,5 @@
 //! Signal Protocol E2E for Kotoba.
-//! SSoT replacing `@gftd/signal` (`10-protocol/signal/`).
+//! SSoT replacing `@etzhayyim/signal` (`10-protocol/signal/`).
 //!
 //! Wire format `signal:v1:{base64url}` is preserved for compatibility.
 

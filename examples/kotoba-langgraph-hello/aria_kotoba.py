@@ -1,7 +1,7 @@
 """aria (kotoba-native port) — 6-signal parallel ingest + Von Neumann minimax.
 
-Faithful port of magatama's ARIA actor
-(`20-actors/magatama/py/src/pymagatama/agents/aria.py`) onto the WASM-native
+Faithful port of kotodama's ARIA actor
+(`40-engine/kotoba/crates/kotoba-kotodama/py/src/kotodama/agents/aria.py`) onto the WASM-native
 `kotoba_langgraph` API so it compiles to a kotoba-node component and runs on a
 live kotoba server via invoke.run / kotoba_wasm_run.
 
@@ -10,7 +10,7 @@ Graph (identical to upstream):
 
 The only change vs. upstream: `_ingest_all` reads the six signal dicts directly
 from the invocation context (`state["context"]`) instead of calling
-`pymagatama.primitives.aria_signal.*`, since those primitives merely project the
+`kotodama.primitives.aria_signal.*`, since those primitives merely project the
 six signals out of the same context.  The decision logic
 (compute_area / minimax_select / witness) is byte-for-byte the upstream logic.
 
@@ -61,7 +61,7 @@ def _ingest_all(state: AriaState) -> dict:
 
     Upstream calls aria_signal.task_aria_*_ingest(ctx); each primitive returns
     ctx[<signal>] (a {"intensity": float, ...} dict). We inline that here so the
-    component is self-contained — no pymagatama dependency in the WASM bundle.
+    component is self-contained — no kotodama dependency in the WASM bundle.
     """
     ctx = state.get("context", {}) or {}
     return {k: ctx.get(k, {}) for k in _SIGNAL_KEYS}

@@ -31,15 +31,15 @@ enum TreeOp {
 use dashmap::DashMap;
 use kotoba_auth::delegation::{DelegationChain, DelegationError};
 use kotoba_core::prolly::ProllyTree;
-use kotoba_kqe::arrangement::Arrangement;
-use kotoba_kqe::datalog::DatalogProgram;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::delta::Delta;
-use kotoba_kqe::quad::LegacyQuad as Quad;
-use kotoba_kqe::quad::LegacyQuadObject;
-use kotoba_kse::journal::Journal;
-use kotoba_kse::topic::Topic;
+use kotoba_query::arrangement::Arrangement;
+use kotoba_query::datalog::DatalogProgram;
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::delta::Delta;
+use kotoba_query::quad::LegacyQuad as Quad;
+use kotoba_query::quad::LegacyQuadObject;
 use kotoba_store::{CapturingBlockStore, CarBundleWriter};
+use kotoba_vault::live_bus::LiveBus;
+use kotoba_vault::topic::Topic;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -56,15 +56,10 @@ pub enum AccessError {
 
 /// QuadStore — legacy graph projection API with Datom-native ProllyTree commit
 pub struct QuadStore {
-    journal: Arc<Journal>,
+    journal: Arc<LiveBus>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
     arrangements: Arc<DashMap<String, Arrangement>>, // graph_cid → Arrangement
     commit_dag: Arc<RwLock<CommitDag>>,
-    /// seq of the last successful commit — persisted as a checkpoint in the Journal store.
-    /// On startup this is loaded from the checkpoint before Journal replay so that
-    /// `replay_from_journal` only processes entries written *after* the last commit,
-    /// not the full WAL history.
-    committed_seq: Arc<RwLock<u64>>,
     /// Per-graph flag: `true` iff the hot arrangement is a SUPERSET of the committed
     /// cold ProllyTree (or there is no committed state).  In that case, query paths
     /// may short-circuit and return from hot alone.  Set to `false` after WAL replay
@@ -87,7 +82,7 @@ pub struct DatomGraphStore {
 }
 
 impl DatomGraphStore {
-    pub fn new(journal: Arc<Journal>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
+    pub fn new(journal: Arc<LiveBus>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
         Self {
             inner: QuadStore::new(journal, block_store),
         }
@@ -191,13 +186,12 @@ impl DatomGraphStore {
 }
 
 impl QuadStore {
-    pub fn new(journal: Arc<Journal>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
+    pub fn new(journal: Arc<LiveBus>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
         Self {
             journal,
             block_store,
             arrangements: Arc::new(DashMap::new()),
             commit_dag: Arc::new(RwLock::new(CommitDag::new())),
-            committed_seq: Arc::new(RwLock::new(0)),
             hot_covers_all: Arc::new(DashMap::new()),
             pending_datoms: Arc::new(DashMap::new()),
         }
@@ -270,7 +264,7 @@ impl QuadStore {
         let delta = Delta::assert_datom(Datom::from_legacy_quad(quad.clone(), true));
         self.arrangements
             .entry(g.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .insert(&quad);
         self.record_pending_datom(&g, quad, true);
         // Normal write: hot remains a superset of (committed ∪ pending uncommitted).
@@ -289,7 +283,7 @@ impl QuadStore {
         self.publish_legacy_quad_assert(&quad).await;
         self.arrangements
             .entry(graph_key.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .insert_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         self.hot_covers_all.entry(graph_key).or_insert(true);
@@ -376,7 +370,7 @@ impl QuadStore {
         let g = quad.graph.to_multibase();
         self.arrangements
             .entry(g.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .remove(&quad);
         self.record_pending_datom(&g, quad.clone(), false);
         Delta::retract_datom(Datom::from_legacy_quad(quad, false))
@@ -388,7 +382,7 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .remove_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         Delta::from_datom(datom)
@@ -422,7 +416,7 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .insert_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         self.hot_covers_all.entry(graph_key).or_insert(true);
@@ -434,13 +428,13 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .remove_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom.clone());
         Delta::from_datom(datom)
     }
 
-    /// Assert without publishing to Journal — used during WAL replay on startup.
+    /// Assert without publishing to LiveBus — used during WAL replay on startup.
     ///
     /// Marks the graph's `hot_covers_all` flag as `false` because replay only
     /// loads post-checkpoint (uncommitted) quads into the arrangement; the
@@ -449,7 +443,7 @@ impl QuadStore {
         let g = quad.graph.to_multibase();
         self.arrangements
             .entry(g.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .insert(&quad);
         self.record_pending_datom(&g, quad, true);
         // Hot is now a strict subset of (committed ∪ uncommitted) — cold must also be consulted.
@@ -461,13 +455,13 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .insert_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom);
         self.hot_covers_all.insert(graph_key, false);
     }
 
-    /// Insert a batch of Datoms without publishing to Journal.
+    /// Insert a batch of Datoms without publishing to LiveBus.
     ///
     /// Bulk ingest uses this to keep the persisted tx/op history exact while
     /// still allowing legacy Quad projections to be served from Arrangement.
@@ -476,7 +470,10 @@ impl QuadStore {
             return;
         }
         let graph_key = graph_cid.to_multibase();
-        let mut arrangement = self.arrangements.entry(graph_key.clone()).or_default();
+        let mut arrangement = self
+            .arrangements
+            .entry(graph_key.clone())
+            .or_insert_with(Arrangement::new);
         let mut pending = self.pending_datoms.entry(graph_key.clone()).or_default();
         for mut datom in datoms {
             datom.op = true;
@@ -487,24 +484,27 @@ impl QuadStore {
     }
 
     /// Insert a batch of quads — fast path for bulk ingest.
-    /// Does not publish to Journal.
+    /// Does not publish to LiveBus.
     pub async fn assert_batch_silent(&self, quads: Vec<Quad>) {
         if quads.is_empty() {
             return;
         }
         for quad in &quads {
             let g = quad.graph.to_multibase();
-            self.arrangements.entry(g.clone()).or_default().insert(quad);
+            self.arrangements
+                .entry(g.clone())
+                .or_insert_with(Arrangement::new)
+                .insert(quad);
             self.record_pending_datom(&g, quad.clone(), true);
         }
     }
 
-    /// Retract without publishing to Journal — used during WAL replay on startup.
+    /// Retract without publishing to LiveBus — used during WAL replay on startup.
     pub async fn retract_silent(&self, quad: Quad) {
         let g = quad.graph.to_multibase();
         self.arrangements
             .entry(g.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .remove(&quad);
         self.record_pending_datom(&g, quad, false);
     }
@@ -514,132 +514,9 @@ impl QuadStore {
         let graph_key = graph_cid.to_multibase();
         self.arrangements
             .entry(graph_key.clone())
-            .or_default()
+            .or_insert_with(Arrangement::new)
             .remove_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom);
-    }
-
-    /// Restore state from Journal on startup.
-    ///
-    /// Reads the checkpoint written by the last `commit()` call to find
-    /// `committed_seq`, then replays only Journal entries **after** that seq.
-    /// This ensures startup cost is O(uncommitted delta) regardless of total
-    /// data history — 1B quads committed = < 1s startup vs ~83 minutes previously.
-    ///
-    /// First-run (no checkpoint): falls back to replaying from seq=1.
-    pub async fn replay_from_journal(&self) {
-        // Load checkpoint; extract committed_seq and restore CommitDag heads.
-        let committed = if let Some(raw) = self.journal.read_checkpoint().await {
-            let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
-            let seq = value
-                .as_ref()
-                .and_then(|v| v["committed_seq"].as_u64())
-                .unwrap_or(0);
-            *self.committed_seq.write().await = seq;
-            tracing::info!(
-                committed_seq = seq,
-                "QuadStore: checkpoint found, replaying delta only"
-            );
-
-            // Restore CommitDag from checkpoint heads map.
-            if let Some(heads) = value.as_ref().and_then(|v| v["heads"].as_object()) {
-                let mut restored = 0usize;
-                for (_graph_mb, commit_mb) in heads {
-                    if let Some(commit_mb_str) = commit_mb.as_str() {
-                        if let Some(commit_cid) = KotobaCid::from_multibase(commit_mb_str) {
-                            match crate::commit::Commit::load(&commit_cid, &*self.block_store) {
-                                Ok(Some(commit)) => {
-                                    self.commit_dag.write().await.add(commit);
-                                    restored += 1;
-                                }
-                                Ok(None) => {
-                                    tracing::warn!(
-                                        commit_cid = %commit_cid,
-                                        "CommitDag restore: commit block not found in BlockStore"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        commit_cid = %commit_cid,
-                                        "CommitDag restore: failed to load commit: {e}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                tracing::info!(graphs = restored, "CommitDag restored from checkpoint");
-            }
-
-            seq
-        } else {
-            tracing::info!("QuadStore: no checkpoint, full WAL replay (first run)");
-            0
-        };
-
-        // Only load entries written after the last committed seq.
-        let entries = self.journal.read_since(committed + 1).await;
-        if entries.is_empty() {
-            return;
-        }
-
-        // (seq, journal entry CID as tx, is_assert, quad projection)
-        let mut ordered: Vec<(u64, KotobaCid, bool, Quad)> = Vec::new();
-
-        for entry in &entries {
-            let t = entry.topic.as_str();
-            // SPO assert topics: "/kotoba/quad/{graph}/..."
-            let is_assert = t.starts_with("/kotoba/quad/");
-            // Retract topics may appear with or without the normalized leading slash.
-            let is_retract = t.starts_with("kotoba/retract/") || t.starts_with("/kotoba/retract/");
-
-            if is_assert || is_retract {
-                if let Ok(quad) = serde_json::from_slice::<Quad>(&entry.payload) {
-                    ordered.push((entry.seq, entry.cid.clone(), is_assert, quad));
-                }
-            }
-        }
-
-        ordered.sort_unstable_by_key(|(seq, _, _, _)| *seq);
-        let total = ordered.len();
-
-        // Track which graphs the replay touched so we can re-evaluate their
-        // `hot_covers_all` flag once the full WAL has been loaded.
-        let mut replayed_graphs: std::collections::HashMap<String, KotobaCid> =
-            std::collections::HashMap::new();
-
-        for (_, tx_cid, is_assert, quad) in ordered {
-            let graph_cid = quad.graph.clone();
-            replayed_graphs
-                .entry(graph_cid.to_multibase())
-                .or_insert_with(|| graph_cid.clone());
-            let mut datom = Datom::from_legacy_quad(quad, is_assert);
-            datom.tx = tx_cid;
-            if is_assert {
-                self.assert_datom_silent(graph_cid, datom).await;
-            } else {
-                self.retract_datom_silent(graph_cid, datom).await;
-            }
-        }
-
-        // `assert_datom_silent`/`retract_datom_silent` conservatively mark
-        // `hot_covers_all = false` (replay may load only post-checkpoint delta on
-        // top of committed cold state). But when a graph has NO CommitDag head,
-        // the in-memory Arrangement is the *sole* source of its committed state —
-        // there is no cold ProllyTree to fall through to. In that case hot truly
-        // covers all committed datoms, so reads MUST (and may safely) be served
-        // from the hot index. Flip the flag to `true` for those graphs so the
-        // SPARQL hot-path activates instead of cold-scanning an empty/absent tree.
-        {
-            let dag = self.commit_dag.read().await;
-            for (key, graph_cid) in &replayed_graphs {
-                if dag.head(graph_cid).is_none() {
-                    self.hot_covers_all.insert(key.clone(), true);
-                }
-            }
-        }
-
-        tracing::info!(entries = total, "QuadStore WAL replay complete");
     }
 
     pub async fn arrangement(&self, graph_cid: &KotobaCid) -> Option<Arrangement> {
@@ -682,7 +559,7 @@ impl QuadStore {
                 .map(|arr| {
                     arr.get_subject_datoms(gcid, subject)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect()
                 })
                 .unwrap_or_default();
@@ -696,7 +573,7 @@ impl QuadStore {
             out.extend(
                 arr.get_subject_datoms(&gcid, subject)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad),
+                    .map(kotoba_query::Datom::into_legacy_quad),
             );
         }
         out
@@ -715,7 +592,7 @@ impl QuadStore {
                 .map(|arr| {
                     arr.datoms_with_attribute_prefix(gcid, prefix)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect()
                 })
                 .unwrap_or_default();
@@ -729,7 +606,7 @@ impl QuadStore {
             out.extend(
                 arr.datoms_with_attribute_prefix(&gcid, prefix)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad),
+                    .map(kotoba_query::Datom::into_legacy_quad),
             );
         }
         out
@@ -752,7 +629,7 @@ impl QuadStore {
     }
 
     /// Find subject CIDs where predicate = `predicate` and the object encodes to
-    /// the canonical AVET `value_key` (keycodec; see `avet_value_key`),
+    /// the canonical AVET `value_key` (keycodec; see [`avet_value_key`]),
     /// optionally within a named graph.
     pub async fn lookup_subject_by_po(
         &self,
@@ -800,7 +677,7 @@ impl QuadStore {
                     return Ok(arr
                         .get_subject_datoms(graph_cid, subject)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect());
                 }
             }
@@ -853,7 +730,7 @@ impl QuadStore {
                 let hot_quads = arr
                     .get_subject_datoms(graph_cid, subject)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad);
+                    .map(kotoba_query::Datom::into_legacy_quad);
                 let mut seen: std::collections::HashSet<(String, Vec<u8>)> = quads
                     .iter()
                     .map(|q| {
@@ -1025,7 +902,7 @@ impl QuadStore {
                     return Ok(arr
                         .datoms_with_attribute_prefix(graph_cid, predicate_prefix)
                         .into_iter()
-                        .map(kotoba_kqe::Datom::into_legacy_quad)
+                        .map(kotoba_query::Datom::into_legacy_quad)
                         .collect());
                 }
             }
@@ -1080,7 +957,7 @@ impl QuadStore {
                 let hot = arr
                     .datoms_with_attribute_prefix(graph_cid, predicate_prefix)
                     .into_iter()
-                    .map(kotoba_kqe::Datom::into_legacy_quad);
+                    .map(kotoba_query::Datom::into_legacy_quad);
                 let mut seen: std::collections::HashSet<(KotobaCid, String, Vec<u8>)> = quads
                     .iter()
                     .map(|q| {
@@ -1268,7 +1145,7 @@ impl QuadStore {
             for node in &frontier {
                 let quads = self.get_entity_quads_cold(graph_cid, node).await?;
                 for q in quads {
-                    if let kotoba_kqe::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
+                    if let kotoba_query::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
                         if depth < max_hops && visited.insert(ref_cid.clone()) {
                             next_frontier.push(ref_cid.clone());
                         }
@@ -1342,7 +1219,7 @@ impl QuadStore {
     /// looks it up in the BlockStore, and:
     ///   - hit  → deserialise and return cached `Vec<Quad>` (≈ µs, no compute)
     ///   - miss → run query, serialise result via dag-cbor, `put` under the
-    ///     computed CID, return live result
+    ///            computed CID, return live result
     ///
     /// This turns repeated identical queries against a sealed graph commit into
     /// content-addressed lookups — the same query against the same commit
@@ -1740,7 +1617,7 @@ impl QuadStore {
         for _hop in 0..max_hops {
             let mut next: Vec<KotobaCid> = Vec::new();
             for q in &result {
-                if let kotoba_kqe::quad::LegacyQuadObject::Cid(ref c) = q.object {
+                if let kotoba_query::quad::LegacyQuadObject::Cid(ref c) = q.object {
                     if visited.insert(c.clone()) {
                         next.push(c.clone());
                     }
@@ -1880,8 +1757,9 @@ impl QuadStore {
                 let mut results = left_quads;
                 for q in right_quads {
                     if left_subjects.contains(&q.subject.to_multibase()) {
-                        let passes_expr =
-                            expression.as_ref().is_none_or(|e| eval_filter_expr(e, &q));
+                        let passes_expr = expression
+                            .as_ref()
+                            .map_or(true, |e| eval_filter_expr(e, &q));
                         if passes_expr && !results.iter().any(|r| quad_eq(r, &q)) {
                             results.push(q);
                         }
@@ -1935,8 +1813,10 @@ impl QuadStore {
                     let mut all_allowed: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     for row in bindings {
-                        for gt in row.iter().flatten() {
-                            all_allowed.insert(ground_term_to_str(gt));
+                        for val_opt in row {
+                            if let Some(gt) = val_opt {
+                                all_allowed.insert(ground_term_to_str(gt));
+                            }
                         }
                     }
                     let right_inner = unwrap_bgp_pattern(*right.clone());
@@ -1947,7 +1827,7 @@ impl QuadStore {
                         .into_iter()
                         .filter(|q| {
                             match &q.object {
-                                kotoba_kqe::quad::LegacyQuadObject::Text(t) => {
+                                kotoba_query::quad::LegacyQuadObject::Text(t) => {
                                     all_allowed.contains(t.as_str())
                                 }
                                 // Non-text objects (CID references, etc.) are not constrained
@@ -2031,22 +1911,24 @@ impl QuadStore {
                         "*".to_string()
                     } else {
                         match &q.object {
-                            kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
-                            kotoba_kqe::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
-                            kotoba_kqe::quad::LegacyQuadObject::Integer(i) => i.to_string(),
-                            kotoba_kqe::quad::LegacyQuadObject::Float(f) => format!("{f}"),
-                            kotoba_kqe::quad::LegacyQuadObject::Bool(b) => b.to_string(),
-                            kotoba_kqe::quad::LegacyQuadObject::Bytes(v) => {
+                            kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
+                            kotoba_query::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
+                            kotoba_query::quad::LegacyQuadObject::Integer(i) => i.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Float(f) => format!("{f}"),
+                            kotoba_query::quad::LegacyQuadObject::Bool(b) => b.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Bytes(v) => {
                                 format!("bytes:{}", v.len())
                             }
-                            kotoba_kqe::quad::LegacyQuadObject::VectorF32(v) => {
+                            kotoba_query::quad::LegacyQuadObject::VectorF32(v) => {
                                 format!("vec:{}", v.len())
                             }
-                            kotoba_kqe::quad::LegacyQuadObject::TensorCid { cid, .. } => {
+                            kotoba_query::quad::LegacyQuadObject::TensorCid { cid, .. } => {
                                 cid.to_multibase()
                             }
-                            kotoba_kqe::quad::LegacyQuadObject::Encrypted { ct_cid, .. }
-                            | kotoba_kqe::quad::LegacyQuadObject::Enveloped { ct_cid, .. } => {
+                            kotoba_query::quad::LegacyQuadObject::Encrypted { ct_cid, .. } => {
+                                ct_cid.to_multibase()
+                            }
+                            kotoba_query::quad::LegacyQuadObject::Enveloped { ct_cid, .. } => {
                                 ct_cid.to_multibase()
                             }
                         }
@@ -2061,7 +1943,7 @@ impl QuadStore {
                     let text_vals: Vec<&str> = members
                         .iter()
                         .filter_map(|q| {
-                            if let kotoba_kqe::quad::LegacyQuadObject::Text(t) = &q.object {
+                            if let kotoba_query::quad::LegacyQuadObject::Text(t) = &q.object {
                                 Some(t.as_str())
                             } else {
                                 None
@@ -2135,17 +2017,17 @@ impl QuadStore {
                         graph: graph_cid.clone(),
                         subject: KotobaCid::from_bytes(key.as_bytes()),
                         predicate: agg_var.to_string(),
-                        object: kotoba_kqe::quad::LegacyQuadObject::Text(agg_str),
+                        object: kotoba_query::quad::LegacyQuadObject::Text(agg_str),
                     });
                 }
                 // Sort by numeric value descending for stable output (fallback to string order)
                 results.sort_by(|a, b| {
-                    let va = if let kotoba_kqe::quad::LegacyQuadObject::Text(t) = &a.object {
+                    let va = if let kotoba_query::quad::LegacyQuadObject::Text(t) = &a.object {
                         t.parse::<u64>().unwrap_or(0)
                     } else {
                         0
                     };
-                    let vb = if let kotoba_kqe::quad::LegacyQuadObject::Text(t) = &b.object {
+                    let vb = if let kotoba_query::quad::LegacyQuadObject::Text(t) = &b.object {
                         t.parse::<u64>().unwrap_or(0)
                     } else {
                         0
@@ -2203,7 +2085,7 @@ impl QuadStore {
                                 graph: graph_cid.clone(),
                                 subject: KotobaCid::from_bytes(val_str.as_bytes()),
                                 predicate: var.as_str().to_string(),
-                                object: kotoba_kqe::quad::LegacyQuadObject::Text(val_str),
+                                object: kotoba_query::quad::LegacyQuadObject::Text(val_str),
                             });
                         }
                     }
@@ -2223,11 +2105,11 @@ impl QuadStore {
                     .unwrap_or(false);
                 quads.sort_by(|a, b| {
                     let av = match &a.object {
-                        kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
+                        kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
                         _ => String::new(),
                     };
                     let bv = match &b.object {
-                        kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
+                        kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
                         _ => String::new(),
                     };
                     if descending {
@@ -2272,11 +2154,11 @@ impl QuadStore {
                     .into_iter()
                     .filter(|q| {
                         let obj_key = match &q.object {
-                            kotoba_kqe::quad::LegacyQuadObject::Text(t) => t.clone(),
-                            kotoba_kqe::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
-                            kotoba_kqe::quad::LegacyQuadObject::Integer(i) => i.to_string(),
-                            kotoba_kqe::quad::LegacyQuadObject::Float(f) => format!("{f}"),
-                            kotoba_kqe::quad::LegacyQuadObject::Bool(b) => b.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Text(t) => t.clone(),
+                            kotoba_query::quad::LegacyQuadObject::Cid(c) => c.to_multibase(),
+                            kotoba_query::quad::LegacyQuadObject::Integer(i) => i.to_string(),
+                            kotoba_query::quad::LegacyQuadObject::Float(f) => format!("{f}"),
+                            kotoba_query::quad::LegacyQuadObject::Bool(b) => b.to_string(),
                             _ => format!("__opaque_{}_{}", q.subject.to_multibase(), q.predicate),
                         };
                         seen.insert(format!(
@@ -2491,7 +2373,7 @@ impl QuadStore {
                     .into_iter()
                     .filter_map(|q| {
                         if q.predicate == pred_a {
-                            if let kotoba_kqe::quad::LegacyQuadObject::Cid(c) = q.object {
+                            if let kotoba_query::quad::LegacyQuadObject::Cid(c) = q.object {
                                 Some(c)
                             } else {
                                 None
@@ -2534,7 +2416,7 @@ impl QuadStore {
                 // Use AEVT scan with predicate prefix; filter by object == start_cid
                 let all = self.quads_by_predicate_prefix_cold(graph_cid, pred).await?;
                 Ok(all.into_iter().filter(|q| {
-                    matches!(&q.object, kotoba_kqe::quad::LegacyQuadObject::Cid(c) if *c == start_cid)
+                    matches!(&q.object, kotoba_query::quad::LegacyQuadObject::Cid(c) if *c == start_cid)
                 }).collect())
             }
 
@@ -2548,7 +2430,7 @@ impl QuadStore {
                 let mut results: Vec<Quad> = own.clone();
                 for q in &own {
                     if q.predicate == pred {
-                        if let kotoba_kqe::quad::LegacyQuadObject::Cid(target) = &q.object {
+                        if let kotoba_query::quad::LegacyQuadObject::Cid(target) = &q.object {
                             let hop = self.get_entity_quads_cold(graph_cid, target).await?;
                             for hq in hop {
                                 if !results.iter().any(|r| quad_eq(r, &hq)) {
@@ -2593,7 +2475,7 @@ impl QuadStore {
                     if q.predicate != predicate {
                         continue;
                     }
-                    if let kotoba_kqe::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
+                    if let kotoba_query::quad::LegacyQuadObject::Cid(ref ref_cid) = q.object {
                         if visited.insert(ref_cid.clone()) {
                             next_frontier.push(ref_cid.clone());
                         }
@@ -2642,14 +2524,14 @@ impl QuadStore {
                             Ok(pred_filtered
                                 .into_iter()
                                 .filter(|q| match &q.object {
-                                    kotoba_kqe::quad::LegacyQuadObject::Text(t) => t == v,
-                                    kotoba_kqe::quad::LegacyQuadObject::Integer(i) => {
-                                        v.parse::<i64>() == Ok(*i)
+                                    kotoba_query::quad::LegacyQuadObject::Text(t) => t == v,
+                                    kotoba_query::quad::LegacyQuadObject::Integer(i) => {
+                                        v.parse::<i64>().map_or(false, |n| *i == n)
                                     }
-                                    kotoba_kqe::quad::LegacyQuadObject::Float(f) => v
+                                    kotoba_query::quad::LegacyQuadObject::Float(f) => v
                                         .parse::<f64>()
-                                        .is_ok_and(|n| (*f - n).abs() < f64::EPSILON),
-                                    kotoba_kqe::quad::LegacyQuadObject::Bool(b) => {
+                                        .map_or(false, |n| (*f - n).abs() < f64::EPSILON),
+                                    kotoba_query::quad::LegacyQuadObject::Bool(b) => {
                                         v == "true" && *b || v == "false" && !b
                                     }
                                     _ => false,
@@ -2660,12 +2542,12 @@ impl QuadStore {
                             let obj_iri = strip_bgp_base(obj_nn.as_str());
                             if let Some(obj_cid) = parse_cid_iri(obj_iri) {
                                 Ok(pred_filtered.into_iter().filter(|q| {
-                                    matches!(&q.object, kotoba_kqe::quad::LegacyQuadObject::Cid(c) if *c == obj_cid)
+                                    matches!(&q.object, kotoba_query::quad::LegacyQuadObject::Cid(c) if *c == obj_cid)
                                 }).collect())
                             } else {
                                 // Named node that's not a CID — compare as text
                                 Ok(pred_filtered.into_iter().filter(|q| {
-                                    matches!(&q.object, kotoba_kqe::quad::LegacyQuadObject::Text(t) if t == obj_iri)
+                                    matches!(&q.object, kotoba_query::quad::LegacyQuadObject::Text(t) if t == obj_iri)
                                 }).collect())
                             }
                         }
@@ -2704,7 +2586,7 @@ impl QuadStore {
                         let obj_iri = strip_bgp_base(obj_nn.as_str());
                         if let Some(obj_cid) = parse_cid_iri(obj_iri) {
                             // AVET: pred + cid-object
-                            let vk = avet_value_key(&kotoba_kqe::quad::LegacyQuadObject::Cid(
+                            let vk = avet_value_key(&kotoba_query::quad::LegacyQuadObject::Cid(
                                 obj_cid.clone(),
                             ));
                             let subjects = self
@@ -2716,7 +2598,7 @@ impl QuadStore {
                                     graph: graph_cid.clone(),
                                     subject: s,
                                     predicate: pred.clone(),
-                                    object: kotoba_kqe::quad::LegacyQuadObject::Cid(
+                                    object: kotoba_query::quad::LegacyQuadObject::Cid(
                                         obj_cid.clone(),
                                     ),
                                 })
@@ -2743,7 +2625,7 @@ impl QuadStore {
                             graph: graph_cid.clone(),
                             subject: subj,
                             predicate: pred,
-                            object: kotoba_kqe::quad::LegacyQuadObject::Cid(obj_cid.clone()),
+                            object: kotoba_query::quad::LegacyQuadObject::Cid(obj_cid.clone()),
                         })
                         .collect());
                 }
@@ -2768,13 +2650,13 @@ impl QuadStore {
                             graph: graph_cid.clone(),
                             subject: s.clone(),
                             predicate: pred1.clone(),
-                            object: kotoba_kqe::quad::LegacyQuadObject::Text(val1.clone()),
+                            object: kotoba_query::quad::LegacyQuadObject::Text(val1.clone()),
                         });
                         out.push(Quad {
                             graph: graph_cid.clone(),
                             subject: s,
                             predicate: pred2.clone(),
-                            object: kotoba_kqe::quad::LegacyQuadObject::Text(val2.clone()),
+                            object: kotoba_query::quad::LegacyQuadObject::Text(val2.clone()),
                         });
                     }
                     return Ok(out);
@@ -3466,7 +3348,7 @@ impl QuadStore {
             all_blocks.extend(blocks);
         }
         let mut roots_by_name = std::collections::HashMap::new();
-        for (name, root) in input_names.into_iter().zip(roots) {
+        for (name, root) in input_names.into_iter().zip(roots.into_iter()) {
             roots_by_name.insert(name.to_string(), root);
         }
         let root_eavt = roots_by_name
@@ -3533,22 +3415,9 @@ impl QuadStore {
         self.commit_dag.write().await.add(commit);
         self.pending_datoms.remove(&graph_key);
 
-        // ── Checkpoint ────────────────────────────────────────────────────────────
-        // Record committed_seq (the JOURNAL's current seq, not the user-provided
-        // commit-seq) + CommitDag heads as a tiny JSON blob in the Journal store.
-        // On the next startup replay_from_journal() will skip all Journal entries
-        // ≤ this seq — reducing startup cost from O(all history) to O(delta) and
-        // preventing already-committed quads from being re-loaded into the hot
-        // arrangement (which would shadow the ProllyTree cold path).
+        // Trim the live-tail ring buffer (in-process memory free). Durable state
+        // is the CommitDag; there is no checkpoint/WAL to record.
         let journal_seq = self.journal.current_seq().await;
-        *self.committed_seq.write().await = journal_seq;
-        {
-            let heads = self.commit_dag.read().await.heads_as_map();
-            let cp = serde_json::json!({ "committed_seq": journal_seq, "heads": heads });
-            let bytes = bytes::Bytes::from(cp.to_string().into_bytes());
-            self.journal.write_checkpoint(bytes).await;
-        }
-        // Trim ring buffer (in-process memory free).
         self.journal.trim_before(journal_seq).await;
         // Trim persistent seq-index in B2 (fire-and-forget; old seq keys deleted).
         {
@@ -3695,28 +3564,28 @@ fn quad_eq(a: &Quad, b: &Quad) -> bool {
         && a.predicate == b.predicate
         && match (&a.object, &b.object) {
             (
-                kotoba_kqe::quad::LegacyQuadObject::Text(at),
-                kotoba_kqe::quad::LegacyQuadObject::Text(bt),
+                kotoba_query::quad::LegacyQuadObject::Text(at),
+                kotoba_query::quad::LegacyQuadObject::Text(bt),
             ) => at == bt,
             (
-                kotoba_kqe::quad::LegacyQuadObject::Cid(ac),
-                kotoba_kqe::quad::LegacyQuadObject::Cid(bc),
+                kotoba_query::quad::LegacyQuadObject::Cid(ac),
+                kotoba_query::quad::LegacyQuadObject::Cid(bc),
             ) => ac == bc,
             _ => false,
         }
 }
 
-// Evaluate a SPARQL FILTER expression against a single Quad.
-//
-// The expression operates on the quad's `object` field as the bound variable value.
-// Supported expression types:
-//   - `Not(expr)`                        → `!eval(expr, quad)`
-//   - `Equal(Variable(_), Literal(v))`   → `quad.object.as_text() == v`
-//   - `NotEqual(...)`                    → `quad.object.as_text() != v`
-//   - `Or(a, b)`                         → `eval(a) || eval(b)`
-//   - `And(a, b)`                        → `eval(a) && eval(b)`
-//   - `FunctionCall(Contains, [_, lit])` → `quad.object.as_text().contains(v)`
-//   - `Exists` / other                   → `true` (pass through)
+/// Evaluate a SPARQL FILTER expression against a single Quad.
+///
+/// The expression operates on the quad's `object` field as the bound variable value.
+/// Supported expression types:
+///   - `Not(expr)`                        → `!eval(expr, quad)`
+///   - `Equal(Variable(_), Literal(v))`   → `quad.object.as_text() == v`
+///   - `NotEqual(...)`                    → `quad.object.as_text() != v`
+///   - `Or(a, b)`                         → `eval(a) || eval(b)`
+///   - `And(a, b)`                        → `eval(a) && eval(b)`
+///   - `FunctionCall(Contains, [_, lit])` → `quad.object.as_text().contains(v)`
+///   - `Exists` / other                   → `true` (pass through)
 // ── SPARQL UPDATE helpers ────────────────────────────────────────────────────
 
 fn sparql_graph_name_to_cid(
@@ -3742,7 +3611,7 @@ fn sparql_named_node_to_cid(iri: &str) -> anyhow::Result<KotobaCid> {
 
 fn sparql_term_to_quad_object(
     term: &spargebra::term::Term,
-) -> anyhow::Result<kotoba_kqe::quad::LegacyQuadObject> {
+) -> anyhow::Result<kotoba_query::quad::LegacyQuadObject> {
     use spargebra::term::Term;
     match term {
         // Same typing as the AVET query path (`typed_literal_object`) so stored
@@ -3751,8 +3620,8 @@ fn sparql_term_to_quad_object(
         Term::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => Ok(kotoba_kqe::quad::LegacyQuadObject::Cid(c)),
-                None => Ok(kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string())),
+                Some(c) => Ok(kotoba_query::quad::LegacyQuadObject::Cid(c)),
+                None => Ok(kotoba_query::quad::LegacyQuadObject::Text(s.to_string())),
             }
         }
         Term::BlankNode(_) => anyhow::bail!("UPDATE: blank node objects are not supported"),
@@ -3761,27 +3630,27 @@ fn sparql_term_to_quad_object(
 
 fn sparql_term_to_quad_object_ground(
     term: &spargebra::term::GroundTerm,
-) -> anyhow::Result<kotoba_kqe::quad::LegacyQuadObject> {
+) -> anyhow::Result<kotoba_query::quad::LegacyQuadObject> {
     use spargebra::term::GroundTerm;
     match term {
         GroundTerm::Literal(lit) => {
             let v = lit.value();
             if let Ok(i) = v.parse::<i64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Integer(i));
+                return Ok(kotoba_query::quad::LegacyQuadObject::Integer(i));
             }
             if let Ok(f) = v.parse::<f64>() {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Float(f));
+                return Ok(kotoba_query::quad::LegacyQuadObject::Float(f));
             }
             if v == "true" || v == "false" {
-                return Ok(kotoba_kqe::quad::LegacyQuadObject::Bool(v == "true"));
+                return Ok(kotoba_query::quad::LegacyQuadObject::Bool(v == "true"));
             }
-            Ok(kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string()))
+            Ok(kotoba_query::quad::LegacyQuadObject::Text(v.to_string()))
         }
         GroundTerm::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => Ok(kotoba_kqe::quad::LegacyQuadObject::Cid(c)),
-                None => Ok(kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string())),
+                Some(c) => Ok(kotoba_query::quad::LegacyQuadObject::Cid(c)),
+                None => Ok(kotoba_query::quad::LegacyQuadObject::Text(s.to_string())),
             }
         }
     }
@@ -3792,7 +3661,7 @@ fn eval_filter_expr(expr: &spargebra::algebra::Expression, quad: &Quad) -> bool 
     use spargebra::algebra::Function;
 
     let obj_text = match &quad.object {
-        kotoba_kqe::quad::LegacyQuadObject::Text(t) => Some(t.as_str()),
+        kotoba_query::quad::LegacyQuadObject::Text(t) => Some(t.as_str()),
         _ => None,
     };
 
@@ -3803,7 +3672,7 @@ fn eval_filter_expr(expr: &spargebra::algebra::Expression, quad: &Quad) -> bool 
 
         Expression::Equal(left, right) => extract_literal_from_expr(left, right)
             .or_else(|| extract_literal_from_expr(right, left))
-            .is_none_or(|v| obj_text == Some(v.as_str())),
+            .map_or(true, |v| obj_text.map_or(false, |t| t == v.as_str())),
         Expression::Greater(left, right) => {
             if let (Some(obj), Some(v)) = (
                 obj_text,
@@ -3854,14 +3723,16 @@ fn eval_filter_expr(expr: &spargebra::algebra::Expression, quad: &Quad) -> bool 
                 Expression::Literal(lit) => Some(lit.value().to_string()),
                 _ => None,
             };
-            substring.is_none_or(|v| obj_text.is_some_and(|t| t.contains(v.as_str())))
+            substring.map_or(true, |v| obj_text.map_or(false, |t| t.contains(v.as_str())))
         }
         Expression::FunctionCall(Function::StrStarts, args) if args.len() == 2 => {
             let prefix = match &args[1] {
                 Expression::Literal(lit) => Some(lit.value().to_string()),
                 _ => None,
             };
-            prefix.is_none_or(|v| obj_text.is_some_and(|t| t.starts_with(v.as_str())))
+            prefix.map_or(true, |v| {
+                obj_text.map_or(false, |t| t.starts_with(v.as_str()))
+            })
         }
 
         // Unknown / unsupported expressions: pass-through (don't discard results)
@@ -3990,22 +3861,22 @@ fn instantiate_quad_pattern(
         TermPattern::Literal(lit) => {
             let v = lit.value();
             if let Ok(i) = v.parse::<i64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Integer(i)
+                kotoba_query::quad::LegacyQuadObject::Integer(i)
             } else if let Ok(f) = v.parse::<f64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Float(f)
+                kotoba_query::quad::LegacyQuadObject::Float(f)
             } else if v == "true" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(true)
+                kotoba_query::quad::LegacyQuadObject::Bool(true)
             } else if v == "false" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(false)
+                kotoba_query::quad::LegacyQuadObject::Bool(false)
             } else {
-                kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string())
+                kotoba_query::quad::LegacyQuadObject::Text(v.to_string())
             }
         }
         TermPattern::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => kotoba_kqe::quad::LegacyQuadObject::Cid(c),
-                None => kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string()),
+                Some(c) => kotoba_query::quad::LegacyQuadObject::Cid(c),
+                None => kotoba_query::quad::LegacyQuadObject::Text(s.to_string()),
             }
         }
         _ => return None,
@@ -4042,22 +3913,22 @@ fn instantiate_ground_quad_pattern(
         GroundTermPattern::Literal(lit) => {
             let v = lit.value();
             if let Ok(i) = v.parse::<i64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Integer(i)
+                kotoba_query::quad::LegacyQuadObject::Integer(i)
             } else if let Ok(f) = v.parse::<f64>() {
-                kotoba_kqe::quad::LegacyQuadObject::Float(f)
+                kotoba_query::quad::LegacyQuadObject::Float(f)
             } else if v == "true" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(true)
+                kotoba_query::quad::LegacyQuadObject::Bool(true)
             } else if v == "false" {
-                kotoba_kqe::quad::LegacyQuadObject::Bool(false)
+                kotoba_query::quad::LegacyQuadObject::Bool(false)
             } else {
-                kotoba_kqe::quad::LegacyQuadObject::Text(v.to_string())
+                kotoba_query::quad::LegacyQuadObject::Text(v.to_string())
             }
         }
         GroundTermPattern::NamedNode(nn) => {
             let s = strip_bgp_base(nn.as_str());
             match KotobaCid::from_multibase(s) {
-                Some(c) => kotoba_kqe::quad::LegacyQuadObject::Cid(c),
-                None => kotoba_kqe::quad::LegacyQuadObject::Text(s.to_string()),
+                Some(c) => kotoba_query::quad::LegacyQuadObject::Cid(c),
+                None => kotoba_query::quad::LegacyQuadObject::Text(s.to_string()),
             }
         }
         #[allow(unreachable_patterns)]
@@ -4121,7 +3992,7 @@ fn enc_object(o: &LegacyQuadObject) -> Vec<u8> {
 /// (ADR-2606022150 D2 / P2b). Both the hot point lookup and the cold scan prefix
 /// route through this.
 fn avet_value_key(object: &LegacyQuadObject) -> Vec<u8> {
-    kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::from(object.clone()))
+    kotoba_query::keycodec::value_key(&kotoba_query::Value::from(object.clone()))
 }
 
 /// Type a SPARQL literal value string into a `LegacyQuadObject` exactly as the
@@ -4171,9 +4042,9 @@ mod tests {
     // The test bodies refer to the object enum by its short name `QuadObject`
     // (the lib historically re-exported it under that alias). Keep the alias so
     // the test module compiles against the renamed `LegacyQuadObject`.
-    use kotoba_kqe::quad::LegacyQuadObject as QuadObject;
-    use kotoba_kse::Journal;
+    use kotoba_query::quad::LegacyQuadObject as QuadObject;
     use kotoba_store::MemoryBlockStore;
+    use kotoba_vault::LiveBus;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A `BlockStore` decorator that counts the bytes returned by `get()` — used
@@ -4240,7 +4111,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_creates_persistent_block() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4263,7 +4134,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_persists_datom_index_roots_and_distinct_tx() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4310,7 +4181,7 @@ mod tests {
         // Commit `delta` fresh datoms onto a graph pre-seeded with `base` datoms,
         // returning the bytes read from the block store during that commit only.
         async fn measure_commit(base: u64, delta: u64) -> u64 {
-            let journal = Arc::new(Journal::new());
+            let journal = Arc::new(LiveBus::new());
             let store = Arc::new(CountingBlockStore::new());
             let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&store) as _);
             let graph = KotobaCid::from_bytes(b"delta-scale-graph");
@@ -4383,7 +4254,7 @@ mod tests {
 
     #[tokio::test]
     async fn incremental_commit_datom_roots_match_full_rebuild() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"incr-eq-graph");
@@ -4544,7 +4415,7 @@ mod tests {
 
     #[tokio::test]
     async fn datom_cold_reads_use_datom_eavt_and_tea_roots() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4581,7 +4452,7 @@ mod tests {
 
     #[tokio::test]
     async fn datom_graph_store_reads_current_without_quad_projection() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let store = DatomGraphStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4643,7 +4514,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_persists_retract_tombstones_in_tea_history() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4672,7 +4543,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_returns_full_chain_for_fresh_agent() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"graph-since");
@@ -4694,7 +4565,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_returns_only_new_commits() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"graph-partial");
@@ -4715,7 +4586,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_returns_empty_when_up_to_date() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"graph-uptodate");
@@ -4729,7 +4600,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_chain_links_prev() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4749,7 +4620,7 @@ mod tests {
     /// quads for a specific subject from the committed EAVT ProllyTree.
     #[tokio::test]
     async fn cold_fallback_returns_committed_quads_after_arrangement_clear() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4781,7 +4652,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_dead_blocks_removes_orphaned_blocks_and_keeps_live() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"gc-graph");
@@ -4826,7 +4697,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_old_commits_removes_historical_keeps_head() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"prune-graph");
@@ -4854,7 +4725,7 @@ mod tests {
 
     #[tokio::test]
     async fn arrangement_unknown_graph_returns_none() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"never-asserted");
@@ -4863,7 +4734,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_commit_unknown_graph_returns_none() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"no-commits-here");
@@ -4872,7 +4743,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_dag_size_is_zero_initially() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         assert_eq!(qs.commit_dag_size().await, 0);
@@ -4880,7 +4751,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_by_predicate_prefix_unknown_graph_returns_zero() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"no-graph");
@@ -4893,7 +4764,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_deltas_unknown_graph_returns_empty() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"empty-graph");
@@ -4903,7 +4774,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_empty_when_no_commits() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"empty-dag-graph");
@@ -4922,7 +4793,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_hop_cold_follows_cid_references() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4968,7 +4839,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_hop_cold_max_hops_zero_returns_only_start() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4992,7 +4863,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_by_two_predicates_cold_returns_intersection() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -5042,7 +4913,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_by_two_predicates_cold_empty_when_no_overlap() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -5075,7 +4946,7 @@ mod tests {
         pred: &str,
         val: &str,
     ) -> (QuadStore, KotobaCid, KotobaCid) {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let bs = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&bs) as _);
         let g = make_cid_from(graph_key);
@@ -5185,7 +5056,7 @@ mod tests {
     #[tokio::test]
     async fn batch_authed_rejected_wrong_capability() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"batch-authed-g1");
@@ -5209,7 +5080,7 @@ mod tests {
     #[tokio::test]
     async fn batch_authed_rejected_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"batch-authed-g2");
@@ -5233,7 +5104,7 @@ mod tests {
     #[tokio::test]
     async fn batch_authed_succeeds_writes_quads() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"batch-authed-g3");
@@ -5277,7 +5148,7 @@ mod tests {
         // Batch spanning two named graphs: chain scoped to graph A only →
         // quad from graph B must cause rejection.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"batch-multi-g-a");
@@ -5309,7 +5180,7 @@ mod tests {
     #[tokio::test]
     async fn datom_authed_rejected_wrong_capability() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-authed-g1");
@@ -5332,7 +5203,7 @@ mod tests {
     #[tokio::test]
     async fn datom_authed_rejected_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-authed-g2");
@@ -5356,7 +5227,7 @@ mod tests {
     #[tokio::test]
     async fn datom_graph_store_authed_write_uses_datom_scope() {
         let store = DatomGraphStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-authed-g3");
@@ -5388,7 +5259,7 @@ mod tests {
     #[tokio::test]
     async fn datom_batch_authed_rejected_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-batch-g1");
@@ -5411,7 +5282,7 @@ mod tests {
     #[tokio::test]
     async fn datom_graph_store_batch_authed_uses_datom_scope() {
         let store = DatomGraphStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-batch-g2");
@@ -5443,7 +5314,7 @@ mod tests {
 
     async fn setup_sparql_qs() -> (QuadStore, KotobaCid) {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"sparql-bgp-graph");
@@ -5709,7 +5580,7 @@ mod tests {
     async fn sparql_graph_variable_multi_graph_returns_all() {
         // Two committed graphs; GRAPH ?g { ?s <role> "admin" } returns quads from both.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"multi-graph-a");
@@ -5755,7 +5626,7 @@ mod tests {
     async fn sparql_graph_variable_with_real_eddsa_cacao() {
         // Real EdDSA CACAO + GRAPH ?g { ?s <role> "admin" } spanning two graphs
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"cacao-graph-a");
@@ -5830,7 +5701,7 @@ mod tests {
     async fn sparql_distinct_cross_graph() {
         // GRAPH ?g + DISTINCT: cross-graph deduplication by (s, p, o) ignoring graph CID
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let ga = KotobaCid::from_bytes(b"dist-graph-a");
@@ -5912,7 +5783,7 @@ mod tests {
         // CACAO authorizes graph_a only; GRAPH ?g returns quads from graph_a+graph_b
         // → multi-graph-authed should filter to graph_a only
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"multi-auth-a");
@@ -5952,7 +5823,7 @@ mod tests {
     async fn sparql_multi_graph_cacao_two_graphs_authorized() {
         // CACAO with two kotoba://graph/ resources → both graphs accessible
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"two-auth-a");
@@ -6137,7 +6008,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_authed_allowed() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"authed-write-graph");
@@ -6156,7 +6027,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_authed_denied_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"target-graph");
@@ -6175,7 +6046,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_authed_denied_wrong_capability() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"read-only-graph");
@@ -6537,7 +6408,7 @@ mod tests {
     async fn sparql_aggregate_sum_numeric() {
         // Insert numeric score quads and verify SUM
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"agg-sum-graph");
@@ -6573,7 +6444,7 @@ mod tests {
     async fn sparql_aggregate_avg_numeric() {
         // Insert numeric score quads and verify AVG
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"agg-avg-graph");
@@ -6609,7 +6480,7 @@ mod tests {
     async fn sparql_aggregate_min_numeric() {
         // Numeric MIN: ensure cmp_values numeric comparison is used (not lexicographic)
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"agg-min-num-graph");
@@ -6648,7 +6519,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_insert_data() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"update-test-graph");
@@ -6686,7 +6557,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_insert_numeric_then_select_by_literal_matches() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"numeric-avet-graph");
@@ -6719,7 +6590,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_delete_data() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"update-delete-graph");
@@ -6770,7 +6641,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_insert_named_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let default_graph = KotobaCid::from_bytes(b"ng-default");
@@ -6815,7 +6686,7 @@ mod tests {
         let alice = KotobaCid::from_bytes(b"alice");
         let alice_mb = alice.to_multibase();
 
-        let sparql = r#"INSERT { ?s <verified> "yes" } WHERE { ?s <role> "admin" }"#.to_string();
+        let sparql = format!(r#"INSERT {{ ?s <verified> "yes" }} WHERE {{ ?s <role> "admin" }}"#);
         let count = qs.sparql_update(&graph, &sparql).await.unwrap();
         assert_eq!(count, 2, "2 admin subjects → 2 inserts");
 
@@ -6837,7 +6708,7 @@ mod tests {
         // DELETE { ?s <role> ?r } WHERE { ?s <role> ?r . FILTER(?r = "user") }
         // Uses hot-only store (no commit/reset) so retract() removes from hot arrangement.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"del-where-graph");
@@ -7208,7 +7079,7 @@ mod tests {
         let bob_cid = KotobaCid::from_bytes(b"bob");
         assert_eq!(
             quads[0].object,
-            kotoba_kqe::quad::LegacyQuadObject::Cid(bob_cid),
+            kotoba_query::quad::LegacyQuadObject::Cid(bob_cid),
         );
     }
 
@@ -7302,7 +7173,7 @@ mod tests {
         // Node A (peer): commits quads to its own MemoryBlockStore.
         let peer_bs = Arc::new(MemoryBlockStore::new());
         let peer_qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::clone(&peer_bs) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
         let graph = make_cid_from("import-g");
@@ -7328,7 +7199,7 @@ mod tests {
 
         // Node B: no quads, no commit — only the replicated blocks.
         let qs_b = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::clone(&local_b) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
         assert!(
@@ -7360,7 +7231,7 @@ mod tests {
         // Get a real commit CID from a peer.
         let peer_bs = Arc::new(MemoryBlockStore::new());
         let peer_qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::clone(&peer_bs) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
         let graph = make_cid_from("import-miss-g");
@@ -7376,7 +7247,7 @@ mod tests {
 
         // Node B has an empty store — commit block not present.
         let qs_b = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new())
                 as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
@@ -7662,7 +7533,7 @@ mod tests {
     async fn setup_two_graph_qs() -> (QuadStore, KotobaCid, KotobaCid) {
         // Two graphs, each with role triples; SERVICE federates from one to the other.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g1 = KotobaCid::from_bytes(b"svc-graph-1");
@@ -7800,7 +7671,7 @@ mod tests {
     /// + each entity has a name quad.
     async fn setup_chain_qs() -> (QuadStore, KotobaCid, [KotobaCid; 4]) {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"nhop-graph");
@@ -8061,86 +7932,10 @@ mod tests {
         );
     }
 
-    // ─── Crash recovery via WAL replay ─────────────────────────────────────────
-
-    #[tokio::test]
-    async fn crash_recovery_committed_data_survives_journal_replay() {
-        // Scenario: store A asserts + commits → write checkpoint.  A is dropped.
-        // Store B is brought up against the SAME BlockStore + Journal head_path.
-        // After replay_from_journal it must serve the committed data via cold query.
-        let dir = tempfile::tempdir().unwrap();
-        let head_path = dir.path().join("journal_head.json");
-        let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(MemoryBlockStore::new());
-
-        let graph = KotobaCid::from_bytes(b"crash-recovery-graph");
-        let alice = KotobaCid::from_bytes(b"crash-alice");
-        let bob = KotobaCid::from_bytes(b"crash-bob");
-
-        // --- Instance A: insert + commit ---
-        {
-            let journal_a = Arc::new(Journal::with_block_store(
-                Arc::clone(&block_store),
-                head_path.clone(),
-            ));
-            let qs_a = QuadStore::new(Arc::clone(&journal_a), Arc::clone(&block_store));
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: alice.clone(),
-                predicate: "name".into(),
-                object: QuadObject::Text("Alice".into()),
-            })
-            .await;
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: alice.clone(),
-                predicate: "role".into(),
-                object: QuadObject::Text("admin".into()),
-            })
-            .await;
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: bob.clone(),
-                predicate: "role".into(),
-                object: QuadObject::Text("user".into()),
-            })
-            .await;
-            qs_a.commit("did:test", graph.clone(), 1).await.unwrap();
-            // A goes out of scope — simulates process crash AFTER commit
-        }
-
-        // --- Instance B: reopen against same store + journal head_path ---
-        let journal_b = Arc::new(Journal::with_block_store(
-            Arc::clone(&block_store),
-            head_path.clone(),
-        ));
-        let qs_b = QuadStore::new(Arc::clone(&journal_b), Arc::clone(&block_store));
-        qs_b.replay_from_journal().await;
-
-        // Verify committed quads are queryable via cold path
-        let quads = qs_b
-            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <role> ?r }"#)
-            .await
-            .unwrap();
-        assert_eq!(
-            quads.len(),
-            2,
-            "2 role quads must survive crash, got {}",
-            quads.len()
-        );
-
-        let entity_quads = qs_b.get_entity_quads_cold(&graph, &alice).await.unwrap();
-        assert_eq!(
-            entity_quads.len(),
-            2,
-            "Alice's name + role survive, got {}",
-            entity_quads.len()
-        );
-    }
-
     #[tokio::test]
     async fn crash_recovery_without_journal_replay_via_commit_dag() {
         // ADR-2606041151 A — validates the journal-removal safety gate: with the
-        // Journal WAL OFF (KOTOBA_JOURNAL_WAL=off), committed data is fully
+        // LiveBus WAL OFF (KOTOBA_JOURNAL_WAL=off), committed data is fully
         // recoverable on restart from the CommitDag ALONE. The synchronous commit
         // seals a ProllyTree whose commit CID (= the durable IPNS head in
         // production) is enough to rebuild the queryable graph WITHOUT
@@ -8152,10 +7947,10 @@ mod tests {
         let bob = KotobaCid::from_bytes(b"nowal-bob");
 
         // --- Instance A: insert + commit, capture the commit CID (durable head).
-        // Ephemeral Journal::new() = no persisted WAL head, modelling WAL=off
+        // Ephemeral LiveBus::new() = no persisted WAL head, modelling WAL=off
         // where the per-datom WAL block-write is skipped.
         let commit_cid = {
-            let qs_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&block_store));
+            let qs_a = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&block_store));
             qs_a.assert(Quad {
                 graph: graph.clone(),
                 subject: alice.clone(),
@@ -8183,7 +7978,7 @@ mod tests {
         };
 
         // --- Instance B: reopen against the SAME block store, NO journal replay.
-        let qs_b = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&block_store));
+        let qs_b = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&block_store));
         assert!(
             qs_b.head_commit(&graph).await.is_none(),
             "fresh instance has no head before import"
@@ -8213,236 +8008,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn crash_recovery_uncommitted_writes_recovered_from_wal() {
-        // Scenario: assert quads WITHOUT commit, drop instance, reopen.
-        // Replay should restore hot-path arrangement from journal entries.
-        let dir = tempfile::tempdir().unwrap();
-        let head_path = dir.path().join("journal_head.json");
-        let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(MemoryBlockStore::new());
-
-        let graph = KotobaCid::from_bytes(b"wal-only-graph");
-
-        {
-            let journal_a = Arc::new(Journal::with_block_store(
-                Arc::clone(&block_store),
-                head_path.clone(),
-            ));
-            let qs_a = QuadStore::new(Arc::clone(&journal_a), Arc::clone(&block_store));
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: KotobaCid::from_bytes(b"wal-s1"),
-                predicate: "label".into(),
-                object: QuadObject::Text("pre-commit-1".into()),
-            })
-            .await;
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: KotobaCid::from_bytes(b"wal-s2"),
-                predicate: "label".into(),
-                object: QuadObject::Text("pre-commit-2".into()),
-            })
-            .await;
-            // NO commit — simulates crash before commit; checkpoint never written
-        }
-
-        let journal_b = Arc::new(Journal::with_block_store(
-            Arc::clone(&block_store),
-            head_path.clone(),
-        ));
-        let qs_b = QuadStore::new(Arc::clone(&journal_b), Arc::clone(&block_store));
-        qs_b.replay_from_journal().await;
-
-        // The two quads should be present in the hot arrangement after replay.
-        // Hot query via predicate scan.
-        let arr_ref = qs_b
-            .arrangements
-            .get(&graph.to_multibase())
-            .expect("graph must have arrangement after replay");
-        let subjects: Vec<_> = arr_ref.get_entities_by_attribute("label");
-        assert_eq!(
-            subjects.len(),
-            2,
-            "2 WAL-restored quads expected, got {}",
-            subjects.len()
-        );
-    }
-
-    #[tokio::test]
-    async fn replayed_retract_commits_as_datom_tombstone() {
-        let dir = tempfile::tempdir().unwrap();
-        let head_path = dir.path().join("journal_head.json");
-        let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(MemoryBlockStore::new());
-        let graph = KotobaCid::from_bytes(b"replay-datom-history");
-        let alice = KotobaCid::from_bytes(b"replay-alice");
-
-        {
-            let journal_a = Arc::new(Journal::with_block_store(
-                Arc::clone(&block_store),
-                head_path.clone(),
-            ));
-            let qs_a = QuadStore::new(Arc::clone(&journal_a), Arc::clone(&block_store));
-            let quad = Quad {
-                graph: graph.clone(),
-                subject: alice.clone(),
-                predicate: "name".into(),
-                object: QuadObject::Text("Alice".into()),
-            };
-            qs_a.assert(quad.clone()).await;
-            journal_a
-                .publish(
-                    Topic(format!("kotoba/retract/{}/{}/{}", graph, alice, "name")),
-                    bytes::Bytes::from(serde_json::to_vec(&quad).unwrap()),
-                )
-                .await;
-        }
-
-        let journal_b = Arc::new(Journal::with_block_store(
-            Arc::clone(&block_store),
-            head_path.clone(),
-        ));
-        let qs_b = QuadStore::new(Arc::clone(&journal_b), Arc::clone(&block_store));
-        qs_b.replay_from_journal().await;
-        assert_eq!(
-            qs_b.pending_datoms
-                .get(&graph.to_multibase())
-                .map(|d| d.len())
-                .unwrap_or_default(),
-            2
-        );
-        qs_b.commit("did:test", graph.clone(), 1).await.unwrap();
-
-        let history = qs_b.history_datoms_cold(&graph).await.unwrap();
-        assert_eq!(history.len(), 2);
-        assert!(history.iter().any(|d| d.op));
-        assert!(history.iter().any(|d| !d.op));
-        assert!(history.iter().all(|d| d.e == alice));
-        assert!(history.iter().all(|d| d.tx != graph));
-    }
-
-    #[tokio::test]
-    async fn crash_recovery_committed_plus_uncommitted_recovered() {
-        // Mixed: commit some quads, assert MORE without commit, crash, reopen.
-        // Both batches must be queryable post-replay.
-        let dir = tempfile::tempdir().unwrap();
-        let head_path = dir.path().join("journal_head.json");
-        let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(MemoryBlockStore::new());
-
-        let graph = KotobaCid::from_bytes(b"mixed-recovery-graph");
-
-        {
-            let journal_a = Arc::new(Journal::with_block_store(
-                Arc::clone(&block_store),
-                head_path.clone(),
-            ));
-            let qs_a = QuadStore::new(Arc::clone(&journal_a), Arc::clone(&block_store));
-            // Batch 1: assert + commit
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: KotobaCid::from_bytes(b"mix-1"),
-                predicate: "role".into(),
-                object: QuadObject::Text("admin".into()),
-            })
-            .await;
-            qs_a.commit("did:test", graph.clone(), 1).await.unwrap();
-            // Batch 2: assert WITHOUT commit
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: KotobaCid::from_bytes(b"mix-2"),
-                predicate: "role".into(),
-                object: QuadObject::Text("editor".into()),
-            })
-            .await;
-        }
-
-        let journal_b = Arc::new(Journal::with_block_store(
-            Arc::clone(&block_store),
-            head_path.clone(),
-        ));
-        let qs_b = QuadStore::new(Arc::clone(&journal_b), Arc::clone(&block_store));
-        qs_b.replay_from_journal().await;
-
-        // Uncommitted quad: visible via hot arrangement (WAL-restored)
-        let arr_ref = qs_b
-            .arrangements
-            .get(&graph.to_multibase())
-            .expect("hot arrangement present");
-        let editors: Vec<_> = arr_ref
-            .get_entities_by_attribute_value("role", &kotoba_kqe::Value::Text("editor".into()));
-        assert_eq!(editors.len(), 1, "uncommitted WAL editor quad must be hot");
-        drop(arr_ref);
-
-        // Committed quad: hot path currently shadows cold when arrangement is
-        // non-empty (route_bgp_triples returns early on hot hit). After
-        // reset_arrangement clears hot, cold ProllyTree serves the committed
-        // admin quad. This documents the current hot-vs-cold semantics —
-        // a true union semantics would query both layers, but that is a
-        // separate design change.
-        qs_b.reset_arrangement(&graph).await;
-        let cold = qs_b
-            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <role> "admin" }"#)
-            .await
-            .unwrap();
-        assert_eq!(
-            cold.len(),
-            1,
-            "committed quad must be cold-readable after hot clear"
-        );
-    }
-
-    #[tokio::test]
-    async fn sparql_bgp_hot_cold_union_after_replay() {
-        // SPARQL BGP query after replay must see BOTH committed (cold) and
-        // WAL-restored (hot) quads — uses the union path via
-        // quads_by_predicate_prefix_cold + lookup_subject_by_po_cold.
-        let dir = tempfile::tempdir().unwrap();
-        let head_path = dir.path().join("journal_head.json");
-        let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(MemoryBlockStore::new());
-        let graph = KotobaCid::from_bytes(b"sparql-union-graph");
-
-        {
-            let journal_a = Arc::new(Journal::with_block_store(
-                Arc::clone(&block_store),
-                head_path.clone(),
-            ));
-            let qs_a = QuadStore::new(Arc::clone(&journal_a), Arc::clone(&block_store));
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: KotobaCid::from_bytes(b"un-alice"),
-                predicate: "role".into(),
-                object: QuadObject::Text("admin".into()),
-            })
-            .await;
-            qs_a.commit("did:union", graph.clone(), 1).await.unwrap();
-            // Uncommitted: another admin role only in WAL
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: KotobaCid::from_bytes(b"un-bob"),
-                predicate: "role".into(),
-                object: QuadObject::Text("admin".into()),
-            })
-            .await;
-        }
-
-        let journal_b = Arc::new(Journal::with_block_store(
-            Arc::clone(&block_store),
-            head_path.clone(),
-        ));
-        let qs_b = QuadStore::new(Arc::clone(&journal_b), Arc::clone(&block_store));
-        qs_b.replay_from_journal().await;
-
-        let admins = qs_b
-            .cold_query_sparql_bgp(&graph, r#"SELECT * WHERE { ?s <role> "admin" }"#)
-            .await
-            .unwrap();
-        assert_eq!(
-            admins.len(),
-            2,
-            "BGP must return committed un-alice + WAL un-bob = 2 admins, got {}",
-            admins.len()
-        );
-    }
-
     // ─── Datalog over IPFS-backed cold storage ────────────────────────────────
 
     #[tokio::test]
@@ -8450,10 +8015,10 @@ mod tests {
         // Datalog rule: transitive_closure(?x, ?z) :- knows(?x, ?y), knows(?y, ?z).
         // Set up a 2-hop knows chain, commit to ProllyTree (cold), then evaluate
         // the program — every join must be served by BlockStore-backed scans.
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"datalog-cold-graph");
@@ -8512,10 +8077,10 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_unions_hot_uncommitted_facts() {
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"datalog-mix-graph");
@@ -8571,10 +8136,10 @@ mod tests {
     async fn datalog_cold_cached_first_miss_second_hit() {
         // CID-MV cache for Datalog: same program against same commit → byte-stable
         // cache lookup on repeat.
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"datalog-mv-graph");
@@ -8630,7 +8195,7 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_cached_distinct_programs_distinct_cids() {
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let (qs, g, _people) = setup_chain_qs().await;
 
@@ -8672,7 +8237,7 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_authed_real_eddsa() {
-        use kotoba_kqe::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
+        use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let (qs, g, _people) = setup_chain_qs().await;
         let chain = make_real_eddsa_cacao(&g.to_multibase(), "datom:read");
@@ -8709,7 +8274,7 @@ mod tests {
 
     #[tokio::test]
     async fn datalog_cold_authed_denied_wrong_graph() {
-        use kotoba_kqe::datalog::DatalogProgram;
+        use kotoba_query::datalog::DatalogProgram;
         let (qs, g, _people) = setup_chain_qs().await;
         let wrong = KotobaCid::from_bytes(b"datalog-wrong-graph");
         let chain = make_real_eddsa_cacao(&wrong.to_multibase(), "datom:read");
@@ -8719,72 +8284,6 @@ mod tests {
             matches!(result, Err(AccessError::Delegation(_))),
             "wrong-graph CACAO must be denied"
         );
-    }
-
-    #[tokio::test]
-    async fn hot_cold_union_after_replay_returns_both_layers() {
-        // Verifies hot_covers_all flag: after replay puts uncommitted in hot,
-        // get_entity_quads_cold must union hot+cold instead of short-circuiting.
-        let dir = tempfile::tempdir().unwrap();
-        let head_path = dir.path().join("journal_head.json");
-        let block_store: Arc<dyn BlockStore + Send + Sync> = Arc::new(MemoryBlockStore::new());
-
-        let graph = KotobaCid::from_bytes(b"hot-cold-union-graph");
-        let alice = KotobaCid::from_bytes(b"hcu-alice");
-
-        {
-            let journal_a = Arc::new(Journal::with_block_store(
-                Arc::clone(&block_store),
-                head_path.clone(),
-            ));
-            let qs_a = QuadStore::new(Arc::clone(&journal_a), Arc::clone(&block_store));
-            // committed: name + role
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: alice.clone(),
-                predicate: "name".into(),
-                object: QuadObject::Text("Alice".into()),
-            })
-            .await;
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: alice.clone(),
-                predicate: "role".into(),
-                object: QuadObject::Text("admin".into()),
-            })
-            .await;
-            qs_a.commit("did:test", graph.clone(), 1).await.unwrap();
-            // uncommitted: an extra label quad — only in hot/journal
-            qs_a.assert(Quad {
-                graph: graph.clone(),
-                subject: alice.clone(),
-                predicate: "label".into(),
-                object: QuadObject::Text("VIP".into()),
-            })
-            .await;
-        }
-
-        let journal_b = Arc::new(Journal::with_block_store(
-            Arc::clone(&block_store),
-            head_path.clone(),
-        ));
-        let qs_b = QuadStore::new(Arc::clone(&journal_b), Arc::clone(&block_store));
-        qs_b.replay_from_journal().await;
-
-        // Without union: would have returned only the WAL-restored "label" (1 quad).
-        // With union: cold name+role + hot label = 3 quads.
-        let quads = qs_b.get_entity_quads_cold(&graph, &alice).await.unwrap();
-        assert_eq!(
-            quads.len(),
-            3,
-            "hot∪cold must return committed name+role + uncommitted label, got {}",
-            quads.len()
-        );
-        let preds: std::collections::HashSet<_> =
-            quads.iter().map(|q| q.predicate.as_str()).collect();
-        assert!(preds.contains("name"), "cold name must be visible");
-        assert!(preds.contains("role"), "cold role must be visible");
-        assert!(preds.contains("label"), "hot label must be visible");
     }
 
     // ─── CID-addressed materialised view cache ─────────────────────────────────

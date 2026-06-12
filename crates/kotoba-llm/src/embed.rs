@@ -1,6 +1,6 @@
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::{Datom, TensorDtype, Value};
-use kotoba_kqe::delta::Delta;
+use kotoba_query::datom::{Datom, TensorDtype, Value};
+use kotoba_query::delta::Delta;
 
 /// Embedding — `vector<f32>` stored as typed Datom value.
 /// dim <= 1024: inline in Datom.v as VectorF32

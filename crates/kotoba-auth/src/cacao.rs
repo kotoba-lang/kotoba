@@ -146,7 +146,7 @@ impl Cacao {
     /// Verify the CACAO signature.
     ///
     /// - `"eip191"` — EIP-191 personal_sign + secp256k1 recovery.
-    ///   Returns `did:erc725:gftd:260425:0x{addr}`.
+    ///   Returns `did:erc725:etzhayyim:260425:0x{addr}`.
     /// - `"EdDSA"` — Ed25519 signature over the SIWE plaintext.
     ///   Issuer must be `did:key:z6Mk...`. Returns the issuer DID unchanged.
     pub fn verify_signature(&self) -> Result<String, CacaoError> {
@@ -473,7 +473,7 @@ impl CacaoPayload {
     /// Self-sovereign capability for the kotobase pin/account/usage SaaS
     /// surface. A CACAO granting this (scoped to the holder's own DID as the
     /// graph) proves ownership of `tenant_did` cryptographically, so the
-    /// kotobase endpoints accept it in place of a gftd-issued JWT `sub`. It is
+    /// kotobase endpoints accept it in place of a etzhayyim-issued JWT `sub`. It is
     /// deliberately distinct from `datom:transact`/`graph:query` so a CACAO
     /// minted for graph access cannot be replayed as pin authorization.
     pub const OP_KOTOBASE_PIN: &'static str = "kotobase:pin";
@@ -1158,7 +1158,7 @@ mod tests {
             call_ret: None,
         };
         let did = cacao.verify_signature_eip191_smart(&rpc).unwrap();
-        assert!(did.starts_with("did:erc725:gftd:"));
+        assert!(did.starts_with("did:erc725:etzhayyim:"));
     }
 
     #[test]
@@ -1166,7 +1166,7 @@ mod tests {
         // iss address that the (zero) signature won't recover to → forces the
         // ERC-1271 contract path.
         let mut cacao =
-            base_cacao("did:erc725:gftd:260425:0x4242424242424242424242424242424242424242");
+            base_cacao("did:erc725:etzhayyim:260425:0x4242424242424242424242424242424242424242");
         cacao.s.s = "00".repeat(65);
         let mut magic = vec![0u8; 32];
         magic[..4].copy_from_slice(&eth::eip1271::MAGIC_VALUE);
@@ -1177,14 +1177,14 @@ mod tests {
         let did = cacao.verify_signature_eip191_smart(&rpc).unwrap();
         assert_eq!(
             did,
-            "did:erc725:gftd:260425:0x4242424242424242424242424242424242424242"
+            "did:erc725:etzhayyim:260425:0x4242424242424242424242424242424242424242"
         );
     }
 
     #[test]
     fn smart_verify_contract_account_non_magic_rejects() {
         let mut cacao =
-            base_cacao("did:erc725:gftd:260425:0x4242424242424242424242424242424242424242");
+            base_cacao("did:erc725:etzhayyim:260425:0x4242424242424242424242424242424242424242");
         cacao.s.s = "00".repeat(65);
         let rpc = MockRpc {
             code: Some(vec![0x60, 0x80]),
@@ -1199,7 +1199,7 @@ mod tests {
     #[test]
     fn smart_verify_eoa_mismatch_rejects_without_eip1271() {
         let mut cacao =
-            base_cacao("did:erc725:gftd:260425:0x4242424242424242424242424242424242424242");
+            base_cacao("did:erc725:etzhayyim:260425:0x4242424242424242424242424242424242424242");
         cacao.s.s = "00".repeat(65);
         let rpc = MockRpc {
             code: Some(vec![]), // empty ⇒ EOA, not a contract

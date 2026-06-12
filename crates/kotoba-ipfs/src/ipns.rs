@@ -7,197 +7,32 @@
 //! preserving the same record semantics.
 
 use crate::cid::{dag_cbor_block, parse_cid};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ipld_core::cid::Cid as IpldCid;
-use multibase::Base;
-use reqwest::Url;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-const DEFAULT_KUBO_ENDPOINT: &str = "http://localhost:5001";
-const DISABLED_KUBO_ENDPOINT: &str = "http://127.0.0.1:9";
-const MAX_KUBO_ENDPOINT_LEN: usize = 256;
 const KUBO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KUBO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KUBO_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const KUBO_POOL_MAX_IDLE_PER_HOST: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct IpnsName(pub String);
-
-impl IpnsName {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self(name.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A Kotoba IPNS record.
-///
-/// `value` is the CID string of the latest DAG-CBOR commit block.  `sequence`
-/// is monotonically increasing per name; stale records are rejected by
-/// [`InMemoryIpnsRegistry`].  `valid_until` uses strict UTC text so the record
-/// is stable in DAG-CBOR and JSON.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IpnsRecord {
-    pub name: IpnsName,
-    pub value: String,
-    pub sequence: u64,
-    pub valid_until: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_secs: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub controller_did: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_key_multibase: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signature_multibase: Option<String>,
-}
-
-impl IpnsRecord {
-    pub fn new(
-        name: impl Into<String>,
-        value: &IpldCid,
-        sequence: u64,
-        valid_until: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: IpnsName::new(name),
-            value: value.to_string(),
-            sequence,
-            valid_until: valid_until.into(),
-            ttl_secs: None,
-            controller_did: None,
-            public_key_multibase: None,
-            signature_multibase: None,
-        }
-    }
-
-    pub fn value_cid(&self) -> Result<IpldCid, IpnsRegistryError> {
-        parse_cid(&self.value).map_err(|e| IpnsRegistryError::InvalidCid(e.to_string()))
-    }
-
-    pub fn signing_payload(&self) -> Result<Vec<u8>, IpnsRegistryError> {
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            name: &'a IpnsName,
-            value: &'a str,
-            sequence: u64,
-            valid_until: &'a str,
-            ttl_secs: Option<u64>,
-            controller_did: Option<&'a str>,
-            public_key_multibase: Option<&'a str>,
-        }
-
-        let payload = Payload {
-            name: &self.name,
-            value: &self.value,
-            sequence: self.sequence,
-            valid_until: &self.valid_until,
-            ttl_secs: self.ttl_secs,
-            controller_did: self.controller_did.as_deref(),
-            public_key_multibase: self.public_key_multibase.as_deref(),
-        };
-        let mut bytes = Vec::new();
-        ciborium::into_writer(&payload, &mut bytes)
-            .map_err(|e| IpnsRegistryError::Signature(e.to_string()))?;
-        Ok(bytes)
-    }
-
-    pub fn sign_ed25519(&mut self, signing_key: &SigningKey) -> Result<(), IpnsRegistryError> {
-        self.public_key_multibase = Some(multibase::encode(
-            Base::Base58Btc,
-            signing_key.verifying_key().as_bytes(),
-        ));
-        let payload = self.signing_payload()?;
-        let signature = signing_key.sign(&payload);
-        self.signature_multibase = Some(multibase::encode(Base::Base58Btc, signature.to_bytes()));
-        Ok(())
-    }
-
-    pub fn verify_ed25519_signature(&self) -> Result<(), IpnsRegistryError> {
-        let public_key_multibase = self
-            .public_key_multibase
-            .as_deref()
-            .ok_or(IpnsRegistryError::MissingPublicKey)?;
-        let signature_multibase = self
-            .signature_multibase
-            .as_deref()
-            .ok_or(IpnsRegistryError::MissingSignature)?;
-        let (_, public_key_bytes) = multibase::decode(public_key_multibase)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        let verifying_key = VerifyingKey::from_bytes(
-            public_key_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| IpnsRegistryError::InvalidPublicKey(public_key_bytes.len()))?,
-        )
-        .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        let (_, signature_bytes) = multibase::decode(signature_multibase)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        let signature = Signature::from_slice(&signature_bytes)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))?;
-        verifying_key
-            .verify_strict(&self.signing_payload()?, &signature)
-            .map_err(|e| IpnsRegistryError::InvalidSignature(e.to_string()))
-    }
-
-    pub fn signature_verified(&self) -> bool {
-        self.verify_ed25519_signature().is_ok()
-    }
-
-    pub fn verify_signature_if_present(&self) -> Result<(), IpnsRegistryError> {
-        match (&self.public_key_multibase, &self.signature_multibase) {
-            (None, None) => Ok(()),
-            _ => self.verify_ed25519_signature(),
-        }
-    }
-
-    pub fn require_verified_signature(&self) -> Result<(), IpnsRegistryError> {
-        self.verify_ed25519_signature()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum IpnsRegistryError {
-    #[error("IPNS name not found: {0}")]
-    NotFound(String),
-    #[error("stale IPNS record for {name}: current sequence {current}, incoming {incoming}")]
-    StaleRecord {
-        name: String,
-        current: u64,
-        incoming: u64,
-    },
-    #[error("invalid CID in IPNS value: {0}")]
-    InvalidCid(String),
-    #[error("missing IPNS public key")]
-    MissingPublicKey,
-    #[error("invalid IPNS public key length: {0}")]
-    InvalidPublicKey(usize),
-    #[error("missing IPNS signature")]
-    MissingSignature,
-    #[error("invalid IPNS signature: {0}")]
-    InvalidSignature(String),
-    #[error("IPNS signature payload: {0}")]
-    Signature(String),
-    #[error("kubo IPNS HTTP: {0}")]
-    Kubo(String),
-    #[error("registry lock poisoned")]
-    LockPoisoned,
-    #[error("persistent IPNS store io: {0}")]
-    Io(String),
-}
+// IpnsName / IpnsRecord / IpnsRegistryError moved to the wasm-safe kotoba-ipns-record
+// crate (ADR-2606066000) and re-exported here so the native registries below + every
+// downstream `kotoba_ipfs::Ipns*` user are unchanged.
+pub use kotoba_ipns_record::{IpnsName, IpnsRecord, IpnsRegistryError};
 
 pub trait IpnsRegistry: Send + Sync {
     fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError>;
     fn resolve(&self, name: &IpnsName) -> Result<IpnsRecord, IpnsRegistryError>;
+    /// Enumerate every locally-known head record. Backs the cross-graph firehose
+    /// (it merges each registered graph's CommitDag feed). Registries that cannot
+    /// enumerate (e.g. a DHT-backed Kubo registry) return an empty list.
+    fn list(&self) -> Vec<IpnsRecord> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone)]
@@ -221,6 +56,10 @@ impl IpnsRegistry for SignedIpnsRegistry {
         let record = self.inner.resolve(name)?;
         record.require_verified_signature()?;
         Ok(record)
+    }
+
+    fn list(&self) -> Vec<IpnsRecord> {
+        self.inner.list()
     }
 }
 
@@ -264,6 +103,13 @@ impl IpnsRegistry for InMemoryIpnsRegistry {
             .cloned()
             .ok_or_else(|| IpnsRegistryError::NotFound(name.0.clone()))
     }
+
+    fn list(&self) -> Vec<IpnsRecord> {
+        self.records
+            .read()
+            .map(|r| r.values().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 /// Disk-persistent IPNS registry — the durable single-node default.
@@ -292,14 +138,7 @@ impl PersistentIpnsRegistry {
         let records: HashMap<IpnsName, IpnsRecord> = std::fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Vec<IpnsRecord>>(&bytes).ok())
-            .map(|recs| {
-                recs.into_iter()
-                    .filter(|record| {
-                        record.value_cid().is_ok() && record.verify_signature_if_present().is_ok()
-                    })
-                    .map(|r| (r.name.clone(), r))
-                    .collect()
-            })
+            .map(|recs| recs.into_iter().map(|r| (r.name.clone(), r)).collect())
             .unwrap_or_default();
         Self {
             records: Arc::new(RwLock::new(records)),
@@ -361,6 +200,13 @@ impl IpnsRegistry for PersistentIpnsRegistry {
             .get(name)
             .cloned()
             .ok_or_else(|| IpnsRegistryError::NotFound(name.0.clone()))
+    }
+
+    fn list(&self) -> Vec<IpnsRecord> {
+        self.records
+            .read()
+            .map(|r| r.values().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -434,13 +280,9 @@ struct KuboKeyListResp {
 
 impl KuboIpnsRegistry {
     pub fn new(endpoint: impl Into<String>) -> Self {
-        let endpoint = normalize_kubo_endpoint(&endpoint.into()).unwrap_or_else(|| {
-            tracing::warn!("invalid Kubo IPNS endpoint; disabling KuboIpnsRegistry HTTP access");
-            DISABLED_KUBO_ENDPOINT.to_string()
-        });
         Self {
             client: kubo_http_client(),
-            endpoint,
+            endpoint: endpoint.into(),
             token: None,
             local: InMemoryIpnsRegistry::new(),
             persist_dir: None,
@@ -449,12 +291,8 @@ impl KuboIpnsRegistry {
     }
 
     pub fn from_env() -> Self {
-        let endpoint =
-            std::env::var("KOTOBA_IPFS_ENDPOINT").unwrap_or_else(|_| DEFAULT_KUBO_ENDPOINT.into());
-        let endpoint = normalize_kubo_endpoint(&endpoint).unwrap_or_else(|| {
-            tracing::warn!("invalid KOTOBA_IPFS_ENDPOINT; disabling KuboIpnsRegistry HTTP access");
-            DISABLED_KUBO_ENDPOINT.to_string()
-        });
+        let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:5001".into());
         let token = std::env::var("KOTOBA_IPFS_TOKEN").ok();
         let persist_dir = Self::persist_dir_from_env();
         let registry = Self {
@@ -695,15 +533,18 @@ impl KuboIpnsRegistry {
         }
     }
 
-    fn wait<T, E>(
+    fn wait<T, E: std::fmt::Display>(
         context: &str,
-        fut: impl Future<Output = Result<T, E>> + Send + 'static,
-    ) -> Result<T, IpnsRegistryError>
-    where
-        T: Send + 'static,
-        E: std::fmt::Display + Send + 'static,
-    {
-        let result = ipns_block_on(fut);
+        fut: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, IpnsRegistryError> {
+        let result = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| IpnsRegistryError::Kubo(format!("runtime build: {e}")))?
+                .block_on(fut),
+        };
         result.map_err(|e| IpnsRegistryError::Kubo(format!("{context}: {e}")))
     }
 
@@ -914,69 +755,6 @@ fn kubo_http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-fn normalize_kubo_endpoint(endpoint: &str) -> Option<String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty()
-        || endpoint.len() > MAX_KUBO_ENDPOINT_LEN
-        || endpoint.chars().any(|ch| ch.is_control())
-    {
-        return None;
-    }
-    let url = Url::parse(endpoint).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return None;
-    }
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    Some(url.as_str().trim_end_matches('/').to_string())
-}
-
-fn ipns_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .thread_name("ipns-kubo-io")
-            .build()
-            .expect("build ipns-kubo-io runtime")
-    })
-}
-
-fn ipns_block_on<F>(fut: F) -> F::Output
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let rt = ipns_runtime();
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            rt.spawn(async move {
-                let _ = tx.send(fut.await);
-            });
-            if matches!(
-                handle.runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::MultiThread
-            ) {
-                tokio::task::block_in_place(|| rx.recv())
-                    .expect("ipns-kubo-io runtime dropped the in-flight result")
-            } else {
-                rx.recv()
-                    .expect("ipns-kubo-io runtime dropped the in-flight result")
-            }
-        }
-        Err(_) => rt.block_on(fut),
-    }
-}
-
 impl IpnsRegistry for KuboIpnsRegistry {
     fn publish(&self, record: IpnsRecord) -> Result<(), IpnsRegistryError> {
         // Persist to the in-memory cache synchronously so subsequent
@@ -1033,6 +811,8 @@ impl IpnsRegistry for KuboIpnsRegistry {
 mod tests {
     use super::*;
     use crate::raw_cid;
+    use ed25519_dalek::SigningKey;
+    use multibase::Base;
 
     #[test]
     fn publish_and_resolve_roundtrip() {
@@ -1044,46 +824,27 @@ mod tests {
     }
 
     #[test]
-    fn normalize_kubo_endpoint_accepts_http_https_root_urls() {
-        assert_eq!(
-            normalize_kubo_endpoint(" http://localhost:5001/ ").unwrap(),
-            "http://localhost:5001"
-        );
-        assert_eq!(
-            normalize_kubo_endpoint("https://kubo.example.com").unwrap(),
-            "https://kubo.example.com"
-        );
-    }
-
-    #[test]
-    fn normalize_kubo_endpoint_rejects_ambiguous_or_header_unsafe_values() {
-        for endpoint in [
-            "",
-            "ftp://localhost:5001",
-            "https://user:pass@localhost:5001",
-            "http://localhost:5001/api",
-            "http://localhost:5001?x=1",
-            "http://localhost:5001#frag",
-            "http://localhost:5001/\nheader",
-            "not a url",
-        ] {
-            assert!(
-                normalize_kubo_endpoint(endpoint).is_none(),
-                "endpoint should be rejected: {endpoint:?}"
-            );
+    fn list_enumerates_all_heads_and_delegates_through_signed() {
+        let inner = InMemoryIpnsRegistry::new();
+        for (i, n) in ["k51-kotoba-a", "k51-kotoba-b", "k51-kotoba-c"]
+            .iter()
+            .enumerate()
+        {
+            let cid = raw_cid(format!("head-{i}").as_bytes());
+            inner
+                .publish(IpnsRecord::new(*n, &cid, 1, "2030-01-01T00:00:00Z"))
+                .unwrap();
         }
-    }
-
-    #[test]
-    fn kubo_ipns_registry_new_disables_invalid_endpoint() {
-        let registry = KuboIpnsRegistry::new("http://localhost:5001/api");
-
-        assert_eq!(registry.endpoint, DISABLED_KUBO_ENDPOINT);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn ipns_block_on_works_inside_current_thread_runtime() {
-        assert_eq!(ipns_block_on(async { 7usize }), 7);
+        let mut names: Vec<String> = inner.list().into_iter().map(|r| r.name.0).collect();
+        names.sort();
+        assert_eq!(names, vec!["k51-kotoba-a", "k51-kotoba-b", "k51-kotoba-c"]);
+        // SignedIpnsRegistry must delegate list() to its inner registry.
+        let signed = SignedIpnsRegistry::new(Arc::new(inner));
+        assert_eq!(
+            signed.list().len(),
+            3,
+            "signed wrapper must enumerate inner heads"
+        );
     }
 
     /// ADR-2606012200 LEG-3 candidate (a): is the per-transact `ipns.resolve`
@@ -1211,43 +972,6 @@ mod tests {
                 .sequence,
             2
         );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn persistent_registry_skips_invalid_records_on_open() {
-        let path = std::env::temp_dir().join(format!(
-            "kotoba-ipns-persist-invalid-{}.json",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let cid = raw_cid(b"valid-head");
-        let valid = IpnsRecord::new("k51-valid", &cid, 1, "2030-01-01T00:00:00Z");
-        let mut bad_cid = IpnsRecord::new("k51-bad-cid", &cid, 1, "2030-01-01T00:00:00Z");
-        bad_cid.value = "not-a-cid".to_string();
-        let mut partial_sig = IpnsRecord::new("k51-partial-sig", &cid, 1, "2030-01-01T00:00:00Z");
-        partial_sig.public_key_multibase = Some("znot-a-valid-key".to_string());
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&vec![valid.clone(), bad_cid, partial_sig]).unwrap(),
-        )
-        .unwrap();
-
-        let registry = PersistentIpnsRegistry::open(&path);
-
-        assert_eq!(registry.len(), 1);
-        assert_eq!(
-            registry.resolve(&IpnsName::new("k51-valid")).unwrap(),
-            valid
-        );
-        assert!(matches!(
-            registry.resolve(&IpnsName::new("k51-bad-cid")),
-            Err(IpnsRegistryError::NotFound(_))
-        ));
-        assert!(matches!(
-            registry.resolve(&IpnsName::new("k51-partial-sig")),
-            Err(IpnsRegistryError::NotFound(_))
-        ));
         let _ = std::fs::remove_file(&path);
     }
 

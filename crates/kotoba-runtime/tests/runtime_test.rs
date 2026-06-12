@@ -257,8 +257,8 @@ fn llm_embed_fn_none_without_configuration() {
 
 #[test]
 fn kqe_evaluate_rules_datalog_cbor_roundtrip() {
-    use kotoba_kqe::datalog::{Atom, BodyLiteral, Term};
-    use kotoba_kqe::DatalogRule;
+    use kotoba_query::datalog::{Atom, BodyLiteral, Term};
+    use kotoba_query::DatalogRule;
 
     // Rule: knows(X, Z) :- knows(X, Y), knows(Y, Z)  (transitivity)
     let rule = DatalogRule {
@@ -302,9 +302,9 @@ fn kqe_evaluate_rules_datalog_cbor_roundtrip() {
 #[test]
 fn kqe_evaluate_rules_derives_transitive_facts() {
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::datalog::{Atom, BodyLiteral, Term};
-    use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-    use kotoba_kqe::{DatalogProgram, DatalogRule, Delta};
+    use kotoba_query::datalog::{Atom, BodyLiteral, Term};
+    use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+    use kotoba_query::{DatalogProgram, DatalogRule, Delta};
 
     fn cid(s: &str) -> KotobaCid {
         KotobaCid::from_bytes(s.as_bytes())

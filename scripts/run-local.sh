@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-STORE_DIR="${KOTOBA_STORE_DIR:-$HOME/.local/kotoba-gftdcojp}"
+STORE_DIR="${KOTOBA_STORE_DIR:-$HOME/.local/kotoba-etzhayyim}"
 mkdir -p "$STORE_DIR"
 
 echo "=== kotoba-server (local) ==="

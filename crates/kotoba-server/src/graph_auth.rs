@@ -501,6 +501,79 @@ pub fn check_read_access(
     }
 }
 
+/// Verify a CACAO delegation that grants `capability` on graph-scope
+/// `graph_scope`, rooted at `required_issuer` (the delegator who alone may
+/// grant it). Mirrors the Private-read branch of [`check_read_access`] but for
+/// an arbitrary capability — used by the git push gate (`git.receive/push`).
+///
+/// `nonce_store` is `Option` and typically `None` for git: a single git
+/// operation reuses the same credential across its discovery (`info/refs`) and
+/// pack requests, so CAIP-74 single-use nonces would false-positive on the
+/// second request. Pass a store only where the credential is single-request.
+pub fn verify_cacao_capability(
+    cacao_b64: &str,
+    capability: &str,
+    graph_scope: &str,
+    required_issuer: &str,
+    expected_aud: Option<&str>,
+    nonce_store: Option<&crate::nonce_store::NonceStore>,
+) -> Result<(), AccessDenied> {
+    const MAX_CACAO_B64_LEN: usize = 8 * 1024;
+    if cacao_b64.len() > MAX_CACAO_B64_LEN {
+        return Err(AccessDenied::CacaoDecodeError(format!(
+            "cacao_b64 too large ({} bytes, limit {MAX_CACAO_B64_LEN})",
+            cacao_b64.len()
+        )));
+    }
+    let cbor = B64
+        .decode(cacao_b64)
+        .map_err(|e| AccessDenied::CacaoDecodeError(e.to_string()))?;
+    let cacao =
+        Cacao::from_cbor(&cbor).map_err(|e| AccessDenied::CacaoParseError(e.to_string()))?;
+    let chain = DelegationChain::new(cacao);
+
+    let issuer_did = match expected_aud {
+        Some(aud) => chain
+            .verify_with_aud(graph_scope, capability, aud)
+            .map_err(|e| match e {
+                kotoba_auth::DelegationError::AudienceMismatch { expected, got } => {
+                    AccessDenied::AudienceMismatch { expected, got }
+                }
+                other => AccessDenied::DelegationError(other.to_string()),
+            })?,
+        None => chain
+            .verify(graph_scope, capability)
+            .map_err(|e| AccessDenied::DelegationError(e.to_string()))?,
+    };
+
+    if issuer_did != required_issuer {
+        return Err(AccessDenied::IssuerMismatch {
+            expected: required_issuer.to_string(),
+            got: issuer_did,
+        });
+    }
+
+    if let Some(store) = nonce_store {
+        let nonce = chain.chain[0].p.nonce.clone();
+        if nonce.is_empty() {
+            return Err(AccessDenied::DelegationError(
+                "CACAO nonce must not be empty".into(),
+            ));
+        }
+        const MAX_CACAO_AGE_SECS: u64 = 7 * 24 * 3600;
+        let expiry_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(MAX_CACAO_AGE_SECS);
+        if !store.check_and_register(&nonce, expiry_unix) {
+            return Err(AccessDenied::ReplayedNonce(nonce));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

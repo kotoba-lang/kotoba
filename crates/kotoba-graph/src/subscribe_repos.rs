@@ -52,9 +52,9 @@ use tracing::{debug, info, warn};
 
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
-use kotoba_kqe::datom::Datom;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::Journal;
+use kotoba_query::datom::Datom;
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_vault::LiveBus;
 
 use crate::atproto::{collection_to_cid, did_to_cid, jetstream_subject_to_topic};
 use crate::quad_store::QuadStore;
@@ -84,7 +84,7 @@ fn save_cursor(store: &dyn BlockStore, seq: u64) {
 /// When `gossip_tx` is `Some`, each asserted quad is also forwarded to the GossipSub
 /// swarm actor on the `"quad/assert"` topic so remote peers receive AT Protocol events.
 pub async fn run_subscribe_repos(
-    journal: Arc<Journal>,
+    journal: Arc<LiveBus>,
     quad_store: Arc<QuadStore>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
     gossip_tx: Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
@@ -173,7 +173,7 @@ pub async fn run_subscribe_repos(
 async fn handle_frame(
     data: &[u8],
     did_filter: &[String],
-    journal: &Arc<Journal>,
+    journal: &Arc<LiveBus>,
     quad_store: &Arc<QuadStore>,
     block_store: &Arc<dyn BlockStore + Send + Sync>,
     gossip_tx: &Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
@@ -229,7 +229,7 @@ async fn handle_frame(
 async fn handle_commit(
     body: Value,
     did_filter: &[String],
-    journal: &Arc<Journal>,
+    journal: &Arc<LiveBus>,
     quad_store: &Arc<QuadStore>,
     block_store: &Arc<dyn BlockStore + Send + Sync>,
     gossip_tx: &Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
@@ -342,7 +342,7 @@ async fn handle_commit(
     Some(seq)
 }
 
-async fn handle_identity(body: Value, journal: &Arc<Journal>, quad_store: &Arc<QuadStore>) {
+async fn handle_identity(body: Value, journal: &Arc<LiveBus>, quad_store: &Arc<QuadStore>) {
     let did = match cbor_str(&body, "did") {
         Some(d) => d,
         None => return,

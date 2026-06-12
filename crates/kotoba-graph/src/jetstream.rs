@@ -1,5 +1,5 @@
 //! Jetstream WebSocket client — subscribes to the AT Protocol Jetstream firehose,
-//! converts events to KOTOBA Quads, and publishes them to the local Journal
+//! converts events to KOTOBA Quads, and publishes them to the local LiveBus
 //! **and** asserts them into the QuadStore (Arrangement + ProllyTree).
 //!
 //! Jetstream docs: <https://github.com/bluesky-social/jetstream>
@@ -16,8 +16,8 @@
 
 use bytes::Bytes;
 use futures::StreamExt;
-use kotoba_kqe::datom::Datom;
-use kotoba_kse::Journal;
+use kotoba_query::datom::Datom;
+use kotoba_vault::LiveBus;
 use std::sync::Arc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
@@ -28,11 +28,11 @@ use crate::quad_store::QuadStore;
 /// Run the Jetstream client loop. Intended to be spawned with `tokio::spawn`.
 ///
 /// Each received event is:
-/// 1. Published to the KSE Journal (SPO topic) for persistence / gossip
+/// 1. Published to the KSE LiveBus (SPO topic) for persistence / gossip
 /// 2. Asserted into the QuadStore (Arrangement index + ProllyTree)
 ///
 /// Reconnects with exponential backoff on disconnect.
-pub async fn run_jetstream_client(journal: Arc<Journal>, quad_store: Arc<QuadStore>) {
+pub async fn run_jetstream_client(journal: Arc<LiveBus>, quad_store: Arc<QuadStore>) {
     let base_url = std::env::var("KOTOBA_JETSTREAM_URL")
         .unwrap_or_else(|_| "wss://jetstream2.us-east.bsky.network/subscribe".into());
 
@@ -55,7 +55,7 @@ pub async fn run_jetstream_client(journal: Arc<Journal>, quad_store: Arc<QuadSto
                         Ok(Message::Text(text)) => {
                             let bytes = text.as_bytes();
                             if let Some((topic, quad)) = jetstream_event_to_quad(bytes) {
-                                // 1. Persist to Journal (for B2 / gossip)
+                                // 1. Persist to LiveBus (for B2 / gossip)
                                 let payload = match serde_json::to_vec(&quad) {
                                     Ok(v) => Bytes::from(v),
                                     Err(e) => {

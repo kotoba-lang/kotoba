@@ -8,7 +8,7 @@
 //! │ QuadStore          │──────▶│ IdbBlockStore                │
 //! │ SyncWindow         │       │   "blocks" object store      │
 //! │ commits_since(…)   │       │   "meta"   object store      │
-//! │ Journal::read_since│       │   (cid → {pinned, last_used, │
+//! │ LiveBus::read_since│       │   (cid → {pinned, last_used, │
 //! └────────────────────┘       │            size})            │
 //!                              └──────────────────────────────┘
 //! ```

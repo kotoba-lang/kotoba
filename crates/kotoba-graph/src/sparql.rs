@@ -23,7 +23,7 @@ use anyhow::anyhow;
 use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern, Variable};
 
-use kotoba_kqe::datalog::{Atom, BodyLiteral, CmpOp, DatalogProgram, DatalogRule, Term};
+use kotoba_query::datalog::{Atom, BodyLiteral, CmpOp, DatalogProgram, DatalogRule, Term};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -295,7 +295,7 @@ fn apply_filter(
 mod tests {
     use super::*;
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{
+    use kotoba_query::{
         datom::{Datom, Value},
         delta::Delta,
     };
@@ -322,7 +322,7 @@ mod tests {
         derived.iter().any(|d| {
             d.attribute() == rel
                 && d.entity() == &cid(s)
-                && matches!(d.value(), kotoba_kqe::Value::Cid(c) if *c == cid(o))
+                && matches!(d.value(), kotoba_query::Value::Cid(c) if *c == cid(o))
         })
     }
 

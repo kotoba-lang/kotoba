@@ -22,17 +22,17 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_ingest::media::{rank_by_cosine, MediaIngestor, MediaInput};
 use kotoba_ingest::media_embed::{Blake3MediaEmbedClient, MediaEmbedClient, MediaItem};
-use kotoba_kqe::datom::Value;
-use kotoba_kse::Journal;
-use kotoba_kse::Vault;
+use kotoba_query::datom::Value;
 use kotoba_store::MemoryBlockStore;
+use kotoba_vault::LiveBus;
+use kotoba_vault::Vault;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dim = 256;
 
     // ── Wiring: in-memory store + Vault + deterministic shared-space encoder ──
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     let block_store =
         Arc::new(MemoryBlockStore::new()) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
     let quad_store = Arc::new(QuadStore::new(journal, block_store));

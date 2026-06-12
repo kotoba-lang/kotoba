@@ -14,7 +14,7 @@ use kotoba_core::prolly::ProllyTree;
 use kotoba_core::store::BlockStore;
 use kotoba_edn::Keyword;
 use kotoba_ipfs::{IpnsName, IpnsRecord, IpnsRegistry, IpnsRegistryError};
-use kotoba_kqe::Datom as KqeDatom;
+use kotoba_query::Datom as KqeDatom;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -44,6 +44,8 @@ pub enum DistributedCommitError {
     Edn(String),
     #[error("block store: {0}")]
     Store(#[from] anyhow::Error),
+    #[error("import rejected: {0}")]
+    ImportRejected(String),
     #[error("ipns: {0}")]
     Ipns(#[from] IpnsRegistryError),
     #[error("ipns signature: {0}")]
@@ -73,14 +75,56 @@ pub struct DistributedDatomCommit {
     /// the IPNS name, while this CID scopes Datomic facts and authorization.
     pub graph: KotobaCid,
     pub tx_cid: KotobaCid,
+    /// First-parent lineage (the "main" chain). `None` only for the root commit.
+    /// Retained so every existing `prev`-walking path (tx_range, gc, firehose)
+    /// keeps following one lineage.
     pub prev: Option<KotobaCid>,
+    /// All parents (ADR-001 phase 2). A normal commit has `parents == [prev]`; a
+    /// **merge** commit has `parents == [theirs, mine_base]`, making the
+    /// CommitDag a true multi-parent DAG. `#[serde(default)]` ⇒ pre-DAG commits
+    /// decode with an empty vec (callers fall back to `prev`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<KotobaCid>,
     pub author: String,
     pub seq: u64,
     pub ts: u64,
+    /// Hybrid Logical Clock (ms·2^16 + counter) — monotonic per node, never goes
+    /// backwards under wall-clock skew. The causal/total ordering key for the
+    /// cross-graph firehose and the merge tiebreak (ADR-001). `#[serde(default)]`
+    /// so pre-HLC commits still decode (hlc = 0).
+    #[serde(default)]
+    pub hlc: u64,
     /// Covering ProllyTree roots: eavt/aevt/avet/vaet/tea.
     pub index_roots: HashMap<String, KotobaCid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cacao_proof_cid: Option<KotobaCid>,
+    /// Ed25519 signature by `author` over `signed_payload()` — the canonical
+    /// DAG-CBOR encoding of this commit with THIS FIELD ABSENT (git-style
+    /// embedded signature; the commit CID then covers the signature too).
+    /// `None` = unsigned; pre-R2b commit blocks decode unchanged
+    /// (ADR-sealed-cold-tier R2b / [knowledge.journal-deprecation]).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub author_sig: Option<Vec<u8>>,
+}
+
+/// Process Hybrid Logical Clock. Packs `physical_ms << 16 | counter`; advances to
+/// `max(physical, last+1)` so it is monotonic even if the wall clock jumps back.
+/// The cross-graph ordering key + merge tiebreak (ADR-001). Single-node variant
+/// (a multi-node deployment also merges observed peer HLCs on read — later phase).
+pub(crate) fn next_hlc(phys_ms: u64) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static HLC: AtomicU64 = AtomicU64::new(0);
+    let phys = phys_ms << 16;
+    loop {
+        let last = HLC.load(Ordering::Relaxed);
+        let next = if phys > last { phys } else { last + 1 };
+        if HLC
+            .compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2360,14 +2404,42 @@ where
 {
     store: &'a dyn BlockStore,
     ipns: &'a R,
+    /// When set, every commit this writer seals is author-signed (R2b).
+    author_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// When set, a FOREIGN head adopted by the merge path must pass this check
+    /// (author-signature verification lives above this crate — kotoba-auth
+    /// resolves did:key — so it is injected as a callback). `Err(reason)` ⇒
+    /// the merge is refused with `ImportRejected`.
+    import_check: Option<ImportCheck>,
 }
+
+/// Callback verifying a foreign commit before the merge path adopts it.
+pub type ImportCheck =
+    std::sync::Arc<dyn Fn(&DistributedDatomCommit) -> Result<(), String> + Send + Sync>;
 
 impl<'a, R> DistributedCommitWriter<'a, R>
 where
     R: IpnsRegistry + ?Sized,
 {
     pub fn new(store: &'a dyn BlockStore, ipns: &'a R) -> Self {
-        Self { store, ipns }
+        Self {
+            store,
+            ipns,
+            author_signing_key: None,
+            import_check: None,
+        }
+    }
+
+    /// Author-sign every commit this writer seals (R2b non-repudiation).
+    pub fn with_author_signing_key(mut self, key: Option<ed25519_dalek::SigningKey>) -> Self {
+        self.author_signing_key = key;
+        self
+    }
+
+    /// Gate foreign heads adopted by the merge path (R2b import enforcement).
+    pub fn with_import_check(mut self, check: Option<ImportCheck>) -> Self {
+        self.import_check = check;
+        self
     }
 
     pub fn commit_datoms(
@@ -2454,15 +2526,31 @@ where
             roots.insert(ROOT_CEAVT.to_string(), ceavt_root);
         }
         let ceavt_ms = t_ceavt.elapsed().as_millis();
-        let commit = DistributedDatomCommit::seal(
-            req.graph,
-            tx_cid.clone(),
-            req.expected_parent,
-            req.author,
-            req.seq,
-            roots,
-            req.cacao_proof_cid,
-        )?;
+        let commit = match req.merge_parents {
+            Some((parents, parent_hlc_max)) => DistributedDatomCommit::seal_merge(
+                req.graph,
+                tx_cid.clone(),
+                parents,
+                parent_hlc_max,
+                req.author,
+                req.seq,
+                roots,
+                req.cacao_proof_cid,
+            )?,
+            None => DistributedDatomCommit::seal(
+                req.graph,
+                tx_cid.clone(),
+                req.expected_parent,
+                req.author,
+                req.seq,
+                roots,
+                req.cacao_proof_cid,
+            )?,
+        };
+        let mut commit = commit;
+        if let Some(key) = &self.author_signing_key {
+            commit.sign(key)?;
+        }
         commit.persist(&cap)?;
         // Durably flush this commit's captured blocks in ONE concurrent batch so the
         // head's reachable set is in the cold tier before we return.
@@ -2699,7 +2787,8 @@ where
             c.extend(datoms.iter().cloned());
             c
         };
-        let commit = self.commit_datoms(CommitDatomsRequest {
+        let commit = self.commit_datoms_merging(CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: req.ipns_name,
             graph: req.graph,
             datoms: datoms.clone(),
@@ -2732,8 +2821,116 @@ where
             context,
         })
     }
+
+    /// Commit with **automatic Merkle-CRDT merge on conflict** (ADR-001 phase 2b).
+    ///
+    /// Tries the normal CAS commit; on `StaleParent` (a concurrent writer won the
+    /// race) it does NOT reject — it 3-way merges its datoms with the concurrent
+    /// history and retries against the new head, looping until it lands. Gated by
+    /// `KOTOBA_MERGE_ON_CONFLICT` (default off ⇒ identical to `commit_datoms`,
+    /// i.e. reject), so the merge path is opt-in until proven in the field.
+    pub fn commit_datoms_merging(
+        &self,
+        req: CommitDatomsRequest,
+    ) -> Result<CommitReport, DistributedCommitError> {
+        let merge_enabled = std::env::var("KOTOBA_MERGE_ON_CONFLICT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        self.commit_datoms_merging_with(req, merge_enabled)
+    }
+
+    pub fn commit_datoms_merging_with(
+        &self,
+        mut req: CommitDatomsRequest,
+        merge_enabled: bool,
+    ) -> Result<CommitReport, DistributedCommitError> {
+        loop {
+            match self.commit_datoms(req.clone()) {
+                Ok(report) => return Ok(report),
+                Err(DistributedCommitError::StaleParent { current, .. }) if merge_enabled => {
+                    let Some(theirs) = current.as_deref().and_then(KotobaCid::from_multibase)
+                    else {
+                        return Err(DistributedCommitError::StaleParent {
+                            name: req.ipns_name.clone(),
+                            expected: req.expected_parent.as_ref().map(KotobaCid::to_multibase),
+                            current,
+                        });
+                    };
+                    let base = req.expected_parent.clone();
+                    let base_live = match &base {
+                        Some(b) => live_datoms_at(b, self.store)?,
+                        None => Vec::new(),
+                    };
+                    let mut ops = gather_concurrent_ops(base.as_ref(), &theirs, self.store)?;
+                    let theirs_commit = DistributedDatomCommit::load(&theirs, self.store)?
+                        .ok_or_else(|| {
+                            DistributedCommitError::MissingCommit(theirs.to_multibase())
+                        })?;
+                    // R2b import enforcement: a foreign head must pass the
+                    // injected signature check before we merge on top of it.
+                    if let Some(check) = &self.import_check {
+                        check(&theirs_commit).map_err(|reason| {
+                            DistributedCommitError::ImportRejected(format!(
+                                "foreign head {}: {reason}",
+                                theirs.to_multibase()
+                            ))
+                        })?;
+                    }
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let mine_hlc = next_hlc(now_ms).max(theirs_commit.hlc + 1);
+                    for d in &req.datoms {
+                        ops.push(TaggedOp {
+                            hlc: mine_hlc,
+                            writer: req.author.clone(),
+                            datom: d.clone(),
+                        });
+                    }
+                    let merged = merge_live_sets(&base_live, &ops);
+                    let theirs_live = live_datoms_at(&theirs, self.store)?;
+                    let delta = delta_between(&theirs_live, &merged);
+                    let parents = match &base {
+                        Some(b) if b != &theirs => vec![theirs.clone(), b.clone()],
+                        _ => vec![theirs.clone()],
+                    };
+                    let parent_hlc_max = theirs_commit.hlc.max(mine_hlc);
+                    req.expected_parent = Some(theirs.clone());
+                    req.seq = theirs_commit.seq + 1;
+                    let seed_roots = build_datom_roots(&delta, self.store)?;
+                    let root_seed = seed_roots
+                        .get(ROOT_EAVT)
+                        .cloned()
+                        .unwrap_or_else(KotobaCid::default);
+                    let tx_cid = derive_tx_cid(
+                        &req.graph,
+                        &root_seed,
+                        req.expected_parent.as_ref(),
+                        req.seq,
+                    );
+                    let delta_with_tx = delta
+                        .iter()
+                        .cloned()
+                        .map(|mut datom| {
+                            datom.t = tx_cid.clone();
+                            datom
+                        })
+                        .collect::<Vec<_>>();
+                    let mut covering = theirs_live;
+                    covering.extend(delta_with_tx);
+                    req.datoms = delta;
+                    req.covering_datoms = Some(current_datoms(&covering));
+                    req.tx_cid = Some(tx_cid);
+                    req.merge_parents = Some((parents, parent_hlc_max));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
+#[derive(Clone)]
 pub struct CommitDatomsRequest {
     pub ipns_name: String,
     pub graph: KotobaCid,
@@ -2753,6 +2950,10 @@ pub struct CommitDatomsRequest {
     pub cacao_proof_cid: Option<KotobaCid>,
     pub ipns_controller_did: Option<String>,
     pub ipns_signing_key: Option<ed25519_dalek::SigningKey>,
+    /// Merge commit marker (ADR-001 phase 2b): `Some((parents, parent_hlc_max))`
+    /// seals via `seal_merge` so the commit records all parents. `None` = normal
+    /// single-parent commit.
+    pub merge_parents: Option<(Vec<KotobaCid>, u64)>,
 }
 
 pub struct DistributedTransactRequest {
@@ -2793,20 +2994,64 @@ impl DistributedDatomCommit {
         index_roots: HashMap<String, KotobaCid>,
         cacao_proof_cid: Option<KotobaCid>,
     ) -> Result<Self, DistributedCommitError> {
-        let ts = std::time::SystemTime::now()
+        let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            .unwrap_or_default();
+        let ts = now.as_secs();
+        let hlc = next_hlc(now.as_millis() as u64);
+        let parents = prev.iter().cloned().collect();
         let mut commit = Self {
             cid: KotobaCid::default(),
             graph,
             tx_cid,
             prev,
+            parents,
             author,
             seq,
             ts,
+            hlc,
             index_roots,
             cacao_proof_cid,
+            author_sig: None,
+        };
+        commit.cid = commit.derived_cid()?;
+        Ok(commit)
+    }
+
+    /// Seal a **merge** commit with multiple parents (ADR-001 phase 2). The HLC
+    /// is `max(parent hlcs)+1` so it strictly succeeds every merged history;
+    /// `prev` (first-parent lineage) is `parents[0]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_merge(
+        graph: KotobaCid,
+        tx_cid: KotobaCid,
+        parents: Vec<KotobaCid>,
+        parent_hlc_max: u64,
+        author: String,
+        seq: u64,
+        index_roots: HashMap<String, KotobaCid>,
+        cacao_proof_cid: Option<KotobaCid>,
+    ) -> Result<Self, DistributedCommitError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let ts = now.as_secs();
+        // Merge HLC must dominate both branches AND the local clock.
+        let hlc = next_hlc(now.as_millis() as u64).max(parent_hlc_max + 1);
+        let prev = parents.first().cloned();
+        let mut commit = Self {
+            cid: KotobaCid::default(),
+            graph,
+            tx_cid,
+            prev,
+            parents,
+            author,
+            seq,
+            ts,
+            hlc,
+            index_roots,
+            cacao_proof_cid,
+            author_sig: None,
         };
         commit.cid = commit.derived_cid()?;
         Ok(commit)
@@ -2817,6 +3062,78 @@ impl DistributedDatomCommit {
         ciborium::into_writer(self, &mut bytes)
             .map_err(|e| DistributedCommitError::Cbor(e.to_string()))?;
         Ok(KotobaCid::from_bytes(&bytes))
+    }
+
+    /// The bytes the author signature covers: a CANONICAL encoding of every
+    /// signed field — `index_roots` as a BTreeMap (sorted) because HashMap
+    /// serialization order is instance-dependent, so re-encoding a LOADED
+    /// commit would not be byte-identical to what was signed. `author_sig`
+    /// itself and `cid` are excluded.
+    pub fn signed_payload(&self) -> Result<Vec<u8>, DistributedCommitError> {
+        #[derive(Serialize)]
+        struct CanonicalCommitPayload<'a> {
+            graph: &'a KotobaCid,
+            tx_cid: &'a KotobaCid,
+            prev: &'a Option<KotobaCid>,
+            parents: &'a Vec<KotobaCid>,
+            author: &'a str,
+            seq: u64,
+            ts: u64,
+            hlc: u64,
+            index_roots: std::collections::BTreeMap<&'a str, &'a KotobaCid>,
+            cacao_proof_cid: &'a Option<KotobaCid>,
+        }
+        let payload = CanonicalCommitPayload {
+            graph: &self.graph,
+            tx_cid: &self.tx_cid,
+            prev: &self.prev,
+            parents: &self.parents,
+            author: &self.author,
+            seq: self.seq,
+            ts: self.ts,
+            hlc: self.hlc,
+            index_roots: self
+                .index_roots
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect(),
+            cacao_proof_cid: &self.cacao_proof_cid,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&payload, &mut bytes)
+            .map_err(|e| DistributedCommitError::Cbor(e.to_string()))?;
+        Ok(bytes)
+    }
+
+    /// Embed the author's Ed25519 signature (git-style) and re-derive the CID.
+    /// Call BEFORE `persist`. The key MUST belong to the `author` DID —
+    /// verifiers resolve the pubkey from `author` (did:key), so a mismatched
+    /// key just yields a commit whose signature never verifies.
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) -> Result<(), DistributedCommitError> {
+        use ed25519_dalek::Signer;
+        let payload = self.signed_payload()?;
+        self.author_sig = Some(key.sign(&payload).to_bytes().to_vec());
+        self.cid = self.derived_cid()?;
+        Ok(())
+    }
+
+    /// Verify the embedded author signature against `verifying_key` (the
+    /// caller resolves it from `author`, e.g. did:key via kotoba-auth, which
+    /// sits ABOVE this crate). Returns `Ok(false)` for unsigned commits.
+    pub fn verify_author_sig(
+        &self,
+        verifying_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<bool, DistributedCommitError> {
+        use ed25519_dalek::Verifier;
+        let Some(sig_bytes) = &self.author_sig else {
+            return Ok(false);
+        };
+        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().map_err(|_| {
+            DistributedCommitError::Cbor(format!("author_sig length {}", sig_bytes.len()))
+        })?;
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        let payload = self.signed_payload()?;
+        Ok(verifying_key.verify(&payload, &sig).is_ok())
     }
 
     pub fn persist(&self, store: &dyn BlockStore) -> Result<KotobaCid, DistributedCommitError> {
@@ -2845,6 +3162,223 @@ impl DistributedDatomCommit {
         commit.cid = cid.clone();
         Ok(Some(commit))
     }
+}
+
+/// Outcome of [`gc_history`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Commits retained (newest `keep_last_n`, plus any tail shorter than that).
+    pub kept_commits: usize,
+    /// Older commits whose blocks became eligible for deletion.
+    pub dropped_commits: usize,
+    /// Blocks actually deleted (reachable only from dropped commits).
+    pub deleted_blocks: usize,
+}
+
+/// Prune Datomic history for one graph: keep the newest `keep_last_n` commits
+/// reachable from `head` and delete the ProllyTree / commit blocks reachable
+/// **only** from older (dropped) commits.
+///
+/// Why this is the safe shape of GC for kotoba's shared content-addressed store:
+/// the durable `BlockStore` is also home to KSE-journal, vault and other
+/// subsystems' blocks, and a naive "sweep everything not reachable from the
+/// latest head" would delete all of them. This routine instead computes
+/// `reachable(dropped) − reachable(kept)`, so a block is removed **iff** some
+/// dropped commit referenced it and **no** kept commit does. Blocks that no
+/// Datomic commit references (journal, vault, …) are never in either set and are
+/// therefore never touched. The current DB value and the last `keep_last_n`
+/// transactions stay fully readable; only deep `as-of`/history past the cutoff
+/// is pruned (Datomic-style history truncation).
+///
+/// `keep_last_n` is clamped to ≥1, so the live head is always preserved.
+pub fn gc_history(
+    head: &KotobaCid,
+    keep_last_n: usize,
+    store: &dyn BlockStore,
+) -> Result<GcReport, DistributedCommitError> {
+    use std::collections::HashSet;
+
+    // Walk the commit chain newest → oldest.
+    let mut chain: Vec<DistributedDatomCommit> = Vec::new();
+    let mut cur = Some(head.clone());
+    while let Some(cid) = cur {
+        let Some(commit) = DistributedDatomCommit::load(&cid, store)? else {
+            break;
+        };
+        cur = commit.prev.clone();
+        chain.push(commit);
+    }
+
+    let keep_last_n = keep_last_n.max(1);
+    if chain.len() <= keep_last_n {
+        return Ok(GcReport {
+            kept_commits: chain.len(),
+            dropped_commits: 0,
+            deleted_blocks: 0,
+        });
+    }
+    let (kept, dropped) = chain.split_at(keep_last_n);
+
+    // Collect every block CID reachable from a set of commits: the commit blocks
+    // themselves plus all nodes of each covering ProllyTree index.
+    let reachable =
+        |commits: &[DistributedDatomCommit]| -> Result<HashSet<[u8; 36]>, DistributedCommitError> {
+            let mut set = HashSet::new();
+            for c in commits {
+                set.insert(c.cid.0);
+                for root in c.index_roots.values() {
+                    for cid in ProllyTree::walk_all_cids(root, store)? {
+                        set.insert(cid.0);
+                    }
+                }
+            }
+            Ok(set)
+        };
+
+    let keep_set = reachable(kept)?;
+    let drop_set = reachable(dropped)?;
+
+    let mut deleted = 0usize;
+    for raw in drop_set.difference(&keep_set) {
+        store.delete(&KotobaCid(*raw))?;
+        deleted += 1;
+    }
+
+    Ok(GcReport {
+        kept_commits: kept.len(),
+        dropped_commits: dropped.len(),
+        deleted_blocks: deleted,
+    })
+}
+
+// ── Merkle-CRDT merge (ADR-001 phase 2) ──────────────────────────────────────
+
+/// A concurrent delta op tagged with its source commit's HLC + author, for
+/// deterministic last-writer-wins resolution.
+#[derive(Debug, Clone)]
+pub struct TaggedOp {
+    pub hlc: u64,
+    pub writer: String,
+    pub datom: Datom,
+}
+
+/// Stable, value-level merge key — `(entity, attribute, canonical-EDN value)`.
+/// `Value` (EdnValue) is not `Hash`, so we key on its canonical string form.
+fn merge_key(d: &Datom) -> (String, String, String) {
+    (d.e.to_multibase(), d.a.clone(), kotoba_edn::to_string(&d.v))
+}
+
+/// Merge concurrent deltas onto a common-ancestor live set (OR-set / LWW).
+///
+/// Each `(e,a,v)` is live iff the highest-`(hlc, writer)` op touching it is an
+/// assert; keys no concurrent op touches keep their base state. The total order
+/// `(hlc, writer, key)` makes the result **deterministic, commutative and
+/// idempotent** — every replica that sees the same set of commits computes the
+/// **same** live set (hence the same ProllyTree root CID), with no coordination.
+///
+/// Cardinality-one conflicts (same `(e,a)`, different `v`) are intentionally kept
+/// as an OR-set here (no data loss); schema-driven single-value LWW is phase 3.
+pub fn merge_live_sets(base_live: &[Datom], concurrent_ops: &[TaggedOp]) -> Vec<Datom> {
+    use std::collections::HashMap;
+    let mut live: HashMap<(String, String, String), Datom> = HashMap::new();
+    for d in base_live {
+        live.insert(merge_key(d), d.clone());
+    }
+    let mut ops: Vec<&TaggedOp> = concurrent_ops.iter().collect();
+    ops.sort_by(|a, b| {
+        (a.hlc, &a.writer, merge_key(&a.datom)).cmp(&(b.hlc, &b.writer, merge_key(&b.datom)))
+    });
+    for op in ops {
+        let k = merge_key(&op.datom);
+        if op.datom.added {
+            live.insert(k, op.datom.clone());
+        } else {
+            live.remove(&k);
+        }
+    }
+    let mut out: Vec<Datom> = live.into_values().collect();
+    out.sort_by(|a, b| merge_key(a).cmp(&merge_key(b)));
+    out
+}
+
+/// Live datom set at `head` via the covering `ceavt` index (the read fast path).
+/// Modern commits always carry `ceavt`; returns empty if absent (caller decides).
+pub fn live_datoms_at(
+    head: &KotobaCid,
+    store: &dyn BlockStore,
+) -> Result<Vec<Datom>, DistributedCommitError> {
+    if let Some(commit) = DistributedDatomCommit::load(head, store)? {
+        if let Some(ceavt_root) = commit.index_roots.get(ROOT_CEAVT) {
+            let entries = ProllyTree::scan_prefix(ceavt_root, &[], store)
+                .map_err(DistributedCommitError::Store)?;
+            return entries
+                .into_iter()
+                .map(|(_, value)| decode_stored_datom(&value))
+                .collect::<Result<Vec<_>, _>>();
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// The net change to go from one live set to another: assert everything in `to`
+/// not in `from`, retract everything in `from` not in `to` (keyed by `(e,a,v)`).
+/// This is the per-commit delta a merge commit records over its first parent.
+pub fn delta_between(from_live: &[Datom], to_live: &[Datom]) -> Vec<Datom> {
+    use std::collections::HashSet;
+    let from_keys: HashSet<_> = from_live.iter().map(merge_key).collect();
+    let to_keys: HashSet<_> = to_live.iter().map(merge_key).collect();
+    let mut delta = Vec::new();
+    for d in to_live {
+        if !from_keys.contains(&merge_key(d)) {
+            delta.push(Datom::assert(
+                d.e.clone(),
+                d.a.clone(),
+                d.v.clone(),
+                d.t.clone(),
+            ));
+        }
+    }
+    for d in from_live {
+        if !to_keys.contains(&merge_key(d)) {
+            delta.push(Datom::retract(
+                d.e.clone(),
+                d.a.clone(),
+                d.v.clone(),
+                d.t.clone(),
+            ));
+        }
+    }
+    delta
+}
+
+/// Collect the concurrent delta ops on the path `(base, theirs]` — every commit
+/// reachable from `theirs` along `prev` until `base` (exclusive), each commit's
+/// delta datoms tagged with that commit's `(hlc, author)`. Feeds
+/// [`merge_live_sets`] as the "theirs" side of a 3-way merge.
+pub fn gather_concurrent_ops(
+    base: Option<&KotobaCid>,
+    theirs: &KotobaCid,
+    store: &dyn BlockStore,
+) -> Result<Vec<TaggedOp>, DistributedCommitError> {
+    let mut ops = Vec::new();
+    let mut cur = Some(theirs.clone());
+    while let Some(cid) = cur {
+        if base == Some(&cid) {
+            break;
+        }
+        let Some(commit) = DistributedDatomCommit::load(&cid, store)? else {
+            break;
+        };
+        for datom in datoms_from_commit(&commit, store)? {
+            ops.push(TaggedOp {
+                hlc: commit.hlc,
+                writer: commit.author.clone(),
+                datom,
+            });
+        }
+        cur = commit.prev.clone();
+    }
+    Ok(ops)
 }
 
 /// Wraps a `BlockStore`, forwarding every `put` to the inner store at NORMAL
@@ -3008,7 +3542,7 @@ fn indexable_kqe_datom(datom: &Datom) -> KqeDatom {
     datom.to_kqe().unwrap_or_else(|_| KqeDatom {
         e: datom.e.clone(),
         a: datom.a.clone(),
-        v: kotoba_kqe::Value::Text(kotoba_edn::to_string(&datom.v)),
+        v: kotoba_query::Value::Text(kotoba_edn::to_string(&datom.v)),
         tx: datom.t.clone(),
         op: datom.added,
     })
@@ -3068,7 +3602,7 @@ fn attr_prefix(attr: &str) -> Vec<u8> {
     // (the second terminator), making EAVT/AEVT/VAET seeks silently return
     // nothing.
     let mut out = Vec::with_capacity(attr.len() + 2);
-    kotoba_kqe::keycodec::push_ordered_str(&mut out, attr);
+    kotoba_query::keycodec::push_ordered_str(&mut out, attr);
     out
 }
 
@@ -3104,9 +3638,9 @@ fn eavt_entity_attr_prefix(entity: &KotobaCid, attr: &str) -> Vec<u8> {
     out
 }
 
-fn kqe_value(value: &Value) -> kotoba_kqe::Value {
+fn kqe_value(value: &Value) -> kotoba_query::Value {
     edn_to_kqe_value(value)
-        .unwrap_or_else(|_| kotoba_kqe::Value::Text(kotoba_edn::to_string(value)))
+        .unwrap_or_else(|_| kotoba_query::Value::Text(kotoba_edn::to_string(value)))
 }
 
 fn prefix_datoms_entity(value: &Value) -> KotobaCid {
@@ -3367,19 +3901,19 @@ fn vaet_key_for_datom(datom: &Datom) -> Option<Vec<u8>> {
     .vaet_key()
 }
 
-fn vaet_ref_value(value: &Value) -> Option<kotoba_kqe::Value> {
+fn vaet_ref_value(value: &Value) -> Option<kotoba_query::Value> {
     match value {
-        Value::String(s) => KotobaCid::from_multibase(s).map(kotoba_kqe::Value::Cid),
+        Value::String(s) => KotobaCid::from_multibase(s).map(kotoba_query::Value::Cid),
         Value::Tagged { tag, value } if tag.to_qualified() == "cid" => value
             .as_string()
             .and_then(KotobaCid::from_multibase)
-            .map(kotoba_kqe::Value::Cid),
+            .map(kotoba_query::Value::Cid),
         _ => None,
     }
 }
 
 fn vaet_prefix_for_parts(
-    v: kotoba_kqe::Value,
+    v: kotoba_query::Value,
     attr: Option<String>,
     entity: Option<KotobaCid>,
     tx: Option<KotobaCid>,
@@ -3409,7 +3943,7 @@ fn vaet_prefix_for_parts(
         // prefix is one byte too long and the scan returns nothing (ADR-2606022150).
         let empty_attr_len = {
             let mut t = Vec::new();
-            kotoba_kqe::keycodec::push_ordered_str(&mut t, "");
+            kotoba_query::keycodec::push_ordered_str(&mut t, "");
             t.len()
         };
         key.truncate(key.len().saturating_sub(empty_attr_len + 36 + 36 + 1));
@@ -4503,6 +5037,7 @@ mod tests {
 
     fn request(ipns_name: &str, graph: KotobaCid, datoms: Vec<Datom>) -> CommitDatomsRequest {
         CommitDatomsRequest {
+            merge_parents: None,
             ipns_name: ipns_name.to_string(),
             graph,
             datoms,
@@ -4882,6 +5417,69 @@ mod tests {
 
         assert_eq!(second.commit.prev, Some(first.commit.cid));
         assert_eq!(second.ipns_record.sequence, 2);
+    }
+
+    #[test]
+    fn merge_on_conflict_is_gated_and_converges_live_datoms() {
+        let store = MemoryBlockStore::new();
+        let ipns = InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns);
+        let graph = KotobaCid::from_bytes(b"graph");
+        let ipns_name = "k51-kotoba-db";
+
+        let base_datom = datom(b"alice", "person/name", "Alice", b"tx-base");
+        let mut base_req = request(ipns_name, graph.clone(), vec![base_datom.clone()]);
+        base_req.covering_datoms = Some(vec![base_datom.clone()]);
+        let base = writer.commit_datoms(base_req).unwrap();
+
+        let bob = datom(b"bob", "person/name", "Bob", b"tx-bob");
+        let mut winner_req = request(ipns_name, graph.clone(), vec![bob.clone()]);
+        winner_req.covering_datoms = Some(vec![base_datom.clone(), bob.clone()]);
+        winner_req.expected_parent = Some(base.commit.cid.clone());
+        winner_req.seq = 2;
+        let winner = writer.commit_datoms(winner_req).unwrap();
+
+        let carol = datom(b"carol", "person/name", "Carol", b"tx-carol");
+        let mut stale_req = request(ipns_name, graph, vec![carol]);
+        stale_req.expected_parent = Some(base.commit.cid.clone());
+        stale_req.seq = 2;
+        assert!(matches!(
+            writer
+                .commit_datoms_merging_with(stale_req.clone(), false)
+                .unwrap_err(),
+            DistributedCommitError::StaleParent { .. }
+        ));
+
+        let merged = writer
+            .commit_datoms_merging_with(stale_req, true)
+            .expect("merge-on-conflict should retry against the winning head");
+        assert_eq!(merged.commit.prev, Some(winner.commit.cid.clone()));
+        assert_eq!(
+            merged.commit.parents,
+            vec![winner.commit.cid.clone(), base.commit.cid.clone()]
+        );
+        assert_eq!(merged.ipns_record.sequence, 3);
+
+        let live = live_datoms_at(&merged.commit.cid, &store).unwrap();
+        for (entity, value) in [
+            (b"alice".as_slice(), "Alice"),
+            (b"bob", "Bob"),
+            (b"carol", "Carol"),
+        ] {
+            assert!(
+                live.iter().any(|d| {
+                    d.e == KotobaCid::from_bytes(entity)
+                        && d.a == "person/name"
+                        && d.v == EdnValue::string(value)
+                }),
+                "merged live set should contain {value}"
+            );
+        }
+        let carol = live
+            .iter()
+            .find(|d| d.e == KotobaCid::from_bytes(b"carol"))
+            .expect("carol datom");
+        assert_eq!(carol.t, merged.commit.tx_cid);
     }
 
     #[test]
@@ -8676,5 +9274,465 @@ mod tests {
                 "N={state_len:>7}  seed={seed_ms:>6}ms  from_datoms={from_datoms_ms:>5}ms  ceavt_build={ceavt_ms:>5}ms  WARM_2datom_transact={warm_tx_ms:>6}ms"
             );
         }
+    }
+
+    #[test]
+    fn gc_history_prunes_old_commits_keeps_current() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let graph = KotobaCid::from_bytes(b"gc-test-graph");
+
+        // Commit 1: a small covering tree.
+        let v1: Vec<(Vec<u8>, Vec<u8>)> = (0..50u32)
+            .map(|i| (format!("k{i:04}").into_bytes(), b"v1".to_vec()))
+            .collect();
+        let root1 = ProllyTree::build_tree(v1, &store).unwrap();
+        let mut roots1 = std::collections::HashMap::new();
+        roots1.insert(ROOT_EAVT.to_string(), root1.clone());
+        let c1 = DistributedDatomCommit::seal(
+            graph.clone(),
+            KotobaCid::from_bytes(b"tx1"),
+            None,
+            "did:key:test".into(),
+            1,
+            roots1,
+            None,
+        )
+        .unwrap();
+        c1.persist(&store).unwrap();
+
+        // Commit 2: a DIFFERENT, larger tree (distinct blocks) chained on c1.
+        let v2: Vec<(Vec<u8>, Vec<u8>)> = (0..2000u32)
+            .map(|i| (format!("k{i:04}").into_bytes(), b"v2-larger-value".to_vec()))
+            .collect();
+        let root2 = ProllyTree::build_tree(v2, &store).unwrap();
+        let mut roots2 = std::collections::HashMap::new();
+        roots2.insert(ROOT_EAVT.to_string(), root2.clone());
+        let c2 = DistributedDatomCommit::seal(
+            graph,
+            KotobaCid::from_bytes(b"tx2"),
+            Some(c1.cid.clone()),
+            "did:key:test".into(),
+            2,
+            roots2,
+            None,
+        )
+        .unwrap();
+        c2.persist(&store).unwrap();
+
+        // Blocks reachable only from the dropped commit c1 (its tree + commit block).
+        let c1_only: Vec<_> = {
+            use std::collections::HashSet;
+            let keep: HashSet<[u8; 36]> = ProllyTree::walk_all_cids(&root2, &store)
+                .unwrap()
+                .into_iter()
+                .map(|c| c.0)
+                .chain(std::iter::once(c2.cid.0))
+                .collect();
+            ProllyTree::walk_all_cids(&root1, &store)
+                .unwrap()
+                .into_iter()
+                .chain(std::iter::once(c1.cid.clone()))
+                .filter(|c| !keep.contains(&c.0))
+                .collect()
+        };
+        assert!(!c1_only.is_empty(), "test needs c1-exclusive blocks");
+
+        let report = gc_history(&c2.cid, 1, &store).unwrap();
+        assert_eq!(report.kept_commits, 1);
+        assert_eq!(report.dropped_commits, 1);
+        assert_eq!(report.deleted_blocks, c1_only.len());
+
+        // current commit + its whole tree survive (DB value readable)
+        assert!(store.get(&c2.cid).unwrap().is_some());
+        for cid in ProllyTree::walk_all_cids(&root2, &store).unwrap() {
+            assert!(
+                store.get(&cid).unwrap().is_some(),
+                "current tree block deleted!"
+            );
+        }
+        // dropped-only blocks are gone
+        for cid in &c1_only {
+            assert!(store.get(cid).unwrap().is_none(), "stale block survived gc");
+        }
+        // idempotent
+        let again = gc_history(&c2.cid, 1, &store).unwrap();
+        assert_eq!(again.deleted_blocks, 0);
+    }
+
+    #[test]
+    fn next_hlc_is_monotonic_under_clock_skew() {
+        // Advancing physical time bumps the high bits.
+        let a = next_hlc(1_000);
+        let b = next_hlc(2_000);
+        assert!(b > a, "HLC must advance with physical time");
+        // A wall-clock JUMP BACKWARDS must NOT produce a smaller HLC.
+        let c = next_hlc(500);
+        assert!(
+            c > b,
+            "HLC must stay monotonic when the clock goes backwards"
+        );
+        // Same-millisecond calls still strictly increase (logical counter).
+        let d = next_hlc(2_000);
+        let e = next_hlc(2_000);
+        assert!(
+            e > d,
+            "HLC must strictly increase within the same millisecond"
+        );
+    }
+
+    #[test]
+    fn seal_stamps_a_nonzero_hlc() {
+        let graph = KotobaCid::from_bytes(b"hlc-seal");
+        let c = DistributedDatomCommit::seal(
+            graph.clone(),
+            KotobaCid::from_bytes(b"tx"),
+            None,
+            "did:key:t".into(),
+            1,
+            std::collections::HashMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(c.hlc > 0, "seal must stamp a Hybrid Logical Clock");
+    }
+
+    // ── Merkle-CRDT merge (phase 2) ──────────────────────────────────────────
+    mod merge {
+        use super::super::{merge_live_sets, TaggedOp};
+        use crate::Datom;
+        use kotoba_core::cid::KotobaCid;
+        use kotoba_edn::EdnValue;
+
+        fn ent(n: &str) -> KotobaCid {
+            KotobaCid::from_bytes(n.as_bytes())
+        }
+        fn tx() -> KotobaCid {
+            KotobaCid::from_bytes(b"tx")
+        }
+        fn assert_d(e: &str, a: &str, v: i64) -> Datom {
+            Datom::assert(ent(e), a.into(), EdnValue::Integer(v), tx())
+        }
+        fn retract_d(e: &str, a: &str, v: i64) -> Datom {
+            Datom::retract(ent(e), a.into(), EdnValue::Integer(v), tx())
+        }
+        fn op(hlc: u64, w: &str, d: Datom) -> TaggedOp {
+            TaggedOp {
+                hlc,
+                writer: w.into(),
+                datom: d,
+            }
+        }
+        /// canonical comparable signature of a live set
+        fn sig(ds: &[Datom]) -> Vec<(String, String, String)> {
+            let mut v: Vec<_> = ds
+                .iter()
+                .map(|d| (d.e.to_multibase(), d.a.clone(), kotoba_edn::to_string(&d.v)))
+                .collect();
+            v.sort();
+            v
+        }
+
+        #[test]
+        fn base_passthrough_when_no_concurrent_ops() {
+            let base = vec![assert_d("a", "name", 1), assert_d("b", "name", 2)];
+            assert_eq!(sig(&merge_live_sets(&base, &[])), sig(&base));
+        }
+
+        #[test]
+        fn commutative_under_input_reordering() {
+            let base = vec![assert_d("a", "x", 0)];
+            let ops = vec![
+                op(10, "w1", assert_d("a", "x", 1)),
+                op(20, "w2", retract_d("a", "x", 1)),
+                op(15, "w1", assert_d("b", "y", 9)),
+            ];
+            let forward = merge_live_sets(&base, &ops);
+            let mut rev = ops.clone();
+            rev.reverse();
+            let backward = merge_live_sets(&base, &rev);
+            assert_eq!(
+                sig(&forward),
+                sig(&backward),
+                "merge must be order-independent"
+            );
+        }
+
+        #[test]
+        fn retract_wins_by_higher_hlc_and_vice_versa() {
+            let base = vec![];
+            // assert@10, retract@20 ⇒ gone
+            let gone = merge_live_sets(
+                &base,
+                &[
+                    op(10, "w", assert_d("a", "x", 1)),
+                    op(20, "w", retract_d("a", "x", 1)),
+                ],
+            );
+            assert!(sig(&gone).is_empty(), "later retract wins");
+            // retract@10, assert@20 ⇒ present
+            let present = merge_live_sets(
+                &base,
+                &[
+                    op(10, "w", retract_d("a", "x", 1)),
+                    op(20, "w", assert_d("a", "x", 1)),
+                ],
+            );
+            assert_eq!(sig(&present).len(), 1, "later assert wins");
+        }
+
+        #[test]
+        fn idempotent() {
+            let base = vec![assert_d("a", "x", 0)];
+            let ops = vec![
+                op(10, "w1", assert_d("a", "x", 1)),
+                op(20, "w2", retract_d("z", "q", 7)),
+            ];
+            let once = merge_live_sets(&base, &ops);
+            let twice = merge_live_sets(&once, &ops);
+            assert_eq!(
+                sig(&once),
+                sig(&twice),
+                "re-merging the same ops changes nothing"
+            );
+        }
+
+        #[test]
+        fn two_writers_converge_to_identical_set() {
+            // Common ancestor.
+            let base = vec![assert_d("u", "role", 0)];
+            // Writer 1 (hlc 100) and Writer 2 (hlc 101) commit concurrently.
+            let w1 = vec![
+                op(100, "did:w1", assert_d("u", "role", 1)),
+                op(100, "did:w1", assert_d("p", "k", 5)),
+            ];
+            let w2 = vec![
+                op(101, "did:w2", assert_d("u", "role", 2)),
+                op(101, "did:w2", retract_d("u", "role", 0)),
+            ];
+            // Node A merges as (w1 then w2); Node B as (w2 then w1).
+            let a = merge_live_sets(&base, &[w1.clone(), w2.clone()].concat());
+            let b = merge_live_sets(&base, &[w2, w1].concat());
+            assert_eq!(
+                sig(&a),
+                sig(&b),
+                "both replicas converge to the same live set"
+            );
+            // OR-set: both concurrent role values survive (no schema = no single-value LWW).
+            let roles: Vec<_> = a.iter().filter(|d| d.a == "role").collect();
+            assert_eq!(
+                roles.len(),
+                2,
+                "concurrent distinct values kept as OR-set; role=0 retracted"
+            );
+        }
+
+        #[test]
+        fn gather_concurrent_ops_walks_chain_and_tags_hlc() {
+            use super::super::{build_datom_roots, gather_concurrent_ops, DistributedDatomCommit};
+            let store = kotoba_store::MemoryBlockStore::new();
+            let g = KotobaCid::from_bytes(b"gather-g");
+
+            // base commit (delta d0)
+            let d0 = assert_d("a", "x", 0);
+            let r0 = build_datom_roots(&[d0], &store).unwrap();
+            let c0 = DistributedDatomCommit::seal(
+                g.clone(),
+                KotobaCid::from_bytes(b"t0"),
+                None,
+                "w0".into(),
+                1,
+                r0,
+                None,
+            )
+            .unwrap();
+            c0.persist(&store).unwrap();
+
+            // concurrent commit on top (delta d1) — "theirs"
+            let d1 = assert_d("b", "y", 1);
+            let r1 = build_datom_roots(&[d1.clone()], &store).unwrap();
+            let c1 = DistributedDatomCommit::seal(
+                g,
+                KotobaCid::from_bytes(b"t1"),
+                Some(c0.cid.clone()),
+                "w1".into(),
+                2,
+                r1,
+                None,
+            )
+            .unwrap();
+            c1.persist(&store).unwrap();
+
+            // gather (base, theirs] → exactly c1's delta, tagged with c1's hlc/author.
+            let ops = gather_concurrent_ops(Some(&c0.cid), &c1.cid, &store).unwrap();
+            assert_eq!(ops.len(), 1, "only the commit after base is gathered");
+            assert_eq!(ops[0].hlc, c1.hlc, "op tagged with its commit's HLC");
+            assert_eq!(ops[0].writer, "w1");
+            assert_eq!(ops[0].datom.a, "y");
+            assert!(c1.hlc > c0.hlc, "later commit has a higher HLC");
+            assert_eq!(
+                c1.parents,
+                vec![c0.cid],
+                "non-merge commit: parents == [prev]"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod author_sig_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_commit(author: &str) -> DistributedDatomCommit {
+        DistributedDatomCommit::seal(
+            KotobaCid::from_bytes(b"sig-test-graph"),
+            KotobaCid::from_bytes(b"sig-test-tx"),
+            None,
+            author.to_string(),
+            1,
+            HashMap::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sign_verify_roundtrip_and_cid_covers_sig() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let vk = key.verifying_key();
+        let mut c = test_commit("did:key:zAuthor");
+        let unsigned_cid = c.cid.clone();
+        assert!(!c.verify_author_sig(&vk).unwrap(), "unsigned → false");
+        c.sign(&key).unwrap();
+        assert!(c.verify_author_sig(&vk).unwrap(), "signed → true");
+        assert_ne!(c.cid, unsigned_cid, "CID must cover the signature");
+        // Wrong key must not verify.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]).verifying_key();
+        assert!(!c.verify_author_sig(&other).unwrap());
+    }
+
+    #[test]
+    fn tampered_field_breaks_signature() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut c = test_commit("did:key:zAuthor");
+        c.sign(&key).unwrap();
+        c.author = "did:key:zImpostor".to_string();
+        assert!(
+            !c.verify_author_sig(&key.verifying_key()).unwrap(),
+            "changing any signed field must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn signed_commit_persists_and_loads_with_sig() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let store = kotoba_store::MemoryBlockStore::new();
+        let mut c = test_commit("did:key:zAuthor");
+        c.sign(&key).unwrap();
+        let cid = c.persist(&store).unwrap();
+        let loaded = DistributedDatomCommit::load(&cid, &store).unwrap().unwrap();
+        assert_eq!(loaded.author_sig, c.author_sig);
+        assert!(loaded.verify_author_sig(&key.verifying_key()).unwrap());
+    }
+
+    #[test]
+    fn pre_r2b_unsigned_commit_decodes_unchanged() {
+        // A commit encoded WITHOUT the author_sig field (pre-R2b block) must
+        // decode with author_sig = None and keep its original CID.
+        let c = test_commit("did:key:zLegacy");
+        assert!(c.author_sig.is_none());
+        let store = kotoba_store::MemoryBlockStore::new();
+        let cid = c.persist(&store).unwrap();
+        let loaded = DistributedDatomCommit::load(&cid, &store).unwrap().unwrap();
+        assert_eq!(loaded.author_sig, None);
+        assert_eq!(
+            loaded.cid, c.cid,
+            "unsigned encoding unchanged (no field emitted)"
+        );
+    }
+
+    #[test]
+    fn merge_path_rejects_foreign_head_failing_import_check() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let ipns = kotoba_ipfs::InMemoryIpnsRegistry::new();
+        let req = |seq: u64, parent: Option<KotobaCid>| CommitDatomsRequest {
+            merge_parents: None,
+            covering_datoms: None,
+            ipns_name: "k51-import-gate-test".into(),
+            graph: KotobaCid::from_bytes(b"import-gate-graph"),
+            datoms: vec![Datom::assert(
+                KotobaCid::from_bytes(b"e"),
+                "a/b".into(),
+                kotoba_edn::EdnValue::string("v"),
+                KotobaCid::from_bytes(b"t"),
+            )],
+            expected_parent: parent,
+            tx_cid: Some(KotobaCid::from_bytes(b"t")),
+            author: "did:key:zForeign".into(),
+            seq,
+            valid_until: "2099-01-01T00:00:00Z".into(),
+            ttl_secs: Some(60),
+            cacao_proof_cid: None,
+            ipns_controller_did: None,
+            ipns_signing_key: None,
+        };
+        // Concurrent writer lands first → our CAS will see StaleParent.
+        DistributedCommitWriter::new(&store, &ipns)
+            .commit_datoms(req(1, None))
+            .unwrap();
+        // Our writer gates foreign heads with a reject-all check: the merge
+        // path must surface ImportRejected instead of merging on top.
+        let gated = DistributedCommitWriter::new(&store, &ipns).with_import_check(Some(
+            std::sync::Arc::new(|_: &DistributedDatomCommit| Err("rejected by test".into())),
+        ));
+        let err = gated
+            .commit_datoms_merging_with(req(1, None), true)
+            .unwrap_err();
+        assert!(
+            matches!(err, DistributedCommitError::ImportRejected(_)),
+            "got {err:?}"
+        );
+        // Without the gate, the same merge succeeds.
+        let open = DistributedCommitWriter::new(&store, &ipns);
+        open.commit_datoms_merging_with(req(1, None), true).unwrap();
+    }
+
+    #[test]
+    fn writer_with_signing_key_signs_every_commit() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
+        let vk = key.verifying_key();
+        let store = kotoba_store::MemoryBlockStore::new();
+        let ipns = kotoba_ipfs::InMemoryIpnsRegistry::new();
+        let writer = DistributedCommitWriter::new(&store, &ipns).with_author_signing_key(Some(key));
+        let commit = writer
+            .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
+                covering_datoms: None,
+                ipns_name: "k51-author-sig-test".into(),
+                graph: KotobaCid::from_bytes(b"sig-writer-graph"),
+                datoms: vec![Datom::assert(
+                    KotobaCid::from_bytes(b"e"),
+                    "a/b".into(),
+                    kotoba_edn::EdnValue::string("v"),
+                    KotobaCid::from_bytes(b"t"),
+                )],
+                expected_parent: None,
+                tx_cid: Some(KotobaCid::from_bytes(b"t")),
+                author: "did:key:zWriterAuthor".into(),
+                seq: 1,
+                valid_until: "2099-01-01T00:00:00Z".into(),
+                ttl_secs: Some(60),
+                cacao_proof_cid: None,
+                ipns_controller_did: None,
+                ipns_signing_key: None,
+            })
+            .unwrap();
+        assert!(commit.commit.author_sig.is_some(), "writer must sign");
+        assert!(commit.commit.verify_author_sig(&vk).unwrap());
+        // And the persisted block round-trips with a valid signature.
+        let loaded = DistributedDatomCommit::load(&commit.commit.cid, &store)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.verify_author_sig(&vk).unwrap());
     }
 }

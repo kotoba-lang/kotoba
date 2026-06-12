@@ -9,8 +9,8 @@
 //   Jetstream identity event → (Topic("jetstream/identity"), Quad(pred="handle", object=Text(handle)))
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::topic::Topic;
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_vault::topic::Topic;
 
 // ── KotobaCid helpers ─────────────────────────────────────────────────────────
 

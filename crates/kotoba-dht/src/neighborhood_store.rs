@@ -20,7 +20,7 @@
 //! ## Placement
 //!
 //! This lives in **kotoba-dht**, not kotoba-store, to avoid a dependency cycle:
-//! `kotoba-store → kotoba-kse → kotoba-store` would loop, and kotoba-dht already
+//! `kotoba-store → kotoba-vault → kotoba-store` would loop, and kotoba-dht already
 //! owns `NodeId` / `Neighborhood` / `availability_proof`.
 //!
 //! ## WASM / edge

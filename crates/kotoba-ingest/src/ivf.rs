@@ -12,8 +12,8 @@
 //!   cc/ivf/n            — Integer(member_count)
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -623,7 +623,7 @@ mod tests {
         let quads = idx.to_quads(&graph, &counts);
         let datoms: Vec<_> = quads
             .into_iter()
-            .map(|quad| kotoba_kqe::datom::Datom::from_legacy_quad(quad, true))
+            .map(|quad| kotoba_query::datom::Datom::from_legacy_quad(quad, true))
             .collect();
 
         let restored = IvfIndex::from_datoms(&datoms).expect("from_datoms must succeed");

@@ -44,6 +44,7 @@ pub mod oid;
 pub mod pack;
 pub mod repo;
 pub mod schema;
+pub mod wire;
 
 pub use error::{GitError, Result};
 pub use object::{GitObject, GitObjectKind, TreeEntry};
@@ -106,6 +107,13 @@ impl<'a> GitStore<'a> {
         Ok(())
     }
 
+    /// A fresh read snapshot of the queryable projection. The wire protocol
+    /// (`wire::smart_http`) takes a new snapshot after each write so a
+    /// receive-pack sees the objects it just ingested when validating refs.
+    pub fn db(&self) -> Db {
+        self.conn.db()
+    }
+
     /// The `KotobaCid` of the framed block for `oid`, from the projection.
     pub fn object_cid(&self, db: &Db, oid: GitOid) -> Result<KotobaCid> {
         object_cid(db, oid)
@@ -134,6 +142,113 @@ impl<'a> GitStore<'a> {
     pub fn materialize_object(&self, db: &Db, oid: GitOid) -> Result<GitObject> {
         let framed = self.materialize_framed(db, oid)?;
         GitObject::parse_framed(&framed)
+    }
+
+    // ── Durable snapshot / rehydrate ──────────────────────────────────────────
+    //
+    // The object *bytes* are already durable: every `put_object` writes the
+    // framed block into the content-addressed `BlockStore` (IPFS), which a real
+    // deployment backs with Kubo. What is *not* inherently durable is the
+    // in-memory projection: the `oid↔cid` index and the refs. These two
+    // methods make a git repo durable by writing that index + refs into one more
+    // content-addressed block (the **manifest**) and rebuilding the projection
+    // from it — so after a restart, given the manifest CID, the full repo
+    // (objects + refs + queryable DAG) is reconstructable purely from IPFS
+    // blocks. The single mutable thing left is "repo → latest manifest CID",
+    // which the caller persists in its mutable-name boundary (e.g. `VaultStore`).
+
+    /// Serialize the projection (object `oid↔cid` index + refs) into a
+    /// content-addressed manifest block and return its CID.
+    ///
+    /// Format (line-oriented ASCII, every git oid/refname is space-free):
+    /// ```text
+    /// kotoba-git-snapshot v1
+    /// O <oid-hex> <cid-multibase>      # one per object
+    /// R <refname> <oid-hex>            # a direct ref
+    /// S <refname> <target-refname>     # a symbolic ref (e.g. HEAD)
+    /// ```
+    pub fn snapshot_manifest(&self) -> Result<KotobaCid> {
+        let db = self.db();
+        let mut out = String::from("kotoba-git-snapshot v1\n");
+        for (oid, cid) in all_objects(&db) {
+            out.push_str(&format!("O {} {}\n", oid.to_hex(), cid.to_multibase()));
+        }
+        for (name, target) in list_refs(&db) {
+            match target {
+                RefTarget::Oid(oid) => out.push_str(&format!("R {} {}\n", name, oid.to_hex())),
+                RefTarget::Symbolic(t) => out.push_str(&format!("S {name} {t}\n")),
+            }
+        }
+        let bytes = out.into_bytes();
+        let cid = KotobaCid::from_bytes(&bytes);
+        put_verified(self.store, &cid, &bytes).map_err(|e| GitError::Store(e.to_string()))?;
+        Ok(cid)
+    }
+
+    /// Rebuild the projection from a manifest block previously produced by
+    /// [`Self::snapshot_manifest`]. Re-projects every object from its (durable)
+    /// block and restores all refs.
+    ///
+    /// Best-effort on missing object blocks: if a referenced block is absent
+    /// (e.g. a dev in-memory store that lost its blocks across restart) that
+    /// object is skipped and counted, rather than failing the whole repo load.
+    /// Returns `(objects_restored, objects_missing)`.
+    pub async fn rehydrate(&self, manifest_cid: &KotobaCid) -> Result<(usize, usize)> {
+        let bytes = self
+            .store
+            .get(manifest_cid)
+            .map_err(|e| GitError::Store(e.to_string()))?
+            .ok_or_else(|| GitError::BlockMissing(manifest_cid.to_multibase()))?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| GitError::MalformedHeader)?;
+
+        let mut lines = text.lines();
+        match lines.next() {
+            Some(l) if l.starts_with("kotoba-git-snapshot ") => {}
+            _ => return Err(GitError::MalformedHeader),
+        }
+
+        let mut restored = 0usize;
+        let mut missing = 0usize;
+        // Two passes: objects first (so refs resolve), then refs.
+        let mut ref_lines: Vec<(char, String, String)> = Vec::new();
+        for line in lines {
+            let mut parts = line.splitn(3, ' ');
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some("O"), Some(_oid), Some(cid_mb)) => {
+                    let Some(cid) = KotobaCid::from_multibase(cid_mb) else {
+                        missing += 1;
+                        continue;
+                    };
+                    match self.store.get(&cid) {
+                        Ok(Some(framed)) => {
+                            let obj = GitObject::parse_framed(&framed)?;
+                            self.put_object(&obj).await?;
+                            restored += 1;
+                        }
+                        _ => missing += 1,
+                    }
+                }
+                (Some("R"), Some(name), Some(oid)) => {
+                    ref_lines.push(('R', name.to_string(), oid.to_string()))
+                }
+                (Some("S"), Some(name), Some(target)) => {
+                    ref_lines.push(('S', name.to_string(), target.to_string()))
+                }
+                _ => {} // tolerate blank/unknown lines
+            }
+        }
+        for (kind, name, val) in ref_lines {
+            match kind {
+                'R' => {
+                    if let Ok(oid) = GitOid::from_hex(&val) {
+                        self.put_ref(&name, oid).await?;
+                    }
+                }
+                'S' => self.put_symbolic_ref(&name, &val).await?,
+                _ => {}
+            }
+        }
+        Ok((restored, missing))
     }
 }
 
@@ -492,6 +607,96 @@ first\n"
                 "b4ed918248039b78f24383523fa4e51f80994fac".into()
             )]]
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_then_rehydrate_into_fresh_connection() {
+        // A shared block store stands in for durable IPFS: the projection
+        // Connection is thrown away and rebuilt from the manifest CID alone.
+        let store = MemoryBlockStore::new();
+        let manifest_cid;
+        let commit_oid;
+        let blob_oid;
+        {
+            let conn = Connection::new();
+            let git = GitStore::new(&conn, &store);
+            git.install_schema().await.unwrap();
+            let blob = GitObject::blob(b"hello\n".to_vec());
+            let (b, _) = git.put_object(&blob).await.unwrap();
+            blob_oid = b;
+            let tree = GitObject::tree(&[TreeEntry {
+                mode: b"100644".to_vec(),
+                name: b"f.txt".to_vec(),
+                oid: blob_oid,
+            }]);
+            let (tree_oid, _) = git.put_object(&tree).await.unwrap();
+            let commit = GitObject::new(
+                GitObjectKind::Commit,
+                format!("tree {tree_oid}\n\nfirst\n").into_bytes(),
+            );
+            let (c, _) = git.put_object(&commit).await.unwrap();
+            commit_oid = c;
+            git.put_ref("refs/heads/main", commit_oid).await.unwrap();
+            git.put_symbolic_ref("HEAD", "refs/heads/main")
+                .await
+                .unwrap();
+            manifest_cid = git.snapshot_manifest().unwrap();
+        }
+
+        // Fresh Connection (projection wiped), same block store (durable blocks).
+        let conn2 = Connection::new();
+        let git2 = GitStore::new(&conn2, &store);
+        git2.install_schema().await.unwrap();
+        let (restored, missing) = git2.rehydrate(&manifest_cid).await.unwrap();
+        assert_eq!((restored, missing), (3, 0));
+
+        let db = conn2.db();
+        assert_eq!(resolve_ref(&db, "refs/heads/main"), Some(commit_oid));
+        assert_eq!(resolve_ref(&db, "HEAD"), Some(commit_oid));
+        assert_eq!(all_objects(&db).len(), 3);
+        // round-trip byte-exact through the rebuilt projection
+        let framed = git2.materialize_framed(&db, blob_oid).unwrap();
+        assert_eq!(framed, b"blob 6\0hello\n");
+    }
+
+    #[tokio::test]
+    async fn rehydrate_counts_and_skips_missing_object_blocks() {
+        // Snapshot against one store, then rehydrate against an EMPTY store:
+        // the manifest is reachable (we hand it over) but the object blocks are
+        // gone — rehydrate must count them missing rather than fail.
+        let store_a = MemoryBlockStore::new();
+        let manifest_bytes;
+        let manifest_cid;
+        {
+            let conn = Connection::new();
+            let git = GitStore::new(&conn, &store_a);
+            git.install_schema().await.unwrap();
+            let (oid, _) = git
+                .put_object(&GitObject::blob(b"hi\n".to_vec()))
+                .await
+                .unwrap();
+            git.put_ref("refs/heads/main", oid).await.unwrap();
+            manifest_cid = git.snapshot_manifest().unwrap();
+            manifest_bytes = store_a.get(&manifest_cid).unwrap().unwrap().to_vec();
+        }
+
+        // Fresh store containing ONLY the manifest block, not the object blocks.
+        let store_b = MemoryBlockStore::new();
+        kotoba_store::put_verified(&store_b, &manifest_cid, &manifest_bytes).unwrap();
+        let conn2 = Connection::new();
+        let git2 = GitStore::new(&conn2, &store_b);
+        git2.install_schema().await.unwrap();
+
+        let (restored, missing) = git2.rehydrate(&manifest_cid).await.unwrap();
+        assert_eq!(
+            (restored, missing),
+            (0, 1),
+            "the one object block is missing"
+        );
+        // The ref is still recorded even though its target object is absent.
+        assert!(list_refs(&conn2.db())
+            .iter()
+            .any(|(n, _)| n == "refs/heads/main"));
     }
 
     #[tokio::test]

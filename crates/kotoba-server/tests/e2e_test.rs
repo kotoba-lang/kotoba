@@ -12985,6 +12985,11 @@ async fn request_log_query_returns_entries_after_requests() {
         "method missing: {entry}"
     );
     assert!(entry["path"].as_str().is_some(), "path missing: {entry}");
+    assert_eq!(
+        entry["principal_did"].as_str(),
+        Some(s.operator_did.as_str()),
+        "principal_did must be decoded from bearer JWT sub: {entry}"
+    );
 }
 
 #[tokio::test]
@@ -13583,5 +13588,544 @@ async fn commit_store_oversized_graph_returns_400() {
     assert_eq!(
         status, 400,
         "oversized graph must be rejected before CACAO: {body}"
+    );
+}
+
+// ── Access receipts (ADR-sealed-cold-tier R1) ────────────────────────────────
+
+/// Full loop: an authenticated kg read with a declared purpose produces a
+/// receipt in the audit graph, listable via audit.listReceipts (operator-gated).
+#[tokio::test]
+async fn access_receipt_recorded_and_listable() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zReceiptReader");
+
+    // Authenticated-tier read (KOTOBA_DEFAULT_VISIBILITY=authenticated in
+    // TestServer) with a declared purpose.
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: verify receipt loop")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200, "kg.catalog read must succeed");
+
+    // The background writer flushes within ~50ms; poll the audit endpoint.
+    let op_tok = tenant_jwt(&s.operator_did);
+    let mut receipts = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, body) = s
+            .get_with_auth(
+                "/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts?accessor=did:key:zReceiptReader",
+                &op_tok,
+            )
+            .await;
+        assert_eq!(status, 200, "audit.listReceipts: {body}");
+        if body["count"].as_u64().unwrap_or(0) >= 1 {
+            receipts = body;
+            break;
+        }
+    }
+    let list = receipts["receipts"]
+        .as_array()
+        .expect("receipt recorded within 4s");
+    let r0 = &list[0];
+    assert_eq!(r0["accessorDid"], "did:key:zReceiptReader");
+    assert_eq!(r0["operation"], "kg:catalog");
+    assert_eq!(r0["purpose"], "e2e: verify receipt loop");
+    assert!(r0["graph"].as_str().is_some());
+    assert!(r0["tsUnix"].as_i64().unwrap_or(0) > 1_700_000_000);
+}
+
+/// audit.listReceipts is operator-only: a non-operator JWT is rejected.
+#[tokio::test]
+async fn audit_list_receipts_rejects_non_operator() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt("did:key:zSomeoneElse");
+    let (status, _) = s
+        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts", &tok)
+        .await;
+    assert_eq!(status, 401);
+}
+
+/// R2a: after a receipted read, audit.anchorPayload returns commitRoot calldata
+/// for the audit-graph head; before any receipt it 404s.
+#[tokio::test]
+async fn audit_anchor_payload_after_receipted_read() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+
+    // Fresh server: nothing to anchor yet.
+    let (status, _) = s
+        .get_with_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload",
+            &op_tok,
+        )
+        .await;
+    assert_eq!(status, 404, "no receipts yet → 404");
+
+    // One receipted read…
+    let tok = tenant_jwt("did:key:zAnchorReader");
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: anchor")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200);
+
+    // …flushes into an audit commit, which becomes anchorable.
+    let mut body = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, b) = s
+            .get_with_auth(
+                "/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload",
+                &op_tok,
+            )
+            .await;
+        if status == 200 {
+            body = b;
+            break;
+        }
+    }
+    assert_eq!(body["ok"], true, "anchor payload within 4s: {body}");
+    assert_eq!(body["function"], "commitRoot(bytes32,bytes,uint64)");
+    assert!(body["seq"].as_u64().unwrap_or(0) >= 1);
+    let calldata = body["calldataHex"].as_str().expect("calldataHex");
+    assert!(calldata.len() > 8, "non-trivial calldata");
+    let head = body["headCid"].as_str().expect("headCid");
+    assert!(head.starts_with('b'), "multibase head CID");
+}
+
+/// R2b: audit.verifyChain reports a fully-valid signed receipt chain over HTTP.
+#[tokio::test]
+async fn audit_verify_chain_reports_valid() {
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+
+    // One receipted read to create the audit chain.
+    let tok = tenant_jwt("did:key:zVerifyReader");
+    let r = s
+        .client
+        .get(format!(
+            "{}/xrpc/com.etzhayyim.apps.kotobase.kg.catalog",
+            s.base_url
+        ))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("x-kotoba-purpose", "e2e: verify chain")
+        .send()
+        .await
+        .expect("kg.catalog");
+    assert_eq!(r.status().as_u16(), 200);
+
+    let mut body = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (status, b) = s
+            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.verifyChain", &op_tok)
+            .await;
+        if status == 200 {
+            body = b;
+            break;
+        }
+    }
+    assert_eq!(body["ok"], true, "chain must verify: {body}");
+    assert!(body["depth"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(body["invalid"].as_array().map(|a| a.len()), Some(0));
+    // The node's commits are signed; with a did:key operator they are Valid.
+    let valid = body["valid"].as_u64().unwrap_or(0);
+    let unverifiable = body["unverifiable"].as_u64().unwrap_or(0);
+    assert!(valid + unverifiable >= 1, "signed commits counted: {body}");
+}
+
+/// R3b: deposit a custodian share, then a CACAO-authorized requester gets it
+/// re-wrapped to their key; an unauthorized request is denied with no share.
+#[tokio::test]
+async fn key_request_share_full_custodian_flow() {
+    use base64::Engine as _;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3b-custody-graph").to_multibase();
+
+    // Fetch THIS node's custodian X25519 pubkey, then deal a 2-of-3 set where
+    // custodian #1 is the node (share[0] is sealed to its real key, so the node
+    // can open it) and #2/#3 are throwaway keys.
+    let (st, info) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
+        .await;
+    assert_eq!(st, 200, "{info}");
+    let node_pk_hex = info["x25519PubkeyHex"]
+        .as_str()
+        .expect("node pubkey")
+        .to_string();
+    let node_pk = {
+        let b = hex::decode(&node_pk_hex).unwrap();
+        let arr: [u8; 32] = b.try_into().unwrap();
+        PublicKey::from(arr)
+    };
+    let block_key = [77u8; 32];
+    let pubs: Vec<(String, PublicKey)> = vec![
+        (info["did"].as_str().unwrap().to_string(), node_pk),
+        (
+            "did:key:zCust2".into(),
+            PublicKey::from(&StaticSecret::from([2u8; 32])),
+        ),
+        (
+            "did:key:zCust3".into(),
+            PublicKey::from(&StaticSecret::from([3u8; 32])),
+        ),
+    ];
+    let shares = kotoba_custody::split_key(&block_key, 2, &pubs).unwrap();
+    let share_json = serde_json::to_value(&shares[0]).unwrap();
+
+    // Deposit (operator-gated): a non-operator is rejected.
+    let (status, _) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": share_json}),
+            &tenant_jwt("did:key:zNotOperator"),
+        )
+        .await;
+    assert_eq!(status, 401, "deposit must be operator-gated");
+
+    let (status, dep) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": share_json}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{dep}");
+
+    let requester_sk = StaticSecret::from([0x99u8; 32]);
+    let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
+
+    // Unauthorized: Private graph, no CACAO → denied, no share material.
+    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "private");
+    let (status, denied) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "nonce": "r3b-no-cacao",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{denied}");
+    assert_eq!(denied["ok"], false, "no CACAO must be denied: {denied}");
+    assert!(denied["sealedShareHex"].is_null(), "denial leaks no share");
+
+    // Authorized: valid datom:read CACAO for the graph.
+    let cacao_b64 = build_ed25519_cacao_for_operation(
+        &graph,
+        &s.operator_did,
+        kotoba_auth::CacaoPayload::OP_DATOM_READ,
+        "r3b-authorized-nonce",
+    );
+    let (status, granted) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "cacao_b64": cacao_b64,
+                "purpose": "e2e custody",
+                "nonce": "r3b-authorized-nonce",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
+    assert_eq!(status, 200, "{granted}");
+    assert_eq!(granted["ok"], true, "valid CACAO must grant: {granted}");
+    assert_eq!(granted["threshold"], 2);
+    let sealed_hex = granted["sealedShareHex"].as_str().expect("sealed share");
+    // The requester opens the re-wrapped share and it matches the dealt commitment.
+    let sealed = hex::decode(sealed_hex).unwrap();
+    let opened = kotoba_crypto::hpke_open(&requester_sk, &sealed).unwrap();
+    let mut h = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut h, &opened);
+    let commitment: [u8; 32] = sha2::Digest::finalize(h).into();
+    assert_eq!(
+        commitment, shares[0].commitment,
+        "released share matches the deal"
+    );
+    let _ = base64::engine::general_purpose::STANDARD; // keep import used
+
+    // The release wrote an access receipt (operation = key:requestShare).
+    let mut found = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (st, body) = s
+            .get_with_auth(
+                "/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts",
+                &op_tok,
+            )
+            .await;
+        assert_eq!(st, 200);
+        if let Some(arr) = body["receipts"].as_array() {
+            if arr.iter().any(|r| r["operation"] == "key:requestShare") {
+                found = true;
+                break;
+            }
+        }
+    }
+    assert!(found, "key release must leave a receipt");
+}
+
+/// R3c: depositShare enforces epoch monotonicity (a stale dealing can't replace
+/// a rotated one), and the grant surfaces the epoch.
+#[tokio::test]
+async fn key_deposit_epoch_monotonic_and_grant_reports_epoch() {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3c-epoch-graph").to_multibase();
+
+    let (st, info) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
+        .await;
+    assert_eq!(st, 200);
+    let node_pk = {
+        let b = hex::decode(info["x25519PubkeyHex"].as_str().unwrap()).unwrap();
+        PublicKey::from(<[u8; 32]>::try_from(b).unwrap())
+    };
+    let node_did = info["did"].as_str().unwrap().to_string();
+    let key = [88u8; 32];
+    let pubs = |extra: &str| -> Vec<(String, PublicKey)> {
+        vec![
+            (node_did.clone(), node_pk),
+            (
+                format!("did:key:zE{extra}A"),
+                PublicKey::from(&StaticSecret::from([20u8; 32])),
+            ),
+            (
+                format!("did:key:zE{extra}B"),
+                PublicKey::from(&StaticSecret::from([21u8; 32])),
+            ),
+        ]
+    };
+
+    // Deal epoch 1, deposit.
+    let e1 = kotoba_custody::shares::split_key_epoch(&key, 2, &pubs("1"), 1).unwrap();
+    let (st, dep) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&e1[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(st, 200, "{dep}");
+    assert_eq!(dep["epoch"], 1);
+
+    // Deal epoch 2 (rotation), deposit replaces.
+    let e2 = kotoba_custody::shares::split_key_epoch(&key, 2, &pubs("2"), 2).unwrap();
+    let (st, dep2) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&e2[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(st, 200, "{dep2}");
+    assert_eq!(dep2["epoch"], 2);
+
+    // Re-depositing the stale epoch-1 share is rejected (409).
+    let (st, conflict) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&e1[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(st, 409, "stale epoch must be rejected: {conflict}");
+
+    // A grant on an Authenticated graph (default) reports the current epoch 2.
+    let requester_sk = StaticSecret::from([0x77u8; 32]);
+    let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
+    let (st, granted) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "nonce": "r3c-epoch-nonce",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    assert_eq!(st, 200, "{granted}");
+    assert_eq!(granted["ok"], true, "{granted}");
+    assert_eq!(granted["epoch"], 2, "grant reports rotated epoch");
+}
+
+/// R3d: a genuine (receipted) release is not warrantable, but a tampered or
+/// fabricated grant with no covering receipt yields a CustodyUnreceiptedRelease
+/// warrant; an invalid signature is rejected.
+#[tokio::test]
+async fn key_report_unreceipted_release_warrants_only_real_violations() {
+    use x25519_dalek::{PublicKey, StaticSecret};
+    std::env::set_var("KOTOBA_RECEIPT_FLUSH_MS", "50");
+    let s = TestServer::start(false).await;
+    let op_tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3d-warrant-graph").to_multibase();
+
+    let (st, info) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
+        .await;
+    assert_eq!(st, 200);
+    let node_pk = {
+        let b = hex::decode(info["x25519PubkeyHex"].as_str().unwrap()).unwrap();
+        PublicKey::from(<[u8; 32]>::try_from(b).unwrap())
+    };
+    let node_did = info["did"].as_str().unwrap().to_string();
+    let key = [44u8; 32];
+    let pubs: Vec<(String, PublicKey)> = vec![
+        (node_did.clone(), node_pk),
+        (
+            "did:key:zRd2".into(),
+            PublicKey::from(&StaticSecret::from([5u8; 32])),
+        ),
+        (
+            "did:key:zRd3".into(),
+            PublicKey::from(&StaticSecret::from([6u8; 32])),
+        ),
+    ];
+    let shares = kotoba_custody::split_key(&key, 2, &pubs).unwrap();
+    let (_, dep) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.depositShare",
+            json!({"graph": graph, "share": serde_json::to_value(&shares[0]).unwrap()}),
+            &op_tok,
+        )
+        .await;
+    assert_eq!(dep["ok"], true);
+
+    // A genuine release: this writes a key:requestShare receipt.
+    let requester_sk = StaticSecret::from([0x55u8; 32]);
+    let requester_pk_hex = hex::encode(PublicKey::from(&requester_sk).as_bytes());
+    let (st, granted) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.requestShare",
+            json!({
+                "graph": graph,
+                "nonce": "r3d-nonce",
+                "requester_x25519_pk_hex": requester_pk_hex,
+            }),
+        )
+        .await;
+    assert_eq!(st, 200, "{granted}");
+    assert_eq!(granted["ok"], true, "{granted}");
+    let real_grant = granted["grant"].clone();
+    assert!(
+        real_grant["grant_sig"].is_array(),
+        "signed grant: {real_grant}"
+    );
+
+    // Let the receipt flush.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // Reporting the genuine grant → NOT warranted (a receipt covers it).
+    let (st, ok_report) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": real_grant, "window_secs": 600}),
+        )
+        .await;
+    assert_eq!(st, 200, "{ok_report}");
+    assert_eq!(
+        ok_report["warranted"], false,
+        "receipted release: {ok_report}"
+    );
+    assert_eq!(ok_report["verdict"], "receipted");
+
+    // Tamper the grant's signature → rejected as invalid (not warranted).
+    let mut bad_sig_grant = real_grant.clone();
+    bad_sig_grant["grant_sig"] = json!(vec![0u8; 64]);
+    let (st, bad) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": bad_sig_grant}),
+        )
+        .await;
+    assert_eq!(st, 200, "{bad}");
+    assert_eq!(bad["warranted"], false, "bad sig must not warrant: {bad}");
+
+    // A genuine grant for a DIFFERENT graph with no receipt → warranted.
+    // Re-sign by asking for a share on a second graph but never... simpler:
+    // request a share for graph2 (writes a receipt), then report it against a
+    // window that excludes the receipt by using a far-future-tampered ts is not
+    // possible (sig covers ts). Instead: deposit + request on graph2, then
+    // report with window_secs=0 and the receipt batched late — flaky. So we
+    // assert the violation path via a graph that was released but whose receipt
+    // we exclude by querying immediately with window 0 is unreliable.
+    // The unit tests cover the audit verdict exhaustively; here we additionally
+    // confirm an UNSIGNED grant is rejected (400).
+    let mut unsigned = real_grant.clone();
+    unsigned["grant_sig"] = serde_json::Value::Null;
+    let (st, _unsigned_resp) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": unsigned}),
+        )
+        .await;
+    assert_eq!(st, 400, "unsigned grant must be rejected");
+
+    // A Byzantine custodian: a grant validly signed by its OWN did:key for a
+    // graph with NO receipt → warranted (warrant emitted + evidence pinned).
+    use ed25519_dalek::{Signer, SigningKey};
+    let byz_key = SigningKey::from_bytes(&[0xB7u8; 32]);
+    let byz_did =
+        kotoba_auth::did_key::ed25519_pubkey_to_did_key(byz_key.verifying_key().as_bytes());
+    let unreceipted_graph =
+        kotoba_core::cid::KotobaCid::from_bytes(b"r3d-never-released").to_multibase();
+    let mut byz_grant = kotoba_custody::GrantedShare {
+        custodian_did: byz_did.clone(),
+        index: 1,
+        threshold: 2,
+        epoch: 0,
+        deal_id: vec![7, 7, 7],
+        graph_cid_mb: unreceipted_graph,
+        requester_x25519_pk: vec![3u8; 32],
+        ts_unix: 1_780_000_000,
+        sealed_for_requester: vec![1u8; 60],
+        grant_sig: None,
+    };
+    let sig = byz_key.sign(&byz_grant.grant_signing_payload());
+    byz_grant.grant_sig = Some(sig.to_bytes().to_vec());
+    let (st, warrant) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease",
+            json!({"grant": serde_json::to_value(&byz_grant).unwrap()}),
+        )
+        .await;
+    assert_eq!(st, 200, "{warrant}");
+    assert_eq!(
+        warrant["warranted"], true,
+        "unreceipted release must warrant: {warrant}"
+    );
+    assert_eq!(warrant["verdict"], "unreceipted-release");
+    assert_eq!(warrant["accusedDid"], byz_did);
+    assert!(
+        warrant["evidenceCid"].as_str().is_some(),
+        "evidence pinned: {warrant}"
     );
 }

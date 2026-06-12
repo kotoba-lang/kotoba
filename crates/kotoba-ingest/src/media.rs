@@ -31,9 +31,9 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::datom::{Datom, TensorDtype, Value};
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::Vault;
+use kotoba_query::datom::{Datom, TensorDtype, Value};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_vault::Vault;
 use tracing::{debug, info};
 
 use crate::ivf::IvfIndex;
@@ -233,7 +233,7 @@ impl MediaIngestor {
             .unwrap_or_default()
             .as_secs();
         self.quad_store
-            .commit("did:web:kotoba.gftd.ai", graph.clone(), commit_seq)
+            .commit("did:web:kotoba.etzhayyim.com", graph.clone(), commit_seq)
             .await?;
         self.quad_store.reset_arrangement(graph).await;
 
@@ -462,11 +462,11 @@ fn mime_for_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::media_embed::Blake3MediaEmbedClient;
-    use kotoba_kse::Journal;
     use kotoba_store::MemoryBlockStore;
+    use kotoba_vault::LiveBus;
 
     fn make_store() -> Arc<QuadStore> {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new())
             as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
         Arc::new(QuadStore::new(journal, block_store))

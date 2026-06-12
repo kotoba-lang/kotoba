@@ -1,7 +1,7 @@
 use crate::pregel::{datalog_compute_fn, graph_from_deltas};
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
-use kotoba_kqe::{arrangement::Arrangement, datalog::DatalogProgram, delta::Delta};
+use kotoba_query::{arrangement::Arrangement, datalog::DatalogProgram, delta::Delta};
 use std::sync::Arc;
 
 /// KVM execution result
@@ -122,7 +122,7 @@ impl KotobaVm {
 mod tests {
     use super::*;
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{
+    use kotoba_query::{
         arrangement::Arrangement,
         datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term},
         datom::{Datom, Value},

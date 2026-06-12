@@ -82,7 +82,7 @@ cmd_push() {
     echo "→ Committing: ${msg}"
     git -C "${WORKTREE_DIR}" \
         -c user.name="Jun Kawasaki" \
-        -c user.email="j.kawasaki@gftd.co.jp" \
+        -c user.email="j.kawasaki@etzhayyim.com" \
         commit -m "${msg}"
 
     echo "→ Pushing to ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH} …"
@@ -103,7 +103,7 @@ cmd_pull() {
     rsync -a --delete "${excludes[@]}" "${WORKTREE_DIR}/" "${KOTOBA_DIR}/"
 
     echo "→ Changes in monorepo after pull:"
-    git -C "${REPO_ROOT}" diff --stat -- "60-apps/ai-gftd-project-kotoba/" | head -20 || true
+    git -C "${REPO_ROOT}" diff --stat -- "60-apps/etzhayyim-project-kotoba/" | head -20 || true
     echo "✓ Pull complete. Review changes and commit to the monorepo manually."
 }
 

@@ -34,14 +34,14 @@ use kotoba_datomic::distributed::{
 };
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_ipfs::{IpnsName, IpnsRegistryError};
-use kotoba_kqe::{
+use kotoba_query::{
     datom::{Datom as KqeDatom, Value as KqeValue},
     delta::Delta,
     quad::LegacyQuad,
     quad::LegacyQuadObject as QuadObject,
 };
-use kotoba_kse::journal::Journal;
 use kotoba_store::MemoryBlockStore;
+use kotoba_vault::live_bus::LiveBus;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -199,10 +199,10 @@ async fn commit_kg_datoms(
     // ADR-2606041151 B — capture this commit's datoms as assert-deltas so the
     // MaterializedView registry can be incrementally maintained after a
     // successful commit (kg ingest is assert-only; no-op when no views exist).
-    let mv_deltas: Vec<kotoba_kqe::delta::Delta> = datoms
+    let mv_deltas: Vec<kotoba_query::delta::Delta> = datoms
         .iter()
         .cloned()
-        .map(kotoba_kqe::delta::Delta::assert_datom)
+        .map(kotoba_query::delta::Delta::assert_datom)
         .collect();
     let resp = crate::xrpc::commit_protocol_datoms(
         state,
@@ -322,8 +322,8 @@ async fn current_graph_deltas(
 /// enterprise SQL can address KG predicates directly: `SELECT t.s, t.o FROM "P" t`.
 /// Without this, the compiler's binary fallback would read predicate `P/o`, which
 /// no KG datom uses — the endpoint would be reachable but always return 0 rows.
-fn schema_from_predicates(deltas: &[Delta]) -> kotoba_kqe::SchemaMap {
-    use kotoba_kqe::{AttrDef, SchemaMap, TableSchema};
+fn schema_from_predicates(deltas: &[Delta]) -> kotoba_query::SchemaMap {
+    use kotoba_query::{AttrDef, SchemaMap, TableSchema};
     let mut schema = SchemaMap::new();
     let mut seen = std::collections::HashSet::new();
     for d in deltas {
@@ -340,7 +340,7 @@ fn schema_from_predicates(deltas: &[Delta]) -> kotoba_kqe::SchemaMap {
 
 /// Readable string form of a datom object value, for resolving enterprise-SQL
 /// result objects back from their content-hash CID. Matches the variants that
-/// `kotoba_kqe::object_value_cid` indexes (Text/Integer/Bool/Cid).
+/// `kotoba_query::object_value_cid` indexes (Text/Integer/Bool/Cid).
 fn readable_value(v: &KqeValue) -> String {
     match v {
         KqeValue::Text(s) => s.clone(),
@@ -374,7 +374,7 @@ async fn distributed_query_store(
         let basis_t = db.basis_t.as_ref().map(KotobaCid::to_multibase);
         let quads = datomic_db_quads(graph_cid, db);
         let query_store =
-            QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
+            QuadStore::new(Arc::new(LiveBus::new()), Arc::new(MemoryBlockStore::new()));
         query_store.assert_batch_silent(quads).await;
         return Ok((Arc::new(query_store), basis_t));
     }
@@ -490,6 +490,15 @@ pub async fn kg_entity(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        q.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:entity",
+    )?;
 
     let (lookup_pred, lookup_val) = match (&q.id, &q.qid) {
         (Some(id), _) => {
@@ -657,6 +666,15 @@ pub async fn kg_catalog(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        q.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:catalog",
+    )?;
 
     let quads = current_graph_quads(&state, &graph_cid).await?;
     let entity_count = quads
@@ -851,6 +869,15 @@ pub async fn kg_search(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        q.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:search",
+    )?;
 
     // Use inference engine for query embedding when available, matching kg_embed semantics.
     // Falls back to blake3 pseudo-vector so search works without an LLM.
@@ -1572,6 +1599,7 @@ pub async fn kg_commit(
     };
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
     match writer.commit_datoms(CommitDatomsRequest {
+        merge_parents: None,
         ipns_name: ipns_name.clone(),
         graph: graph.clone(),
         datoms: db.datoms(),
@@ -1615,7 +1643,7 @@ pub async fn kg_commit(
 /// POST /xrpc/com.etzhayyim.apps.kotobase.kg.delete
 ///
 /// Retract all quads for the given entity from the `kotobase-kg-v1` graph.
-/// Publishes a retract event to the Journal for each quad (WAL + GossipSub).
+/// Publishes a retract event to the LiveBus for each quad (WAL + GossipSub).
 pub async fn kg_delete(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,
@@ -1792,7 +1820,7 @@ pub async fn kg_mv_register(
     Json(req): Json<MvRegisterReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use kotoba_graph::sparql::SparqlCompiler;
-    use kotoba_kqe::cypher::CypherCompiler;
+    use kotoba_query::cypher::CypherCompiler;
     require_kg_write_auth(&headers)?;
     if req.name.is_empty() || req.name.len() > 128 {
         return Err((StatusCode::BAD_REQUEST, "name must be 1–128 bytes".into()));
@@ -1884,7 +1912,7 @@ pub async fn kg_query(
     Json(req): Json<KgQueryReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use kotoba_graph::sparql::SparqlCompiler;
-    use kotoba_kqe::cypher::CypherCompiler;
+    use kotoba_query::cypher::CypherCompiler;
     use std::time::Instant;
 
     const MAX_KG_LANG_LEN: usize = 16;
@@ -1904,7 +1932,7 @@ pub async fn kg_query(
             format!("query must be 1–{MAX_KG_QUERY_PROG_LEN} bytes"),
         ));
     }
-    let is_enterprise_sql = kotoba_kqe::enterprise::dialect_by_name(&req.lang).is_some();
+    let is_enterprise_sql = kotoba_query::enterprise::dialect_by_name(&req.lang).is_some();
     if !matches!(req.lang.as_str(), "sparql" | "cypher") && !is_enterprise_sql {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1931,6 +1959,15 @@ pub async fn kg_query(
         Some(&state.nonce_store),
     )
     .map_err(AccessDenied::into_response)?;
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt.
+    crate::access_receipt::enforce_and_record(
+        &state,
+        &headers,
+        req.cacao_b64.as_deref(),
+        &graph_cid,
+        &visibility,
+        "kg:query",
+    )?;
     // Persist emit_cid envelopes only for Public graphs (block.get is
     // unauthenticated — see put_envelope).
     let kg_persist = matches!(
@@ -1998,7 +2035,7 @@ pub async fn kg_query(
             (
                 compiled.program,
                 compiled.output_relation,
-                kotoba_kqe::PostProcess::default(),
+                kotoba_query::PostProcess::default(),
             )
         }
         "cypher" => {
@@ -2007,7 +2044,7 @@ pub async fn kg_query(
             (
                 compiled.program,
                 compiled.output_relation,
-                kotoba_kqe::PostProcess::default(),
+                kotoba_query::PostProcess::default(),
             )
         }
         sql_lang => {
@@ -2023,7 +2060,7 @@ pub async fn kg_query(
             // in CID space and previously returned an unfiltered superset).
             // ORDER BY is not applied. Object values in the response are resolved
             // back to their source scalar text via `value_index` (see below).
-            let dialect = kotoba_kqe::enterprise::dialect_by_name(sql_lang)
+            let dialect = kotoba_query::enterprise::dialect_by_name(sql_lang)
                 .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("unknown lang: {sql_lang}")))?;
             let schema = schema_from_predicates(&input_deltas);
             let compiled = dialect
@@ -2045,7 +2082,7 @@ pub async fn kg_query(
         input_deltas
             .iter()
             .filter_map(|d| {
-                kotoba_kqe::object_value_cid(d.value())
+                kotoba_query::object_value_cid(d.value())
                     .map(|cid| (cid.to_multibase(), readable_value(d.value())))
             })
             .collect()
@@ -2076,7 +2113,7 @@ pub async fn kg_query(
         .take(effective_limit)
         .map(|d| {
             let b = match d.value() {
-                kotoba_kqe::Value::Cid(c) => {
+                kotoba_query::Value::Cid(c) => {
                     let mb = c.to_multibase();
                     // SQL path: resolve content-hash CID back to its source scalar.
                     value_index.get(&mb).cloned().unwrap_or(mb)
@@ -2445,7 +2482,7 @@ fn query_emit_cids(
     (query_spec, query_job, result_cid)
 }
 
-fn quad_to_json(q: kotoba_kqe::quad::LegacyQuad) -> serde_json::Value {
+fn quad_to_json(q: kotoba_query::quad::LegacyQuad) -> serde_json::Value {
     serde_json::json!({
         "graph":     q.graph.to_multibase(),
         "subject":   q.subject.to_multibase(),
@@ -2501,6 +2538,7 @@ mod tests {
         let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
         let first = writer
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
@@ -2526,6 +2564,7 @@ mod tests {
             .unwrap();
         writer
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
@@ -2672,6 +2711,7 @@ mod tests {
         let alice = KotobaCid::from_bytes(b"kg-sparql-vp-private-alice");
         DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
             .commit_datoms(CommitDatomsRequest {
+                merge_parents: None,
                 covering_datoms: None,
                 ipns_name: ipns_name.clone(),
                 graph: graph.clone(),
@@ -3265,7 +3305,7 @@ mod tests {
 
     /// End-to-end reachability of the enterprise SQL path: validation → public
     /// read-access → dialect resolve → SQL compile → datalog eval → JSON.
-    /// Data-bearing correctness of each dialect is covered by kotoba-kqe tests;
+    /// Data-bearing correctness of each dialect is covered by kotoba-query tests;
     /// here the empty kg graph yields count=0 but proves the pipeline runs.
     async fn assert_dialect_reachable(lang: &str) {
         std::env::set_var("KOTOBA_IPFS", "off");
@@ -3321,7 +3361,7 @@ mod tests {
     #[test]
     fn schema_from_predicates_projects_real_kg_predicate_rows() {
         use kotoba_core::cid::KotobaCid;
-        use kotoba_kqe::datom::{Datom, Value};
+        use kotoba_query::datom::{Datom, Value};
 
         let g = KotobaCid::from_bytes(b"g");
         let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
@@ -3348,7 +3388,7 @@ mod tests {
 
         let schema = schema_from_predicates(&deltas);
         for lang in ["postgresql", "mysql"] {
-            let dialect = kotoba_kqe::enterprise::dialect_by_name(lang).unwrap();
+            let dialect = kotoba_query::enterprise::dialect_by_name(lang).unwrap();
             let compiled = dialect
                 .compile(
                     r#"SELECT t.s, t.o FROM "kg/claim/role" t"#,
@@ -3375,7 +3415,7 @@ mod tests {
     #[test]
     fn sql_where_equality_works_and_inequality_is_rejected() {
         use kotoba_core::cid::KotobaCid;
-        use kotoba_kqe::datom::{Datom, Value};
+        use kotoba_query::datom::{Datom, Value};
 
         let g = KotobaCid::from_bytes(b"g");
         let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
@@ -3394,7 +3434,7 @@ mod tests {
             )),
         ];
         let schema = schema_from_predicates(&deltas);
-        let pg = kotoba_kqe::enterprise::dialect_by_name("postgresql").unwrap();
+        let pg = kotoba_query::enterprise::dialect_by_name("postgresql").unwrap();
 
         // Equality compiles and filters to the matching row.
         let eq = pg
@@ -3437,7 +3477,7 @@ mod tests {
     #[test]
     fn sql_object_values_resolve_to_readable_text() {
         use kotoba_core::cid::KotobaCid;
-        use kotoba_kqe::datom::{Datom, Value};
+        use kotoba_query::datom::{Datom, Value};
 
         let g = KotobaCid::from_bytes(b"g");
         let cid = |s: &str| KotobaCid::from_bytes(s.as_bytes());
@@ -3458,19 +3498,19 @@ mod tests {
         let index: std::collections::HashMap<String, String> = deltas
             .iter()
             .filter_map(|d| {
-                kotoba_kqe::object_value_cid(d.value())
+                kotoba_query::object_value_cid(d.value())
                     .map(|c| (c.to_multibase(), readable_value(d.value())))
             })
             .collect();
 
         // A derived fact carries the object as Value::Cid(object_value_cid(value)).
-        let admin_cid = kotoba_kqe::object_value_cid(&Value::Text("admin".into())).unwrap();
+        let admin_cid = kotoba_query::object_value_cid(&Value::Text("admin".into())).unwrap();
         assert_eq!(
             index.get(&admin_cid.to_multibase()).map(String::as_str),
             Some("admin"),
             "text object CID must resolve back to readable text"
         );
-        let age_cid = kotoba_kqe::object_value_cid(&Value::Integer(42)).unwrap();
+        let age_cid = kotoba_query::object_value_cid(&Value::Integer(42)).unwrap();
         assert_eq!(
             index.get(&age_cid.to_multibase()).map(String::as_str),
             Some("42"),
