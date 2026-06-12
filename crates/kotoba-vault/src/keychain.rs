@@ -11,8 +11,10 @@
 //! the caller can fall through to env vars or ephemeral generation.
 
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "etzhayyim.kotoba";
 const ACCOUNT_ED25519: &str = "agent-ed25519";
 const ACCOUNT_X25519: &str = "agent-x25519";
