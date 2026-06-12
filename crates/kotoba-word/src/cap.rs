@@ -1,10 +1,10 @@
 //! Capability model — what a word is allowed to reach outside its own input.
 //!
 //! Grammar (string form, used in manifests and lexicon docs):
-//!   proc:<bin>        spawn local executable whose basename is <bin> ("*" = any)
-//!   net:<host>        HTTP to exact <host>, or "*.<suffix>" subdomain wildcard
-//!   fs:ro:<path>      read under <path> prefix
-//!   fs:rw:<path>      read/write under <path> prefix
+//!   `proc:<bin>`      spawn local executable whose basename is `<bin>` (`*` = any)
+//!   `net:<host>`      HTTP to exact `<host>`, or `*.<suffix>` subdomain wildcard
+//!   `fs:ro:<path>`    read under `<path>` prefix
+//!   `fs:rw:<path>`    read/write under `<path>` prefix
 
 use std::fmt;
 use std::str::FromStr;

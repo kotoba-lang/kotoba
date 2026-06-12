@@ -8,7 +8,9 @@
     clippy::type_complexity,
     clippy::unnecessary_literal_unwrap,
     clippy::unnecessary_min_or_max,
-    clippy::useless_vec
+    clippy::useless_vec,
+    rustdoc::broken_intra_doc_links,
+    rustdoc::invalid_html_tags
 )]
 
 pub mod access_receipt;

@@ -623,7 +623,7 @@ impl QuadStore {
     }
 
     /// Find subject CIDs where predicate = `predicate` and the object encodes to
-    /// the canonical AVET `value_key` (keycodec; see [`avet_value_key`]),
+    /// the canonical AVET `value_key` (keycodec; see `avet_value_key`),
     /// optionally within a named graph.
     pub async fn lookup_subject_by_po(
         &self,

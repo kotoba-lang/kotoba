@@ -24,7 +24,7 @@
 //!     host calls to place lowered values into guest memory.
 //!
 //! String literals are laid out in an active data segment starting at
-//! [`DATA_BASE`]; the bump heap starts immediately above them. This is the
+//! `DATA_BASE`; the bump heap starts immediately above them. This is the
 //! linear-memory foundation that the future `list<u8>` Component export and
 //! CBOR `InvokeContext` decode will build on (see `docs/ADR-clojure-wasm.md`).
 
