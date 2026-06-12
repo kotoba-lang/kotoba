@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use kotoba_evm::logs::logs_bloom;
 use kotoba_evm::{apply_call, apply_create, tx::apply_raw_tx, RevmU256 as U256};
-use kotoba_kqe::delta::Delta;
-use kotoba_kqe::evm_state::{
+use kotoba_query::delta::Delta;
+use kotoba_query::evm_state::{
     account_datoms, eth_chain_id, eth_get_balance, eth_get_code, eth_get_storage_at,
     eth_get_transaction_count, EvmStateView, KOTOBA_EVM_CHAIN_ID,
 };
@@ -53,7 +53,7 @@ impl EvmNode {
         self.apply(datoms);
     }
 
-    fn apply(&mut self, datoms: Vec<kotoba_kqe::datom::Datom>) {
+    fn apply(&mut self, datoms: Vec<kotoba_query::datom::Datom>) {
         self.view
             .apply(&datoms.into_iter().map(Delta::assert_datom).collect::<Vec<_>>());
     }

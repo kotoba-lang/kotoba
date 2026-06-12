@@ -33,7 +33,7 @@ use kotoba_ingest::embed_client::EmbedClient;
 use kotoba_ingest::fusion::{reciprocal_rank_fusion, Ranking, Signal, RRF_K};
 use kotoba_ingest::ivf::IvfIndex;
 use kotoba_ingest::pagerank::PageRankIndex;
-use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
 use crate::server::KotobaState;
 

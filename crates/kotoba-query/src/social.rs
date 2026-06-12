@@ -27,7 +27,7 @@
 //! an integer recurrence — matching the Quad `Integer(i64)` boundary, saturating
 //! at `i64::MAX` (same convention as `Mkoto`).
 //!
-//! Lives in `kotoba-kqe` (the query/MV engine) so the incremental
+//! Lives in `kotoba-query` (the query/MV engine) so the incremental
 //! [`SocialCapitalView`] MaterializedView reducer and the [`SocialCapitalLedger`]
 //! share one decay primitive; `kotoba-server::social` re-exports this module.
 

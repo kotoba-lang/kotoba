@@ -1,4 +1,4 @@
-//! SQL SELECT → Datalog rule compiler for kotoba-kqe
+//! SQL SELECT → Datalog rule compiler for kotoba-query
 //!
 //! Supported subset:
 //!   SELECT a.s, b.o

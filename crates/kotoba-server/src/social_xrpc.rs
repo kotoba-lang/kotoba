@@ -18,9 +18,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::Datom;
-use kotoba_kqe::delta::Delta;
-use kotoba_kqe::social::{SocialCapitalView, SCALE};
+use kotoba_query::datom::Datom;
+use kotoba_query::delta::Delta;
+use kotoba_query::social::{SocialCapitalView, SCALE};
 
 use crate::server::KotobaState;
 

@@ -6,7 +6,7 @@
 //! correctly without the 10-second GossipSub heartbeat overhead.
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use kotoba_server::server::KotobaState;
 use std::sync::Arc;
 use tokio::sync::mpsc;

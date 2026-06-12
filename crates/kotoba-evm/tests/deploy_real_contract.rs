@@ -4,8 +4,8 @@
 #[test]
 fn deploys_real_solc_contract() {
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::delta::Delta;
-    use kotoba_kqe::evm_state::{account_datoms, EvmStateView};
+    use kotoba_query::delta::Delta;
+    use kotoba_query::evm_state::{account_datoms, EvmStateView};
     use kotoba_evm::{apply_create, RevmU256 as U256};
     let g = KotobaCid::from_bytes(b"g:evm");
     let mut from=[0u8;20]; from.copy_from_slice(&hex::decode("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap());

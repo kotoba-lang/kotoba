@@ -49,7 +49,7 @@ use axum::{
 };
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::{delta::Delta, quad::LegacyQuad, quad::LegacyQuadObject};
+use kotoba_query::{delta::Delta, quad::LegacyQuad, quad::LegacyQuadObject};
 use kotoba_kse::journal::Journal;
 use kotoba_store::MemoryBlockStore;
 use serde::{Deserialize, Serialize};
@@ -420,7 +420,7 @@ async fn commit_mcp_datoms(
     graph_cid: KotobaCid,
     graph: String,
     entity_cid: KotobaCid,
-    datoms: Vec<kotoba_kqe::Datom>,
+    datoms: Vec<kotoba_query::Datom>,
     tx_cid: KotobaCid,
     caller: Option<&str>,
 ) -> Result<crate::xrpc::ProtocolDatomWriteResp, (i32, String)> {
@@ -542,7 +542,7 @@ async fn call_tool(
         // ── kotoba_datom_create / legacy kotoba_quad_create ─────────────────
         MCP_TOOL_DATOM_CREATE | MCP_TOOL_QUAD_CREATE => {
             use kotoba_core::cid::KotobaCid;
-            use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+            use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
             let graph = get_str("graph")?;
             let subject = get_str("subject")?;
@@ -654,7 +654,7 @@ async fn call_tool(
                         if quad.predicate != pred {
                             return false;
                         }
-                        let value: kotoba_kqe::datom::Value = quad.object.clone().into();
+                        let value: kotoba_query::datom::Value = quad.object.clone().into();
                         datom_value_key(&value).as_deref() == Some(obj)
                     })
                     .collect();
@@ -799,7 +799,7 @@ async fn call_tool(
         MCP_TOOL_WEIGHT_PUT => {
             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
             use kotoba_core::cid::KotobaCid;
-            use kotoba_kqe::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
+            use kotoba_query::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
 
             let data_b64 = get_str("data_b64")?;
             let model_str = get_str("model_cid")?;
@@ -898,7 +898,7 @@ async fn call_tool(
         MCP_TOOL_LORA_APPLY => {
             use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
             use kotoba_core::cid::KotobaCid;
-            use kotoba_kqe::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
+            use kotoba_query::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
 
             let adapter_b64 = get_str("adapter_b64")?;
             let model_str = get_str("model_cid")?;
@@ -1161,7 +1161,7 @@ async fn call_tool(
             // Write gas consumption Quad per agent DID + provider attribution
             {
                 use kotoba_core::cid::KotobaCid;
-                use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+                use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
                 let gas_graph = KotobaCid::from_bytes(b"kotoba/gas/ledger");
                 let agent_cid = KotobaCid::from_bytes(agent_did.as_bytes());
                 let tx_cid = mcp_tx_cid(
@@ -1201,7 +1201,7 @@ async fn call_tool(
             // Write WASM-asserted quads into the store (capped to prevent runaway writes).
             {
                 use kotoba_core::cid::KotobaCid;
-                use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+                use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
                 const MAX_ASSERT_QUADS: usize = 10_000;
                 if result.assert_quads.len() > MAX_ASSERT_QUADS {
                     return Err((
@@ -1254,7 +1254,7 @@ async fn call_tool(
         // ── kotoba_datalog_run ───────────────────────────────────────────────
         MCP_TOOL_DATALOG_RUN => {
             use kotoba_core::cid::KotobaCid;
-            use kotoba_kqe::{CitationLedger, DatalogProgram, DatalogRule};
+            use kotoba_query::{CitationLedger, DatalogProgram, DatalogRule};
 
             let graph_str = get_str("graph")?;
             let epoch_pool = args
@@ -1334,7 +1334,7 @@ async fn call_tool(
 
             // Pin provider attribution — identifies which pin node served this query
             {
-                use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+                use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
                 let provider_cid = KotobaCid::from_bytes(state.operator_did.as_bytes());
                 let provider_datom = KqeDatom::assert(
                     provider_cid,
@@ -1671,12 +1671,12 @@ pub async fn mcp_handler(
     Json(JsonRpcResponse::ok(req.id, result))
 }
 
-fn datom_value_key(value: &kotoba_kqe::datom::Value) -> Option<String> {
+fn datom_value_key(value: &kotoba_query::datom::Value) -> Option<String> {
     match value {
-        kotoba_kqe::datom::Value::Cid(c) => Some(c.to_multibase()),
-        kotoba_kqe::datom::Value::Text(s) => Some(s.clone()),
-        kotoba_kqe::datom::Value::Integer(n) => Some(n.to_string()),
-        kotoba_kqe::datom::Value::Encrypted { ct_cid, .. } => {
+        kotoba_query::datom::Value::Cid(c) => Some(c.to_multibase()),
+        kotoba_query::datom::Value::Text(s) => Some(s.clone()),
+        kotoba_query::datom::Value::Integer(n) => Some(n.to_string()),
+        kotoba_query::datom::Value::Encrypted { ct_cid, .. } => {
             Some(format!("enc:{}", ct_cid.to_multibase()))
         }
         _ => None,
@@ -2647,7 +2647,7 @@ mod tests {
     #[tokio::test]
     async fn call_tool_email_list_reads_distributed_datomic_view() {
         use kotoba_ingest::graph_cid_for;
-        use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
         let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
         let owner_did = "did:key:zEmailListDistributed1";

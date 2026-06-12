@@ -23,7 +23,7 @@ use kotoba_auth::{Cacao, CacaoHeader, CacaoPayload, CacaoSig};
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use kotoba_kse::journal::Journal;
 use kotoba_store::{DistributedBlockStore, MemoryBlockStore};
 

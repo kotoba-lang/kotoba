@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kotoba_core::cid::KotobaCid;
 use kotoba_server::econ::Econ;
 use kotoba_server::social_economy::{fetch_kaizen_feed, live_evm_source, SocialEconomyDriver};
-use kotoba_kqe::social::MintParams;
+use kotoba_query::social::MintParams;
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.is_empty())
@@ -76,8 +76,8 @@ async fn main() {
 }
 
 async fn run_fake_demo(graph: KotobaCid, epoch: u64, pool: i64) {
-    use kotoba_kqe::datom::{Datom, Value};
-    use kotoba_kqe::social::{MintSource, ObservedDisclosure, SCALE};
+    use kotoba_query::datom::{Datom, Value};
+    use kotoba_query::social::{MintSource, ObservedDisclosure, SCALE};
 
     let did = |s: &str| KotobaCid::from_bytes(s.as_bytes());
     let cid_datom = |e: &KotobaCid, a: &str, v: &KotobaCid| {

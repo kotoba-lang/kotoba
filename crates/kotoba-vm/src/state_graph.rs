@@ -21,7 +21,7 @@
 //! for cross-thread parallelism in a future phase, not intra-graph sequencing).
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -22,7 +22,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_ingest::media::{rank_by_cosine, MediaIngestor, MediaInput};
 use kotoba_ingest::media_embed::{Blake3MediaEmbedClient, MediaEmbedClient, MediaItem};
-use kotoba_kqe::datom::Value;
+use kotoba_query::datom::Value;
 use kotoba_kse::Journal;
 use kotoba_kse::Vault;
 use kotoba_store::MemoryBlockStore;

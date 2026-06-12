@@ -418,9 +418,9 @@ pub async fn key_report_unreceipted_release(
 
 /// Project audit-graph quads into the flat ReceiptRecords the cross-audit needs.
 fn receipt_records_from_quads(
-    quads: &[kotoba_kqe::quad::LegacyQuad],
+    quads: &[kotoba_query::quad::LegacyQuad],
 ) -> Vec<kotoba_custody::ReceiptRecord> {
-    use kotoba_kqe::quad::LegacyQuadObject;
+    use kotoba_query::quad::LegacyQuadObject;
     use std::collections::HashMap;
     type ReceiptFields = (Option<String>, Option<String>, Option<u64>);
     let mut by_subject: HashMap<[u8; 36], ReceiptFields> = HashMap::new();

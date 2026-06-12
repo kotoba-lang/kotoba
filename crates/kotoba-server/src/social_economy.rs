@@ -23,9 +23,9 @@ use crate::mishmar_observe::{
 };
 use crate::social::settle_retainer_to_econ;
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::Datom;
-use kotoba_kqe::delta::Delta;
-use kotoba_kqe::social::{
+use kotoba_query::datom::Datom;
+use kotoba_query::delta::Delta;
+use kotoba_query::social::{
     allocate_retainer, build_pin_origins, settle_retainer, Falsification, MintParams,
     ObservedDisclosure, ObservedWellbecoming, OriginIndex, PinIndex, RetainerCredit, RetainerShare,
     SocialCapitalView, SocialMintJob,
@@ -146,7 +146,7 @@ pub fn fetch_kaizen_feed() -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::mishmar_observe::JsonRpcTransport;
-    use kotoba_kqe::social::{MintSource, ValidatedDisclosure, SCALE};
+    use kotoba_query::social::{MintSource, ValidatedDisclosure, SCALE};
     use serde_json::json;
 
     fn did(s: &str) -> KotobaCid {
@@ -154,7 +154,7 @@ mod tests {
     }
 
     fn cid_datom(e: &KotobaCid, attr: &str, v: &KotobaCid) -> Datom {
-        Datom::assert(e.clone(), attr.to_string(), kotoba_kqe::datom::Value::Cid(v.clone()), did("g"))
+        Datom::assert(e.clone(), attr.to_string(), kotoba_query::datom::Value::Cid(v.clone()), did("g"))
     }
 
     /// fake EVM transport returning canned eth_getLogs results.

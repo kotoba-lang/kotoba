@@ -25,8 +25,8 @@
 use std::collections::HashMap;
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 
 // ---------------------------------------------------------------------------
 // Core algorithm (index-based, dependency-free)

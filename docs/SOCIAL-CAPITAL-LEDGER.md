@@ -78,7 +78,7 @@ SC(did, t) = Σ_{e ≤ t} ( mint_disclosure(did,e) + mint_wellbecoming(did,e) �
 ### Incremental recurrence (what the MV actually computes — O(1)/epoch/DID)
 
 Because decay is geometric, the score is a single carried accumulator. This is
-the implementable form and maps directly onto `kotoba-kqe/src/mv.rs`
+the implementable form and maps directly onto `kotoba-query/src/mv.rs`
 (per-commit Δ MaterializedView):
 
 ```
@@ -174,7 +174,7 @@ fn decay_idle(prev_smic: i64, gap_epochs: u64, lambda_q: i64) -> i64 {
 Placement (follow-up impl, not yet written):
 - `kotoba-server/src/social.rs` — mint/burn jobs that consume the observed
   anchor-chain events (`docs/MISHMAR-OBSERVATION.md`) + CitationLedger + KaizenObserver feed, write `social/mint|burn/*` Datoms.
-- `kotoba-kqe/src/mv.rs` — register a `social/capital` MV with the `step_social_capital` reducer keyed by DID.
+- `kotoba-query/src/mv.rs` — register a `social/capital` MV with the `step_social_capital` reducer keyed by DID.
 - `kotoba-graph` — `:social/*` projection namespace + XRPC read
   `com.etzhayyim.apps.kotoba.social.capital?did=…&epoch=…`.
 

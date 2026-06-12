@@ -14,7 +14,7 @@ use kotoba_core::prolly::ProllyTree;
 use kotoba_core::store::BlockStore;
 use kotoba_edn::Keyword;
 use kotoba_ipfs::{IpnsName, IpnsRecord, IpnsRegistry, IpnsRegistryError};
-use kotoba_kqe::Datom as KqeDatom;
+use kotoba_query::Datom as KqeDatom;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
@@ -3498,7 +3498,7 @@ fn indexable_kqe_datom(datom: &Datom) -> KqeDatom {
     datom.to_kqe().unwrap_or_else(|_| KqeDatom {
         e: datom.e.clone(),
         a: datom.a.clone(),
-        v: kotoba_kqe::Value::Text(kotoba_edn::to_string(&datom.v)),
+        v: kotoba_query::Value::Text(kotoba_edn::to_string(&datom.v)),
         tx: datom.t.clone(),
         op: datom.added,
     })
@@ -3558,7 +3558,7 @@ fn attr_prefix(attr: &str) -> Vec<u8> {
     // (the second terminator), making EAVT/AEVT/VAET seeks silently return
     // nothing.
     let mut out = Vec::with_capacity(attr.len() + 2);
-    kotoba_kqe::keycodec::push_ordered_str(&mut out, attr);
+    kotoba_query::keycodec::push_ordered_str(&mut out, attr);
     out
 }
 
@@ -3594,9 +3594,9 @@ fn eavt_entity_attr_prefix(entity: &KotobaCid, attr: &str) -> Vec<u8> {
     out
 }
 
-fn kqe_value(value: &Value) -> kotoba_kqe::Value {
+fn kqe_value(value: &Value) -> kotoba_query::Value {
     edn_to_kqe_value(value)
-        .unwrap_or_else(|_| kotoba_kqe::Value::Text(kotoba_edn::to_string(value)))
+        .unwrap_or_else(|_| kotoba_query::Value::Text(kotoba_edn::to_string(value)))
 }
 
 fn prefix_datoms_entity(value: &Value) -> KotobaCid {
@@ -3857,19 +3857,19 @@ fn vaet_key_for_datom(datom: &Datom) -> Option<Vec<u8>> {
     .vaet_key()
 }
 
-fn vaet_ref_value(value: &Value) -> Option<kotoba_kqe::Value> {
+fn vaet_ref_value(value: &Value) -> Option<kotoba_query::Value> {
     match value {
-        Value::String(s) => KotobaCid::from_multibase(s).map(kotoba_kqe::Value::Cid),
+        Value::String(s) => KotobaCid::from_multibase(s).map(kotoba_query::Value::Cid),
         Value::Tagged { tag, value } if tag.to_qualified() == "cid" => value
             .as_string()
             .and_then(KotobaCid::from_multibase)
-            .map(kotoba_kqe::Value::Cid),
+            .map(kotoba_query::Value::Cid),
         _ => None,
     }
 }
 
 fn vaet_prefix_for_parts(
-    v: kotoba_kqe::Value,
+    v: kotoba_query::Value,
     attr: Option<String>,
     entity: Option<KotobaCid>,
     tx: Option<KotobaCid>,
@@ -3899,7 +3899,7 @@ fn vaet_prefix_for_parts(
         // prefix is one byte too long and the scan returns nothing (ADR-2606022150).
         let empty_attr_len = {
             let mut t = Vec::new();
-            kotoba_kqe::keycodec::push_ordered_str(&mut t, "");
+            kotoba_query::keycodec::push_ordered_str(&mut t, "");
             t.len()
         };
         key.truncate(key.len().saturating_sub(empty_attr_len + 36 + 36 + 1));

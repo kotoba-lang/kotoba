@@ -8,7 +8,7 @@
 
 use kotoba_auth::eth::{keccak256, recover_eth_address};
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::evm_state::EvmStateView;
+use kotoba_query::evm_state::EvmStateView;
 use revm::primitives::U256;
 
 use crate::ExecOutcome;
@@ -242,8 +242,8 @@ pub fn apply_raw_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_kqe::delta::Delta;
-    use kotoba_kqe::evm_state::account_datoms;
+    use kotoba_query::delta::Delta;
+    use kotoba_query::evm_state::account_datoms;
 
     fn graph() -> KotobaCid {
         KotobaCid::from_bytes(b"g:evm")

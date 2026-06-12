@@ -1,7 +1,7 @@
 use kotoba_auth::delegation::DelegationChain;
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::{
+use kotoba_query::{
     arrangement::Arrangement,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
@@ -160,7 +160,7 @@ fn query_latencies(
         times.push(t.elapsed());
         // AVET
         let t = Instant::now();
-        let _ = arr.get_entities_by_attribute_value(p, &kotoba_kqe::Value::Text("Alice".into()));
+        let _ = arr.get_entities_by_attribute_value(p, &kotoba_query::Value::Text("Alice".into()));
         times.push(t.elapsed());
         // VAET
         let t = Instant::now();
@@ -478,7 +478,7 @@ async fn phase3_cold_queries() {
         qs.lookup_subject_by_po_cold(
             &graph,
             "name",
-            &kotoba_kqe::keycodec::value_key(&kotoba_kqe::Value::Text("entity-100".into())),
+            &kotoba_query::keycodec::value_key(&kotoba_query::Value::Text("entity-100".into())),
         )
         .await
             .unwrap()

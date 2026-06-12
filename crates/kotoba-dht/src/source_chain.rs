@@ -1,5 +1,5 @@
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::{Datom, LegacyQuad};
+use kotoba_query::{Datom, LegacyQuad};
 use serde::{Deserialize, Serialize};
 
 /// How to dispatch an Invoke ChainEntry
@@ -315,7 +315,7 @@ mod tests {
         ChainContent::Datom(Datom::assert(
             KotobaCid::from_bytes(b"entity"),
             "source/attr".to_string(),
-            kotoba_kqe::Value::Text("value".to_string()),
+            kotoba_query::Value::Text("value".to_string()),
             tx,
         ))
     }

@@ -5,7 +5,7 @@ views under `../models/*.sql`, per **ADR-2605262130** (no projection layer) +
 **ADR-2605312345** (the Datom log is first-class canonical state).
 
 A RisingWave MV is a *derived read*, not state. Under kotoba the read path is
-`kotoba-kqe` arrangements (EAVT / AEVT / AVET / VAET) run **directly over the
+`kotoba-query` arrangements (EAVT / AEVT / AVET / VAET) run **directly over the
 canonical Datom log** — so each MV becomes a **view** = a Datalog
 `[:find … :where …]` query, materialized on demand by kqe rather than maintained
 as a separate streaming table.

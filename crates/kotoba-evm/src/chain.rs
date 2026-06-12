@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
-use kotoba_kqe::datom::Datom;
+use kotoba_query::datom::Datom;
 use kotoba_store::car_bundle::CarBundleWriter;
 use kotoba_store::put_verified;
 
@@ -121,8 +121,8 @@ impl<'a> EvmChain<'a> {
 mod tests {
     use super::*;
     use crate::block::produce_block;
-    use kotoba_kqe::delta::Delta;
-    use kotoba_kqe::evm_state::{account_datoms, EvmStateView};
+    use kotoba_query::delta::Delta;
+    use kotoba_query::evm_state::{account_datoms, EvmStateView};
     use kotoba_store::memory_store::MemoryBlockStore;
     use revm::primitives::U256;
 
