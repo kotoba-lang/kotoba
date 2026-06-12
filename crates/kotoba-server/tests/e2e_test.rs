@@ -35,7 +35,6 @@ struct TestServer {
 }
 
 struct TestServerEnvGuard {
-    previous_default_visibility: Option<std::ffi::OsString>,
     previous_ipfs: Option<std::ffi::OsString>,
     previous_store_path: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -45,11 +44,12 @@ impl TestServerEnvGuard {
     fn apply(store_path: Option<&std::path::Path>) -> Self {
         static TEST_SERVER_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let lock = TEST_SERVER_ENV_MUTEX.lock().expect("test server env mutex");
-        let previous_default_visibility = std::env::var_os("KOTOBA_DEFAULT_VISIBILITY");
         let previous_ipfs = std::env::var_os("KOTOBA_IPFS");
         let previous_store_path = std::env::var_os("KOTOBA_STORE_PATH");
         // Tests pre-date the 2026-05-28 default-Private flip; keep the historic
-        // Bearer-token-only auth behaviour unless an individual test overrides.
+        // Bearer-token-only auth behaviour unless an individual test registers
+        // the graph as private. This must persist for request-time visibility
+        // checks; `graph_visibility` reads the env on each request.
         std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
         // KuboBlockStore::put uses block_in_place which requires the multi-
         // thread tokio runtime; #[tokio::test] defaults to current_thread.
@@ -60,7 +60,6 @@ impl TestServerEnvGuard {
             None => std::env::remove_var("KOTOBA_STORE_PATH"),
         }
         Self {
-            previous_default_visibility,
             previous_ipfs,
             previous_store_path,
             _lock: lock,
@@ -70,10 +69,6 @@ impl TestServerEnvGuard {
 
 impl Drop for TestServerEnvGuard {
     fn drop(&mut self) {
-        match self.previous_default_visibility.take() {
-            Some(value) => std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", value),
-            None => std::env::remove_var("KOTOBA_DEFAULT_VISIBILITY"),
-        }
         match self.previous_ipfs.take() {
             Some(value) => std::env::set_var("KOTOBA_IPFS", value),
             None => std::env::remove_var("KOTOBA_IPFS"),
