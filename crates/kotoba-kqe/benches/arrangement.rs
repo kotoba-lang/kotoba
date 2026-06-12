@@ -85,9 +85,7 @@ fn bench_pos_lookup(c: &mut Criterion) {
     }
 
     c.bench_function("arrangement/pos_lookup_avet", |b| {
-        b.iter(|| {
-            arr.get_entities_by_attribute_value("status", &Value::Text("active".to_string()))
-        });
+        b.iter(|| arr.get_entities_by_attribute_value("status", &Value::Text("active".to_string())));
     });
 }
 
@@ -194,8 +192,7 @@ fn bench_join_avet_intersection(c: &mut Criterion) {
                 .get_entities_by_attribute_value("status", &Value::Text("active".to_string()))
                 .into_iter()
                 .collect();
-            let admins =
-                arr.get_entities_by_attribute_value("role", &Value::Text("admin".to_string()));
+            let admins = arr.get_entities_by_attribute_value("role", &Value::Text("admin".to_string()));
             // intersection
             admins
                 .iter()

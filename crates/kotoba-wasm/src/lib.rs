@@ -308,6 +308,18 @@ impl Node {
     /// server). This is the in-browser content-addressed WRITE. Call
     /// `commitToIdb` (wasm) to make the captured blocks durable in IndexedDB.
     pub fn commit(&mut self) -> KotobaCid {
+        // Leaf value shape MUST match what `hydrate_from_prolly` decodes —
+        // `ServerDatom { e, a, v_edn, t?, added? }` — not the bare `Written`,
+        // otherwise a block-path reader fails with `missing field v_edn`. We
+        // encode the same per-datom shape `export_snapshot_json` emits (v as an
+        // EDN-quoted string) so commit→block→hydrate round-trips.
+        #[derive(serde::Serialize)]
+        struct LeafDatom<'a> {
+            e: &'a str,
+            a: &'a str,
+            v_edn: String,
+            added: bool,
+        }
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(self.written.len());
         for w in &self.written {
             // EAVT key: entity-CID(36) | 0x00 | attr | 0x00 | value — sorted set.
@@ -317,8 +329,15 @@ impl Node {
             key.extend_from_slice(w.a.as_bytes());
             key.push(0);
             key.extend_from_slice(w.v.as_bytes());
+            let leaf = LeafDatom {
+                e: &w.e,
+                a: &w.a,
+                // EDN-quoted string; parse_edn_scalar unwraps it on read.
+                v_edn: serde_json::Value::String(w.v.clone()).to_string(),
+                added: true,
+            };
             let mut val = Vec::new();
-            ciborium::into_writer(w, &mut val).expect("cbor datom");
+            ciborium::into_writer(&leaf, &mut val).expect("cbor datom");
             entries.push((key, val));
         }
         let root = ProllyTree::build_tree(entries, &self.blocks).expect("build_tree");
@@ -950,6 +969,27 @@ mod wasm {
         /// (CIDv1 dag-cbor sha2-256). Pure-compute, no persistence yet.
         pub fn commit(&mut self) -> String {
             self.inner.commit().to_multibase()
+        }
+
+        /// Export every captured ProllyTree block after a `commit()` as JSON
+        /// `[{ cid, hex }]`. Lets an offline tool (node) write each block as a
+        /// content-addressed static file and publish the root CID, so a browser
+        /// can hydrate straight from CID-verified IPFS-style blocks — with NO
+        /// kotoba query node exposed (ADR-2605312345: Datom log canonical, IPFS
+        /// = block backend; ADR-2606014600: trustless CID-verified fetch).
+        #[wasm_bindgen(js_name = exportBlocks)]
+        pub fn export_blocks(&self) -> Result<String, JsValue> {
+            let entries = self.inner.blocks.entries();
+            let arr: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|(cid, data)| {
+                    serde_json::json!({
+                        "cid": cid.to_multibase(),
+                        "hex": hex::encode(data),
+                    })
+                })
+                .collect();
+            serde_json::to_string(&arr).map_err(|e| JsValue::from_str(&e.to_string()))
         }
 
         /// Durable WRITE: `commit()` then flush every captured ProllyTree block

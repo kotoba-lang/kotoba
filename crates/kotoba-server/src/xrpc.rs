@@ -47,12 +47,6 @@ pub const NSID_AGENT_SYNC_ADV: &str = "com.etzhayyim.apps.kotoba.agent.syncadvan
 pub const NSID_AGENT_SYNC_CLOSE: &str = "com.etzhayyim.apps.kotoba.agent.syncclose";
 pub const NSID_VAULT_PUT: &str = "com.etzhayyim.apps.kotoba.vault.put";
 pub const NSID_VAULT_GET: &str = "com.etzhayyim.apps.kotoba.vault.get";
-pub const NSID_VAULT_ENVELOPE_PUT: &str = "com.etzhayyim.apps.kotoba.vault.envelopePut";
-pub const NSID_VAULT_ENVELOPE_GET: &str = "com.etzhayyim.apps.kotoba.vault.envelopeGet";
-pub const NSID_VAULT_ENVELOPE_CURRENT: &str = "com.etzhayyim.apps.kotoba.vault.envelopeCurrent";
-pub const NSID_VAULT_ENVELOPE_INSPECT: &str = "com.etzhayyim.apps.kotoba.vault.envelopeInspect";
-pub const NSID_VAULT_ENVELOPE_GRANT: &str = "com.etzhayyim.apps.kotoba.vault.envelopeGrant";
-pub const NSID_VAULT_ENVELOPE_REVOKE: &str = "com.etzhayyim.apps.kotoba.vault.envelopeRevoke";
 pub const NSID_ECON_BALANCE: &str = "com.etzhayyim.apps.kotoba.econ.balance";
 pub const NSID_ECON_CREDIT: &str = "com.etzhayyim.apps.kotoba.econ.credit";
 
@@ -66,7 +60,6 @@ use kotoba_datomic::distributed::{
     RemoteIpfsIpnsRegistry, ROOT_AEVT, ROOT_AVET, ROOT_EAVT, ROOT_TEA, ROOT_VAET,
 };
 use kotoba_ipfs::{IpnsName, IpnsRegistry, IpnsRegistryError};
-use kotoba_kse::{BUCKET_VAULT_ENVELOPES, BUCKET_VAULT_ENVELOPE_TOMBSTONES};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -74,25 +67,6 @@ use std::sync::Arc;
 
 /// Maximum size of a base64-encoded CACAO delegation token (8 KiB decoded ≈ 6 KiB base64).
 const MAX_CACAO_B64_LEN: usize = 8 * 1024;
-/// Maximum size of a base64-encoded vault blob request.
-const MAX_VAULT_B64_LEN: usize = 10 * 1024 * 1024;
-/// Maximum length of a vault CID query parameter.
-const MAX_VAULT_CID_LEN: usize = 512;
-/// Maximum decoded envelope AAD bytes stored in an envelope manifest.
-const MAX_VAULT_ENVELOPE_AAD_LEN: usize = kotoba_core::EnvelopeManifest::MAX_AAD_LEN;
-/// Maximum size of base64-encoded envelope AAD accepted by the JSON API.
-const MAX_VAULT_ENVELOPE_AAD_B64_LEN: usize =
-    base64_standard_encoded_len(MAX_VAULT_ENVELOPE_AAD_LEN);
-/// Maximum recipient identifier length accepted by vault envelope APIs.
-const MAX_VAULT_ENVELOPE_RECIPIENT_LEN: usize = kotoba_core::EnvelopeManifest::MAX_RECIPIENT_LEN;
-/// Current schema version for persisted envelope manifest cleanup tombstones.
-const ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION: u64 = 1;
-/// Maximum valid cleanup tombstones returned inline from node.status.
-const RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT: usize = 8;
-
-const fn base64_standard_encoded_len(raw_len: usize) -> usize {
-    raw_len.div_ceil(3) * 4
-}
 
 // ── Request / Response types ───────────────────────────────────────────────
 
@@ -135,120 +109,6 @@ pub struct VaultPutResp {
 pub struct VaultGetResp {
     pub cid: String,
     pub data_b64: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VaultEnvelopePutReq {
-    /// Raw plaintext encoded as standard base64. The server stores only
-    /// ciphertext plus an envelope manifest.
-    pub data_b64: String,
-    /// Recipient DID/key id for the initial DEK wrap. Defaults to this node's
-    /// operator DID for the local operator-trusted vault path.
-    pub recipient: Option<String>,
-    /// Optional standard-base64 AAD bound into both the ciphertext and DEK wrap.
-    pub aad_b64: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VaultEnvelopePutResp {
-    pub ct_cid: String,
-    pub manifest_cid: String,
-    pub recipient: String,
-    pub size: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VaultEnvelopeGetResp {
-    pub ct_cid: String,
-    pub manifest_cid: String,
-    pub recipient: String,
-    pub data_b64: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VaultEnvelopeCurrentResp {
-    pub ct_cid: String,
-    pub manifest_cid: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VaultEnvelopeWrapInfo {
-    pub recipient: String,
-    pub wrap_alg: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VaultEnvelopeCurrentStatus {
-    Current,
-    Stale,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum EnvelopeManifestCleanupReason {
-    FailedCurrentPointerUpdate,
-    GrantOldManifest,
-    RevokeOldManifest,
-}
-
-impl EnvelopeManifestCleanupReason {
-    const KNOWN_VALUES: [&'static str; 3] = [
-        "failed_current_pointer_update",
-        "grant_old_manifest",
-        "revoke_old_manifest",
-    ];
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::FailedCurrentPointerUpdate => "failed_current_pointer_update",
-            Self::GrantOldManifest => "grant_old_manifest",
-            Self::RevokeOldManifest => "revoke_old_manifest",
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct VaultEnvelopeInspectResp {
-    pub ct_cid: String,
-    pub manifest_cid: String,
-    pub current_manifest_cid: Option<String>,
-    pub current_status: VaultEnvelopeCurrentStatus,
-    pub version: u16,
-    pub content_alg: String,
-    pub aad_b64: String,
-    pub recipients: Vec<String>,
-    pub wraps: Vec<VaultEnvelopeWrapInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VaultEnvelopeGrantReq {
-    pub manifest_cid: String,
-    /// Optional expected ciphertext CID. When present it must match the manifest.
-    pub ct_cid: Option<String>,
-    /// Recipient whose existing wrap authorizes unwrapping the DEK.
-    /// Defaults to this node's operator DID.
-    pub from_recipient: Option<String>,
-    /// Recipient DID/key id to add or replace in the new manifest.
-    pub to_recipient: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VaultEnvelopeRevokeReq {
-    pub manifest_cid: String,
-    /// Optional expected ciphertext CID. When present it must match the manifest.
-    pub ct_cid: Option<String>,
-    /// Recipient DID/key id to remove from the new manifest.
-    pub recipient: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VaultEnvelopeRotateResp {
-    pub ct_cid: String,
-    pub old_manifest_cid: String,
-    pub manifest_cid: String,
-    pub recipients: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -917,61 +777,6 @@ pub struct InvokeRunReq {
     pub graph_cid: Option<String>,
 }
 
-const MAX_INVOKE_AGENT_DID_LEN: usize = 512;
-const MAX_INVOKE_PROGRAM_CID_LEN: usize = 512;
-const MAX_INVOKE_GRAPH_CID_LEN: usize = 512;
-const MAX_INVOKE_PROGRAM_TYPE_LEN: usize = 16;
-
-fn normalize_invoke_program_id(program_cid: &str) -> Result<String, (StatusCode, String)> {
-    let program_cid = program_cid.trim();
-    if program_cid.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "program_cid is required".into()));
-    }
-    if program_cid.len() > MAX_INVOKE_PROGRAM_CID_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "program_cid too long ({} bytes, limit {MAX_INVOKE_PROGRAM_CID_LEN})",
-                program_cid.len()
-            ),
-        ));
-    }
-    if program_cid.chars().any(|ch| ch.is_control()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "program_cid must not contain control characters".into(),
-        ));
-    }
-    Ok(program_cid.to_string())
-}
-
-fn parse_optional_invoke_graph_cid(
-    graph_cid: Option<&str>,
-) -> Result<Option<kotoba_core::cid::KotobaCid>, (StatusCode, String)> {
-    let Some(graph_cid) = graph_cid else {
-        return Ok(None);
-    };
-    let graph_cid = graph_cid.trim();
-    if graph_cid.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "graph_cid must be non-empty".into(),
-        ));
-    }
-    if graph_cid.len() > MAX_INVOKE_GRAPH_CID_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "graph_cid too long ({} bytes, limit {MAX_INVOKE_GRAPH_CID_LEN})",
-                graph_cid.len()
-            ),
-        ));
-    }
-    kotoba_core::cid::KotobaCid::from_multibase(graph_cid)
-        .map(Some)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph_cid".into()))
-}
-
 #[derive(Debug, Serialize)]
 pub struct InvokeRunResp {
     pub status: &'static str,
@@ -1446,63 +1251,6 @@ pub async fn datom_create(
     quad_create(State(state), Json(req)).await
 }
 
-fn normalize_vault_envelope_recipient(
-    recipient: &str,
-    field: &'static str,
-) -> Result<String, (StatusCode, String)> {
-    let recipient = recipient.trim();
-    if recipient.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("{field} must not be empty"),
-        ));
-    }
-    if !recipient.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("{field} must be a visible ASCII DID or key id"),
-        ));
-    }
-    if recipient.len() > MAX_VAULT_ENVELOPE_RECIPIENT_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{field} too long ({} bytes, limit {MAX_VAULT_ENVELOPE_RECIPIENT_LEN})",
-                recipient.len()
-            ),
-        ));
-    }
-    Ok(recipient.to_string())
-}
-
-fn parse_vault_cid_param(
-    value: &str,
-    field: &'static str,
-) -> Result<kotoba_core::cid::KotobaCid, (StatusCode, String)> {
-    if value.len() > MAX_VAULT_CID_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "{field} too long ({} bytes, limit {MAX_VAULT_CID_LEN})",
-                value.len()
-            ),
-        ));
-    }
-    if !value.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("{field} must be a visible ASCII CID"),
-        ));
-    }
-    let invalid_field = if field == "cid" { "CID" } else { field };
-    kotoba_core::cid::KotobaCid::from_multibase(value).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid {invalid_field}: {value}"),
-        )
-    })
-}
-
 /// POST /xrpc/com.etzhayyim.apps.kotoba.vault.put
 /// Store an opaque blob in the private Vault.  Returns a CID (multibase blake3).
 /// No GossipSub propagation — vault blobs stay local (or in B2 when configured).
@@ -1515,8 +1263,9 @@ pub async fn vault_put(
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use bytes::Bytes;
 
-    // Vault blobs are content-addressed chunks; oversized payloads should be
-    // split by the chunker, not sent raw.
+    // 10 MiB base64 cap (decodes to ~7.5 MiB raw). Vault blobs are content-addressed
+    // chunks; oversized payloads should be split by the chunker, not sent raw.
+    const MAX_VAULT_B64_LEN: usize = 10 * 1024 * 1024;
     if req.data_b64.len() > MAX_VAULT_B64_LEN {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1543,7 +1292,7 @@ pub async fn vault_put(
     ))
 }
 
-/// `GET /xrpc/com.etzhayyim.apps.kotoba.vault.get?cid=<multibase>`
+/// GET /xrpc/com.etzhayyim.apps.kotoba.vault.get?cid=<multibase>
 /// Retrieve a blob from the Vault by CID.  Returns 404 if not found.
 pub async fn vault_get(
     State(state): State<Arc<KotobaState>>,
@@ -1552,6 +1301,7 @@ pub async fn vault_get(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use kotoba_core::cid::KotobaCid;
 
     let cid_str = params.get("cid").ok_or_else(|| {
         (
@@ -1559,7 +1309,9 @@ pub async fn vault_get(
             "missing `cid` query param".to_string(),
         )
     })?;
-    let cid = parse_vault_cid_param(cid_str, "cid")?;
+
+    let cid = KotobaCid::from_multibase(cid_str)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("invalid CID: {cid_str}")))?;
 
     let data = state.vault.get(&cid).await.ok_or_else(|| {
         (
@@ -1577,500 +1329,6 @@ pub async fn vault_get(
     ))
 }
 
-/// POST /xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut
-/// Store plaintext through SecureVault envelope encryption. The ciphertext CID
-/// remains stable while future access changes can publish a new manifest CID.
-pub async fn vault_envelope_put(
-    State(state): State<Arc<KotobaState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<VaultEnvelopePutReq>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    use bytes::Bytes;
-
-    if req.data_b64.len() > MAX_VAULT_B64_LEN {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "data_b64 too large ({} bytes, limit {MAX_VAULT_B64_LEN})",
-                req.data_b64.len()
-            ),
-        ));
-    }
-
-    let recipient = normalize_vault_envelope_recipient(
-        req.recipient
-            .unwrap_or_else(|| state.operator_did.clone())
-            .as_str(),
-        "recipient",
-    )?;
-    let data = B64
-        .decode(&req.data_b64)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("data_b64 decode: {e}")))?;
-    let aad = match req.aad_b64 {
-        Some(aad_b64) => {
-            if aad_b64.len() > MAX_VAULT_ENVELOPE_AAD_B64_LEN {
-                return Err((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "aad_b64 too large ({} bytes, limit {MAX_VAULT_ENVELOPE_AAD_B64_LEN})",
-                        aad_b64.len()
-                    ),
-                ));
-            }
-            let aad = B64
-                .decode(&aad_b64)
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("aad_b64 decode: {e}")))?;
-            if aad.len() > MAX_VAULT_ENVELOPE_AAD_LEN {
-                return Err((
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!(
-                        "aad_b64 decoded payload too large ({} bytes, limit {MAX_VAULT_ENVELOPE_AAD_LEN})",
-                        aad.len()
-                    ),
-                ));
-            }
-            aad
-        }
-        None => Vec::new(),
-    };
-    let wrapping_key = state.pre_wrapping_key(&recipient).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("wrapping key: {e}"),
-        )
-    })?;
-
-    let (blob_ref, policy, _manifest) = state
-        .secure_vault
-        .put_enveloped_with_policy(&wrapping_key, &recipient, Bytes::from(data), &aad)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("envelope put: {e}"),
-            )
-        })?;
-    let kotoba_core::policy::DataPolicy::Enveloped {
-        ct_cid,
-        manifest_cid,
-    } = policy
-    else {
-        unreachable!("put_enveloped_with_policy returns an enveloped policy");
-    };
-
-    tracing::info!(
-        ct_cid = %ct_cid.to_multibase(),
-        manifest_cid = %manifest_cid.to_multibase(),
-        recipient = %recipient,
-        size = blob_ref.size,
-        "vault.envelopePut"
-    );
-    set_current_envelope_manifest(&state, &ct_cid, &manifest_cid).await;
-
-    Ok((
-        StatusCode::OK,
-        Json(VaultEnvelopePutResp {
-            ct_cid: ct_cid.to_multibase(),
-            manifest_cid: manifest_cid.to_multibase(),
-            recipient,
-            size: blob_ref.size,
-        }),
-    ))
-}
-
-/// `GET /xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?manifest_cid=<cid>[&ct_cid=<cid>][&recipient=<did>]`
-/// Retrieve and decrypt an envelope manifest. When `ct_cid` is supplied, it is
-/// checked against the manifest before decryption.
-pub async fn vault_envelope_get(
-    State(state): State<Arc<KotobaState>>,
-    headers: axum::http::HeaderMap,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    let manifest_cid_str = params.get("manifest_cid").ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "missing `manifest_cid` query param".to_string(),
-        )
-    })?;
-    let manifest_cid = parse_vault_cid_param(manifest_cid_str, "manifest_cid")?;
-    let expected_ct_cid = params
-        .get("ct_cid")
-        .map(|ct_cid_str| parse_vault_cid_param(ct_cid_str, "ct_cid"))
-        .transpose()?;
-    let recipient = normalize_vault_envelope_recipient(
-        params
-            .get("recipient")
-            .map(String::as_str)
-            .unwrap_or(&state.operator_did),
-        "recipient",
-    )?;
-    let manifest = match state
-        .secure_vault
-        .get_envelope_manifest(&manifest_cid)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("envelope manifest: {e}")))?
-    {
-        Some(manifest) => manifest,
-        None => {
-            return Err(
-                envelope_manifest_missing_error(&state, &manifest_cid, manifest_cid_str).await,
-            );
-        }
-    };
-    if let Some(expected_ct_cid) = expected_ct_cid {
-        ensure_manifest_matches_expected_ciphertext(&expected_ct_cid, &manifest)?;
-    }
-    ensure_current_envelope_manifest(&state, &manifest.ct_cid, &manifest_cid).await?;
-    let wrapping_key = state.pre_wrapping_key(&recipient).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("wrapping key: {e}"),
-        )
-    })?;
-    let plaintext = state
-        .secure_vault
-        .get_enveloped(&manifest, &wrapping_key, &recipient)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("envelope get: {e}")))?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "vault ciphertext not found: {}",
-                    manifest.ct_cid.to_multibase()
-                ),
-            )
-        })?;
-
-    Ok((
-        StatusCode::OK,
-        Json(VaultEnvelopeGetResp {
-            ct_cid: manifest.ct_cid.to_multibase(),
-            manifest_cid: manifest_cid.to_multibase(),
-            recipient,
-            data_b64: B64.encode(&plaintext),
-        }),
-    ))
-}
-
-/// `GET /xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid=<cid>`
-/// Resolve the current manifest pointer for a ciphertext CID.
-pub async fn vault_envelope_current(
-    State(state): State<Arc<KotobaState>>,
-    headers: axum::http::HeaderMap,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    let ct_cid_str = params.get("ct_cid").ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "missing `ct_cid` query param".to_string(),
-        )
-    })?;
-    let ct_cid = parse_vault_cid_param(ct_cid_str, "ct_cid")?;
-    let manifest_cid = get_current_envelope_manifest(&state, &ct_cid)
-        .await?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("current envelope manifest not found: {ct_cid_str}"),
-            )
-        })?;
-    let Some(current_manifest) =
-        get_envelope_manifest_for_current_pointer(&state, &manifest_cid).await?
-    else {
-        return Err(envelope_manifest_missing_error(
-            &state,
-            &manifest_cid,
-            &manifest_cid.to_multibase(),
-        )
-        .await);
-    };
-    ensure_current_manifest_matches_ciphertext(&ct_cid, &manifest_cid, &current_manifest)?;
-
-    Ok((
-        StatusCode::OK,
-        Json(VaultEnvelopeCurrentResp {
-            ct_cid: ct_cid.to_multibase(),
-            manifest_cid: manifest_cid.to_multibase(),
-        }),
-    ))
-}
-
-/// `GET /xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?manifest_cid=<cid>[&ct_cid=<cid>]`
-/// Inspect non-secret envelope manifest metadata and current/stale status.
-pub async fn vault_envelope_inspect(
-    State(state): State<Arc<KotobaState>>,
-    headers: axum::http::HeaderMap,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    let manifest_cid_str = params.get("manifest_cid").ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "missing `manifest_cid` query param".to_string(),
-        )
-    })?;
-    let manifest_cid = parse_vault_cid_param(manifest_cid_str, "manifest_cid")?;
-    let expected_ct_cid = params
-        .get("ct_cid")
-        .map(|ct_cid_str| parse_vault_cid_param(ct_cid_str, "ct_cid"))
-        .transpose()?;
-    let manifest = match state
-        .secure_vault
-        .get_envelope_manifest(&manifest_cid)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("envelope manifest: {e}")))?
-    {
-        Some(manifest) => manifest,
-        None => {
-            return Err(
-                envelope_manifest_missing_error(&state, &manifest_cid, manifest_cid_str).await,
-            );
-        }
-    };
-    if let Some(expected_ct_cid) = expected_ct_cid {
-        if expected_ct_cid != manifest.ct_cid {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "policy ct_cid {} does not match manifest ct_cid {}",
-                    expected_ct_cid.to_multibase(),
-                    manifest.ct_cid.to_multibase()
-                ),
-            ));
-        }
-    }
-    let current_manifest_cid =
-        get_readable_current_envelope_manifest_for_inspect(&state, &manifest.ct_cid).await?;
-    let current_status = match &current_manifest_cid {
-        Some(current) if *current == manifest_cid => VaultEnvelopeCurrentStatus::Current,
-        Some(_) => VaultEnvelopeCurrentStatus::Stale,
-        None => VaultEnvelopeCurrentStatus::Unknown,
-    };
-    let wraps: Vec<VaultEnvelopeWrapInfo> = manifest
-        .dek_wraps
-        .iter()
-        .map(|wrap| VaultEnvelopeWrapInfo {
-            recipient: wrap.recipient.clone(),
-            wrap_alg: wrap.wrap_alg.clone(),
-        })
-        .collect();
-    let recipients = wraps.iter().map(|wrap| wrap.recipient.clone()).collect();
-
-    Ok((
-        StatusCode::OK,
-        Json(VaultEnvelopeInspectResp {
-            ct_cid: manifest.ct_cid.to_multibase(),
-            manifest_cid: manifest_cid.to_multibase(),
-            current_manifest_cid: current_manifest_cid.map(|cid| cid.to_multibase()),
-            current_status,
-            version: manifest.version,
-            content_alg: manifest.content_alg,
-            aad_b64: B64.encode(&manifest.aad),
-            recipients,
-            wraps,
-        }),
-    ))
-}
-
-/// POST /xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant
-/// Add or replace one recipient wrap, producing a new manifest CID while
-/// leaving the ciphertext CID unchanged.
-pub async fn vault_envelope_grant(
-    State(state): State<Arc<KotobaState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<VaultEnvelopeGrantReq>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    let old_manifest_cid = parse_vault_cid_param(&req.manifest_cid, "manifest_cid")?;
-    let expected_ct_cid = req
-        .ct_cid
-        .as_deref()
-        .map(|ct_cid| parse_vault_cid_param(ct_cid, "ct_cid"))
-        .transpose()?;
-    let from_recipient = normalize_vault_envelope_recipient(
-        req.from_recipient
-            .unwrap_or_else(|| state.operator_did.clone())
-            .as_str(),
-        "from_recipient",
-    )?;
-    let to_recipient = normalize_vault_envelope_recipient(&req.to_recipient, "to_recipient")?;
-    let manifest = match state
-        .secure_vault
-        .get_envelope_manifest(&old_manifest_cid)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("envelope manifest: {e}")))?
-    {
-        Some(manifest) => manifest,
-        None => {
-            return Err(envelope_manifest_missing_error(
-                &state,
-                &old_manifest_cid,
-                &req.manifest_cid,
-            )
-            .await);
-        }
-    };
-    if let Some(expected_ct_cid) = expected_ct_cid {
-        ensure_manifest_matches_expected_ciphertext(&expected_ct_cid, &manifest)?;
-    }
-    let expected_current =
-        ensure_current_envelope_manifest(&state, &manifest.ct_cid, &old_manifest_cid).await?;
-
-    let from_key = state.pre_wrapping_key(&from_recipient).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("wrapping key: {e}"),
-        )
-    })?;
-    let dek = state
-        .secure_vault
-        .unwrap_envelope_dek(&manifest, &from_key, &from_recipient)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("envelope unwrap: {e}")))?;
-    let to_key = state.pre_wrapping_key(&to_recipient).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("wrapping key: {e}"),
-        )
-    })?;
-    let (new_manifest_cid, new_manifest) = state
-        .secure_vault
-        .put_envelope_manifest_with_wrap(manifest, &to_key, &to_recipient, &dek)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("envelope grant: {e}"),
-            )
-        })?;
-    advance_current_envelope_manifest_or_delete_new(
-        &state,
-        &new_manifest.ct_cid,
-        Some(&expected_current),
-        &new_manifest_cid,
-    )
-    .await?;
-    cleanup_replaced_envelope_manifest(
-        &state,
-        &old_manifest_cid,
-        &new_manifest_cid,
-        EnvelopeManifestCleanupReason::GrantOldManifest,
-    )
-    .await;
-
-    Ok((
-        StatusCode::OK,
-        Json(VaultEnvelopeRotateResp {
-            ct_cid: new_manifest.ct_cid.to_multibase(),
-            old_manifest_cid: old_manifest_cid.to_multibase(),
-            manifest_cid: new_manifest_cid.to_multibase(),
-            recipients: new_manifest
-                .dek_wraps
-                .iter()
-                .map(|wrap| wrap.recipient.clone())
-                .collect(),
-        }),
-    ))
-}
-
-/// POST /xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke
-/// Remove one recipient wrap, producing a new manifest CID while leaving the
-/// ciphertext CID unchanged.
-pub async fn vault_envelope_revoke(
-    State(state): State<Arc<KotobaState>>,
-    headers: axum::http::HeaderMap,
-    Json(req): Json<VaultEnvelopeRevokeReq>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    let old_manifest_cid = parse_vault_cid_param(&req.manifest_cid, "manifest_cid")?;
-    let expected_ct_cid = req
-        .ct_cid
-        .as_deref()
-        .map(|ct_cid| parse_vault_cid_param(ct_cid, "ct_cid"))
-        .transpose()?;
-    let recipient = normalize_vault_envelope_recipient(&req.recipient, "recipient")?;
-    let mut manifest = match state
-        .secure_vault
-        .get_envelope_manifest(&old_manifest_cid)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("envelope manifest: {e}")))?
-    {
-        Some(manifest) => manifest,
-        None => {
-            return Err(envelope_manifest_missing_error(
-                &state,
-                &old_manifest_cid,
-                &req.manifest_cid,
-            )
-            .await);
-        }
-    };
-    if let Some(expected_ct_cid) = expected_ct_cid {
-        ensure_manifest_matches_expected_ciphertext(&expected_ct_cid, &manifest)?;
-    }
-    let expected_current =
-        ensure_current_envelope_manifest(&state, &manifest.ct_cid, &old_manifest_cid).await?;
-
-    let old_len = manifest.dek_wraps.len();
-    manifest
-        .dek_wraps
-        .retain(|wrap| wrap.recipient != recipient);
-    if manifest.dek_wraps.len() == old_len {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("recipient not present in envelope manifest: {recipient}"),
-        ));
-    }
-    if manifest.dek_wraps.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "cannot revoke the last envelope recipient".to_string(),
-        ));
-    }
-
-    let new_manifest_cid = state
-        .secure_vault
-        .put_envelope_manifest(&manifest)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("envelope revoke: {e}"),
-            )
-        })?;
-    advance_current_envelope_manifest_or_delete_new(
-        &state,
-        &manifest.ct_cid,
-        Some(&expected_current),
-        &new_manifest_cid,
-    )
-    .await?;
-    cleanup_replaced_envelope_manifest(
-        &state,
-        &old_manifest_cid,
-        &new_manifest_cid,
-        EnvelopeManifestCleanupReason::RevokeOldManifest,
-    )
-    .await;
-
-    Ok((
-        StatusCode::OK,
-        Json(VaultEnvelopeRotateResp {
-            ct_cid: manifest.ct_cid.to_multibase(),
-            old_manifest_cid: old_manifest_cid.to_multibase(),
-            manifest_cid: new_manifest_cid.to_multibase(),
-            recipients: manifest
-                .dek_wraps
-                .iter()
-                .map(|wrap| wrap.recipient.clone())
-                .collect(),
-        }),
-    ))
-}
-
 fn datomic_datom_resp(datom: kotoba_datomic::Datom) -> DatomicDatomResp {
     DatomicDatomResp {
         e: datom.e.to_multibase(),
@@ -2079,364 +1337,6 @@ fn datomic_datom_resp(datom: kotoba_datomic::Datom) -> DatomicDatomResp {
         t: datom.t.to_multibase(),
         added: datom.added,
     }
-}
-
-async fn set_current_envelope_manifest(
-    state: &KotobaState,
-    ct_cid: &kotoba_core::cid::KotobaCid,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-) {
-    state
-        .shelf
-        .put(
-            BUCKET_VAULT_ENVELOPES,
-            ct_cid.to_multibase(),
-            bytes::Bytes::from(manifest_cid.to_multibase()),
-        )
-        .await;
-}
-
-async fn ensure_current_envelope_manifest(
-    state: &KotobaState,
-    ct_cid: &kotoba_core::cid::KotobaCid,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-) -> Result<kotoba_core::cid::KotobaCid, (StatusCode, String)> {
-    let Some(current_cid) = get_current_envelope_manifest(state, ct_cid).await? else {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "missing current envelope manifest pointer for ciphertext {}; refusing manifest {}",
-                ct_cid.to_multibase(),
-                manifest_cid.to_multibase()
-            ),
-        ));
-    };
-    if current_cid != *manifest_cid {
-        let Some(current_manifest) =
-            get_envelope_manifest_for_current_pointer(state, &current_cid).await?
-        else {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "stale envelope manifest: requested {}, current {}",
-                    manifest_cid.to_multibase(),
-                    current_cid.to_multibase()
-                ),
-            ));
-        };
-        ensure_current_manifest_matches_ciphertext(ct_cid, &current_cid, &current_manifest)?;
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "stale envelope manifest: requested {}, current {}",
-                manifest_cid.to_multibase(),
-                current_cid.to_multibase()
-            ),
-        ));
-    }
-    Ok(current_cid)
-}
-
-fn ensure_current_manifest_matches_ciphertext(
-    ct_cid: &kotoba_core::cid::KotobaCid,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-    manifest: &kotoba_core::EnvelopeManifest,
-) -> Result<(), (StatusCode, String)> {
-    if manifest.ct_cid == *ct_cid {
-        return Ok(());
-    }
-    Err((
-        StatusCode::CONFLICT,
-        format!(
-            "current envelope manifest {} belongs to ciphertext {}, not {}",
-            manifest_cid.to_multibase(),
-            manifest.ct_cid.to_multibase(),
-            ct_cid.to_multibase()
-        ),
-    ))
-}
-
-fn ensure_manifest_matches_expected_ciphertext(
-    expected_ct_cid: &kotoba_core::cid::KotobaCid,
-    manifest: &kotoba_core::EnvelopeManifest,
-) -> Result<(), (StatusCode, String)> {
-    if *expected_ct_cid == manifest.ct_cid {
-        return Ok(());
-    }
-    Err((
-        StatusCode::BAD_REQUEST,
-        format!(
-            "policy ct_cid {} does not match manifest ct_cid {}",
-            expected_ct_cid.to_multibase(),
-            manifest.ct_cid.to_multibase()
-        ),
-    ))
-}
-
-async fn advance_current_envelope_manifest(
-    state: &KotobaState,
-    ct_cid: &kotoba_core::cid::KotobaCid,
-    expected_current_cid: Option<&kotoba_core::cid::KotobaCid>,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-) -> Result<(), (StatusCode, String)> {
-    let expected_current = expected_current_cid.map(|cid| cid.to_multibase());
-    let new_current = manifest_cid.to_multibase();
-    state
-        .shelf
-        .compare_and_swap(
-            BUCKET_VAULT_ENVELOPES,
-            ct_cid.to_multibase(),
-            expected_current.as_deref().map(str::as_bytes),
-            bytes::Bytes::from(new_current),
-        )
-        .await
-        .map_err(|err| {
-            let current = err
-                .current
-                .as_ref()
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .unwrap_or("<missing>");
-            (
-                StatusCode::CONFLICT,
-                format!(
-                    "stale envelope manifest update: expected {}, current {}",
-                    expected_current.as_deref().unwrap_or("<missing>"),
-                    current
-                ),
-            )
-        })?;
-    Ok(())
-}
-
-async fn advance_current_envelope_manifest_or_delete_new(
-    state: &KotobaState,
-    ct_cid: &kotoba_core::cid::KotobaCid,
-    expected_current_cid: Option<&kotoba_core::cid::KotobaCid>,
-    new_manifest_cid: &kotoba_core::cid::KotobaCid,
-) -> Result<(), (StatusCode, String)> {
-    if let Err(err) =
-        advance_current_envelope_manifest(state, ct_cid, expected_current_cid, new_manifest_cid)
-            .await
-    {
-        cleanup_envelope_manifest(
-            state,
-            new_manifest_cid,
-            EnvelopeManifestCleanupReason::FailedCurrentPointerUpdate,
-        )
-        .await;
-        return Err(err);
-    }
-    Ok(())
-}
-
-async fn cleanup_replaced_envelope_manifest(
-    state: &KotobaState,
-    old_manifest_cid: &kotoba_core::cid::KotobaCid,
-    new_manifest_cid: &kotoba_core::cid::KotobaCid,
-    reason: EnvelopeManifestCleanupReason,
-) -> bool {
-    if old_manifest_cid == new_manifest_cid {
-        tracing::warn!(
-            manifest_cid = %old_manifest_cid.to_multibase(),
-            reason = reason.as_str(),
-            "skipping envelope manifest cleanup because old and new manifest CIDs are identical"
-        );
-        return false;
-    }
-    cleanup_envelope_manifest(state, old_manifest_cid, reason).await
-}
-
-async fn cleanup_envelope_manifest(
-    state: &KotobaState,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-    reason: EnvelopeManifestCleanupReason,
-) -> bool {
-    use std::sync::atomic::Ordering;
-
-    let cleanup_attempt = state
-        .envelope_manifest_cleanup_attempts
-        .fetch_add(1, Ordering::Relaxed)
-        + 1;
-    let deleted = state
-        .secure_vault
-        .delete_envelope_manifest(manifest_cid)
-        .await;
-    record_envelope_manifest_tombstone(state, manifest_cid, reason, deleted, cleanup_attempt).await;
-    if deleted {
-        state
-            .envelope_manifest_cleanup_successes
-            .fetch_add(1, Ordering::Relaxed);
-    } else {
-        state
-            .envelope_manifest_cleanup_failures
-            .fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(
-            manifest_cid = %manifest_cid.to_multibase(),
-            reason = reason.as_str(),
-            "envelope manifest cleanup did not delete a block"
-        );
-    }
-    deleted
-}
-
-async fn record_envelope_manifest_tombstone(
-    state: &KotobaState,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-    reason: EnvelopeManifestCleanupReason,
-    deleted: bool,
-    cleanup_attempt: u64,
-) {
-    let manifest_cid = manifest_cid.to_multibase();
-    let recorded_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
-    let record = serde_json::json!({
-        "schema_version": ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-        "manifest_cid": manifest_cid,
-        "reason": reason.as_str(),
-        "deleted": deleted,
-        "cleanup_attempt": cleanup_attempt,
-        "recorded_at_unix_ms": recorded_at_unix_ms,
-    });
-    state
-        .shelf
-        .put(
-            BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-            manifest_cid,
-            bytes::Bytes::from(record.to_string()),
-        )
-        .await;
-}
-
-async fn envelope_manifest_missing_error(
-    state: &KotobaState,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-    manifest_cid_str: &str,
-) -> (StatusCode, String) {
-    let tombstone = state
-        .shelf
-        .get(
-            BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-            &manifest_cid.to_multibase(),
-        )
-        .await
-        .and_then(|bytes| decode_envelope_manifest_tombstone(&manifest_cid.to_multibase(), &bytes));
-
-    if let Some(tombstone) = tombstone {
-        let reason = tombstone["reason"].as_str().unwrap_or("unknown");
-        let deleted = tombstone["deleted"].as_bool().unwrap_or(false);
-        return (
-            StatusCode::GONE,
-            format!(
-                "vault envelope manifest deleted: {manifest_cid_str} (reason: {reason}, deleted: {deleted})"
-            ),
-        );
-    }
-
-    (
-        StatusCode::NOT_FOUND,
-        format!("vault envelope manifest not found: {manifest_cid_str}"),
-    )
-}
-
-async fn get_envelope_manifest_for_current_pointer(
-    state: &KotobaState,
-    manifest_cid: &kotoba_core::cid::KotobaCid,
-) -> Result<Option<kotoba_core::EnvelopeManifest>, (StatusCode, String)> {
-    state
-        .secure_vault
-        .get_envelope_manifest(manifest_cid)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::CONFLICT,
-                format!("current envelope manifest: {e}"),
-            )
-        })
-}
-
-async fn get_readable_current_envelope_manifest_for_inspect(
-    state: &KotobaState,
-    ct_cid: &kotoba_core::cid::KotobaCid,
-) -> Result<Option<kotoba_core::cid::KotobaCid>, (StatusCode, String)> {
-    let Some(current_bytes) = state
-        .shelf
-        .get(BUCKET_VAULT_ENVELOPES, &ct_cid.to_multibase())
-        .await
-    else {
-        return Ok(None);
-    };
-    let Ok(current_str) = std::str::from_utf8(&current_bytes) else {
-        tracing::warn!(
-            ct_cid = %ct_cid.to_multibase(),
-            "vault envelope inspect ignored non-UTF-8 current manifest pointer"
-        );
-        return Ok(None);
-    };
-    let Some(current_cid) = kotoba_core::cid::KotobaCid::from_multibase(current_str) else {
-        tracing::warn!(
-            ct_cid = %ct_cid.to_multibase(),
-            current = current_str,
-            "vault envelope inspect ignored invalid current manifest pointer"
-        );
-        return Ok(None);
-    };
-    let current_manifest =
-        match get_envelope_manifest_for_current_pointer(state, &current_cid).await {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => {
-                tracing::warn!(
-                    ct_cid = %ct_cid.to_multibase(),
-                    current = %current_cid.to_multibase(),
-                    "vault envelope inspect ignored unreadable current manifest pointer"
-                );
-                return Ok(None);
-            }
-            Err((status, message)) => {
-                tracing::warn!(
-                    ct_cid = %ct_cid.to_multibase(),
-                    current = %current_cid.to_multibase(),
-                    status = %status,
-                    error = %message,
-                    "vault envelope inspect ignored invalid current manifest pointer body"
-                );
-                return Ok(None);
-            }
-        };
-    if current_manifest.ct_cid != *ct_cid {
-        tracing::warn!(
-            ct_cid = %ct_cid.to_multibase(),
-            current = %current_cid.to_multibase(),
-            manifest_ct_cid = %current_manifest.ct_cid.to_multibase(),
-            "vault envelope inspect ignored current manifest pointer for a different ciphertext"
-        );
-        return Ok(None);
-    }
-    Ok(Some(current_cid))
-}
-
-async fn get_current_envelope_manifest(
-    state: &KotobaState,
-    ct_cid: &kotoba_core::cid::KotobaCid,
-) -> Result<Option<kotoba_core::cid::KotobaCid>, (StatusCode, String)> {
-    let Some(current_bytes) = state
-        .shelf
-        .get(BUCKET_VAULT_ENVELOPES, &ct_cid.to_multibase())
-        .await
-    else {
-        return Ok(None);
-    };
-    let current_str = std::str::from_utf8(&current_bytes)
-        .map_err(|e| (StatusCode::CONFLICT, format!("current manifest: {e}")))?;
-    let current_cid =
-        kotoba_core::cid::KotobaCid::from_multibase(current_str).ok_or_else(|| {
-            (
-                StatusCode::CONFLICT,
-                format!("invalid current manifest CID: {current_str}"),
-            )
-        })?;
-    Ok(Some(current_cid))
 }
 
 fn parse_graph_cid(graph: &str) -> Result<kotoba_core::cid::KotobaCid, (StatusCode, String)> {
@@ -4945,7 +3845,10 @@ async fn try_resident_datomic_q(
     let rows = kotoba_datomic::q(query.clone(), &db, inputs)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic q: {e}")))?;
     let basis_t = db.basis_t.as_ref().map(|t| t.to_multibase());
-    *live_guard = Some(crate::server::LiveDatomicGraph { head: head_cid, db });
+    *live_guard = Some(crate::server::LiveDatomicGraph {
+        head: head_cid,
+        db,
+    });
     Ok(Some((basis_t, rows)))
 }
 
@@ -5822,8 +4725,8 @@ pub async fn datomic_transact(
             .holder
             .clone()
             .unwrap_or_else(|| state.operator_did.clone());
-    } else {
-        operator_auth?;
+    } else if let Err(operator_err) = operator_auth {
+        return Err(operator_err);
     }
 
     let tx_data = kotoba_edn::parse(&req.tx_edn)
@@ -6277,7 +5180,7 @@ pub async fn datomic_datoms(
         req.remote_peer.as_deref(),
         req.remote_ipns_name.as_deref(),
     )? {
-        let limit = req.limit.unwrap_or(1000).min(10_000);
+        let limit = req.limit.unwrap_or(1000).min(10_000) as usize;
         datoms.retain(|datom| datomic_datoms_value_matches_index(datom, index));
         let mut fallback_datoms = db.datoms();
         fallback_datoms.sort_by_key(|datom| datomic_datoms_sort_key(datom, index));
@@ -7161,8 +6064,9 @@ pub async fn datomic_history(
         .history()
         .datoms()
         .iter()
-        .take(limit)
         .cloned()
+        .into_iter()
+        .take(limit)
         .map(datomic_datom_resp)
         .collect::<Vec<_>>();
 
@@ -8036,19 +6940,6 @@ pub async fn node_status(
     }
     let nb = state.neighborhood.read().await;
     let did_document = state.local_did_document().await;
-    let cleanup_attempts = state
-        .envelope_manifest_cleanup_attempts
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let cleanup_successes = state
-        .envelope_manifest_cleanup_successes
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let cleanup_failures = state
-        .envelope_manifest_cleanup_failures
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let tombstone_summary = summarize_envelope_manifest_tombstones(
-        state.shelf.list(BUCKET_VAULT_ENVELOPE_TOMBSTONES).await,
-    );
-    let current_pointer_summary = summarize_envelope_current_pointers(&state).await;
     Json(serde_json::json!({
         "node_id":    hex::encode(state.local_node_id.0),
         "operator_did": state.operator_did.as_str(),
@@ -8056,125 +6947,8 @@ pub async fn node_status(
         "peer_count": nb.peers.len(),
         "peers":      nb.peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>(),
         "k":          kotoba_dht::neighborhood::K,
-        "envelope_manifest_cleanup": {
-            "attempts": cleanup_attempts,
-            "successes": cleanup_successes,
-            "failures": cleanup_failures,
-            "tombstone_count": tombstone_summary.total_count,
-            "valid_tombstone_count": tombstone_summary.valid_count,
-            "malformed_tombstone_count": tombstone_summary.malformed_count,
-            "omitted_tombstone_count": tombstone_summary.omitted_count,
-            "recent_tombstone_limit": RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT,
-            "recent_tombstones": tombstone_summary.recent,
-        },
-        "envelope_current_pointers": {
-            "total_count": current_pointer_summary.total_count,
-            "readable_count": current_pointer_summary.readable_count,
-            "unreadable_manifest_count": current_pointer_summary.unreadable_manifest_count,
-            "malformed_ct_cid_count": current_pointer_summary.malformed_ct_cid_count,
-            "malformed_manifest_cid_count": current_pointer_summary.malformed_manifest_cid_count,
-        },
     }))
     .into_response()
-}
-
-#[derive(Debug, Default)]
-struct EnvelopeCurrentPointerSummary {
-    total_count: usize,
-    readable_count: usize,
-    unreadable_manifest_count: usize,
-    malformed_ct_cid_count: usize,
-    malformed_manifest_cid_count: usize,
-}
-
-async fn summarize_envelope_current_pointers(state: &KotobaState) -> EnvelopeCurrentPointerSummary {
-    let entries = state.shelf.list(BUCKET_VAULT_ENVELOPES).await;
-    let mut summary = EnvelopeCurrentPointerSummary {
-        total_count: entries.len(),
-        ..EnvelopeCurrentPointerSummary::default()
-    };
-    for (ct_cid, manifest_cid_bytes) in entries {
-        let Some(ct_cid) = kotoba_core::cid::KotobaCid::from_multibase(&ct_cid) else {
-            summary.malformed_ct_cid_count += 1;
-            continue;
-        };
-        let Ok(manifest_cid) = std::str::from_utf8(&manifest_cid_bytes) else {
-            summary.malformed_manifest_cid_count += 1;
-            continue;
-        };
-        let Some(manifest_cid) = kotoba_core::cid::KotobaCid::from_multibase(manifest_cid) else {
-            summary.malformed_manifest_cid_count += 1;
-            continue;
-        };
-        match get_envelope_manifest_for_current_pointer(state, &manifest_cid).await {
-            Ok(Some(manifest)) if manifest.ct_cid == ct_cid => summary.readable_count += 1,
-            Ok(Some(_)) | Ok(None) | Err(_) => summary.unreadable_manifest_count += 1,
-        }
-    }
-    summary
-}
-
-#[derive(Debug, Default)]
-struct EnvelopeTombstoneSummary {
-    total_count: usize,
-    valid_count: usize,
-    malformed_count: usize,
-    omitted_count: usize,
-    recent: Vec<serde_json::Value>,
-}
-
-fn summarize_envelope_manifest_tombstones(
-    tombstones: Vec<(String, bytes::Bytes)>,
-) -> EnvelopeTombstoneSummary {
-    let total_count = tombstones.len();
-    let mut tombstone_records = Vec::new();
-    let mut malformed_count = 0usize;
-    for (key, bytes) in tombstones {
-        match decode_envelope_manifest_tombstone(&key, &bytes) {
-            Some(record) => tombstone_records.push(record),
-            None => malformed_count += 1,
-        }
-    }
-    tombstone_records.sort_by(|a, b| {
-        b["cleanup_attempt"]
-            .as_u64()
-            .cmp(&a["cleanup_attempt"].as_u64())
-    });
-    let valid_count = tombstone_records.len();
-    let omitted_count = valid_count.saturating_sub(RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT);
-    let recent = tombstone_records
-        .into_iter()
-        .take(RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT)
-        .collect();
-    EnvelopeTombstoneSummary {
-        total_count,
-        valid_count,
-        malformed_count,
-        omitted_count,
-        recent,
-    }
-}
-
-fn decode_envelope_manifest_tombstone(key: &str, bytes: &[u8]) -> Option<serde_json::Value> {
-    let record = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
-    valid_envelope_manifest_tombstone(&record)
-        .then_some(record)
-        .filter(|record| record["manifest_cid"].as_str() == Some(key))
-}
-
-fn valid_envelope_manifest_tombstone(record: &serde_json::Value) -> bool {
-    record["schema_version"].as_u64() == Some(ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION)
-        && record["manifest_cid"].as_str().is_some()
-        && record["reason"]
-            .as_str()
-            .is_some_and(|reason| EnvelopeManifestCleanupReason::KNOWN_VALUES.contains(&reason))
-        && record["deleted"].as_bool().is_some()
-        && record["cleanup_attempt"]
-            .as_u64()
-            .is_some_and(|value| value > 0)
-        && record["recorded_at_unix_ms"]
-            .as_u64()
-            .is_some_and(|value| value > 0)
 }
 
 /// POST /xrpc/com.etzhayyim.apps.kotoba.invoke.run
@@ -8186,18 +6960,40 @@ pub async fn invoke_run(
     Json(req): Json<InvokeRunReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    crate::graph_auth::validate_did(&req.agent_did, "agent_did", MAX_INVOKE_AGENT_DID_LEN)?;
-    let program_cid = normalize_invoke_program_id(&req.program_cid)?;
-    if req.program_type.len() > MAX_INVOKE_PROGRAM_TYPE_LEN {
+    const MAX_AGENT_DID_LEN: usize = 512;
+    const MAX_PROGRAM_CID_LEN: usize = 512;
+    const MAX_GRAPH_CID_LEN: usize = 512;
+    const MAX_PROGRAM_TYPE_LEN: usize = 16;
+    crate::graph_auth::validate_did(&req.agent_did, "agent_did", MAX_AGENT_DID_LEN)?;
+    if req.program_cid.len() > MAX_PROGRAM_CID_LEN {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "program_type too long ({} bytes, limit {MAX_INVOKE_PROGRAM_TYPE_LEN})",
+                "program_cid too long ({} bytes, limit {MAX_PROGRAM_CID_LEN})",
+                req.program_cid.len()
+            ),
+        ));
+    }
+    if req.program_type.len() > MAX_PROGRAM_TYPE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "program_type too long ({} bytes, limit {MAX_PROGRAM_TYPE_LEN})",
                 req.program_type.len()
             ),
         ));
     }
-    let graph_cid_for_snapshot = parse_optional_invoke_graph_cid(req.graph_cid.as_deref())?;
+    if let Some(gcid) = &req.graph_cid {
+        if gcid.len() > MAX_GRAPH_CID_LEN {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "graph_cid too long ({} bytes, limit {MAX_GRAPH_CID_LEN})",
+                    gcid.len()
+                ),
+            ));
+        }
+    }
 
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_dht::source_chain::ProgramType;
@@ -8259,11 +7055,17 @@ pub async fn invoke_run(
         None => vec![],
     };
 
+    use kotoba_core::cid::KotobaCid;
     use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
     use kotoba_runtime::host::WitQuad;
     use kotoba_vm::DispatchResult;
 
     // Build quad snapshot from the distributed Datom head for kqe.query in WASM guests.
+    let graph_cid_for_snapshot = req
+        .graph_cid
+        .as_deref()
+        .map(KotobaCid::from_multibase)
+        .and_then(|x| x);
     let quad_snapshot: Vec<WitQuad> = if let Some(gcid) = &graph_cid_for_snapshot {
         match current_db_for_graph(&state, gcid).await {
             Ok(db) => db
@@ -8310,6 +7112,7 @@ pub async fn invoke_run(
     }
 
     // Move owned data into spawn_blocking — dispatch is CPU-bound (Cranelift JIT)
+    let program_cid = req.program_cid.clone();
     let agent_did = req.agent_did.clone();
     let router = Arc::clone(&state.router);
     let wasm_owned = if wasm_bytes.is_empty() {
@@ -8427,9 +7230,8 @@ pub async fn invoke_run(
                 use kotoba_kse::Topic;
                 state
                     .journal
-                    .publish_checked(Topic(topic.clone()), bytes::Bytes::from(payload.clone()))
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+                    .publish(Topic(topic.clone()), bytes::Bytes::from(payload.clone()))
+                    .await;
             }
 
             tracing::info!(
@@ -8469,21 +7271,9 @@ pub async fn invoke_run(
 pub async fn invoke_run(
     State(state): State<Arc<KotobaState>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<InvokeRunReq>,
+    Json(_req): Json<InvokeRunReq>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    crate::graph_auth::validate_did(&req.agent_did, "agent_did", MAX_INVOKE_AGENT_DID_LEN)?;
-    let _program_cid = normalize_invoke_program_id(&req.program_cid)?;
-    if req.program_type.len() > MAX_INVOKE_PROGRAM_TYPE_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "program_type too long ({} bytes, limit {MAX_INVOKE_PROGRAM_TYPE_LEN})",
-                req.program_type.len()
-            ),
-        ));
-    }
-    let _graph_cid_for_snapshot = parse_optional_invoke_graph_cid(req.graph_cid.as_deref())?;
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
         "invoke.run requires the `wasm-runtime` feature".to_string(),
@@ -8569,7 +7359,7 @@ pub async fn block_put(
     }))
 }
 
-/// `GET /xrpc/com.etzhayyim.apps.kotoba.block.get?cid=<multibase>`
+/// GET /xrpc/com.etzhayyim.apps.kotoba.block.get?cid=<multibase>
 ///
 /// SECURITY INVARIANT: this endpoint is intentionally UNAUTHENTICATED — blocks
 /// are content-addressed (IPFS-style), so the CID itself is the capability
@@ -8620,64 +7410,6 @@ pub struct NodeRegisterReq {
     pub endpoint: String,
 }
 
-const MAX_NODE_REGISTER_APP_LEN: usize = 128;
-const MAX_NODE_REGISTER_ENDPOINT_LEN: usize = 512;
-
-fn normalize_node_register_app(app: &str) -> Result<String, (StatusCode, String)> {
-    let app = app.trim();
-    if app.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "app is required".into()));
-    }
-    if app.len() > MAX_NODE_REGISTER_APP_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "app too long ({} bytes, limit {MAX_NODE_REGISTER_APP_LEN})",
-                app.len()
-            ),
-        ));
-    }
-    if !app
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "app must be an ASCII NSID segment".into(),
-        ));
-    }
-    Ok(app.to_string())
-}
-
-fn normalize_node_register_endpoint(endpoint: &str) -> Result<String, (StatusCode, String)> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "endpoint is required".into()));
-    }
-    if endpoint.len() > MAX_NODE_REGISTER_ENDPOINT_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "endpoint too long ({} bytes, limit {MAX_NODE_REGISTER_ENDPOINT_LEN})",
-                endpoint.len()
-            ),
-        ));
-    }
-    if endpoint.chars().any(|ch| ch.is_control()) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "endpoint must not contain control characters".into(),
-        ));
-    }
-    kotoba_core::cid::KotobaCid::from_multibase(endpoint).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "endpoint must be a valid CID".into(),
-        )
-    })?;
-    Ok(endpoint.to_string())
-}
-
 /// POST /xrpc/com.etzhayyim.apps.kotoba.node.register
 /// Register an external app's wasm node so `generic_invoke` resolves+dispatches it.
 pub async fn node_register(
@@ -8686,13 +7418,14 @@ pub async fn node_register(
     Json(req): Json<NodeRegisterReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    let app = normalize_node_register_app(&req.app)?;
-    let endpoint = normalize_node_register_endpoint(&req.endpoint)?;
-    state.register_external_node(&app, &endpoint).await;
+    if req.app.trim().is_empty() || req.endpoint.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "app and endpoint are required".into()));
+    }
+    state.register_external_node(&req.app, &req.endpoint).await;
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "app": app,
-        "endpoint": endpoint,
+        "app": req.app,
+        "endpoint": req.endpoint,
     })))
 }
 
@@ -8731,7 +7464,7 @@ pub struct CommitGetResp {
     pub ipns_verified: Option<bool>,
 }
 
-/// `GET /xrpc/com.etzhayyim.apps.kotoba.commit.get?graph=<multibase>`
+/// GET /xrpc/com.etzhayyim.apps.kotoba.commit.get?graph=<multibase>
 pub async fn commit_get(
     State(state): State<Arc<KotobaState>>,
     axum::extract::Query(req): axum::extract::Query<CommitGetReq>,
@@ -9501,7 +8234,7 @@ pub struct WeightGetResp {
     pub data_b64: String,
 }
 
-/// `GET /xrpc/com.etzhayyim.apps.kotoba.weight.get?cid=<multibase>`
+/// GET /xrpc/com.etzhayyim.apps.kotoba.weight.get?cid=<multibase>
 pub async fn weight_get(
     State(state): State<Arc<KotobaState>>,
     axum::extract::Query(req): axum::extract::Query<WeightGetReq>,
@@ -9990,19 +8723,12 @@ pub async fn agent_run(
                     .unwrap_or_else(|| ("agent".to_string(), input.trim().to_string()));
                 let j = Arc::clone(&journal2);
                 let topic_str2 = topic_str.clone();
-                let published = tokio::task::block_in_place(|| {
+                tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async move {
-                        j.publish_checked(kotoba_kse::Topic(topic_str2), bytes::Bytes::from(msg))
-                            .await
-                    })
+                        j.publish(kotoba_kse::Topic(topic_str2), bytes::Bytes::from(msg))
+                            .await;
+                    });
                 });
-                if let Err(err) = published {
-                    return ToolOutput {
-                        observation: format!("publish rejected: {err}"),
-                        done: false,
-                        route: None,
-                    };
-                }
                 ToolOutput {
                     observation: format!("published to '{topic_str}'"),
                     done: false,
@@ -10218,7 +8944,6 @@ pub async fn agent_sync_advance(
     Json(req): Json<AgentSyncAdvReq>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kse::sync_window::SyncWindowError;
 
     const MAX_SESSION_ID_LEN: usize = 256;
     if req.session_id.is_empty()
@@ -10244,16 +8969,13 @@ pub async fn agent_sync_advance(
         )
     })?;
 
-    window
-        .try_advance(new_head, req.new_seq, state.block_store.as_ref())
-        .map_err(|err| match err {
-            SyncWindowError::SequenceRollback { current, requested } => (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "new_seq must be >= current since_seq (requested {requested}, current {current})"
-                ),
-            ),
-        })?;
+    // Unpin old head, pin new head
+    if let Some(old) = &window.head_cid {
+        state.block_store.unpin(old);
+    }
+    state.block_store.pin(&new_head);
+    window.head_cid = Some(new_head);
+    window.since_seq = req.new_seq;
 
     let since_seq = window.since_seq;
     tracing::info!(session_id = %req.session_id, since_seq, "agent.syncadvance");
@@ -10325,31 +9047,15 @@ mod ssrf_guard_tests {
     #[test]
     fn rejects_private_loopback_metadata() {
         for ip in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.0.1",
-            "192.168.1.1",
-            "169.254.169.254",
-            "0.0.0.0",
-            "::1",
-            "::",
-            "fe80::1",
-            "fc00::1",
-            "fd12:3456::1",
-            "::ffff:127.0.0.1",
-            "::ffff:10.0.0.1",
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+            "0.0.0.0", "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1",
+            "::ffff:127.0.0.1", "::ffff:10.0.0.1",
         ] {
-            assert!(
-                peer_ip_disallowed(ip.parse().unwrap()),
-                "{ip} must be disallowed"
-            );
+            assert!(peer_ip_disallowed(ip.parse().unwrap()), "{ip} must be disallowed");
         }
         // public IPs are allowed
         for ip in ["1.1.1.1", "8.8.8.8", "203.0.113.5", "2606:4700::1111"] {
-            assert!(
-                !peer_ip_disallowed(ip.parse().unwrap()),
-                "{ip} must be allowed"
-            );
+            assert!(!peer_ip_disallowed(ip.parse().unwrap()), "{ip} must be allowed");
         }
     }
 
@@ -10365,17 +9071,17 @@ mod tests {
         atproto_repo_write, atproto_repo_write_datoms, datomic_basis_t, datomic_datoms,
         datomic_datoms_sort_values, datomic_db_stats, datomic_entid, datomic_entity,
         datomic_history, datomic_ident, datomic_index_pull, datomic_index_range, datomic_log,
-        datomic_pull, datomic_pull_many, datomic_q, datomic_q_emit_cids, datomic_seek_datoms,
-        datomic_sync, datomic_transact, datomic_tx_range, datomic_with, did_document_publish,
-        didcomm_send, distributed_graph_ipns_name, enforce_datomic_range_tx_scope,
-        is_did_web_ip_host, normalize_invoke_program_id, normalize_node_register_app,
-        normalize_node_register_endpoint, parse_optional_invoke_graph_cid, protocol_payload_tx_cid,
-        vc_issue, vp_capability_projection, warm_datomic_resident_cache, AtprotoRepoWriteReq,
-        AuthCapabilityProjection, DatomicBasisTReq, DatomicDatomsIndex, DatomicDatomsReq,
-        DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq, DatomicIdentReq,
-        DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq, DatomicPullManyReq,
-        DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq, DatomicTransactReq,
-        DatomicTxRangeReq, DatomicWarmOutcome, DatomicWithReq, DidCommSendReq,
+        datomic_pull, datomic_pull_many, DatomicDatomsIndex,
+        datomic_q, datomic_q_emit_cids, datomic_seek_datoms, datomic_sync, datomic_transact,
+        datomic_tx_range,
+        datomic_with, did_document_publish, didcomm_send, distributed_graph_ipns_name,
+        enforce_datomic_range_tx_scope, is_did_web_ip_host, protocol_payload_tx_cid,
+        warm_datomic_resident_cache, vc_issue, vp_capability_projection, AtprotoRepoWriteReq,
+        AuthCapabilityProjection, DatomicBasisTReq, DatomicWarmOutcome,
+        DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq,
+        DatomicIdentReq, DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq,
+        DatomicPullManyReq, DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq,
+        DatomicTransactReq, DatomicTxRangeReq, DatomicWithReq, DidCommSendReq,
         DidDocumentPublishReq, VcIssueReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CAPABILITY_INVOCATION_IRI,
         ZCAP_CONTROLLER_IRI, ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI,
         ZCAP_INVOKER_IRI,
@@ -10397,898 +9103,7 @@ mod tests {
     use kotoba_edn::EdnValue;
     use kotoba_ipfs::{InMemoryIpnsRegistry, IpfsConfig};
     use kotoba_store::MemoryBlockStore;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
-
-    #[test]
-    fn node_register_app_accepts_only_nsid_segment() {
-        assert_eq!(normalize_node_register_app(" app_1-2 ").unwrap(), "app_1-2");
-
-        for app in ["", "bad.app", "bad/app", "bad\napp", "日本語"] {
-            assert!(
-                normalize_node_register_app(app).is_err(),
-                "app should be rejected: {app:?}"
-            );
-        }
-
-        assert!(normalize_node_register_app(&"a".repeat(129)).is_err());
-    }
-
-    #[test]
-    fn node_register_endpoint_requires_valid_cid() {
-        let cid = KotobaCid::from_bytes(b"registered wasm component");
-        let endpoint = format!(" {} ", cid.to_multibase());
-
-        assert_eq!(
-            normalize_node_register_endpoint(&endpoint).unwrap(),
-            cid.to_multibase()
-        );
-
-        for endpoint in ["", "not-a-cid", "bad\ncid"] {
-            assert!(
-                normalize_node_register_endpoint(endpoint).is_err(),
-                "endpoint should be rejected: {endpoint:?}"
-            );
-        }
-        assert!(normalize_node_register_endpoint(&"b".repeat(513)).is_err());
-    }
-
-    #[test]
-    fn invoke_program_id_rejects_empty_control_and_oversized_values() {
-        assert_eq!(
-            normalize_invoke_program_id(" program-1 ").unwrap(),
-            "program-1"
-        );
-
-        for program_id in ["", "bad\nprogram"] {
-            assert!(
-                normalize_invoke_program_id(program_id).is_err(),
-                "program id should be rejected: {program_id:?}"
-            );
-        }
-        assert!(normalize_invoke_program_id(&"p".repeat(513)).is_err());
-    }
-
-    #[test]
-    fn invoke_graph_cid_must_be_valid_when_present() {
-        let cid = KotobaCid::from_bytes(b"invoke graph");
-        let parsed = parse_optional_invoke_graph_cid(Some(&format!(" {} ", cid.to_multibase())))
-            .unwrap()
-            .unwrap();
-        assert_eq!(parsed, cid);
-
-        assert!(parse_optional_invoke_graph_cid(None).unwrap().is_none());
-        for graph_cid in ["", "not-a-cid"] {
-            assert!(
-                parse_optional_invoke_graph_cid(Some(graph_cid)).is_err(),
-                "graph_cid should be rejected: {graph_cid:?}"
-            );
-        }
-        assert!(parse_optional_invoke_graph_cid(Some(&"b".repeat(513))).is_err());
-    }
-
-    #[tokio::test]
-    async fn envelope_current_advance_uses_compare_and_swap() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = KotobaState::new(None).expect("state");
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let ct_cid = KotobaCid::from_bytes(b"envelope-cas-ct");
-        let manifest_v1 = KotobaCid::from_bytes(b"envelope-cas-manifest-v1");
-        let manifest_v2 = KotobaCid::from_bytes(b"envelope-cas-manifest-v2");
-        let manifest_v3 = KotobaCid::from_bytes(b"envelope-cas-manifest-v3");
-
-        super::set_current_envelope_manifest(&state, &ct_cid, &manifest_v2).await;
-
-        let err = super::advance_current_envelope_manifest(
-            &state,
-            &ct_cid,
-            Some(&manifest_v1),
-            &manifest_v3,
-        )
-        .await
-        .expect_err("stale expected current must not advance pointer");
-        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
-        assert_eq!(
-            super::get_current_envelope_manifest(&state, &ct_cid)
-                .await
-                .expect("current manifest"),
-            Some(manifest_v2.clone())
-        );
-
-        super::advance_current_envelope_manifest(&state, &ct_cid, Some(&manifest_v2), &manifest_v3)
-            .await
-            .expect("matching current advances pointer");
-        assert_eq!(
-            super::get_current_envelope_manifest(&state, &ct_cid)
-                .await
-                .expect("current manifest"),
-            Some(manifest_v3)
-        );
-    }
-
-    #[tokio::test]
-    async fn get_current_envelope_manifest_reports_malformed_pointer_as_conflict() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = KotobaState::new(None).expect("state");
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let invalid_utf8_ct = KotobaCid::from_bytes(b"current-pointer-invalid-utf8");
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPES,
-                invalid_utf8_ct.to_multibase(),
-                bytes::Bytes::from_static(&[0xff, 0xfe]),
-            )
-            .await;
-        let err = super::get_current_envelope_manifest(&state, &invalid_utf8_ct)
-            .await
-            .expect_err("non-UTF-8 current pointer must fail closed");
-        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
-
-        let invalid_cid_ct = KotobaCid::from_bytes(b"current-pointer-invalid-cid");
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPES,
-                invalid_cid_ct.to_multibase(),
-                bytes::Bytes::from_static(b"not-a-manifest-cid"),
-            )
-            .await;
-        let err = super::get_current_envelope_manifest(&state, &invalid_cid_ct)
-            .await
-            .expect_err("invalid current pointer CID must fail closed");
-        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
-        assert!(
-            err.1.contains("invalid current manifest CID"),
-            "error should identify the malformed pointer: {}",
-            err.1
-        );
-    }
-
-    #[tokio::test]
-    async fn envelope_current_advance_cleans_new_manifest_on_stale_cas() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = KotobaState::new(None).expect("state");
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let wrapping_key = [11u8; 32];
-        let (blob_ref, new_manifest_cid, _manifest) = state
-            .secure_vault
-            .put_enveloped(
-                &wrapping_key,
-                "did:example:alice",
-                bytes::Bytes::from_static(b"orphan manifest cleanup"),
-                b"cas-cleanup-slot",
-            )
-            .await
-            .expect("put envelope");
-        let stale_expected = KotobaCid::from_bytes(b"stale-expected-manifest");
-        let actual_current = KotobaCid::from_bytes(b"actual-current-manifest");
-        super::set_current_envelope_manifest(&state, &blob_ref.cid, &actual_current).await;
-
-        let err = super::advance_current_envelope_manifest_or_delete_new(
-            &state,
-            &blob_ref.cid,
-            Some(&stale_expected),
-            &new_manifest_cid,
-        )
-        .await
-        .expect_err("stale expected current must fail");
-        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
-        assert_eq!(
-            super::get_current_envelope_manifest(&state, &blob_ref.cid)
-                .await
-                .expect("current manifest"),
-            Some(actual_current)
-        );
-        assert!(
-            state
-                .secure_vault
-                .get_envelope_manifest(&new_manifest_cid)
-                .await
-                .expect("manifest lookup")
-                .is_none(),
-            "failed CAS must not leave a newly written envelope manifest behind"
-        );
-        assert_eq!(
-            state
-                .envelope_manifest_cleanup_attempts
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            state
-                .envelope_manifest_cleanup_successes
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            state
-                .envelope_manifest_cleanup_failures
-                .load(Ordering::Relaxed),
-            0
-        );
-        let tombstone = state
-            .shelf
-            .get(
-                kotoba_kse::BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-                &new_manifest_cid.to_multibase(),
-            )
-            .await
-            .expect("cleanup tombstone");
-        let tombstone: serde_json::Value =
-            serde_json::from_slice(&tombstone).expect("cleanup tombstone JSON");
-        assert_eq!(
-            tombstone["schema_version"].as_u64(),
-            Some(super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION)
-        );
-        assert_eq!(
-            tombstone["manifest_cid"].as_str(),
-            Some(new_manifest_cid.to_multibase().as_str())
-        );
-        assert_eq!(
-            tombstone["reason"].as_str(),
-            Some("failed_current_pointer_update")
-        );
-        assert_eq!(tombstone["deleted"].as_bool(), Some(true));
-        assert_eq!(tombstone["cleanup_attempt"].as_u64(), Some(1));
-        assert!(
-            tombstone["recorded_at_unix_ms"]
-                .as_u64()
-                .is_some_and(|ts| ts > 0),
-            "cleanup tombstone must include a positive recorded_at_unix_ms: {tombstone}"
-        );
-    }
-
-    #[tokio::test]
-    async fn envelope_replaced_manifest_cleanup_skips_identical_old_and_new_cid() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = KotobaState::new(None).expect("state");
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let wrapping_key = [12u8; 32];
-        let (_blob_ref, manifest_cid, _manifest) = state
-            .secure_vault
-            .put_enveloped(
-                &wrapping_key,
-                "did:example:alice",
-                bytes::Bytes::from_static(b"identical cleanup guard"),
-                b"cleanup-same-manifest",
-            )
-            .await
-            .expect("put envelope");
-
-        let deleted = super::cleanup_replaced_envelope_manifest(
-            &state,
-            &manifest_cid,
-            &manifest_cid,
-            super::EnvelopeManifestCleanupReason::GrantOldManifest,
-        )
-        .await;
-        assert!(
-            !deleted,
-            "identical old/new manifest cleanup must be skipped"
-        );
-        assert!(
-            state
-                .secure_vault
-                .get_envelope_manifest(&manifest_cid)
-                .await
-                .expect("manifest lookup")
-                .is_some(),
-            "identical old/new cleanup must not delete the current manifest"
-        );
-        assert_eq!(
-            state
-                .envelope_manifest_cleanup_attempts
-                .load(Ordering::Relaxed),
-            0,
-            "skipped identical cleanup must not consume a cleanup attempt"
-        );
-        assert!(
-            state
-                .shelf
-                .get(
-                    kotoba_kse::BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-                    &manifest_cid.to_multibase(),
-                )
-                .await
-                .is_none(),
-            "skipped identical cleanup must not record a tombstone"
-        );
-    }
-
-    #[tokio::test]
-    async fn envelope_manifest_cleanup_records_failed_delete_tombstone() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = KotobaState::new(None).expect("state");
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let missing_manifest_cid = KotobaCid::from_bytes(b"missing-cleanup-manifest");
-        let deleted = super::cleanup_envelope_manifest(
-            &state,
-            &missing_manifest_cid,
-            super::EnvelopeManifestCleanupReason::RevokeOldManifest,
-        )
-        .await;
-        assert!(
-            !deleted,
-            "cleanup of an absent manifest must report a failed delete"
-        );
-        assert_eq!(
-            state
-                .envelope_manifest_cleanup_attempts
-                .load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            state
-                .envelope_manifest_cleanup_successes
-                .load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            state
-                .envelope_manifest_cleanup_failures
-                .load(Ordering::Relaxed),
-            1
-        );
-        let tombstone = state
-            .shelf
-            .get(
-                kotoba_kse::BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-                &missing_manifest_cid.to_multibase(),
-            )
-            .await
-            .expect("cleanup failure tombstone");
-        let tombstone: serde_json::Value =
-            serde_json::from_slice(&tombstone).expect("cleanup failure tombstone JSON");
-        assert_eq!(
-            tombstone["schema_version"].as_u64(),
-            Some(super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION)
-        );
-        assert_eq!(
-            tombstone["manifest_cid"].as_str(),
-            Some(missing_manifest_cid.to_multibase().as_str())
-        );
-        assert_eq!(tombstone["reason"].as_str(), Some("revoke_old_manifest"));
-        assert_eq!(tombstone["deleted"].as_bool(), Some(false));
-        assert_eq!(tombstone["cleanup_attempt"].as_u64(), Some(1));
-        assert!(
-            tombstone["recorded_at_unix_ms"]
-                .as_u64()
-                .is_some_and(|ts| ts > 0),
-            "cleanup failure tombstone must include a positive recorded_at_unix_ms: {tombstone}"
-        );
-    }
-
-    #[tokio::test]
-    async fn deleted_envelope_manifest_reports_gone_from_tombstone() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = KotobaState::new(None).expect("state");
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let manifest_cid = KotobaCid::from_bytes(b"deleted-envelope-manifest");
-        let missing = super::envelope_manifest_missing_error(
-            &state,
-            &manifest_cid,
-            &manifest_cid.to_multibase(),
-        )
-        .await;
-        assert_eq!(missing.0, axum::http::StatusCode::NOT_FOUND);
-
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-                manifest_cid.to_multibase(),
-                bytes::Bytes::from(
-                    serde_json::json!({
-                        "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-                        "manifest_cid": "different-manifest-cid",
-                        "reason": "grant_old_manifest",
-                        "deleted": true,
-                        "cleanup_attempt": 1,
-                        "recorded_at_unix_ms": 1,
-                    })
-                    .to_string(),
-                ),
-            )
-            .await;
-        let mismatched = super::envelope_manifest_missing_error(
-            &state,
-            &manifest_cid,
-            &manifest_cid.to_multibase(),
-        )
-        .await;
-        assert_eq!(mismatched.0, axum::http::StatusCode::NOT_FOUND);
-
-        super::record_envelope_manifest_tombstone(
-            &state,
-            &manifest_cid,
-            super::EnvelopeManifestCleanupReason::GrantOldManifest,
-            true,
-            1,
-        )
-        .await;
-        let deleted = super::envelope_manifest_missing_error(
-            &state,
-            &manifest_cid,
-            &manifest_cid.to_multibase(),
-        )
-        .await;
-        assert_eq!(deleted.0, axum::http::StatusCode::GONE);
-        assert!(
-            deleted.1.contains("grant_old_manifest"),
-            "deleted manifest error must include cleanup reason: {}",
-            deleted.1
-        );
-    }
-
-    #[test]
-    fn vault_envelope_current_status_serializes_to_lexicon_values() {
-        assert_eq!(
-            serde_json::to_value(super::VaultEnvelopeCurrentStatus::Current).expect("status JSON"),
-            "current"
-        );
-        assert_eq!(
-            serde_json::to_value(super::VaultEnvelopeCurrentStatus::Stale).expect("status JSON"),
-            "stale"
-        );
-        assert_eq!(
-            serde_json::to_value(super::VaultEnvelopeCurrentStatus::Unknown).expect("status JSON"),
-            "unknown"
-        );
-    }
-
-    #[test]
-    fn envelope_manifest_cleanup_reason_serializes_to_lexicon_values() {
-        for (reason, expected) in [
-            (
-                super::EnvelopeManifestCleanupReason::FailedCurrentPointerUpdate,
-                "failed_current_pointer_update",
-            ),
-            (
-                super::EnvelopeManifestCleanupReason::GrantOldManifest,
-                "grant_old_manifest",
-            ),
-            (
-                super::EnvelopeManifestCleanupReason::RevokeOldManifest,
-                "revoke_old_manifest",
-            ),
-        ] {
-            assert_eq!(reason.as_str(), expected);
-            assert_eq!(serde_json::to_value(reason).expect("reason JSON"), expected);
-        }
-    }
-
-    #[tokio::test]
-    async fn node_status_exposes_envelope_cleanup_tombstone_summary() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = Arc::new(KotobaState::new(None).expect("state"));
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let manifest_cid = KotobaCid::from_bytes(b"status-cleanup-tombstone-manifest");
-        super::record_envelope_manifest_tombstone(
-            &state,
-            &manifest_cid,
-            super::EnvelopeManifestCleanupReason::FailedCurrentPointerUpdate,
-            true,
-            7,
-        )
-        .await;
-        let later_manifest_cid = KotobaCid::from_bytes(b"status-cleanup-tombstone-manifest-later");
-        super::record_envelope_manifest_tombstone(
-            &state,
-            &later_manifest_cid,
-            super::EnvelopeManifestCleanupReason::RevokeOldManifest,
-            true,
-            8,
-        )
-        .await;
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-                "malformed-json-tombstone".to_string(),
-                bytes::Bytes::from_static(b"not-json"),
-            )
-            .await;
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-                "malformed-shape-tombstone".to_string(),
-                bytes::Bytes::from_static(br#"{"manifest_cid":"missing-required-fields"}"#),
-            )
-            .await;
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPE_TOMBSTONES,
-                "unsupported-version-tombstone".to_string(),
-                bytes::Bytes::from_static(
-                    br#"{"schema_version":2,"manifest_cid":"future","reason":"future","deleted":true,"cleanup_attempt":9,"recorded_at_unix_ms":1}"#,
-                ),
-            )
-            .await;
-
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"sub":"{}","exp":9999999999}}"#, state.operator_did).as_bytes());
-        let token = format!("{header}.{payload}.fakesig");
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Bearer {token}")
-                .parse()
-                .expect("authorization header"),
-        );
-        let response = super::node_status(axum::extract::State(state.clone()), headers)
-            .await
-            .into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("status body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("status JSON");
-        let cleanup = &body["envelope_manifest_cleanup"];
-        assert_eq!(cleanup["tombstone_count"].as_u64(), Some(5));
-        assert_eq!(cleanup["valid_tombstone_count"].as_u64(), Some(2));
-        assert_eq!(cleanup["malformed_tombstone_count"].as_u64(), Some(3));
-        assert_eq!(cleanup["omitted_tombstone_count"].as_u64(), Some(0));
-        assert_eq!(
-            cleanup["recent_tombstone_limit"].as_u64(),
-            Some(super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT as u64)
-        );
-        let tombstones = cleanup["recent_tombstones"]
-            .as_array()
-            .expect("recent tombstones");
-        assert_eq!(tombstones.len(), 2);
-        assert_eq!(
-            tombstones[0]["manifest_cid"].as_str(),
-            Some(later_manifest_cid.to_multibase().as_str())
-        );
-        assert_eq!(
-            tombstones[0]["schema_version"].as_u64(),
-            Some(super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION)
-        );
-        assert_eq!(tombstones[0]["cleanup_attempt"].as_u64(), Some(8));
-        assert!(
-            tombstones[0]["recorded_at_unix_ms"]
-                .as_u64()
-                .is_some_and(|ts| ts > 0),
-            "recent tombstone must include recorded_at_unix_ms: {cleanup}"
-        );
-        assert_eq!(
-            tombstones[0]["reason"].as_str(),
-            Some("revoke_old_manifest")
-        );
-        assert_eq!(tombstones[0]["deleted"].as_bool(), Some(true));
-        assert_eq!(
-            tombstones[1]["manifest_cid"].as_str(),
-            Some(manifest_cid.to_multibase().as_str())
-        );
-        assert_eq!(tombstones[1]["cleanup_attempt"].as_u64(), Some(7));
-        assert!(
-            tombstones[1]["recorded_at_unix_ms"]
-                .as_u64()
-                .is_some_and(|ts| ts > 0),
-            "recent tombstone must include recorded_at_unix_ms: {cleanup}"
-        );
-    }
-
-    #[tokio::test]
-    async fn node_status_reports_omitted_envelope_cleanup_tombstones() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = Arc::new(KotobaState::new(None).expect("state"));
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let valid_count = super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT + 2;
-        for cleanup_attempt in 1..=valid_count {
-            let manifest_cid = KotobaCid::from_bytes(
-                format!("status-omitted-tombstone-{cleanup_attempt}").as_bytes(),
-            );
-            super::record_envelope_manifest_tombstone(
-                &state,
-                &manifest_cid,
-                super::EnvelopeManifestCleanupReason::GrantOldManifest,
-                true,
-                cleanup_attempt as u64,
-            )
-            .await;
-        }
-
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"sub":"{}","exp":9999999999}}"#, state.operator_did).as_bytes());
-        let token = format!("{header}.{payload}.fakesig");
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Bearer {token}")
-                .parse()
-                .expect("authorization header"),
-        );
-        let response = super::node_status(axum::extract::State(state), headers)
-            .await
-            .into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("status body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("status JSON");
-        let cleanup = &body["envelope_manifest_cleanup"];
-        assert_eq!(
-            cleanup["valid_tombstone_count"].as_u64(),
-            Some(valid_count as u64)
-        );
-        assert_eq!(
-            cleanup["omitted_tombstone_count"].as_u64(),
-            Some((valid_count - super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT) as u64)
-        );
-        assert_eq!(
-            cleanup["recent_tombstone_limit"].as_u64(),
-            Some(super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT as u64)
-        );
-        let tombstones = cleanup["recent_tombstones"]
-            .as_array()
-            .expect("recent tombstones");
-        assert_eq!(
-            tombstones.len(),
-            super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT
-        );
-        assert_eq!(
-            tombstones
-                .first()
-                .and_then(|value| value["cleanup_attempt"].as_u64()),
-            Some(valid_count as u64)
-        );
-        assert_eq!(
-            tombstones
-                .last()
-                .and_then(|value| value["cleanup_attempt"].as_u64()),
-            Some((valid_count - super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT + 1) as u64)
-        );
-    }
-
-    #[tokio::test]
-    async fn node_status_summarizes_envelope_current_pointer_health() {
-        std::env::set_var("KOTOBA_IPFS", "off");
-        std::env::set_var("KOTOBA_IPNS", "memory");
-        let state = KotobaState::new(None).expect("state");
-        std::env::remove_var("KOTOBA_IPFS");
-        std::env::remove_var("KOTOBA_IPNS");
-
-        let wrapping_key = [41u8; 32];
-        let (blob_ref, readable_manifest_cid, _manifest) = state
-            .secure_vault
-            .put_enveloped(
-                &wrapping_key,
-                "did:example:alice",
-                bytes::Bytes::from_static(b"current pointer health"),
-                b"status-current-pointer-health",
-            )
-            .await
-            .expect("put readable envelope");
-        super::set_current_envelope_manifest(&state, &blob_ref.cid, &readable_manifest_cid).await;
-
-        let missing_ct_cid = KotobaCid::from_bytes(b"status-current-pointer-missing-ct");
-        let missing_manifest_cid =
-            KotobaCid::from_bytes(b"status-current-pointer-missing-manifest");
-        super::set_current_envelope_manifest(&state, &missing_ct_cid, &missing_manifest_cid).await;
-
-        let mismatched_ct_cid = KotobaCid::from_bytes(b"status-current-pointer-mismatched-ct");
-        super::set_current_envelope_manifest(&state, &mismatched_ct_cid, &readable_manifest_cid)
-            .await;
-
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPES,
-                "not-a-ciphertext-cid".to_string(),
-                bytes::Bytes::from(readable_manifest_cid.to_multibase()),
-            )
-            .await;
-        state
-            .shelf
-            .put(
-                kotoba_kse::BUCKET_VAULT_ENVELOPES,
-                KotobaCid::from_bytes(b"status-current-pointer-bad-manifest").to_multibase(),
-                bytes::Bytes::from_static(b"not-a-manifest-cid"),
-            )
-            .await;
-
-        let summary = super::summarize_envelope_current_pointers(&state).await;
-        assert_eq!(summary.total_count, 5);
-        assert_eq!(summary.readable_count, 1);
-        assert_eq!(summary.unreadable_manifest_count, 2);
-        assert_eq!(summary.malformed_ct_cid_count, 1);
-        assert_eq!(summary.malformed_manifest_cid_count, 1);
-        assert_eq!(
-            summary.total_count,
-            summary.readable_count
-                + summary.unreadable_manifest_count
-                + summary.malformed_ct_cid_count
-                + summary.malformed_manifest_cid_count
-        );
-    }
-
-    #[test]
-    fn envelope_manifest_tombstone_summary_preserves_count_invariants() {
-        let mut tombstones = Vec::new();
-        for cleanup_attempt in 1..=(super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT + 1) {
-            let manifest_cid = format!("bafy-{cleanup_attempt}");
-            let record = serde_json::json!({
-                "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-                "manifest_cid": manifest_cid,
-                "reason": "grant_old_manifest",
-                "deleted": true,
-                "cleanup_attempt": cleanup_attempt,
-                "recorded_at_unix_ms": cleanup_attempt,
-            });
-            tombstones.push((manifest_cid, bytes::Bytes::from(record.to_string())));
-        }
-        tombstones.push((
-            "malformed-json".to_string(),
-            bytes::Bytes::from_static(b"not-json"),
-        ));
-        tombstones.push((
-            "malformed-shape".to_string(),
-            bytes::Bytes::from_static(br#"{"schema_version":1}"#),
-        ));
-
-        let summary = super::summarize_envelope_manifest_tombstones(tombstones);
-        assert_eq!(
-            summary.total_count,
-            super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT + 3
-        );
-        assert_eq!(
-            summary.valid_count,
-            super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT + 1
-        );
-        assert_eq!(summary.malformed_count, 2);
-        assert_eq!(summary.omitted_count, 1);
-        assert_eq!(
-            summary.recent.len(),
-            super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT
-        );
-        assert_eq!(
-            summary
-                .recent
-                .first()
-                .and_then(|value| value["cleanup_attempt"].as_u64()),
-            Some((super::RECENT_ENVELOPE_MANIFEST_TOMBSTONE_LIMIT + 1) as u64)
-        );
-        assert_eq!(
-            summary
-                .recent
-                .last()
-                .and_then(|value| value["cleanup_attempt"].as_u64()),
-            Some(2)
-        );
-        assert_eq!(
-            summary.total_count,
-            summary.valid_count + summary.malformed_count
-        );
-        assert_eq!(
-            summary.omitted_count,
-            summary.valid_count - summary.recent.len()
-        );
-    }
-
-    #[test]
-    fn envelope_manifest_tombstone_summary_rejects_key_cid_mismatch() {
-        let record = serde_json::json!({
-            "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-            "manifest_cid": "bafy-real-manifest",
-            "reason": "grant_old_manifest",
-            "deleted": true,
-            "cleanup_attempt": 1,
-            "recorded_at_unix_ms": 1,
-        });
-
-        let summary = super::summarize_envelope_manifest_tombstones(vec![(
-            "bafy-different-key".to_string(),
-            bytes::Bytes::from(record.to_string()),
-        )]);
-
-        assert_eq!(summary.total_count, 1);
-        assert_eq!(summary.valid_count, 0);
-        assert_eq!(summary.malformed_count, 1);
-        assert_eq!(summary.omitted_count, 0);
-        assert!(summary.recent.is_empty());
-    }
-
-    #[test]
-    fn envelope_manifest_tombstone_validator_rejects_schema_drift() {
-        let valid = serde_json::json!({
-            "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-            "manifest_cid": "bafy-manifest",
-            "reason": "grant_old_manifest",
-            "deleted": true,
-            "cleanup_attempt": 1,
-            "recorded_at_unix_ms": 1,
-        });
-        assert!(super::valid_envelope_manifest_tombstone(&valid));
-
-        for invalid in [
-            serde_json::json!({
-                "schema_version": 2,
-                "manifest_cid": "bafy-manifest",
-                "reason": "grant_old_manifest",
-                "deleted": true,
-                "cleanup_attempt": 1,
-                "recorded_at_unix_ms": 1,
-            }),
-            serde_json::json!({
-                "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-                "manifest_cid": "bafy-manifest",
-                "reason": "grant_old_manifest",
-                "deleted": true,
-                "cleanup_attempt": 0,
-                "recorded_at_unix_ms": 1,
-            }),
-            serde_json::json!({
-                "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-                "manifest_cid": "bafy-manifest",
-                "reason": "grant_old_manifest",
-                "deleted": true,
-                "cleanup_attempt": 1,
-                "recorded_at_unix_ms": 0,
-            }),
-            serde_json::json!({
-                "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-                "manifest_cid": "bafy-manifest",
-                "reason": "grant_old_manifest",
-                "deleted": "true",
-                "cleanup_attempt": 1,
-                "recorded_at_unix_ms": 1,
-            }),
-            serde_json::json!({
-                "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-                "manifest_cid": "bafy-manifest",
-                "reason": "unknown_reason",
-                "deleted": true,
-                "cleanup_attempt": 1,
-                "recorded_at_unix_ms": 1,
-            }),
-            serde_json::json!({
-                "schema_version": super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION,
-                "manifest_cid": "bafy-manifest",
-                "deleted": true,
-                "cleanup_attempt": 1,
-                "recorded_at_unix_ms": 1,
-            }),
-        ] {
-            assert!(
-                !super::valid_envelope_manifest_tombstone(&invalid),
-                "invalid tombstone accepted: {invalid}"
-            );
-        }
-    }
 
     // `emit_cid` provenance: result_cid is content-derived (tamper-evident),
     // deterministic, basis-sensitive, formatting-invariant on the query, PUT and
@@ -11303,39 +9118,25 @@ mod tests {
         let query_spaced =
             kotoba_edn::parse("[:find   ?name\n  :where  [?e :person/name ?name]]").unwrap();
         let inputs: Vec<EdnValue> = vec![];
-        let rows = vec![vec![r#""Alice""#.to_string()], vec![r#""Bob""#.to_string()]];
+        let rows = vec![
+            vec![r#""Alice""#.to_string()],
+            vec![r#""Bob""#.to_string()],
+        ];
         let emit = |q: &EdnValue, basis: &str, rows: &[Vec<String>]| {
-            datomic_q_emit_cids(
-                &state,
-                q,
-                &inputs,
-                Some(basis),
-                None,
-                None,
-                false,
-                rows,
-                true,
-            )
+            datomic_q_emit_cids(&state, q, &inputs, Some(basis), None, None, false, rows, true)
         };
 
         let (spec1, job1, result1) = emit(&query, "tx-basis-1", &rows);
 
         // 1. Deterministic: identical inputs reproduce identical CIDs.
-        assert_eq!(
-            (spec1.clone(), job1.clone(), result1.clone()),
-            emit(&query, "tx-basis-1", &rows)
-        );
+        assert_eq!((spec1.clone(), job1.clone(), result1.clone()), emit(&query, "tx-basis-1", &rows));
 
         // 2. Tamper-evident: changing a single row changes result_cid.
         let tampered = vec![
             vec![r#""Alice""#.to_string()],
             vec![r#""Mallory""#.to_string()],
         ];
-        assert_ne!(
-            result1,
-            emit(&query, "tx-basis-1", &tampered).2,
-            "row edit must move result_cid"
-        );
+        assert_ne!(result1, emit(&query, "tx-basis-1", &tampered).2, "row edit must move result_cid");
 
         // 3. Basis-sensitive: a different basis transaction changes job + result.
         let (_, job_b2, result_b2) = emit(&query, "tx-basis-2", &rows);
@@ -11343,21 +9144,14 @@ mod tests {
         assert_ne!(result1, result_b2);
 
         // 4. Canonicalization: formatting-only differences collapse to one spec CID.
-        assert_eq!(
-            spec1,
-            emit(&query_spaced, "tx-basis-1", &rows).0,
-            "whitespace must not move query_spec_cid"
-        );
+        assert_eq!(spec1, emit(&query_spaced, "tx-basis-1", &rows).0, "whitespace must not move query_spec_cid");
 
         // 5. Verify-by-CID: every envelope was PUT, is IPFS-compatible (CIDv1
         //    dag-cbor sha2-256), and the stored bytes hash back to that exact CID
         //    (closes the loop — proves the block IS the content the CID names).
         for cid_mb in [&spec1, &job1, &result1] {
             let kcid = KotobaCid::from_multibase(cid_mb).expect("multibase CID parses");
-            assert!(
-                kcid.is_ipfs_compatible(),
-                "envelope CID must be IPFS-compatible"
-            );
+            assert!(kcid.is_ipfs_compatible(), "envelope CID must be IPFS-compatible");
             let bytes = state
                 .block_store
                 .get(&kcid)
@@ -11384,17 +9178,8 @@ mod tests {
         // One cell past the 1 MiB PUT cap → the result envelope exceeds it.
         let rows = vec![vec!["x".repeat(1_100_000)]];
 
-        let (spec, job, result) = datomic_q_emit_cids(
-            &state,
-            &query,
-            &inputs,
-            Some("tx1"),
-            None,
-            None,
-            false,
-            &rows,
-            true,
-        );
+        let (spec, job, result) =
+            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, true);
 
         // CIDs are returned regardless of persistence (content-derived).
         assert!(!spec.is_empty() && !job.is_empty() && !result.is_empty());
@@ -11427,21 +9212,9 @@ mod tests {
         let rows = vec![vec![r#""secret""#.to_string()]];
 
         // persist=false (private/authenticated graph): CIDs returned, nothing stored.
-        let (spec, job, result) = datomic_q_emit_cids(
-            &state,
-            &query,
-            &inputs,
-            Some("tx1"),
-            None,
-            None,
-            false,
-            &rows,
-            false,
-        );
-        assert!(
-            !spec.is_empty() && !job.is_empty() && !result.is_empty(),
-            "CIDs still returned"
-        );
+        let (spec, job, result) =
+            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, false);
+        assert!(!spec.is_empty() && !job.is_empty() && !result.is_empty(), "CIDs still returned");
         for cid in [&spec, &job, &result] {
             let kcid = KotobaCid::from_multibase(cid).unwrap();
             assert!(
@@ -11451,27 +9224,11 @@ mod tests {
         }
 
         // persist=true (public) DOES store — and yields the SAME CID (content-derived).
-        let (spec_pub, _, _) = datomic_q_emit_cids(
-            &state,
-            &query,
-            &inputs,
-            Some("tx1"),
-            None,
-            None,
-            false,
-            &rows,
-            true,
-        );
-        assert_eq!(
-            spec, spec_pub,
-            "persist must not change the content-derived CID"
-        );
+        let (spec_pub, _, _) =
+            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, true);
+        assert_eq!(spec, spec_pub, "persist must not change the content-derived CID");
         assert!(
-            state
-                .block_store
-                .get(&KotobaCid::from_multibase(&spec_pub).unwrap())
-                .unwrap()
-                .is_some(),
+            state.block_store.get(&KotobaCid::from_multibase(&spec_pub).unwrap()).unwrap().is_some(),
             "public envelope must be persisted"
         );
     }
@@ -11606,18 +9363,8 @@ mod tests {
                     graph: graph.clone(),
                     covering_datoms: None,
                     datoms: vec![
-                        Datom::assert(
-                            e.clone(),
-                            ":person/name".into(),
-                            EdnValue::string("Alice"),
-                            tx.clone(),
-                        ),
-                        Datom::assert(
-                            e,
-                            ":person/role".into(),
-                            EdnValue::string("admin"),
-                            tx.clone(),
-                        ),
+                        Datom::assert(e.clone(), ":person/name".into(), EdnValue::string("Alice"), tx.clone()),
+                        Datom::assert(e, ":person/role".into(), EdnValue::string("admin"), tx.clone()),
                     ],
                     expected_parent: None,
                     tx_cid: Some(tx),
@@ -11647,9 +9394,7 @@ mod tests {
             }
         }
         async fn rows(resp: axum::response::Response) -> serde_json::Value {
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["rows_edn"].clone()
         }
         let expected = json!([[r#""Alice""#, r#""admin""#]]);
@@ -11657,11 +9402,7 @@ mod tests {
         // ── Public graph: anonymous read is allowed and returns the rows. ──
         let g_pub = KotobaCid::from_bytes(b"pp-public-graph");
         seed(&state, &g_pub, b"pp-pub-tx");
-        state
-            .graph_registry
-            .write()
-            .await
-            .insert(g_pub.clone(), ("pub".into(), GraphVisibility::Public));
+        state.graph_registry.write().await.insert(g_pub.clone(), ("pub".into(), GraphVisibility::Public));
         let resp = datomic_q(
             axum::extract::State(Arc::clone(&state)),
             axum::http::HeaderMap::new(),
@@ -11671,28 +9412,17 @@ mod tests {
         .expect("public read must be allowed anonymously")
         .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            rows(resp).await,
-            expected,
-            "public read returns the seeded rows"
-        );
+        assert_eq!(rows(resp).await, expected, "public read returns the seeded rows");
 
         // ── Private graph owned by the signed_cacao_b64 issuer (key [42u8;32]). ──
         let owner_did = kotoba_auth::ed25519_pubkey_to_did_key(
-            &ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
-                .verifying_key()
-                .to_bytes(),
+            &ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]).verifying_key().to_bytes(),
         );
         let g_priv = KotobaCid::from_bytes(b"pp-private-graph");
         seed(&state, &g_priv, b"pp-priv-tx");
         state.graph_registry.write().await.insert(
             g_priv.clone(),
-            (
-                "priv".into(),
-                GraphVisibility::Private {
-                    owner_did: owner_did.clone(),
-                },
-            ),
+            ("priv".into(), GraphVisibility::Private { owner_did: owner_did.clone() }),
         );
         let g_priv_mb = g_priv.to_multibase();
 
@@ -11709,11 +9439,7 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(denied.0, axum::http::StatusCode::UNAUTHORIZED);
-        assert!(
-            denied.1.to_lowercase().contains("cacao"),
-            "deny must be the CACAO gate, got: {}",
-            denied.1
-        );
+        assert!(denied.1.to_lowercase().contains("cacao"), "deny must be the CACAO gate, got: {}", denied.1);
 
         // (b) valid CACAO (datom:read on private/{owner}, fresh nonce) → OK + rows.
         let cacao = signed_cacao_b64(
@@ -11732,11 +9458,7 @@ mod tests {
         .expect("private read WITH a valid cacao must be allowed")
         .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        assert_eq!(
-            rows(resp).await,
-            expected,
-            "authorized private read returns the seeded rows"
-        );
+        assert_eq!(rows(resp).await, expected, "authorized private read returns the seeded rows");
     }
 
     #[test]
@@ -12879,13 +10601,7 @@ mod tests {
         {
             let slot = state.datomic_live_slot(&graph_mb);
             let g = slot.lock().await;
-            assert_eq!(
-                g.as_ref()
-                    .expect("slot seeded after tx1")
-                    .head
-                    .to_multibase(),
-                c1
-            );
+            assert_eq!(g.as_ref().expect("slot seeded after tx1").head.to_multibase(), c1);
         }
 
         // Simulate a restart on an already-populated graph: drop the resident
@@ -12921,10 +10637,7 @@ mod tests {
             let slot = state.datomic_live_slot(&graph_mb);
             let g = slot.lock().await;
             assert_eq!(
-                g.as_ref()
-                    .expect("slot seeded after tx3")
-                    .head
-                    .to_multibase(),
+                g.as_ref().expect("slot seeded after tx3").head.to_multibase(),
                 c3,
                 "cache head must track the latest commit"
             );
@@ -15068,8 +12781,7 @@ mod tests {
     fn agent_run_step_cap() {
         const MAX_STEPS_LIMIT: u32 = 50;
         // Caller sending u32::MAX is clamped to 50.
-        let caller_steps = std::hint::black_box(u32::MAX);
-        assert_eq!(caller_steps.min(MAX_STEPS_LIMIT), MAX_STEPS_LIMIT);
+        assert_eq!(u32::MAX.min(MAX_STEPS_LIMIT), MAX_STEPS_LIMIT);
         // Default of 10 passes through unchanged.
         assert_eq!(10_u32.min(MAX_STEPS_LIMIT), 10);
     }
@@ -15128,12 +12840,6 @@ mod tests {
             super::NSID_AGENT_SYNC_CLOSE,
             super::NSID_VAULT_PUT,
             super::NSID_VAULT_GET,
-            super::NSID_VAULT_ENVELOPE_PUT,
-            super::NSID_VAULT_ENVELOPE_GET,
-            super::NSID_VAULT_ENVELOPE_CURRENT,
-            super::NSID_VAULT_ENVELOPE_INSPECT,
-            super::NSID_VAULT_ENVELOPE_GRANT,
-            super::NSID_VAULT_ENVELOPE_REVOKE,
         ];
         for nsid in nsids {
             assert!(
@@ -15193,12 +12899,6 @@ mod tests {
             super::NSID_AGENT_SYNC_CLOSE,
             super::NSID_VAULT_PUT,
             super::NSID_VAULT_GET,
-            super::NSID_VAULT_ENVELOPE_PUT,
-            super::NSID_VAULT_ENVELOPE_GET,
-            super::NSID_VAULT_ENVELOPE_CURRENT,
-            super::NSID_VAULT_ENVELOPE_INSPECT,
-            super::NSID_VAULT_ENVELOPE_GRANT,
-            super::NSID_VAULT_ENVELOPE_REVOKE,
         ];
         let original_len = nsids.len();
         nsids.sort_unstable();
@@ -15212,26 +12912,17 @@ mod tests {
 
     #[test]
     fn nsid_datom_create_exact_value() {
-        assert_eq!(
-            super::NSID_DATOM_CREATE,
-            "com.etzhayyim.apps.kotoba.datom.create"
-        );
+        assert_eq!(super::NSID_DATOM_CREATE, "com.etzhayyim.apps.kotoba.datom.create");
     }
 
     #[test]
     fn nsid_quad_create_exact_value() {
-        assert_eq!(
-            super::NSID_QUAD_CREATE,
-            "com.etzhayyim.apps.kotoba.quad.create"
-        );
+        assert_eq!(super::NSID_QUAD_CREATE, "com.etzhayyim.apps.kotoba.quad.create");
     }
 
     #[test]
     fn nsid_graph_query_exact_value() {
-        assert_eq!(
-            super::NSID_GRAPH_QUERY,
-            "com.etzhayyim.apps.kotoba.graph.query"
-        );
+        assert_eq!(super::NSID_GRAPH_QUERY, "com.etzhayyim.apps.kotoba.graph.query");
     }
 
     #[test]
@@ -15256,10 +12947,7 @@ mod tests {
             super::NSID_DATOMIC_INDEX_PULL,
             "com.etzhayyim.apps.kotoba.datomic.indexPull"
         );
-        assert_eq!(
-            super::NSID_DATOMIC_PULL,
-            "com.etzhayyim.apps.kotoba.datomic.pull"
-        );
+        assert_eq!(super::NSID_DATOMIC_PULL, "com.etzhayyim.apps.kotoba.datomic.pull");
         assert_eq!(
             super::NSID_DATOMIC_PULL_MANY,
             "com.etzhayyim.apps.kotoba.datomic.pullMany"
@@ -15273,26 +12961,17 @@ mod tests {
             super::NSID_DATOMIC_SINCE,
             "com.etzhayyim.apps.kotoba.datomic.since"
         );
-        assert_eq!(
-            super::NSID_DATOMIC_SYNC,
-            "com.etzhayyim.apps.kotoba.datomic.sync"
-        );
+        assert_eq!(super::NSID_DATOMIC_SYNC, "com.etzhayyim.apps.kotoba.datomic.sync");
         assert_eq!(
             super::NSID_DATOMIC_HISTORY,
             "com.etzhayyim.apps.kotoba.datomic.history"
         );
-        assert_eq!(
-            super::NSID_DATOMIC_TX,
-            "com.etzhayyim.apps.kotoba.datomic.tx"
-        );
+        assert_eq!(super::NSID_DATOMIC_TX, "com.etzhayyim.apps.kotoba.datomic.tx");
         assert_eq!(
             super::NSID_DATOMIC_TX_RANGE,
             "com.etzhayyim.apps.kotoba.datomic.txRange"
         );
-        assert_eq!(
-            super::NSID_DATOMIC_LOG,
-            "com.etzhayyim.apps.kotoba.datomic.log"
-        );
+        assert_eq!(super::NSID_DATOMIC_LOG, "com.etzhayyim.apps.kotoba.datomic.log");
         assert_eq!(
             super::NSID_DATOMIC_BASIS_T,
             "com.etzhayyim.apps.kotoba.datomic.basisT"
@@ -15318,18 +12997,12 @@ mod tests {
     #[test]
     fn nsid_protocol_projection_exact_values() {
         assert_eq!(super::NSID_VC_ISSUE, "com.etzhayyim.apps.kotoba.vc.issue");
-        assert_eq!(
-            super::NSID_VC_PRESENT,
-            "com.etzhayyim.apps.kotoba.vc.present"
-        );
+        assert_eq!(super::NSID_VC_PRESENT, "com.etzhayyim.apps.kotoba.vc.present");
         assert_eq!(
             super::NSID_DID_DOCUMENT_PUBLISH,
             "com.etzhayyim.apps.kotoba.did.document.publish"
         );
-        assert_eq!(
-            super::NSID_DIDCOMM_SEND,
-            "com.etzhayyim.apps.kotoba.didcomm.send"
-        );
+        assert_eq!(super::NSID_DIDCOMM_SEND, "com.etzhayyim.apps.kotoba.didcomm.send");
         assert_eq!(
             super::NSID_ATPROTO_REPO_WRITE,
             "com.etzhayyim.apps.kotoba.atproto.repo.write"
@@ -15448,50 +13121,6 @@ mod tests {
                 include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/store.json"),
             ),
             (
-                super::NSID_NODE_STATUS,
-                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/node/status.json"),
-            ),
-            (
-                super::NSID_VAULT_PUT,
-                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/put.json"),
-            ),
-            (
-                super::NSID_VAULT_GET,
-                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/get.json"),
-            ),
-            (
-                super::NSID_VAULT_ENVELOPE_PUT,
-                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopePut.json"),
-            ),
-            (
-                super::NSID_VAULT_ENVELOPE_GET,
-                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGet.json"),
-            ),
-            (
-                super::NSID_VAULT_ENVELOPE_CURRENT,
-                include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeCurrent.json"
-                ),
-            ),
-            (
-                super::NSID_VAULT_ENVELOPE_INSPECT,
-                include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeInspect.json"
-                ),
-            ),
-            (
-                super::NSID_VAULT_ENVELOPE_GRANT,
-                include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGrant.json"
-                ),
-            ),
-            (
-                super::NSID_VAULT_ENVELOPE_REVOKE,
-                include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeRevoke.json"
-                ),
-            ),
-            (
                 super::NSID_VC_ISSUE,
                 include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/issue.json"),
             ),
@@ -15501,9 +13130,7 @@ mod tests {
             ),
             (
                 super::NSID_DID_DOCUMENT_PUBLISH,
-                include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json"
-                ),
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json"),
             ),
             (
                 super::NSID_DIDCOMM_SEND,
@@ -15528,80 +13155,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kotoba_lexicon_ids_match_file_paths() {
-        let lexicon_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../lexicons/com/etzhayyim/apps/kotoba");
-        let mut files = Vec::new();
-        collect_json_files(&lexicon_root, &mut files);
-        files.sort();
-        assert!(
-            !files.is_empty(),
-            "kotoba lexicon directory must contain JSON lexicons"
-        );
-
-        for path in files {
-            let src = std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("read lexicon {}: {err}", path.display()));
-            let value: serde_json::Value = serde_json::from_str(&src)
-                .unwrap_or_else(|err| panic!("parse lexicon {}: {err}", path.display()));
-            let relative = path
-                .strip_prefix(&lexicon_root)
-                .expect("lexicon file under root");
-            let mut relative_parts = Vec::new();
-            for component in relative.components() {
-                let std::path::Component::Normal(part) = component else {
-                    panic!("unexpected lexicon path component in {}", path.display());
-                };
-                relative_parts.push(part.to_string_lossy().into_owned());
-            }
-            let Some(last) = relative_parts.last_mut() else {
-                panic!("empty relative lexicon path for {}", path.display());
-            };
-            *last = last
-                .strip_suffix(".json")
-                .unwrap_or_else(|| panic!("lexicon path must end in .json: {}", path.display()))
-                .to_string();
-
-            let expected_id = std::iter::once("com")
-                .chain(std::iter::once("etzhayyim"))
-                .chain(std::iter::once("apps"))
-                .chain(std::iter::once("kotoba"))
-                .chain(relative_parts.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(".");
-
-            assert_eq!(value["lexicon"], 1, "{} must be lexicon v1", path.display());
-            assert_eq!(
-                value["id"],
-                expected_id,
-                "{} id must match file path",
-                path.display()
-            );
-            assert!(
-                matches!(
-                    value["defs"]["main"]["type"].as_str(),
-                    Some("procedure" | "query")
-                ),
-                "{} must expose a procedure or query main definition",
-                path.display()
-            );
-        }
-    }
-
-    fn collect_json_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir)
-            .unwrap_or_else(|err| panic!("read lexicon directory {}: {err}", dir.display()))
-        {
-            let path = entry.expect("lexicon dir entry").path();
-            if path.is_dir() {
-                collect_json_files(&path, out);
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                out.push(path);
-            }
-        }
-    }
-
     #[derive(Debug, Clone, Copy)]
     struct DatomicCompatSurface {
         nsid: &'static str,
@@ -15618,9 +13171,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_TRANSACT,
                 file_name: "transact.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
                 distributed_read: false,
                 distributed_write: true,
                 remote_read: false,
@@ -15638,9 +13189,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_DATOMS,
                 file_name: "datoms.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15649,9 +13198,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_SEEK_DATOMS,
                 file_name: "seekDatoms.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15660,9 +13207,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_INDEX_RANGE,
                 file_name: "indexRange.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15671,9 +13216,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_INDEX_PULL,
                 file_name: "indexPull.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15691,9 +13234,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_PULL_MANY,
                 file_name: "pullMany.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15738,9 +13279,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_HISTORY,
                 file_name: "history.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15758,9 +13297,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_TX_RANGE,
                 file_name: "txRange.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15778,9 +13315,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_BASIS_T,
                 file_name: "basisT.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15789,9 +13324,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_DB_STATS,
                 file_name: "dbStats.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -15800,9 +13333,7 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_ENTITY,
                 file_name: "entity.json",
-                src: include_str!(
-                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"
-                ),
+                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -16398,8 +13929,7 @@ mod tests {
 
     #[test]
     fn did_document_publish_lexicon_exposes_w3c_did_document_and_write_response() {
-        let src =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json");
+        let src = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json");
         assert_lexicon_input_fields(
             src,
             &["graph", "document"],
@@ -16468,12 +13998,10 @@ mod tests {
         );
         assert_protocol_datom_write_output_fields(vc_issue);
 
-        let vc_present =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json");
+        let vc_present = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json");
         assert_protocol_datom_write_output_fields(vc_present);
 
-        let didcomm_send =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/didcomm/send.json");
+        let didcomm_send = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/didcomm/send.json");
         assert_lexicon_input_object_fields(
             didcomm_send,
             "message",
@@ -16508,8 +14036,7 @@ mod tests {
 
     #[test]
     fn graph_query_lexicons_expose_structured_sparql_and_quad_outputs() {
-        let graph_query =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/query.json");
+        let graph_query = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/query.json");
         let graph_query_value: serde_json::Value =
             serde_json::from_str(graph_query).expect("graph.query lexicon JSON");
         let graph_query_description = graph_query_value["defs"]["main"]["description"]
@@ -16552,8 +14079,7 @@ mod tests {
             &["graph", "subject", "predicate", "object"],
         );
 
-        let graph_sparql =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/sparql.json");
+        let graph_sparql = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/sparql.json");
         let graph_sparql_value: serde_json::Value =
             serde_json::from_str(graph_sparql).expect("graph.sparql lexicon JSON");
         let graph_sparql_description = graph_sparql_value["defs"]["main"]["description"]
@@ -16611,15 +14137,12 @@ mod tests {
         let block_get = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/block/get.json");
         assert_lexicon_parameter_fields(block_get, &["cid"], &[]);
         assert_lexicon_output_fields(block_get, &["cid", "data_b64"], &[]);
-        assert_lexicon_description_mentions(block_get, &["public", "SecureVault", "manifests"]);
 
-        let commit_store =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/store.json");
+        let commit_store = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/store.json");
         assert_lexicon_input_fields(commit_store, &["graph", "author", "seq"], &["cacao_b64"]);
         assert_lexicon_output_fields(commit_store, &["cid"], &[]);
 
-        let commit_get =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/get.json");
+        let commit_get = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/get.json");
         assert_lexicon_parameter_fields(commit_get, &["graph"], &[]);
         assert_lexicon_output_fields(
             commit_get,
@@ -16652,349 +14175,6 @@ mod tests {
                 "ipns_verified",
             ],
         );
-
-        let vault_put = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/put.json");
-        assert_lexicon_input_fields(vault_put, &["data_b64"], &[]);
-        assert_lexicon_output_fields(vault_put, &["cid", "size"], &[]);
-        assert_lexicon_description_mentions(
-            vault_put,
-            &[
-                "operator-trusted",
-                "operator authorization",
-                "private vault blob",
-                "public block.get",
-            ],
-        );
-        let vault_put_json: serde_json::Value =
-            serde_json::from_str(vault_put).expect("vault.put lexicon JSON");
-        assert_eq!(
-            vault_put_json["defs"]["main"]["input"]["schema"]["properties"]["data_b64"]
-                ["maxLength"]
-                .as_u64(),
-            Some(super::MAX_VAULT_B64_LEN as u64),
-            "vault.put data_b64 must expose the server-side size limit"
-        );
-
-        let vault_get = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/get.json");
-        assert_lexicon_parameter_fields(vault_get, &["cid"], &[]);
-        assert_lexicon_output_fields(vault_get, &["cid", "data_b64"], &[]);
-        assert_lexicon_description_mentions(
-            vault_get,
-            &[
-                "operator authorization",
-                "public block.get",
-                "vault blobs",
-                "multibase CID",
-            ],
-        );
-        let vault_get_json: serde_json::Value =
-            serde_json::from_str(vault_get).expect("vault.get lexicon JSON");
-        assert_eq!(
-            vault_get_json["defs"]["main"]["parameters"]["properties"]["cid"]["maxLength"].as_u64(),
-            Some(super::MAX_VAULT_CID_LEN as u64),
-            "vault.get cid must expose the server-side length limit"
-        );
-
-        let envelope_put =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopePut.json");
-        assert_lexicon_input_fields(envelope_put, &["data_b64"], &["recipient", "aad_b64"]);
-        assert_lexicon_output_fields(
-            envelope_put,
-            &["ct_cid", "manifest_cid", "recipient", "size"],
-            &[],
-        );
-        assert_lexicon_description_mentions(
-            envelope_put,
-            &[
-                "operator authorization",
-                "ciphertext CID",
-                "manifest CID",
-                "rotatable",
-            ],
-        );
-
-        let envelope_get =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGet.json");
-        assert_lexicon_parameter_fields(envelope_get, &["manifest_cid"], &["ct_cid", "recipient"]);
-        assert_lexicon_output_fields(
-            envelope_get,
-            &["ct_cid", "manifest_cid", "recipient", "data_b64"],
-            &[],
-        );
-        assert_lexicon_description_mentions(
-            envelope_get,
-            &[
-                "operator authorization",
-                "manifest CID",
-                "ciphertext CID",
-                "decryption",
-            ],
-        );
-
-        let envelope_current =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeCurrent.json");
-        assert_lexicon_parameter_fields(envelope_current, &["ct_cid"], &[]);
-        assert_lexicon_output_fields(envelope_current, &["ct_cid", "manifest_cid"], &[]);
-        assert_lexicon_description_mentions(
-            envelope_current,
-            &[
-                "operator authorization",
-                "current envelope manifest pointer",
-                "stale manifest",
-                "readable",
-            ],
-        );
-
-        let envelope_inspect =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeInspect.json");
-        assert_lexicon_parameter_fields(envelope_inspect, &["manifest_cid"], &["ct_cid"]);
-        assert_lexicon_output_fields(
-            envelope_inspect,
-            &[
-                "ct_cid",
-                "manifest_cid",
-                "current_status",
-                "version",
-                "content_alg",
-                "aad_b64",
-                "recipients",
-                "wraps",
-            ],
-            &["current_manifest_cid"],
-        );
-        assert_lexicon_array_item_fields(envelope_inspect, "wraps", &["recipient", "wrap_alg"]);
-        let inspect_json: serde_json::Value =
-            serde_json::from_str(envelope_inspect).expect("envelopeInspect lexicon JSON");
-        let current_status_known_values = inspect_json["defs"]["main"]["output"]["schema"]
-            ["properties"]["current_status"]["knownValues"]
-            .as_array()
-            .expect("current_status knownValues");
-        for expected in ["current", "stale", "unknown"] {
-            assert!(
-                current_status_known_values
-                    .iter()
-                    .any(|value| value.as_str() == Some(expected)),
-                "envelopeInspect current_status must advertise {expected}"
-            );
-        }
-        assert_lexicon_description_mentions(
-            envelope_inspect,
-            &[
-                "non-secret",
-                "operator authorization",
-                "readable",
-                "stale status",
-                "Wrapped DEKs",
-                "Malformed",
-                "unknown",
-            ],
-        );
-
-        let envelope_grant =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGrant.json");
-        assert_lexicon_input_fields(
-            envelope_grant,
-            &["manifest_cid", "to_recipient"],
-            &["ct_cid", "from_recipient"],
-        );
-        assert_lexicon_output_fields(
-            envelope_grant,
-            &["ct_cid", "old_manifest_cid", "manifest_cid", "recipients"],
-            &[],
-        );
-        assert_lexicon_description_mentions(
-            envelope_grant,
-            &[
-                "operator authorization",
-                "recipient wrap",
-                "ciphertext CID",
-                "manifest CID",
-            ],
-        );
-
-        let envelope_revoke =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeRevoke.json");
-        assert_lexicon_input_fields(envelope_revoke, &["manifest_cid", "recipient"], &["ct_cid"]);
-        assert_lexicon_output_fields(
-            envelope_revoke,
-            &["ct_cid", "old_manifest_cid", "manifest_cid", "recipients"],
-            &[],
-        );
-        assert_lexicon_description_mentions(
-            envelope_revoke,
-            &[
-                "operator authorization",
-                "recipient wrap",
-                "ciphertext CID",
-                "manifest CID",
-            ],
-        );
-    }
-
-    #[test]
-    fn node_status_lexicon_exposes_cleanup_observability() {
-        let node_status =
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/node/status.json");
-        assert_lexicon_output_fields(
-            node_status,
-            &[
-                "node_id",
-                "operator_did",
-                "did_document",
-                "peer_count",
-                "peers",
-                "k",
-                "envelope_manifest_cleanup",
-                "envelope_current_pointers",
-            ],
-            &[],
-        );
-        assert_lexicon_description_mentions(
-            node_status,
-            &[
-                "Operator-only",
-                "envelope current pointer health",
-                "envelope manifest cleanup counters/tombstones",
-                "orphan",
-            ],
-        );
-
-        let value: serde_json::Value =
-            serde_json::from_str(node_status).expect("node.status lexicon JSON");
-        let cleanup =
-            &value["defs"]["main"]["output"]["schema"]["properties"]["envelope_manifest_cleanup"];
-        assert_eq!(
-            cleanup["type"], "object",
-            "cleanup counters must be grouped as an object"
-        );
-        let cleanup_required = cleanup["required"].as_array().expect("required array");
-        for field in [
-            "attempts",
-            "successes",
-            "failures",
-            "tombstone_count",
-            "valid_tombstone_count",
-            "malformed_tombstone_count",
-            "omitted_tombstone_count",
-            "recent_tombstone_limit",
-        ] {
-            assert!(
-                cleanup_required
-                    .iter()
-                    .any(|value| value.as_str() == Some(field)),
-                "cleanup counters missing required field {field}"
-            );
-            assert_eq!(
-                cleanup["properties"][field]["type"], "integer",
-                "cleanup counter {field} must be integer"
-            );
-            assert_eq!(
-                cleanup["properties"][field]["minimum"], 0,
-                "cleanup counter {field} must be non-negative"
-            );
-        }
-        assert!(
-            cleanup_required
-                .iter()
-                .any(|value| value.as_str() == Some("recent_tombstones")),
-            "cleanup tombstone sample missing required field"
-        );
-        let tombstones = &cleanup["properties"]["recent_tombstones"];
-        assert_eq!(tombstones["type"], "array");
-        let tombstone_item = &tombstones["items"];
-        assert_eq!(tombstone_item["type"], "object");
-        let item_required = tombstone_item["required"]
-            .as_array()
-            .expect("required array");
-        for field in [
-            "schema_version",
-            "manifest_cid",
-            "reason",
-            "deleted",
-            "cleanup_attempt",
-            "recorded_at_unix_ms",
-        ] {
-            assert!(
-                item_required
-                    .iter()
-                    .any(|value| value.as_str() == Some(field)),
-                "cleanup tombstone missing required field {field}"
-            );
-        }
-        assert_eq!(
-            tombstone_item["properties"]["schema_version"]["type"], "integer",
-            "cleanup tombstone schema version must be integer"
-        );
-        assert!(
-            tombstone_item["properties"]["schema_version"]["knownValues"]
-                .as_array()
-                .is_some_and(|values| values.iter().any(|value| value.as_u64()
-                    == Some(super::ENVELOPE_MANIFEST_TOMBSTONE_SCHEMA_VERSION))),
-            "cleanup tombstone schema version must advertise the current version"
-        );
-        let reason_known_values = tombstone_item["properties"]["reason"]["knownValues"]
-            .as_array()
-            .expect("cleanup reason knownValues");
-        for reason in super::EnvelopeManifestCleanupReason::KNOWN_VALUES {
-            assert!(
-                reason_known_values
-                    .iter()
-                    .any(|value| value.as_str() == Some(reason)),
-                "cleanup tombstone reason must advertise {reason}"
-            );
-        }
-        assert_eq!(
-            tombstone_item["properties"]["deleted"]["type"], "boolean",
-            "cleanup tombstone deleted flag must be boolean"
-        );
-        assert_eq!(
-            tombstone_item["properties"]["cleanup_attempt"]["type"], "integer",
-            "cleanup tombstone attempt must be integer"
-        );
-        assert_eq!(
-            tombstone_item["properties"]["cleanup_attempt"]["minimum"], 1,
-            "cleanup tombstone attempt must be positive"
-        );
-        assert_eq!(
-            tombstone_item["properties"]["recorded_at_unix_ms"]["type"], "integer",
-            "cleanup tombstone timestamp must be integer"
-        );
-        assert_eq!(
-            tombstone_item["properties"]["recorded_at_unix_ms"]["minimum"], 1,
-            "cleanup tombstone timestamp must be positive"
-        );
-
-        let current_pointers =
-            &value["defs"]["main"]["output"]["schema"]["properties"]["envelope_current_pointers"];
-        assert_eq!(
-            current_pointers["type"], "object",
-            "current pointer health counters must be grouped as an object"
-        );
-        let current_pointer_required = current_pointers["required"]
-            .as_array()
-            .expect("current pointer required array");
-        for field in [
-            "total_count",
-            "readable_count",
-            "unreadable_manifest_count",
-            "malformed_ct_cid_count",
-            "malformed_manifest_cid_count",
-        ] {
-            assert!(
-                current_pointer_required
-                    .iter()
-                    .any(|value| value.as_str() == Some(field)),
-                "current pointer health missing required field {field}"
-            );
-            assert_eq!(
-                current_pointers["properties"][field]["type"], "integer",
-                "current pointer health counter {field} must be integer"
-            );
-            assert_eq!(
-                current_pointers["properties"][field]["minimum"], 0,
-                "current pointer health counter {field} must be non-negative"
-            );
-        }
     }
 
     fn assert_protocol_datom_write_output_fields(src: &str) {
@@ -17422,40 +14602,13 @@ mod tests {
 
     #[test]
     fn nsid_invoke_run_exact_value() {
-        assert_eq!(
-            super::NSID_INVOKE_RUN,
-            "com.etzhayyim.apps.kotoba.invoke.run"
-        );
+        assert_eq!(super::NSID_INVOKE_RUN, "com.etzhayyim.apps.kotoba.invoke.run");
     }
 
     #[test]
     fn nsid_vault_put_and_get_exact_values() {
         assert_eq!(super::NSID_VAULT_PUT, "com.etzhayyim.apps.kotoba.vault.put");
         assert_eq!(super::NSID_VAULT_GET, "com.etzhayyim.apps.kotoba.vault.get");
-        assert_eq!(
-            super::NSID_VAULT_ENVELOPE_PUT,
-            "com.etzhayyim.apps.kotoba.vault.envelopePut"
-        );
-        assert_eq!(
-            super::NSID_VAULT_ENVELOPE_GET,
-            "com.etzhayyim.apps.kotoba.vault.envelopeGet"
-        );
-        assert_eq!(
-            super::NSID_VAULT_ENVELOPE_CURRENT,
-            "com.etzhayyim.apps.kotoba.vault.envelopeCurrent"
-        );
-        assert_eq!(
-            super::NSID_VAULT_ENVELOPE_INSPECT,
-            "com.etzhayyim.apps.kotoba.vault.envelopeInspect"
-        );
-        assert_eq!(
-            super::NSID_VAULT_ENVELOPE_GRANT,
-            "com.etzhayyim.apps.kotoba.vault.envelopeGrant"
-        );
-        assert_eq!(
-            super::NSID_VAULT_ENVELOPE_REVOKE,
-            "com.etzhayyim.apps.kotoba.vault.envelopeRevoke"
-        );
     }
 
     #[test]
@@ -17478,316 +14631,6 @@ mod tests {
     fn max_cacao_b64_len_is_8kib() {
         assert_eq!(super::MAX_CACAO_B64_LEN, 8 * 1024);
     }
-
-    #[test]
-    fn vault_envelope_input_limits_are_sane() {
-        assert_eq!(super::MAX_VAULT_B64_LEN, 10 * 1024 * 1024);
-        assert_eq!(super::MAX_VAULT_CID_LEN, 512);
-        assert_eq!(super::MAX_VAULT_ENVELOPE_AAD_LEN, 64 * 1024);
-        assert_eq!(
-            super::MAX_VAULT_ENVELOPE_AAD_B64_LEN,
-            super::base64_standard_encoded_len(super::MAX_VAULT_ENVELOPE_AAD_LEN)
-        );
-        assert_eq!(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN, 512);
-    }
-
-    #[test]
-    fn normalize_vault_envelope_recipient_trims_and_bounds() {
-        let max = "r".repeat(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN);
-        assert_eq!(
-            super::normalize_vault_envelope_recipient(" did:example:alice ", "recipient")
-                .expect("valid recipient"),
-            "did:example:alice"
-        );
-        assert_eq!(
-            super::normalize_vault_envelope_recipient(&max, "recipient")
-                .expect("recipient at limit"),
-            max
-        );
-        assert_eq!(
-            super::normalize_vault_envelope_recipient("   ", "recipient")
-                .expect_err("empty recipient")
-                .0,
-            axum::http::StatusCode::BAD_REQUEST
-        );
-        for invalid in [
-            "did:example:alice bob",
-            "did:example:\nalice",
-            "did:例:alice",
-        ] {
-            assert_eq!(
-                super::normalize_vault_envelope_recipient(invalid, "recipient")
-                    .expect_err("invalid recipient")
-                    .0,
-                axum::http::StatusCode::BAD_REQUEST,
-                "{invalid:?} must be rejected"
-            );
-        }
-        assert_eq!(
-            super::normalize_vault_envelope_recipient(
-                &"r".repeat(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN + 1),
-                "recipient"
-            )
-            .expect_err("oversized recipient")
-            .0,
-            axum::http::StatusCode::BAD_REQUEST
-        );
-    }
-
-    #[test]
-    fn parse_vault_cid_param_rejects_control_chars_before_echoing_value() {
-        let err = super::parse_vault_cid_param("bad\ncid", "manifest_cid")
-            .expect_err("control characters must be rejected before CID parsing");
-
-        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(err.1, "manifest_cid must be a visible ASCII CID");
-        assert!(
-            !err.1.contains('\n'),
-            "error must not echo control characters"
-        );
-    }
-
-    #[test]
-    fn vault_envelope_lexicons_expose_input_limits() {
-        let put: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopePut.json"
-        ))
-        .expect("put lexicon");
-        let put_props = &put["defs"]["main"]["input"]["schema"]["properties"];
-        assert_eq!(
-            put_props["data_b64"]["maxLength"].as_u64(),
-            Some(super::MAX_VAULT_B64_LEN as u64)
-        );
-        assert_eq!(
-            put_props["aad_b64"]["maxLength"].as_u64(),
-            Some(super::MAX_VAULT_ENVELOPE_AAD_B64_LEN as u64)
-        );
-        assert!(
-            put_props["aad_b64"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("65536 bytes")),
-            "aad_b64 lexicon must disclose the decoded AAD byte limit"
-        );
-        assert_eq!(
-            put_props["recipient"]["maxLength"].as_u64(),
-            Some(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN as u64)
-        );
-        assert_eq!(put_props["recipient"]["minLength"].as_u64(), Some(1));
-        assert!(
-            put_props["recipient"]["description"]
-                .as_str()
-                .is_some_and(|description| description.contains("Visible-ASCII")),
-            "recipient lexicon must disclose visible ASCII constraint"
-        );
-
-        for src in [
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGet.json"),
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeCurrent.json"),
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeInspect.json"),
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGrant.json"),
-            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeRevoke.json"),
-        ] {
-            let value: serde_json::Value = serde_json::from_str(src).expect("lexicon JSON");
-            let main = &value["defs"]["main"];
-            let schema = main
-                .get("parameters")
-                .or_else(|| main.get("input").and_then(|input| input.get("schema")))
-                .expect("input or params schema");
-            let props = schema["properties"].as_object().expect("properties");
-            for (field, property) in props {
-                if field.contains("recipient") {
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN as u64),
-                        "{} must expose recipient maxLength for {field}",
-                        value["id"]
-                    );
-                    assert_eq!(
-                        property["minLength"].as_u64(),
-                        Some(1),
-                        "{} must expose recipient minLength for {field}",
-                        value["id"]
-                    );
-                    assert!(
-                        property["description"]
-                            .as_str()
-                            .is_some_and(|description| description.contains("Visible-ASCII")),
-                        "{} must disclose visible ASCII constraint for {field}",
-                        value["id"]
-                    );
-                }
-                if matches!(field.as_str(), "ct_cid" | "manifest_cid") {
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(super::MAX_VAULT_CID_LEN as u64),
-                        "{} must expose CID maxLength for {field}",
-                        value["id"]
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn vault_envelope_lexicons_expose_output_limits() {
-        let envelope_lexicons = [
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopePut.json"
-            ))
-            .expect("envelopePut lexicon"),
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGet.json"
-            ))
-            .expect("envelopeGet lexicon"),
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeCurrent.json"
-            ))
-            .expect("envelopeCurrent lexicon"),
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeInspect.json"
-            ))
-            .expect("envelopeInspect lexicon"),
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeGrant.json"
-            ))
-            .expect("envelopeGrant lexicon"),
-            serde_json::from_str::<serde_json::Value>(include_str!(
-                "../../../lexicons/com/etzhayyim/apps/kotoba/vault/envelopeRevoke.json"
-            ))
-            .expect("envelopeRevoke lexicon"),
-        ];
-
-        for value in envelope_lexicons {
-            let props = value["defs"]["main"]["output"]["schema"]["properties"]
-                .as_object()
-                .expect("output properties");
-            for (field, property) in props {
-                if matches!(
-                    field.as_str(),
-                    "ct_cid" | "manifest_cid" | "old_manifest_cid" | "current_manifest_cid"
-                ) {
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(super::MAX_VAULT_CID_LEN as u64),
-                        "{} output must expose CID maxLength for {field}",
-                        value["id"]
-                    );
-                }
-                if field == "recipient" {
-                    assert_eq!(
-                        property["minLength"].as_u64(),
-                        Some(1),
-                        "{} output recipient must expose minLength",
-                        value["id"]
-                    );
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN as u64),
-                        "{} output recipient must expose maxLength",
-                        value["id"]
-                    );
-                }
-                if field == "data_b64" {
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(super::MAX_VAULT_B64_LEN as u64),
-                        "{} output plaintext must expose maxLength",
-                        value["id"]
-                    );
-                }
-                if field == "aad_b64" {
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(super::MAX_VAULT_ENVELOPE_AAD_B64_LEN as u64),
-                        "{} output AAD must expose maxLength",
-                        value["id"]
-                    );
-                }
-                if field == "content_alg" {
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(kotoba_core::EnvelopeManifest::CONTENT_ALG_AES_256_GCM.len() as u64),
-                        "{} output content_alg must expose maxLength",
-                        value["id"]
-                    );
-                    assert!(
-                        property["knownValues"]
-                            .as_array()
-                            .is_some_and(|values| values.iter().any(|value| value.as_str()
-                                == Some(kotoba_core::EnvelopeManifest::CONTENT_ALG_AES_256_GCM))),
-                        "{} output content_alg must advertise the supported algorithm",
-                        value["id"]
-                    );
-                }
-                if field == "recipients" {
-                    assert_envelope_recipient_array_limits(&value, field, property);
-                }
-                if field == "wraps" {
-                    assert_eq!(
-                        property["maxLength"].as_u64(),
-                        Some(kotoba_core::EnvelopeManifest::MAX_DEK_WRAP_COUNT as u64),
-                        "{} output wraps must expose manifest wrap count",
-                        value["id"]
-                    );
-                    let item_props = property["items"]["properties"]
-                        .as_object()
-                        .expect("wrap item properties");
-                    let recipient = &item_props["recipient"];
-                    assert_eq!(
-                        recipient["minLength"].as_u64(),
-                        Some(1),
-                        "{} output wrap recipient must expose minLength",
-                        value["id"]
-                    );
-                    assert_eq!(
-                        recipient["maxLength"].as_u64(),
-                        Some(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN as u64),
-                        "{} output wrap recipient must expose maxLength",
-                        value["id"]
-                    );
-                    assert_eq!(
-                        item_props["wrap_alg"]["maxLength"].as_u64(),
-                        Some(kotoba_core::EnvelopeManifest::MAX_WRAP_ALG_LEN as u64),
-                        "{} output wrap_alg must expose maxLength",
-                        value["id"]
-                    );
-                    assert!(
-                        item_props["wrap_alg"]["knownValues"]
-                            .as_array()
-                            .is_some_and(|values| values.iter().any(|value| value.as_str()
-                                == Some(kotoba_core::EnvelopeKeyWrap::WRAP_ALG_AES_256_GCM))),
-                        "{} output wrap_alg must advertise the supported algorithm",
-                        value["id"]
-                    );
-                }
-            }
-        }
-    }
-
-    fn assert_envelope_recipient_array_limits(
-        lexicon: &serde_json::Value,
-        field: &str,
-        property: &serde_json::Value,
-    ) {
-        assert_eq!(
-            property["maxLength"].as_u64(),
-            Some(kotoba_core::EnvelopeManifest::MAX_DEK_WRAP_COUNT as u64),
-            "{} output {field} must expose manifest wrap count",
-            lexicon["id"]
-        );
-        assert_eq!(
-            property["items"]["minLength"].as_u64(),
-            Some(1),
-            "{} output {field} items must expose minLength",
-            lexicon["id"]
-        );
-        assert_eq!(
-            property["items"]["maxLength"].as_u64(),
-            Some(super::MAX_VAULT_ENVELOPE_RECIPIENT_LEN as u64),
-            "{} output {field} items must expose maxLength",
-            lexicon["id"]
-        );
-    }
 }
 
 // ── Generic XRPC dispatch ──────────────────────────────────────────────────
@@ -17805,7 +14648,7 @@ pub async fn generic_invoke(
     if parts.len() < 5 || parts[0..3] != ["ai", "gftd", "apps"] {
         return Err((StatusCode::BAD_REQUEST, "invalid generic nsid".into()));
     }
-    let app = normalize_node_register_app(parts[3])?;
+    let app = parts[3];
 
     let graph_cid = kotoba_core::cid::KotobaCid::from_bytes(b"kotoba/network/nodes");
     let mut program_cid = app.to_string();
@@ -17825,21 +14668,13 @@ pub async fn generic_invoke(
         for q in &node_quads {
             if q.predicate == "node/did" {
                 if let LegacyQuadObject::Text(s) = &q.object {
-                    if s == app.as_str() || s.ends_with(&format!("{app}.gftd.co.jp")) {
+                    if s == app || s.ends_with(&format!("{app}.gftd.co.jp")) {
                         if let Some(ep) = node_quads
                             .iter()
                             .find(|d| d.subject == q.subject && d.predicate == "node/endpoint")
                         {
                             if let LegacyQuadObject::Text(cid) = &ep.object {
-                                if normalize_node_register_endpoint(cid).is_ok() {
-                                    program_cid = cid.to_string();
-                                } else {
-                                    tracing::warn!(
-                                        app = %app,
-                                        endpoint = %cid,
-                                        "generic_invoke: ignoring invalid quad_store node endpoint"
-                                    );
-                                }
+                                program_cid = cid.to_string();
                             }
                         }
                         break;
@@ -17858,29 +14693,14 @@ pub async fn generic_invoke(
 
     if program_cid == app {
         let ipns_name = distributed_graph_ipns_name(&graph_cid);
-        if let Ok(Some(db)) =
-            DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
-                .current_db_for_name(&ipns_name)
-        {
+        if let Ok(Some(db)) = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry).current_db_for_name(&ipns_name) {
             for datom in db.datoms() {
                 if datom.a == "node/did" {
                     if let kotoba_datomic::Value::String(s) = &datom.v {
-                        if s == app.as_str() || s.ends_with(&format!("{app}.gftd.co.jp")) {
-                            if let Some(endpoint) = db
-                                .datoms()
-                                .iter()
-                                .find(|d| d.e == datom.e && d.a == "node/endpoint")
-                            {
+                        if s == app || s.ends_with(&format!("{app}.gftd.co.jp")) {
+                            if let Some(endpoint) = db.datoms().iter().find(|d| d.e == datom.e && d.a == "node/endpoint") {
                                 if let kotoba_datomic::Value::String(ep) = &endpoint.v {
-                                    if normalize_node_register_endpoint(ep).is_ok() {
-                                        program_cid = ep.to_string();
-                                    } else {
-                                        tracing::warn!(
-                                            app = %app,
-                                            endpoint = %ep,
-                                            "generic_invoke: ignoring invalid distributed node endpoint"
-                                        );
-                                    }
+                                    program_cid = ep.to_string();
                                 }
                             }
                             break;
@@ -17892,12 +14712,7 @@ pub async fn generic_invoke(
     }
 
     let mut ctx_cbor = Vec::new();
-    ciborium::into_writer(&req_body, &mut ctx_cbor).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cbor encode: {e}"),
-        )
-    })?;
+    ciborium::into_writer(&req_body, &mut ctx_cbor).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cbor encode: {e}")))?;
 
     // Load the registered WasmNode program bytes from the block store by CID.
     // `program_cid` is the resolved `node/endpoint` value (a wasm CID) when the
@@ -17948,10 +14763,7 @@ pub async fn generic_invoke(
     let mut head_commits = std::collections::HashMap::new();
     if let Some(gcid) = &snapshot_graph_cid {
         let ipns_name = distributed_graph_ipns_name(gcid);
-        match state
-            .ipns_registry
-            .resolve(&IpnsName::new(ipns_name.clone()))
-        {
+        match state.ipns_registry.resolve(&IpnsName::new(ipns_name.clone())) {
             Ok(record) => {
                 head_commits.insert(gcid.to_multibase(), record.value);
             }
@@ -18066,18 +14878,14 @@ pub async fn generic_invoke(
                 use kotoba_kse::Topic;
                 state
                     .journal
-                    .publish_checked(Topic(topic.clone()), bytes::Bytes::from(payload.clone()))
-                    .await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+                    .publish(Topic(topic.clone()), bytes::Bytes::from(payload.clone()))
+                    .await;
             }
             let out_val: serde_json::Value = ciborium::from_reader(r.output_cbor.as_slice())
                 .unwrap_or(serde_json::json!({ "output_bytes": r.output_cbor }));
             Ok(Json(out_val))
         }
-        _ => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "expected wasm result".into(),
-        )),
+        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "expected wasm result".into())),
     }
 }
 
@@ -18089,8 +14897,5 @@ pub async fn generic_invoke(
     Json(_req_body): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "generic dispatch requires the `wasm-runtime` feature".to_string(),
-    ))
+    Err((StatusCode::SERVICE_UNAVAILABLE, "generic dispatch requires the `wasm-runtime` feature".to_string()))
 }

@@ -57,7 +57,8 @@ impl WasmSim {
         let mut config = wasmtime::Config::new();
         config.cranelift_nan_canonicalization(true);
         let engine = Engine::new(&config).map_err(|e| WasmSimError::Wasm(e.to_string()))?;
-        let module = Module::new(&engine, wasm).map_err(|e| WasmSimError::Wasm(e.to_string()))?;
+        let module =
+            Module::new(&engine, wasm).map_err(|e| WasmSimError::Wasm(e.to_string()))?;
         let mut store = Store::new(&engine, ());
         // The `game` world imports nothing → no linker entries required.
         let instance = Instance::new(&mut store, &module, &[])

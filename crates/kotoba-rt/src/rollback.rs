@@ -242,10 +242,7 @@ impl<S: SimHost> RollbackEngine<S> {
     pub fn add_input(&mut self, player: PlayerId, tick: Tick, input: Input) -> bool {
         let t = tick.0;
         // Record it (idempotent; last write wins for the same tick).
-        self.received
-            .entry(player)
-            .or_default()
-            .insert(t, input.clone());
+        self.received.entry(player).or_default().insert(t, input.clone());
 
         // Future or current tick: nothing simulated yet, no rollback needed.
         if t >= self.current.0 {
@@ -292,10 +289,7 @@ impl<S: SimHost> RollbackEngine<S> {
         {
             return false;
         }
-        self.roster_events
-            .entry(t)
-            .or_default()
-            .insert(player, joined);
+        self.roster_events.entry(t).or_default().insert(player, joined);
 
         // Future/current tick: affects only ticks not yet simulated.
         if t >= self.current.0 {

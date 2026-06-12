@@ -39,9 +39,7 @@ use tokio::sync::Mutex;
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_kse::{Journal, Topic};
-use kotoba_rt::{
-    protocol, ClientMsg, CounterSim, PlayerId, RoomActor, RoomConfig, SimHost, SnapshotRef,
-};
+use kotoba_rt::{protocol, ClientMsg, CounterSim, PlayerId, RoomActor, RoomConfig, SimHost, SnapshotRef};
 
 /// A room's simulation behind dynamic dispatch — `CounterSim` by default, or a
 /// real `kotoba:kge` `WasmComponentSim` when a kge component is configured
@@ -60,61 +58,6 @@ const TICK_PERIOD: Duration = Duration::from_millis(50); // 20 Hz
 const IDLE_TICKS_BEFORE_REAP: u32 = 200; // ~10s at 20 Hz
 /// Per-room player capacity (simulation slots). Membership within it is dynamic.
 const ROOM_CAPACITY: u32 = 8;
-const MAX_ROOM_ID_LEN: usize = 128;
-const MAX_PROGRAM_CID_LEN: usize = 256;
-
-fn validate_room_id(room: &str) -> Result<(), (StatusCode, String)> {
-    if room.is_empty() || room.len() > MAX_ROOM_ID_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("room must be 1-{MAX_ROOM_ID_LEN} bytes"),
-        ));
-    }
-    if !room
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "room must contain only ASCII letters, digits, '.', '_', or '-'".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_player_id(player: u32) -> Result<(), (StatusCode, String)> {
-    if player >= ROOM_CAPACITY {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("player must be less than room capacity {ROOM_CAPACITY}"),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_program_cid_hint(program_cid: Option<&str>) -> Result<(), (StatusCode, String)> {
-    let Some(program_cid) = program_cid else {
-        return Ok(());
-    };
-    if program_cid.is_empty() || program_cid.len() > MAX_PROGRAM_CID_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("program_cid must be 1-{MAX_PROGRAM_CID_LEN} bytes"),
-        ));
-    }
-    if program_cid.chars().any(char::is_control) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "program_cid must not contain control characters".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_connect_params(params: &ConnectParams) -> Result<(), (StatusCode, String)> {
-    validate_room_id(&params.room)?;
-    validate_player_id(params.player)
-}
 
 #[derive(Clone)]
 struct RoomHandle {
@@ -155,9 +98,7 @@ fn make_sim_for(program_cid: Option<&str>) -> RoomSim {
             if let Some(bytes) = cold().and_then(|c| load_component_from(&*c.block_store, pc)) {
                 match kotoba_rt::WasmComponentSim::from_bytes(&bytes) {
                     Ok(sim) => return Box::new(sim),
-                    Err(e) => {
-                        tracing::warn!(error = %e, program_cid = pc, "kge component instantiate failed")
-                    }
+                    Err(e) => tracing::warn!(error = %e, program_cid = pc, "kge component instantiate failed"),
                 }
             } else {
                 tracing::warn!(program_cid = pc, "kge component not found in block store");
@@ -167,9 +108,7 @@ fn make_sim_for(program_cid: Option<&str>) -> RoomSim {
         if let Some(bytes) = KGE_COMPONENT.get() {
             match kotoba_rt::WasmComponentSim::from_bytes(bytes) {
                 Ok(sim) => return Box::new(sim),
-                Err(e) => {
-                    tracing::warn!(error = %e, "kotoba-rt: kge component load failed; CounterSim")
-                }
+                Err(e) => tracing::warn!(error = %e, "kotoba-rt: kge component load failed; CounterSim"),
             }
         }
     }
@@ -206,7 +145,10 @@ static COLD: OnceLock<ColdLane> = OnceLock::new();
 
 /// Wire the realtime cold-lane bridge to the node's block store + Journal.
 /// Call once from `build_router`. Idempotent (later calls are ignored).
-pub fn install_cold_lane(block_store: Arc<dyn BlockStore + Send + Sync>, journal: Arc<Journal>) {
+pub fn install_cold_lane(
+    block_store: Arc<dyn BlockStore + Send + Sync>,
+    journal: Arc<Journal>,
+) {
     let _ = COLD.set(ColdLane {
         block_store,
         journal,
@@ -234,7 +176,12 @@ fn persist_block(c: &ColdLane, blob: &[u8]) -> KotobaCid {
 
 /// Announce a durable snapshot on the room-scoped Journal topic — the single
 /// hot→cold/federated bridge. Per-frame traffic never reaches here.
-async fn announce_to_journal(c: &ColdLane, room: &str, tick: kotoba_rt::Tick, cid: &KotobaCid) {
+async fn announce_to_journal(
+    c: &ColdLane,
+    room: &str,
+    tick: kotoba_rt::Tick,
+    cid: &KotobaCid,
+) {
     let sref = SnapshotRef {
         room: room.to_string(),
         tick,
@@ -242,10 +189,7 @@ async fn announce_to_journal(c: &ColdLane, room: &str, tick: kotoba_rt::Tick, ci
     };
     if let Ok(payload) = protocol::encode(&sref) {
         c.journal
-            .publish(
-                Topic::new(format!("live/{}/snapshot", room)),
-                Bytes::from(payload),
-            )
+            .publish(Topic::new(format!("live/{}/snapshot", room)), Bytes::from(payload))
             .await;
     }
 }
@@ -383,7 +327,8 @@ pub fn verify_room_token(
         _ => return Err("malformed token".into()),
     };
     let sig = B64URL.decode(s).map_err(|_| "bad signature b64")?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| "bad secret")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|_| "bad secret")?;
     mac.update(format!("{h}.{p}").as_bytes());
     // Constant-time verification.
     mac.verify_slice(&sig).map_err(|_| "signature mismatch")?;
@@ -406,9 +351,7 @@ pub fn verify_room_token(
 
 /// The shared room-token secret, if the realtime control plane is wired.
 fn rt_token_secret() -> Option<String> {
-    std::env::var("RT_TOKEN_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
+    std::env::var("RT_TOKEN_SECRET").ok().filter(|s| !s.is_empty())
 }
 
 fn now_secs() -> u64 {
@@ -433,9 +376,6 @@ pub async fn ws_connect(
     headers: HeaderMap,
     Query(params): Query<ConnectParams>,
 ) -> Response {
-    if let Err((status, msg)) = validate_connect_params(&params) {
-        return (status, msg).into_response();
-    }
     // When the realtime control plane is wired (`RT_TOKEN_SECRET` shared with the
     // Worker), require a valid room token that authorizes THIS room + player —
     // the per-room/per-player authz the visibility gate can't express. The token
@@ -447,16 +387,8 @@ pub async fn ws_connect(
             return (StatusCode::UNAUTHORIZED, "room token required".to_string()).into_response();
         };
         match verify_room_token(&secret, token, now_secs(), &params.room, params.player) {
-            Ok(claims) => {
-                if let Err((status, msg)) = validate_program_cid_hint(claims.program_cid.as_deref())
-                {
-                    return (status, msg).into_response();
-                }
-                program_cid = claims.program_cid;
-            }
-            Err(e) => {
-                return (StatusCode::UNAUTHORIZED, format!("room token: {e}")).into_response()
-            }
+            Ok(claims) => program_cid = claims.program_cid,
+            Err(e) => return (StatusCode::UNAUTHORIZED, format!("room token: {e}")).into_response(),
         }
     } else if let Err((status, msg)) =
         ws_authorize(&state, &headers, params.cacao_b64.as_deref()).await
@@ -515,9 +447,7 @@ async fn handle_socket(socket: WebSocket, params: ConnectParams, program_cid: Op
                         ClientMsg::Leave { player, .. } => a.leave(player),
                         // T2: relay WebRTC signaling to the target peer over the
                         // reliable WS channel so they can establish a DataChannel.
-                        ClientMsg::Signal { to, payload, .. } => {
-                            a.relay_signal(player, to, payload)
-                        }
+                        ClientMsg::Signal { to, payload, .. } => a.relay_signal(player, to, payload),
                     }
                 }
             }
@@ -550,9 +480,6 @@ mod tests {
         ws: WebSocketUpgrade,
         Query(params): Query<ConnectParams>,
     ) -> Response {
-        if let Err((status, msg)) = validate_connect_params(&params) {
-            return (status, msg).into_response();
-        }
         ws.on_upgrade(move |socket| handle_socket(socket, params, None))
     }
 
@@ -571,7 +498,10 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let url = format!("ws://{}/xrpc/{}?room=e2e&player=0", addr, NSID_SYNC_CONNECT);
+        let url = format!(
+            "ws://{}/xrpc/{}?room=e2e&player=0",
+            addr, NSID_SYNC_CONNECT
+        );
         let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
         // Expect a Welcome shortly after upgrade (join broadcast).
@@ -584,93 +514,17 @@ mod tests {
             player: PlayerId(0),
             tick: Tick(0),
             seq: 1,
-            input: Input {
-                buttons: 7,
-                axes: vec![],
-            },
+            input: Input { buttons: 7, axes: vec![] },
         });
         ws.send(WsMessage::Binary(protocol::encode(&frame).unwrap()))
             .await
             .unwrap();
 
-        let got_input = read_until(
-            &mut ws,
-            |m| matches!(m, ServerMsg::Input(f) if f.input.buttons == 7 && f.player == PlayerId(0)),
-        )
+        let got_input = read_until(&mut ws, |m| {
+            matches!(m, ServerMsg::Input(f) if f.input.buttons == 7 && f.player == PlayerId(0))
+        })
         .await;
-        assert!(
-            got_input,
-            "submitted input must be forwarded on the room bus"
-        );
-    }
-
-    #[test]
-    fn realtime_connect_validation_rejects_bad_room_player_and_program_cid() {
-        assert!(validate_room_id("arena-1.v2").is_ok());
-        assert!(validate_room_id("").is_err());
-        assert!(validate_room_id(&"r".repeat(MAX_ROOM_ID_LEN + 1)).is_err());
-        assert!(validate_room_id("arena/one").is_err());
-        assert!(validate_room_id("arena\none").is_err());
-
-        assert!(validate_player_id(0).is_ok());
-        assert!(validate_player_id(ROOM_CAPACITY - 1).is_ok());
-        assert!(validate_player_id(ROOM_CAPACITY).is_err());
-
-        assert!(validate_program_cid_hint(None).is_ok());
-        assert!(validate_program_cid_hint(Some("bafykgecounter123")).is_ok());
-        assert!(validate_program_cid_hint(Some("")).is_err());
-        assert!(validate_program_cid_hint(Some(&"b".repeat(MAX_PROGRAM_CID_LEN + 1))).is_err());
-        assert!(validate_program_cid_hint(Some("bad\ncid")).is_err());
-    }
-
-    #[tokio::test]
-    async fn ws_connect_rejects_invalid_room_before_upgrade() {
-        let app = Router::new().route(
-            &format!("/xrpc/{}", NSID_SYNC_CONNECT),
-            get(ws_connect_ungated),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let url = format!(
-            "ws://{}/xrpc/{}?room=bad%2Froom&player=0",
-            addr, NSID_SYNC_CONNECT
-        );
-        let err = tokio_tungstenite::connect_async(url)
-            .await
-            .expect_err("invalid room must not upgrade");
-        assert!(
-            err.to_string().contains("400"),
-            "expected 400 handshake error, got {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn ws_connect_rejects_player_over_capacity_before_upgrade() {
-        let app = Router::new().route(
-            &format!("/xrpc/{}", NSID_SYNC_CONNECT),
-            get(ws_connect_ungated),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let url = format!(
-            "ws://{}/xrpc/{}?room=arena&player={}",
-            addr, NSID_SYNC_CONNECT, ROOM_CAPACITY
-        );
-        let err = tokio_tungstenite::connect_async(url)
-            .await
-            .expect_err("over-capacity player must not upgrade");
-        assert!(
-            err.to_string().contains("400"),
-            "expected 400 handshake error, got {err}"
-        );
+        assert!(got_input, "submitted input must be forwarded on the room bus");
     }
 
     /// Cross-implementation vector: this token was minted by the Worker
@@ -730,8 +584,7 @@ mod tests {
 
         let bytes = load_component_from(&store, &cid.to_multibase()).expect("load by program_cid");
         assert_eq!(bytes.len(), WASM.len());
-        kotoba_rt::WasmComponentSim::from_bytes(&bytes)
-            .expect("instantiate from block-store bytes");
+        kotoba_rt::WasmComponentSim::from_bytes(&bytes).expect("instantiate from block-store bytes");
 
         // Unknown / malformed CID → None (no panic).
         assert!(load_component_from(&store, "!!!not-multibase").is_none());

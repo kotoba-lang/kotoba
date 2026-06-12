@@ -80,12 +80,7 @@ impl<S: SimHost, B: GossipBus> P2pAuthority<S, B> {
     pub fn new(room: RoomActor<S>, bus: B) -> Self {
         let room_id = room.room_id().to_string();
         let rx = room.subscribe();
-        Self {
-            room_id,
-            room,
-            rx,
-            bus,
-        }
+        Self { room_id, room, rx, bus }
     }
 
     /// One pump cycle: ingest peer inputs → advance one tick → publish outputs.
@@ -123,10 +118,7 @@ pub struct P2pClient<B: GossipBus> {
 
 impl<B: GossipBus> P2pClient<B> {
     pub fn new(room_id: impl Into<String>, bus: B) -> Self {
-        Self {
-            room_id: room_id.into(),
-            bus,
-        }
+        Self { room_id: room_id.into(), bus }
     }
 
     pub fn send_input(&mut self, frame: InputFrame) {
@@ -166,9 +158,7 @@ mod tests {
     }
     impl GossipBus for Node {
         fn publish(&mut self, topic: &str, data: Vec<u8>) {
-            self.log
-                .borrow_mut()
-                .push((self.id, topic.to_string(), data));
+            self.log.borrow_mut().push((self.id, topic.to_string(), data));
         }
         fn drain(&mut self) -> Vec<(String, Vec<u8>)> {
             let out: Vec<_> = self.log.borrow()[self.cursor..]
@@ -195,26 +185,14 @@ mod tests {
 
         // publish → reaches the swarm side (publish_rx).
         bus.publish("rt/r/input", vec![1, 2, 3]);
-        assert_eq!(
-            out_rx.recv().await.unwrap(),
-            ("rt/r/input".to_string(), vec![1, 2, 3])
-        );
+        assert_eq!(out_rx.recv().await.unwrap(), ("rt/r/input".to_string(), vec![1, 2, 3]));
 
         // inbound swarm events → drain.
-        in_tx
-            .send(("rt/r/state".to_string(), vec![9]))
-            .await
-            .unwrap();
-        in_tx
-            .send(("rt/r/state".to_string(), vec![8]))
-            .await
-            .unwrap();
+        in_tx.send(("rt/r/state".to_string(), vec![9])).await.unwrap();
+        in_tx.send(("rt/r/state".to_string(), vec![8])).await.unwrap();
         assert_eq!(
             bus.drain(),
-            vec![
-                ("rt/r/state".to_string(), vec![9]),
-                ("rt/r/state".to_string(), vec![8])
-            ]
+            vec![("rt/r/state".to_string(), vec![9]), ("rt/r/state".to_string(), vec![8])]
         );
         assert!(bus.drain().is_empty(), "drain consumes the inbox");
     }
@@ -222,16 +200,8 @@ mod tests {
     #[test]
     fn p2p_authority_relays_peer_input_and_confirms_over_gossip() {
         let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let auth_node = Node {
-            id: 0,
-            log: log.clone(),
-            cursor: 0,
-        };
-        let client_node = Node {
-            id: 1,
-            log: log.clone(),
-            cursor: 0,
-        };
+        let auth_node = Node { id: 0, log: log.clone(), cursor: 0 };
+        let client_node = Node { id: 1, log: log.clone(), cursor: 0 };
 
         let mut cfg = RoomConfig::new("p2p", vec![PlayerId(0), PlayerId(1)]);
         cfg.capacity = 2;
@@ -247,10 +217,7 @@ mod tests {
             player: PlayerId(1),
             tick: Tick(0),
             seq: 1,
-            input: Input {
-                buttons: 5,
-                axes: vec![],
-            },
+            input: Input { buttons: 5, axes: vec![] },
         });
 
         // Authority pumps: ingest → tick → publish. Twice so tick 0 finalizes.
@@ -259,8 +226,7 @@ mod tests {
 
         let msgs = client.recv();
         assert!(
-            msgs.iter()
-                .any(|m| matches!(m, ServerMsg::Input(f) if f.player == PlayerId(1))),
+            msgs.iter().any(|m| matches!(m, ServerMsg::Input(f) if f.player == PlayerId(1))),
             "peer input must be forwarded on the gossip state stream"
         );
         assert!(

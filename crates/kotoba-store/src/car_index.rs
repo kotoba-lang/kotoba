@@ -64,14 +64,24 @@ impl CarIndex {
             ));
         }
         let path = self.path(cid);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
+        let write = |p: &std::path::Path| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(p)?;
             write!(f, "{car_key}\n{offset}\n{len}")?;
-            f.flush()?;
+            f.flush()
+        };
+        // Hot path assumes the shard dir exists — `create_dir_all` only runs on
+        // the first write into a shard (NotFound), not on every put. With 1024
+        // shards that is ~1024 dir-creates total instead of one per block.
+        if let Err(e) = write(&tmp) {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                write(&tmp)?;
+            } else {
+                return Err(e);
+            }
         }
         std::fs::rename(&tmp, &path)
     }

@@ -9,7 +9,7 @@
 use tokio::sync::broadcast;
 
 use crate::protocol::{
-    Confirm, Input, InputBundle, InputFrame, PlayerId, Presence, ServerMsg, SignalPayload,
+    Confirm, Input, InputBundle, InputFrame, Presence, PlayerId, ServerMsg, SignalPayload,
     SnapshotRef, Tick,
 };
 use crate::rollback::RollbackEngine;
@@ -112,11 +112,7 @@ impl<S: SimHost> RoomActor<S> {
     /// the effective tick) + Presence. Rejected if `player >= capacity`.
     pub fn join(&mut self, player: PlayerId) {
         if player.0 >= self.cfg.capacity {
-            tracing::warn!(
-                player = player.0,
-                capacity = self.cfg.capacity,
-                "kotoba-rt: join over capacity"
-            );
+            tracing::warn!(player = player.0, capacity = self.cfg.capacity, "kotoba-rt: join over capacity");
             return;
         }
         let effective = Tick(self.engine.current_tick().0 + self.cfg.join_delay);
