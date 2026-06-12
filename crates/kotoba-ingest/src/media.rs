@@ -33,7 +33,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_query::datom::{Datom, TensorDtype, Value};
 use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-use kotoba_kse::Vault;
+use kotoba_vault::Vault;
 use tracing::{debug, info};
 
 use crate::ivf::IvfIndex;
@@ -444,11 +444,11 @@ fn mime_for_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::media_embed::Blake3MediaEmbedClient;
-    use kotoba_kse::Journal;
+    use kotoba_vault::LiveBus;
     use kotoba_store::MemoryBlockStore;
 
     fn make_store() -> Arc<QuadStore> {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new())
             as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
         Arc::new(QuadStore::new(journal, block_store))

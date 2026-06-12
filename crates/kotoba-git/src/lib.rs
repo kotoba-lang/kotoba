@@ -155,7 +155,7 @@ impl<'a> GitStore<'a> {
     // from it — so after a restart, given the manifest CID, the full repo
     // (objects + refs + queryable DAG) is reconstructable purely from IPFS
     // blocks. The single mutable thing left is "repo → latest manifest CID",
-    // which the caller persists in its mutable-name boundary (e.g. `KseStore`).
+    // which the caller persists in its mutable-name boundary (e.g. `VaultStore`).
 
     /// Serialize the projection (object `oid↔cid` index + refs) into a
     /// content-addressed manifest block and return its CID.

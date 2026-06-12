@@ -2,7 +2,7 @@
 //!
 //! CBOR-framed, room-scoped, tick-ordered. These types travel on the HOT lane
 //! only — the per-room broadcast bus and the T1 WebSocket / T2 DataChannel /
-//! T3 QUIC transports. They NEVER enter the global KSE Journal, firehose, or
+//! T3 QUIC transports. They NEVER enter the global KSE LiveBus, firehose, or
 //! gossip mesh; only the low-rate `SnapshotRef` references a cold-lane blob.
 
 use serde::{Deserialize, Serialize};

@@ -50,7 +50,7 @@ use axum::{
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_query::{delta::Delta, quad::LegacyQuad, quad::LegacyQuadObject};
-use kotoba_kse::journal::Journal;
+use kotoba_vault::live_bus::LiveBus;
 use kotoba_store::MemoryBlockStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -486,7 +486,7 @@ async fn distributed_query_store(
     graph_cid: &KotobaCid,
 ) -> Result<QuadStore, (i32, String)> {
     let quads = current_graph_quads(state, graph_cid).await?;
-    let query_store = QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
+    let query_store = QuadStore::new(Arc::new(LiveBus::new()), Arc::new(MemoryBlockStore::new()));
     query_store.assert_batch_silent(quads).await;
     Ok(query_store)
 }

@@ -9,7 +9,7 @@
 //! WASM guests reach this engine through the `kotoba:kais/kqe` WIT interface
 //! (ASSERT 0x1 / RETRACT 0xD / QUERY 0x2 frames); KAIS = Kotoba Instruction
 //! Set Architecture. Sibling engines: KSE (Kotoba Stream Engine,
-//! `kotoba-kse`), KDHT (Kotoba DHT, `kotoba-dht`), KVM (Kotoba VM,
+//! `kotoba-vault`), KDHT (Kotoba DHT, `kotoba-dht`), KVM (Kotoba VM,
 //! `kotoba-vm`).
 pub mod arrangement;
 pub mod citation;

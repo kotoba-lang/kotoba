@@ -2,7 +2,7 @@ use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use kotoba_query::datom::{Datom, Value};
 use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject, TensorDtype};
-use kotoba_kse::vault::Vault;
+use kotoba_vault::vault::Vault;
 
 /// Unified weight predicate scheme (ADR-2605250005).
 ///

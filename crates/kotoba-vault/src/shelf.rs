@@ -12,7 +12,7 @@ pub const BUCKET_WARRANTS: &str = "KOTOBA_WARRANTS";
 pub const BUCKET_WEIGHTS: &str = "KOTOBA_WEIGHTS"; // FP8 weight blob CIDs
 pub const BUCKET_PRE_KEYS: &str = "KOTOBA_PRE_KEYS"; // PRE grant index
 
-/// Shelf — CID-keyed KV, built on Journal (clean room, inspired by NATS KV)
+/// Shelf — CID-keyed KV, built on LiveBus (clean room, inspired by NATS KV)
 pub struct Shelf {
     buckets: Arc<RwLock<HashMap<String, ShelfBucket>>>,
 }

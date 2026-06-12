@@ -9,7 +9,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_crypto::AgentCrypto;
 use kotoba_graph::QuadStore;
 use kotoba_query::datom::{Datom, Value};
-use kotoba_kse::Vault;
+use kotoba_vault::Vault;
 
 /// Ingest raw RFC 2822 emails into the kotoba encrypted quad graph.
 pub struct EmailIngestor {
@@ -249,7 +249,7 @@ mod tests {
     use super::*;
     use kotoba_crypto::{AgentCrypto, VaultKeyedCrypto};
     use kotoba_graph::QuadStore;
-    use kotoba_kse::{Journal, Vault};
+    use kotoba_vault::{LiveBus, Vault};
     use kotoba_store::MemoryBlockStore;
     use std::sync::Arc;
     use zeroize::Zeroizing;
@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn make_ingestor() -> EmailIngestor {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new())
             as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>;
         let quad_store = Arc::new(QuadStore::new(journal, block_store));

@@ -40,7 +40,7 @@ use kotoba_query::{
     quad::LegacyQuad,
     quad::LegacyQuadObject as QuadObject,
 };
-use kotoba_kse::journal::Journal;
+use kotoba_vault::live_bus::LiveBus;
 use kotoba_store::MemoryBlockStore;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -374,7 +374,7 @@ async fn distributed_query_store(
         let basis_t = db.basis_t.as_ref().map(KotobaCid::to_multibase);
         let quads = datomic_db_quads(graph_cid, db);
         let query_store =
-            QuadStore::new(Arc::new(Journal::new()), Arc::new(MemoryBlockStore::new()));
+            QuadStore::new(Arc::new(LiveBus::new()), Arc::new(MemoryBlockStore::new()));
         query_store.assert_batch_silent(quads).await;
         return Ok((Arc::new(query_store), basis_t));
     }
@@ -1643,7 +1643,7 @@ pub async fn kg_commit(
 /// POST /xrpc/com.etzhayyim.apps.kotobase.kg.delete
 ///
 /// Retract all quads for the given entity from the `kotobase-kg-v1` graph.
-/// Publishes a retract event to the Journal for each quad (WAL + GossipSub).
+/// Publishes a retract event to the LiveBus for each quad (WAL + GossipSub).
 pub async fn kg_delete(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,

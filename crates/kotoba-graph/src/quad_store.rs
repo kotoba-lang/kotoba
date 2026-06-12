@@ -37,8 +37,8 @@ use kotoba_query::datom::{Datom, Value};
 use kotoba_query::delta::Delta;
 use kotoba_query::quad::LegacyQuad as Quad;
 use kotoba_query::quad::LegacyQuadObject;
-use kotoba_kse::journal::Journal;
-use kotoba_kse::topic::Topic;
+use kotoba_vault::live_bus::LiveBus;
+use kotoba_vault::topic::Topic;
 use kotoba_store::{CapturingBlockStore, CarBundleWriter};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -56,7 +56,7 @@ pub enum AccessError {
 
 /// QuadStore — legacy graph projection API with Datom-native ProllyTree commit
 pub struct QuadStore {
-    journal: Arc<Journal>,
+    journal: Arc<LiveBus>,
     block_store: Arc<dyn BlockStore + Send + Sync>,
     arrangements: Arc<DashMap<String, Arrangement>>, // graph_cid → Arrangement
     commit_dag: Arc<RwLock<CommitDag>>,
@@ -82,7 +82,7 @@ pub struct DatomGraphStore {
 }
 
 impl DatomGraphStore {
-    pub fn new(journal: Arc<Journal>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
+    pub fn new(journal: Arc<LiveBus>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
         Self {
             inner: QuadStore::new(journal, block_store),
         }
@@ -186,7 +186,7 @@ impl DatomGraphStore {
 }
 
 impl QuadStore {
-    pub fn new(journal: Arc<Journal>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
+    pub fn new(journal: Arc<LiveBus>, block_store: Arc<dyn BlockStore + Send + Sync>) -> Self {
         Self {
             journal,
             block_store,
@@ -434,7 +434,7 @@ impl QuadStore {
         Delta::from_datom(datom)
     }
 
-    /// Assert without publishing to Journal — used during WAL replay on startup.
+    /// Assert without publishing to LiveBus — used during WAL replay on startup.
     ///
     /// Marks the graph's `hot_covers_all` flag as `false` because replay only
     /// loads post-checkpoint (uncommitted) quads into the arrangement; the
@@ -461,7 +461,7 @@ impl QuadStore {
         self.hot_covers_all.insert(graph_key, false);
     }
 
-    /// Insert a batch of Datoms without publishing to Journal.
+    /// Insert a batch of Datoms without publishing to LiveBus.
     ///
     /// Bulk ingest uses this to keep the persisted tx/op history exact while
     /// still allowing legacy Quad projections to be served from Arrangement.
@@ -484,7 +484,7 @@ impl QuadStore {
     }
 
     /// Insert a batch of quads — fast path for bulk ingest.
-    /// Does not publish to Journal.
+    /// Does not publish to LiveBus.
     pub async fn assert_batch_silent(&self, quads: Vec<Quad>) {
         if quads.is_empty() {
             return;
@@ -499,7 +499,7 @@ impl QuadStore {
         }
     }
 
-    /// Retract without publishing to Journal — used during WAL replay on startup.
+    /// Retract without publishing to LiveBus — used during WAL replay on startup.
     pub async fn retract_silent(&self, quad: Quad) {
         let g = quad.graph.to_multibase();
         self.arrangements
@@ -4051,7 +4051,7 @@ mod tests {
     // (the lib historically re-exported it under that alias). Keep the alias so
     // the test module compiles against the renamed `LegacyQuadObject`.
     use kotoba_query::quad::LegacyQuadObject as QuadObject;
-    use kotoba_kse::Journal;
+    use kotoba_vault::LiveBus;
     use kotoba_store::MemoryBlockStore;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4119,7 +4119,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_creates_persistent_block() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4142,7 +4142,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_persists_datom_index_roots_and_distinct_tx() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4189,7 +4189,7 @@ mod tests {
         // Commit `delta` fresh datoms onto a graph pre-seeded with `base` datoms,
         // returning the bytes read from the block store during that commit only.
         async fn measure_commit(base: u64, delta: u64) -> u64 {
-            let journal = Arc::new(Journal::new());
+            let journal = Arc::new(LiveBus::new());
             let store = Arc::new(CountingBlockStore::new());
             let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&store) as _);
             let graph = KotobaCid::from_bytes(b"delta-scale-graph");
@@ -4262,7 +4262,7 @@ mod tests {
 
     #[tokio::test]
     async fn incremental_commit_datom_roots_match_full_rebuild() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"incr-eq-graph");
@@ -4395,7 +4395,7 @@ mod tests {
 
     #[tokio::test]
     async fn datom_cold_reads_use_datom_eavt_and_tea_roots() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4432,7 +4432,7 @@ mod tests {
 
     #[tokio::test]
     async fn datom_graph_store_reads_current_without_quad_projection() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let store = DatomGraphStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4494,7 +4494,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_persists_retract_tombstones_in_tea_history() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4523,7 +4523,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_returns_full_chain_for_fresh_agent() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"graph-since");
@@ -4545,7 +4545,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_returns_only_new_commits() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"graph-partial");
@@ -4566,7 +4566,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_returns_empty_when_up_to_date() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"graph-uptodate");
@@ -4580,7 +4580,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_chain_links_prev() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4600,7 +4600,7 @@ mod tests {
     /// quads for a specific subject from the committed EAVT ProllyTree.
     #[tokio::test]
     async fn cold_fallback_returns_committed_quads_after_arrangement_clear() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4632,7 +4632,7 @@ mod tests {
 
     #[tokio::test]
     async fn gc_dead_blocks_removes_orphaned_blocks_and_keeps_live() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"gc-graph");
@@ -4677,7 +4677,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_old_commits_removes_historical_keeps_head() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"prune-graph");
@@ -4705,7 +4705,7 @@ mod tests {
 
     #[tokio::test]
     async fn arrangement_unknown_graph_returns_none() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"never-asserted");
@@ -4714,7 +4714,7 @@ mod tests {
 
     #[tokio::test]
     async fn head_commit_unknown_graph_returns_none() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"no-commits-here");
@@ -4723,7 +4723,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_dag_size_is_zero_initially() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         assert_eq!(qs.commit_dag_size().await, 0);
@@ -4731,7 +4731,7 @@ mod tests {
 
     #[tokio::test]
     async fn count_by_predicate_prefix_unknown_graph_returns_zero() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"no-graph");
@@ -4740,7 +4740,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_deltas_unknown_graph_returns_empty() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"empty-graph");
@@ -4750,7 +4750,7 @@ mod tests {
 
     #[tokio::test]
     async fn commits_since_empty_when_no_commits() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let graph = KotobaCid::from_bytes(b"empty-dag-graph");
@@ -4769,7 +4769,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_hop_cold_follows_cid_references() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4815,7 +4815,7 @@ mod tests {
 
     #[tokio::test]
     async fn multi_hop_cold_max_hops_zero_returns_only_start() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4839,7 +4839,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_by_two_predicates_cold_returns_intersection() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4889,7 +4889,7 @@ mod tests {
 
     #[tokio::test]
     async fn join_by_two_predicates_cold_empty_when_no_overlap() {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
 
@@ -4922,7 +4922,7 @@ mod tests {
         pred: &str,
         val: &str,
     ) -> (QuadStore, KotobaCid, KotobaCid) {
-        let journal = Arc::new(Journal::new());
+        let journal = Arc::new(LiveBus::new());
         let bs = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&bs) as _);
         let g = make_cid_from(graph_key);
@@ -5032,7 +5032,7 @@ mod tests {
     #[tokio::test]
     async fn batch_authed_rejected_wrong_capability() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"batch-authed-g1");
@@ -5056,7 +5056,7 @@ mod tests {
     #[tokio::test]
     async fn batch_authed_rejected_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"batch-authed-g2");
@@ -5080,7 +5080,7 @@ mod tests {
     #[tokio::test]
     async fn batch_authed_succeeds_writes_quads() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"batch-authed-g3");
@@ -5124,7 +5124,7 @@ mod tests {
         // Batch spanning two named graphs: chain scoped to graph A only →
         // quad from graph B must cause rejection.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"batch-multi-g-a");
@@ -5156,7 +5156,7 @@ mod tests {
     #[tokio::test]
     async fn datom_authed_rejected_wrong_capability() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-authed-g1");
@@ -5179,7 +5179,7 @@ mod tests {
     #[tokio::test]
     async fn datom_authed_rejected_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-authed-g2");
@@ -5203,7 +5203,7 @@ mod tests {
     #[tokio::test]
     async fn datom_graph_store_authed_write_uses_datom_scope() {
         let store = DatomGraphStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-authed-g3");
@@ -5235,7 +5235,7 @@ mod tests {
     #[tokio::test]
     async fn datom_batch_authed_rejected_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-batch-g1");
@@ -5258,7 +5258,7 @@ mod tests {
     #[tokio::test]
     async fn datom_graph_store_batch_authed_uses_datom_scope() {
         let store = DatomGraphStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"datom-batch-g2");
@@ -5290,7 +5290,7 @@ mod tests {
 
     async fn setup_sparql_qs() -> (QuadStore, KotobaCid) {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"sparql-bgp-graph");
@@ -5556,7 +5556,7 @@ mod tests {
     async fn sparql_graph_variable_multi_graph_returns_all() {
         // Two committed graphs; GRAPH ?g { ?s <role> "admin" } returns quads from both.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"multi-graph-a");
@@ -5602,7 +5602,7 @@ mod tests {
     async fn sparql_graph_variable_with_real_eddsa_cacao() {
         // Real EdDSA CACAO + GRAPH ?g { ?s <role> "admin" } spanning two graphs
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"cacao-graph-a");
@@ -5677,7 +5677,7 @@ mod tests {
     async fn sparql_distinct_cross_graph() {
         // GRAPH ?g + DISTINCT: cross-graph deduplication by (s, p, o) ignoring graph CID
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let ga = KotobaCid::from_bytes(b"dist-graph-a");
@@ -5759,7 +5759,7 @@ mod tests {
         // CACAO authorizes graph_a only; GRAPH ?g returns quads from graph_a+graph_b
         // → multi-graph-authed should filter to graph_a only
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"multi-auth-a");
@@ -5799,7 +5799,7 @@ mod tests {
     async fn sparql_multi_graph_cacao_two_graphs_authorized() {
         // CACAO with two kotoba://graph/ resources → both graphs accessible
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph_a = KotobaCid::from_bytes(b"two-auth-a");
@@ -5984,7 +5984,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_authed_allowed() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"authed-write-graph");
@@ -6003,7 +6003,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_authed_denied_wrong_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"target-graph");
@@ -6022,7 +6022,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_authed_denied_wrong_capability() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"read-only-graph");
@@ -6384,7 +6384,7 @@ mod tests {
     async fn sparql_aggregate_sum_numeric() {
         // Insert numeric score quads and verify SUM
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"agg-sum-graph");
@@ -6420,7 +6420,7 @@ mod tests {
     async fn sparql_aggregate_avg_numeric() {
         // Insert numeric score quads and verify AVG
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"agg-avg-graph");
@@ -6456,7 +6456,7 @@ mod tests {
     async fn sparql_aggregate_min_numeric() {
         // Numeric MIN: ensure cmp_values numeric comparison is used (not lexicographic)
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"agg-min-num-graph");
@@ -6495,7 +6495,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_insert_data() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"update-test-graph");
@@ -6533,7 +6533,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_insert_numeric_then_select_by_literal_matches() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"numeric-avet-graph");
@@ -6566,7 +6566,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_delete_data() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"update-delete-graph");
@@ -6617,7 +6617,7 @@ mod tests {
     #[tokio::test]
     async fn sparql_update_insert_named_graph() {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let default_graph = KotobaCid::from_bytes(b"ng-default");
@@ -6684,7 +6684,7 @@ mod tests {
         // DELETE { ?s <role> ?r } WHERE { ?s <role> ?r . FILTER(?r = "user") }
         // Uses hot-only store (no commit/reset) so retract() removes from hot arrangement.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let graph = KotobaCid::from_bytes(b"del-where-graph");
@@ -7149,7 +7149,7 @@ mod tests {
         // Node A (peer): commits quads to its own MemoryBlockStore.
         let peer_bs = Arc::new(MemoryBlockStore::new());
         let peer_qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::clone(&peer_bs) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
         let graph = make_cid_from("import-g");
@@ -7175,7 +7175,7 @@ mod tests {
 
         // Node B: no quads, no commit — only the replicated blocks.
         let qs_b = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::clone(&local_b) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
         assert!(
@@ -7207,7 +7207,7 @@ mod tests {
         // Get a real commit CID from a peer.
         let peer_bs = Arc::new(MemoryBlockStore::new());
         let peer_qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::clone(&peer_bs) as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
         let graph = make_cid_from("import-miss-g");
@@ -7223,7 +7223,7 @@ mod tests {
 
         // Node B has an empty store — commit block not present.
         let qs_b = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new())
                 as Arc<dyn kotoba_core::store::BlockStore + Send + Sync>,
         );
@@ -7509,7 +7509,7 @@ mod tests {
     async fn setup_two_graph_qs() -> (QuadStore, KotobaCid, KotobaCid) {
         // Two graphs, each with role triples; SERVICE federates from one to the other.
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g1 = KotobaCid::from_bytes(b"svc-graph-1");
@@ -7647,7 +7647,7 @@ mod tests {
     /// + each entity has a name quad.
     async fn setup_chain_qs() -> (QuadStore, KotobaCid, [KotobaCid; 4]) {
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"nhop-graph");
@@ -7912,7 +7912,7 @@ mod tests {
     #[tokio::test]
     async fn crash_recovery_without_journal_replay_via_commit_dag() {
         // ADR-2606041151 A — validates the journal-removal safety gate: with the
-        // Journal WAL OFF (KOTOBA_JOURNAL_WAL=off), committed data is fully
+        // LiveBus WAL OFF (KOTOBA_JOURNAL_WAL=off), committed data is fully
         // recoverable on restart from the CommitDag ALONE. The synchronous commit
         // seals a ProllyTree whose commit CID (= the durable IPNS head in
         // production) is enough to rebuild the queryable graph WITHOUT
@@ -7924,10 +7924,10 @@ mod tests {
         let bob = KotobaCid::from_bytes(b"nowal-bob");
 
         // --- Instance A: insert + commit, capture the commit CID (durable head).
-        // Ephemeral Journal::new() = no persisted WAL head, modelling WAL=off
+        // Ephemeral LiveBus::new() = no persisted WAL head, modelling WAL=off
         // where the per-datom WAL block-write is skipped.
         let commit_cid = {
-            let qs_a = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&block_store));
+            let qs_a = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&block_store));
             qs_a.assert(Quad {
                 graph: graph.clone(),
                 subject: alice.clone(),
@@ -7955,7 +7955,7 @@ mod tests {
         };
 
         // --- Instance B: reopen against the SAME block store, NO journal replay.
-        let qs_b = QuadStore::new(Arc::new(Journal::new()), Arc::clone(&block_store));
+        let qs_b = QuadStore::new(Arc::new(LiveBus::new()), Arc::clone(&block_store));
         assert!(
             qs_b.head_commit(&graph).await.is_none(),
             "fresh instance has no head before import"
@@ -7999,7 +7999,7 @@ mod tests {
         use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"datalog-cold-graph");
@@ -8061,7 +8061,7 @@ mod tests {
         use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"datalog-mix-graph");
@@ -8120,7 +8120,7 @@ mod tests {
         use kotoba_query::datalog::{Atom, BodyLiteral, DatalogProgram, DatalogRule, Term};
 
         let qs = QuadStore::new(
-            Arc::new(Journal::new()),
+            Arc::new(LiveBus::new()),
             Arc::new(MemoryBlockStore::new()) as Arc<dyn BlockStore + Send + Sync>,
         );
         let g = KotobaCid::from_bytes(b"datalog-mv-graph");

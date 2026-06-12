@@ -123,7 +123,7 @@ async fn signal_store_field_encryption_roundtrip() {
 #[tokio::test]
 async fn secure_vault_roundtrip_via_store_key() {
     use bytes::Bytes;
-    use kotoba_kse::SecureVault;
+    use kotoba_vault::SecureVault;
 
     let sv = SecureVault::new();
     let mut key = [0u8; 32];

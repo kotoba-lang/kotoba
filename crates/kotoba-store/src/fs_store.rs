@@ -3,7 +3,7 @@
 //! The keystone of the "kotoba is its own IPFS block store + pinner" design
 //! (ADR-2606041151 Decision A): a local-disk durable tier that writes blocks
 //! directly (no Kubo-over-HTTP round-trip), so micro-batch synchronous commit is
-//! cheap and the separate Journal WAL becomes unnecessary (the CommitDag is the
+//! cheap and the separate LiveBus WAL becomes unnecessary (the CommitDag is the
 //! WAL). Re-introduces the durability the `sled` store provided before its
 //! 2026-05-26 removal, without an embedded DB dependency — flatfs-style layout
 //! over `std::fs` only.

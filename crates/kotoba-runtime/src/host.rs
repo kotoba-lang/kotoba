@@ -57,7 +57,7 @@ pub struct HostState {
     /// so that `kqe.query` can do synchronous predicate-filter lookups.
     pub quad_snapshot: Vec<WitQuad>,
     /// kse.publish calls buffered during WASM execution.
-    /// Applied to the KSE Journal by the caller after execute() returns.
+    /// Applied to the KSE LiveBus by the caller after execute() returns.
     pub pending_publishes: Vec<(String, Vec<u8>)>,
     /// chain.append-infer calls buffered during WASM execution.
     /// Each entry: (model_cid, prompt_cid, output_cid).
@@ -480,7 +480,7 @@ fn bind_kse(linker: &mut Linker<HostState>) -> Result<()> {
          (topic, payload): (String, Vec<u8>)|
          -> Result<(Result<String, String>,)> {
             ctx.data_mut().charge_gas(20)?;
-            // Buffer the publish; the caller applies it to the KSE Journal after execute().
+            // Buffer the publish; the caller applies it to the KSE LiveBus after execute().
             let synthetic_cid = format!("pending/{}/{}", topic, ctx.data().pending_publishes.len());
             ctx.data_mut().pending_publishes.push((topic, payload));
             Ok((Ok(synthetic_cid),))

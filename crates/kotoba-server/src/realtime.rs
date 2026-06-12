@@ -5,7 +5,7 @@
 //! WebSocket (T1 transport): the client sends `kotoba_rt::ClientMsg` (CBOR
 //! binary) frames and receives `kotoba_rt::ServerMsg` frames off the room's
 //! per-room broadcast bus. This bus is PHYSICALLY ISOLATED from the global KSE
-//! Journal / firehose / gossip — per-frame traffic never federates; only the
+//! LiveBus / firehose / gossip — per-frame traffic never federates; only the
 //! periodic durable snapshot crosses into the cold lane (TODO P1 bridge).
 //!
 //! Scope notes (honest P0):
@@ -38,7 +38,7 @@ use tokio::sync::Mutex;
 
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
-use kotoba_kse::{Journal, Topic};
+use kotoba_vault::{LiveBus, Topic};
 use kotoba_rt::{protocol, ClientMsg, CounterSim, PlayerId, RoomActor, RoomConfig, SimHost, SnapshotRef};
 
 /// A room's simulation behind dynamic dispatch — `CounterSim` by default, or a
@@ -130,7 +130,7 @@ fn registry() -> &'static Registry {
 /// The cold-lane sink: where periodic durable snapshots are content-addressed,
 /// persisted, and announced. This is the ONLY path by which game state crosses
 /// from the isolated per-room hot bus into the durable + federated lane
-/// (block store + KSE Journal → firehose/gossip). Per-frame traffic never does.
+/// (block store + KSE LiveBus → firehose/gossip). Per-frame traffic never does.
 ///
 /// Injected once at server boot (`install_cold_lane`) so the WS handler stays
 /// free of `KotobaState` — keeping the route testable in isolation. When absent
@@ -138,16 +138,16 @@ fn registry() -> &'static Registry {
 /// persisted.
 struct ColdLane {
     block_store: Arc<dyn BlockStore + Send + Sync>,
-    journal: Arc<Journal>,
+    journal: Arc<LiveBus>,
 }
 
 static COLD: OnceLock<ColdLane> = OnceLock::new();
 
-/// Wire the realtime cold-lane bridge to the node's block store + Journal.
+/// Wire the realtime cold-lane bridge to the node's block store + LiveBus.
 /// Call once from `build_router`. Idempotent (later calls are ignored).
 pub fn install_cold_lane(
     block_store: Arc<dyn BlockStore + Send + Sync>,
-    journal: Arc<Journal>,
+    journal: Arc<LiveBus>,
 ) {
     let _ = COLD.set(ColdLane {
         block_store,
@@ -174,7 +174,7 @@ fn persist_block(c: &ColdLane, blob: &[u8]) -> KotobaCid {
     cid
 }
 
-/// Announce a durable snapshot on the room-scoped Journal topic — the single
+/// Announce a durable snapshot on the room-scoped LiveBus topic — the single
 /// hot→cold/federated bridge. Per-frame traffic never reaches here.
 async fn announce_to_journal(
     c: &ColdLane,
@@ -234,8 +234,8 @@ impl Registry {
                 };
 
                 // The single bridge HOT → COLD/federated: announce the durable
-                // snapshot on a room-scoped Journal topic (low rate). Per-frame
-                // input/confirms never reach the Journal.
+                // snapshot on a room-scoped LiveBus topic (low rate). Per-frame
+                // input/confirms never reach the LiveBus.
                 if let (Some(ds), Some(c)) = (snap, cold()) {
                     let cid = KotobaCid::from_bytes(&ds.blob);
                     announce_to_journal(c, &room_id, ds.tick, &cid).await;
@@ -608,14 +608,14 @@ mod tests {
     }
 
     /// Cold-lane bridge: a durable snapshot is content-addressed into the block
-    /// store (retrievable by CID) and announced on the room-scoped Journal topic
+    /// store (retrievable by CID) and announced on the room-scoped LiveBus topic
     /// — and ONLY that. Uses a local `ColdLane` so it never touches the global.
     #[tokio::test]
     async fn durable_snapshot_persists_to_block_store_and_journal() {
         use kotoba_rt::DurableSnapshot;
         let c = ColdLane {
             block_store: Arc::new(kotoba_store::MemoryBlockStore::new()),
-            journal: Arc::new(Journal::new()),
+            journal: Arc::new(LiveBus::new()),
         };
         let ds = DurableSnapshot {
             tick: Tick(60),
@@ -631,7 +631,7 @@ mod tests {
         // ...and PINNED (replay guarantee — protected from eviction).
         assert!(c.block_store.is_pinned(&cid), "snapshot must be pinned");
 
-        // Exactly one Journal entry, on the room-scoped snapshot topic, carrying
+        // Exactly one LiveBus entry, on the room-scoped snapshot topic, carrying
         // the SnapshotRef with the same CID.
         let entries = c.journal.read_since(0).await;
         assert_eq!(entries.len(), 1, "one snapshot announcement");

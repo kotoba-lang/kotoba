@@ -606,7 +606,7 @@ pub mod kotoba {
                 }
             }
         }
-        /// KSE (Kotoba Stream Engine) — Journal topic publish/subscribe interface
+        /// KSE (Kotoba Stream Engine) — LiveBus topic publish/subscribe interface
         #[allow(dead_code, async_fn_in_trait, unused_imports, clippy::all)]
         pub mod kse {
             #[used]
@@ -615,7 +615,7 @@ pub mod kotoba {
             use super::super::super::_rt;
             #[allow(unused_unsafe, clippy::all)]
             /// SEND frame (0x3): publish bytes to a KOTOBA topic
-            /// Returns CID of the JournalEntry
+            /// Returns CID of the LiveBusEntry
             pub fn publish(
                 topic: &str,
                 payload: &[u8],

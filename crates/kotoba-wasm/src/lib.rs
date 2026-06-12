@@ -609,8 +609,8 @@ impl Node {
 }
 
 /// Client-side sovereign crypto for the browser node — the same model as
-/// `kotoba-kse::SovereignCrypto`/`AgentIdentity`, but self-contained and
-/// wasm32-clean (no Journal/Vault/tokio deps). The agent holds an Ed25519
+/// `kotoba-vault::SovereignCrypto`/`AgentIdentity`, but self-contained and
+/// wasm32-clean (no LiveBus/Vault/tokio deps). The agent holds an Ed25519
 /// identity (signs commits → authorship) and a 32-byte symmetric vault key
 /// (AES-256-GCM field encryption → the persisted ProllyTree/IndexedDB blocks
 /// hold ciphertext, never plaintext). Entropy comes from `getrandom`'s `js`

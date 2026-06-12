@@ -1,12 +1,12 @@
 //! ashiba.etzhayyim.com Lean BMC — kotoba Datomic-on-IPFS pipeline (Datom projection →
-//! Journal WAL → ProllyTree indexes → Kubo cold tier → AEAD summary → IPFS self-pin) + Datalog
+//! LiveBus WAL → ProllyTree indexes → Kubo cold tier → AEAD summary → IPFS self-pin) + Datalog
 //! coverage scoring.
 //!
 //! Data source:  `60-apps/etzhayyim-project-jp-ashiba/docs/bmc/ashiba-lean-bmc-v60.toml`
 //! Rules source: `60-apps/etzhayyim-project-jp-ashiba/docs/bmc/coverage.dl`
 //!
 //! Requires a running Kubo daemon (default `http://localhost:5001`); override with
-//! `KOTOBA_IPFS_ENDPOINT`.  `KOTOBA_STORE_PATH` controls the on-disk Journal head
+//! `KOTOBA_IPFS_ENDPOINT`.  `KOTOBA_STORE_PATH` controls the on-disk LiveBus head
 //! pointer (default `/tmp/ashiba-bmc-kse`).
 
 use anyhow::Result;
@@ -18,7 +18,7 @@ use kotoba_query::{
     delta::Delta,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
-use kotoba_kse::{Journal, SecureVault, Vault};
+use kotoba_vault::{LiveBus, SecureVault, Vault};
 use kotoba_store::{
     BudgetedBlockStore, IpfsPinClient, KuboBlockStore, MemoryBlockStore, TieredBlockStore,
 };
@@ -392,10 +392,10 @@ async fn main() -> Result<()> {
     println!("BlockStore: TieredBlockStore<BudgetedMemory(64MiB), KuboIpfs>");
 
     // 2. LiveBus — in-memory ephemeral event bus (durable state = CommitDag).
-    let journal = Arc::new(Journal::new());
+    let journal = Arc::new(LiveBus::new());
     println!("LiveBus:    in-memory (durable replay via CommitDag)");
 
-    // 3. Datom projection store — wraps Journal + BlockStore; provides Arrangement + ProllyTree commit.
+    // 3. Datom projection store — wraps LiveBus + BlockStore; provides Arrangement + ProllyTree commit.
     let quad_store = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store));
 
     // 4. SecureVault — AES-256-GCM-sealed blob store over the same block_store.
@@ -411,10 +411,10 @@ async fn main() -> Result<()> {
     println!("IPFS pin:   kotoba self-pin via Kubo (extended >1GB → kotobase out-of-band)");
     println!();
 
-    // 6. Ingest all BMC facts as real Quad writes (Journal-backed).
+    // 6. Ingest all BMC facts as real Quad writes (LiveBus-backed).
     let facts = build_bmc_facts();
     println!(
-        "Ingesting {} BMC quads → kotoba QuadStore (Journal WAL → Kubo)…",
+        "Ingesting {} BMC quads → kotoba QuadStore (LiveBus WAL → Kubo)…",
         facts.len()
     );
     let t0 = std::time::Instant::now();
