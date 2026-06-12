@@ -46,11 +46,18 @@ pub enum Builtin {
     Mul,
     Div,
     Mod,
+    Inc,
+    Dec,
+    Abs,
     Eq,
+    NotEq,
     Lt,
     Gt,
     Le,
     Ge,
+    Zero,
+    Pos,
+    Neg,
     And,
     Or,
     Not,
@@ -96,6 +103,31 @@ pub enum Builtin {
     /// handle, or `0` (the nil-ish sentinel) on the `err` variant — the i64
     /// value model has no exceptions, so a failed inference reads as empty.
     LlmInfer,
+    /// `(kqe-assert! graph subject predicate object-cbor)` — host call into the
+    /// `kotoba:kais` `kqe` interface (`assert-quad: func(quad) -> result<_,
+    /// string>`). All four arguments are string handles — the WIT record's
+    /// fields each flatten to a `(ptr,len)` pair, and `object-cbor` is the
+    /// CBOR-encoded QuadObject (buildable with the CBOR encoder prelude).
+    /// Returns `1` on ok, `0` on the err variant. **This is the Datom write
+    /// surface**: each call buffers an assertion the host commits after `run`
+    /// returns (`HostState::pending_asserts`, 10 gas).
+    KqeAssert,
+    /// `(kqe-retract! graph subject predicate object-cbor)` — `retract-quad`,
+    /// the tombstone twin of [`Builtin::KqeAssert`]. Same shape; returns 1/0.
+    KqeRetract,
+    /// `(kqe-get-objects graph subject predicate)` — SPO point lookup
+    /// (`get-objects: func(string,string,string) -> list<list<u8>>`, 5 gas).
+    /// Returns a packed **list handle** `(ptr << 32) | count` over the lifted
+    /// element array (8 bytes per element: `[ptr:i32, len:i32]`). Read it with
+    /// the [`crate::KQE_PRELUDE`] accessors `kqe-count` / `kqe-obj-nth`.
+    KqeGetObjects,
+    /// `(kqe-query predicate-filter)` — snapshot query (`query: func(string) ->
+    /// result<list<quad>, string>`, 100 gas; empty filter = all quads). Returns
+    /// a packed list handle `(ptr << 32) | count` over the lifted quad array
+    /// (32 bytes per quad: 4 × `[ptr,len]` for graph/subject/predicate/
+    /// object-cbor), or `0` on err. Read with `kqe-count` /
+    /// `kqe-quad-{graph,subject,predicate,object}`.
+    KqeQuery,
 }
 
 impl Builtin {
@@ -106,6 +138,10 @@ impl Builtin {
         match self {
             Builtin::HasCapability => Some(HostImport::HasCapability),
             Builtin::LlmInfer => Some(HostImport::LlmInfer),
+            Builtin::KqeAssert => Some(HostImport::KqeAssertQuad),
+            Builtin::KqeRetract => Some(HostImport::KqeRetractQuad),
+            Builtin::KqeGetObjects => Some(HostImport::KqeGetObjects),
+            Builtin::KqeQuery => Some(HostImport::KqeQuery),
             _ => None,
         }
     }
@@ -123,6 +159,21 @@ pub enum HostImport {
     /// result<list<u8>, string>`. Indirect result: lowers with a trailing
     /// return-area pointer the guest allocates.
     LlmInfer,
+    /// `kotoba:kais/kqe@0.1.0` → `assert-quad: func(quad) -> result<_,
+    /// string>`. The `quad` record flattens to 8 i32 params (4 × `(ptr,len)`);
+    /// the result is indirect (12-byte return area: `[tag:u8 @0, err-ptr @4,
+    /// err-len @8]`).
+    KqeAssertQuad,
+    /// `kotoba:kais/kqe@0.1.0` → `retract-quad` — same core shape as
+    /// [`HostImport::KqeAssertQuad`].
+    KqeRetractQuad,
+    /// `kotoba:kais/kqe@0.1.0` → `get-objects: func(string,string,string) ->
+    /// list<list<u8>>`. Indirect result (8-byte return area: `[ptr @0, len @4]`).
+    KqeGetObjects,
+    /// `kotoba:kais/kqe@0.1.0` → `query: func(string) -> result<list<quad>,
+    /// string>`. Indirect result (12-byte return area, same variant layout as
+    /// `llm.infer`).
+    KqeQuery,
 }
 
 impl HostImport {
@@ -132,23 +183,35 @@ impl HostImport {
         match self {
             HostImport::HasCapability => ("kotoba:kais/auth@0.1.0", "has-capability"),
             HostImport::LlmInfer => ("kotoba:kais/llm@0.1.0", "infer"),
+            HostImport::KqeAssertQuad => ("kotoba:kais/kqe@0.1.0", "assert-quad"),
+            HostImport::KqeRetractQuad => ("kotoba:kais/kqe@0.1.0", "retract-quad"),
+            HostImport::KqeGetObjects => ("kotoba:kais/kqe@0.1.0", "get-objects"),
+            HostImport::KqeQuery => ("kotoba:kais/kqe@0.1.0", "query"),
         }
     }
 }
 
 impl Builtin {
     fn from_name(s: &str) -> Option<Builtin> {
+        let s = s.strip_prefix("clojure.core/").unwrap_or(s);
         Some(match s {
             "+" => Builtin::Add,
             "-" => Builtin::Sub,
             "*" => Builtin::Mul,
-            "/" => Builtin::Div,
+            "/" | "quot" => Builtin::Div,
             "mod" | "rem" => Builtin::Mod,
+            "inc" => Builtin::Inc,
+            "dec" => Builtin::Dec,
+            "abs" => Builtin::Abs,
             "=" => Builtin::Eq,
+            "!=" | "not=" => Builtin::NotEq,
             "<" => Builtin::Lt,
             ">" => Builtin::Gt,
             "<=" => Builtin::Le,
             ">=" => Builtin::Ge,
+            "zero?" => Builtin::Zero,
+            "pos?" => Builtin::Pos,
+            "neg?" => Builtin::Neg,
             "and" => Builtin::And,
             "or" => Builtin::Or,
             "not" => Builtin::Not,
@@ -165,6 +228,10 @@ impl Builtin {
             "store32!" => Builtin::Store32,
             "has-capability?" => Builtin::HasCapability,
             "llm-infer" => Builtin::LlmInfer,
+            "kqe-assert!" => Builtin::KqeAssert,
+            "kqe-retract!" => Builtin::KqeRetract,
+            "kqe-get-objects" => Builtin::KqeGetObjects,
+            "kqe-query" => Builtin::KqeQuery,
             _ => return None,
         })
     }
@@ -259,7 +326,9 @@ fn list_head_symbol(items: &[EdnValue]) -> Result<&Symbol, CljError> {
 fn lower_def(items: &[EdnValue]) -> Result<Def, CljError> {
     // (def name value)
     if items.len() != 3 {
-        return Err(CljError::Lower("def takes exactly: (def name value)".into()));
+        return Err(CljError::Lower(
+            "def takes exactly: (def name value)".into(),
+        ));
     }
     let name = sym_name(&items[1], "def name")?;
     let value = lower_expr(&items[2])?;
@@ -308,7 +377,13 @@ fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
 fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
     let head = list_head_symbol(items)?;
     let args = &items[1..];
-    match head.name.as_str() {
+    let special = head
+        .namespace
+        .as_deref()
+        .filter(|ns| *ns == "clojure.core")
+        .map(|_| head.name.as_str())
+        .unwrap_or(head.name.as_str());
+    match special {
         "if" => lower_if(args),
         "when" => lower_when(args),
         "let" => lower_let(args),
@@ -367,7 +442,11 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
     // (let [b v b v …] body…)
     let binding_vec = match args.first() {
         Some(EdnValue::Vector(v)) => v,
-        _ => return Err(CljError::Lower("let requires a binding vector: (let [b v …] …)".into())),
+        _ => {
+            return Err(CljError::Lower(
+                "let requires a binding vector: (let [b v …] …)".into(),
+            ))
+        }
     };
     if binding_vec.len() % 2 != 0 {
         return Err(CljError::Lower(
@@ -384,7 +463,9 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
     if body.is_empty() {
-        return Err(CljError::Lower("let requires at least one body expression".into()));
+        return Err(CljError::Lower(
+            "let requires at least one body expression".into(),
+        ));
     }
     Ok(Expr::Let { bindings, body })
 }
@@ -430,7 +511,11 @@ fn is_else_test(v: &EdnValue) -> bool {
 fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
     let binding_vec = match args.first() {
         Some(EdnValue::Vector(v)) => v,
-        _ => return Err(CljError::Lower("loop requires a binding vector: (loop [b v …] …)".into())),
+        _ => {
+            return Err(CljError::Lower(
+                "loop requires a binding vector: (loop [b v …] …)".into(),
+            ))
+        }
     };
     if binding_vec.len() % 2 != 0 {
         return Err(CljError::Lower(
@@ -447,7 +532,9 @@ fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
     if body.is_empty() {
-        return Err(CljError::Lower("loop requires at least one body expression".into()));
+        return Err(CljError::Lower(
+            "loop requires at least one body expression".into(),
+        ));
     }
     Ok(Expr::Loop { bindings, body })
 }
@@ -476,7 +563,11 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     // (defgraph name :k v :k v …)
     let name = match items.get(1) {
         Some(EdnValue::Symbol(s)) => s.to_qualified(),
-        _ => return Err(CljError::Lower("defgraph requires a name: (defgraph name …)".into())),
+        _ => {
+            return Err(CljError::Lower(
+                "defgraph requires a name: (defgraph name …)".into(),
+            ))
+        }
     };
     let kwargs = &items[2..];
     if kwargs.len() % 2 != 0 {
@@ -492,14 +583,22 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     while let (Some(k), Some(v)) = (it.next(), it.next()) {
         let key = match k {
             EdnValue::Keyword(kw) => kw.name().to_string(),
-            other => return Err(CljError::Lower(format!("defgraph option key must be a keyword, found {other:?}"))),
+            other => {
+                return Err(CljError::Lower(format!(
+                    "defgraph option key must be a keyword, found {other:?}"
+                )))
+            }
         };
         match key.as_str() {
             "entry" => entry = Some(kw_name(v, "defgraph :entry")?),
             "nodes" => nodes = Some(as_map(v, "defgraph :nodes")?),
             "edges" => edges = Some(as_map(v, "defgraph :edges")?),
             "state" => state_decl = Some(as_map(v, "defgraph :state")?),
-            other => return Err(CljError::Lower(format!("unknown defgraph option `:{other}`"))),
+            other => {
+                return Err(CljError::Lower(format!(
+                    "unknown defgraph option `:{other}`"
+                )))
+            }
         }
     }
     let nodes = nodes.ok_or_else(|| CljError::Lower("defgraph requires :nodes".into()))?;
@@ -515,7 +614,11 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         let kw = kw_name(k, "defgraph node key")?;
         let func = match v {
             EdnValue::Symbol(s) => s.to_qualified(),
-            other => return Err(CljError::Lower(format!("defgraph node `{kw}` must map to a fn symbol, found {other:?}"))),
+            other => {
+                return Err(CljError::Lower(format!(
+                    "defgraph node `{kw}` must map to a fn symbol, found {other:?}"
+                )))
+            }
         };
         id_of.insert(kw.clone(), node_order.len() as i64);
         node_order.push((kw, func));
@@ -686,7 +789,9 @@ fn parse_one_defn(src: &str) -> Result<Function, CljError> {
     let forms = kotoba_edn::parse_all(src).map_err(|e| CljError::Read(e.to_string()))?;
     match forms.first() {
         Some(EdnValue::List(items)) => lower_defn(items),
-        _ => Err(CljError::Lower("generated merge fn did not parse as a defn".into())),
+        _ => Err(CljError::Lower(
+            "generated merge fn did not parse as a defn".into(),
+        )),
     }
 }
 
@@ -709,7 +814,11 @@ fn lower_if_edge(
     }
     let pred = match &parts[1] {
         EdnValue::Symbol(s) => s.to_qualified(),
-        other => return Err(CljError::Lower(format!("if-edge predicate must be a fn symbol, found {other:?}"))),
+        other => {
+            return Err(CljError::Lower(format!(
+                "if-edge predicate must be a fn symbol, found {other:?}"
+            )))
+        }
     };
     let then_id = resolve_id(&kw_name(&parts[2], "if-edge :then")?)?;
     let else_id = resolve_id(&kw_name(&parts[3], "if-edge :else")?)?;
@@ -727,7 +836,9 @@ fn lower_if_edge(
 fn kw_name(v: &EdnValue, ctx: &str) -> Result<String, CljError> {
     match v {
         EdnValue::Keyword(k) => Ok(k.name().to_string()),
-        other => Err(CljError::Lower(format!("{ctx} must be a keyword, found {other:?}"))),
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a keyword, found {other:?}"
+        ))),
     }
 }
 
@@ -737,20 +848,33 @@ fn as_map<'a>(
 ) -> Result<&'a std::collections::BTreeMap<EdnValue, EdnValue>, CljError> {
     match v {
         EdnValue::Map(m) => Ok(m),
-        other => Err(CljError::Lower(format!("{ctx} must be a map `{{…}}`, found {other:?}"))),
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a map `{{…}}`, found {other:?}"
+        ))),
     }
 }
 
 fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
     let ok = match op {
-        Builtin::Not | Builtin::StrLen => n == 1,
+        Builtin::Not
+        | Builtin::Inc
+        | Builtin::Dec
+        | Builtin::Abs
+        | Builtin::Zero
+        | Builtin::Pos
+        | Builtin::Neg
+        | Builtin::StrLen => n == 1,
         Builtin::BytesAlloc | Builtin::BytesLen | Builtin::BytesFinish => n == 1,
         Builtin::Alloc | Builtin::Load64 | Builtin::Load32 => n == 1,
         Builtin::Store64 | Builtin::Store32 | Builtin::HasCapability | Builtin::LlmInfer => n == 2,
         Builtin::Sub => n >= 1, // unary negate or n-ary subtract
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,
         Builtin::Div | Builtin::Mod | Builtin::ByteAt | Builtin::ByteAppend => n == 2,
-        Builtin::Eq | Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n == 2,
+        Builtin::Eq | Builtin::NotEq => n >= 1,
+        Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n >= 1,
+        Builtin::KqeAssert | Builtin::KqeRetract => n == 4,
+        Builtin::KqeGetObjects => n == 3,
+        Builtin::KqeQuery => n == 1,
     };
     if ok {
         Ok(())
@@ -764,6 +888,8 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
 fn sym_name(v: &EdnValue, ctx: &str) -> Result<String, CljError> {
     match v {
         EdnValue::Symbol(s) => Ok(s.to_qualified()),
-        other => Err(CljError::Lower(format!("{ctx} must be a symbol, found {other:?}"))),
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a symbol, found {other:?}"
+        ))),
     }
 }

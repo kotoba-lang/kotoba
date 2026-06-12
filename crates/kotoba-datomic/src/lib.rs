@@ -116,8 +116,8 @@ impl Datom {
         (&self.e, &self.a, &self.v, &self.t, self.added)
     }
 
-    pub fn to_kqe(&self) -> Result<kotoba_kqe::Datom> {
-        Ok(kotoba_kqe::Datom {
+    pub fn to_kqe(&self) -> Result<kotoba_query::Datom> {
+        Ok(kotoba_query::Datom {
             e: self.e.clone(),
             a: self.a.clone(),
             v: edn_to_kqe_value(&self.v)?,
@@ -126,7 +126,7 @@ impl Datom {
         })
     }
 
-    pub fn from_kqe(datom: kotoba_kqe::Datom) -> Self {
+    pub fn from_kqe(datom: kotoba_query::Datom) -> Self {
         Self {
             e: datom.e,
             a: datom.a,
@@ -6216,14 +6216,14 @@ fn kw_value(name: &str) -> EdnValue {
     kw(name.trim_start_matches(':'))
 }
 
-fn edn_to_kqe_value(value: &EdnValue) -> Result<kotoba_kqe::Value> {
+fn edn_to_kqe_value(value: &EdnValue) -> Result<kotoba_query::Value> {
     match value {
-        EdnValue::Nil => Ok(kotoba_kqe::Value::Text("nil".into())),
-        EdnValue::Bool(b) => Ok(kotoba_kqe::Value::Bool(*b)),
-        EdnValue::Integer(i) => Ok(kotoba_kqe::Value::Integer(*i)),
-        EdnValue::Float(f) => Ok(kotoba_kqe::Value::Float(f.0)),
-        EdnValue::String(s) => Ok(kotoba_kqe::Value::Text(s.clone())),
-        EdnValue::Keyword(k) => Ok(kotoba_kqe::Value::Text(keyword_to_attr(k))),
+        EdnValue::Nil => Ok(kotoba_query::Value::Text("nil".into())),
+        EdnValue::Bool(b) => Ok(kotoba_query::Value::Bool(*b)),
+        EdnValue::Integer(i) => Ok(kotoba_query::Value::Integer(*i)),
+        EdnValue::Float(f) => Ok(kotoba_query::Value::Float(f.0)),
+        EdnValue::String(s) => Ok(kotoba_query::Value::Text(s.clone())),
+        EdnValue::Keyword(k) => Ok(kotoba_query::Value::Text(keyword_to_attr(k))),
         EdnValue::Vector(values)
             if values
                 .iter()
@@ -6237,7 +6237,7 @@ fn edn_to_kqe_value(value: &EdnValue) -> Result<kotoba_kqe::Value> {
                     _ => unreachable!("guarded by all() above"),
                 }
             }
-            Ok(kotoba_kqe::Value::VectorF32(vector))
+            Ok(kotoba_query::Value::VectorF32(vector))
         }
         EdnValue::Tagged { tag, value } if tag.to_qualified() == "cid" => {
             let Some(cid) = value
@@ -6246,10 +6246,10 @@ fn edn_to_kqe_value(value: &EdnValue) -> Result<kotoba_kqe::Value> {
             else {
                 return Err(DatomicError::UnsupportedValue(edn_to_string(value)));
             };
-            Ok(kotoba_kqe::Value::Cid(cid))
+            Ok(kotoba_query::Value::Cid(cid))
         }
         EdnValue::Tagged { tag, .. } if matches!(tag.to_qualified().as_str(), "inst" | "uuid") => {
-            Ok(kotoba_kqe::Value::Text(edn_to_string(value)))
+            Ok(kotoba_query::Value::Text(edn_to_string(value)))
         }
         EdnValue::Tagged { tag, value } if tag.to_qualified() == "bytes" => {
             let Some(hex_value) = value.as_string() else {
@@ -6257,30 +6257,30 @@ fn edn_to_kqe_value(value: &EdnValue) -> Result<kotoba_kqe::Value> {
             };
             let bytes = hex::decode(hex_value)
                 .map_err(|_| DatomicError::UnsupportedValue(edn_to_string(value)))?;
-            Ok(kotoba_kqe::Value::Bytes(bytes))
+            Ok(kotoba_query::Value::Bytes(bytes))
         }
         other => Err(DatomicError::UnsupportedValue(edn_to_string(other))),
     }
 }
 
-fn kqe_value_to_edn(value: kotoba_kqe::Value) -> EdnValue {
+fn kqe_value_to_edn(value: kotoba_query::Value) -> EdnValue {
     match value {
-        kotoba_kqe::Value::Cid(cid) => EdnValue::Tagged {
+        kotoba_query::Value::Cid(cid) => EdnValue::Tagged {
             tag: Symbol::bare("cid"),
             value: Box::new(EdnValue::String(cid.to_multibase())),
         },
-        kotoba_kqe::Value::Integer(i) => EdnValue::Integer(i),
-        kotoba_kqe::Value::Float(f) => EdnValue::float(f),
-        kotoba_kqe::Value::Text(s) => EdnValue::String(s),
-        kotoba_kqe::Value::Bool(b) => EdnValue::Bool(b),
-        kotoba_kqe::Value::Bytes(bytes) => EdnValue::Tagged {
+        kotoba_query::Value::Integer(i) => EdnValue::Integer(i),
+        kotoba_query::Value::Float(f) => EdnValue::float(f),
+        kotoba_query::Value::Text(s) => EdnValue::String(s),
+        kotoba_query::Value::Bool(b) => EdnValue::Bool(b),
+        kotoba_query::Value::Bytes(bytes) => EdnValue::Tagged {
             tag: Symbol::bare("bytes"),
             value: Box::new(EdnValue::String(hex::encode(bytes))),
         },
-        kotoba_kqe::Value::VectorF32(v) => {
+        kotoba_query::Value::VectorF32(v) => {
             EdnValue::Vector(v.into_iter().map(|f| EdnValue::float(f as f64)).collect())
         }
-        kotoba_kqe::Value::TensorCid { cid, shape, dtype } => EdnValue::Map(BTreeMap::from([
+        kotoba_query::Value::TensorCid { cid, shape, dtype } => EdnValue::Map(BTreeMap::from([
             (
                 kw_value(":tensor/cid"),
                 EdnValue::Tagged {
@@ -6302,7 +6302,7 @@ fn kqe_value_to_edn(value: kotoba_kqe::Value) -> EdnValue {
                 EdnValue::String(format!("{dtype:?}")),
             ),
         ])),
-        kotoba_kqe::Value::Encrypted { ct_cid, policy_cid } => EdnValue::Map(BTreeMap::from([
+        kotoba_query::Value::Encrypted { ct_cid, policy_cid } => EdnValue::Map(BTreeMap::from([
             (
                 kw_value(":encrypted/ct-cid"),
                 EdnValue::Tagged {
@@ -6346,7 +6346,7 @@ mod tests {
         let value = parse("[1 2.5 -3]").unwrap();
         assert_eq!(
             edn_to_kqe_value(&value).unwrap(),
-            kotoba_kqe::Value::VectorF32(vec![1.0, 2.5, -3.0])
+            kotoba_query::Value::VectorF32(vec![1.0, 2.5, -3.0])
         );
     }
 
@@ -9063,6 +9063,48 @@ mod tests {
                 EdnValue::Integer(43),
                 EdnValue::Integer(41),
                 EdnValue::Integer(43),
+            ]]
+        );
+    }
+
+    #[tokio::test]
+    async fn q_accepts_clojure_core_qualified_collection_functions() {
+        let conn = Connection::new();
+        let query = parse(
+            r#"{:find [?n ?first ?last ?nth ?conj ?assoc ?dissoc]
+                :where [[(clojure.core/vector 1 2 3) ?v]
+                        [(clojure.core/count ?v) ?n]
+                        [(clojure.core/first ?v) ?first]
+                        [(clojure.core/last ?v) ?last]
+                        [(clojure.core/nth ?v 1) ?nth]
+                        [(clojure.core/conj ?v 4) ?conj]
+                        [(clojure.core/hash-map :a 1 :b 2) ?m]
+                        [(clojure.core/assoc ?m :c 3) ?assoc]
+                        [(clojure.core/dissoc ?assoc :b) ?dissoc]]}"#,
+        )
+        .unwrap();
+        let rows = q(query, &conn.db(), &[]).unwrap();
+        let mut assoc = BTreeMap::new();
+        assoc.insert(EdnValue::Keyword(Keyword::parse("a")), EdnValue::Integer(1));
+        assoc.insert(EdnValue::Keyword(Keyword::parse("b")), EdnValue::Integer(2));
+        assoc.insert(EdnValue::Keyword(Keyword::parse("c")), EdnValue::Integer(3));
+        let mut dissoc = assoc.clone();
+        dissoc.remove(&EdnValue::Keyword(Keyword::parse("b")));
+        assert_eq!(
+            rows,
+            vec![vec![
+                EdnValue::Integer(3),
+                EdnValue::Integer(1),
+                EdnValue::Integer(3),
+                EdnValue::Integer(2),
+                EdnValue::Vector(vec![
+                    EdnValue::Integer(1),
+                    EdnValue::Integer(2),
+                    EdnValue::Integer(3),
+                    EdnValue::Integer(4),
+                ]),
+                EdnValue::Map(assoc),
+                EdnValue::Map(dissoc),
             ]]
         );
     }

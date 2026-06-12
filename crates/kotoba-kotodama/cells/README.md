@@ -50,6 +50,18 @@ Per [ADR-2605242330](../../../90-docs/adr/2605242330-gov-procedure-pregel-mcp-co
 - Charter Rider §2(a)-(h) prohibitions apply to L5 substrate (commercial activity ban is universal).
 - The 4-th state function (出生 / 死亡 / 戸籍) is NOT on the L5 roadmap — those need a separate ADR resolving "non-consenting minor adherent" and "SBT revocation on death" semantics first.
 
+## seigyo control-layer cells (2026-06-11 wave, scaffold-only)
+
+Per [ADR-2606111000](../../../90-docs/adr/2606111000-seigyo-industrial-control-layer-tier-b-actor-r0.md), five cells promote the industrial control layer (ISA-95 L0–L2: OpenPLC / open-source SCADA / OPC UA) to a first-class substrate under the existing L3 manufacturing cells (igata_* / silicon_* / pharma_* / moto_* / suki_* / pillow_* / tsutae_* / power_denki_* / water_*). All five ship as **Council-attestation-gated scaffolds** (`cell.py` raises `RuntimeError` at import). Safety invariant: interlocks are hardwired L1S — no cell, LLM, or Murakumo inference is ever in the safety path; cells attest and supervise only.
+
+| Cell | Role | ISA-95 seam | Murakumo node (proposed) | §2(a)(c) risk |
+|---|---|---|---|---|
+| [`seigyo_plc_program_lifecycle/`](seigyo_plc_program_lifecycle/) | IEC 61131-3 program lifecycle (validate → simulate → attest → deploy → runtime-hash watch) | L4 → L1 | judah | HIGH |
+| [`seigyo_interlock_attestation/`](seigyo_interlock_attestation/) | Hardwired-interlock verification records (commissioning + annual) | L4 → L1S (attest only) | benjamin | HIGH |
+| [`seigyo_scada_gateway/`](seigyo_scada_gateway/) | SCADA project CID-attestation (FUXA / Rapid SCADA) + alarm ingestion | L2 ↔ L3 | judah | MEDIUM |
+| [`seigyo_opcua_bridge/`](seigyo_opcua_bridge/) | OPC UA address space ↔ kotoba graph; envelope-prechecked recipe dispatch | L2.5 ↔ L3 | judah | MEDIUM |
+| [`seigyo_historian_aggregate/`](seigyo_historian_aggregate/) | Site historian → N7 aggregate-only northbound telemetry | L2 → L3 | simeon | LOW |
+
 ## Per-cell structure
 
 Each cell directory contains:

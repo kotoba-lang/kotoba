@@ -21,7 +21,7 @@ Companion to `SOCIAL-SECURITY-PIPELINE.md` (orchestration). Master: ADR-26053023
 
 - **Cells**: `socialsecurity_outreach` (0/5), `socialsecurity_publish` (4)
 - **Substrate**: feed-post membrane + feed-discover projection (ADR-2605231902), `50-infra/mst-projector/projection/`.
-- **Wire (R1)**: cells write `app.bsky.feed.post` (invitation / transparency-metric / declaration) and the PII-free member record + aggregate `socialsecurity.metricReport` to the PDS/MST; feed-discover projects to the read path (kotoba-kqe at Phase 2.5).
+- **Wire (R1)**: cells write `app.bsky.feed.post` (invitation / transparency-metric / declaration) and the PII-free member record + aggregate `socialsecurity.metricReport` to the PDS/MST; feed-discover projects to the read path (kotoba-query at Phase 2.5).
 - **Inert at R0**: `FEED_POST_MEMBRANE_PROJECTION_DID = None` (+ `CHARTER_RIDER_SCANNER_DID = None` for outreach) → cells raise at import; `outreachPost.published` / `metricReport` publish default false.
 - **Gate binding**: G7 (outreach `adFreeAttest`/`noTrackerAttest`/`noMicrotargetAttest` const true), G1 (Charter Rider §2 scan before publish), G12 (publish aggregate-only — `metricReport.aggregateOnly` const true), G6 (member record PII-free), G13 (Transparent audit datom per publish).
 - **Membrane note**: the feed-post membrane (ADR-2605231902) is preserved unchanged; this pipeline is a new producer into it, not a modification.

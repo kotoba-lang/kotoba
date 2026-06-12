@@ -16,6 +16,28 @@ n= 5  fact=120         fib=5
 n=10  fact=3628800     fib=55
 ```
 
+## `.kotoba` files
+
+`kotoba-clj` also installs a runner for Clojure-subset source files with the
+`.kotoba` extension:
+
+```clojure
+#!/usr/bin/env kotoba-clj
+(defn main [x]
+  (clojure.core/inc x))
+```
+
+```
+$ kotoba-clj app.kotoba 41
+42
+$ kotoba-clj --func fact math.kotoba 5
+120
+```
+
+By default the file runner prepends the kotoba-clj prelude, so common
+container helpers such as `count`, `nth`, `get`, and `assoc!` are available.
+Use `--no-prelude` for a bare compiler surface.
+
 ## Pipeline
 
 ```
@@ -41,13 +63,23 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
 
 - top-level: `(def name <const>)`, `(defn name [params…] body…)`, `(ns …)` (ignored)
 - control: `if`, `when`, `cond`, `let` (sequential), `do`, `loop`/`recur` (bounded)
-- arithmetic: `+ - * / mod` · comparison: `= < > <= >=` · logic: `and or not`
+- arithmetic: `+ - * / quot mod rem inc dec abs` · comparison:
+  `= not= < > <= >=` (n-ary where Clojure is n-ary) · predicates:
+  `zero? pos? neg?` · logic: `and or not`
 - strings: `"…"` literals, `(str-len s)`, `(byte-at s i)`
 - byte builder: `(bytes-alloc cap)`, `(byte-append! buf b)`, `(bytes-len buf)`,
   `(bytes-finish buf)` — mutable buffer in linear memory; `bytes-finish` → string handle
 - raw memory: `(alloc n)`, `(load64 a)`, `(store64! a v)`, `(load32 a)`, `(store32! a v)`
+- prelude aliases for common Clojure-style container calls: `count`, `empty?`,
+  `nth`, `first`, `last`, `conj!`, `get`, `assoc!`, `contains-key?`
+- `clojure.core/`-qualified builtin calls are accepted for the supported core
+  numeric/comparison/logical operations.
 - host calls: `(has-capability? resource ability)` → `auth.has-capability`;
-  `(llm-infer model prompt)` → `llm.infer` (ok → output handle, err → `0`)
+  `(llm-infer model prompt)` → `llm.infer` (ok → output handle, err → `0`);
+  `(kqe-assert! g s p obj-cbor)` / `(kqe-retract! …)` → `kqe.assert-quad` /
+  `retract-quad` (**Datom write surface**, 1/0); `(kqe-get-objects g s p)` /
+  `(kqe-query filter)` → packed list handles, read via `KQE_PRELUDE`
+  (`kqe-count`, `kqe-obj-nth`, `kqe-quad-{graph,subject,predicate,object}`)
 - in-guest CBOR decode (`CBOR_PRELUDE`): `cbor-reader`, `cbor-uint`, `cbor-text`,
   `cbor-map-seek`, `cbor-skip` — decode a `run(ctx-cbor)` payload in the language
 - in-guest CBOR encode (`CBOR_ENC_PRELUDE`): `cbor-enc-uint!`, `cbor-enc-text!`,
@@ -69,8 +101,12 @@ export, which needs memory + an allocator + byte/string values first:
 1. ✅ linear memory + `cabi_realloc`
 2. ✅ Str/Bytes values (`str-len`, `byte-at`)
 3. ✅ `list<u8>` in/out Component export via `wit-component`
-4. ⬜ CBOR-decode `InvokeContext` in-guest — *blocked on language growth (loops + byte-building)*
+4. ✅ CBOR decode/encode in-guest (`CBOR_PRELUDE` / `CBOR_ENC_PRELUDE`)
 5. ✅ emit `kotoba-node` `run` — **runs on kotoba-runtime**: `compile_kais_component_str` + the runtime's `WasmExecutor` invokes `run(ctx)` end-to-end (`tests/kais_invoke.rs`)
+6. ✅ kqe host builtins — Datom read/write from the guest (`tests/kqe.rs`,
+   incl. the Datomic loop: agent asserts → `kotoba_datomic::Db` reads)
+7. ✅ Pregel/BSP — the compiled agent runs on `kotoba-vm::WasmPregelRunner`
+   across multiple supersteps, asserting Datoms each superstep (`tests/pregel.rs`)
 
 A `(defn run [input] …)` program compiles to a real Component today:
 

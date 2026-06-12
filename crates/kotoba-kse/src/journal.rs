@@ -1,3 +1,16 @@
+//! KSE Journal — topic pub/sub event stream (Merkle WAL).
+//!
+//! ## ⚠ DEPRECATED as a canonical chain (2026-06-11, etzhayyim/kotoba#115)
+//!
+//! Accountability / signed chains live on the **CommitDag**
+//! (`kotoba-datomic` `DistributedDatomCommit`), not here. Do not build new
+//! features on the Journal. Sanctioned remaining use: the **ephemeral
+//! live-tail** ([`Journal::publish_ephemeral`] — broadcast + ring buffer, no
+//! block persist) feeding the firehose SSE tap; durable history replays from
+//! the CommitDag (`sync.eventsFromCommits`). The block-persisting
+//! [`Journal::publish`] path and `read_since` cold-fallback remain only for
+//! legacy replay of pre-deprecation data.
+
 use crate::topic::Topic;
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;

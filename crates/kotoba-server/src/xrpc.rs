@@ -1075,7 +1075,7 @@ pub async fn quad_create(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
     // ── CACAO verification (required) ────────────────────────────────────
     let b64 = req.cacao_b64.as_deref().ok_or_else(|| {
@@ -1453,36 +1453,49 @@ async fn require_datomic_read_any_operation(
     use crate::graph_auth::{check_read_access, AccessDenied};
 
     let graph_scope = graph.to_multibase();
-    if cacao_b64.is_some() {
-        if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
-            state,
-            &graph_scope,
-            cacao_b64,
-            operations,
-        ) {
-            enforce_datomic_temporal_tx_scope(&payload, as_of, since)?;
-            return Ok(());
-        }
-    }
-    if let Some(presentation) = presentation {
-        verify_vc_presentation_capability_any_operation(
-            state,
-            &graph_scope,
-            presentation,
-            operations,
-        )?;
-        return Ok(());
-    }
-
     let visibility = state.graph_visibility(graph).await;
-    check_read_access(
-        &visibility,
+    // Authorize via one of: CACAO operation grant, VC presentation, or the
+    // graph-visibility fallback gate.
+    'authorized: {
+        if cacao_b64.is_some() {
+            if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
+                state,
+                &graph_scope,
+                cacao_b64,
+                operations,
+            ) {
+                enforce_datomic_temporal_tx_scope(&payload, as_of, since)?;
+                break 'authorized;
+            }
+        }
+        if let Some(presentation) = presentation {
+            verify_vc_presentation_capability_any_operation(
+                state,
+                &graph_scope,
+                presentation,
+                operations,
+            )?;
+            break 'authorized;
+        }
+        check_read_access(
+            &visibility,
+            headers,
+            cacao_b64,
+            Some(state.operator_did.as_str()),
+            None,
+        )
+        .map_err(AccessDenied::into_response)?;
+    }
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt for every
+    // authorized non-public datomic read, regardless of which gate passed.
+    crate::access_receipt::enforce_and_record(
+        state,
         headers,
         cacao_b64,
-        Some(state.operator_did.as_str()),
-        None,
+        graph,
+        &visibility,
+        operations.first().copied().unwrap_or("datom:read"),
     )
-    .map_err(AccessDenied::into_response)
 }
 
 async fn require_datomic_read_tx_range(
@@ -1498,46 +1511,57 @@ async fn require_datomic_read_tx_range(
     use crate::graph_auth::{check_read_access, AccessDenied};
 
     let graph_scope = graph.to_multibase();
-    if cacao_b64.is_some() {
-        if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
-            state,
-            &graph_scope,
-            cacao_b64,
-            operations,
-        ) {
-            enforce_datomic_range_tx_scope(&payload, start, end)?;
-            return Ok(());
+    let visibility = state.graph_visibility(graph).await;
+    'authorized: {
+        if cacao_b64.is_some() {
+            if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
+                state,
+                &graph_scope,
+                cacao_b64,
+                operations,
+            ) {
+                enforce_datomic_range_tx_scope(&payload, start, end)?;
+                break 'authorized;
+            }
         }
-    }
-    if let Some(presentation) = presentation {
-        verify_vc_presentation_capability_any_operation(
-            state,
-            &graph_scope,
-            presentation,
-            operations,
-        )?;
-        if vc_presentation_declares_tx_scope(presentation) {
-            enforce_vc_presentation_range_tx_scope(
+        if let Some(presentation) = presentation {
+            verify_vc_presentation_capability_any_operation(
                 state,
                 &graph_scope,
                 presentation,
                 operations,
-                start,
-                end,
             )?;
+            if vc_presentation_declares_tx_scope(presentation) {
+                enforce_vc_presentation_range_tx_scope(
+                    state,
+                    &graph_scope,
+                    presentation,
+                    operations,
+                    start,
+                    end,
+                )?;
+            }
+            break 'authorized;
         }
-        return Ok(());
+        check_read_access(
+            &visibility,
+            headers,
+            cacao_b64,
+            Some(state.operator_did.as_str()),
+            None,
+        )
+        .map_err(AccessDenied::into_response)?;
     }
-
-    let visibility = state.graph_visibility(graph).await;
-    check_read_access(
-        &visibility,
+    // ADR-sealed-cold-tier R1: purpose policy + access receipt (see
+    // require_datomic_read_any_operation).
+    crate::access_receipt::enforce_and_record(
+        state,
         headers,
         cacao_b64,
-        Some(state.operator_did.as_str()),
-        None,
+        graph,
+        &visibility,
+        operations.first().copied().unwrap_or("datom:read"),
     )
-    .map_err(AccessDenied::into_response)
 }
 
 fn enforce_datomic_temporal_tx_scope(
@@ -2226,17 +2250,12 @@ pub(crate) fn authorize_protocol_datom_write(
     })
 }
 
-fn db_from_kqe_datoms(datoms: Vec<kotoba_kqe::Datom>) -> kotoba_datomic::Db {
+fn db_from_kqe_datoms(datoms: Vec<kotoba_query::Datom>) -> kotoba_datomic::Db {
     let basis_t = datoms.last().map(|d| d.tx.clone());
     let datoms = datoms
         .into_iter()
         .map(kotoba_datomic::Datom::from_kqe)
         .collect();
-    kotoba_datomic::Db::from_datoms(datoms, basis_t)
-}
-
-fn db_from_datomic_history(datoms: Vec<kotoba_datomic::Datom>) -> kotoba_datomic::Db {
-    let basis_t = datoms.last().map(|d| d.t.clone());
     kotoba_datomic::Db::from_datoms(datoms, basis_t)
 }
 
@@ -2277,9 +2296,9 @@ fn did_document_ipns_name(did: &str) -> String {
 pub(crate) fn datom_to_projection_quad(
     datom: &kotoba_datomic::Datom,
     graph_cid: &kotoba_core::cid::KotobaCid,
-) -> kotoba_kqe::quad::LegacyQuad {
+) -> kotoba_query::quad::LegacyQuad {
     let substrate = datom_to_projection_kqe(datom);
-    kotoba_kqe::quad::LegacyQuad {
+    kotoba_query::quad::LegacyQuad {
         graph: graph_cid.clone(),
         subject: substrate.e,
         predicate: substrate.a,
@@ -2287,11 +2306,11 @@ pub(crate) fn datom_to_projection_quad(
     }
 }
 
-fn datom_to_projection_kqe(datom: &kotoba_datomic::Datom) -> kotoba_kqe::Datom {
-    datom.to_kqe().unwrap_or_else(|_| kotoba_kqe::Datom {
+fn datom_to_projection_kqe(datom: &kotoba_datomic::Datom) -> kotoba_query::Datom {
+    datom.to_kqe().unwrap_or_else(|_| kotoba_query::Datom {
         e: datom.e.clone(),
         a: datom.a.clone(),
-        v: kotoba_kqe::Value::Text(kotoba_edn::to_string(&datom.v)),
+        v: kotoba_query::Value::Text(kotoba_edn::to_string(&datom.v)),
         tx: datom.t.clone(),
         op: datom.added,
     })
@@ -2646,7 +2665,15 @@ pub(crate) async fn commit_protocol_datoms(
     if let Some(auth_capability) = &auth_capability {
         append_auth_capability_datoms(&mut datoms, &tx_cid, auth_capability);
     }
-    let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
+    // R2b: author-sign commits the node itself authors. Client-authored
+    // writes carry their own non-repudiation via cacao_proof_cid.
+    let author_key = (author == state.operator_did).then(|| state.operator_signing_key());
+    let require_signed = std::env::var("KOTOBA_REQUIRE_SIGNED_COMMITS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false);
+    let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry)
+        .with_author_signing_key(author_key)
+        .with_import_check(Some(kotoba_auth::commit_import_check(require_signed)));
     let distributed = writer
         .commit_datoms(CommitDatomsRequest {
             merge_parents: None,
@@ -3194,17 +3221,70 @@ pub(crate) async fn current_db_for_graph(
     state: &KotobaState,
     graph_cid: &kotoba_core::cid::KotobaCid,
 ) -> Result<kotoba_datomic::Db, (StatusCode, String)> {
-    let reader = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry);
-    let distributed_history = reader
-        .history_for_name(&distributed_graph_ipns_name(graph_cid))
-        .map_err(|e| {
-            (
+    // Resident fast path (read-side completion of the kotoba#19 / ADR-2605302130
+    // write-scaling fix): every consumer of this helper (cc.status, search.web,
+    // kg.*, media, email, attestation, mcp — 20 call sites) previously paid a
+    // FULL commit-chain replay (`history_for_name` → O(total-history) block
+    // reads + Db rebuild) on EVERY request, while `datomic.transact` and
+    // `datomic.q` already served from the per-graph resident `datomic_live_slot`.
+    // Empirically (2026-06-11, ADR-2606111900): at ~30k datoms cc.status took
+    // 325 s and search.web 333 s, CPU-bound in this cold load.
+    //
+    // On a head match we clone the resident current-state Db (O(state) memcpy,
+    // ms); on a miss we pay ONE `db_from_head` (CEAVT covering-index fast path,
+    // O(state) not O(history)) and re-seed the slot, so the next read — and the
+    // next transact's `db_before` — are cache hits. The cached Db is the same
+    // `db_from_head` value the transact path maintains, so the slot stays
+    // coherent across both paths.
+    //
+    // Semantics: callers only consume the CURRENT view (`db.datoms()` — see all
+    // 20 call sites); none call `db.history()` (history consumers go through
+    // `require_distributed_datomic_history_db`). `Db::datoms()` nets retractions
+    // via `current_datoms`, so a Db built from the netted CEAVT scan and one
+    // built from full history yield the identical current view.
+    let ipns_name = distributed_graph_ipns_name(graph_cid);
+    match state.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
+        Ok(head_record) => {
+            if let Some(head_cid) =
+                kotoba_core::cid::KotobaCid::from_multibase(&head_record.value)
+            {
+                let graph_mb = graph_cid.to_multibase();
+                let live_slot = state.datomic_live_slot(&graph_mb);
+                // Held across read-or-rebuild + reseed so a concurrent transact
+                // on the same graph serialises against us (same discipline as
+                // `try_resident_datomic_q` and the transact db_before section).
+                let mut live_guard = live_slot.lock().await;
+                if let Some(live) = live_guard.as_ref() {
+                    if live.head == head_cid {
+                        return Ok(live.db.clone());
+                    }
+                }
+                state
+                    .datomic_cold_db_loads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let reader =
+                    DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry);
+                let db = reader.db_from_head(&head_cid).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("distributed datomic read: {e}"),
+                    )
+                })?;
+                *live_guard = Some(crate::server::LiveDatomicGraph {
+                    head: head_cid,
+                    db: db.clone(),
+                });
+                return Ok(db);
+            }
+        }
+        // No committed head yet — fall through to the local QuadStore view.
+        Err(IpnsRegistryError::NotFound(_)) => {}
+        Err(e) => {
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("distributed datomic read: {e}"),
-            )
-        })?;
-    if !distributed_history.is_empty() {
-        return Ok(db_from_datomic_history(distributed_history));
+                format!("ipns resolve: {e}"),
+            ))
+        }
     }
 
     let mut datoms = state
@@ -4734,6 +4814,14 @@ pub async fn datomic_transact(
 
     let tx_data = kotoba_edn::parse(&req.tx_edn)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("tx_edn parse: {e}")))?;
+    // Engine-tier DNA integrity (ADR-2606112000): if this graph has a registered Actor DNA
+    // integrity ruleset (node config KOTOBA_DNA_RULES), validate the incoming datoms BEFORE
+    // commit — so a peer's writes are checked too, not just a well-behaved actor's. No-op when
+    // no ruleset is registered for the graph (backward-compatible).
+    if let Some(ruleset) = crate::dna_integrity::ruleset_for(&graph_cid.to_multibase()) {
+        crate::dna_integrity::validate_tx(&tx_data, ruleset)
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("dna integrity: {e}")))?;
+    }
     let ipns_name = datomic_write_ipns_name(&graph_cid, req.ipns_name.as_deref())?;
     let current_head = match state
         .ipns_registry
@@ -7108,7 +7196,7 @@ pub async fn invoke_run(
     };
 
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
     use kotoba_runtime::host::WitQuad;
     use kotoba_vm::DispatchResult;
 
@@ -7125,7 +7213,7 @@ pub async fn invoke_run(
                 .into_iter()
                 .filter_map(|datom| {
                     let substrate = datom.to_kqe().ok()?;
-                    let object: kotoba_kqe::quad::LegacyQuadObject = substrate.v.into();
+                    let object: kotoba_query::quad::LegacyQuadObject = substrate.v.into();
                     Some(WitQuad {
                         graph: gcid.to_multibase(),
                         subject: substrate.e.to_multibase(),
@@ -7936,7 +8024,7 @@ pub async fn weight_put(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
 
     // ── Input length guards ───────────────────────────────────────────────
     const MAX_GRAPH_LEN: usize = 512;
@@ -8170,7 +8258,7 @@ pub async fn quad_retract(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+    use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 
     // ── CACAO verification (required) ────────────────────────────────────
     let b64 = req.cacao_b64.as_deref().ok_or_else(|| {
@@ -8353,7 +8441,7 @@ pub async fn lora_apply(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, DatomTensorDtype, Value as KqeValue};
 
     // ── Input length guards ───────────────────────────────────────────────
     const MAX_GRAPH_LEN: usize = 512;
@@ -10700,6 +10788,90 @@ mod tests {
         }
         assert_ne!(c1, c2);
         assert_ne!(c2, c3);
+    }
+
+    /// Read-side resident cache (ADR-2606111900 finding): `current_db_for_graph`
+    /// — the helper behind cc.status / search.web / kg.* / media / attestation —
+    /// must serve from the same per-graph `datomic_live_slot` the transact path
+    /// maintains, paying at most ONE cold `db_from_head` after a restart instead
+    /// of a full commit-chain replay on EVERY request (measured 325 s cc.status /
+    /// 333 s search.web at ~30k datoms before this fix).
+    #[tokio::test]
+    async fn current_db_for_graph_serves_from_resident_cache() {
+        use std::sync::atomic::Ordering;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = KotobaCid::from_bytes(b"read-resident-cache-graph");
+        let graph_mb = graph.to_multibase();
+
+        let c1 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "alice" :person/name "Alice"]]"#,
+        )
+        .await;
+
+        // Simulate a restart: IPNS head + blocks survive, resident cache is gone.
+        state.datomic_live.lock().unwrap().clear();
+        let cold_before = state.datomic_cold_db_loads.load(Ordering::Relaxed);
+
+        // First read after restart: exactly one cold load, slot re-seeded.
+        let db = crate::xrpc::current_db_for_graph(&state, &graph).await.unwrap();
+        assert!(
+            db.datoms()
+                .iter()
+                .any(|d| d.a == ":person/name"
+                    && d.v == kotoba_edn::EdnValue::string("Alice")),
+            "read must surface the committed datom"
+        );
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            cold_before + 1,
+            "first read after restart pays exactly one cold load"
+        );
+        {
+            let slot = state.datomic_live_slot(&graph_mb);
+            let g = slot.lock().await;
+            assert_eq!(
+                g.as_ref().expect("read must re-seed the slot").head.to_multibase(),
+                c1
+            );
+        }
+
+        // Second read: resident HIT — no new cold load.
+        let db = crate::xrpc::current_db_for_graph(&state, &graph).await.unwrap();
+        assert!(db
+            .datoms()
+            .iter()
+            .any(|d| d.v == kotoba_edn::EdnValue::string("Alice")));
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            cold_before + 1,
+            "warm read must hit the resident cache"
+        );
+
+        // A transact advances the head AND the slot (write path re-seeds);
+        // the next read must see the new state with still no extra cold load.
+        let c2 = run_transact_for_cache_test(
+            &state,
+            &graph_mb,
+            r#"[[:db/add "bob" :person/name "Bob"]]"#,
+        )
+        .await;
+        assert_ne!(c1, c2);
+        let db = crate::xrpc::current_db_for_graph(&state, &graph).await.unwrap();
+        assert!(
+            db.datoms()
+                .iter()
+                .any(|d| d.v == kotoba_edn::EdnValue::string("Bob")),
+            "read after transact must see the advanced head"
+        );
+        assert_eq!(
+            state.datomic_cold_db_loads.load(Ordering::Relaxed),
+            cold_before + 1,
+            "read after a local transact stays a cache hit (slot re-seeded by the write path)"
+        );
     }
 
     /// ADR-2605302130 startup-warm: prove the resident `db_before` cache can be
@@ -14717,7 +14889,7 @@ pub async fn generic_invoke(
     // app nodes — unlike the distributed IPNS head, which did not (ADR-2605312355).
     // Fall back to the distributed head for federation (an app hosted on a remote peer).
     {
-        use kotoba_kqe::quad::LegacyQuadObject;
+        use kotoba_query::quad::LegacyQuadObject;
         let node_quads = state
             .quad_store
             .quads_by_predicate_prefix(Some(&graph_cid), "node/")
@@ -14787,7 +14959,7 @@ pub async fn generic_invoke(
     // committed graph data (ADR-2605312355 Stage-3 persistence blocker). Absent
     // graph_cid → empty snapshot (write-only / read-nothing guests still work).
     use kotoba_core::cid::KotobaCid;
-    use kotoba_kqe::{Datom as KqeDatom, Value as KqeValue};
+    use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
     use kotoba_runtime::host::WitQuad;
 
     let snapshot_graph_cid = req_body
@@ -14801,7 +14973,7 @@ pub async fn generic_invoke(
                 .into_iter()
                 .filter_map(|datom| {
                     let substrate = datom.to_kqe().ok()?;
-                    let object: kotoba_kqe::quad::LegacyQuadObject = substrate.v.into();
+                    let object: kotoba_query::quad::LegacyQuadObject = substrate.v.into();
                     Some(WitQuad {
                         graph: gcid.to_multibase(),
                         subject: substrate.e.to_multibase(),

@@ -413,8 +413,8 @@ fn bind_kqe(linker: &mut Linker<HostState>) -> Result<()> {
             ctx.data_mut().charge_gas(500)?;
             let result = (|| -> anyhow::Result<Vec<WitQuad>> {
                 use kotoba_core::cid::KotobaCid;
-                use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
-                use kotoba_kqe::{DatalogProgram, DatalogRule, Delta};
+                use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+                use kotoba_query::{DatalogProgram, DatalogRule, Delta};
 
                 // Deserialize rules from CBOR
                 let rules: Vec<DatalogRule> = ciborium::de::from_reader(rules_cbor.as_slice())

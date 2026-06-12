@@ -1,6 +1,6 @@
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::{Datom, TensorDtype, Value};
-use kotoba_kqe::delta::Delta;
+use kotoba_query::datom::{Datom, TensorDtype, Value};
+use kotoba_query::delta::Delta;
 
 /// LoraAdapter — weight delta as Datom Delta
 /// LoRA is natively expressed as Delta(Datom) in KOTOBA

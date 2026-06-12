@@ -1,7 +1,7 @@
-//! Social Capital ledger — re-exported from `kotoba-kqe` (the engine home), plus
+//! Social Capital ledger — re-exported from `kotoba-query` (the engine home), plus
 //! the server-side **L6 settlement bridge** to the live mKOTO wallet.
 //!
-//! The ledger/MV/mint/retainer implementation lives in [`kotoba_kqe::social`]
+//! The ledger/MV/mint/retainer implementation lives in [`kotoba_query::social`]
 //! (ADR-2606082100) so the reducer and the ledger share one decay primitive; the
 //! `kotoba_server::social::*` path re-exports it. This module adds the one piece
 //! that is server-specific: writing settled retainer credits into the persisted
@@ -9,10 +9,10 @@
 //!
 //! See `docs/SOCIAL-CAPITAL-LEDGER.md` + `docs/MISHMAR-OBSERVATION.md`.
 
-pub use kotoba_kqe::social::*;
+pub use kotoba_query::social::*;
 
 use crate::econ::Econ;
-// `RetainerCredit` is in scope via the `pub use kotoba_kqe::social::*` above.
+// `RetainerCredit` is in scope via the `pub use kotoba_query::social::*` above.
 
 /// Apply an L6 retainer settlement to the live, persisted mKOTO wallet
 /// ([`Econ`]): credit each pinner's balance by its aggregated retainer. mKOTO is
@@ -35,7 +35,7 @@ pub async fn settle_retainer_to_econ(econ: &Econ, credits: &[RetainerCredit]) ->
     total
 }
 
-use kotoba_kqe::datom::Datom;
+use kotoba_query::datom::Datom;
 
 /// The I/O boundary for the social mint job (#3): a source that **observes** an
 /// epoch's validated social inputs. Real implementations call the anchor-chain

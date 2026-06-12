@@ -133,6 +133,15 @@ is distributed. Acceptance of the License constitutes acceptance of this Rider.
        thirty (30) day public objection period (ref. ADR-2605172600 Council
        governance).
 
+   (j) MONOPOLISTIC RESOURCE EXTRACTION / MINING (added in v2.0). Operation of
+       commercial mining or extraction of rare metals and other geologically
+       restricted resources. DERIVED FROM: Mission to avoid dependence on
+       monopolistic resources and prevent resource monopolies on Earth. This
+       prohibition is structural: it is designed to create a system that does
+       not depend on monopolistic rare metals or restricted resources. Closed-
+       loop recycling (urban mining) and non-monopolistic material recovery
+       are NOT prohibited.
+
 3. EFFECT OF VIOLATION
 
    Use of this work by a Non-Aligned Entity, or by any entity providing this

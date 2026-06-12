@@ -1,3 +1,16 @@
+//! # kotoba-query — **KQE = Kotoba Query Engine**
+//!
+//! The Datalog query layer of KOTOBA: semi-naive Datalog evaluation
+//! ([`datalog`]), the 4-index in-memory [`arrangement`] (EAVT/AEVT/AVET/VAET),
+//! assert/retract [`delta`]s over the atomic [`datom::Datom`] 5-tuple
+//! `(E, A, V, T, Added)`, materialized views ([`mv`]), and citation-royalty
+//! accounting ([`citation`]).
+//!
+//! WASM guests reach this engine through the `kotoba:kais/kqe` WIT interface
+//! (ASSERT 0x1 / RETRACT 0xD / QUERY 0x2 frames); KAIS = Kotoba Instruction
+//! Set Architecture. Sibling engines: KSE (Kotoba Stream Engine,
+//! `kotoba-kse`), KDHT (Kotoba DHT, `kotoba-dht`), KVM (Kotoba VM,
+//! `kotoba-vm`).
 pub mod arrangement;
 pub mod citation;
 pub mod cypher;

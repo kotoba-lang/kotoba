@@ -12,6 +12,7 @@ pub mod fs_store;
 pub mod ipfs_pin;
 pub mod kubo_store;
 pub mod memory_store;
+pub mod sealed_store;
 pub mod tiered_store;
 
 pub use b2_car_store::B2CarBlockStore;
@@ -27,4 +28,5 @@ pub use fs_store::FsBlockStore;
 pub use ipfs_pin::IpfsPinClient;
 pub use kubo_store::KuboBlockStore;
 pub use memory_store::MemoryBlockStore;
+pub use sealed_store::{SealedBlockStore, SealedKeyConfig, SEALED_INDEX_FILE};
 pub use tiered_store::TieredBlockStore;

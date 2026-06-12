@@ -22,7 +22,7 @@ use kotoba_ingest::media_embed::{HttpMediaEmbedClient, MediaEmbedClient};
 use kotoba_ipfs::{
     InMemoryIpnsRegistry, IpnsName, IpnsRecord, IpnsRegistry, KuboIpnsRegistry, SignedIpnsRegistry,
 };
-use kotoba_kqe::{quad::LegacyQuad as Quad, Datom as KqeDatom, Value as KqeValue};
+use kotoba_query::{quad::LegacyQuad as Quad, Datom as KqeDatom, Value as KqeValue};
 use kotoba_kse::SecureVault;
 use kotoba_kse::{
     sync_window::SyncWindow, AgentIdentity, Journal, KseStore, PreKeyRegistry, Shelf, Topic, Vault,
@@ -280,7 +280,7 @@ pub struct KotobaState {
     /// Registered, incrementally-maintained Datalog MaterializedViews.
     /// Maintained on every kg commit (`commit_kg_datoms`); registered + read via
     /// `kg.mv.register` / `kg.mv.result`.
-    pub mv_registry: Arc<tokio::sync::RwLock<kotoba_kqe::mv::MvRegistry>>,
+    pub mv_registry: Arc<tokio::sync::RwLock<kotoba_query::mv::MvRegistry>>,
     // ── kotobase Pinning ─────────────────────────────────────────────────────────
     /// Optional kotobase.net XRPC pin client (KOTOBA_PIN_TOKEN; ADR-2606091500).
     pub ipfs_pin: Arc<IpfsPinClient>,
@@ -318,6 +318,19 @@ pub struct KotobaState {
     /// Replay-prevention registry for CACAO nonces (CAIP-74 §8).
     /// Tracks each nonce until the corresponding CACAO expires.
     pub nonce_store: Arc<crate::nonce_store::NonceStore>,
+    // ── Access receipts (ADR-sealed-cold-tier R1) ─────────────────────────────
+    /// Read handlers enqueue receipts here; ONE background writer batches them
+    /// into audit-graph commits (`access_receipt::spawn_receipt_writer`).
+    pub receipt_tx: tokio::sync::mpsc::UnboundedSender<crate::access_receipt::AccessReceipt>,
+    /// Receiver parked until `spawn_receipt_writer` takes it (once).
+    pub receipt_rx: std::sync::Mutex<
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::access_receipt::AccessReceipt>>,
+    >,
+    // ── Key custody (ADR-sealed-cold-tier R3b) ────────────────────────────────
+    /// This node's custodian shares, keyed by graph multibase CID. Installed
+    /// via `key.depositShare` (operator-gated); consulted by `key.requestShare`.
+    pub custody_shares:
+        Arc<tokio::sync::RwLock<HashMap<String, kotoba_custody::CustodianShare>>>,
     // ── Write-cost economy (ADR-2606013400) ───────────────────────────────────
     /// Per-DID mKOTO balance ledger. `datomic.transact` debits the writer here;
     /// the operator is exempt/unlimited. See `crate::econ::Econ`.
@@ -457,6 +470,41 @@ impl KotobaState {
                 };
                 let endpoint = std::env::var("KOTOBA_IPFS_ENDPOINT")
                     .unwrap_or_else(|_| "http://localhost:5001".into());
+                // ADR-2606112200 — sealed cold tier. When KOTOBA_BLOCK_KEY (or
+                // KOTOBA_BLOCK_KEY_FILE) is set, every block leaving for Kubo
+                // (and from there bitswap/DHT + the kotobase.net pin fanout) is
+                // an AES-256-GCM envelope; the network only ever replicates
+                // ciphertext. Unset = current plaintext behaviour, with a loud
+                // warning because the kotobase pin fanout is on by default.
+                let cold: Arc<dyn BlockStore + Send + Sync> =
+                    match kotoba_store::SealedKeyConfig::from_env()? {
+                        Some(cfg) => {
+                            let index_path = store_path.as_ref().map(|p| {
+                                std::path::Path::new(p).join(kotoba_store::SEALED_INDEX_FILE)
+                            });
+                            if index_path.is_none() {
+                                tracing::warn!(
+                                    "sealed cold tier: no KOTOBA_STORE_PATH — plaintext→sealed \
+                                     CID index is in-memory only (rebuilt by re-put after restart)"
+                                );
+                            }
+                            let sealed =
+                                kotoba_store::SealedBlockStore::new(cold, cfg, index_path)?;
+                            tracing::info!(
+                                index_entries = sealed.index_len(),
+                                "cold tier SEALED — AES-256-GCM block envelopes (KOTOBA_BLOCK_KEY, ADR-2606112200)"
+                            );
+                            Arc::new(sealed)
+                        }
+                        None => {
+                            tracing::warn!(
+                                "cold tier UNSEALED — blocks replicate beyond this node in \
+                                 PLAINTEXT (Kubo bitswap + kotobase.net pin fanout). Set \
+                                 KOTOBA_BLOCK_KEY to seal (ADR-2606112200)."
+                            );
+                            Arc::new(cold)
+                        }
+                    };
                 let tiered = kotoba_store::TieredBlockStore::new(hot, cold);
 
                 let peers_str = std::env::var("KOTOBA_PEERS").unwrap_or_default();
@@ -818,10 +866,11 @@ impl KotobaState {
         // Write-cost economy (ADR-2606013400) — operator-funded mKOTO ledger.
         let econ = crate::econ::Econ::from_env(operator_did.clone());
 
+        let (receipt_tx, receipt_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
             mv_registry: Arc::new(tokio::sync::RwLock::new(
-                kotoba_kqe::mv::MvRegistry::new(),
+                kotoba_query::mv::MvRegistry::new(),
             )),
             operator_did,
             node_roles,
@@ -856,6 +905,9 @@ impl KotobaState {
             graph_registry,
             econ,
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
+            receipt_tx,
+            receipt_rx: std::sync::Mutex::new(Some(receipt_rx)),
+            custody_shares: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             datomic_live: Arc::new(std::sync::Mutex::new(HashMap::new())),
             datomic_cold_db_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             git_repos: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1173,6 +1225,25 @@ impl KotobaState {
     ///
     /// The DEFAULT is `private` so CACAO is the canonical authentication path
     /// out-of-the-box.
+    /// Operator Ed25519 signing key — author-signs CommitDag commits the node
+    /// itself authors (R2b non-repudiation, ADR-sealed-cold-tier).
+    pub(crate) fn operator_signing_key(&self) -> ed25519_dalek::SigningKey {
+        self.identity.signing_key.clone()
+    }
+
+    /// Operator X25519 secret — this node's custodian key for opening the key
+    /// shares HPKE-wrapped to it (R3b `/kotoba/key/1`).
+    pub(crate) fn custodian_x25519_secret(&self) -> x25519_dalek::StaticSecret {
+        self.identity.dh_secret.clone()
+    }
+
+    /// This node's custodian X25519 PUBLIC key (hex) — operators dealing key
+    /// shares wrap this node's share to it (R3b). Public by design.
+    pub(crate) fn custodian_x25519_pubkey_hex(&self) -> String {
+        let pk = x25519_dalek::PublicKey::from(&self.identity.dh_secret);
+        hex::encode(pk.as_bytes())
+    }
+
     pub async fn graph_visibility(&self, cid: &KotobaCid) -> GraphVisibility {
         let registry = self.graph_registry.read().await;
         if let Some((_, v)) = registry.get(cid) {

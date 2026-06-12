@@ -1,7 +1,7 @@
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::arrangement::Arrangement;
-use kotoba_kqe::datom::{Datom, Value};
-use kotoba_kqe::delta::Delta;
+use kotoba_query::arrangement::Arrangement;
+use kotoba_query::datom::{Datom, Value};
+use kotoba_query::delta::Delta;
 
 /// KvCache — attention KV-cache as ephemeral Arrangement
 /// session_cid = blake3(CBOR{model_cid, prompt_hash, ts})

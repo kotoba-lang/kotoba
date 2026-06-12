@@ -31,9 +31,9 @@
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
-    FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg, MemorySection,
-    MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 use crate::ast::{Builtin, Expr, HostImport, Program};
@@ -110,7 +110,10 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     let mut fn_index: HashMap<String, (u32, usize)> = HashMap::new();
     for (i, f) in program.functions.iter().enumerate() {
         if fn_index.contains_key(&f.name) {
-            return Err(CljError::Codegen(format!("function `{}` defined twice", f.name)));
+            return Err(CljError::Codegen(format!(
+                "function `{}` defined twice",
+                f.name
+            )));
         }
         fn_index.insert(f.name.clone(), (import_base + i as u32, f.params.len()));
     }
@@ -119,7 +122,9 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     let entry_target = match entry {
         Some(Entry { name, abi }) => {
             let (idx, arity) = fn_index.get(name).copied().ok_or_else(|| {
-                CljError::Codegen(format!("component entry `(defn {name} [input] …)` not found"))
+                CljError::Codegen(format!(
+                    "component entry `(defn {name} [input] …)` not found"
+                ))
             })?;
             if arity != 1 {
                 return Err(CljError::Codegen(format!(
@@ -239,7 +244,11 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     // ---- Data segment -------------------------------------------------------
     let mut data = DataSection::new();
     if !literals.blob.is_empty() {
-        data.active(0, &ConstExpr::i32_const(DATA_BASE as i32), literals.blob.iter().copied());
+        data.active(
+            0,
+            &ConstExpr::i32_const(DATA_BASE as i32),
+            literals.blob.iter().copied(),
+        );
     }
 
     // Sections must be emitted in ascending id order.
@@ -297,9 +306,34 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
         //     core import returns nothing. The host writes the 12-byte variant
         //     `[tag:u8 @0, ptr:i32 @4, len:i32 @8]` into that area.
         HostImport::LlmInfer => (
-            vec![ValType::I32, ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            vec![
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+                ValType::I32,
+            ],
             vec![],
         ),
+        // `assert-quad` / `retract-quad: func(q: quad) -> result<_, string>`:
+        //   - the `quad` record flattens to its fields: 3 × `string` + 1 ×
+        //     `list<u8>`, each a `(ptr,len)` pair → 8 i32 params,
+        //   - `result<_, string>` flattens to >1 value (tag + err string) → the
+        //     caller appends a return-area pointer (9th i32) and the core import
+        //     returns nothing. Area: `[tag:u8 @0, err-ptr @4, err-len @8]`.
+        HostImport::KqeAssertQuad | HostImport::KqeRetractQuad => {
+            (vec![ValType::I32; 9], vec![])
+        }
+        // `get-objects: func(string,string,string) -> list<list<u8>>`:
+        //   - 3 strings → 6 i32 params,
+        //   - a bare `list` result flattens to `(ptr,len)` = 2 values > 1 → an
+        //     8-byte return area `[ptr @0, len @4]` (7th i32 param).
+        HostImport::KqeGetObjects => (vec![ValType::I32; 7], vec![]),
+        // `query: func(string) -> result<list<quad>, string>`:
+        //   - 1 string → 2 i32 params,
+        //   - indirect 12-byte return area `[tag:u8 @0, ptr @4, len @8]` (the
+        //     same variant layout as `llm.infer`).
+        HostImport::KqeQuery => (vec![ValType::I32; 3], vec![]),
     }
 }
 
@@ -558,7 +592,11 @@ impl<'a> FnCtx<'a> {
         self.out.push(ins);
     }
     fn resolve(&self, name: &str) -> Option<u32> {
-        self.scope.iter().rev().find(|(n, _)| n == name).map(|(_, i)| *i)
+        self.scope
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, i)| *i)
     }
     fn alloc_local(&mut self) -> u32 {
         let i = self.next_local;
@@ -705,11 +743,10 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
         Expr::Builtin { op, args } => compile_builtin(cg, *op, args)?,
 
         Expr::Call { name, args } => {
-            let (idx, arity) = cg
-                .fn_index
-                .get(name)
-                .copied()
-                .ok_or_else(|| CljError::Codegen(format!("call to unknown function `{name}`")))?;
+            let (idx, arity) =
+                cg.fn_index.get(name).copied().ok_or_else(|| {
+                    CljError::Codegen(format!("call to unknown function `{name}`"))
+                })?;
             if args.len() != arity {
                 return Err(CljError::Codegen(format!(
                     "`{name}` expects {arity} args, got {}",
@@ -758,12 +795,61 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         }
         Builtin::Div => binop(cg, args, Instruction::I64DivS),
         Builtin::Mod => binop(cg, args, Instruction::I64RemS),
+        Builtin::Inc => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(1));
+            cg.emit(Instruction::I64Add);
+            Ok(())
+        }
+        Builtin::Dec => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(1));
+            cg.emit(Instruction::I64Sub);
+            Ok(())
+        }
+        Builtin::Abs => {
+            compile_expr(cg, &args[0])?;
+            let value = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(value));
+            cg.emit(Instruction::LocalGet(value));
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64LtS);
+            cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::LocalGet(value));
+            cg.emit(Instruction::I64Sub);
+            cg.emit(Instruction::Else);
+            cg.emit(Instruction::LocalGet(value));
+            cg.close_frame();
+            Ok(())
+        }
 
-        Builtin::Eq => cmp(cg, args, Instruction::I64Eq),
-        Builtin::Lt => cmp(cg, args, Instruction::I64LtS),
-        Builtin::Gt => cmp(cg, args, Instruction::I64GtS),
-        Builtin::Le => cmp(cg, args, Instruction::I64LeS),
-        Builtin::Ge => cmp(cg, args, Instruction::I64GeS),
+        Builtin::Eq => pairwise_cmp(cg, args, Instruction::I64Eq),
+        Builtin::NotEq => compile_not_eq(cg, args),
+        Builtin::Lt => pairwise_cmp(cg, args, Instruction::I64LtS),
+        Builtin::Gt => pairwise_cmp(cg, args, Instruction::I64GtS),
+        Builtin::Le => pairwise_cmp(cg, args, Instruction::I64LeS),
+        Builtin::Ge => pairwise_cmp(cg, args, Instruction::I64GeS),
+        Builtin::Zero => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Eqz);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        Builtin::Pos => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64GtS);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        Builtin::Neg => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64LtS);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
 
         Builtin::Not => {
             compile_expr(cg, &args[0])?;
@@ -836,7 +922,147 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
 
         Builtin::HasCapability => compile_host_call(cg, HostImport::HasCapability, args),
         Builtin::LlmInfer => compile_llm_infer(cg, &args[0], &args[1]),
+        Builtin::KqeAssert => compile_kqe_mutate(cg, HostImport::KqeAssertQuad, args),
+        Builtin::KqeRetract => compile_kqe_mutate(cg, HostImport::KqeRetractQuad, args),
+        Builtin::KqeGetObjects => compile_kqe_get_objects(cg, args),
+        Builtin::KqeQuery => compile_kqe_query(cg, &args[0]),
     }
+}
+
+/// Lower `(kqe-assert!/kqe-retract! graph subject predicate object-cbor)` — a
+/// host import taking the flattened `quad` record (4 × `(ptr,len)`) whose
+/// `result<_, string>` return uses the indirect return-area ABI:
+///   1. `cabi_realloc` a 12-byte area (align 4),
+///   2. push the four fields as `(ptr,len)` pairs, then the area pointer,
+///   3. `call` the import (no core result),
+///   4. read `tag = mem[area]` → `1` on ok (tag 0), `0` on err.
+fn compile_kqe_mutate(cg: &mut FnCtx, imp: HostImport, args: &[Expr]) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&imp)
+        .ok_or_else(|| CljError::Codegen(format!("host import {imp:?} not registered")))?;
+    let realloc = cg.realloc_index;
+    let area = cg.alloc_local();
+
+    // area = cabi_realloc(0, 0, 4, 12)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(4));
+    cg.emit(Instruction::I32Const(12));
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(area));
+
+    // graph, subject, predicate, object-cbor — each as (ptr,len)
+    for a in args {
+        lower_string_arg_to_ptr_len(cg, a)?;
+    }
+    // return-area pointer (i32)
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::Call(idx));
+
+    // tag == 0 (ok) → 1, else (err) → 0
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load8U(mem8(0)));
+    cg.emit(Instruction::I32Eqz);
+    cg.emit(Instruction::I64ExtendI32U);
+    Ok(())
+}
+
+/// Lower `(kqe-get-objects graph subject predicate)` — the host lifts a
+/// `list<list<u8>>` into guest memory (via our exported `cabi_realloc`) and
+/// writes `[ptr @0, len @4]` into an 8-byte return area. The builtin yields a
+/// packed list handle `(ptr << 32) | count`; elements (8 bytes each:
+/// `[ptr,len]`) are read in-language via `load32` (see `KQE_PRELUDE`).
+fn compile_kqe_get_objects(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&HostImport::KqeGetObjects)
+        .ok_or_else(|| CljError::Codegen("host import KqeGetObjects not registered".into()))?;
+    let realloc = cg.realloc_index;
+    let area = cg.alloc_local();
+
+    // area = cabi_realloc(0, 0, 4, 8)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(4));
+    cg.emit(Instruction::I32Const(8));
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(area));
+
+    // graph, subject, predicate — each as (ptr,len)
+    for a in args {
+        lower_string_arg_to_ptr_len(cg, a)?;
+    }
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::Call(idx));
+
+    // handle = (mem[area] << 32) | mem[area+4]   (element-array ptr | count)
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(0)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Const(32));
+    cg.emit(Instruction::I64Shl);
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Or);
+    Ok(())
+}
+
+/// Lower `(kqe-query predicate-filter)` — same indirect `result<list<…>,
+/// string>` tail as `llm.infer`, but the ok payload is a `list<quad>`: the
+/// handle packs `(quad-array-ptr << 32) | count`, 32 bytes per quad (4 ×
+/// `[ptr,len]` fields, read in-language via `load32`). `0` on err.
+fn compile_kqe_query(cg: &mut FnCtx, filter: &Expr) -> Result<(), CljError> {
+    let idx = *cg
+        .import_index
+        .get(&HostImport::KqeQuery)
+        .ok_or_else(|| CljError::Codegen("host import KqeQuery not registered".into()))?;
+    let realloc = cg.realloc_index;
+    let area = cg.alloc_local();
+
+    // area = cabi_realloc(0, 0, 4, 12)
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(0));
+    cg.emit(Instruction::I32Const(4));
+    cg.emit(Instruction::I32Const(12));
+    cg.emit(Instruction::Call(realloc));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::LocalSet(area));
+
+    lower_string_arg_to_ptr_len(cg, filter)?;
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::Call(idx));
+
+    // tag == 0 ? (ptr << 32) | count : 0
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load8U(mem8(0)));
+    cg.emit(Instruction::I32Eqz);
+    cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Const(32));
+    cg.emit(Instruction::I64Shl);
+    cg.emit(Instruction::LocalGet(area));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(8)));
+    cg.emit(Instruction::I64ExtendI32U);
+    cg.emit(Instruction::I64Or);
+    cg.emit(Instruction::Else);
+    cg.emit(Instruction::I64Const(0));
+    cg.close_frame();
+    Ok(())
 }
 
 /// Lower `(llm-infer model-cid prompt)` — a host import whose
@@ -954,15 +1180,27 @@ fn compile_store(cg: &mut FnCtx, addr: &Expr, val: &Expr, word32: bool) -> Resul
 
 /// A 4-byte-aligned i32 access MemArg at `offset`.
 fn mem32(offset: u64) -> MemArg {
-    MemArg { offset, align: 2, memory_index: 0 }
+    MemArg {
+        offset,
+        align: 2,
+        memory_index: 0,
+    }
 }
 /// An unaligned single-byte access MemArg at `offset`.
 fn mem8(offset: u64) -> MemArg {
-    MemArg { offset, align: 0, memory_index: 0 }
+    MemArg {
+        offset,
+        align: 0,
+        memory_index: 0,
+    }
 }
 /// An 8-byte-aligned i64 access MemArg at `offset`.
 fn mem64(offset: u64) -> MemArg {
-    MemArg { offset, align: 3, memory_index: 0 }
+    MemArg {
+        offset,
+        align: 3,
+        memory_index: 0,
+    }
 }
 
 /// A byte buffer is an 8-byte header `[cap:i32 @0, len:i32 @4]` followed by
@@ -1030,7 +1268,7 @@ fn compile_byte_append(cg: &mut FnCtx, buf_expr: &Expr, b_expr: &Expr) -> Result
     cg.emit(Instruction::I32WrapI64);
     cg.emit(Instruction::I32Load(mem32(4))); // len
     cg.emit(Instruction::I32Add); // addr = buf+8+len
-    // value byte
+                                  // value byte
     cg.emit(Instruction::LocalGet(val_l));
     cg.emit(Instruction::I32WrapI64);
     cg.emit(Instruction::I32Store8(mem8(0))); // mem[addr] = b
@@ -1094,6 +1332,90 @@ fn cmp(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), C
     compile_expr(cg, &args[1])?;
     cg.emit(ins);
     cg.emit(Instruction::I64ExtendI32U);
+    Ok(())
+}
+
+/// Clojure-style n-ary comparisons. A single operand is vacuously true; with
+/// more operands every adjacent pair must satisfy the comparison.
+fn pairwise_cmp(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), CljError> {
+    if args.len() == 1 {
+        cg.emit(Instruction::I64Const(1));
+        return Ok(());
+    }
+    if args.len() == 2 {
+        return cmp(cg, args, ins);
+    }
+
+    let prev = cg.alloc_local();
+    let cur = cg.alloc_local();
+    let acc = cg.alloc_local();
+    compile_expr(cg, &args[0])?;
+    cg.emit(Instruction::LocalSet(prev));
+    cg.emit(Instruction::I64Const(1));
+    cg.emit(Instruction::LocalSet(acc));
+
+    for arg in &args[1..] {
+        compile_expr(cg, arg)?;
+        cg.emit(Instruction::LocalSet(cur));
+
+        cg.emit(Instruction::LocalGet(acc));
+        cg.emit(Instruction::I64Const(0));
+        cg.emit(Instruction::I64Ne);
+        cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+        cg.emit(Instruction::LocalGet(prev));
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(ins.clone());
+        cg.emit(Instruction::I64ExtendI32U);
+        cg.emit(Instruction::Else);
+        cg.emit(Instruction::I64Const(0));
+        cg.close_frame();
+        cg.emit(Instruction::LocalSet(acc));
+
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::LocalSet(prev));
+    }
+
+    cg.emit(Instruction::LocalGet(acc));
+    Ok(())
+}
+
+/// Clojure `not=` means pairwise distinct for all operands.
+fn compile_not_eq(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
+    if args.len() == 1 {
+        cg.emit(Instruction::I64Const(1));
+        return Ok(());
+    }
+    let values = args
+        .iter()
+        .map(|arg| {
+            compile_expr(cg, arg)?;
+            let local = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(local));
+            Ok(local)
+        })
+        .collect::<Result<Vec<_>, CljError>>()?;
+    let acc = cg.alloc_local();
+    cg.emit(Instruction::I64Const(1));
+    cg.emit(Instruction::LocalSet(acc));
+
+    for i in 0..values.len() {
+        for j in (i + 1)..values.len() {
+            cg.emit(Instruction::LocalGet(acc));
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64Ne);
+            cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+            cg.emit(Instruction::LocalGet(values[i]));
+            cg.emit(Instruction::LocalGet(values[j]));
+            cg.emit(Instruction::I64Ne);
+            cg.emit(Instruction::I64ExtendI32U);
+            cg.emit(Instruction::Else);
+            cg.emit(Instruction::I64Const(0));
+            cg.close_frame();
+            cg.emit(Instruction::LocalSet(acc));
+        }
+    }
+
+    cg.emit(Instruction::LocalGet(acc));
     Ok(())
 }
 
@@ -1193,11 +1515,21 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Mod => v[0]
             .checked_rem(v[1])
             .ok_or_else(|| CljError::Codegen("rem by zero in const".into()))?,
-        Builtin::Eq => b(v[0] == v[1]),
-        Builtin::Lt => b(v[0] < v[1]),
-        Builtin::Gt => b(v[0] > v[1]),
-        Builtin::Le => b(v[0] <= v[1]),
-        Builtin::Ge => b(v[0] >= v[1]),
+        Builtin::Inc => v[0] + 1,
+        Builtin::Dec => v[0] - 1,
+        Builtin::Abs => v[0].abs(),
+        Builtin::Eq => b(v.windows(2).all(|pair| pair[0] == pair[1])),
+        Builtin::NotEq => b(v
+            .iter()
+            .enumerate()
+            .all(|(i, x)| v.iter().skip(i + 1).all(|y| x != y))),
+        Builtin::Lt => b(v.windows(2).all(|pair| pair[0] < pair[1])),
+        Builtin::Gt => b(v.windows(2).all(|pair| pair[0] > pair[1])),
+        Builtin::Le => b(v.windows(2).all(|pair| pair[0] <= pair[1])),
+        Builtin::Ge => b(v.windows(2).all(|pair| pair[0] >= pair[1])),
+        Builtin::Zero => b(v[0] == 0),
+        Builtin::Pos => b(v[0] > 0),
+        Builtin::Neg => b(v[0] < 0),
         Builtin::Not => b(v[0] == 0),
         Builtin::And => b(v.iter().all(|x| *x != 0)),
         Builtin::Or => b(v.iter().any(|x| *x != 0)),
@@ -1216,7 +1548,12 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
                 "string/bytes/memory operations are not allowed in a `def` initialiser".into(),
             ))
         }
-        Builtin::HasCapability | Builtin::LlmInfer => {
+        Builtin::HasCapability
+        | Builtin::LlmInfer
+        | Builtin::KqeAssert
+        | Builtin::KqeRetract
+        | Builtin::KqeGetObjects
+        | Builtin::KqeQuery => {
             return Err(CljError::Codegen(
                 "host calls are not allowed in a `def` initialiser".into(),
             ))

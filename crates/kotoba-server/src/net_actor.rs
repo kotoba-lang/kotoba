@@ -1,7 +1,7 @@
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_graph::QuadStore;
-use kotoba_kqe::{quad::LegacyQuad as Quad, Datom};
+use kotoba_query::{quad::LegacyQuad as Quad, Datom};
 use kotoba_kse::JournalEntry;
 use kotoba_net::{KotobaNetEvent, KotobaSwarm, PREGEL_GOSSIP_TOPIC};
 use kotoba_vm::distributed::DistributedMessage;

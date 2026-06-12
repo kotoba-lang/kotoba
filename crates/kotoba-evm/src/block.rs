@@ -10,9 +10,9 @@
 //! wired next.
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::datom::Datom;
-use kotoba_kqe::delta::Delta;
-use kotoba_kqe::evm_state::EvmStateView;
+use kotoba_query::datom::Datom;
+use kotoba_query::delta::Delta;
+use kotoba_query::evm_state::EvmStateView;
 
 use crate::logs::logs_bloom;
 use crate::tx::apply_raw_tx;
@@ -102,7 +102,7 @@ pub fn produce_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_kqe::evm_state::account_datoms;
+    use kotoba_query::evm_state::account_datoms;
     use revm::primitives::U256;
 
     fn graph() -> KotobaCid {

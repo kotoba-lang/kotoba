@@ -8,7 +8,7 @@ use std::sync::Arc;
 use kotoba_core::cid::KotobaCid;
 use kotoba_crypto::AgentCrypto;
 use kotoba_graph::QuadStore;
-use kotoba_kqe::datom::{Datom, Value};
+use kotoba_query::datom::{Datom, Value};
 use kotoba_kse::Vault;
 
 /// Ingest raw RFC 2822 emails into the kotoba encrypted quad graph.
@@ -307,7 +307,7 @@ mod tests {
         assert_eq!(body_cid_values.len(), 1, "body_cid datom must exist");
 
         // Retrieve the body blob and verify it is encrypted (not plaintext)
-        if let kotoba_kqe::Value::Text(body_cid_mb) = &body_cid_values[0] {
+        if let kotoba_query::Value::Text(body_cid_mb) = &body_cid_values[0] {
             let vault_cid = KotobaCid::from_multibase(body_cid_mb).unwrap();
             let enc_blob = ing
                 .vault
@@ -335,7 +335,7 @@ mod tests {
         let arr = ing.quad_store.arrangement(&graph_cid).await.unwrap();
         let subj_values = arr.get_values(&cid, "email/subject");
         assert_eq!(subj_values.len(), 1);
-        if let kotoba_kqe::Value::Text(enc) = &subj_values[0] {
+        if let kotoba_query::Value::Text(enc) = &subj_values[0] {
             assert!(
                 enc.starts_with("signal:v1:"),
                 "subject must be signal:v1: envelope, got: {enc}"
@@ -354,7 +354,7 @@ mod tests {
         let graph_cid = graph_cid_for("did:plc:test");
         let arrangement = ing.quad_store.arrangement(&graph_cid).await.unwrap();
         let body_cid_values = arrangement.get_values(&email_cid, "email/body_cid");
-        if let kotoba_kqe::Value::Text(body_cid_mb) = &body_cid_values[0] {
+        if let kotoba_query::Value::Text(body_cid_mb) = &body_cid_values[0] {
             // Correct owning email CID → decrypts.
             let body = ing.decrypt_body(&email_cid_mb, body_cid_mb).await.unwrap();
             assert!(body.contains("Hello from kotoba-ingest!"), "body={body}");
@@ -384,7 +384,7 @@ mod tests {
         let graph_cid = graph_cid_for("did:plc:test");
         let arr = ing.quad_store.arrangement(&graph_cid).await.unwrap();
         let vals = arr.get_values(&email_cid, "email/body_cid");
-        if let kotoba_kqe::Value::Text(body_cid_mb) = &vals[0] {
+        if let kotoba_query::Value::Text(body_cid_mb) = &vals[0] {
             let body = ing.decrypt_body(&email_cid_mb, body_cid_mb).await.unwrap();
             assert_eq!(body, "");
         } else {

@@ -5,11 +5,11 @@
 //!        → SocialCapitalView (decayed balances) → SC_root
 //!        → retainer allocation (donation pool split by social capital)
 //!
-//! Run: `cargo run --example social_capital_loop -p kotoba-kqe`
+//! Run: `cargo run --example social_capital_loop -p kotoba-query`
 
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::delta::Delta;
-use kotoba_kqe::social::{
+use kotoba_query::delta::Delta;
+use kotoba_query::social::{
     allocate_retainer, apply_retainer_credits, settle_retainer, Falsification, MintParams,
     PinOrigin, SocialCapitalView, ValidatedDisclosure, ValidatedWellbecoming, SCALE,
 };
@@ -65,7 +65,7 @@ fn main() {
     println!("minted {} social Datoms at epoch 0:", datoms.len());
     for d in &datoms {
         let v = match &d.v {
-            kotoba_kqe::datom::Value::Integer(n) => pts(*n),
+            kotoba_query::datom::Value::Integer(n) => pts(*n),
             _ => "?".into(),
         };
         println!("  {}  {}  = {v}", &d.e.to_string()[..20.min(d.e.to_string().len())], d.a);

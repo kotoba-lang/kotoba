@@ -365,3 +365,77 @@ in compiled Clojure on kotoba-runtime:
     `override_reducer_is_last_write_wins`.
   Deferred refinement: `graph_def_cid` derivation from sorted topology (matching
   the StateGraph rule) for content-addressed graph caching.
+- **C-5 ✅ kqe host builtins — the Datomic surface (2026-06-11)** — the guest
+  can now **read and write Datoms**: `(kqe-assert! g s p obj-cbor)` /
+  `(kqe-retract! …)` lower to `kqe.assert-quad` / `retract-quad` (the WIT
+  `quad` record flattens to 8 i32 params; the `result<_, string>` return is
+  indirect via a 12-byte area → builtin yields 1/0), `(kqe-get-objects g s p)`
+  lowers to `get-objects` (host **lifts** `list<list<u8>>` into guest memory
+  through our `cabi_realloc`; builtin yields a packed `(ptr<<32)|count` list
+  handle), and `(kqe-query filter)` lowers to `query` (`result<list<quad>,
+  string>`, 32-byte quad records). The new `KQE_PRELUDE` reads the lifted
+  arrays *in the language* (`kqe-count`, `kqe-obj-nth`,
+  `kqe-quad-{graph,subject,predicate,object}` via `load32` → string handles).
+  `tests/kqe.rs` (9 live tests on `WasmExecutor`): assert/retract land in
+  `InvokeResult::{assert,retract}_quads` with guest-built CBOR objects (10 gas
+  each), a 5-datom `loop`/`recur` write burst, list lifts (count + element
+  bytes + all four quad fields verified in-guest via `str-eq?`), a
+  read-modify-write agent (read `kg/role` → assert derived `kg/verified`),
+  **and the Datomic loop**: agent-asserted quads → `kotoba_query::Datom` →
+  `kotoba_datomic::Datom::from_kqe` → `Db::from_datoms` → `datoms()` returns
+  the agent's facts as EDN (`kg/name = "Alice"`, `kg/role = "admin"`) —
+  **compiled Clojure writes, the Datomic facade reads.**
+- **E ✅ Pregel/BSP verification (2026-06-11)** — `tests/pregel.rs` (3 tests)
+  drives the compiled component through **`kotoba-vm::WasmPregelRunner`** (the
+  Pregel BSP engine, single-vertex self-loop): each superstep the guest
+  CBOR-decodes its ctx (C-3), runs a `defgraph` (D) whose node `kqe-assert!`s a
+  tick Datom (C-5) and bumps the counter, then emits `{"status":
+  "continue"|"done", "n": k}` (C-4); the runner feeds `continue` output back as
+  the next superstep's ctx. Verified: a 4-superstep run (n 0→4) accumulates
+  exactly 4 Datoms + ≥40 gas across supersteps with a structured `done` output;
+  a 1-superstep immediate halt; and the `max_supersteps` cap stopping a
+  continue-loop at the BSP boundary. **A langgraph-shaped compiled-Clojure
+  agent runs on Pregel BSP, writing Datoms every superstep.**
+
+---
+
+## R1 — `.kotoba` source files and Clojure-core compatibility (DONE, 2026-06-11)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj`.
+
+`kotoba-clj` now has a file runner for Clojure-subset source files using the
+`.kotoba` extension, matching the operational shape of `clj` / `bb` scripts:
+
+```clojure
+#!/usr/bin/env kotoba-clj
+(defn main [x]
+  (clojure.core/inc x))
+```
+
+```text
+kotoba-clj app.kotoba 41
+kotoba-clj --func fact math.kotoba 5
+kotoba-clj --wasm-out app.wasm app.kotoba
+```
+
+The runner strips a leading Unix shebang before the EDN reader sees the source,
+prepends the kotoba-clj prelude by default, validates the `.kotoba` extension
+unless `--allow-any-ext` is passed, and invokes exported `main` unless
+`--func` selects another exported function. `compile_file` and
+`compile_file_with_prelude` expose the same behavior to Rust callers.
+
+The supported Clojure-core compatibility surface also grew:
+
+- `clojure.core/`-qualified supported builtins resolve to their unqualified
+  names.
+- Numeric aliases and predicates: `quot`, `rem`, `inc`, `dec`, `abs`, `zero?`,
+  `pos?`, `neg?`.
+- Clojure-style n-ary comparisons: `=`, `not=`, `<`, `>`, `<=`, `>=`.
+- Prelude container aliases over the existing vector/map heap representation:
+  `count`, `empty?`, `nth`, `first`, `last`, `conj!`, `get`, `assoc!`,
+  `contains-key?`.
+
+Verification: `cargo test -p kotoba-clj` passed, including `.kotoba` file
+execution and shebang tests. Datomic query compatibility gained a regression
+test for `clojure.core/`-qualified collection functions in
+`kotoba-datomic::q`.

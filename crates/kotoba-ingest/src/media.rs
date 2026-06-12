@@ -31,8 +31,8 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
-use kotoba_kqe::datom::{Datom, TensorDtype, Value};
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::datom::{Datom, TensorDtype, Value};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use kotoba_kse::Vault;
 use tracing::{debug, info};
 

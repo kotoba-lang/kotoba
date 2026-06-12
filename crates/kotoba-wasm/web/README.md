@@ -1,7 +1,7 @@
 # kotoba browser node — web integration (ADR-2606013600)
 
 Run the kotoba **read/query engine in the browser**: `kotoba-wasm`
-(`kotoba-kqe` plus the Datomic `q` engine compiled to wasm) behind a transparent
+(`kotoba-query` plus the Datomic `q` engine compiled to wasm) behind a transparent
 Service Worker, so yoro feed reads and Datomic queries resolve locally with no
 server query round-trip after sync.
 

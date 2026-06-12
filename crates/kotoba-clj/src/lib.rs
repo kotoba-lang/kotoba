@@ -34,7 +34,10 @@
 //! - raw memory: `(alloc n)`, `(load64 a)`, `(store64! a v)`, `(load32 a)`,
 //!   `(store32! a v)` — the substrate the [`PRELUDE`] vector/map build on
 //! - host calls: `(has-capability? resource ability)` → `auth.has-capability`;
-//!   `(llm-infer model prompt)` → `llm.infer` (ok → output handle, err → `0`).
+//!   `(llm-infer model prompt)` → `llm.infer` (ok → output handle, err → `0`);
+//!   `(kqe-assert! g s p obj-cbor)` / `(kqe-retract! …)` → `kqe.assert-quad` /
+//!   `retract-quad` (the **Datom write surface**, 1/0); `(kqe-get-objects g s
+//!   p)` / `(kqe-query filter)` → packed list handles read via [`KQE_PRELUDE`].
 //!   These grow a real wasm import section wired to the `kotoba:kais` world.
 //! - in-guest CBOR decode via [`CBOR_PRELUDE`] (`cbor-reader`, `cbor-uint`,
 //!   `cbor-text`, `cbor-map-seek`, …) — decode a `run(ctx-cbor)` payload
@@ -86,6 +89,7 @@ pub mod component;
 #[cfg(feature = "run")]
 pub mod run;
 
+use std::path::Path;
 use thiserror::Error;
 
 /// Errors across the read → lower → codegen → run pipeline.
@@ -111,6 +115,38 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, CljError> {
     codegen::compile(&program)
 }
 
+/// Compile a `.kotoba` source file into WebAssembly bytes.
+///
+/// A leading Unix shebang (`#!...`) is stripped before the EDN/Clojure reader
+/// sees the source, so executable scripts can start with:
+///
+/// ```text
+/// #!/usr/bin/env kotoba-clj
+/// ```
+pub fn compile_file(path: impl AsRef<Path>) -> Result<Vec<u8>, CljError> {
+    let src = std::fs::read_to_string(path.as_ref())
+        .map_err(|e| CljError::Read(format!("read {}: {e}", path.as_ref().display())))?;
+    compile_str(strip_shebang(&src))
+}
+
+/// Compile a source file with the container + CBOR prelude.
+pub fn compile_file_with_prelude(path: impl AsRef<Path>) -> Result<Vec<u8>, CljError> {
+    let src = std::fs::read_to_string(path.as_ref())
+        .map_err(|e| CljError::Read(format!("read {}: {e}", path.as_ref().display())))?;
+    compile_str_with_prelude(strip_shebang(&src))
+}
+
+fn strip_shebang(src: &str) -> &str {
+    if let Some(rest) = src.strip_prefix("#!") {
+        match rest.find('\n') {
+            Some(i) => &rest[i + 1..],
+            None => "",
+        }
+    } else {
+        src
+    }
+}
+
 /// A dynamic-container prelude written in the kotoba-clj subset **itself**:
 /// growable `vector` and string-keyed `map`, built on the raw-memory builtins
 /// (`alloc`/`load64`/`store64!`) and Stage-A `loop`/`recur`. This is the heap
@@ -124,7 +160,9 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, CljError> {
 ///
 /// Prepend it with [`compile_str_with_prelude`]. Names: `vec-make` `vec-count`
 /// `vec-nth` `vec-conj!` `vec-extend!` (the `add_messages` reducer), `map-make`
-/// `map-count` `map-get` `map-assoc!`, and `str-eq?`.
+/// `map-count` `map-get` `map-assoc!`, and `str-eq?`. It also exposes a small
+/// Clojure-core compatibility layer: `count`, `empty?`, `nth`, `first`, `last`,
+/// `conj!`, `get`, `assoc!`, and `contains-key?`.
 pub const PRELUDE: &str = r#"
 ;; ---- vector: [len, cap, e0, e1, …] ----------------------------------------
 (defn vec-make [cap]
@@ -192,6 +230,19 @@ pub const PRELUDE: &str = r#"
         (store64! m (+ n 1))
         m)
       (do (store64! (+ m (+ 24 (* 16 idx))) v) m))))
+
+;; ---- Clojure-core-ish compatibility aliases -------------------------------
+;; These are intentionally thin: vectors and maps both store their count at
+;; offset 0, while nth/conj! are vector-oriented and get/assoc! are map-oriented.
+(defn count [x] (load64 x))
+(defn empty? [x] (= (count x) 0))
+(defn nth [v i] (vec-nth v i))
+(defn first [v] (vec-nth v 0))
+(defn last [v] (vec-nth v (- (vec-count v) 1)))
+(defn conj! [v x] (vec-conj! v x))
+(defn get [m k] (map-get m k))
+(defn assoc! [m k v] (map-assoc! m k v))
+(defn contains-key? [m k] (>= (map-find m k) 0))
 "#;
 
 /// An **in-guest CBOR decoder** (subset) written in the kotoba-clj language,
@@ -310,16 +361,46 @@ pub const CBOR_ENC_PRELUDE: &str = r#"
 (defn cbor-enc-bytes! [buf s] (cbor-enc--str! buf 2 s))
 "#;
 
+/// Accessors for the packed list handles the **kqe host builtins** return —
+/// written in the language itself on `load32` (the host lifts results into
+/// guest memory via `cabi_realloc`; the Canonical-ABI layouts are flat arrays).
+///
+/// A kqe list handle packs `(element-array-ptr << 32) | count`:
+/// - `kqe-get-objects` elements are `list<u8>`: 8 bytes each, `[ptr:i32, len:i32]`.
+/// - `kqe-query` elements are `quad` records: 32 bytes each — 4 × `[ptr,len]`
+///   fields in WIT order graph(0) / subject(1) / predicate(2) / object-cbor(3).
+///
+/// Every accessor yields a normal **string handle** `(ptr << 32) | len`, so the
+/// results read back through `str-len` / `byte-at` / `str-eq?` / `cbor-reader`.
+pub const KQE_PRELUDE: &str = r#"
+;; ---- kqe packed-list accessors ---------------------------------------------
+(defn kqe-count [h] (str-len h))
+(defn kqe--ptr [h] (/ h 4294967296))
+;; read the [ptr:i32, len:i32] pair at address e into a string handle
+(defn kqe--handle-at [e] (+ (* (load32 e) 4294967296) (load32 (+ e 4))))
+;; i-th object of a (kqe-get-objects …) result → string handle of the CBOR bytes
+(defn kqe-obj-nth [h i] (kqe--handle-at (+ (kqe--ptr h) (* 8 i))))
+;; field f (0=graph 1=subject 2=predicate 3=object-cbor) of the i-th quad
+(defn kqe-quad-field [h i f] (kqe--handle-at (+ (+ (kqe--ptr h) (* 32 i)) (* 8 f))))
+(defn kqe-quad-graph [h i] (kqe-quad-field h i 0))
+(defn kqe-quad-subject [h i] (kqe-quad-field h i 1))
+(defn kqe-quad-predicate [h i] (kqe-quad-field h i 2))
+(defn kqe-quad-object [h i] (kqe-quad-field h i 3))
+"#;
+
 /// Compile `src` with the container [`PRELUDE`], the CBOR decoder
-/// [`CBOR_PRELUDE`], and the CBOR encoder [`CBOR_ENC_PRELUDE`] prepended, so the
-/// program can use `vec-*` / `map-*` / `cbor-*` directly.
+/// [`CBOR_PRELUDE`], the CBOR encoder [`CBOR_ENC_PRELUDE`], and the kqe
+/// accessors [`KQE_PRELUDE`] prepended, so the program can use `vec-*` /
+/// `map-*` / `cbor-*` / `kqe-*` directly.
 pub fn compile_str_with_prelude(src: &str) -> Result<Vec<u8>, CljError> {
-    compile_str(&format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{src}"))
+    compile_str(&format!(
+        "{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}\n{src}"
+    ))
 }
 
-/// The combined prelude text (containers + CBOR decode + CBOR encode), for
-/// callers that compile via the component/kais path and need to prepend it to
-/// their own `(defn run …)`.
+/// The combined prelude text (containers + CBOR decode + CBOR encode + kqe
+/// accessors), for callers that compile via the component/kais path and need to
+/// prepend it to their own `(defn run …)`.
 pub fn prelude() -> String {
-    format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}")
+    format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}")
 }

@@ -28,7 +28,7 @@ use axum::{
     Json,
 };
 use kotoba_core::cid::KotobaCid;
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -248,7 +248,7 @@ async fn commit_quads_as_datoms(
     let datoms = quads
         .into_iter()
         .map(|quad| {
-            let mut datom = kotoba_kqe::Datom::from_legacy_quad(quad, true);
+            let mut datom = kotoba_query::Datom::from_legacy_quad(quad, true);
             datom.tx = tx_cid.clone();
             kotoba_datomic::Datom::from_kqe(datom)
         })

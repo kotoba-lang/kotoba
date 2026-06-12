@@ -1,8 +1,9 @@
 //! Request fingerprint middleware.
 //!
 //! Every inbound XRPC / MCP request is fingerprinted with blake3 and stored
-//! as distributed Datoms in the `kotoba/audit/requests` named graph.  Storage
-//! is fire-and-forget (background task) so latency impact is negligible.
+//! as distributed Datoms in the `kotoba/audit/requests` named graph. Storage
+//! is fire-and-forget by default; `KOTOBA_AUDIT_STRICT=1` makes the commit
+//! synchronous and fail-closed before the request reaches its handler.
 //!
 //! Quads emitted per request:
 //! - `(audit_graph, request_cid, "request/method",  Text(method))`
@@ -10,14 +11,21 @@
 //! - `(audit_graph, request_cid, "request/node_id", Text(hex_node_id))`
 //! - `(audit_graph, request_cid, "request/ts_unix", Integer(unix_secs))`
 //! - `(audit_graph, request_cid, "request/peer_ip", Text(ip))` — when available
+//! - `(audit_graph, request_cid, "request/principal_did", Text(did))` — when available
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use kotoba_core::cid::KotobaCid;
 #[cfg(test)]
-use kotoba_kqe::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
+use kotoba_query::quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject};
 
 use crate::server::KotobaState;
 
@@ -61,9 +69,52 @@ fn extract_ip(req: &Request<Body>) -> Option<String> {
     None
 }
 
+/// Maximum stored DID/principal string length.
+const MAX_AUDIT_PRINCIPAL_LEN: usize = 256;
+
+/// Extract the authenticated principal from `Authorization: Bearer <JWT>`.
+///
+/// The middleware only records the decoded `sub`; it never stores the bearer token.
+fn extract_principal_did(req: &Request<Body>) -> Option<String> {
+    let header = req.headers().get("authorization")?.to_str().ok()?.trim();
+    let token = header.strip_prefix("Bearer ")?;
+    crate::graph_auth::jwt_sub(token)
+        .filter(|sub| !sub.is_empty())
+        .map(|sub| sub.chars().take(MAX_AUDIT_PRINCIPAL_LEN).collect())
+}
+
 /// Maximum path length stored in audit Quads.  Paths longer than this are
 /// truncated to prevent unbounded Quad object growth from crafted URLs.
 const MAX_AUDIT_PATH_LEN: usize = 512;
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false)
+}
+
+async fn commit_request_audit(
+    state: Arc<KotobaState>,
+    graph: KotobaCid,
+    req_cid: KotobaCid,
+    datoms: Vec<kotoba_datomic::Datom>,
+    tx_cid: KotobaCid,
+) -> Result<(), (StatusCode, String)> {
+    crate::xrpc::commit_protocol_datoms(
+        &state,
+        graph.clone(),
+        graph.to_multibase(),
+        req_cid,
+        datoms,
+        tx_cid,
+        state.operator_did.clone(),
+        kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
 
 /// Axum middleware: fingerprint every request and store Datoms asynchronously.
 ///
@@ -81,10 +132,7 @@ pub async fn fingerprint_middleware(
     // "background".  When durability of the audit graph isn't required (the
     // primary user data graphs are already durable on their own), this
     // env-gate cuts the per-request fixed cost to zero.
-    if std::env::var("KOTOBA_AUDIT_DISABLED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
-        .unwrap_or(false)
-    {
+    if env_flag("KOTOBA_AUDIT_DISABLED") {
         return next.run(req).await;
     }
     let method = req.method().as_str().to_string();
@@ -101,6 +149,7 @@ pub async fn fingerprint_middleware(
         raw.to_string()
     };
     let peer_ip = extract_ip(&req);
+    let principal_did = extract_principal_did(&req);
 
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -111,44 +160,53 @@ pub async fn fingerprint_middleware(
     let req_cid = request_cid(&method, &path, ts, &node_id);
     let graph = audit_graph_cid();
     let node_hex = hex::encode(node_id);
-
-    // Fire-and-forget: clone what we need into the background task.
-    let state_c = Arc::clone(&state);
-    let method_c = method.clone();
-    let path_c = path.clone();
-    let peer_ip_c = peer_ip.clone();
-
-    tokio::spawn(async move {
-        let tx_cid = KotobaCid::from_bytes(
-            format!(
-                "request.audit:{}:{}",
-                graph.to_multibase(),
-                req_cid.to_multibase()
-            )
-            .as_bytes(),
-        );
-        let datoms = build_request_datoms(
-            req_cid.clone(),
-            &method_c,
-            &path_c,
-            &node_hex,
-            ts,
-            peer_ip_c.as_deref(),
-            &tx_cid,
-        );
-        if let Err((status, message)) = crate::xrpc::commit_protocol_datoms(
-            &state_c,
-            graph.clone(),
+    let tx_cid = KotobaCid::from_bytes(
+        format!(
+            "request.audit:{}:{}",
             graph.to_multibase(),
-            req_cid,
-            datoms,
-            tx_cid,
-            state_c.operator_did.clone(),
-            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
-            None,
-            None,
+            req_cid.to_multibase()
+        )
+        .as_bytes(),
+    );
+    let datoms = build_request_datoms(
+        req_cid.clone(),
+        &method,
+        &path,
+        &node_hex,
+        ts,
+        peer_ip.as_deref(),
+        principal_did.as_deref(),
+        &tx_cid,
+    );
+
+    if env_flag("KOTOBA_AUDIT_STRICT") {
+        if let Err((status, message)) = commit_request_audit(
+            Arc::clone(&state),
+            graph.clone(),
+            req_cid.clone(),
+            datoms.clone(),
+            tx_cid.clone(),
         )
         .await
+        {
+            tracing::warn!(
+                status = %status, error = %message,
+                "strict request audit commit failed; rejecting request"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "strict request audit commit failed",
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
+
+    // Fire-and-forget unless strict mode is enabled.
+    let state_c = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err((status, message)) =
+            commit_request_audit(state_c, graph, req_cid, datoms, tx_cid).await
         {
             // Demoted to debug! 2026-05-30: request-audit is best-effort
             // telemetry — the underlying datomic transact already commits
@@ -177,6 +235,7 @@ fn build_request_quads(
     node_hex: &str,
     ts: u64,
     peer_ip: Option<&str>,
+    principal_did: Option<&str>,
 ) -> Vec<Quad> {
     let mut quads = vec![
         Quad {
@@ -207,10 +266,19 @@ fn build_request_quads(
 
     if let Some(ip) = peer_ip {
         quads.push(Quad {
-            graph,
-            subject,
+            graph: graph.clone(),
+            subject: subject.clone(),
             predicate: "request/peer_ip".to_string(),
             object: QuadObject::Text(ip.to_string()),
+        });
+    }
+
+    if let Some(did) = principal_did {
+        quads.push(Quad {
+            graph,
+            subject,
+            predicate: "request/principal_did".to_string(),
+            object: QuadObject::Text(did.to_string()),
         });
     }
 
@@ -224,6 +292,7 @@ fn build_request_datoms(
     node_hex: &str,
     ts: u64,
     peer_ip: Option<&str>,
+    principal_did: Option<&str>,
     tx_cid: &KotobaCid,
 ) -> Vec<kotoba_datomic::Datom> {
     let mut datoms = vec![
@@ -255,9 +324,18 @@ fn build_request_datoms(
 
     if let Some(ip) = peer_ip {
         datoms.push(kotoba_datomic::Datom::assert(
-            subject,
+            subject.clone(),
             "request/peer_ip".to_string(),
             kotoba_edn::EdnValue::string(ip),
+            tx_cid.clone(),
+        ));
+    }
+
+    if let Some(did) = principal_did {
+        datoms.push(kotoba_datomic::Datom::assert(
+            subject,
+            "request/principal_did".to_string(),
+            kotoba_edn::EdnValue::string(did),
             tx_cid.clone(),
         ));
     }
@@ -296,15 +374,17 @@ mod tests {
             "deadbeef",
             42,
             Some("1.2.3.4"),
+            Some("did:key:zAlice"),
         );
-        assert_eq!(quads.len(), 5);
+        assert_eq!(quads.len(), 6);
     }
 
     #[test]
     fn build_quads_count_without_ip() {
         let graph = audit_graph_cid();
         let subject = KotobaCid::from_bytes(b"test-req");
-        let quads = build_request_quads(graph, subject, "GET", "/health", "deadbeef", 42, None);
+        let quads =
+            build_request_quads(graph, subject, "GET", "/health", "deadbeef", 42, None, None);
         assert_eq!(quads.len(), 4);
     }
 
@@ -323,6 +403,7 @@ mod tests {
             "deadbeef",
             1_779_945_602,
             Some("203.0.113.1"),
+            Some("did:key:zAuditCaller"),
             &tx_cid,
         );
 
@@ -350,10 +431,11 @@ mod tests {
             .q_triples(
                 &commit.commit.cid,
                 &kotoba_edn::parse(
-                    r#"{:find [?method ?path ?ip]
+                    r#"{:find [?method ?path ?ip ?principal]
                         :where [[?req :request/method ?method]
                                 [?req :request/path ?path]
-                                [?req :request/peer_ip ?ip]]}"#,
+                                [?req :request/peer_ip ?ip]
+                                [?req :request/principal_did ?principal]]}"#,
                 )
                 .unwrap(),
             )
@@ -365,6 +447,7 @@ mod tests {
                 kotoba_edn::EdnValue::string("POST"),
                 kotoba_edn::EdnValue::string("/xrpc/com.etzhayyim.apps.kotoba.datomic.q"),
                 kotoba_edn::EdnValue::string("203.0.113.1"),
+                kotoba_edn::EdnValue::string("did:key:zAuditCaller"),
             ]]
         );
         assert!(reader
@@ -423,6 +506,7 @@ mod tests {
             "ff00",
             100,
             Some("10.0.0.1"),
+            Some("did:key:zBob"),
         );
 
         let predicates: Vec<&str> = quads.iter().map(|q| q.predicate.as_str()).collect();
@@ -446,12 +530,17 @@ mod tests {
             predicates.contains(&"request/peer_ip"),
             "should have request/peer_ip quad when IP provided"
         );
+        assert!(
+            predicates.contains(&"request/principal_did"),
+            "should have request/principal_did quad when principal is available"
+        );
     }
 
     #[test]
     fn max_audit_constants_values() {
         assert_eq!(MAX_AUDIT_IP_LEN, 64);
         assert_eq!(MAX_AUDIT_PATH_LEN, 512);
+        assert_eq!(MAX_AUDIT_PRINCIPAL_LEN, 256);
     }
 
     // ── path truncation edge cases ────────────────────────────────────────────

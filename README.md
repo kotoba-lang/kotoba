@@ -105,7 +105,7 @@ exactly how to silence or fix it.
 |--------------------|----------------------------------------------------------------------------|
 | `kotoba-core`      | CIDv1 dag-cbor sha2-256, KAIS 8-bit frame, Prolly Tree                     |
 | `kotoba-kse`       | Journal (Merkle WAL), Vault (CDC chunker), Topic, Shelf, AgentIdentity     |
-| `kotoba-kqe`       | Datalog engine, Arrangement (EAVT/AEVT/AVET/VAET), Delta, MV               |
+| `kotoba-query`       | Datalog engine, Arrangement (EAVT/AEVT/AVET/VAET), Delta, MV               |
 | `kotoba-dht`       | Source Chain, Warrant, Neighborhood (DHT)                                  |
 | `kotoba-net`       | libp2p QUIC/Noise/GossipSub                                                |
 | `kotoba-auth`      | CACAO chain (depth-2), multi-graph grants, EdDSA verify, did:key, Passkey  |
@@ -134,6 +134,7 @@ exactly how to silence or fix it.
 - **E2E encryption** — Signal Protocol + CACAO auth for consent-gated data
 - **Datomic/Datalog primary, SPARQL auxiliary** — the distributed Datom DB is the source of truth; SPARQL 1.1 reads the same projection for RDF-compatible query and federation
 - **CACAO-native authz** — depth-2 delegation chains, multi-graph grants, anti-replay nonce
+- **X-Road-style accountability** — ciphertext-only replication, purpose-declared + signed + receipted key release via t-of-N custodians, anchored tamper-evident audit log, slashable unreceipted releases. See [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md)
 
 ## Architecture
 
@@ -163,7 +164,7 @@ since, no second-log replay.
 
 **② Query — Datomic first-tier** — the 4-index model is tier-1: BGP routing does
 direct index scans (EAVT point lookup ~180 ns, AVET, VAET reverse) over the
-ProllyTree, and an incremental **MaterializedView** (`kotoba-kqe/src/mv.rs`,
+ProllyTree, and an incremental **MaterializedView** (`kotoba-query/src/mv.rs`,
 maintained per commit Δ) serves recurring/Datalog queries without re-evaluating
 from scratch. `kg.sparql` (SELECT/ASK/DESCRIBE/CONSTRUCT/UPDATE/SERVICE) is the
 auxiliary RDF surface over the same indexes; `db_before`/TEA give Datomic-style
@@ -257,6 +258,17 @@ cargo build --workspace
 cargo test --workspace                  # ~1184 tests pass
 cargo build --release -p kotoba-cli     # final `kotoba` binary
 ```
+
+## Coverage
+
+```bash
+./scripts/coverage.sh        # per-crate + total line/region coverage (lib tests)
+./scripts/coverage.sh html   # browsable report at target/llvm-cov/html/index.html
+./scripts/coverage.sh lcov   # lcov.info for CI / codecov upload
+```
+
+Requires `cargo install cargo-llvm-cov` and a rustup toolchain (the script pins
+to `rustup run stable` because Homebrew rust ships no `llvm-tools`).
 
 ## ADR
 
