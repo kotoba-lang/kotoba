@@ -180,6 +180,7 @@ impl RemoteIpfsBlockStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
             .iter()
+            .filter(|(cid, bytes)| remote_block_matches_cid(cid, bytes))
             .map(|(cid, bytes)| (cid.clone(), bytes.clone()))
             .collect())
     }
@@ -187,6 +188,12 @@ impl RemoteIpfsBlockStore {
 
 impl BlockStore for RemoteIpfsBlockStore {
     fn put(&self, cid: &KotobaCid, data: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            remote_block_matches_cid(cid, data),
+            "cid mismatch: expected {}, got {}",
+            cid.to_multibase(),
+            KotobaCid::from_bytes(data).to_multibase()
+        );
         self.cache
             .lock()
             .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
@@ -195,14 +202,22 @@ impl BlockStore for RemoteIpfsBlockStore {
     }
 
     fn get(&self, cid: &KotobaCid) -> anyhow::Result<Option<bytes::Bytes>> {
-        if let Some(bytes) = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
-            .get(cid)
-            .cloned()
-        {
-            return Ok(Some(bytes));
+        let cached = {
+            self.cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
+                .get(cid)
+                .cloned()
+        };
+        if let Some(bytes) = cached {
+            if remote_block_matches_cid(cid, &bytes) {
+                return Ok(Some(bytes));
+            }
+            tracing::warn!(cid = %cid, "remote IPFS cached block failed CID verification");
+            self.cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
+                .remove(cid);
         }
         let Some(bytes) = fetch_remote_block(self.socket, cid)? else {
             return Ok(None);
@@ -216,6 +231,20 @@ impl BlockStore for RemoteIpfsBlockStore {
 
     fn has(&self, cid: &KotobaCid) -> bool {
         self.get(cid).ok().flatten().is_some()
+    }
+
+    fn delete(&self, cid: &KotobaCid) -> anyhow::Result<()> {
+        self.cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote block cache lock poisoned"))?
+            .remove(cid);
+        Ok(())
+    }
+
+    fn all_cids(&self) -> Vec<KotobaCid> {
+        self.cached_blocks()
+            .map(|blocks| blocks.into_iter().map(|(cid, _)| cid).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -270,6 +299,10 @@ fn fetch_remote_block(socket: SocketAddr, cid: &KotobaCid) -> anyhow::Result<Opt
     Ok(Some(bytes::Bytes::from(buf)))
 }
 
+fn remote_block_matches_cid(cid: &KotobaCid, data: &[u8]) -> bool {
+    KotobaCid::from_bytes(data) == *cid
+}
+
 fn fetch_remote_ipns_record(
     socket: SocketAddr,
     name: &IpnsName,
@@ -302,7 +335,24 @@ fn fetch_remote_ipns_record(
     stream
         .read_exact(&mut buf)
         .map_err(|e| IpnsRegistryError::Kubo(e.to_string()))?;
-    ciborium::from_reader(&buf[..]).map_err(|e| IpnsRegistryError::Kubo(e.to_string()))
+    let record: IpnsRecord =
+        ciborium::from_reader(&buf[..]).map_err(|e| IpnsRegistryError::Kubo(e.to_string()))?;
+    verify_remote_ipns_record(name, &record)?;
+    Ok(record)
+}
+
+fn verify_remote_ipns_record(
+    expected_name: &IpnsName,
+    record: &IpnsRecord,
+) -> Result<(), IpnsRegistryError> {
+    if record.name != *expected_name {
+        return Err(IpnsRegistryError::Kubo(format!(
+            "remote IPNS record name mismatch: requested {}, got {}",
+            expected_name.0, record.name.0
+        )));
+    }
+    record.value_cid()?;
+    record.verify_signature_if_present()
 }
 
 pub struct DistributedDatomReader<'a, R>
@@ -1148,13 +1198,10 @@ where
                 .map(query_value_vec)
                 .transpose()?
                 .unwrap_or_default();
-            return aggregate_distributed_rows(
-                &find_items,
-                &with_items,
-                bindings,
-                pull_db.as_ref(),
-            )
-            .and_then(|rows| crate::query_result_window(&query, find, rows).map_err(Into::into));
+            return aggregate_distributed_rows(&find_items, with_items, bindings, pull_db.as_ref())
+                .and_then(|rows| {
+                    crate::query_result_window(&query, find, rows).map_err(Into::into)
+                });
         }
         let mut rows = BTreeSet::new();
         for binding in bindings {
@@ -3062,10 +3109,7 @@ impl DistributedDatomCommit {
     /// Call BEFORE `persist`. The key MUST belong to the `author` DID —
     /// verifiers resolve the pubkey from `author` (did:key), so a mismatched
     /// key just yields a commit whose signature never verifies.
-    pub fn sign(
-        &mut self,
-        key: &ed25519_dalek::SigningKey,
-    ) -> Result<(), DistributedCommitError> {
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) -> Result<(), DistributedCommitError> {
         use ed25519_dalek::Signer;
         let payload = self.signed_payload()?;
         self.author_sig = Some(key.sign(&payload).to_bytes().to_vec());
@@ -5113,6 +5157,132 @@ mod tests {
         assert!(stored[0].added);
         let resolved = ipns.resolve(&IpnsName::new("k51-kotoba-db")).unwrap();
         assert_eq!(resolved.value, report.commit.cid.to_multibase());
+    }
+
+    #[test]
+    fn remote_ipfs_block_store_rejects_mismatched_put() {
+        let store = RemoteIpfsBlockStore::new("127.0.0.1:9".parse().unwrap());
+        let cid = KotobaCid::from_bytes(b"expected remote block");
+
+        let err = store.put(&cid, b"different remote block").unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
+        assert!(store.cached_blocks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remote_ipfs_block_store_get_removes_corrupted_cache_entry() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            stream.write_all(&u64::MAX.to_be_bytes()).unwrap();
+            request
+        });
+        let store = RemoteIpfsBlockStore::new(socket);
+        let cid = KotobaCid::from_bytes(b"expected remote block");
+        store.cache.lock().unwrap().insert(
+            cid.clone(),
+            bytes::Bytes::from_static(b"corrupt remote block"),
+        );
+
+        let result = store.get(&cid);
+
+        assert!(result.unwrap().is_none());
+        assert!(store.cache.lock().unwrap().get(&cid).is_none());
+        let request = String::from_utf8(server.join().unwrap()).unwrap();
+        assert!(request.contains(&cid.to_multibase()));
+    }
+
+    #[test]
+    fn remote_ipfs_block_store_all_cids_returns_verified_cache_entries() {
+        let store = RemoteIpfsBlockStore::new("127.0.0.1:9".parse().unwrap());
+        let good = KotobaCid::from_bytes(b"good remote block");
+        let corrupt = KotobaCid::from_bytes(b"expected remote block");
+        store.put(&good, b"good remote block").unwrap();
+        store.cache.lock().unwrap().insert(
+            corrupt.clone(),
+            bytes::Bytes::from_static(b"corrupt remote block"),
+        );
+
+        let cids = store.all_cids();
+        let cached = store.cached_blocks().unwrap();
+
+        assert_eq!(cids, vec![good.clone()]);
+        assert_eq!(
+            cached,
+            vec![(good, bytes::Bytes::from_static(b"good remote block"))]
+        );
+    }
+
+    fn serve_ipns_record_once(record: IpnsRecord) -> (SocketAddr, std::thread::JoinHandle<String>) {
+        let mut body = Vec::new();
+        ciborium::into_writer(&record, &mut body).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            stream
+                .write_all(&(body.len() as u64).to_be_bytes())
+                .unwrap();
+            stream.write_all(&body).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (socket, server)
+    }
+
+    #[test]
+    fn remote_ipns_record_rejects_name_mismatch() {
+        let value = KotobaCid::from_bytes(b"remote head")
+            .to_standard_cid()
+            .unwrap();
+        let record = IpnsRecord::new("k51-wrong-name", &value, 1, "2030-01-01T00:00:00Z");
+        let (socket, server) = serve_ipns_record_once(record);
+
+        let err =
+            fetch_remote_ipns_record(socket, &IpnsName::new("k51-expected-name")).unwrap_err();
+
+        assert!(err.to_string().contains("name mismatch"));
+        assert!(server.join().unwrap().contains("k51-expected-name"));
+    }
+
+    #[test]
+    fn remote_ipns_record_rejects_invalid_signature_fields() {
+        let value = KotobaCid::from_bytes(b"remote head")
+            .to_standard_cid()
+            .unwrap();
+        let mut record = IpnsRecord::new("k51-expected-name", &value, 1, "2030-01-01T00:00:00Z");
+        record.public_key_multibase = Some("znot-a-valid-key".to_string());
+        record.signature_multibase = Some("znot-a-valid-signature".to_string());
+        let (socket, server) = serve_ipns_record_once(record);
+
+        let err =
+            fetch_remote_ipns_record(socket, &IpnsName::new("k51-expected-name")).unwrap_err();
+
+        assert!(
+            err.to_string().contains("signature")
+                || err.to_string().contains("public key")
+                || err.to_string().contains("invalid")
+        );
+        assert!(server.join().unwrap().contains("k51-expected-name"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9475,7 +9645,10 @@ mod author_sig_tests {
         let cid = c.persist(&store).unwrap();
         let loaded = DistributedDatomCommit::load(&cid, &store).unwrap().unwrap();
         assert_eq!(loaded.author_sig, None);
-        assert_eq!(loaded.cid, c.cid, "unsigned encoding unchanged (no field emitted)");
+        assert_eq!(
+            loaded.cid, c.cid,
+            "unsigned encoding unchanged (no field emitted)"
+        );
     }
 
     #[test]
@@ -9530,8 +9703,7 @@ mod author_sig_tests {
         let vk = key.verifying_key();
         let store = kotoba_store::MemoryBlockStore::new();
         let ipns = kotoba_ipfs::InMemoryIpnsRegistry::new();
-        let writer = DistributedCommitWriter::new(&store, &ipns)
-            .with_author_signing_key(Some(key));
+        let writer = DistributedCommitWriter::new(&store, &ipns).with_author_signing_key(Some(key));
         let commit = writer
             .commit_datoms(CommitDatomsRequest {
                 merge_parents: None,

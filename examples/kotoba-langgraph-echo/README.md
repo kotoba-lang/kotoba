@@ -15,7 +15,7 @@ START → echo → END        # _echo: {"response": state["prompt"]}
 cd 40-engine/kotoba
 export PATH="$PWD/../../.venv/bin:$PATH"
 export KOTOBA_SITE_PKG="$PWD/../../.venv/lib/python3.12/site-packages"
-./scripts/build-pywasm.sh examples/kotoba-langgraph-echo/agent.py
+./scripts/build-pywasm.bb examples/kotoba-langgraph-echo/agent.py
 # → agent.wasm (~18 MB)
 ```
 

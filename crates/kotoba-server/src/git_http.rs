@@ -153,10 +153,7 @@ fn cacao_header(headers: &HeaderMap) -> Option<&str> {
 /// firehose's `check_read_access`. A CACAO read credential (capability
 /// `datom:read`) may ride in the `x-kotoba-cacao` header. No nonce store: a
 /// clone reuses the same credential across `info/refs` + `upload-pack`.
-async fn read_gate(
-    state: &KotobaState,
-    headers: &HeaderMap,
-) -> Result<(), (StatusCode, String)> {
+async fn read_gate(state: &KotobaState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
     // Sentinel all-zero CID → node default visibility (not a registered graph).
     let visibility = state.graph_visibility(&KotobaCid([0u8; 36])).await;
     graph_auth::check_read_access(
@@ -226,7 +223,10 @@ fn smart_response(content_type: &str, body: Vec<u8>) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "no-cache, max-age=0, must-revalidate")
+        .header(
+            header::CACHE_CONTROL,
+            "no-cache, max-age=0, must-revalidate",
+        )
         .body(Body::from(body))
         .expect("static header values are valid")
 }
@@ -264,7 +264,10 @@ mod tests {
         // Case-insensitive ("GZIP") is also handled.
         let mut h = HeaderMap::new();
         h.insert(header::CONTENT_ENCODING, "GZIP".parse().unwrap());
-        assert_eq!(decode_body(&h, Bytes::from(gzip(&payload))).unwrap(), payload);
+        assert_eq!(
+            decode_body(&h, Bytes::from(gzip(&payload))).unwrap(),
+            payload
+        );
     }
 
     #[test]

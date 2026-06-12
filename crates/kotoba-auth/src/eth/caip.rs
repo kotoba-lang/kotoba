@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn caip10_roundtrip_checksummed() {
-        let addr = [0xAbu8; 20];
+        let addr = [0xAB_u8; 20];
         let id = caip10_account(1, &addr);
         assert!(id.starts_with("eip155:1:0x"));
         let (chain, parsed) = parse_caip10(&id).unwrap();

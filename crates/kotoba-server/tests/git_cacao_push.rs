@@ -10,7 +10,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use base64::{engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD, Engine,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use kotoba_auth::did_key::ed25519_pubkey_to_did_key;
 use kotoba_auth::{Cacao, CacaoHeader, CacaoPayload, CacaoSig};
@@ -24,7 +26,9 @@ fn build_cacao(scope: &str, capability: &str, aud: &str, nonce: &str) -> String 
     let sk = SigningKey::from_bytes(&hex::decode(SEED_HEX).unwrap().try_into().unwrap());
     let did = ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes());
     let mut cacao = Cacao {
-        h: CacaoHeader { t: "caip122".into() },
+        h: CacaoHeader {
+            t: "caip122".into(),
+        },
         p: CacaoPayload {
             iss: did.clone(),
             aud: aud.to_string(),
@@ -39,7 +43,10 @@ fn build_cacao(scope: &str, capability: &str, aud: &str, nonce: &str) -> String 
                 format!("kotoba://can/{capability}"),
             ],
         },
-        s: CacaoSig { t: "EdDSA".into(), s: String::new() },
+        s: CacaoSig {
+            t: "EdDSA".into(),
+            s: String::new(),
+        },
     };
     let sig: ed25519_dalek::Signature = sk.sign(cacao.siwe_message().as_bytes());
     cacao.s.s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
@@ -58,7 +65,8 @@ fn operator_did() -> String {
 fn git(cwd: &Path, header: Option<&str>, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("git");
     if let Some(h) = header {
-        cmd.arg("-c").arg(format!("http.extraHeader=x-kotoba-cacao: {h}"));
+        cmd.arg("-c")
+            .arg(format!("http.extraHeader=x-kotoba-cacao: {h}"));
     }
     let out = cmd
         .args(args)
@@ -142,7 +150,10 @@ async fn push_authorized_by_cacao_capability() {
         Some(&read_cacao),
         &["push", "-q", &url, "main:refs/heads/main"],
     );
-    assert!(wrong_cap.is_err(), "a datom:read CACAO must not authorize push");
+    assert!(
+        wrong_cap.is_err(),
+        "a datom:read CACAO must not authorize push"
+    );
 
     // 3. POSITIVE: a CACAO granting `git.receive/push` on this repo → accepted.
     let push_cacao = build_cacao("git/repo/cacaorepo", "git.receive/push", &did, "n-push");

@@ -220,7 +220,9 @@ pub fn require_internal_trust(headers: &HeaderMap) -> Result<(), (StatusCode, St
     if ct_eq(got.as_bytes(), secret.as_bytes()) {
         Ok(())
     } else {
-        tracing::warn!("internal-trust gate: missing/invalid x-internal-trust (direct pod access?)");
+        tracing::warn!(
+            "internal-trust gate: missing/invalid x-internal-trust (direct pod access?)"
+        );
         Err((
             StatusCode::UNAUTHORIZED,
             "request must arrive through the trusted edge (x-internal-trust)".to_string(),
@@ -526,7 +528,8 @@ pub fn verify_cacao_capability(
     let cbor = B64
         .decode(cacao_b64)
         .map_err(|e| AccessDenied::CacaoDecodeError(e.to_string()))?;
-    let cacao = Cacao::from_cbor(&cbor).map_err(|e| AccessDenied::CacaoParseError(e.to_string()))?;
+    let cacao =
+        Cacao::from_cbor(&cbor).map_err(|e| AccessDenied::CacaoParseError(e.to_string()))?;
     let chain = DelegationChain::new(cacao);
 
     let issuer_did = match expected_aud {

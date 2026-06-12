@@ -46,7 +46,11 @@ pub struct EvmChain<'a> {
 
 impl<'a> EvmChain<'a> {
     pub fn new(store: &'a dyn BlockStore) -> Self {
-        Self { store, head: None, height: 0 }
+        Self {
+            store,
+            head: None,
+            height: 0,
+        }
     }
 
     pub fn head(&self) -> Option<&KotobaCid> {
@@ -67,7 +71,8 @@ impl<'a> EvmChain<'a> {
         let mut datom_cids = Vec::with_capacity(produced.datoms.len());
         for d in &produced.datoms {
             let mut bytes = Vec::new();
-            ciborium::ser::into_writer(d, &mut bytes).map_err(|e| anyhow::anyhow!("datom enc: {e}"))?;
+            ciborium::ser::into_writer(d, &mut bytes)
+                .map_err(|e| anyhow::anyhow!("datom enc: {e}"))?;
             let cid = KotobaCid::from_bytes(&bytes);
             put_verified(self.store, &cid, &bytes)?;
             car.append(&cid, &bytes);
@@ -84,7 +89,8 @@ impl<'a> EvmChain<'a> {
             datom_cids,
         };
         let mut hbytes = Vec::new();
-        ciborium::ser::into_writer(&header, &mut hbytes).map_err(|e| anyhow::anyhow!("header enc: {e}"))?;
+        ciborium::ser::into_writer(&header, &mut hbytes)
+            .map_err(|e| anyhow::anyhow!("header enc: {e}"))?;
         // header is keyed by the block CID (the chain-id digest), not its own hash.
         self.store.put(&block_cid, &hbytes)?;
         car.append(&block_cid, &hbytes);
@@ -96,21 +102,31 @@ impl<'a> EvmChain<'a> {
         self.head = Some(block_cid.clone());
         self.height = produced.block.number;
 
-        Ok(CommittedBlock { block_cid, car: car_bytes })
+        Ok(CommittedBlock {
+            block_cid,
+            car: car_bytes,
+        })
     }
 
     /// Read a persisted block back from the store: its header + reconstructed
     /// state-diff Datoms. `None` if the block CID is absent.
-    pub fn read_block(&self, block_cid: &KotobaCid) -> anyhow::Result<Option<(EvmBlockHeader, Vec<Datom>)>> {
+    pub fn read_block(
+        &self,
+        block_cid: &KotobaCid,
+    ) -> anyhow::Result<Option<(EvmBlockHeader, Vec<Datom>)>> {
         let Some(hbytes) = self.store.get(block_cid)? else {
             return Ok(None);
         };
-        let header: EvmBlockHeader =
-            ciborium::de::from_reader(&hbytes[..]).map_err(|e| anyhow::anyhow!("header dec: {e}"))?;
+        let header: EvmBlockHeader = ciborium::de::from_reader(&hbytes[..])
+            .map_err(|e| anyhow::anyhow!("header dec: {e}"))?;
         let mut datoms = Vec::with_capacity(header.datom_cids.len());
         for cid in &header.datom_cids {
-            let b: Bytes = self.store.get(cid)?.ok_or_else(|| anyhow::anyhow!("missing datom block"))?;
-            let d: Datom = ciborium::de::from_reader(&b[..]).map_err(|e| anyhow::anyhow!("datom dec: {e}"))?;
+            let b: Bytes = self
+                .store
+                .get(cid)?
+                .ok_or_else(|| anyhow::anyhow!("missing datom block"))?;
+            let d: Datom =
+                ciborium::de::from_reader(&b[..]).map_err(|e| anyhow::anyhow!("datom dec: {e}"))?;
             datoms.push(d);
         }
         Ok(Some((header, datoms)))
@@ -159,13 +175,21 @@ mod tests {
 
         // the block is replayable from the store: read header + diff Datoms back,
         // apply them, and confirm the post-state (recipient credited).
-        let (header, datoms) = chain.read_block(&committed.block_cid).expect("read").expect("present");
+        let (header, datoms) = chain
+            .read_block(&committed.block_cid)
+            .expect("read")
+            .expect("present");
         assert_eq!(header.number, 1);
         assert_eq!(header.tx_count, 1);
         assert_eq!(header.state_root, produced.block.state_root);
 
         let mut v = EvmStateView::new();
-        v.apply(&datoms.into_iter().map(Delta::assert_datom).collect::<Vec<_>>());
+        v.apply(
+            &datoms
+                .into_iter()
+                .map(Delta::assert_datom)
+                .collect::<Vec<_>>(),
+        );
         let mut to = [0u8; 20];
         to.copy_from_slice(&hex::decode("3535353535353535353535353535353535353535").unwrap());
         assert_eq!(v.balance_of(&to), u256(1_000_000_000_000_000_000));
@@ -196,6 +220,9 @@ mod tests {
     fn read_unknown_block_is_none() {
         let store = MemoryBlockStore::new();
         let chain = EvmChain::new(&store);
-        assert!(chain.read_block(&KotobaCid::from_bytes(b"nope")).unwrap().is_none());
+        assert!(chain
+            .read_block(&KotobaCid::from_bytes(b"nope"))
+            .unwrap()
+            .is_none());
     }
 }

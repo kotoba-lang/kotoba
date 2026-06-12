@@ -96,13 +96,13 @@ fn write_seq<'a, I: Iterator<Item = &'a EdnValue>>(
     out: &mut String,
     open: &str,
     close: &str,
-    mut it: I,
+    it: I,
     indent: Option<usize>,
     depth: usize,
 ) {
     out.push_str(open);
     let mut first = true;
-    while let Some(v) = it.next() {
+    for v in it {
         if !first {
             match indent {
                 Some(n) => {
@@ -127,13 +127,13 @@ fn write_seq<'a, I: Iterator<Item = &'a EdnValue>>(
 
 fn write_map<'a, I: Iterator<Item = (&'a EdnValue, &'a EdnValue)>>(
     out: &mut String,
-    mut it: I,
+    it: I,
     indent: Option<usize>,
     depth: usize,
 ) {
     out.push('{');
     let mut first = true;
-    while let Some((k, v)) = it.next() {
+    for (k, v) in it {
         if !first {
             match indent {
                 Some(n) => {
@@ -214,17 +214,18 @@ mod tests {
         // unescape would drift the value.
         for s in [
             "he said \"hi\"",   // embedded double-quote
-            "back\\slash",       // backslash
-            "line1\nline2",      // newline
-            "carriage\rreturn",  // CR
-            "tab\there",         // tab
-            "all: \"a\\b\nc\"",  // several escapes at once
-            "",                   // empty string
-            "日本語 ✓ unicode",  // multibyte (no escape, must survive verbatim)
+            "back\\slash",      // backslash
+            "line1\nline2",     // newline
+            "carriage\rreturn", // CR
+            "tab\there",        // tab
+            "all: \"a\\b\nc\"", // several escapes at once
+            "",                 // empty string
+            "日本語 ✓ unicode", // multibyte (no escape, must survive verbatim)
         ] {
             let v = EdnValue::string(s);
             let out = to_string(&v);
-            let v2 = parse(&out).unwrap_or_else(|e| panic!("reparse failed for {s:?} -> {out:?}: {e:?}"));
+            let v2 = parse(&out)
+                .unwrap_or_else(|e| panic!("reparse failed for {s:?} -> {out:?}: {e:?}"));
             assert_eq!(v, v2, "string roundtrip drift for {s:?} -> {out:?}");
         }
     }

@@ -81,7 +81,9 @@ pub fn decode_pinned_logs(logs: &serde_json::Value, graph: &KotobaCid) -> Vec<Da
         return out;
     };
     for log in arr {
-        let Some(topics) = topics_of(log) else { continue };
+        let Some(topics) = topics_of(log) else {
+            continue;
+        };
         // Pinned has 4 topics: sig + pinId + rootCid + pinner.
         if topics.len() < 4 {
             continue;
@@ -117,16 +119,22 @@ pub fn decode_slash_logs(logs: &serde_json::Value) -> Vec<ObservedSlash> {
         return out;
     };
     for log in arr {
-        let Some(topics) = topics_of(log) else { continue };
+        let Some(topics) = topics_of(log) else {
+            continue;
+        };
         if topics.len() < 2 {
             continue;
         }
         if !format!("0x{}", hex::encode(topics[0])).eq_ignore_ascii_case(&want) {
             continue;
         }
-        let Some(data_str) = log.get("data").and_then(|d| d.as_str()) else { continue };
+        let Some(data_str) = log.get("data").and_then(|d| d.as_str()) else {
+            continue;
+        };
         let body = data_str.strip_prefix("0x").unwrap_or(data_str);
-        let Ok(bytes) = hex::decode(body) else { continue };
+        let Ok(bytes) = hex::decode(body) else {
+            continue;
+        };
         if bytes.len() < 96 {
             continue;
         }
@@ -166,7 +174,8 @@ pub struct ReqwestRpc {
 
 impl JsonRpcTransport for ReqwestRpc {
     fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-        let body = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let body =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let resp: serde_json::Value = reqwest::blocking::Client::new()
             .post(&self.url)
             .json(&body)
@@ -177,7 +186,10 @@ impl JsonRpcTransport for ReqwestRpc {
         if let Some(err) = resp.get("error") {
             return Err(format!("rpc error: {err}"));
         }
-        Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(resp
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 }
 
@@ -192,7 +204,11 @@ pub struct EvmLogObservationSource<T: JsonRpcTransport> {
 
 impl<T: JsonRpcTransport> EvmLogObservationSource<T> {
     pub fn new(transport: T, escrow_address: impl Into<String>, graph: KotobaCid) -> Self {
-        Self { transport, escrow_address: escrow_address.into(), graph }
+        Self {
+            transport,
+            escrow_address: escrow_address.into(),
+            graph,
+        }
     }
 
     fn fetch_logs(&self, from_block: &str, to_block: &str) -> Result<serde_json::Value, String> {
@@ -201,7 +217,8 @@ impl<T: JsonRpcTransport> EvmLogObservationSource<T> {
             "fromBlock": from_block,
             "toBlock": to_block,
         });
-        self.transport.call("eth_getLogs", serde_json::json!([filter]))
+        self.transport
+            .call("eth_getLogs", serde_json::json!([filter]))
     }
 
     /// Fetch + decode `Pinned` logs → `mishmar/pin/{pinner,root}` Datoms (feed PinIndex).
@@ -267,7 +284,11 @@ mod tests {
         logs: serde_json::Value,
     }
     impl JsonRpcTransport for FakeRpc {
-        fn call(&self, method: &str, _params: serde_json::Value) -> Result<serde_json::Value, String> {
+        fn call(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             assert_eq!(method, "eth_getLogs");
             Ok(self.logs.clone())
         }
@@ -304,11 +325,17 @@ mod tests {
 
         // feed PinIndex and confirm the mapping resolves to the from_bytes CIDs.
         let mut idx = PinIndex::new();
-        let deltas: Vec<_> = datoms.into_iter().map(kotoba_query::delta::Delta::assert_datom).collect();
+        let deltas: Vec<_> = datoms
+            .into_iter()
+            .map(kotoba_query::delta::Delta::assert_datom)
+            .collect();
         idx.apply(&deltas);
         let pin_cid = KotobaCid::from_bytes(&pin);
         assert_eq!(idx.root_of(&pin_cid), Some(KotobaCid::from_bytes(&root)));
-        assert_eq!(idx.pinner_of(&pin_cid), Some(KotobaCid::from_bytes(&addr20(&pinner_topic))));
+        assert_eq!(
+            idx.pinner_of(&pin_cid),
+            Some(KotobaCid::from_bytes(&addr20(&pinner_topic)))
+        );
     }
 
     #[test]
@@ -368,8 +395,16 @@ mod tests {
         assert_eq!(datoms.len(), 2);
         // decoded Datoms drive PinIndex identically to the direct decoder.
         let mut idx = PinIndex::new();
-        idx.apply(&datoms.into_iter().map(kotoba_query::delta::Delta::assert_datom).collect::<Vec<_>>());
-        assert_eq!(idx.root_of(&KotobaCid::from_bytes(&pin)), Some(KotobaCid::from_bytes(&root)));
+        idx.apply(
+            &datoms
+                .into_iter()
+                .map(kotoba_query::delta::Delta::assert_datom)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            idx.root_of(&KotobaCid::from_bytes(&pin)),
+            Some(KotobaCid::from_bytes(&root))
+        );
     }
 
     #[test]

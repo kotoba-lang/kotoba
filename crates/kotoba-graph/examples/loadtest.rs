@@ -5,8 +5,8 @@ use kotoba_query::{
     arrangement::Arrangement,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
-use kotoba_vault::live_bus::LiveBus;
 use kotoba_store::{DistributedBlockStore, MemoryBlockStore};
+use kotoba_vault::live_bus::LiveBus;
 /// Load test: legacy Arrangement + Datom-backed commit cycle + cold-path queries.
 ///
 /// Usage:
@@ -481,7 +481,7 @@ async fn phase3_cold_queries() {
             &kotoba_query::keycodec::value_key(&kotoba_query::Value::Text("entity-100".into())),
         )
         .await
-            .unwrap()
+        .unwrap()
     );
 
     // VAET: reverse lookup (all subjects referencing an object CID)

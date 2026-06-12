@@ -11,7 +11,7 @@
 //!     scores — ideal when BM25 (unbounded), cosine (∈[-1,1]) and PageRank
 //!     (∈(0,1]) live on wildly different scales.
 //!
-//!   * `weighted_score_fusion` — min-max-normalise each signal to [0,1], then a
+//!   * `weighted_score_fusion` — min-max-normalise each signal to `[0,1]`, then a
 //!     weighted linear blend, optionally multiplied by a per-doc authority
 //!     boost.  Use when you trust the raw magnitudes.
 //!
@@ -181,8 +181,16 @@ mod tests {
         let lex: Ranking = vec![(cid("a"), 9.0), (cid("b"), 5.0), (cid("c"), 1.0)];
         let sem: Ranking = vec![(cid("a"), 0.9), (cid("c"), 0.8), (cid("b"), 0.2)];
         let signals = vec![
-            Signal { name: "lex", weight: 1.0, ranking: &lex },
-            Signal { name: "sem", weight: 1.0, ranking: &sem },
+            Signal {
+                name: "lex",
+                weight: 1.0,
+                ranking: &lex,
+            },
+            Signal {
+                name: "sem",
+                weight: 1.0,
+                ranking: &sem,
+            },
         ];
         let fused = reciprocal_rank_fusion(&signals, RRF_K, 10);
         assert_eq!(fused[0].cid, cid("a"));
@@ -193,7 +201,11 @@ mod tests {
     #[test]
     fn rrf_single_signal_preserves_order() {
         let lex: Ranking = vec![(cid("x"), 3.0), (cid("y"), 2.0), (cid("z"), 1.0)];
-        let signals = vec![Signal { name: "lex", weight: 1.0, ranking: &lex }];
+        let signals = vec![Signal {
+            name: "lex",
+            weight: 1.0,
+            ranking: &lex,
+        }];
         let fused = reciprocal_rank_fusion(&signals, RRF_K, 10);
         assert_eq!(fused[0].cid, cid("x"));
         assert_eq!(fused[1].cid, cid("y"));
@@ -206,8 +218,16 @@ mod tests {
         let a_first: Ranking = vec![(cid("a"), 1.0), (cid("b"), 0.5)];
         let b_first: Ranking = vec![(cid("b"), 1.0), (cid("a"), 0.5)];
         let signals = vec![
-            Signal { name: "s1", weight: 3.0, ranking: &a_first },
-            Signal { name: "s2", weight: 1.0, ranking: &b_first },
+            Signal {
+                name: "s1",
+                weight: 3.0,
+                ranking: &a_first,
+            },
+            Signal {
+                name: "s2",
+                weight: 1.0,
+                ranking: &b_first,
+            },
         ];
         let fused = reciprocal_rank_fusion(&signals, RRF_K, 10);
         assert_eq!(fused[0].cid, cid("a"), "heavier signal's leader wins");
@@ -218,7 +238,11 @@ mod tests {
         let r: Ranking = (0..20u8)
             .map(|i| (cid(&format!("d{i}")), (20 - i) as f32))
             .collect();
-        let signals = vec![Signal { name: "s", weight: 1.0, ranking: &r }];
+        let signals = vec![Signal {
+            name: "s",
+            weight: 1.0,
+            ranking: &r,
+        }];
         let fused = reciprocal_rank_fusion(&signals, RRF_K, 5);
         assert_eq!(fused.len(), 5);
     }
@@ -240,11 +264,23 @@ mod tests {
         let sig1: Ranking = vec![(cid("t"), 9.0), (cid("m"), 5.0)]; // t#1, m#2
         let sig2: Ranking = vec![(cid("u"), 9.0), (cid("m"), 5.0)]; // u#1, m#2
         let signals = vec![
-            Signal { name: "s1", weight: 1.0, ranking: &sig1 },
-            Signal { name: "s2", weight: 1.0, ranking: &sig2 },
+            Signal {
+                name: "s1",
+                weight: 1.0,
+                ranking: &sig1,
+            },
+            Signal {
+                name: "s2",
+                weight: 1.0,
+                ranking: &sig2,
+            },
         ];
         let fused = reciprocal_rank_fusion(&signals, RRF_K, 10);
-        assert_eq!(fused[0].cid, cid("m"), "doc present in both signals must win");
+        assert_eq!(
+            fused[0].cid,
+            cid("m"),
+            "doc present in both signals must win"
+        );
         assert_eq!(fused[0].ranks.len(), 2, "m contributed from both signals");
         // The single-signal leaders sit below it.
         assert!(fused[1].cid == cid("t") || fused[1].cid == cid("u"));
@@ -257,23 +293,48 @@ mod tests {
         // drift to 0-based ranks or a k*rank denominator.
         let k = RRF_K;
         let r: Ranking = vec![(cid("first"), 9.0), (cid("second"), 1.0)];
-        let signals = vec![Signal { name: "s", weight: 1.0, ranking: &r }];
+        let signals = vec![Signal {
+            name: "s",
+            weight: 1.0,
+            ranking: &r,
+        }];
         let fused = reciprocal_rank_fusion(&signals, k, 10);
         let by = |c: &str| fused.iter().find(|h| h.cid == cid(c)).unwrap().score;
-        assert!((by("first") - 1.0 / (k + 1.0)).abs() < 1e-6, "rank-1 score = 1/(k+1)");
-        assert!((by("second") - 1.0 / (k + 2.0)).abs() < 1e-6, "rank-2 score = 1/(k+2)");
+        assert!(
+            (by("first") - 1.0 / (k + 1.0)).abs() < 1e-6,
+            "rank-1 score = 1/(k+1)"
+        );
+        assert!(
+            (by("second") - 1.0 / (k + 2.0)).abs() < 1e-6,
+            "rank-2 score = 1/(k+2)"
+        );
         // Weight scales the contribution linearly.
-        let signals_w = vec![Signal { name: "s", weight: 3.0, ranking: &r }];
+        let signals_w = vec![Signal {
+            name: "s",
+            weight: 3.0,
+            ranking: &r,
+        }];
         let fused_w = reciprocal_rank_fusion(&signals_w, k, 10);
-        let first_w = fused_w.iter().find(|h| h.cid == cid("first")).unwrap().score;
-        assert!((first_w - 3.0 / (k + 1.0)).abs() < 1e-6, "weight multiplies the contribution");
+        let first_w = fused_w
+            .iter()
+            .find(|h| h.cid == cid("first"))
+            .unwrap()
+            .score;
+        assert!(
+            (first_w - 3.0 / (k + 1.0)).abs() < 1e-6,
+            "weight multiplies the contribution"
+        );
     }
 
     #[test]
     fn weighted_fusion_authority_boost_changes_order() {
         // Without boost, a and b are equally relevant; authority lifts b.
         let lex: Ranking = vec![(cid("a"), 1.0), (cid("b"), 1.0)];
-        let signals = vec![Signal { name: "lex", weight: 1.0, ranking: &lex }];
+        let signals = vec![Signal {
+            name: "lex",
+            weight: 1.0,
+            ranking: &lex,
+        }];
         let mut authority = HashMap::new();
         authority.insert(cid("b").to_multibase(), 1.0);
         authority.insert(cid("a").to_multibase(), 0.0);
@@ -287,8 +348,16 @@ mod tests {
         let lex: Ranking = vec![(cid("a"), 1000.0), (cid("b"), 0.0)];
         let sem: Ranking = vec![(cid("b"), 1.0), (cid("a"), 0.0)];
         let signals = vec![
-            Signal { name: "lex", weight: 1.0, ranking: &lex },
-            Signal { name: "sem", weight: 1.0, ranking: &sem },
+            Signal {
+                name: "lex",
+                weight: 1.0,
+                ranking: &lex,
+            },
+            Signal {
+                name: "sem",
+                weight: 1.0,
+                ranking: &sem,
+            },
         ];
         let fused = weighted_score_fusion(&signals, &HashMap::new(), 0.0, 10);
         // a: lex=1 sem=0 → 1.0 ; b: lex=0 sem=1 → 1.0 ; tie broken by cid.

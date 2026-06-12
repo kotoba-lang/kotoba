@@ -160,6 +160,7 @@ impl WebGpuTrainer {
     }
 
     /// Execute one fine-tuning step (CPU emulation of WGSL logic; no wgpu device needed).
+    #[allow(clippy::too_many_arguments)]
     pub async fn train_step(
         &mut self,
         model_cid: KotobaCid,
@@ -367,12 +368,12 @@ fn cpu_matmul_at(a: &[f32], delta: &[f32], g: &mut [f32], m: usize, n: usize, k:
 fn cpu_ce_loss_grad(logits: &[f32], labels: &[u32], grad: &mut [f32], quality: f32, vocab: usize) {
     let seq_len = labels.len();
     let scale = quality / seq_len as f32;
-    for t in 0..seq_len {
+    for (t, &label) in labels.iter().enumerate().take(seq_len) {
         let base = t * vocab;
         let slice = &logits[base..base + vocab];
         let max_v = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let sum_e: f32 = slice.iter().map(|&x| (x - max_v).exp()).sum();
-        let label = labels[t] as usize;
+        let label = label as usize;
         for v in 0..vocab {
             let sm = ((logits[base + v] - max_v).exp()) / sum_e;
             grad[base + v] = (sm - if v == label { 1.0 } else { 0.0 }) * scale;

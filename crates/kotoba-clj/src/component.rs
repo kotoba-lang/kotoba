@@ -50,8 +50,13 @@ fn encode_component(mut core_module: Vec<u8>) -> Result<Vec<u8>, CljError> {
         .select_world(pkg, Some("program"))
         .map_err(|e| CljError::Codegen(format!("WIT world: {e}")))?;
 
-    wit_component::embed_component_metadata(&mut core_module, &resolve, world, StringEncoding::UTF8)
-        .map_err(|e| CljError::Codegen(format!("embed component metadata: {e}")))?;
+    wit_component::embed_component_metadata(
+        &mut core_module,
+        &resolve,
+        world,
+        StringEncoding::UTF8,
+    )
+    .map_err(|e| CljError::Codegen(format!("embed component metadata: {e}")))?;
 
     ComponentEncoder::default()
         .module(&core_module)

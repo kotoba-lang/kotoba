@@ -9,7 +9,12 @@
 /// re-derive the CID.
 use crate::vault::{BlobRef, Vault};
 use bytes::Bytes;
-use kotoba_core::DataPolicy;
+use kotoba_core::{DataPolicy, EnvelopeKeyWrap, EnvelopeManifest, KotobaCid};
+use kotoba_crypto::key_wrap::{unwrap_key, wrap_key};
+use rand_core::RngCore;
+use zeroize::Zeroizing;
+
+pub const MAX_ENVELOPE_MANIFEST_CBOR_BYTES: usize = 8 * 1024 * 1024;
 
 /// AEAD-encrypted Vault.  Callers must supply the 32-byte vault key.
 pub struct SecureVault {
@@ -126,6 +131,286 @@ impl SecureVault {
     pub async fn contains(&self, blob_ref: &BlobRef) -> bool {
         self.inner.contains(&blob_ref.cid).await
     }
+
+    /// Store plaintext using envelope encryption.
+    ///
+    /// A fresh random DEK encrypts the blob. The supplied `wrapping_key` only
+    /// wraps that DEK for `recipient`, so future access-policy changes can
+    /// publish a new manifest without re-encrypting the ciphertext block.
+    pub async fn put_enveloped(
+        &self,
+        wrapping_key: &[u8; 32],
+        recipient: &str,
+        plaintext: Bytes,
+        aad: &[u8],
+    ) -> Result<(BlobRef, KotobaCid, EnvelopeManifest), kotoba_crypto::aead::CryptoError> {
+        validate_envelope_recipient(recipient)?;
+        validate_envelope_aad(aad)?;
+        let mut dek = Zeroizing::new([0u8; 32]);
+        rand_core::OsRng.fill_bytes(dek.as_mut());
+
+        let ct = kotoba_crypto::aead::seal_with_aad(&dek, &plaintext, aad)?;
+        let blob_ref = self.inner.put(Bytes::from(ct)).await;
+        let wrap_aad = envelope_wrap_aad(&blob_ref.cid, recipient, aad)?;
+        let wrapped_dek = wrap_key(wrapping_key, dek.as_ref(), &wrap_aad)?;
+        let manifest = EnvelopeManifest::new(
+            blob_ref.cid.clone(),
+            aad.to_vec(),
+            vec![EnvelopeKeyWrap::aes_256_gcm(recipient, wrapped_dek)],
+        );
+        let manifest_cid = self.put_envelope_manifest(&manifest).await?;
+        Ok((blob_ref, manifest_cid, manifest))
+    }
+
+    /// Envelope-encrypt plaintext and return a `DataPolicy::Enveloped`.
+    pub async fn put_enveloped_with_policy(
+        &self,
+        wrapping_key: &[u8; 32],
+        recipient: &str,
+        plaintext: Bytes,
+        aad: &[u8],
+    ) -> Result<(BlobRef, DataPolicy, EnvelopeManifest), kotoba_crypto::aead::CryptoError> {
+        let (blob_ref, manifest_cid, manifest) = self
+            .put_enveloped(wrapping_key, recipient, plaintext, aad)
+            .await?;
+        let policy = DataPolicy::Enveloped {
+            ct_cid: blob_ref.cid.clone(),
+            manifest_cid,
+        };
+        Ok((blob_ref, policy, manifest))
+    }
+
+    /// Add or replace one recipient wrap in an existing envelope manifest.
+    ///
+    /// The caller must provide the raw DEK. This method is intentionally small:
+    /// policy engines can obtain the DEK via an authorized existing wrap, then
+    /// publish the returned new manifest CID as the current policy pointer.
+    pub async fn put_envelope_manifest_with_wrap(
+        &self,
+        mut manifest: EnvelopeManifest,
+        wrapping_key: &[u8; 32],
+        recipient: &str,
+        dek: &[u8; 32],
+    ) -> Result<(KotobaCid, EnvelopeManifest), kotoba_crypto::aead::CryptoError> {
+        validate_envelope_recipient(recipient)?;
+        let wrap_aad = envelope_wrap_aad(&manifest.ct_cid, recipient, &manifest.aad)?;
+        let wrapped_dek = wrap_key(wrapping_key, dek, &wrap_aad)?;
+        manifest
+            .dek_wraps
+            .retain(|wrap| wrap.recipient != recipient);
+        manifest
+            .dek_wraps
+            .push(EnvelopeKeyWrap::aes_256_gcm(recipient, wrapped_dek));
+        let manifest_cid = self.put_envelope_manifest(&manifest).await?;
+        Ok((manifest_cid, manifest))
+    }
+
+    /// Store an envelope manifest as a content-addressed CBOR block.
+    pub async fn put_envelope_manifest(
+        &self,
+        manifest: &EnvelopeManifest,
+    ) -> Result<KotobaCid, kotoba_crypto::aead::CryptoError> {
+        manifest
+            .validate()
+            .map_err(|e| kotoba_crypto::aead::CryptoError::InvalidEnvelope(e.to_string()))?;
+        let mut cbor = Vec::new();
+        ciborium::into_writer(manifest, &mut cbor)
+            .map_err(|e| kotoba_crypto::aead::CryptoError::InvalidEnvelope(e.to_string()))?;
+        if cbor.len() > MAX_ENVELOPE_MANIFEST_CBOR_BYTES {
+            return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+                "envelope manifest CBOR too large: {} bytes > {}",
+                cbor.len(),
+                MAX_ENVELOPE_MANIFEST_CBOR_BYTES
+            )));
+        }
+        Ok(self
+            .inner
+            .put_typed(Bytes::from(cbor), "application/cbor")
+            .await
+            .cid)
+    }
+
+    /// Load an envelope manifest by CID.
+    pub async fn get_envelope_manifest(
+        &self,
+        manifest_cid: &KotobaCid,
+    ) -> Result<Option<EnvelopeManifest>, kotoba_crypto::aead::CryptoError> {
+        let Some(bytes) = self.inner.get(manifest_cid).await else {
+            return Ok(None);
+        };
+        let actual_cid = KotobaCid::from_bytes(&bytes);
+        if actual_cid != *manifest_cid {
+            return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+                "envelope manifest CID mismatch: expected {}, got {}",
+                manifest_cid.to_multibase(),
+                actual_cid.to_multibase()
+            )));
+        }
+        if bytes.len() > MAX_ENVELOPE_MANIFEST_CBOR_BYTES {
+            return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+                "envelope manifest CBOR too large: {} bytes > {}",
+                bytes.len(),
+                MAX_ENVELOPE_MANIFEST_CBOR_BYTES
+            )));
+        }
+        let manifest = ciborium::from_reader::<EnvelopeManifest, _>(&bytes[..])
+            .map_err(|e| kotoba_crypto::aead::CryptoError::InvalidEnvelope(e.to_string()))?;
+        manifest
+            .validate()
+            .map_err(|e| kotoba_crypto::aead::CryptoError::InvalidEnvelope(e.to_string()))?;
+        Ok(Some(manifest))
+    }
+
+    /// Delete an envelope manifest block without touching the ciphertext block.
+    pub async fn delete_envelope_manifest(&self, manifest_cid: &KotobaCid) -> bool {
+        self.inner.delete_block(manifest_cid).await
+    }
+
+    /// Unwrap the DEK for `recipient`.
+    pub fn unwrap_envelope_dek(
+        &self,
+        manifest: &EnvelopeManifest,
+        wrapping_key: &[u8; 32],
+        recipient: &str,
+    ) -> Result<Zeroizing<[u8; 32]>, kotoba_crypto::aead::CryptoError> {
+        validate_envelope_recipient(recipient)?;
+        manifest
+            .validate()
+            .map_err(|e| kotoba_crypto::aead::CryptoError::InvalidEnvelope(e.to_string()))?;
+        let wrap = manifest.wrap_for(recipient).ok_or_else(|| {
+            kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+                "missing envelope wrap for recipient: {recipient}"
+            ))
+        })?;
+        if wrap.wrap_alg != EnvelopeKeyWrap::WRAP_ALG_AES_256_GCM {
+            return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+                "unsupported wrap algorithm: {}",
+                wrap.wrap_alg
+            )));
+        }
+        let wrap_aad = envelope_wrap_aad(&manifest.ct_cid, recipient, &manifest.aad)?;
+        let dek_bytes = unwrap_key(wrapping_key, &wrap.wrapped_dek, &wrap_aad)?;
+        if dek_bytes.len() != 32 {
+            return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+                "DEK has wrong length: {}",
+                dek_bytes.len()
+            )));
+        }
+        let mut dek = Zeroizing::new([0u8; 32]);
+        dek.copy_from_slice(&dek_bytes);
+        Ok(dek)
+    }
+
+    /// Retrieve and decrypt a blob described by an envelope manifest.
+    pub async fn get_enveloped(
+        &self,
+        manifest: &EnvelopeManifest,
+        wrapping_key: &[u8; 32],
+        recipient: &str,
+    ) -> Result<Option<Bytes>, kotoba_crypto::aead::CryptoError> {
+        manifest
+            .validate()
+            .map_err(|e| kotoba_crypto::aead::CryptoError::InvalidEnvelope(e.to_string()))?;
+        let Some(ct) = self.inner.get(&manifest.ct_cid).await else {
+            return Ok(None);
+        };
+        let dek = self.unwrap_envelope_dek(manifest, wrapping_key, recipient)?;
+        let pt = kotoba_crypto::aead::open_with_aad(&dek, &ct, &manifest.aad)?;
+        Ok(Some(Bytes::from(pt.to_vec())))
+    }
+
+    /// Retrieve and decrypt a blob through `DataPolicy::Enveloped`.
+    ///
+    /// This is the intended upper-layer read path: the policy points to the
+    /// current manifest, and the manifest must point back to the same
+    /// ciphertext CID. A mismatch is rejected so a policy cannot be silently
+    /// paired with a different manifest.
+    pub async fn get_enveloped_policy(
+        &self,
+        policy: &DataPolicy,
+        wrapping_key: &[u8; 32],
+        recipient: &str,
+    ) -> Result<Option<Bytes>, kotoba_crypto::aead::CryptoError> {
+        let DataPolicy::Enveloped {
+            ct_cid,
+            manifest_cid,
+        } = policy
+        else {
+            return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(
+                "expected DataPolicy::Enveloped".to_string(),
+            ));
+        };
+        let Some(manifest) = self.get_envelope_manifest(manifest_cid).await? else {
+            return Ok(None);
+        };
+        if &manifest.ct_cid != ct_cid {
+            return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+                "policy ct_cid {} does not match manifest ct_cid {}",
+                ct_cid.to_multibase(),
+                manifest.ct_cid.to_multibase()
+            )));
+        }
+        self.get_enveloped(&manifest, wrapping_key, recipient).await
+    }
+}
+
+fn envelope_wrap_aad(
+    ct_cid: &KotobaCid,
+    recipient: &str,
+    aad: &[u8],
+) -> Result<Vec<u8>, kotoba_crypto::aead::CryptoError> {
+    let cid = ct_cid.to_multibase();
+    let cid_len = u32::try_from(cid.len()).map_err(|_| {
+        kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+            "ciphertext CID label too large for envelope wrap AAD: {} bytes",
+            cid.len()
+        ))
+    })?;
+    let recipient_len = u32::try_from(recipient.len()).map_err(|_| {
+        kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+            "recipient too large for envelope wrap AAD: {} bytes",
+            recipient.len()
+        ))
+    })?;
+    let mut out = Vec::with_capacity(4 + cid.len() + 4 + recipient.len() + aad.len());
+    out.extend_from_slice(&cid_len.to_be_bytes());
+    out.extend_from_slice(cid.as_bytes());
+    out.extend_from_slice(&recipient_len.to_be_bytes());
+    out.extend_from_slice(recipient.as_bytes());
+    out.extend_from_slice(aad);
+    Ok(out)
+}
+
+fn validate_envelope_recipient(recipient: &str) -> Result<(), kotoba_crypto::aead::CryptoError> {
+    if recipient.is_empty() {
+        return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(
+            "envelope recipient is empty".to_string(),
+        ));
+    }
+    if recipient.len() > EnvelopeManifest::MAX_RECIPIENT_LEN {
+        return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+            "envelope recipient too large: {} bytes > {}",
+            recipient.len(),
+            EnvelopeManifest::MAX_RECIPIENT_LEN
+        )));
+    }
+    if !recipient.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
+        return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(
+            "envelope recipient must be visible ASCII".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_envelope_aad(aad: &[u8]) -> Result<(), kotoba_crypto::aead::CryptoError> {
+    if aad.len() > EnvelopeManifest::MAX_AAD_LEN {
+        return Err(kotoba_crypto::aead::CryptoError::InvalidEnvelope(format!(
+            "envelope AAD too large: {} bytes > {}",
+            aad.len(),
+            EnvelopeManifest::MAX_AAD_LEN
+        )));
+    }
+    Ok(())
 }
 
 impl Default for SecureVault {
@@ -143,6 +428,36 @@ mod tests {
         let mut k = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut k);
         k
+    }
+
+    #[test]
+    fn envelope_wrap_aad_is_length_prefixed() {
+        let cid = KotobaCid::from_bytes(b"ciphertext block");
+        let cid_label = cid.to_multibase();
+
+        let got = envelope_wrap_aad(&cid, "did:example:alice", b"slot").unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(cid_label.len() as u32).to_be_bytes());
+        expected.extend_from_slice(cid_label.as_bytes());
+        expected.extend_from_slice(&(b"did:example:alice".len() as u32).to_be_bytes());
+        expected.extend_from_slice(b"did:example:alice");
+        expected.extend_from_slice(b"slot");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn envelope_wrap_aad_keeps_tuple_boundaries_unambiguous() {
+        let cid_a = KotobaCid::from_bytes(b"ciphertext");
+        let cid_b = KotobaCid::from_bytes(b"ciphertextdid:example:a");
+
+        let cid_boundary_a = envelope_wrap_aad(&cid_a, "did:example:a", b"b").unwrap();
+        let cid_boundary_b = envelope_wrap_aad(&cid_b, "", b"b").unwrap();
+        assert_ne!(cid_boundary_a, cid_boundary_b);
+
+        let recipient_boundary_a = envelope_wrap_aad(&cid_a, "did:example:a", b"bc").unwrap();
+        let recipient_boundary_b = envelope_wrap_aad(&cid_a, "did:example:ab", b"c").unwrap();
+        assert_ne!(recipient_boundary_a, recipient_boundary_b);
     }
 
     #[tokio::test]
@@ -186,7 +501,7 @@ mod tests {
                 assert_eq!(ct_cid, blob_ref.cid);
                 assert_eq!(pcid, policy_cid);
             }
-            DataPolicy::Open => panic!("expected Encrypted policy"),
+            other => panic!("expected Encrypted policy, got {other:?}"),
         }
         // Decrypt must still work via the existing get() path.
         let got = sv.get(&key, &blob_ref).await.unwrap().unwrap();
@@ -291,11 +606,14 @@ mod tests {
             .await
             .unwrap();
         match policy {
-            DataPolicy::Encrypted { ct_cid, policy_cid: pcid } => {
+            DataPolicy::Encrypted {
+                ct_cid,
+                policy_cid: pcid,
+            } => {
                 assert_eq!(ct_cid, blob_ref.cid);
                 assert_eq!(pcid, policy_cid);
             }
-            DataPolicy::Open => panic!("expected Encrypted policy"),
+            other => panic!("expected Encrypted policy, got {other:?}"),
         }
         // Same aad decrypts; wrong aad fails.
         let got = sv.get_bound(&key, &blob_ref, aad).await.unwrap().unwrap();
@@ -308,7 +626,11 @@ mod tests {
         let sv = SecureVault::new();
         let key = random_key();
         let blob_ref = sv.put_bound(&key, Bytes::new(), b"slot").await.unwrap();
-        let got = sv.get_bound(&key, &blob_ref, b"slot").await.unwrap().unwrap();
+        let got = sv
+            .get_bound(&key, &blob_ref, b"slot")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.len(), 0);
     }
 
@@ -353,7 +675,10 @@ mod tests {
         );
         // The correctly-bound read still works (not a vacuous rejection).
         assert_eq!(
-            sv.get_bound(&key, &blob_ref, b"slot-A").await.unwrap().unwrap(),
+            sv.get_bound(&key, &blob_ref, b"slot-A")
+                .await
+                .unwrap()
+                .unwrap(),
             Bytes::from_static(b"personal record")
         );
     }
@@ -383,6 +708,339 @@ mod tests {
             sv.get_bound(&key, &blob_ref, b"").await.unwrap().unwrap(),
             Bytes::from_static(b"loose"),
             "empty-AAD bound read must match the plain read"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_get_enveloped_roundtrip() {
+        let sv = SecureVault::new();
+        let wrapping_key = random_key();
+        let plaintext = Bytes::from_static(b"future-rotatable secret");
+        let aad = b"kotoba://graph/envelope";
+
+        let (blob_ref, manifest_cid, manifest) = sv
+            .put_enveloped(&wrapping_key, "did:example:alice", plaintext.clone(), aad)
+            .await
+            .unwrap();
+
+        assert_eq!(manifest.ct_cid, blob_ref.cid);
+        assert_ne!(
+            manifest_cid, blob_ref.cid,
+            "manifest and ciphertext are separate blocks"
+        );
+        assert_eq!(manifest.aad, aad);
+
+        let loaded = sv
+            .get_envelope_manifest(&manifest_cid)
+            .await
+            .unwrap()
+            .expect("manifest must be stored");
+        assert_eq!(loaded, manifest);
+
+        let got = sv
+            .get_enveloped(&manifest, &wrapping_key, "did:example:alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, plaintext);
+    }
+
+    #[tokio::test]
+    async fn put_enveloped_with_policy_returns_manifest_policy() {
+        let sv = SecureVault::new();
+        let wrapping_key = random_key();
+        let (blob_ref, policy, manifest) = sv
+            .put_enveloped_with_policy(
+                &wrapping_key,
+                "did:example:alice",
+                Bytes::from_static(b"policy-bound envelope"),
+                b"policy-slot",
+            )
+            .await
+            .unwrap();
+
+        match &policy {
+            DataPolicy::Enveloped {
+                ct_cid,
+                manifest_cid,
+            } => {
+                assert_eq!(ct_cid, &blob_ref.cid);
+                let loaded = sv
+                    .get_envelope_manifest(manifest_cid)
+                    .await
+                    .unwrap()
+                    .expect("manifest must be stored");
+                assert_eq!(loaded, manifest);
+            }
+            other => panic!("expected Enveloped policy, got {other:?}"),
+        }
+
+        let got = sv
+            .get_enveloped_policy(&policy, &wrapping_key, "did:example:alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, Bytes::from_static(b"policy-bound envelope"));
+    }
+
+    #[tokio::test]
+    async fn envelope_rewrap_changes_manifest_not_ciphertext() {
+        let sv = SecureVault::new();
+        let alice_key = random_key();
+        let bob_key = random_key();
+        let plaintext = Bytes::from_static(b"do not rewrite ciphertext");
+
+        let (blob_ref, manifest_cid_a, manifest_a) = sv
+            .put_enveloped(
+                &alice_key,
+                "did:example:alice",
+                plaintext.clone(),
+                b"slot-1",
+            )
+            .await
+            .unwrap();
+
+        let dek = sv
+            .unwrap_envelope_dek(&manifest_a, &alice_key, "did:example:alice")
+            .unwrap();
+        let (manifest_cid_b, manifest_b) = sv
+            .put_envelope_manifest_with_wrap(manifest_a.clone(), &bob_key, "did:example:bob", &dek)
+            .await
+            .unwrap();
+
+        assert_eq!(manifest_b.ct_cid, blob_ref.cid);
+        assert_eq!(manifest_b.ct_cid, manifest_a.ct_cid);
+        assert_ne!(manifest_cid_a, manifest_cid_b);
+        assert_eq!(manifest_b.dek_wraps.len(), 2);
+
+        let got_bob = sv
+            .get_enveloped(&manifest_b, &bob_key, "did:example:bob")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_bob, plaintext);
+    }
+
+    #[tokio::test]
+    async fn delete_envelope_manifest_leaves_ciphertext_block_readable_with_retained_manifest() {
+        let sv = SecureVault::new();
+        let wrapping_key = random_key();
+        let plaintext = Bytes::from_static(b"delete only manifest");
+
+        let (_blob_ref, manifest_cid, manifest) = sv
+            .put_enveloped(
+                &wrapping_key,
+                "did:example:alice",
+                plaintext.clone(),
+                b"slot-delete",
+            )
+            .await
+            .unwrap();
+
+        assert!(sv.delete_envelope_manifest(&manifest_cid).await);
+        assert!(sv
+            .get_envelope_manifest(&manifest_cid)
+            .await
+            .unwrap()
+            .is_none());
+
+        let got = sv
+            .get_enveloped(&manifest, &wrapping_key, "did:example:alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, plaintext);
+    }
+
+    #[tokio::test]
+    async fn envelope_wrong_recipient_or_key_fails() {
+        let sv = SecureVault::new();
+        let wrapping_key = random_key();
+        let wrong_key = random_key();
+        let (_blob_ref, _manifest_cid, manifest) = sv
+            .put_enveloped(
+                &wrapping_key,
+                "did:example:alice",
+                Bytes::from_static(b"secret"),
+                b"slot-2",
+            )
+            .await
+            .unwrap();
+
+        assert!(sv
+            .get_enveloped(&manifest, &wrapping_key, "did:example:bob")
+            .await
+            .is_err());
+        assert!(sv
+            .get_enveloped(&manifest, &wrong_key, "did:example:alice")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn envelope_tampered_aad_fails() {
+        let sv = SecureVault::new();
+        let wrapping_key = random_key();
+        let (_blob_ref, _manifest_cid, mut manifest) = sv
+            .put_enveloped(
+                &wrapping_key,
+                "did:example:alice",
+                Bytes::from_static(b"slot-bound"),
+                b"original-slot",
+            )
+            .await
+            .unwrap();
+        manifest.aad = b"tampered-slot".to_vec();
+
+        assert!(sv
+            .get_enveloped(&manifest, &wrapping_key, "did:example:alice")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn get_enveloped_policy_rejects_ct_manifest_mismatch() {
+        let sv = SecureVault::new();
+        let wrapping_key = random_key();
+        let (_blob_ref, policy, _manifest) = sv
+            .put_enveloped_with_policy(
+                &wrapping_key,
+                "did:example:alice",
+                Bytes::from_static(b"policy mismatch"),
+                b"policy-mismatch-slot",
+            )
+            .await
+            .unwrap();
+
+        let DataPolicy::Enveloped { manifest_cid, .. } = policy else {
+            panic!("expected enveloped policy");
+        };
+        let tampered_policy = DataPolicy::Enveloped {
+            ct_cid: KotobaCid::from_bytes(b"different ciphertext"),
+            manifest_cid,
+        };
+
+        assert!(sv
+            .get_enveloped_policy(&tampered_policy, &wrapping_key, "did:example:alice")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn put_enveloped_rejects_invalid_recipient_and_oversized_aad_before_storing() {
+        let sv = SecureVault::new();
+        let wrapping_key = random_key();
+
+        assert!(sv
+            .put_enveloped(
+                &wrapping_key,
+                "did:example:bad recipient",
+                Bytes::from_static(b"secret"),
+                b"slot",
+            )
+            .await
+            .is_err());
+        assert!(sv
+            .put_enveloped(
+                &wrapping_key,
+                "did:example:alice",
+                Bytes::from_static(b"secret"),
+                &vec![0u8; EnvelopeManifest::MAX_AAD_LEN + 1],
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn put_envelope_manifest_rejects_oversized_cbor_block() {
+        let sv = SecureVault::new();
+        let manifest = EnvelopeManifest::new(
+            KotobaCid::from_bytes(b"large envelope ciphertext"),
+            Vec::new(),
+            (0..EnvelopeManifest::MAX_DEK_WRAP_COUNT)
+                .map(|idx| {
+                    EnvelopeKeyWrap::aes_256_gcm(
+                        format!("did:example:user{idx}"),
+                        vec![idx as u8; 9 * 1024],
+                    )
+                })
+                .collect(),
+        );
+
+        assert!(manifest.validate().is_ok());
+        assert!(sv.put_envelope_manifest(&manifest).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn put_envelope_manifest_stores_large_cbor_as_raw_manifest_cid() {
+        let sv = SecureVault::new();
+        let manifest = EnvelopeManifest::new(
+            KotobaCid::from_bytes(b"large readable envelope ciphertext"),
+            Vec::new(),
+            (0..96)
+                .map(|idx| {
+                    EnvelopeKeyWrap::aes_256_gcm(
+                        format!("did:example:large{idx}"),
+                        vec![idx as u8; 2 * 1024],
+                    )
+                })
+                .collect(),
+        );
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&manifest, &mut cbor).expect("manifest CBOR");
+        assert!(
+            cbor.len() > 128 * 1024,
+            "test setup must exceed Vault's single-block threshold"
+        );
+        assert!(
+            cbor.len() < MAX_ENVELOPE_MANIFEST_CBOR_BYTES,
+            "test setup must stay within the envelope manifest size cap"
+        );
+        let expected_cid = KotobaCid::from_bytes(&cbor);
+
+        let manifest_cid = sv
+            .put_envelope_manifest(&manifest)
+            .await
+            .expect("put large readable manifest");
+        assert_eq!(
+            manifest_cid, expected_cid,
+            "envelope manifest CID must be the raw CBOR CID, not a Vault chunk-manifest CID"
+        );
+        let loaded = sv
+            .get_envelope_manifest(&manifest_cid)
+            .await
+            .expect("get large readable manifest")
+            .expect("manifest exists");
+        assert_eq!(loaded, manifest);
+    }
+
+    #[tokio::test]
+    async fn get_envelope_manifest_rejects_oversized_cbor_block_before_decoding() {
+        let sv = SecureVault::new();
+        let blob_ref = sv
+            .inner
+            .put(Bytes::from(vec![0u8; MAX_ENVELOPE_MANIFEST_CBOR_BYTES + 1]))
+            .await;
+
+        assert!(sv.get_envelope_manifest(&blob_ref.cid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_envelope_manifest_rejects_cid_mismatch_before_decoding() {
+        let sv = SecureVault::new();
+        let blob_ref = sv
+            .inner
+            .put_typed(Bytes::from(vec![7u8; 600 * 1024]), "video/mp4".to_string())
+            .await;
+        assert!(blob_ref.chunked, "test setup must produce a chunked blob");
+
+        let err = sv
+            .get_envelope_manifest(&blob_ref.cid)
+            .await
+            .expect_err("CID-mismatched manifest bytes must be rejected");
+        assert!(
+            err.to_string().contains("envelope manifest CID mismatch"),
+            "unexpected error: {err}"
         );
     }
 }

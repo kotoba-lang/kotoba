@@ -59,13 +59,21 @@ impl SocialEconomyDriver {
 
     /// Ingest observed `mishmar/pin/*` Datoms (from `EvmLogObservationSource::pin_datoms`).
     pub fn ingest_pins(&mut self, pin_datoms: &[Datom]) {
-        let deltas: Vec<Delta> = pin_datoms.iter().cloned().map(Delta::assert_datom).collect();
+        let deltas: Vec<Delta> = pin_datoms
+            .iter()
+            .cloned()
+            .map(Delta::assert_datom)
+            .collect();
         self.pins.apply(&deltas);
     }
 
     /// Ingest observed `social/origin` Datoms.
     pub fn ingest_origins(&mut self, origin_datoms: &[Datom]) {
-        let deltas: Vec<Delta> = origin_datoms.iter().cloned().map(Delta::assert_datom).collect();
+        let deltas: Vec<Delta> = origin_datoms
+            .iter()
+            .cloned()
+            .map(Delta::assert_datom)
+            .collect();
         self.origins.apply(&deltas);
     }
 
@@ -77,7 +85,9 @@ impl SocialEconomyDriver {
         wellbecomings: &[ObservedWellbecoming],
         falsifications: &[Falsification],
     ) -> Vec<Datom> {
-        let datoms = self.job.run_epoch(disclosures, wellbecomings, falsifications);
+        let datoms = self
+            .job
+            .run_epoch(disclosures, wellbecomings, falsifications);
         let deltas: Vec<Delta> = datoms.iter().cloned().map(Delta::assert_datom).collect();
         self.view.apply(&deltas);
         datoms
@@ -90,7 +100,12 @@ impl SocialEconomyDriver {
         let pin_origins = build_pin_origins(&pin_ids, &self.pins, &self.origins);
         let (shares, remainder) = allocate_retainer(&pin_origins, &self.view, epoch, pool_mkoto);
         let (credits, total) = settle_retainer(&shares, |p| self.pins.pinner_of(p));
-        SettlementResult { shares, credits, total_mkoto: total, remainder_mkoto: remainder }
+        SettlementResult {
+            shares,
+            credits,
+            total_mkoto: total,
+            remainder_mkoto: remainder,
+        }
     }
 
     /// One full cycle, generic over the EVM transport so it is testable end-to-end
@@ -131,7 +146,11 @@ impl SocialEconomyDriver {
 pub fn live_evm_source(graph: KotobaCid) -> Option<EvmLogObservationSource<ReqwestRpc>> {
     let url = std::env::var("KOTOBA_EVM_RPC_URL").ok()?;
     let escrow = std::env::var("KOTOBA_MISHMAR_ESCROW_ADDR").ok()?;
-    Some(EvmLogObservationSource::new(ReqwestRpc { url }, escrow, graph))
+    Some(EvmLogObservationSource::new(
+        ReqwestRpc { url },
+        escrow,
+        graph,
+    ))
 }
 
 /// Fetch the KaizenObserver wellbecoming feed JSON from `KOTOBA_KAIZEN_FEED_URL`
@@ -146,7 +165,7 @@ pub fn fetch_kaizen_feed() -> Option<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::mishmar_observe::JsonRpcTransport;
-    use kotoba_query::social::{MintSource, ValidatedDisclosure, SCALE};
+    use kotoba_query::social::{ValidatedDisclosure, SCALE};
     use serde_json::json;
 
     fn did(s: &str) -> KotobaCid {
@@ -154,7 +173,12 @@ mod tests {
     }
 
     fn cid_datom(e: &KotobaCid, attr: &str, v: &KotobaCid) -> Datom {
-        Datom::assert(e.clone(), attr.to_string(), kotoba_query::datom::Value::Cid(v.clone()), did("g"))
+        Datom::assert(
+            e.clone(),
+            attr.to_string(),
+            kotoba_query::datom::Value::Cid(v.clone()),
+            did("g"),
+        )
     }
 
     /// fake EVM transport returning canned eth_getLogs results.
@@ -189,8 +213,22 @@ mod tests {
 
         // mint: a = 30 pts disclosure, b = 70 pts disclosure (validated)
         let disc = vec![
-            ObservedDisclosure { did: a.clone(), epoch: 0, n_validated: 30, citation_hits: 0, terminal_honest: true, witness_quorum_met: true },
-            ObservedDisclosure { did: b.clone(), epoch: 0, n_validated: 70, citation_hits: 0, terminal_honest: true, witness_quorum_met: true },
+            ObservedDisclosure {
+                did: a.clone(),
+                epoch: 0,
+                n_validated: 30,
+                citation_hits: 0,
+                terminal_honest: true,
+                witness_quorum_met: true,
+            },
+            ObservedDisclosure {
+                did: b.clone(),
+                epoch: 0,
+                n_validated: 70,
+                citation_hits: 0,
+                terminal_honest: true,
+                witness_quorum_met: true,
+            },
         ];
         let minted = d.mint(&disc, &[], &[]);
         assert_eq!(minted.len(), 2);
@@ -237,12 +275,19 @@ mod tests {
         // origin: rootA originated by alice (whose entity cid = did_to_cid).
         let alice_cid = crate::did_bridge::did_to_cid("did:web:alice");
         let mut d = SocialEconomyDriver::new(MintParams::default(), graph);
-        d.ingest_origins(&[cid_datom(&KotobaCid::from_bytes(&root), "social/origin", &alice_cid)]);
+        d.ingest_origins(&[cid_datom(
+            &KotobaCid::from_bytes(&root),
+            "social/origin",
+            &alice_cid,
+        )]);
 
         // Kaizen feed: alice Δ=+10 council-attested → 20 pts.
-        let feed = json!([{ "did": "did:web:alice", "epoch": 0, "delta": 10, "council_attested": true }]);
+        let feed =
+            json!([{ "did": "did:web:alice", "epoch": 0, "delta": 10, "council_attested": true }]);
 
-        let (minted, result) = d.tick(&evm, &feed, "0x0", "latest", 0, 500_000).expect("tick ok");
+        let (minted, result) = d
+            .tick(&evm, &feed, "0x0", "latest", 0, 500_000)
+            .expect("tick ok");
         assert_eq!(minted.len(), 1); // alice's wellbecoming mint
         assert_eq!(d.view.capital(&alice_cid, 0), 20 * SCALE); // w_wellbecoming 2.0 * 10
 
@@ -266,7 +311,14 @@ mod tests {
         // give 'a' some capital so the pin's SC_root > 0
         let v = ValidatedDisclosure::new(did("did:key:a"), 0, 10, 0, true, true).unwrap();
         d.mint(
-            &[ObservedDisclosure { did: did("did:key:a"), epoch: 0, n_validated: 10, citation_hits: 0, terminal_honest: true, witness_quorum_met: true }],
+            &[ObservedDisclosure {
+                did: did("did:key:a"),
+                epoch: 0,
+                n_validated: 10,
+                citation_hits: 0,
+                terminal_honest: true,
+                witness_quorum_met: true,
+            }],
             &[],
             &[],
         );

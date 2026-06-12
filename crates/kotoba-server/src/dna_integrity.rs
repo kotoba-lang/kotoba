@@ -49,18 +49,35 @@ pub fn parse_ruleset(edn: &str) -> Result<IntegrityRuleset, String> {
 
     match get("integrity", "spec").and_then(|x| x.as_string()) {
         Some(SPEC) => {}
-        other => return Err(format!("unsupported ruleset spec {other:?} (expected {SPEC:?})")),
+        other => {
+            return Err(format!(
+                "unsupported ruleset spec {other:?} (expected {SPEC:?})"
+            ))
+        }
     }
     let mut rs = IntegrityRuleset {
-        graph: get("integrity", "graph").and_then(|x| x.as_string()).map(String::from),
-        append_only: get("integrity", "append-only").and_then(|x| x.as_bool()).unwrap_or(false),
+        graph: get("integrity", "graph")
+            .and_then(|x| x.as_string())
+            .map(String::from),
+        append_only: get("integrity", "append-only")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
         ..Default::default()
     };
     if let Some(d) = get("integrity", "deny-attrs").and_then(|x| x.as_vector()) {
-        rs.deny_attrs = d.iter().filter_map(|x| x.as_keyword()).map(kw_str).collect();
+        rs.deny_attrs = d
+            .iter()
+            .filter_map(|x| x.as_keyword())
+            .map(kw_str)
+            .collect();
     }
     if let Some(c) = get("integrity", "closed-attrs").and_then(|x| x.as_vector()) {
-        rs.closed_attrs = Some(c.iter().filter_map(|x| x.as_keyword()).map(kw_str).collect());
+        rs.closed_attrs = Some(
+            c.iter()
+                .filter_map(|x| x.as_keyword())
+                .map(kw_str)
+                .collect(),
+        );
     }
     Ok(rs)
 }
@@ -70,17 +87,23 @@ pub fn parse_ruleset(edn: &str) -> Result<IntegrityRuleset, String> {
 pub fn validate_tx(tx: &EdnValue, rs: &IntegrityRuleset) -> Result<(), String> {
     let forms = tx.as_seq().ok_or("tx must be a vector of datom forms")?;
     for (i, form) in forms.iter().enumerate() {
-        let d = form.as_seq().ok_or_else(|| format!("datom {i} is not a vector"))?;
+        let d = form
+            .as_seq()
+            .ok_or_else(|| format!("datom {i} is not a vector"))?;
         if d.len() < 3 {
             return Err(format!("datom {i}: too few elements (need [:op e a v])"));
         }
         let op = d[0].as_keyword().map(kw_str).unwrap_or_default();
         if rs.append_only && op != ":db/add" {
-            return Err(format!("datom {i}: op {op} violates :integrity/append-only (only :db/add)"));
+            return Err(format!(
+                "datom {i}: op {op} violates :integrity/append-only (only :db/add)"
+            ));
         }
         if let Some(attr) = d.get(2).and_then(|x| x.as_keyword()).map(kw_str) {
             if rs.deny_attrs.contains(&attr) {
-                return Err(format!("datom {i}: attribute {attr} is structurally forbidden (:integrity/deny-attrs)"));
+                return Err(format!(
+                    "datom {i}: attribute {attr} is structurally forbidden (:integrity/deny-attrs)"
+                ));
             }
             if let Some(closed) = &rs.closed_attrs {
                 if !closed.contains(&attr) {
@@ -109,8 +132,12 @@ fn load_registry() -> HashMap<String, IntegrityRuleset> {
     };
     for entry in rd.flatten() {
         let path = entry.path();
-        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else { continue };
-        let Some(graph) = fname.strip_suffix(".integrity.edn") else { continue };
+        let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(graph) = fname.strip_suffix(".integrity.edn") else {
+            continue;
+        };
         if let Ok(text) = std::fs::read_to_string(&path) {
             match parse_ruleset(&text) {
                 Ok(rs) => {

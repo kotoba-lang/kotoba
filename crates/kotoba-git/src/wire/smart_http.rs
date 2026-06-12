@@ -134,10 +134,12 @@ fn ref_advert_lines(db: &Db) -> Vec<(String, String)> {
 }
 
 fn head_symref_target(db: &Db) -> Option<String> {
-    list_refs(db).into_iter().find_map(|(name, target)| match target {
-        RefTarget::Symbolic(t) if name == "HEAD" => Some(t),
-        _ => None,
-    })
+    list_refs(db)
+        .into_iter()
+        .find_map(|(name, target)| match target {
+            RefTarget::Symbolic(t) if name == "HEAD" => Some(t),
+            _ => None,
+        })
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -341,8 +343,7 @@ fn parse_receive_request(body: &[u8]) -> Result<ReceiveRequest> {
                 let line = String::from_utf8_lossy(cmd_bytes);
                 let line = line.trim_end_matches('\n');
                 let mut parts = line.splitn(3, ' ');
-                let (Some(old), Some(new), Some(name)) =
-                    (parts.next(), parts.next(), parts.next())
+                let (Some(old), Some(new), Some(name)) = (parts.next(), parts.next(), parts.next())
                 else {
                     return Err(crate::error::GitError::MalformedHeader);
                 };
@@ -473,7 +474,11 @@ async fn apply_command(
     }
     // Lost-update guard: the client's expected `old` must match the stored ref.
     let current = resolve_ref(db, &cmd.name);
-    let expected = if is_zero(&cmd.old) { None } else { Some(cmd.old) };
+    let expected = if is_zero(&cmd.old) {
+        None
+    } else {
+        Some(cmd.old)
+    };
     if current != expected {
         return Err("stale info: fetch first".into());
     }
@@ -520,7 +525,9 @@ mod tests {
         );
         let (commit_oid, _) = git.put_object(&commit).await.unwrap();
         git.put_ref("refs/heads/main", commit_oid).await.unwrap();
-        git.put_symbolic_ref("HEAD", "refs/heads/main").await.unwrap();
+        git.put_symbolic_ref("HEAD", "refs/heads/main")
+            .await
+            .unwrap();
         commit_oid
     }
 
@@ -598,7 +605,9 @@ mod tests {
             let reach = collect_reachable(&src, &db, &[commit]).unwrap();
             let mut v: Vec<GitOid> = reach.into_iter().collect();
             v.sort();
-            v.into_iter().map(|o| src.materialize_object(&db, o).unwrap()).collect()
+            v.into_iter()
+                .map(|o| src.materialize_object(&db, o).unwrap())
+                .collect()
         };
         let pack = encode_pack(&objs).unwrap();
 
@@ -609,8 +618,11 @@ mod tests {
         let mut body = Vec::new();
         pktline::write_data(
             &mut body,
-            format!("{ZERO_OID} {} refs/heads/main\0report-status\n", commit.to_hex())
-                .as_bytes(),
+            format!(
+                "{ZERO_OID} {} refs/heads/main\0report-status\n",
+                commit.to_hex()
+            )
+            .as_bytes(),
         )
         .unwrap();
         pktline::write_flush(&mut body);
@@ -712,7 +724,10 @@ mod tests {
         let oids: std::collections::HashSet<_> = got.iter().map(|(_, o)| *o).collect();
         // Only c2's new objects (commit2 + tree2 + blob2); NOT c1's closure.
         assert!(oids.contains(&c2) && oids.contains(&t2) && oids.contains(&b2));
-        assert!(!oids.contains(&c1), "objects reachable from the have must be excluded");
+        assert!(
+            !oids.contains(&c1),
+            "objects reachable from the have must be excluded"
+        );
         assert_eq!(oids.len(), 3);
     }
 
@@ -738,8 +753,11 @@ mod tests {
 
         let resp = upload_pack(&git, &body).unwrap();
         let pack = &resp[resp.windows(4).position(|w| w == b"PACK").unwrap()..];
-        let oids: std::collections::HashSet<_> =
-            parse_pack(pack, |_| Ok(None)).unwrap().into_iter().map(|(_, o)| o).collect();
+        let oids: std::collections::HashSet<_> = parse_pack(pack, |_| Ok(None))
+            .unwrap()
+            .into_iter()
+            .map(|(_, o)| o)
+            .collect();
         // tag → commit → tree → blob, all four reachable from the tag.
         assert!(oids.contains(&tag_oid) && oids.contains(&commit));
         assert_eq!(oids.len(), 4);
@@ -754,8 +772,11 @@ mod tests {
         let mut body = Vec::new();
         pktline::write_data(
             &mut body,
-            format!("{ZERO_OID} {} refs/heads/main\0report-status\n", commit.to_hex())
-                .as_bytes(),
+            format!(
+                "{ZERO_OID} {} refs/heads/main\0report-status\n",
+                commit.to_hex()
+            )
+            .as_bytes(),
         )
         .unwrap();
         pktline::write_flush(&mut body);
@@ -777,9 +798,14 @@ mod tests {
 
         let objs: Vec<GitObject> = {
             let db = git.db();
-            let mut v: Vec<GitOid> = collect_reachable(&git, &db, &[commit]).unwrap().into_iter().collect();
+            let mut v: Vec<GitOid> = collect_reachable(&git, &db, &[commit])
+                .unwrap()
+                .into_iter()
+                .collect();
             v.sort();
-            v.into_iter().map(|o| git.materialize_object(&db, o).unwrap()).collect()
+            v.into_iter()
+                .map(|o| git.materialize_object(&db, o).unwrap())
+                .collect()
         };
         let pack = encode_pack(&objs).unwrap();
 
@@ -787,8 +813,11 @@ mod tests {
         // cmd 1 (first → carries caps): create refs/heads/feature @ commit  → ok
         pktline::write_data(
             &mut body,
-            format!("{ZERO_OID} {} refs/heads/feature\0report-status\n", commit.to_hex())
-                .as_bytes(),
+            format!(
+                "{ZERO_OID} {} refs/heads/feature\0report-status\n",
+                commit.to_hex()
+            )
+            .as_bytes(),
         )
         .unwrap();
         // cmd 2: update main claiming old=zero (but it exists @ commit) → stale ng
@@ -803,8 +832,14 @@ mod tests {
         let resp = receive_pack(&git, &body).await.unwrap();
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("unpack ok"), "got: {text}");
-        assert!(text.contains("ok refs/heads/feature"), "create must succeed: {text}");
-        assert!(text.contains("ng refs/heads/main"), "stale update must be rejected: {text}");
+        assert!(
+            text.contains("ok refs/heads/feature"),
+            "create must succeed: {text}"
+        );
+        assert!(
+            text.contains("ng refs/heads/main"),
+            "stale update must be rejected: {text}"
+        );
         // The accepted ref took effect; the rejected one did not change.
         let db = git.db();
         assert_eq!(resolve_ref(&db, "refs/heads/feature"), Some(commit));
@@ -820,8 +855,11 @@ mod tests {
         let mut body = Vec::new();
         pktline::write_data(
             &mut body,
-            format!("{} {ZERO_OID} refs/heads/main\0report-status\n", commit.to_hex())
-                .as_bytes(),
+            format!(
+                "{} {ZERO_OID} refs/heads/main\0report-status\n",
+                commit.to_hex()
+            )
+            .as_bytes(),
         )
         .unwrap();
         pktline::write_flush(&mut body);
@@ -829,7 +867,10 @@ mod tests {
         let resp = receive_pack(&git, &body).await.unwrap();
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("unpack ok"), "got: {text}");
-        assert!(text.contains("ng refs/heads/main deletion unsupported"), "got: {text}");
+        assert!(
+            text.contains("ng refs/heads/main deletion unsupported"),
+            "got: {text}"
+        );
     }
 
     #[test]
@@ -870,8 +911,11 @@ mod tests {
         let mut body = Vec::new();
         pktline::write_data(
             &mut body,
-            format!("{ZERO_OID} {} refs/heads/main\0report-status\n", commit.to_hex())
-                .as_bytes(),
+            format!(
+                "{ZERO_OID} {} refs/heads/main\0report-status\n",
+                commit.to_hex()
+            )
+            .as_bytes(),
         )
         .unwrap();
         pktline::write_flush(&mut body);

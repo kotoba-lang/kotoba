@@ -123,14 +123,16 @@ mod tests {
     #[tokio::test]
     async fn register_and_invoke() {
         let mut root = Root::new("com.example.word", vec![]).unwrap();
-        root.register(echo("com.example.word.echo", vec![])).unwrap();
+        root.register(echo("com.example.word.echo", vec![]))
+            .unwrap();
         let out = root
             .invoke("com.example.word.echo", serde_json::json!({"text": "hi"}))
             .await
             .unwrap();
         assert_eq!(out["text"], "hi");
         assert!(matches!(
-            root.invoke("com.example.word.nope", serde_json::json!({})).await,
+            root.invoke("com.example.word.nope", serde_json::json!({}))
+                .await,
             Err(WordError::NotFound(_))
         ));
     }
@@ -142,7 +144,8 @@ mod tests {
             root.register(echo("org.other.word.echo", vec![])),
             Err(WordError::OutsideRoot { .. })
         ));
-        root.register(echo("com.example.word.echo", vec![])).unwrap();
+        root.register(echo("com.example.word.echo", vec![]))
+            .unwrap();
         assert!(matches!(
             root.register(echo("com.example.word.echo", vec![])),
             Err(WordError::Duplicate(_))
@@ -153,7 +156,10 @@ mod tests {
     fn rejects_cap_exceeding_grant() {
         let mut root = Root::new("com.example.word", vec![Cap::Proc("git".into())]).unwrap();
         assert!(root
-            .register(echo("com.example.word.gitty", vec![Cap::Proc("git".into())]))
+            .register(echo(
+                "com.example.word.gitty",
+                vec![Cap::Proc("git".into())]
+            ))
             .is_ok());
         assert!(matches!(
             root.register(echo("com.example.word.rmrf", vec![Cap::Proc("rm".into())])),

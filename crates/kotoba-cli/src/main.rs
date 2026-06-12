@@ -303,14 +303,14 @@ enum BlockCmd {
 
 #[derive(Subcommand)]
 enum QuadCmd {
-    /// Assert a quad: <graph-cid> <subject> <predicate> <object>
+    /// Assert a quad: `<graph-cid> <subject> <predicate> <object>`
     Put {
         graph: String,
         subject: String,
         predicate: String,
         object: String,
     },
-    /// Retract a quad: <graph-cid> <subject> <predicate> <object>
+    /// Retract a quad: `<graph-cid> <subject> <predicate> <object>`
     Retract {
         graph: String,
         subject: String,
@@ -977,7 +977,9 @@ async fn run_bench(
     println!("→ benchmarking {iters} iters × concurrency {concurrency} ({mode}):");
     println!("    {query}");
 
-    let url = Arc::new(format!("{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"));
+    let url = Arc::new(format!(
+        "{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"
+    ));
     let token = Arc::new(token);
     let cacao_static = Arc::new(cacao);
     let signer = Arc::new(signer);
@@ -1192,7 +1194,9 @@ async fn sparql_req(
     query: &str,
 ) -> Result<serde_json::Value> {
     let resp = client
-        .post(format!("{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"))
+        .post(format!(
+            "{base}/xrpc/com.etzhayyim.apps.kotoba.graph.sparql"
+        ))
         .header("Authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({ "query": query, "limit": 1000 }))
         .send()
@@ -1679,7 +1683,10 @@ fn run_key_cmd(cmd: KeyCmd) -> Result<()> {
             requester_sk_hex,
             threshold,
         } => {
-            let sk = x25519_dalek::StaticSecret::from(parse_hex32(&requester_sk_hex, "requester_sk_hex")?);
+            let sk = x25519_dalek::StaticSecret::from(parse_hex32(
+                &requester_sk_hex,
+                "requester_sk_hex",
+            )?);
             let mut parsed = Vec::with_capacity(grants.len());
             for path in &grants {
                 let bytes = std::fs::read(path)
@@ -1749,6 +1756,9 @@ mod key_custody_cli_tests {
             })
             .collect();
         let recovered = kotoba_custody::combine_granted(2, &grants, &req_sk).unwrap();
-        assert_eq!(*recovered, key, "CLI deal→grant→combine reconstructs the key");
+        assert_eq!(
+            *recovered, key,
+            "CLI deal→grant→combine reconstructs the key"
+        );
     }
 }

@@ -4,7 +4,7 @@ Port of `20-actors/gov-municipality/cells/final_sign_off/cell.py`
 onto the WASM-native `kotoba_langgraph` API so it compiles to a kotoba-node component.
 
 Build:
-    ../../scripts/build-pywasm.sh final_sign_off_kotoba.py -o final_sign_off_kotoba.wasm
+    ../../scripts/build-pywasm.bb final_sign_off_kotoba.py -o final_sign_off_kotoba.wasm
 """
 
 from __future__ import annotations

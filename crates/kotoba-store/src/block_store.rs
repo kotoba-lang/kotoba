@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn store_error_is_displayable() {
-        let err = StoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, "disk full"));
+        let err = StoreError::Io(std::io::Error::other("disk full"));
         let msg = err.to_string();
         assert!(
             msg.contains("io error") || msg.contains("disk full"),
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn store_error_debug_is_non_empty() {
-        let err = StoreError::Io(std::io::Error::new(std::io::ErrorKind::Other, "err"));
+        let err = StoreError::Io(std::io::Error::other("err"));
         let s = format!("{:?}", err);
         assert!(!s.is_empty());
     }
@@ -125,10 +125,7 @@ mod tests {
 
     #[test]
     fn store_error_contains_io_message() {
-        let err = StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "no space left",
-        ));
+        let err = StoreError::Io(std::io::Error::other("no space left"));
         assert!(err.to_string().contains("no space left") || err.to_string().contains("io error"));
     }
 
@@ -186,5 +183,22 @@ mod tests {
             msg.contains("mismatch") || msg.contains("cid"),
             "error must mention cid mismatch, got: {msg}"
         );
+    }
+
+    #[test]
+    fn default_put_many_durable_rejects_mismatch_before_partial_write() {
+        let store = Arc::new(MemoryBlockStore::new());
+        let good = b"default batch good".to_vec();
+        let good_cid = KotobaCid::from_bytes(&good);
+        let bad_cid = KotobaCid::from_bytes(b"default batch expected");
+        let bad = b"default batch different".to_vec();
+
+        let err = store
+            .put_many_durable(&[(good_cid.clone(), good), (bad_cid.clone(), bad)])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
+        assert!(!store.has(&good_cid));
+        assert!(!store.has(&bad_cid));
     }
 }

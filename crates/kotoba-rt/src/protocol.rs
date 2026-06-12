@@ -8,15 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Stable per-room player id (assigned by the control plane on join).
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PlayerId(pub u32);
 
 /// Simulation tick (monotonic from 0 at `init`).
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Tick(pub u64);
 
 impl Tick {
@@ -113,17 +109,31 @@ pub enum SignalPayload {
 /// Messages a client sends to the authority (T1/T2/T3 ingress).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClientMsg {
-    Join { room: String, player: PlayerId },
-    Leave { room: String, player: PlayerId },
+    Join {
+        room: String,
+        player: PlayerId,
+    },
+    Leave {
+        room: String,
+        player: PlayerId,
+    },
     Input(InputFrame),
     /// T2: ask the authority to relay a signaling payload to peer `to`.
-    Signal { room: String, to: PlayerId, payload: SignalPayload },
+    Signal {
+        room: String,
+        to: PlayerId,
+        payload: SignalPayload,
+    },
 }
 
 /// Messages the authority broadcasts to room members (egress).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ServerMsg {
-    Welcome { room: String, player: PlayerId, tick: Tick },
+    Welcome {
+        room: String,
+        player: PlayerId,
+        tick: Tick,
+    },
     /// Immediate, PROVISIONAL forward of a player's input to all members, so
     /// clients can predict at low latency. Not final — may be superseded.
     Input(InputFrame),
@@ -135,7 +145,12 @@ pub enum ServerMsg {
     Presence(Presence),
     /// T2: a signaling payload relayed from peer `from` to peer `to`. Members
     /// process only those addressed to them.
-    Signal { room: String, from: PlayerId, to: PlayerId, payload: SignalPayload },
+    Signal {
+        room: String,
+        from: PlayerId,
+        to: PlayerId,
+        payload: SignalPayload,
+    },
 }
 
 /// CBOR encode any protocol value. Stable framing for all transports.

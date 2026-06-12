@@ -37,8 +37,11 @@ type IndexEntry = (KotobaCid, u64, u32);
 
 const MAGIC: &[u8; 4] = b"KCAR";
 const VERSION: u32 = 1;
-const HEADER_LEN: usize = 72;
+pub(crate) const HEADER_LEN: usize = 72;
 const INDEX_ENTRY: usize = 48; // 36 (cid) + 8 (offset) + 4 (len)
+pub(crate) const MAX_CAR_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const MAX_CAR_BLOCKS: usize = 1_000_000;
+pub(crate) const MAX_CAR_BLOCK_BYTES: u32 = 64 * 1024 * 1024;
 
 // ─── CarBundleWriter ─────────────────────────────────────────────────────────
 
@@ -130,6 +133,9 @@ pub fn parse_index(car: &[u8]) -> Result<(KotobaCid, Vec<IndexEntry>)> {
     if car.len() < HEADER_LEN {
         bail!("car too short: {} bytes", car.len());
     }
+    if car.len() > MAX_CAR_BYTES {
+        bail!("car too large: {} bytes, limit {MAX_CAR_BYTES}", car.len());
+    }
     if &car[0..4] != MAGIC {
         bail!("invalid car magic");
     }
@@ -137,12 +143,31 @@ pub fn parse_index(car: &[u8]) -> Result<(KotobaCid, Vec<IndexEntry>)> {
     if version != 1 {
         bail!("unsupported car version {version}");
     }
-    let block_count = u64::from_le_bytes(car[8..16].try_into().unwrap()) as usize;
-    let index_offset = u64::from_le_bytes(car[16..24].try_into().unwrap()) as usize;
+    let block_count_raw = u64::from_le_bytes(car[8..16].try_into().unwrap());
+    let block_count = usize::try_from(block_count_raw)
+        .map_err(|_| anyhow::anyhow!("car block_count does not fit usize: {block_count_raw}"))?;
+    if block_count > MAX_CAR_BLOCKS {
+        bail!("car block_count exceeds limit: {block_count} > {MAX_CAR_BLOCKS}");
+    }
+    let index_offset_raw = u64::from_le_bytes(car[16..24].try_into().unwrap());
+    let index_offset = usize::try_from(index_offset_raw)
+        .map_err(|_| anyhow::anyhow!("car index_offset does not fit usize: {index_offset_raw}"))?;
+    if index_offset < HEADER_LEN {
+        bail!("invalid car index_offset {index_offset}: before header end {HEADER_LEN}");
+    }
+    if index_offset > car.len() {
+        bail!(
+            "invalid car index_offset {index_offset}: beyond car length {}",
+            car.len()
+        );
+    }
 
     let mut root = [0u8; 36];
     root.copy_from_slice(&car[24..60]);
     let root_cid = KotobaCid(root);
+    if car[60..72].iter().any(|&b| b != 0) {
+        bail!("invalid car reserved header bytes");
+    }
 
     // The index section size (index_offset + block_count*INDEX_ENTRY) is derived
     // from untrusted header bytes; compute it with checked arithmetic so a hostile
@@ -166,6 +191,19 @@ pub fn parse_index(car: &[u8]) -> Result<(KotobaCid, Vec<IndexEntry>)> {
         cid_bytes.copy_from_slice(&car[pos..pos + 36]);
         let abs_off = u64::from_le_bytes(car[pos + 36..pos + 44].try_into().unwrap());
         let data_len = u32::from_le_bytes(car[pos + 44..pos + 48].try_into().unwrap());
+        if data_len > MAX_CAR_BLOCK_BYTES {
+            bail!("car block length exceeds limit: {data_len} > {MAX_CAR_BLOCK_BYTES}");
+        }
+        let start = usize::try_from(abs_off)
+            .map_err(|_| anyhow::anyhow!("car block offset does not fit usize: {abs_off}"))?;
+        let end = start
+            .checked_add(data_len as usize)
+            .ok_or_else(|| anyhow::anyhow!("car block offset+len overflows usize"))?;
+        if start < HEADER_LEN || end > index_offset {
+            bail!(
+                "car block range outside blocks section: [{start}..{end}] not within [{HEADER_LEN}..{index_offset}]"
+            );
+        }
         entries.push((KotobaCid(cid_bytes), abs_off, data_len));
         pos += INDEX_ENTRY;
     }
@@ -175,7 +213,8 @@ pub fn parse_index(car: &[u8]) -> Result<(KotobaCid, Vec<IndexEntry>)> {
 
 /// Extract a single block from a CAR byte buffer using a pre-parsed index entry.
 pub fn extract_block(car: &[u8], abs_offset: u64, data_len: u32) -> Result<Bytes> {
-    let start = abs_offset as usize;
+    let start = usize::try_from(abs_offset)
+        .map_err(|_| anyhow::anyhow!("block offset does not fit usize: {abs_offset}"))?;
     // abs_offset/data_len come from the (untrusted) index; checked_add so a wrapped
     // `end` can't slip past the bound check and panic at `car[start..end]`.
     let end = match start.checked_add(data_len as usize) {
@@ -189,6 +228,34 @@ pub fn extract_block(car: &[u8], abs_offset: u64, data_len: u32) -> Result<Bytes
         );
     }
     Ok(Bytes::copy_from_slice(&car[start..end]))
+}
+
+/// Extract a block and verify that its bytes hash back to the expected CID.
+pub fn extract_verified_block(
+    car: &[u8],
+    expected_cid: &KotobaCid,
+    abs_offset: u64,
+    data_len: u32,
+) -> Result<Bytes> {
+    let block = extract_block(car, abs_offset, data_len)?;
+    let actual_cid = KotobaCid::from_bytes(&block);
+    if actual_cid != *expected_cid {
+        bail!(
+            "car block CID mismatch: expected {}, got {}",
+            expected_cid.to_multibase(),
+            actual_cid.to_multibase()
+        );
+    }
+    Ok(block)
+}
+
+/// Parse the index and verify every indexed block against its CID.
+pub fn parse_verified_index(car: &[u8]) -> Result<(KotobaCid, Vec<IndexEntry>)> {
+    let (root, entries) = parse_index(car)?;
+    for (cid, off, len) in &entries {
+        extract_verified_block(car, cid, *off, *len)?;
+    }
+    Ok((root, entries))
 }
 
 // ─── CarBlockIndex ────────────────────────────────────────────────────────────
@@ -387,6 +454,87 @@ mod tests {
     }
 
     #[test]
+    fn parse_index_rejects_index_offset_before_header_end() {
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(MAGIC);
+        car[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        car[8..16].copy_from_slice(&0u64.to_le_bytes());
+        car[16..24].copy_from_slice(&(HEADER_LEN as u64 - 1).to_le_bytes());
+
+        let err = parse_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("index_offset"),
+            "index offsets inside the CAR header must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_overflowing_index_offset_without_panicking() {
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(MAGIC);
+        car[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        car[8..16].copy_from_slice(&1u64.to_le_bytes());
+        car[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let result = parse_index(&car);
+
+        assert!(
+            result.is_err(),
+            "overflowing index_offset must be rejected, not panic or wrap"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_index_offset_beyond_car_length() {
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(MAGIC);
+        car[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        car[8..16].copy_from_slice(&0u64.to_le_bytes());
+        car[16..24].copy_from_slice(&((HEADER_LEN + 1) as u64).to_le_bytes());
+
+        let err = parse_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("beyond car length"),
+            "index offsets past EOF must be rejected early: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_nonzero_reserved_header_bytes() {
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(MAGIC);
+        car[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        car[8..16].copy_from_slice(&0u64.to_le_bytes());
+        car[16..24].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes());
+        car[60] = 1;
+
+        let err = parse_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("reserved"),
+            "reserved header bytes must stay canonical zeroes: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_block_count_above_limit_without_allocating_index() {
+        let mut car = vec![0u8; HEADER_LEN];
+        car[0..4].copy_from_slice(MAGIC);
+        car[4..8].copy_from_slice(&VERSION.to_le_bytes());
+        car[8..16].copy_from_slice(&((MAX_CAR_BLOCKS as u64) + 1).to_le_bytes());
+        car[16..24].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes());
+
+        let err = parse_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("block_count exceeds limit"),
+            "oversized block_count must be capped before index allocation: {err}"
+        );
+    }
+
+    #[test]
     fn parse_index_rejects_truncated_index_section() {
         // Build a valid 1-block CAR, then truncate it
         let mut w = CarBundleWriter::new(fake_cid(0));
@@ -397,6 +545,63 @@ mod tests {
         let result = parse_index(truncated);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn parse_index_rejects_block_length_above_limit() {
+        let data = b"data";
+        let mut w = CarBundleWriter::new(fake_cid(0));
+        w.append(&fake_cid(1), data);
+        let (mut car, _) = w.finish();
+        let index_offset = HEADER_LEN + data.len();
+        let data_len_pos = index_offset + 44;
+        car[data_len_pos..data_len_pos + 4]
+            .copy_from_slice(&(MAX_CAR_BLOCK_BYTES + 1).to_le_bytes());
+
+        let err = parse_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("block length exceeds limit"),
+            "oversized block lengths must be rejected before extraction: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_block_range_inside_header() {
+        let data = b"data";
+        let mut w = CarBundleWriter::new(fake_cid(0));
+        w.append(&fake_cid(1), data);
+        let (mut car, _) = w.finish();
+        let index_offset = HEADER_LEN + data.len();
+        let data_offset_pos = index_offset + 36;
+        let invalid_offset = (HEADER_LEN - 1) as u64;
+        car[data_offset_pos..data_offset_pos + 8].copy_from_slice(&invalid_offset.to_le_bytes());
+
+        let err = parse_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("outside blocks section"),
+            "block ranges cannot point into the header: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_block_range_inside_index_section() {
+        let data = b"data";
+        let mut w = CarBundleWriter::new(fake_cid(0));
+        w.append(&fake_cid(1), data);
+        let (mut car, _) = w.finish();
+        let index_offset = HEADER_LEN + data.len();
+        let data_offset_pos = index_offset + 36;
+        let invalid_offset = index_offset as u64;
+        car[data_offset_pos..data_offset_pos + 8].copy_from_slice(&invalid_offset.to_le_bytes());
+
+        let err = parse_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("outside blocks section"),
+            "block ranges cannot point into the index section: {err}"
+        );
     }
 
     // ── extract_block out-of-range ────────────────────────────────────────────
@@ -418,7 +623,100 @@ mod tests {
         // must now be Err, never a panic.
         let car = vec![0u8; 100];
         let result = extract_block(&car, u64::MAX, 50);
-        assert!(result.is_err(), "overflowing offset/len must be rejected, not panic");
+        assert!(
+            result.is_err(),
+            "overflowing offset/len must be rejected, not panic"
+        );
+    }
+
+    #[test]
+    fn extract_verified_block_accepts_matching_cid() {
+        let root = fake_cid(0);
+        let data = b"verified car block";
+        let cid = KotobaCid::from_bytes(data);
+        let mut w = CarBundleWriter::new(root);
+        w.append(&cid, data);
+        let (car, index) = w.finish();
+        let (indexed_cid, off, len) = &index[0];
+
+        let block = extract_verified_block(&car, indexed_cid, *off, *len).unwrap();
+
+        assert_eq!(indexed_cid, &cid);
+        assert_eq!(block.as_ref(), data);
+    }
+
+    #[test]
+    fn extract_verified_block_rejects_cid_mismatch() {
+        let root = fake_cid(0);
+        let data = b"verified car block";
+        let cid = KotobaCid::from_bytes(data);
+        let wrong_cid = KotobaCid::from_bytes(b"different block bytes");
+        let mut w = CarBundleWriter::new(root);
+        w.append(&cid, data);
+        let (car, index) = w.finish();
+        let (_indexed_cid, off, len) = &index[0];
+
+        let err = extract_verified_block(&car, &wrong_cid, *off, *len).unwrap_err();
+
+        assert!(
+            err.to_string().contains("CID mismatch"),
+            "verified extraction should reject an index/data mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_verified_index_accepts_matching_blocks() {
+        let root = fake_cid(0);
+        let mut w = CarBundleWriter::new(root.clone());
+        for i in 1u64..=3 {
+            let data = fake_data(i, 32);
+            w.append(&KotobaCid::from_bytes(&data), &data);
+        }
+        let (car, _index) = w.finish();
+
+        let (parsed_root, entries) = parse_verified_index(&car).unwrap();
+
+        assert_eq!(parsed_root, root);
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn parse_verified_index_rejects_index_data_mismatch() {
+        let root = fake_cid(0);
+        let data = b"verified car block";
+        let cid = KotobaCid::from_bytes(data);
+        let mut w = CarBundleWriter::new(root);
+        w.append(&cid, data);
+        let (mut car, _index) = w.finish();
+        car[HEADER_LEN] ^= 0xff;
+
+        let err = parse_verified_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("CID mismatch"),
+            "verified index parsing should reject CARs whose block bytes no longer match the index: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_verified_index_rejects_block_range_outside_car() {
+        let root = fake_cid(0);
+        let data = b"verified car block";
+        let cid = KotobaCid::from_bytes(data);
+        let mut w = CarBundleWriter::new(root);
+        w.append(&cid, data);
+        let (mut car, _index) = w.finish();
+        let index_offset = HEADER_LEN + data.len();
+        let data_offset_pos = index_offset + 36;
+        let invalid_offset = car.len() as u64;
+        car[data_offset_pos..data_offset_pos + 8].copy_from_slice(&invalid_offset.to_le_bytes());
+
+        let err = parse_verified_index(&car).unwrap_err();
+
+        assert!(
+            err.to_string().contains("outside blocks section"),
+            "verified index parsing should reject entries that point outside the CAR: {err}"
+        );
     }
 
     #[test]
@@ -431,9 +729,12 @@ mod tests {
         car[4..8].copy_from_slice(&1u32.to_le_bytes()); // version
         car[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // block_count
         car[16..24].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes()); // index_offset
-        // root cid bytes [24..60] left zero; reserved [60..72] zero.
+                                                                         // root cid bytes [24..60] left zero; reserved [60..72] zero.
         let result = parse_index(&car);
-        assert!(result.is_err(), "overflowing block_count must be rejected, not panic/OOM");
+        assert!(
+            result.is_err(),
+            "overflowing block_count must be rejected, not panic/OOM"
+        );
     }
 
     // ── CarBlockIndex ─────────────────────────────────────────────────────────

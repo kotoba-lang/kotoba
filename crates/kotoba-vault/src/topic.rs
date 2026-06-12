@@ -3,9 +3,44 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Topic(pub String);
 
+pub const MAX_TOPIC_BYTES: usize = 1024;
+pub const MAX_TOPIC_SEGMENT_BYTES: usize = 512;
+pub const MAX_TOPIC_SEGMENTS: usize = 32;
+
 impl Topic {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let topic = self.0.trim_start_matches('/');
+        if topic.is_empty() {
+            return Err("topic must not be empty".into());
+        }
+        if topic.len() > MAX_TOPIC_BYTES {
+            return Err(format!("topic exceeds {MAX_TOPIC_BYTES} byte limit"));
+        }
+        if topic.bytes().any(|b| b.is_ascii_control()) {
+            return Err("topic contains control byte".into());
+        }
+        let segments: Vec<&str> = topic.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return Err("topic must contain at least one segment".into());
+        }
+        if segments.len() > MAX_TOPIC_SEGMENTS {
+            return Err(format!("topic exceeds {MAX_TOPIC_SEGMENTS} segment limit"));
+        }
+        for segment in segments {
+            if segment == "*" || segment == ">" {
+                return Err("topic must not contain wildcard segments".into());
+            }
+            if segment.len() > MAX_TOPIC_SEGMENT_BYTES {
+                return Err(format!(
+                    "topic segment exceeds {MAX_TOPIC_SEGMENT_BYTES} byte limit"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn segments(&self) -> Vec<&str> {
@@ -188,5 +223,39 @@ mod tests {
     fn exact_single_segment_match() {
         assert!(t("hello").matches(&p("hello")));
         assert!(!t("hello").matches(&p("world")));
+    }
+
+    #[test]
+    fn validate_rejects_empty_topic() {
+        assert!(Topic::new("").validate().is_err());
+        assert!(Topic::new("/").validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_control_bytes() {
+        assert!(Topic::new("quad/\nassert").validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_wildcards_in_concrete_topic() {
+        assert!(Topic::new("quad/*/assert").validate().is_err());
+        assert!(Topic::new("quad/>").validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_topic_and_segment() {
+        assert!(Topic::new("a".repeat(MAX_TOPIC_BYTES + 1))
+            .validate()
+            .is_err());
+        assert!(
+            Topic::new(format!("quad/{}", "a".repeat(MAX_TOPIC_SEGMENT_BYTES + 1)))
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_leading_slash_topic() {
+        assert!(Topic::new("/kotoba/quad/g/s/p/o").validate().is_ok());
     }
 }

@@ -117,7 +117,9 @@ pub async fn key_request_share(
             // it is non-repudiable evidence of THIS release (same seam as R2b
             // commit signing — kotoba-custody is X25519-only).
             use ed25519_dalek::Signer as _;
-            let sig = state.operator_signing_key().sign(&g.grant_signing_payload());
+            let sig = state
+                .operator_signing_key()
+                .sign(&g.grant_signing_payload());
             g.grant_sig = Some(sig.to_bytes().to_vec());
             Ok(Json(RequestShareResp {
                 ok: true,
@@ -158,7 +160,11 @@ fn authorize_share_release(
             // A share for an Authenticated graph still needs a presented CACAO
             // to attribute the read; without one we cannot name the accessor.
             req.cacao_b64.as_deref().and_then(|b64| {
-                crate::access_receipt::accessor_from_request(&HeaderMap::new(), Some(b64), visibility)
+                crate::access_receipt::accessor_from_request(
+                    &HeaderMap::new(),
+                    Some(b64),
+                    visibility,
+                )
             })
         }
         GraphVisibility::Private { .. } => {
@@ -183,7 +189,13 @@ fn authorize_share_release(
     let purpose = req
         .purpose
         .as_deref()
-        .map(|p| p.trim().chars().filter(|c| !c.is_control()).take(256).collect::<String>())
+        .map(|p| {
+            p.trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(256)
+                .collect::<String>()
+        })
         .filter(|p| !p.is_empty());
     if matches!(visibility, GraphVisibility::Private { .. })
         && purpose.is_none()
@@ -262,7 +274,6 @@ pub async fn key_deposit_share(
     }))
 }
 
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustodianInfoResp {
@@ -275,9 +286,7 @@ pub struct CustodianInfoResp {
 ///
 /// Public: returns this node's custodian identity (DID + X25519 pubkey) so an
 /// operator dealing key shares can wrap this node's share to it.
-pub async fn key_custodian_info(
-    State(state): State<Arc<KotobaState>>,
-) -> Json<CustodianInfoResp> {
+pub async fn key_custodian_info(State(state): State<Arc<KotobaState>>) -> Json<CustodianInfoResp> {
     Json(CustodianInfoResp {
         did: state.operator_did.clone(),
         x25519_pubkey_hex: state.custodian_x25519_pubkey_hex(),
@@ -286,8 +295,7 @@ pub async fn key_custodian_info(
 
 // ── key.reportUnreceiptedRelease (R3d enforcement) ───────────────────────────
 
-pub const NSID_KEY_REPORT_RELEASE: &str =
-    "com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease";
+pub const NSID_KEY_REPORT_RELEASE: &str = "com.etzhayyim.apps.kotoba.key.reportUnreceiptedRelease";
 
 #[derive(Debug, Deserialize)]
 pub struct ReportReleaseReq {
@@ -379,8 +387,12 @@ pub async fn key_report_unreceipted_release(
         kotoba_custody::AuditVerdict::UnreceiptedRelease => {
             // Pin the signed grant as warrant evidence.
             let mut ev = Vec::new();
-            ciborium::into_writer(&grant, &mut ev)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode grant: {e}")))?;
+            ciborium::into_writer(&grant, &mut ev).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("encode grant: {e}"),
+                )
+            })?;
             let evidence_cid = KotobaCid::from_bytes(&ev);
             if let Err(e) = state.block_store.put(&evidence_cid, &ev) {
                 tracing::warn!(err = %e, "warrant evidence block put failed");
@@ -396,7 +408,11 @@ pub async fn key_report_unreceipted_release(
                     .unwrap_or(0),
                 sig: {
                     use ed25519_dalek::Signer as _;
-                    state.operator_signing_key().sign(&evidence_cid.0).to_bytes().to_vec()
+                    state
+                        .operator_signing_key()
+                        .sign(&evidence_cid.0)
+                        .to_bytes()
+                        .to_vec()
                 },
             };
             tracing::warn!(

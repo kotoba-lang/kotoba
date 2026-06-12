@@ -71,7 +71,10 @@ pub fn decode(buf: &[u8]) -> Result<ChannelData<'_>, ChannelError> {
     if 4 + len > buf.len() {
         return Err(ChannelError::Short);
     }
-    Ok(ChannelData { channel, data: &buf[4..4 + len] })
+    Ok(ChannelData {
+        channel,
+        data: &buf[4..4 + len],
+    })
 }
 
 #[cfg(test)]
@@ -85,7 +88,13 @@ mod tests {
         assert_eq!(framed.len(), 8);
         assert_eq!(&framed[0..4], &[0x40, 0x01, 0x00, 0x03]);
         let d = decode(&framed).unwrap();
-        assert_eq!(d, ChannelData { channel: 0x4001, data: &[0xAA, 0xBB, 0xCC] });
+        assert_eq!(
+            d,
+            ChannelData {
+                channel: 0x4001,
+                data: &[0xAA, 0xBB, 0xCC]
+            }
+        );
     }
 
     #[test]
@@ -99,8 +108,14 @@ mod tests {
     fn rejects_bad_channel_and_short_buffer() {
         assert_eq!(encode(0x3FFF, &[1], true), Err(ChannelError::BadChannel));
         assert_eq!(decode(&[0x40, 0x01, 0x00]), Err(ChannelError::Short)); // <4 bytes
-        assert_eq!(decode(&[0x40, 0x01, 0x00, 0x09, 1, 2]), Err(ChannelError::Short)); // len>buf
-        assert_eq!(decode(&[0x00, 0x01, 0x00, 0x00]), Err(ChannelError::BadChannel)); // STUN-range channel
+        assert_eq!(
+            decode(&[0x40, 0x01, 0x00, 0x09, 1, 2]),
+            Err(ChannelError::Short)
+        ); // len>buf
+        assert_eq!(
+            decode(&[0x00, 0x01, 0x00, 0x00]),
+            Err(ChannelError::BadChannel)
+        ); // STUN-range channel
     }
 
     #[test]

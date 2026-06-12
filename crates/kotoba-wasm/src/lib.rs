@@ -23,10 +23,10 @@
 //! covering EAVT `ProllyTree` (root = CIDv1 dag-cbor **sha2-256**, byte-identical
 //! hashing to the server), and the wasm `commitToIdb` flushes the captured blocks
 //! + a rehydration snapshot to **IndexedDB** (`IdbBlockStore`) so the write
-//! survives a page reload (`hydrateFromIdb`). The sync ProllyTree build runs over
-//! an in-memory hot tier, then async-flushes to IndexedDB — the same hot/cold
-//! split as the server's `TieredBlockStore`. No Kubo / IPNS, so the server's
-//! DHT-resolve / cold-block stalls do not apply in-browser.
+//!   survives a page reload (`hydrateFromIdb`). The sync ProllyTree build runs over
+//!   an in-memory hot tier, then async-flushes to IndexedDB — the same hot/cold
+//!   split as the server's `TieredBlockStore`. No Kubo / IPNS, so the server's
+//!   DHT-resolve / cold-block stalls do not apply in-browser.
 //!
 //! What it does NOT yet do (subsequent phases in ADR-2606013600):
 //!   - retractions + delta journal (commit is assert-only, full-snapshot);
@@ -51,9 +51,9 @@
 
 use bytes::Bytes;
 use kotoba_core::cid::KotobaCid;
-use kotoba_ipns_record::IpnsRecord;
 use kotoba_core::prolly::ProllyTree;
 use kotoba_core::store::BlockStore;
+use kotoba_ipns_record::IpnsRecord;
 use kotoba_query::{Arrangement, Datom, Value};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -283,7 +283,12 @@ impl Node {
         if !self.seen.insert(key) {
             return; // already present — keep the arrangement vectors duplicate-free
         }
-        let d = Datom::assert(e.clone(), attr.to_string(), Value::Text(value.to_string()), self.tx.clone());
+        let d = Datom::assert(
+            e.clone(),
+            attr.to_string(),
+            Value::Text(value.to_string()),
+            self.tx.clone(),
+        );
         self.arr.insert_datom(&d);
         self.written.push(Written {
             e: entity.to_string(),
@@ -676,7 +681,8 @@ impl WriteCrypto {
     ) -> Result<IpnsRecord, String> {
         let mut rec = IpnsRecord::with_value_string(name, value_multibase, sequence, valid_until);
         rec.controller_did = Some(self.did());
-        rec.sign_ed25519(&self.signing_key).map_err(|e| e.to_string())?;
+        rec.sign_ed25519(&self.signing_key)
+            .map_err(|e| e.to_string())?;
         Ok(rec)
     }
 
@@ -688,8 +694,9 @@ impl WriteCrypto {
         let cipher = Aes256Gcm::new_from_slice(&self.vault_key).map_err(|e| e.to_string())?;
         let mut nonce_bytes = [0u8; 12];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let ct = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|e| e.to_string())?;
         let mut blob = nonce_bytes.to_vec();
         blob.extend_from_slice(&ct);
@@ -708,10 +715,12 @@ impl WriteCrypto {
             return Err("envelope too short".into());
         }
         let (nonce_bytes, ct) = blob.split_at(12);
+        let nonce_bytes: [u8; 12] = nonce_bytes
+            .try_into()
+            .map_err(|_| "invalid nonce length".to_string())?;
+        let nonce = Nonce::from(nonce_bytes);
         let cipher = Aes256Gcm::new_from_slice(&self.vault_key).map_err(|e| e.to_string())?;
-        let pt = cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ct)
-            .map_err(|e| e.to_string())?;
+        let pt = cipher.decrypt(&nonce, ct).map_err(|e| e.to_string())?;
         String::from_utf8(pt).map_err(|e| e.to_string())
     }
 }
@@ -1144,21 +1153,42 @@ mod tests {
     #[test]
     fn write_commit_yields_ipfs_sha256_root_and_is_deterministic() {
         let mut n = Node::new();
-        n.assert_text("did:web:x:actor:a", ":yoro.profile/did", "did:web:x:actor:a");
+        n.assert_text(
+            "did:web:x:actor:a",
+            ":yoro.profile/did",
+            "did:web:x:actor:a",
+        );
         n.assert_text("did:web:x:actor:a", ":yoro.profile/handle", "x.actor.a");
         assert_eq!(n.written_len(), 2);
 
         let root = n.commit();
         // Root is the canonical IPFS-compatible CIDv1 dag-cbor sha2-256 form.
-        assert!(root.is_ipfs_compatible(), "commit root must be sha2-256 CIDv1");
-        assert!(!n.blocks.is_empty(), "commit must capture ProllyTree blocks");
-        assert_eq!(n.root_multibase().as_deref(), Some(root.to_multibase().as_str()));
+        assert!(
+            root.is_ipfs_compatible(),
+            "commit root must be sha2-256 CIDv1"
+        );
+        assert!(
+            !n.blocks.is_empty(),
+            "commit must capture ProllyTree blocks"
+        );
+        assert_eq!(
+            n.root_multibase().as_deref(),
+            Some(root.to_multibase().as_str())
+        );
 
         // Determinism: same write-set → same root (content-addressed).
         let mut n2 = Node::new();
-        n2.assert_text("did:web:x:actor:a", ":yoro.profile/did", "did:web:x:actor:a");
+        n2.assert_text(
+            "did:web:x:actor:a",
+            ":yoro.profile/did",
+            "did:web:x:actor:a",
+        );
         n2.assert_text("did:web:x:actor:a", ":yoro.profile/handle", "x.actor.a");
-        assert_eq!(n2.commit(), root, "same facts must commit to the same root CID");
+        assert_eq!(
+            n2.commit(),
+            root,
+            "same facts must commit to the same root CID"
+        );
     }
 
     #[test]
@@ -1188,8 +1218,14 @@ mod tests {
         assert!(c.did().starts_with("did:key:z"));
 
         let env = c.encrypt("秘密 payload").unwrap();
-        assert!(env.starts_with("signal:v1:"), "must be an encrypted envelope");
-        assert!(!env.contains("秘密"), "plaintext must not appear in ciphertext");
+        assert!(
+            env.starts_with("signal:v1:"),
+            "must be an encrypted envelope"
+        );
+        assert!(
+            !env.contains("秘密"),
+            "plaintext must not appear in ciphertext"
+        );
         assert_eq!(c.decrypt(&env).unwrap(), "秘密 payload");
 
         // Deterministic identity; signature verifies against the public key.
@@ -1212,8 +1248,14 @@ mod tests {
 
         // The durable snapshot (what hits IndexedDB / a peer) holds ciphertext.
         let snap = n.export_snapshot_json();
-        assert!(snap.contains("signal:v1:"), "snapshot must carry the envelope");
-        assert!(!snap.contains("12345"), "plaintext must NOT be in the snapshot");
+        assert!(
+            snap.contains("signal:v1:"),
+            "snapshot must carry the envelope"
+        );
+        assert!(
+            !snap.contains("12345"),
+            "plaintext must NOT be in the snapshot"
+        );
 
         // Signed content-addressed commit.
         let (root, did, sig) = n.commit_signed(&crypto);
@@ -1302,7 +1344,11 @@ mod tests {
           {"e":"bafyA","a":":yoro.profile/displayName","v_edn":"\"紡ぎ Tsumugi\"","added":true}
         ]"#;
         let mut n = Node::new();
-        assert_eq!(n.load_server_datoms(json).unwrap(), 2, "first load applies both");
+        assert_eq!(
+            n.load_server_datoms(json).unwrap(),
+            2,
+            "first load applies both"
+        );
         assert_eq!(n.load_server_datoms(json).unwrap(), 0, "re-load is a no-op");
         assert_eq!(n.datom_count(), 2);
         let hits = n.search_actors("tsumugi");
@@ -1359,14 +1405,19 @@ mod tests {
         let compacted = restarted.export_datoms_json();
         let mut next = Node::new();
         next.load_server_datoms(&compacted).unwrap();
-        assert_eq!(next.replay_journal(&journal).unwrap(), 0, "compacted → journal empty");
+        assert_eq!(
+            next.replay_journal(&journal).unwrap(),
+            0,
+            "compacted → journal empty"
+        );
         assert_eq!(next.search_actors("newcomer").len(), 1);
     }
 
     #[test]
     fn replay_journal_skips_blank_lines() {
         let mut n = Node::new();
-        let journal = "\n  \n[{\"e\":\"e1\",\"a\":\":yoro.profile/handle\",\"v_edn\":\"\\\"solo\\\"\"}]\n\n";
+        let journal =
+            "\n  \n[{\"e\":\"e1\",\"a\":\":yoro.profile/handle\",\"v_edn\":\"\\\"solo\\\"\"}]\n\n";
         assert_eq!(n.replay_journal(journal).unwrap(), 1);
         assert_eq!(n.datom_count(), 1);
     }
@@ -1427,9 +1478,11 @@ mod tests {
         let browser = BlockCache::new();
         for cid in ProllyTree::walk_all_cids(&root, &server).unwrap() {
             let bytes = server.get(&cid).unwrap().unwrap();
-            browser.insert_verified(&cid, &bytes).expect("block CID verifies");
+            browser
+                .insert_verified(&cid, &bytes)
+                .expect("block CID verifies");
         }
-        assert!(browser.len() >= 1);
+        assert!(!browser.is_empty());
 
         // Hydrate purely by traversing the Prolly tree over the verified cache.
         let mut node = Node::new();
@@ -1465,9 +1518,13 @@ mod tests {
                 let e = KotobaCid::from_bytes(format!("e{i}").as_bytes());
                 let a = ":yoro.profile/handle";
                 let v = format!("user{i}");
-                let key =
-                    KqeDatom::assert(e.clone(), a.to_string(), KqeValue::Text(v.clone()), tx.clone())
-                        .eavt_key();
+                let key = KqeDatom::assert(
+                    e.clone(),
+                    a.to_string(),
+                    KqeValue::Text(v.clone()),
+                    tx.clone(),
+                )
+                .eavt_key();
                 let stored = StoredDatom {
                     e: e.to_multibase(),
                     a: a.to_string(),
@@ -1502,7 +1559,10 @@ mod tests {
 
         let mut node = Node::new();
         let applied = node.hydrate_from_prolly(&root, &browser).unwrap();
-        assert_eq!(applied, 400, "all datoms reconstructed after full block sync");
+        assert_eq!(
+            applied, 400,
+            "all datoms reconstructed after full block sync"
+        );
         assert_eq!(node.search_actors("user42").len(), 1);
     }
 

@@ -28,18 +28,9 @@ use std::collections::HashMap;
 
 /// A raw, not-yet-resolved pack object record.
 enum Raw {
-    Full {
-        kind: GitObjectKind,
-        body: Vec<u8>,
-    },
-    OfsDelta {
-        base_offset: usize,
-        delta: Vec<u8>,
-    },
-    RefDelta {
-        base_oid: GitOid,
-        delta: Vec<u8>,
-    },
+    Full { kind: GitObjectKind, body: Vec<u8> },
+    OfsDelta { base_offset: usize, delta: Vec<u8> },
+    RefDelta { base_oid: GitOid, delta: Vec<u8> },
 }
 
 /// Parse a complete pack byte stream into `(object, oid)` pairs.
@@ -57,7 +48,9 @@ where
     }
     let version = u32::from_be_bytes([pack[4], pack[5], pack[6], pack[7]]);
     if version != 2 {
-        return Err(GitError::UnknownObjectKind(format!("pack version {version}")));
+        return Err(GitError::UnknownObjectKind(format!(
+            "pack version {version}"
+        )));
     }
     let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]) as usize;
 
@@ -277,9 +270,9 @@ mod tests {
 
     // ── A flexible hand-roller for multi-object packs (full / ofs / ref). ─────
     enum E<'a> {
-        Full(u8, &'a [u8]),       // (pack type, body)
-        Ofs(usize, &'a [u8]),     // (index of an already-emitted base, delta)
-        Ref(GitOid, &'a [u8]),    // (base oid, delta)
+        Full(u8, &'a [u8]),    // (pack type, body)
+        Ofs(usize, &'a [u8]),  // (index of an already-emitted base, delta)
+        Ref(GitOid, &'a [u8]), // (base oid, delta)
     }
 
     fn write_obj_header(out: &mut Vec<u8>, pack_type: u8, mut size: usize) {
@@ -361,10 +354,7 @@ mod tests {
     #[test]
     fn ofs_delta_resolves_against_in_pack_base() {
         // [ full "hello world" , ofs_delta → that base ]
-        let pack = build_pack(&[
-            E::Full(OBJ_BLOB, b"hello world"),
-            E::Ofs(0, HELLO_DELTA),
-        ]);
+        let pack = build_pack(&[E::Full(OBJ_BLOB, b"hello world"), E::Ofs(0, HELLO_DELTA)]);
         let got = parse_pack(&pack, |_| Ok(None)).unwrap();
         let blobs: std::collections::HashSet<Vec<u8>> =
             got.into_iter().map(|(o, _)| o.body).collect();
@@ -384,7 +374,10 @@ mod tests {
         let got = parse_pack(&pack, |_| Ok(None)).unwrap();
         let blobs: std::collections::HashSet<Vec<u8>> =
             got.into_iter().map(|(o, _)| o.body).collect();
-        assert!(blobs.contains(&b"hello!!".to_vec()), "out-of-order base must resolve");
+        assert!(
+            blobs.contains(&b"hello!!".to_vec()),
+            "out-of-order base must resolve"
+        );
     }
 
     #[test]

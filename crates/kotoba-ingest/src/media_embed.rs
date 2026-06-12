@@ -29,9 +29,14 @@ use std::pin::Pin;
 
 use anyhow::Result;
 use base64::Engine as _;
+use reqwest::Url;
 use serde_json::json;
 
 type EmbedFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
+
+const DEFAULT_MM_EMBED_URL: &str = "http://localhost:8800";
+const DISABLED_MM_EMBED_URL: &str = "http://127.0.0.1:9";
+const MAX_MM_EMBED_URL_LEN: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Modality
@@ -157,8 +162,14 @@ impl HttpMediaEmbedClient {
         dim: usize,
         batch_size: usize,
     ) -> Self {
+        let base_url = normalize_mm_embed_url(&base_url.into()).unwrap_or_else(|| {
+            tracing::warn!(
+                "invalid multimodal embed base URL; disabling HttpMediaEmbedClient HTTP access"
+            );
+            DISABLED_MM_EMBED_URL.to_string()
+        });
         Self {
-            base_url: base_url.into(),
+            base_url,
             model: model.into(),
             dim,
             batch_size: batch_size.max(1),
@@ -168,7 +179,11 @@ impl HttpMediaEmbedClient {
 
     pub fn from_env() -> Result<Self> {
         let base_url = std::env::var("KOTOBA_MM_EMBED_URL")
-            .unwrap_or_else(|_| "http://localhost:8800".to_string());
+            .unwrap_or_else(|_| DEFAULT_MM_EMBED_URL.to_string());
+        anyhow::ensure!(
+            normalize_mm_embed_url(&base_url).is_some(),
+            "invalid KOTOBA_MM_EMBED_URL"
+        );
         let model =
             std::env::var("KOTOBA_MM_EMBED_MODEL").unwrap_or_else(|_| "clip-shared".to_string());
         let dim: usize = std::env::var("KOTOBA_MM_EMBED_DIM")
@@ -233,6 +248,30 @@ impl HttpMediaEmbedClient {
     }
 }
 
+fn normalize_mm_embed_url(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim();
+    if base_url.is_empty()
+        || base_url.len() > MAX_MM_EMBED_URL_LEN
+        || base_url.chars().any(|ch| ch.is_control())
+    {
+        return None;
+    }
+    let url = Url::parse(base_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
+}
+
 impl MediaEmbedClient for HttpMediaEmbedClient {
     fn embed_media<'a>(&'a self, items: &'a [MediaItem<'a>]) -> EmbedFuture<'a> {
         Box::pin(async move {
@@ -264,7 +303,9 @@ impl MediaEmbedClient for HttpMediaEmbedClient {
 pub fn blake3_pseudo_vector(seed: &[u8], dim: usize) -> Vec<f32> {
     let hash = blake3::hash(seed);
     let bytes = hash.as_bytes();
-    (0..dim).map(|i| (bytes[i % 32] as f32 / 127.5) - 1.0).collect()
+    (0..dim)
+        .map(|i| (bytes[i % 32] as f32 / 127.5) - 1.0)
+        .collect()
 }
 
 /// Deterministic multimodal client for testing / CI.  No HTTP, no ML.
@@ -318,7 +359,10 @@ mod tests {
         assert_eq!(Modality::from_mime("video/mp4"), Modality::Video);
         assert_eq!(Modality::from_mime("audio/mpeg"), Modality::Audio);
         assert_eq!(Modality::from_mime("application/pdf"), Modality::Document);
-        assert_eq!(Modality::from_mime("application/epub+zip"), Modality::Document);
+        assert_eq!(
+            Modality::from_mime("application/epub+zip"),
+            Modality::Document
+        );
         assert_eq!(Modality::from_mime("text/plain"), Modality::Text);
         // Unknown binary falls back to Document, never dropped.
         assert_eq!(
@@ -393,5 +437,49 @@ mod tests {
         for (i, x) in v.iter().enumerate() {
             assert!((*x - ((bytes[i % 32] as f32 / 127.5) - 1.0)).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn normalize_mm_embed_url_accepts_http_https_root_urls() {
+        assert_eq!(
+            normalize_mm_embed_url(" http://localhost:8800/ ").unwrap(),
+            "http://localhost:8800"
+        );
+        assert_eq!(
+            normalize_mm_embed_url("https://mm-embed.example.com").unwrap(),
+            "https://mm-embed.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_mm_embed_url_rejects_ambiguous_or_header_unsafe_values() {
+        for endpoint in [
+            "",
+            "ftp://localhost:8800",
+            "https://user:pass@localhost:8800",
+            "http://localhost:8800/api",
+            "http://localhost:8800?x=1",
+            "http://localhost:8800#frag",
+            "http://localhost:8800/\nheader",
+            "not a url",
+        ] {
+            assert!(
+                normalize_mm_embed_url(endpoint).is_none(),
+                "endpoint should be rejected: {endpoint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_media_embed_client_normalizes_endpoint_and_batch_size() {
+        let client = HttpMediaEmbedClient::new(" http://localhost:8800/ ", "model", 128, 0);
+        assert_eq!(client.base_url, "http://localhost:8800");
+        assert_eq!(client.batch_size, 1);
+    }
+
+    #[test]
+    fn http_media_embed_client_new_disables_invalid_endpoint() {
+        let client = HttpMediaEmbedClient::new("http://localhost:8800/api", "model", 128, 1);
+        assert_eq!(client.base_url, DISABLED_MM_EMBED_URL);
     }
 }

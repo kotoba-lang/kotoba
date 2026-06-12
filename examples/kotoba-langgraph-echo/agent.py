@@ -10,7 +10,7 @@ Build entrypoint must be named `agent.py` (componentize target = module basename
 and expose the `WitWorld.run` export.
 
 Build:
-    ./scripts/build-pywasm.sh examples/kotoba-langgraph-echo/agent.py
+    ./scripts/build-pywasm.bb examples/kotoba-langgraph-echo/agent.py
 Run (in-WASM on :8077): MCP `kotoba_wasm_run` — see ../kotoba-langgraph-aria/README.md
 for the verified recipe (unique agent_did + ctx encoded with kotoba_langgraph._cbor).
 """

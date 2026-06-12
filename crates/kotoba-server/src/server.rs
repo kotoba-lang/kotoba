@@ -23,13 +23,14 @@ use kotoba_ipfs::{
     InMemoryIpnsRegistry, IpnsName, IpnsRecord, IpnsRegistry, KuboIpnsRegistry, SignedIpnsRegistry,
 };
 use kotoba_query::{quad::LegacyQuad as Quad, Datom as KqeDatom, Value as KqeValue};
-use kotoba_vault::SecureVault;
-use kotoba_vault::{
-    sync_window::SyncWindow, AgentIdentity, LiveBus, VaultStore, PreKeyRegistry, Shelf, Topic, Vault,
-};
 #[cfg(feature = "wasm-runtime")]
 use kotoba_runtime::{UdfExecutor, WasmExecutor};
 use kotoba_store::IpfsPinClient;
+use kotoba_vault::SecureVault;
+use kotoba_vault::{
+    sync_window::SyncWindow, AgentIdentity, LiveBus, PreKeyRegistry, Shelf, Topic, Vault,
+    VaultStore,
+};
 #[cfg(feature = "wasm-runtime")]
 use kotoba_vm::{distributed::DistributedPregelRunner, InvokeRouter};
 
@@ -329,8 +330,7 @@ pub struct KotobaState {
     // ── Key custody (ADR-sealed-cold-tier R3b) ────────────────────────────────
     /// This node's custodian shares, keyed by graph multibase CID. Installed
     /// via `key.depositShare` (operator-gated); consulted by `key.requestShare`.
-    pub custody_shares:
-        Arc<tokio::sync::RwLock<HashMap<String, kotoba_custody::CustodianShare>>>,
+    pub custody_shares: Arc<tokio::sync::RwLock<HashMap<String, kotoba_custody::CustodianShare>>>,
     // ── Write-cost economy (ADR-2606013400) ───────────────────────────────────
     /// Per-DID mKOTO balance ledger. `datomic.transact` debits the writer here;
     /// the operator is exempt/unlimited. See `crate::econ::Econ`.
@@ -359,8 +359,7 @@ pub struct KotobaState {
     /// `block_store` (IPFS, content-addressed); this `Connection` is the datomic
     /// projection over them. Lazily created with the `:git/*` schema installed on
     /// first access — see `git_connection`.
-    pub git_repos:
-        Arc<tokio::sync::RwLock<HashMap<String, Arc<kotoba_datomic::Connection>>>>,
+    pub git_repos: Arc<tokio::sync::RwLock<HashMap<String, Arc<kotoba_datomic::Connection>>>>,
 }
 
 impl KotobaState {
@@ -869,9 +868,7 @@ impl KotobaState {
         let (receipt_tx, receipt_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             version: env!("CARGO_PKG_VERSION"),
-            mv_registry: Arc::new(tokio::sync::RwLock::new(
-                kotoba_query::mv::MvRegistry::new(),
-            )),
+            mv_registry: Arc::new(tokio::sync::RwLock::new(kotoba_query::mv::MvRegistry::new())),
             operator_did,
             node_roles,
             identity,
@@ -1020,7 +1017,11 @@ impl KotobaState {
             let Some(head) = head else { continue };
             let slot = self.datomic_live_slot(&graph_cid.to_multibase());
             let mut guard = slot.lock().await;
-            if guard.as_ref().map(|live| live.head == head).unwrap_or(false) {
+            if guard
+                .as_ref()
+                .map(|live| live.head == head)
+                .unwrap_or(false)
+            {
                 continue; // already warm at this head
             }
             self.datomic_cold_db_loads
@@ -1078,7 +1079,9 @@ impl KotobaState {
             if let Some(cid) = self.git_head_cid(repo).await {
                 match git.rehydrate(&cid).await {
                     Ok((restored, missing)) => tracing::info!(
-                        repo, restored, missing,
+                        repo,
+                        restored,
+                        missing,
                         "git: rehydrated repo projection from durable snapshot"
                     ),
                     Err(e) => tracing::warn!(repo, error = %e, "git: rehydrate failed"),
@@ -1130,7 +1133,10 @@ impl KotobaState {
         match self.kse_store.as_ref() {
             Some(ks) => {
                 let key = Self::git_repo_key(repo);
-                if let Err(e) = ks.put(&key, Bytes::from(cid.to_multibase().into_bytes())).await {
+                if let Err(e) = ks
+                    .put(&key, Bytes::from(cid.to_multibase().into_bytes()))
+                    .await
+                {
                     tracing::warn!(repo, error = %e, "git: persisting snapshot pointer failed");
                 }
             }
@@ -1209,8 +1215,11 @@ impl KotobaState {
         let evidence_cid = reg.revoke_emit_warrant(owner_did, accessor_did).await?;
         // Channel carries raw KSE names (no "kotoba/" prefix); publish adds it.
         if let Some(tx) = &self.gossip_tx {
-            tx.try_send(("rekey/revoke".to_string(), evidence_cid.to_multibase().into_bytes()))
-                .ok();
+            tx.try_send((
+                "rekey/revoke".to_string(),
+                evidence_cid.to_multibase().into_bytes(),
+            ))
+            .ok();
         }
         Ok(())
     }
@@ -1469,7 +1478,8 @@ impl KotobaState {
             }
             // Already committed to the CommitDag above (commit_datoms) — announce
             // to the live-tail without a redundant LiveBus block.
-            self.journal_assert_datom_ephemeral(&graph_cid, &datom).await;
+            self.journal_assert_datom_ephemeral(&graph_cid, &datom)
+                .await;
             self.quad_store
                 .apply_journaled_datom(graph_cid.clone(), datom)
                 .await;
@@ -1557,7 +1567,9 @@ impl KotobaState {
         let entry = if persist {
             self.journal.publish(topic, Bytes::from(payload)).await
         } else {
-            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+            self.journal
+                .publish_ephemeral(topic, Bytes::from(payload))
+                .await
         };
         entry.cid.to_multibase()
     }
@@ -1650,7 +1662,9 @@ impl KotobaState {
         let entry = if persist {
             self.journal.publish(topic, Bytes::from(payload)).await
         } else {
-            self.journal.publish_ephemeral(topic, Bytes::from(payload)).await
+            self.journal
+                .publish_ephemeral(topic, Bytes::from(payload))
+                .await
         };
         entry.cid.to_multibase()
     }

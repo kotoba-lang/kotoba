@@ -40,6 +40,13 @@ pub enum LegacyQuadObject {
         /// CID of the PRE key-registry entry for this value.
         policy_cid: KotobaCid,
     },
+    /// Envelope-encrypted value — ciphertext is at `ct_cid`; DEK wraps and
+    /// crypto metadata live in an `EnvelopeManifest` at `manifest_cid`.
+    /// VAET does NOT index this variant.
+    Enveloped {
+        ct_cid: KotobaCid,
+        manifest_cid: KotobaCid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,8 +74,9 @@ impl LegacyQuad {
         key.extend_from_slice(self.predicate.as_bytes());
         match &self.object {
             LegacyQuadObject::Cid(c) => key.extend_from_slice(&c.0),
-            // Encrypted: use ct_cid for dedup so each ciphertext is a distinct fact.
-            LegacyQuadObject::Encrypted { ct_cid, .. } => key.extend_from_slice(&ct_cid.0),
+            // Encrypted values use ct_cid for dedup so each ciphertext is a distinct fact.
+            LegacyQuadObject::Encrypted { ct_cid, .. }
+            | LegacyQuadObject::Enveloped { ct_cid, .. } => key.extend_from_slice(&ct_cid.0),
             _ => {}
         }
         key
@@ -142,6 +150,21 @@ mod tests {
         assert_eq!(&key[36 + "enc/field".len()..], &ct.0);
     }
 
+    #[test]
+    fn spo_key_enveloped_uses_ct_cid() {
+        let ct = cid(b"ct");
+        let manifest = cid(b"manifest");
+        let q = quad(
+            "enc/envelope",
+            QuadObject::Enveloped {
+                ct_cid: ct.clone(),
+                manifest_cid: manifest,
+            },
+        );
+        let key = q.spo_key();
+        assert_eq!(&key[36 + "enc/envelope".len()..], &ct.0);
+    }
+
     // ── spo_key for remaining scalar variants ────────────────────────────────
 
     #[test]
@@ -152,7 +175,7 @@ mod tests {
 
     #[test]
     fn spo_key_float_not_appended() {
-        let k = quad("p", QuadObject::Float(3.14)).spo_key();
+        let k = quad("p", QuadObject::Float(2.5)).spo_key();
         assert_eq!(k.len(), 36 + "p".len());
     }
 
@@ -274,7 +297,7 @@ mod tests {
 
     #[test]
     fn serde_quad_object_float() {
-        let obj = QuadObject::Float(2.718281828);
+        let obj = QuadObject::Float(1.25);
         assert_eq!(roundtrip(obj.clone()), obj);
     }
 
@@ -317,6 +340,15 @@ mod tests {
         let obj = QuadObject::Encrypted {
             ct_cid: cid(b"ct"),
             policy_cid: cid(b"policy"),
+        };
+        assert_eq!(roundtrip(obj.clone()), obj);
+    }
+
+    #[test]
+    fn serde_quad_object_enveloped() {
+        let obj = QuadObject::Enveloped {
+            ct_cid: cid(b"ct"),
+            manifest_cid: cid(b"manifest"),
         };
         assert_eq!(roundtrip(obj.clone()), obj);
     }

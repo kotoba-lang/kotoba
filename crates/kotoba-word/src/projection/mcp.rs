@@ -100,7 +100,11 @@ pub async fn handle(root: &Root, req: Value) -> Option<Value> {
                 )),
             }
         }
-        _ => Some(rpc_error(id, -32601, format!("method `{method}` not found"))),
+        _ => Some(rpc_error(
+            id,
+            -32601,
+            format!("method `{method}` not found"),
+        )),
     }
 }
 
@@ -121,9 +125,7 @@ pub async fn serve_stdio(root: Arc<Root>) -> anyhow::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 let resp = rpc_error(None, -32700, format!("parse error: {e}"));
-                stdout
-                    .write_all(format!("{resp}\n").as_bytes())
-                    .await?;
+                stdout.write_all(format!("{resp}\n").as_bytes()).await?;
                 stdout.flush().await?;
                 continue;
             }

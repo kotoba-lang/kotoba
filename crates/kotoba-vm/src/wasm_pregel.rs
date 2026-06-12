@@ -579,9 +579,11 @@ mod tests {
 
     #[test]
     fn wasm_vertex_state_cbor_roundtrip() {
-        let mut state = WasmVertexState::default();
-        state.total_gas_used = 42;
-        state.final_output_cbor = b"hello".to_vec();
+        let state = WasmVertexState {
+            total_gas_used: 42,
+            final_output_cbor: b"hello".to_vec(),
+            ..Default::default()
+        };
         let mut buf = Vec::new();
         ciborium::into_writer(&state, &mut buf).unwrap();
         let back: WasmVertexState = ciborium::from_reader(buf.as_slice()).unwrap();

@@ -145,8 +145,10 @@ mod live {
     const GAS: u64 = 10_000_000;
 
     fn cbor_map(pairs: &[(&str, &str)]) -> Vec<u8> {
-        let map: BTreeMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let mut out = Vec::new();
         ciborium::into_writer(&map, &mut out).expect("cbor encode");
         out

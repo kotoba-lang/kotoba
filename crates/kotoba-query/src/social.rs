@@ -87,7 +87,10 @@ pub const fn redeemable_usd_micros() -> i64 {
 /// op derives the constant; ALL per-epoch math below is integer (deterministic).
 /// H=30 → 977_159.
 pub fn lambda_q(half_life_epochs: u64) -> i64 {
-    debug_assert!(half_life_epochs > 0, "half_life must be > 0 (else no decay = usury)");
+    debug_assert!(
+        half_life_epochs > 0,
+        "half_life must be > 0 (else no decay = usury)"
+    );
     (0.5_f64.powf(1.0 / half_life_epochs as f64) * SCALE as f64).round() as i64
 }
 
@@ -205,7 +208,12 @@ impl ValidatedDisclosure {
         witness_quorum_met: bool,
     ) -> Option<Self> {
         if terminal_honest && witness_quorum_met && n_validated > 0 && citation_hits >= 0 {
-            Some(Self { did, epoch, n_validated, citation_hits })
+            Some(Self {
+                did,
+                epoch,
+                n_validated,
+                citation_hits,
+            })
         } else {
             None
         }
@@ -261,7 +269,9 @@ impl ValidatedWellbecoming {
             return 0;
         }
         sat_i64(
-            (SCALE as i128) * (p.w_wellbecoming_milli as i128) * (self.delta.unsigned_abs() as i128)
+            (SCALE as i128)
+                * (p.w_wellbecoming_milli as i128)
+                * (self.delta.unsigned_abs() as i128)
                 / 1_000,
         )
     }
@@ -347,9 +357,15 @@ pub enum Op {
 pub enum LedgerError {
     NonPositiveUnits,
     /// Epoch went backwards — the log is append-only and monotone in epoch.
-    EpochRegression { last: u64, got: u64 },
+    EpochRegression {
+        last: u64,
+        got: u64,
+    },
     /// A burn cannot exceed the live (decayed) balance (conservation).
-    InsufficientBalance { available: i64, requested: i64 },
+    InsufficientBalance {
+        available: i64,
+        requested: i64,
+    },
 }
 
 /// Append-only social-capital ledger: balances are a decayed fold over the
@@ -407,7 +423,10 @@ impl SocialCapitalLedger {
         let did = did.into();
         let available = self.balance(&did, epoch);
         if smic > available {
-            return Err(LedgerError::InsufficientBalance { available, requested: smic });
+            return Err(LedgerError::InsufficientBalance {
+                available,
+                requested: smic,
+            });
         }
         self.append(did, Op::Burn, smic, epoch, reference.into())
     }
@@ -424,10 +443,19 @@ impl SocialCapitalLedger {
             return Err(LedgerError::NonPositiveUnits);
         }
         if epoch < self.last_epoch {
-            return Err(LedgerError::EpochRegression { last: self.last_epoch, got: epoch });
+            return Err(LedgerError::EpochRegression {
+                last: self.last_epoch,
+                got: epoch,
+            });
         }
         self.last_epoch = epoch;
-        self.entries.push(Entry { did, op, smic, epoch, reference });
+        self.entries.push(Entry {
+            did,
+            op,
+            smic,
+            epoch,
+            reference,
+        });
         Ok(self.entries.last().expect("just pushed"))
     }
 
@@ -507,11 +535,17 @@ impl Default for SocialCapitalView {
 
 impl SocialCapitalView {
     pub fn new() -> Self {
-        Self { lambda_q: lambda_q(HALF_LIFE_EPOCHS), balances: HashMap::new() }
+        Self {
+            lambda_q: lambda_q(HALF_LIFE_EPOCHS),
+            balances: HashMap::new(),
+        }
     }
 
     pub fn with_half_life(half_life_epochs: u64) -> Self {
-        Self { lambda_q: lambda_q(half_life_epochs), balances: HashMap::new() }
+        Self {
+            lambda_q: lambda_q(half_life_epochs),
+            balances: HashMap::new(),
+        }
     }
 
     /// Parse a social predicate → `(is_mint, epoch)`, or `None` if not a
@@ -738,7 +772,11 @@ pub fn allocate_retainer(
             0
         };
         distributed += r as i128;
-        shares.push(RetainerShare { pin_id: p.pin_id.clone(), sc_root, retainer_mkoto: r });
+        shares.push(RetainerShare {
+            pin_id: p.pin_id.clone(),
+            sc_root,
+            retainer_mkoto: r,
+        });
     }
     let remainder = sat_i64(pool_mkoto as i128 - distributed);
     (shares, remainder)
@@ -931,7 +969,11 @@ mod tests {
     #[test]
     fn lambda_q_h30_matches_spec() {
         // spec §2: H=30 → LAMBDA_Q ≈ 977_159 (f64 round, ±1 smic).
-        assert!((lambda_q(30) - 977_159).abs() <= 1, "lambda_q(30)={}", lambda_q(30));
+        assert!(
+            (lambda_q(30) - 977_159).abs() <= 1,
+            "lambda_q(30)={}",
+            lambda_q(30)
+        );
     }
 
     #[test]
@@ -960,8 +1002,14 @@ mod tests {
         }
         let idle = decay_idle(start, gap, lq);
         let tol = (truth / 100_000).max(64);
-        assert!((step - truth).abs() <= tol, "step={step} truth={truth} tol={tol}");
-        assert!((idle - truth).abs() <= tol, "idle={idle} truth={truth} tol={tol}");
+        assert!(
+            (step - truth).abs() <= tol,
+            "step={step} truth={truth} tol={tol}"
+        );
+        assert!(
+            (idle - truth).abs() <= tol,
+            "idle={idle} truth={truth} tol={tol}"
+        );
     }
 
     #[test]
@@ -976,7 +1024,14 @@ mod tests {
     #[test]
     fn mint_then_balance_decays_over_time() {
         let mut l = SocialCapitalLedger::new();
-        l.mint("did:key:alice", MintSource::Disclosure, 100 * SCALE, 0, "attest-1").unwrap();
+        l.mint(
+            "did:key:alice",
+            MintSource::Disclosure,
+            100 * SCALE,
+            0,
+            "attest-1",
+        )
+        .unwrap();
         assert_eq!(l.balance("did:key:alice", 0), 100 * SCALE);
         let later = l.balance("did:key:alice", 30);
         assert!((later - 50 * SCALE).abs() <= SCALE, "later={later}");
@@ -985,25 +1040,32 @@ mod tests {
     #[test]
     fn disclosure_and_wellbecoming_both_accumulate() {
         let mut l = SocialCapitalLedger::new();
-        l.mint("did:key:bob", MintSource::Disclosure, 10 * SCALE, 1, "d1").unwrap();
-        l.mint("did:key:bob", MintSource::Wellbecoming, 20 * SCALE, 1, "w1").unwrap();
+        l.mint("did:key:bob", MintSource::Disclosure, 10 * SCALE, 1, "d1")
+            .unwrap();
+        l.mint("did:key:bob", MintSource::Wellbecoming, 20 * SCALE, 1, "w1")
+            .unwrap();
         assert_eq!(l.balance("did:key:bob", 1), 30 * SCALE);
     }
 
     #[test]
     fn burn_cannot_exceed_balance_conservation() {
         let mut l = SocialCapitalLedger::new();
-        l.mint("did:key:carol", MintSource::Disclosure, 10 * SCALE, 0, "d1").unwrap();
-        let err = l.burn("did:key:carol", 11 * SCALE, 0, "falsified-1").unwrap_err();
+        l.mint("did:key:carol", MintSource::Disclosure, 10 * SCALE, 0, "d1")
+            .unwrap();
+        let err = l
+            .burn("did:key:carol", 11 * SCALE, 0, "falsified-1")
+            .unwrap_err();
         assert!(matches!(err, LedgerError::InsufficientBalance { .. }));
-        l.burn("did:key:carol", 10 * SCALE, 0, "falsified-2").unwrap();
+        l.burn("did:key:carol", 10 * SCALE, 0, "falsified-2")
+            .unwrap();
         assert_eq!(l.balance("did:key:carol", 0), 0);
     }
 
     #[test]
     fn non_transferable_by_construction() {
         let mut l = SocialCapitalLedger::new();
-        l.mint("did:key:a", MintSource::Disclosure, 50 * SCALE, 0, "d").unwrap();
+        l.mint("did:key:a", MintSource::Disclosure, 50 * SCALE, 0, "d")
+            .unwrap();
         assert_eq!(l.balance("did:key:b", 0), 0);
         assert_eq!(l.balance("did:key:a", 0), 50 * SCALE);
     }
@@ -1011,15 +1073,24 @@ mod tests {
     #[test]
     fn epoch_regression_rejected() {
         let mut l = SocialCapitalLedger::new();
-        l.mint("did:key:a", MintSource::Disclosure, SCALE, 5, "d1").unwrap();
-        let err = l.mint("did:key:a", MintSource::Disclosure, SCALE, 4, "d2").unwrap_err();
+        l.mint("did:key:a", MintSource::Disclosure, SCALE, 5, "d1")
+            .unwrap();
+        let err = l
+            .mint("did:key:a", MintSource::Disclosure, SCALE, 4, "d2")
+            .unwrap_err();
         assert_eq!(err, LedgerError::EpochRegression { last: 5, got: 4 });
     }
 
     #[test]
     fn predicates_match_spec() {
-        assert_eq!(MintSource::Disclosure.mint_predicate(7), "social/mint/disclosure/7");
-        assert_eq!(MintSource::Wellbecoming.mint_predicate(7), "social/mint/wellbecoming/7");
+        assert_eq!(
+            MintSource::Disclosure.mint_predicate(7),
+            "social/mint/disclosure/7"
+        );
+        assert_eq!(
+            MintSource::Wellbecoming.mint_predicate(7),
+            "social/mint/wellbecoming/7"
+        );
         assert_eq!(burn_predicate(7), "social/burn/7");
         assert_eq!(capital_predicate(7), "social/capital/7");
     }
@@ -1028,8 +1099,10 @@ mod tests {
     fn deterministic_replay() {
         let build = || {
             let mut l = SocialCapitalLedger::new();
-            l.mint("did:key:x", MintSource::Disclosure, 30 * SCALE, 0, "d").unwrap();
-            l.mint("did:key:x", MintSource::Wellbecoming, 70 * SCALE, 10, "w").unwrap();
+            l.mint("did:key:x", MintSource::Disclosure, 30 * SCALE, 0, "d")
+                .unwrap();
+            l.mint("did:key:x", MintSource::Wellbecoming, 70 * SCALE, 10, "w")
+                .unwrap();
             l.burn("did:key:x", 20 * SCALE, 20, "b").unwrap();
             l.balance("did:key:x", 40)
         };
@@ -1062,9 +1135,18 @@ mod tests {
 
     #[test]
     fn view_parse_attr() {
-        assert_eq!(SocialCapitalView::parse_attr("social/mint/disclosure/12"), Some((true, 12)));
-        assert_eq!(SocialCapitalView::parse_attr("social/mint/wellbecoming/3"), Some((true, 3)));
-        assert_eq!(SocialCapitalView::parse_attr("social/burn/9"), Some((false, 9)));
+        assert_eq!(
+            SocialCapitalView::parse_attr("social/mint/disclosure/12"),
+            Some((true, 12))
+        );
+        assert_eq!(
+            SocialCapitalView::parse_attr("social/mint/wellbecoming/3"),
+            Some((true, 3))
+        );
+        assert_eq!(
+            SocialCapitalView::parse_attr("social/burn/9"),
+            Some((false, 9))
+        );
         assert_eq!(SocialCapitalView::parse_attr("kg/claim/role"), None);
         assert_eq!(SocialCapitalView::parse_attr("social/capital/5"), None); // output, not input
     }
@@ -1150,7 +1232,12 @@ mod tests {
     // ── Observation indexes (pin→pinner, social/origin) ───────────────────
 
     fn cid_datom(e: &KotobaCid, attr: &str, v: &KotobaCid) -> Delta {
-        Delta::assert_datom(Datom::assert(e.clone(), attr.to_string(), Value::Cid(v.clone()), did("g")))
+        Delta::assert_datom(Datom::assert(
+            e.clone(),
+            attr.to_string(),
+            Value::Cid(v.clone()),
+            did("g"),
+        ))
     }
 
     #[test]
@@ -1218,7 +1305,7 @@ mod tests {
         let pin_origins = build_pin_origins(&[pinA.clone(), pinB.clone()], &pins, &origins);
         assert_eq!(pin_origins.len(), 2);
         let (shares, _) = allocate_retainer(&pin_origins, &view, 0, 1_000); // 300 / 700
-        // settle via the PinIndex pinner resolver — both pins → peggy → 1000 total.
+                                                                            // settle via the PinIndex pinner resolver — both pins → peggy → 1000 total.
         let (credits, total) = settle_retainer(&shares, |pin| pins.pinner_of(pin));
         assert_eq!(total, 1_000);
         assert_eq!(credits.len(), 1);
@@ -1279,7 +1366,11 @@ mod tests {
     fn falsification_burn_is_asymmetric() {
         let p = MintParams::default();
         // 2 falsified → 1.5 * 1.0 * 2 = 3 points burned (> the 2 they'd have earned)
-        let f = Falsification { did: did("did:key:liar"), epoch: 0, count: 2 };
+        let f = Falsification {
+            did: did("did:key:liar"),
+            epoch: 0,
+            count: 2,
+        };
         assert_eq!(f.burn_smic(&p), 3 * SCALE);
     }
 
@@ -1323,20 +1414,38 @@ mod tests {
         let disclosures = vec![
             // valid: 2 validated + 5 hits = 2.5 pts
             ObservedDisclosure {
-                did: a.clone(), epoch: 0, n_validated: 2, citation_hits: 5,
-                terminal_honest: true, witness_quorum_met: true,
+                did: a.clone(),
+                epoch: 0,
+                n_validated: 2,
+                citation_hits: 5,
+                terminal_honest: true,
+                witness_quorum_met: true,
             },
             // INVALID: no witness quorum → dropped
             ObservedDisclosure {
-                did: b.clone(), epoch: 0, n_validated: 9, citation_hits: 9,
-                terminal_honest: true, witness_quorum_met: false,
+                did: b.clone(),
+                epoch: 0,
+                n_validated: 9,
+                citation_hits: 9,
+                terminal_honest: true,
+                witness_quorum_met: false,
             },
         ];
         let wellbecomings = vec![
             // valid +5 → 10 pts
-            ObservedWellbecoming { did: a.clone(), epoch: 0, delta: 5, council_attested: true },
+            ObservedWellbecoming {
+                did: a.clone(),
+                epoch: 0,
+                delta: 5,
+                council_attested: true,
+            },
             // INVALID: not council-attested → dropped
-            ObservedWellbecoming { did: b.clone(), epoch: 0, delta: 99, council_attested: false },
+            ObservedWellbecoming {
+                did: b.clone(),
+                epoch: 0,
+                delta: 99,
+                council_attested: false,
+            },
         ];
         let datoms = job.run_epoch(&disclosures, &wellbecomings, &[]);
         // only a's two valid acts emit (b dropped both)
@@ -1355,10 +1464,18 @@ mod tests {
         let a = did("did:key:a");
         // mint 5 pts then falsify 2 (burn 3) in the same epoch run
         let disc = vec![ObservedDisclosure {
-            did: a.clone(), epoch: 0, n_validated: 5, citation_hits: 0,
-            terminal_honest: true, witness_quorum_met: true,
+            did: a.clone(),
+            epoch: 0,
+            n_validated: 5,
+            citation_hits: 0,
+            terminal_honest: true,
+            witness_quorum_met: true,
         }];
-        let fals = vec![Falsification { did: a.clone(), epoch: 0, count: 2 }];
+        let fals = vec![Falsification {
+            did: a.clone(),
+            epoch: 0,
+            count: 2,
+        }];
         let datoms = job.run_epoch(&disc, &[], &fals);
         let deltas: Vec<Delta> = datoms.into_iter().map(Delta::assert_datom).collect();
         let mut v = SocialCapitalView::new();
@@ -1412,7 +1529,11 @@ mod tests {
         let pool = 1_000;
         let (shares, remainder) = allocate_retainer(&pins, &v, 0, pool);
         let sum: i64 = shares.iter().map(|s| s.retainer_mkoto).sum();
-        assert_eq!(sum + remainder, pool, "Σ shares + remainder == pool (conserving)");
+        assert_eq!(
+            sum + remainder,
+            pool,
+            "Σ shares + remainder == pool (conserving)"
+        );
         assert_eq!(remainder, 1); // 1000 = 333+333+333 + 1 dust
     }
 
@@ -1422,7 +1543,10 @@ mod tests {
         let pins = [pin("p1", "r1", &[&did("did:key:a")])];
         let (shares, remainder) = allocate_retainer(&pins, &v, 0, 5_000);
         assert_eq!(shares[0].retainer_mkoto, 0);
-        assert_eq!(remainder, 5_000, "whole pool rolls over when no validated social value");
+        assert_eq!(
+            remainder, 5_000,
+            "whole pool rolls over when no validated social value"
+        );
     }
 
     #[test]
@@ -1444,7 +1568,11 @@ mod tests {
     // ── L6 settlement ─────────────────────────────────────────────────────
 
     fn share(pin: &str, sc_root: i64, mkoto: i64) -> RetainerShare {
-        RetainerShare { pin_id: did(pin), sc_root, retainer_mkoto: mkoto }
+        RetainerShare {
+            pin_id: did(pin),
+            sc_root,
+            retainer_mkoto: mkoto,
+        }
     }
 
     #[test]
@@ -1452,7 +1580,11 @@ mod tests {
         // peggy holds pinA(300)+pinB(200); quinn holds pinC(500).
         let peggy = did("did:key:peggy");
         let quinn = did("did:key:quinn");
-        let shares = [share("pinA", 0, 300), share("pinB", 0, 200), share("pinC", 0, 500)];
+        let shares = [
+            share("pinA", 0, 300),
+            share("pinB", 0, 200),
+            share("pinC", 0, 500),
+        ];
         let resolve = |pin: &KotobaCid| {
             if *pin == did("pinA") || *pin == did("pinB") {
                 Some(peggy.clone())
@@ -1486,13 +1618,16 @@ mod tests {
     #[test]
     fn settlement_apply_credits_is_additive_non_transferable() {
         let peggy = did("did:key:peggy");
-        let credits = vec![RetainerCredit { pinner_did: peggy.clone(), mkoto: 500 }];
+        let credits = vec![RetainerCredit {
+            pinner_did: peggy.clone(),
+            mkoto: 500,
+        }];
         let mut balances: std::collections::HashMap<KotobaCid, i64> =
             std::collections::HashMap::new();
         balances.insert(peggy.clone(), 100); // existing balance
         apply_retainer_credits(&mut balances, &credits);
         assert_eq!(balances[&peggy], 600); // additive credit, no debit-from-other path
-        // a DID never named in credits is untouched (no transfer exists).
+                                           // a DID never named in credits is untouched (no transfer exists).
         assert!(!balances.contains_key(&did("did:key:other")));
     }
 
@@ -1508,7 +1643,7 @@ mod tests {
         ]);
         let pins = [pin("pinA", "rootA", &[&a]), pin("pinB", "rootB", &[&b])];
         let (shares, _) = allocate_retainer(&pins, &v, 0, 1_000); // 300 / 700
-        // both pins kept by the same pinner "zed" → aggregates to the full pool.
+                                                                  // both pins kept by the same pinner "zed" → aggregates to the full pool.
         let zed = did("did:key:zed");
         let (credits, total) = settle_retainer(&shares, |_pin| Some(zed.clone()));
         assert_eq!(total, 1_000);
@@ -1529,9 +1664,20 @@ mod tests {
         let pins = [pin("pa", "ra", &[&a]), pin("pb", "rb", &[&b])];
         // at epoch 30: a decayed to ~50, b is 100 → b gets ~2x a's share.
         let (shares, _) = allocate_retainer(&pins, &v, 30, 3_000);
-        assert!(shares[1].retainer_mkoto > shares[0].retainer_mkoto, "fresh b > decayed a");
+        assert!(
+            shares[1].retainer_mkoto > shares[0].retainer_mkoto,
+            "fresh b > decayed a"
+        );
         // a ≈ 1000, b ≈ 2000 (±rounding from the ~50/100 split)
-        assert!((shares[0].retainer_mkoto - 1_000).abs() <= 20, "a={}", shares[0].retainer_mkoto);
-        assert!((shares[1].retainer_mkoto - 2_000).abs() <= 20, "b={}", shares[1].retainer_mkoto);
+        assert!(
+            (shares[0].retainer_mkoto - 1_000).abs() <= 20,
+            "a={}",
+            shares[0].retainer_mkoto
+        );
+        assert!(
+            (shares[1].retainer_mkoto - 2_000).abs() <= 20,
+            "b={}",
+            shares[1].retainer_mkoto
+        );
     }
 }

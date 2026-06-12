@@ -155,10 +155,7 @@ impl PersistentIpnsRegistry {
         self.len() == 0
     }
 
-    fn persist(
-        &self,
-        records: &HashMap<IpnsName, IpnsRecord>,
-    ) -> Result<(), IpnsRegistryError> {
+    fn persist(&self, records: &HashMap<IpnsName, IpnsRecord>) -> Result<(), IpnsRegistryError> {
         let snapshot: Vec<&IpnsRecord> = records.values().collect();
         let json = serde_json::to_vec_pretty(&snapshot)
             .map_err(|e| IpnsRegistryError::Io(e.to_string()))?;
@@ -402,9 +399,7 @@ impl KuboIpnsRegistry {
         };
         // Write to a temp file then rename for an atomic head swap.
         let tmp = path.with_extension("json.tmp");
-        if let Err(e) =
-            std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path))
-        {
+        if let Err(e) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, &path)) {
             tracing::warn!(err = %e, path = %path.display(), "ipns: head persist failed");
         }
     }
@@ -447,14 +442,13 @@ impl KuboIpnsRegistry {
     /// Called from `from_env` on startup; safe to call again at any time.
     pub fn bootstrap_aliases_from_kubo(&self) -> Result<(), IpnsRegistryError> {
         let url = format!("{}?ipns-base=base36", self.api_url("key/list"));
-        let resp = Self::wait(
-            "key/list send",
-            self.authed(self.client.post(url)).send(),
-        )?;
+        let resp = Self::wait("key/list send", self.authed(self.client.post(url)).send())?;
         let status = resp.status();
         if !status.is_success() {
             let text = Self::wait("key/list body", resp.text()).unwrap_or_default();
-            return Err(IpnsRegistryError::Kubo(format!("key/list {status}: {text}")));
+            return Err(IpnsRegistryError::Kubo(format!(
+                "key/list {status}: {text}"
+            )));
         }
         let parsed: KuboKeyListResp = Self::wait("key/list parse", resp.json())?;
         let mut map = self
@@ -832,7 +826,10 @@ mod tests {
     #[test]
     fn list_enumerates_all_heads_and_delegates_through_signed() {
         let inner = InMemoryIpnsRegistry::new();
-        for (i, n) in ["k51-kotoba-a", "k51-kotoba-b", "k51-kotoba-c"].iter().enumerate() {
+        for (i, n) in ["k51-kotoba-a", "k51-kotoba-b", "k51-kotoba-c"]
+            .iter()
+            .enumerate()
+        {
             let cid = raw_cid(format!("head-{i}").as_bytes());
             inner
                 .publish(IpnsRecord::new(*n, &cid, 1, "2030-01-01T00:00:00Z"))
@@ -843,7 +840,11 @@ mod tests {
         assert_eq!(names, vec!["k51-kotoba-a", "k51-kotoba-b", "k51-kotoba-c"]);
         // SignedIpnsRegistry must delegate list() to its inner registry.
         let signed = SignedIpnsRegistry::new(Arc::new(inner));
-        assert_eq!(signed.list().len(), 3, "signed wrapper must enumerate inner heads");
+        assert_eq!(
+            signed.list().len(),
+            3,
+            "signed wrapper must enumerate inner heads"
+        );
     }
 
     /// ADR-2606012200 LEG-3 candidate (a): is the per-transact `ipns.resolve`
@@ -935,8 +936,8 @@ mod tests {
         // A head published into a PersistentIpnsRegistry must survive dropping
         // the registry (= a process restart) and reloading from the same file —
         // this is the durability the in-memory registry lacks.
-        let path = std::env::temp_dir()
-            .join(format!("kotoba-ipns-persist-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("kotoba-ipns-persist-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cid = raw_cid(b"commit-head");
         let name = "k51-kotoba-persist-test";

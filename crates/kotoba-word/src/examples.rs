@@ -118,9 +118,7 @@ pub fn example_root() -> Result<Root, WordError> {
                 let mut files = Vec::new();
                 for line in out.stdout.lines() {
                     if let Some(rest) = line.strip_prefix("## ") {
-                        branch = Some(
-                            rest.split("...").next().unwrap_or(rest).to_string(),
-                        );
+                        branch = Some(rest.split("...").next().unwrap_or(rest).to_string());
                     } else if line.len() > 3 {
                         files.push(GitFile {
                             status: line[..2].to_string(),

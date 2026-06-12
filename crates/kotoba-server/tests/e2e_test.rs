@@ -34,8 +34,20 @@ struct TestServer {
     client: reqwest::Client,
 }
 
-impl TestServer {
-    async fn start(with_inference: bool) -> Self {
+struct TestServerEnvGuard {
+    previous_default_visibility: Option<std::ffi::OsString>,
+    previous_ipfs: Option<std::ffi::OsString>,
+    previous_store_path: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl TestServerEnvGuard {
+    fn apply(store_path: Option<&std::path::Path>) -> Self {
+        static TEST_SERVER_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let lock = TEST_SERVER_ENV_MUTEX.lock().expect("test server env mutex");
+        let previous_default_visibility = std::env::var_os("KOTOBA_DEFAULT_VISIBILITY");
+        let previous_ipfs = std::env::var_os("KOTOBA_IPFS");
+        let previous_store_path = std::env::var_os("KOTOBA_STORE_PATH");
         // Tests pre-date the 2026-05-28 default-Private flip; keep the historic
         // Bearer-token-only auth behaviour unless an individual test overrides.
         std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", "authenticated");
@@ -43,12 +55,79 @@ impl TestServer {
         // thread tokio runtime; #[tokio::test] defaults to current_thread.
         // Disable IPFS cold tier in tests so puts stay in the hot memory cache.
         std::env::set_var("KOTOBA_IPFS", "off");
+        match store_path {
+            Some(path) => std::env::set_var("KOTOBA_STORE_PATH", path),
+            None => std::env::remove_var("KOTOBA_STORE_PATH"),
+        }
+        Self {
+            previous_default_visibility,
+            previous_ipfs,
+            previous_store_path,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for TestServerEnvGuard {
+    fn drop(&mut self) {
+        match self.previous_default_visibility.take() {
+            Some(value) => std::env::set_var("KOTOBA_DEFAULT_VISIBILITY", value),
+            None => std::env::remove_var("KOTOBA_DEFAULT_VISIBILITY"),
+        }
+        match self.previous_ipfs.take() {
+            Some(value) => std::env::set_var("KOTOBA_IPFS", value),
+            None => std::env::remove_var("KOTOBA_IPFS"),
+        }
+        match self.previous_store_path.take() {
+            Some(path) => std::env::set_var("KOTOBA_STORE_PATH", path),
+            None => std::env::remove_var("KOTOBA_STORE_PATH"),
+        }
+    }
+}
+
+async fn json_or_text(r: reqwest::Response) -> (u16, Value) {
+    let status = r.status().as_u16();
+    let text = r.text().await.unwrap_or_default();
+    let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    (status, body)
+}
+
+impl TestServer {
+    async fn start(with_inference: bool) -> Self {
+        Self::start_inner(with_inference, false, None).await
+    }
+
+    async fn start_with_crypto(with_inference: bool) -> Self {
+        Self::start_inner(with_inference, true, None).await
+    }
+
+    async fn start_with_crypto_store_path(
+        with_inference: bool,
+        store_path: &std::path::Path,
+    ) -> Self {
+        Self::start_inner(with_inference, true, Some(store_path)).await
+    }
+
+    async fn start_inner(
+        with_inference: bool,
+        with_crypto: bool,
+        store_path: Option<&std::path::Path>,
+    ) -> Self {
         let engine = if with_inference {
             Some(stub_engine())
         } else {
             None
         };
-        let state = Arc::new(KotobaState::new(engine).expect("KotobaState::new"));
+        let state = {
+            let _test_server_env = TestServerEnvGuard::apply(store_path);
+            KotobaState::new(engine).expect("KotobaState::new")
+        };
+        let state = if with_crypto {
+            state.init_crypto().await.expect("init_crypto")
+        } else {
+            state
+        };
+        let state = Arc::new(state);
         let operator_did = state.operator_did.clone();
         let app = build_router(Arc::clone(&state));
 
@@ -81,9 +160,7 @@ impl TestServer {
             .send()
             .await
             .expect("GET");
-        let status = r.status().as_u16();
-        let body: Value = r.json().await.unwrap_or(Value::Null);
-        (status, body)
+        json_or_text(r).await
     }
 
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
@@ -94,10 +171,7 @@ impl TestServer {
             .send()
             .await
             .expect("POST");
-        let status = r.status().as_u16();
-        let text = r.text().await.unwrap_or_default();
-        let resp: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        (status, resp)
+        json_or_text(r).await
     }
 
     async fn post_auth(&self, path: &str, body: Value, token: &str) -> (u16, Value) {
@@ -109,10 +183,7 @@ impl TestServer {
             .send()
             .await
             .expect("POST");
-        let status = r.status().as_u16();
-        let text = r.text().await.unwrap_or_default();
-        let resp: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-        (status, resp)
+        json_or_text(r).await
     }
 
     /// GET with `Authorization: Bearer <token>` for authenticated-tier graphs.
@@ -124,9 +195,7 @@ impl TestServer {
             .send()
             .await
             .expect("GET authed");
-        let status = r.status().as_u16();
-        let body: Value = r.json().await.unwrap_or(Value::Null);
-        (status, body)
+        json_or_text(r).await
     }
 
     async fn get_with_auth(&self, path: &str, token: &str) -> (u16, Value) {
@@ -137,9 +206,7 @@ impl TestServer {
             .send()
             .await
             .expect("GET with auth");
-        let status = r.status().as_u16();
-        let body: Value = r.json().await.unwrap_or(Value::Null);
-        (status, body)
+        json_or_text(r).await
     }
 
     /// POST quad.create with a freshly-signed Ed25519 CACAO for the given graph.
@@ -223,6 +290,57 @@ async fn node_status_returns_node_id() {
         body["node_id"].as_str().is_some(),
         "node_id missing: {body}"
     );
+    assert_eq!(
+        body["envelope_manifest_cleanup"]["attempts"].as_u64(),
+        Some(0),
+        "cleanup attempts missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_manifest_cleanup"]["successes"].as_u64(),
+        Some(0),
+        "cleanup successes missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_manifest_cleanup"]["failures"].as_u64(),
+        Some(0),
+        "cleanup failures missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_manifest_cleanup"]["tombstone_count"].as_u64(),
+        Some(0),
+        "cleanup tombstone count missing: {body}"
+    );
+    assert!(
+        body["envelope_manifest_cleanup"]["recent_tombstones"]
+            .as_array()
+            .is_some_and(|values| values.is_empty()),
+        "cleanup tombstone sample missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_current_pointers"]["total_count"].as_u64(),
+        Some(0),
+        "current pointer total count missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_current_pointers"]["readable_count"].as_u64(),
+        Some(0),
+        "current pointer readable count missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_current_pointers"]["unreadable_manifest_count"].as_u64(),
+        Some(0),
+        "current pointer unreadable manifest count missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_current_pointers"]["malformed_ct_cid_count"].as_u64(),
+        Some(0),
+        "current pointer malformed ct count missing: {body}"
+    );
+    assert_eq!(
+        body["envelope_current_pointers"]["malformed_manifest_cid_count"].as_u64(),
+        Some(0),
+        "current pointer malformed manifest count missing: {body}"
+    );
 }
 
 #[tokio::test]
@@ -233,6 +351,48 @@ async fn node_status_without_auth_returns_401() {
 }
 
 #[tokio::test]
+async fn test_server_start_ignores_ambient_store_path() {
+    let mut ambient_dir = std::env::temp_dir();
+    ambient_dir.push(format!(
+        "kotoba-ambient-store-path-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&ambient_dir);
+    let previous = std::env::var_os("KOTOBA_STORE_PATH");
+    std::env::set_var("KOTOBA_STORE_PATH", &ambient_dir);
+
+    let s = TestServer::start_with_crypto(false).await;
+    let wrapping_key = [0x55u8; 32];
+    let (_blob_ref, _manifest_cid, _manifest) = s
+        .state
+        .secure_vault
+        .put_enveloped(
+            &wrapping_key,
+            "did:example:alice",
+            bytes::Bytes::from_static(b"ambient store path isolation"),
+            b"ambient-store-path",
+        )
+        .await
+        .expect("put envelope");
+
+    match previous {
+        Some(ref value) => std::env::set_var("KOTOBA_STORE_PATH", value),
+        None => std::env::remove_var("KOTOBA_STORE_PATH"),
+    }
+
+    assert!(
+        !ambient_dir.join("vault-private-blocks").exists(),
+        "default TestServer startup must not inherit ambient KOTOBA_STORE_PATH"
+    );
+    assert_eq!(
+        std::env::var_os("KOTOBA_STORE_PATH").as_deref(),
+        previous.as_deref(),
+        "TestServer startup must restore ambient KOTOBA_STORE_PATH"
+    );
+    let _ = std::fs::remove_dir_all(&ambient_dir);
+}
+
+#[tokio::test]
 async fn node_status_non_operator_returns_401() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt("did:key:zNonOperator");
@@ -240,6 +400,32 @@ async fn node_status_non_operator_returns_401() {
         .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.node.status", &tok)
         .await;
     assert_eq!(status, 401, "{body}");
+}
+
+#[tokio::test]
+async fn sync_events_rejects_max_cursor() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let (status, body) = s
+        .get_with_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.sync.events?cursor=18446744073709551615",
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn sync_events_rejects_control_topic_prefix() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let (status, body) = s
+        .get_with_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.sync.events?topic_prefix=jetstream%0Abad",
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
 }
 
 #[tokio::test]
@@ -1588,7 +1774,10 @@ async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     assert_eq!(status, 200, "{keys_body}");
     assert_eq!(
         keys_body["rows_edn"],
-        json!([[r#"{:name "Alice" :role :admin}"#], [r#"{:name "Bob" :role :guest}"#]]),
+        json!([
+            [r#"{:name "Alice" :role :admin}"#],
+            [r#"{:name "Bob" :role :guest}"#]
+        ]),
         "{keys_body}"
     );
     let key_rows = keys_body["rows_map_edn"].as_array().expect("rows_map_edn");
@@ -2609,7 +2798,10 @@ async fn datomic_as_of_and_since_expose_distributed_database_values() {
     // P3: sync exposes the covering ProllyTree index roots so a browser node can
     // traverse the canonical tree over CID-verified blocks (ADR-2606013600 P3).
     let eavt_root = sync_body["index_roots"]["eavt"].as_str();
-    assert!(eavt_root.is_some(), "sync must expose the eavt index root: {sync_body}");
+    assert!(
+        eavt_root.is_some(),
+        "sync must expose the eavt index root: {sync_body}"
+    );
     assert!(
         kotoba_core::cid::KotobaCid::from_multibase(eavt_root.unwrap()).is_some(),
         "eavt root must be a valid CID: {sync_body}"
@@ -6551,7 +6743,9 @@ async fn block_get_unknown_cid_returns_404() {
     let s = TestServer::start(false).await;
     let cid = KotobaCid::from_bytes(b"block-does-not-exist-xyz").to_multibase();
     let (status, body) = s
-        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={cid}"))
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={cid}"
+        ))
         .await;
     assert_eq!(status, 404, "{body}");
 }
@@ -6571,7 +6765,9 @@ async fn commit_get_unknown_graph_returns_404() {
     let s = TestServer::start(false).await;
     let cid = KotobaCid::from_bytes(b"graph-commit-does-not-exist").to_multibase();
     let (status, body) = s
-        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={cid}"))
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.commit.get?graph={cid}"
+        ))
         .await;
     assert_eq!(status, 404, "{body}");
 }
@@ -6594,7 +6790,9 @@ async fn block_put_and_get_roundtrip() {
     let cid = put["cid"].as_str().expect("cid");
 
     let (status2, get) = s
-        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={cid}"))
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={cid}"
+        ))
         .await;
     assert_eq!(status2, 200, "{get}");
     let bytes = B64
@@ -7506,6 +7704,50 @@ async fn agent_sync_advance_updates_watermark() {
 }
 
 #[tokio::test]
+async fn agent_sync_advance_rejects_sequence_rollback() {
+    let s = TestServer::start(false).await;
+    use kotoba_core::cid::KotobaCid;
+    let graph_cid = KotobaCid::from_bytes(b"sync-graph-rollback");
+    let head_v1 = KotobaCid::from_bytes(b"rollback-head-v1");
+    let head_v2 = KotobaCid::from_bytes(b"rollback-head-v2");
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncopen",
+            json!({
+                "session_id": "sess-rollback",
+                "graph_cid":  graph_cid.to_multibase(),
+                "since_seq":  10,
+                "head_cid":   head_v1.to_multibase(),
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.agent.syncadvance",
+            json!({
+                "session_id": "sess-rollback",
+                "new_head_cid": head_v2.to_multibase(),
+                "new_seq": 9,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(s.state.block_store.is_pinned(&head_v1));
+    assert!(!s.state.block_store.is_pinned(&head_v2));
+
+    let sessions = s.state.agent_sessions.read().await;
+    let window = sessions.get("sess-rollback").expect("session remains open");
+    assert_eq!(window.since_seq, 10);
+    assert_eq!(window.head_cid, Some(head_v1));
+}
+
+#[tokio::test]
 async fn agent_sync_close_removes_session() {
     let s = TestServer::start(false).await;
     use kotoba_core::cid::KotobaCid;
@@ -7593,6 +7835,7 @@ async fn agent_sync_full_lifecycle() {
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "wasm-runtime")]
 fn build_guest_component() -> Option<Vec<u8>> {
     use std::process::Command;
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -7688,6 +7931,64 @@ async fn vault_put_then_get_roundtrip() {
         Some(data_b64.as_str()),
         "data mismatch"
     );
+
+    let (status, block_body) = s
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={cid}"
+        ))
+        .await;
+    assert_eq!(
+        status, 404,
+        "operator-trusted vault CID must not be retrievable through unauthenticated block.get: {block_body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_put_rejects_invalid_and_oversized_base64() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.put",
+            json!({ "data_b64": "not valid base64!" }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("data_b64 decode"),
+        "invalid base64 response should identify data_b64: {body}"
+    );
+
+    let oversized = "A".repeat(10 * 1024 * 1024 + 1);
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.put",
+            json!({ "data_b64": oversized }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 413, "{body}");
+    assert!(
+        body.to_string().contains("data_b64 too large")
+            || body.to_string().contains("length limit exceeded"),
+        "oversized base64 response should come from the JSON body limit or vault size limit: {body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_put_without_auth_returns_401() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start(false).await;
+
+    let (status, _body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.put",
+            json!({ "data_b64": B64.encode(b"private vault write") }),
+        )
+        .await;
+    assert_eq!(status, 401, "vault_put must reject unauthenticated writes");
 }
 
 #[tokio::test]
@@ -7722,6 +8023,41 @@ async fn vault_get_unknown_cid_returns_404() {
 }
 
 #[tokio::test]
+async fn vault_get_invalid_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let (status, body) = s
+        .get_with_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.get?cid=not-a-valid-cid",
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("invalid CID"),
+        "invalid CID response should identify the CID parse failure: {body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_get_oversized_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let oversized_cid = "b".repeat(513);
+    let (status, body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.get?cid={oversized_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("cid too long"),
+        "oversized CID response should identify the CID size limit: {body}"
+    );
+}
+
+#[tokio::test]
 async fn vault_get_missing_cid_param_returns_400() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);
@@ -7729,6 +8065,1376 @@ async fn vault_get_missing_cid_param_returns_400() {
         .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.vault.get", &tok)
         .await;
     assert_eq!(status, 400);
+}
+
+#[tokio::test]
+async fn vault_envelope_put_then_get_roundtrip() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let data = b"rotatable envelope content";
+    let aad = b"graph:private-slot-1";
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(data),
+                "recipient": s.operator_did,
+                "aad_b64": B64.encode(aad),
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+    assert_ne!(
+        ct_cid, manifest_cid,
+        "manifest must be addressable separately from ciphertext"
+    );
+    assert_eq!(put_body["size"], (data.len() + 28) as u64);
+
+    let (status, get_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={manifest_cid}&recipient={}",
+                s.operator_did
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{get_body}");
+    assert_eq!(get_body["ct_cid"].as_str(), Some(ct_cid));
+    assert_eq!(get_body["manifest_cid"].as_str(), Some(manifest_cid));
+    assert_eq!(
+        get_body["data_b64"].as_str(),
+        Some(B64.encode(data).as_str())
+    );
+
+    for private_cid in [ct_cid, manifest_cid] {
+        let (status, body) = s
+            .get(&format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.block.get?cid={private_cid}"
+            ))
+            .await;
+        assert_eq!(
+            status, 404,
+            "SecureVault envelope CID must not be retrievable through unauthenticated block.get: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vault_envelope_put_without_auth_returns_401() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+
+    let (status, _body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"private envelope write") }),
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "vault_envelope_put must reject unauthenticated writes"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_put_rejects_oversized_metadata() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(b"small envelope"),
+                "recipient": "r".repeat(513),
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(b"small envelope"),
+                "aad_b64": "not valid base64!",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("aad_b64 decode"),
+        "invalid aad_b64 response should identify aad_b64: {body}"
+    );
+
+    let max_aad = vec![0u8; kotoba_core::EnvelopeManifest::MAX_AAD_LEN];
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(b"small envelope"),
+                "aad_b64": B64.encode(&max_aad),
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let oversized_aad_b64 =
+        "A".repeat(kotoba_core::EnvelopeManifest::MAX_AAD_LEN.div_ceil(3) * 4 + 1);
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(b"small envelope"),
+                "aad_b64": oversized_aad_b64,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 413, "{body}");
+    assert!(
+        body.to_string().contains("aad_b64 too large"),
+        "oversized aad_b64 string should be rejected before decode: {body}"
+    );
+
+    let oversized_aad = vec![0u8; kotoba_core::EnvelopeManifest::MAX_AAD_LEN + 1];
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(b"small envelope"),
+                "aad_b64": B64.encode(&oversized_aad),
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 413, "{body}");
+    assert!(
+        body.to_string()
+            .contains("aad_b64 decoded payload too large"),
+        "oversized decoded aad should identify decoded payload size: {body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_grant_and_revoke_rotate_manifest_not_ciphertext() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let data = b"grant revoke envelope content";
+    let bob = "did:example:bob";
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(data),
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{current_body}");
+    assert_eq!(current_body["ct_cid"].as_str(), Some(ct_cid));
+    assert_eq!(current_body["manifest_cid"].as_str(), Some(manifest_cid));
+
+    let (status, inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{inspect_body}");
+    assert_eq!(inspect_body["current_status"].as_str(), Some("current"));
+    assert_eq!(
+        inspect_body["current_manifest_cid"].as_str(),
+        Some(manifest_cid)
+    );
+    assert_eq!(inspect_body["content_alg"].as_str(), Some("AES-256-GCM"));
+    assert!(inspect_body["wraps"].as_array().is_some_and(|wraps| {
+        wraps.iter().any(|wrap| {
+            wrap["recipient"].as_str() == Some(s.operator_did.as_str())
+                && wrap["wrap_alg"].as_str() == Some("AES-256-GCM-KW")
+        })
+    }));
+    assert!(
+        !inspect_body["wraps"].to_string().contains("wrapped_dek"),
+        "inspect must not expose wrapped DEK material: {inspect_body}"
+    );
+
+    let (status, grant_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": manifest_cid,
+                "from_recipient": s.operator_did,
+                "to_recipient": bob,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{grant_body}");
+    let granted_manifest_cid = grant_body["manifest_cid"].as_str().expect("grant manifest");
+    assert_eq!(grant_body["ct_cid"].as_str(), Some(ct_cid));
+    assert_ne!(granted_manifest_cid, manifest_cid);
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{current_body}");
+    assert_eq!(
+        current_body["manifest_cid"].as_str(),
+        Some(granted_manifest_cid)
+    );
+    let recipients = grant_body["recipients"].as_array().expect("recipients");
+    assert!(recipients.iter().any(|value| value.as_str() == Some(bob)));
+    assert!(recipients
+        .iter()
+        .any(|value| value.as_str() == Some(s.operator_did.as_str())));
+
+    let (status, stale_inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 410, "{stale_inspect_body}");
+    assert!(
+        stale_inspect_body
+            .to_string()
+            .contains("grant_old_manifest"),
+        "deleted manifest response should expose cleanup reason: {stale_inspect_body}"
+    );
+
+    let (status, granted_inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={granted_manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{granted_inspect_body}");
+    assert_eq!(
+        granted_inspect_body["current_status"].as_str(),
+        Some("current")
+    );
+    let inspect_recipients = granted_inspect_body["recipients"]
+        .as_array()
+        .expect("inspect recipients");
+    assert!(inspect_recipients
+        .iter()
+        .any(|value| value.as_str() == Some(bob)));
+
+    let (status, stale_initial_get) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={manifest_cid}&recipient={}",
+                s.operator_did
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 410, "{stale_initial_get}");
+    assert!(
+        stale_initial_get.to_string().contains("grant_old_manifest"),
+        "deleted manifest response should expose cleanup reason: {stale_initial_get}"
+    );
+
+    let (status, bob_get) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={granted_manifest_cid}&recipient={bob}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{bob_get}");
+    assert_eq!(
+        bob_get["data_b64"].as_str(),
+        Some(B64.encode(data).as_str())
+    );
+
+    let (status, revoke_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": granted_manifest_cid,
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{revoke_body}");
+    let revoked_manifest_cid = revoke_body["manifest_cid"]
+        .as_str()
+        .expect("revoke manifest");
+    assert_eq!(revoke_body["ct_cid"].as_str(), Some(ct_cid));
+    assert_ne!(revoked_manifest_cid, granted_manifest_cid);
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{current_body}");
+    assert_eq!(
+        current_body["manifest_cid"].as_str(),
+        Some(revoked_manifest_cid)
+    );
+    let recipients = revoke_body["recipients"].as_array().expect("recipients");
+    assert_eq!(recipients.len(), 1);
+    assert_eq!(recipients[0].as_str(), Some(bob));
+
+    let (status, stale_granted_get) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={granted_manifest_cid}&recipient={bob}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 410, "{stale_granted_get}");
+    assert!(
+        stale_granted_get
+            .to_string()
+            .contains("revoke_old_manifest"),
+        "deleted manifest response should expose cleanup reason: {stale_granted_get}"
+    );
+
+    let (status, stale_granted_inspect) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={granted_manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 410, "{stale_granted_inspect}");
+    assert!(
+        stale_granted_inspect
+            .to_string()
+            .contains("revoke_old_manifest"),
+        "deleted manifest response should expose cleanup reason: {stale_granted_inspect}"
+    );
+
+    let (status, operator_get) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={revoked_manifest_cid}&recipient={}",
+                s.operator_did
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{operator_get}");
+
+    let (status, bob_get_after_revoke) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={revoked_manifest_cid}&recipient={bob}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{bob_get_after_revoke}");
+    assert_eq!(
+        bob_get_after_revoke["data_b64"].as_str(),
+        Some(B64.encode(data).as_str())
+    );
+
+    let missing_recipient = "did:example:missing";
+    let (status, missing_revoke_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": revoked_manifest_cid,
+                "recipient": missing_recipient,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 404, "{missing_revoke_body}");
+    assert!(
+        missing_revoke_body
+            .to_string()
+            .contains("recipient not present"),
+        "missing-recipient revoke should identify the absent recipient: {missing_revoke_body}"
+    );
+
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{current_body}");
+    assert_eq!(
+        current_body["manifest_cid"].as_str(),
+        Some(revoked_manifest_cid),
+        "missing-recipient revoke must not advance the current manifest pointer"
+    );
+
+    let (status, last_revoke_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": revoked_manifest_cid,
+                "recipient": bob,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{last_revoke_body}");
+    assert!(
+        last_revoke_body
+            .to_string()
+            .contains("cannot revoke the last envelope recipient"),
+        "last-recipient revoke should identify the invariant: {last_revoke_body}"
+    );
+
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{current_body}");
+    assert_eq!(
+        current_body["manifest_cid"].as_str(),
+        Some(revoked_manifest_cid),
+        "failed last-recipient revoke must not advance the current manifest pointer"
+    );
+
+    let (status, bob_get_after_failed_last_revoke) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={revoked_manifest_cid}&recipient={bob}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{bob_get_after_failed_last_revoke}");
+    assert_eq!(
+        bob_get_after_failed_last_revoke["data_b64"].as_str(),
+        Some(B64.encode(data).as_str()),
+        "failed last-recipient revoke must leave the manifest readable by the remaining recipient"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_current_requires_auth_and_pointer() {
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let missing_ct_cid =
+        kotoba_core::cid::KotobaCid::from_bytes(b"missing-envelope-current").to_multibase();
+
+    let (status, _body) = s
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={missing_ct_cid}"
+        ))
+        .await;
+    assert_eq!(status, 401);
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={missing_ct_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+}
+
+#[tokio::test]
+async fn vault_envelope_inspect_without_auth_returns_401() {
+    let s = TestServer::start_with_crypto(false).await;
+    let manifest_cid =
+        kotoba_core::cid::KotobaCid::from_bytes(b"unauth-envelope-inspect").to_multibase();
+
+    let (status, _body) = s
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?manifest_cid={manifest_cid}"
+        ))
+        .await;
+    assert_eq!(
+        status, 401,
+        "envelopeInspect must reject unauthenticated metadata reads"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_rotation_without_auth_returns_401() {
+    let s = TestServer::start_with_crypto(false).await;
+    let manifest_cid =
+        kotoba_core::cid::KotobaCid::from_bytes(b"unauth-envelope-rotation").to_multibase();
+
+    let (status, _body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "manifest_cid": manifest_cid,
+                "to_recipient": "did:example:bob",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "envelopeGrant must reject unauthenticated writes"
+    );
+
+    let (status, _body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "manifest_cid": manifest_cid,
+                "recipient": "did:example:bob",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "envelopeRevoke must reject unauthenticated writes"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_rejects_oversized_cid_inputs() {
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let oversized_cid = "b".repeat(513);
+    let missing_manifest_cid =
+        kotoba_core::cid::KotobaCid::from_bytes(b"missing-envelope-cid-boundary").to_multibase();
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={oversized_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("ct_cid too long"),
+        "oversized ct_cid response should identify the size limit: {body}"
+    );
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?manifest_cid={oversized_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("manifest_cid too long"),
+        "oversized manifest_cid response should identify the size limit: {body}"
+    );
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?manifest_cid={missing_manifest_cid}&ct_cid={oversized_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("ct_cid too long"),
+        "oversized optional envelopeGet ct_cid should be validated before manifest lookup: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "manifest_cid": oversized_cid,
+                "to_recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("manifest_cid too long"),
+        "oversized grant manifest_cid response should identify the size limit: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "manifest_cid": missing_manifest_cid,
+                "ct_cid": oversized_cid,
+                "to_recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("ct_cid too long"),
+        "oversized optional grant ct_cid should be validated before manifest lookup: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "manifest_cid": oversized_cid,
+                "recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("manifest_cid too long"),
+        "oversized revoke manifest_cid response should identify the size limit: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "manifest_cid": missing_manifest_cid,
+                "ct_cid": oversized_cid,
+                "recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("ct_cid too long"),
+        "oversized optional revoke ct_cid should be validated before manifest lookup: {body}"
+    );
+
+    let (status, body) = s
+        .get_with_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid=bad%0Acid",
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("ct_cid must be a visible ASCII CID"),
+        "control ct_cid response should reject before echoing decoded control bytes: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "manifest_cid": "bad\ncid",
+                "to_recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string()
+            .contains("manifest_cid must be a visible ASCII CID"),
+        "control manifest_cid response should reject before echoing decoded control bytes: {body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_current_rejects_missing_current_manifest_body() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"current pointer body required") }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+    let manifest_cid = kotoba_core::cid::KotobaCid::from_multibase(manifest_cid)
+        .expect("manifest CID from envelopePut");
+
+    assert!(
+        s.state
+            .secure_vault
+            .delete_envelope_manifest(&manifest_cid)
+            .await,
+        "test setup must delete current manifest body"
+    );
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 404, "{body}");
+    assert!(
+        body.to_string()
+            .contains("vault envelope manifest not found"),
+        "current endpoint must not return a pointer to a missing manifest body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_current_rejects_invalid_current_manifest_body() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "kotoba-invalid-current-manifest-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let s = TestServer::start_with_crypto_store_path(false, &dir).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"invalid current manifest body") }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+
+    let corrupt_bytes = b"not a valid envelope manifest cbor";
+    let corrupt_cid = kotoba_core::cid::KotobaCid::from_bytes(corrupt_bytes);
+    let private_store =
+        kotoba_store::FsBlockStore::open(dir.join("vault-private-blocks")).expect("private store");
+    kotoba_core::store::BlockStore::put(&private_store, &corrupt_cid, corrupt_bytes)
+        .expect("write corrupt manifest block");
+
+    s.state
+        .shelf
+        .put(
+            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            ct_cid.to_string(),
+            bytes::Bytes::from(corrupt_cid.to_multibase()),
+        )
+        .await;
+
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{current_body}");
+    assert!(
+        current_body
+            .to_string()
+            .contains("current envelope manifest"),
+        "current endpoint must classify invalid current manifest bodies as conflict: {current_body}"
+    );
+
+    let (status, get_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{get_body}");
+    assert!(
+        get_body.to_string().contains("current envelope manifest"),
+        "envelopeGet must fail closed on invalid current manifest bodies: {get_body}"
+    );
+
+    let (status, inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{inspect_body}");
+    assert_eq!(inspect_body["current_status"].as_str(), Some("unknown"));
+    assert!(
+        inspect_body["current_manifest_cid"].is_null(),
+        "inspect must not expose invalid current manifest bodies: {inspect_body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn vault_envelope_current_rejects_manifest_for_different_ciphertext() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, first_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"first ciphertext") }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{first_body}");
+    let first_ct_cid = first_body["ct_cid"].as_str().expect("first ct_cid");
+    let first_manifest_cid = first_body["manifest_cid"]
+        .as_str()
+        .expect("first manifest_cid");
+
+    let (status, second_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"second ciphertext") }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{second_body}");
+    let second_manifest_cid = second_body["manifest_cid"]
+        .as_str()
+        .expect("second manifest_cid");
+
+    s.state
+        .shelf
+        .put(
+            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            first_ct_cid.to_string(),
+            bytes::Bytes::from(second_manifest_cid.to_string()),
+        )
+        .await;
+
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={first_ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{current_body}");
+    assert!(
+        current_body.to_string().contains("belongs to ciphertext"),
+        "current endpoint must reject a manifest bound to a different ciphertext: {current_body}"
+    );
+
+    let (status, get_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={first_ct_cid}&manifest_cid={first_manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{get_body}");
+    assert!(
+        get_body.to_string().contains("belongs to ciphertext"),
+        "envelopeGet must fail closed when current pointer is cross-bound: {get_body}"
+    );
+
+    let (status, grant_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "ct_cid": first_ct_cid,
+                "manifest_cid": first_manifest_cid,
+                "to_recipient": "did:example:bob"
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{grant_body}");
+    assert!(
+        grant_body.to_string().contains("belongs to ciphertext"),
+        "envelopeGrant must fail closed when current pointer is cross-bound: {grant_body}"
+    );
+
+    let (status, revoke_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": first_ct_cid,
+                "manifest_cid": first_manifest_cid,
+                "recipient": s.operator_did
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{revoke_body}");
+    assert!(
+        revoke_body.to_string().contains("belongs to ciphertext"),
+        "envelopeRevoke must fail closed when current pointer is cross-bound: {revoke_body}"
+    );
+
+    let (status, inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={first_ct_cid}&manifest_cid={first_manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{inspect_body}");
+    assert_eq!(inspect_body["current_status"].as_str(), Some("unknown"));
+    assert!(
+        inspect_body["current_manifest_cid"].is_null(),
+        "inspect must not expose a cross-bound current manifest pointer: {inspect_body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_inspect_hides_missing_current_manifest_pointer() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"inspect readable current pointer") }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+    let missing_current_cid =
+        kotoba_core::cid::KotobaCid::from_bytes(b"missing current manifest body").to_multibase();
+
+    s.state
+        .shelf
+        .put(
+            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            ct_cid.to_string(),
+            bytes::Bytes::from(missing_current_cid.clone()),
+        )
+        .await;
+
+    let (status, inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{inspect_body}");
+    assert_eq!(inspect_body["current_status"].as_str(), Some("unknown"));
+    assert!(
+        inspect_body["current_manifest_cid"].is_null(),
+        "inspect must not expose a current pointer whose manifest body is unreadable: {inspect_body}"
+    );
+
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 404, "{current_body}");
+    assert!(
+        current_body
+            .to_string()
+            .contains("vault envelope manifest not found"),
+        "current endpoint must agree that the pointer is unreadable: {current_body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_inspect_tolerates_malformed_current_manifest_pointer() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"inspect malformed current pointer") }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+
+    s.state
+        .shelf
+        .put(
+            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            ct_cid.to_string(),
+            bytes::Bytes::from_static(b"not-a-cid"),
+        )
+        .await;
+
+    let (status, inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{inspect_body}");
+    assert_eq!(inspect_body["ct_cid"].as_str(), Some(ct_cid));
+    assert_eq!(inspect_body["manifest_cid"].as_str(), Some(manifest_cid));
+    assert_eq!(inspect_body["current_status"].as_str(), Some("unknown"));
+    assert!(
+        inspect_body["current_manifest_cid"].is_null(),
+        "inspect must not fail or expose malformed current pointers: {inspect_body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_current_get_grant_revoke_fail_closed_on_malformed_current_pointer() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(b"malformed current pointer fail closed"),
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+
+    s.state
+        .shelf
+        .put(
+            kotoba_kse::BUCKET_VAULT_ENVELOPES,
+            ct_cid.to_string(),
+            bytes::Bytes::from_static(b"not-a-manifest-cid"),
+        )
+        .await;
+
+    let (status, current_body) = s
+        .get_with_auth(
+            &format!("/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeCurrent?ct_cid={ct_cid}"),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{current_body}");
+    assert!(
+        current_body
+            .to_string()
+            .contains("invalid current manifest CID"),
+        "current endpoint must report malformed current pointer as conflict: {current_body}"
+    );
+
+    let (status, get_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={manifest_cid}&recipient={}",
+                s.operator_did
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{get_body}");
+
+    let (status, grant_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": manifest_cid,
+                "from_recipient": s.operator_did,
+                "to_recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{grant_body}");
+
+    let (status, revoke_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": manifest_cid,
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{revoke_body}");
+}
+
+#[tokio::test]
+async fn vault_envelope_get_grant_revoke_fail_closed_without_current_pointer() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({
+                "data_b64": B64.encode(b"current pointer required"),
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+
+    assert!(
+        s.state
+            .shelf
+            .delete(kotoba_kse::BUCKET_VAULT_ENVELOPES, ct_cid)
+            .await,
+        "test setup must remove current pointer"
+    );
+
+    let (status, inspect_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{inspect_body}");
+    assert_eq!(inspect_body["current_status"].as_str(), Some("unknown"));
+    assert!(inspect_body["current_manifest_cid"].is_null());
+
+    let (status, get_body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={ct_cid}&manifest_cid={manifest_cid}&recipient={}",
+                s.operator_did
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{get_body}");
+
+    let (status, grant_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": manifest_cid,
+                "from_recipient": s.operator_did,
+                "to_recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{grant_body}");
+
+    let (status, revoke_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": ct_cid,
+                "manifest_cid": manifest_cid,
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 409, "{revoke_body}");
+}
+
+#[tokio::test]
+async fn vault_envelope_rejects_policy_manifest_ct_mismatch() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let s = TestServer::start_with_crypto(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    let (status, put_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopePut",
+            json!({ "data_b64": B64.encode(b"mismatch envelope") }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{put_body}");
+    let manifest_cid = put_body["manifest_cid"].as_str().expect("manifest_cid");
+    let wrong_ct_cid =
+        kotoba_core::cid::KotobaCid::from_bytes(b"wrong-envelope-ciphertext").to_multibase();
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={wrong_ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("policy ct_cid"),
+        "envelopeGet mismatch response should identify the ct_cid policy mismatch: {body}"
+    );
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeInspect?ct_cid={wrong_ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("policy ct_cid"),
+        "envelopeInspect mismatch response should identify the ct_cid policy mismatch: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "ct_cid": wrong_ct_cid,
+                "manifest_cid": manifest_cid,
+                "to_recipient": "did:example:bob",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("policy ct_cid"),
+        "envelopeGrant mismatch response should identify the ct_cid policy mismatch: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": wrong_ct_cid,
+                "manifest_cid": manifest_cid,
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("policy ct_cid"),
+        "envelopeRevoke mismatch response should identify the ct_cid policy mismatch: {body}"
+    );
+
+    let ct_cid = put_body["ct_cid"].as_str().expect("ct_cid");
+    assert!(
+        s.state
+            .shelf
+            .delete(kotoba_kse::BUCKET_VAULT_ENVELOPES, ct_cid)
+            .await,
+        "test setup must remove current pointer"
+    );
+
+    let (status, body) = s
+        .get_with_auth(
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?ct_cid={wrong_ct_cid}&manifest_cid={manifest_cid}"
+            ),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("policy ct_cid"),
+        "envelopeGet must report explicit ct_cid mismatch before current pointer state: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGrant",
+            json!({
+                "ct_cid": wrong_ct_cid,
+                "manifest_cid": manifest_cid,
+                "to_recipient": "did:example:carol",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("policy ct_cid"),
+        "envelopeGrant must report explicit ct_cid mismatch before current pointer state: {body}"
+    );
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeRevoke",
+            json!({
+                "ct_cid": wrong_ct_cid,
+                "manifest_cid": manifest_cid,
+                "recipient": s.operator_did,
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("policy ct_cid"),
+        "envelopeRevoke must report explicit ct_cid mismatch before current pointer state: {body}"
+    );
+}
+
+#[tokio::test]
+async fn vault_envelope_get_without_auth_returns_401() {
+    let s = TestServer::start(false).await;
+    let zero_cid =
+        kotoba_core::cid::KotobaCid::from_bytes(b"vault-envelope-missing-e2e").to_multibase();
+    let (status, _body) = s
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.vault.envelopeGet?manifest_cid={zero_cid}"
+        ))
+        .await;
+    assert_eq!(
+        status, 401,
+        "vault_envelope_get must reject unauthenticated requests"
+    );
 }
 
 // ── kg.entity / kg.ingest tests ──────────────────────────────────────────────
@@ -7758,7 +9464,9 @@ async fn kg_entity_lookup_by_id_after_quad_create() {
 
     // Query by id — kg graph defaults to Authenticated tier.
     let (status, body) = s
-        .get_authed(&format!("/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id={subj}"))
+        .get_authed(&format!(
+            "/xrpc/com.etzhayyim.apps.kotobase.kg.entity?id={subj}"
+        ))
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false), "ok false: {body}");
@@ -7816,7 +9524,9 @@ async fn kg_entity_not_found_returns_ok_false() {
 async fn kg_entity_missing_param_returns_400() {
     let s = TestServer::start(false).await;
     // Must pass auth first (authenticated tier), then the missing-param check fires.
-    let (status, _) = s.get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity").await;
+    let (status, _) = s
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.entity")
+        .await;
     assert_eq!(status, 400);
 }
 
@@ -8016,7 +9726,9 @@ async fn kg_catalog_reflects_ingested_entities() {
     }
 
     // kg graph defaults to Authenticated tier — send a Bearer token.
-    let (status, body) = s.get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.catalog").await;
+    let (status, body) = s
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.catalog")
+        .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false));
     assert!(
@@ -8888,7 +10600,9 @@ async fn mcp_graph_gc_non_operator_returns_auth_error() {
 async fn kg_catalog_empty_returns_zero_stats() {
     let s = TestServer::start(false).await;
     // KG graph defaults to Authenticated visibility — opaque Bearer token suffices
-    let (status, body) = s.get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.catalog").await;
+    let (status, body) = s
+        .get_authed("/xrpc/com.etzhayyim.apps.kotobase.kg.catalog")
+        .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["ok"].as_bool().unwrap_or(false), "{body}");
     let stats = &body["stats"];
@@ -8981,6 +10695,47 @@ async fn email_ingest_empty_owner_did_returns_400() {
         )
         .await;
     assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn email_send_rejects_oversized_signal_metadata() {
+    let s = TestServer::start(false).await;
+    let sender = "did:key:zEmailSenderMeta";
+    let recipient = "did:key:zEmailRecipientMeta";
+    let tok = tenant_jwt(sender);
+
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.email.send",
+            json!({
+                "senderDid": sender,
+                "threadId": "thread-meta",
+                "recipients": [{
+                    "messageType": "directMessage",
+                    "senderDid": sender,
+                    "recipientDid": recipient,
+                    "deviceId": "d".repeat(129),
+                    "ciphertextEnvelope": "sealed",
+                    "timestamp": "2026-06-12T00:00:00Z"
+                }]
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("deviceId")),
+        "response should identify the oversized deviceId: {body}"
+    );
+    assert!(
+        body["deliveredSoFar"]
+            .as_array()
+            .map(|items| items.is_empty())
+            .unwrap_or(false),
+        "no recipient should be delivered before rejecting invalid metadata: {body}"
+    );
 }
 
 // ── weight.put CACAO auth tests ───────────────────────────────────────────────
@@ -9255,7 +11010,9 @@ async fn weight_get_unknown_cid_returns_404() {
     // A well-formed multibase CID that does not exist in the store
     let cid = KotobaCid::from_bytes(b"nonexistent-weight-blob").to_multibase();
     let (status, _body) = s
-        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={cid}"))
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={cid}"
+        ))
         .await;
     assert_eq!(status, 404);
 }
@@ -9338,7 +11095,9 @@ async fn weight_put_param_key_and_u32_dtype() {
 
     // blob round-trips
     let (status, get_body) = s
-        .get(&format!("/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={blob_cid}"))
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.weight.get?cid={blob_cid}"
+        ))
         .await;
     assert_eq!(status, 200, "{get_body}");
     assert_eq!(
@@ -9363,7 +11122,10 @@ async fn weight_put_param_key_and_u32_dtype() {
         txt.contains(param_key),
         "predicate must be the verbatim param_key: {pull_body}"
     );
-    assert!(txt.contains("U32"), "dtype must serialize as U32: {pull_body}");
+    assert!(
+        txt.contains("U32"),
+        "dtype must serialize as U32: {pull_body}"
+    );
 }
 
 // ── kg.search / kg.query / kg.delete smoke tests ─────────────────────────────
@@ -9977,7 +11739,9 @@ async fn cc_search_without_auth_returns_401() {
     // Regression guard: cc_search calls the embed service per request — exposing
     // it without auth enables resource-exhaustion attacks on the embed backend.
     let s = TestServer::start(false).await;
-    let (status, _body) = s.get("/xrpc/com.etzhayyim.apps.kotoba.cc.search?q=test").await;
+    let (status, _body) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.cc.search?q=test")
+        .await;
     assert_eq!(
         status, 401,
         "cc_search must reject unauthenticated requests"
@@ -10209,7 +11973,9 @@ async fn kg_embed_empty_text_returns_400() {
 #[tokio::test]
 async fn kg_search_empty_query_returns_400() {
     let s = TestServer::start(false).await;
-    let (status, body) = s.get("/xrpc/com.etzhayyim.apps.kotobase.kg.search?q=").await;
+    let (status, body) = s
+        .get("/xrpc/com.etzhayyim.apps.kotobase.kg.search?q=")
+        .await;
     assert_eq!(status, 400, "{body}");
 }
 
@@ -10362,7 +12128,9 @@ async fn signal_send_message_oversized_payload_returns_413() {
 #[tokio::test]
 async fn signal_get_prekey_bundle_empty_did_returns_400() {
     let s = TestServer::start(false).await;
-    let (status, body) = s.get("/xrpc/com.etzhayyim.signal.get.prekey.bundle?did=").await;
+    let (status, body) = s
+        .get("/xrpc/com.etzhayyim.signal.get.prekey.bundle?did=")
+        .await;
     assert_eq!(status, 400, "{body}");
 }
 
@@ -10650,6 +12418,9 @@ async fn attest_claim_roundtrip() {
         )
         .await;
     assert_eq!(status, 200, "{tx_meta_body}");
+    let expected_ipns_name = format!("\"{}\"", body["ipns_name"].as_str().unwrap());
+    let expected_ipns_sequence = body["ipns_sequence"].as_i64().unwrap().to_string();
+    let expected_controller = format!("\"{}\"", s.operator_did);
     assert!(
         tx_meta_body["rows_edn"]
             .as_array()
@@ -10657,9 +12428,9 @@ async fn attest_claim_roundtrip() {
             .iter()
             .any(|row| row.as_array().is_some_and(|row| {
                 row[0] == "\"vc:issue\""
-                    && row[1] == format!("\"{}\"", body["ipns_name"].as_str().unwrap())
-                    && row[2] == body["ipns_sequence"].as_i64().unwrap().to_string()
-                    && row[3] == format!("\"{}\"", s.operator_did)
+                    && row[1].as_str() == Some(expected_ipns_name.as_str())
+                    && row[2].as_str() == Some(expected_ipns_sequence.as_str())
+                    && row[3].as_str() == Some(expected_controller.as_str())
                     && row[4] == "\"ipfs/ipld/ipns\""
                     && row[5] == "\"dag-cbor\""
                     && row[6] == "\"prolly-tree\""
@@ -10907,6 +12678,69 @@ async fn attest_challenge_empty_claim_cid_returns_400() {
     assert_eq!(status, 400, "{body}");
 }
 
+#[tokio::test]
+async fn attest_challenge_control_claim_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let did = "did:key:zChallengerControlCid";
+    let tok = tenant_jwt(did);
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
+            json!({
+                "claim_cid":      "bad\ncid",
+                "challenger_did": did,
+                "reason":         "some reason",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn attest_challenge_space_claim_cid_returns_400() {
+    let s = TestServer::start(false).await;
+    let did = "did:key:zChallengerSpaceCid";
+    let tok = tenant_jwt(did);
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
+            json!({
+                "claim_cid":      "bad cid",
+                "challenger_did": did,
+                "reason":         "some reason",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("visible ASCII")),
+        "response should identify visible ASCII claim_cid constraint: {body}"
+    );
+}
+
+#[tokio::test]
+async fn attest_challenge_whitespace_reason_returns_400() {
+    let s = TestServer::start(false).await;
+    let did = "did:key:zChallengerWhitespaceReason";
+    let tok = tenant_jwt(did);
+    let (status, body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.attest.challenge",
+            json!({
+                "claim_cid":      "bafybeifake000000000000000000000000000",
+                "challenger_did": did,
+                "reason":         "   ",
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
 // ── attest_query ─────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -10931,6 +12765,15 @@ async fn attest_query_oversized_entity_did_returns_400() {
         .get(&format!(
             "/xrpc/com.etzhayyim.apps.kotoba.attest.query?entity_did={big_did}"
         ))
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn attest_query_invalid_attester_did_returns_400() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.attest.query?attester_did=invalid")
         .await;
     assert_eq!(status, 400, "{body}");
 }
@@ -11177,6 +13020,19 @@ async fn request_log_query_path_prefix_filter() {
     }
 }
 
+#[tokio::test]
+async fn request_log_query_control_path_prefix_returns_400() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let (status, body) = s
+        .get_with_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.request.log?path_prefix=/xrpc%0Abad",
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+}
+
 // ── signal.distribute.sender.key ─────────────────────────────────────────────
 
 #[tokio::test]
@@ -11234,6 +13090,33 @@ async fn signal_send_message_without_auth_returns_401() {
         )
         .await;
     assert_eq!(status, 401, "{body}");
+}
+
+#[tokio::test]
+async fn signal_send_message_invalid_sender_did_returns_400_before_auth() {
+    let s = TestServer::start(false).await;
+    let (status, body) = s
+        .post(
+            "/xrpc/com.etzhayyim.signal.send.message",
+            json!({
+                "signalMessage": {
+                    "messageType":       "directMessage",
+                    "senderDid":         "not-a-did",
+                    "recipientDid":      "did:key:zRecipient",
+                    "deviceId":          "dev-1",
+                    "ciphertextEnvelope": "AAAA",
+                    "timestamp":         "2026-06-12T00:00:00Z",
+                },
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("sender_did")),
+        "response should identify invalid sender_did: {body}"
+    );
 }
 
 #[tokio::test]
@@ -11613,18 +13496,21 @@ async fn email_read_empty_cid_returns_400() {
 }
 
 #[tokio::test]
-async fn email_read_without_crypto_returns_503() {
-    // The test server does not call init_crypto(), so crypto = None.
+async fn email_read_unknown_owner_without_crypto_returns_404() {
+    // The test server does not call init_crypto(), but an unknown mailbox should
+    // still return the precise not-found error before any decrypt path is needed.
     let s = TestServer::start(false).await;
     let did = "did:key:zReader3";
     let tok = tenant_jwt(did);
     let (status, body) = s
         .get_with_auth(
-            &format!("/xrpc/com.etzhayyim.apps.kotoba.email.read?owner_did={did}&email_cid=fakecid"),
+            &format!(
+                "/xrpc/com.etzhayyim.apps.kotoba.email.read?owner_did={did}&email_cid=fakecid"
+            ),
             &tok,
         )
         .await;
-    assert_eq!(status, 503, "{body}");
+    assert_eq!(status, 404, "{body}");
     assert!(
         body["error"].as_str().is_some(),
         "expected error field: {body}"
@@ -11747,7 +13633,9 @@ async fn access_receipt_recorded_and_listable() {
             break;
         }
     }
-    let list = receipts["receipts"].as_array().expect("receipt recorded within 4s");
+    let list = receipts["receipts"]
+        .as_array()
+        .expect("receipt recorded within 4s");
     let r0 = &list[0];
     assert_eq!(r0["accessorDid"], "did:key:zReceiptReader");
     assert_eq!(r0["operation"], "kg:catalog");
@@ -11777,7 +13665,10 @@ async fn audit_anchor_payload_after_receipted_read() {
 
     // Fresh server: nothing to anchor yet.
     let (status, _) = s
-        .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload", &op_tok)
+        .get_with_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload",
+            &op_tok,
+        )
         .await;
     assert_eq!(status, 404, "no receipts yet → 404");
 
@@ -11801,7 +13692,10 @@ async fn audit_anchor_payload_after_receipted_read() {
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let (status, b) = s
-            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload", &op_tok)
+            .get_with_auth(
+                "/xrpc/com.etzhayyim.apps.kotoba.audit.anchorPayload",
+                &op_tok,
+            )
             .await;
         if status == 200 {
             body = b;
@@ -11878,7 +13772,10 @@ async fn key_request_share_full_custodian_flow() {
         .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
         .await;
     assert_eq!(st, 200, "{info}");
-    let node_pk_hex = info["x25519PubkeyHex"].as_str().expect("node pubkey").to_string();
+    let node_pk_hex = info["x25519PubkeyHex"]
+        .as_str()
+        .expect("node pubkey")
+        .to_string();
     let node_pk = {
         let b = hex::decode(&node_pk_hex).unwrap();
         let arr: [u8; 32] = b.try_into().unwrap();
@@ -11887,8 +13784,14 @@ async fn key_request_share_full_custodian_flow() {
     let block_key = [77u8; 32];
     let pubs: Vec<(String, PublicKey)> = vec![
         (info["did"].as_str().unwrap().to_string(), node_pk),
-        ("did:key:zCust2".into(), PublicKey::from(&StaticSecret::from([2u8; 32]))),
-        ("did:key:zCust3".into(), PublicKey::from(&StaticSecret::from([3u8; 32]))),
+        (
+            "did:key:zCust2".into(),
+            PublicKey::from(&StaticSecret::from([2u8; 32])),
+        ),
+        (
+            "did:key:zCust3".into(),
+            PublicKey::from(&StaticSecret::from([3u8; 32])),
+        ),
     ];
     let shares = kotoba_custody::split_key(&block_key, 2, &pubs).unwrap();
     let share_json = serde_json::to_value(&shares[0]).unwrap();
@@ -11961,7 +13864,10 @@ async fn key_request_share_full_custodian_flow() {
     let mut h = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut h, &opened);
     let commitment: [u8; 32] = sha2::Digest::finalize(h).into();
-    assert_eq!(commitment, shares[0].commitment, "released share matches the deal");
+    assert_eq!(
+        commitment, shares[0].commitment,
+        "released share matches the deal"
+    );
     let _ = base64::engine::general_purpose::STANDARD; // keep import used
 
     // The release wrote an access receipt (operation = key:requestShare).
@@ -11969,7 +13875,10 @@ async fn key_request_share_full_custodian_flow() {
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let (st, body) = s
-            .get_with_auth("/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts", &op_tok)
+            .get_with_auth(
+                "/xrpc/com.etzhayyim.apps.kotoba.audit.listReceipts",
+                &op_tok,
+            )
             .await;
         assert_eq!(st, 200);
         if let Some(arr) = body["receipts"].as_array() {
@@ -11992,7 +13901,9 @@ async fn key_deposit_epoch_monotonic_and_grant_reports_epoch() {
     let op_tok = tenant_jwt(&s.operator_did);
     let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3c-epoch-graph").to_multibase();
 
-    let (st, info) = s.get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo").await;
+    let (st, info) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
+        .await;
     assert_eq!(st, 200);
     let node_pk = {
         let b = hex::decode(info["x25519PubkeyHex"].as_str().unwrap()).unwrap();
@@ -12003,8 +13914,14 @@ async fn key_deposit_epoch_monotonic_and_grant_reports_epoch() {
     let pubs = |extra: &str| -> Vec<(String, PublicKey)> {
         vec![
             (node_did.clone(), node_pk),
-            (format!("did:key:zE{extra}A"), PublicKey::from(&StaticSecret::from([20u8; 32]))),
-            (format!("did:key:zE{extra}B"), PublicKey::from(&StaticSecret::from([21u8; 32]))),
+            (
+                format!("did:key:zE{extra}A"),
+                PublicKey::from(&StaticSecret::from([20u8; 32])),
+            ),
+            (
+                format!("did:key:zE{extra}B"),
+                PublicKey::from(&StaticSecret::from([21u8; 32])),
+            ),
         ]
     };
 
@@ -12071,7 +13988,9 @@ async fn key_report_unreceipted_release_warrants_only_real_violations() {
     let op_tok = tenant_jwt(&s.operator_did);
     let graph = kotoba_core::cid::KotobaCid::from_bytes(b"r3d-warrant-graph").to_multibase();
 
-    let (st, info) = s.get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo").await;
+    let (st, info) = s
+        .get("/xrpc/com.etzhayyim.apps.kotoba.key.custodianInfo")
+        .await;
     assert_eq!(st, 200);
     let node_pk = {
         let b = hex::decode(info["x25519PubkeyHex"].as_str().unwrap()).unwrap();
@@ -12081,8 +14000,14 @@ async fn key_report_unreceipted_release_warrants_only_real_violations() {
     let key = [44u8; 32];
     let pubs: Vec<(String, PublicKey)> = vec![
         (node_did.clone(), node_pk),
-        ("did:key:zRd2".into(), PublicKey::from(&StaticSecret::from([5u8; 32]))),
-        ("did:key:zRd3".into(), PublicKey::from(&StaticSecret::from([6u8; 32]))),
+        (
+            "did:key:zRd2".into(),
+            PublicKey::from(&StaticSecret::from([5u8; 32])),
+        ),
+        (
+            "did:key:zRd3".into(),
+            PublicKey::from(&StaticSecret::from([6u8; 32])),
+        ),
     ];
     let shares = kotoba_custody::split_key(&key, 2, &pubs).unwrap();
     let (_, dep) = s
@@ -12110,7 +14035,10 @@ async fn key_report_unreceipted_release_warrants_only_real_violations() {
     assert_eq!(st, 200, "{granted}");
     assert_eq!(granted["ok"], true, "{granted}");
     let real_grant = granted["grant"].clone();
-    assert!(real_grant["grant_sig"].is_array(), "signed grant: {real_grant}");
+    assert!(
+        real_grant["grant_sig"].is_array(),
+        "signed grant: {real_grant}"
+    );
 
     // Let the receipt flush.
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -12123,7 +14051,10 @@ async fn key_report_unreceipted_release_warrants_only_real_violations() {
         )
         .await;
     assert_eq!(st, 200, "{ok_report}");
-    assert_eq!(ok_report["warranted"], false, "receipted release: {ok_report}");
+    assert_eq!(
+        ok_report["warranted"], false,
+        "receipted release: {ok_report}"
+    );
     assert_eq!(ok_report["verdict"], "receipted");
 
     // Tamper the grant's signature → rejected as invalid (not warranted).
@@ -12162,7 +14093,8 @@ async fn key_report_unreceipted_release_warrants_only_real_violations() {
     // graph with NO receipt → warranted (warrant emitted + evidence pinned).
     use ed25519_dalek::{Signer, SigningKey};
     let byz_key = SigningKey::from_bytes(&[0xB7u8; 32]);
-    let byz_did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(byz_key.verifying_key().as_bytes());
+    let byz_did =
+        kotoba_auth::did_key::ed25519_pubkey_to_did_key(byz_key.verifying_key().as_bytes());
     let unreceipted_graph =
         kotoba_core::cid::KotobaCid::from_bytes(b"r3d-never-released").to_multibase();
     let mut byz_grant = kotoba_custody::GrantedShare {
@@ -12186,8 +14118,14 @@ async fn key_report_unreceipted_release_warrants_only_real_violations() {
         )
         .await;
     assert_eq!(st, 200, "{warrant}");
-    assert_eq!(warrant["warranted"], true, "unreceipted release must warrant: {warrant}");
+    assert_eq!(
+        warrant["warranted"], true,
+        "unreceipted release must warrant: {warrant}"
+    );
     assert_eq!(warrant["verdict"], "unreceipted-release");
     assert_eq!(warrant["accusedDid"], byz_did);
-    assert!(warrant["evidenceCid"].as_str().is_some(), "evidence pinned: {warrant}");
+    assert!(
+        warrant["evidenceCid"].as_str().is_some(),
+        "evidence pinned: {warrant}"
+    );
 }

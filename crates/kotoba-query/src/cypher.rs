@@ -1,11 +1,13 @@
 //! Cypher MATCH/RETURN → Datalog rule compiler for kotoba-query
 //!
 //! Supported subset:
-//!   MATCH (a)-[:RELATION]->(b)
-//!   MATCH (a:Label)-[:RELATION]->(b:Label)
-//!   MATCH (a)-[:R1]->(b)-[:R2]->(c)
-//!   WHERE n.prop = "value"  (or WHERE n = "value" for node-level constant)
-//!   RETURN x, y            (exactly 2 node variables — binary-relation arity invariant)
+//! ```text
+//! MATCH (a)-[:RELATION]->(b)
+//! MATCH (a:Label)-[:RELATION]->(b:Label)
+//! MATCH (a)-[:R1]->(b)-[:R2]->(c)
+//! WHERE n.prop = "value"  (or WHERE n = "value" for node-level constant)
+//! RETURN x, y            (exactly 2 node variables — binary-relation arity invariant)
+//! ```
 //!
 //! Node labels are ignored (schema-free). Anonymous `-->` uses relation `"*"`.
 //! No aggregation, no OPTIONAL MATCH, no CREATE/DELETE/MERGE.
@@ -139,10 +141,7 @@ fn parse(input: &str) -> anyhow::Result<CypherQuery> {
     // Require MATCH clause
     let upper_check = upper.to_uppercase();
     if !upper_check.starts_with("MATCH") {
-        anyhow::bail!(
-            "query must start with MATCH; got: {}",
-            clip(upper, 20)
-        );
+        anyhow::bail!("query must start with MATCH; got: {}", clip(upper, 20));
     }
 
     // Reject non-MATCH write operations
@@ -377,7 +376,9 @@ fn parse_where(s: &str) -> anyhow::Result<Vec<(String, String)>> {
         // `a.x != "y"` would be parsed as `a.x = "y"` — silently INVERTING the
         // filter. (Standalone `<` / `>` have no `=` and already fail above.)
         if eq_pos > 0 && matches!(part.as_bytes()[eq_pos - 1], b'!' | b'<' | b'>') {
-            anyhow::bail!("WHERE only supports '=' equality; inequality operators are not supported: {part}");
+            anyhow::bail!(
+                "WHERE only supports '=' equality; inequality operators are not supported: {part}"
+            );
         }
         let lhs = part[..eq_pos].trim();
         let rhs = part[eq_pos + 1..].trim();
@@ -837,7 +838,10 @@ mod tests {
         // before the char-safe `clip`).
         let no_match = "あ".repeat(30);
         let r = CypherCompiler::compile(&no_match, "out");
-        assert!(r.is_err(), "multibyte non-MATCH query must error, not panic");
+        assert!(
+            r.is_err(),
+            "multibyte non-MATCH query must error, not panic"
+        );
 
         // A MATCH query missing RETURN with long multibyte text → keyword-not-found
         // diagnostic clips `input` at byte 60; must not panic.
@@ -876,7 +880,11 @@ mod tests {
     #[test]
     fn split_and_is_multibyte_safe_and_quote_aware() {
         // (1) Multibyte value: a byte-by-byte cursor used to land mid-char and panic.
-        assert_eq!(split_and(r#"n.name = "日本語""#).len(), 1, "multibyte value, no panic");
+        assert_eq!(
+            split_and(r#"n.name = "日本語""#).len(),
+            1,
+            "multibyte value, no panic"
+        );
         // (2) `AND` inside a quoted value must NOT split the condition.
         assert_eq!(
             split_and(r#"n.label = "Tom AND Jerry""#).len(),
@@ -904,7 +912,10 @@ mod tests {
         // offset, mis-splitting (or panicking) when a length-changing char preceded
         // the keyword. Searching `input` directly keeps offsets correct.
         let (before, after) = split_clause_after("aﬁb RETURN x", "RETURN").unwrap();
-        assert_eq!(before, "aﬁb ", "before-clause must keep the trailing space, intact");
+        assert_eq!(
+            before, "aﬁb ",
+            "before-clause must keep the trailing space, intact"
+        );
         assert_eq!(after, " x");
         // End-to-end: a length-changing char before RETURN must not mis-split/panic.
         let q = r#"MATCH (a)-[:r]->(b) WHERE a.x = "aﬁz" RETURN a, b"#;
@@ -918,11 +929,19 @@ mod tests {
         // `&s[1..]` slice from panicking). Multibyte content survives intact.
         assert_eq!(parse_string_literal(r#""hi""#), Some("hi".into()));
         assert_eq!(parse_string_literal("'hi'"), Some("hi".into()));
-        assert_eq!(parse_string_literal(r#""日本""#), Some("日本".into()), "multibyte content");
+        assert_eq!(
+            parse_string_literal(r#""日本""#),
+            Some("日本".into()),
+            "multibyte content"
+        );
         // Malformed → None, never a panic.
         assert_eq!(parse_string_literal(""), None, "empty");
         assert_eq!(parse_string_literal("\""), None, "lone quote (len < 2)");
-        assert_eq!(parse_string_literal("\"unterminated"), None, "no closing quote");
+        assert_eq!(
+            parse_string_literal("\"unterminated"),
+            None,
+            "no closing quote"
+        );
         assert_eq!(parse_string_literal("notquoted"), None, "not quoted");
     }
 }

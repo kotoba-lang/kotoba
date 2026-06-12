@@ -108,8 +108,7 @@ impl SovereignCrypto {
                 // tampering, or a wrong-identity load — NOT a missing block. It must
                 // be a hard error so we never re-genesis OVER a recoverable key and
                 // orphan every blob encrypted under it.
-                let wrapped = decode_wrapped_block(&block)
-                    .context("decode wrapped key block")?;
+                let wrapped = decode_wrapped_block(&block).context("decode wrapped key block")?;
                 let vault_key_bytes =
                     hpke_open(&identity.dh_secret, &wrapped).context("HPKE unwrap vault key")?;
                 if vault_key_bytes.len() != 32 {
@@ -247,8 +246,8 @@ impl SovereignCrypto {
         // Wrap and store
         let pk = identity.x25519_public_key();
         let wrapped = hpke_seal(&pk, raw_key.as_ref()).context("HPKE wrap rotated vault key")?;
-        let block = encode_wrapped_block(&wrapped)
-            .context("CBOR-encode rotated wrapped key block")?;
+        let block =
+            encode_wrapped_block(&wrapped).context("CBOR-encode rotated wrapped key block")?;
         let cid = store_block(block_store, &block)?;
         let cid_mb = cid.to_multibase();
 

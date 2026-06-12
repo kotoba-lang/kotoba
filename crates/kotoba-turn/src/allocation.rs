@@ -56,7 +56,11 @@ struct Allocation {
 }
 
 fn clamp_lifetime(requested: u64) -> u64 {
-    if requested == 0 { DEFAULT_LIFETIME } else { requested.min(MAX_LIFETIME) }
+    if requested == 0 {
+        DEFAULT_LIFETIME
+    } else {
+        requested.min(MAX_LIFETIME)
+    }
 }
 
 fn channel_in_range(n: u16) -> bool {
@@ -88,16 +92,26 @@ impl AllocationTable {
             return Err(AllocError::Mismatch);
         }
         let expires_at = now + clamp_lifetime(requested_lifetime);
-        self.allocations.insert(tuple, Allocation {
-            relay, scope, expires_at,
-            permissions: HashMap::new(),
-            channels: HashMap::new(),
-        });
+        self.allocations.insert(
+            tuple,
+            Allocation {
+                relay,
+                scope,
+                expires_at,
+                permissions: HashMap::new(),
+                channels: HashMap::new(),
+            },
+        );
         Ok(expires_at)
     }
 
     /// Refresh an allocation. `requested_lifetime == 0` deletes it (RFC 8656 §7).
-    pub fn refresh(&mut self, tuple: &FiveTuple, requested_lifetime: u64, now: u64) -> Result<u64, AllocError> {
+    pub fn refresh(
+        &mut self,
+        tuple: &FiveTuple,
+        requested_lifetime: u64,
+        now: u64,
+    ) -> Result<u64, AllocError> {
         if !self.is_live(tuple, now) {
             return Err(AllocError::Mismatch);
         }
@@ -105,13 +119,21 @@ impl AllocationTable {
             self.allocations.remove(tuple);
             return Ok(0);
         }
-        let alloc = self.allocations.get_mut(tuple).ok_or(AllocError::Mismatch)?;
+        let alloc = self
+            .allocations
+            .get_mut(tuple)
+            .ok_or(AllocError::Mismatch)?;
         alloc.expires_at = now + clamp_lifetime(requested_lifetime);
         Ok(alloc.expires_at)
     }
 
     /// Install/refresh a peer permission (CreatePermission).
-    pub fn create_permission(&mut self, tuple: &FiveTuple, peer: IpAddr, now: u64) -> Result<(), AllocError> {
+    pub fn create_permission(
+        &mut self,
+        tuple: &FiveTuple,
+        peer: IpAddr,
+        now: u64,
+    ) -> Result<(), AllocError> {
         let alloc = self.live_mut(tuple, now)?;
         alloc.permissions.insert(peer, now + PERMISSION_LIFETIME);
         Ok(())
@@ -119,7 +141,8 @@ impl AllocationTable {
 
     /// Is `peer` currently permitted to exchange data on this allocation?
     pub fn permitted(&self, tuple: &FiveTuple, peer: IpAddr, now: u64) -> bool {
-        self.allocations.get(tuple)
+        self.allocations
+            .get(tuple)
             .filter(|a| a.expires_at > now)
             .and_then(|a| a.permissions.get(&peer))
             .is_some_and(|&exp| exp > now)
@@ -127,19 +150,30 @@ impl AllocationTable {
 
     /// Bind a channel to a peer (ChannelBind). Also installs a permission for the
     /// peer's IP, per RFC 8656 §12. Rejects out-of-range channel numbers.
-    pub fn bind_channel(&mut self, tuple: &FiveTuple, channel: u16, peer: SocketAddr, now: u64) -> Result<(), AllocError> {
+    pub fn bind_channel(
+        &mut self,
+        tuple: &FiveTuple,
+        channel: u16,
+        peer: SocketAddr,
+        now: u64,
+    ) -> Result<(), AllocError> {
         if !channel_in_range(channel) {
             return Err(AllocError::BadChannel);
         }
         let alloc = self.live_mut(tuple, now)?;
-        alloc.channels.insert(channel, (peer, now + CHANNEL_LIFETIME));
-        alloc.permissions.insert(peer.ip(), now + PERMISSION_LIFETIME);
+        alloc
+            .channels
+            .insert(channel, (peer, now + CHANNEL_LIFETIME));
+        alloc
+            .permissions
+            .insert(peer.ip(), now + PERMISSION_LIFETIME);
         Ok(())
     }
 
     /// Resolve a channel number to its bound peer, if the binding is live.
     pub fn channel_peer(&self, tuple: &FiveTuple, channel: u16, now: u64) -> Option<SocketAddr> {
-        self.allocations.get(tuple)
+        self.allocations
+            .get(tuple)
             .filter(|a| a.expires_at > now)
             .and_then(|a| a.channels.get(&channel))
             .filter(|&&(_, exp)| exp > now)
@@ -148,12 +182,18 @@ impl AllocationTable {
 
     /// The relay address assigned to a live allocation.
     pub fn relay_addr(&self, tuple: &FiveTuple, now: u64) -> Option<SocketAddr> {
-        self.allocations.get(tuple).filter(|a| a.expires_at > now).map(|a| a.relay)
+        self.allocations
+            .get(tuple)
+            .filter(|a| a.expires_at > now)
+            .map(|a| a.relay)
     }
 
     /// The owning room/player scope of a live allocation.
     pub fn scope(&self, tuple: &FiveTuple, now: u64) -> Option<&Scope> {
-        self.allocations.get(tuple).filter(|a| a.expires_at > now).map(|a| &a.scope)
+        self.allocations
+            .get(tuple)
+            .filter(|a| a.expires_at > now)
+            .map(|a| &a.scope)
     }
 
     /// Drop expired allocations, and expired permissions/channels within live ones.
@@ -170,11 +210,16 @@ impl AllocationTable {
 
     /// Count of live allocations (after lazily ignoring expired ones).
     pub fn live_count(&self, now: u64) -> usize {
-        self.allocations.values().filter(|a| a.expires_at > now).count()
+        self.allocations
+            .values()
+            .filter(|a| a.expires_at > now)
+            .count()
     }
 
     fn is_live(&self, tuple: &FiveTuple, now: u64) -> bool {
-        self.allocations.get(tuple).is_some_and(|a| a.expires_at > now)
+        self.allocations
+            .get(tuple)
+            .is_some_and(|a| a.expires_at > now)
     }
 
     fn live_mut(&mut self, tuple: &FiveTuple, now: u64) -> Result<&mut Allocation, AllocError> {
@@ -196,8 +241,16 @@ mod tests {
             proto: TransportProto::Udp,
         }
     }
-    fn relay() -> SocketAddr { "198.51.100.1:49160".parse().unwrap() }
-    fn scope() -> Scope { Scope { room: "r".into(), player: 1, expires_at: 9_999_999_999 } }
+    fn relay() -> SocketAddr {
+        "198.51.100.1:49160".parse().unwrap()
+    }
+    fn scope() -> Scope {
+        Scope {
+            room: "r".into(),
+            player: 1,
+            expires_at: 9_999_999_999,
+        }
+    }
 
     #[test]
     fn allocate_then_reject_duplicate() {
@@ -205,7 +258,10 @@ mod tests {
         let exp = t.allocate(tuple(), relay(), scope(), 0, 1000).unwrap();
         assert_eq!(exp, 1000 + DEFAULT_LIFETIME);
         assert_eq!(t.relay_addr(&tuple(), 1000), Some(relay()));
-        assert_eq!(t.allocate(tuple(), relay(), scope(), 0, 1000), Err(AllocError::Mismatch));
+        assert_eq!(
+            t.allocate(tuple(), relay(), scope(), 0, 1000),
+            Err(AllocError::Mismatch)
+        );
     }
 
     #[test]
@@ -242,7 +298,10 @@ mod tests {
         let mut t = AllocationTable::new();
         t.allocate(tuple(), relay(), scope(), 3600, 0).unwrap();
         let peer: SocketAddr = "192.0.2.9:6000".parse().unwrap();
-        assert_eq!(t.bind_channel(&tuple(), 0x3FFF, peer, 0), Err(AllocError::BadChannel));
+        assert_eq!(
+            t.bind_channel(&tuple(), 0x3FFF, peer, 0),
+            Err(AllocError::BadChannel)
+        );
         t.bind_channel(&tuple(), 0x4001, peer, 0).unwrap();
         assert_eq!(t.channel_peer(&tuple(), 0x4001, 10), Some(peer));
         // ChannelBind also implies a permission for the peer IP.

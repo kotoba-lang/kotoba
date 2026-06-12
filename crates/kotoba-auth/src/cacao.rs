@@ -517,9 +517,7 @@ impl CacaoPayload {
     }
 
     pub fn has_operation(&self, operation: &str) -> bool {
-        self.capabilities()
-            .iter()
-            .any(|granted| *granted == operation)
+        self.capabilities().contains(&operation)
     }
 
     pub fn tx_cid(&self) -> Option<&str> {

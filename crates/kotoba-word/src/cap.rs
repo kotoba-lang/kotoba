@@ -115,7 +115,12 @@ mod tests {
 
     #[test]
     fn parse_roundtrip() {
-        for s in ["proc:git", "net:example.com", "fs:ro:/tmp", "fs:rw:/var/data"] {
+        for s in [
+            "proc:git",
+            "net:example.com",
+            "fs:ro:/tmp",
+            "fs:rw:/var/data",
+        ] {
             let c: Cap = s.parse().unwrap();
             assert_eq!(c.to_string(), s);
         }

@@ -102,18 +102,16 @@ impl DelegationChain {
 
         // 2. Capability check
         let granted_caps = cacao.p.capabilities();
-        if !granted_caps.is_empty() {
-            if !cacao.p.has_operation(required_cap) {
-                return Err(DelegationError::CapabilityDenied(format!(
-                    "need '{required_cap}', CACAO grants '{}'",
-                    granted_caps.join(",")
-                )));
-            }
+        if !granted_caps.is_empty() && !cacao.p.has_operation(required_cap) {
+            return Err(DelegationError::CapabilityDenied(format!(
+                "need '{required_cap}', CACAO grants '{}'",
+                granted_caps.join(",")
+            )));
         }
 
         // 3. Graph-CID scope check (multi-graph: any granted graph matches)
         let granted = cacao.p.all_graph_cids();
-        if !granted.is_empty() && !granted.iter().any(|g| *g == graph_cid) {
+        if !granted.is_empty() && !granted.contains(&graph_cid) {
             return Err(DelegationError::GraphMismatch {
                 expected: granted.join(","),
                 got: graph_cid.to_string(),
@@ -142,7 +140,7 @@ impl DelegationChain {
     /// Verify the delegation chain using a DID resolver for Ed25519 issuer keys.
     ///
     /// This keeps the same temporal, capability, graph-scope, and attenuation
-    /// checks as [`verify`], but resolves Ed25519 DID keys through the configured
+    /// checks as `verify`, but resolves Ed25519 DID keys through the configured
     /// DID resolver so non-`did:key` issuers such as `did:web` and `did:plc` can
     /// authorize invocations.
     pub fn verify_with_resolver(
@@ -207,20 +205,18 @@ impl DelegationChain {
 
         // 2. Capability check — kotoba://can/{cap} must match required_cap (if present)
         let granted_caps = cacao.p.capabilities();
-        if !granted_caps.is_empty() {
-            if !cacao.p.has_operation(required_cap) {
-                return Err(DelegationError::CapabilityDenied(format!(
-                    "need '{required_cap}', CACAO grants '{}'",
-                    granted_caps.join(",")
-                )));
-            }
+        if !granted_caps.is_empty() && !cacao.p.has_operation(required_cap) {
+            return Err(DelegationError::CapabilityDenied(format!(
+                "need '{required_cap}', CACAO grants '{}'",
+                granted_caps.join(",")
+            )));
         }
 
         // 3. Graph-CID scope check — requested graph must be one of the granted graphs.
         //    A CACAO may grant access to multiple graphs via repeated
         //    `kotoba://graph/{cid}` resources; the caller's graph_cid must match any.
         let granted = cacao.p.all_graph_cids();
-        if !granted.is_empty() && !granted.iter().any(|g| *g == graph_cid) {
+        if !granted.is_empty() && !granted.contains(&graph_cid) {
             return Err(DelegationError::GraphMismatch {
                 expected: granted.join(","),
                 got: graph_cid.to_string(),
@@ -335,7 +331,7 @@ impl DelegationChain {
         } else {
             &root_graphs
         };
-        if !effective.is_empty() && !effective.iter().any(|g| *g == graph_cid) {
+        if !effective.is_empty() && !effective.contains(&graph_cid) {
             return Err(DelegationError::GraphMismatch {
                 expected: effective.join(","),
                 got: graph_cid.to_string(),
@@ -522,7 +518,7 @@ pub enum DelegationError {
 }
 
 impl DelegationChain {
-    /// Like [`verify`] but also validates that `cacao.p.aud` matches `expected_aud`.
+    /// Like `verify` but also validates that `cacao.p.aud` matches `expected_aud`.
     ///
     /// CAIP-74 requires the audience field to equal the verifier's own identifier so
     /// a CACAO intended for service A cannot be replayed against service B.
@@ -547,7 +543,7 @@ impl DelegationChain {
         self.verify(graph_cid, required_cap)
     }
 
-    /// Like [`verify_with_aud`] but resolves Ed25519 signing keys through a DID resolver.
+    /// Like `verify_with_aud` but resolves Ed25519 signing keys through a DID resolver.
     pub fn verify_with_aud_and_resolver(
         &self,
         graph_cid: &str,
@@ -598,13 +594,11 @@ impl DelegationChain {
         }
         // Capability check
         let granted_caps = cacao.p.capabilities();
-        if !granted_caps.is_empty() {
-            if !cacao.p.has_operation(required_cap) {
-                return Err(DelegationError::CapabilityDenied(format!(
-                    "need '{required_cap}', CACAO grants '{}'",
-                    granted_caps.join(",")
-                )));
-            }
+        if !granted_caps.is_empty() && !cacao.p.has_operation(required_cap) {
+            return Err(DelegationError::CapabilityDenied(format!(
+                "need '{required_cap}', CACAO grants '{}'",
+                granted_caps.join(",")
+            )));
         }
         // Signature — if using verify (not skip_sig), do full EdDSA verify here.
         // For skip_sig paths this is called from verify_skip_sig context; for real

@@ -14,9 +14,14 @@ use std::future::Future;
 use std::pin::Pin;
 
 use anyhow::Result;
+use reqwest::Url;
 use serde_json::json;
 
 type EmbedFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>>> + Send + 'a>>;
+
+const DEFAULT_EMBED_URL: &str = "http://localhost:11434";
+const DISABLED_EMBED_URL: &str = "http://127.0.0.1:9";
+const MAX_EMBED_URL_LEN: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -56,19 +61,27 @@ impl HttpEmbedClient {
         dim: usize,
         batch_size: usize,
     ) -> Self {
+        let base_url = normalize_embed_url(&base_url.into()).unwrap_or_else(|| {
+            tracing::warn!("invalid embed base URL; disabling HttpEmbedClient HTTP access");
+            DISABLED_EMBED_URL.to_string()
+        });
         Self {
-            base_url: base_url.into(),
+            base_url,
             model: model.into(),
             dim,
-            batch_size,
+            batch_size: batch_size.max(1),
             http: reqwest::Client::new(),
         }
     }
 
     /// Construct from environment variables (with defaults).
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("KOTOBA_EMBED_URL")
-            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let base_url =
+            std::env::var("KOTOBA_EMBED_URL").unwrap_or_else(|_| DEFAULT_EMBED_URL.to_string());
+        anyhow::ensure!(
+            normalize_embed_url(&base_url).is_some(),
+            "invalid KOTOBA_EMBED_URL"
+        );
         let model = std::env::var("KOTOBA_EMBED_MODEL")
             .unwrap_or_else(|_| "nomic-embed-text:v1.5".to_string());
         let dim: usize = std::env::var("KOTOBA_EMBED_DIM")
@@ -125,6 +138,30 @@ impl HttpEmbedClient {
             })
             .collect()
     }
+}
+
+fn normalize_embed_url(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim();
+    if base_url.is_empty()
+        || base_url.len() > MAX_EMBED_URL_LEN
+        || base_url.chars().any(|ch| ch.is_control())
+    {
+        return None;
+    }
+    let url = Url::parse(base_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.as_str().trim_end_matches('/').to_string())
 }
 
 impl EmbedClient for HttpEmbedClient {
@@ -236,7 +273,7 @@ mod tests {
         for v in &results {
             assert_eq!(v.len(), 32);
             for &x in v {
-                assert!(x >= -1.0 && x <= 1.0);
+                assert!((-1.0..=1.0).contains(&x));
             }
         }
     }
@@ -266,7 +303,7 @@ mod tests {
         let client = Blake3EmbedClient::new(32);
         let results = client.embed_batch(&["test text here"]).await.unwrap();
         for &v in &results[0] {
-            assert!(v >= -1.0 && v <= 1.0, "value out of range: {v}");
+            assert!((-1.0..=1.0).contains(&v), "value out of range: {v}");
         }
     }
 
@@ -289,6 +326,50 @@ mod tests {
         let client = HttpEmbedClient::new("http://example.com", "my-model", 384, 32);
         assert_eq!(client.dim(), 384);
         assert_eq!(client.model_id(), "my-model");
+    }
+
+    #[test]
+    fn normalize_embed_url_accepts_http_https_root_urls() {
+        assert_eq!(
+            normalize_embed_url(" http://localhost:11434/ ").unwrap(),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            normalize_embed_url("https://embed.example.com").unwrap(),
+            "https://embed.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_embed_url_rejects_ambiguous_or_header_unsafe_values() {
+        for endpoint in [
+            "",
+            "ftp://localhost:11434",
+            "https://user:pass@localhost:11434",
+            "http://localhost:11434/api",
+            "http://localhost:11434?x=1",
+            "http://localhost:11434#frag",
+            "http://localhost:11434/\nheader",
+            "not a url",
+        ] {
+            assert!(
+                normalize_embed_url(endpoint).is_none(),
+                "endpoint should be rejected: {endpoint:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_embed_client_normalizes_endpoint_and_batch_size() {
+        let client = HttpEmbedClient::new(" http://localhost:11434/ ", "model", 128, 0);
+        assert_eq!(client.base_url, "http://localhost:11434");
+        assert_eq!(client.batch_size, 1);
+    }
+
+    #[tokio::test]
+    async fn http_embed_client_new_disables_invalid_endpoint() {
+        let client = HttpEmbedClient::new("http://localhost:11434/api", "model", 128, 1);
+        assert_eq!(client.base_url, DISABLED_EMBED_URL);
     }
 
     #[tokio::test]

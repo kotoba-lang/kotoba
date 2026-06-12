@@ -15,7 +15,7 @@ six signals out of the same context.  The decision logic
 (compute_area / minimax_select / witness) is byte-for-byte the upstream logic.
 
 Build:
-    ../../scripts/build-pywasm.sh aria_kotoba.py -o aria_kotoba.wasm
+    ../../scripts/build-pywasm.bb aria_kotoba.py -o aria_kotoba.wasm
 """
 
 from __future__ import annotations

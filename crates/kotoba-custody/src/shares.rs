@@ -45,7 +45,9 @@ pub enum CustodyError {
     Combine(String),
     #[error("combined secret has wrong length {0} (expected 32)")]
     BadSecretLen(usize),
-    #[error("shares come from different dealings (mixed epoch/custodian-set) — refusing to combine")]
+    #[error(
+        "shares come from different dealings (mixed epoch/custodian-set) — refusing to combine"
+    )]
     MixedDealing,
 }
 
@@ -315,8 +317,7 @@ mod tests {
         // different recipients — re-seal share 1's bytes for custodian 0 so
         // HPKE opens fine but the commitment no longer matches).
         let share1_bytes = open_share(&shares[1], &fleet[1].1).unwrap().bytes;
-        shares[0].sealed_share =
-            kotoba_crypto::hpke_seal(&fleet[0].2, &share1_bytes).unwrap();
+        shares[0].sealed_share = kotoba_crypto::hpke_seal(&fleet[0].2, &share1_bytes).unwrap();
         assert!(matches!(
             open_share(&shares[0], &fleet[0].1),
             Err(CustodyError::CommitmentMismatch(_))

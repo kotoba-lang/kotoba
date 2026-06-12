@@ -1,8 +1,8 @@
 pub mod btc;
 pub mod cacao;
+pub mod commit_sig;
 pub mod delegation;
 pub mod did_document;
-pub mod commit_sig;
 pub mod did_key;
 pub mod eth;
 pub mod passkey;
@@ -13,6 +13,7 @@ pub use btc::{
     signed_message_hash, verify_message, AddressKind, BtcAddress, BtcError, BtcNetwork,
 };
 pub use cacao::{Cacao, CacaoError, CacaoHeader, CacaoPayload, CacaoSig};
+pub use commit_sig::{commit_import_check, verify_commit_author_sig, CommitSigVerdict};
 pub use delegation::{DelegationChain, DelegationError};
 pub use did_document::{
     DidDocument, ServiceEndpoint, VerificationMethod, ATPROTO_PDS_SERVICE,
@@ -23,7 +24,6 @@ pub use did_document::{
     KOTOBA_NODE_SERVICE,
 };
 pub use did_key::{ed25519_pubkey_to_did_key, parse_ed25519_did_key};
-pub use commit_sig::{commit_import_check, verify_commit_author_sig, CommitSigVerdict};
 pub use eth::{
     eth_address_to_erc725_did, is_valid_address, is_valid_checksum_address, keccak256,
     parse_address, personal_sign_hash, recover_eth_address, to_checksum_address,

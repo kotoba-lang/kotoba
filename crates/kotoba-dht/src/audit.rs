@@ -75,7 +75,12 @@ impl AvailabilityAuditor {
     }
 
     /// Build the per-peer challenge for an epoch.
-    fn challenge_for(&self, epoch: u64, peer: &NodeId, cids: &[KotobaCid]) -> AvailabilityChallenge {
+    fn challenge_for(
+        &self,
+        epoch: u64,
+        peer: &NodeId,
+        cids: &[KotobaCid],
+    ) -> AvailabilityChallenge {
         AvailabilityChallenge {
             epoch,
             target_peer: peer.0.to_vec(),
@@ -407,7 +412,9 @@ mod tests {
             peer: &NodeId,
             challenge: &AvailabilityChallenge,
         ) -> Option<AvailabilityProof> {
-            self.stores.get(peer).map(|s| s.respond_to_challenge(challenge))
+            self.stores
+                .get(peer)
+                .map(|s| s.respond_to_challenge(challenge))
         }
     }
 
@@ -560,7 +567,7 @@ mod tests {
         let sched = AuditScheduler::new(auditor, fetcher, InMemoryVerdictSink::default());
 
         for epoch in 0..3 {
-            sched.run_epoch(epoch, &blocks, &[pid.clone()]);
+            sched.run_epoch(epoch, &blocks, std::slice::from_ref(&pid));
         }
         let rep = sched.reputation(&pid).unwrap();
         assert_eq!(rep.epochs, 3);
@@ -585,13 +592,13 @@ mod tests {
             .with_distrust_threshold(3);
 
         for epoch in 0..2 {
-            sched.run_epoch(epoch, &blocks, &[pid.clone()]);
+            sched.run_epoch(epoch, &blocks, std::slice::from_ref(&pid));
         }
         assert!(
             sched.distrusted_peers().is_empty(),
             "2 slashes < threshold 3"
         );
-        sched.run_epoch(2, &blocks, &[pid.clone()]); // 3rd consecutive slash
+        sched.run_epoch(2, &blocks, std::slice::from_ref(&pid)); // 3rd consecutive slash
         let rep = sched.reputation(&pid).unwrap();
         assert_eq!(rep.slashes, 3);
         assert_eq!(rep.consecutive_failures, 3);
@@ -612,10 +619,10 @@ mod tests {
         let sched = AuditScheduler::new(auditor, fetcher, InMemoryVerdictSink::default())
             .with_distrust_threshold(3);
 
-        sched.run_epoch(0, &blocks, &[pid.clone()]); // slash
-        sched.run_epoch(1, &blocks, &[pid.clone()]); // slash
+        sched.run_epoch(0, &blocks, std::slice::from_ref(&pid)); // slash
+        sched.run_epoch(1, &blocks, std::slice::from_ref(&pid)); // slash
         pstore.put(&blocks[0], payloads[0]).unwrap(); // peer recovers the block
-        sched.run_epoch(2, &blocks, &[pid.clone()]); // reward → reset
+        sched.run_epoch(2, &blocks, std::slice::from_ref(&pid)); // reward → reset
         let rep = sched.reputation(&pid).unwrap();
         assert_eq!(rep.slashes, 2);
         assert_eq!(rep.rewards, 1);
@@ -635,8 +642,8 @@ mod tests {
         };
         let sink = std::sync::Arc::new(InMemoryVerdictSink::default());
         let sched = AuditScheduler::new(auditor, fetcher, sink.clone());
-        sched.run_epoch(0, &blocks, &[pid.clone()]);
-        sched.run_epoch(1, &blocks, &[pid.clone()]);
+        sched.run_epoch(0, &blocks, std::slice::from_ref(&pid));
+        sched.run_epoch(1, &blocks, std::slice::from_ref(&pid));
         let recs = sink.records.lock().unwrap();
         assert_eq!(recs.len(), 2, "every epoch's verdict reaches the sink");
         assert!(recs.iter().all(|(_, _, a)| *a == AuditAction::Reward));
@@ -686,10 +693,12 @@ mod tests {
         };
         let sink = std::sync::Arc::new(SettlementIntentSink::new(10, 7));
         let sched = AuditScheduler::new(auditor, fetcher, sink.clone());
-        sched.run_epoch(0, &blocks, &[pid.clone()]);
+        sched.run_epoch(0, &blocks, std::slice::from_ref(&pid));
         sched.run_epoch(1, &blocks, &[pid]);
         let intents = sink.drain();
         assert_eq!(intents.len(), 2);
-        assert!(intents.iter().all(|i| i.kind == SettlementKind::Reward && i.units == 10));
+        assert!(intents
+            .iter()
+            .all(|i| i.kind == SettlementKind::Reward && i.units == 10));
     }
 }

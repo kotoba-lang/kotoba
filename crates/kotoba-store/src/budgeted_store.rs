@@ -108,10 +108,25 @@ impl<S: BlockStore + 'static> BudgetedBlockStore<S> {
         }
         freed
     }
+
+    fn forget_index_entry(&self, cid: &KotobaCid) {
+        let mut st = self.state.lock().unwrap();
+        st.lru_gen.remove(&cid.0);
+        st.pinned.remove(&cid.0);
+        if let Some(sz) = st.sizes.remove(&cid.0) {
+            st.used_bytes = st.used_bytes.saturating_sub(sz);
+        }
+    }
 }
 
 impl<S: BlockStore + 'static> BlockStore for BudgetedBlockStore<S> {
     fn put(&self, cid: &KotobaCid, data: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            KotobaCid::from_bytes(data) == *cid,
+            "cid mismatch: expected {}, got {}",
+            cid.to_multibase(),
+            KotobaCid::from_bytes(data).to_multibase()
+        );
         let size = data.len();
         self.inner.put(cid, data)?;
         {
@@ -139,20 +154,31 @@ impl<S: BlockStore + 'static> BlockStore for BudgetedBlockStore<S> {
             }
         };
         if in_index {
-            self.inner.get(cid)
+            let Some(block) = self.inner.get(cid)? else {
+                self.forget_index_entry(cid);
+                return Ok(None);
+            };
+            if KotobaCid::from_bytes(&block) != *cid {
+                tracing::warn!(cid = %cid, "budgeted block failed CID verification");
+                let _ = self.inner.delete(cid);
+                self.forget_index_entry(cid);
+                return Ok(None);
+            }
+            Ok(Some(block))
         } else {
             Ok(None)
         }
     }
 
     fn has(&self, cid: &KotobaCid) -> bool {
-        self.state.lock().unwrap().sizes.contains_key(&cid.0)
+        self.get(cid).ok().flatten().is_some()
     }
 
     fn delete(&self, cid: &KotobaCid) -> Result<()> {
         self.inner.delete(cid)?;
         let mut st = self.state.lock().unwrap();
         st.lru_gen.remove(&cid.0);
+        st.pinned.remove(&cid.0);
         if let Some(sz) = st.sizes.remove(&cid.0) {
             st.used_bytes = st.used_bytes.saturating_sub(sz);
         }
@@ -169,6 +195,21 @@ impl<S: BlockStore + 'static> BlockStore for BudgetedBlockStore<S> {
 
     fn is_pinned(&self, cid: &KotobaCid) -> bool {
         self.state.lock().unwrap().pinned.contains(&cid.0)
+    }
+
+    fn all_cids(&self) -> Vec<KotobaCid> {
+        let cids: Vec<KotobaCid> = self
+            .state
+            .lock()
+            .unwrap()
+            .sizes
+            .keys()
+            .copied()
+            .map(KotobaCid)
+            .collect();
+        cids.into_iter()
+            .filter(|cid| self.get(cid).ok().flatten().is_some())
+            .collect()
     }
 }
 
@@ -245,9 +286,12 @@ mod tests {
         store.put(&c1, d1).unwrap();
         store.pin(&c1);
         store.put(&cid(b"abcdefghij"), b"abcdefghij").unwrap(); // → 20, at budget
-        // Push over budget while c1 is pinned: the unpinned blocks are evicted, c1 survives.
+                                                                // Push over budget while c1 is pinned: the unpinned blocks are evicted, c1 survives.
         store.put(&cid(b"PRESSURE01"), b"PRESSURE01").unwrap(); // 30 > 20 → evict
-        assert!(store.has(&c1), "while pinned, c1 survives eviction pressure");
+        assert!(
+            store.has(&c1),
+            "while pinned, c1 survives eviction pressure"
+        );
 
         // Unpin, then apply pressure again. c1 is now the coldest UNPINNED block and
         // must be evicted to restore the budget.
@@ -283,7 +327,10 @@ mod tests {
         // If a prior auto-eviction already left us at/under budget, evict_cold is a
         // no-op (freed 0); otherwise it must reach the 80% target and report freed.
         assert_eq!(freed, before - after, "freed must equal the byte delta");
-        assert!(after <= 80, "usage must be driven to ≤ 80% of the 100-byte budget, got {after}");
+        assert!(
+            after <= 80,
+            "usage must be driven to ≤ 80% of the 100-byte budget, got {after}"
+        );
     }
 
     #[test]
@@ -292,9 +339,11 @@ mod tests {
         let data = b"deletable";
         let c = cid(data);
         store.put(&c, data).unwrap();
+        store.pin(&c);
         assert_eq!(store.used_bytes(), data.len());
         store.delete(&c).unwrap();
         assert!(!store.has(&c));
+        assert!(!store.is_pinned(&c));
         assert_eq!(store.used_bytes(), 0);
     }
 
@@ -308,5 +357,64 @@ mod tests {
         store.put(&cid(d2), d2).unwrap();
         assert!(!store.has(&c1));
         assert!(store.get(&c1).unwrap().is_none());
+    }
+
+    #[test]
+    fn put_rejects_mismatched_cid_before_indexing() {
+        let store = budgeted(1024);
+        let bad_cid = cid(b"expected");
+
+        let err = store.put(&bad_cid, b"different").unwrap_err();
+
+        assert!(err.to_string().contains("cid mismatch"));
+        assert!(!store.has(&bad_cid));
+        assert_eq!(store.used_bytes(), 0);
+        assert_eq!(store.block_count(), 0);
+    }
+
+    #[test]
+    fn get_cleans_index_when_inner_block_disappears() {
+        let store = budgeted(1024);
+        let data = b"vanishing block";
+        let c = cid(data);
+        store.put(&c, data).unwrap();
+        store.inner.delete(&c).unwrap();
+
+        assert!(store.get(&c).unwrap().is_none());
+        assert!(!store.has(&c));
+        assert_eq!(store.used_bytes(), 0);
+        assert_eq!(store.block_count(), 0);
+    }
+
+    #[test]
+    fn get_cleans_index_when_inner_block_is_corrupt() {
+        let store = budgeted(1024);
+        let data = b"budgeted block";
+        let c = cid(data);
+        store.put(&c, data).unwrap();
+        store.inner.insert_unchecked(&c, b"corrupt bytes");
+
+        assert!(store.get(&c).unwrap().is_none());
+        assert!(!store.has(&c));
+        assert_eq!(store.used_bytes(), 0);
+        assert_eq!(store.block_count(), 0);
+    }
+
+    #[test]
+    fn all_cids_returns_verified_index_entries_and_cleans_stale_ones() {
+        let store = budgeted(1024);
+        let good = b"budgeted good block";
+        let good_cid = cid(good);
+        let stale = b"budgeted stale block";
+        let stale_cid = cid(stale);
+        store.put(&good_cid, good).unwrap();
+        store.put(&stale_cid, stale).unwrap();
+        store.inner.delete(&stale_cid).unwrap();
+
+        let cids = store.all_cids();
+
+        assert_eq!(cids, vec![good_cid]);
+        assert_eq!(store.used_bytes(), good.len());
+        assert_eq!(store.block_count(), 1);
     }
 }

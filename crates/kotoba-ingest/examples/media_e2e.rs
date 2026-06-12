@@ -23,9 +23,9 @@ use kotoba_graph::quad_store::QuadStore;
 use kotoba_ingest::media::{rank_by_cosine, MediaIngestor, MediaInput};
 use kotoba_ingest::media_embed::{Blake3MediaEmbedClient, MediaEmbedClient, MediaItem};
 use kotoba_query::datom::Value;
+use kotoba_store::MemoryBlockStore;
 use kotoba_vault::LiveBus;
 use kotoba_vault::Vault;
-use kotoba_store::MemoryBlockStore;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,8 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let vault = Arc::new(Vault::new());
     let embed: Arc<dyn MediaEmbedClient> = Arc::new(Blake3MediaEmbedClient::new(dim));
 
-    let ingestor =
-        MediaIngestor::new(quad_store, vault, Arc::clone(&embed)).with_k(6);
+    let ingestor = MediaIngestor::new(quad_store, vault, Arc::clone(&embed)).with_k(6);
 
     // ── A small mixed-modality corpus ────────────────────────────────────────
     // Bytes are placeholder payloads; captions stand in for what a real encoder
@@ -62,10 +61,13 @@ async fn main() -> anyhow::Result<()> {
             .with_title("cookbook.pdf")
             .with_page(3)
             .with_caption("recipe for an apple pie with cinnamon"),
-        MediaInput::new("application/epub+zip", Bytes::from_static(b"PK...chapter-1"))
-            .with_title("novel.epub")
-            .with_page(1)
-            .with_caption("the sailor returned home from the sea"),
+        MediaInput::new(
+            "application/epub+zip",
+            Bytes::from_static(b"PK...chapter-1"),
+        )
+        .with_title("novel.epub")
+        .with_page(1)
+        .with_caption("the sailor returned home from the sea"),
     ];
 
     // `ingest_items_datoms` stores each blob in the Vault and returns the
@@ -88,7 +90,10 @@ async fn main() -> anyhow::Result<()> {
             _ => None,
         })
         .collect();
-    println!("== index == {} asset vectors in the shared space\n", embeddings.len());
+    println!(
+        "== index == {} asset vectors in the shared space\n",
+        embeddings.len()
+    );
 
     let title_of = |subject: &KotobaCid| -> String {
         datoms

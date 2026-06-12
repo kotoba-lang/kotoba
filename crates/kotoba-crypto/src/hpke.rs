@@ -113,18 +113,27 @@ mod tests {
         // Ephemeral pubkey: feeds both the DH secret and the HKDF salt → wrong key.
         let mut t_eph = hpke_seal(&pk, msg).unwrap();
         t_eph[0] ^= 0xFF;
-        assert!(hpke_open(&sk, &t_eph).is_err(), "tampered ephemeral pk must not open");
+        assert!(
+            hpke_open(&sk, &t_eph).is_err(),
+            "tampered ephemeral pk must not open"
+        );
 
         // Nonce region (byte 32) → AES-GCM nonce mismatch.
         let mut t_nonce = hpke_seal(&pk, msg).unwrap();
         t_nonce[32] ^= 0xFF;
-        assert!(hpke_open(&sk, &t_nonce).is_err(), "tampered nonce must not open");
+        assert!(
+            hpke_open(&sk, &t_nonce).is_err(),
+            "tampered nonce must not open"
+        );
 
         // Final ciphertext/tag byte → AEAD integrity failure.
         let mut t_ct = hpke_seal(&pk, msg).unwrap();
         let last = t_ct.len() - 1;
         t_ct[last] ^= 0xFF;
-        assert!(hpke_open(&sk, &t_ct).is_err(), "tampered ciphertext must not open");
+        assert!(
+            hpke_open(&sk, &t_ct).is_err(),
+            "tampered ciphertext must not open"
+        );
     }
 
     #[test]

@@ -14,7 +14,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut resolve = Resolve::new();
     let (pkg, _src) = resolve.push_dir(wit_dir)?;
-    println!("parsed WIT tree; {} package(s) resolved", resolve.packages.len());
+    println!(
+        "parsed WIT tree; {} package(s) resolved",
+        resolve.packages.len()
+    );
 
     for world in ["kotoba-node", "kotoba-udf"] {
         match resolve.select_world(pkg, Some(world)) {

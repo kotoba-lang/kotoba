@@ -96,9 +96,19 @@ async fn real_git_delta_compressed_push_ingests_correctly() {
         let db = gs.db();
         for (hex, want) in &versions {
             let oid = kotoba_git::GitOid::from_hex(hex).unwrap();
-            let obj = gs.materialize_object(&db, oid).expect("blob present after delta ingest");
-            assert_eq!(&String::from_utf8_lossy(&obj.body), want, "blob {hex} byte-exact");
-            assert_eq!(obj.oid().to_hex(), *hex, "recomputed oid matches (fidelity)");
+            let obj = gs
+                .materialize_object(&db, oid)
+                .expect("blob present after delta ingest");
+            assert_eq!(
+                &String::from_utf8_lossy(&obj.body),
+                want,
+                "blob {hex} byte-exact"
+            );
+            assert_eq!(
+                obj.oid().to_hex(),
+                *hex,
+                "recomputed oid matches (fidelity)"
+            );
         }
         assert_eq!(
             kotoba_git::resolve_ref(&db, "refs/heads/main").map(|o| o.to_hex()),
@@ -108,7 +118,10 @@ async fn real_git_delta_compressed_push_ingests_correctly() {
 
     // Clone back: the checked-out content equals the latest version.
     git(&work, &["clone", "-q", &url, "clone"]);
-    assert_eq!(std::fs::read_to_string(work.join("clone").join("big.txt")).unwrap(), latest);
+    assert_eq!(
+        std::fs::read_to_string(work.join("clone").join("big.txt")).unwrap(),
+        latest
+    );
 
     let _ = std::fs::remove_dir_all(&work);
 }

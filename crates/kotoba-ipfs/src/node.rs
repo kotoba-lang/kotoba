@@ -2625,11 +2625,13 @@ async fn fetch_from_socket(socket: SocketAddr, cid: &IpldCid) -> Result<Bytes> {
     if len == NOT_FOUND {
         bail!("block not found on peer: {cid}");
     }
-    if len > usize::MAX as u64 {
-        bail!("block too large: {len}");
+    const MAX_REMOTE_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+    if len > MAX_REMOTE_BLOCK_BYTES {
+        bail!("block too large: {len} > {MAX_REMOTE_BLOCK_BYTES}");
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
+    verify_cid(cid, &buf)?;
     Ok(Bytes::from(buf))
 }
 
@@ -2648,12 +2650,33 @@ async fn fetch_name_from_socket(socket: SocketAddr, name: &IpnsName) -> Result<I
     if len == NOT_FOUND {
         bail!("IPNS name not found on peer: {}", name.0);
     }
-    if len > usize::MAX as u64 {
-        bail!("IPNS record too large: {len}");
+    const MAX_REMOTE_IPNS_RECORD_BYTES: u64 = 1024 * 1024;
+    if len > MAX_REMOTE_IPNS_RECORD_BYTES {
+        bail!("IPNS record too large: {len} > {MAX_REMOTE_IPNS_RECORD_BYTES}");
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
-    ciborium::from_reader(&buf[..]).map_err(|e| anyhow!("ipns record cbor decode: {e}"))
+    let record: IpnsRecord =
+        ciborium::from_reader(&buf[..]).map_err(|e| anyhow!("ipns record cbor decode: {e}"))?;
+    verify_remote_ipns_record(name, &record)?;
+    Ok(record)
+}
+
+fn verify_ipns_record(record: &IpnsRecord) -> Result<()> {
+    record.value_cid()?;
+    record.verify_signature_if_present()?;
+    Ok(())
+}
+
+fn verify_remote_ipns_record(expected_name: &IpnsName, record: &IpnsRecord) -> Result<()> {
+    if record.name != *expected_name {
+        bail!(
+            "remote IPNS record name mismatch: requested {}, got {}",
+            expected_name.0,
+            record.name.0
+        );
+    }
+    verify_ipns_record(record)
 }
 
 async fn fetch_providers_from_socket(socket: SocketAddr, cid: &IpldCid) -> Result<Vec<Provider>> {
@@ -2668,13 +2691,15 @@ async fn fetch_providers_from_socket(socket: SocketAddr, cid: &IpldCid) -> Resul
     let mut len_buf = [0u8; 8];
     stream.read_exact(&mut len_buf).await?;
     let len = u64::from_be_bytes(len_buf);
-    if len > usize::MAX as u64 {
-        bail!("provider response too large: {len}");
+    const MAX_REMOTE_PROVIDERS_BYTES: u64 = 1024 * 1024;
+    if len > MAX_REMOTE_PROVIDERS_BYTES {
+        bail!("provider response too large: {len} > {MAX_REMOTE_PROVIDERS_BYTES}");
     }
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
     let rows: Vec<(u64, Vec<String>)> =
         ciborium::from_reader(&buf[..]).map_err(|e| anyhow!("providers cbor decode: {e}"))?;
+    validate_provider_wire_rows(&rows)?;
     rows.into_iter()
         .map(|(peer, addrs)| {
             let addrs = addrs
@@ -2687,6 +2712,32 @@ async fn fetch_providers_from_socket(socket: SocketAddr, cid: &IpldCid) -> Resul
             })
         })
         .collect()
+}
+
+fn validate_provider_wire_rows(rows: &[(u64, Vec<String>)]) -> Result<()> {
+    const MAX_REMOTE_PROVIDERS: usize = 4096;
+    const MAX_REMOTE_PROVIDER_ADDRS: usize = 32;
+    if rows.len() > MAX_REMOTE_PROVIDERS {
+        bail!(
+            "provider response has too many providers: {} > {MAX_REMOTE_PROVIDERS}",
+            rows.len()
+        );
+    }
+    for (peer, addrs) in rows {
+        if *peer == 0 {
+            bail!("provider response contains invalid peer id 0");
+        }
+        if addrs.len() > MAX_REMOTE_PROVIDER_ADDRS {
+            bail!(
+                "provider response for peer {peer} has too many addrs: {} > {MAX_REMOTE_PROVIDER_ADDRS}",
+                addrs.len()
+            );
+        }
+        if addrs.iter().any(|addr| addr.trim().is_empty()) {
+            bail!("provider response for peer {peer} contains empty addr");
+        }
+    }
+    Ok(())
 }
 
 fn cbor_len<T: Serialize>(value: &T) -> Result<u64> {
@@ -3066,10 +3117,8 @@ async fn load_repo_state(state: &Arc<State>, repo: &Path) -> Result<()> {
         let mut names = state.names.write().await;
         names.clear();
         for record in manifest.names {
-            record
-                .value
-                .parse::<IpldCid>()
-                .map_err(|err| anyhow!("invalid IPNS record CID for {}: {err}", record.name.0))?;
+            verify_ipns_record(&record)
+                .with_context(|| format!("invalid IPNS record for {}", record.name.0))?;
             names.insert(record.name.clone(), record);
         }
     }
@@ -3208,4 +3257,128 @@ fn multiaddr_to_socket(addr: &Multiaddr) -> Result<SocketAddr> {
 
 fn socket_to_multiaddr(socket: SocketAddr) -> Multiaddr {
     Multiaddr { socket, peer: None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn serve_payload_once(payload: Vec<u8>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            stream = reader.into_inner();
+            stream
+                .write_all(&(payload.len() as u64).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&payload).await.unwrap();
+        });
+        socket
+    }
+
+    async fn serve_ipns_record_once(record: IpnsRecord) -> SocketAddr {
+        let mut body = Vec::new();
+        ciborium::into_writer(&record, &mut body).unwrap();
+        serve_payload_once(body).await
+    }
+
+    async fn serve_provider_rows_once(rows: Vec<(u64, Vec<String>)>) -> SocketAddr {
+        let mut body = Vec::new();
+        ciborium::into_writer(&rows, &mut body).unwrap();
+        serve_payload_once(body).await
+    }
+
+    async fn serve_declared_length_once(len: u64) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            stream = reader.into_inner();
+            stream.write_all(&len.to_be_bytes()).await.unwrap();
+        });
+        socket
+    }
+
+    #[tokio::test]
+    async fn fetch_from_socket_rejects_cid_mismatch() {
+        let expected = raw_cid(b"expected block");
+        let socket = serve_payload_once(b"different block".to_vec()).await;
+
+        let err = fetch_from_socket(socket, &expected).await.unwrap_err();
+
+        assert!(err.to_string().contains("mismatch"));
+    }
+
+    #[tokio::test]
+    async fn fetch_name_from_socket_rejects_name_mismatch() {
+        let value = raw_cid(b"remote head");
+        let record = IpnsRecord::new("k51-wrong-name", &value, 1, "2030-01-01T00:00:00Z");
+        let socket = serve_ipns_record_once(record).await;
+
+        let err = fetch_name_from_socket(socket, &IpnsName::new("k51-expected-name"))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("name mismatch"));
+    }
+
+    #[tokio::test]
+    async fn fetch_name_from_socket_rejects_invalid_signature_fields() {
+        let value = raw_cid(b"remote head");
+        let mut record = IpnsRecord::new("k51-expected-name", &value, 1, "2030-01-01T00:00:00Z");
+        record.public_key_multibase = Some("znot-a-valid-key".to_string());
+        record.signature_multibase = Some("znot-a-valid-signature".to_string());
+        let socket = serve_ipns_record_once(record).await;
+
+        let err = fetch_name_from_socket(socket, &IpnsName::new("k51-expected-name"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("signature")
+                || err.to_string().contains("public key")
+                || err.to_string().contains("invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_providers_from_socket_rejects_oversized_response() {
+        let cid = raw_cid(b"provider target");
+        let socket = serve_declared_length_once(1024 * 1024 + 1).await;
+
+        let err = fetch_providers_from_socket(socket, &cid).await.unwrap_err();
+
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn fetch_providers_from_socket_rejects_invalid_provider_rows() {
+        let cid = raw_cid(b"provider target");
+        let socket = serve_provider_rows_once(vec![(0, vec!["/ip4/127.0.0.1/tcp/1".into()])]).await;
+
+        let err = fetch_providers_from_socket(socket, &cid).await.unwrap_err();
+
+        assert!(err.to_string().contains("invalid peer id"));
+    }
+
+    #[tokio::test]
+    async fn fetch_providers_from_socket_accepts_valid_rows() {
+        let cid = raw_cid(b"provider target");
+        let socket =
+            serve_provider_rows_once(vec![(7, vec!["/ip4/127.0.0.1/tcp/4001".into()])]).await;
+
+        let providers = fetch_providers_from_socket(socket, &cid).await.unwrap();
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].peer, PeerId(7));
+        assert_eq!(providers[0].addrs.len(), 1);
+    }
 }

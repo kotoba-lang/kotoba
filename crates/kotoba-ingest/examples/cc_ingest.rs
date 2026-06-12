@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use kotoba_graph::QuadStore;
-use kotoba_vault::LiveBus;
 use kotoba_store::MemoryBlockStore;
+use kotoba_vault::LiveBus;
 
 use kotoba_ingest::cc::{CcChunkIngestor, CcPageIngestor};
 use kotoba_ingest::embed_client::{Blake3EmbedClient, EmbedClient, HttpEmbedClient};

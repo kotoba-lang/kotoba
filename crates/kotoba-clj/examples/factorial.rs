@@ -17,7 +17,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     "#;
 
     let wasm = kotoba_clj::compile_str(src)?;
-    println!("compiled {} bytes of wasm (magic: {:?})", wasm.len(), &wasm[..4]);
+    println!(
+        "compiled {} bytes of wasm (magic: {:?})",
+        wasm.len(),
+        &wasm[..4]
+    );
 
     for n in 0..=10 {
         let f = kotoba_clj::run::run(&wasm, "fact", &[n])?;

@@ -52,7 +52,9 @@ async fn t3_peer_input_round_trips_through_authority_over_libp2p() {
     }
 
     // Connect peer → authority.
-    let la = get_listen_addr(&mut sa).await.expect("authority listen addr");
+    let la = get_listen_addr(&mut sa)
+        .await
+        .expect("authority listen addr");
     sb.add_peer(sa.local_peer_id, la);
     let connected = timeout(Duration::from_secs(5), async {
         loop {
@@ -88,7 +90,10 @@ async fn t3_peer_input_round_trips_through_authority_over_libp2p() {
         player: PlayerId(1),
         tick: Tick(0),
         seq: 1,
-        input: Input { buttons: 5, axes: vec![] },
+        input: Input {
+            buttons: 5,
+            axes: vec![],
+        },
     });
 
     let mut pend_a: Vec<(String, Vec<u8>)> = Vec::new();
@@ -139,5 +144,8 @@ async fn t3_peer_input_round_trips_through_authority_over_libp2p() {
         got_input_back,
         "peer's InputFrame must traverse real gossip → authority ingest → forward → back to peer"
     );
-    assert!(got_confirm, "peer must receive an authoritative Confirm over real gossip");
+    assert!(
+        got_confirm,
+        "peer must receive an authoritative Confirm over real gossip"
+    );
 }

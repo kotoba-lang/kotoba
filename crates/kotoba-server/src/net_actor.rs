@@ -1,9 +1,9 @@
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_graph::QuadStore;
+use kotoba_net::{KotobaNetEvent, KotobaSwarm, PREGEL_GOSSIP_TOPIC};
 use kotoba_query::{quad::LegacyQuad as Quad, Datom};
 use kotoba_vault::LiveBusEntry;
-use kotoba_net::{KotobaNetEvent, KotobaSwarm, PREGEL_GOSSIP_TOPIC};
 use kotoba_vm::distributed::DistributedMessage;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;

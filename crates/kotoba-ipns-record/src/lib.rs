@@ -218,16 +218,13 @@ mod tests {
 
     #[test]
     fn sign_then_verify_roundtrips() {
-        let mut rec = IpnsRecord::with_value_string(
-            "did:key:zfeed",
-            HEAD_CID,
-            1,
-            "2030-01-01T00:00:00Z",
-        );
+        let mut rec =
+            IpnsRecord::with_value_string("did:key:zfeed", HEAD_CID, 1, "2030-01-01T00:00:00Z");
         rec.sign_ed25519(&key()).unwrap();
         assert!(rec.public_key_multibase.is_some());
         assert!(rec.signature_multibase.is_some());
-        rec.verify_ed25519_signature().expect("valid signature verifies");
+        rec.verify_ed25519_signature()
+            .expect("valid signature verifies");
         assert!(rec.signature_verified());
     }
 
@@ -291,9 +288,9 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         let parsed: IpnsRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, rec); // lossless wire round-trip
-        parsed
-            .require_verified_signature()
-            .expect("Rust-signed record verifies after JSON round-trip (wasm verifyIpnsRecord path)");
+        parsed.require_verified_signature().expect(
+            "Rust-signed record verifies after JSON round-trip (wasm verifyIpnsRecord path)",
+        );
         // A flipped field in the transported JSON must fail verification.
         let tampered = json.replace("\"sequence\":9", "\"sequence\":10");
         let bad: IpnsRecord = serde_json::from_str(&tampered).unwrap();
@@ -303,11 +300,7 @@ mod tests {
     // Tiny local hex (test-only) to avoid a dev-dep just for the did string.
     mod hex {
         pub fn encode_upper(bytes: impl AsRef<[u8]>) -> String {
-            bytes
-                .as_ref()
-                .iter()
-                .map(|b| format!("{b:02X}"))
-                .collect()
+            bytes.as_ref().iter().map(|b| format!("{b:02X}")).collect()
         }
     }
 }

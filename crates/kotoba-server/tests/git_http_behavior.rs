@@ -49,7 +49,9 @@ async fn protocol_guard_and_auth_gates() {
 
     // 3. Push discovery (no auth, anon push off) → denied.
     let r = client
-        .get(format!("{base}/git/repo/info/refs?service=git-receive-pack"))
+        .get(format!(
+            "{base}/git/repo/info/refs?service=git-receive-pack"
+        ))
         .send()
         .await
         .unwrap();
@@ -66,9 +68,5 @@ async fn protocol_guard_and_auth_gates() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        r.status().as_u16(),
-        401,
-        "unauthenticated push must be 401"
-    );
+    assert_eq!(r.status().as_u16(), 401, "unauthenticated push must be 401");
 }

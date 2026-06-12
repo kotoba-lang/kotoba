@@ -9,11 +9,11 @@ use kotoba_vault::vault::Vault;
 /// Maps to Datom predicates: `weight/{kind.path()}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeightKind {
-    /// Embedding table: `weight/embed` — shape [vocab × H]
+    /// Embedding table: `weight/embed` — shape `[vocab × H]`
     Embed,
-    /// LM head projection: `weight/lm_head` — shape [H × vocab]
+    /// LM head projection: `weight/lm_head` — shape `[H × vocab]`
     LmHead,
-    /// Final RMSNorm: `weight/norm/final` — shape [H]
+    /// Final RMSNorm: `weight/norm/final` — shape `[H]`
     FinalNorm,
     /// Q projection for block N: `weight/block/{N}/attn/q`
     BlockAttnQ(u32),

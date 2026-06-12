@@ -18,10 +18,10 @@ use kotoba_query::{
     delta::Delta,
     quad::{LegacyQuad as Quad, LegacyQuadObject as QuadObject},
 };
-use kotoba_vault::{LiveBus, SecureVault, Vault};
 use kotoba_store::{
     BudgetedBlockStore, IpfsPinClient, KuboBlockStore, MemoryBlockStore, TieredBlockStore,
 };
+use kotoba_vault::{LiveBus, SecureVault, Vault};
 use std::sync::Arc;
 
 const BMC_BLOCKS: &[(&str, i64)] = &[

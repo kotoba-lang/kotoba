@@ -11,7 +11,11 @@ use kotoba_clj::CljError;
 #[test]
 fn component_is_real_wasm() {
     let bytes = compile_component_str("(defn run [input] input)").unwrap();
-    assert_eq!(&bytes[..4], b"\0asm", "component must be a real wasm binary");
+    assert_eq!(
+        &bytes[..4],
+        b"\0asm",
+        "component must be a real wasm binary"
+    );
 }
 
 #[test]
@@ -77,7 +81,8 @@ fn kais_kotoba_node_component_loads_in_wasmtime() {
     let component = compile_kais_component_str(r#"(defn run [ctx] "hello")"#, KAIS_WIT_DIR)
         .expect("compile against kotoba-node world");
     assert_eq!(&component[..4], b"\0asm");
-    assert_loads(&component).expect("kotoba-node component must load under wasmtime component model");
+    assert_loads(&component)
+        .expect("kotoba-node component must load under wasmtime component model");
 }
 
 #[test]

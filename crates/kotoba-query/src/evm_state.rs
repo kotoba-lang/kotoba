@@ -81,22 +81,52 @@ pub fn account_datoms(
 ) -> Vec<Datom> {
     let e = addr_cid(addr);
     let mut out = vec![
-        Datom::assert(e.clone(), ACCT_NONCE_PRED.to_string(), Value::Integer(nonce as i64), graph.clone()),
-        Datom::assert(e.clone(), ACCT_BALANCE_PRED.to_string(), Value::Bytes(balance.to_vec()), graph.clone()),
+        Datom::assert(
+            e.clone(),
+            ACCT_NONCE_PRED.to_string(),
+            Value::Integer(nonce as i64),
+            graph.clone(),
+        ),
+        Datom::assert(
+            e.clone(),
+            ACCT_BALANCE_PRED.to_string(),
+            Value::Bytes(balance.to_vec()),
+            graph.clone(),
+        ),
     ];
     if let Some((codehash, bytecode)) = code {
         let ch = codehash_cid(codehash);
         // account points to code by the RAW keccak hash (recoverable for revm);
         // the code blob is content-addressed under the codehash CID.
-        out.push(Datom::assert(e, ACCT_CODEHASH_PRED.to_string(), Value::Bytes(codehash.to_vec()), graph.clone()));
-        out.push(Datom::assert(ch, CODE_PRED.to_string(), Value::Bytes(bytecode.to_vec()), graph.clone()));
+        out.push(Datom::assert(
+            e,
+            ACCT_CODEHASH_PRED.to_string(),
+            Value::Bytes(codehash.to_vec()),
+            graph.clone(),
+        ));
+        out.push(Datom::assert(
+            ch,
+            CODE_PRED.to_string(),
+            Value::Bytes(bytecode.to_vec()),
+            graph.clone(),
+        ));
     }
     out
 }
 
 /// Project a single storage write into a Datom.
-pub fn storage_datom(addr: &[u8; 20], slot: &[u8; 32], value: &[u8; 32], graph: &KotobaCid) -> Datom {
-    Datom::assert(addr_cid(addr), storage_pred(slot), Value::Bytes(value.to_vec()), graph.clone())
+pub fn storage_datom(
+    addr: &[u8; 20],
+    slot: &[u8; 32],
+    value: &[u8; 32],
+    graph: &KotobaCid,
+) -> Datom {
+    Datom::assert(
+        addr_cid(addr),
+        storage_pred(slot),
+        Value::Bytes(value.to_vec()),
+        graph.clone(),
+    )
 }
 
 // ── Read view (a Datom reducer; the EVM world-state for reads) ────────────────
@@ -160,7 +190,10 @@ impl EvmStateView {
     }
 
     pub fn balance_of(&self, addr: &[u8; 20]) -> [u8; 32] {
-        self.balance.get(&addr_cid(addr)).copied().unwrap_or([0u8; 32])
+        self.balance
+            .get(&addr_cid(addr))
+            .copied()
+            .unwrap_or([0u8; 32])
     }
 
     /// Contract bytecode (empty for EOAs / unknown accounts).
@@ -173,12 +206,18 @@ impl EvmStateView {
     }
 
     pub fn storage_of(&self, addr: &[u8; 20], slot: &[u8; 32]) -> [u8; 32] {
-        self.storage.get(&(addr_cid(addr), *slot)).copied().unwrap_or([0u8; 32])
+        self.storage
+            .get(&(addr_cid(addr), *slot))
+            .copied()
+            .unwrap_or([0u8; 32])
     }
 
     /// Bytecode by its keccak256 code hash (for revm `code_by_hash_ref`). Empty if absent.
     pub fn code_by_hash(&self, codehash: &[u8; 32]) -> &[u8] {
-        self.code.get(&codehash_cid(codehash)).map(Vec::as_slice).unwrap_or(&[])
+        self.code
+            .get(&codehash_cid(codehash))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// The raw keccak code hash recorded for an account (for revm `AccountInfo.code_hash`).
@@ -208,7 +247,12 @@ impl EvmStateView {
             rows.push(format!("c|{}|{}", e.to_multibase(), hex::encode(v)));
         }
         for ((e, slot), v) in &self.storage {
-            rows.push(format!("s|{}|{}|{}", e.to_multibase(), hex::encode(slot), hex::encode(v)));
+            rows.push(format!(
+                "s|{}|{}|{}",
+                e.to_multibase(),
+                hex::encode(slot),
+                hex::encode(v)
+            ));
         }
         rows.sort();
         KotobaCid::from_bytes(rows.join("\n").as_bytes())
@@ -306,11 +350,14 @@ mod tests {
     fn eoa_account_roundtrips_through_view() {
         let mut v = EvmStateView::new();
         let a = addr(0xAA);
-        apply(&mut v, account_datoms(&a, 7, &u256(1_000_000), None, &graph()));
+        apply(
+            &mut v,
+            account_datoms(&a, 7, &u256(1_000_000), None, &graph()),
+        );
         assert_eq!(v.nonce_of(&a), 7);
         assert_eq!(v.balance_of(&a), u256(1_000_000));
         assert_eq!(v.code_of(&a), &[] as &[u8]); // EOA: no code
-        // RPC encodings
+                                                 // RPC encodings
         assert_eq!(eth_get_transaction_count(&v, &a), "0x7");
         assert_eq!(eth_get_balance(&v, &a), "0xf4240"); // 1_000_000
         assert_eq!(eth_get_code(&v, &a), "0x");
@@ -321,18 +368,27 @@ mod tests {
         let mut v = EvmStateView::new();
         let c = addr(0xC0);
         let bytecode = vec![0x60, 0x80, 0x60, 0x40]; // PUSH1 0x80 PUSH1 0x40 …
-        // R0 stores code under the codehash CID without re-deriving keccak; a fixed
-        // 32-byte codehash suffices (real keccak binding is enforced at R1 execution).
+                                                     // R0 stores code under the codehash CID without re-deriving keccak; a fixed
+                                                     // 32-byte codehash suffices (real keccak binding is enforced at R1 execution).
         let codehash = [0x11u8; 32];
-        apply(&mut v, account_datoms(&c, 1, &u256(0), Some((&codehash, &bytecode)), &graph()));
-        apply(&mut v, vec![storage_datom(&c, &slot(0x05), &u256(42), &graph())]);
+        apply(
+            &mut v,
+            account_datoms(&c, 1, &u256(0), Some((&codehash, &bytecode)), &graph()),
+        );
+        apply(
+            &mut v,
+            vec![storage_datom(&c, &slot(0x05), &u256(42), &graph())],
+        );
 
         assert_eq!(v.code_of(&c), bytecode.as_slice());
         assert_eq!(eth_get_code(&v, &c), "0x60806040");
         assert_eq!(v.storage_of(&c, &slot(0x05)), u256(42));
         assert_eq!(eth_get_storage_at(&v, &c, &slot(0x05)), data_hex(&u256(42)));
         // unset slot → 32 zero bytes
-        assert_eq!(eth_get_storage_at(&v, &c, &slot(0x06)), data_hex(&[0u8; 32]));
+        assert_eq!(
+            eth_get_storage_at(&v, &c, &slot(0x06)),
+            data_hex(&[0u8; 32])
+        );
     }
 
     #[test]

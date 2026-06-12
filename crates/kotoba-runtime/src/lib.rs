@@ -52,6 +52,8 @@ mod tests {
 
     use crate::host::WitQuad;
 
+    type KseDrainResult = (Result<Vec<(String, Vec<u8>)>, String>,);
+
     struct TestState {
         wasi_ctx: WasiCtx,
         wasi_table: ResourceTable,
@@ -76,8 +78,11 @@ mod tests {
             &mut self,
             request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
             config: wasmtime_wasi_http::types::OutgoingRequestConfig,
-        ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-            Ok(wasmtime_wasi_http::types::default_send_request(request, config))
+        ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse>
+        {
+            Ok(wasmtime_wasi_http::types::default_send_request(
+                request, config,
+            ))
         }
     }
 
@@ -160,9 +165,7 @@ mod tests {
                 "drain",
                 |_: wasmtime::StoreContextMut<TestState>,
                  (_pat, _max): (String, u32)|
-                 -> Result<(Result<Vec<(String, Vec<u8>)>, String>,)> {
-                    Ok((Ok(vec![]),))
-                },
+                 -> Result<KseDrainResult> { Ok((Ok(vec![]),)) },
             )?;
         }
         {
@@ -414,13 +417,25 @@ mod tests {
         assert_eq!(s.gas_remaining, 70, "successful charge deducts the cost");
 
         assert!(s.charge_gas(71).is_err(), "overspend must be rejected");
-        assert_eq!(s.gas_remaining, 70, "a rejected charge must not deduct or underflow");
+        assert_eq!(
+            s.gas_remaining, 70,
+            "a rejected charge must not deduct or underflow"
+        );
 
-        assert!(s.charge_gas(70).is_ok(), "exact spend to zero (cost == remaining) succeeds");
+        assert!(
+            s.charge_gas(70).is_ok(),
+            "exact spend to zero (cost == remaining) succeeds"
+        );
         assert_eq!(s.gas_remaining, 0);
 
-        assert!(s.charge_gas(1).is_err(), "no gas left → any positive charge fails");
-        assert!(s.charge_gas(0).is_ok(), "a zero-cost charge at zero remaining is allowed");
+        assert!(
+            s.charge_gas(1).is_err(),
+            "no gas left → any positive charge fails"
+        );
+        assert!(
+            s.charge_gas(0).is_ok(),
+            "a zero-cost charge at zero remaining is allowed"
+        );
     }
 
     #[test]
@@ -436,7 +451,10 @@ mod tests {
             err.contains("gas") && err.contains("prohibited"),
             "0 gas_limit must be rejected with a clear reason, got: {err}"
         );
-        assert!(crate::WasmExecutor::new(1).is_ok(), "a positive gas_limit constructs");
+        assert!(
+            crate::WasmExecutor::new(1).is_ok(),
+            "a positive gas_limit constructs"
+        );
     }
 
     #[test]
@@ -514,18 +532,29 @@ mod wasi_http_tests {
         wasi_http_ctx: WasiHttpCtx,
     }
     impl WasiView for TestState {
-        fn ctx(&mut self) -> &mut WasiCtx { &mut self.wasi_ctx }
-        fn table(&mut self) -> &mut ResourceTable { &mut self.wasi_table }
+        fn ctx(&mut self) -> &mut WasiCtx {
+            &mut self.wasi_ctx
+        }
+        fn table(&mut self) -> &mut ResourceTable {
+            &mut self.wasi_table
+        }
     }
     impl WasiHttpView for TestState {
-        fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.wasi_http_ctx }
-        fn table(&mut self) -> &mut ResourceTable { &mut self.wasi_table }
+        fn ctx(&mut self) -> &mut WasiHttpCtx {
+            &mut self.wasi_http_ctx
+        }
+        fn table(&mut self) -> &mut ResourceTable {
+            &mut self.wasi_table
+        }
         fn send_request(
             &mut self,
             request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
             config: wasmtime_wasi_http::types::OutgoingRequestConfig,
-        ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-            Ok(wasmtime_wasi_http::types::default_send_request(request, config))
+        ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse>
+        {
+            Ok(wasmtime_wasi_http::types::default_send_request(
+                request, config,
+            ))
         }
     }
 
@@ -534,24 +563,24 @@ mod wasi_http_tests {
         let mut config = Config::new();
         config.wasm_component_model(true);
         let engine = Engine::new(&config)?;
-        
+
         let wat = r#"
         (component
             (import "wasi:http/outgoing-handler@0.2.0" (instance))
         )
         "#;
         let component = Component::new(&engine, wat)?;
-        
+
         let mut linker: Linker<TestState> = Linker::new(&engine);
         wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker)?;
-        
+
         let state = TestState {
             wasi_ctx: WasiCtxBuilder::new().build(),
             wasi_table: ResourceTable::new(),
             wasi_http_ctx: WasiHttpCtx::new(),
         };
         let mut store = Store::new(&engine, state);
-        
+
         let _instance = linker.instantiate(&mut store, &component)?;
         Ok(())
     }

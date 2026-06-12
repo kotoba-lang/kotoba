@@ -182,7 +182,10 @@ mod tests {
         // ILIKE is preprocessed to LIKE, but LIKE is not a supported WHERE filter
         // in the CID-hashed object space — it must be rejected, not silently
         // dropped (which would return an unfiltered superset).
-        assert_eq!(preprocess_postgres("WHERE x ILIKE 'a%'"), "WHERE x LIKE 'a%'");
+        assert_eq!(
+            preprocess_postgres("WHERE x ILIKE 'a%'"),
+            "WHERE x LIKE 'a%'"
+        );
 
         let mut schema = SchemaMap::new();
         schema.add(

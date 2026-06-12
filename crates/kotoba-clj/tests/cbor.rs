@@ -28,7 +28,10 @@ fn build(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("(byte-append! b {b}) "))
         .collect();
-    format!("(let [b (bytes-alloc {})] {appends} (bytes-finish b))", bytes.len())
+    format!(
+        "(let [b (bytes-alloc {})] {appends} (bytes-finish b))",
+        bytes.len()
+    )
 }
 
 // ---- pure uint decoding -----------------------------------------------------
@@ -43,14 +46,20 @@ fn uint_inline() {
 #[test]
 fn uint_one_byte_ext() {
     // 0x18 0x2A → 42
-    let v = eval(&format!("(cbor-uint (cbor-reader {}))", build(&[0x18, 0x2A])));
+    let v = eval(&format!(
+        "(cbor-uint (cbor-reader {}))",
+        build(&[0x18, 0x2A])
+    ));
     assert_eq!(v, 42);
 }
 
 #[test]
 fn uint_two_byte_ext() {
     // 0x19 0x01 0x00 → 256
-    let v = eval(&format!("(cbor-uint (cbor-reader {}))", build(&[0x19, 0x01, 0x00])));
+    let v = eval(&format!(
+        "(cbor-uint (cbor-reader {}))",
+        build(&[0x19, 0x01, 0x00])
+    ));
     assert_eq!(v, 256);
 }
 
@@ -131,8 +140,10 @@ mod live {
     /// CBOR-encode a `{key: value}` map with `ciborium` — the same library the
     /// runtime uses, so a passing test proves real interop.
     fn cbor_map(pairs: &[(&str, &str)]) -> Vec<u8> {
-        let map: BTreeMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         let mut out = Vec::new();
         ciborium::into_writer(&map, &mut out).expect("cbor encode");
         out

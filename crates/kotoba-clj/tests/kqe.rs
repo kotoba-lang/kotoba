@@ -29,8 +29,15 @@ fn invoke(src: &str, snapshot: Vec<WitQuad>) -> InvokeResult {
     let full = format!("{}\n{}", prelude(), src);
     let component = compile_kais_component_str(&full, KAIS_WIT_DIR).expect("compile + encode");
     let exec = WasmExecutor::new(GAS).expect("executor");
-    exec.execute("clj-kqe-test", &component, AGENT, b"ctx".to_vec(), snapshot, HashMap::new())
-        .expect("execute run(ctx)")
+    exec.execute(
+        "clj-kqe-test",
+        &component,
+        AGENT,
+        b"ctx".to_vec(),
+        snapshot,
+        HashMap::new(),
+    )
+    .expect("execute run(ctx)")
 }
 
 /// CBOR text bytes (what `cbor-enc-text!` produces in-guest) via ciborium, so
@@ -69,7 +76,11 @@ fn assert_quad_buffers_a_datom() {
     // the guest-built object-cbor is spec-conformant CBOR text
     assert_eq!(q.object_cbor, cbor_text("Alice"));
     // assert-quad charges 10 gas
-    assert!(result.gas_used >= 10, "expected gas for the assert, got {}", result.gas_used);
+    assert!(
+        result.gas_used >= 10,
+        "expected gas for the assert, got {}",
+        result.gas_used
+    );
 }
 
 #[test]
@@ -236,8 +247,14 @@ fn agent_asserts_flow_into_datomic_db() {
         assert_eq!(f.e, alice, "both datoms are about the same entity");
         assert!(f.added);
     }
-    let name = facts.iter().find(|f| f.a == "kg/name").expect("kg/name datom");
-    let role = facts.iter().find(|f| f.a == "kg/role").expect("kg/role datom");
+    let name = facts
+        .iter()
+        .find(|f| f.a == "kg/name")
+        .expect("kg/name datom");
+    let role = facts
+        .iter()
+        .find(|f| f.a == "kg/role")
+        .expect("kg/role datom");
     assert_eq!(name.v, kotoba_edn::EdnValue::String("Alice".to_string()));
     assert_eq!(role.v, kotoba_edn::EdnValue::String("admin".to_string()));
 }

@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 ///
 /// | Datomic | Key order            | Primary use                         |
 /// |---------|----------------------|-------------------------------------|
-/// | EAVT    | E → A → [V]          | Entity lookup (all attrs of E)      |
-/// | AEVT    | A → E → [V]          | Attribute scan (all E with attr A)  |
-/// | AVET    | A → value_key → [E]  | Value lookup (find E by A + V)      |
-/// | VAET    | V_cid → A → [E]      | Reverse ref (who points to V_cid?)  |
+/// | EAVT    | `E → A → [V]`          | Entity lookup (all attrs of E)      |
+/// | AEVT    | `A → E → [V]`          | Attribute scan (all E with attr A)  |
+/// | AVET    | `A → value_key → [E]`  | Value lookup (find E by A + V)      |
+/// | VAET    | `V_cid → A → [E]`      | Reverse ref (who points to V_cid?)  |
 ///
 /// VAET only indexes `Value::Cid` values — mirroring Datomic's ref-only VAET.
 #[derive(Debug, Default, Clone)]
@@ -178,7 +178,7 @@ impl Arrangement {
             .unwrap_or_default()
     }
 
-    /// All (entity, [value]) pairs for `attr` — AEVT index.
+    /// All `(entity, [value])` pairs for `attr` — AEVT index.
     pub fn get_by_attribute(&self, attr: &str) -> Vec<(KotobaCid, Vec<Value>)> {
         self.pso
             .get(attr)
@@ -689,7 +689,7 @@ mod tests {
 
         let deltas = arr.to_deltas(&g);
         assert_eq!(deltas.len(), 2);
-        assert!(deltas.iter().all(|d| d.datom.op == true));
+        assert!(deltas.iter().all(|d| d.datom.op));
     }
 
     #[test]

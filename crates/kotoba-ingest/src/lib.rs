@@ -12,9 +12,7 @@ pub mod pagerank;
 
 pub use gmail::GmailClient;
 pub use ingest::{graph_cid_for, EmailIngestor};
-pub use media::{
-    media_assets_graph, rank_by_cosine, MediaIngestReport, MediaIngestor, MediaInput,
-};
+pub use media::{media_assets_graph, rank_by_cosine, MediaIngestReport, MediaIngestor, MediaInput};
 pub use media_embed::{
     Blake3MediaEmbedClient, HttpMediaEmbedClient, MediaEmbedClient, MediaItem, Modality,
 };

@@ -18,9 +18,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kotoba_core::cid::KotobaCid;
+use kotoba_query::social::MintParams;
 use kotoba_server::econ::Econ;
 use kotoba_server::social_economy::{fetch_kaizen_feed, live_evm_source, SocialEconomyDriver};
-use kotoba_query::social::MintParams;
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.is_empty())
@@ -31,7 +31,10 @@ async fn main() {
     let pool: i64 = env("KOTOBA_RETAINER_POOL_MKOTO")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
-    let epoch = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() / 86_400).unwrap_or(0);
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
     let operator = env("KOTOBA_OPERATOR_DID").unwrap_or_else(|| "did:web:etzhayyim.com".into());
     let from_block = env("KOTOBA_EVM_FROM_BLOCK").unwrap_or_else(|| "0x0".into());
     let to_block = env("KOTOBA_EVM_TO_BLOCK").unwrap_or_else(|| "latest".into());
@@ -59,7 +62,10 @@ async fn main() {
                     println!("LIVE: credited {credited} mKOTO to the persisted wallet.");
                     // NOTE: `minted` must be transacted to the canonical Datom log
                     // (datomic.transact) so the view survives restart.
-                    println!("NOTE: transact {} minted Datoms to the log (datomic.transact).", minted.len());
+                    println!(
+                        "NOTE: transact {} minted Datoms to the log (datomic.transact).",
+                        minted.len()
+                    );
                 }
                 Err(e) => {
                     eprintln!("LIVE tick failed (is geth-private / the escrow reachable?): {e}");
@@ -93,17 +99,30 @@ async fn run_fake_demo(graph: KotobaCid, epoch: u64, pool: i64) {
     ]);
     driver.ingest_origins(&[cid_datom(&did("rootA"), "social/origin", &a)]);
     driver.mint(
-        &[ObservedDisclosure { did: a.clone(), epoch, n_validated: 10, citation_hits: 0, terminal_honest: true, witness_quorum_met: true }],
+        &[ObservedDisclosure {
+            did: a.clone(),
+            epoch,
+            n_validated: 10,
+            citation_hits: 0,
+            terminal_honest: true,
+            witness_quorum_met: true,
+        }],
         &[],
         &[],
     );
     let _ = MintSource::Disclosure;
     let result = driver.settle(epoch, pool);
-    println!("FAKE: a's capital = {} pts; pinA → peggy gets {} mKOTO (remainder {})",
-        driver.view.capital(&a, epoch) / SCALE, result.total_mkoto, result.remainder_mkoto);
+    println!(
+        "FAKE: a's capital = {} pts; pinA → peggy gets {} mKOTO (remainder {})",
+        driver.view.capital(&a, epoch) / SCALE,
+        result.total_mkoto,
+        result.remainder_mkoto
+    );
     let econ = Econ::from_env("did:key:demo-operator".to_string());
     let credited = SocialEconomyDriver::settle_to_wallet(&econ, &result).await;
-    println!("FAKE: credited {credited} mKOTO to peggy; balance now {}.",
-        econ.balance(&peggy.to_string()).await);
+    println!(
+        "FAKE: credited {credited} mKOTO to peggy; balance now {}.",
+        econ.balance(&peggy.to_string()).await
+    );
     println!("== fake demo ok — set the KOTOBA_EVM_* env to run live on a fleet node ==");
 }

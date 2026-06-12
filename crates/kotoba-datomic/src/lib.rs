@@ -969,37 +969,32 @@ fn entity_map_to_datoms(
     bind_unique_identity_tempid(&eid_value, &entity, tempids, db, schema, pending)?;
     let eid = entity_ref_to_cid_for_tx(&eid_value, tempids, db, &tx_cid)?;
     let mut out = Vec::new();
+    let mut ctx = EntityAttrDatomCtx {
+        tx_cid: &tx_cid,
+        tempids,
+        db,
+        schema,
+        pending,
+    };
     for (a, v) in entity {
         let a = attr_to_string(&a)?;
         if schema.cardinality_many.contains(&a) {
             for v in cardinality_many_tx_values(v) {
-                append_entity_attr_datoms(
-                    &mut out,
-                    eid.clone(),
-                    a.clone(),
-                    v,
-                    tx_cid.clone(),
-                    tempids,
-                    db,
-                    schema,
-                    pending,
-                )?;
+                append_entity_attr_datoms(&mut out, eid.clone(), a.clone(), v, &mut ctx)?;
             }
             continue;
         }
-        append_entity_attr_datoms(
-            &mut out,
-            eid.clone(),
-            a,
-            v,
-            tx_cid.clone(),
-            tempids,
-            db,
-            schema,
-            pending,
-        )?;
+        append_entity_attr_datoms(&mut out, eid.clone(), a, v, &mut ctx)?;
     }
     Ok(out)
+}
+
+struct EntityAttrDatomCtx<'a> {
+    tx_cid: &'a KotobaCid,
+    tempids: &'a mut BTreeMap<String, KotobaCid>,
+    db: &'a Db,
+    schema: &'a Schema,
+    pending: &'a [Datom],
 }
 
 fn append_entity_attr_datoms(
@@ -1007,33 +1002,35 @@ fn append_entity_attr_datoms(
     eid: KotobaCid,
     attr: String,
     value: EdnValue,
-    tx_cid: KotobaCid,
-    tempids: &mut BTreeMap<String, KotobaCid>,
-    db: &Db,
-    schema: &Schema,
-    pending: &[Datom],
+    ctx: &mut EntityAttrDatomCtx<'_>,
 ) -> Result<()> {
-    if schema.value_types.get(&attr) == Some(&ValueType::Ref) {
+    if ctx.schema.value_types.get(&attr) == Some(&ValueType::Ref) {
         if let EdnValue::Map(mut nested_entity) = value {
             let nested_eid_value =
                 ensure_nested_entity_id(&mut nested_entity, &eid, &attr, out.len());
-            let nested_eid = entity_ref_to_cid_for_tx(&nested_eid_value, tempids, db, &tx_cid)?;
-            let mut nested_pending = Vec::with_capacity(pending.len() + out.len());
-            nested_pending.extend_from_slice(pending);
+            let nested_eid =
+                entity_ref_to_cid_for_tx(&nested_eid_value, ctx.tempids, ctx.db, ctx.tx_cid)?;
+            let mut nested_pending = Vec::with_capacity(ctx.pending.len() + out.len());
+            nested_pending.extend_from_slice(ctx.pending);
             nested_pending.extend_from_slice(out);
             out.extend(entity_map_to_datoms(
                 nested_entity,
-                tx_cid.clone(),
-                tempids,
-                db,
-                schema,
+                ctx.tx_cid.clone(),
+                ctx.tempids,
+                ctx.db,
+                ctx.schema,
                 &nested_pending,
             )?);
-            out.push(Datom::assert(eid, attr, cid_value(&nested_eid), tx_cid));
+            out.push(Datom::assert(
+                eid,
+                attr,
+                cid_value(&nested_eid),
+                ctx.tx_cid.clone(),
+            ));
             return Ok(());
         }
     }
-    out.push(Datom::assert(eid, attr, value, tx_cid));
+    out.push(Datom::assert(eid, attr, value, ctx.tx_cid.clone()));
     Ok(())
 }
 
@@ -1308,7 +1305,7 @@ fn canonical_tx_value(value: &EdnValue, tx_placeholder: &KotobaCid) -> String {
         EdnValue::String(s) if s == &tx_placeholder.to_multibase() => "\"<tx-self>\"".to_string(),
         EdnValue::Tagged { tag, value }
             if tag.to_qualified() == "cid"
-                && value.as_string().as_deref() == Some(&tx_placeholder.to_multibase()) =>
+                && value.as_string() == Some(&tx_placeholder.to_multibase()) =>
         {
             "#cid \"<tx-self>\"".to_string()
         }
@@ -1341,8 +1338,8 @@ fn rewrite_tx_placeholder_value(
         return;
     }
     if let EdnValue::Tagged { tag, value } = value {
-        if tag.to_qualified() == "cid" && value.as_string().as_deref() == Some(&placeholder) {
-            *value = Box::new(EdnValue::String(tx_cid.to_multibase()));
+        if tag.to_qualified() == "cid" && value.as_string() == Some(&placeholder) {
+            **value = EdnValue::String(tx_cid.to_multibase());
         }
     }
 }
@@ -2104,8 +2101,8 @@ fn pull_entity_inner(db: &Db, pattern: &EdnValue, eid: &Entity, depth: usize) ->
     }
     for (attr, value) in &pattern.defaults {
         let key = pattern.attr_key(attr);
-        if !map.contains_key(&key) {
-            map.insert(key, pattern.apply_xform(attr, value.clone())?);
+        if let std::collections::btree_map::Entry::Vacant(entry) = map.entry(key) {
+            entry.insert(pattern.apply_xform(attr, value.clone())?);
         }
     }
     Ok(EdnValue::Map(map))
@@ -2952,10 +2949,7 @@ pub(crate) fn query_collection_transform_value(op: &str, args: Vec<EdnValue>) ->
             let mut current_values = Vec::new();
             for value in values {
                 let key = query_apply_value_function(&function, vec![value.clone()])?;
-                if current_key
-                    .as_ref()
-                    .map_or(true, |existing| existing == &key)
-                {
+                if current_key.as_ref().is_none_or(|existing| existing == &key) {
                     current_key = Some(key);
                     current_values.push(value);
                 } else {
@@ -3125,7 +3119,7 @@ pub(crate) fn query_set_operation_value(op: &str, args: Vec<EdnValue>) -> Result
 }
 
 pub(crate) fn query_hash_map_value(args: Vec<EdnValue>) -> Result<EdnValue> {
-    if args.len() % 2 != 0 {
+    if !args.len().is_multiple_of(2) {
         return Err(DatomicError::Query(
             "hash-map expects an even number of arguments".into(),
         ));
@@ -3627,7 +3621,7 @@ pub(crate) fn query_collection_order_value(op: &str, args: Vec<EdnValue>) -> Res
             }
             Ok(EdnValue::Vector(out))
         }
-        other => return Err(DatomicError::UnsupportedOperation(other.into())),
+        other => Err(DatomicError::UnsupportedOperation(other.into())),
     }
 }
 
@@ -4131,7 +4125,7 @@ pub(crate) fn query_variadic_predicate(op: &str, args: &[EdnValue]) -> Result<bo
             query_string_search_predicate(op, &args[0], &args[1])?
         }
         "every?" | "not-every?" | "not-any?" => {
-            query_collection_predicate_value(op, args.iter().cloned().collect::<Vec<_>>())?
+            query_collection_predicate_value(op, args.to_vec())?
         }
         other => return Err(DatomicError::UnsupportedOperation(other.into())),
     })
@@ -5947,7 +5941,7 @@ fn eval_query_function(
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
             .collect::<Result<Vec<_>>>()
-            .and_then(|values| query_arithmetic_value(&op, values)),
+            .and_then(|values| query_arithmetic_value(op, values)),
         "tuple" => args
             .iter()
             .map(|arg| resolve_query_value(arg, binding))
@@ -6315,6 +6309,25 @@ fn kqe_value_to_edn(value: kotoba_query::Value) -> EdnValue {
                 EdnValue::Tagged {
                     tag: Symbol::bare("cid"),
                     value: Box::new(EdnValue::String(policy_cid.to_multibase())),
+                },
+            ),
+        ])),
+        kotoba_query::Value::Enveloped {
+            ct_cid,
+            manifest_cid,
+        } => EdnValue::Map(BTreeMap::from([
+            (
+                kw_value(":enveloped/ct-cid"),
+                EdnValue::Tagged {
+                    tag: Symbol::bare("cid"),
+                    value: Box::new(EdnValue::String(ct_cid.to_multibase())),
+                },
+            ),
+            (
+                kw_value(":enveloped/manifest-cid"),
+                EdnValue::Tagged {
+                    tag: Symbol::bare("cid"),
+                    value: Box::new(EdnValue::String(manifest_cid.to_multibase())),
                 },
             ),
         ])),
@@ -6860,14 +6873,20 @@ mod tests {
             .unwrap();
 
         let aof = conn.db().as_of(&t1.tx_cid);
-        assert!(aof.datoms().iter().any(|d| d.a == ":k/x"), "as_of(t1) includes t1's datom");
+        assert!(
+            aof.datoms().iter().any(|d| d.a == ":k/x"),
+            "as_of(t1) includes t1's datom"
+        );
         assert!(
             aof.datoms().iter().all(|d| d.a != ":k/y"),
             "as_of(t1) must NOT see the later transaction's datom (no peeking into the future)"
         );
 
         let sin = conn.db().since(&t1.tx_cid);
-        assert!(sin.datoms().iter().any(|d| d.a == ":k/y"), "since(t1) includes the later datom");
+        assert!(
+            sin.datoms().iter().any(|d| d.a == ":k/y"),
+            "since(t1) includes the later datom"
+        );
         assert!(
             sin.datoms().iter().all(|d| d.a != ":k/x"),
             "since(t1) must NOT see t1's datom (the past is excluded)"
@@ -7061,12 +7080,18 @@ mod tests {
                 d.a == ":person/name" && d.v == EdnValue::String(v.into()) && d.added == added
             })
         };
-        assert!(name_is("Alice", true), "original Alice assertion must remain in history");
+        assert!(
+            name_is("Alice", true),
+            "original Alice assertion must remain in history"
+        );
         assert!(
             name_is("Alice", false),
             "card-one replacement must RETRACT the old value into history, not delete it"
         );
-        assert!(name_is("Alicia", true), "the new value is asserted in history");
+        assert!(
+            name_is("Alicia", true),
+            "the new value is asserted in history"
+        );
     }
 
     #[tokio::test]

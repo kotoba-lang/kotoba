@@ -47,8 +47,7 @@ pub struct ExecutorMeta {
     pub reference: String,
 }
 
-type Runner =
-    Arc<dyn Fn(Value, Ctx) -> BoxFuture<'static, Result<Value, WordError>> + Send + Sync>;
+type Runner = Arc<dyn Fn(Value, Ctx) -> BoxFuture<'static, Result<Value, WordError>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Word {

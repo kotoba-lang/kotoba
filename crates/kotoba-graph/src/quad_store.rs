@@ -37,9 +37,9 @@ use kotoba_query::datom::{Datom, Value};
 use kotoba_query::delta::Delta;
 use kotoba_query::quad::LegacyQuad as Quad;
 use kotoba_query::quad::LegacyQuadObject;
+use kotoba_store::{CapturingBlockStore, CarBundleWriter};
 use kotoba_vault::live_bus::LiveBus;
 use kotoba_vault::topic::Topic;
-use kotoba_store::{CapturingBlockStore, CarBundleWriter};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -518,7 +518,6 @@ impl QuadStore {
             .remove_datom(&datom);
         self.record_exact_pending_datom(&graph_key, datom);
     }
-
 
     pub async fn arrangement(&self, graph_cid: &KotobaCid) -> Option<Arrangement> {
         self.arrangements
@@ -1929,6 +1928,9 @@ impl QuadStore {
                             kotoba_query::quad::LegacyQuadObject::Encrypted { ct_cid, .. } => {
                                 ct_cid.to_multibase()
                             }
+                            kotoba_query::quad::LegacyQuadObject::Enveloped { ct_cid, .. } => {
+                                ct_cid.to_multibase()
+                            }
                         }
                     };
                     groups.entry(key).or_default().push(q);
@@ -3067,12 +3069,7 @@ impl QuadStore {
         graph_cid: KotobaCid,
         seq: u64,
     ) -> anyhow::Result<KotobaCid> {
-        let prev_commit = self
-            .commit_dag
-            .read()
-            .await
-            .head(&graph_cid)
-            .cloned();
+        let prev_commit = self.commit_dag.read().await.head(&graph_cid).cloned();
         let prev = prev_commit.as_ref().map(|c| c.cid.clone());
         // Previous index roots — the anchors the incremental Datom-native trees
         // path-copy from.  EAVT is stored as `Commit::root`; the rest live in
@@ -3326,19 +3323,12 @@ impl QuadStore {
                             // previous root (bounded scan_prefix, delta-sized).
                             if let Some(root) = prev_root.as_ref() {
                                 for prefix in &delete_prefixes {
-                                    for (k, _) in
-                                        ProllyTree::scan_prefix(root, prefix, &*cap)?
-                                    {
+                                    for (k, _) in ProllyTree::scan_prefix(root, prefix, &*cap)? {
                                         deletes.push(k);
                                     }
                                 }
                             }
-                            ProllyTree::apply_batch(
-                                prev_root.as_ref(),
-                                upserts,
-                                deletes,
-                                &*cap,
-                            )?
+                            ProllyTree::apply_batch(prev_root.as_ref(), upserts, deletes, &*cap)?
                         }
                     };
                     let blocks = cap.drain();
@@ -3394,7 +3384,9 @@ impl QuadStore {
                 Ok(Some(commit_bytes)) => {
                     writer.append(&cid, &commit_bytes);
                 }
-                _ => tracing::warn!(%cid, "commit block missing for CAR; CAR will not be self-restorable"),
+                _ => {
+                    tracing::warn!(%cid, "commit block missing for CAR; CAR will not be self-restorable")
+                }
             }
             for (bcid, data) in &all_blocks {
                 writer.append(bcid, data);
@@ -4051,8 +4043,8 @@ mod tests {
     // (the lib historically re-exported it under that alias). Keep the alias so
     // the test module compiles against the renamed `LegacyQuadObject`.
     use kotoba_query::quad::LegacyQuadObject as QuadObject;
-    use kotoba_vault::LiveBus;
     use kotoba_store::MemoryBlockStore;
+    use kotoba_vault::LiveBus;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A `BlockStore` decorator that counts the bytes returned by `get()` — used
@@ -4309,11 +4301,9 @@ mod tests {
                 bs,
             )
             .unwrap();
-            let exp_tea = ProllyTree::build_tree(
-                history.iter().map(|d| (d.tea_key(), enc(d))).collect(),
-                bs,
-            )
-            .unwrap();
+            let exp_tea =
+                ProllyTree::build_tree(history.iter().map(|d| (d.tea_key(), enc(d))).collect(), bs)
+                    .unwrap();
             let exp_avet = ProllyTree::build_tree(
                 model.values().map(|d| (d.avet_key(), enc(d))).collect(),
                 bs,
@@ -4361,8 +4351,18 @@ mod tests {
         qs.assert(ref_quad(bob.clone())).await;
         qs.commit("did:test", graph.clone(), 1).await.unwrap();
         let t1 = qs.head_commit(&graph).await.unwrap().tx_cid;
-        let d_name_alice = Datom::assert(alice.clone(), "name".into(), Value::Text("Alice".into()), t1.clone());
-        let d_knows_bob = Datom::assert(alice.clone(), ":knows".into(), Value::Cid(bob.clone()), t1.clone());
+        let d_name_alice = Datom::assert(
+            alice.clone(),
+            "name".into(),
+            Value::Text("Alice".into()),
+            t1.clone(),
+        );
+        let d_knows_bob = Datom::assert(
+            alice.clone(),
+            ":knows".into(),
+            Value::Cid(bob.clone()),
+            t1.clone(),
+        );
         model.insert(d_name_alice.avet_prefix(), d_name_alice);
         model.insert(d_knows_bob.avet_prefix(), d_knows_bob);
         check(&qs, &block_store, &graph, &model, "after commit 1").await;
@@ -4374,9 +4374,19 @@ mod tests {
             .await;
         qs.commit("did:test", graph.clone(), 2).await.unwrap();
         let t2 = qs.head_commit(&graph).await.unwrap().tx_cid;
-        let alice_alice = Datom::assert(alice.clone(), "name".into(), Value::Text("Alice".into()), t2.clone());
+        let alice_alice = Datom::assert(
+            alice.clone(),
+            "name".into(),
+            Value::Text("Alice".into()),
+            t2.clone(),
+        );
         model.remove(&alice_alice.avet_prefix());
-        let d_name_alicia = Datom::assert(alice.clone(), "name".into(), Value::Text("Alicia".into()), t2.clone());
+        let d_name_alicia = Datom::assert(
+            alice.clone(),
+            "name".into(),
+            Value::Text("Alicia".into()),
+            t2.clone(),
+        );
         model.insert(d_name_alicia.avet_prefix(), d_name_alicia);
         check(&qs, &block_store, &graph, &model, "after commit 2").await;
 
@@ -4386,9 +4396,19 @@ mod tests {
             .await;
         qs.commit("did:test", graph.clone(), 3).await.unwrap();
         let t3 = qs.head_commit(&graph).await.unwrap().tx_cid;
-        let knows_bob3 = Datom::assert(alice.clone(), ":knows".into(), Value::Cid(bob.clone()), t3.clone());
+        let knows_bob3 = Datom::assert(
+            alice.clone(),
+            ":knows".into(),
+            Value::Cid(bob.clone()),
+            t3.clone(),
+        );
         model.remove(&knows_bob3.avet_prefix());
-        let d_carol = Datom::assert(carol.clone(), "name".into(), Value::Text("Carol".into()), t3.clone());
+        let d_carol = Datom::assert(
+            carol.clone(),
+            "name".into(),
+            Value::Text("Carol".into()),
+            t3.clone(),
+        );
         model.insert(d_carol.avet_prefix(), d_carol);
         check(&qs, &block_store, &graph, &model, "after commit 3").await;
     }
@@ -4735,7 +4755,11 @@ mod tests {
         let block_store = Arc::new(MemoryBlockStore::new());
         let qs = QuadStore::new(Arc::clone(&journal), Arc::clone(&block_store) as _);
         let unknown = KotobaCid::from_bytes(b"no-graph");
-        assert_eq!(qs.count_by_attribute_prefix(&unknown, "com.etzhayyim/").await, 0);
+        assert_eq!(
+            qs.count_by_attribute_prefix(&unknown, "com.etzhayyim/")
+                .await,
+            0
+        );
     }
 
     #[tokio::test]
@@ -7908,7 +7932,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn crash_recovery_without_journal_replay_via_commit_dag() {
         // ADR-2606041151 A — validates the journal-removal safety gate: with the
@@ -7984,10 +8007,6 @@ mod tests {
             alice_quads.len()
         );
     }
-
-
-
-
 
     // ─── Datalog over IPFS-backed cold storage ────────────────────────────────
 
@@ -8266,7 +8285,6 @@ mod tests {
             "wrong-graph CACAO must be denied"
         );
     }
-
 
     // ─── CID-addressed materialised view cache ─────────────────────────────────
 

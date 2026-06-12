@@ -249,8 +249,8 @@ mod tests {
     use super::*;
     use kotoba_crypto::{AgentCrypto, VaultKeyedCrypto};
     use kotoba_graph::QuadStore;
-    use kotoba_vault::{LiveBus, Vault};
     use kotoba_store::MemoryBlockStore;
+    use kotoba_vault::{LiveBus, Vault};
     use std::sync::Arc;
     use zeroize::Zeroizing;
 
@@ -360,7 +360,9 @@ mod tests {
             assert!(body.contains("Hello from kotoba-ingest!"), "body={body}");
             // Wrong owning CID (blob lifted into another email) → AEAD rejects.
             assert!(
-                ing.decrypt_body("z-wrong-owner-cid", body_cid_mb).await.is_err(),
+                ing.decrypt_body("z-wrong-owner-cid", body_cid_mb)
+                    .await
+                    .is_err(),
                 "body bound to its email CID must not decrypt under a different owner"
             );
         } else {
@@ -467,7 +469,10 @@ mod tests {
         let msg = MessageParser::default().parse(raw).expect("parse");
         let to = addr_header(msg.to());
         assert!(to.contains("bob@example.com"), "first recipient kept: {to}");
-        assert!(to.contains("carol@example.com"), "second recipient kept: {to}");
+        assert!(
+            to.contains("carol@example.com"),
+            "second recipient kept: {to}"
+        );
         assert!(to.contains("Bob"), "display name preserved: {to}");
         let from = addr_header(msg.from());
         assert!(from.contains("alice@example.com") && from.contains("Alice"));
@@ -477,8 +482,14 @@ mod tests {
             Subject: g\r\n\r\nbody";
         let gmsg = MessageParser::default().parse(graw).expect("parse group");
         let gto = addr_header(gmsg.to());
-        assert!(gto.contains("bob@example.com"), "group member 1 flattened: {gto}");
-        assert!(gto.contains("carol@example.com"), "group member 2 flattened: {gto}");
+        assert!(
+            gto.contains("bob@example.com"),
+            "group member 1 flattened: {gto}"
+        );
+        assert!(
+            gto.contains("carol@example.com"),
+            "group member 2 flattened: {gto}"
+        );
     }
 
     #[tokio::test]

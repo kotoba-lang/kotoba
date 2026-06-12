@@ -80,8 +80,14 @@ mod tests {
         let peggy = did("did:key:peggy");
         let quinn = did("did:key:quinn");
         let credits = vec![
-            RetainerCredit { pinner_did: peggy.clone(), mkoto: 963_768 },
-            RetainerCredit { pinner_did: quinn.clone(), mkoto: 36_231 },
+            RetainerCredit {
+                pinner_did: peggy.clone(),
+                mkoto: 963_768,
+            },
+            RetainerCredit {
+                pinner_did: quinn.clone(),
+                mkoto: 36_231,
+            },
         ];
 
         let total = settle_retainer_to_econ(&econ, &credits).await;
@@ -100,18 +106,31 @@ mod tests {
         fn disclosures(&self, epoch: u64) -> Vec<ObservedDisclosure> {
             vec![
                 ObservedDisclosure {
-                    did: self.a.clone(), epoch, n_validated: 2, citation_hits: 5,
-                    terminal_honest: true, witness_quorum_met: true,
+                    did: self.a.clone(),
+                    epoch,
+                    n_validated: 2,
+                    citation_hits: 5,
+                    terminal_honest: true,
+                    witness_quorum_met: true,
                 },
                 // unvalidated → must be dropped by the pipeline
                 ObservedDisclosure {
-                    did: did("did:key:spam"), epoch, n_validated: 99, citation_hits: 0,
-                    terminal_honest: false, witness_quorum_met: false,
+                    did: did("did:key:spam"),
+                    epoch,
+                    n_validated: 99,
+                    citation_hits: 0,
+                    terminal_honest: false,
+                    witness_quorum_met: false,
                 },
             ]
         }
         fn wellbecomings(&self, epoch: u64) -> Vec<ObservedWellbecoming> {
-            vec![ObservedWellbecoming { did: self.a.clone(), epoch, delta: 5, council_attested: true }]
+            vec![ObservedWellbecoming {
+                did: self.a.clone(),
+                epoch,
+                delta: 5,
+                council_attested: true,
+            }]
         }
         fn falsifications(&self, _epoch: u64) -> Vec<Falsification> {
             vec![]
@@ -134,13 +153,26 @@ mod tests {
         let econ = Econ::from_env("did:key:operator".to_string());
         let p = did("did:key:p");
         // first settlement
-        settle_retainer_to_econ(&econ, &[RetainerCredit { pinner_did: p.clone(), mkoto: 100 }]).await;
+        settle_retainer_to_econ(
+            &econ,
+            &[RetainerCredit {
+                pinner_did: p.clone(),
+                mkoto: 100,
+            }],
+        )
+        .await;
         // second settlement accumulates; a zero credit is skipped (no row churn)
         let total = settle_retainer_to_econ(
             &econ,
             &[
-                RetainerCredit { pinner_did: p.clone(), mkoto: 50 },
-                RetainerCredit { pinner_did: did("did:key:zero"), mkoto: 0 },
+                RetainerCredit {
+                    pinner_did: p.clone(),
+                    mkoto: 50,
+                },
+                RetainerCredit {
+                    pinner_did: did("did:key:zero"),
+                    mkoto: 0,
+                },
             ],
         )
         .await;

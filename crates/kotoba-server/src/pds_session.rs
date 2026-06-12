@@ -23,7 +23,12 @@ pub struct PopVerdict {
 }
 
 fn fail(reason: impl Into<String>) -> PopVerdict {
-    PopVerdict { valid: false, did: None, reason: reason.into(), claims: None }
+    PopVerdict {
+        valid: false,
+        did: None,
+        reason: reason.into(),
+        claims: None,
+    }
 }
 
 /// Verify a compact EdDSA JWS session PoP (`b64url(header).b64url(payload).b64url(sig)`)
@@ -59,11 +64,19 @@ pub fn verify_session_pop_with_audience(
     }
     let (h, p, s) = (parts[0], parts[1], parts[2]);
 
-    let header: Value = match B64U.decode(h).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+    let header: Value = match B64U
+        .decode(h)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
         Some(v) => v,
         None => return fail("bad header encoding"),
     };
-    let payload: Value = match B64U.decode(p).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+    let payload: Value = match B64U
+        .decode(p)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
         Some(v) => v,
         None => return fail("bad payload encoding"),
     };
@@ -77,7 +90,12 @@ pub fn verify_session_pop_with_audience(
     };
     if let Some(exp) = payload.get("exp").and_then(Value::as_u64) {
         if exp < now_secs {
-            return PopVerdict { valid: false, did: Some(did), reason: "expired".into(), claims: None };
+            return PopVerdict {
+                valid: false,
+                did: Some(did),
+                reason: "expired".into(),
+                claims: None,
+            };
         }
     }
 
@@ -94,21 +112,47 @@ pub fn verify_session_pop_with_audience(
             }
         },
         Err(e) => {
-            return PopVerdict { valid: false, did: Some(did), reason: format!("DID resolution failed: {e}"), claims: None }
+            return PopVerdict {
+                valid: false,
+                did: Some(did),
+                reason: format!("DID resolution failed: {e}"),
+                claims: None,
+            }
         }
     };
 
     let sig_bytes = match B64U.decode(s) {
         Ok(b) => b,
-        Err(_) => return PopVerdict { valid: false, did: Some(did), reason: "bad signature encoding".into(), claims: None },
+        Err(_) => {
+            return PopVerdict {
+                valid: false,
+                did: Some(did),
+                reason: "bad signature encoding".into(),
+                claims: None,
+            }
+        }
     };
     let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
         Ok(a) => a,
-        Err(_) => return PopVerdict { valid: false, did: Some(did), reason: "signature not 64 bytes".into(), claims: None },
+        Err(_) => {
+            return PopVerdict {
+                valid: false,
+                did: Some(did),
+                reason: "signature not 64 bytes".into(),
+                claims: None,
+            }
+        }
     };
     let vk = match VerifyingKey::from_bytes(&pubkey) {
         Ok(k) => k,
-        Err(_) => return PopVerdict { valid: false, did: Some(did), reason: "bad Ed25519 public key".into(), claims: None },
+        Err(_) => {
+            return PopVerdict {
+                valid: false,
+                did: Some(did),
+                reason: "bad Ed25519 public key".into(),
+                claims: None,
+            }
+        }
     };
     let signing_input = format!("{h}.{p}");
     match vk.verify(signing_input.as_bytes(), &Signature::from_bytes(&sig_arr)) {
@@ -135,9 +179,19 @@ pub fn verify_session_pop_with_audience(
                     }
                 }
             }
-            PopVerdict { valid: true, did: Some(did), reason: "ok".into(), claims: Some(payload) }
+            PopVerdict {
+                valid: true,
+                did: Some(did),
+                reason: "ok".into(),
+                claims: Some(payload),
+            }
         }
-        Err(_) => PopVerdict { valid: false, did: Some(did), reason: "signature invalid".into(), claims: None },
+        Err(_) => PopVerdict {
+            valid: false,
+            did: Some(did),
+            reason: "signature invalid".into(),
+            claims: None,
+        },
     }
 }
 
@@ -155,13 +209,21 @@ mod tests {
     fn make_pop(seed: u8, exp: u64) -> (String, String) {
         let sk = SigningKey::from_bytes(&[seed; 32]);
         let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&sk.verifying_key().to_bytes());
-        let header = B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA", "typ": "pop+jwt" })).unwrap());
+        let header = B64U.encode(
+            serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA", "typ": "pop+jwt" })).unwrap(),
+        );
         let payload = B64U.encode(
-            serde_json::to_vec(&serde_json::json!({ "iss": did, "sub": did, "iat": 1_750_000_000u64, "exp": exp })).unwrap(),
+            serde_json::to_vec(
+                &serde_json::json!({ "iss": did, "sub": did, "iat": 1_750_000_000u64, "exp": exp }),
+            )
+            .unwrap(),
         );
         let signing_input = format!("{header}.{payload}");
         let sig = sk.sign(signing_input.as_bytes());
-        (format!("{signing_input}.{}", B64U.encode(sig.to_bytes())), did)
+        (
+            format!("{signing_input}.{}", B64U.encode(sig.to_bytes())),
+            did,
+        )
     }
 
     /// Build a signed PoP carrying an `aud` claim (or none when `aud` is `None`).
@@ -177,7 +239,10 @@ mod tests {
         let payload = B64U.encode(serde_json::to_vec(&claims).unwrap());
         let signing_input = format!("{header}.{payload}");
         let sig = sk.sign(signing_input.as_bytes());
-        (format!("{signing_input}.{}", B64U.encode(sig.to_bytes())), did)
+        (
+            format!("{signing_input}.{}", B64U.encode(sig.to_bytes())),
+            did,
+        )
     }
 
     #[test]
@@ -249,8 +314,12 @@ mod tests {
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let did = "did:web:etzhayyim.com:actor:alice";
         // sign a PoP for the did:web issuer with sk
-        let header = B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
-        let payload = B64U.encode(serde_json::to_vec(&serde_json::json!({ "iss": did, "exp": 1_750_003_600u64 })).unwrap());
+        let header =
+            B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
+        let payload = B64U.encode(
+            serde_json::to_vec(&serde_json::json!({ "iss": did, "exp": 1_750_003_600u64 }))
+                .unwrap(),
+        );
         let signing_input = format!("{header}.{payload}");
         let sig = sk.sign(signing_input.as_bytes());
         let token = format!("{signing_input}.{}", B64U.encode(sig.to_bytes()));
@@ -260,7 +329,10 @@ mod tests {
             id: format!("{did}#session-key"),
             key_type: ED25519_KEY_TYPE_2020.to_string(),
             controller: did.to_string(),
-            public_key_multibase: multibase::encode(multibase::Base::Base58Btc, sk.verifying_key().as_bytes()),
+            public_key_multibase: multibase::encode(
+                multibase::Base::Base58Btc,
+                sk.verifying_key().as_bytes(),
+            ),
         });
         let resolver = InMemoryDidResolver::new();
         resolver.insert(did, doc);
@@ -275,7 +347,11 @@ mod tests {
         // empty resolver → did:key method unavailable → resolution fails
         let v = verify_session_pop(&token, &CompositeDidResolver::new(), 1_750_000_100);
         assert!(!v.valid);
-        assert!(v.reason.contains("resolution failed"), "reason={}", v.reason);
+        assert!(
+            v.reason.contains("resolution failed"),
+            "reason={}",
+            v.reason
+        );
     }
 
     // ── error-path coverage ───────────────────────────────────────────────────
@@ -285,7 +361,11 @@ mod tests {
         for bad in ["", "only-one", "two.parts", "a.b.c.d"] {
             let v = verify_session_pop(bad, &didkey_resolver(), 1_750_000_100);
             assert!(!v.valid, "{bad:?} should be rejected");
-            assert!(v.reason.contains("malformed") || v.reason.contains("encoding") || v.reason.contains("alg"));
+            assert!(
+                v.reason.contains("malformed")
+                    || v.reason.contains("encoding")
+                    || v.reason.contains("alg")
+            );
         }
     }
 
@@ -324,7 +404,11 @@ mod tests {
         parts[2] = &short_sig;
         let v = verify_session_pop(&parts.join("."), &didkey_resolver(), 1_750_000_100);
         assert!(!v.valid);
-        assert!(v.reason.contains("64 bytes") || v.reason.contains("invalid"), "reason={}", v.reason);
+        assert!(
+            v.reason.contains("64 bytes") || v.reason.contains("invalid"),
+            "reason={}",
+            v.reason
+        );
     }
 
     #[test]
@@ -336,11 +420,14 @@ mod tests {
         // from `tampered_payload_rejected`, which swaps to an *invalid* issuer that
         // fails at resolution rather than at the signature check.
         let victim_sk = SigningKey::from_bytes(&[7u8; 32]);
-        let victim_did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
+        let victim_did =
+            kotoba_auth::did_key::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
         let attacker_sk = SigningKey::from_bytes(&[8u8; 32]); // not the victim's key
-        let header = B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
+        let header =
+            B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
         let payload = B64U.encode(
-            serde_json::to_vec(&serde_json::json!({ "iss": victim_did, "exp": 1_750_003_600u64 })).unwrap(),
+            serde_json::to_vec(&serde_json::json!({ "iss": victim_did, "exp": 1_750_003_600u64 }))
+                .unwrap(),
         );
         let signing_input = format!("{header}.{payload}");
         let sig = attacker_sk.sign(signing_input.as_bytes()); // valid sig, wrong signer
@@ -348,7 +435,11 @@ mod tests {
 
         let v = verify_session_pop(&token, &didkey_resolver(), 1_750_000_100);
         assert!(!v.valid, "a PoP signed by a non-DID key must not verify");
-        assert_eq!(v.did.as_deref(), Some(victim_did.as_str()), "iss still extracted");
+        assert_eq!(
+            v.did.as_deref(),
+            Some(victim_did.as_str()),
+            "iss still extracted"
+        );
         assert_eq!(v.reason, "signature invalid");
     }
 

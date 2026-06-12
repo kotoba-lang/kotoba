@@ -59,7 +59,11 @@ pub fn produce_block(
     // seed the evolving view with the prior state.
     let mut view = EvmStateView::new();
     view.apply(
-        &prior_state_datoms.iter().cloned().map(Delta::assert_datom).collect::<Vec<_>>(),
+        &prior_state_datoms
+            .iter()
+            .cloned()
+            .map(Delta::assert_datom)
+            .collect::<Vec<_>>(),
     );
 
     let mut diff: Vec<Datom> = Vec::new();
@@ -71,7 +75,13 @@ pub fn produce_block(
         match apply_raw_tx(&view, raw, graph) {
             Ok((_tx, out)) if out.success => {
                 // fold this tx's diff into the evolving view so the next tx sees it.
-                view.apply(&out.datoms.iter().cloned().map(Delta::assert_datom).collect::<Vec<_>>());
+                view.apply(
+                    &out.datoms
+                        .iter()
+                        .cloned()
+                        .map(Delta::assert_datom)
+                        .collect::<Vec<_>>(),
+                );
                 diff.extend(out.datoms);
                 logs.extend(out.logs);
                 applied += 1;
@@ -83,7 +93,10 @@ pub fn produce_block(
     let bloom = logs_bloom(&logs);
 
     let state_root = view.state_root();
-    let parent_tag = parent.as_ref().map(|c| c.to_multibase()).unwrap_or_default();
+    let parent_tag = parent
+        .as_ref()
+        .map(|c| c.to_multibase())
+        .unwrap_or_default();
     let header = format!(
         "kotoba-evm/block/v1\n{number}\n{parent_tag}\n{timestamp}\n{applied}\n{}",
         state_root.to_multibase()
@@ -91,7 +104,14 @@ pub fn produce_block(
     let block_cid = KotobaCid::from_bytes(header.as_bytes());
 
     ProducedBlock {
-        block: EvmBlock { number, parent, timestamp, tx_count: applied, state_root, block_cid },
+        block: EvmBlock {
+            number,
+            parent,
+            timestamp,
+            tx_count: applied,
+            state_root,
+            block_cid,
+        },
         datoms: diff,
         logs,
         logs_bloom: bloom,
@@ -134,7 +154,14 @@ mod tests {
 
         // the diff advances state: recipient credited, sender nonce bumped.
         let mut pv = EvmStateView::new();
-        pv.apply(&produced.datoms.iter().cloned().map(Delta::assert_datom).collect::<Vec<_>>());
+        pv.apply(
+            &produced
+                .datoms
+                .iter()
+                .cloned()
+                .map(Delta::assert_datom)
+                .collect::<Vec<_>>(),
+        );
         let mut to = [0u8; 20];
         to.copy_from_slice(&hex::decode("3535353535353535353535353535353535353535").unwrap());
         assert_eq!(pv.balance_of(&to), u256(1_000_000_000_000_000_000));
@@ -149,11 +176,24 @@ mod tests {
 
         let b1 = produce_block(&genesis, &[raw.clone()], None, 1, 100, &graph());
         let b1again = produce_block(&genesis, &[raw.clone()], None, 1, 100, &graph());
-        assert_eq!(b1.block.block_cid, b1again.block.block_cid, "deterministic block hash");
-        assert_eq!(b1.block.state_root, b1again.block.state_root, "deterministic state root");
+        assert_eq!(
+            b1.block.block_cid, b1again.block.block_cid,
+            "deterministic block hash"
+        );
+        assert_eq!(
+            b1.block.state_root, b1again.block.state_root,
+            "deterministic state root"
+        );
 
         // block 2 links block 1 as parent → distinct CID.
-        let b2 = produce_block(&genesis, &[], Some(b1.block.block_cid.clone()), 2, 200, &graph());
+        let b2 = produce_block(
+            &genesis,
+            &[],
+            Some(b1.block.block_cid.clone()),
+            2,
+            200,
+            &graph(),
+        );
         assert_eq!(b2.block.parent, Some(b1.block.block_cid.clone()));
         assert_ne!(b2.block.block_cid, b1.block.block_cid);
     }
@@ -168,6 +208,9 @@ mod tests {
         let produced = produce_block(&genesis, &[bad, good], None, 1, 1, &graph());
         assert_eq!(produced.block.tx_count, 1, "good tx applied, bad rejected");
         assert_eq!(produced.rejected.len(), 1);
-        assert_eq!(produced.rejected[0].0, 0, "the bad tx (index 0) was rejected");
+        assert_eq!(
+            produced.rejected[0].0, 0,
+            "the bad tx (index 0) was rejected"
+        );
     }
 }

@@ -147,7 +147,7 @@ impl DatalogProgram {
 
         // Seed from assert deltas only (retracts handled by caller via Arrangement)
         for d in deltas {
-            if d.datom.op != true {
+            if !d.datom.op {
                 continue;
             }
             if let Some(obj_cid) = value_to_cid(d.value()) {
@@ -813,26 +813,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn derived_facts_cap_constant_is_reasonable() {
+    const _: () = {
         // Sanity check: the safety constants have sensible values.
-        assert!(
-            MAX_DATALOG_ITERATIONS >= 100,
-            "iteration limit must be at least 100"
-        );
-        assert!(
-            MAX_DATALOG_ITERATIONS <= 100_000,
-            "iteration limit should not be excessively high"
-        );
-        assert!(
-            MAX_DERIVED_FACTS >= 10_000,
-            "derived fact cap must allow reasonable programs"
-        );
-        assert!(
-            MAX_DERIVED_FACTS <= 100_000_000,
-            "derived fact cap should not be excessively high"
-        );
-    }
+        assert!(MAX_DATALOG_ITERATIONS >= 100);
+        assert!(MAX_DATALOG_ITERATIONS <= 100_000);
+        assert!(MAX_DERIVED_FACTS >= 10_000);
+        assert!(MAX_DERIVED_FACTS <= 100_000_000);
+    };
 
     // ── Arity guards (reject malformed user-supplied rules gracefully) ─────────
 

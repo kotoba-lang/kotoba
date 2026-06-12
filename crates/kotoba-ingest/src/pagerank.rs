@@ -79,10 +79,7 @@ pub fn pagerank(num_nodes: usize, edges: &[(usize, usize)], cfg: PageRankConfig)
         let mut next = vec![(1.0 - d) / n as f64; n];
 
         // Dangling mass: rank of nodes with no outlinks, spread uniformly.
-        let dangling: f64 = (0..n)
-            .filter(|&i| out_deg[i] == 0)
-            .map(|i| rank[i])
-            .sum();
+        let dangling: f64 = (0..n).filter(|&i| out_deg[i] == 0).map(|i| rank[i]).sum();
         let dangling_share = d * dangling / n as f64;
         for v in next.iter_mut() {
             *v += dangling_share;
@@ -100,7 +97,11 @@ pub fn pagerank(num_nodes: usize, edges: &[(usize, usize)], cfg: PageRankConfig)
         }
 
         // Convergence check (L1).
-        let delta: f64 = rank.iter().zip(next.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let delta: f64 = rank
+            .iter()
+            .zip(next.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         rank = next;
         if delta < cfg.tol {
             break;
@@ -140,11 +141,7 @@ impl PageRankIndex {
     /// Score normalised to `[0, 1]` by the index maximum (handy as a fusion
     /// boost factor).  Returns 0.0 for unknown pages.
     pub fn normalized_score(&self, cid: &KotobaCid) -> f64 {
-        let max = self
-            .scores
-            .values()
-            .map(|(_, s)| *s)
-            .fold(0.0f64, f64::max);
+        let max = self.scores.values().map(|(_, s)| *s).fold(0.0f64, f64::max);
         if max <= 0.0 {
             return 0.0;
         }
@@ -177,8 +174,8 @@ impl PageRankIndex {
         let mut idx_edges: Vec<(usize, usize)> = Vec::with_capacity(edges.len());
 
         let intern = |cid: &KotobaCid,
-                          id_of: &mut HashMap<String, usize>,
-                          cids: &mut Vec<KotobaCid>|
+                      id_of: &mut HashMap<String, usize>,
+                      cids: &mut Vec<KotobaCid>|
          -> usize {
             let mb = cid.to_multibase();
             if let Some(&id) = id_of.get(&mb) {
@@ -355,9 +352,11 @@ mod tests {
         //   3 = H → 4 = X                (X inherits H's authority)
         //   5 = L → 6 = Y                (Y inherits ~teleport-only authority)
         let edges = [
-            (0usize, 3usize), (1, 3), (2, 3), // A,B,C → H
-            (3, 4),                            // H → X
-            (5, 6),                            // L → Y
+            (0usize, 3usize),
+            (1, 3),
+            (2, 3), // A,B,C → H
+            (3, 4), // H → X
+            (5, 6), // L → Y
         ];
         let r = pagerank(7, &edges, PageRankConfig::default());
         let (x, y) = (r[4], r[6]);
@@ -376,9 +375,15 @@ mod tests {
         // must remain a probability distribution.
         let edges = [(0usize, 0usize), (0, 1)]; // node 0 self-loops AND links to 1
         let r = pagerank(2, &edges, PageRankConfig::default());
-        assert!(r.iter().all(|v| v.is_finite()), "no NaN/inf with a self-loop");
+        assert!(
+            r.iter().all(|v| v.is_finite()),
+            "no NaN/inf with a self-loop"
+        );
         let sum: f64 = r.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-6, "self-loop must not leak/inflate mass, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "self-loop must not leak/inflate mass, got {sum}"
+        );
     }
 
     #[test]
@@ -424,11 +429,7 @@ mod tests {
         let restored = PageRankIndex::from_datoms(&datoms).expect("restore");
         assert_eq!(restored.len(), idx.len());
         for (cid, (_, s)) in &idx.scores {
-            let back = restored
-                .scores
-                .get(cid)
-                .expect("missing restored score")
-                .1;
+            let back = restored.scores.get(cid).expect("missing restored score").1;
             assert!((back - s).abs() < 1e-9);
         }
     }

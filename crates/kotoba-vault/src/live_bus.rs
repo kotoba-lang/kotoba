@@ -271,8 +271,6 @@ mod tests {
         assert_eq!(all[2].seq, 4);
     }
 
-
-
     // ── additional gap tests ──────────────────────────────────────────────────
 
     #[tokio::test]

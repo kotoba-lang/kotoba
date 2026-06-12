@@ -4,7 +4,7 @@ Flagship port of kotodama's ARIA actor onto the WASM-native ``kotoba_langgraph``
 API so it compiles to a kotoba-node component (`componentize-py`) and runs
 in-WASM on a live kotoba server (`:8077`) via invoke.run / kotoba_wasm_run.
 
-This module is the *build entrypoint*: ``scripts/build-pywasm.sh`` runs
+This module is the *build entrypoint*: ``scripts/build-pywasm.bb`` runs
 ``componentize-py componentize agent`` against the module basename, so the file
 MUST be named ``agent.py`` and MUST expose the ``WitWorld.run`` export.
 
@@ -22,7 +22,7 @@ model is **gemma-4-26B-A4B** (MoE) via LiteLLM 127.0.0.1:4000 per ADR-2605302355
 ``model_cid=""`` so the host's ``MURAKUMO_DEFAULT_MODEL`` selects gemma-4-26B-A4B.
 
 Build:
-    ./scripts/build-pywasm.sh examples/kotoba-langgraph-aria/agent.py
+    ./scripts/build-pywasm.bb examples/kotoba-langgraph-aria/agent.py
 Deploy (in-WASM on the running :8077 node — see README.md for the exact call):
     kotoba_wasm_run / invoke.run with the produced agent.wasm
 """

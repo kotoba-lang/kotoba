@@ -10,8 +10,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use kotoba_server::server::KotobaState;
 use kotoba_server::build_router;
+use kotoba_server::server::KotobaState;
 
 /// Run `git` in `cwd` with a hermetic environment (no user/system config, no
 /// credential prompt). Panics with captured stderr on failure.
@@ -125,7 +125,10 @@ async fn real_git_clone_push_fetch_over_kotoba() {
 
     git(&clone, &["fetch", "-q", "origin"]);
     let fetched_tip = git(&clone, &["rev-parse", "origin/main"]);
-    assert_eq!(fetched_tip, head2, "incremental fetch must deliver the new tip");
+    assert_eq!(
+        fetched_tip, head2,
+        "incremental fetch must deliver the new tip"
+    );
 
     // ── Clean up scratch dir (best-effort). ──────────────────────────────────
     let _ = std::fs::remove_dir_all(&work);

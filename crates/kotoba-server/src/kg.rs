@@ -40,8 +40,8 @@ use kotoba_query::{
     quad::LegacyQuad,
     quad::LegacyQuadObject as QuadObject,
 };
-use kotoba_vault::live_bus::LiveBus;
 use kotoba_store::MemoryBlockStore;
+use kotoba_vault::live_bus::LiveBus;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1829,12 +1829,16 @@ pub async fn kg_mv_register(
         return Err((StatusCode::BAD_REQUEST, "query too large".into()));
     }
     let program = match req.lang.as_str() {
-        "sparql" => SparqlCompiler::compile(&req.query, &req.name)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("SPARQL compile: {e}")))?
-            .program,
-        "cypher" => CypherCompiler::compile(&req.query, &req.name)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Cypher compile: {e}")))?
-            .program,
+        "sparql" => {
+            SparqlCompiler::compile(&req.query, &req.name)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("SPARQL compile: {e}")))?
+                .program
+        }
+        "cypher" => {
+            CypherCompiler::compile(&req.query, &req.name)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Cypher compile: {e}")))?
+                .program
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1966,7 +1970,10 @@ pub async fn kg_query(
     )?;
     // Persist emit_cid envelopes only for Public graphs (block.get is
     // unauthenticated — see put_envelope).
-    let kg_persist = matches!(visibility, kotoba_core::named_graph::GraphVisibility::Public);
+    let kg_persist = matches!(
+        visibility,
+        kotoba_core::named_graph::GraphVisibility::Public
+    );
 
     // ADR-2606041151 B — route through a maintained MaterializedView when the
     // caller names one. Serves the incrementally-maintained result (read from the
@@ -1974,9 +1981,12 @@ pub async fn kg_query(
     // from-scratch evaluation below — first-tier Datomic-Datalog.
     if let Some(mv_name) = req.mv_name.as_deref() {
         let reg = state.mv_registry.read().await;
-        let arr = reg
-            .result(mv_name)
-            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no maintained view '{mv_name}'")))?;
+        let arr = reg.result(mv_name).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("no maintained view '{mv_name}'"),
+            )
+        })?;
         let rows: Vec<serde_json::Value> = arr
             .current_datoms()
             .into_iter()
@@ -1998,12 +2008,16 @@ pub async fn kg_query(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (spec, job, result_cid) =
-                query_emit_cids(&state, &lang, &req.query, None, None, None, &canonical, kg_persist);
+            let (spec, job, result_cid) = query_emit_cids(
+                &state, &lang, &req.query, None, None, None, &canonical, kg_persist,
+            );
             if let Some(obj) = response.as_object_mut() {
                 obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
                 obj.insert("queryJobCid".to_string(), serde_json::Value::String(job));
-                obj.insert("resultCid".to_string(), serde_json::Value::String(result_cid));
+                obj.insert(
+                    "resultCid".to_string(),
+                    serde_json::Value::String(result_cid),
+                );
             }
         }
         return Ok(Json(response));
@@ -2127,12 +2141,16 @@ pub async fn kg_query(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (spec, job, result_cid) =
-            query_emit_cids(&state, &lang, &req.query, None, None, None, &canonical, kg_persist);
+        let (spec, job, result_cid) = query_emit_cids(
+            &state, &lang, &req.query, None, None, None, &canonical, kg_persist,
+        );
         if let Some(obj) = response.as_object_mut() {
             obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
             obj.insert("queryJobCid".to_string(), serde_json::Value::String(job));
-            obj.insert("resultCid".to_string(), serde_json::Value::String(result_cid));
+            obj.insert(
+                "resultCid".to_string(),
+                serde_json::Value::String(result_cid),
+            );
         }
     }
     Ok(Json(response))
@@ -2356,7 +2374,10 @@ pub async fn kg_sparql(
         if let Some(obj) = response.as_object_mut() {
             obj.insert("querySpecCid".to_string(), serde_json::Value::String(spec));
             obj.insert("queryJobCid".to_string(), serde_json::Value::String(job));
-            obj.insert("resultCid".to_string(), serde_json::Value::String(result_cid));
+            obj.insert(
+                "resultCid".to_string(),
+                serde_json::Value::String(result_cid),
+            );
         }
     }
     Ok(Json(response))
@@ -2837,11 +2858,10 @@ mod tests {
         let state = Arc::new(state.init_crypto().await.unwrap());
         let graph = kg_graph_cid();
         // Public so the kg_entity read gate passes without a CACAO.
-        state
-            .graph_registry
-            .write()
-            .await
-            .insert(graph.clone(), ("kg-default".into(), GraphVisibility::Public));
+        state.graph_registry.write().await.insert(
+            graph.clone(),
+            ("kg-default".into(), GraphVisibility::Public),
+        );
 
         // ── Ingest one sensitive + one non-sensitive claim via the real handler ──
         let resp = kg_ingest(
@@ -3292,10 +3312,11 @@ mod tests {
         let state = Arc::new(KotobaState::new(None).unwrap());
         // Register the fixed kg graph as Public in this test's own state so the
         // read-access gate passes without CACAO (no global env mutation).
-        state.graph_registry.write().await.insert(
-            kg_graph_cid(),
-            ("kg".into(), GraphVisibility::Public),
-        );
+        state
+            .graph_registry
+            .write()
+            .await
+            .insert(kg_graph_cid(), ("kg".into(), GraphVisibility::Public));
 
         let resp = kg_query(
             State(Arc::clone(&state)),
@@ -3429,7 +3450,10 @@ mod tests {
             .iter()
             .filter(|d| d.attribute() == "out" && d.is_assert())
             .count();
-        assert_eq!(n, 1, "equality on scalar text must filter to the matching row");
+        assert_eq!(
+            n, 1,
+            "equality on scalar text must filter to the matching row"
+        );
 
         // Non-equality operators are rejected at compile (fail-loud).
         for sql in [
@@ -3480,8 +3504,7 @@ mod tests {
             .collect();
 
         // A derived fact carries the object as Value::Cid(object_value_cid(value)).
-        let admin_cid =
-            kotoba_query::object_value_cid(&Value::Text("admin".into())).unwrap();
+        let admin_cid = kotoba_query::object_value_cid(&Value::Text("admin".into())).unwrap();
         assert_eq!(
             index.get(&admin_cid.to_multibase()).map(String::as_str),
             Some("admin"),
@@ -3511,21 +3534,40 @@ mod tests {
         let resp_ba = serde_json::json!({"form": "select", "basisT": "tx1", "quads": [q2.clone(), q1.clone()]});
 
         // Canonical result is identical regardless of quad order.
-        assert_eq!(query_canonical_result(&resp_ab), query_canonical_result(&resp_ba));
+        assert_eq!(
+            query_canonical_result(&resp_ab),
+            query_canonical_result(&resp_ba)
+        );
 
         let sparql = "SELECT ?s WHERE { ?s ?p ?o }";
         let emit = |resp: &serde_json::Value| {
-            query_emit_cids(&state, "sparql", sparql, Some("tx1"), None, None, &query_canonical_result(resp), true)
+            query_emit_cids(
+                &state,
+                "sparql",
+                sparql,
+                Some("tx1"),
+                None,
+                None,
+                &query_canonical_result(resp),
+                true,
+            )
         };
         let (spec_ab, job_ab, result_ab) = emit(&resp_ab);
         let (_, _, result_ba) = emit(&resp_ba);
         // 1. Order-independence: a reordered bag yields the SAME resultCid.
-        assert_eq!(result_ab, result_ba, "reordered SPARQL bag must yield the same resultCid");
+        assert_eq!(
+            result_ab, result_ba,
+            "reordered SPARQL bag must yield the same resultCid"
+        );
 
         // 2. Tamper-evidence: a changed object moves resultCid.
         let q2b = serde_json::json!({"subject": "b", "predicate": "p", "object": {"text": "999"}});
         let resp_t = serde_json::json!({"form": "select", "basisT": "tx1", "quads": [q1, q2b]});
-        assert_ne!(result_ab, emit(&resp_t).2, "changed quad must move resultCid");
+        assert_ne!(
+            result_ab,
+            emit(&resp_t).2,
+            "changed quad must move resultCid"
+        );
 
         // 3. Canonicalization: whitespace-only query edits don't move querySpecCid.
         let (spec_spaced, _, _) = query_emit_cids(
@@ -3538,12 +3580,18 @@ mod tests {
             &query_canonical_result(&resp_ab),
             true,
         );
-        assert_eq!(spec_ab, spec_spaced, "whitespace must not move querySpecCid");
+        assert_eq!(
+            spec_ab, spec_spaced,
+            "whitespace must not move querySpecCid"
+        );
 
         // 4. Verify-by-CID: every envelope was persisted.
         for cid in [&spec_ab, &job_ab, &result_ab] {
             let kcid = kotoba_core::cid::KotobaCid::from_multibase(cid).unwrap();
-            assert!(state.block_store.get(&kcid).unwrap().is_some(), "envelope persisted: {cid}");
+            assert!(
+                state.block_store.get(&kcid).unwrap().is_some(),
+                "envelope persisted: {cid}"
+            );
         }
     }
 
@@ -3561,12 +3609,17 @@ mod tests {
         // The "results" field is read and canonicalized order-independently.
         let canon = query_canonical_result(&resp_ab);
         assert_eq!(canon.len(), 2, "results field is read");
-        assert_eq!(canon, query_canonical_result(&resp_ba), "results order must not matter");
+        assert_eq!(
+            canon,
+            query_canonical_result(&resp_ba),
+            "results order must not matter"
+        );
 
         // lang is part of querySpec → same query text, different dialect → different CID.
         let q = "SELECT a, b FROM t";
         let (spec_sql, _, _) = query_emit_cids(&state, "sql", q, None, None, None, &canon, true);
-        let (spec_cypher, _, _) = query_emit_cids(&state, "cypher", q, None, None, None, &canon, true);
+        let (spec_cypher, _, _) =
+            query_emit_cids(&state, "cypher", q, None, None, None, &canon, true);
         assert_ne!(spec_sql, spec_cypher, "lang must be part of querySpecCid");
     }
 }

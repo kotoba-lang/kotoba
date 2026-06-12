@@ -68,7 +68,11 @@ fn main() {
             kotoba_query::datom::Value::Integer(n) => pts(*n),
             _ => "?".into(),
         };
-        println!("  {}  {}  = {v}", &d.e.to_string()[..20.min(d.e.to_string().len())], d.a);
+        println!(
+            "  {}  {}  = {v}",
+            &d.e.to_string()[..20.min(d.e.to_string().len())],
+            d.a
+        );
     }
 
     // ── 3. SocialCapitalView reducer (decayed balances over the Datom stream) ──
@@ -85,8 +89,16 @@ fn main() {
     // ── 4. Retainer allocation (donation pool split by social capital, §6) ──
     // Three pins; alice originated rootA, bob rootB, alice+bob co-originated rootC.
     let pins = [
-        PinOrigin { pin_id: did("pinA"), root_cid: did("rootA"), origin_dids: vec![alice.clone()] },
-        PinOrigin { pin_id: did("pinB"), root_cid: did("rootB"), origin_dids: vec![bob.clone()] },
+        PinOrigin {
+            pin_id: did("pinA"),
+            root_cid: did("rootA"),
+            origin_dids: vec![alice.clone()],
+        },
+        PinOrigin {
+            pin_id: did("pinB"),
+            root_cid: did("rootB"),
+            origin_dids: vec![bob.clone()],
+        },
         PinOrigin {
             pin_id: did("pinC"),
             root_cid: did("rootC"),
@@ -107,7 +119,10 @@ fn main() {
     }
     println!("  undistributed remainder (rolls over) = {remainder} mKOTO");
     let total: i64 = shares.iter().map(|s| s.retainer_mkoto).sum();
-    println!("  conservation: Σ shares + remainder = {} == pool ✓", total + remainder);
+    println!(
+        "  conservation: Σ shares + remainder = {} == pool ✓",
+        total + remainder
+    );
 
     // ── 5. Decay re-weights allocation over time ──
     // 30 days (one half-life) later, with no new acts, every balance ~halves —
@@ -126,7 +141,11 @@ fn main() {
     println!("retainer @ epoch 30 (pool = {pool_mkoto} mKOTO):");
     for (s, p) in shares30.iter().zip(pins.iter()) {
         let root = &p.root_cid.to_string()[..16.min(p.root_cid.to_string().len())];
-        println!("  {root}…  SC_root={:>8}  → {:>7} mKOTO", pts(s.sc_root), s.retainer_mkoto);
+        println!(
+            "  {root}…  SC_root={:>8}  → {:>7} mKOTO",
+            pts(s.sc_root),
+            s.retainer_mkoto
+        );
     }
 
     // ── 6. L6 settlement: RetainerShare → pinner mKOTO credit ──
@@ -145,15 +164,25 @@ fn main() {
     let (credits, total) = settle_retainer(&shares, pinner_of);
     let mut wallet: HashMap<KotobaCid, i64> = HashMap::new();
     apply_retainer_credits(&mut wallet, &credits);
-    println!("\nL6 settlement @ epoch 0 — pinner mKOTO credits (peggy keeps pinA+pinC, quinn pinB):");
+    println!(
+        "\nL6 settlement @ epoch 0 — pinner mKOTO credits (peggy keeps pinA+pinC, quinn pinB):"
+    );
     for c in &credits {
-        let who = if c.pinner_did == peggy { "peggy" } else { "quinn" };
+        let who = if c.pinner_did == peggy {
+            "peggy"
+        } else {
+            "quinn"
+        };
         println!("  {who:6} += {:>7} mKOTO", c.mkoto);
     }
     println!("  settled total = {total} mKOTO (aggregated; non-transferable, internal accounting)");
 
     // sanity: a falsification burns more than it earned (asymmetric 嘘で損)
-    let f = Falsification { did: alice.clone(), epoch: 30, count: 2 };
+    let f = Falsification {
+        did: alice.clone(),
+        epoch: 30,
+        count: 2,
+    };
     println!(
         "\nfalsification burn (alice, 2 claims): {} (> the 2.0 pts they'd have earned) ✓",
         pts(f.burn_smic(&params))

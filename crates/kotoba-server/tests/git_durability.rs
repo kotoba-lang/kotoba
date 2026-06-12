@@ -97,7 +97,10 @@ async fn pushed_repo_survives_projection_loss() {
     // ── Simulate a restart: discard the resident datomic projection. ──────────
     {
         let mut repos = probe.git_repos.write().await;
-        assert!(repos.contains_key("durable"), "repo should be resident after push");
+        assert!(
+            repos.contains_key("durable"),
+            "repo should be resident after push"
+        );
         repos.clear();
     }
 
@@ -106,7 +109,10 @@ async fn pushed_repo_survives_projection_loss() {
     let got = std::fs::read_to_string(work.join("clone").join("data.txt")).unwrap();
     assert_eq!(got, "durable content\n");
     let cloned_head = git(&work.join("clone"), &["rev-parse", "HEAD"]);
-    assert_eq!(cloned_head, head, "rehydrated tip must equal the pushed tip");
+    assert_eq!(
+        cloned_head, head,
+        "rehydrated tip must equal the pushed tip"
+    );
 
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&base);

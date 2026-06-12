@@ -28,7 +28,8 @@ use sha1::Sha1;
 
 type HmacSha1 = Hmac<Sha1>;
 
-const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 
 /// HMAC-SHA1 of `message` under `secret`, base64 (standard alphabet, padded).
 pub fn hmac_sha1_base64(secret: &str, message: &str) -> String {
@@ -51,7 +52,11 @@ pub struct Credential {
 pub fn mint(secret: &str, room: &str, player: u32, expires_at: u64) -> Credential {
     let username = format!("{expires_at}:{room}:{player}");
     let credential = hmac_sha1_base64(secret, &username);
-    Credential { username, credential, expires_at }
+    Credential {
+        username,
+        credential,
+        expires_at,
+    }
 }
 
 /// The room/player a verified credential authorizes.
@@ -77,7 +82,12 @@ pub enum AuthError {
 
 /// Verify a credential exactly as the relay's `Allocate` handler must: structure,
 /// expiry, then a constant-time HMAC check. `now` is unix seconds.
-pub fn verify(secret: &str, username: &str, credential: &str, now: u64) -> Result<Scope, AuthError> {
+pub fn verify(
+    secret: &str,
+    username: &str,
+    credential: &str,
+    now: u64,
+) -> Result<Scope, AuthError> {
     let parts: Vec<&str> = username.split(':').collect();
     if parts.len() != 3 {
         return Err(AuthError::Malformed);
@@ -88,11 +98,19 @@ pub fn verify(secret: &str, username: &str, credential: &str, now: u64) -> Resul
         return Err(AuthError::Expired);
     }
     // Constant-time: decode the presented MAC and let `verify_slice` compare.
-    let presented = B64.decode(credential).map_err(|_| AuthError::BadSignature)?;
-    let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).map_err(|_| AuthError::BadSignature)?;
+    let presented = B64
+        .decode(credential)
+        .map_err(|_| AuthError::BadSignature)?;
+    let mut mac =
+        HmacSha1::new_from_slice(secret.as_bytes()).map_err(|_| AuthError::BadSignature)?;
     mac.update(username.as_bytes());
-    mac.verify_slice(&presented).map_err(|_| AuthError::BadSignature)?;
-    Ok(Scope { room: parts[1].to_string(), player, expires_at })
+    mac.verify_slice(&presented)
+        .map_err(|_| AuthError::BadSignature)?;
+    Ok(Scope {
+        room: parts[1].to_string(),
+        player,
+        expires_at,
+    })
 }
 
 #[cfg(test)]
@@ -114,26 +132,45 @@ mod tests {
         let c = mint("k", "room-1", 7, 1_700_000_600);
         assert_eq!(c.username, "1700000600:room-1:7");
         let scope = verify("k", &c.username, &c.credential, 1_700_000_000).unwrap();
-        assert_eq!(scope, Scope { room: "room-1".into(), player: 7, expires_at: 1_700_000_600 });
+        assert_eq!(
+            scope,
+            Scope {
+                room: "room-1".into(),
+                player: 7,
+                expires_at: 1_700_000_600
+            }
+        );
     }
 
     #[test]
     fn rejects_expired() {
         let c = mint("k", "r", 1, 1_700_000_060);
-        assert_eq!(verify("k", &c.username, &c.credential, 1_700_000_061), Err(AuthError::Expired));
+        assert_eq!(
+            verify("k", &c.username, &c.credential, 1_700_000_061),
+            Err(AuthError::Expired)
+        );
     }
 
     #[test]
     fn rejects_tampered_and_wrong_secret() {
         let c = mint("k", "r", 1, 1_700_000_600);
         let tampered = format!("{}A", c.credential);
-        assert_eq!(verify("k", &c.username, &tampered, 1_700_000_000), Err(AuthError::BadSignature));
-        assert_eq!(verify("WRONG", &c.username, &c.credential, 1_700_000_000), Err(AuthError::BadSignature));
+        assert_eq!(
+            verify("k", &c.username, &tampered, 1_700_000_000),
+            Err(AuthError::BadSignature)
+        );
+        assert_eq!(
+            verify("WRONG", &c.username, &c.credential, 1_700_000_000),
+            Err(AuthError::BadSignature)
+        );
     }
 
     #[test]
     fn rejects_malformed_username() {
         assert_eq!(verify("k", "no-colons", "x", 0), Err(AuthError::Malformed));
-        assert_eq!(verify("k", "1700000600:r", "x", 0), Err(AuthError::Malformed));
+        assert_eq!(
+            verify("k", "1700000600:r", "x", 0),
+            Err(AuthError::Malformed)
+        );
     }
 }

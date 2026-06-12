@@ -118,10 +118,7 @@ mod interop {
         let value: ciborium::value::Value =
             ciborium::from_reader(&out[..]).expect("ciborium decode");
         let arr = value.as_array().expect("a CBOR array");
-        let nums: Vec<i128> = arr
-            .iter()
-            .map(|v| v.as_integer().unwrap().into())
-            .collect();
+        let nums: Vec<i128> = arr.iter().map(|v| v.as_integer().unwrap().into()).collect();
         assert_eq!(nums, vec![1, 2, 3]);
     }
 }

@@ -202,7 +202,15 @@ pub fn decode_and_recover(raw: &[u8]) -> Result<RecoveredTx, String> {
     sig[64] = rec_id;
     let from = recover_eth_address(&sign_hash, &sig).map_err(|e| format!("recover: {e}"))?;
 
-    Ok(RecoveredTx { from, to, value, input, nonce, gas_limit, chain_id })
+    Ok(RecoveredTx {
+        from,
+        to,
+        value,
+        input,
+        nonce,
+        gas_limit,
+        chain_id,
+    })
 }
 
 /// `eth_sendRawTransaction`: decode + recover + execute over the Datom state.
@@ -282,7 +290,10 @@ mod tests {
             "9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f",
             "EIP-155 canonical sender"
         );
-        assert_eq!(hex::encode(tx.to.unwrap()), "3535353535353535353535353535353535353535");
+        assert_eq!(
+            hex::encode(tx.to.unwrap()),
+            "3535353535353535353535353535353535353535"
+        );
         assert_eq!(tx.value, U256::from(1_000_000_000_000_000_000u128));
         assert_eq!(tx.nonce, 9);
         assert_eq!(tx.chain_id, Some(1));

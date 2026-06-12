@@ -4,7 +4,7 @@ Port of `20-actors/gov-municipality/cells/inspection_scheduling/cell.py`
 onto the WASM-native `kotoba_langgraph` API so it compiles to a kotoba-node component.
 
 Build:
-    ../../scripts/build-pywasm.sh inspection_scheduling_kotoba.py -o inspection_scheduling_kotoba.wasm
+    ../../scripts/build-pywasm.bb inspection_scheduling_kotoba.py -o inspection_scheduling_kotoba.wasm
 """
 
 from __future__ import annotations

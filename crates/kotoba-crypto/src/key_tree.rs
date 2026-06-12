@@ -273,7 +273,10 @@ mod tests {
             );
         }
         // The untampered wrap still recovers the exact ARK.
-        assert_eq!(unwrap_ark(prf, &wrapped, did).unwrap().as_slice(), ark.as_slice());
+        assert_eq!(
+            unwrap_ark(prf, &wrapped, did).unwrap().as_slice(),
+            ark.as_slice()
+        );
     }
 
     #[test]
@@ -312,7 +315,10 @@ mod tests {
         assert_eq!(rec.as_slice(), ark.as_slice());
         // A different 3 also reconstruct.
         let pick2 = vec![shares[1].clone(), shares[3].clone(), shares[4].clone()];
-        assert_eq!(recovery::combine(&pick2).unwrap().as_slice(), ark.as_slice());
+        assert_eq!(
+            recovery::combine(&pick2).unwrap().as_slice(),
+            ark.as_slice()
+        );
     }
 
     #[test]
@@ -333,7 +339,10 @@ mod tests {
     fn shamir_all_shares_recover() {
         let ark = generate_ark();
         let shares = recovery::split(&ark, 2, 2);
-        assert_eq!(recovery::combine(&shares).unwrap().as_slice(), ark.as_slice());
+        assert_eq!(
+            recovery::combine(&shares).unwrap().as_slice(),
+            ark.as_slice()
+        );
     }
 
     #[test]
@@ -342,7 +351,12 @@ mod tests {
         let ark = generate_ark();
         let shares = recovery::split(&ark, 1, 4);
         for sh in &shares {
-            assert_eq!(recovery::combine(&[sh.clone()]).unwrap().as_slice(), ark.as_slice());
+            assert_eq!(
+                recovery::combine(std::slice::from_ref(sh))
+                    .unwrap()
+                    .as_slice(),
+                ark.as_slice()
+            );
         }
     }
 
@@ -351,7 +365,12 @@ mod tests {
         // Providing MORE than t shares (4 of a 3-of-5) must still reconstruct.
         let ark = generate_ark();
         let shares = recovery::split(&ark, 3, 5);
-        let four = vec![shares[0].clone(), shares[1].clone(), shares[2].clone(), shares[4].clone()];
+        let four = vec![
+            shares[0].clone(),
+            shares[1].clone(),
+            shares[2].clone(),
+            shares[4].clone(),
+        ];
         assert_eq!(recovery::combine(&four).unwrap().as_slice(), ark.as_slice());
     }
 
@@ -395,7 +414,7 @@ mod tests {
         let mut shares = recovery::split(&ark, 2, 3);
         shares[0][0] = 0; // forge the x-index to 0
         assert!(
-            recovery::combine(&shares[..2].to_vec()).is_none(),
+            recovery::combine(&shares[..2]).is_none(),
             "a share with x-index 0 must be rejected"
         );
     }
@@ -411,7 +430,11 @@ mod tests {
         let reversed = vec![shares[4].clone(), shares[2].clone(), shares[0].clone()];
         let a = recovery::combine(&forward).unwrap();
         let b = recovery::combine(&reversed).unwrap();
-        assert_eq!(a.as_slice(), b.as_slice(), "order must not change the result");
+        assert_eq!(
+            a.as_slice(),
+            b.as_slice(),
+            "order must not change the result"
+        );
         assert_eq!(a.as_slice(), ark.as_slice());
     }
 }

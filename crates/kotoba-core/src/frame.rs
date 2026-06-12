@@ -1,7 +1,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 
 /// KAIS — Kotoba Instruction Set
-/// 8-bit header: [7:4]=TYPE [3]=CMP [2]=FRG [1]=ACK [0]=PRI
+/// 8-bit header: `bits 7:4 = TYPE`, `3 = CMP`, `2 = FRG`, `1 = ACK`, `0 = PRI`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {

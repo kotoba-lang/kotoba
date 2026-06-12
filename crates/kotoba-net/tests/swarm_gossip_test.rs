@@ -21,9 +21,8 @@ use tokio::time::{sleep, timeout, Instant};
 async fn get_listen_addr(swarm: &mut KotobaSwarm) -> Option<Multiaddr> {
     timeout(Duration::from_secs(5), async {
         loop {
-            match swarm.next_event().await? {
-                KotobaNetEvent::ListenAddr(a) => return Some(a),
-                _ => {}
+            if let KotobaNetEvent::ListenAddr(a) = swarm.next_event().await? {
+                return Some(a);
             }
         }
     })
@@ -50,7 +49,7 @@ async fn drive_until_gossip(
         }
         tokio::select! {
             ev1 = swarm1.next_event() => {
-                if ev1.is_none() { return None; }
+                ev1.as_ref()?;
                 // Swarm1 events keep it alive (GossipSub heartbeat, GRAFT etc.)
             }
             ev2 = swarm2.next_event() => {

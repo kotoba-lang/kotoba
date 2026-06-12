@@ -155,7 +155,12 @@ impl<C: BlockStore + 'static> SealedBlockStore<C> {
 
     /// The sealed CID this plaintext CID is stored under, if known.
     pub fn sealed_cid(&self, cid: &KotobaCid) -> Option<KotobaCid> {
-        self.index.read().unwrap().get(&cid.0).copied().map(KotobaCid)
+        self.index
+            .read()
+            .unwrap()
+            .get(&cid.0)
+            .copied()
+            .map(KotobaCid)
     }
 
     /// Deterministic seal: same key + same plaintext → same envelope, so
@@ -307,7 +312,12 @@ impl<C: BlockStore + 'static> BlockStore for SealedBlockStore<C> {
     /// that can list — Memory/Fs — would return sealed CIDs, which are
     /// meaningless to callers like gc_dead_blocks; the index IS the listing.)
     fn all_cids(&self) -> Vec<KotobaCid> {
-        self.index.read().unwrap().keys().map(|k| KotobaCid(*k)).collect()
+        self.index
+            .read()
+            .unwrap()
+            .keys()
+            .map(|k| KotobaCid(*k))
+            .collect()
     }
 }
 
@@ -513,7 +523,10 @@ mod tests {
         store.put(&cid, data).unwrap();
         let sealed = store.sealed_cid(&cid).unwrap();
         store.pin(&cid);
-        assert!(store.inner().is_pinned(&sealed), "inner pin is on sealed CID");
+        assert!(
+            store.inner().is_pinned(&sealed),
+            "inner pin is on sealed CID"
+        );
         assert!(!store.inner().is_pinned(&cid));
         assert!(store.is_pinned(&cid), "wrapper view stays plaintext-keyed");
         store.unpin(&cid);
@@ -531,7 +544,10 @@ mod tests {
         store.put(&cid, data).unwrap();
         let sealed = store.sealed_cid(&cid).unwrap();
         store.inner().delete(&sealed).unwrap();
-        assert!(store.sealed_cid(&cid).is_some(), "mapping intentionally stale");
+        assert!(
+            store.sealed_cid(&cid).is_some(),
+            "mapping intentionally stale"
+        );
         assert!(store.get(&cid).unwrap().is_none());
         assert!(!store.has(&cid));
     }

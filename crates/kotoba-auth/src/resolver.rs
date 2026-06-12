@@ -440,7 +440,7 @@ mod tests {
     };
 
     fn make_doc_with_x25519(did: &str, key: [u8; 32]) -> DidDocument {
-        let encoded = multibase::encode(multibase::Base::Base58Btc, &key);
+        let encoded = multibase::encode(multibase::Base::Base58Btc, key);
         let key_id = format!("{did}#key-x25519-1");
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".into()],

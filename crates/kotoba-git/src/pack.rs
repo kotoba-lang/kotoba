@@ -146,9 +146,7 @@ impl PackSet {
                 // negative offset to base within this pack
                 let (neg, consumed) = read_ofs_varint(&data[pos..])?;
                 pos += consumed;
-                let base_offset = offset
-                    .checked_sub(neg)
-                    .ok_or(GitError::MalformedHeader)?;
+                let base_offset = offset.checked_sub(neg).ok_or(GitError::MalformedHeader)?;
                 let delta = inflate(&data[pos..])?;
                 let (base_kind, base_body) =
                     self.unpack_at_depth(pack_index, base_offset, depth + 1)?;
@@ -156,9 +154,8 @@ impl PackSet {
                 Ok((base_kind, body))
             }
             OBJ_REF_DELTA => {
-                let base_oid = GitOid::from_raw(
-                    data.get(pos..pos + 20).ok_or(GitError::MalformedHeader)?,
-                )?;
+                let base_oid =
+                    GitOid::from_raw(data.get(pos..pos + 20).ok_or(GitError::MalformedHeader)?)?;
                 pos += 20;
                 let delta = inflate(&data[pos..])?;
                 let (base_kind, base_body) = self.resolve_ref_base_depth(base_oid, depth + 1)?;
@@ -242,7 +239,9 @@ fn parse_idx(idx: &[u8]) -> Result<HashMap<GitOid, u64>> {
     }
     let version = read_u32_be(idx, 4)?;
     if version != 2 {
-        return Err(GitError::UnknownObjectKind(format!("idx version {version}")));
+        return Err(GitError::UnknownObjectKind(format!(
+            "idx version {version}"
+        )));
     }
     // fanout[255] = object count
     let n = read_u32_be(idx, 8 + 255 * 4)? as usize;
@@ -342,9 +341,7 @@ pub(crate) fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
             let end = copy_offset
                 .checked_add(copy_size)
                 .ok_or(GitError::MalformedTree)?;
-            let slice = base
-                .get(copy_offset..end)
-                .ok_or(GitError::MalformedTree)?;
+            let slice = base.get(copy_offset..end).ok_or(GitError::MalformedTree)?;
             out.extend_from_slice(slice);
         } else if op != 0 {
             // insert `op` literal bytes

@@ -54,7 +54,7 @@ impl MvRegistry {
         let is_new = !self.views.contains_key(&name);
         self.views
             .insert(name.clone(), MaterializedView::new(name.clone(), program));
-        self.results.entry(name).or_insert_with(Arrangement::new);
+        self.results.entry(name).or_default();
         is_new
     }
 
@@ -77,10 +77,7 @@ impl MvRegistry {
                 .get_mut(&name)
                 .expect("view present")
                 .apply(deltas);
-            self.results
-                .entry(name)
-                .or_insert_with(Arrangement::new)
-                .apply(&derived);
+            self.results.entry(name).or_default().apply(&derived);
         }
     }
 

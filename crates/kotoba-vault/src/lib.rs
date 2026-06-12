@@ -14,8 +14,8 @@
 //! `sync.eventsFromCommits`).
 pub mod agent_identity;
 pub mod chunker;
-pub mod live_bus;
 pub mod keychain;
+pub mod live_bus;
 pub mod pre_key_registry;
 pub mod secure_vault;
 pub mod shelf;

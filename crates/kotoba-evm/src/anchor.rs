@@ -43,7 +43,7 @@ pub fn commit_root_calldata(root_hash: &[u8; 32], ipfs_cid: &[u8], batch_size: u
     out.extend_from_slice(root_hash); // word 0: bytes32
     out.extend_from_slice(&word_u64(0x60)); // word 1: offset to dynamic tail = 3*32
     out.extend_from_slice(&word_u64(batch_size)); // word 2: uint64
-    // tail: len(ipfsCid) + padded data
+                                                  // tail: len(ipfsCid) + padded data
     out.extend_from_slice(&word_u64(ipfs_cid.len() as u64));
     pad32(&mut out, ipfs_cid);
     out
@@ -52,7 +52,11 @@ pub fn commit_root_calldata(root_hash: &[u8; 32], ipfs_cid: &[u8], batch_size: u
 /// Convenience: build the anchor calldata for a block from its state-root CID +
 /// block CID. The state-root commitment is the low 32 bytes of the CID's 36-byte
 /// content hash (`KotobaCid.0` = 4-byte prefix + 32-byte hash).
-pub fn anchor_block_calldata(state_root: &KotobaCid, block_cid: &KotobaCid, batch_size: u64) -> Vec<u8> {
+pub fn anchor_block_calldata(
+    state_root: &KotobaCid,
+    block_cid: &KotobaCid,
+    batch_size: u64,
+) -> Vec<u8> {
     let mut root_hash = [0u8; 32];
     root_hash.copy_from_slice(&state_root.0[4..36]);
     commit_root_calldata(&root_hash, block_cid.to_multibase().as_bytes(), batch_size)
@@ -89,7 +93,10 @@ mod tests {
         assert_eq!(data[4 + 32 * 3 + 31], 9);
         // tail data = the cid bytes, right-padded
         assert_eq!(&data[4 + 32 * 4..4 + 32 * 4 + 9], cid);
-        assert!(data[4 + 32 * 4 + 9..].iter().all(|&b| b == 0), "zero padding");
+        assert!(
+            data[4 + 32 * 4 + 9..].iter().all(|&b| b == 0),
+            "zero padding"
+        );
     }
 
     #[test]

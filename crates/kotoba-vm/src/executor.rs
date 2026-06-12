@@ -251,7 +251,7 @@ mod tests {
         // Run for exactly 2 steps — graph never halts (self-loop + vote_halt=false)
         let results = graph.run(&compute, 2);
         let steps_used = results.len() as u32;
-        let all_halted = results.last().map_or(false, |r| r.all_halted);
+        let all_halted = results.last().is_some_and(|r| r.all_halted);
 
         // Verify the StepsExceeded condition is met
         assert!(steps_used >= 2);
@@ -372,8 +372,6 @@ mod tests {
         let s = ExecStatus::StepsExceeded;
         let c = s; // Copy
         assert_eq!(s, c);
-        let c2 = s.clone();
-        assert_eq!(s, c2);
     }
 
     #[test]

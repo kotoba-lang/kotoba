@@ -13,7 +13,8 @@
 //!   kotoba_weight_put       — store an FP8 tensor weight blob
 //!   kotoba_lora_apply       — register a LoRA adapter delta
 //!   kotoba_email_list       — list encrypted emails for an owner DID
-//!   kotoba_email_read       — decrypt and return one email body + metadata
+//!   kotoba_email_read       — return one email; legacy bodies decrypt server-side,
+//!                             Signal envelopes are returned for client-side open
 //!   kotoba_wasm_run         — run a WASM Component Model program via Pregel BSP
 //!   kotoba_datalog_run      — evaluate Datalog with citation tracking + royalty flush
 //!   kotoba_node_info        — return this node's DID, roles, NodeId, peer count
@@ -50,8 +51,8 @@ use axum::{
 use kotoba_core::cid::KotobaCid;
 use kotoba_graph::quad_store::QuadStore;
 use kotoba_query::{delta::Delta, quad::LegacyQuad, quad::LegacyQuadObject};
-use kotoba_vault::live_bus::LiveBus;
 use kotoba_store::MemoryBlockStore;
+use kotoba_vault::live_bus::LiveBus;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -116,6 +117,126 @@ const ERR_NOT_FOUND: i32 = -32601;
 const ERR_INVALID_PARAMS: i32 = -32602;
 const ERR_INTERNAL: i32 = -32603;
 const ERR_AUTH: i32 = -32001; // kotoba extension
+
+use crate::email_xrpc::{
+    DEFAULT_EMAIL_LIST_LIMIT, ENC_SIGNAL_V1, MAX_EMAIL_CID_LEN, MAX_EMAIL_DATE_LEN,
+    MAX_EMAIL_LIST_LIMIT, MAX_EMAIL_LIST_OFFSET, MAX_EMAIL_MESSAGE_ID_LEN, MAX_LEGACY_ADDR_LEN,
+    MAX_LEGACY_SUBJECT_LEN, MAX_OWNER_DID_LEN, MAX_THREAD_ID_LEN,
+};
+
+const MAX_MCP_CID_FIELD_LEN: usize = 512;
+
+fn parse_mcp_cid_field(label: &str, value: &str) -> Result<KotobaCid, (i32, String)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err((ERR_INVALID_PARAMS, format!("{label} must not be empty")));
+    }
+    if value.len() > MAX_MCP_CID_FIELD_LEN {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!(
+                "{label} too large ({} bytes, limit {MAX_MCP_CID_FIELD_LEN})",
+                value.len()
+            ),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("{label} contains control characters"),
+        ));
+    }
+    Ok(KotobaCid::from_multibase(value).unwrap_or_else(|| KotobaCid::from_bytes(value.as_bytes())))
+}
+
+fn validate_mcp_text_field(label: &str, value: &str, max_len: usize) -> Result<(), (i32, String)> {
+    if value.trim().is_empty() {
+        return Err((ERR_INVALID_PARAMS, format!("{label} must not be empty")));
+    }
+    if value.len() > max_len {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("{label} too large ({} bytes, limit {max_len})", value.len()),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("{label} contains control characters"),
+        ));
+    }
+    Ok(())
+}
+
+fn optional_usize_param(args: &Value, key: &str, default: usize) -> Result<usize, (i32, String)> {
+    let Some(value) = args.get(key) else {
+        return Ok(default);
+    };
+    let Some(value) = value.as_u64() else {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("{key} must be a non-negative integer"),
+        ));
+    };
+    usize::try_from(value).map_err(|_| {
+        (
+            ERR_INVALID_PARAMS,
+            format!("{key} is too large for this platform"),
+        )
+    })
+}
+
+fn email_list_limit_param(args: &Value) -> Result<usize, (i32, String)> {
+    let limit = optional_usize_param(args, "limit", DEFAULT_EMAIL_LIST_LIMIT)?;
+    if limit == 0 {
+        return Err((ERR_INVALID_PARAMS, "limit must be at least 1".to_string()));
+    }
+    if limit > MAX_EMAIL_LIST_LIMIT {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("limit exceeds {MAX_EMAIL_LIST_LIMIT}"),
+        ));
+    }
+    Ok(limit)
+}
+
+fn email_list_offset_param(args: &Value) -> Result<usize, (i32, String)> {
+    let offset = optional_usize_param(args, "offset", 0)?;
+    if offset > MAX_EMAIL_LIST_OFFSET {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("offset exceeds {MAX_EMAIL_LIST_OFFSET}"),
+        ));
+    }
+    Ok(offset)
+}
+
+fn validate_mcp_email_cid_param(value: &str) -> Result<KotobaCid, (i32, String)> {
+    if value.trim().is_empty() {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "email_cid must not be empty".to_string(),
+        ));
+    }
+    if value.len() > MAX_EMAIL_CID_LEN {
+        return Err((
+            ERR_INVALID_PARAMS,
+            format!("email_cid must be 1-{MAX_EMAIL_CID_LEN} bytes"),
+        ));
+    }
+    if value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+        return Err((
+            ERR_INVALID_PARAMS,
+            "email_cid must contain only visible ASCII characters".to_string(),
+        ));
+    }
+    KotobaCid::from_multibase(value).ok_or_else(|| {
+        (
+            ERR_INVALID_PARAMS,
+            "invalid email_cid multibase".to_string(),
+        )
+    })
+}
 
 // ── Tool InputSchema definitions ─────────────────────────────────────────────
 
@@ -209,25 +330,25 @@ fn tools_list() -> Value {
             },
             {
                 "name": MCP_TOOL_EMAIL_LIST,
-                "description": "List emails stored in the Kotoba encrypted inbox for an owner DID. Returns plaintext date and message_id; encrypted fields (from/subject) are decrypted server-side.",
+                "description": "List emails stored in the Kotoba encrypted inbox for an owner DID. Returns plaintext date and message_id; legacy encrypted display fields (from/subject) are opened server-side when possible; Signal metadata remains zero-access.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "owner_did": { "type": "string", "description": "DID of the mailbox owner (e.g. did:plc:xxxx)" },
-                        "limit":     { "type": "integer", "description": "Max results (default 50, max 200)" },
-                        "offset":    { "type": "integer", "description": "Pagination offset" }
+                        "owner_did": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^did:[!-~]+$", "description": "DID of the mailbox owner (e.g. did:plc:xxxx)" },
+                        "limit":     { "type": "integer", "minimum": 1, "maximum": 200, "description": "Max results (default 50, max 200)" },
+                        "offset":    { "type": "integer", "minimum": 0, "maximum": 10000, "description": "Pagination offset" }
                     },
                     "required": ["owner_did"]
                 }
             },
             {
                 "name": MCP_TOOL_EMAIL_READ,
-                "description": "Decrypt and return the full body and metadata of one stored email. Requires KOTOBA_VAULT_KEY to be configured on the server.",
+                "description": "Return one stored email. Legacy records decrypt body and metadata server-side with KOTOBA_VAULT_KEY; Signal records return signalMessage for client-side open and do not expose a server-decrypted body.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "email_cid": { "type": "string", "description": "Email CID (multibase) returned by kotoba_email_list" },
-                        "owner_did": { "type": "string", "description": "DID of the mailbox owner" }
+                        "email_cid": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Email CID (canonical multibase) returned by kotoba_email_list; only visible ASCII is accepted" },
+                        "owner_did": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^did:[!-~]+$", "description": "DID of the mailbox owner" }
                     },
                     "required": ["email_cid", "owner_did"]
                 }
@@ -505,6 +626,203 @@ fn text_from_quads(quads: &[LegacyQuad], subject: &KotobaCid, predicate: &str) -
         .unwrap_or_default()
 }
 
+fn optional_unique_visible_text_from_quads(
+    quads: &[LegacyQuad],
+    subject: &KotobaCid,
+    predicate: &'static str,
+) -> Result<Option<String>, (i32, String)> {
+    let mut value = None;
+    for quad in quads {
+        if &quad.subject != subject || quad.predicate != predicate {
+            continue;
+        }
+        let LegacyQuadObject::Text(text) = &quad.object else {
+            return Err((ERR_INTERNAL, format!("invalid {predicate}")));
+        };
+        if text.is_empty() || text.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+            return Err((ERR_INTERNAL, format!("invalid {predicate}")));
+        }
+        match &value {
+            Some(existing) if existing != text => {
+                return Err((ERR_INTERNAL, format!("multiple {predicate} values found")));
+            }
+            Some(_) => {}
+            None => value = Some(text.clone()),
+        }
+    }
+    Ok(value)
+}
+
+fn unique_visible_bounded_text_from_quads(
+    quads: &[LegacyQuad],
+    subject: &KotobaCid,
+    predicate: &'static str,
+    max_len: usize,
+) -> Result<String, (i32, String)> {
+    let Some(value) = optional_unique_visible_text_from_quads(quads, subject, predicate)? else {
+        return Err((ERR_NOT_FOUND, "email_cid not found in mailbox".to_string()));
+    };
+    if value.len() > max_len {
+        return Err((ERR_INTERNAL, format!("invalid {predicate}")));
+    }
+    Ok(value)
+}
+
+fn latest_visible_bounded_text_from_quads(
+    quads: &[LegacyQuad],
+    subject: &KotobaCid,
+    predicate: &'static str,
+    max_len: usize,
+) -> String {
+    quads
+        .iter()
+        .filter_map(|quad| {
+            if &quad.subject != subject || quad.predicate != predicate {
+                return None;
+            }
+            let LegacyQuadObject::Text(text) = &quad.object else {
+                return None;
+            };
+            if !text.is_empty()
+                && text.len() <= max_len
+                && text.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or_default()
+}
+
+fn visible_bounded_text_from_quads(
+    quads: &[LegacyQuad],
+    subject: &KotobaCid,
+    predicate: &'static str,
+    max_len: usize,
+) -> String {
+    quads
+        .iter()
+        .find_map(|quad| {
+            if &quad.subject != subject || quad.predicate != predicate {
+                return None;
+            }
+            let LegacyQuadObject::Text(text) = &quad.object else {
+                return None;
+            };
+            if !text.is_empty()
+                && text.len() <= max_len
+                && text.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn validate_legacy_read_text_output(
+    field: &'static str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), String> {
+    if value.len() > max_len {
+        return Err(format!("{field} exceeds {max_len} bytes"));
+    }
+    if !value.is_empty() && value.bytes().any(|byte| !(0x21..=0x7e).contains(&byte)) {
+        return Err(format!(
+            "{field} must contain only visible ASCII characters"
+        ));
+    }
+    Ok(())
+}
+
+async fn open_unique_legacy_text_field_from_quads(
+    crypto: &dyn kotoba_crypto::AgentCrypto,
+    quads: &[LegacyQuad],
+    subject: &KotobaCid,
+    predicate: &'static str,
+    scope: &'static [u8],
+    field: &'static str,
+    max_len: usize,
+) -> Result<String, (i32, String)> {
+    let mut opened_value: Option<String> = None;
+    for quad in quads {
+        if &quad.subject != subject || quad.predicate != predicate {
+            continue;
+        }
+        let LegacyQuadObject::Text(text) = &quad.object else {
+            return Err((ERR_INTERNAL, format!("invalid {predicate}")));
+        };
+        let opened = if text.starts_with("signal:v1:") {
+            crypto
+                .open_field(scope, text)
+                .await
+                .map_err(|err| (ERR_INTERNAL, format!("decrypt {field}: {err}")))?
+        } else {
+            text.clone()
+        };
+        validate_legacy_read_text_output(field, &opened, max_len)
+            .map_err(|err| (ERR_INTERNAL, err))?;
+        match &opened_value {
+            Some(existing) if existing != &opened => {
+                return Err((ERR_INTERNAL, format!("multiple {predicate} values found")));
+            }
+            Some(_) => {}
+            None => opened_value = Some(opened),
+        }
+    }
+    Ok(opened_value.unwrap_or_default())
+}
+
+fn signal_enc_from_quads(quads: &[LegacyQuad], subject: &KotobaCid) -> Result<bool, (i32, String)> {
+    let mut has_signal_enc = false;
+    for quad in quads {
+        if &quad.subject != subject || quad.predicate != "email/enc" {
+            continue;
+        }
+        let LegacyQuadObject::Text(text) = &quad.object else {
+            return Err((ERR_INTERNAL, "invalid email/enc".to_string()));
+        };
+        if text != ENC_SIGNAL_V1 {
+            return Err((ERR_INTERNAL, "invalid email/enc".to_string()));
+        }
+        has_signal_enc = true;
+    }
+    Ok(has_signal_enc)
+}
+
+fn email_body_cid_from_quads(
+    quads: &[LegacyQuad],
+    subject: &KotobaCid,
+) -> Result<String, (i32, String)> {
+    let mut body_cid = None;
+    for quad in quads {
+        if &quad.subject != subject || quad.predicate != "email/body_cid" {
+            continue;
+        }
+        let LegacyQuadObject::Text(text) = &quad.object else {
+            return Err((ERR_INTERNAL, "invalid body_cid multibase".to_string()));
+        };
+        if KotobaCid::from_multibase(text).is_none() {
+            return Err((ERR_INTERNAL, "invalid body_cid multibase".to_string()));
+        }
+        match &body_cid {
+            Some(existing) if existing != text => {
+                return Err((
+                    ERR_INTERNAL,
+                    "multiple email/body_cid values found".to_string(),
+                ));
+            }
+            Some(_) => {}
+            None => body_cid = Some(text.clone()),
+        }
+    }
+    body_cid.ok_or_else(|| (ERR_NOT_FOUND, "email/body_cid not found".to_string()))
+}
+
 // ── Dispatch to state methods ────────────────────────────────────────────────
 
 async fn call_tool(
@@ -541,7 +859,6 @@ async fn call_tool(
     match tool {
         // ── kotoba_datom_create / legacy kotoba_quad_create ─────────────────
         MCP_TOOL_DATOM_CREATE | MCP_TOOL_QUAD_CREATE => {
-            use kotoba_core::cid::KotobaCid;
             use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
             let graph = get_str("graph")?;
@@ -552,25 +869,19 @@ async fn call_tool(
             // Guard: reject oversized field values before any CID computation.
             // Malformed inputs with multi-MiB strings would bloat the block store.
             const MAX_FIELD_LEN: usize = 4096;
-            for (name, val) in [
-                ("graph", &graph),
-                ("subject", &subject),
-                ("predicate", &predicate),
-                ("object", &object),
-            ] {
-                if val.len() > MAX_FIELD_LEN {
-                    return Err((
-                        ERR_INVALID_PARAMS,
-                        format!(
-                            "field '{name}' too large ({} bytes, limit {MAX_FIELD_LEN})",
-                            val.len()
-                        ),
-                    ));
-                }
+            if object.len() > MAX_FIELD_LEN {
+                return Err((
+                    ERR_INVALID_PARAMS,
+                    format!(
+                        "object too large ({} bytes, limit {MAX_FIELD_LEN})",
+                        object.len()
+                    ),
+                ));
             }
+            validate_mcp_text_field("predicate", &predicate, MAX_FIELD_LEN)?;
 
-            let graph_cid = KotobaCid::from_bytes(graph.as_bytes());
-            let subject_cid = KotobaCid::from_bytes(subject.as_bytes());
+            let graph_cid = parse_mcp_cid_field("graph", &graph)?;
+            let subject_cid = parse_mcp_cid_field("subject", &subject)?;
             let tx_cid = mcp_tx_cid("datom.create", &[&graph, &subject, &predicate, &object]);
             let datom = KqeDatom::assert(
                 subject_cid.clone(),
@@ -600,10 +911,8 @@ async fn call_tool(
 
         // ── kotoba_graph_query ───────────────────────────────────────────────
         MCP_TOOL_GRAPH_QUERY => {
-            use kotoba_core::cid::KotobaCid;
-
             let graph = get_str("graph")?;
-            let graph_cid = KotobaCid::from_bytes(graph.as_bytes());
+            let graph_cid = parse_mcp_cid_field("graph", &graph)?;
 
             const MAX_QUERY_RESULTS: usize = 1_000;
             const MAX_QUERY_FIELD_LEN: usize = 4096;
@@ -620,11 +929,9 @@ async fn call_tool(
 
             // Bound optional filter fields to prevent oversized BTree prefix scans.
             for (name, val) in [
-                ("graph", Some(graph.as_str())),
                 ("predicate_prefix", predicate_prefix),
                 ("predicate", predicate),
                 ("object", object_key),
-                ("subject", subject_str),
             ] {
                 if let Some(v) = val {
                     if v.len() > MAX_QUERY_FIELD_LEN {
@@ -638,8 +945,14 @@ async fn call_tool(
                     }
                 }
             }
+            if let Some(prefix) = predicate_prefix {
+                validate_mcp_text_field("predicate_prefix", prefix, MAX_QUERY_FIELD_LEN)?;
+            }
+            if let Some(pred) = predicate {
+                validate_mcp_text_field("predicate", pred, MAX_QUERY_FIELD_LEN)?;
+            }
 
-            let mut quads = current_graph_quads(&state, &graph_cid).await?;
+            let mut quads = current_graph_quads(state, &graph_cid).await?;
             let quads: Vec<_> = if let Some(prefix) = predicate_prefix {
                 let mut q: Vec<_> = quads
                     .into_iter()
@@ -662,7 +975,7 @@ async fn call_tool(
                 q
             } else {
                 if let Some(s) = subject_str {
-                    let s_cid = KotobaCid::from_bytes(s.as_bytes());
+                    let s_cid = parse_mcp_cid_field("subject", s)?;
                     quads.retain(|q| q.subject == s_cid);
                 }
                 if let Some(p) = predicate {
@@ -715,7 +1028,6 @@ async fn call_tool(
 
         // ── kotoba_embed_create ──────────────────────────────────────────────
         MCP_TOOL_EMBED_CREATE => {
-            use kotoba_core::cid::KotobaCid;
             use kotoba_llm::embed::{embed_to_delta, Embedding};
 
             let text = get_str("text")?;
@@ -737,9 +1049,9 @@ async fn call_tool(
                 ));
             }
 
-            let doc_cid = KotobaCid::from_bytes(doc_cid.as_bytes());
-            let model_cid = KotobaCid::from_bytes(model_cid.as_bytes());
-            let graph_cid = KotobaCid::from_bytes(graph.as_bytes());
+            let doc_cid = parse_mcp_cid_field("doc_cid", &doc_cid)?;
+            let model_cid = parse_mcp_cid_field("model_cid", &model_cid)?;
+            let graph_cid = parse_mcp_cid_field("graph", &graph)?;
 
             let vector: Vec<f32> = if let Some(engine) = &state.inference_engine {
                 let engine = engine.clone();
@@ -840,8 +1152,8 @@ async fn call_tool(
                 .map_err(|e| (ERR_INVALID_PARAMS, e.to_string()))?;
 
             let blob_cid = KotobaCid::from_bytes(&bytes);
-            let model_cid = KotobaCid::from_bytes(model_str.as_bytes());
-            let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
+            let model_cid = parse_mcp_cid_field("model_cid", &model_str)?;
+            let graph_cid = parse_mcp_cid_field("graph", &graph_str)?;
 
             state
                 .block_store
@@ -929,8 +1241,8 @@ async fn call_tool(
                 .map_err(|e| (ERR_INVALID_PARAMS, e.to_string()))?;
 
             let adapter_cid = KotobaCid::from_bytes(&bytes);
-            let model_cid = KotobaCid::from_bytes(model_str.as_bytes());
-            let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
+            let model_cid = parse_mcp_cid_field("model_cid", &model_str)?;
+            let graph_cid = parse_mcp_cid_field("graph", &graph_str)?;
 
             state
                 .block_store
@@ -979,31 +1291,15 @@ async fn call_tool(
             use kotoba_ingest::graph_cid_for;
 
             let owner_did = get_str("owner_did")?;
-            crate::graph_auth::validate_did(&owner_did, "owner_did", 512)
+            crate::graph_auth::validate_did(&owner_did, "owner_did", MAX_OWNER_DID_LEN)
                 .map_err(|(_, msg)| (ERR_INVALID_PARAMS, msg))?;
-            let limit = args
-                .get("limit")
-                .and_then(Value::as_u64)
-                .unwrap_or(50)
-                .min(200) as usize;
-            let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let limit = email_list_limit_param(args)?;
+            let offset = email_list_offset_param(args)?;
 
             let graph_cid = graph_cid_for(&owner_did);
-            let quads = current_graph_quads(&state, &graph_cid).await?;
+            let quads = current_graph_quads(state, &graph_cid).await?;
 
-            let mut entries: Vec<(KotobaCid, String)> = quads
-                .iter()
-                .filter_map(|quad| {
-                    if quad.predicate != "email/date" {
-                        return None;
-                    }
-                    match &quad.object {
-                        LegacyQuadObject::Text(date) => Some((quad.subject.clone(), date.clone())),
-                        _ => None,
-                    }
-                })
-                .collect();
-            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            let entries = crate::email_xrpc::email_entries_from_quads(&quads);
             let total = entries.len();
 
             let mut emails: Vec<Value> = Vec::new();
@@ -1012,21 +1308,54 @@ async fn call_tool(
                 let message_id = text_from_quads(&quads, &email_cid, "email/message_id");
                 let subject_enc = text_from_quads(&quads, &email_cid, "email/subject");
                 let from_enc = text_from_quads(&quads, &email_cid, "email/from");
-                let (subject, from) = if let Some(ref crypto) = state.crypto {
-                    let s = crypto
-                        .open_field(b"email/subject", &subject_enc)
-                        .await
-                        .unwrap_or_else(|_| subject_enc.clone());
-                    let f = crypto
-                        .open_field(b"email/from", &from_enc)
-                        .await
-                        .unwrap_or_else(|_| from_enc.clone());
-                    (s, f)
-                } else {
-                    (subject_enc, from_enc)
-                };
+                let open_list_field =
+                    |scope: &'static [u8], value: String, field: &'static str, max_len: usize| {
+                        let crypto = state.crypto.as_ref().map(Arc::clone);
+                        async move {
+                            let opened = if value.starts_with("signal:v1:") {
+                                let Some(crypto) = crypto else {
+                                    return String::new();
+                                };
+                                match crypto.open_field(scope, &value).await {
+                                    Ok(opened) => opened,
+                                    Err(_) => return String::new(),
+                                }
+                            } else {
+                                value
+                            };
+                            if validate_legacy_read_text_output(field, &opened, max_len).is_ok() {
+                                opened
+                            } else {
+                                String::new()
+                            }
+                        }
+                    };
+                let subject = open_list_field(
+                    b"email/subject",
+                    subject_enc,
+                    "subject",
+                    MAX_LEGACY_SUBJECT_LEN,
+                )
+                .await;
+                let from =
+                    open_list_field(b"email/from", from_enc, "from", MAX_LEGACY_ADDR_LEN).await;
 
-                emails.push(json!({ "cid": cid_mb, "date": date, "message_id": message_id, "subject": subject, "from": from }));
+                let mut item = json!({
+                    "cid": cid_mb,
+                    "date": date,
+                    "message_id": message_id,
+                    "subject": subject,
+                    "from": from,
+                });
+                let (enc, recipient_device) =
+                    crate::email_xrpc::email_list_signal_metadata_from_quads(&quads, &email_cid);
+                if let Some(enc) = enc {
+                    item["enc"] = json!(enc);
+                }
+                if let Some(recipient_device) = recipient_device {
+                    item["recipient_device"] = json!(recipient_device);
+                }
+                emails.push(item);
             }
 
             Ok(json!({ "emails": emails, "total": total, "offset": offset, "limit": limit }))
@@ -1038,60 +1367,172 @@ async fn call_tool(
 
             let email_cid_str = get_str("email_cid")?;
             let owner_did = get_str("owner_did")?;
-            crate::graph_auth::validate_did(&owner_did, "owner_did", 512)
+            crate::graph_auth::validate_did(&owner_did, "owner_did", MAX_OWNER_DID_LEN)
                 .map_err(|(_, msg)| (ERR_INVALID_PARAMS, msg))?;
+            let email_cid = validate_mcp_email_cid_param(&email_cid_str)?;
+            let email_cid_mb = email_cid.to_multibase();
+
+            let graph_cid = graph_cid_for(&owner_did);
+            let quads = current_graph_quads(state, &graph_cid).await?;
+            if quads.is_empty() {
+                return Err((ERR_NOT_FOUND, "no emails found for owner_did".to_string()));
+            }
+            let message_id = unique_visible_bounded_text_from_quads(
+                &quads,
+                &email_cid,
+                "email/message_id",
+                MAX_EMAIL_MESSAGE_ID_LEN,
+            )?;
+            let date = latest_visible_bounded_text_from_quads(
+                &quads,
+                &email_cid,
+                "email/date",
+                MAX_EMAIL_DATE_LEN,
+            );
+            if date.is_empty() {
+                return Err((ERR_NOT_FOUND, "email_cid not found in mailbox".to_string()));
+            }
+
+            let body_cid_str = email_body_cid_from_quads(&quads, &email_cid)?;
+            let blob_cid = kotoba_core::cid::KotobaCid::from_multibase(&body_cid_str)
+                .expect("validated body CID");
+            if signal_enc_from_quads(&quads, &email_cid)? {
+                let envelope_bytes = state.vault.get(&blob_cid).await.ok_or_else(|| {
+                    (
+                        ERR_NOT_FOUND,
+                        "signal envelope not found in vault".to_string(),
+                    )
+                })?;
+                let signal_message =
+                    crate::email_xrpc::signal_message_value_from_envelope_bytes(&envelope_bytes)
+                        .map_err(|err| (ERR_INTERNAL, err))?;
+                let signal_from = signal_message["senderDid"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let signal_to = signal_message["recipientDid"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if signal_to != owner_did {
+                    return Err((
+                        ERR_INTERNAL,
+                        "signal envelope recipientDid does not match mailbox owner_did".to_string(),
+                    ));
+                }
+                let stored_signal_from =
+                    optional_unique_visible_text_from_quads(&quads, &email_cid, "email/from")?;
+                if stored_signal_from
+                    .as_deref()
+                    .is_some_and(|value| value != signal_from)
+                {
+                    return Err((
+                        ERR_INTERNAL,
+                        "signal envelope senderDid does not match email/from".to_string(),
+                    ));
+                }
+                let stored_signal_to =
+                    optional_unique_visible_text_from_quads(&quads, &email_cid, "email/to")?;
+                if stored_signal_to
+                    .as_deref()
+                    .is_some_and(|value| value != signal_to)
+                {
+                    return Err((
+                        ERR_INTERNAL,
+                        "signal envelope recipientDid does not match email/to".to_string(),
+                    ));
+                }
+                let signal_timestamp = signal_message["timestamp"].as_str().unwrap_or_default();
+                if date != signal_timestamp {
+                    return Err((
+                        ERR_INTERNAL,
+                        "signal envelope timestamp does not match email/date".to_string(),
+                    ));
+                }
+                let expected_email_cid = crate::email_xrpc::signal_email_cid_for(
+                    &signal_from,
+                    &signal_to,
+                    signal_timestamp,
+                    &body_cid_str,
+                );
+                if expected_email_cid != email_cid {
+                    return Err((
+                        ERR_INTERNAL,
+                        "signal envelope body_cid does not match email_cid".to_string(),
+                    ));
+                }
+                return Ok(json!({
+                    "email_cid":     email_cid_mb,
+                    "enc":           ENC_SIGNAL_V1,
+                    "message_id":    message_id,
+                    "from":          signal_from,
+                    "to":            signal_to,
+                    "date":          signal_timestamp,
+                    "thread_id":     visible_bounded_text_from_quads(&quads, &email_cid, "email/thread_id", MAX_THREAD_ID_LEN),
+                    "signalMessage": signal_message,
+                }));
+            }
 
             let crypto = state
                 .crypto
                 .as_ref()
                 .ok_or_else(|| (ERR_INTERNAL, "crypto not initialised".to_string()))?;
 
-            let graph_cid = graph_cid_for(&owner_did);
-            let quads = current_graph_quads(&state, &graph_cid).await?;
-            if quads.is_empty() {
-                return Err((ERR_NOT_FOUND, "no emails found for owner_did".to_string()));
-            }
-
-            let email_cid = kotoba_core::cid::KotobaCid::from_multibase(&email_cid_str)
-                .ok_or_else(|| (ERR_INTERNAL, "invalid email_cid multibase".to_string()))?;
-
             // body_cid → Vault decrypt via AgentCrypto
-            let body_cid_str = text_from_quads(&quads, &email_cid, "email/body_cid");
-            if body_cid_str.is_empty() {
-                return Err((ERR_NOT_FOUND, "email/body_cid not found".to_string()));
-            }
-            let blob_cid = kotoba_core::cid::KotobaCid::from_multibase(&body_cid_str)
-                .ok_or_else(|| (ERR_INTERNAL, "invalid body_cid multibase".to_string()))?;
             let enc_bytes = state
                 .vault
                 .get(&blob_cid)
                 .await
                 .ok_or_else(|| (ERR_NOT_FOUND, "body blob not found in vault".to_string()))?;
-            let body_pt = crypto
-                .decrypt_blob(&enc_bytes)
+            let mut body_pt = crypto
+                .decrypt_blob_bound(email_cid_mb.as_bytes(), &enc_bytes)
                 .await
                 .map_err(|e| (ERR_INTERNAL, format!("decrypt body: {e}")))?;
-            let body = String::from_utf8_lossy(&body_pt).into_owned();
-
-            let open_f = |scope: &'static [u8], enc: String| {
-                let cr = Arc::clone(crypto);
-                async move {
-                    if enc.starts_with("signal:v1:") {
-                        cr.open_field(scope, &enc).await.unwrap_or(enc)
-                    } else {
-                        enc
-                    }
-                }
+            let body = {
+                let bytes = std::mem::take(&mut *body_pt);
+                String::from_utf8(bytes)
+                    .map_err(|err| (ERR_INTERNAL, format!("body is not valid UTF-8: {err}")))?
             };
 
+            let from = open_unique_legacy_text_field_from_quads(
+                &**crypto,
+                &quads,
+                &email_cid,
+                "email/from",
+                b"email/from",
+                "from",
+                MAX_LEGACY_ADDR_LEN,
+            )
+            .await?;
+            let to = open_unique_legacy_text_field_from_quads(
+                &**crypto,
+                &quads,
+                &email_cid,
+                "email/to",
+                b"email/to",
+                "to",
+                MAX_LEGACY_ADDR_LEN,
+            )
+            .await?;
+            let subject = open_unique_legacy_text_field_from_quads(
+                &**crypto,
+                &quads,
+                &email_cid,
+                "email/subject",
+                b"email/subject",
+                "subject",
+                MAX_LEGACY_SUBJECT_LEN,
+            )
+            .await?;
+
             Ok(json!({
-                "email_cid":  email_cid_str,
-                "message_id": text_from_quads(&quads, &email_cid, "email/message_id"),
-                "from":       open_f(b"email/from",    text_from_quads(&quads, &email_cid, "email/from")).await,
-                "to":         open_f(b"email/to",      text_from_quads(&quads, &email_cid, "email/to")).await,
-                "subject":    open_f(b"email/subject", text_from_quads(&quads, &email_cid, "email/subject")).await,
-                "date":       text_from_quads(&quads, &email_cid, "email/date"),
-                "thread_id":  text_from_quads(&quads, &email_cid, "email/thread_id"),
+                "email_cid":  email_cid_mb,
+                "message_id": message_id,
+                "from":       from,
+                "to":         to,
+                "subject":    subject,
+                "date":       date,
+                "thread_id":  visible_bounded_text_from_quads(&quads, &email_cid, "email/thread_id", MAX_THREAD_ID_LEN),
                 "body":       body,
             }))
         }
@@ -1213,8 +1654,9 @@ async fn call_tool(
                     ));
                 }
                 for sq in &result.assert_quads {
-                    let graph_cid = KotobaCid::from_bytes(sq.graph.as_bytes());
-                    let subject_cid = KotobaCid::from_bytes(sq.subject.as_bytes());
+                    let graph_cid = parse_mcp_cid_field("assert_quads[].graph", &sq.graph)?;
+                    let subject_cid = parse_mcp_cid_field("assert_quads[].subject", &sq.subject)?;
+                    validate_mcp_text_field("assert_quads[].predicate", &sq.predicate, 4096)?;
                     let tx_cid =
                         mcp_tx_cid("wasm.assert", &[&sq.graph, &sq.subject, &sq.predicate]);
                     let datom = KqeDatom::assert(
@@ -1293,8 +1735,8 @@ async fn call_tool(
                 }
             }
 
-            let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
-            let input_deltas = current_graph_deltas(&state, &graph_cid).await?;
+            let graph_cid = parse_mcp_cid_field("graph", &graph_str)?;
+            let input_deltas = current_graph_deltas(state, &graph_cid).await?;
 
             let mut program = DatalogProgram::new();
             for rule in rules {
@@ -1460,7 +1902,6 @@ async fn call_tool(
         // ── kotoba_sparql_query ──────────────────────────────────────────────
         MCP_TOOL_SPARQL_QUERY => {
             use kotoba_auth::{Cacao, DelegationChain};
-            use kotoba_core::cid::KotobaCid;
 
             let graph_str = get_str("graph")?;
             let sparql = get_str("sparql")?;
@@ -1470,8 +1911,8 @@ async fn call_tool(
                     "sparql query too large (limit 8KiB)".into(),
                 ));
             }
-            let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
-            let query_store = distributed_query_store(&state, &graph_cid).await?;
+            let graph_cid = parse_mcp_cid_field("graph", &graph_str)?;
+            let query_store = distributed_query_store(state, &graph_cid).await?;
 
             let quads = if let Some(b64) = args.get("cacao_b64").and_then(Value::as_str) {
                 if b64.len() > 8 * 1024 {
@@ -1510,7 +1951,6 @@ async fn call_tool(
         // ── kotoba_multi_hop ─────────────────────────────────────────────────
         MCP_TOOL_MULTI_HOP => {
             use kotoba_auth::{Cacao, DelegationChain};
-            use kotoba_core::cid::KotobaCid;
 
             let graph_str = get_str("graph")?;
             let start_str = get_str("start")?;
@@ -1520,9 +1960,8 @@ async fn call_tool(
                 .unwrap_or(2)
                 .min(8) as usize;
 
-            let graph_cid = KotobaCid::from_bytes(graph_str.as_bytes());
-            let start_cid = KotobaCid::from_multibase(&start_str)
-                .unwrap_or_else(|| KotobaCid::from_bytes(start_str.as_bytes()));
+            let graph_cid = parse_mcp_cid_field("graph", &graph_str)?;
+            let start_cid = parse_mcp_cid_field("start", &start_str)?;
 
             let hops = if let Some(b64) = args.get("cacao_b64").and_then(Value::as_str) {
                 if b64.len() > 8 * 1024 {
@@ -1679,6 +2118,9 @@ fn datom_value_key(value: &kotoba_query::datom::Value) -> Option<String> {
         kotoba_query::datom::Value::Encrypted { ct_cid, .. } => {
             Some(format!("enc:{}", ct_cid.to_multibase()))
         }
+        kotoba_query::datom::Value::Enveloped { ct_cid, .. } => {
+            Some(format!("env:{}", ct_cid.to_multibase()))
+        }
         _ => None,
     }
 }
@@ -1688,6 +2130,362 @@ fn datom_value_key(value: &kotoba_query::datom::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_state() -> Arc<crate::server::KotobaState> {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        Arc::new(crate::server::KotobaState::new(None).expect("state"))
+    }
+
+    fn test_text_quad(subject: KotobaCid, predicate: &'static str, text: String) -> LegacyQuad {
+        LegacyQuad {
+            graph: KotobaCid::from_bytes(b"mcp-test-graph"),
+            subject,
+            predicate: predicate.to_string(),
+            object: LegacyQuadObject::Text(text),
+        }
+    }
+
+    async fn commit_legacy_email_fixture_on_state(
+        state: Arc<crate::server::KotobaState>,
+        owner_did: &str,
+        email_seed: &[u8],
+        body: &[u8],
+        tx_label: &str,
+        extra_datoms: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> (KotobaCid, String) {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(email_seed);
+        let email_cid_mb = email_cid.to_multibase();
+        let encrypted_body = crypto
+            .encrypt_blob_bound(email_cid_mb.as_bytes(), body)
+            .await
+            .expect("bound body ciphertext");
+        let blob = state.vault.put(bytes::Bytes::from(encrypted_body)).await;
+        let tx_cid = mcp_tx_cid(tx_label, &[owner_did]);
+        let datoms = [
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+        ]
+        .into_iter()
+        .chain(extra_datoms)
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+        (email_cid, email_cid_mb)
+    }
+
+    async fn commit_legacy_email_fixture(
+        owner_did: &str,
+        email_seed: &[u8],
+        body: &[u8],
+        tx_label: &str,
+        extra_datoms: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> (Arc<crate::server::KotobaState>, KotobaCid, String) {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let (email_cid, email_cid_mb) = commit_legacy_email_fixture_on_state(
+            Arc::clone(&state),
+            owner_did,
+            email_seed,
+            body,
+            tx_label,
+            extra_datoms,
+        )
+        .await;
+        (state, email_cid, email_cid_mb)
+    }
+
+    #[test]
+    fn email_body_cid_from_quads_allows_duplicate_identical_values() {
+        let subject = KotobaCid::from_bytes(b"mcp-body-cid-duplicate-identical");
+        let body_cid = KotobaCid::from_bytes(b"mcp-body-cid-same").to_multibase();
+        let quads = vec![
+            test_text_quad(subject.clone(), "email/body_cid", body_cid.clone()),
+            test_text_quad(subject.clone(), "email/body_cid", body_cid.clone()),
+        ];
+
+        assert_eq!(
+            email_body_cid_from_quads(&quads, &subject).unwrap(),
+            body_cid
+        );
+    }
+
+    #[test]
+    fn signal_enc_from_quads_allows_duplicate_identical_signal_values() {
+        let subject = KotobaCid::from_bytes(b"mcp-enc-duplicate-identical");
+        let other_subject = KotobaCid::from_bytes(b"mcp-enc-other-subject");
+        let quads = vec![
+            test_text_quad(other_subject, "email/enc", "unknown:v1".to_string()),
+            test_text_quad(subject.clone(), "email/enc", ENC_SIGNAL_V1.to_string()),
+            test_text_quad(subject.clone(), "email/enc", ENC_SIGNAL_V1.to_string()),
+        ];
+
+        assert!(!signal_enc_from_quads(&[], &subject).unwrap());
+        assert!(signal_enc_from_quads(&quads, &subject).unwrap());
+    }
+
+    #[test]
+    fn signal_enc_from_quads_rejects_invalid_values_for_subject() {
+        let subject = KotobaCid::from_bytes(b"mcp-enc-invalid-subject");
+        let graph = KotobaCid::from_bytes(b"mcp-test-graph");
+        let non_text_enc = LegacyQuad {
+            graph,
+            subject: subject.clone(),
+            predicate: "email/enc".to_string(),
+            object: LegacyQuadObject::Integer(1),
+        };
+
+        for quads in [
+            vec![test_text_quad(
+                subject.clone(),
+                "email/enc",
+                "unknown:v1".to_string(),
+            )],
+            vec![non_text_enc],
+        ] {
+            let err = signal_enc_from_quads(&quads, &subject).unwrap_err();
+            assert_eq!(err.0, ERR_INTERNAL);
+            assert!(err.1.contains("invalid email/enc"), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn optional_unique_visible_text_from_quads_allows_missing_and_duplicate_identical_values() {
+        let subject = KotobaCid::from_bytes(b"mcp-visible-text-duplicate-identical");
+        let other_subject = KotobaCid::from_bytes(b"mcp-visible-text-other-subject");
+        let quads = vec![
+            test_text_quad(
+                other_subject,
+                "email/from",
+                "other@example.test".to_string(),
+            ),
+            test_text_quad(
+                subject.clone(),
+                "email/from",
+                "sender@example.test".to_string(),
+            ),
+            test_text_quad(
+                subject.clone(),
+                "email/from",
+                "sender@example.test".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            optional_unique_visible_text_from_quads(&[], &subject, "email/from").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_unique_visible_text_from_quads(&quads, &subject, "email/from").unwrap(),
+            Some("sender@example.test".to_string())
+        );
+    }
+
+    #[test]
+    fn optional_unique_visible_text_from_quads_rejects_invalid_or_conflicting_values() {
+        let subject = KotobaCid::from_bytes(b"mcp-visible-text-invalid");
+        let graph = KotobaCid::from_bytes(b"mcp-test-graph");
+        let non_text_from = LegacyQuad {
+            graph,
+            subject: subject.clone(),
+            predicate: "email/from".to_string(),
+            object: LegacyQuadObject::Integer(1),
+        };
+
+        for (quads, expected) in [
+            (
+                vec![test_text_quad(subject.clone(), "email/from", String::new())],
+                "invalid email/from",
+            ),
+            (
+                vec![test_text_quad(
+                    subject.clone(),
+                    "email/from",
+                    "bad\nsender".to_string(),
+                )],
+                "invalid email/from",
+            ),
+            (vec![non_text_from], "invalid email/from"),
+            (
+                vec![
+                    test_text_quad(
+                        subject.clone(),
+                        "email/from",
+                        "first@example.test".to_string(),
+                    ),
+                    test_text_quad(
+                        subject.clone(),
+                        "email/from",
+                        "second@example.test".to_string(),
+                    ),
+                ],
+                "multiple email/from values found",
+            ),
+        ] {
+            let err = optional_unique_visible_text_from_quads(&quads, &subject, "email/from")
+                .unwrap_err();
+            assert_eq!(err.0, ERR_INTERNAL);
+            assert!(err.1.contains(expected), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn unique_visible_bounded_text_from_quads_enforces_presence_and_length() {
+        let subject = KotobaCid::from_bytes(b"mcp-unique-visible-bounded");
+        let max_len = 4;
+
+        let missing =
+            unique_visible_bounded_text_from_quads(&[], &subject, "email/message_id", max_len)
+                .unwrap_err();
+        assert_eq!(missing.0, ERR_NOT_FOUND);
+        assert!(missing.1.contains("email_cid not found"), "{missing:?}");
+
+        assert_eq!(
+            unique_visible_bounded_text_from_quads(
+                &[test_text_quad(
+                    subject.clone(),
+                    "email/message_id",
+                    "abcd".to_string(),
+                )],
+                &subject,
+                "email/message_id",
+                max_len,
+            )
+            .unwrap(),
+            "abcd"
+        );
+
+        let oversized = unique_visible_bounded_text_from_quads(
+            &[test_text_quad(
+                subject.clone(),
+                "email/message_id",
+                "abcde".to_string(),
+            )],
+            &subject,
+            "email/message_id",
+            max_len,
+        )
+        .unwrap_err();
+        assert_eq!(oversized.0, ERR_INTERNAL);
+        assert!(
+            oversized.1.contains("invalid email/message_id"),
+            "{oversized:?}"
+        );
+    }
+
+    #[test]
+    fn latest_visible_bounded_text_from_quads_ignores_invalid_values() {
+        let subject = KotobaCid::from_bytes(b"mcp-latest-visible-bounded");
+        let other_subject = KotobaCid::from_bytes(b"mcp-latest-visible-other");
+        let max_len = MAX_EMAIL_DATE_LEN;
+        let quads = vec![
+            test_text_quad(
+                other_subject,
+                "email/date",
+                "9999-12-31T00:00:00Z".to_string(),
+            ),
+            test_text_quad(subject.clone(), "email/date", String::new()),
+            test_text_quad(
+                subject.clone(),
+                "email/date",
+                "2026-06-01T00:00:00Z".to_string(),
+            ),
+            test_text_quad(
+                subject.clone(),
+                "email/date",
+                "2026-06-03\n00:00:00Z".to_string(),
+            ),
+            test_text_quad(subject.clone(), "email/date", "x".repeat(max_len + 1)),
+            test_text_quad(
+                subject.clone(),
+                "email/date",
+                "2026-06-02T00:00:00Z".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            latest_visible_bounded_text_from_quads(&quads, &subject, "email/date", max_len),
+            "2026-06-02T00:00:00Z"
+        );
+        assert_eq!(
+            latest_visible_bounded_text_from_quads(&[], &subject, "email/date", max_len),
+            ""
+        );
+    }
+
+    #[test]
+    fn visible_bounded_text_from_quads_returns_first_valid_value() {
+        let subject = KotobaCid::from_bytes(b"mcp-visible-bounded");
+        let other_subject = KotobaCid::from_bytes(b"mcp-visible-bounded-other");
+        let max_len = 8;
+        let quads = vec![
+            test_text_quad(other_subject, "email/thread_id", "other".to_string()),
+            test_text_quad(subject.clone(), "email/thread_id", String::new()),
+            test_text_quad(subject.clone(), "email/thread_id", "bad\nid".to_string()),
+            test_text_quad(subject.clone(), "email/thread_id", "x".repeat(max_len + 1)),
+            test_text_quad(subject.clone(), "email/thread_id", "thread-1".to_string()),
+            test_text_quad(subject.clone(), "email/thread_id", "thread-2".to_string()),
+        ];
+
+        assert_eq!(
+            visible_bounded_text_from_quads(&quads, &subject, "email/thread_id", max_len),
+            "thread-1"
+        );
+        assert_eq!(
+            visible_bounded_text_from_quads(&[], &subject, "email/thread_id", max_len),
+            ""
+        );
+    }
+
+    #[test]
+    fn parse_mcp_cid_field_accepts_cids_and_legacy_labels_with_bounds() {
+        let cid = KotobaCid::from_bytes(b"mcp-cid-field");
+        assert_eq!(
+            parse_mcp_cid_field("cid", &format!("  {}  ", cid.to_multibase())).unwrap(),
+            cid
+        );
+        assert_eq!(
+            parse_mcp_cid_field("cid", "legacy-label").unwrap(),
+            KotobaCid::from_bytes(b"legacy-label")
+        );
+
+        for value in ["", "   ", "bad\ncid"] {
+            assert!(
+                parse_mcp_cid_field("cid", value).is_err(),
+                "CID-like field should be rejected: {value:?}"
+            );
+        }
+        let oversized = "b".repeat(MAX_MCP_CID_FIELD_LEN + 1);
+        assert!(parse_mcp_cid_field("cid", &oversized).is_err());
+    }
 
     #[test]
     fn tools_list_contains_all() {
@@ -1702,6 +2500,8 @@ mod tests {
         assert!(names.contains(&MCP_TOOL_EMBED_CREATE));
         assert!(names.contains(&MCP_TOOL_WEIGHT_PUT));
         assert!(names.contains(&MCP_TOOL_LORA_APPLY));
+        assert!(names.contains(&MCP_TOOL_EMAIL_LIST));
+        assert!(names.contains(&MCP_TOOL_EMAIL_READ));
         assert!(names.contains(&MCP_TOOL_WASM_RUN));
         assert!(names.contains(&MCP_TOOL_DATALOG_RUN));
         assert!(names.contains(&MCP_TOOL_NODE_INFO));
@@ -1732,6 +2532,76 @@ mod tests {
                 "{name} missing required array"
             );
         }
+    }
+
+    #[test]
+    fn email_list_tool_schema_matches_pagination_contract() {
+        let list = tools_list();
+        let tool = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == MCP_TOOL_EMAIL_LIST)
+            .expect("email list tool");
+        let props = &tool["inputSchema"]["properties"];
+        assert!(
+            tool["description"].as_str().is_some_and(
+                |description| description.contains("Signal metadata remains zero-access")
+            ),
+            "email.list description must disclose Signal zero-access behavior"
+        );
+        assert_eq!(props["owner_did"]["minLength"].as_u64(), Some(1));
+        assert_eq!(
+            props["owner_did"]["maxLength"].as_u64(),
+            Some(MAX_OWNER_DID_LEN as u64)
+        );
+        assert_eq!(props["owner_did"]["pattern"].as_str(), Some("^did:[!-~]+$"));
+        assert_eq!(props["limit"]["minimum"].as_u64(), Some(1));
+        assert_eq!(
+            props["limit"]["maximum"].as_u64(),
+            Some(MAX_EMAIL_LIST_LIMIT as u64)
+        );
+        assert_eq!(props["offset"]["minimum"].as_u64(), Some(0));
+        assert_eq!(
+            props["offset"]["maximum"].as_u64(),
+            Some(MAX_EMAIL_LIST_OFFSET as u64)
+        );
+    }
+
+    #[test]
+    fn email_read_tool_schema_matches_input_contract() {
+        let list = tools_list();
+        let tool = list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == MCP_TOOL_EMAIL_READ)
+            .expect("email read tool");
+        let props = &tool["inputSchema"]["properties"];
+        let description = tool["description"].as_str().expect("description");
+        assert!(
+            description.contains("Legacy records decrypt")
+                && description.contains("Signal records return signalMessage")
+                && description.contains("do not expose a server-decrypted body"),
+            "email.read description must disclose legacy-vs-Signal behavior: {description}"
+        );
+        assert_eq!(props["owner_did"]["minLength"].as_u64(), Some(1));
+        assert_eq!(
+            props["owner_did"]["maxLength"].as_u64(),
+            Some(MAX_OWNER_DID_LEN as u64)
+        );
+        assert_eq!(props["owner_did"]["pattern"].as_str(), Some("^did:[!-~]+$"));
+        assert_eq!(props["email_cid"]["minLength"].as_u64(), Some(1));
+        assert_eq!(
+            props["email_cid"]["maxLength"].as_u64(),
+            Some(MAX_EMAIL_CID_LEN as u64)
+        );
+        assert!(
+            props["email_cid"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("visible ASCII")),
+            "email_cid description must disclose visible-ASCII rejection"
+        );
     }
 
     #[test]
@@ -1811,7 +2681,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_unknown_returns_not_found() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool("nonexistent_tool", &json!({}), &state, None).await;
         let (code, _) = result.unwrap_err();
         assert_eq!(code, ERR_NOT_FOUND);
@@ -1819,7 +2689,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_quad_create_ok() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_QUAD_CREATE,
             &json!({
@@ -1842,7 +2712,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_datom_create_ok() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_DATOM_CREATE,
             &json!({
@@ -1864,7 +2734,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_datom_create_commits_to_distributed_datomic_head() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let graph = "mcp_distributed_graph";
         let subject = "mcp_subject";
         let predicate = "mcp/predicate";
@@ -1904,7 +2774,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_quad_create_missing_field_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_QUAD_CREATE,
             &json!({
@@ -1922,7 +2792,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_quad_create_oversized_field_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let big = "x".repeat(4097);
         let result = call_tool(
             MCP_TOOL_QUAD_CREATE,
@@ -1942,8 +2812,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_tool_datom_create_rejects_unsafe_graph_subject_and_predicate() {
+        let state = test_state();
+        for (field, value) in [
+            ("graph", "graph\n1"),
+            ("subject", "subject\r1"),
+            ("predicate", " \t "),
+        ] {
+            let mut args = json!({
+                "graph":     "graph1",
+                "subject":   "alice",
+                "predicate": "knows",
+                "object":    "bob"
+            });
+            args[field] = Value::String(value.to_string());
+            let result = call_tool(MCP_TOOL_DATOM_CREATE, &args, &state, None).await;
+            let (code, msg) = result.unwrap_err();
+            assert_eq!(code, ERR_INVALID_PARAMS);
+            assert!(msg.contains(field), "{msg}");
+        }
+    }
+
+    #[tokio::test]
     async fn call_tool_graph_query_empty_graph() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_GRAPH_QUERY,
             &json!({
@@ -1959,8 +2851,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_tool_graph_query_rejects_unsafe_filters() {
+        let state = test_state();
+        for (field, value) in [
+            ("graph", "graph\n1"),
+            ("subject", "subject\n1"),
+            ("predicate", "predicate\n1"),
+            ("predicate_prefix", "prefix\n"),
+        ] {
+            let mut args = json!({
+                "graph": "graph1"
+            });
+            args[field] = Value::String(value.to_string());
+            let result = call_tool(MCP_TOOL_GRAPH_QUERY, &args, &state, None).await;
+            let (code, msg) = result.unwrap_err();
+            assert_eq!(code, ERR_INVALID_PARAMS);
+            assert!(msg.contains(field), "{msg}");
+        }
+    }
+
+    #[tokio::test]
     async fn graph_query_avet_predicate_prefix_returns_matching_quads() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // Seed two quads with predicate "weight/layer/0" and one with "other"
         for (pred, obj) in [
             ("weight/layer/0", "val0"),
@@ -1998,7 +2910,7 @@ mod tests {
 
     #[tokio::test]
     async fn graph_query_avet_predicate_object_returns_subjects() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // Seed: alice knows bob, carol knows bob, dave knows eve
         for (s, o) in [("alice", "bob"), ("carol", "bob"), ("dave", "eve")] {
             call_tool(
@@ -2030,7 +2942,7 @@ mod tests {
 
     #[tokio::test]
     async fn admin_tools_reject_non_operator() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // Any DID other than operator_did must be rejected with ERR_AUTH.
         for tool in ADMIN_ONLY_TOOLS {
             let args = if *tool == MCP_TOOL_COMMIT_PRUNE {
@@ -2055,7 +2967,7 @@ mod tests {
 
     #[tokio::test]
     async fn graph_gc_returns_ok_with_deleted_count() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // Fresh store has no committed blocks — GC should delete 0 and succeed.
         let v = call_tool(
             MCP_TOOL_GRAPH_GC,
@@ -2074,7 +2986,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_prune_returns_ok_with_counts() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // Fresh store — no commits yet; prune with before_seq=0 removes nothing.
         let v = call_tool(
             MCP_TOOL_COMMIT_PRUNE,
@@ -2094,7 +3006,7 @@ mod tests {
 
     #[tokio::test]
     async fn commit_prune_missing_before_seq_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_COMMIT_PRUNE,
             &json!({}),
@@ -2110,7 +3022,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_embed_create_ok_blake3_fallback() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_EMBED_CREATE,
             &json!({
@@ -2162,7 +3074,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_embed_create_empty_text_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_EMBED_CREATE,
             &json!({
@@ -2182,7 +3094,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_embed_create_missing_text_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_EMBED_CREATE,
             &json!({
@@ -2198,11 +3110,31 @@ mod tests {
         assert_eq!(code, ERR_INVALID_PARAMS);
     }
 
+    #[tokio::test]
+    async fn call_tool_embed_create_rejects_unsafe_cid_fields() {
+        let state = test_state();
+        let result = call_tool(
+            MCP_TOOL_EMBED_CREATE,
+            &json!({
+                "text":      "hello",
+                "doc_cid":   "doc\n1",
+                "model_cid": "model1",
+                "graph":     "graph1"
+            }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INVALID_PARAMS);
+        assert!(msg.contains("doc_cid"), "{msg}");
+    }
+
     // ── kotoba_infer_run ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn call_tool_infer_run_without_engine_returns_error() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // No inference engine loaded → must fail
         let result = call_tool(
             MCP_TOOL_INFER_RUN,
@@ -2224,7 +3156,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_infer_run_missing_prompt_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // Engine check precedes prompt validation — either ERR_INTERNAL (no engine)
         // or ERR_INVALID_PARAMS (missing prompt) are both acceptable errors.
         let result = call_tool(MCP_TOOL_INFER_RUN, &json!({}), &state, None).await;
@@ -2235,7 +3167,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_node_info_returns_node_fields() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(MCP_TOOL_NODE_INFO, &json!({}), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
@@ -2253,7 +3185,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_node_register_returns_ok() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_NODE_REGISTER,
             &json!({}),
@@ -2274,7 +3206,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_network_peers_returns_peer_list() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(MCP_TOOL_NETWORK_PEERS, &json!({}), &state, None).await;
         assert!(result.is_ok(), "{result:?}");
         let v = result.unwrap();
@@ -2296,7 +3228,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[tokio::test]
     async fn call_tool_wasm_run_missing_wasm_b64_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_WASM_RUN,
             &json!({
@@ -2314,7 +3246,7 @@ mod tests {
     #[cfg(feature = "wasm-runtime")]
     #[tokio::test]
     async fn call_tool_wasm_run_invalid_base64_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_WASM_RUN,
             &json!({
@@ -2334,7 +3266,7 @@ mod tests {
     #[cfg(not(feature = "wasm-runtime"))]
     #[tokio::test]
     async fn call_tool_wasm_run_requires_feature_when_disabled() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_WASM_RUN,
             &json!({
@@ -2369,7 +3301,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_datalog_run_missing_rules_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_DATALOG_RUN,
             &json!({
@@ -2386,7 +3318,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_datalog_run_empty_graph_returns_empty_derived() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // Empty graph with no rules — should succeed with 0 derived facts
         let result = call_tool(
             MCP_TOOL_DATALOG_RUN,
@@ -2408,7 +3340,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_weight_put_missing_layer_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         let data = B64.encode(b"fake-weight-data");
         let result = call_tool(
@@ -2431,7 +3363,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_weight_put_ok() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         let data = B64.encode(b"fake-weight-bytes");
         let result = call_tool(
@@ -2459,7 +3391,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_lora_apply_missing_rank_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         let adapter = B64.encode(b"fake-lora-adapter");
         let result = call_tool(
@@ -2481,7 +3413,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_lora_apply_ok() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         let adapter = B64.encode(b"fake-lora-adapter-bytes");
         let result = call_tool(
@@ -2507,7 +3439,7 @@ mod tests {
 
     #[tokio::test]
     async fn weight_store_layer_overflow_u32_is_rejected() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         let data = B64.encode(b"fake-weight-bytes");
         let overflow_layer: u64 = u32::MAX as u64 + 1;
@@ -2538,7 +3470,7 @@ mod tests {
 
     #[tokio::test]
     async fn lora_apply_rank_overflow_u32_is_rejected() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         let adapter = B64.encode(b"fake-lora");
         let overflow_rank: u64 = u32::MAX as u64 + 1;
@@ -2576,7 +3508,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_sparql_query_missing_graph_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_SPARQL_QUERY,
             &json!({
@@ -2592,7 +3524,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_sparql_query_missing_sparql_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_SPARQL_QUERY,
             &json!({
@@ -2608,7 +3540,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_sparql_query_oversized_sparql_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let big = "x".repeat(8 * 1024 + 1);
         let result = call_tool(
             MCP_TOOL_SPARQL_QUERY,
@@ -2627,7 +3559,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_sparql_query_empty_graph_returns_empty() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_SPARQL_QUERY,
             &json!({
@@ -2649,11 +3581,12 @@ mod tests {
         use kotoba_ingest::graph_cid_for;
         use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
 
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let owner_did = "did:key:zEmailListDistributed1";
         let graph_cid = graph_cid_for(owner_did);
         let graph = graph_cid.to_multibase();
         let email_cid = KotobaCid::from_bytes(b"email-list-distributed-1");
+        let date_only_cid = KotobaCid::from_bytes(b"email-list-date-only");
         let tx_cid = mcp_tx_cid("email.list.test", &[owner_did]);
         let datoms = vec![
             KqeDatom::assert(
@@ -2670,14 +3603,28 @@ mod tests {
             ),
             KqeDatom::assert(
                 email_cid.clone(),
+                "email/body_cid".into(),
+                KqeValue::Text(
+                    KotobaCid::from_bytes(b"email-list-distributed-body").to_multibase(),
+                ),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
                 "email/subject".into(),
-                KqeValue::Text("Distributed subject".into()),
+                KqeValue::Text("Distributed-subject".into()),
                 tx_cid.clone(),
             ),
             KqeDatom::assert(
                 email_cid.clone(),
                 "email/from".into(),
                 KqeValue::Text("sender@example.test".into()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                date_only_cid,
+                "email/date".into(),
+                KqeValue::Text("9999999999".into()),
                 tx_cid.clone(),
             ),
         ];
@@ -2705,13 +3652,3628 @@ mod tests {
         let email = &value["emails"][0];
         assert_eq!(email["cid"], email_cid.to_multibase(), "{value}");
         assert_eq!(email["message_id"], "<distributed@example.test>", "{value}");
-        assert_eq!(email["subject"], "Distributed subject", "{value}");
+        assert_eq!(email["subject"], "Distributed-subject", "{value}");
         assert_eq!(email["from"], "sender@example.test", "{value}");
     }
 
     #[tokio::test]
+    async fn call_tool_email_list_rejects_invalid_pagination() {
+        let state = test_state();
+        let owner_did = "did:key:zEmailListPagination";
+
+        for args in [
+            json!({ "owner_did": owner_did, "limit": 0 }),
+            json!({ "owner_did": owner_did, "limit": MAX_EMAIL_LIST_LIMIT + 1 }),
+            json!({ "owner_did": owner_did, "limit": "200" }),
+            json!({ "owner_did": owner_did, "offset": -1 }),
+            json!({ "owner_did": owner_did, "offset": MAX_EMAIL_LIST_OFFSET + 1 }),
+        ] {
+            let result = call_tool(MCP_TOOL_EMAIL_LIST, &args, &state, None).await;
+            let (code, msg) = result.unwrap_err();
+            assert_eq!(code, ERR_INVALID_PARAMS, "{args}");
+            assert!(
+                msg.contains("limit") || msg.contains("offset"),
+                "unexpected error for {args}: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_applies_limit_and_offset_after_filter_and_sort() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailListPaged";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let newest = KotobaCid::from_bytes(b"mcp-list-paged-newest");
+        let middle = KotobaCid::from_bytes(b"mcp-list-paged-middle");
+        let oldest = KotobaCid::from_bytes(b"mcp-list-paged-oldest");
+        let invalid_newer = KotobaCid::from_bytes(b"mcp-list-paged-invalid-newer");
+        let tx_cid = mcp_tx_cid("email.list.paged", &[owner_did]);
+        let mut datoms = Vec::new();
+        for (email_cid, date) in [
+            (oldest.clone(), "2026-06-10T00:00:00Z"),
+            (newest.clone(), "2026-06-12T00:00:00Z"),
+            (middle.clone(), "2026-06-11T00:00:00Z"),
+        ] {
+            for (predicate, object) in [
+                ("email/message_id", email_cid.to_multibase()),
+                (
+                    "email/body_cid",
+                    KotobaCid::from_bytes(format!("mcp-list-paged-body-{date}").as_bytes())
+                        .to_multibase(),
+                ),
+                ("email/date", date.to_string()),
+            ] {
+                datoms.push(KqeDatom::assert(
+                    email_cid.clone(),
+                    predicate.to_string(),
+                    KqeValue::Text(object),
+                    tx_cid.clone(),
+                ));
+            }
+        }
+        for (predicate, object) in [
+            ("email/message_id", invalid_newer.to_multibase()),
+            ("email/date", "2026-06-13T00:00:00Z".to_string()),
+        ] {
+            datoms.push(KqeDatom::assert(
+                invalid_newer.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            ));
+        }
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            newest.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did, "limit": 1, "offset": 1 }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 3, "{value}");
+        assert_eq!(value["offset"], 1, "{value}");
+        assert_eq!(value["limit"], 1, "{value}");
+        let emails = value["emails"].as_array().expect("emails");
+        assert_eq!(emails.len(), 1, "{value}");
+        assert_eq!(emails[0]["cid"], middle.to_multibase(), "{value}");
+        assert_eq!(emails[0]["date"], "2026-06-11T00:00:00Z", "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_tiebreaks_same_date_by_cid() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailListSameDate";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let first = KotobaCid::from_bytes(b"mcp-list-same-date-a");
+        let second = KotobaCid::from_bytes(b"mcp-list-same-date-b");
+        let date = "2026-06-12T00:00:00Z";
+        let tx_cid = mcp_tx_cid("email.list.same-date", &[owner_did]);
+        let mut datoms = Vec::new();
+        for email_cid in [second.clone(), first.clone()] {
+            for (predicate, object) in [
+                ("email/message_id", email_cid.to_multibase()),
+                (
+                    "email/body_cid",
+                    KotobaCid::from_bytes(email_cid.to_multibase().as_bytes()).to_multibase(),
+                ),
+                ("email/date", date.to_string()),
+            ] {
+                datoms.push(KqeDatom::assert(
+                    email_cid.clone(),
+                    predicate.to_string(),
+                    KqeValue::Text(object),
+                    tx_cid.clone(),
+                ));
+            }
+        }
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            first.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut expected = [first.to_multibase(), second.to_multibase()];
+        expected.sort();
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did, "limit": 2, "offset": 0 }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 2, "{value}");
+        let emails = value["emails"].as_array().expect("emails");
+        assert_eq!(emails.len(), 2, "{value}");
+        assert_eq!(emails[0]["cid"], expected[0], "{value}");
+        assert_eq!(emails[1]["cid"], expected[1], "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_exposes_signal_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zEmailListSignalRecipient";
+        let sender_did = "did:key:zEmailListSignalSender";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-list-signal");
+        let tx_cid = mcp_tx_cid("email.list.signal", &[owner_did]);
+        let datoms = vec![
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/message_id", email_cid.to_multibase()),
+            ("email/from", sender_did.to_string()),
+            (
+                "email/body_cid",
+                KotobaCid::from_bytes(b"body").to_multibase(),
+            ),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+            ("email/recipient_device", "device-1".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        let email = &value["emails"][0];
+        assert_eq!(email["cid"], email_cid.to_multibase(), "{value}");
+        assert_eq!(email["enc"], ENC_SIGNAL_V1, "{value}");
+        assert_eq!(email["recipient_device"], "device-1", "{value}");
+        assert_eq!(email["from"], sender_did, "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_sanitizes_legacy_display_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let owner_did = "did:key:zMcpEmailListSanitizeLegacyMetadata";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-list-sanitize-legacy-metadata");
+        let tx_cid = mcp_tx_cid("email.list.sanitize-legacy-metadata", &[owner_did]);
+        let datoms = vec![
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/message_id", email_cid.to_multibase()),
+            (
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-email-list-sanitize-body").to_multibase(),
+            ),
+            ("email/from", "sender\n@example.test".to_string()),
+            ("email/subject", "signal:v1:corrupt-envelope".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        let email = &value["emails"][0];
+        assert_eq!(email["cid"], email_cid.to_multibase(), "{value}");
+        assert_eq!(email["from"], "", "{value}");
+        assert_eq!(email["subject"], "", "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_skips_subjects_with_invalid_enc() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zEmailListInvalidSignalMetadata";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let valid_email_cid = KotobaCid::from_bytes(b"mcp-email-list-valid-enc");
+        let invalid_enc_cid = KotobaCid::from_bytes(b"mcp-email-list-invalid-enc");
+        let tx_cid = mcp_tx_cid("email.list.invalid-signal-metadata", &[owner_did]);
+        let datoms = vec![
+            (
+                valid_email_cid.clone(),
+                "email/date",
+                "2026-06-12T00:00:00Z".to_string(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/message_id",
+                valid_email_cid.to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-email-list-valid-enc-body").to_multibase(),
+            ),
+            (
+                invalid_enc_cid.clone(),
+                "email/date",
+                "2026-06-13T00:00:00Z".to_string(),
+            ),
+            (
+                invalid_enc_cid.clone(),
+                "email/message_id",
+                invalid_enc_cid.to_multibase(),
+            ),
+            (
+                invalid_enc_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-email-list-invalid-enc-body").to_multibase(),
+            ),
+            (invalid_enc_cid, "email/enc", "unknown:v1".to_string()),
+        ]
+        .into_iter()
+        .map(|(subject, predicate, object)| {
+            KqeDatom::assert(
+                subject,
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            valid_email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        let email = &value["emails"][0];
+        assert_eq!(email["cid"], valid_email_cid.to_multibase(), "{value}");
+        assert!(email.get("enc").is_none(), "{value}");
+        assert!(email.get("recipient_device").is_none(), "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_skips_subjects_without_valid_body_cid() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailListInvalidBodyCid";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let valid_email_cid = KotobaCid::from_bytes(b"mcp-list-valid-body-cid");
+        let missing_body_cid = KotobaCid::from_bytes(b"mcp-list-missing-body-cid");
+        let invalid_body_cid = KotobaCid::from_bytes(b"mcp-list-invalid-body-cid");
+        let tx_cid = mcp_tx_cid("email.list.invalid-body-cid", &[owner_did]);
+        let datoms = vec![
+            (
+                valid_email_cid.clone(),
+                "email/message_id",
+                valid_email_cid.to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-valid-body-cid-body").to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/date",
+                "2026-06-12T00:00:00Z".to_string(),
+            ),
+            (
+                missing_body_cid.clone(),
+                "email/message_id",
+                missing_body_cid.to_multibase(),
+            ),
+            (
+                missing_body_cid,
+                "email/date",
+                "2026-06-13T00:00:00Z".to_string(),
+            ),
+            (
+                invalid_body_cid.clone(),
+                "email/message_id",
+                invalid_body_cid.to_multibase(),
+            ),
+            (
+                invalid_body_cid.clone(),
+                "email/body_cid",
+                "not-a-multibase-cid".to_string(),
+            ),
+            (
+                invalid_body_cid,
+                "email/date",
+                "2026-06-14T00:00:00Z".to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(subject, predicate, object)| {
+            KqeDatom::assert(
+                subject,
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            valid_email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        assert_eq!(
+            value["emails"][0]["cid"],
+            valid_email_cid.to_multibase(),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_skips_subjects_with_invalid_message_id() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailListInvalidMessageId";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let valid_email_cid = KotobaCid::from_bytes(b"mcp-list-valid-message-id");
+        let empty_message_id_cid = KotobaCid::from_bytes(b"mcp-list-empty-message-id");
+        let control_message_id_cid = KotobaCid::from_bytes(b"mcp-list-control-message-id");
+        let tx_cid = mcp_tx_cid("email.list.invalid-message-id", &[owner_did]);
+        let datoms = vec![
+            (
+                valid_email_cid.clone(),
+                "email/message_id",
+                valid_email_cid.to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-valid-message-id-body").to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/date",
+                "2026-06-12T00:00:00Z".to_string(),
+            ),
+            (
+                empty_message_id_cid.clone(),
+                "email/message_id",
+                String::new(),
+            ),
+            (
+                empty_message_id_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-empty-message-id-body").to_multibase(),
+            ),
+            (
+                empty_message_id_cid,
+                "email/date",
+                "2026-06-13T00:00:00Z".to_string(),
+            ),
+            (
+                control_message_id_cid.clone(),
+                "email/message_id",
+                "bad\nmessage-id".to_string(),
+            ),
+            (
+                control_message_id_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-control-message-id-body").to_multibase(),
+            ),
+            (
+                control_message_id_cid,
+                "email/date",
+                "2026-06-14T00:00:00Z".to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(subject, predicate, object)| {
+            KqeDatom::assert(
+                subject,
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            valid_email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        assert_eq!(
+            value["emails"][0]["cid"],
+            valid_email_cid.to_multibase(),
+            "{value}"
+        );
+        assert_eq!(
+            value["emails"][0]["message_id"],
+            valid_email_cid.to_multibase(),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_skips_subjects_with_invalid_date() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailListInvalidDate";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let valid_email_cid = KotobaCid::from_bytes(b"mcp-list-valid-date");
+        let empty_date_cid = KotobaCid::from_bytes(b"mcp-list-empty-date");
+        let control_date_cid = KotobaCid::from_bytes(b"mcp-list-control-date");
+        let oversized_date_cid = KotobaCid::from_bytes(b"mcp-list-oversized-date");
+        let tx_cid = mcp_tx_cid("email.list.invalid-date", &[owner_did]);
+        let datoms = vec![
+            (
+                valid_email_cid.clone(),
+                "email/message_id",
+                valid_email_cid.to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-valid-date-body").to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/date",
+                "2026-06-12T00:00:00Z".to_string(),
+            ),
+            (
+                empty_date_cid.clone(),
+                "email/message_id",
+                empty_date_cid.to_multibase(),
+            ),
+            (
+                empty_date_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-empty-date-body").to_multibase(),
+            ),
+            (empty_date_cid, "email/date", String::new()),
+            (
+                control_date_cid.clone(),
+                "email/message_id",
+                control_date_cid.to_multibase(),
+            ),
+            (
+                control_date_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-control-date-body").to_multibase(),
+            ),
+            (
+                control_date_cid,
+                "email/date",
+                "2026-06-13\n00:00:00Z".to_string(),
+            ),
+            (
+                oversized_date_cid.clone(),
+                "email/message_id",
+                oversized_date_cid.to_multibase(),
+            ),
+            (
+                oversized_date_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-oversized-date-body").to_multibase(),
+            ),
+            (
+                oversized_date_cid,
+                "email/date",
+                "x".repeat(MAX_EMAIL_DATE_LEN + 1),
+            ),
+        ]
+        .into_iter()
+        .map(|(subject, predicate, object)| {
+            KqeDatom::assert(
+                subject,
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            valid_email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        assert_eq!(
+            value["emails"][0]["cid"],
+            valid_email_cid.to_multibase(),
+            "{value}"
+        );
+        assert_eq!(value["emails"][0]["date"], "2026-06-12T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_skips_subjects_with_non_text_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailListNonTextMetadata";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let valid_email_cid = KotobaCid::from_bytes(b"mcp-list-valid-text-metadata");
+        let non_text_date_cid = KotobaCid::from_bytes(b"mcp-list-non-text-date");
+        let non_text_message_id_cid = KotobaCid::from_bytes(b"mcp-list-non-text-message-id");
+        let non_text_body_cid = KotobaCid::from_bytes(b"mcp-list-non-text-body-cid");
+        let non_text_enc_cid = KotobaCid::from_bytes(b"mcp-list-non-text-enc");
+        let tx_cid = mcp_tx_cid("email.list.non-text-metadata", &[owner_did]);
+        let datoms = vec![
+            KqeDatom::assert(
+                valid_email_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Text(valid_email_cid.to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                valid_email_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Text(KotobaCid::from_bytes(b"mcp-list-valid-text-body").to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                valid_email_cid.clone(),
+                "email/date".to_string(),
+                KqeValue::Text("2026-06-12T00:00:00Z".to_string()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_date_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Text(non_text_date_cid.to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_date_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Text(
+                    KotobaCid::from_bytes(b"mcp-list-non-text-date-body").to_multibase(),
+                ),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_date_cid,
+                "email/date".to_string(),
+                KqeValue::Integer(1),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_message_id_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Integer(1),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_message_id_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Text(
+                    KotobaCid::from_bytes(b"mcp-list-non-text-message-id-body").to_multibase(),
+                ),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_message_id_cid,
+                "email/date".to_string(),
+                KqeValue::Text("2026-06-13T00:00:00Z".to_string()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_body_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Text(non_text_body_cid.to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_body_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Integer(1),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_body_cid,
+                "email/date".to_string(),
+                KqeValue::Text("2026-06-14T00:00:00Z".to_string()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_enc_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Text(non_text_enc_cid.to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_enc_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Text(KotobaCid::from_bytes(b"mcp-list-non-text-enc-body").to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_enc_cid.clone(),
+                "email/date".to_string(),
+                KqeValue::Text("2026-06-15T00:00:00Z".to_string()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                non_text_enc_cid,
+                "email/enc".to_string(),
+                KqeValue::Integer(1),
+                tx_cid.clone(),
+            ),
+        ];
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            valid_email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        assert_eq!(
+            value["emails"][0]["cid"],
+            valid_email_cid.to_multibase(),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_skips_subjects_with_ambiguous_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailListAmbiguousMetadata";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let valid_email_cid = KotobaCid::from_bytes(b"mcp-list-valid-unambiguous");
+        let ambiguous_message_id_cid = KotobaCid::from_bytes(b"mcp-list-ambiguous-message-id");
+        let ambiguous_body_cid = KotobaCid::from_bytes(b"mcp-list-ambiguous-body-cid");
+        let tx_cid = mcp_tx_cid("email.list.ambiguous-metadata", &[owner_did]);
+        let datoms = vec![
+            (
+                valid_email_cid.clone(),
+                "email/message_id",
+                valid_email_cid.to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-valid-unambiguous-body").to_multibase(),
+            ),
+            (
+                valid_email_cid.clone(),
+                "email/date",
+                "2026-06-12T00:00:00Z".to_string(),
+            ),
+            (
+                ambiguous_message_id_cid.clone(),
+                "email/message_id",
+                "<first@example.test>".to_string(),
+            ),
+            (
+                ambiguous_message_id_cid.clone(),
+                "email/message_id",
+                "<second@example.test>".to_string(),
+            ),
+            (
+                ambiguous_message_id_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-ambiguous-message-id-body").to_multibase(),
+            ),
+            (
+                ambiguous_message_id_cid,
+                "email/date",
+                "2026-06-13T00:00:00Z".to_string(),
+            ),
+            (
+                ambiguous_body_cid.clone(),
+                "email/message_id",
+                ambiguous_body_cid.to_multibase(),
+            ),
+            (
+                ambiguous_body_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-ambiguous-body-a").to_multibase(),
+            ),
+            (
+                ambiguous_body_cid.clone(),
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-list-ambiguous-body-b").to_multibase(),
+            ),
+            (
+                ambiguous_body_cid,
+                "email/date",
+                "2026-06-14T00:00:00Z".to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(subject, predicate, object)| {
+            KqeDatom::assert(
+                subject,
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            valid_email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_LIST,
+            &json!({ "owner_did": owner_did }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["total"], 1, "{value}");
+        assert_eq!(
+            value["emails"][0]["cid"],
+            valid_email_cid.to_multibase(),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_invalid_email_cid_params() {
+        let state = test_state();
+        let owner_did = "did:key:zEmailReadCidValidation";
+
+        for email_cid in [
+            "",
+            "   ",
+            "bafy\ncid",
+            "bafy cid",
+            "bafyé",
+            &"b".repeat(MAX_EMAIL_CID_LEN + 1),
+            "not-a-multibase-cid",
+        ] {
+            let result = call_tool(
+                MCP_TOOL_EMAIL_READ,
+                &json!({ "owner_did": owner_did, "email_cid": email_cid }),
+                &state,
+                None,
+            )
+            .await;
+            let (code, msg) = result.unwrap_err();
+            assert_eq!(code, ERR_INVALID_PARAMS, "{email_cid:?}");
+            assert!(msg.contains("email_cid"), "unexpected error: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_list_and_read_reject_invalid_owner_did_params() {
+        let state = test_state();
+        let email_cid = KotobaCid::from_bytes(b"mcp-owner-did-validation").to_multibase();
+
+        for owner_did in [
+            "",
+            "not-a-did",
+            "did:key:zBad Owner",
+            "did:key:zBad/Owner",
+            &format!("did:key:z{}", "x".repeat(MAX_OWNER_DID_LEN)),
+        ] {
+            let list_result = call_tool(
+                MCP_TOOL_EMAIL_LIST,
+                &json!({ "owner_did": owner_did }),
+                &state,
+                None,
+            )
+            .await;
+            let (list_code, list_msg) = list_result.unwrap_err();
+            assert_eq!(list_code, ERR_INVALID_PARAMS, "{owner_did:?}");
+            assert!(
+                list_msg.contains("owner_did"),
+                "unexpected error: {list_msg}"
+            );
+
+            let read_result = call_tool(
+                MCP_TOOL_EMAIL_READ,
+                &json!({ "owner_did": owner_did, "email_cid": email_cid }),
+                &state,
+                None,
+            )
+            .await;
+            let (read_code, read_msg) = read_result.unwrap_err();
+            assert_eq!(read_code, ERR_INVALID_PARAMS, "{owner_did:?}");
+            assert!(
+                read_msg.contains("owner_did"),
+                "unexpected error: {read_msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_ambiguous_message_id_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadAmbiguousMessageId";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-ambiguous-message-id");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.ambiguous-message-id", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", "<first@example.test>".to_string()),
+            ("email/message_id", "<second@example.test>".to_string()),
+            (
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-email-read-ambiguous-message-id-body").to_multibase(),
+            ),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("multiple email/message_id values found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_body_decrypts_blob_bound_to_email_cid() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let owner_did = "did:key:zMcpLegacyBodyBoundRoundtrip";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-legacy-body-bound-roundtrip");
+        let email_cid_mb = email_cid.to_multibase();
+        let body_text = "mcp body bound to this email cid";
+        let body = crypto
+            .encrypt_blob_bound(email_cid_mb.as_bytes(), body_text.as_bytes())
+            .await
+            .expect("bound body ciphertext");
+        let blob = state.vault.put(bytes::Bytes::from(body)).await;
+        let tx_cid = mcp_tx_cid("email.read.legacy.body-bound-roundtrip", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/from", "sender@example.test".to_string()),
+            ("email/to", "recipient@example.test".to_string()),
+            ("email/subject", "Bound-body".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["email_cid"], email_cid_mb, "{value}");
+        assert_eq!(value["body"], body_text, "{value}");
+        assert_eq!(value["from"], "sender@example.test", "{value}");
+        assert_eq!(value["subject"], "Bound-body", "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_body_rejects_blob_bound_to_different_email_cid() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let owner_did = "did:key:zMcpLegacyBodyBoundSwap";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-legacy-body-bound-target");
+        let email_cid_mb = email_cid.to_multibase();
+        let other_email_cid_mb =
+            KotobaCid::from_bytes(b"mcp-legacy-body-bound-other").to_multibase();
+        let swapped_body = crypto
+            .encrypt_blob_bound(other_email_cid_mb.as_bytes(), b"swapped body")
+            .await
+            .expect("bound body ciphertext");
+        let blob = state.vault.put(bytes::Bytes::from(swapped_body)).await;
+        let tx_cid = mcp_tx_cid("email.read.legacy.body-bound-swap", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(msg.contains("decrypt body"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_body_rejects_invalid_utf8_plaintext() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let owner_did = "did:key:zMcpLegacyInvalidUtf8Body";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-legacy-invalid-utf8-body");
+        let email_cid_mb = email_cid.to_multibase();
+        let body = crypto
+            .encrypt_blob_bound(email_cid_mb.as_bytes(), &[0xff, 0xfe, 0xfd])
+            .await
+            .expect("bound body ciphertext");
+        let blob = state.vault.put(bytes::Bytes::from(body)).await;
+        let tx_cid = mcp_tx_cid("email.read.legacy.invalid-utf8-body", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("body is not valid UTF-8"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_rejects_corrupt_encrypted_metadata() {
+        let owner_did = "did:key:zMcpLegacyCorruptMetadata";
+        let (state, _, email_cid_mb) = commit_legacy_email_fixture(
+            owner_did,
+            b"mcp-legacy-corrupt-metadata",
+            b"valid body",
+            "email.read.legacy.corrupt-metadata",
+            [("email/from", "signal:v1:not-valid-ciphertext".to_string())],
+        )
+        .await;
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(msg.contains("decrypt from"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_rejects_ambiguous_display_metadata() {
+        let owner_did = "did:key:zMcpLegacyAmbiguousDisplayMetadata";
+        let (state, _, email_cid_mb) = commit_legacy_email_fixture(
+            owner_did,
+            b"mcp-legacy-ambiguous-display-metadata",
+            b"valid body",
+            "email.read.legacy.ambiguous-display",
+            [
+                ("email/subject", "First-subject".to_string()),
+                ("email/subject", "Second-subject".to_string()),
+            ],
+        )
+        .await;
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("multiple email/subject values found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_rejects_ambiguous_sender_metadata() {
+        let owner_did = "did:key:zMcpLegacyAmbiguousSenderMetadata";
+        let (state, _, email_cid_mb) = commit_legacy_email_fixture(
+            owner_did,
+            b"mcp-legacy-ambiguous-sender-metadata",
+            b"valid body",
+            "email.read.legacy.ambiguous-sender",
+            [
+                ("email/from", "first@example.test".to_string()),
+                ("email/from", "second@example.test".to_string()),
+            ],
+        )
+        .await;
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("multiple email/from values found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_rejects_ambiguous_recipient_metadata() {
+        let owner_did = "did:key:zMcpLegacyAmbiguousRecipientMetadata";
+        let (state, _, email_cid_mb) = commit_legacy_email_fixture(
+            owner_did,
+            b"mcp-legacy-ambiguous-recipient-metadata",
+            b"valid body",
+            "email.read.legacy.ambiguous-recipient",
+            [
+                ("email/to", "first-recipient@example.test".to_string()),
+                ("email/to", "second-recipient@example.test".to_string()),
+            ],
+        )
+        .await;
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("multiple email/to values found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_allows_duplicate_identical_display_metadata() {
+        let owner_did = "did:key:zMcpLegacyDuplicateIdenticalDisplay";
+        let body_text = "body with duplicate identical metadata";
+        let (state, _, email_cid_mb) = commit_legacy_email_fixture(
+            owner_did,
+            b"mcp-legacy-duplicate-identical-display",
+            body_text.as_bytes(),
+            "email.read.legacy.duplicate-identical-display",
+            [
+                ("email/from", "sender@example.test".to_string()),
+                ("email/from", "sender@example.test".to_string()),
+                ("email/subject", "Same-subject".to_string()),
+                ("email/subject", "Same-subject".to_string()),
+            ],
+        )
+        .await;
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["body"], body_text, "{value}");
+        assert_eq!(value["from"], "sender@example.test", "{value}");
+        assert_eq!(value["subject"], "Same-subject", "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_allows_duplicate_encrypted_metadata_with_same_plaintext() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let owner_did = "did:key:zMcpLegacyDuplicateEncryptedDisplay";
+        let body_text = "body with duplicate encrypted metadata";
+        let subject_a = crypto
+            .seal_field(b"email/subject", "Encrypted-same-subject")
+            .await
+            .expect("sealed subject a");
+        let subject_b = crypto
+            .seal_field(b"email/subject", "Encrypted-same-subject")
+            .await
+            .expect("sealed subject b");
+        let (_, email_cid_mb) = commit_legacy_email_fixture_on_state(
+            Arc::clone(&state),
+            owner_did,
+            b"mcp-legacy-duplicate-encrypted-display",
+            body_text.as_bytes(),
+            "email.read.legacy.duplicate-encrypted-display",
+            [("email/subject", subject_a), ("email/subject", subject_b)],
+        )
+        .await;
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["body"], body_text, "{value}");
+        assert_eq!(value["subject"], "Encrypted-same-subject", "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_allows_mixed_plaintext_and_encrypted_duplicate_metadata() {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let owner_did = "did:key:zMcpLegacyMixedDuplicateDisplay";
+        let body_text = "body with mixed duplicate metadata";
+        let sealed_subject = crypto
+            .seal_field(b"email/subject", "Mixed-same-subject")
+            .await
+            .expect("sealed subject");
+        let (_, email_cid_mb) = commit_legacy_email_fixture_on_state(
+            Arc::clone(&state),
+            owner_did,
+            b"mcp-legacy-mixed-duplicate-display",
+            body_text.as_bytes(),
+            "email.read.legacy.mixed-duplicate-display",
+            [
+                ("email/subject", "Mixed-same-subject".to_string()),
+                ("email/subject", sealed_subject),
+            ],
+        )
+        .await;
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["body"], body_text, "{value}");
+        assert_eq!(value["subject"], "Mixed-same-subject", "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_rejects_mixed_plaintext_and_encrypted_duplicate_metadata_with_different_plaintext(
+    ) {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let owner_did = "did:key:zMcpLegacyConflictingMixedDisplay";
+        let sealed_subject = crypto
+            .seal_field(b"email/subject", "Mixed-encrypted-subject")
+            .await
+            .expect("sealed subject");
+        let (_, email_cid_mb) = commit_legacy_email_fixture_on_state(
+            Arc::clone(&state),
+            owner_did,
+            b"mcp-legacy-conflicting-mixed-display",
+            b"valid body",
+            "email.read.legacy.conflicting-mixed-display",
+            [
+                ("email/subject", "Mixed-plain-subject".to_string()),
+                ("email/subject", sealed_subject),
+            ],
+        )
+        .await;
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("multiple email/subject values found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_rejects_duplicate_encrypted_metadata_with_different_plaintext(
+    ) {
+        let state = Arc::new(
+            crate::server::KotobaState::new(None)
+                .expect("state")
+                .init_crypto()
+                .await
+                .expect("crypto"),
+        );
+        let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+        let owner_did = "did:key:zMcpLegacyConflictingEncryptedDisplay";
+        let subject_a = crypto
+            .seal_field(b"email/subject", "Encrypted-first-subject")
+            .await
+            .expect("sealed subject a");
+        let subject_b = crypto
+            .seal_field(b"email/subject", "Encrypted-second-subject")
+            .await
+            .expect("sealed subject b");
+        let (_, email_cid_mb) = commit_legacy_email_fixture_on_state(
+            Arc::clone(&state),
+            owner_did,
+            b"mcp-legacy-conflicting-encrypted-display",
+            b"valid body",
+            "email.read.legacy.conflicting-encrypted-display",
+            [("email/subject", subject_a), ("email/subject", subject_b)],
+        )
+        .await;
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("multiple email/subject values found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_legacy_rejects_decrypted_metadata_outside_ingest_caps() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        for (case, predicate, scope, plaintext, expected) in [
+            (
+                "oversized-from",
+                "email/from",
+                b"email/from" as &'static [u8],
+                "f".repeat(MAX_LEGACY_ADDR_LEN + 1),
+                "from exceeds 4096 bytes",
+            ),
+            (
+                "control-subject",
+                "email/subject",
+                b"email/subject" as &'static [u8],
+                "hello\nworld".to_string(),
+                "subject must contain only visible ASCII characters",
+            ),
+        ] {
+            let state = Arc::new(
+                crate::server::KotobaState::new(None)
+                    .expect("state")
+                    .init_crypto()
+                    .await
+                    .expect("crypto"),
+            );
+            let crypto = Arc::clone(state.crypto.as_ref().expect("crypto"));
+            let owner_did = format!("did:key:zMcpLegacyMetadata{case}");
+            let graph_cid = graph_cid_for(&owner_did);
+            let graph = graph_cid.to_multibase();
+            let email_cid = KotobaCid::from_bytes(format!("mcp-legacy-metadata-{case}").as_bytes());
+            let email_cid_mb = email_cid.to_multibase();
+            let body = crypto
+                .encrypt_blob_bound(email_cid_mb.as_bytes(), b"valid body")
+                .await
+                .expect("bound body ciphertext");
+            let blob = state.vault.put(bytes::Bytes::from(body)).await;
+            let sealed_metadata = crypto
+                .seal_field(scope, &plaintext)
+                .await
+                .expect("sealed metadata");
+            let tx_cid = mcp_tx_cid("email.read.legacy.invalid-metadata", &[&owner_did, case]);
+            let datoms = vec![
+                ("email/message_id", email_cid_mb.clone()),
+                ("email/body_cid", blob.cid.to_multibase()),
+                ("email/date", "2026-06-02T00:00:00Z".to_string()),
+                (predicate, sealed_metadata),
+            ]
+            .into_iter()
+            .map(|(predicate, object)| {
+                KqeDatom::assert(
+                    email_cid.clone(),
+                    predicate.to_string(),
+                    KqeValue::Text(object),
+                    tx_cid.clone(),
+                )
+            })
+            .collect();
+            commit_mcp_datoms(
+                &state,
+                graph_cid,
+                graph,
+                email_cid.clone(),
+                datoms,
+                tx_cid,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let result = call_tool(
+                MCP_TOOL_EMAIL_READ,
+                &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+                &state,
+                None,
+            )
+            .await;
+            let (code, msg) = result.unwrap_err();
+            assert_eq!(code, ERR_INTERNAL);
+            assert!(msg.contains(expected), "unexpected error: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_returns_signal_envelope_without_server_decrypt() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalSender";
+        let owner_did = "did:key:zMcpSignalRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/thread_id", "thread-signal".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["email_cid"], email_cid_mb, "{value}");
+        assert_eq!(value["enc"], ENC_SIGNAL_V1, "{value}");
+        // Signal routing metadata is canonicalized from the validated envelope,
+        // not from potentially stale mailbox datoms.
+        assert_eq!(value["from"], sender_did, "{value}");
+        assert_eq!(value["to"], owner_did, "{value}");
+        assert_eq!(value["thread_id"], "thread-signal", "{value}");
+        assert_eq!(value["signalMessage"], signal_message, "{value}");
+        assert!(
+            value.get("body").is_none(),
+            "signal read must not expose server-decrypted body: {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_omits_invalid_signal_thread_id() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        for (case, thread_id) in [
+            ("control-thread", "thread\nid".to_string()),
+            ("oversized-thread", "t".repeat(MAX_THREAD_ID_LEN + 1)),
+        ] {
+            let state = test_state();
+            let sender_did = format!("did:key:zMcpSignalInvalidThreadSender{case}");
+            let owner_did = format!("did:key:zMcpSignalInvalidThreadRecipient{case}");
+            let graph_cid = graph_cid_for(&owner_did);
+            let graph = graph_cid.to_multibase();
+            let signal_message = json!({
+                "messageType": "directMessage",
+                "senderDid": sender_did,
+                "recipientDid": owner_did,
+                "deviceId": "device-1",
+                "ciphertextEnvelope": "sealed-mime",
+                "timestamp": "2026-06-02T00:00:00Z"
+            });
+            let blob_ref = state
+                .vault
+                .put(bytes::Bytes::from(
+                    serde_json::to_vec(&signal_message).expect("signal message JSON"),
+                ))
+                .await;
+            let body_cid = blob_ref.cid.to_multibase();
+            let email_cid = crate::email_xrpc::signal_email_cid_for(
+                &sender_did,
+                &owner_did,
+                "2026-06-02T00:00:00Z",
+                &body_cid,
+            );
+            let email_cid_mb = email_cid.to_multibase();
+            let tx_cid = mcp_tx_cid("email.read.signal.invalid-thread", &[&owner_did, case]);
+            let datoms = vec![
+                ("email/message_id", email_cid_mb.clone()),
+                ("email/from", sender_did),
+                ("email/to", owner_did.clone()),
+                ("email/body_cid", body_cid),
+                ("email/date", "2026-06-02T00:00:00Z".to_string()),
+                ("email/thread_id", thread_id),
+                ("email/enc", ENC_SIGNAL_V1.to_string()),
+            ]
+            .into_iter()
+            .map(|(predicate, object)| {
+                KqeDatom::assert(
+                    email_cid.clone(),
+                    predicate.to_string(),
+                    KqeValue::Text(object),
+                    tx_cid.clone(),
+                )
+            })
+            .collect();
+            commit_mcp_datoms(
+                &state,
+                graph_cid,
+                graph,
+                email_cid.clone(),
+                datoms,
+                tx_cid,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let value = call_tool(
+                MCP_TOOL_EMAIL_READ,
+                &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+                &state,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(value["thread_id"], "", "{value}");
+            assert_eq!(value["signalMessage"], signal_message, "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_signal_envelope_for_different_recipient() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpSignalMailboxOwner";
+        let actual_recipient = "did:key:zMcpSignalOtherRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-signal-recipient-mismatch");
+        let email_cid_mb = email_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": "did:key:zMcpSignalMismatchSender",
+            "recipientDid": actual_recipient,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let tx_cid = mcp_tx_cid("email.read.signal.recipient-mismatch", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", "did:key:zMcpSignalMismatchSender".to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", blob_ref.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("recipientDid"), "{err:?}");
+        assert!(err.1.contains("owner_did"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_signal_date_mismatch() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalDateSender";
+        let owner_did = "did:key:zMcpSignalDateRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.date-mismatch", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-03T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("timestamp"), "{err:?}");
+        assert!(err.1.contains("email/date"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_signal_routing_datoms_that_mismatch_envelope() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalRoutingSender";
+        let owner_did = "did:key:zMcpSignalRoutingRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.routing-mismatch", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            (
+                "email/from",
+                "did:key:zMcpSignalRoutingOtherSender".to_string(),
+            ),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("senderDid"), "{err:?}");
+        assert!(err.1.contains("email/from"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_signal_to_datom_that_mismatches_envelope() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalToSender";
+        let owner_did = "did:key:zMcpSignalToRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.to-mismatch", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/to", "did:key:zMcpSignalOtherRecipient".to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("recipientDid"), "{err:?}");
+        assert!(err.1.contains("email/to"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_ambiguous_signal_from_routing_datoms() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalAmbiguousFromSender";
+        let owner_did = "did:key:zMcpSignalAmbiguousFromRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.ambiguous-from", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/from", "did:key:zMcpSignalOtherSender".to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(
+            err.1.contains("multiple email/from values found"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_invalid_signal_from_routing_datom() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalInvalidFromSender";
+        let owner_did = "did:key:zMcpSignalInvalidFromRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.invalid-from", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", "did:key:zMcpSignalInvalid\nFrom".to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("invalid email/from"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_ambiguous_signal_to_routing_datoms() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalAmbiguousToSender";
+        let owner_did = "did:key:zMcpSignalAmbiguousToRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.ambiguous-to", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/to", "did:key:zMcpSignalOtherRecipient".to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("multiple email/to values found"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_invalid_signal_to_routing_datom() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalInvalidToSender";
+        let owner_did = "did:key:zMcpSignalInvalidToRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.invalid-to", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/to", "did:key:zMcpSignalInvalid\nTo".to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("invalid email/to"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_invalid_enc_before_legacy_crypto() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        assert!(
+            state.crypto.is_none(),
+            "test must prove invalid enc is rejected before legacy crypto"
+        );
+        let owner_did = "did:key:zMcpEmailReadInvalidEnc";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-invalid-enc");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.invalid-enc", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            (
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-invalid-enc-body").to_multibase(),
+            ),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", "unknown:v1".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("invalid email/enc"), "{err:?}");
+        assert!(!err.1.contains("crypto not initialised"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_invalid_body_cid() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadInvalidBodyCid";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-invalid-body-cid");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.invalid-body-cid", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", "not a multibase cid".to_string()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("invalid body_cid multibase"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_conflicting_body_cid_metadata() {
+        let owner_did = "did:key:zMcpEmailReadConflictingBodyCid";
+        let (state, _, email_cid_mb) = commit_legacy_email_fixture(
+            owner_did,
+            b"mcp-email-read-conflicting-body-cid",
+            b"valid body",
+            "email.read.conflicting-body-cid",
+            [(
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-email-read-other-body-cid").to_multibase(),
+            )],
+        )
+        .await;
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(
+            err.1.contains("multiple email/body_cid values found"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_non_text_body_cid() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadNonTextBodyCid";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-non-text-body-cid");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.non-text-body-cid", &[owner_did]);
+        let datoms = vec![
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Text(email_cid_mb.clone()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Integer(1),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/date".to_string(),
+                KqeValue::Text("2026-06-02T00:00:00Z".to_string()),
+                tx_cid.clone(),
+            ),
+        ];
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("invalid body_cid multibase"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_uses_latest_valid_date_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalLatestDateSender";
+        let owner_did = "did:key:zMcpSignalLatestDateRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.latest-date", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-01T00:00:00Z".to_string()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["date"], "2026-06-02T00:00:00Z", "{value}");
+        assert_eq!(value["signalMessage"], signal_message, "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_skips_invalid_date_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalInvalidDateSender";
+        let owner_did = "did:key:zMcpSignalInvalidDateRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.invalid-date", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "2026-06-02\n00:00:00Z".to_string()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["date"], "2026-06-02T00:00:00Z", "{value}");
+        assert_eq!(value["signalMessage"], signal_message, "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_skips_oversized_date_metadata() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalOversizedDateSender";
+        let owner_did = "did:key:zMcpSignalOversizedDateRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let body_cid = blob_ref.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.oversized-date", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/from", sender_did.to_string()),
+            ("email/to", owner_did.to_string()),
+            ("email/body_cid", body_cid),
+            ("email/date", "x".repeat(MAX_EMAIL_DATE_LEN + 1)),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["date"], "2026-06-02T00:00:00Z", "{value}");
+        assert_eq!(value["signalMessage"], signal_message, "{value}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_oversized_date_as_missing_record() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadOversizedDateOnly";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-oversized-date-only");
+        let email_cid_mb = email_cid.to_multibase();
+        let body_cid = KotobaCid::from_bytes(b"mcp-email-read-oversized-date-body").to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.oversized-date-only", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", body_cid),
+            ("email/date", "x".repeat(MAX_EMAIL_DATE_LEN + 1)),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_NOT_FOUND);
+        assert!(
+            msg.contains("email_cid not found in mailbox"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_multiple_body_cids() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadMultipleBodyCids";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-multiple-body-cids");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.multiple-body-cids", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            (
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-body-cid-a").to_multibase(),
+            ),
+            (
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-body-cid-b").to_multibase(),
+            ),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(
+            err.1.contains("multiple email/body_cid values found"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_mixed_signal_and_invalid_enc() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadMixedEnc";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-mixed-enc");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.mixed-enc", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            (
+                "email/body_cid",
+                KotobaCid::from_bytes(b"mcp-mixed-enc-body").to_multibase(),
+            ),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+            ("email/enc", "unknown:v1".to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("invalid email/enc"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_non_text_enc() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadNonTextEnc";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-email-read-non-text-enc");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.non-text-enc", &[owner_did]);
+        let datoms = vec![
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Text(email_cid_mb.clone()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Text(KotobaCid::from_bytes(b"mcp-non-text-enc-body").to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/date".to_string(),
+                KqeValue::Text("2026-06-02T00:00:00Z".to_string()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                email_cid.clone(),
+                "email/enc".to_string(),
+                KqeValue::Integer(1),
+                tx_cid.clone(),
+            ),
+        ];
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("invalid email/enc"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_signal_body_cid_swapped_after_send() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let sender_did = "did:key:zMcpSignalBodySender";
+        let owner_did = "did:key:zMcpSignalBodyRecipient";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": sender_did,
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "sealed-mime",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let original_blob = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let mut swapped_message = signal_message.clone();
+        swapped_message["ciphertextEnvelope"] = json!("sealed-mime-swapped");
+        let swapped_blob = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&swapped_message).expect("signal message JSON"),
+            ))
+            .await;
+        let original_body_cid = original_blob.cid.to_multibase();
+        let swapped_body_cid = swapped_blob.cid.to_multibase();
+        let email_cid = crate::email_xrpc::signal_email_cid_for(
+            sender_did,
+            owner_did,
+            "2026-06-02T00:00:00Z",
+            &original_body_cid,
+        );
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.body-cid-swap", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", swapped_body_cid),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, ERR_INTERNAL);
+        assert!(err.1.contains("body_cid"), "{err:?}");
+        assert!(err.1.contains("email_cid"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_corrupt_signal_envelope_blob() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpSignalCorruptEnvelope";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-signal-corrupt-envelope");
+        let email_cid_mb = email_cid.to_multibase();
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from_static(b"not-json"))
+            .await;
+        let tx_cid = mcp_tx_cid("email.read.signal.corrupt", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob_ref.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("invalid signal envelope JSON"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_malformed_signal_envelope_object() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpSignalMalformedEnvelope";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-signal-malformed-envelope");
+        let email_cid_mb = email_cid.to_multibase();
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from_static(
+                br#"{"messageType":"directMessage"}"#,
+            ))
+            .await;
+        let tx_cid = mcp_tx_cid("email.read.signal.malformed", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob_ref.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(
+            msg.contains("invalid signal envelope JSON"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_policy_invalid_signal_envelope() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpSignalPolicyInvalidEnvelope";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-signal-policy-invalid-envelope");
+        let email_cid_mb = email_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "directMessage",
+            "senderDid": "did:key:zSender",
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let tx_cid = mcp_tx_cid("email.read.signal.policy-invalid", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob_ref.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(msg.contains("invalid signal envelope JSON"));
+        assert!(msg.contains("ciphertextEnvelope"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_rejects_group_message_without_group_id() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpSignalGroupMissingGroupId";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-signal-group-missing-group-id");
+        let email_cid_mb = email_cid.to_multibase();
+        let signal_message = json!({
+            "messageType": "groupMessage",
+            "senderDid": "did:key:zSender",
+            "recipientDid": owner_did,
+            "deviceId": "device-1",
+            "ciphertextEnvelope": "c2VhbGVk",
+            "timestamp": "2026-06-02T00:00:00Z"
+        });
+        let blob_ref = state
+            .vault
+            .put(bytes::Bytes::from(
+                serde_json::to_vec(&signal_message).expect("signal message JSON"),
+            ))
+            .await;
+        let tx_cid = mcp_tx_cid("email.read.signal.group-missing-group-id", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/body_cid", blob_ref.cid.to_multibase()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_INTERNAL);
+        assert!(msg.contains("invalid signal envelope JSON"));
+        assert!(msg.contains("groupId"));
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_signal_mail_without_body_cid_returns_not_found() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpSignalMissingBodyCid";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let email_cid = KotobaCid::from_bytes(b"mcp-signal-missing-body-cid");
+        let email_cid_mb = email_cid.to_multibase();
+        let tx_cid = mcp_tx_cid("email.read.signal.missing-body", &[owner_did]);
+        let datoms = vec![
+            ("email/message_id", email_cid_mb.clone()),
+            ("email/date", "2026-06-02T00:00:00Z".to_string()),
+            ("email/enc", ENC_SIGNAL_V1.to_string()),
+        ]
+        .into_iter()
+        .map(|(predicate, object)| {
+            KqeDatom::assert(
+                email_cid.clone(),
+                predicate.to_string(),
+                KqeValue::Text(object),
+                tx_cid.clone(),
+            )
+        })
+        .collect();
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            email_cid.clone(),
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({ "owner_did": owner_did, "email_cid": email_cid_mb }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_NOT_FOUND);
+        assert!(
+            msg.contains("email/body_cid not found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_missing_email_cid_returns_not_found_before_body_lookup() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadMissingCid";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let existing_email_cid = KotobaCid::from_bytes(b"mcp-existing-email-cid");
+        let missing_email_cid = KotobaCid::from_bytes(b"mcp-missing-email-cid");
+        let tx_cid = mcp_tx_cid("email.read.missing-cid", &[owner_did]);
+        let datoms = vec![
+            KqeDatom::assert(
+                existing_email_cid.clone(),
+                "email/message_id".to_string(),
+                KqeValue::Text(existing_email_cid.to_multibase()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                existing_email_cid.clone(),
+                "email/date".to_string(),
+                KqeValue::Text("2026-06-02T00:00:00Z".to_string()),
+                tx_cid.clone(),
+            ),
+            KqeDatom::assert(
+                existing_email_cid.clone(),
+                "email/body_cid".to_string(),
+                KqeValue::Text(KotobaCid::from_bytes(b"body").to_multibase()),
+                tx_cid.clone(),
+            ),
+        ];
+        commit_mcp_datoms(
+            &state,
+            graph_cid,
+            graph,
+            existing_email_cid,
+            datoms,
+            tx_cid,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({
+                "owner_did": owner_did,
+                "email_cid": missing_email_cid.to_multibase()
+            }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_NOT_FOUND);
+        assert!(
+            msg.contains("email_cid not found in mailbox"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_ignores_non_email_subject_datoms_when_checking_existence() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadNonEmailSubject";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let cid = KotobaCid::from_bytes(b"mcp-non-email-subject");
+        let tx_cid = mcp_tx_cid("email.read.non-email-subject", &[owner_did]);
+        let datoms = vec![KqeDatom::assert(
+            cid.clone(),
+            "profile/name".to_string(),
+            KqeValue::Text("not an email".to_string()),
+            tx_cid.clone(),
+        )];
+        commit_mcp_datoms(&state, graph_cid, graph, cid.clone(), datoms, tx_cid, None)
+            .await
+            .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({
+                "owner_did": owner_did,
+                "email_cid": cid.to_multibase()
+            }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_NOT_FOUND);
+        assert!(
+            msg.contains("email_cid not found in mailbox"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_email_read_ignores_enc_only_subject_when_checking_existence() {
+        use kotoba_ingest::graph_cid_for;
+        use kotoba_query::{Datom as KqeDatom, Value as KqeValue};
+
+        let state = test_state();
+        let owner_did = "did:key:zMcpEmailReadEncOnlySubject";
+        let graph_cid = graph_cid_for(owner_did);
+        let graph = graph_cid.to_multibase();
+        let cid = KotobaCid::from_bytes(b"mcp-enc-only-subject");
+        let tx_cid = mcp_tx_cid("email.read.enc-only-subject", &[owner_did]);
+        let datoms = vec![KqeDatom::assert(
+            cid.clone(),
+            "email/enc".to_string(),
+            KqeValue::Text(ENC_SIGNAL_V1.to_string()),
+            tx_cid.clone(),
+        )];
+        commit_mcp_datoms(&state, graph_cid, graph, cid.clone(), datoms, tx_cid, None)
+            .await
+            .unwrap();
+
+        let result = call_tool(
+            MCP_TOOL_EMAIL_READ,
+            &json!({
+                "owner_did": owner_did,
+                "email_cid": cid.to_multibase()
+            }),
+            &state,
+            None,
+        )
+        .await;
+        let (code, msg) = result.unwrap_err();
+        assert_eq!(code, ERR_NOT_FOUND);
+        assert!(
+            msg.contains("email_cid not found in mailbox"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn call_tool_sparql_query_invalid_cacao_b64_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_SPARQL_QUERY,
             &json!({
@@ -2731,7 +7293,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_multi_hop_missing_graph_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_MULTI_HOP,
             &json!({
@@ -2747,7 +7309,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_multi_hop_missing_start_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_MULTI_HOP,
             &json!({
@@ -2763,7 +7325,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_multi_hop_empty_graph_returns_empty() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_MULTI_HOP,
             &json!({
@@ -2782,7 +7344,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_multi_hop_max_hops_clamped_to_8() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         // max_hops=100 should be silently clamped to 8 (no error)
         let result = call_tool(
             MCP_TOOL_MULTI_HOP,
@@ -2800,7 +7362,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_tool_multi_hop_invalid_cacao_b64_errors() {
-        let state = Arc::new(crate::server::KotobaState::new(None).expect("state"));
+        let state = test_state();
         let result = call_tool(
             MCP_TOOL_MULTI_HOP,
             &json!({

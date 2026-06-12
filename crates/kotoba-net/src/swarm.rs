@@ -44,8 +44,7 @@ pub fn ed25519_keypair_from_hex(seed_hex: &str) -> Result<Keypair> {
     if bytes.len() != 32 {
         anyhow::bail!("p2p ed25519 seed: expected 32 bytes, got {}", bytes.len());
     }
-    Keypair::ed25519_from_bytes(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("p2p ed25519 seed: {e}"))
+    Keypair::ed25519_from_bytes(&mut bytes).map_err(|e| anyhow::anyhow!("p2p ed25519 seed: {e}"))
 }
 
 /// High-level wrapper around the libp2p Swarm.
@@ -248,14 +247,18 @@ impl KotobaSwarm {
 
     /// Subscribe to a GossipSub topic mapped from a KSE topic name.
     pub fn subscribe(&mut self, kse_topic: &str) -> Result<()> {
-        let topic = gossipsub::IdentTopic::new(crate::gossipsub::gossipsub_topic(kse_topic));
+        let topic = gossipsub::IdentTopic::new(
+            crate::gossipsub::checked_gossipsub_topic(kse_topic).map_err(anyhow::Error::msg)?,
+        );
         self.swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
         Ok(())
     }
 
     /// Publish bytes to a GossipSub topic.
     pub fn publish(&mut self, kse_topic: &str, data: Vec<u8>) -> Result<gossipsub::MessageId> {
-        let topic = gossipsub::IdentTopic::new(crate::gossipsub::gossipsub_topic(kse_topic));
+        let topic = gossipsub::IdentTopic::new(
+            crate::gossipsub::checked_gossipsub_topic(kse_topic).map_err(anyhow::Error::msg)?,
+        );
         let id = self.swarm.behaviour_mut().gossipsub.publish(topic, data)?;
         Ok(id)
     }
@@ -473,13 +476,9 @@ impl KotobaSwarm {
         dst: &str,
         payload: &[u8],
     ) -> Result<gossipsub::MessageId> {
-        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        let msg = crate::pregel_msg::PregelNetMessage {
-            src: src.to_string(),
-            dst: dst.to_string(),
-            payload_b64: B64.encode(payload),
-        };
-        let data = serde_json::to_vec(&msg)?;
+        let msg = crate::pregel_msg::PregelNetMessage::new(src, dst, payload)
+            .map_err(anyhow::Error::msg)?;
+        let data = msg.to_json_vec().map_err(anyhow::Error::msg)?;
         self.publish(crate::pregel_msg::PREGEL_GOSSIP_TOPIC, data)
     }
 
@@ -492,7 +491,7 @@ impl KotobaSwarm {
             let full_topic =
                 crate::gossipsub::gossipsub_topic(crate::pregel_msg::PREGEL_GOSSIP_TOPIC);
             if topic == &full_topic || topic.ends_with(crate::pregel_msg::PREGEL_GOSSIP_TOPIC) {
-                return serde_json::from_slice(data).ok();
+                return crate::pregel_msg::PregelNetMessage::from_json_slice(data).ok();
             }
         }
         None
@@ -596,6 +595,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_pregel_event_returns_none_for_invalid_wire_message() {
+        let full_topic = crate::gossipsub::gossipsub_topic(crate::pregel_msg::PREGEL_GOSSIP_TOPIC);
+        let msg = crate::pregel_msg::PregelNetMessage {
+            src: String::new(),
+            dst: "node-B".to_string(),
+            payload_b64: "not base64!".to_string(),
+        };
+        let event = KotobaNetEvent::GossipMessage {
+            topic: full_topic,
+            data: serde_json::to_vec(&msg).unwrap(),
+            source: None,
+        };
+
+        assert!(KotobaSwarm::parse_pregel_event(&event).is_none());
+    }
+
+    #[test]
     fn parse_pregel_event_succeeds_for_valid_message() {
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
         let full_topic = crate::gossipsub::gossipsub_topic(crate::pregel_msg::PREGEL_GOSSIP_TOPIC);
@@ -693,7 +709,9 @@ mod tests {
             format!("/ip4/127.0.0.1/udp/4999/quic-v1/p2p/{}", PeerId::random())
                 .parse()
                 .unwrap();
-        swarm.reserve_relay(relay_addr).expect("reserve_relay accepts circuit addr");
+        swarm
+            .reserve_relay(relay_addr)
+            .expect("reserve_relay accepts circuit addr");
     }
 
     #[test]
@@ -744,6 +762,9 @@ mod tests {
     #[test]
     fn ed25519_keypair_from_hex_rejects_bad_input() {
         assert!(ed25519_keypair_from_hex("deadbeef").is_err(), "too short");
-        assert!(ed25519_keypair_from_hex(&"zz".repeat(32)).is_err(), "non-hex");
+        assert!(
+            ed25519_keypair_from_hex(&"zz".repeat(32)).is_err(),
+            "non-hex"
+        );
     }
 }

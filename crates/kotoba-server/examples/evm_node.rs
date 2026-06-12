@@ -33,13 +33,18 @@ fn eth_to_wei_be(eth: u128) -> [u8; 32] {
 
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::var("KOTOBA_EVM_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8545);
+    let port: u16 = std::env::var("KOTOBA_EVM_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8545);
     // default funded account = the standard Anvil/Hardhat dev account #0
     // (pk 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80).
     let genesis_addr = std::env::var("KOTOBA_EVM_GENESIS_ADDR")
         .unwrap_or_else(|_| "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into());
-    let genesis_eth: u128 =
-        std::env::var("KOTOBA_EVM_GENESIS_ETH").ok().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    let genesis_eth: u128 = std::env::var("KOTOBA_EVM_GENESIS_ETH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
 
     let mut node = EvmNode::default_node();
     let addr = parse_addr20(&genesis_addr);

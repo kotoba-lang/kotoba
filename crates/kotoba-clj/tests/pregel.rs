@@ -63,7 +63,13 @@ fn agent_component() -> Vec<u8> {
 
 fn runner(max_supersteps: u32) -> WasmPregelRunner {
     let executor = Arc::new(WasmExecutor::new(GAS).expect("executor"));
-    WasmPregelRunner::new(executor, "clj-bsp-agent-cid", agent_component(), AGENT, max_supersteps)
+    WasmPregelRunner::new(
+        executor,
+        "clj-bsp-agent-cid",
+        agent_component(),
+        AGENT,
+        max_supersteps,
+    )
 }
 
 /// Initial ctx `{"n": n}` — what superstep 0 decodes.
@@ -80,7 +86,9 @@ fn ctx_with_n(n: u64) -> Vec<u8> {
 /// Decode `{"status": s, "n": k}` from the agent's final output.
 fn decode_status_n(cbor: &[u8]) -> (String, u64) {
     let val: ciborium::Value = ciborium::from_reader(cbor).expect("final output cbor");
-    let ciborium::Value::Map(pairs) = val else { panic!("not a cbor map") };
+    let ciborium::Value::Map(pairs) = val else {
+        panic!("not a cbor map")
+    };
     let mut status = None;
     let mut n = None;
     for (k, v) in &pairs {
@@ -108,7 +116,11 @@ fn clj_agent_runs_multiple_bsp_supersteps_and_writes_datoms() {
     }
 
     // 4 × assert-quad (10 gas each) accumulated across supersteps
-    assert!(result.total_gas_used >= 40, "gas: {}", result.total_gas_used);
+    assert!(
+        result.total_gas_used >= 40,
+        "gas: {}",
+        result.total_gas_used
+    );
 
     let (status, n) = decode_status_n(&result.final_output_cbor);
     assert_eq!(status, "done");

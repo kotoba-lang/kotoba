@@ -186,7 +186,8 @@ pub fn verify_message_integrity(msg: &[u8], key: &[u8]) -> Result<(), StunError>
     covered[2..4].copy_from_slice(&len_field.to_be_bytes());
     let mut mac = HmacSha1::new_from_slice(key).map_err(|_| StunError::BadAttr)?;
     mac.update(&covered);
-    mac.verify_slice(&body[p + 4..p + 24]).map_err(|_| StunError::BadAttr)
+    mac.verify_slice(&body[p + 4..p + 24])
+        .map_err(|_| StunError::BadAttr)
 }
 
 /// Append a FINGERPRINT attribute (RFC 8489 §14.7) — must be the last attribute.
@@ -221,12 +222,19 @@ mod tests {
     fn xor_mapped_address_matches_rfc5769() {
         let encoded = encode_xor_mapped_v4(Ipv4Addr::new(192, 0, 2, 1), 32853);
         assert_eq!(encoded, [0x00, 0x01, 0xA1, 0x47, 0xE1, 0x12, 0xA6, 0x43]);
-        assert_eq!(decode_xor_mapped_v4(&encoded).unwrap(), (Ipv4Addr::new(192, 0, 2, 1), 32853));
+        assert_eq!(
+            decode_xor_mapped_v4(&encoded).unwrap(),
+            (Ipv4Addr::new(192, 0, 2, 1), 32853)
+        );
     }
 
     #[test]
     fn header_round_trips_and_rejects_bad_magic() {
-        let h = Header { typ: ALLOCATE_REQUEST, length: 8, txid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] };
+        let h = Header {
+            typ: ALLOCATE_REQUEST,
+            length: 8,
+            txid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        };
         let bytes = h.encode();
         assert_eq!(Header::decode(&bytes).unwrap(), h);
 
@@ -240,8 +248,8 @@ mod tests {
     fn attributes_parse_with_padding() {
         // USERNAME(len 3, +1 pad) then SOFTWARE(len 4, no pad).
         let body = [
-            0x00, 0x06, 0x00, 0x03, b'a', b'b', b'c', 0x00,
-            0x80, 0x22, 0x00, 0x04, b'k', b'o', b't', b'o',
+            0x00, 0x06, 0x00, 0x03, b'a', b'b', b'c', 0x00, 0x80, 0x22, 0x00, 0x04, b'k', b'o',
+            b't', b'o',
         ];
         let attrs = attributes(&body).unwrap();
         assert_eq!(attrs.len(), 2);
@@ -263,7 +271,11 @@ mod tests {
 
     /// A header + one SOFTWARE attribute, no MI/FINGERPRINT yet.
     fn sample_message() -> Vec<u8> {
-        let h = Header { typ: BINDING_REQUEST, length: 0, txid: [9; 12] };
+        let h = Header {
+            typ: BINDING_REQUEST,
+            length: 0,
+            txid: [9; 12],
+        };
         let mut buf = h.encode().to_vec();
         buf.extend_from_slice(&ATTR_SOFTWARE.to_be_bytes());
         buf.extend_from_slice(&4u16.to_be_bytes());

@@ -265,11 +265,17 @@ impl ProllyTree {
         // Load only the leaves unique to each side; their entries, concatenated
         // in leaf order, are globally sorted (leaf ranges are ordered + disjoint).
         let a_entries = Self::collect_leaf_entries(
-            a_leaves.iter().filter(|(_, c)| !b_set.contains(c)).map(|(_, c)| c),
+            a_leaves
+                .iter()
+                .filter(|(_, c)| !b_set.contains(c))
+                .map(|(_, c)| c),
             store,
         )?;
         let b_entries = Self::collect_leaf_entries(
-            b_leaves.iter().filter(|(_, c)| !a_set.contains(c)).map(|(_, c)| c),
+            b_leaves
+                .iter()
+                .filter(|(_, c)| !a_set.contains(c))
+                .map(|(_, c)| c),
             store,
         )?;
 
@@ -508,8 +514,7 @@ impl ProllyTree {
             // Region entry map = all entries of leaves[lo..=hi].
             let mut region: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
             for leaf_ptr in &leaves[lo..=hi] {
-                if let Some(ProllyNode::Leaf { entries, .. }) =
-                    Self::load_node(&leaf_ptr.1, store)?
+                if let Some(ProllyNode::Leaf { entries, .. }) = Self::load_node(&leaf_ptr.1, store)?
                 {
                     region.extend(entries);
                 }
@@ -862,17 +867,18 @@ mod tests {
         // Full build_tree cost (blake3 boundary) over 100k entries, to size the
         // hash portion against total tree-build work.
         let store = MemoryBlockStore::new();
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = keys
-            .iter()
-            .map(|k| (k.clone(), b"v".to_vec()))
-            .collect();
+        let entries: Vec<(Vec<u8>, Vec<u8>)> =
+            keys.iter().map(|k| (k.clone(), b"v".to_vec())).collect();
         let t = Instant::now();
         let _root = ProllyTree::build_tree(entries, &store).unwrap();
         let build_ms = t.elapsed().as_millis();
 
         eprintln!("\n── ProllyTree boundary hash: blake3 vs sha2-256 (per key, ~48B) ──");
         eprintln!("blake3      : {blake3_ns:.1} ns/hash");
-        eprintln!("sha2-256    : {sha_ns:.1} ns/hash   ({:.2}x blake3)", sha_ns / blake3_ns);
+        eprintln!(
+            "sha2-256    : {sha_ns:.1} ns/hash   ({:.2}x blake3)",
+            sha_ns / blake3_ns
+        );
         eprintln!("build_tree(100k, blake3): {build_ms} ms total");
         eprintln!(
             "est. boundary-hash share of build_tree: blake3≈{:.0}ms  sha256≈{:.0}ms  (Δ≈{:.0}ms/100k entries)",
@@ -911,15 +917,26 @@ mod tests {
         let store = MemoryBlockStore::new();
         // Two real child blocks → two CIDv1 dag-cbor links in the parent.
         let child_a = ProllyTree::put_node(
-            &ProllyNode::Leaf { entries: vec![(b"a".to_vec(), b"1".to_vec())], cid: KotobaCid::from_bytes(b"x") },
+            &ProllyNode::Leaf {
+                entries: vec![(b"a".to_vec(), b"1".to_vec())],
+                cid: KotobaCid::from_bytes(b"x"),
+            },
             &store,
-        ).unwrap();
+        )
+        .unwrap();
         let child_b = ProllyTree::put_node(
-            &ProllyNode::Leaf { entries: vec![(b"b".to_vec(), b"2".to_vec())], cid: KotobaCid::from_bytes(b"x") },
+            &ProllyNode::Leaf {
+                entries: vec![(b"b".to_vec(), b"2".to_vec())],
+                cid: KotobaCid::from_bytes(b"x"),
+            },
             &store,
-        ).unwrap();
+        )
+        .unwrap();
         let parent = ProllyNode::Internal {
-            children: vec![(b"a".to_vec(), child_a.clone()), (b"b".to_vec(), child_b.clone())],
+            children: vec![
+                (b"a".to_vec(), child_a.clone()),
+                (b"b".to_vec(), child_b.clone()),
+            ],
             cid: KotobaCid::from_bytes(b"x"),
         };
         let parent_cid = ProllyTree::put_node(&parent, &store).unwrap();
@@ -928,12 +945,21 @@ mod tests {
         let raw = store.get(&parent_cid).unwrap().unwrap();
         // CBOR tag 42 prefix appears once per child link.
         let tag42 = raw.windows(2).filter(|w| w == b"\xd8\x2a").count();
-        assert_eq!(tag42, 2, "two children → two tag-42 CID links in the DAG-CBOR block");
+        assert_eq!(
+            tag42, 2,
+            "two children → two tag-42 CID links in the DAG-CBOR block"
+        );
 
         // And the canonical tag-42 payload is `0x00 || cid-bytes` (multibase
         // identity prefix), so each child's 36 CID bytes appear verbatim.
-        assert!(raw.windows(36).any(|w| w == child_a.0), "child_a CID bytes present in block");
-        assert!(raw.windows(36).any(|w| w == child_b.0), "child_b CID bytes present in block");
+        assert!(
+            raw.windows(36).any(|w| w == child_a.0),
+            "child_a CID bytes present in block"
+        );
+        assert!(
+            raw.windows(36).any(|w| w == child_b.0),
+            "child_b CID bytes present in block"
+        );
 
         // Round-trips back to the same KotobaCid links.
         match ProllyTree::load_node(&parent_cid, &store).unwrap().unwrap() {
@@ -958,7 +984,10 @@ mod tests {
         // Same entries, DIFFERENT bogus self-cid → same block CID (self-cid not encoded).
         let c1 = ProllyTree::put_node(&mk(b"self-one"), &store).unwrap();
         let c2 = ProllyTree::put_node(&mk(b"self-two"), &store).unwrap();
-        assert_eq!(c1, c2, "self-CID field must not affect the content-addressed block");
+        assert_eq!(
+            c1, c2,
+            "self-CID field must not affect the content-addressed block"
+        );
         // The CID is a valid CIDv1 dag-cbor sha2-256 link.
         assert!(c1.is_ipfs_compatible());
         assert!(c1.to_standard_cid().is_ok());
@@ -1314,17 +1343,19 @@ mod tests {
             after.insert(i.to_be_bytes().to_vec(), b"added".to_vec());
         }
 
-        let root_a =
-            ProllyTree::build_tree(before.clone().into_iter().collect(), &store).unwrap();
-        let root_b =
-            ProllyTree::build_tree(after.clone().into_iter().collect(), &store).unwrap();
+        let root_a = ProllyTree::build_tree(before.clone().into_iter().collect(), &store).unwrap();
+        let root_b = ProllyTree::build_tree(after.clone().into_iter().collect(), &store).unwrap();
         let d = ProllyTree::diff_entries(&root_a, &root_b, &store).unwrap();
 
         // brute force
         let mut exp_added = 0;
         let mut exp_removed = 0;
         let mut exp_changed = 0;
-        for k in before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>() {
+        for k in before
+            .keys()
+            .chain(after.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
             match (before.get(k), after.get(k)) {
                 (Some(_), None) => exp_removed += 1,
                 (None, Some(_)) => exp_added += 1,
@@ -1375,13 +1406,17 @@ mod tests {
         let root = ProllyTree::build_tree(base.clone(), &store).unwrap();
 
         let k = find_non_boundary_key(10_000, 11_000).expect("a non-boundary key exists");
-        let new = ProllyTree::apply_batch(Some(&root), vec![(be(k), b"NEW".to_vec())], vec![], &store)
-            .unwrap();
+        let new =
+            ProllyTree::apply_batch(Some(&root), vec![(be(k), b"NEW".to_vec())], vec![], &store)
+                .unwrap();
 
         let mut final_set = base;
         final_set.push((be(k), b"NEW".to_vec()));
         let scratch = ProllyTree::build_tree(final_set, &store).unwrap();
-        assert_eq!(new, scratch, "incremental insert must converge with build_tree");
+        assert_eq!(
+            new, scratch,
+            "incremental insert must converge with build_tree"
+        );
         assert_eq!(
             ProllyTree::get(&new, &be(k), &store).unwrap().as_deref(),
             Some(b"NEW".as_ref())
@@ -1402,8 +1437,13 @@ mod tests {
         let k = (1u64..20_000)
             .find(|i| i % 10 != 0 && ProllyNode::is_boundary(&i.to_be_bytes()))
             .expect("a fresh boundary key exists");
-        let new = ProllyTree::apply_batch(Some(&root), vec![(be(k), b"SPLIT".to_vec())], vec![], &store)
-            .unwrap();
+        let new = ProllyTree::apply_batch(
+            Some(&root),
+            vec![(be(k), b"SPLIT".to_vec())],
+            vec![],
+            &store,
+        )
+        .unwrap();
 
         let mut final_set = base;
         final_set.push((be(k), b"SPLIT".to_vec()));
@@ -1422,8 +1462,7 @@ mod tests {
 
         // a boundary key that is present and not the global max
         let k = find_boundary_key(1, 2_900).expect("a present boundary key exists");
-        let new =
-            ProllyTree::apply_batch(Some(&root), vec![], vec![be(k)], &store).unwrap();
+        let new = ProllyTree::apply_batch(Some(&root), vec![], vec![be(k)], &store).unwrap();
 
         let final_set: Vec<_> = base.into_iter().filter(|(kk, _)| kk != &be(k)).collect();
         let scratch = ProllyTree::build_tree(final_set, &store).unwrap();
@@ -1435,9 +1474,7 @@ mod tests {
     #[test]
     fn apply_batch_delete_all_converges_to_empty() {
         let store = MemoryBlockStore::new();
-        let base: Vec<(Vec<u8>, Vec<u8>)> = (0u64..500)
-            .map(|i| (be(i), b"v".to_vec()))
-            .collect();
+        let base: Vec<(Vec<u8>, Vec<u8>)> = (0u64..500).map(|i| (be(i), b"v".to_vec())).collect();
         let root = ProllyTree::build_tree(base.clone(), &store).unwrap();
         let dels: Vec<Vec<u8>> = base.iter().map(|(k, _)| k.clone()).collect();
         let new = ProllyTree::apply_batch(Some(&root), vec![], dels, &store).unwrap();
@@ -1453,7 +1490,9 @@ mod tests {
         // Deterministic LCG — no external rng, reproducible.
         let mut seed = 0x1234_5678_9abc_def0u64;
         let mut rng = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             seed >> 16
         };
 

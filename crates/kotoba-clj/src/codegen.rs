@@ -321,9 +321,7 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
         //   - `result<_, string>` flattens to >1 value (tag + err string) → the
         //     caller appends a return-area pointer (9th i32) and the core import
         //     returns nothing. Area: `[tag:u8 @0, err-ptr @4, err-len @8]`.
-        HostImport::KqeAssertQuad | HostImport::KqeRetractQuad => {
-            (vec![ValType::I32; 9], vec![])
-        }
+        HostImport::KqeAssertQuad | HostImport::KqeRetractQuad => (vec![ValType::I32; 9], vec![]),
         // `get-objects: func(string,string,string) -> list<list<u8>>`:
         //   - 3 strings → 6 i32 params,
         //   - a bare `list` result flattens to `(ptr,len)` = 2 values > 1 → an

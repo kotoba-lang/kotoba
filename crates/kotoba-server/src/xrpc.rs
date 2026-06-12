@@ -57,8 +57,9 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use ed25519_dalek::Signer;
 use kotoba_datomic::distributed::{
     gc_history, CommitDatomsRequest, DistributedCommitError, DistributedCommitWriter,
-    DistributedDatomCommit, DistributedDatomReader, DistributedTransactRequest, RemoteIpfsBlockStore,
-    RemoteIpfsIpnsRegistry, ROOT_AEVT, ROOT_AVET, ROOT_EAVT, ROOT_TEA, ROOT_VAET,
+    DistributedDatomCommit, DistributedDatomReader, DistributedTransactRequest,
+    RemoteIpfsBlockStore, RemoteIpfsIpnsRegistry, ROOT_AEVT, ROOT_AVET, ROOT_EAVT, ROOT_TEA,
+    ROOT_VAET,
 };
 use kotoba_ipfs::{IpnsName, IpnsRegistry, IpnsRegistryError};
 use serde::{Deserialize, Serialize};
@@ -3245,8 +3246,7 @@ pub(crate) async fn current_db_for_graph(
     let ipns_name = distributed_graph_ipns_name(graph_cid);
     match state.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
         Ok(head_record) => {
-            if let Some(head_cid) =
-                kotoba_core::cid::KotobaCid::from_multibase(&head_record.value)
+            if let Some(head_cid) = kotoba_core::cid::KotobaCid::from_multibase(&head_record.value)
             {
                 let graph_mb = graph_cid.to_multibase();
                 let live_slot = state.datomic_live_slot(&graph_mb);
@@ -3928,10 +3928,7 @@ async fn try_resident_datomic_q(
     let rows = kotoba_datomic::q(query.clone(), &db, inputs)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic q: {e}")))?;
     let basis_t = db.basis_t.as_ref().map(|t| t.to_multibase());
-    *live_guard = Some(crate::server::LiveDatomicGraph {
-        head: head_cid,
-        db,
-    });
+    *live_guard = Some(crate::server::LiveDatomicGraph { head: head_cid, db });
     Ok(Some((basis_t, rows)))
 }
 
@@ -4819,8 +4816,12 @@ pub async fn datomic_transact(
     // commit — so a peer's writes are checked too, not just a well-behaved actor's. No-op when
     // no ruleset is registered for the graph (backward-compatible).
     if let Some(ruleset) = crate::dna_integrity::ruleset_for(&graph_cid.to_multibase()) {
-        crate::dna_integrity::validate_tx(&tx_data, ruleset)
-            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("dna integrity: {e}")))?;
+        crate::dna_integrity::validate_tx(&tx_data, ruleset).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("dna integrity: {e}"),
+            )
+        })?;
     }
     let ipns_name = datomic_write_ipns_name(&graph_cid, req.ipns_name.as_deref())?;
     let current_head = match state
@@ -7559,7 +7560,10 @@ pub async fn node_register(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
     if req.app.trim().is_empty() || req.endpoint.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "app and endpoint are required".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "app and endpoint are required".into(),
+        ));
     }
     state.register_external_node(&req.app, &req.endpoint).await;
     Ok(Json(serde_json::json!({
@@ -9188,15 +9192,31 @@ mod ssrf_guard_tests {
     #[test]
     fn rejects_private_loopback_metadata() {
         for ip in [
-            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
-            "0.0.0.0", "::1", "::", "fe80::1", "fc00::1", "fd12:3456::1",
-            "::ffff:127.0.0.1", "::ffff:10.0.0.1",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
         ] {
-            assert!(peer_ip_disallowed(ip.parse().unwrap()), "{ip} must be disallowed");
+            assert!(
+                peer_ip_disallowed(ip.parse().unwrap()),
+                "{ip} must be disallowed"
+            );
         }
         // public IPs are allowed
         for ip in ["1.1.1.1", "8.8.8.8", "203.0.113.5", "2606:4700::1111"] {
-            assert!(!peer_ip_disallowed(ip.parse().unwrap()), "{ip} must be allowed");
+            assert!(
+                !peer_ip_disallowed(ip.parse().unwrap()),
+                "{ip} must be allowed"
+            );
         }
     }
 
@@ -9212,20 +9232,18 @@ mod tests {
         atproto_repo_write, atproto_repo_write_datoms, datomic_basis_t, datomic_datoms,
         datomic_datoms_sort_values, datomic_db_stats, datomic_entid, datomic_entity,
         datomic_history, datomic_ident, datomic_index_pull, datomic_index_range, datomic_log,
-        datomic_pull, datomic_pull_many, DatomicDatomsIndex,
-        datomic_q, datomic_q_emit_cids, datomic_seek_datoms, datomic_sync, datomic_transact,
-        datomic_tx_range,
-        datomic_with, did_document_publish, didcomm_send, distributed_graph_ipns_name,
-        enforce_datomic_range_tx_scope, is_did_web_ip_host, protocol_payload_tx_cid,
-        warm_datomic_resident_cache, vc_issue, vp_capability_projection, AtprotoRepoWriteReq,
-        AuthCapabilityProjection, DatomicBasisTReq, DatomicWarmOutcome,
-        DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq,
-        DatomicIdentReq, DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq,
-        DatomicPullManyReq, DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq,
-        DatomicTransactReq, DatomicTxRangeReq, DatomicWithReq, DidCommSendReq,
-        DidDocumentPublishReq, VcIssueReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CAPABILITY_INVOCATION_IRI,
-        ZCAP_CONTROLLER_IRI, ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI,
-        ZCAP_INVOKER_IRI,
+        datomic_pull, datomic_pull_many, datomic_q, datomic_q_emit_cids, datomic_seek_datoms,
+        datomic_sync, datomic_transact, datomic_tx_range, datomic_with, did_document_publish,
+        didcomm_send, distributed_graph_ipns_name, enforce_datomic_range_tx_scope,
+        is_did_web_ip_host, protocol_payload_tx_cid, vc_issue, vp_capability_projection,
+        warm_datomic_resident_cache, AtprotoRepoWriteReq, AuthCapabilityProjection,
+        DatomicBasisTReq, DatomicDatomsIndex, DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq,
+        DatomicEntityReq, DatomicHistoryReq, DatomicIdentReq, DatomicIndexPullReq,
+        DatomicIndexRangeReq, DatomicLogReq, DatomicPullManyReq, DatomicPullReq, DatomicQReq,
+        DatomicSeekDatomsReq, DatomicSyncReq, DatomicTransactReq, DatomicTxRangeReq,
+        DatomicWarmOutcome, DatomicWithReq, DidCommSendReq, DidDocumentPublishReq, VcIssueReq,
+        ZCAP_ALLOWED_ACTION_IRI, ZCAP_CAPABILITY_INVOCATION_IRI, ZCAP_CONTROLLER_IRI,
+        ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI, ZCAP_INVOKER_IRI,
     };
     use crate::server::KotobaState;
     use axum::response::IntoResponse;
@@ -9259,25 +9277,39 @@ mod tests {
         let query_spaced =
             kotoba_edn::parse("[:find   ?name\n  :where  [?e :person/name ?name]]").unwrap();
         let inputs: Vec<EdnValue> = vec![];
-        let rows = vec![
-            vec![r#""Alice""#.to_string()],
-            vec![r#""Bob""#.to_string()],
-        ];
+        let rows = vec![vec![r#""Alice""#.to_string()], vec![r#""Bob""#.to_string()]];
         let emit = |q: &EdnValue, basis: &str, rows: &[Vec<String>]| {
-            datomic_q_emit_cids(&state, q, &inputs, Some(basis), None, None, false, rows, true)
+            datomic_q_emit_cids(
+                &state,
+                q,
+                &inputs,
+                Some(basis),
+                None,
+                None,
+                false,
+                rows,
+                true,
+            )
         };
 
         let (spec1, job1, result1) = emit(&query, "tx-basis-1", &rows);
 
         // 1. Deterministic: identical inputs reproduce identical CIDs.
-        assert_eq!((spec1.clone(), job1.clone(), result1.clone()), emit(&query, "tx-basis-1", &rows));
+        assert_eq!(
+            (spec1.clone(), job1.clone(), result1.clone()),
+            emit(&query, "tx-basis-1", &rows)
+        );
 
         // 2. Tamper-evident: changing a single row changes result_cid.
         let tampered = vec![
             vec![r#""Alice""#.to_string()],
             vec![r#""Mallory""#.to_string()],
         ];
-        assert_ne!(result1, emit(&query, "tx-basis-1", &tampered).2, "row edit must move result_cid");
+        assert_ne!(
+            result1,
+            emit(&query, "tx-basis-1", &tampered).2,
+            "row edit must move result_cid"
+        );
 
         // 3. Basis-sensitive: a different basis transaction changes job + result.
         let (_, job_b2, result_b2) = emit(&query, "tx-basis-2", &rows);
@@ -9285,14 +9317,21 @@ mod tests {
         assert_ne!(result1, result_b2);
 
         // 4. Canonicalization: formatting-only differences collapse to one spec CID.
-        assert_eq!(spec1, emit(&query_spaced, "tx-basis-1", &rows).0, "whitespace must not move query_spec_cid");
+        assert_eq!(
+            spec1,
+            emit(&query_spaced, "tx-basis-1", &rows).0,
+            "whitespace must not move query_spec_cid"
+        );
 
         // 5. Verify-by-CID: every envelope was PUT, is IPFS-compatible (CIDv1
         //    dag-cbor sha2-256), and the stored bytes hash back to that exact CID
         //    (closes the loop — proves the block IS the content the CID names).
         for cid_mb in [&spec1, &job1, &result1] {
             let kcid = KotobaCid::from_multibase(cid_mb).expect("multibase CID parses");
-            assert!(kcid.is_ipfs_compatible(), "envelope CID must be IPFS-compatible");
+            assert!(
+                kcid.is_ipfs_compatible(),
+                "envelope CID must be IPFS-compatible"
+            );
             let bytes = state
                 .block_store
                 .get(&kcid)
@@ -9319,8 +9358,17 @@ mod tests {
         // One cell past the 1 MiB PUT cap → the result envelope exceeds it.
         let rows = vec![vec!["x".repeat(1_100_000)]];
 
-        let (spec, job, result) =
-            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, true);
+        let (spec, job, result) = datomic_q_emit_cids(
+            &state,
+            &query,
+            &inputs,
+            Some("tx1"),
+            None,
+            None,
+            false,
+            &rows,
+            true,
+        );
 
         // CIDs are returned regardless of persistence (content-derived).
         assert!(!spec.is_empty() && !job.is_empty() && !result.is_empty());
@@ -9353,9 +9401,21 @@ mod tests {
         let rows = vec![vec![r#""secret""#.to_string()]];
 
         // persist=false (private/authenticated graph): CIDs returned, nothing stored.
-        let (spec, job, result) =
-            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, false);
-        assert!(!spec.is_empty() && !job.is_empty() && !result.is_empty(), "CIDs still returned");
+        let (spec, job, result) = datomic_q_emit_cids(
+            &state,
+            &query,
+            &inputs,
+            Some("tx1"),
+            None,
+            None,
+            false,
+            &rows,
+            false,
+        );
+        assert!(
+            !spec.is_empty() && !job.is_empty() && !result.is_empty(),
+            "CIDs still returned"
+        );
         for cid in [&spec, &job, &result] {
             let kcid = KotobaCid::from_multibase(cid).unwrap();
             assert!(
@@ -9365,11 +9425,27 @@ mod tests {
         }
 
         // persist=true (public) DOES store — and yields the SAME CID (content-derived).
-        let (spec_pub, _, _) =
-            datomic_q_emit_cids(&state, &query, &inputs, Some("tx1"), None, None, false, &rows, true);
-        assert_eq!(spec, spec_pub, "persist must not change the content-derived CID");
+        let (spec_pub, _, _) = datomic_q_emit_cids(
+            &state,
+            &query,
+            &inputs,
+            Some("tx1"),
+            None,
+            None,
+            false,
+            &rows,
+            true,
+        );
+        assert_eq!(
+            spec, spec_pub,
+            "persist must not change the content-derived CID"
+        );
         assert!(
-            state.block_store.get(&KotobaCid::from_multibase(&spec_pub).unwrap()).unwrap().is_some(),
+            state
+                .block_store
+                .get(&KotobaCid::from_multibase(&spec_pub).unwrap())
+                .unwrap()
+                .is_some(),
             "public envelope must be persisted"
         );
     }
@@ -9505,8 +9581,18 @@ mod tests {
                     graph: graph.clone(),
                     covering_datoms: None,
                     datoms: vec![
-                        Datom::assert(e.clone(), ":person/name".into(), EdnValue::string("Alice"), tx.clone()),
-                        Datom::assert(e, ":person/role".into(), EdnValue::string("admin"), tx.clone()),
+                        Datom::assert(
+                            e.clone(),
+                            ":person/name".into(),
+                            EdnValue::string("Alice"),
+                            tx.clone(),
+                        ),
+                        Datom::assert(
+                            e,
+                            ":person/role".into(),
+                            EdnValue::string("admin"),
+                            tx.clone(),
+                        ),
                     ],
                     expected_parent: None,
                     tx_cid: Some(tx),
@@ -9536,7 +9622,9 @@ mod tests {
             }
         }
         async fn rows(resp: axum::response::Response) -> serde_json::Value {
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()["rows_edn"].clone()
         }
         let expected = json!([[r#""Alice""#, r#""admin""#]]);
@@ -9544,7 +9632,11 @@ mod tests {
         // ── Public graph: anonymous read is allowed and returns the rows. ──
         let g_pub = KotobaCid::from_bytes(b"pp-public-graph");
         seed(&state, &g_pub, b"pp-pub-tx");
-        state.graph_registry.write().await.insert(g_pub.clone(), ("pub".into(), GraphVisibility::Public));
+        state
+            .graph_registry
+            .write()
+            .await
+            .insert(g_pub.clone(), ("pub".into(), GraphVisibility::Public));
         let resp = datomic_q(
             axum::extract::State(Arc::clone(&state)),
             axum::http::HeaderMap::new(),
@@ -9554,17 +9646,28 @@ mod tests {
         .expect("public read must be allowed anonymously")
         .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        assert_eq!(rows(resp).await, expected, "public read returns the seeded rows");
+        assert_eq!(
+            rows(resp).await,
+            expected,
+            "public read returns the seeded rows"
+        );
 
         // ── Private graph owned by the signed_cacao_b64 issuer (key [42u8;32]). ──
         let owner_did = kotoba_auth::ed25519_pubkey_to_did_key(
-            &ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]).verifying_key().to_bytes(),
+            &ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+                .verifying_key()
+                .to_bytes(),
         );
         let g_priv = KotobaCid::from_bytes(b"pp-private-graph");
         seed(&state, &g_priv, b"pp-priv-tx");
         state.graph_registry.write().await.insert(
             g_priv.clone(),
-            ("priv".into(), GraphVisibility::Private { owner_did: owner_did.clone() }),
+            (
+                "priv".into(),
+                GraphVisibility::Private {
+                    owner_did: owner_did.clone(),
+                },
+            ),
         );
         let g_priv_mb = g_priv.to_multibase();
 
@@ -9581,7 +9684,11 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(denied.0, axum::http::StatusCode::UNAUTHORIZED);
-        assert!(denied.1.to_lowercase().contains("cacao"), "deny must be the CACAO gate, got: {}", denied.1);
+        assert!(
+            denied.1.to_lowercase().contains("cacao"),
+            "deny must be the CACAO gate, got: {}",
+            denied.1
+        );
 
         // (b) valid CACAO (datom:read on private/{owner}, fresh nonce) → OK + rows.
         let cacao = signed_cacao_b64(
@@ -9600,7 +9707,11 @@ mod tests {
         .expect("private read WITH a valid cacao must be allowed")
         .into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        assert_eq!(rows(resp).await, expected, "authorized private read returns the seeded rows");
+        assert_eq!(
+            rows(resp).await,
+            expected,
+            "authorized private read returns the seeded rows"
+        );
     }
 
     #[test]
@@ -10745,7 +10856,13 @@ mod tests {
         {
             let slot = state.datomic_live_slot(&graph_mb);
             let g = slot.lock().await;
-            assert_eq!(g.as_ref().expect("slot seeded after tx1").head.to_multibase(), c1);
+            assert_eq!(
+                g.as_ref()
+                    .expect("slot seeded after tx1")
+                    .head
+                    .to_multibase(),
+                c1
+            );
         }
 
         // Simulate a restart on an already-populated graph: drop the resident
@@ -10781,7 +10898,10 @@ mod tests {
             let slot = state.datomic_live_slot(&graph_mb);
             let g = slot.lock().await;
             assert_eq!(
-                g.as_ref().expect("slot seeded after tx3").head.to_multibase(),
+                g.as_ref()
+                    .expect("slot seeded after tx3")
+                    .head
+                    .to_multibase(),
                 c3,
                 "cache head must track the latest commit"
             );
@@ -10817,12 +10937,13 @@ mod tests {
         let cold_before = state.datomic_cold_db_loads.load(Ordering::Relaxed);
 
         // First read after restart: exactly one cold load, slot re-seeded.
-        let db = crate::xrpc::current_db_for_graph(&state, &graph).await.unwrap();
+        let db = crate::xrpc::current_db_for_graph(&state, &graph)
+            .await
+            .unwrap();
         assert!(
             db.datoms()
                 .iter()
-                .any(|d| d.a == ":person/name"
-                    && d.v == kotoba_edn::EdnValue::string("Alice")),
+                .any(|d| d.a == ":person/name" && d.v == kotoba_edn::EdnValue::string("Alice")),
             "read must surface the committed datom"
         );
         assert_eq!(
@@ -10834,13 +10955,18 @@ mod tests {
             let slot = state.datomic_live_slot(&graph_mb);
             let g = slot.lock().await;
             assert_eq!(
-                g.as_ref().expect("read must re-seed the slot").head.to_multibase(),
+                g.as_ref()
+                    .expect("read must re-seed the slot")
+                    .head
+                    .to_multibase(),
                 c1
             );
         }
 
         // Second read: resident HIT — no new cold load.
-        let db = crate::xrpc::current_db_for_graph(&state, &graph).await.unwrap();
+        let db = crate::xrpc::current_db_for_graph(&state, &graph)
+            .await
+            .unwrap();
         assert!(db
             .datoms()
             .iter()
@@ -10860,7 +10986,9 @@ mod tests {
         )
         .await;
         assert_ne!(c1, c2);
-        let db = crate::xrpc::current_db_for_graph(&state, &graph).await.unwrap();
+        let db = crate::xrpc::current_db_for_graph(&state, &graph)
+            .await
+            .unwrap();
         assert!(
             db.datoms()
                 .iter()
@@ -13141,17 +13269,26 @@ mod tests {
 
     #[test]
     fn nsid_datom_create_exact_value() {
-        assert_eq!(super::NSID_DATOM_CREATE, "com.etzhayyim.apps.kotoba.datom.create");
+        assert_eq!(
+            super::NSID_DATOM_CREATE,
+            "com.etzhayyim.apps.kotoba.datom.create"
+        );
     }
 
     #[test]
     fn nsid_quad_create_exact_value() {
-        assert_eq!(super::NSID_QUAD_CREATE, "com.etzhayyim.apps.kotoba.quad.create");
+        assert_eq!(
+            super::NSID_QUAD_CREATE,
+            "com.etzhayyim.apps.kotoba.quad.create"
+        );
     }
 
     #[test]
     fn nsid_graph_query_exact_value() {
-        assert_eq!(super::NSID_GRAPH_QUERY, "com.etzhayyim.apps.kotoba.graph.query");
+        assert_eq!(
+            super::NSID_GRAPH_QUERY,
+            "com.etzhayyim.apps.kotoba.graph.query"
+        );
     }
 
     #[test]
@@ -13176,7 +13313,10 @@ mod tests {
             super::NSID_DATOMIC_INDEX_PULL,
             "com.etzhayyim.apps.kotoba.datomic.indexPull"
         );
-        assert_eq!(super::NSID_DATOMIC_PULL, "com.etzhayyim.apps.kotoba.datomic.pull");
+        assert_eq!(
+            super::NSID_DATOMIC_PULL,
+            "com.etzhayyim.apps.kotoba.datomic.pull"
+        );
         assert_eq!(
             super::NSID_DATOMIC_PULL_MANY,
             "com.etzhayyim.apps.kotoba.datomic.pullMany"
@@ -13190,17 +13330,26 @@ mod tests {
             super::NSID_DATOMIC_SINCE,
             "com.etzhayyim.apps.kotoba.datomic.since"
         );
-        assert_eq!(super::NSID_DATOMIC_SYNC, "com.etzhayyim.apps.kotoba.datomic.sync");
+        assert_eq!(
+            super::NSID_DATOMIC_SYNC,
+            "com.etzhayyim.apps.kotoba.datomic.sync"
+        );
         assert_eq!(
             super::NSID_DATOMIC_HISTORY,
             "com.etzhayyim.apps.kotoba.datomic.history"
         );
-        assert_eq!(super::NSID_DATOMIC_TX, "com.etzhayyim.apps.kotoba.datomic.tx");
+        assert_eq!(
+            super::NSID_DATOMIC_TX,
+            "com.etzhayyim.apps.kotoba.datomic.tx"
+        );
         assert_eq!(
             super::NSID_DATOMIC_TX_RANGE,
             "com.etzhayyim.apps.kotoba.datomic.txRange"
         );
-        assert_eq!(super::NSID_DATOMIC_LOG, "com.etzhayyim.apps.kotoba.datomic.log");
+        assert_eq!(
+            super::NSID_DATOMIC_LOG,
+            "com.etzhayyim.apps.kotoba.datomic.log"
+        );
         assert_eq!(
             super::NSID_DATOMIC_BASIS_T,
             "com.etzhayyim.apps.kotoba.datomic.basisT"
@@ -13226,12 +13375,18 @@ mod tests {
     #[test]
     fn nsid_protocol_projection_exact_values() {
         assert_eq!(super::NSID_VC_ISSUE, "com.etzhayyim.apps.kotoba.vc.issue");
-        assert_eq!(super::NSID_VC_PRESENT, "com.etzhayyim.apps.kotoba.vc.present");
+        assert_eq!(
+            super::NSID_VC_PRESENT,
+            "com.etzhayyim.apps.kotoba.vc.present"
+        );
         assert_eq!(
             super::NSID_DID_DOCUMENT_PUBLISH,
             "com.etzhayyim.apps.kotoba.did.document.publish"
         );
-        assert_eq!(super::NSID_DIDCOMM_SEND, "com.etzhayyim.apps.kotoba.didcomm.send");
+        assert_eq!(
+            super::NSID_DIDCOMM_SEND,
+            "com.etzhayyim.apps.kotoba.didcomm.send"
+        );
         assert_eq!(
             super::NSID_ATPROTO_REPO_WRITE,
             "com.etzhayyim.apps.kotoba.atproto.repo.write"
@@ -13359,7 +13514,9 @@ mod tests {
             ),
             (
                 super::NSID_DID_DOCUMENT_PUBLISH,
-                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json"),
+                include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json"
+                ),
             ),
             (
                 super::NSID_DIDCOMM_SEND,
@@ -13400,7 +13557,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_TRANSACT,
                 file_name: "transact.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/transact.json"
+                ),
                 distributed_read: false,
                 distributed_write: true,
                 remote_read: false,
@@ -13418,7 +13577,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_DATOMS,
                 file_name: "datoms.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/datoms.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13427,7 +13588,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_SEEK_DATOMS,
                 file_name: "seekDatoms.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/seekDatoms.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13436,7 +13599,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_INDEX_RANGE,
                 file_name: "indexRange.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexRange.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13445,7 +13610,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_INDEX_PULL,
                 file_name: "indexPull.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/indexPull.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13463,7 +13630,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_PULL_MANY,
                 file_name: "pullMany.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/pullMany.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13508,7 +13677,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_HISTORY,
                 file_name: "history.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/history.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13526,7 +13697,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_TX_RANGE,
                 file_name: "txRange.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/txRange.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13544,7 +13717,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_BASIS_T,
                 file_name: "basisT.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/basisT.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13553,7 +13728,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_DB_STATS,
                 file_name: "dbStats.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/dbStats.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -13562,7 +13739,9 @@ mod tests {
             DatomicCompatSurface {
                 nsid: super::NSID_DATOMIC_ENTITY,
                 file_name: "entity.json",
-                src: include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"),
+                src: include_str!(
+                    "../../../lexicons/com/etzhayyim/apps/kotoba/datomic/entity.json"
+                ),
                 distributed_read: true,
                 distributed_write: false,
                 remote_read: true,
@@ -14158,7 +14337,8 @@ mod tests {
 
     #[test]
     fn did_document_publish_lexicon_exposes_w3c_did_document_and_write_response() {
-        let src = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json");
+        let src =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/did/document/publish.json");
         assert_lexicon_input_fields(
             src,
             &["graph", "document"],
@@ -14227,10 +14407,12 @@ mod tests {
         );
         assert_protocol_datom_write_output_fields(vc_issue);
 
-        let vc_present = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json");
+        let vc_present =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/vc/present.json");
         assert_protocol_datom_write_output_fields(vc_present);
 
-        let didcomm_send = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/didcomm/send.json");
+        let didcomm_send =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/didcomm/send.json");
         assert_lexicon_input_object_fields(
             didcomm_send,
             "message",
@@ -14265,7 +14447,8 @@ mod tests {
 
     #[test]
     fn graph_query_lexicons_expose_structured_sparql_and_quad_outputs() {
-        let graph_query = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/query.json");
+        let graph_query =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/query.json");
         let graph_query_value: serde_json::Value =
             serde_json::from_str(graph_query).expect("graph.query lexicon JSON");
         let graph_query_description = graph_query_value["defs"]["main"]["description"]
@@ -14308,7 +14491,8 @@ mod tests {
             &["graph", "subject", "predicate", "object"],
         );
 
-        let graph_sparql = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/sparql.json");
+        let graph_sparql =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/graph/sparql.json");
         let graph_sparql_value: serde_json::Value =
             serde_json::from_str(graph_sparql).expect("graph.sparql lexicon JSON");
         let graph_sparql_description = graph_sparql_value["defs"]["main"]["description"]
@@ -14367,11 +14551,13 @@ mod tests {
         assert_lexicon_parameter_fields(block_get, &["cid"], &[]);
         assert_lexicon_output_fields(block_get, &["cid", "data_b64"], &[]);
 
-        let commit_store = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/store.json");
+        let commit_store =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/store.json");
         assert_lexicon_input_fields(commit_store, &["graph", "author", "seq"], &["cacao_b64"]);
         assert_lexicon_output_fields(commit_store, &["cid"], &[]);
 
-        let commit_get = include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/get.json");
+        let commit_get =
+            include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/commit/get.json");
         assert_lexicon_parameter_fields(commit_get, &["graph"], &[]);
         assert_lexicon_output_fields(
             commit_get,
@@ -14831,7 +15017,10 @@ mod tests {
 
     #[test]
     fn nsid_invoke_run_exact_value() {
-        assert_eq!(super::NSID_INVOKE_RUN, "com.etzhayyim.apps.kotoba.invoke.run");
+        assert_eq!(
+            super::NSID_INVOKE_RUN,
+            "com.etzhayyim.apps.kotoba.invoke.run"
+        );
     }
 
     #[test]
@@ -14922,12 +15111,19 @@ pub async fn generic_invoke(
 
     if program_cid == app {
         let ipns_name = distributed_graph_ipns_name(&graph_cid);
-        if let Ok(Some(db)) = DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry).current_db_for_name(&ipns_name) {
+        if let Ok(Some(db)) =
+            DistributedDatomReader::new(&*state.block_store, &*state.ipns_registry)
+                .current_db_for_name(&ipns_name)
+        {
             for datom in db.datoms() {
                 if datom.a == "node/did" {
                     if let kotoba_datomic::Value::String(s) = &datom.v {
                         if s == app || s.ends_with(&format!("{app}.etzhayyim.com")) {
-                            if let Some(endpoint) = db.datoms().iter().find(|d| d.e == datom.e && d.a == "node/endpoint") {
+                            if let Some(endpoint) = db
+                                .datoms()
+                                .iter()
+                                .find(|d| d.e == datom.e && d.a == "node/endpoint")
+                            {
                                 if let kotoba_datomic::Value::String(ep) = &endpoint.v {
                                     program_cid = ep.to_string();
                                 }
@@ -14941,7 +15137,12 @@ pub async fn generic_invoke(
     }
 
     let mut ctx_cbor = Vec::new();
-    ciborium::into_writer(&req_body, &mut ctx_cbor).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cbor encode: {e}")))?;
+    ciborium::into_writer(&req_body, &mut ctx_cbor).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cbor encode: {e}"),
+        )
+    })?;
 
     // Load the registered WasmNode program bytes from the block store by CID.
     // `program_cid` is the resolved `node/endpoint` value (a wasm CID) when the
@@ -14992,7 +15193,10 @@ pub async fn generic_invoke(
     let mut head_commits = std::collections::HashMap::new();
     if let Some(gcid) = &snapshot_graph_cid {
         let ipns_name = distributed_graph_ipns_name(gcid);
-        match state.ipns_registry.resolve(&IpnsName::new(ipns_name.clone())) {
+        match state
+            .ipns_registry
+            .resolve(&IpnsName::new(ipns_name.clone()))
+        {
             Ok(record) => {
                 head_commits.insert(gcid.to_multibase(), record.value);
             }
@@ -15114,7 +15318,10 @@ pub async fn generic_invoke(
                 .unwrap_or(serde_json::json!({ "output_bytes": r.output_cbor }));
             Ok(Json(out_val))
         }
-        _ => Err((StatusCode::INTERNAL_SERVER_ERROR, "expected wasm result".into())),
+        _ => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "expected wasm result".into(),
+        )),
     }
 }
 
@@ -15126,5 +15333,8 @@ pub async fn generic_invoke(
     Json(_req_body): Json<serde_json::Value>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
-    Err((StatusCode::SERVICE_UNAVAILABLE, "generic dispatch requires the `wasm-runtime` feature".to_string()))
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "generic dispatch requires the `wasm-runtime` feature".to_string(),
+    ))
 }

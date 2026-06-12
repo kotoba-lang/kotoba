@@ -41,7 +41,7 @@ module must be `agent.py` (the build target is the module basename).
 ```sh
 # from 40-engine/kotoba/
 PATH="$PWD/../../.venv/bin:$PATH" \
-  ./scripts/build-pywasm.sh examples/kotoba-langgraph-aria/agent.py
+  ./scripts/build-pywasm.bb examples/kotoba-langgraph-aria/agent.py
 # → examples/kotoba-langgraph-aria/agent.wasm  (~18 MB, same as the other examples)
 ```
 

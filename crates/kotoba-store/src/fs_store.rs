@@ -78,7 +78,10 @@ impl FsBlockStore {
             }
         }
         if let Some(level) = zstd_level {
-            tracing::info!(level, "FsBlockStore: on-disk zstd block compression ENABLED");
+            tracing::info!(
+                level,
+                "FsBlockStore: on-disk zstd block compression ENABLED"
+            );
         }
         Ok(Self {
             root: Arc::new(root),
@@ -285,7 +288,11 @@ mod tests {
         assert_eq!(s.get(&c).unwrap().unwrap().as_ref(), data);
         // on-disk file is the compressed form (header + zstd) and much smaller.
         let on_disk = fs::metadata(s.block_path(&c)).unwrap().len() as usize;
-        assert!(on_disk < data.len() / 2, "expected compression, got {on_disk} vs {}", data.len());
+        assert!(
+            on_disk < data.len() / 2,
+            "expected compression, got {on_disk} vs {}",
+            data.len()
+        );
         // a fresh handle WITHOUT compression still reads the compressed block
         // (auto-detected via the ZBL1 header) — toggling the level is safe.
         let s2 = FsBlockStore::open_with_zstd(&root, None).unwrap();
@@ -376,7 +383,10 @@ mod tests {
         // a fresh FsBlockStore on the same root sees the block — durability is on
         // disk, independent of the in-memory cache (no Kubo / no HTTP involved).
         let fs2 = FsBlockStore::open(&root).unwrap();
-        assert!(fs2.has(&c), "put_durable must land the block on the FS tier");
+        assert!(
+            fs2.has(&c),
+            "put_durable must land the block on the FS tier"
+        );
         assert_eq!(fs2.get(&c).unwrap().unwrap().as_ref(), data);
         let _ = fs::remove_dir_all(&root);
     }

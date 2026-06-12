@@ -37,7 +37,13 @@ pub struct EvmNode {
 
 impl EvmNode {
     pub fn new(chain_id: u64, graph: KotobaCid) -> Self {
-        Self { view: EvmStateView::new(), chain_id, block_number: 0, graph, receipts: HashMap::new() }
+        Self {
+            view: EvmStateView::new(),
+            chain_id,
+            block_number: 0,
+            graph,
+            receipts: HashMap::new(),
+        }
     }
 
     pub fn default_node() -> Self {
@@ -54,8 +60,12 @@ impl EvmNode {
     }
 
     fn apply(&mut self, datoms: Vec<kotoba_query::datom::Datom>) {
-        self.view
-            .apply(&datoms.into_iter().map(Delta::assert_datom).collect::<Vec<_>>());
+        self.view.apply(
+            &datoms
+                .into_iter()
+                .map(Delta::assert_datom)
+                .collect::<Vec<_>>(),
+        );
     }
 }
 
@@ -136,14 +146,22 @@ pub fn dispatch(node: &mut EvmNode, method: &str, params: &Value) -> Result<Valu
                 .map(U256::from_be_bytes)
                 .unwrap_or(U256::ZERO);
             let nonce = node.view.nonce_of(&from);
-            let out = apply_call(&node.view, from, to, value, data, nonce, 30_000_000, &node.graph)
-                .map_err(|e| (-32000, e))?;
+            let out = apply_call(
+                &node.view,
+                from,
+                to,
+                value,
+                data,
+                nonce,
+                30_000_000,
+                &node.graph,
+            )
+            .map_err(|e| (-32000, e))?;
             Ok(json!(format!("0x{}", hex::encode(out.output))))
         }
         "eth_sendRawTransaction" => {
             let raw = parse_hex_bytes(&p(0)).ok_or_else(|| bad("invalid raw tx"))?;
-            let (tx, out) =
-                apply_raw_tx(&node.view, &raw, &node.graph).map_err(|e| (-32000, e))?;
+            let (tx, out) = apply_raw_tx(&node.view, &raw, &node.graph).map_err(|e| (-32000, e))?;
             if !out.success {
                 return Err((
                     -32000,
@@ -203,11 +221,32 @@ pub fn dispatch(node: &mut EvmNode, method: &str, params: &Value) -> Result<Valu
             let call = p(0);
             let from = call.get("from").and_then(parse_addr).unwrap_or([0u8; 20]);
             let data = call_input(&call);
-            let value = call.get("value").and_then(parse_b32).map(U256::from_be_bytes).unwrap_or(U256::ZERO);
+            let value = call
+                .get("value")
+                .and_then(parse_b32)
+                .map(U256::from_be_bytes)
+                .unwrap_or(U256::ZERO);
             let nonce = node.view.nonce_of(&from);
             let gas = match parse_addr(call.get("to").unwrap_or(&Value::Null)) {
-                Some(to) => apply_call(&node.view, from, to, value, data, nonce, 30_000_000, &node.graph),
-                None => apply_create(&node.view, from, value, data, nonce, 30_000_000, &node.graph),
+                Some(to) => apply_call(
+                    &node.view,
+                    from,
+                    to,
+                    value,
+                    data,
+                    nonce,
+                    30_000_000,
+                    &node.graph,
+                ),
+                None => apply_create(
+                    &node.view,
+                    from,
+                    value,
+                    data,
+                    nonce,
+                    30_000_000,
+                    &node.graph,
+                ),
             }
             .map(|o| o.gas_used)
             .unwrap_or(21_000);
@@ -257,7 +296,10 @@ pub fn handle(node: &mut EvmNode, req: &Value) -> Value {
     }
 }
 
-async fn rpc_handler(State(node): State<Arc<RwLock<EvmNode>>>, Json(req): Json<Value>) -> Json<Value> {
+async fn rpc_handler(
+    State(node): State<Arc<RwLock<EvmNode>>>,
+    Json(req): Json<Value>,
+) -> Json<Value> {
     let mut n = node.write().await;
     Json(handle(&mut n, &req))
 }
@@ -297,12 +339,22 @@ mod tests {
         let alice = addr(0xAA);
         node.genesis(&[(alice, u256(1_000_000), 0)]);
 
-        assert_eq!(result(&mut node, "eth_chainId", json!([])), json!("0x6b6f74"));
         assert_eq!(
-            result(&mut node, "eth_getBalance", json!(["0x00000000000000000000000000000000000000aa", "latest"])),
+            result(&mut node, "eth_chainId", json!([])),
+            json!("0x6b6f74")
+        );
+        assert_eq!(
+            result(
+                &mut node,
+                "eth_getBalance",
+                json!(["0x00000000000000000000000000000000000000aa", "latest"])
+            ),
             json!("0xf4240") // 1_000_000
         );
-        assert_eq!(result(&mut node, "eth_blockNumber", json!([])), json!("0x0"));
+        assert_eq!(
+            result(&mut node, "eth_blockNumber", json!([])),
+            json!("0x0")
+        );
     }
 
     #[test]
@@ -316,13 +368,24 @@ mod tests {
         assert!(txhash.as_str().unwrap().starts_with("0x"));
         // recipient credited 1e18, block advanced.
         assert_eq!(
-            result(&mut node, "eth_getBalance", json!(["0x3535353535353535353535353535353535353535", "latest"])),
+            result(
+                &mut node,
+                "eth_getBalance",
+                json!(["0x3535353535353535353535353535353535353535", "latest"])
+            ),
             json!("0xde0b6b3a7640000") // 1e18
         );
-        assert_eq!(result(&mut node, "eth_blockNumber", json!([])), json!("0x1"));
+        assert_eq!(
+            result(&mut node, "eth_blockNumber", json!([])),
+            json!("0x1")
+        );
         // sender nonce 9 → 10
         assert_eq!(
-            result(&mut node, "eth_getTransactionCount", json!(["0x9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f", "latest"])),
+            result(
+                &mut node,
+                "eth_getTransactionCount",
+                json!(["0x9d8a62f656a8d1615c1294fd71e9cfb3e4855a4f", "latest"])
+            ),
             json!("0xa")
         );
     }
@@ -339,7 +402,11 @@ mod tests {
         let mut node = EvmNode::default_node();
         node.genesis(&[(addr(0x01), u256(1), 0)]);
         assert_eq!(
-            result(&mut node, "eth_getCode", json!(["0x0000000000000000000000000000000000000001", "latest"])),
+            result(
+                &mut node,
+                "eth_getCode",
+                json!(["0x0000000000000000000000000000000000000001", "latest"])
+            ),
             json!("0x")
         );
     }

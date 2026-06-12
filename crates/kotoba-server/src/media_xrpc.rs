@@ -45,6 +45,14 @@ const MAX_TOP_K: usize = 100;
 const DEFAULT_EMBED_DIM: usize = 768;
 /// 33 MiB base64 asset + JSON framing (matches the email-ingest body limit).
 pub const MEDIA_INGEST_BODY_LIMIT: usize = 36 * 1024 * 1024;
+const MAX_MEDIA_ITEM_B64_LEN: usize = 34 * 1024 * 1024;
+const MAX_MEDIA_ITEM_BYTES: usize = 25 * 1024 * 1024;
+const MAX_MEDIA_MIME_LEN: usize = 256;
+const MAX_MEDIA_TITLE_LEN: usize = 512;
+const MAX_MEDIA_SOURCE_LEN: usize = 2048;
+const MAX_MEDIA_CAPTION_LEN: usize = 8192;
+const MIN_MEDIA_PAGE: i64 = 0;
+const MAX_MEDIA_PAGE: i64 = 1_000_000;
 
 fn default_top_k() -> usize {
     10
@@ -62,15 +70,15 @@ fn resolve_embed_client(state: &KotobaState) -> Arc<dyn MediaEmbedClient> {
     }
 }
 
-async fn current_media_datoms(
-    state: &KotobaState,
-) -> Result<Vec<KqeDatom>, (StatusCode, String)> {
-    Ok(crate::xrpc::current_db_for_graph(state, &media_assets_graph())
-        .await?
-        .datoms()
-        .into_iter()
-        .filter_map(|datom| datom.to_kqe().ok())
-        .collect())
+async fn current_media_datoms(state: &KotobaState) -> Result<Vec<KqeDatom>, (StatusCode, String)> {
+    Ok(
+        crate::xrpc::current_db_for_graph(state, &media_assets_graph())
+            .await?
+            .datoms()
+            .into_iter()
+            .filter_map(|datom| datom.to_kqe().ok())
+            .collect(),
+    )
 }
 
 /// Collect (subject, embedding) pairs from the asset graph, de-duplicated by
@@ -112,6 +120,36 @@ fn field_cid(datoms: &[KqeDatom], subject: &KotobaCid, predicate: &str) -> Optio
         })
 }
 
+fn validate_media_search_query(q: &MediaSearchQuery) -> Result<(), (StatusCode, String)> {
+    if q.q.trim().is_empty() || q.q.len() > MAX_QUERY_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("q must be 1–{MAX_QUERY_LEN} bytes"),
+        ));
+    }
+    if q.q.chars().any(char::is_control) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "q contains control characters".to_string(),
+        ));
+    }
+    if let Some(modality) = q.modality.as_deref() {
+        if modality.len() > MAX_MODALITY_LEN {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("modality exceeds {MAX_MODALITY_LEN} chars"),
+            ));
+        }
+        if !matches!(modality, "text" | "image" | "audio" | "video" | "document") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "modality must be one of text,image,audio,video,document".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── media.search ──────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -146,21 +184,8 @@ pub async fn media_search(
     {
         return (code, Json(json!({ "error": msg }))).into_response();
     }
-    if q.q.is_empty() || q.q.len() > MAX_QUERY_LEN {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("q must be 1–{MAX_QUERY_LEN} bytes") })),
-        )
-            .into_response();
-    }
-    if let Some(ref m) = q.modality {
-        if m.len() > MAX_MODALITY_LEN {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("modality exceeds {MAX_MODALITY_LEN} chars") })),
-            )
-                .into_response();
-        }
+    if let Err((code, msg)) = validate_media_search_query(&q) {
+        return (code, Json(json!({ "error": msg }))).into_response();
     }
 
     let embed_client = resolve_embed_client(&state);
@@ -276,12 +301,8 @@ pub async fn media_ingest(
     let b64 = base64::engine::general_purpose::STANDARD;
     let mut inputs = Vec::with_capacity(body.items.len());
     for (i, item) in body.items.into_iter().enumerate() {
-        if item.mime.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("item {i}: mime required") })),
-            )
-                .into_response();
+        if let Err((code, msg)) = validate_media_ingest_item(i, &item) {
+            return (code, Json(json!({ "error": msg }))).into_response();
         }
         let bytes = match b64.decode(item.b64.as_bytes()) {
             Ok(b) => b,
@@ -293,6 +314,13 @@ pub async fn media_ingest(
                     .into_response()
             }
         };
+        if bytes.len() > MAX_MEDIA_ITEM_BYTES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({ "error": format!("item {i}: decoded payload exceeds {MAX_MEDIA_ITEM_BYTES} bytes") })),
+            )
+                .into_response();
+        }
         let mut input = MediaInput::new(item.mime, Bytes::from(bytes)).with_page(item.page);
         if let Some(t) = item.title {
             input = input.with_title(t);
@@ -332,6 +360,69 @@ pub async fn media_ingest(
 
 // ── media.status ──────────────────────────────────────────────────────────────────
 
+fn validate_media_ingest_item(
+    index: usize,
+    item: &MediaIngestItem,
+) -> Result<(), (StatusCode, String)> {
+    validate_media_text_field(index, "mime", &item.mime, 1, MAX_MEDIA_MIME_LEN)?;
+    if item.b64.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("item {index}: b64 required"),
+        ));
+    }
+    if item.b64.len() > MAX_MEDIA_ITEM_B64_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("item {index}: b64 exceeds {MAX_MEDIA_ITEM_B64_LEN} bytes"),
+        ));
+    }
+    if !(MIN_MEDIA_PAGE..=MAX_MEDIA_PAGE).contains(&item.page) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("item {index}: page must be {MIN_MEDIA_PAGE}–{MAX_MEDIA_PAGE}"),
+        ));
+    }
+    if let Some(title) = &item.title {
+        validate_media_text_field(index, "title", title, 0, MAX_MEDIA_TITLE_LEN)?;
+    }
+    if let Some(source) = &item.source {
+        validate_media_text_field(index, "source", source, 0, MAX_MEDIA_SOURCE_LEN)?;
+    }
+    if let Some(caption) = &item.caption {
+        validate_media_text_field(index, "caption", caption, 0, MAX_MEDIA_CAPTION_LEN)?;
+    }
+    Ok(())
+}
+
+fn validate_media_text_field(
+    index: usize,
+    field: &'static str,
+    value: &str,
+    min_len: usize,
+    max_len: usize,
+) -> Result<(), (StatusCode, String)> {
+    if value.len() < min_len {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("item {index}: {field} required"),
+        ));
+    }
+    if value.len() > max_len {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("item {index}: {field} exceeds {max_len} bytes"),
+        ));
+    }
+    if value.bytes().any(|b| b < 0x20 && b != b'\t') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("item {index}: {field} contains control characters"),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn media_status(
     State(state): State<Arc<KotobaState>>,
     headers: HeaderMap,
@@ -367,7 +458,8 @@ pub async fn media_status(
         .len();
 
     // Per-modality breakdown.
-    let mut by_modality: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut by_modality: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     for d in &datoms {
         if d.a == "media/modality" {
             if let KqeValue::Text(t) = &d.v {
@@ -407,8 +499,16 @@ mod tests {
     #[test]
     fn collect_media_embeddings_dedupes_by_subject() {
         let s = KotobaCid::from_bytes(b"asset-1");
-        let d1 = datom(s.clone(), "media/embed/m", KqeValue::VectorF32(vec![1.0, 0.0]));
-        let d2 = datom(s.clone(), "media/embed/m", KqeValue::VectorF32(vec![0.0, 1.0]));
+        let d1 = datom(
+            s.clone(),
+            "media/embed/m",
+            KqeValue::VectorF32(vec![1.0, 0.0]),
+        );
+        let d2 = datom(
+            s.clone(),
+            "media/embed/m",
+            KqeValue::VectorF32(vec![0.0, 1.0]),
+        );
         let out = collect_media_embeddings(&[d1, d2]);
         assert_eq!(out.len(), 1, "same subject must collapse to one embedding");
     }
@@ -418,11 +518,111 @@ mod tests {
         let s = KotobaCid::from_bytes(b"asset-2");
         let blob = KotobaCid::from_bytes(b"blob-2");
         let datoms = vec![
-            datom(s.clone(), "media/title", KqeValue::Text("apple".to_string())),
+            datom(
+                s.clone(),
+                "media/title",
+                KqeValue::Text("apple".to_string()),
+            ),
             datom(s.clone(), "media/blob", KqeValue::Cid(blob.clone())),
         ];
-        assert_eq!(field_text(&datoms, &s, "media/title").as_deref(), Some("apple"));
+        assert_eq!(
+            field_text(&datoms, &s, "media/title").as_deref(),
+            Some("apple")
+        );
         assert_eq!(field_cid(&datoms, &s, "media/blob"), Some(blob));
         assert!(field_text(&datoms, &s, "media/missing").is_none());
+    }
+
+    #[test]
+    fn media_search_query_validation_rejects_control_and_unknown_modality() {
+        let valid = MediaSearchQuery {
+            q: "camera".into(),
+            top_k: 10,
+            modality: Some("image".into()),
+        };
+        assert!(validate_media_search_query(&valid).is_ok());
+
+        for (q, modality) in [
+            ("", None),
+            ("   ", None),
+            ("bad\nquery", None),
+            ("camera", Some("unknown")),
+            ("camera", Some("image\n")),
+        ] {
+            let query = MediaSearchQuery {
+                q: q.into(),
+                top_k: 10,
+                modality: modality.map(str::to_string),
+            };
+            assert!(
+                validate_media_search_query(&query).is_err(),
+                "media search query should be rejected"
+            );
+        }
+    }
+
+    fn sample_item() -> MediaIngestItem {
+        MediaIngestItem {
+            mime: "image/png".to_string(),
+            b64: "aGVsbG8=".to_string(),
+            title: Some("title".to_string()),
+            source: Some("source".to_string()),
+            page: 0,
+            caption: Some("caption".to_string()),
+        }
+    }
+
+    #[test]
+    fn media_ingest_item_validation_accepts_sample_item() {
+        validate_media_ingest_item(0, &sample_item()).unwrap();
+    }
+
+    #[test]
+    fn media_ingest_item_validation_rejects_missing_and_oversized_fields() {
+        let mut item = sample_item();
+        item.mime.clear();
+        let (code, err) = validate_media_ingest_item(3, &item).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(err.contains("item 3: mime"));
+
+        item.mime = "image/png".to_string();
+        item.title = Some("x".repeat(MAX_MEDIA_TITLE_LEN + 1));
+        let (code, err) = validate_media_ingest_item(3, &item).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(err.contains("title"));
+    }
+
+    #[test]
+    fn media_ingest_item_validation_rejects_oversized_b64_before_decode() {
+        let mut item = sample_item();
+        item.b64 = "A".repeat(MAX_MEDIA_ITEM_B64_LEN + 1);
+        let (code, err) = validate_media_ingest_item(1, &item).unwrap_err();
+        assert_eq!(code, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(err.contains("b64"));
+    }
+
+    #[test]
+    fn media_ingest_item_validation_rejects_bad_page_and_control_chars() {
+        let mut item = sample_item();
+        item.page = -1;
+        let (code, err) = validate_media_ingest_item(2, &item).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(err.contains("page"));
+
+        item.page = 1;
+        item.source = Some("line\nbreak".to_string());
+        let (code, err) = validate_media_ingest_item(2, &item).unwrap_err();
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(err.contains("control"));
+    }
+
+    #[test]
+    fn media_decoded_size_guard_catches_b64_raw_overshoot() {
+        let max_b64_decoded = (MAX_MEDIA_ITEM_B64_LEN / 4) * 3;
+        assert!(
+            max_b64_decoded > MAX_MEDIA_ITEM_BYTES,
+            "decoded size guard must be reachable after the b64 length guard"
+        );
+        assert_eq!(MAX_MEDIA_ITEM_BYTES, 25 * 1024 * 1024);
     }
 }

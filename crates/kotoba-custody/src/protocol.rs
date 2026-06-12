@@ -219,7 +219,11 @@ mod tests {
         (format!("did:key:zC{seed}"), sk, pk)
     }
 
-    fn deal(key: &[u8; 32], t: u8, n: u8) -> (Vec<CustodianShare>, Vec<(String, StaticSecret, PublicKey)>) {
+    fn deal(
+        key: &[u8; 32],
+        t: u8,
+        n: u8,
+    ) -> (Vec<CustodianShare>, Vec<(String, StaticSecret, PublicKey)>) {
         let fleet: Vec<_> = (1..=n).map(custodian).collect();
         let pubs: Vec<(String, PublicKey)> =
             fleet.iter().map(|(d, _, p)| (d.clone(), *p)).collect();
@@ -320,9 +324,11 @@ mod tests {
         let allow = |_: &KeyShareRequest| Ok(());
         let grants: Vec<GrantedShare> = [0usize, 1]
             .iter()
-            .map(|&i| match handle_key_share_request(&req(req_pk), &shares[i], &fleet[i].1, &allow) {
-                KeyShareResponse::Granted(g) => g,
-                _ => panic!(),
+            .map(|&i| {
+                match handle_key_share_request(&req(req_pk), &shares[i], &fleet[i].1, &allow) {
+                    KeyShareResponse::Granted(g) => g,
+                    _ => panic!(),
+                }
             })
             .collect();
         assert!(matches!(

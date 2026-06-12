@@ -33,7 +33,7 @@ pub struct AvailabilityChallenge {
 /// block identified by `cid_bytes`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofEntry {
-    /// 36-byte KotobaCid of the block (as Vec<u8>).
+    /// 36-byte KotobaCid of the block (as `Vec<u8>`).
     pub cid_bytes: Vec<u8>,
     /// blake3 hash of the raw block content (32 bytes).
     pub content_hash: Vec<u8>,

@@ -32,6 +32,15 @@ pub trait BlockStore: Send + Sync {
     /// durable without N sequential `block/put`s.
     fn put_many_durable(&self, blocks: &[(KotobaCid, Vec<u8>)]) -> anyhow::Result<()> {
         for (cid, data) in blocks {
+            let actual = KotobaCid::from_bytes(data);
+            anyhow::ensure!(
+                actual == *cid,
+                "cid mismatch: expected {}, got {}",
+                cid.to_multibase(),
+                actual.to_multibase()
+            );
+        }
+        for (cid, data) in blocks {
             self.put_durable(cid, data)?;
         }
         Ok(())

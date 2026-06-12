@@ -70,12 +70,19 @@ impl<'a> DatabaseRef for DatomDatabase<'a> {
             }
             None => (revm::primitives::KECCAK_EMPTY, None),
         };
-        Ok(Some(AccountInfo { balance, nonce, code_hash, code }))
+        Ok(Some(AccountInfo {
+            balance,
+            nonce,
+            code_hash,
+            code,
+        }))
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
         let ch: [u8; 32] = code_hash.into();
-        Ok(Bytecode::new_raw(Bytes::from(self.view.code_by_hash(&ch).to_vec())))
+        Ok(Bytecode::new_raw(Bytes::from(
+            self.view.code_by_hash(&ch).to_vec(),
+        )))
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -155,16 +162,23 @@ pub fn apply_call(
     let ResultAndState { result, state } = evm.transact().map_err(|e| format!("{e:?}"))?;
 
     let (success, gas_used, output) = match &result {
-        ExecutionResult::Success { gas_used, output, .. } => {
-            (true, *gas_used, output.data().to_vec())
-        }
+        ExecutionResult::Success {
+            gas_used, output, ..
+        } => (true, *gas_used, output.data().to_vec()),
         ExecutionResult::Revert { gas_used, output } => (false, *gas_used, output.to_vec()),
         ExecutionResult::Halt { gas_used, .. } => (false, *gas_used, Vec::new()),
     };
 
     let logs: Vec<EvmLog> = result.logs().iter().map(EvmLog::from_revm).collect();
     let datoms = state_to_datoms(&state, graph);
-    Ok(ExecOutcome { success, gas_used, datoms, output, logs, created: None })
+    Ok(ExecOutcome {
+        success,
+        gas_used,
+        datoms,
+        output,
+        logs,
+        created: None,
+    })
 }
 
 /// Execute a **contract-creation** tx (`from` deploys `init_code`) against the
@@ -199,7 +213,9 @@ pub fn apply_create(
     let ResultAndState { result, state } = evm.transact().map_err(|e| format!("{e:?}"))?;
 
     let (success, gas_used, output, created) = match &result {
-        ExecutionResult::Success { gas_used, output, .. } => {
+        ExecutionResult::Success {
+            gas_used, output, ..
+        } => {
             let created = match output {
                 revm::primitives::Output::Create(_, Some(a)) => Some(a.into_array()),
                 _ => None,
@@ -212,7 +228,14 @@ pub fn apply_create(
 
     let logs: Vec<EvmLog> = result.logs().iter().map(EvmLog::from_revm).collect();
     let datoms = state_to_datoms(&state, graph);
-    Ok(ExecOutcome { success, gas_used, datoms, output, logs, created })
+    Ok(ExecOutcome {
+        success,
+        gas_used,
+        datoms,
+        output,
+        logs,
+        created,
+    })
 }
 
 /// Convert revm's post-execution state into `evm/*` Datoms (the block's state diff).
@@ -238,9 +261,13 @@ pub fn state_to_datoms(
             })
         });
         match &code {
-            Some((ch, raw)) => {
-                out.extend(account_datoms(&a, acct.info.nonce, &balance, Some((ch, raw)), graph))
-            }
+            Some((ch, raw)) => out.extend(account_datoms(
+                &a,
+                acct.info.nonce,
+                &balance,
+                Some((ch, raw)),
+                graph,
+            )),
             None => out.extend(account_datoms(&a, acct.info.nonce, &balance, None, graph)),
         }
         for (slot, val) in acct.storage.iter() {
@@ -314,7 +341,16 @@ mod tests {
         let alice = addr(0x01);
         let bob = addr(0x02);
         let view = view_with(mk_account(&alice, 0, &u256(100), None, &graph()));
-        let res = apply_call(&view, alice, bob, U256::from(1_000u64), vec![], 0, 100_000, &graph());
+        let res = apply_call(
+            &view,
+            alice,
+            bob,
+            U256::from(1_000u64),
+            vec![],
+            0,
+            100_000,
+            &graph(),
+        );
         // revm rejects the tx (insufficient funds) → Err from transact validation.
         assert!(res.is_err(), "over-balance transfer must be rejected");
     }
@@ -324,7 +360,10 @@ mod tests {
         let alice = addr(0xAA);
         let view = view_with(mk_account(&alice, 3, &u256(500), None, &graph()));
         let db = DatomDatabase::new(&view);
-        let info = db.basic_ref(Address::from(alice)).unwrap().expect("account present");
+        let info = db
+            .basic_ref(Address::from(alice))
+            .unwrap()
+            .expect("account present");
         assert_eq!(info.nonce, 3);
         assert_eq!(info.balance, U256::from(500u64));
         // unknown account → None
@@ -340,7 +379,13 @@ mod tests {
         let caller = addr(0xAA);
 
         let mut datoms = mk_account(&caller, 0, &u256(1_000_000), None, &graph());
-        datoms.extend(mk_account(&c, 1, &u256(0), Some((&codehash, &code)), &graph()));
+        datoms.extend(mk_account(
+            &c,
+            1,
+            &u256(0),
+            Some((&codehash, &code)),
+            &graph(),
+        ));
         let view = view_with(datoms);
 
         let out = apply_call(&view, caller, c, U256::ZERO, vec![], 0, 100_000, &graph())

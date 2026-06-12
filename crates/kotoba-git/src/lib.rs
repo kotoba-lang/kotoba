@@ -453,7 +453,10 @@ mod tests {
             oid: blob_oid,
         }]);
         let (tree_oid, _) = git.put_object(&tree).await.unwrap();
-        assert_eq!(tree_oid.to_hex(), "b4ed918248039b78f24383523fa4e51f80994fac");
+        assert_eq!(
+            tree_oid.to_hex(),
+            "b4ed918248039b78f24383523fa4e51f80994fac"
+        );
 
         let commit_body = b"tree b4ed918248039b78f24383523fa4e51f80994fac\n\
 author t <t@t> 1700000000 +0000\n\
@@ -469,7 +472,9 @@ first\n"
         );
 
         git.put_ref("refs/heads/main", commit_oid).await.unwrap();
-        git.put_symbolic_ref("HEAD", "refs/heads/main").await.unwrap();
+        git.put_symbolic_ref("HEAD", "refs/heads/main")
+            .await
+            .unwrap();
 
         let db = conn.db();
 
@@ -632,7 +637,9 @@ first\n"
             let (c, _) = git.put_object(&commit).await.unwrap();
             commit_oid = c;
             git.put_ref("refs/heads/main", commit_oid).await.unwrap();
-            git.put_symbolic_ref("HEAD", "refs/heads/main").await.unwrap();
+            git.put_symbolic_ref("HEAD", "refs/heads/main")
+                .await
+                .unwrap();
             manifest_cid = git.snapshot_manifest().unwrap();
         }
 
@@ -664,7 +671,10 @@ first\n"
             let conn = Connection::new();
             let git = GitStore::new(&conn, &store_a);
             git.install_schema().await.unwrap();
-            let (oid, _) = git.put_object(&GitObject::blob(b"hi\n".to_vec())).await.unwrap();
+            let (oid, _) = git
+                .put_object(&GitObject::blob(b"hi\n".to_vec()))
+                .await
+                .unwrap();
             git.put_ref("refs/heads/main", oid).await.unwrap();
             manifest_cid = git.snapshot_manifest().unwrap();
             manifest_bytes = store_a.get(&manifest_cid).unwrap().unwrap().to_vec();
@@ -678,9 +688,15 @@ first\n"
         git2.install_schema().await.unwrap();
 
         let (restored, missing) = git2.rehydrate(&manifest_cid).await.unwrap();
-        assert_eq!((restored, missing), (0, 1), "the one object block is missing");
+        assert_eq!(
+            (restored, missing),
+            (0, 1),
+            "the one object block is missing"
+        );
         // The ref is still recorded even though its target object is absent.
-        assert!(list_refs(&conn2.db()).iter().any(|(n, _)| n == "refs/heads/main"));
+        assert!(list_refs(&conn2.db())
+            .iter()
+            .any(|(n, _)| n == "refs/heads/main"));
     }
 
     #[tokio::test]

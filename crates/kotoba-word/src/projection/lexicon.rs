@@ -182,7 +182,10 @@ mod tests {
             doc["defs"]["main"]["parameters"]["properties"]["name"]["type"],
             "string"
         );
-        assert_eq!(doc["defs"]["main"]["output"]["encoding"], "application/json");
+        assert_eq!(
+            doc["defs"]["main"]["output"]["encoding"],
+            "application/json"
+        );
     }
 
     #[test]
@@ -198,7 +201,10 @@ mod tests {
 
     #[test]
     fn path_layout_matches_repo_convention() {
-        let p = lexicon_path(Path::new("lexicons"), "com.etzhayyim.apps.kotoba.word.git.status");
+        let p = lexicon_path(
+            Path::new("lexicons"),
+            "com.etzhayyim.apps.kotoba.word.git.status",
+        );
         assert_eq!(
             p,
             Path::new("lexicons/com/etzhayyim/apps/kotoba/word/git/status.json")
@@ -211,8 +217,7 @@ mod tests {
         let written = write_lexicons(&manifest(), dir.path()).unwrap();
         assert_eq!(written.len(), 2);
         for p in &written {
-            let doc: Value =
-                serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+            let doc: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
             assert_eq!(doc["lexicon"], 1);
         }
     }

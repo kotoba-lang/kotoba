@@ -36,7 +36,10 @@ async fn full_passkey_hierarchy_l0_to_l5() {
     let body = b"From: doctor@example.com\nSubject: results\n\n<private>";
     let sealed = storage.encrypt_blob_bound(intake_slot, body).await.unwrap();
     // Right slot opens; a swapped slot must fail (the D2 binding).
-    let opened = storage.decrypt_blob_bound(intake_slot, &sealed).await.unwrap();
+    let opened = storage
+        .decrypt_blob_bound(intake_slot, &sealed)
+        .await
+        .unwrap();
     assert_eq!(opened.as_slice(), body);
     assert!(
         storage
@@ -51,7 +54,10 @@ async fn full_passkey_hierarchy_l0_to_l5() {
     // device that can recover ARK (we only assert determinism of the seed here).
     let signal_seed_a = derive_signal_seed(&ark);
     let signal_seed_b = derive_signal_seed(&ark);
-    assert_eq!(signal_seed_a, signal_seed_b, "Signal seed is ARK-deterministic");
+    assert_eq!(
+        signal_seed_a, signal_seed_b,
+        "Signal seed is ARK-deterministic"
+    );
     assert_ne!(
         signal_seed_a,
         derive_session_seed(&ark),
@@ -62,8 +68,12 @@ async fn full_passkey_hierarchy_l0_to_l5() {
     use ed25519_dalek::SigningKey;
     let alice_did_key = SigningKey::from_bytes(&[3u8; 32]);
     let alice_signal = IdentityKeyPair::generate();
-    let binding =
-        SignalBinding::from_identity(ACCOUNT_DID, &alice_signal.public_key(), 4242, "2026-06-01T00:00:00Z");
+    let binding = SignalBinding::from_identity(
+        ACCOUNT_DID,
+        &alice_signal.public_key(),
+        4242,
+        "2026-06-01T00:00:00Z",
+    );
     let binding_sig = binding.sign(&alice_did_key);
     assert!(
         binding.verify(&binding_sig, &alice_did_key.verifying_key().to_bytes()),
@@ -85,7 +95,12 @@ async fn full_passkey_hierarchy_l0_to_l5() {
         one_time_prekey_id: Some(bob_opk.id),
     };
     // Bob's binding matches the bundle he advertises (substitution guard).
-    let bob_binding = SignalBinding::from_identity("did:web:etzhayyim.com:actor:bob", &bob_ik.public_key(), 7, "t");
+    let bob_binding = SignalBinding::from_identity(
+        "did:web:etzhayyim.com:actor:bob",
+        &bob_ik.public_key(),
+        7,
+        "t",
+    );
     assert!(bob_binding.matches_bundle(&bundle));
 
     let (mut alice_sess, ep) = Session::initiate(&alice_signal, &bundle).unwrap();
@@ -106,7 +121,10 @@ async fn full_passkey_hierarchy_l0_to_l5() {
     let record_key = [0x77u8; 32];
     let kw = wrap_record_key(&mut alice_sess, &record_key).unwrap();
     let unwrapped = unwrap_record_key(&mut bob_sess, &kw).unwrap();
-    assert_eq!(unwrapped, record_key, "Bob recovers the record key via the Signal wrap transport");
+    assert_eq!(
+        unwrapped, record_key,
+        "Bob recovers the record key via the Signal wrap transport"
+    );
 }
 
 #[tokio::test]
@@ -116,7 +134,10 @@ async fn guardian_recovery_then_resume_storage() {
     let ark = generate_ark();
     let storage = VaultKeyedCrypto::from_ark(&ark);
     let slot = b"kotoba://datom/bafyRecoveryTest";
-    let sealed = storage.encrypt_blob_bound(slot, b"survives recovery").await.unwrap();
+    let sealed = storage
+        .encrypt_blob_bound(slot, b"survives recovery")
+        .await
+        .unwrap();
 
     let shares = key_tree::recovery::split(&ark, 2, 3);
     let quorum = vec![shares[0].clone(), shares[2].clone()];

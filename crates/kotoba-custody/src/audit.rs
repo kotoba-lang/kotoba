@@ -87,10 +87,7 @@ mod tests {
     #[test]
     fn no_receipt_is_an_unreceipted_release() {
         let g = grant("bGraph", 1000);
-        assert_eq!(
-            audit_grant(&g, &[], 5),
-            AuditVerdict::UnreceiptedRelease
-        );
+        assert_eq!(audit_grant(&g, &[], 5), AuditVerdict::UnreceiptedRelease);
     }
 
     #[test]

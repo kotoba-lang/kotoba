@@ -1,3 +1,5 @@
+pub mod access_receipt;
+pub mod account_xrpc;
 pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
@@ -7,12 +9,11 @@ pub mod dna_integrity;
 pub mod econ;
 pub mod email_xrpc;
 pub mod evm_rpc;
-pub mod access_receipt;
-pub mod key_share;
 pub mod fingerprint;
 pub mod firehose;
 pub mod git_http;
 pub mod graph_auth;
+pub mod key_share;
 pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
@@ -21,7 +22,6 @@ pub mod mishmar_observe;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
 pub mod nonce_store;
-pub mod account_xrpc;
 pub mod pds_session;
 pub mod pds_xrpc;
 pub mod pre_proxy;
@@ -239,16 +239,16 @@ mod tests {
     async fn generic_xrpc_dispatch_resolves() {
         use axum::http::Request;
         use tower::ServiceExt;
-        
+
         let state = std::sync::Arc::new(super::server::KotobaState::new(None).expect("state"));
         let app = super::build_router(state);
-        
+
         let req = Request::builder()
             .method("POST")
             .uri("/xrpc/com.etzhayyim.apps.yata.some_method")
             .body(axum::body::Body::empty())
             .unwrap();
-            
+
         let response = app.oneshot(req).await.unwrap();
         // Since we provided empty body, we expect a 400 Bad Request or 401 Unauthorized,
         // but definitely NOT a 404 Not Found (which means no route matched)
@@ -283,8 +283,18 @@ mod tests {
             graph: graph.clone(),
             covering_datoms: None,
             datoms: vec![
-                kotoba_datomic::Datom::assert(e.clone(), ":person/name".into(), kotoba_edn::EdnValue::string("Alice"), tx.clone()),
-                kotoba_datomic::Datom::assert(e, ":person/role".into(), kotoba_edn::EdnValue::string("admin"), tx.clone()),
+                kotoba_datomic::Datom::assert(
+                    e.clone(),
+                    ":person/name".into(),
+                    kotoba_edn::EdnValue::string("Alice"),
+                    tx.clone(),
+                ),
+                kotoba_datomic::Datom::assert(
+                    e,
+                    ":person/role".into(),
+                    kotoba_edn::EdnValue::string("admin"),
+                    tx.clone(),
+                ),
             ],
             expected_parent: None,
             tx_cid: Some(tx),
@@ -299,7 +309,10 @@ mod tests {
         .unwrap();
         state.graph_registry.write().await.insert(
             graph.clone(),
-            ("http".into(), kotoba_core::named_graph::GraphVisibility::Public),
+            (
+                "http".into(),
+                kotoba_core::named_graph::GraphVisibility::Public,
+            ),
         );
 
         let app = super::build_router(std::sync::Arc::clone(&state));
@@ -313,9 +326,15 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let v = body_json(resp).await;
         // Rows came through the full stack…
-        assert_eq!(v["rows_edn"], serde_json::json!([[r#""Alice""#, r#""admin""#]]), "body={v}");
+        assert_eq!(
+            v["rows_edn"],
+            serde_json::json!([[r#""Alice""#, r#""admin""#]]),
+            "body={v}"
+        );
         // …and result_cid is present and fetchable from the block store by CID.
-        let result_cid = v["result_cid"].as_str().expect("result_cid present in HTTP response");
+        let result_cid = v["result_cid"]
+            .as_str()
+            .expect("result_cid present in HTTP response");
         let kcid = Cid::from_multibase(result_cid).expect("multibase CID");
         assert!(
             state.block_store.get(&kcid).unwrap().is_some(),
@@ -326,7 +345,9 @@ mod tests {
     // ── HTTP integration: PDS session PoP + zero-access endpoints (ADR-2606015000) ──
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
@@ -360,7 +381,10 @@ mod tests {
         ));
         let uri = format!("/xrpc/{}", super::pds_xrpc::NSID_PDS_SESSION_VERIFY);
         let resp = app
-            .oneshot(post_json(&uri, serde_json::json!({ "token": make_didkey_pop() })))
+            .oneshot(post_json(
+                &uri,
+                serde_json::json!({ "token": make_didkey_pop() }),
+            ))
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -381,7 +405,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
-        assert_eq!(body_json(resp).await["valid"], serde_json::Value::Bool(false));
+        assert_eq!(
+            body_json(resp).await["valid"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[tokio::test]
@@ -390,7 +417,10 @@ mod tests {
         let app = super::build_router(std::sync::Arc::new(
             super::server::KotobaState::new(None).expect("state"),
         ));
-        let uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         // No Authorization header → owner-auth must reject (not 404, not 200).
         let resp = app
             .oneshot(post_json(
@@ -462,18 +492,26 @@ mod tests {
         let wrapped = "QUFBQUFBQUFBQUFB"; // opaque wrap blob (server stores verbatim)
 
         // PUT — store the wrapped ARK.
-        let put_uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let put_uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         let put_req = axum::http::Request::builder()
             .method("POST")
             .uri(&put_uri)
             .header("content-type", "application/json")
             .header("authorization", &bearer)
             .body(axum::body::Body::from(
-                serde_json::json!({ "did": did, "credentialId": "cred-rt", "wrappedArk": wrapped }).to_string(),
+                serde_json::json!({ "did": did, "credentialId": "cred-rt", "wrappedArk": wrapped })
+                    .to_string(),
             ))
             .unwrap();
         let put_resp = app.clone().oneshot(put_req).await.unwrap();
-        assert_eq!(put_resp.status(), axum::http::StatusCode::OK, "put should succeed");
+        assert_eq!(
+            put_resp.status(),
+            axum::http::StatusCode::OK,
+            "put should succeed"
+        );
 
         // GET — same opaque blob comes back (shelf roundtrip through the same state).
         let get_uri = format!(
@@ -488,9 +526,16 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let get_resp = app.oneshot(get_req).await.unwrap();
-        assert_eq!(get_resp.status(), axum::http::StatusCode::OK, "get should succeed");
+        assert_eq!(
+            get_resp.status(),
+            axum::http::StatusCode::OK,
+            "get should succeed"
+        );
         let v = body_json(get_resp).await;
-        assert_eq!(v["wrappedArk"], serde_json::Value::String(wrapped.to_string()));
+        assert_eq!(
+            v["wrappedArk"],
+            serde_json::Value::String(wrapped.to_string())
+        );
         assert_eq!(v["did"], serde_json::Value::String(did.to_string()));
     }
 
@@ -535,13 +580,21 @@ mod tests {
 
         let bob = "did:web:etzhayyim.com:actor:bob";
         let alice = "did:web:etzhayyim.com:actor:alice";
-        let bob_bearer = format!("Bearer x.{}.x", B64U.encode(format!("{{\"sub\":\"{bob}\"}}").as_bytes()));
-        let alice_bearer =
-            format!("Bearer x.{}.x", B64U.encode(format!("{{\"sub\":\"{alice}\"}}").as_bytes()));
+        let bob_bearer = format!(
+            "Bearer x.{}.x",
+            B64U.encode(format!("{{\"sub\":\"{bob}\"}}").as_bytes())
+        );
+        let alice_bearer = format!(
+            "Bearer x.{}.x",
+            B64U.encode(format!("{{\"sub\":\"{alice}\"}}").as_bytes())
+        );
         let wrapped = "Qk9CX1dSQVA"; // bob's opaque wrap
 
         // Bob stores his own wrap (baseline).
-        let put_uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let put_uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         let put = app
             .clone()
             .oneshot(
@@ -670,8 +723,15 @@ mod tests {
             ))
             .unwrap();
         let pub_resp = app.clone().oneshot(pub_req).await.unwrap();
-        assert_eq!(pub_resp.status(), axum::http::StatusCode::OK, "publish should succeed");
-        assert_eq!(body_json(pub_resp).await["verifiedOnPublish"], serde_json::Value::Bool(true));
+        assert_eq!(
+            pub_resp.status(),
+            axum::http::StatusCode::OK,
+            "publish should succeed"
+        );
+        assert_eq!(
+            body_json(pub_resp).await["verifiedOnPublish"],
+            serde_json::Value::Bool(true)
+        );
 
         // RESOLVE — the stored binding verifies against the did:key (trustless).
         let res_uri = format!(
@@ -685,7 +745,11 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let res_resp = app.oneshot(res_req).await.unwrap();
-        assert_eq!(res_resp.status(), axum::http::StatusCode::OK, "resolve should succeed");
+        assert_eq!(
+            res_resp.status(),
+            axum::http::StatusCode::OK,
+            "resolve should succeed"
+        );
         let v = body_json(res_resp).await;
         assert_eq!(v["verified"], serde_json::Value::Bool(true), "body={v}");
         assert_eq!(v["did"], serde_json::Value::String(did));
@@ -715,10 +779,13 @@ mod tests {
     ) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine as _};
         use ed25519_dalek::Signer;
-        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
-        let header = B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
-        let payload =
-            B64U.encode(serde_json::to_vec(&serde_json::json!({ "iss": did, "sub": did, "exp": exp })).unwrap());
+        let did =
+            kotoba_auth::did_key::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
+        let header =
+            B64U.encode(serde_json::to_vec(&serde_json::json!({ "alg": "EdDSA" })).unwrap());
+        let payload = B64U.encode(
+            serde_json::to_vec(&serde_json::json!({ "iss": did, "sub": did, "exp": exp })).unwrap(),
+        );
         let signing_input = format!("{header}.{payload}");
         let sig = sign_sk.sign(signing_input.as_bytes());
         format!("{signing_input}.{}", B64U.encode(sig.to_bytes()))
@@ -743,7 +810,11 @@ mod tests {
             .oneshot(post_json(&uri, serde_json::json!({ "token": token })))
             .await
             .unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::OK, "valid PoP must return 200");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "valid PoP must return 200"
+        );
         let v = body_json(resp).await;
         assert_eq!(v["valid"], serde_json::Value::Bool(true), "body={v}");
         assert_eq!(v["did"], serde_json::Value::String(did));
@@ -773,7 +844,10 @@ mod tests {
             axum::http::StatusCode::UNAUTHORIZED,
             "invalid PoP must return 401"
         );
-        assert_eq!(body_json(resp).await["valid"], serde_json::Value::Bool(false));
+        assert_eq!(
+            body_json(resp).await["valid"],
+            serde_json::Value::Bool(false)
+        );
     }
 
     #[tokio::test]
@@ -787,7 +861,10 @@ mod tests {
         let payload_b64 = B64U.encode(format!("{{\"sub\":\"{did}\"}}").as_bytes());
         let bearer = format!("Bearer x.{payload_b64}.x");
         // Authenticated, but credentialId has a path-traversal slash → 400 (validation).
-        let uri = format!("/xrpc/{}", super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK);
+        let uri = format!(
+            "/xrpc/{}",
+            super::account_xrpc::NSID_ACCOUNT_PUT_WRAPPED_ARK
+        );
         let req = axum::http::Request::builder()
             .method("POST")
             .uri(&uri)
@@ -841,7 +918,11 @@ mod tests {
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "forged did:key binding must be rejected on publish");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "forged did:key binding must be rejected on publish"
+        );
     }
 
     #[tokio::test]
@@ -864,7 +945,8 @@ mod tests {
             super::server::KotobaState::new(None).expect("state"),
         ));
         let victim_sk = SigningKey::from_bytes(&[7u8; 32]);
-        let victim_did = kotoba_auth::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
+        let victim_did =
+            kotoba_auth::ed25519_pubkey_to_did_key(&victim_sk.verifying_key().to_bytes());
         let attacker_sk = SigningKey::from_bytes(&[8u8; 32]); // a DIFFERENT key
         let signal = kotoba_signal::identity::IdentityKeyPair::generate().public_key();
         let binding = SignalBinding::from_identity(&victim_did, &signal, 1, "2026-06-02T00:00:00Z");
@@ -1382,13 +1464,11 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route("/git/:repo/info/refs", get(git_http::info_refs))
         .route(
             "/git/:repo/git-upload-pack",
-            post(git_http::upload_pack)
-                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
+            post(git_http::upload_pack).layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
         )
         .route(
             "/git/:repo/git-receive-pack",
-            post(git_http::receive_pack)
-                .layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
+            post(git_http::receive_pack).layer(DefaultBodyLimit::max(git_http::GIT_BODY_LIMIT)),
         )
         // ── Generic XRPC dispatch ──────────────────────────────────────────
         .route(
@@ -1531,7 +1611,9 @@ pub async fn run() -> anyhow::Result<()> {
             Ok(seed_hex) => match kotoba_net::ed25519_keypair_from_hex(&seed_hex) {
                 Ok(kp) => KotobaSwarm::with_config(kp, listen_addr, nat_cfg).await,
                 Err(e) => {
-                    tracing::warn!("KOTOBA_P2P_ED25519_HEX invalid ({e}); using ephemeral identity");
+                    tracing::warn!(
+                        "KOTOBA_P2P_ED25519_HEX invalid ({e}); using ephemeral identity"
+                    );
                     KotobaSwarm::new_with_config(listen_addr, nat_cfg).await
                 }
             },

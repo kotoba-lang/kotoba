@@ -17,7 +17,12 @@ pub struct Receipt {
 impl Receipt {
     pub fn new(success: bool, gas_used: u64, logs: Vec<EvmLog>) -> Self {
         let logs_bloom = logs_bloom(&logs);
-        Self { success, gas_used, logs, logs_bloom }
+        Self {
+            success,
+            gas_used,
+            logs,
+            logs_bloom,
+        }
     }
 }
 
@@ -77,7 +82,11 @@ mod tests {
 
     #[test]
     fn bloom_contains_logged_address_and_topic() {
-        let log = EvmLog { address: addr(0xAA), topics: vec![topic(0x01)], data: vec![] };
+        let log = EvmLog {
+            address: addr(0xAA),
+            topics: vec![topic(0x01)],
+            data: vec![],
+        };
         let bloom = logs_bloom(&[log]);
         // a single-item bloom over the same address must match its own bits.
         let mut probe = [0u8; 256];
@@ -95,20 +104,39 @@ mod tests {
     #[test]
     fn filter_by_address_and_topic() {
         let logs = vec![
-            EvmLog { address: addr(0x01), topics: vec![topic(0xAA)], data: vec![] },
-            EvmLog { address: addr(0x02), topics: vec![topic(0xBB)], data: vec![] },
-            EvmLog { address: addr(0x01), topics: vec![topic(0xBB)], data: vec![] },
+            EvmLog {
+                address: addr(0x01),
+                topics: vec![topic(0xAA)],
+                data: vec![],
+            },
+            EvmLog {
+                address: addr(0x02),
+                topics: vec![topic(0xBB)],
+                data: vec![],
+            },
+            EvmLog {
+                address: addr(0x01),
+                topics: vec![topic(0xBB)],
+                data: vec![],
+            },
         ];
         assert_eq!(filter_logs(&logs, Some(&addr(0x01)), None).len(), 2);
         assert_eq!(filter_logs(&logs, None, Some(&topic(0xBB))).len(), 2);
-        assert_eq!(filter_logs(&logs, Some(&addr(0x01)), Some(&topic(0xBB))).len(), 1);
+        assert_eq!(
+            filter_logs(&logs, Some(&addr(0x01)), Some(&topic(0xBB))).len(),
+            1
+        );
         assert_eq!(filter_logs(&logs, None, None).len(), 3);
         assert_eq!(filter_logs(&logs, Some(&addr(0x09)), None).len(), 0);
     }
 
     #[test]
     fn receipt_carries_bloom() {
-        let logs = vec![EvmLog { address: addr(0xAA), topics: vec![], data: vec![] }];
+        let logs = vec![EvmLog {
+            address: addr(0xAA),
+            topics: vec![],
+            data: vec![],
+        }];
         let r = Receipt::new(true, 21000, logs.clone());
         assert!(r.success);
         assert_eq!(r.logs_bloom, logs_bloom(&logs));

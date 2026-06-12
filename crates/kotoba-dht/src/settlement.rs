@@ -163,7 +163,11 @@ mod tests {
             intent(b"carol", SettlementKind::Slash, 4, 1),
         ];
         let batch = SettlementBatch::from_intents(&intents, schedule);
-        assert_eq!(batch.len(), 2, "reward and slash never net against each other");
+        assert_eq!(
+            batch.len(),
+            2,
+            "reward and slash never net against each other"
+        );
         assert_eq!(batch.total_reward_micros, 10);
         assert_eq!(batch.total_slash_micros, 4);
     }

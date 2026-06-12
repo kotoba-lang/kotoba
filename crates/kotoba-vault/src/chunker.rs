@@ -305,7 +305,10 @@ mod tests {
 
         // Byte-exact reassembly (stronger than the sum-of-lengths check above).
         let joined: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
-        assert_eq!(joined, data, "CDC chunks must concatenate back to the original");
+        assert_eq!(
+            joined, data,
+            "CDC chunks must concatenate back to the original"
+        );
 
         // Determinism: identical input → identical boundaries (basis of dedup/CAS).
         let again = split(&data, &ChunkStrategy::ContentDefined);

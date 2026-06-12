@@ -542,7 +542,10 @@ fn verify_binding_against_did(
                     (false, format!("signature does not verify against {method}"))
                 }
             }
-            None => (false, "DID document has no Ed25519 verification method".to_string()),
+            None => (
+                false,
+                "DID document has no Ed25519 verification method".to_string(),
+            ),
         },
         Err(e) => (false, format!("DID resolution failed: {e}")),
     }
@@ -593,7 +596,11 @@ pub async fn publish_signal_identity(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")))?;
     state
         .shelf
-        .put("KOTOBA_SIGNAL", shelf_binding_key(&req.did), bytes::Bytes::from(bytes))
+        .put(
+            "KOTOBA_SIGNAL",
+            shelf_binding_key(&req.did),
+            bytes::Bytes::from(bytes),
+        )
         .await;
 
     Ok(Json(serde_json::json!({
@@ -614,10 +621,16 @@ pub async fn resolve_signal_identity(
     Query(q): Query<ResolveSignalIdentityQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_signal_did(&q.did, "did")?;
-    let Some(raw) = state.shelf.get("KOTOBA_SIGNAL", &shelf_binding_key(&q.did)).await else {
+    let Some(raw) = state
+        .shelf
+        .get("KOTOBA_SIGNAL", &shelf_binding_key(&q.did))
+        .await
+    else {
         return Ok((
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no signal identity binding for did", "did": q.did })),
+            Json(
+                serde_json::json!({ "error": "no signal identity binding for did", "did": q.did }),
+            ),
         )
             .into_response());
     };
@@ -770,7 +783,10 @@ mod tests {
 
     #[test]
     fn nsid_send_message_exact_value() {
-        assert_eq!(NSID_SIGNAL_SEND_MESSAGE, "com.etzhayyim.signal.send.message");
+        assert_eq!(
+            NSID_SIGNAL_SEND_MESSAGE,
+            "com.etzhayyim.signal.send.message"
+        );
     }
 
     #[test]
@@ -841,7 +857,8 @@ mod tests {
     fn signed_didkey_binding() -> (String, PublishSignalIdentityReq) {
         // The DID key IS the issuer for did:key — the binding is signed by it.
         let did_sk = SigningKey::from_bytes(&[5u8; 32]);
-        let did = kotoba_auth::did_key::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
+        let did =
+            kotoba_auth::did_key::ed25519_pubkey_to_did_key(&did_sk.verifying_key().to_bytes());
         let signal = IdentityKeyPair::generate().public_key();
         let binding = SignalBinding::from_identity(&did, &signal, 99, "2026-06-01T00:00:00Z");
         let sig = binding.sign(&did_sk);
@@ -869,8 +886,12 @@ mod tests {
         )
         .unwrap();
         // Local did:key resolver — no network.
-        let (verified, reason) = verify_binding_against_did(&binding, &sig, &local_didkey_resolver());
-        assert!(verified, "did:key binding must verify trustlessly: {reason}");
+        let (verified, reason) =
+            verify_binding_against_did(&binding, &sig, &local_didkey_resolver());
+        assert!(
+            verified,
+            "did:key binding must verify trustlessly: {reason}"
+        );
     }
 
     #[test]
@@ -893,7 +914,10 @@ mod tests {
 
     /// Build an InMemory resolver mapping `did` → a DID document whose Ed25519
     /// verification key is `did_pubkey` (simulates the ERC725/apex-Worker mirror).
-    fn resolver_with_doc(did: &str, did_pubkey: &[u8; 32]) -> kotoba_auth::resolver::InMemoryDidResolver {
+    fn resolver_with_doc(
+        did: &str,
+        did_pubkey: &[u8; 32],
+    ) -> kotoba_auth::resolver::InMemoryDidResolver {
         use kotoba_auth::did_document::{DidDocument, VerificationMethod, ED25519_KEY_TYPE_2020};
         let mut doc = DidDocument::empty(did);
         doc.verification_method.push(VerificationMethod {
@@ -919,10 +943,18 @@ mod tests {
 
         let resolver = resolver_with_doc(did, &did_sk.verifying_key().to_bytes());
         let (verified, reason) = verify_binding_against_did(&binding, &sig, &resolver);
-        assert!(verified, "did:web binding must verify against its resolved doc: {reason}");
+        assert!(
+            verified,
+            "did:web binding must verify against its resolved doc: {reason}"
+        );
 
         // A document carrying the WRONG key must reject (substitution attempt).
-        let wrong = resolver_with_doc(did, &SigningKey::from_bytes(&[12u8; 32]).verifying_key().to_bytes());
+        let wrong = resolver_with_doc(
+            did,
+            &SigningKey::from_bytes(&[12u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
         let (bad, _) = verify_binding_against_did(&binding, &sig, &wrong);
         assert!(!bad, "wrong DID-document key must fail");
     }
@@ -931,7 +963,8 @@ mod tests {
     fn didweb_binding_not_vouched_when_unresolvable() {
         // No resolver method for did:web → resolution fails → never vouched.
         let signal = IdentityKeyPair::generate().public_key();
-        let binding = SignalBinding::from_identity("did:web:etzhayyim.com:actor:bob", &signal, 1, "t");
+        let binding =
+            SignalBinding::from_identity("did:web:etzhayyim.com:actor:bob", &signal, 1, "t");
         let empty = CompositeDidResolver::new();
         let (verified, reason) = verify_binding_against_did(&binding, &[0u8; 64], &empty);
         assert!(!verified);

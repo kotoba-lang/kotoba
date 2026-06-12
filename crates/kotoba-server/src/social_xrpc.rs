@@ -42,16 +42,27 @@ pub async fn social_capital(
     Query(q): Query<SocialCapitalQuery>,
 ) -> impl IntoResponse {
     let Some(graph) = KotobaCid::from_multibase(&q.graph) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid graph cid"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid graph cid"})),
+        )
+            .into_response();
     };
     let Some(did) = KotobaCid::from_multibase(&q.did) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid did cid"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid did cid"})),
+        )
+            .into_response();
     };
 
     let quads = match state.quad_store.get_entity_quads_cold(&graph, &did).await {
         Ok(qs) => qs,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
                 .into_response();
         }
     };

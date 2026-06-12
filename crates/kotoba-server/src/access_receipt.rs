@@ -448,7 +448,8 @@ pub async fn audit_list_receipts(
             serde_json::Value::Object(fields)
         })
         .collect();
-    receipts.sort_by_key(|r| std::cmp::Reverse(r.get("tsUnix").and_then(|v| v.as_i64()).unwrap_or(0)));
+    receipts
+        .sort_by_key(|r| std::cmp::Reverse(r.get("tsUnix").and_then(|v| v.as_i64()).unwrap_or(0)));
     receipts.truncate(limit);
 
     Ok(Json(serde_json::json!({
@@ -505,15 +506,18 @@ pub async fn audit_verify_chain(
         if depth >= limit {
             break;
         }
-        let commit = kotoba_datomic::distributed::DistributedDatomCommit::load(
-            &cid,
-            &*state.block_store,
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("commit load: {e}")))?
-        .ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("commit block missing: {}", cid.to_multibase()),
-        ))?;
+        let commit =
+            kotoba_datomic::distributed::DistributedDatomCommit::load(&cid, &*state.block_store)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("commit load: {e}"),
+                    )
+                })?
+                .ok_or((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("commit block missing: {}", cid.to_multibase()),
+                ))?;
         match kotoba_auth::verify_commit_author_sig(&commit) {
             kotoba_auth::CommitSigVerdict::Valid => valid += 1,
             kotoba_auth::CommitSigVerdict::Unsigned => unsigned += 1,
@@ -594,7 +598,10 @@ mod tests {
             accessor_from_request(&h, None, &auth_tier).as_deref(),
             Some("did:key:zJwtCaller")
         );
-        assert_eq!(accessor_from_request(&HeaderMap::new(), None, &auth_tier), None);
+        assert_eq!(
+            accessor_from_request(&HeaderMap::new(), None, &auth_tier),
+            None
+        );
     }
 
     #[test]
@@ -604,8 +611,15 @@ mod tests {
         };
         assert!(purpose_violation(&private, None, true));
         assert!(!purpose_violation(&private, Some("ops"), true));
-        assert!(!purpose_violation(&private, None, false), "observe-only default");
-        assert!(!purpose_violation(&GraphVisibility::Authenticated, None, true));
+        assert!(
+            !purpose_violation(&private, None, false),
+            "observe-only default"
+        );
+        assert!(!purpose_violation(
+            &GraphVisibility::Authenticated,
+            None,
+            true
+        ));
         assert!(!purpose_violation(&GraphVisibility::Public, None, true));
     }
 
@@ -856,15 +870,12 @@ mod anchor_tests {
 
         // The calldata layout matches kotoba-evm's pinned ABI: selector, then
         // rootHash = low 32 bytes of the head CID.
-        let calldata =
-            kotoba_evm::anchor::anchor_block_calldata(&head, &head, record.sequence);
+        let calldata = kotoba_evm::anchor::anchor_block_calldata(&head, &head, record.sequence);
         assert_eq!(&calldata[..4], &kotoba_evm::anchor::commit_root_selector());
         assert_eq!(&calldata[4..36], &head.0[4..36]);
         // dynamic tail carries the multibase CID string.
         let mb = head.to_multibase();
-        assert!(calldata
-            .windows(mb.len())
-            .any(|w| w == mb.as_bytes()));
+        assert!(calldata.windows(mb.len()).any(|w| w == mb.as_bytes()));
     }
 }
 
@@ -896,12 +907,10 @@ mod signed_commit_tests {
             .resolve(&kotoba_ipfs::IpnsName::new(ipns))
             .expect("audit head");
         let head = KotobaCid::from_multibase(&record.value).expect("head CID");
-        let commit = kotoba_datomic::distributed::DistributedDatomCommit::load(
-            &head,
-            &*state.block_store,
-        )
-        .expect("load")
-        .expect("commit block");
+        let commit =
+            kotoba_datomic::distributed::DistributedDatomCommit::load(&head, &*state.block_store)
+                .expect("load")
+                .expect("commit block");
         assert_eq!(commit.author, state.operator_did);
         assert!(commit.author_sig.is_some(), "audit commit must be signed");
         // Verify with the node key…
@@ -952,7 +961,11 @@ mod signed_commit_tests {
             .unwrap();
             let verdict = kotoba_auth::verify_commit_author_sig(&commit);
             if did_key_operator {
-                assert_eq!(verdict, kotoba_auth::CommitSigVerdict::Valid, "depth {depth}");
+                assert_eq!(
+                    verdict,
+                    kotoba_auth::CommitSigVerdict::Valid,
+                    "depth {depth}"
+                );
             } else {
                 assert!(matches!(
                     verdict,

@@ -195,8 +195,14 @@ mod tests {
             "http://localhost:5001/api/v0/pin/add",
             "trailing slash must be normalized, not doubled"
         );
-        assert_eq!(client("http://h/").api_url("pin/ls"), "http://h/api/v0/pin/ls");
+        assert_eq!(
+            client("http://h/").api_url("pin/ls"),
+            "http://h/api/v0/pin/ls"
+        );
         // Multiple trailing slashes are all trimmed.
-        assert_eq!(client("http://h///").api_url("pin/rm"), "http://h/api/v0/pin/rm");
+        assert_eq!(
+            client("http://h///").api_url("pin/rm"),
+            "http://h/api/v0/pin/rm"
+        );
     }
 }

@@ -84,8 +84,8 @@ mod tests {
         did_document::ServiceEndpointValue, DidDocument, InMemoryDidResolver, ServiceEndpoint,
         VerificationMethod,
     };
-    use kotoba_vault::PreKeyRegistry;
     use kotoba_store::MemoryBlockStore;
+    use kotoba_vault::PreKeyRegistry;
 
     fn make_doc_with_x25519(did: &str, key: [u8; 32]) -> DidDocument {
         let encoded = multibase::encode(multibase::Base::Base58Btc, &key);
@@ -428,7 +428,9 @@ mod tests {
         // ── Negative: a different node cannot derive the same owner_enc_key ──
         let other_node = VaultKeyedCrypto::new(Zeroizing::new([0x99u8; 32]));
         assert_ne!(
-            other_node.derive_wrapping_key(owner_did.as_bytes()).as_ref(),
+            other_node
+                .derive_wrapping_key(owner_did.as_bytes())
+                .as_ref(),
             owner_enc_key.as_ref(),
             "owner_enc_key must be bound to the originating node's vault key"
         );
