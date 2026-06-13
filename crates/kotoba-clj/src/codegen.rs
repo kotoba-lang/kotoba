@@ -823,6 +823,8 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
             cg.close_frame();
             Ok(())
         }
+        Builtin::Min => compile_min_max(cg, args, true),
+        Builtin::Max => compile_min_max(cg, args, false),
 
         Builtin::Eq => pairwise_cmp(cg, args, Instruction::I64Eq),
         Builtin::NotEq => compile_not_eq(cg, args),
@@ -1333,6 +1335,37 @@ fn binop(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(),
     Ok(())
 }
 
+fn compile_min_max(cg: &mut FnCtx, args: &[Expr], is_min: bool) -> Result<(), CljError> {
+    compile_expr(cg, &args[0])?;
+    if args.len() == 1 {
+        return Ok(());
+    }
+
+    let best = cg.alloc_local();
+    let cur = cg.alloc_local();
+    cg.emit(Instruction::LocalSet(best));
+
+    for arg in &args[1..] {
+        compile_expr(cg, arg)?;
+        cg.emit(Instruction::LocalSet(cur));
+
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::LocalGet(best));
+        cg.emit(if is_min {
+            Instruction::I64LtS
+        } else {
+            Instruction::I64GtS
+        });
+        cg.open_frame(Instruction::If(BlockType::Empty));
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::LocalSet(best));
+        cg.close_frame();
+    }
+
+    cg.emit(Instruction::LocalGet(best));
+    Ok(())
+}
+
 /// Comparison: two i64 operands → i32 result, extended back to i64 (1/0).
 fn cmp(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), CljError> {
     compile_expr(cg, &args[0])?;
@@ -1525,6 +1558,8 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Inc => v[0] + 1,
         Builtin::Dec => v[0] - 1,
         Builtin::Abs => v[0].abs(),
+        Builtin::Min => *v.iter().min().expect("min arity checked"),
+        Builtin::Max => *v.iter().max().expect("max arity checked"),
         Builtin::Eq => b(v.windows(2).all(|pair| pair[0] == pair[1])),
         Builtin::NotEq => b(v
             .iter()

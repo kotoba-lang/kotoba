@@ -43,6 +43,14 @@ fn arithmetic_and_nary() {
         compile_and_run("(defn r [a b] (mod a b))", "r", &[20, 6]).unwrap(),
         2
     );
+    assert_eq!(
+        compile_and_run("(defn mn [a b c] (min a b c))", "mn", &[7, -3, 4]).unwrap(),
+        -3
+    );
+    assert_eq!(
+        compile_and_run("(defn mx [a b c] (max a b c))", "mx", &[7, -3, 4]).unwrap(),
+        7
+    );
 }
 
 #[test]
@@ -96,7 +104,9 @@ fn clojure_core_qualified_numeric_builtins_work() {
           (+ (clojure.core/inc x)
              (clojure.core/dec x)
              (clojure.core/abs -3)
-             (clojure.core/quot 9 2)))
+             (clojure.core/quot 9 2)
+             (clojure.core/min 9 2 7)
+             (clojure.core/max -5 -2 -9)))
         (defn predicates []
           (and (clojure.core/zero? 0)
                (clojure.core/nil? nil)

@@ -41,7 +41,7 @@
 //!   `loop`, `if-let`, and `when-let`; vectors support nested destructuring,
 //!   `_` placeholders, `& rest`, and `:as whole`; maps support `{local :key}`,
 //!   `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`
-//! - arithmetic: `+ - * / mod`
+//! - arithmetic: `+ - * / quot mod rem inc dec abs min max`
 //! - comparison: `= < > <= >=`
 //! - predicates: `nil? some? zero? pos? neg?`
 //! - logic: `and or not` (short-circuit; return 0/1)
