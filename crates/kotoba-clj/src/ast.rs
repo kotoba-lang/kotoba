@@ -50,6 +50,10 @@ pub struct Function {
     pub params: Vec<String>,
     /// Implicit `do`: the last expression is the return value.
     pub body: Vec<Expr>,
+    /// `Some(slot)` for a lambda-lifted anonymous function: it is reachable via
+    /// `call_indirect` and occupies `slot` in the module's funcref table. `None`
+    /// for ordinary `defn`s (called directly by index).
+    pub table_slot: Option<u32>,
 }
 
 /// Builtin operators recognised in call position.
@@ -303,6 +307,31 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// An anonymous function `(fn [params…] body…)` (also the target of the
+    /// `#(…)` reader macro). This is a *transient* node: the lambda-lifting pass
+    /// ([`lift_program`]) rewrites every `Fn` site into a [`Expr::MakeClosure`]
+    /// plus a synthetic top-level [`Function`], so codegen never sees a raw `Fn`.
+    Fn {
+        params: Vec<String>,
+        body: Vec<Expr>,
+    },
+    /// Heap-allocate a closure record `[table-slot:i64, cap0:i64, …]` and yield a
+    /// pointer handle. Produced by lambda-lifting to stand in for an `(fn …)`.
+    /// `table_slot` is the funcref-table index of the lifted function; `captures`
+    /// are the free-variable values, evaluated in the enclosing scope.
+    MakeClosure {
+        table_slot: u32,
+        captures: Vec<Expr>,
+    },
+    /// Inside a lifted function, read capture slot `n` from the closure record
+    /// (local 0 holds the `self` closure pointer). Produced by lambda-lifting.
+    ClosureRef(u32),
+    /// Indirectly call a closure *value* (`(f args…)` where `f` is a local /
+    /// captured binding, or `((fn …) args…)`). Lowers to `call_indirect`.
+    CallValue {
+        f: Box<Expr>,
+        args: Vec<Expr>,
+    },
 }
 
 /// Parse Clojure-subset source text into a [`Program`].
@@ -315,7 +344,9 @@ pub fn parse_program(src: &str) -> Result<Program, CljError> {
         parse_top_level_form(form, &mut defs, &mut functions)?;
     }
 
-    Ok(Program { defs, functions })
+    let mut program = Program { defs, functions };
+    lift_program(&mut program)?;
+    Ok(program)
 }
 
 fn parse_top_level_form(
@@ -365,6 +396,281 @@ fn list_head_symbol(items: &[EdnValue]) -> Result<&Symbol, CljError> {
             "list must begin with a symbol in head position".into(),
         )),
     }
+}
+
+// ---- lambda lifting --------------------------------------------------------
+//
+// Anonymous functions are compiled by *lambda lifting*: every `(fn …)` becomes a
+// synthetic top-level [`Function`] whose first parameter (`__self`) is a pointer
+// to a heap closure record `[table-slot, cap0, cap1, …]`. Free variables (the
+// enclosing locals the body references) are captured into that record at the
+// `(fn …)` site (an [`Expr::MakeClosure`]); inside the lifted function each such
+// reference is rewritten to an [`Expr::ClosureRef`] that loads from `__self`.
+// Calls to a closure *value* (a local/captured binding, or an `(fn …)` in head
+// position) become [`Expr::CallValue`], which codegen lowers to `call_indirect`.
+//
+// The same pass also rewrites *every* call whose head names a lexical binding
+// (rather than a top-level `defn`) into a `CallValue` — this is what makes a
+// higher-order parameter, e.g. `(defn ap [f x] (f x))`, work.
+
+/// How a name in scope is accessed *in the function currently being lowered*:
+/// either a real wasm local (`Var`) or a slot in the current closure record.
+type LiftScope = Vec<(String, Expr)>;
+
+fn scope_get<'a>(scope: &'a LiftScope, name: &str) -> Option<&'a Expr> {
+    scope.iter().rev().find(|(n, _)| n == name).map(|(_, e)| e)
+}
+
+struct Lifter {
+    /// Synthetic functions produced for each `(fn …)`, appended to the program.
+    new_fns: Vec<Function>,
+    /// Monotonic id for unique synthetic names.
+    counter: u32,
+    /// Next funcref-table slot to hand out.
+    next_slot: u32,
+}
+
+impl Lifter {
+    fn new() -> Self {
+        Self {
+            new_fns: Vec::new(),
+            counter: 0,
+            next_slot: 0,
+        }
+    }
+
+    fn lift_body(&mut self, body: Vec<Expr>, scope: &LiftScope) -> Result<Vec<Expr>, CljError> {
+        body.into_iter().map(|e| self.lift_expr(e, scope)).collect()
+    }
+
+    fn lift_expr(&mut self, e: Expr, scope: &LiftScope) -> Result<Expr, CljError> {
+        Ok(match e {
+            Expr::Int(_) | Expr::Str(_) | Expr::ClosureRef(_) => e,
+
+            // A bare symbol that names a lexical binding is read through that
+            // binding's current access path (`Var` for a local, `ClosureRef` for
+            // a capture). Unknown names are top-level consts/defns — left as-is.
+            Expr::Var(name) => match scope_get(scope, &name) {
+                Some(access) => access.clone(),
+                None => Expr::Var(name),
+            },
+
+            Expr::If { cond, then, els } => Expr::If {
+                cond: Box::new(self.lift_expr(*cond, scope)?),
+                then: Box::new(self.lift_expr(*then, scope)?),
+                els: Box::new(self.lift_expr(*els, scope)?),
+            },
+
+            Expr::Let { bindings, body } => {
+                let mut inner = scope.clone();
+                let mut lowered = Vec::with_capacity(bindings.len());
+                for (n, v) in bindings {
+                    let v = self.lift_expr(v, &inner)?; // sequential: sees prior
+                    inner.push((n.clone(), Expr::Var(n.clone())));
+                    lowered.push((n, v));
+                }
+                Expr::Let {
+                    bindings: lowered,
+                    body: self.lift_body(body, &inner)?,
+                }
+            }
+
+            Expr::Loop { bindings, body } => {
+                let mut inner = scope.clone();
+                let mut lowered = Vec::with_capacity(bindings.len());
+                for (n, v) in bindings {
+                    let v = self.lift_expr(v, &inner)?;
+                    inner.push((n.clone(), Expr::Var(n.clone())));
+                    lowered.push((n, v));
+                }
+                Expr::Loop {
+                    bindings: lowered,
+                    body: self.lift_body(body, &inner)?,
+                }
+            }
+
+            Expr::Do(es) => Expr::Do(self.lift_body(es, scope)?),
+            Expr::Recur(es) => Expr::Recur(self.lift_body(es, scope)?),
+            Expr::Builtin { op, args } => Expr::Builtin {
+                op,
+                args: self.lift_body(args, scope)?,
+            },
+
+            // A call whose head names a lexical binding is an indirect closure
+            // call; otherwise it is a direct call to a top-level `defn`.
+            Expr::Call { name, args } => {
+                let args = self.lift_body(args, scope)?;
+                match scope_get(scope, &name) {
+                    Some(access) => Expr::CallValue {
+                        f: Box::new(access.clone()),
+                        args,
+                    },
+                    None => Expr::Call { name, args },
+                }
+            }
+
+            Expr::CallValue { f, args } => Expr::CallValue {
+                f: Box::new(self.lift_expr(*f, scope)?),
+                args: self.lift_body(args, scope)?,
+            },
+
+            Expr::Fn { params, body } => self.lift_fn(params, body, scope)?,
+
+            // MakeClosure only appears post-lift; recurse defensively.
+            Expr::MakeClosure {
+                table_slot,
+                captures,
+            } => Expr::MakeClosure {
+                table_slot,
+                captures: self.lift_body(captures, scope)?,
+            },
+        })
+    }
+
+    /// Lift a single `(fn params body)` at `scope`, returning the `MakeClosure`.
+    fn lift_fn(
+        &mut self,
+        params: Vec<String>,
+        body: Vec<Expr>,
+        scope: &LiftScope,
+    ) -> Result<Expr, CljError> {
+        // Free vars = lexical names the body references that live in `scope`.
+        let free = free_vars(&params, &body, scope);
+        let captures: Vec<Expr> = free
+            .iter()
+            .map(|n| {
+                scope_get(scope, n)
+                    .cloned()
+                    .ok_or_else(|| CljError::Lower(format!("free var `{n}` vanished from scope")))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Inside the lifted fn: captures map to closure slots; params to locals.
+        let mut inner: LiftScope = Vec::new();
+        for (i, n) in free.iter().enumerate() {
+            inner.push((n.clone(), Expr::ClosureRef(i as u32)));
+        }
+        for p in &params {
+            inner.push((p.clone(), Expr::Var(p.clone())));
+        }
+        let lifted_body = self.lift_body(body, &inner)?;
+
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        let fname = format!("\0kotoba_fn_{}", self.counter);
+        self.counter += 1;
+
+        let mut fn_params = Vec::with_capacity(params.len() + 1);
+        fn_params.push("\0kotoba_self".to_string());
+        fn_params.extend(params);
+
+        self.new_fns.push(Function {
+            name: fname,
+            export_name: None,
+            params: fn_params,
+            body: lifted_body,
+            table_slot: Some(slot),
+        });
+
+        Ok(Expr::MakeClosure {
+            table_slot: slot,
+            captures,
+        })
+    }
+}
+
+/// Ordered, de-duplicated free lexical variables of `(fn params body)`: the
+/// names referenced in `body` that are present in `scope` (the enclosing
+/// lexical environment) and not shadowed by `params` or an inner binder.
+fn free_vars(params: &[String], body: &[Expr], scope: &LiftScope) -> Vec<String> {
+    let mut bound: Vec<String> = params.to_vec();
+    let mut acc: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in body {
+        free_walk(e, &mut bound, scope, &mut acc, &mut seen);
+    }
+    acc
+}
+
+fn free_walk(
+    e: &Expr,
+    bound: &mut Vec<String>,
+    scope: &LiftScope,
+    acc: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let refer = |name: &str,
+                     bound: &Vec<String>,
+                     acc: &mut Vec<String>,
+                     seen: &mut std::collections::HashSet<String>| {
+        if !bound.iter().any(|b| b == name)
+            && scope_get(scope, name).is_some()
+            && seen.insert(name.to_string())
+        {
+            acc.push(name.to_string());
+        }
+    };
+    match e {
+        Expr::Int(_) | Expr::Str(_) | Expr::ClosureRef(_) => {}
+        Expr::Var(n) => refer(n, bound, acc, seen),
+        Expr::If { cond, then, els } => {
+            free_walk(cond, bound, scope, acc, seen);
+            free_walk(then, bound, scope, acc, seen);
+            free_walk(els, bound, scope, acc, seen);
+        }
+        Expr::Let { bindings, body } | Expr::Loop { bindings, body } => {
+            let depth = bound.len();
+            for (n, v) in bindings {
+                free_walk(v, bound, scope, acc, seen); // value sees prior bindings
+                bound.push(n.clone());
+            }
+            for b in body {
+                free_walk(b, bound, scope, acc, seen);
+            }
+            bound.truncate(depth);
+        }
+        Expr::Do(es) | Expr::Recur(es) | Expr::Builtin { args: es, .. } => {
+            es.iter().for_each(|e| free_walk(e, bound, scope, acc, seen));
+        }
+        Expr::Call { name, args } => {
+            refer(name, bound, acc, seen); // a call head may be a closure value
+            args.iter().for_each(|a| free_walk(a, bound, scope, acc, seen));
+        }
+        Expr::CallValue { f, args } => {
+            free_walk(f, bound, scope, acc, seen);
+            args.iter().for_each(|a| free_walk(a, bound, scope, acc, seen));
+        }
+        // A nested `(fn …)` captures from us too, so descend with its params
+        // added to `bound` (its own params are not our free vars).
+        Expr::Fn { params, body } => {
+            let depth = bound.len();
+            bound.extend(params.iter().cloned());
+            body.iter().for_each(|e| free_walk(e, bound, scope, acc, seen));
+            bound.truncate(depth);
+        }
+        Expr::MakeClosure { captures, .. } => {
+            captures.iter().for_each(|e| free_walk(e, bound, scope, acc, seen));
+        }
+    }
+}
+
+/// Run lambda-lifting over every function body, appending the synthetic
+/// closure functions to the program.
+fn lift_program(program: &mut Program) -> Result<(), CljError> {
+    let mut lifter = Lifter::new();
+    let mut rewritten: Vec<Function> = Vec::with_capacity(program.functions.len());
+    for f in std::mem::take(&mut program.functions) {
+        let scope: LiftScope = f
+            .params
+            .iter()
+            .map(|p| (p.clone(), Expr::Var(p.clone())))
+            .collect();
+        let body = lifter.lift_body(f.body, &scope)?;
+        rewritten.push(Function { body, ..f });
+    }
+    rewritten.append(&mut lifter.new_fns);
+    program.functions = rewritten;
+    Ok(())
 }
 
 fn lower_def(items: &[EdnValue]) -> Result<Def, CljError> {
@@ -449,6 +755,7 @@ fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         name,
         params,
         body,
+        table_slot: None,
     }])
 }
 
@@ -486,6 +793,7 @@ fn lower_defn_arity(
         export_name,
         params,
         body,
+        table_slot: None,
     })
 }
 
@@ -608,7 +916,23 @@ fn lower_map_literal(
 }
 
 fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
-    let head = list_head_symbol(items)?;
+    // A call whose head is not a symbol — e.g. `((fn [x] …) 1)` or `((get m :f) 1)`
+    // — is an indirect call of a closure value.
+    let head = match items.first() {
+        Some(EdnValue::Symbol(s)) => s,
+        Some(other) => {
+            let f = lower_expr(other)?;
+            let args = items[1..]
+                .iter()
+                .map(lower_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Expr::CallValue {
+                f: Box::new(f),
+                args,
+            });
+        }
+        None => return Err(CljError::Lower("cannot call an empty list `()`".into())),
+    };
     let args = &items[1..];
     let special = head
         .namespace
@@ -627,6 +951,7 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
         "cond" => lower_cond(args),
         "case" => lower_case(args),
         "loop" => lower_loop(args),
+        "fn" | "fn*" => lower_fn(args),
         "recur" => Ok(Expr::Recur(
             args.iter().map(lower_expr).collect::<Result<_, _>>()?,
         )),
@@ -1437,6 +1762,55 @@ fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
     Ok(Expr::Loop { bindings, body })
 }
 
+/// `(fn [params…] body…)` / `(fn name [params…] body…)` / `(fn* …)`.
+///
+/// Produces a transient [`Expr::Fn`]; the lambda-lifting pass turns it into a
+/// synthetic top-level function plus a [`Expr::MakeClosure`] at this site. An
+/// optional self-name (for `(fn rec [..] …)`) is accepted but not yet bound for
+/// self-recursion — milestone-1 closures are non-self-referential.
+fn lower_fn(args: &[EdnValue]) -> Result<Expr, CljError> {
+    // Skip an optional self-name symbol.
+    let rest = match args.first() {
+        Some(EdnValue::Symbol(_)) => &args[1..],
+        _ => args,
+    };
+    // Multi-arity `(fn ([a] …) ([a b] …))` is not supported yet.
+    if matches!(rest.first(), Some(EdnValue::List(_))) {
+        return Err(CljError::Lower(
+            "multi-arity `(fn ([params] …) …)` is not yet supported in kotoba-clj; use a single `[params]` vector".into(),
+        ));
+    }
+    let param_vec = match rest.first() {
+        Some(EdnValue::Vector(ps)) => ps,
+        _ => {
+            return Err(CljError::Lower(
+                "fn requires a parameter vector: (fn [params…] body…)".into(),
+            ))
+        }
+    };
+    if param_vec.iter().any(is_amp_symbol) {
+        return Err(CljError::Lower(
+            "variadic `& rest` params in `(fn …)` / `#(… %&)` are not yet supported in kotoba-clj".into(),
+        ));
+    }
+    let (params, destructured) = lower_param_list(param_vec, "fn parameter")?;
+    let body = rest[1..]
+        .iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    if body.is_empty() {
+        return Err(CljError::Lower(
+            "fn requires at least one body expression".into(),
+        ));
+    }
+    let body = prepend_bindings(destructured, body);
+    Ok(Expr::Fn { params, body })
+}
+
+fn is_amp_symbol(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Symbol(s) if s.namespace.is_none() && s.name == "&")
+}
+
 // ---- defgraph: a langgraph-shaped control-flow graph as data ---------------
 
 /// `(defgraph name :entry :n0 :nodes {:n0 fn0 :n1 fn1 …} :edges {:n0 :n1 …})`
@@ -1582,6 +1956,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         export_name: Some(dispatch_name.clone()),
         params: vec!["__nid".into(), "__state".into()],
         body: vec![dispatch_body],
+        table_slot: None,
     };
 
     // next: nested if over node ids → successor id (static / if-edge); default -1.
@@ -1608,6 +1983,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         export_name: Some(next_name.clone()),
         params: vec!["__nid".into(), "__state".into()],
         body: vec![next_body],
+        table_slot: None,
     };
 
     // runner: loop [__nid entry __s state] — dispatch then advance until -1.
@@ -1644,6 +2020,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
                 }),
             }],
         }],
+        table_slot: None,
     };
 
     let mut out = vec![dispatch_fn, next_fn, runner];

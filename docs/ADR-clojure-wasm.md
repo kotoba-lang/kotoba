@@ -439,3 +439,63 @@ Verification: `cargo test -p kotoba-clj` passed, including `.kotoba` file
 execution and shebang tests. Datomic query compatibility gained a regression
 test for `clojure.core/`-qualified collection functions in
 `kotoba-datomic::q`.
+
+## Anonymous functions & closures (`(fn …)` / `#(…)`) — 2026-06-13
+
+First-class anonymous functions now compile via **lambda lifting** to a WASM
+funcref table + `call_indirect`. This is milestone 1 toward running
+`langgraph-clj` / `langchain-clj` (the portable `.cljc` LangGraph/LangChain
+implementations) on kotoba-clj/WASM, since both lean heavily on `(fn …)`.
+
+### Reader (`kotoba-edn`)
+
+`#(…)` is desugared in the EDN reader: `parse_dispatch` routes `#(` to
+`parse_anon_fn`, which reads the body list, scans the implicit args
+(`%`/`%1`..`%9` → arity = max index; `%&` → rest), normalises bare `%` to `%1`,
+and rewrites to `(fn [%1 … %N] body)`. Nested `#(…)`/`(fn …)` are **not**
+descended into (their `%` args belong to them). `#(+ % 1)` → `(fn [%1] (+ %1 1))`.
+
+### AST + lambda lifting (`kotoba-clj::ast`)
+
+`Expr` gains four nodes: transient `Fn { params, body }`; and the post-lift
+`MakeClosure { table_slot, captures }`, `ClosureRef(slot)`, and
+`CallValue { f, args }`. `lift_program` runs after parsing and:
+
+1. rewrites every `(fn …)` site to a `MakeClosure` plus a synthetic top-level
+   `Function` whose first parameter `__self` is the closure record pointer;
+2. computes free **lexical** variables (enclosing locals the body references,
+   minus inner binders) — these become the captures, in first-occurrence order;
+3. inside the lifted fn, each captured reference becomes `ClosureRef(slot)`
+   (a load from `__self`); params/lets stay real locals;
+4. rewrites any call whose head names a lexical binding (a local/captured
+   closure, or a higher-order parameter like `(defn ap [f x] (f x))`) into a
+   `CallValue` — direct `Call` is reserved for top-level `defn`s.
+
+Nested closures capture transitively: an inner fn that references a variable
+which is itself a capture of the outer fn captures the outer's `ClosureRef`
+value at closure-construction time (verified by test).
+
+### Codegen (`kotoba-clj::codegen`)
+
+- Closure record on the bump heap: `[table-slot:i64 @0, cap0:i64 @8, …]`; the
+  value is the record pointer as an i64 handle.
+- `MakeClosure` → `cabi_realloc` the record, store the slot + captures, yield the
+  pointer. `ClosureRef(n)` → load `mem64(8 + 8n)` off `local 0` (`__self`).
+- `CallValue` → push `__self` + args, load the slot from record[0], and
+  `call_indirect` the single funcref table (type = `(N+1)×i64 → i64`).
+- A new `table` (section 4) + active `element` segment (section 9) list the
+  lifted functions; `arity_type` lets `call_indirect` pick the right type index.
+
+### Honest scope
+
+Fixed-arity only: variadic `& rest` / `%&` and multi-arity `(fn ([a] …) …)` are
+rejected with a clear error. `(fn …)` is not yet self-recursive (a self-name is
+parsed but unbound). Full `langgraph-clj` additionally needs HOFs over seqs
+(`map`/`filter`/`reduce`) and protocols — later milestones.
+
+Verification: `cargo test -p kotoba-edn` (27, incl. 5 `#(…)` reader tests) and
+`cargo test -p kotoba-clj --features run,component` (incl. the 9-test
+`tests/closures.rs` end-to-end suite: head-position application, reader macro,
+let/param capture, bound-then-called, higher-order param, distinct table slots,
+**escaping returned closure**, **nested transitive capture**) all green; clippy
+clean.
