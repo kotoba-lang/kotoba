@@ -572,13 +572,17 @@ async fn ipns_publish_advances_head_and_round_trips_via_ipns_head() {
 
     // Build + member-sign the record locally (what KotobaNode.commitHeadSigned does).
     let sk = SigningKey::from_bytes(&[7u8; 32]);
-    let mut record = IpnsRecord::with_value_string(&name, head_value.clone(), 1, "2030-01-01T00:00:00Z");
+    let mut record =
+        IpnsRecord::with_value_string(&name, head_value.clone(), 1, "2030-01-01T00:00:00Z");
     record.sign_ed25519(&sk).expect("sign record");
     let record_json = serde_json::to_value(&record).expect("record json");
 
     // Publish — authority is the signature, not a server credential (no auth header).
     let (status, body) = s
-        .post("/xrpc/com.etzhayyim.apps.kotoba.ipns.publish", record_json.clone())
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.ipns.publish",
+            record_json.clone(),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "ok");
