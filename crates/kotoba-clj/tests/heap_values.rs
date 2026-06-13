@@ -57,9 +57,15 @@ fn clojure_core_vector_aliases() {
            (conj! v 11)
            (conj! v 22)
            (conj! v 33)
-           (+ (count v) (first v) (nth v 1) (last v)))",
+           (+ (count v)
+              (first v)
+              (second v)
+              (nth v 1)
+              (nth v 99 7)
+              (last v)
+              (peek v)))",
     );
-    assert_eq!(v, 69);
+    assert_eq!(v, 131);
 }
 
 #[test]
