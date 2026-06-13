@@ -9,10 +9,18 @@
 //!
 //! Quads emitted per receipt (subject = unique receipt CID):
 //! - `(audit, r, "access/graph",        Text(target graph multibase))`
-//! - `(audit, r, "access/accessor-did", Text(DID))` — CACAO leaf `iss`, else JWT `sub`
+//! - `(audit, r, "access/accessor-did", Text(DID))` — CACAO leaf `iss`, else JWT `sub`; absent when anonymous
 //! - `(audit, r, "access/operation",    Text(op))` — e.g. `datom:q`, `kg:entity`
 //! - `(audit, r, "access/purpose",      Text(purpose))` — from `x-kotoba-purpose`
 //! - `(audit, r, "access/ts-unix",      Integer(secs))`
+//! - `(audit, r, "access/client-ip",    Text(ip))`     — edge-forwarded (ADR-2606131600 P0)
+//! - `(audit, r, "access/user-agent",   Text(ua))`     — edge-forwarded
+//! - `(audit, r, "access/request-id",   Text(reqid))`  — edge-forwarded
+//!
+//! ADR-2606131600 P0 (universal read audit): receipts are recorded for EVERY
+//! instrumented read, **Public graphs included** (anonymous reads simply omit
+//! `access/accessor-did`). With `KOTOBA_RECEIPT_STRICT=1` an un-recordable
+//! receipt fails the read closed (503) instead of proceeding best-effort.
 //!
 //! Write path: handlers enqueue on an unbounded channel; ONE background writer
 //! batches receipts (`KOTOBA_RECEIPT_FLUSH_MS`, default 1000ms / 256 receipts)
@@ -55,7 +63,7 @@ pub fn receipts_graph_cid() -> KotobaCid {
     KotobaCid::from_bytes(b"kotoba/audit/access-receipts/v1")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AccessReceipt {
     pub graph_mb: String,
     pub accessor_did: Option<String>,
@@ -66,6 +74,14 @@ pub struct AccessReceipt {
     /// the requester-signed half of the two-party evidence (R2b): the receipt
     /// commit is operator-signed (author_sig), the CACAO is requester-signed.
     pub cacao_cid: Option<String>,
+    /// Caller network metadata (ADR-2606131600 P0 — universal read audit). The
+    /// pod sits behind the CF tunnel, so these are forwarded by the trusted edge
+    /// Worker (`CF-Connecting-IP` → `x-kotoba-client-ip`, UA, request-id) and are
+    /// only honoured on internally-trusted requests; a directly-reachable pod
+    /// leaves them `None` (an untrusted caller cannot forge its own IP record).
+    pub client_ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub request_id: Option<String>,
 }
 
 /// Extract + sanitise the declared purpose from `x-kotoba-purpose`.
@@ -120,15 +136,69 @@ fn require_purpose_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Fail-closed when receipt enqueue fails (ADR-2606131600 P0). Off by default so
+/// the rollout is observe-first; flip `KOTOBA_RECEIPT_STRICT=1` once the writer
+/// is proven healthy and the audit trail must be unbroken.
+fn receipt_strict_enabled() -> bool {
+    std::env::var("KOTOBA_RECEIPT_STRICT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        .unwrap_or(false)
+}
+
+/// Longest stored network-metadata string (bytes, post-trim).
+const MAX_NETMETA_LEN: usize = 256;
+
+/// Read one trusted, control-char-free header value, capped at `MAX_NETMETA_LEN`.
+fn trusted_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(name)?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NETMETA_LEN)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Extract caller network metadata (client IP / user-agent / request-id) for the
+/// audit receipt. The pod is behind the CF tunnel and cannot observe the real
+/// client socket, so these are sourced from headers the trusted edge Worker
+/// forwards. They are only honoured when the request carries the internal-trust
+/// secret (`require_internal_trust` passes), so a caller hitting the pod directly
+/// cannot inject a forged IP into the audit log; in that case they are `None`.
+pub(crate) fn client_meta_from_request(
+    headers: &HeaderMap,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if crate::graph_auth::require_internal_trust(headers).is_err() {
+        return (None, None, None);
+    }
+    (
+        trusted_header(headers, "x-kotoba-client-ip"),
+        trusted_header(headers, "user-agent"),
+        trusted_header(headers, "x-request-id"),
+    )
+}
+
 /// Pure policy: is this (visibility, purpose) pair a violation under `enforce`?
 fn purpose_violation(visibility: &GraphVisibility, purpose: Option<&str>, enforce: bool) -> bool {
     enforce && matches!(visibility, GraphVisibility::Private { .. }) && purpose.is_none()
 }
 
 /// Post-auth hook for instrumented read seams: enforce the purpose policy and
-/// enqueue a receipt. Public reads pass through unrecorded (no identity, no
-/// personal-data accountability obligation — Estonia's tracker covers personal
-/// data, not open data).
+/// enqueue a receipt.
+///
+/// ADR-2606131600 P0 (universal read audit): EVERY non-trivial read — Public
+/// included — leaves a receipt now, so "who read which data" is provable for the
+/// whole surface, not just non-public graphs. Public reads simply carry no
+/// `accessor_did` (anonymous), but still record graph / operation / ts and any
+/// forwarded client IP / user-agent / request-id. The purpose-required policy
+/// remains Private-only.
 pub(crate) fn enforce_and_record(
     state: &KotobaState,
     headers: &HeaderMap,
@@ -137,9 +207,6 @@ pub(crate) fn enforce_and_record(
     visibility: &GraphVisibility,
     operation: &str,
 ) -> Result<(), (StatusCode, String)> {
-    if matches!(visibility, GraphVisibility::Public) {
-        return Ok(());
-    }
     let purpose = purpose_from_headers(headers);
     if purpose_violation(visibility, purpose.as_deref(), require_purpose_enabled()) {
         return Err((
@@ -162,6 +229,7 @@ pub(crate) fn enforce_and_record(
             }
             cid.to_multibase()
         });
+    let (client_ip, user_agent, request_id) = client_meta_from_request(headers);
     let receipt = AccessReceipt {
         graph_mb: graph.to_multibase(),
         accessor_did: accessor_from_request(headers, cacao_b64, visibility),
@@ -172,10 +240,23 @@ pub(crate) fn enforce_and_record(
             .unwrap_or_default()
             .as_secs(),
         cacao_cid,
+        client_ip,
+        user_agent,
+        request_id,
     };
     if state.receipt_tx.send(receipt).is_err() {
-        // Writer task gone (shutdown or never spawned outside a runtime):
-        // best-effort in R1 — the read proceeds, loudly.
+        // Writer task gone (shutdown or never spawned outside a runtime).
+        // ADR-2606131600 P0: under KOTOBA_RECEIPT_STRICT the audit trail is a
+        // hard precondition — refuse the read rather than let it go unrecorded.
+        // Default (strict off) stays best-effort: the read proceeds, loudly.
+        if receipt_strict_enabled() {
+            tracing::error!(graph = %graph.to_multibase(), operation, "access receipt UNRECORDABLE — refusing read (KOTOBA_RECEIPT_STRICT)");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "read audit unavailable: receipt could not be recorded (KOTOBA_RECEIPT_STRICT)"
+                    .to_string(),
+            ));
+        }
         tracing::warn!(graph = %graph.to_multibase(), operation, "access receipt DROPPED — writer unavailable");
     }
     Ok(())
@@ -268,6 +349,32 @@ pub(crate) fn build_receipt_datoms(
             subject.clone(),
             "access/cacao-cid".to_string(),
             kotoba_edn::EdnValue::string(cacao_cid),
+            tx_cid.clone(),
+        ));
+    }
+    // Caller network metadata (ADR-2606131600 P0). Forwarded by the trusted edge
+    // Worker; absent for direct-pod / dev callers.
+    if let Some(ip) = &r.client_ip {
+        datoms.push(kotoba_datomic::Datom::assert(
+            subject.clone(),
+            "access/client-ip".to_string(),
+            kotoba_edn::EdnValue::string(ip),
+            tx_cid.clone(),
+        ));
+    }
+    if let Some(ua) = &r.user_agent {
+        datoms.push(kotoba_datomic::Datom::assert(
+            subject.clone(),
+            "access/user-agent".to_string(),
+            kotoba_edn::EdnValue::string(ua),
+            tx_cid.clone(),
+        ));
+    }
+    if let Some(rid) = &r.request_id {
+        datoms.push(kotoba_datomic::Datom::assert(
+            subject.clone(),
+            "access/request-id".to_string(),
+            kotoba_edn::EdnValue::string(rid),
             tx_cid.clone(),
         ));
     }
@@ -423,6 +530,9 @@ pub async fn audit_list_receipts(
             "access/purpose" => "purpose",
             "access/cacao-cid" => "cacaoCid",
             "access/ts-unix" => "tsUnix",
+            "access/client-ip" => "clientIp",
+            "access/user-agent" => "userAgent",
+            "access/request-id" => "requestId",
             _ => continue,
         };
         entry.insert(key.to_string(), value);
@@ -551,6 +661,7 @@ mod tests {
             purpose: Some("billing-dispute #42".into()),
             ts_unix: 1_780_000_000,
             cacao_cid: None,
+            ..Default::default()
         }
     }
 
@@ -627,6 +738,9 @@ mod tests {
     fn receipt_datoms_carry_all_fields() {
         let mut r = receipt();
         r.cacao_cid = Some("bcacaoevidence".into());
+        r.client_ip = Some("203.0.113.7".into());
+        r.user_agent = Some("kotoba-cli/0.1".into());
+        r.request_id = Some("req-abc123".into());
         let subject = receipt_cid(&r, 1);
         let tx = KotobaCid::from_bytes(b"tx");
         let datoms = build_receipt_datoms(&r, &subject, &tx);
@@ -639,10 +753,55 @@ mod tests {
                 "access/ts-unix",
                 "access/accessor-did",
                 "access/purpose",
-                "access/cacao-cid"
+                "access/cacao-cid",
+                "access/client-ip",
+                "access/user-agent",
+                "access/request-id",
             ]
         );
         assert!(datoms.iter().all(|d| d.t == tx && d.added));
+    }
+
+    #[test]
+    fn anonymous_public_read_still_records_a_receipt_sans_did() {
+        // ADR-2606131600 P0: a Public-graph read with no credential is recorded
+        // (graph/operation/ts) but carries no accessor-did.
+        let r = AccessReceipt {
+            graph_mb: "bpublicgraph".into(),
+            accessor_did: None,
+            operation: "datom:q".into(),
+            purpose: None,
+            ts_unix: 1_780_000_999,
+            ..Default::default()
+        };
+        let subject = receipt_cid(&r, 7);
+        let tx = KotobaCid::from_bytes(b"tx");
+        let datoms = build_receipt_datoms(&r, &subject, &tx);
+        let attrs: Vec<&str> = datoms.iter().map(|d| d.a.as_str()).collect();
+        assert!(attrs.contains(&"access/graph"));
+        assert!(attrs.contains(&"access/operation"));
+        assert!(attrs.contains(&"access/ts-unix"));
+        assert!(
+            !attrs.contains(&"access/accessor-did"),
+            "anonymous read must not fabricate an accessor DID"
+        );
+    }
+
+    #[test]
+    fn client_meta_ignored_without_internal_trust() {
+        // Network metadata is only honoured behind the trusted edge. With
+        // KOTOBA_INTERNAL_SECRET set and absent on the request, forged IP headers
+        // are dropped. (When the secret is unset, require_internal_trust is a
+        // no-op by design — dev/back-compat — so this asserts the gated path.)
+        std::env::set_var("KOTOBA_INTERNAL_SECRET", "s3cr3t-test");
+        let mut h = HeaderMap::new();
+        h.insert("x-kotoba-client-ip", "203.0.113.7".parse().unwrap());
+        h.insert("user-agent", "evil/1.0".parse().unwrap());
+        let (ip, ua, rid) = client_meta_from_request(&h);
+        assert_eq!(ip, None, "untrusted IP header must be ignored");
+        assert_eq!(ua, None);
+        assert_eq!(rid, None);
+        std::env::remove_var("KOTOBA_INTERNAL_SECRET");
     }
 
     #[test]
@@ -680,6 +839,7 @@ mod write_path_tests {
             purpose: Some("unit".into()),
             ts_unix: 1_780_000_123,
             cacao_cid: None,
+            ..Default::default()
         };
         write_receipt_batch(&state, vec![r]).await;
         let quads = state
@@ -721,6 +881,7 @@ mod writer_task_tests {
                 purpose: Some("ct".into()),
                 ts_unix: 1_780_000_456,
                 cacao_cid: None,
+                ..Default::default()
             })
             .expect("send");
         for _ in 0..50 {
@@ -859,6 +1020,7 @@ mod anchor_tests {
                 purpose: Some("anchor-test".into()),
                 ts_unix: 1_780_000_789,
                 cacao_cid: None,
+                ..Default::default()
             }],
         )
         .await;
@@ -898,6 +1060,7 @@ mod signed_commit_tests {
                 purpose: Some("sig-test".into()),
                 ts_unix: 1_780_001_000,
                 cacao_cid: None,
+                ..Default::default()
             }],
         )
         .await;
@@ -940,6 +1103,7 @@ mod signed_commit_tests {
                     purpose: None,
                     ts_unix: 1_780_002_000 + i,
                     cacao_cid: None,
+                    ..Default::default()
                 }],
             )
             .await;
