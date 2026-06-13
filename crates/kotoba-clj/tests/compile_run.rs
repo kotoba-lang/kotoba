@@ -120,9 +120,21 @@ fn if_when_let_do() {
     assert_eq!(compile_and_run(max, "max", &[3, 9]).unwrap(), 9);
     assert_eq!(compile_and_run(max, "max", &[9, 3]).unwrap(), 9);
 
+    let if_without_else = "(defn f [x] (if (> x 0) (* x 2)))";
+    assert_eq!(compile_and_run(if_without_else, "f", &[4]).unwrap(), 8);
+    assert_eq!(compile_and_run(if_without_else, "f", &[-4]).unwrap(), 0);
+
+    let if_not = "(defn f [x] (if-not (> x 0) 9 (* x 2)))";
+    assert_eq!(compile_and_run(if_not, "f", &[4]).unwrap(), 8);
+    assert_eq!(compile_and_run(if_not, "f", &[-4]).unwrap(), 9);
+
     let w = "(defn w [x] (when (> x 0) (* x 10)))";
     assert_eq!(compile_and_run(w, "w", &[4]).unwrap(), 40);
     assert_eq!(compile_and_run(w, "w", &[-4]).unwrap(), 0);
+
+    let when_not = "(defn w [x] (when-not (> x 0) (* (- x) 10)))";
+    assert_eq!(compile_and_run(when_not, "w", &[4]).unwrap(), 0);
+    assert_eq!(compile_and_run(when_not, "w", &[-4]).unwrap(), 40);
 
     // sequential let: second binding sees the first
     let l = "(defn l [x] (let [a (* x 2) b (+ a 1)] (do a b)))";

@@ -33,12 +33,14 @@
 //!   `(defmulti …)`, `(defmethod …)`, `(defmacro …)`, `(defstruct …)`,
 //!   `(create-struct …)`, `(comment …)`, and `(declare …)` (ignored where noted;
 //!   macros are accepted but not expanded)
-//! - control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let`, `do`,
-//!   `loop`/`recur` (bounded iteration), threading macros `->`, `->>`,
-//!   `cond->`, `cond->>`, `some->`, `some->>`, and `as->`
-//! - binding forms: symbols and vector destructuring in `defn`, `let`,
-//!   `if-let`, and `when-let`, including nested vectors, `_` placeholders,
-//!   `& rest`, and `:as whole`
+//! - control: `if` (2- or 3-form), `if-not`, `when`, `when-not`, `if-let`,
+//!   `when-let`, `cond`, `case`, `let`, `do`, `loop`/`recur` (bounded
+//!   iteration), threading macros `->`, `->>`, `cond->`, `cond->>`, `some->`,
+//!   `some->>`, and `as->`
+//! - binding forms: symbols plus vector and map destructuring in `defn`, `let`,
+//!   `loop`, `if-let`, and `when-let`; vectors support nested destructuring,
+//!   `_` placeholders, `& rest`, and `:as whole`; maps support `{local :key}`,
+//!   `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`
 //! - arithmetic: `+ - * / mod`
 //! - comparison: `= < > <= >=`
 //! - logic: `and or not` (short-circuit; return 0/1)

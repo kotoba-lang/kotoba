@@ -9,7 +9,8 @@
 //!               top-level `(do …)` wrapping definitions
 //!               `(ns …)` namespace management decls, `(require …)` `(use …)` `(refer-clojure …)` `(import …)` `(gen-class …)` `(set! …)` record/type/protocol/multimethod decls, `(defmacro …)`, `(comment …)`, `(declare …)` ignored
 //!   expressions integer literal, `true`/`false`, symbol
-//!               `(if c t e)`  `(when c body…)` `(if-let [b v] t e)`
+//!               `(if c t e?)`  `(if-not c t e?)` `(when c body…)`
+//!               `(when-not c body…)` `(if-let [b v] t e)`
 //!               `(when-let [b v] body…)` `(case e test result … default?)`
 //!               `(let [b v …] body…)`  `(do e…)`, vector/map literals
 //!               `(-> x step…)` `(->> x step…)` `(cond-> x test step …)`
@@ -606,7 +607,9 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
         .unwrap_or(head.name.as_str());
     match special {
         "if" => lower_if(args),
+        "if-not" => lower_if_not(args),
         "when" => lower_when(args),
+        "when-not" => lower_when_not(args),
         "if-let" => lower_if_let(args),
         "when-let" => lower_when_let(args),
         "let" => lower_let(args),
@@ -804,13 +807,32 @@ fn lower_as_thread(args: &[EdnValue]) -> Result<Expr, CljError> {
 }
 
 fn lower_if(args: &[EdnValue]) -> Result<Expr, CljError> {
-    if args.len() != 3 {
-        return Err(CljError::Lower("if takes: (if cond then else)".into()));
+    if args.len() < 2 || args.len() > 3 {
+        return Err(CljError::Lower("if takes: (if cond then else?)".into()));
     }
     Ok(Expr::If {
         cond: Box::new(lower_expr(&args[0])?),
         then: Box::new(lower_expr(&args[1])?),
-        els: Box::new(lower_expr(&args[2])?),
+        els: Box::new(match args.get(2) {
+            Some(els) => lower_expr(els)?,
+            None => Expr::Int(0),
+        }),
+    })
+}
+
+fn lower_if_not(args: &[EdnValue]) -> Result<Expr, CljError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(CljError::Lower(
+            "if-not takes: (if-not cond then else?)".into(),
+        ));
+    }
+    Ok(Expr::If {
+        cond: Box::new(lower_expr(&args[0])?),
+        then: Box::new(match args.get(2) {
+            Some(els) => lower_expr(els)?,
+            None => Expr::Int(0),
+        }),
+        els: Box::new(lower_expr(&args[1])?),
     })
 }
 
@@ -828,6 +850,25 @@ fn lower_when(args: &[EdnValue]) -> Result<Expr, CljError> {
         cond: Box::new(cond),
         then: Box::new(Expr::Do(body)),
         els: Box::new(Expr::Int(0)),
+    })
+}
+
+fn lower_when_not(args: &[EdnValue]) -> Result<Expr, CljError> {
+    // (when-not c body…) == (if c 0 (do body…))
+    if args.is_empty() {
+        return Err(CljError::Lower(
+            "when-not takes: (when-not cond body…)".into(),
+        ));
+    }
+    let cond = lower_expr(&args[0])?;
+    let body = args[1..]
+        .iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::If {
+        cond: Box::new(cond),
+        then: Box::new(Expr::Int(0)),
+        els: Box::new(Expr::Do(body)),
     })
 }
 
