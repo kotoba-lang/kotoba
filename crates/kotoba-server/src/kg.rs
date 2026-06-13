@@ -87,6 +87,9 @@ const QUERY_ENGINE_DATOMIC: &str = "datomic";
 const STORAGE_MODEL_IPLD_DAG_CBOR_PROLLY_TREE: &str = "ipld-dag-cbor-prolly-tree";
 pub const NSID_KG_INGEST: &str = "com.etzhayyim.apps.kotobase.kg.ingest";
 pub const NSID_KG_INGEST_BATCH: &str = "com.etzhayyim.apps.kotobase.kg.ingest_batch";
+/// Public kotobase NSID aliases for kg.ingest surface.
+pub const NSID_KG_INGEST_ALIAS: &str = "ai.gftd.apps.kotobase.kg.ingest";
+pub const NSID_KG_INGEST_BATCH_ALIAS: &str = "ai.gftd.apps.kotobase.kg.ingest_batch";
 pub const NSID_KG_DELETE: &str = "com.etzhayyim.apps.kotobase.kg.delete";
 pub const NSID_KG_COMMIT: &str = "com.etzhayyim.apps.kotobase.kg.commit";
 pub const NSID_KG_MV_REGISTER: &str = "com.etzhayyim.apps.kotobase.kg.mv.register";

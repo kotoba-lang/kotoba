@@ -1214,6 +1214,15 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", kg::NSID_KG_INGEST_BATCH),
             post(kg::kg_ingest_batch),
         )
+        // ── ai.gftd.apps.kotobase.kg.* aliases (canonical public NSIDs) ──────
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_INGEST_ALIAS),
+            post(kg::kg_ingest),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_INGEST_BATCH_ALIAS),
+            post(kg::kg_ingest_batch),
+        )
         .route(
             &format!("/xrpc/{}", kg::NSID_KG_DELETE),
             post(kg::kg_delete),
