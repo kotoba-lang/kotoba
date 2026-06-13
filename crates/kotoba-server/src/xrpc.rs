@@ -76,6 +76,8 @@ pub const NSID_EMBED_CREATE: &str = "com.etzhayyim.apps.kotoba.embed.create";
 pub const NSID_NODE_STATUS: &str = "com.etzhayyim.apps.kotoba.node.status";
 pub const NSID_BLOCK_PUT: &str = "com.etzhayyim.apps.kotoba.block.put";
 pub const NSID_BLOCK_GET: &str = "com.etzhayyim.apps.kotoba.block.get";
+pub const NSID_IPNS_HEAD: &str = "com.etzhayyim.apps.kotoba.ipns.head";
+pub const NSID_IPNS_PUBLISH: &str = "com.etzhayyim.apps.kotoba.ipns.publish";
 pub const NSID_COMMIT_STORE: &str = "com.etzhayyim.apps.kotoba.commit.store";
 pub const NSID_AGENT_RUN: &str = "com.etzhayyim.apps.kotoba.agent.run";
 pub const NSID_AGENT_SYNC_OPEN: &str = "com.etzhayyim.apps.kotoba.agent.syncopen";
@@ -7497,6 +7499,13 @@ pub struct BlockGetReq {
     pub cid: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct IpnsHeadReq {
+    /// Graph CID (multibase). The mutable head is resolved from the
+    /// distributed IPNS name derived from it.
+    pub graph: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BlockGetResp {
     pub cid: String,
@@ -7596,6 +7605,84 @@ pub async fn block_get(
             cid: req.cid.clone(),
             data_b64: B64.encode(&bytes),
         })),
+    }
+}
+
+/// GET /xrpc/com.etzhayyim.apps.kotoba.ipns.head?graph=<multibase-cid>
+///
+/// Returns the member-signed `IpnsRecord` that is the current mutable head of
+/// `graph` (its `value` field is the head/commit CID).
+///
+/// SECURITY: intentionally UNAUTHENTICATED, like `block.get`. The record is
+/// self-verifying — it carries an Ed25519 signature over a canonical CBOR payload
+/// (kotoba-ipns-record). A browser checks it in-wasm via
+/// `KotobaNode.verifyIpnsRecord`, so this server (or any caching gateway) is NOT
+/// trusted: it can withhold a newer head but cannot forge one. See
+/// docs/ADR-browser-cid-query-vs-p2p.md §1.
+pub async fn ipns_head(
+    State(state): State<Arc<KotobaState>>,
+    axum::extract::Query(req): axum::extract::Query<IpnsHeadReq>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    use kotoba_core::cid::KotobaCid;
+
+    const MAX_CID_LEN: usize = 512;
+    if req.graph.len() > MAX_CID_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "graph cid too long ({} bytes, limit {MAX_CID_LEN})",
+                req.graph.len()
+            ),
+        ));
+    }
+    let graph_cid = KotobaCid::from_multibase(&req.graph)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "invalid graph CID".into()))?;
+
+    let ipns_name = distributed_graph_ipns_name(&graph_cid);
+    match state.ipns_registry.resolve(&IpnsName::new(ipns_name)) {
+        Ok(record) => Ok(Json(record)),
+        Err(e) => Err((StatusCode::NOT_FOUND, format!("ipns head: {e}"))),
+    }
+}
+
+/// POST /xrpc/com.etzhayyim.apps.kotoba.ipns.publish
+///
+/// Advance a graph's mutable head by publishing a **member-signed `IpnsRecord`**.
+/// The symmetric write to `ipns.head`: a browser builds the record locally
+/// (`KotobaNode.commitHeadSigned`) and pushes it here.
+///
+/// AUTHORITY = the Ed25519 signature over the record, NOT a server credential.
+/// This endpoint requires a valid signature (unsigned records are rejected) and
+/// the registry enforces a monotonic `sequence` CAS, so a holder cannot roll the
+/// head back. The head pointer is therefore only as authoritative as the key that
+/// signed it — which is takeover-proof exactly when the IPNS name is derived from
+/// that key (a sovereign/DID-scoped graph). It does NOT grant write access to a
+/// shared `k51-kotoba-<graph_cid>` head owned by someone else; CACAO-gated
+/// `datomic.transact` remains the authority path for those.
+pub async fn ipns_publish(
+    State(state): State<Arc<KotobaState>>,
+    Json(record): Json<kotoba_ipfs::IpnsRecord>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Reject unsigned / invalid records outright — the underlying registry may be
+    // lenient on an absent signature, but the write endpoint must not be.
+    record
+        .require_verified_signature()
+        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("ipns publish: {e}")))?;
+    let name = record.name.0.clone();
+    match state.ipns_registry.publish(record) {
+        Ok(()) => Ok(Json(serde_json::json!({ "status": "ok", "name": name }))),
+        Err(e) => {
+            let code = match &e {
+                IpnsRegistryError::StaleRecord { .. } => StatusCode::CONFLICT,
+                IpnsRegistryError::MissingSignature
+                | IpnsRegistryError::InvalidSignature(_)
+                | IpnsRegistryError::MissingPublicKey
+                | IpnsRegistryError::InvalidPublicKey(_) => StatusCode::UNAUTHORIZED,
+                IpnsRegistryError::InvalidCid(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            Err((code, format!("ipns publish: {e}")))
+        }
     }
 }
 
@@ -13562,6 +13649,14 @@ mod tests {
             (
                 super::NSID_BLOCK_GET,
                 include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/block/get.json"),
+            ),
+            (
+                super::NSID_IPNS_HEAD,
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/ipns/head.json"),
+            ),
+            (
+                super::NSID_IPNS_PUBLISH,
+                include_str!("../../../lexicons/com/etzhayyim/apps/kotoba/ipns/publish.json"),
             ),
             (
                 super::NSID_COMMIT_GET,

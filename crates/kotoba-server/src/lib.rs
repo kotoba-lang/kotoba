@@ -1072,6 +1072,14 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             get(xrpc::block_get),
         )
         .route(
+            &format!("/xrpc/{}", xrpc::NSID_IPNS_HEAD),
+            get(xrpc::ipns_head),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_IPNS_PUBLISH),
+            post(xrpc::ipns_publish),
+        )
+        .route(
             &format!("/xrpc/{}", xrpc::NSID_COMMIT_GET),
             get(xrpc::commit_get),
         )
