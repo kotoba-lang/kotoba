@@ -534,6 +534,123 @@ async fn graph_query_accepts_cacao_graph_query_operation_scope_on_private_graph(
 }
 
 #[tokio::test]
+async fn ipns_publish_advances_head_and_round_trips_via_ipns_head() {
+    use ed25519_dalek::SigningKey;
+    use kotoba_ipns_record::IpnsRecord;
+
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+
+    // Obtain a real committed commit CID to use as the head value (a valid IpldCid
+    // string — `value_cid()` parses it on publish).
+    let seed_graph = kotoba_core::cid::KotobaCid::from_bytes(b"ipns-publish-seed").to_multibase();
+    let (status, tx) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({ "graph": seed_graph, "tx_edn": r#"[{:db/id "x" :k/v "v"}]"# }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{tx}");
+    let head_value = tx["commit_cid"].as_str().expect("commit cid").to_string();
+
+    // A fresh, never-committed graph — no prior head, so sequence 1 is accepted.
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"ipns-publish-e2e").to_multibase();
+    // The graph head name the server reads under (mirrors distributed_graph_ipns_name).
+    let name = format!("k51-kotoba-{graph}");
+
+    // Build + member-sign the record locally (what KotobaNode.commitHeadSigned does).
+    let sk = SigningKey::from_bytes(&[7u8; 32]);
+    let mut record = IpnsRecord::with_value_string(&name, head_value.clone(), 1, "2030-01-01T00:00:00Z");
+    record.sign_ed25519(&sk).expect("sign record");
+    let record_json = serde_json::to_value(&record).expect("record json");
+
+    // Publish — authority is the signature, not a server credential (no auth header).
+    let (status, body) = s
+        .post("/xrpc/com.etzhayyim.apps.kotoba.ipns.publish", record_json.clone())
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["name"], name);
+
+    // Read it back via ipns.head — the published head round-trips.
+    let (status, head) = s
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.ipns.head?graph={graph}"
+        ))
+        .await;
+    assert_eq!(status, 200, "{head}");
+    assert_eq!(head["value"], head_value, "{head}");
+    assert_eq!(head["sequence"], 1, "{head}");
+
+    // Stale sequence (CAS) → 409.
+    let (status, b2) = s
+        .post("/xrpc/com.etzhayyim.apps.kotoba.ipns.publish", record_json)
+        .await;
+    assert_eq!(status, 409, "{b2}");
+
+    // Unsigned record → 401 (signature is the authority).
+    let unsigned = IpnsRecord::with_value_string(&name, head_value, 2, "2030-01-01T00:00:00Z");
+    let (status, b3) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.ipns.publish",
+            serde_json::to_value(&unsigned).unwrap(),
+        )
+        .await;
+    assert_eq!(status, 401, "{b3}");
+}
+
+#[tokio::test]
+async fn ipns_head_resolves_signed_record_for_committed_graph() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let graph = kotoba_core::cid::KotobaCid::from_bytes(b"ipns-head-e2e").to_multibase();
+
+    // A distributed transact publishes the graph's mutable IPNS head (seq 1).
+    let (status, tx_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({
+                "graph": graph,
+                "tx_edn": r#"[{:db/id "alice" :person/name "Alice"}]"#
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{tx_body}");
+
+    // ipns.head resolves that head — UNAUTHENTICATED, self-verifying record.
+    let (status, head) = s
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.ipns.head?graph={graph}"
+        ))
+        .await;
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        head["name"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("k51-kotoba-"),
+        "{head}"
+    );
+    assert_eq!(head["sequence"], 1, "{head}");
+    let value = head["value"].as_str().expect("head value");
+    assert!(
+        kotoba_core::cid::KotobaCid::from_multibase(value).is_some(),
+        "head value must be a valid CID: {head}"
+    );
+
+    // Unknown graph → 404: a node cannot fabricate a head it never committed.
+    let other = kotoba_core::cid::KotobaCid::from_bytes(b"ipns-head-absent").to_multibase();
+    let (status, _b) = s
+        .get(&format!(
+            "/xrpc/com.etzhayyim.apps.kotoba.ipns.head?graph={other}"
+        ))
+        .await;
+    assert_eq!(status, 404, "{_b}");
+}
+
+#[tokio::test]
 async fn datomic_transact_q_pull_history_roundtrip_via_distributed_head() {
     let s = TestServer::start(false).await;
     let tok = tenant_jwt(&s.operator_did);

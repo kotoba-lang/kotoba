@@ -577,6 +577,50 @@ impl Node {
         .map_err(|e| e.to_string())
     }
 
+    /// Decode a **CID-verified** commit block (the `value` of a signed IPNS head
+    /// points at a `DistributedDatomCommit`) and return its covering ProllyTree
+    /// index roots as JSON `{ "eavt": "<cid>", "aevt": …, … }`.
+    ///
+    /// `bytes` must hash to `commit_cid` (same content-address check as
+    /// `ingestBlock`), so the EAVT root is **derived from the verified head**
+    /// rather than trusted from a server's `datomic.sync`. This closes the trust
+    /// gap in `hydrate-and-query-verified!`: head signature (kotoba.ipns) →
+    /// commit CID → index roots, every hop either signature- or CID-checked.
+    pub fn commit_index_roots(commit_cid: &str, bytes: &[u8]) -> Result<String, String> {
+        // Partial, wasm-safe view of `kotoba_datomic::distributed::DistributedDatomCommit`.
+        // That type lives behind `#[cfg(not(wasm32))]` (it pulls tokio), but the
+        // commit is encoded as a CBOR **map** keyed by field name, so a struct
+        // declaring only `index_roots` decodes the same bytes — serde ignores the
+        // other keys. KotobaCid (kotoba-core, shared) decodes identically here.
+        #[derive(serde::Deserialize)]
+        struct CommitIndexRootsView {
+            #[serde(default)]
+            index_roots: HashMap<String, KotobaCid>,
+        }
+
+        let cid = KotobaCid::from_multibase(commit_cid)
+            .ok_or_else(|| format!("bad commit CID: {commit_cid}"))?;
+        let actual = KotobaCid::from_bytes(bytes);
+        if actual != cid {
+            return Err(format!(
+                "commit CID mismatch: claimed {} != actual {}",
+                cid.to_multibase(),
+                actual.to_multibase()
+            ));
+        }
+        let view: CommitIndexRootsView = ciborium::from_reader(bytes)
+            .map_err(|e| format!("decode commit DAG-CBOR: {e}"))?;
+        if view.index_roots.is_empty() {
+            return Err("commit block has no index_roots".to_string());
+        }
+        let roots: std::collections::BTreeMap<String, String> = view
+            .index_roots
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_multibase()))
+            .collect();
+        serde_json::to_string(&roots).map_err(|e| e.to_string())
+    }
+
     /// yoro-style actor search: scan `:yoro.profile/*` Datoms, group by entity,
     /// and return profiles whose did/handle/displayName/description contains `q`
     /// (case-insensitive). Empty `q` returns all. This mirrors
@@ -1121,12 +1165,64 @@ mod wasm {
                 .datomic_q(query_edn, inputs_json)
                 .map_err(|e| JsValue::from_str(&e))
         }
+
+        /// Decode a CID-verified commit block (the `value` of a signed IPNS head)
+        /// → covering ProllyTree index roots as JSON `{ "eavt": "<cid>", … }`.
+        /// Lets the browser derive the EAVT root from the verified head instead
+        /// of trusting `datomic.sync` (closes `hydrate-and-query-verified!`).
+        #[wasm_bindgen(js_name = commitIndexRoots)]
+        pub fn commit_index_roots(&self, commit_cid: &str, bytes: &[u8]) -> Result<String, JsValue> {
+            Node::commit_index_roots(commit_cid, bytes).map_err(|e| JsValue::from_str(&e))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_index_roots_extracts_roots_from_verified_block() {
+        use kotoba_datomic::distributed::DistributedDatomCommit;
+        use std::collections::HashMap;
+
+        let eavt = KotobaCid::from_bytes(b"eavt-root");
+        let mut index_roots = HashMap::new();
+        index_roots.insert("eavt".to_string(), eavt.clone());
+        index_roots.insert("aevt".to_string(), KotobaCid::from_bytes(b"aevt-root"));
+
+        let commit = DistributedDatomCommit {
+            cid: KotobaCid::from_bytes(b"ignored-not-serialized"),
+            graph: KotobaCid::from_bytes(b"graph"),
+            tx_cid: KotobaCid::from_bytes(b"tx"),
+            prev: None,
+            parents: vec![],
+            author: "did:web:test".to_string(),
+            seq: 1,
+            ts: 0,
+            hlc: 0,
+            index_roots,
+            cacao_proof_cid: None,
+            author_sig: None,
+        };
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&commit, &mut bytes).expect("encode commit");
+        let cid = KotobaCid::from_bytes(&bytes);
+
+        // Correct CID → decode + extract roots.
+        let json = Node::commit_index_roots(&cid.to_multibase(), &bytes).expect("decode roots");
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&json).expect("roots json");
+        assert_eq!(map.get("eavt"), Some(&eavt.to_multibase()));
+        assert_eq!(map.len(), 2);
+
+        // Wrong CID (tampered/spoofed) → rejected before decode (trustless).
+        let wrong = KotobaCid::from_bytes(b"a-different-cid");
+        assert!(
+            Node::commit_index_roots(&wrong.to_multibase(), &bytes).is_err(),
+            "CID mismatch must be rejected"
+        );
+    }
 
     #[test]
     fn search_actors_over_in_wasm_read_engine() {
