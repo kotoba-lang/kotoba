@@ -237,6 +237,39 @@ fn literal_lowering_does_not_shadow_source_locals() {
     assert_eq!(v, 42);
 }
 
+#[test]
+fn map_destructuring_supports_keys_strs_as_and_or_defaults() {
+    let src = r#"
+        (defn score [{:keys [a missing] :strs [b] :or {missing 7} :as whole}]
+          (+ a b missing (count whole)))
+        (defn t [_]
+          (let [{x :x :keys [a missing] :strs [b] :or {missing 5} :as whole}
+                {:a 10 "b" 20 :x 3}]
+            (+ x a b missing (count whole) (score {:a 1 "b" 2}))))
+    "#;
+    let wasm = compile_str_with_prelude(src).expect("compile");
+    let v = run(&wasm, "t", &[0]).expect("run");
+    assert_eq!(v, 53);
+}
+
+#[test]
+fn map_destructuring_works_in_if_and_when_let() {
+    let v = eval(
+        "(+ (if-let [{:keys [a] :strs [b]} {:a 10 \"b\" 20}] (+ a b) 0)
+            (when-let [{x :x :or {x 12}} {}] x))",
+    );
+    assert_eq!(v, 42);
+}
+
+#[test]
+fn map_destructuring_allows_nested_vector_values() {
+    let v = eval(
+        "(let [{[a _ & xs] :items :keys [n]} {:items [10 99 20 30] :n 2}]
+           (+ a (count xs) (last xs) n))",
+    );
+    assert_eq!(v, 44);
+}
+
 // ---- the langgraph state substrate -----------------------------------------
 
 #[test]

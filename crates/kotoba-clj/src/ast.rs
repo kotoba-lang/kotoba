@@ -15,7 +15,8 @@
 //!               `(-> x step…)` `(->> x step…)` `(cond-> x test step …)`
 //!               `(cond->> x test step …)` `(some-> x step…)`
 //!               `(some->> x step…)` `(as-> x name form …)`
-//!               vector destructuring in `defn`, `let`, `if-let`, `when-let`
+//!               vector and map destructuring in `defn`, `let`, `if-let`,
+//!               `when-let`
 //!               builtins: + - * / mod  = < > <= >=  and or not
 //!               `(f args…)`  call a user `defn`
 
@@ -485,19 +486,14 @@ fn lower_param_list(params: &[EdnValue], ctx: &str) -> Result<LoweredParams, Clj
     for (idx, param) in params.iter().enumerate() {
         match param {
             EdnValue::Symbol(_) => lowered.push(sym_name(param, ctx)?),
-            EdnValue::Vector(_) => {
+            EdnValue::Vector(_) | EdnValue::Map(_) => {
                 let temp = format!("\0kotoba_param_{idx}");
-                collect_vector_destructuring(
-                    param,
-                    Expr::Var(temp.clone()),
-                    &mut destructured,
-                    ctx,
-                )?;
+                collect_destructuring(param, Expr::Var(temp.clone()), &mut destructured, ctx)?;
                 lowered.push(temp);
             }
             other => {
                 return Err(CljError::Lower(format!(
-                    "{ctx} must be a symbol or vector destructuring form, found {other:?}"
+                    "{ctx} must be a symbol or destructuring form, found {other:?}"
                 )))
             }
         }
@@ -951,14 +947,29 @@ fn lower_binding_pattern(
             let name = sym_name(pattern, ctx)?;
             Ok((name.clone(), vec![(name, init)]))
         }
-        EdnValue::Vector(_) => {
+        EdnValue::Vector(_) | EdnValue::Map(_) => {
             let temp = format!("\0kotoba_destructure_{idx}");
             let mut bindings = vec![(temp.clone(), init)];
-            collect_vector_destructuring(pattern, Expr::Var(temp.clone()), &mut bindings, ctx)?;
+            collect_destructuring(pattern, Expr::Var(temp.clone()), &mut bindings, ctx)?;
             Ok((temp, bindings))
         }
         other => Err(CljError::Lower(format!(
-            "{ctx} must be a symbol or vector destructuring form, found {other:?}"
+            "{ctx} must be a symbol or destructuring form, found {other:?}"
+        ))),
+    }
+}
+
+fn collect_destructuring(
+    pattern: &EdnValue,
+    source: Expr,
+    out: &mut LoweredBindings,
+    ctx: &str,
+) -> Result<(), CljError> {
+    match pattern {
+        EdnValue::Vector(_) => collect_vector_destructuring(pattern, source, out, ctx),
+        EdnValue::Map(_) => collect_map_destructuring(pattern, source, out, ctx),
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a destructuring form, found {other:?}"
         ))),
     }
 }
@@ -1040,11 +1051,16 @@ fn collect_vector_destructuring(
             EdnValue::Vector(_) => {
                 let temp = format!("\0kotoba_nested_destructure_{}", out.len());
                 out.push((temp.clone(), value));
-                collect_vector_destructuring(item, Expr::Var(temp), out, ctx)?;
+                collect_destructuring(item, Expr::Var(temp), out, ctx)?;
+            }
+            EdnValue::Map(_) => {
+                let temp = format!("\0kotoba_nested_destructure_{}", out.len());
+                out.push((temp.clone(), value));
+                collect_destructuring(item, Expr::Var(temp), out, ctx)?;
             }
             other => {
                 return Err(CljError::Lower(format!(
-                    "{ctx} vector destructuring entries must be symbols or nested vectors, found {other:?}"
+                    "{ctx} vector destructuring entries must be symbols or nested destructuring forms, found {other:?}"
                 )))
             }
         }
@@ -1052,6 +1068,165 @@ fn collect_vector_destructuring(
         value_idx += 1;
     }
     Ok(())
+}
+
+fn collect_map_destructuring(
+    pattern: &EdnValue,
+    source: Expr,
+    out: &mut LoweredBindings,
+    ctx: &str,
+) -> Result<(), CljError> {
+    let EdnValue::Map(items) = pattern else {
+        return Err(CljError::Lower(format!(
+            "{ctx} must be a map destructuring form"
+        )));
+    };
+
+    let defaults = map_destructure_defaults(items, ctx)?;
+
+    for (binding, key) in items {
+        if map_destructure_option(binding, "or") || map_destructure_option(binding, "keys") {
+            continue;
+        }
+        if map_destructure_option(binding, "strs") {
+            let EdnValue::Vector(names) = key else {
+                return Err(CljError::Lower(format!(
+                    "{ctx} map destructuring `:strs` requires a vector of symbols"
+                )));
+            };
+            for name in names {
+                let name = sym_name(name, ctx)?;
+                if name != "_" {
+                    let key = Expr::Str(name.as_bytes().to_vec());
+                    out.push((
+                        name.clone(),
+                        map_destructure_get(source.clone(), key, Some((&name, &defaults)))?,
+                    ));
+                }
+            }
+            continue;
+        }
+        if map_destructure_option(binding, "as") {
+            let name = sym_name(key, ctx)?;
+            if name != "_" {
+                out.push((name, source.clone()));
+            }
+            continue;
+        }
+
+        if map_destructure_option(binding, "keys") {
+            unreachable!("handled above")
+        }
+
+        lower_map_destructure_entry(binding, key, source.clone(), &defaults, out, ctx)?;
+    }
+
+    if let Some(keys) = items
+        .iter()
+        .find_map(|(k, v)| map_destructure_option(k, "keys").then_some(v))
+    {
+        let EdnValue::Vector(names) = keys else {
+            return Err(CljError::Lower(format!(
+                "{ctx} map destructuring `:keys` requires a vector of symbols"
+            )));
+        };
+        for name in names {
+            let name = sym_name(name, ctx)?;
+            if name != "_" {
+                let key = Expr::Str(format!(":{name}").into_bytes());
+                out.push((
+                    name.clone(),
+                    map_destructure_get(source.clone(), key, Some((&name, &defaults)))?,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn lower_map_destructure_entry(
+    binding: &EdnValue,
+    key: &EdnValue,
+    source: Expr,
+    defaults: &std::collections::BTreeMap<String, Expr>,
+    out: &mut LoweredBindings,
+    ctx: &str,
+) -> Result<(), CljError> {
+    let lookup = lower_expr(key)?;
+    match binding {
+        EdnValue::Symbol(_) => {
+            let name = sym_name(binding, ctx)?;
+            if name != "_" {
+                out.push((
+                    name.clone(),
+                    map_destructure_get(source, lookup, Some((&name, defaults)))?,
+                ));
+            }
+        }
+        EdnValue::Vector(_) | EdnValue::Map(_) => {
+            let temp = format!("\0kotoba_nested_destructure_{}", out.len());
+            out.push((temp.clone(), map_destructure_get(source, lookup, None)?));
+            collect_destructuring(binding, Expr::Var(temp), out, ctx)?;
+        }
+        other => {
+            return Err(CljError::Lower(format!(
+                "{ctx} map destructuring entries must bind symbols or nested destructuring forms, found {other:?}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+fn map_destructure_get(
+    source: Expr,
+    key: Expr,
+    default: Option<(&str, &std::collections::BTreeMap<String, Expr>)>,
+) -> Result<Expr, CljError> {
+    let get = Expr::Call {
+        name: "get".to_string(),
+        args: vec![source.clone(), key.clone()],
+    };
+    let Some((name, defaults)) = default else {
+        return Ok(get);
+    };
+    let Some(default_expr) = defaults.get(name) else {
+        return Ok(get);
+    };
+    Ok(Expr::If {
+        cond: Box::new(Expr::Call {
+            name: "contains-key?".to_string(),
+            args: vec![source, key],
+        }),
+        then: Box::new(get),
+        els: Box::new(default_expr.clone()),
+    })
+}
+
+fn map_destructure_defaults(
+    items: &std::collections::BTreeMap<EdnValue, EdnValue>,
+    ctx: &str,
+) -> Result<std::collections::BTreeMap<String, Expr>, CljError> {
+    let mut defaults = std::collections::BTreeMap::new();
+    let Some(default_map) = items
+        .iter()
+        .find_map(|(k, v)| map_destructure_option(k, "or").then_some(v))
+    else {
+        return Ok(defaults);
+    };
+    let EdnValue::Map(entries) = default_map else {
+        return Err(CljError::Lower(format!(
+            "{ctx} map destructuring `:or` requires a map of symbol defaults"
+        )));
+    };
+    for (name, value) in entries {
+        defaults.insert(sym_name(name, ctx)?, lower_expr(value)?);
+    }
+    Ok(defaults)
+}
+
+fn map_destructure_option(v: &EdnValue, name: &str) -> bool {
+    matches!(v, EdnValue::Keyword(k) if k.namespace().is_none() && k.name() == name)
 }
 
 fn is_destructure_rest(v: &EdnValue) -> bool {
