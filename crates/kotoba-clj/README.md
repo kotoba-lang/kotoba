@@ -143,7 +143,7 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
   `do`, `loop`/`recur` (bounded), threading macros `->`, `->>`, `cond->`,
   `cond->>`, `some->`, `some->>`, and `as->`
 - binding forms: symbols plus vector and map destructuring in `defn`, `let`,
-  `if-let`, and `when-let`; vectors support nested destructuring, `_`
+  `loop`, `if-let`, and `when-let`; vectors support nested destructuring, `_`
   placeholders, `& rest`, and `:as whole`; maps support `{local :key}`,
   `{:keys [...]}`, `{:strs [...]}`, `:or` defaults, and `:as whole`
 - arithmetic: `+ - * / quot mod rem inc dec abs` · comparison:
