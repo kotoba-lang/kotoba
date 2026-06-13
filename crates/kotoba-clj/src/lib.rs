@@ -51,6 +51,8 @@
 //!   lowers to the referenced symbol name handle; vector literals (`[1 2]`) and
 //!   map literals (`{:k v}`) lower to the [`PRELUDE`] container handles when the
 //!   prelude is enabled
+//! - prelude container constructors: `vector` (0-4 elements), `hash-map` /
+//!   `array-map` (0-3 key/value pairs)
 //! - `defn` pre/post condition maps (`{:pre […] :post […]}`) are accepted for
 //!   source compatibility but not asserted
 //! - Clojure reader metadata (`^:private`, `^String`, `^long`) is stripped before
@@ -228,7 +230,7 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// Clojure-core compatibility layer: `count`, `empty?`, `seq`, `not-empty`,
 /// `nth`, `first`, `second`, `last`, `peek`, `subvec`, `rest`, `conj`,
 /// `conj!`, `get`, `assoc`, `assoc!`, `contains?`, `contains-key?`, `keys`,
-/// `vals`, `identity`, and `constantly`. The
+/// `vals`, `vector`, `hash-map`, `array-map`, `identity`, and `constantly`. The
 /// lowering phase also accepts vector and map destructuring in `defn`, `let`,
 /// `loop`, `if-let`, and `when-let`; map destructuring supports `{local :key}`,
 /// `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`.
@@ -332,6 +334,22 @@ pub const PRELUDE: &str = r#"
 (defn assoc! [m k v] (map-assoc! m k v))
 (defn contains? [m k] (>= (map-find m k) 0))
 (defn contains-key? [m k] (>= (map-find m k) 0))
+(defn vector
+  ([] (vec-make 0))
+  ([x] (let [v (vec-make 1)] (vec-conj! v x) v))
+  ([x y] (let [v (vec-make 2)] (vec-conj! v x) (vec-conj! v y) v))
+  ([x y z] (let [v (vec-make 3)] (vec-conj! v x) (vec-conj! v y) (vec-conj! v z) v))
+  ([x y z w] (let [v (vec-make 4)] (vec-conj! v x) (vec-conj! v y) (vec-conj! v z) (vec-conj! v w) v)))
+(defn hash-map
+  ([] (map-make 0))
+  ([k v] (let [m (map-make 1)] (map-assoc! m k v) m))
+  ([k v k2 v2] (let [m (map-make 2)] (map-assoc! m k v) (map-assoc! m k2 v2) m))
+  ([k v k2 v2 k3 v3] (let [m (map-make 3)] (map-assoc! m k v) (map-assoc! m k2 v2) (map-assoc! m k3 v3) m)))
+(defn array-map
+  ([] (hash-map))
+  ([k v] (hash-map k v))
+  ([k v k2 v2] (hash-map k v k2 v2))
+  ([k v k2 v2 k3 v3] (hash-map k v k2 v2 k3 v3)))
 (defn identity [x] x)
 (defn constantly
   ([x] x)

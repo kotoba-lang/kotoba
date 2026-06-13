@@ -166,6 +166,7 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
   `seq`, `not-empty`, `nth` (2- or 3-arity), `first`, `second`, `last`,
   `peek`, `subvec`, `rest`, `conj`, `conj!`, `get` (2- or 3-arity),
   `assoc`, `assoc!`, `contains?`, `contains-key?`, `keys`, `vals`,
+  `vector` (0-4 elements), `hash-map` / `array-map` (0-3 key/value pairs),
   `identity`, `constantly`
 - `clojure.core/`-qualified builtin calls are accepted for the supported core
   numeric/comparison/logical operations.
