@@ -939,6 +939,24 @@ fn collect_pattern_shadow(pattern: &EdnValue, out: &mut HashSet<String>) {
                 }
             }
         }
+        EdnValue::Map(items) => {
+            for (binding, value) in items {
+                if is_destructure_keys(binding)
+                    || is_destructure_strs(binding)
+                    || is_destructure_as(binding)
+                {
+                    collect_pattern_shadow(value, out);
+                } else if is_destructure_or(binding) {
+                    if let EdnValue::Map(defaults) = value {
+                        for name in defaults.keys() {
+                            collect_pattern_shadow(name, out);
+                        }
+                    }
+                } else {
+                    collect_pattern_shadow(binding, out);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -949,6 +967,18 @@ fn is_destructure_rest(v: &EdnValue) -> bool {
 
 fn is_destructure_as(v: &EdnValue) -> bool {
     matches!(v, EdnValue::Keyword(k) if k.namespace().is_none() && k.name() == "as")
+}
+
+fn is_destructure_keys(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Keyword(k) if k.namespace().is_none() && k.name() == "keys")
+}
+
+fn is_destructure_strs(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Keyword(k) if k.namespace().is_none() && k.name() == "strs")
+}
+
+fn is_destructure_or(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Keyword(k) if k.namespace().is_none() && k.name() == "or")
 }
 
 fn qualify_expr(v: EdnValue, ctx: &NamespaceCtx, qualify_defs: bool) -> EdnValue {

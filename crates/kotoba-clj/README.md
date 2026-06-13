@@ -142,9 +142,10 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
 - control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let` (sequential),
   `do`, `loop`/`recur` (bounded), threading macros `->`, `->>`, `cond->`,
   `cond->>`, `some->`, `some->>`, and `as->`
-- binding forms: symbols and vector destructuring in `defn`, `let`, `if-let`,
-  and `when-let`, including nested vectors, `_` placeholders, `& rest`, and
-  `:as whole`
+- binding forms: symbols plus vector and map destructuring in `defn`, `let`,
+  `if-let`, and `when-let`; vectors support nested destructuring, `_`
+  placeholders, `& rest`, and `:as whole`; maps support `{local :key}`,
+  `{:keys [...]}`, `{:strs [...]}`, `:or` defaults, and `:as whole`
 - arithmetic: `+ - * / quot mod rem inc dec abs` · comparison:
   `= not= < > <= >=` (n-ary where Clojure is n-ary) · predicates:
   `zero? pos? neg?` · logic: `and or not`

@@ -661,17 +661,18 @@ fn destructuring_bindings_shadow_referred_names() {
     fs::create_dir_all(dir.join("demo")).unwrap();
     fs::write(
         dir.join("demo/math.clj"),
-        "(ns demo.math)\n(defn x [n] (+ n 1000))\n(defn rest [n] (+ n 1000))\n(defn whole [n] (+ n 1000))\n",
+        "(ns demo.math)\n(defn x [n] (+ n 1000))\n(defn rest [n] (+ n 1000))\n(defn whole [n] (+ n 1000))\n(defn a [n] (+ n 1000))\n(defn b [n] (+ n 1000))\n(defn missing [n] (+ n 1000))\n",
     )
     .unwrap();
     let main = dir.join("main.clj");
     fs::write(
         &main,
         r#"
-(ns demo.main (:require [demo.math :refer [x rest whole]]))
+(ns demo.main (:require [demo.math :refer [x rest whole a b missing]]))
 (defn main [n]
   (let [[x & rest :as whole] [27 4 10]]
-    (+ n x (count rest) (last rest) (count whole))))
+    (let [{:keys [a missing] :strs [b] :or {missing 5}} {:a 2 "b" 4}]
+      (+ n x (count rest) (last rest) (count whole) a b missing))))
 "#,
     )
     .unwrap();
@@ -687,7 +688,7 @@ fn destructuring_bindings_shadow_referred_names() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "53");
 
     let _ = fs::remove_dir_all(dir);
 }
