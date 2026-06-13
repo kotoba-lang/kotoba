@@ -139,9 +139,10 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
   `(extend-protocol …)`, `(defmulti …)`, `(defmethod …)`, `(defmacro …)`,
   `(defstruct …)`, `(create-struct …)`, `(comment …)`, and `(declare …)`
   (ignored where noted)
-- control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let` (sequential),
-  `do`, `loop`/`recur` (bounded), threading macros `->`, `->>`, `cond->`,
-  `cond->>`, `some->`, `some->>`, and `as->`
+- control: `if` (2- or 3-form), `if-not`, `when`, `when-not`, `if-let`,
+  `when-let`, `cond`, `case`, `let` (sequential), `do`, `loop`/`recur`
+  (bounded), threading macros `->`, `->>`, `cond->`, `cond->>`, `some->`,
+  `some->>`, and `as->`
 - binding forms: symbols plus vector and map destructuring in `defn`, `let`,
   `loop`, `if-let`, and `when-let`; vectors support nested destructuring, `_`
   placeholders, `& rest`, and `:as whole`; maps support `{local :key}`,
