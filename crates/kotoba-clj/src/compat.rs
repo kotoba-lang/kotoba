@@ -721,7 +721,7 @@ fn read_require_options(ns: &str, opts: &[EdnValue], ctx: &mut NamespaceCtx) {
                     saw_alias_or_refer = true;
                 }
             }
-            Some("refer") => {
+            Some("refer" | "refer-macros") => {
                 match &opts[i + 1] {
                     EdnValue::Vector(names) => {
                         for name in names {

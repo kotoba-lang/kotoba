@@ -824,6 +824,40 @@ fn require_macros_is_loaded_like_require_for_compat() {
 }
 
 #[test]
+fn require_refer_macros_is_loaded_like_refer_for_compat() {
+    let dir = temp_dir("require-refer-macros");
+    fs::create_dir_all(dir.join("demo")).unwrap();
+    fs::write(
+        dir.join("demo/math.clj"),
+        "(ns demo.math)\n(defn twice [x] (* x 2))\n",
+    )
+    .unwrap();
+    let main = dir.join("main.cljs");
+    fs::write(
+        &main,
+        "(ns demo.main (:require [demo.math :refer-macros [twice]]))\n(defn main [x] (+ (twice x) 2))\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kotoba-clj"))
+        .arg("--reader-target")
+        .arg("cljs")
+        .arg(&main)
+        .arg("20")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn require_macros_can_load_macro_only_namespace() {
     let dir = temp_dir("require-macro-only");
     fs::create_dir_all(dir.join("demo")).unwrap();
