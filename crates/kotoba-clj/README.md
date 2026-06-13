@@ -163,8 +163,8 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
   `(bytes-finish buf)` — mutable buffer in linear memory; `bytes-finish` → string handle
 - raw memory: `(alloc n)`, `(load64 a)`, `(store64! a v)`, `(load32 a)`, `(store32! a v)`
 - prelude aliases for common Clojure-style container calls: `count`, `empty?`,
-  `nth`, `first`, `last`, `subvec`, `rest`, `conj!`, `get`, `assoc!`,
-  `contains-key?`
+  `seq`, `not-empty`, `nth`, `first`, `last`, `subvec`, `rest`, `conj!`,
+  `get` (2- or 3-arity), `assoc!`, `contains-key?`
 - `clojure.core/`-qualified builtin calls are accepted for the supported core
   numeric/comparison/logical operations.
 - host calls: `(has-capability? resource ability)` → `auth.has-capability`;

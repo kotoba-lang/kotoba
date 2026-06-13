@@ -194,10 +194,16 @@ fn clojure_core_map_aliases() {
            (assoc! m \"k\" 42)
            (+ (count m)
               (get m \"k\")
+              (get m \"missing\" 7)
+              (get m \"k\" 100)
               (contains-key? m \"k\")
-              (empty? (map-make 1))))",
+              (empty? (map-make 1))
+              (if (seq m) 10 0)
+              (if (seq (map-make 1)) 1000 0)
+              (if (not-empty m) 20 0)
+              (if (not-empty (map-make 1)) 1000 0)))",
     );
-    assert_eq!(v, 45);
+    assert_eq!(v, 124);
 }
 
 #[test]
