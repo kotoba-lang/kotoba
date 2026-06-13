@@ -22,12 +22,32 @@
 //! `1`/`0`, truthy ⇔ non-zero). A **string** is a packed `(offset << 32) | len`
 //! handle into linear memory.
 //!
-//! - top-level: `(def name <const>)`, `(defn name [params…] body…)`, `(ns …)` (ignored)
-//! - control: `if`, `when`, `cond`, `let`, `do`, `loop`/`recur` (bounded iteration)
+//! - top-level: `(def name "doc?" <const>)`, `(defonce name "doc?" <const>)`,
+//!   `(defn name "doc?" attr-map? [params…] body…)`, arity-list
+//!   `(defn name "doc?" attr-map? ([params…] body…) ([params…] body…))`,
+//!   `(defn- …)`, top-level `(do …)` wrapping definitions, `(ns …)`,
+//!   `(in-ns …)`, `(alias …)`, `(create-ns …)`, `(remove-ns …)`,
+//!   `(require …)`, `(use …)`, `(refer-clojure …)`, `(import …)`,
+//!   `(gen-class …)`, `(set! …)`, `(defrecord …)`, `(deftype …)`,
+//!   `(defprotocol …)`, `(extend-type …)`, `(extend-protocol …)`,
+//!   `(defmulti …)`, `(defmethod …)`, `(defmacro …)`, `(defstruct …)`,
+//!   `(create-struct …)`, `(comment …)`, and `(declare …)` (ignored where noted;
+//!   macros are accepted but not expanded)
+//! - control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let`, `do`,
+//!   `loop`/`recur` (bounded iteration), threading macros `->`, `->>`,
+//!   `cond->`, `cond->>`, `some->`, `some->>`, and `as->`
 //! - arithmetic: `+ - * / mod`
 //! - comparison: `= < > <= >=`
 //! - logic: `and or not` (short-circuit; return 0/1)
 //! - strings: `"…"` literals, `(str-len s)`, `(byte-at s i)`
+//! - Clojure literals: `nil` lowers to `0`; keyword literals and quoted forms
+//!   lower to canonical EDN string handles; var quote (`#'foo`, `(var foo)`)
+//!   lowers to the referenced symbol name handle
+//! - `defn` pre/post condition maps (`{:pre […] :post […]}`) are accepted for
+//!   source compatibility but not asserted
+//! - Clojure reader metadata (`^:private`, `^String`, `^long`) is stripped before
+//!   lowering
+//! - Clojure discard forms (`#_ form`) are stripped before lowering
 //! - byte builder: `(bytes-alloc cap)`, `(byte-append! buf b)`, `(bytes-len buf)`,
 //!   `(bytes-finish buf)` — a mutable buffer in linear memory; `bytes-finish`
 //!   yields a string handle (the foundation for in-guest CBOR encode/decode)
@@ -48,11 +68,14 @@
 //!   with `:state`, a reducer-merge) `defn`s. Static + `(if-edge pred? :then
 //!   :else)` edges; `:state {:ch add-messages}` makes nodes return partial
 //!   updates merged per channel (extend vs override). State = a Stage-B map.
-//! - user function calls, including (mutual) recursion
+//! - user function calls, including (mutual) recursion and arity-based
+//!   resolution
 //!
-//! Each `defn` is exported under its own name. `def` initialisers are evaluated
-//! at compile time and inlined. Every module also exports a linear `memory` and
-//! a `cabi_realloc` bump allocator (the Canonical-ABI substrate).
+//! Each single-arity `defn` is exported under its own name. Multi-arity `defn`s
+//! are resolved for source-level calls and Component entry wrapping, but are not
+//! exported as multiple same-name core wasm functions. `def` initialisers are
+//! evaluated at compile time and inlined. Every module also exports a linear
+//! `memory` and a `cabi_realloc` bump allocator (the Canonical-ABI substrate).
 //!
 //! ## Roadmap to the kotoba:kais binding
 //!
@@ -84,10 +107,13 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod compat;
 #[cfg(feature = "component")]
 pub mod component;
 #[cfg(feature = "run")]
 pub mod run;
+
+pub use compat::ReaderTarget;
 
 use std::path::Path;
 use thiserror::Error;
@@ -111,11 +137,20 @@ pub enum CljError {
 
 /// Compile Clojure-subset source text into WebAssembly bytes.
 pub fn compile_str(src: &str) -> Result<Vec<u8>, CljError> {
-    let program = ast::parse_program(src)?;
+    compile_str_with_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Compile source text after applying Clojure reader compatibility for `target`.
+pub fn compile_str_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    let src = compat::normalize_source(src, target)?;
+    let program = ast::parse_program(&src)?;
     codegen::compile(&program)
 }
 
-/// Compile a `.kotoba` source file into WebAssembly bytes.
+/// Compile a `.kotoba` / `.clj` / `.cljc` / `.cljs` source file into WebAssembly bytes.
 ///
 /// A leading Unix shebang (`#!...`) is stripped before the EDN/Clojure reader
 /// sees the source, so executable scripts can start with:
@@ -124,27 +159,48 @@ pub fn compile_str(src: &str) -> Result<Vec<u8>, CljError> {
 /// #!/usr/bin/env kotoba-clj
 /// ```
 pub fn compile_file(path: impl AsRef<Path>) -> Result<Vec<u8>, CljError> {
-    let src = std::fs::read_to_string(path.as_ref())
-        .map_err(|e| CljError::Read(format!("read {}: {e}", path.as_ref().display())))?;
-    compile_str(strip_shebang(&src))
+    compile_file_with_reader_target(path, ReaderTarget::Kotoba)
+}
+
+/// Compile a source file with a specific reader conditional target.
+pub fn compile_file_with_reader_target(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    compile_file_with_reader_target_and_source_paths(path, target, &[])
+}
+
+/// Compile a source file with a reader target and additional source paths.
+pub fn compile_file_with_reader_target_and_source_paths(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+    source_paths: &[std::path::PathBuf],
+) -> Result<Vec<u8>, CljError> {
+    let src = compat::load_file_graph_with_source_paths(path.as_ref(), target, source_paths)?;
+    compile_str_with_reader_target(&src, target)
 }
 
 /// Compile a source file with the container + CBOR prelude.
 pub fn compile_file_with_prelude(path: impl AsRef<Path>) -> Result<Vec<u8>, CljError> {
-    let src = std::fs::read_to_string(path.as_ref())
-        .map_err(|e| CljError::Read(format!("read {}: {e}", path.as_ref().display())))?;
-    compile_str_with_prelude(strip_shebang(&src))
+    compile_file_with_prelude_and_reader_target(path, ReaderTarget::Kotoba)
 }
 
-fn strip_shebang(src: &str) -> &str {
-    if let Some(rest) = src.strip_prefix("#!") {
-        match rest.find('\n') {
-            Some(i) => &rest[i + 1..],
-            None => "",
-        }
-    } else {
-        src
-    }
+/// Compile a source file with the container + CBOR prelude and reader target.
+pub fn compile_file_with_prelude_and_reader_target(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    compile_file_with_prelude_reader_target_and_source_paths(path, target, &[])
+}
+
+/// Compile a source file with prelude, reader target, and additional source paths.
+pub fn compile_file_with_prelude_reader_target_and_source_paths(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+    source_paths: &[std::path::PathBuf],
+) -> Result<Vec<u8>, CljError> {
+    let src = compat::load_file_graph_with_source_paths(path.as_ref(), target, source_paths)?;
+    compile_str_with_prelude_and_reader_target(&src, target)
 }
 
 /// A dynamic-container prelude written in the kotoba-clj subset **itself**:
@@ -393,9 +449,18 @@ pub const KQE_PRELUDE: &str = r#"
 /// accessors [`KQE_PRELUDE`] prepended, so the program can use `vec-*` /
 /// `map-*` / `cbor-*` / `kqe-*` directly.
 pub fn compile_str_with_prelude(src: &str) -> Result<Vec<u8>, CljError> {
-    compile_str(&format!(
-        "{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}\n{src}"
-    ))
+    compile_str_with_prelude_and_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Compile `src` with the combined prelude and a specific reader target.
+pub fn compile_str_with_prelude_and_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    compile_str_with_reader_target(
+        &format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}\n{src}"),
+        target,
+    )
 }
 
 /// The combined prelude text (containers + CBOR decode + CBOR encode + kqe

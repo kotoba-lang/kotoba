@@ -3,15 +3,22 @@
 //!
 //! Subset (everything is a 64-bit signed integer; booleans are 1/0):
 //!   top-level   `(def name <const-expr>)`     compile-time integer constant
-//!               `(defn name [a b …] body…)`   exported wasm function
-//!               `(ns …)`                        ignored (namespace decl)
+//!               `(defn name [a b …] body…)` / `(defn- …)` wasm function
+//!               multi-arity `(defn name ([a] …) ([a b] …))`
+//!               `(defonce name <const-expr>)` compile-time integer constant
+//!               top-level `(do …)` wrapping definitions
+//!               `(ns …)` namespace management decls, `(require …)` `(use …)` `(refer-clojure …)` `(import …)` `(gen-class …)` `(set! …)` record/type/protocol/multimethod decls, `(defmacro …)`, `(comment …)`, `(declare …)` ignored
 //!   expressions integer literal, `true`/`false`, symbol
-//!               `(if c t e)`  `(when c body…)`
+//!               `(if c t e)`  `(when c body…)` `(if-let [b v] t e)`
+//!               `(when-let [b v] body…)` `(case e test result … default?)`
 //!               `(let [b v …] body…)`  `(do e…)`
+//!               `(-> x step…)` `(->> x step…)` `(cond-> x test step …)`
+//!               `(cond->> x test step …)` `(some-> x step…)`
+//!               `(some->> x step…)` `(as-> x name form …)`
 //!               builtins: + - * / mod  = < > <= >=  and or not
 //!               `(f args…)`  call a user `defn`
 
-use kotoba_edn::{EdnValue, Symbol};
+use kotoba_edn::{to_string as edn_to_string, EdnValue, Symbol};
 
 use crate::CljError;
 
@@ -29,10 +36,13 @@ pub struct Def {
     pub value: Expr,
 }
 
-/// `(defn name [params…] body…)` — becomes an exported wasm function.
+/// `(defn name [params…] body…)` — becomes an exported wasm function when
+/// `export_name` is set. Multi-arity definitions share `name` for source-level
+/// calls and are resolved by arity during codegen.
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    pub export_name: Option<String>,
     pub params: Vec<String>,
     /// Implicit `do`: the last expression is the return value.
     pub body: Vec<Expr>,
@@ -288,30 +298,50 @@ pub fn parse_program(src: &str) -> Result<Program, CljError> {
     let mut functions = Vec::new();
 
     for form in &forms {
-        let items = match form {
-            EdnValue::List(items) => items,
-            // A bare top-level non-list (e.g. a stray literal) is meaningless.
-            other => {
-                return Err(CljError::Lower(format!(
-                    "top-level form must be a list, found: {other:?}"
-                )))
-            }
-        };
-        let head = list_head_symbol(items)?;
-        match head.name.as_str() {
-            "ns" => { /* namespace declaration — accepted and ignored */ }
-            "def" => defs.push(lower_def(items)?),
-            "defn" => functions.push(lower_defn(items)?),
-            "defgraph" => functions.extend(lower_defgraph(items)?),
-            other => {
-                return Err(CljError::Lower(format!(
-                    "unsupported top-level form `({other} …)` — expected def/defn/ns/defgraph"
-                )))
-            }
-        }
+        parse_top_level_form(form, &mut defs, &mut functions)?;
     }
 
     Ok(Program { defs, functions })
+}
+
+fn parse_top_level_form(
+    form: &EdnValue,
+    defs: &mut Vec<Def>,
+    functions: &mut Vec<Function>,
+) -> Result<(), CljError> {
+    let items = match form {
+        EdnValue::List(items) => items,
+        // A bare top-level non-list (e.g. a stray literal) is meaningless.
+        other => {
+            return Err(CljError::Lower(format!(
+                "top-level form must be a list, found: {other:?}"
+            )))
+        }
+    };
+    let head = list_head_symbol(items)?;
+    match head.name.as_str() {
+        "ns" | "require" | "require-macros" | "use" | "use-macros" | "refer-clojure"
+        | "in-ns" | "alias" | "create-ns" | "remove-ns" | "import" | "gen-class" | "set!"
+        | "defrecord" | "deftype" | "defprotocol" | "extend-type" | "extend-protocol"
+        | "defmulti" | "defmethod" | "defmacro" | "defstruct" | "create-struct" | "comment"
+        | "declare" => {
+            /* source-compat declarations — accepted and ignored */
+        }
+        "do" => {
+            for item in &items[1..] {
+                parse_top_level_form(item, defs, functions)?;
+            }
+        }
+        "def" | "defonce" => defs.push(lower_def(items)?),
+        "defn" | "defn-" => functions.extend(lower_defn(items)?),
+        "defgraph" => functions.extend(lower_defgraph(items)?),
+        other => {
+            return Err(CljError::Lower(format!(
+                "unsupported top-level form `({other} …)` — expected def/defonce/defn/defn-/defmacro/ns/namespace-management/require/use/refer-clojure/import/gen-class/set!/record-type-protocol-multimethod/struct/defgraph/do/comment/declare"
+            )))
+        }
+    }
+    Ok(())
 }
 
 fn list_head_symbol(items: &[EdnValue]) -> Result<&Symbol, CljError> {
@@ -324,27 +354,60 @@ fn list_head_symbol(items: &[EdnValue]) -> Result<&Symbol, CljError> {
 }
 
 fn lower_def(items: &[EdnValue]) -> Result<Def, CljError> {
-    // (def name value)
-    if items.len() != 3 {
+    // (def name "doc?" value)
+    if items.len() != 3 && items.len() != 4 {
         return Err(CljError::Lower(
-            "def takes exactly: (def name value)".into(),
+            "def takes exactly: (def name \"doc?\" value)".into(),
         ));
     }
     let name = sym_name(&items[1], "def name")?;
-    let value = lower_expr(&items[2])?;
+    let value_idx = if items.len() == 4 && matches!(items.get(2), Some(EdnValue::String(_))) {
+        3
+    } else {
+        2
+    };
+    let value = lower_expr(&items[value_idx])?;
     Ok(Def { name, value })
 }
 
-fn lower_defn(items: &[EdnValue]) -> Result<Function, CljError> {
-    // (defn name [params…] body…)
-    if items.len() < 4 {
+fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
+    // (defn name "doc?" attr-map? [params…] body…)
+    // (defn name "doc?" attr-map? ([params…] body…) ([params…] body…))
+    if items.len() < 3 {
         return Err(CljError::Lower(
-            "defn requires: (defn name [params…] body…)".into(),
+            "defn requires: (defn name \"doc?\" attr-map? [params…] body…)".into(),
         ));
     }
     let name = sym_name(&items[1], "defn name")?;
-    let params = match &items[2] {
-        EdnValue::Vector(ps) => ps
+    let mut params_idx = 2;
+    if matches!(items.get(params_idx), Some(EdnValue::String(_))) {
+        params_idx += 1;
+    }
+    if matches!(items.get(params_idx), Some(EdnValue::Map(_))) {
+        params_idx += 1;
+    }
+    if let Some(EdnValue::List(arity)) = items.get(params_idx) {
+        if !items[params_idx..]
+            .iter()
+            .all(|item| matches!(item, EdnValue::List(_)))
+        {
+            return Err(CljError::Lower(format!(
+                "defn `{name}` arity-list form cannot be mixed with non-arity body forms"
+            )));
+        }
+        if items.len() == params_idx + 1 {
+            return Ok(vec![lower_defn_arity(&name, arity, Some(name.clone()))?]);
+        }
+        return items[params_idx..]
+            .iter()
+            .map(|item| match item {
+                EdnValue::List(arity) => lower_defn_arity(&name, arity, None),
+                _ => unreachable!("checked above"),
+            })
+            .collect();
+    }
+    let params = match items.get(params_idx) {
+        Some(EdnValue::Vector(ps)) => ps
             .iter()
             .map(|p| sym_name(p, "defn parameter"))
             .collect::<Result<Vec<_>, _>>()?,
@@ -354,18 +417,94 @@ fn lower_defn(items: &[EdnValue]) -> Result<Function, CljError> {
             )))
         }
     };
-    let body = items[3..]
+    if items.len() <= params_idx + 1 {
+        return Err(CljError::Lower(format!(
+            "defn `{name}` requires at least one body expression"
+        )));
+    }
+    let body_idx = skip_prepost_map(items, params_idx + 1);
+    if items.len() <= body_idx {
+        return Err(CljError::Lower(format!(
+            "defn `{name}` requires at least one body expression after pre/post conditions"
+        )));
+    }
+    let body = items[body_idx..]
         .iter()
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Function { name, params, body })
+    Ok(vec![Function {
+        export_name: Some(name.clone()),
+        name,
+        params,
+        body,
+    }])
+}
+
+fn lower_defn_arity(
+    name: &str,
+    items: &[EdnValue],
+    export_name: Option<String>,
+) -> Result<Function, CljError> {
+    if items.len() < 2 {
+        return Err(CljError::Lower(format!(
+            "defn `{name}` arity-list requires: ([params…] body…)"
+        )));
+    }
+    let params = match &items[0] {
+        EdnValue::Vector(ps) => ps
+            .iter()
+            .map(|p| sym_name(p, "defn parameter"))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(CljError::Lower(format!(
+                "defn `{name}` arity-list must begin with a parameter vector"
+            )))
+        }
+    };
+    let body_idx = skip_prepost_map(items, 1);
+    if items.len() <= body_idx {
+        return Err(CljError::Lower(format!(
+            "defn `{name}` arity-list requires at least one body expression after pre/post conditions"
+        )));
+    }
+    let body = items[body_idx..]
+        .iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Function {
+        name: name.to_string(),
+        export_name,
+        params,
+        body,
+    })
+}
+
+fn skip_prepost_map(items: &[EdnValue], body_idx: usize) -> usize {
+    match items.get(body_idx) {
+        Some(EdnValue::Map(m)) if is_prepost_map(m) => body_idx + 1,
+        _ => body_idx,
+    }
+}
+
+fn is_prepost_map(m: &std::collections::BTreeMap<EdnValue, EdnValue>) -> bool {
+    !m.is_empty()
+        && m.keys().all(|k| {
+            matches!(
+                k,
+                EdnValue::Keyword(keyword)
+                    if keyword.namespace().is_none()
+                        && matches!(keyword.name(), "pre" | "post")
+            )
+        })
 }
 
 fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
     match v {
+        EdnValue::Nil => Ok(Expr::Int(0)),
         EdnValue::Integer(i) => Ok(Expr::Int(*i)),
         EdnValue::Bool(b) => Ok(Expr::Int(if *b { 1 } else { 0 })),
         EdnValue::String(s) => Ok(Expr::Str(s.clone().into_bytes())),
+        EdnValue::Keyword(_) => Ok(Expr::Str(edn_to_string(v).into_bytes())),
         EdnValue::Symbol(s) => Ok(Expr::Var(s.to_qualified())),
         EdnValue::List(items) => lower_call(items),
         other => Err(CljError::Lower(format!(
@@ -386,12 +525,24 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
     match special {
         "if" => lower_if(args),
         "when" => lower_when(args),
+        "if-let" => lower_if_let(args),
+        "when-let" => lower_when_let(args),
         "let" => lower_let(args),
         "cond" => lower_cond(args),
+        "case" => lower_case(args),
         "loop" => lower_loop(args),
         "recur" => Ok(Expr::Recur(
             args.iter().map(lower_expr).collect::<Result<_, _>>()?,
         )),
+        "quote" => lower_quote(args),
+        "var" => lower_var(args),
+        "->" => lower_thread(args, ThreadPosition::First),
+        "->>" => lower_thread(args, ThreadPosition::Last),
+        "cond->" => lower_cond_thread(args, ThreadPosition::First),
+        "cond->>" => lower_cond_thread(args, ThreadPosition::Last),
+        "some->" => lower_some_thread(args, ThreadPosition::First),
+        "some->>" => lower_some_thread(args, ThreadPosition::Last),
+        "as->" => lower_as_thread(args),
         "do" => Ok(Expr::Do(
             args.iter().map(lower_expr).collect::<Result<_, _>>()?,
         )),
@@ -408,6 +559,166 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
             }
         }
     }
+}
+
+fn lower_quote(args: &[EdnValue]) -> Result<Expr, CljError> {
+    if args.len() != 1 {
+        return Err(CljError::Lower("quote takes: (quote form)".into()));
+    }
+    Ok(Expr::Str(edn_to_string(&args[0]).into_bytes()))
+}
+
+fn lower_var(args: &[EdnValue]) -> Result<Expr, CljError> {
+    if args.len() != 1 {
+        return Err(CljError::Lower("var takes: (var symbol)".into()));
+    }
+    match &args[0] {
+        EdnValue::Symbol(_) => Ok(Expr::Str(edn_to_string(&args[0]).into_bytes())),
+        other => Err(CljError::Lower(format!(
+            "var requires a symbol, found {other:?}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ThreadPosition {
+    First,
+    Last,
+}
+
+fn lower_thread(args: &[EdnValue], position: ThreadPosition) -> Result<Expr, CljError> {
+    let Some((first, steps)) = args.split_first() else {
+        return Err(CljError::Lower("threading macro requires a value".into()));
+    };
+    let mut acc = first.clone();
+    for step in steps {
+        acc = thread_step(acc, step, position)?;
+    }
+    lower_expr(&acc)
+}
+
+fn thread_step(
+    value: EdnValue,
+    step: &EdnValue,
+    position: ThreadPosition,
+) -> Result<EdnValue, CljError> {
+    match step {
+        EdnValue::List(items) => {
+            let Some((head, args)) = items.split_first() else {
+                return Err(CljError::Lower(
+                    "threading macro step cannot be an empty list".into(),
+                ));
+            };
+            let mut out = Vec::with_capacity(items.len() + 1);
+            out.push(head.clone());
+            match position {
+                ThreadPosition::First => {
+                    out.push(value);
+                    out.extend(args.iter().cloned());
+                }
+                ThreadPosition::Last => {
+                    out.extend(args.iter().cloned());
+                    out.push(value);
+                }
+            }
+            Ok(EdnValue::List(out))
+        }
+        EdnValue::Symbol(_) => Ok(EdnValue::List(vec![step.clone(), value])),
+        other => Err(CljError::Lower(format!(
+            "threading macro step must be a list or symbol, found: {other:?}"
+        ))),
+    }
+}
+
+fn lower_cond_thread(args: &[EdnValue], position: ThreadPosition) -> Result<Expr, CljError> {
+    let Some((first, clauses)) = args.split_first() else {
+        return Err(CljError::Lower(
+            "conditional threading macro requires a value".into(),
+        ));
+    };
+    if clauses.len() % 2 != 0 {
+        return Err(CljError::Lower(
+            "conditional threading macro requires test/step pairs".into(),
+        ));
+    }
+    let thread_value = "__kotoba_cond_thread_value".to_string();
+    let mut body = Expr::Var(thread_value.clone());
+    for pair in clauses.chunks_exact(2).rev() {
+        let threaded = thread_step(
+            EdnValue::Symbol(Symbol::bare(thread_value.clone())),
+            &pair[1],
+            position,
+        )?;
+        body = Expr::Let {
+            bindings: vec![(
+                thread_value.clone(),
+                Expr::If {
+                    cond: Box::new(lower_expr(&pair[0])?),
+                    then: Box::new(lower_expr(&threaded)?),
+                    els: Box::new(Expr::Var(thread_value.clone())),
+                },
+            )],
+            body: vec![body],
+        };
+    }
+    Ok(Expr::Let {
+        bindings: vec![(thread_value, lower_expr(first)?)],
+        body: vec![body],
+    })
+}
+
+fn lower_some_thread(args: &[EdnValue], position: ThreadPosition) -> Result<Expr, CljError> {
+    let Some((first, steps)) = args.split_first() else {
+        return Err(CljError::Lower(
+            "nil-aware threading macro requires a value".into(),
+        ));
+    };
+    let thread_value = "__kotoba_some_thread_value".to_string();
+    let mut body = Expr::Var(thread_value.clone());
+    for step in steps.iter().rev() {
+        let threaded = thread_step(
+            EdnValue::Symbol(Symbol::bare(thread_value.clone())),
+            step,
+            position,
+        )?;
+        body = Expr::Let {
+            bindings: vec![(
+                thread_value.clone(),
+                Expr::If {
+                    cond: Box::new(Expr::Var(thread_value.clone())),
+                    then: Box::new(lower_expr(&threaded)?),
+                    els: Box::new(Expr::Int(0)),
+                },
+            )],
+            body: vec![body],
+        };
+    }
+    Ok(Expr::Let {
+        bindings: vec![(thread_value, lower_expr(first)?)],
+        body: vec![body],
+    })
+}
+
+fn lower_as_thread(args: &[EdnValue]) -> Result<Expr, CljError> {
+    if args.len() < 2 {
+        return Err(CljError::Lower("as-> takes: (as-> expr name form…)".into()));
+    }
+    let name = sym_name(&args[1], "as-> binding name")?;
+    let mut forms = args[2..].iter().rev();
+    let mut body = match forms.next() {
+        Some(last) => lower_expr(last)?,
+        None => Expr::Var(name.clone()),
+    };
+    for form in forms {
+        body = Expr::Let {
+            bindings: vec![(name.clone(), lower_expr(form)?)],
+            body: vec![body],
+        };
+    }
+    Ok(Expr::Let {
+        bindings: vec![(name, lower_expr(&args[0])?)],
+        body: vec![body],
+    })
 }
 
 fn lower_if(args: &[EdnValue]) -> Result<Expr, CljError> {
@@ -436,6 +747,72 @@ fn lower_when(args: &[EdnValue]) -> Result<Expr, CljError> {
         then: Box::new(Expr::Do(body)),
         els: Box::new(Expr::Int(0)),
     })
+}
+
+fn lower_if_let(args: &[EdnValue]) -> Result<Expr, CljError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(CljError::Lower(
+            "if-let takes: (if-let [name init] then else?)".into(),
+        ));
+    }
+    let (name, init) = lower_single_binding(args.first(), "if-let")?;
+    let then = lower_expr(&args[1])?;
+    let els = match args.get(2) {
+        Some(els) => lower_expr(els)?,
+        None => Expr::Int(0),
+    };
+    Ok(Expr::Let {
+        bindings: vec![(name.clone(), init)],
+        body: vec![Expr::If {
+            cond: Box::new(Expr::Var(name)),
+            then: Box::new(then),
+            els: Box::new(els),
+        }],
+    })
+}
+
+fn lower_when_let(args: &[EdnValue]) -> Result<Expr, CljError> {
+    if args.len() < 2 {
+        return Err(CljError::Lower(
+            "when-let takes: (when-let [name init] body…)".into(),
+        ));
+    }
+    let (name, init) = lower_single_binding(args.first(), "when-let")?;
+    let body = args[1..]
+        .iter()
+        .map(lower_expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Expr::Let {
+        bindings: vec![(name.clone(), init)],
+        body: vec![Expr::If {
+            cond: Box::new(Expr::Var(name)),
+            then: Box::new(Expr::Do(body)),
+            els: Box::new(Expr::Int(0)),
+        }],
+    })
+}
+
+fn lower_single_binding(
+    binding_form: Option<&EdnValue>,
+    form_name: &str,
+) -> Result<(String, Expr), CljError> {
+    let binding_vec = match binding_form {
+        Some(EdnValue::Vector(v)) => v,
+        _ => {
+            return Err(CljError::Lower(format!(
+                "{form_name} requires a binding vector: ({form_name} [name init] …)"
+            )))
+        }
+    };
+    if binding_vec.len() != 2 {
+        return Err(CljError::Lower(format!(
+            "{form_name} binding vector must contain exactly one name/init pair"
+        )));
+    }
+    Ok((
+        sym_name(&binding_vec[0], &format!("{form_name} binding name"))?,
+        lower_expr(&binding_vec[1])?,
+    ))
 }
 
 fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
@@ -468,6 +845,72 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
         ));
     }
     Ok(Expr::Let { bindings, body })
+}
+
+fn lower_case(args: &[EdnValue]) -> Result<Expr, CljError> {
+    let Some((value, clauses)) = args.split_first() else {
+        return Err(CljError::Lower(
+            "case takes: (case expr test result … default?)".into(),
+        ));
+    };
+    if clauses.len() < 2 {
+        return Err(CljError::Lower(
+            "case requires at least one test/result clause".into(),
+        ));
+    }
+    let default = if clauses.len() % 2 == 1 {
+        lower_expr(clauses.last().expect("default exists"))?
+    } else {
+        Expr::Int(0)
+    };
+    let pairs = &clauses[..clauses.len() - (clauses.len() % 2)];
+    let case_value = "__kotoba_case_value".to_string();
+    let mut acc = default;
+    for pair in pairs.chunks_exact(2).rev() {
+        let tests = case_tests(&pair[0]);
+        let then = lower_expr(&pair[1])?;
+        let cond = lower_case_tests(&case_value, tests)?;
+        acc = Expr::If {
+            cond: Box::new(cond),
+            then: Box::new(then),
+            els: Box::new(acc),
+        };
+    }
+    Ok(Expr::Let {
+        bindings: vec![(case_value, lower_expr(value)?)],
+        body: vec![acc],
+    })
+}
+
+fn case_tests(test: &EdnValue) -> Vec<&EdnValue> {
+    match test {
+        EdnValue::List(xs) | EdnValue::Vector(xs) => xs.iter().collect(),
+        EdnValue::Set(xs) => xs.iter().collect(),
+        other => vec![other],
+    }
+}
+
+fn lower_case_tests(case_value: &str, tests: Vec<&EdnValue>) -> Result<Expr, CljError> {
+    if tests.is_empty() {
+        return Ok(Expr::Int(0));
+    }
+    let mut iter = tests.into_iter().rev();
+    let first = iter.next().expect("non-empty case tests");
+    let mut acc = case_eq(case_value, first)?;
+    for test in iter {
+        acc = Expr::Builtin {
+            op: Builtin::Or,
+            args: vec![case_eq(case_value, test)?, acc],
+        };
+    }
+    Ok(acc)
+}
+
+fn case_eq(case_value: &str, test: &EdnValue) -> Result<Expr, CljError> {
+    Ok(Expr::Builtin {
+        op: Builtin::Eq,
+        args: vec![Expr::Var(case_value.to_string()), lower_expr(test)?],
+    })
 }
 
 /// `(cond t1 e1 t2 e2 … [:else ed])` → right-nested `if`. A `:else` keyword (or
@@ -681,6 +1124,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     }
     let dispatch_fn = Function {
         name: dispatch_name.clone(),
+        export_name: Some(dispatch_name.clone()),
         params: vec!["__nid".into(), "__state".into()],
         body: vec![dispatch_body],
     };
@@ -706,6 +1150,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     }
     let next_fn = Function {
         name: next_name.clone(),
+        export_name: Some(next_name.clone()),
         params: vec!["__nid".into(), "__state".into()],
         body: vec![next_body],
     };
@@ -713,6 +1158,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     // runner: loop [__nid entry __s state] — dispatch then advance until -1.
     let runner = Function {
         name: name.clone(),
+        export_name: Some(name.clone()),
         params: vec!["state".into()],
         body: vec![Expr::Loop {
             bindings: vec![
@@ -788,7 +1234,16 @@ fn build_merge_fn(
 fn parse_one_defn(src: &str) -> Result<Function, CljError> {
     let forms = kotoba_edn::parse_all(src).map_err(|e| CljError::Read(e.to_string()))?;
     match forms.first() {
-        Some(EdnValue::List(items)) => lower_defn(items),
+        Some(EdnValue::List(items)) => {
+            let mut functions = lower_defn(items)?;
+            if functions.len() == 1 {
+                Ok(functions.remove(0))
+            } else {
+                Err(CljError::Lower(
+                    "generated merge fn unexpectedly lowered to multiple arities".into(),
+                ))
+            }
+        }
         _ => Err(CljError::Lower(
             "generated merge fn did not parse as a defn".into(),
         )),

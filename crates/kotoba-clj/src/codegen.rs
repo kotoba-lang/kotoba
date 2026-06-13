@@ -107,30 +107,30 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         import_index.insert(*imp, i as u32);
     }
 
-    let mut fn_index: HashMap<String, (u32, usize)> = HashMap::new();
+    let mut fn_index: HashMap<(String, usize), u32> = HashMap::new();
     for (i, f) in program.functions.iter().enumerate() {
-        if fn_index.contains_key(&f.name) {
+        let arity = f.params.len();
+        let key = (f.name.clone(), arity);
+        if fn_index.contains_key(&key) {
             return Err(CljError::Codegen(format!(
-                "function `{}` defined twice",
+                "function `{}` with arity {arity} defined twice",
                 f.name
             )));
         }
-        fn_index.insert(f.name.clone(), (import_base + i as u32, f.params.len()));
+        fn_index.insert(key, import_base + i as u32);
     }
 
     // Validate the entry point up front.
     let entry_target = match entry {
         Some(Entry { name, abi }) => {
-            let (idx, arity) = fn_index.get(name).copied().ok_or_else(|| {
-                CljError::Codegen(format!(
-                    "component entry `(defn {name} [input] …)` not found"
-                ))
-            })?;
-            if arity != 1 {
-                return Err(CljError::Codegen(format!(
-                    "component entry `{name}` must take exactly 1 argument (the input bytes), got {arity}"
-                )));
-            }
+            let idx = fn_index
+                .get(&(name.to_string(), 1))
+                .copied()
+                .ok_or_else(|| {
+                    CljError::Codegen(format!(
+                        "component entry `(defn {name} [input] …)` not found"
+                    ))
+                })?;
             Some((idx, abi))
         }
         None => None,
@@ -153,7 +153,9 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         // In component mode the wrapper owns the export names; don't leak the
         // raw i64 functions (avoids a clash on the `run` name).
         if entry.is_none() {
-            exports.export(&f.name, ExportKind::Func, import_base + i as u32);
+            if let Some(export_name) = &f.export_name {
+                exports.export(export_name, ExportKind::Func, import_base + i as u32);
+            }
         }
     }
 
@@ -566,7 +568,7 @@ struct LoopTarget {
 /// Per-function compilation context.
 struct FnCtx<'a> {
     consts: &'a HashMap<String, i64>,
-    fn_index: &'a HashMap<String, (u32, usize)>,
+    fn_index: &'a HashMap<(String, usize), u32>,
     /// Host-import → wasm function index (imports occupy `0..num_imports`).
     import_index: &'a HashMap<HostImport, u32>,
     literals: &'a Literals,
@@ -741,16 +743,16 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
         Expr::Builtin { op, args } => compile_builtin(cg, *op, args)?,
 
         Expr::Call { name, args } => {
-            let (idx, arity) =
-                cg.fn_index.get(name).copied().ok_or_else(|| {
-                    CljError::Codegen(format!("call to unknown function `{name}`"))
+            let arity = args.len();
+            let idx = cg
+                .fn_index
+                .get(&(name.clone(), arity))
+                .copied()
+                .ok_or_else(|| {
+                    CljError::Codegen(format!(
+                        "call to unknown function `{name}` with arity {arity}"
+                    ))
                 })?;
-            if args.len() != arity {
-                return Err(CljError::Codegen(format!(
-                    "`{name}` expects {arity} args, got {}",
-                    args.len()
-                )));
-            }
             for a in args {
                 compile_expr(cg, a)?;
             }
