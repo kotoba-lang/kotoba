@@ -260,11 +260,40 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `#(...)` anonymous-function reader macro.
+    ///
+    /// Reads the body list, scans for the implicit args `%`, `%1`..`%9` and `%&`,
+    /// then rewrites to `(fn [%1 .. %N & %&?] body)`. A bare `%` is normalised to
+    /// `%1`. The body keeps the surrounding parens, e.g. `#(+ % 1)` → `(fn [%1] (+ %1 1))`.
+    fn parse_anon_fn(&mut self) -> Result<EdnValue, ParseError> {
+        // self.pos is at '(' (the '#' was already consumed by parse_dispatch).
+        let body = self.parse_list()?;
+        let mut max_arg: u32 = 0;
+        let mut has_rest = false;
+        collect_anon_args(&body, &mut max_arg, &mut has_rest)?;
+        let rewritten = rewrite_anon_args(body);
+
+        // Build the param vector [%1 %2 .. %N (& %&)?].
+        let mut params: Vec<EdnValue> = (1..=max_arg)
+            .map(|i| EdnValue::Symbol(Symbol::bare(format!("%{i}"))))
+            .collect();
+        if has_rest {
+            params.push(EdnValue::Symbol(Symbol::bare("&")));
+            params.push(EdnValue::Symbol(Symbol::bare("%&")));
+        }
+        Ok(EdnValue::List(vec![
+            EdnValue::Symbol(Symbol::bare("fn")),
+            EdnValue::Vector(params),
+            rewritten,
+        ]))
+    }
+
     fn parse_dispatch(&mut self) -> Result<EdnValue, ParseError> {
         let off = self.pos;
         self.pos += 1; // '#'
         match self.peek() {
             Some(b'{') => self.parse_set(),
+            Some(b'(') => self.parse_anon_fn(),
             Some(b':') => self.parse_namespaced_map(),
             Some(b'#') => self.parse_symbolic_float(off),
             Some(b'_') => {
@@ -577,6 +606,112 @@ fn is_symbol_start(b: u8) -> bool {
     )
 }
 
+/// If `name` is an anonymous-fn implicit arg (`%`, `%N`, `%&`), classify it.
+/// Returns `Some(Some(n))` for `%`/`%N` (n>=1), `Some(None)` for `%&`, `None` otherwise.
+fn anon_arg_index(name: &str) -> Option<Option<u32>> {
+    match name {
+        "%" => Some(Some(1)),
+        "%&" => Some(None),
+        _ => {
+            let rest = name.strip_prefix('%')?;
+            let n: u32 = rest.parse().ok()?;
+            if n >= 1 {
+                Some(Some(n))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Returns true if `v` is a `(fn ...)` form (so anon-arg scanning must not descend
+/// into a nested anonymous function — its `%` args belong to it, not the outer one).
+fn is_fn_form(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::List(items)
+        if matches!(items.first(), Some(EdnValue::Symbol(s)) if s.namespace.is_none() && s.name == "fn"))
+}
+
+/// Walk `body`, recording the max positional arg and whether `%&` is used.
+/// Does not descend into nested `(fn ...)` forms.
+fn collect_anon_args(
+    body: &EdnValue,
+    max_arg: &mut u32,
+    has_rest: &mut bool,
+) -> Result<(), ParseError> {
+    match body {
+        EdnValue::Symbol(s) if s.namespace.is_none() => {
+            if let Some(idx) = anon_arg_index(&s.name) {
+                match idx {
+                    Some(n) => *max_arg = (*max_arg).max(n),
+                    None => *has_rest = true,
+                }
+            }
+            Ok(())
+        }
+        EdnValue::List(items) => {
+            if is_fn_form(body) {
+                // nested anonymous fn already lifted its own % args; skip it
+                return Ok(());
+            }
+            for it in items {
+                collect_anon_args(it, max_arg, has_rest)?;
+            }
+            Ok(())
+        }
+        EdnValue::Vector(items) => {
+            for it in items {
+                collect_anon_args(it, max_arg, has_rest)?;
+            }
+            Ok(())
+        }
+        EdnValue::Set(items) => {
+            for it in items {
+                collect_anon_args(it, max_arg, has_rest)?;
+            }
+            Ok(())
+        }
+        EdnValue::Map(m) => {
+            for (k, val) in m {
+                collect_anon_args(k, max_arg, has_rest)?;
+                collect_anon_args(val, max_arg, has_rest)?;
+            }
+            Ok(())
+        }
+        EdnValue::Tagged { value, .. } => collect_anon_args(value, max_arg, has_rest),
+        _ => Ok(()),
+    }
+}
+
+/// Rewrite a bare `%` symbol to `%1` throughout `body`, without descending into
+/// nested `(fn ...)` forms.
+fn rewrite_anon_args(body: EdnValue) -> EdnValue {
+    match body {
+        EdnValue::Symbol(ref s) if s.namespace.is_none() && s.name == "%" => {
+            EdnValue::Symbol(Symbol::bare("%1"))
+        }
+        EdnValue::List(items) => {
+            if is_fn_form(&EdnValue::List(items.clone())) {
+                return EdnValue::List(items);
+            }
+            EdnValue::List(items.into_iter().map(rewrite_anon_args).collect())
+        }
+        EdnValue::Vector(items) => {
+            EdnValue::Vector(items.into_iter().map(rewrite_anon_args).collect())
+        }
+        EdnValue::Set(items) => EdnValue::Set(items.into_iter().map(rewrite_anon_args).collect()),
+        EdnValue::Map(m) => EdnValue::Map(
+            m.into_iter()
+                .map(|(k, v)| (rewrite_anon_args(k), rewrite_anon_args(v)))
+                .collect(),
+        ),
+        EdnValue::Tagged { tag, value } => EdnValue::Tagged {
+            tag,
+            value: Box::new(rewrite_anon_args(*value)),
+        },
+        other => other,
+    }
+}
+
 /// Parse a single EDN value. Trailing content (after optional whitespace) is an error.
 pub fn parse(src: &str) -> Result<EdnValue, ParseError> {
     let mut p = Parser::new(src);
@@ -802,5 +937,84 @@ mod tests {
             parse(&at_cap).is_ok(),
             "nesting at exactly MAX_DEPTH must parse"
         );
+    }
+
+    // ---- #() anonymous-function reader macro ----
+
+    /// `(fn [params...] body)` builder for expected-value assertions.
+    fn fnform(params: Vec<EdnValue>, body: EdnValue) -> EdnValue {
+        EdnValue::list([EdnValue::sym("fn"), EdnValue::vector(params), body])
+    }
+
+    #[test]
+    fn anon_fn_bare_pct_normalises_to_pct1() {
+        // #(+ % 1) => (fn [%1] (+ %1 1))
+        let v = parse("#(+ % 1)").unwrap();
+        assert_eq!(
+            v,
+            fnform(
+                vec![EdnValue::sym("%1")],
+                EdnValue::list([EdnValue::sym("+"), EdnValue::sym("%1"), EdnValue::int(1)])
+            )
+        );
+    }
+
+    #[test]
+    fn anon_fn_multiple_positional_args() {
+        // #(+ %1 %2) => (fn [%1 %2] (+ %1 %2))
+        let v = parse("#(+ %1 %2)").unwrap();
+        assert_eq!(
+            v,
+            fnform(
+                vec![EdnValue::sym("%1"), EdnValue::sym("%2")],
+                EdnValue::list([EdnValue::sym("+"), EdnValue::sym("%1"), EdnValue::sym("%2")])
+            )
+        );
+    }
+
+    #[test]
+    fn anon_fn_arity_is_max_index_not_count() {
+        // #(nth % 3) only mentions % (=>%1) and the literal 3; arity must be 1.
+        // #(vector %1 %3) mentions %1 and %3 => arity 3 (gap %2 still a param).
+        let v = parse("#(vector %1 %3)").unwrap();
+        assert_eq!(
+            v,
+            fnform(
+                vec![
+                    EdnValue::sym("%1"),
+                    EdnValue::sym("%2"),
+                    EdnValue::sym("%3")
+                ],
+                EdnValue::list([
+                    EdnValue::sym("vector"),
+                    EdnValue::sym("%1"),
+                    EdnValue::sym("%3")
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn anon_fn_rest_arg() {
+        // #(apply + %&) => (fn [& %&] (apply + %&))
+        let v = parse("#(apply + %&)").unwrap();
+        assert_eq!(
+            v,
+            fnform(
+                vec![EdnValue::sym("&"), EdnValue::sym("%&")],
+                EdnValue::list([
+                    EdnValue::sym("apply"),
+                    EdnValue::sym("+"),
+                    EdnValue::sym("%&")
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn anon_fn_no_args() {
+        // #(rand) => (fn [] (rand))
+        let v = parse("#(rand)").unwrap();
+        assert_eq!(v, fnform(vec![], EdnValue::list([EdnValue::sym("rand")])));
     }
 }

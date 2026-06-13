@@ -31,9 +31,10 @@
 use std::collections::HashMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, GlobalType, ImportSection, Instruction, MemArg,
-    MemorySection, MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    Instruction, MemArg, MemorySection, MemoryType, Module, RefType, TableSection, TableType,
+    TypeSection, ValType,
 };
 
 use crate::ast::{Builtin, Expr, HostImport, Program};
@@ -45,6 +46,9 @@ const DATA_BASE: u32 = 1024;
 /// Bump-heap alignment for `cabi_realloc` returns and the heap base.
 const HEAP_ALIGN: u32 = 16;
 const WASM_PAGE: u32 = 65536;
+/// Table index of the funcref table holding lambda-lifted closures (the only
+/// table in the module, so index 0).
+const CLOSURE_TABLE: u32 = 0;
 
 /// Compile a parsed [`Program`] into WebAssembly bytes (core module; every
 /// `defn` exported by name).
@@ -118,6 +122,23 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
             )));
         }
         fn_index.insert(key, import_base + i as u32);
+    }
+
+    // Funcref table for lambda-lifted closures: slot `s` → the absolute function
+    // index of the lifted fn carrying `table_slot == Some(s)`. Slots are dense
+    // (0..K) and assigned in lifting order, so we just place each at its slot.
+    let num_slots = program
+        .functions
+        .iter()
+        .filter_map(|f| f.table_slot)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
+    let mut table_funcs: Vec<u32> = vec![0; num_slots as usize];
+    for (i, f) in program.functions.iter().enumerate() {
+        if let Some(slot) = f.table_slot {
+            table_funcs[slot as usize] = import_base + i as u32;
+        }
     }
 
     // Validate the entry point up front.
@@ -214,6 +235,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         let mut cg = FnCtx {
             consts: &consts,
             fn_index: &fn_index,
+            arity_type: &type_for_arity,
             import_index: &import_index,
             literals: &literals,
             scope: f
@@ -253,6 +275,25 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         );
     }
 
+    // Funcref table + element segment for closures (only when some exist).
+    let mut tables = TableSection::new();
+    let mut elements = ElementSection::new();
+    let elem_offset = ConstExpr::i32_const(0);
+    if !table_funcs.is_empty() {
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: table_funcs.len() as u64,
+            maximum: Some(table_funcs.len() as u64),
+            shared: false,
+        });
+        elements.active(
+            Some(CLOSURE_TABLE),
+            &elem_offset,
+            Elements::Functions(table_funcs.as_slice().into()),
+        );
+    }
+
     // Sections must be emitted in ascending id order.
     let mut module = Module::new();
     module.section(&types); // 1
@@ -260,9 +301,15 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         module.section(&imports); // 2
     }
     module.section(&funcs); // 3
+    if !table_funcs.is_empty() {
+        module.section(&tables); // 4
+    }
     module.section(&memories); // 5
     module.section(&globals); // 6
     module.section(&exports); // 7
+    if !table_funcs.is_empty() {
+        module.section(&elements); // 9
+    }
     module.section(&code); // 10
     module.section(&data); // 11
     Ok(module.finish())
@@ -367,6 +414,13 @@ fn collect_host_imports(program: &Program) -> Vec<HostImport> {
                 }
                 args.iter().for_each(|e| walk(e, note));
             }
+            Expr::Fn { body, .. } => body.iter().for_each(|e| walk(e, note)),
+            Expr::MakeClosure { captures, .. } => captures.iter().for_each(|e| walk(e, note)),
+            Expr::ClosureRef(_) => {}
+            Expr::CallValue { f, args } => {
+                walk(f, note);
+                args.iter().for_each(|e| walk(e, note));
+            }
         }
     }
     for d in &program.defs {
@@ -420,6 +474,13 @@ fn walk_strings(expr: &Expr, f: &mut impl FnMut(&[u8])) {
         | Expr::Builtin { args: es, .. }
         | Expr::Call { args: es, .. } => {
             es.iter().for_each(|e| walk_strings(e, f));
+        }
+        Expr::Fn { body, .. } => body.iter().for_each(|e| walk_strings(e, f)),
+        Expr::MakeClosure { captures, .. } => captures.iter().for_each(|e| walk_strings(e, f)),
+        Expr::ClosureRef(_) => {}
+        Expr::CallValue { f: callee, args } => {
+            walk_strings(callee, f);
+            args.iter().for_each(|e| walk_strings(e, f));
         }
     }
 }
@@ -569,6 +630,10 @@ struct LoopTarget {
 struct FnCtx<'a> {
     consts: &'a HashMap<String, i64>,
     fn_index: &'a HashMap<(String, usize), u32>,
+    /// wasm function-type index for a user-fn of a given arity (params×i64 → i64).
+    /// `call_indirect` of a closure with N args needs the type for arity `N+1`
+    /// (the hidden `__self` closure pointer is the extra leading parameter).
+    arity_type: &'a HashMap<usize, u32>,
     /// Host-import → wasm function index (imports occupy `0..num_imports`).
     import_index: &'a HashMap<HostImport, u32>,
     literals: &'a Literals,
@@ -757,6 +822,82 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
                 compile_expr(cg, a)?;
             }
             cg.emit(Instruction::Call(idx));
+        }
+
+        // `(fn …)` must have been rewritten by lambda-lifting (lift_program).
+        Expr::Fn { .. } => {
+            return Err(CljError::Codegen(
+                "internal error: `(fn …)` reached codegen un-lifted".into(),
+            ))
+        }
+
+        // Read capture slot `n` from the current closure record. Local 0 is the
+        // `__self` pointer (an i64 handle); the record is `[slot@0, cap0@8, …]`.
+        Expr::ClosureRef(slot) => {
+            cg.emit(Instruction::LocalGet(0));
+            cg.emit(Instruction::I32WrapI64);
+            cg.emit(Instruction::I64Load(mem64(8 + 8 * (*slot as u64))));
+        }
+
+        // Allocate `[table-slot, captures…]` and yield the record pointer (i64).
+        Expr::MakeClosure {
+            table_slot,
+            captures,
+        } => {
+            let size = 8 + 8 * captures.len() as i32;
+            let rec = cg.alloc_local();
+            // rec = cabi_realloc(0, 0, HEAP_ALIGN, size)
+            cg.emit(Instruction::I32Const(0));
+            cg.emit(Instruction::I32Const(0));
+            cg.emit(Instruction::I32Const(HEAP_ALIGN as i32));
+            cg.emit(Instruction::I32Const(size));
+            let realloc = cg.realloc_index;
+            cg.emit(Instruction::Call(realloc));
+            cg.emit(Instruction::I64ExtendI32U);
+            cg.emit(Instruction::LocalSet(rec));
+            // record[0] = table_slot
+            cg.emit(Instruction::LocalGet(rec));
+            cg.emit(Instruction::I32WrapI64);
+            cg.emit(Instruction::I64Const(*table_slot as i64));
+            cg.emit(Instruction::I64Store(mem64(0)));
+            // record[8 + 8*i] = captures[i]
+            for (i, cap) in captures.iter().enumerate() {
+                cg.emit(Instruction::LocalGet(rec));
+                cg.emit(Instruction::I32WrapI64);
+                compile_expr(cg, cap)?;
+                cg.emit(Instruction::I64Store(mem64(8 + 8 * i as u64)));
+            }
+            cg.emit(Instruction::LocalGet(rec));
+        }
+
+        // Indirect call: push `__self` (the closure ptr) + args, then the table
+        // slot read from the record, and `call_indirect` the funcref table.
+        Expr::CallValue { f, args } => {
+            let type_idx = *cg.arity_type.get(&(args.len() + 1)).ok_or_else(|| {
+                CljError::Codegen(format!(
+                    "no closure of arity {} exists to call indirectly \
+                     (define a matching `(fn …)`)",
+                    args.len()
+                ))
+            })?;
+            let clo = cg.alloc_local();
+            compile_expr(cg, f)?;
+            cg.emit(Instruction::LocalSet(clo));
+            // __self
+            cg.emit(Instruction::LocalGet(clo));
+            // args
+            for a in args {
+                compile_expr(cg, a)?;
+            }
+            // table slot = record[0]
+            cg.emit(Instruction::LocalGet(clo));
+            cg.emit(Instruction::I32WrapI64);
+            cg.emit(Instruction::I64Load(mem64(0)));
+            cg.emit(Instruction::I32WrapI64);
+            cg.emit(Instruction::CallIndirect {
+                type_index: type_idx,
+                table_index: CLOSURE_TABLE,
+            });
         }
     }
     Ok(())
@@ -1555,6 +1696,11 @@ fn eval_const(expr: &Expr, consts: &HashMap<String, i64>) -> Result<i64, CljErro
             return Err(CljError::Codegen(format!(
                 "`def` initialiser cannot call function `{name}` (must be a compile-time constant)"
             )))
+        }
+        Expr::Fn { .. } | Expr::MakeClosure { .. } | Expr::ClosureRef(_) | Expr::CallValue { .. } => {
+            return Err(CljError::Codegen(
+                "anonymous functions / closures are not allowed in a `def` initialiser (must be a compile-time constant)".into(),
+            ))
         }
     })
 }
