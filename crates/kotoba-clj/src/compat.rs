@@ -913,13 +913,25 @@ fn param_shadow(params: Option<&EdnValue>) -> HashSet<String> {
     let Some(EdnValue::Vector(params)) = params else {
         return HashSet::new();
     };
-    params
-        .iter()
-        .filter_map(|p| match p {
-            EdnValue::Symbol(s) if s.namespace.is_none() => Some(s.name.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut out = HashSet::new();
+    for param in params {
+        collect_pattern_shadow(param, &mut out);
+    }
+    out
+}
+
+fn collect_pattern_shadow(pattern: &EdnValue, out: &mut HashSet<String>) {
+    match pattern {
+        EdnValue::Symbol(s) if s.namespace.is_none() => {
+            out.insert(s.name.clone());
+        }
+        EdnValue::Vector(items) => {
+            for item in items {
+                collect_pattern_shadow(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn qualify_expr(v: EdnValue, ctx: &NamespaceCtx, qualify_defs: bool) -> EdnValue {
@@ -975,11 +987,7 @@ fn qualify_list_expr(
                         qualify_defs,
                         &inner_shadow,
                     );
-                    if let Some(EdnValue::Symbol(s)) = bindings.get(i - 1) {
-                        if s.namespace.is_none() {
-                            inner_shadow.insert(s.name.clone());
-                        }
-                    }
+                    collect_pattern_shadow(&bindings[i - 1], &mut inner_shadow);
                 }
             }
             for item in out.iter_mut().skip(2) {
@@ -994,10 +1002,8 @@ fn qualify_list_expr(
                 if let Some(init) = bindings.get_mut(1) {
                     *init = qualify_expr_with_shadow(init.clone(), ctx, qualify_defs, shadowed);
                 }
-                if let Some(EdnValue::Symbol(s)) = bindings.first() {
-                    if s.namespace.is_none() {
-                        inner_shadow.insert(s.name.clone());
-                    }
+                if let Some(pattern) = bindings.first() {
+                    collect_pattern_shadow(pattern, &mut inner_shadow);
                 }
             }
             for item in out.iter_mut().skip(2) {
