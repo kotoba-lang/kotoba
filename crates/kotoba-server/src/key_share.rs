@@ -220,6 +220,9 @@ fn authorize_share_release(
                 .unwrap_or_default()
                 .as_secs(),
             cacao_cid,
+            // Custody-protocol seam, not a plain HTTP read: no edge-forwarded
+            // network metadata (ADR-2606131600 P0).
+            ..Default::default()
         },
     );
     Ok(())

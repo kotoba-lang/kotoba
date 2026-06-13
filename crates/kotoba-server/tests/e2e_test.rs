@@ -195,13 +195,24 @@ impl TestServer {
     }
 
     async fn register_private_graph(&self, graph: &str) {
+        // Owner = the DID that build_ed25519_cacao_for_operation* signs with, so
+        // a self-signed read CACAO satisfies the ADR-2606131600 P1 owner-binding
+        // invariant (issuer == owner). The VC-presentation path is owner-
+        // independent (it checks for an operator-issued capability), so VC
+        // fixtures are unaffected by this owner choice.
+        self.register_private_graph_owned_by(graph, &cacao_signer_did())
+            .await;
+    }
+
+    /// Register a Private graph with an explicit owner DID (P1 cross-tenant tests).
+    async fn register_private_graph_owned_by(&self, graph: &str, owner_did: &str) {
         let cid = kotoba_core::cid::KotobaCid::from_multibase(graph).expect("graph cid");
         self.state.graph_registry.write().await.insert(
             cid,
             (
                 format!("test-private:{graph}"),
                 kotoba_core::named_graph::GraphVisibility::Private {
-                    owner_did: self.operator_did.clone(),
+                    owner_did: owner_did.to_string(),
                 },
             ),
         );
@@ -4492,6 +4503,69 @@ async fn datomic_q_accepts_cacao_graph_query_operation_scope_on_private_graph() 
         .await;
     assert_eq!(status, 200, "{q_body}");
     assert_eq!(q_body["rows_edn"][0][0], "\"Alice\"", "{q_body}");
+}
+
+/// ADR-2606131600 P1 — cross-tenant read leak is closed. A self-signed CACAO
+/// scoped to a Private graph owned by SOMEONE ELSE (issuer != owner) must be
+/// rejected, even though it carries the right capability + aud==operator + a
+/// valid signature. Before P1 this returned 200 and leaked the owner's datoms.
+#[tokio::test]
+async fn datomic_q_rejects_cacao_from_non_owner_on_private_graph() {
+    let s = TestServer::start(false).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let graph =
+        kotoba_core::cid::KotobaCid::from_bytes(b"datomic-cross-tenant-leak-e2e").to_multibase();
+
+    // Graph owned by a victim DID that is NOT the CACAO signer (seed 43).
+    let victim_owner = {
+        use ed25519_dalek::SigningKey;
+        use kotoba_auth::did_key::ed25519_pubkey_to_did_key;
+        let sk = SigningKey::from_bytes(&[99u8; 32]);
+        ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes())
+    };
+    assert_ne!(victim_owner, cacao_signer_did(), "fixture sanity");
+    s.register_private_graph_owned_by(&graph, &victim_owner).await;
+
+    // Seed the victim's private graph (operator-gated write path).
+    let (status, tx_body) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({
+                "graph": graph,
+                "tx_edn": r#"[[:db/add "secret" :person/name "TopSecret"]]"#
+            }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{tx_body}");
+
+    // Attacker (seed 43) self-signs a datom:read CACAO scoped to the victim's
+    // graph CID with aud == operator — everything valid EXCEPT ownership.
+    let attacker_cacao = build_ed25519_cacao_for_operation(
+        &graph,
+        &s.operator_did,
+        kotoba_auth::CacaoPayload::OP_DATOM_READ,
+        "nonce-cross-tenant-leak",
+    );
+    let (status, q_body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
+            json!({
+                "graph": graph,
+                "query_edn": r#"{:find [?name] :where [[?e :person/name ?name]]}"#,
+                "cacao_b64": attacker_cacao
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 401,
+        "non-owner CACAO must NOT read a private graph (P1 owner-binding): {q_body}"
+    );
+    // And nothing leaked.
+    assert!(
+        q_body.get("rows_edn").is_none(),
+        "denied read must not return rows: {q_body}"
+    );
 }
 
 #[tokio::test]
@@ -9924,6 +9998,17 @@ fn build_ed25519_cacao_for_operation(
     nonce: &str,
 ) -> String {
     build_ed25519_cacao_for_operation_with_resources(graph, audience, operation, nonce, vec![])
+}
+
+/// DID of the key that `build_ed25519_cacao_for_operation*` signs with (seed
+/// `[43u8; 32]`). After ADR-2606131600 P1, a Private graph's CACAO read path
+/// binds the verified issuer to the graph owner, so private-graph fixtures must
+/// register THIS DID as the owner for a self-signed read CACAO to be honoured.
+fn cacao_signer_did() -> String {
+    use ed25519_dalek::SigningKey;
+    use kotoba_auth::did_key::ed25519_pubkey_to_did_key;
+    let sk = SigningKey::from_bytes(&[43u8; 32]);
+    ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes())
 }
 
 fn build_ed25519_cacao_for_operation_with_resources(
