@@ -225,7 +225,7 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// Clojure-core compatibility layer: `count`, `empty?`, `nth`, `first`, `last`,
 /// `subvec`, `rest`, `conj!`, `get`, `assoc!`, and `contains-key?`. The
 /// lowering phase also accepts vector and map destructuring in `defn`, `let`,
-/// `if-let`, and `when-let`; map destructuring supports `{local :key}`,
+/// `loop`, `if-let`, and `when-let`; map destructuring supports `{local :key}`,
 /// `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`.
 pub const PRELUDE: &str = r#"
 ;; ---- vector: [len, cap, e0, e1, …] ----------------------------------------

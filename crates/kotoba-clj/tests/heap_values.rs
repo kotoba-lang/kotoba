@@ -270,6 +270,21 @@ fn map_destructuring_allows_nested_vector_values() {
     assert_eq!(v, 44);
 }
 
+#[test]
+fn loop_destructuring_rebinds_each_recur_iteration() {
+    let v = eval(
+        "(loop [[a & xs] [1 2]
+                {:keys [n] :as m} {:n 10}
+                i 0]
+           (if (>= i 3)
+             (+ a (last xs) n (count m))
+             (recur [(+ a 1) (+ (last xs) 1)]
+                    {:n (+ n 10)}
+                    (+ i 1))))",
+    );
+    assert_eq!(v, 50);
+}
+
 // ---- the langgraph state substrate -----------------------------------------
 
 #[test]

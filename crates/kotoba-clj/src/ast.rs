@@ -15,8 +15,8 @@
 //!               `(-> x step…)` `(->> x step…)` `(cond-> x test step …)`
 //!               `(cond->> x test step …)` `(some-> x step…)`
 //!               `(some->> x step…)` `(as-> x name form …)`
-//!               vector and map destructuring in `defn`, `let`, `if-let`,
-//!               `when-let`
+//!               vector and map destructuring in `defn`, `let`, `loop`,
+//!               `if-let`, `when-let`
 //!               builtins: + - * / mod  = < > <= >=  and or not
 //!               `(f args…)`  call a user `defn`
 
@@ -1356,9 +1356,20 @@ fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
         ));
     }
     let mut bindings = Vec::with_capacity(binding_vec.len() / 2);
+    let mut destructured_bindings = Vec::new();
     let mut it = binding_vec.iter();
+    let mut idx = 0;
     while let (Some(name), Some(val)) = (it.next(), it.next()) {
-        bindings.push((sym_name(name, "loop binding name")?, lower_expr(val)?));
+        let (_, lowered) = lower_binding_pattern(name, lower_expr(val)?, idx, "loop binding name")?;
+        let mut lowered = lowered.into_iter();
+        let Some(loop_binding) = lowered.next() else {
+            return Err(CljError::Lower(
+                "loop binding lowering unexpectedly produced no binding".into(),
+            ));
+        };
+        bindings.push(loop_binding);
+        destructured_bindings.extend(lowered);
+        idx += 1;
     }
     let body = args[1..]
         .iter()
@@ -1369,6 +1380,7 @@ fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
             "loop requires at least one body expression".into(),
         ));
     }
+    let body = prepend_bindings(destructured_bindings, body);
     Ok(Expr::Loop { bindings, body })
 }
 
