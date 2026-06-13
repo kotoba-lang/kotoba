@@ -55,7 +55,7 @@ fn clojure_core_vector_aliases() {
     let v = eval(
         "(let [v (vec-make 8)]
            (conj! v 11)
-           (conj! v 22)
+           (conj v 22)
            (conj! v 33)
            (+ (count v)
               (first v)
@@ -197,14 +197,15 @@ fn clojure_core_map_aliases() {
     let v = eval(
         "(let [m (map-make 4)]
            (assoc! m \"k\" 41)
-           (assoc! m \"k\" 42)
-           (assoc! m \"z\" 5)
+           (assoc m \"k\" 42)
+           (assoc m \"z\" 5)
            (let [ks (keys m)
                  vs (vals m)]
            (+ (count m)
               (get m \"k\")
               (get m \"missing\" 7)
               (get m \"k\" 100)
+              (contains? m \"z\")
               (contains-key? m \"k\")
               (empty? (map-make 1))
               (if (seq m) 10 0)
@@ -216,7 +217,7 @@ fn clojure_core_map_aliases() {
               (str-len (first ks))
               (last vs))))",
     );
-    assert_eq!(v, 135);
+    assert_eq!(v, 136);
 }
 
 #[test]
