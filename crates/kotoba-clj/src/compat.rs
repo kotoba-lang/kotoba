@@ -922,16 +922,33 @@ fn param_shadow(params: Option<&EdnValue>) -> HashSet<String> {
 
 fn collect_pattern_shadow(pattern: &EdnValue, out: &mut HashSet<String>) {
     match pattern {
-        EdnValue::Symbol(s) if s.namespace.is_none() => {
+        EdnValue::Symbol(s) if s.namespace.is_none() && s.name != "_" => {
             out.insert(s.name.clone());
         }
         EdnValue::Vector(items) => {
-            for item in items {
-                collect_pattern_shadow(item, out);
+            let mut i = 0;
+            while i < items.len() {
+                if is_destructure_rest(&items[i]) || is_destructure_as(&items[i]) {
+                    if let Some(name) = items.get(i + 1) {
+                        collect_pattern_shadow(name, out);
+                    }
+                    i += 2;
+                } else {
+                    collect_pattern_shadow(&items[i], out);
+                    i += 1;
+                }
             }
         }
         _ => {}
     }
+}
+
+fn is_destructure_rest(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Symbol(s) if s.namespace.is_none() && s.name == "&")
+}
+
+fn is_destructure_as(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Keyword(k) if k.namespace().is_none() && k.name() == "as")
 }
 
 fn qualify_expr(v: EdnValue, ctx: &NamespaceCtx, qualify_defs: bool) -> EdnValue {

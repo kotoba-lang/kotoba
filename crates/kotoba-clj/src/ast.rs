@@ -11,10 +11,11 @@
 //!   expressions integer literal, `true`/`false`, symbol
 //!               `(if c t e)`  `(when c body…)` `(if-let [b v] t e)`
 //!               `(when-let [b v] body…)` `(case e test result … default?)`
-//!               `(let [b v …] body…)`  `(do e…)`
+//!               `(let [b v …] body…)`  `(do e…)`, vector/map literals
 //!               `(-> x step…)` `(->> x step…)` `(cond-> x test step …)`
 //!               `(cond->> x test step …)` `(some-> x step…)`
 //!               `(some->> x step…)` `(as-> x name form …)`
+//!               vector destructuring in `defn`, `let`, `if-let`, `when-let`
 //!               builtins: + - * / mod  = < > <= >=  and or not
 //!               `(f args…)`  call a user `defn`
 
@@ -973,15 +974,68 @@ fn collect_vector_destructuring(
             "{ctx} must be a vector destructuring form"
         )));
     };
-    for (idx, item) in items.iter().enumerate() {
+
+    let mut item_idx = 0;
+    let mut value_idx = 0;
+    let mut rest_seen = false;
+    while item_idx < items.len() {
+        let item = &items[item_idx];
+        if is_destructure_as(item) {
+            let Some(name) = items.get(item_idx + 1) else {
+                return Err(CljError::Lower(format!(
+                    "{ctx} vector destructuring `:as` requires a following symbol"
+                )));
+            };
+            if item_idx + 2 != items.len() {
+                return Err(CljError::Lower(format!(
+                    "{ctx} vector destructuring `:as` must be the final option"
+                )));
+            }
+            let name = sym_name(name, ctx)?;
+            if name != "_" {
+                out.push((name, source.clone()));
+            }
+            item_idx += 2;
+            continue;
+        }
+
+        if is_destructure_rest(item) {
+            let Some(rest) = items.get(item_idx + 1) else {
+                return Err(CljError::Lower(format!(
+                    "{ctx} vector destructuring `&` requires a following symbol"
+                )));
+            };
+            let name = sym_name(rest, ctx)?;
+            if name != "_" {
+                out.push((
+                    name,
+                    Expr::Call {
+                        name: "subvec".to_string(),
+                        args: vec![source.clone(), Expr::Int(value_idx as i64)],
+                    },
+                ));
+            }
+            rest_seen = true;
+            item_idx += 2;
+            continue;
+        }
+
+        if rest_seen {
+            return Err(CljError::Lower(format!(
+                "{ctx} vector destructuring only allows `:as` after `& rest`"
+            )));
+        }
+
         let value = Expr::Call {
             name: "nth".to_string(),
-            args: vec![source.clone(), Expr::Int(idx as i64)],
+            args: vec![source.clone(), Expr::Int(value_idx as i64)],
         };
         match item {
             EdnValue::Symbol(_) => {
                 let name = sym_name(item, ctx)?;
-                out.push((name, value));
+                if name != "_" {
+                    out.push((name, value));
+                }
             }
             EdnValue::Vector(_) => {
                 let temp = format!("\0kotoba_nested_destructure_{}", out.len());
@@ -994,8 +1048,18 @@ fn collect_vector_destructuring(
                 )))
             }
         }
+        item_idx += 1;
+        value_idx += 1;
     }
     Ok(())
+}
+
+fn is_destructure_rest(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Symbol(s) if s.namespace.is_none() && s.name == "&")
+}
+
+fn is_destructure_as(v: &EdnValue) -> bool {
+    matches!(v, EdnValue::Keyword(k) if k.namespace().is_none() && k.name() == "as")
 }
 
 fn lower_case(args: &[EdnValue]) -> Result<Expr, CljError> {

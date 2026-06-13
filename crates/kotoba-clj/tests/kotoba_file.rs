@@ -661,17 +661,17 @@ fn destructuring_bindings_shadow_referred_names() {
     fs::create_dir_all(dir.join("demo")).unwrap();
     fs::write(
         dir.join("demo/math.clj"),
-        "(ns demo.math)\n(defn x [n] (+ n 1000))\n(defn y [n] (+ n 1000))\n",
+        "(ns demo.math)\n(defn x [n] (+ n 1000))\n(defn rest [n] (+ n 1000))\n(defn whole [n] (+ n 1000))\n",
     )
     .unwrap();
     let main = dir.join("main.clj");
     fs::write(
         &main,
         r#"
-(ns demo.main (:require [demo.math :refer [x y]]))
+(ns demo.main (:require [demo.math :refer [x rest whole]]))
 (defn main [n]
-  (let [[x y] [20 22]]
-    (+ n x y)))
+  (let [[x & rest :as whole] [27 4 10]]
+    (+ n x (count rest) (last rest) (count whole))))
 "#,
     )
     .unwrap();

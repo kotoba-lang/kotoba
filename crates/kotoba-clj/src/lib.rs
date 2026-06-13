@@ -36,8 +36,9 @@
 //! - control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let`, `do`,
 //!   `loop`/`recur` (bounded iteration), threading macros `->`, `->>`,
 //!   `cond->`, `cond->>`, `some->`, `some->>`, and `as->`
-//! - binding forms: symbols and simple/nested vector destructuring in `defn`,
-//!   `let`, `if-let`, and `when-let`
+//! - binding forms: symbols and vector destructuring in `defn`, `let`,
+//!   `if-let`, and `when-let`, including nested vectors, `_` placeholders,
+//!   `& rest`, and `:as whole`
 //! - arithmetic: `+ - * / mod`
 //! - comparison: `= < > <= >=`
 //! - logic: `and or not` (short-circuit; return 0/1)
@@ -222,7 +223,7 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// `vec-nth` `vec-conj!` `vec-extend!` (the `add_messages` reducer), `map-make`
 /// `map-count` `map-get` `map-assoc!`, and `str-eq?`. It also exposes a small
 /// Clojure-core compatibility layer: `count`, `empty?`, `nth`, `first`, `last`,
-/// `conj!`, `get`, `assoc!`, and `contains-key?`.
+/// `subvec`, `rest`, `conj!`, `get`, `assoc!`, and `contains-key?`.
 pub const PRELUDE: &str = r#"
 ;; ---- vector: [len, cap, e0, e1, …] ----------------------------------------
 (defn vec-make [cap]
@@ -244,6 +245,14 @@ pub const PRELUDE: &str = r#"
       dst
       (do (vec-conj! dst (vec-nth src i))
           (recur (+ i 1))))))
+(defn subvec [v start]
+  (let [n (vec-count v)
+        out (vec-make (- n start))]
+    (loop [i start]
+      (if (>= i n)
+        out
+        (do (vec-conj! out (vec-nth v i))
+            (recur (+ i 1)))))))
 
 ;; ---- string equality by content -------------------------------------------
 (defn str-eq? [a b]
@@ -299,6 +308,7 @@ pub const PRELUDE: &str = r#"
 (defn nth [v i] (vec-nth v i))
 (defn first [v] (vec-nth v 0))
 (defn last [v] (vec-nth v (- (vec-count v) 1)))
+(defn rest [v] (subvec v 1))
 (defn conj! [v x] (vec-conj! v x))
 (defn get [m k] (map-get m k))
 (defn assoc! [m k v] (map-assoc! m k v))
