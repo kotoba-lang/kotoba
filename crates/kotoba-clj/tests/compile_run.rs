@@ -127,6 +127,187 @@ fn if_when_let_do() {
     // sequential let: second binding sees the first
     let l = "(defn l [x] (let [a (* x 2) b (+ a 1)] (do a b)))";
     assert_eq!(compile_and_run(l, "l", &[5]).unwrap(), 11);
+
+    let if_let = "(defn il [x] (if-let [v x] (+ v 2) 99))";
+    assert_eq!(compile_and_run(if_let, "il", &[40]).unwrap(), 42);
+    assert_eq!(compile_and_run(if_let, "il", &[0]).unwrap(), 99);
+
+    let when_let = "(defn wl [x] (when-let [v x] (+ v 2)))";
+    assert_eq!(compile_and_run(when_let, "wl", &[40]).unwrap(), 42);
+    assert_eq!(compile_and_run(when_let, "wl", &[0]).unwrap(), 0);
+
+    let c = "(defn c [x] (case x 0 99 1 10 (2 3) 42 5))";
+    assert_eq!(compile_and_run(c, "c", &[2]).unwrap(), 42);
+    assert_eq!(compile_and_run(c, "c", &[3]).unwrap(), 42);
+    assert_eq!(compile_and_run(c, "c", &[1]).unwrap(), 10);
+    assert_eq!(compile_and_run(c, "c", &[9]).unwrap(), 5);
+}
+
+#[test]
+fn nil_keyword_and_quote_literals() {
+    assert_eq!(compile_and_run("(defn n [] nil)", "n", &[]).unwrap(), 0);
+    assert_eq!(
+        compile_and_run("(defn k [] (str-len :demo/ok))", "k", &[]).unwrap(),
+        8
+    );
+    assert_eq!(
+        compile_and_run("(defn k [] (byte-at :demo/ok 0))", "k", &[]).unwrap(),
+        b':' as i64
+    );
+    assert_eq!(
+        compile_and_run("(defn q [] (str-len 'demo/ok))", "q", &[]).unwrap(),
+        7
+    );
+    assert_eq!(
+        compile_and_run("(defn q [] (str-len '(a b c)))", "q", &[]).unwrap(),
+        7
+    );
+    assert_eq!(
+        compile_and_run("(defn q [] (byte-at '[1 2] 0))", "q", &[]).unwrap(),
+        b'[' as i64
+    );
+    assert_eq!(
+        compile_and_run("(defn v [] (str-len #'demo/ok))", "v", &[]).unwrap(),
+        7
+    );
+    assert_eq!(
+        compile_and_run("(defn v [] (str-len (var demo/ok)))", "v", &[]).unwrap(),
+        7
+    );
+}
+
+#[test]
+fn accepts_common_clojure_declaration_forms() {
+    let src = r#"
+        (comment
+          (defn ignored [x] (missing x)))
+        (declare later)
+        (refer-clojure :exclude [max])
+        (in-ns 'demo.main)
+        (create-ns 'demo.extra)
+        (alias 'extra 'demo.extra)
+        (remove-ns 'demo.extra)
+        (import '[java.time Instant])
+        (gen-class)
+        (set! *warn-on-reflection* true)
+        (defrecord User [id name])
+        (deftype Box [value])
+        (defprotocol Renderable (render [this]))
+        (extend-type User Renderable (render [this] (:name this)))
+        (extend-protocol Renderable Box (render [this] "box"))
+        (defmulti describe :kind)
+        (defmethod describe :user [x] (:name x))
+        (defstruct legacy-user :id :name)
+        (create-struct :id :name)
+        (def offset "compile-time constant" 1)
+        (defonce bonus 1)
+        (defn later "Adds one." {:private true} [x] (inc x))
+        (defn- hidden [x] (+ x bonus))
+        (defn main {:export true} [x] (hidden (+ (later x) offset)))
+    "#;
+    assert_eq!(compile_and_run(src, "main", &[39]).unwrap(), 42);
+}
+
+#[test]
+fn accepts_top_level_do_wrapping_definitions() {
+    let src = r#"
+        (do
+          (def offset 2)
+          (defn helper [x] (+ x offset)))
+        (do
+          (defn main [x] (helper x)))
+    "#;
+    assert_eq!(compile_and_run(src, "main", &[40]).unwrap(), 42);
+}
+
+#[test]
+fn accepts_single_arity_list_defn_shape() {
+    let src = r#"
+        (defn wrapped
+          "Single arity written in Clojure's arity-list shape."
+          ([x] (+ x 2)))
+    "#;
+    assert_eq!(compile_and_run(src, "wrapped", &[40]).unwrap(), 42);
+}
+
+#[test]
+fn accepts_multi_arity_defn_for_source_calls() {
+    let src = r#"
+        (defn addish
+          ([x] (+ x 1))
+          ([x y] (+ x y)))
+        (defn main [x]
+          (+ (addish x) (addish x 1)))
+    "#;
+    assert_eq!(compile_and_run(src, "main", &[20]).unwrap(), 42);
+}
+
+#[test]
+fn accepts_defn_prepost_condition_maps() {
+    let src = r#"
+        (defn guarded [x]
+          {:pre [(pos? x)] :post [(pos? %)]}
+          (+ x 4))
+        (defn addish
+          ([x]
+           {:pre [(pos? x)]}
+           (+ x 1))
+          ([x y]
+           {:post [(pos? %)]}
+           (+ x y)))
+        (defn main [x]
+          (+ (guarded x) (addish x) (addish x 1)))
+    "#;
+    assert_eq!(compile_and_run(src, "main", &[12]).unwrap(), 42);
+}
+
+#[test]
+fn accepts_threading_macros() {
+    let src = r#"
+        (defn first-thread [x]
+          (-> x inc (+ 10) (* 2)))
+        (defn last-thread [x]
+          (->> x (+ 10) (* 2)))
+        (defn conditional-first-thread [x]
+          (cond-> x true (+ 10) (> x 0) (* 2) false (+ 1000)))
+        (defn conditional-last-thread [x]
+          (cond->> x true (- 100) false (+ 1000)))
+        (defn named-thread [x]
+          (as-> x v
+            (+ v 1)
+            (* v 2)))
+        (defn nil-aware-first-thread [x]
+          (some-> x inc (+ 10) (* 2)))
+        (defn nil-aware-last-thread [x]
+          (some->> x (+ 10) (* 2)))
+    "#;
+    assert_eq!(compile_and_run(src, "first-thread", &[10]).unwrap(), 42);
+    assert_eq!(compile_and_run(src, "last-thread", &[11]).unwrap(), 42);
+    assert_eq!(
+        compile_and_run(src, "conditional-first-thread", &[11]).unwrap(),
+        42
+    );
+    assert_eq!(
+        compile_and_run(src, "conditional-last-thread", &[58]).unwrap(),
+        42
+    );
+    assert_eq!(compile_and_run(src, "named-thread", &[20]).unwrap(), 42);
+    assert_eq!(
+        compile_and_run(src, "nil-aware-first-thread", &[10]).unwrap(),
+        42
+    );
+    assert_eq!(
+        compile_and_run(src, "nil-aware-first-thread", &[0]).unwrap(),
+        0
+    );
+    assert_eq!(
+        compile_and_run(src, "nil-aware-last-thread", &[11]).unwrap(),
+        42
+    );
+    assert_eq!(
+        compile_and_run(src, "nil-aware-last-thread", &[0]).unwrap(),
+        0
+    );
 }
 
 #[test]

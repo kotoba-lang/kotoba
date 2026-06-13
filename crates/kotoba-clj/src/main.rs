@@ -9,17 +9,25 @@ fn main() {
 
 fn real_main() -> Result<(), String> {
     let opts = Options::parse(std::env::args().skip(1).collect())?;
-    if opts.path.extension().is_none_or(|ext| ext != "kotoba") && !opts.allow_any_ext {
+    if !is_supported_source_ext(&opts.path) && !opts.allow_any_ext {
         return Err(format!(
-            "expected a .kotoba file (got {}). Use --allow-any-ext to run anyway.",
+            "expected a .kotoba/.clj/.cljc/.cljs file (got {}). Use --allow-any-ext to run anyway.",
             opts.path.display()
         ));
     }
 
     let wasm = if opts.prelude {
-        kotoba_clj::compile_file_with_prelude(&opts.path)
+        kotoba_clj::compile_file_with_prelude_reader_target_and_source_paths(
+            &opts.path,
+            opts.reader_target,
+            &opts.source_paths,
+        )
     } else {
-        kotoba_clj::compile_file(&opts.path)
+        kotoba_clj::compile_file_with_reader_target_and_source_paths(
+            &opts.path,
+            opts.reader_target,
+            &opts.source_paths,
+        )
     }
     .map_err(|e| e.to_string())?;
 
@@ -39,6 +47,8 @@ struct Options {
     args: Vec<i64>,
     prelude: bool,
     allow_any_ext: bool,
+    reader_target: kotoba_clj::ReaderTarget,
+    source_paths: Vec<PathBuf>,
     wasm_out: Option<PathBuf>,
 }
 
@@ -47,6 +57,8 @@ impl Options {
         let mut func = "main".to_string();
         let mut prelude = true;
         let mut allow_any_ext = false;
+        let mut reader_target = kotoba_clj::ReaderTarget::Kotoba;
+        let mut source_paths = Vec::new();
         let mut wasm_out = None;
         let mut positional = Vec::new();
         let mut i = 0;
@@ -62,6 +74,22 @@ impl Options {
                 }
                 "--no-prelude" => prelude = false,
                 "--allow-any-ext" => allow_any_ext = true,
+                "--reader-target" => {
+                    i += 1;
+                    let target = argv
+                        .get(i)
+                        .ok_or_else(|| "--reader-target requires kotoba|clj|cljs".to_string())?;
+                    reader_target = kotoba_clj::ReaderTarget::parse(target)
+                        .ok_or_else(|| format!("unsupported reader target: {target}"))?;
+                }
+                "-S" | "--source-path" => {
+                    i += 1;
+                    let path = argv
+                        .get(i)
+                        .cloned()
+                        .ok_or_else(|| "--source-path requires a directory".to_string())?;
+                    source_paths.push(PathBuf::from(path));
+                }
                 "--wasm-out" => {
                     i += 1;
                     let path = argv
@@ -101,16 +129,27 @@ impl Options {
             args,
             prelude,
             allow_any_ext,
+            reader_target,
+            source_paths,
             wasm_out,
         })
     }
 }
 
+fn is_supported_source_ext(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("kotoba" | "clj" | "cljc" | "cljs")
+    )
+}
+
 fn usage() -> String {
-    "usage: kotoba-clj [--func NAME|-f NAME] [--no-prelude] [--wasm-out OUT.wasm] [--allow-any-ext] FILE.kotoba [i64 args...]\n\
+    "usage: kotoba-clj [--func NAME|-f NAME] [--no-prelude] [--reader-target kotoba|clj|cljs] [--source-path DIR|-S DIR] [--wasm-out OUT.wasm] [--allow-any-ext] FILE.{kotoba,clj,cljc,cljs} [i64 args...]\n\
      examples:\n\
        kotoba-clj app.kotoba\n\
        kotoba-clj --func fact math.kotoba 10\n\
+       kotoba-clj -S src app.clj\n\
+       kotoba-clj --reader-target kotoba agent.cljc\n\
        chmod +x app.kotoba && ./app.kotoba"
         .to_string()
 }
@@ -129,6 +168,8 @@ mod tests {
                 args: vec![1, 2],
                 prelude: true,
                 allow_any_ext: false,
+                reader_target: kotoba_clj::ReaderTarget::Kotoba,
+                source_paths: vec![],
                 wasm_out: None,
             }
         );
@@ -142,6 +183,12 @@ mod tests {
                 "fact".into(),
                 "--no-prelude".into(),
                 "--allow-any-ext".into(),
+                "--reader-target".into(),
+                "cljs".into(),
+                "-S".into(),
+                "src".into(),
+                "--source-path".into(),
+                "vendor".into(),
                 "--wasm-out".into(),
                 "out.wasm".into(),
                 "math.clj".into(),
@@ -154,6 +201,8 @@ mod tests {
                 args: vec![5],
                 prelude: false,
                 allow_any_ext: true,
+                reader_target: kotoba_clj::ReaderTarget::Cljs,
+                source_paths: vec![PathBuf::from("src"), PathBuf::from("vendor")],
                 wasm_out: Some(PathBuf::from("out.wasm")),
             }
         );

@@ -76,7 +76,11 @@ fn ok_json(output_cbor: &[u8]) -> String {
     let map = value.as_map().expect("output is a CBOR map");
     assert_eq!(map.len(), 1, "exactly the ok entry");
     assert_eq!(map[0].0.as_text(), Some("ok"));
-    map[0].1.as_text().expect("ok holds a JSON string").to_string()
+    map[0]
+        .1
+        .as_text()
+        .expect("ok holds a JSON string")
+        .to_string()
 }
 
 // ---- echo semantics: prompt round-trips to response ---------------------------
@@ -102,7 +106,10 @@ fn empty_prompt_when_input_has_no_prompt_key() {
         (text("session_cid"), text("sess-2")),
     ]));
     let result = invoke(ctx);
-    assert_eq!(ok_json(&result.output_cbor), r#"{"prompt": "", "response": ""}"#);
+    assert_eq!(
+        ok_json(&result.output_cbor),
+        r#"{"prompt": "", "response": ""}"#
+    );
 }
 
 #[test]
@@ -110,7 +117,10 @@ fn prompt_falls_back_to_args_when_input_absent() {
     // _entry.py: input_state = args.get("input", args) — without an "input"
     // map the args dict itself is the input state.
     let ctx = cbor(&Value::Map(vec![
-        (text("args"), Value::Map(vec![(text("prompt"), text("direct"))])),
+        (
+            text("args"),
+            Value::Map(vec![(text("prompt"), text("direct"))]),
+        ),
         (text("session_cid"), text("sess-3")),
     ]));
     let result = invoke(ctx);
@@ -127,7 +137,11 @@ fn checkpointer_persists_state_to_lgraph_ckpt() {
     // checkpointer.py storage layout: graph "lgraph/ckpt" / subject thread_id /
     // predicate "state" / object CBOR {"Text": json.dumps(state)}.
     let result = invoke(invoke_ctx("hi", "sess-4", Some("thread-42")));
-    assert_eq!(result.assert_quads.len(), 1, "one checkpoint write per invoke");
+    assert_eq!(
+        result.assert_quads.len(),
+        1,
+        "one checkpoint write per invoke"
+    );
     let q = &result.assert_quads[0];
     assert_eq!(q.graph, "lgraph/ckpt");
     assert_eq!(q.subject, "thread-42");
@@ -138,7 +152,11 @@ fn checkpointer_persists_state_to_lgraph_ckpt() {
     )]));
     assert_eq!(q.object_cbor, expected_obj);
     // kqe.assert-quad charges gas, same as the Python actor's checkpoint write
-    assert!(result.gas_used >= 10, "gas charged for the assert, got {}", result.gas_used);
+    assert!(
+        result.gas_used >= 10,
+        "gas charged for the assert, got {}",
+        result.gas_used
+    );
 }
 
 #[test]

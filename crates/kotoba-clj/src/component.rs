@@ -8,12 +8,14 @@
 //!
 //! The source program must define `(defn run [input] …)`: an arity-1 function
 //! whose argument is the input bytes (as a string handle) and whose result is a
-//! string handle for the output bytes.
+//! string handle for the output bytes. Source text is normalized through the
+//! same Clojure reader compatibility layer as [`crate::compile_str`].
 
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::Resolve;
 
 use crate::codegen::{Entry, EntryAbi};
+use crate::compat::{self, ReaderTarget};
 use crate::CljError;
 
 /// The WIT world every kotoba-clj program component targets.
@@ -28,7 +30,17 @@ world program {
 /// Compile Clojure-subset source into a WASM **Component** exporting
 /// `run(list<u8>) -> list<u8>`. Requires a `(defn run [input] …)`.
 pub fn compile_component_str(src: &str) -> Result<Vec<u8>, CljError> {
-    let program = crate::ast::parse_program(src)?;
+    compile_component_str_with_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Compile source into a WASM **Component** after applying Clojure reader
+/// compatibility for `target`.
+pub fn compile_component_str_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    let src = compat::normalize_source(src, target)?;
+    let program = crate::ast::parse_program(&src)?;
     let core = crate::codegen::compile_core(
         &program,
         Some(Entry {
@@ -114,7 +126,18 @@ pub fn compile_and_run_component(src: &str, input: &[u8]) -> Result<Vec<u8>, Clj
 /// component that `kotoba-runtime` can load. It does not make a program that
 /// meaningfully reads `ctx`/`args`.
 pub fn compile_kais_component_str(src: &str, wit_dir: &str) -> Result<Vec<u8>, CljError> {
-    let program = crate::ast::parse_program(src)?;
+    compile_kais_component_str_with_reader_target(src, wit_dir, ReaderTarget::Kotoba)
+}
+
+/// Compile source into a `kotoba-node` Component after applying Clojure reader
+/// compatibility for `target`.
+pub fn compile_kais_component_str_with_reader_target(
+    src: &str,
+    wit_dir: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    let src = compat::normalize_source(src, target)?;
+    let program = crate::ast::parse_program(&src)?;
     let core = crate::codegen::compile_core(
         &program,
         Some(Entry {

@@ -5,8 +5,11 @@
 //! machinery the future kotoba:kais `run(ctx-cbor: list<u8>)` export reuses.
 #![cfg(feature = "component")]
 
-use kotoba_clj::component::{compile_and_run_component, compile_component_str};
+use kotoba_clj::component::{
+    compile_and_run_component, compile_component_str, compile_component_str_with_reader_target,
+};
 use kotoba_clj::CljError;
+use kotoba_clj::ReaderTarget;
 
 #[test]
 fn component_is_real_wasm() {
@@ -39,6 +42,42 @@ fn returns_data_segment_literal() {
     // Output handle points into the data segment (not the input buffer) — proves
     // the lift reads arbitrary guest memory, not just the host-lowered input.
     let out = compile_and_run_component(r#"(defn run [input] "ok")"#, b"ignored").unwrap();
+    assert_eq!(out, b"ok");
+}
+
+#[test]
+fn component_compile_applies_clojure_reader_compat() {
+    let src = r#"
+        #_ (defn ignored [input] "bad")
+        ^:private
+        (defn run "entry" [input]
+          (if-let [x (str-len '(a b c))]
+            (-> input)
+            "bad"))
+    "#;
+    let out = compile_and_run_component(src, b"ok").unwrap();
+    assert_eq!(out, b"ok");
+}
+
+#[test]
+fn component_compile_honors_reader_target() {
+    let src = r#"
+        (defn run [input]
+          #?(:cljs "cljs" :clj "clj" :default "default"))
+    "#;
+    let component = compile_component_str_with_reader_target(src, ReaderTarget::Cljs).unwrap();
+    let out = kotoba_clj::component::run_component(&component, b"ignored").unwrap();
+    assert_eq!(out, b"cljs");
+}
+
+#[test]
+fn component_entry_can_be_multi_arity_defn() {
+    let src = r#"
+        (defn run
+          ([input] input)
+          ([input suffix] suffix))
+    "#;
+    let out = compile_and_run_component(src, b"ok").unwrap();
     assert_eq!(out, b"ok");
 }
 
@@ -90,5 +129,23 @@ fn kais_entry_can_echo_raw_ctx() {
     // The raw ctx-cbor bytes are handed to the program as its input handle, so
     // an echo program is well-typed against the result<list<u8>,string> ABI.
     let component = compile_kais_component_str("(defn run [ctx] ctx)", KAIS_WIT_DIR).unwrap();
+    assert_loads(&component).unwrap();
+}
+
+#[test]
+fn kais_component_compile_applies_clojure_reader_compat() {
+    let component = compile_kais_component_str(
+        r#"
+        (do
+          #_ (defn run [ctx] "bad")
+          ^String
+          (defn run "entry" [ctx]
+            (if-let [quoted (str-len '(ctx payload))]
+              (-> ctx)
+              "bad")))
+        "#,
+        KAIS_WIT_DIR,
+    )
+    .unwrap();
     assert_loads(&component).unwrap();
 }
