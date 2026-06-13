@@ -4524,7 +4524,8 @@ async fn datomic_q_rejects_cacao_from_non_owner_on_private_graph() {
         ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes())
     };
     assert_ne!(victim_owner, cacao_signer_did(), "fixture sanity");
-    s.register_private_graph_owned_by(&graph, &victim_owner).await;
+    s.register_private_graph_owned_by(&graph, &victim_owner)
+        .await;
 
     // Seed the victim's private graph (operator-gated write path).
     let (status, tx_body) = s
