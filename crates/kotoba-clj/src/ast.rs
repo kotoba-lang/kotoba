@@ -75,6 +75,8 @@ pub enum Builtin {
     Some,
     Pos,
     Neg,
+    Even,
+    Odd,
     And,
     Or,
     Not,
@@ -232,6 +234,8 @@ impl Builtin {
             "some?" => Builtin::Some,
             "pos?" => Builtin::Pos,
             "neg?" => Builtin::Neg,
+            "even?" => Builtin::Even,
+            "odd?" => Builtin::Odd,
             "and" => Builtin::And,
             "or" => Builtin::Or,
             "not" => Builtin::Not,
@@ -1770,6 +1774,8 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         | Builtin::Some
         | Builtin::Pos
         | Builtin::Neg
+        | Builtin::Even
+        | Builtin::Odd
         | Builtin::StrLen => n == 1,
         Builtin::BytesAlloc | Builtin::BytesLen | Builtin::BytesFinish => n == 1,
         Builtin::Alloc | Builtin::Load64 | Builtin::Load32 => n == 1,

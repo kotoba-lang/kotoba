@@ -859,6 +859,23 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
             cg.emit(Instruction::I64ExtendI32U);
             Ok(())
         }
+        Builtin::Even => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(1));
+            cg.emit(Instruction::I64And);
+            cg.emit(Instruction::I64Eqz);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
+        Builtin::Odd => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(1));
+            cg.emit(Instruction::I64And);
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64Ne);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
 
         Builtin::Not => {
             compile_expr(cg, &args[0])?;
@@ -1573,6 +1590,8 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Some => b(v[0] != 0),
         Builtin::Pos => b(v[0] > 0),
         Builtin::Neg => b(v[0] < 0),
+        Builtin::Even => b(v[0] & 1 == 0),
+        Builtin::Odd => b(v[0] & 1 != 0),
         Builtin::Not => b(v[0] == 0),
         Builtin::And => b(v.iter().all(|x| *x != 0)),
         Builtin::Or => b(v.iter().any(|x| *x != 0)),
