@@ -227,7 +227,7 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// `map-count` `map-get` `map-assoc!`, and `str-eq?`. It also exposes a small
 /// Clojure-core compatibility layer: `count`, `empty?`, `seq`, `not-empty`,
 /// `nth`, `first`, `second`, `last`, `peek`, `subvec`, `rest`, `conj!`, `get`,
-/// `assoc!`, and `contains-key?`. The
+/// `assoc!`, `contains-key?`, `keys`, and `vals`. The
 /// lowering phase also accepts vector and map destructuring in `defn`, `let`,
 /// `loop`, `if-let`, and `when-let`; map destructuring supports `{local :key}`,
 /// `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`.
@@ -328,6 +328,22 @@ pub const PRELUDE: &str = r#"
   ([m k default] (if (contains-key? m k) (map-get m k) default)))
 (defn assoc! [m k v] (map-assoc! m k v))
 (defn contains-key? [m k] (>= (map-find m k) 0))
+(defn keys [m]
+  (let [n (map-count m)
+        out (vec-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (do (vec-conj! out (map-key-at m i))
+            (recur (+ i 1)))))))
+(defn vals [m]
+  (let [n (map-count m)
+        out (vec-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (do (vec-conj! out (map-val-at m i))
+            (recur (+ i 1)))))))
 "#;
 
 /// An **in-guest CBOR decoder** (subset) written in the kotoba-clj language,
