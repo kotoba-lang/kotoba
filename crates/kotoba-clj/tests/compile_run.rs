@@ -433,6 +433,10 @@ fn strings_are_interned_and_usable_in_logic() {
 
 #[test]
 fn errors_are_reported() {
+    assert!(
+        compile_str("(defn f [x] (comment (g x) y) (+ x 1))").is_ok(),
+        "expression comment bodies must not be lowered or resolved"
+    );
     assert!(matches!(
         compile_str("(defn f [x] (g x))"),
         Err(CljError::Codegen(_))
