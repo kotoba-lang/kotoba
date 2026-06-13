@@ -225,8 +225,9 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// Prepend it with [`compile_str_with_prelude`]. Names: `vec-make` `vec-count`
 /// `vec-nth` `vec-conj!` `vec-extend!` (the `add_messages` reducer), `map-make`
 /// `map-count` `map-get` `map-assoc!`, and `str-eq?`. It also exposes a small
-/// Clojure-core compatibility layer: `count`, `empty?`, `nth`, `first`, `last`,
-/// `subvec`, `rest`, `conj!`, `get`, `assoc!`, and `contains-key?`. The
+/// Clojure-core compatibility layer: `count`, `empty?`, `seq`, `not-empty`,
+/// `nth`, `first`, `last`, `subvec`, `rest`, `conj!`, `get`, `assoc!`, and
+/// `contains-key?`. The
 /// lowering phase also accepts vector and map destructuring in `defn`, `let`,
 /// `loop`, `if-let`, and `when-let`; map destructuring supports `{local :key}`,
 /// `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`.
@@ -311,12 +312,16 @@ pub const PRELUDE: &str = r#"
 ;; offset 0, while nth/conj! are vector-oriented and get/assoc! are map-oriented.
 (defn count [x] (load64 x))
 (defn empty? [x] (= (count x) 0))
+(defn seq [x] (if (empty? x) 0 x))
+(defn not-empty [x] (if (empty? x) 0 x))
 (defn nth [v i] (vec-nth v i))
 (defn first [v] (vec-nth v 0))
 (defn last [v] (vec-nth v (- (vec-count v) 1)))
 (defn rest [v] (subvec v 1))
 (defn conj! [v x] (vec-conj! v x))
-(defn get [m k] (map-get m k))
+(defn get
+  ([m k] (map-get m k))
+  ([m k default] (if (contains-key? m k) (map-get m k) default)))
 (defn assoc! [m k v] (map-assoc! m k v))
 (defn contains-key? [m k] (>= (map-find m k) 0))
 "#;
