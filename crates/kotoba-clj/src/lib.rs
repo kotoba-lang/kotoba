@@ -43,6 +43,7 @@
 //!   `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`
 //! - arithmetic: `+ - * / mod`
 //! - comparison: `= < > <= >=`
+//! - predicates: `nil? some? zero? pos? neg?`
 //! - logic: `and or not` (short-circuit; return 0/1)
 //! - strings: `"…"` literals, `(str-len s)`, `(byte-at s i)`
 //! - Clojure literals: `nil` lowers to `0`; keyword literals and quoted forms

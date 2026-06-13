@@ -70,6 +70,7 @@ pub enum Builtin {
     Le,
     Ge,
     Zero,
+    Some,
     Pos,
     Neg,
     And,
@@ -223,7 +224,8 @@ impl Builtin {
             ">" => Builtin::Gt,
             "<=" => Builtin::Le,
             ">=" => Builtin::Ge,
-            "zero?" => Builtin::Zero,
+            "zero?" | "nil?" => Builtin::Zero,
+            "some?" => Builtin::Some,
             "pos?" => Builtin::Pos,
             "neg?" => Builtin::Neg,
             "and" => Builtin::And,
@@ -1761,6 +1763,7 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         | Builtin::Dec
         | Builtin::Abs
         | Builtin::Zero
+        | Builtin::Some
         | Builtin::Pos
         | Builtin::Neg
         | Builtin::StrLen => n == 1,
