@@ -149,7 +149,7 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
   `{:keys [...]}`, `{:strs [...]}`, `:or` defaults, and `:as whole`
 - arithmetic: `+ - * / quot mod rem inc dec abs` · comparison:
   `= not= < > <= >=` (n-ary where Clojure is n-ary) · predicates:
-  `zero? pos? neg?` · logic: `and or not`
+  `nil? some? zero? pos? neg?` · logic: `and or not`
 - strings: `"…"` literals, `(str-len s)`, `(byte-at s i)`
 - Clojure literals: `nil` lowers to `0`; keyword literals and quoted forms
   (`'foo`, `'(a b)`, `(quote {:k 1})`) lower to canonical EDN string handles;

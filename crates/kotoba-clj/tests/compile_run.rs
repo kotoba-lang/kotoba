@@ -99,6 +99,8 @@ fn clojure_core_qualified_numeric_builtins_work() {
              (clojure.core/quot 9 2)))
         (defn predicates []
           (and (clojure.core/zero? 0)
+               (clojure.core/nil? nil)
+               (clojure.core/some? 1)
                (clojure.core/pos? 4)
                (clojure.core/neg? -1)
                (clojure.core/not= 1 2 3)))

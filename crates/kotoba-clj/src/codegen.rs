@@ -836,6 +836,13 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
             cg.emit(Instruction::I64ExtendI32U);
             Ok(())
         }
+        Builtin::Some => {
+            compile_expr(cg, &args[0])?;
+            cg.emit(Instruction::I64Const(0));
+            cg.emit(Instruction::I64Ne);
+            cg.emit(Instruction::I64ExtendI32U);
+            Ok(())
+        }
         Builtin::Pos => {
             compile_expr(cg, &args[0])?;
             cg.emit(Instruction::I64Const(0));
@@ -1528,6 +1535,7 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Le => b(v.windows(2).all(|pair| pair[0] <= pair[1])),
         Builtin::Ge => b(v.windows(2).all(|pair| pair[0] >= pair[1])),
         Builtin::Zero => b(v[0] == 0),
+        Builtin::Some => b(v[0] != 0),
         Builtin::Pos => b(v[0] > 0),
         Builtin::Neg => b(v[0] < 0),
         Builtin::Not => b(v[0] == 0),
