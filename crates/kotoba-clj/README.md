@@ -164,8 +164,8 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
 - raw memory: `(alloc n)`, `(load64 a)`, `(store64! a v)`, `(load32 a)`, `(store32! a v)`
 - prelude aliases for common Clojure-style container calls: `count`, `empty?`,
   `seq`, `not-empty`, `nth` (2- or 3-arity), `first`, `second`, `last`,
-  `peek`, `subvec`, `rest`, `conj!`, `get` (2- or 3-arity), `assoc!`,
-  `contains-key?`, `keys`, `vals`
+  `peek`, `subvec`, `rest`, `conj`, `conj!`, `get` (2- or 3-arity),
+  `assoc`, `assoc!`, `contains?`, `contains-key?`, `keys`, `vals`
 - `clojure.core/`-qualified builtin calls are accepted for the supported core
   numeric/comparison/logical operations.
 - host calls: `(has-capability? resource ability)` → `auth.has-capability`;
