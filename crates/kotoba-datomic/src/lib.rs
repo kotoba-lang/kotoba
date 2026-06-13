@@ -260,12 +260,7 @@ impl Connection {
         datoms.push(tx_instant_datom(tx_placeholder.clone(), tx_instant.clone()));
         let schema = Schema::from_datoms(&db_before.datoms);
         datoms = enforce_schema(datoms, tx_placeholder.clone(), &db_before, &schema)?;
-        let tx_cid = tx_cid_for_datoms(
-            &datoms,
-            &tx_placeholder,
-            &tx_instant,
-            db_before.basis_t.as_ref(),
-        );
+        let tx_cid = tx_cid_for_datoms(&datoms, &tx_placeholder, db_before.basis_t.as_ref());
         rewrite_tx_placeholder(&mut datoms, &tx_placeholder, &tx_cid);
         rewrite_tempid_placeholder(&mut tempids, &tx_placeholder, &tx_cid);
 
@@ -1275,12 +1270,12 @@ fn tx_placeholder_cid() -> KotobaCid {
 fn tx_cid_for_datoms(
     datoms: &[Datom],
     tx_placeholder: &KotobaCid,
-    tx_instant: &str,
     prev: Option<&KotobaCid>,
 ) -> KotobaCid {
     let mut seed = b"kotoba-tx:v2\n".to_vec();
     let mut datom_cids = datoms
         .iter()
+        .filter(|datom| datom.a != DB_TX_INSTANT)
         .map(|datom| datom_content_cid(datom, tx_placeholder).to_multibase())
         .collect::<Vec<_>>();
     datom_cids.sort();
@@ -1288,8 +1283,6 @@ fn tx_cid_for_datoms(
         seed.extend_from_slice(cid.as_bytes());
         seed.push(b'\n');
     }
-    seed.extend_from_slice(tx_instant.as_bytes());
-    seed.push(b'\n');
     if let Some(prev) = prev {
         seed.extend_from_slice(&prev.0);
     }
@@ -7347,7 +7340,7 @@ mod tests {
     }
 
     #[test]
-    fn tx_cid_is_derived_from_sorted_datom_content_and_prev_tx() {
+    fn tx_cid_is_derived_from_sorted_datom_content_and_prev_tx_not_wall_clock() {
         let placeholder = tx_placeholder_cid();
         let alice = cid(b"alice");
         let d1 = Datom::assert(
@@ -7362,16 +7355,16 @@ mod tests {
             EdnValue::String("Alice".into()),
             placeholder.clone(),
         );
-        let instant = "2026-05-29T00:00:00Z";
+        let instant1 = tx_instant_datom(placeholder.clone(), "2026-05-29T00:00:00Z".into());
+        let instant2 = tx_instant_datom(placeholder.clone(), "2026-05-30T00:00:00Z".into());
         let prev = cid(b"prev-tx");
 
         let forward = tx_cid_for_datoms(
-            &[d1.clone(), d2.clone()],
+            &[d1.clone(), d2.clone(), instant1],
             &placeholder,
-            instant,
             Some(&prev),
         );
-        let reversed = tx_cid_for_datoms(&[d2, d1], &placeholder, instant, Some(&prev));
+        let reversed = tx_cid_for_datoms(&[instant2, d2, d1], &placeholder, Some(&prev));
         let different_prev = tx_cid_for_datoms(
             &[Datom::assert(
                 placeholder.clone(),
@@ -7380,7 +7373,6 @@ mod tests {
                 placeholder.clone(),
             )],
             &placeholder,
-            instant,
             Some(&cid(b"other-prev")),
         );
 
