@@ -142,8 +142,9 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
 - control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let` (sequential),
   `do`, `loop`/`recur` (bounded), threading macros `->`, `->>`, `cond->`,
   `cond->>`, `some->`, `some->>`, and `as->`
-- binding forms: symbols and simple/nested vector destructuring in `defn`,
-  `let`, `if-let`, and `when-let`
+- binding forms: symbols and vector destructuring in `defn`, `let`, `if-let`,
+  and `when-let`, including nested vectors, `_` placeholders, `& rest`, and
+  `:as whole`
 - arithmetic: `+ - * / quot mod rem inc dec abs` · comparison:
   `= not= < > <= >=` (n-ary where Clojure is n-ary) · predicates:
   `zero? pos? neg?` · logic: `and or not`
@@ -160,7 +161,8 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
   `(bytes-finish buf)` — mutable buffer in linear memory; `bytes-finish` → string handle
 - raw memory: `(alloc n)`, `(load64 a)`, `(store64! a v)`, `(load32 a)`, `(store32! a v)`
 - prelude aliases for common Clojure-style container calls: `count`, `empty?`,
-  `nth`, `first`, `last`, `conj!`, `get`, `assoc!`, `contains-key?`
+  `nth`, `first`, `last`, `subvec`, `rest`, `conj!`, `get`, `assoc!`,
+  `contains-key?`
 - `clojure.core/`-qualified builtin calls are accepted for the supported core
   numeric/comparison/logical operations.
 - host calls: `(has-capability? resource ability)` → `auth.has-capability`;

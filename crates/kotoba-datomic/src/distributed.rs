@@ -6300,8 +6300,8 @@ mod tests {
     /// ADR-2605302130 safety contract: the value the server caches as the resident
     /// `db_before` — `current_datoms(db_after)` keyed by the new head — MUST equal
     /// the cold path `db_from_head(head)`: same net-live datom set AND same
-    /// `basis_t`. Both are derived from the SAME commit so this is timestamp-
-    /// independent (the wall-clock `:db/txInstant` is baked identically into both).
+    /// `basis_t`. Both are derived from the SAME commit; wall-clock
+    /// `:db/txInstant` is metadata and is intentionally excluded from tx identity.
     /// `tx_cid` depends only on the new tx datoms + `db_before.basis_t`, and
     /// tempid/upsert/schema resolution reads `db_before.datoms`, so an equal
     /// `db_before` yields a byte-identical commit — no DAG fork. tx2 retracts a

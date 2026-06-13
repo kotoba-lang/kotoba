@@ -103,6 +103,41 @@ fn vector_destructuring_in_if_and_when_let() {
 }
 
 #[test]
+fn vector_destructuring_supports_rest_as_and_placeholders() {
+    let src = r#"
+        (defn consume [[a _ & more :as whole]]
+          (+ a (count more) (first more) (last more) (count whole)))
+        (defn t [_]
+          (let [[x _ & xs :as all] [5 99 6 7]]
+            (+ (consume [10 999 20 30]) x (count xs) (last xs) (count all))))
+    "#;
+    let wasm = compile_str_with_prelude(src).expect("compile");
+    let v = run(&wasm, "t", &[0]).expect("run");
+    assert_eq!(v, 84);
+}
+
+#[test]
+fn vector_destructuring_rest_works_in_if_and_when_let() {
+    let v = eval(
+        "(+ (if-let [[a & xs] [10 20 30]] (+ a (count xs) (last xs)) 0)
+            (when-let [[_ & ys :as all] [1 2 3 4]] (+ (count ys) (count all) (first ys))))",
+    );
+    assert_eq!(v, 51);
+}
+
+#[test]
+fn subvec_and_rest_return_independent_vector_handles() {
+    let v = eval(
+        "(let [v [10 20 30 40]
+               tail (rest v)
+               suffix (subvec v 2)]
+           (conj! tail 50)
+           (+ (count v) (count tail) (count suffix) (last tail) (first suffix)))",
+    );
+    assert_eq!(v, 90);
+}
+
+#[test]
 fn add_messages_extend_reducer() {
     // vec-extend! is the add_messages reducer: a=[1,2], extend by b=[3,4,5]
     // → a=[1,2,3,4,5]; assert count + a[4] = 5 + 5 = 10
