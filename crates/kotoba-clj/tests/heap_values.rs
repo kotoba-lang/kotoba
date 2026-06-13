@@ -75,6 +75,23 @@ fn clojure_core_value_function_aliases() {
 }
 
 #[test]
+fn clojure_core_container_constructor_aliases() {
+    let v = eval(
+        "(let [v (vector 10 20 30 40)
+               m (hash-map \"a\" 5 \"b\" 7 \"c\" 11)
+               a (array-map \"x\" 13 \"y\" 17)]
+           (+ (count (vector))
+              (count v)
+              (nth v 2)
+              (get m \"b\")
+              (count m)
+              (get a \"y\")
+              (count a)))",
+    );
+    assert_eq!(v, 63);
+}
+
+#[test]
 fn vector_literals_lower_to_prelude_vectors() {
     let v = eval("(let [v [11 22 33]] (+ (count v) (first v) (nth v 1) (last v)))");
     assert_eq!(v, 69);
