@@ -578,7 +578,26 @@ pub fn query_map(query: &EdnValue) -> Result<BTreeMap<EdnValue, EdnValue>> {
                 }
                 values[0].clone()
             }
-            "where" | "in" | "with" | "keys" | "strs" | "syms" | "order-by" => {
+            "where" => {
+                if values.len() == 1 {
+                    if let Some(items) = values[0].as_seq() {
+                        // Unwrap only when the inner elements are themselves sequences
+                        // (map form or extra-wrapped flat form: {:where [[c1][c2]]}).
+                        // If the first element is not a sequence, this IS a single
+                        // clause vector in flat form (e.g. [?e :attr :val]) — keep it.
+                        if items.first().map(|e| e.as_seq().is_some()).unwrap_or(false) {
+                            EdnValue::Vector(items.to_vec())
+                        } else {
+                            EdnValue::Vector(values.to_vec())
+                        }
+                    } else {
+                        EdnValue::Vector(values.to_vec())
+                    }
+                } else {
+                    EdnValue::Vector(values.to_vec())
+                }
+            }
+            "in" | "with" | "keys" | "strs" | "syms" | "order-by" => {
                 if values.len() == 1 {
                     if let Some(items) = values[0].as_seq() {
                         EdnValue::Vector(items.to_vec())

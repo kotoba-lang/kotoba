@@ -1194,6 +1194,31 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", xrpc::NSID_DATOMIC_ENTID),
             post(xrpc::datomic_entid),
         )
+        // ── ai.gftd.apps.kotobase.* aliases (canonical public NSIDs) ─────────
+        // Same handlers; the CF Worker at kotobase.net also uses these NSIDs.
+        // Registering them here means local dev and production share one namespace.
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.transact",  post(xrpc::datomic_transact))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.q",         post(xrpc::datomic_q).layer(DefaultBodyLimit::max(1024 * 1024)))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.pull",      post(xrpc::datomic_pull))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.pullMany",  post(xrpc::datomic_pull_many))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.datoms",    post(xrpc::datomic_datoms))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.seekDatoms",post(xrpc::datomic_seek_datoms))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.indexRange",post(xrpc::datomic_index_range))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.indexPull", post(xrpc::datomic_index_pull))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.entity",    post(xrpc::datomic_entity))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.ident",     post(xrpc::datomic_ident))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.entid",     post(xrpc::datomic_entid))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.asOf",      post(xrpc::datomic_as_of))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.since",     post(xrpc::datomic_since))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.sync",      post(xrpc::datomic_sync))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.history",   post(xrpc::datomic_history))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.tx",        post(xrpc::datomic_tx))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.txRange",   post(xrpc::datomic_tx_range))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.log",       post(xrpc::datomic_log))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.basisT",    post(xrpc::datomic_basis_t))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.dbStats",   post(xrpc::datomic_db_stats))
+        .route("/xrpc/ai.gftd.apps.kotobase.datomic.with",      post(xrpc::datomic_with))
+        .route("/xrpc/ai.gftd.apps.kotobase.graph.query",       post(xrpc::graph_query))
         .route(
             &format!("/xrpc/{}", xrpc::NSID_VC_ISSUE),
             post(xrpc::vc_issue),
@@ -1284,6 +1309,15 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         )
         .route(
             &format!("/xrpc/{}", kg::NSID_KG_INGEST_BATCH),
+            post(kg::kg_ingest_batch),
+        )
+        // ── ai.gftd.apps.kotobase.kg.* aliases (canonical public NSIDs) ──────
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_INGEST_ALIAS),
+            post(kg::kg_ingest),
+        )
+        .route(
+            &format!("/xrpc/{}", kg::NSID_KG_INGEST_BATCH_ALIAS),
             post(kg::kg_ingest_batch),
         )
         .route(

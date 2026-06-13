@@ -1,5 +1,40 @@
 //! XRPC endpoint declarations and handlers for Kotoba
-//! NSIDs follow com.etzhayyim.apps.kotoba.* namespace
+//! NSIDs follow com.etzhayyim.apps.kotoba.* namespace.
+//!
+//! The canonical public NSID prefix is `ai.gftd.apps.kotobase.*` (the surface
+//! exposed by kotobase.net). The pod registers BOTH the legacy
+//! `com.etzhayyim.apps.kotoba.*` paths AND the `ai.gftd.apps.kotobase.*` aliases
+//! so that local dev and the production CF Worker use the same NSIDs without
+//! needing a translation layer. Mapping follows net-kotobase `toBackendNsid`:
+//!   ai.gftd.apps.kotobase.datomic.* → com.etzhayyim.apps.kotoba.datomic.*
+//!   ai.gftd.apps.kotobase.graph.*   → com.etzhayyim.apps.kotoba.graph.*
+
+/// Public kotobase NSID aliases — same handlers as com.etzhayyim.apps.kotoba.*
+pub mod kotobase {
+    pub const DATOMIC_TRANSACT:   &str = "ai.gftd.apps.kotobase.datomic.transact";
+    pub const DATOMIC_Q:          &str = "ai.gftd.apps.kotobase.datomic.q";
+    pub const DATOMIC_PULL:       &str = "ai.gftd.apps.kotobase.datomic.pull";
+    pub const DATOMIC_PULL_MANY:  &str = "ai.gftd.apps.kotobase.datomic.pullMany";
+    pub const DATOMIC_DATOMS:     &str = "ai.gftd.apps.kotobase.datomic.datoms";
+    pub const DATOMIC_SEEK_DATOMS:&str = "ai.gftd.apps.kotobase.datomic.seekDatoms";
+    pub const DATOMIC_INDEX_RANGE:&str = "ai.gftd.apps.kotobase.datomic.indexRange";
+    pub const DATOMIC_INDEX_PULL: &str = "ai.gftd.apps.kotobase.datomic.indexPull";
+    pub const DATOMIC_ENTITY:     &str = "ai.gftd.apps.kotobase.datomic.entity";
+    pub const DATOMIC_IDENT:      &str = "ai.gftd.apps.kotobase.datomic.ident";
+    pub const DATOMIC_ENTID:      &str = "ai.gftd.apps.kotobase.datomic.entid";
+    pub const DATOMIC_AS_OF:      &str = "ai.gftd.apps.kotobase.datomic.asOf";
+    pub const DATOMIC_SINCE:      &str = "ai.gftd.apps.kotobase.datomic.since";
+    pub const DATOMIC_SYNC:       &str = "ai.gftd.apps.kotobase.datomic.sync";
+    pub const DATOMIC_HISTORY:    &str = "ai.gftd.apps.kotobase.datomic.history";
+    pub const DATOMIC_TX:         &str = "ai.gftd.apps.kotobase.datomic.tx";
+    pub const DATOMIC_TX_RANGE:   &str = "ai.gftd.apps.kotobase.datomic.txRange";
+    pub const DATOMIC_LOG:        &str = "ai.gftd.apps.kotobase.datomic.log";
+    pub const DATOMIC_BASIS_T:    &str = "ai.gftd.apps.kotobase.datomic.basisT";
+    pub const DATOMIC_DB_STATS:   &str = "ai.gftd.apps.kotobase.datomic.dbStats";
+    pub const DATOMIC_WITH:       &str = "ai.gftd.apps.kotobase.datomic.with";
+    pub const GRAPH_QUERY:        &str = "ai.gftd.apps.kotobase.graph.query";
+    pub const GRAPH_SPARQL:       &str = "ai.gftd.apps.kotobase.graph.sparql";
+}
 
 pub const NSID_DATOM_CREATE: &str = "com.etzhayyim.apps.kotoba.datom.create";
 pub const NSID_QUAD_CREATE: &str = "com.etzhayyim.apps.kotoba.quad.create";
