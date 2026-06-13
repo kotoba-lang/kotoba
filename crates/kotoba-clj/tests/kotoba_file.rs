@@ -245,6 +245,37 @@ fn cljc_reader_conditionals_select_kotoba_then_clj_fallback() {
 }
 
 #[test]
+fn binary_accepts_vector_and_map_literals_in_file() {
+    let path = temp_path("literals.clj");
+    fs::write(
+        &path,
+        r#"
+(ns demo.literals)
+(defn main [x]
+  (let [v [10 20 30]
+        m {:offset x :values v}]
+    (+ (get m :offset) (count (get m :values)) (last v))))
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kotoba-clj"))
+        .arg(&path)
+        .arg("9")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn reader_target_can_select_cljs_branch() {
     let path = temp_path("target.cljs");
     fs::write(
@@ -611,6 +642,43 @@ fn require_refer_all_exclude_preserves_local_name() {
     let output = Command::new(env!("CARGO_BIN_EXE_kotoba-clj"))
         .arg(&main)
         .arg("38")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn destructuring_bindings_shadow_referred_names() {
+    let dir = temp_dir("destructuring-shadow");
+    fs::create_dir_all(dir.join("demo")).unwrap();
+    fs::write(
+        dir.join("demo/math.clj"),
+        "(ns demo.math)\n(defn x [n] (+ n 1000))\n(defn y [n] (+ n 1000))\n",
+    )
+    .unwrap();
+    let main = dir.join("main.clj");
+    fs::write(
+        &main,
+        r#"
+(ns demo.main (:require [demo.math :refer [x y]]))
+(defn main [n]
+  (let [[x y] [20 22]]
+    (+ n x y)))
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kotoba-clj"))
+        .arg(&main)
+        .arg("0")
         .output()
         .unwrap();
 

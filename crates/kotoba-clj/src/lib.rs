@@ -36,13 +36,17 @@
 //! - control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let`, `do`,
 //!   `loop`/`recur` (bounded iteration), threading macros `->`, `->>`,
 //!   `cond->`, `cond->>`, `some->`, `some->>`, and `as->`
+//! - binding forms: symbols and simple/nested vector destructuring in `defn`,
+//!   `let`, `if-let`, and `when-let`
 //! - arithmetic: `+ - * / mod`
 //! - comparison: `= < > <= >=`
 //! - logic: `and or not` (short-circuit; return 0/1)
 //! - strings: `"…"` literals, `(str-len s)`, `(byte-at s i)`
 //! - Clojure literals: `nil` lowers to `0`; keyword literals and quoted forms
 //!   lower to canonical EDN string handles; var quote (`#'foo`, `(var foo)`)
-//!   lowers to the referenced symbol name handle
+//!   lowers to the referenced symbol name handle; vector literals (`[1 2]`) and
+//!   map literals (`{:k v}`) lower to the [`PRELUDE`] container handles when the
+//!   prelude is enabled
 //! - `defn` pre/post condition maps (`{:pre […] :post […]}`) are accepted for
 //!   source compatibility but not asserted
 //! - Clojure reader metadata (`^:private`, `^String`, `^long`) is stripped before

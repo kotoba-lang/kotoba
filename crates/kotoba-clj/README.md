@@ -142,13 +142,17 @@ non-zero); a **string** is a packed `(offset << 32) | len` handle into memory.
 - control: `if`, `when`, `if-let`, `when-let`, `cond`, `case`, `let` (sequential),
   `do`, `loop`/`recur` (bounded), threading macros `->`, `->>`, `cond->`,
   `cond->>`, `some->`, `some->>`, and `as->`
+- binding forms: symbols and simple/nested vector destructuring in `defn`,
+  `let`, `if-let`, and `when-let`
 - arithmetic: `+ - * / quot mod rem inc dec abs` · comparison:
   `= not= < > <= >=` (n-ary where Clojure is n-ary) · predicates:
   `zero? pos? neg?` · logic: `and or not`
 - strings: `"…"` literals, `(str-len s)`, `(byte-at s i)`
 - Clojure literals: `nil` lowers to `0`; keyword literals and quoted forms
   (`'foo`, `'(a b)`, `(quote {:k 1})`) lower to canonical EDN string handles;
-  var quote (`#'foo`, `(var foo)`) lowers to the referenced symbol name handle
+  var quote (`#'foo`, `(var foo)`) lowers to the referenced symbol name handle;
+  vector literals (`[1 2]`) and map literals (`{:k v}`) lower to the prelude's
+  mutable vector/map handles when the prelude is enabled
 - Clojure reader metadata (`^:private`, `^String`, `^long`) is stripped before
   lowering.
 - Clojure discard forms (`#_ form`) are stripped before lowering.

@@ -406,11 +406,8 @@ fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
             })
             .collect();
     }
-    let params = match items.get(params_idx) {
-        Some(EdnValue::Vector(ps)) => ps
-            .iter()
-            .map(|p| sym_name(p, "defn parameter"))
-            .collect::<Result<Vec<_>, _>>()?,
+    let (params, destructured_params) = match items.get(params_idx) {
+        Some(EdnValue::Vector(ps)) => lower_param_list(ps, "defn parameter")?,
         _ => {
             return Err(CljError::Lower(format!(
                 "defn `{name}` parameter list must be a vector `[…]`"
@@ -432,6 +429,7 @@ fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         .iter()
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
+    let body = prepend_bindings(destructured_params, body);
     Ok(vec![Function {
         export_name: Some(name.clone()),
         name,
@@ -450,11 +448,8 @@ fn lower_defn_arity(
             "defn `{name}` arity-list requires: ([params…] body…)"
         )));
     }
-    let params = match &items[0] {
-        EdnValue::Vector(ps) => ps
-            .iter()
-            .map(|p| sym_name(p, "defn parameter"))
-            .collect::<Result<Vec<_>, _>>()?,
+    let (params, destructured_params) = match &items[0] {
+        EdnValue::Vector(ps) => lower_param_list(ps, "defn parameter")?,
         _ => {
             return Err(CljError::Lower(format!(
                 "defn `{name}` arity-list must begin with a parameter vector"
@@ -471,12 +466,50 @@ fn lower_defn_arity(
         .iter()
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
+    let body = prepend_bindings(destructured_params, body);
     Ok(Function {
         name: name.to_string(),
         export_name,
         params,
         body,
     })
+}
+
+type LoweredBindings = Vec<(String, Expr)>;
+type LoweredParams = (Vec<String>, LoweredBindings);
+
+fn lower_param_list(params: &[EdnValue], ctx: &str) -> Result<LoweredParams, CljError> {
+    let mut lowered = Vec::with_capacity(params.len());
+    let mut destructured = Vec::new();
+    for (idx, param) in params.iter().enumerate() {
+        match param {
+            EdnValue::Symbol(_) => lowered.push(sym_name(param, ctx)?),
+            EdnValue::Vector(_) => {
+                let temp = format!("\0kotoba_param_{idx}");
+                collect_vector_destructuring(
+                    param,
+                    Expr::Var(temp.clone()),
+                    &mut destructured,
+                    ctx,
+                )?;
+                lowered.push(temp);
+            }
+            other => {
+                return Err(CljError::Lower(format!(
+                    "{ctx} must be a symbol or vector destructuring form, found {other:?}"
+                )))
+            }
+        }
+    }
+    Ok((lowered, destructured))
+}
+
+fn prepend_bindings(bindings: LoweredBindings, body: Vec<Expr>) -> Vec<Expr> {
+    if bindings.is_empty() {
+        body
+    } else {
+        vec![Expr::Let { bindings, body }]
+    }
 }
 
 fn skip_prepost_map(items: &[EdnValue], body_idx: usize) -> usize {
@@ -507,10 +540,62 @@ fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
         EdnValue::Keyword(_) => Ok(Expr::Str(edn_to_string(v).into_bytes())),
         EdnValue::Symbol(s) => Ok(Expr::Var(s.to_qualified())),
         EdnValue::List(items) => lower_call(items),
+        EdnValue::Vector(items) => lower_vector_literal(items),
+        EdnValue::Map(items) => lower_map_literal(items),
         other => Err(CljError::Lower(format!(
-            "unsupported expression: {other:?} (only integers, booleans, symbols and lists are supported)"
+            "unsupported expression: {other:?} (only integers, booleans, strings, keywords, symbols, lists, vectors and maps are supported)"
         ))),
     }
+}
+
+fn lower_vector_literal(items: &[EdnValue]) -> Result<Expr, CljError> {
+    let name = "\0kotoba_vec_literal".to_string();
+    let mut body = Vec::with_capacity(items.len() + 1);
+    for item in items {
+        body.push(Expr::Call {
+            name: "vec-conj!".to_string(),
+            args: vec![Expr::Var(name.clone()), lower_expr(item)?],
+        });
+    }
+    body.push(Expr::Var(name.clone()));
+    Ok(Expr::Let {
+        bindings: vec![(
+            name,
+            Expr::Call {
+                name: "vec-make".to_string(),
+                args: vec![Expr::Int(items.len() as i64)],
+            },
+        )],
+        body,
+    })
+}
+
+fn lower_map_literal(
+    items: &std::collections::BTreeMap<EdnValue, EdnValue>,
+) -> Result<Expr, CljError> {
+    let name = "\0kotoba_map_literal".to_string();
+    let mut body = Vec::with_capacity(items.len() + 1);
+    for (key, value) in items {
+        body.push(Expr::Call {
+            name: "map-assoc!".to_string(),
+            args: vec![
+                Expr::Var(name.clone()),
+                lower_expr(key)?,
+                lower_expr(value)?,
+            ],
+        });
+    }
+    body.push(Expr::Var(name.clone()));
+    Ok(Expr::Let {
+        bindings: vec![(
+            name,
+            Expr::Call {
+                name: "map-make".to_string(),
+                args: vec![Expr::Int(items.len() as i64)],
+            },
+        )],
+        body,
+    })
 }
 
 fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
@@ -755,16 +840,16 @@ fn lower_if_let(args: &[EdnValue]) -> Result<Expr, CljError> {
             "if-let takes: (if-let [name init] then else?)".into(),
         ));
     }
-    let (name, init) = lower_single_binding(args.first(), "if-let")?;
+    let (truthy_name, bindings) = lower_single_binding(args.first(), "if-let")?;
     let then = lower_expr(&args[1])?;
     let els = match args.get(2) {
         Some(els) => lower_expr(els)?,
         None => Expr::Int(0),
     };
     Ok(Expr::Let {
-        bindings: vec![(name.clone(), init)],
+        bindings,
         body: vec![Expr::If {
-            cond: Box::new(Expr::Var(name)),
+            cond: Box::new(Expr::Var(truthy_name)),
             then: Box::new(then),
             els: Box::new(els),
         }],
@@ -777,15 +862,15 @@ fn lower_when_let(args: &[EdnValue]) -> Result<Expr, CljError> {
             "when-let takes: (when-let [name init] body…)".into(),
         ));
     }
-    let (name, init) = lower_single_binding(args.first(), "when-let")?;
+    let (truthy_name, bindings) = lower_single_binding(args.first(), "when-let")?;
     let body = args[1..]
         .iter()
         .map(lower_expr)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Expr::Let {
-        bindings: vec![(name.clone(), init)],
+        bindings,
         body: vec![Expr::If {
-            cond: Box::new(Expr::Var(name)),
+            cond: Box::new(Expr::Var(truthy_name)),
             then: Box::new(Expr::Do(body)),
             els: Box::new(Expr::Int(0)),
         }],
@@ -795,7 +880,7 @@ fn lower_when_let(args: &[EdnValue]) -> Result<Expr, CljError> {
 fn lower_single_binding(
     binding_form: Option<&EdnValue>,
     form_name: &str,
-) -> Result<(String, Expr), CljError> {
+) -> Result<(String, LoweredBindings), CljError> {
     let binding_vec = match binding_form {
         Some(EdnValue::Vector(v)) => v,
         _ => {
@@ -809,10 +894,13 @@ fn lower_single_binding(
             "{form_name} binding vector must contain exactly one name/init pair"
         )));
     }
-    Ok((
-        sym_name(&binding_vec[0], &format!("{form_name} binding name"))?,
-        lower_expr(&binding_vec[1])?,
-    ))
+    let init = lower_expr(&binding_vec[1])?;
+    lower_binding_pattern(
+        &binding_vec[0],
+        init,
+        0,
+        &format!("{form_name} binding name"),
+    )
 }
 
 fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
@@ -832,8 +920,12 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
     }
     let mut bindings = Vec::with_capacity(binding_vec.len() / 2);
     let mut it = binding_vec.iter();
+    let mut idx = 0;
     while let (Some(name), Some(val)) = (it.next(), it.next()) {
-        bindings.push((sym_name(name, "let binding name")?, lower_expr(val)?));
+        let (_, mut lowered) =
+            lower_binding_pattern(name, lower_expr(val)?, idx, "let binding name")?;
+        bindings.append(&mut lowered);
+        idx += 1;
     }
     let body = args[1..]
         .iter()
@@ -845,6 +937,65 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
         ));
     }
     Ok(Expr::Let { bindings, body })
+}
+
+fn lower_binding_pattern(
+    pattern: &EdnValue,
+    init: Expr,
+    idx: usize,
+    ctx: &str,
+) -> Result<(String, LoweredBindings), CljError> {
+    match pattern {
+        EdnValue::Symbol(_) => {
+            let name = sym_name(pattern, ctx)?;
+            Ok((name.clone(), vec![(name, init)]))
+        }
+        EdnValue::Vector(_) => {
+            let temp = format!("\0kotoba_destructure_{idx}");
+            let mut bindings = vec![(temp.clone(), init)];
+            collect_vector_destructuring(pattern, Expr::Var(temp.clone()), &mut bindings, ctx)?;
+            Ok((temp, bindings))
+        }
+        other => Err(CljError::Lower(format!(
+            "{ctx} must be a symbol or vector destructuring form, found {other:?}"
+        ))),
+    }
+}
+
+fn collect_vector_destructuring(
+    pattern: &EdnValue,
+    source: Expr,
+    out: &mut LoweredBindings,
+    ctx: &str,
+) -> Result<(), CljError> {
+    let EdnValue::Vector(items) = pattern else {
+        return Err(CljError::Lower(format!(
+            "{ctx} must be a vector destructuring form"
+        )));
+    };
+    for (idx, item) in items.iter().enumerate() {
+        let value = Expr::Call {
+            name: "nth".to_string(),
+            args: vec![source.clone(), Expr::Int(idx as i64)],
+        };
+        match item {
+            EdnValue::Symbol(_) => {
+                let name = sym_name(item, ctx)?;
+                out.push((name, value));
+            }
+            EdnValue::Vector(_) => {
+                let temp = format!("\0kotoba_nested_destructure_{}", out.len());
+                out.push((temp.clone(), value));
+                collect_vector_destructuring(item, Expr::Var(temp), out, ctx)?;
+            }
+            other => {
+                return Err(CljError::Lower(format!(
+                    "{ctx} vector destructuring entries must be symbols or nested vectors, found {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn lower_case(args: &[EdnValue]) -> Result<Expr, CljError> {
