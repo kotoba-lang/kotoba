@@ -95,6 +95,22 @@ fn comparisons_and_logic() {
         compile_and_run("(defn o [x y] (or x y))", "o", &[0, 7]).unwrap(),
         1
     );
+    assert_eq!(
+        compile_and_run("(defn p [x] (even? x))", "p", &[-4]).unwrap(),
+        1
+    );
+    assert_eq!(
+        compile_and_run("(defn p [x] (even? x))", "p", &[-3]).unwrap(),
+        0
+    );
+    assert_eq!(
+        compile_and_run("(defn p [x] (odd? x))", "p", &[7]).unwrap(),
+        1
+    );
+    assert_eq!(
+        compile_and_run("(defn p [x] (odd? x))", "p", &[8]).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -113,6 +129,8 @@ fn clojure_core_qualified_numeric_builtins_work() {
                (clojure.core/some? 1)
                (clojure.core/pos? 4)
                (clojure.core/neg? -1)
+               (clojure.core/even? 8)
+               (clojure.core/odd? -3)
                (clojure.core/not= 1 2 3)))
         (defn nary []
           (and (= 1 1 1) (< 1 2 3) (<= 1 1 2) (> 3 2 1) (>= 3 3 2)))
