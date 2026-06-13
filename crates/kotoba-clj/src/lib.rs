@@ -228,7 +228,7 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// Clojure-core compatibility layer: `count`, `empty?`, `seq`, `not-empty`,
 /// `nth`, `first`, `second`, `last`, `peek`, `subvec`, `rest`, `conj`,
 /// `conj!`, `get`, `assoc`, `assoc!`, `contains?`, `contains-key?`, `keys`,
-/// and `vals`. The
+/// `vals`, `identity`, and `constantly`. The
 /// lowering phase also accepts vector and map destructuring in `defn`, `let`,
 /// `loop`, `if-let`, and `when-let`; map destructuring supports `{local :key}`,
 /// `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`.
@@ -332,6 +332,11 @@ pub const PRELUDE: &str = r#"
 (defn assoc! [m k v] (map-assoc! m k v))
 (defn contains? [m k] (>= (map-find m k) 0))
 (defn contains-key? [m k] (>= (map-find m k) 0))
+(defn identity [x] x)
+(defn constantly
+  ([x] x)
+  ([x _] x)
+  ([x _ _] x))
 (defn keys [m]
   (let [n (map-count m)
         out (vec-make n)]

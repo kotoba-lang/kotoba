@@ -69,6 +69,12 @@ fn clojure_core_vector_aliases() {
 }
 
 #[test]
+fn clojure_core_value_function_aliases() {
+    let v = eval("(+ (identity 10) (constantly 20) (constantly 5 999) (constantly 7 1 2))");
+    assert_eq!(v, 42);
+}
+
+#[test]
 fn vector_literals_lower_to_prelude_vectors() {
     let v = eval("(let [v [11 22 33]] (+ (count v) (first v) (nth v 1) (last v)))");
     assert_eq!(v, 69);
