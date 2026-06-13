@@ -226,8 +226,8 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// `vec-nth` `vec-conj!` `vec-extend!` (the `add_messages` reducer), `map-make`
 /// `map-count` `map-get` `map-assoc!`, and `str-eq?`. It also exposes a small
 /// Clojure-core compatibility layer: `count`, `empty?`, `seq`, `not-empty`,
-/// `nth`, `first`, `last`, `subvec`, `rest`, `conj!`, `get`, `assoc!`, and
-/// `contains-key?`. The
+/// `nth`, `first`, `second`, `last`, `peek`, `subvec`, `rest`, `conj!`, `get`,
+/// `assoc!`, and `contains-key?`. The
 /// lowering phase also accepts vector and map destructuring in `defn`, `let`,
 /// `loop`, `if-let`, and `when-let`; map destructuring supports `{local :key}`,
 /// `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`.
@@ -314,9 +314,13 @@ pub const PRELUDE: &str = r#"
 (defn empty? [x] (= (count x) 0))
 (defn seq [x] (if (empty? x) 0 x))
 (defn not-empty [x] (if (empty? x) 0 x))
-(defn nth [v i] (vec-nth v i))
+(defn nth
+  ([v i] (vec-nth v i))
+  ([v i default] (if (>= i (vec-count v)) default (vec-nth v i))))
 (defn first [v] (vec-nth v 0))
+(defn second [v] (nth v 1))
 (defn last [v] (vec-nth v (- (vec-count v) 1)))
+(defn peek [v] (last v))
 (defn rest [v] (subvec v 1))
 (defn conj! [v x] (vec-conj! v x))
 (defn get
