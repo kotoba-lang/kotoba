@@ -12,7 +12,8 @@
 //!               `(if c t e?)`  `(if-not c t e?)` `(when c body…)`
 //!               `(when-not c body…)` `(if-let [b v] t e)`
 //!               `(when-let [b v] body…)` `(case e test result … default?)`
-//!               `(let [b v …] body…)`  `(do e…)`, vector/map literals
+//!               `(let [b v …] body…)`  `(do e…)` `(comment …)`,
+//!               vector/map literals
 //!               `(-> x step…)` `(->> x step…)` `(cond-> x test step …)`
 //!               `(cond->> x test step …)` `(some-> x step…)`
 //!               `(some->> x step…)` `(as-> x name form …)`
@@ -631,6 +632,7 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
         "do" => Ok(Expr::Do(
             args.iter().map(lower_expr).collect::<Result<_, _>>()?,
         )),
+        "comment" => Ok(Expr::Int(0)),
         name => {
             let lowered: Vec<Expr> = args.iter().map(lower_expr).collect::<Result<_, _>>()?;
             if let Some(op) = Builtin::from_name(name) {

@@ -34,7 +34,7 @@
 //!   `(create-struct …)`, `(comment …)`, and `(declare …)` (ignored where noted;
 //!   macros are accepted but not expanded)
 //! - control: `if` (2- or 3-form), `if-not`, `when`, `when-not`, `if-let`,
-//!   `when-let`, `cond`, `case`, `let`, `do`, `loop`/`recur` (bounded
+//!   `when-let`, `cond`, `case`, `let`, `do`, `comment`, `loop`/`recur` (bounded
 //!   iteration), threading macros `->`, `->>`, `cond->`, `cond->>`, `some->`,
 //!   `some->>`, and `as->`
 //! - binding forms: symbols plus vector and map destructuring in `defn`, `let`,
