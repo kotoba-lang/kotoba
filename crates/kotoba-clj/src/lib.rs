@@ -230,7 +230,11 @@ pub fn compile_file_with_prelude_reader_target_and_source_paths(
 /// Clojure-core compatibility layer: `count`, `empty?`, `seq`, `not-empty`,
 /// `nth`, `first`, `second`, `last`, `peek`, `subvec`, `rest`, `conj`,
 /// `conj!`, `get`, `assoc`, `assoc!`, `contains?`, `contains-key?`, `keys`,
-/// `vals`, `vector`, `hash-map`, `array-map`, `identity`, and `constantly`. The
+/// `vals`, `vector`, `hash-map`, `array-map`, `identity`, and `constantly`.
+/// Higher-order sequence fns (driven by the closure / `call_indirect` path):
+/// `map`, `mapv`, `map-indexed`, `filter`, `filterv`, `remove`, `keep`,
+/// `reduce` (2/3-arity), `reduce-kv`, `range` (1/2-arity), `some`, `every?`,
+/// `not-any?`, `into`, `comp`, and `partial`. The
 /// lowering phase also accepts vector and map destructuring in `defn`, `let`,
 /// `loop`, `if-let`, and `when-let`; map destructuring supports `{local :key}`,
 /// `{:keys [...]}`, `{:strs [...]}`, `:or`, and `:as`.
@@ -371,6 +375,108 @@ pub const PRELUDE: &str = r#"
         out
         (do (vec-conj! out (map-val-at m i))
             (recur (+ i 1)))))))
+
+;; ---- higher-order sequence fns --------------------------------------------
+;; These take a function argument and invoke it via the closure call path
+;; ((f x) → call_indirect). Output vectors are pre-sized to the input count
+;; (vec-conj! does not grow), which is exact for map and an upper bound for
+;; filter/remove/keep. Predicates are truthy on any non-zero value.
+(defn map [f v]
+  (let [n (vec-count v)
+        out (vec-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (do (vec-conj! out (f (vec-nth v i)))
+            (recur (+ i 1)))))))
+(defn mapv [f v] (map f v))
+(defn map-indexed [f v]
+  (let [n (vec-count v)
+        out (vec-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (do (vec-conj! out (f i (vec-nth v i)))
+            (recur (+ i 1)))))))
+(defn filter [pred v]
+  (let [n (vec-count v)
+        out (vec-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (let [x (vec-nth v i)]
+          (do (if (pred x) (vec-conj! out x) 0)
+              (recur (+ i 1))))))))
+(defn filterv [pred v] (filter pred v))
+(defn remove [pred v]
+  (let [n (vec-count v)
+        out (vec-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (let [x (vec-nth v i)]
+          (do (if (pred x) 0 (vec-conj! out x))
+              (recur (+ i 1))))))))
+(defn keep [f v]
+  (let [n (vec-count v)
+        out (vec-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (let [r (f (vec-nth v i))]
+          (do (if (nil? r) 0 (vec-conj! out r))
+              (recur (+ i 1))))))))
+(defn reduce
+  ([f init v]
+   (let [n (vec-count v)]
+     (loop [i 0 acc init]
+       (if (>= i n)
+         acc
+         (recur (+ i 1) (f acc (vec-nth v i)))))))
+  ([f v]
+   (let [n (vec-count v)]
+     (if (= n 0)
+       (f)
+       (loop [i 1 acc (vec-nth v 0)]
+         (if (>= i n)
+           acc
+           (recur (+ i 1) (f acc (vec-nth v i)))))))))
+(defn reduce-kv [f init m]
+  (let [n (map-count m)]
+    (loop [i 0 acc init]
+      (if (>= i n)
+        acc
+        (recur (+ i 1) (f acc (map-key-at m i) (map-val-at m i)))))))
+(defn range
+  ([n]
+   (let [out (vec-make n)]
+     (loop [i 0]
+       (if (>= i n) out (do (vec-conj! out i) (recur (+ i 1)))))))
+  ([start end]
+   (let [out (vec-make (- end start))]
+     (loop [i start]
+       (if (>= i end) out (do (vec-conj! out i) (recur (+ i 1))))))))
+(defn some [pred v]
+  (let [n (vec-count v)]
+    (loop [i 0]
+      (if (>= i n)
+        0
+        (let [r (pred (vec-nth v i))]
+          (if r r (recur (+ i 1))))))))
+(defn every? [pred v]
+  (let [n (vec-count v)]
+    (loop [i 0]
+      (if (>= i n)
+        1
+        (if (pred (vec-nth v i))
+          (recur (+ i 1))
+          0)))))
+(defn not-any? [pred v] (if (some pred v) 0 1))
+(defn into [dst src] (vec-extend! dst src))
+(defn comp [f g] (fn [x] (f (g x))))
+(defn partial
+  ([f a] (fn [x] (f a x)))
+  ([f a b] (fn [x] (f a b x))))
 "#;
 
 /// An **in-guest CBOR decoder** (subset) written in the kotoba-clj language,

@@ -180,6 +180,24 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         }
     }
 
+    // An indirect closure call of N args needs the function type for arity N+1
+    // (the hidden `__self` pointer). A defined function of that arity may not
+    // exist (e.g. `map`'s `(f x)` when no arity-2 `defn` is present), so ensure
+    // every needed type is present and remember whether *any* indirect call
+    // exists — a `call_indirect` is only valid if the module has a table.
+    let indirect_arities = collect_call_value_arities(program);
+    let has_indirect = !indirect_arities.is_empty();
+    for a in &indirect_arities {
+        let arity = a + 1;
+        type_for_arity.entry(arity).or_insert_with(|| {
+            let idx = types.len();
+            types
+                .ty()
+                .function(std::iter::repeat_n(ValType::I64, arity), [ValType::I64]);
+            idx
+        });
+    }
+
     // cabi_realloc: (old:i32, old_sz:i32, align:i32, new_sz:i32) -> i32
     let realloc_type = types.len();
     types.ty().function(
@@ -275,11 +293,15 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         );
     }
 
-    // Funcref table + element segment for closures (only when some exist).
+    // Funcref table + element segment for closures. The table must exist whenever
+    // the module contains *any* `call_indirect` (a CallValue) — even with zero
+    // lifted closures — or the indirect call fails validation. The element
+    // segment is only emitted when there are actual closures to install.
+    let needs_table = has_indirect || !table_funcs.is_empty();
     let mut tables = TableSection::new();
     let mut elements = ElementSection::new();
     let elem_offset = ConstExpr::i32_const(0);
-    if !table_funcs.is_empty() {
+    if needs_table {
         tables.table(TableType {
             element_type: RefType::FUNCREF,
             table64: false,
@@ -287,6 +309,8 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
             maximum: Some(table_funcs.len() as u64),
             shared: false,
         });
+    }
+    if !table_funcs.is_empty() {
         elements.active(
             Some(CLOSURE_TABLE),
             &elem_offset,
@@ -301,7 +325,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         module.section(&imports); // 2
     }
     module.section(&funcs); // 3
-    if !table_funcs.is_empty() {
+    if needs_table {
         module.section(&tables); // 4
     }
     module.section(&memories); // 5
@@ -432,6 +456,46 @@ fn collect_host_imports(program: &Program) -> Vec<HostImport> {
         }
     }
     seen
+}
+
+/// Every distinct `args.len()` appearing in a `CallValue` (indirect closure
+/// call) anywhere in the program. Used to (a) pre-create the needed
+/// `call_indirect` function types and (b) decide whether a funcref table is
+/// required at all.
+fn collect_call_value_arities(program: &Program) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(e: &Expr, out: &mut std::collections::HashSet<usize>) {
+        match e {
+            Expr::Int(_) | Expr::Str(_) | Expr::Var(_) | Expr::ClosureRef(_) => {}
+            Expr::If { cond, then, els } => {
+                walk(cond, out);
+                walk(then, out);
+                walk(els, out);
+            }
+            Expr::Let { bindings, body } | Expr::Loop { bindings, body } => {
+                bindings.iter().for_each(|(_, v)| walk(v, out));
+                body.iter().for_each(|e| walk(e, out));
+            }
+            Expr::Do(es) | Expr::Recur(es) | Expr::Call { args: es, .. } => {
+                es.iter().for_each(|e| walk(e, out));
+            }
+            Expr::Builtin { args, .. } => args.iter().for_each(|e| walk(e, out)),
+            Expr::Fn { body, .. } => body.iter().for_each(|e| walk(e, out)),
+            Expr::MakeClosure { captures, .. } => captures.iter().for_each(|e| walk(e, out)),
+            Expr::CallValue { f, args } => {
+                out.insert(args.len());
+                walk(f, out);
+                args.iter().for_each(|e| walk(e, out));
+            }
+        }
+    }
+    for d in &program.defs {
+        walk(&d.value, &mut out);
+    }
+    for f in &program.functions {
+        f.body.iter().for_each(|e| walk(e, &mut out));
+    }
+    out
 }
 
 fn collect_literals(program: &Program) -> Literals {

@@ -499,3 +499,41 @@ Verification: `cargo test -p kotoba-edn` (27, incl. 5 `#(…)` reader tests) and
 let/param capture, bound-then-called, higher-order param, distinct table slots,
 **escaping returned closure**, **nested transitive capture**) all green; clippy
 clean.
+
+## Higher-order sequence functions (`map`/`filter`/`reduce`/…) — 2026-06-14
+
+With closures + `call_indirect` in place (previous section), the seq HOFs are
+written as **ordinary prelude `defn`s** in the kotoba-clj subset itself — no new
+codegen. Each takes a function argument and invokes it through the closure path
+(`(f x)` → `CallValue` → `call_indirect`), iterating the heap vector with
+`loop`/`recur` + `vec-nth`/`vec-conj!`.
+
+Added to `PRELUDE`: `map`, `mapv`, `map-indexed`, `filter`, `filterv`, `remove`,
+`keep`, `reduce` (2- and 3-arity), `reduce-kv`, `range` (1- and 2-arity), `some`,
+`every?`, `not-any?`, `into`, `comp`, `partial`. `comp`/`partial` *return*
+closures (`(fn [x] (f (g x)))`), exercising closure construction from inside the
+prelude. Output vectors are pre-sized to the input count (exact for `map`, an
+upper bound for `filter`/`remove`/`keep`) because `vec-conj!` does not grow.
+
+Because the prelude now always contains `call_indirect`, **every** compiled
+module needs a funcref table to exist (an indirect call to a missing table is a
+validation error). Codegen therefore emits the table whenever the program
+contains any `CallValue` *or* any lifted closure (`needs_table = has_indirect ||
+!table_funcs.is_empty()`), and `collect_call_value_arities` pre-creates the
+`(N+1)×i64 → i64` function types that `call_indirect` needs even when no `defn`
+of that arity exists.
+
+### Honest scope / known limits
+
+`reduce` with no init over an empty coll calls `(f)` (Clojure semantics) which
+traps on a binary reducer — caller's bug, fails cleanly. `into`/`conj!` onto a
+fixed-capacity literal vector can overflow (pre-existing `vec-conj!` footgun —
+vectors don't auto-grow); pre-size with `vec-make`. `apply` (dynamic arity),
+multi-collection `map`, and lazy seqs are not provided. Remaining for full
+langgraph-clj: protocols / `defrecord` dispatch.
+
+Verification: `cargo test -p kotoba-clj --features run,component` green incl. the
+new 16-test `tests/hofs.rs` (map→filter→reduce chains, reader-macro callbacks,
+captured-variable callbacks, `comp`/`partial` returning closures, `range`,
+`some`/`every?`/`keep`, `map-indexed`); clippy clean; no regressions across the
+component/kqe/pregel suites that compile with the now-table-bearing prelude.
