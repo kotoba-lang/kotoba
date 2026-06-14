@@ -10,6 +10,7 @@
 //!   free:    3 pins,  100 MB
 //!   starter: 50 pins,   5 GB  ($9/mo — Stripe stub)
 //!   pro:    500 pins,  50 GB  ($49/mo — Stripe stub)
+//!   enterprise: 5000 pins, 1 TB
 
 pub const NSID_ACCOUNT_CREATE: &str = "com.etzhayyim.apps.kotobase.accountCreate";
 pub const NSID_ACCOUNT_STATUS: &str = "com.etzhayyim.apps.kotobase.accountStatus";
@@ -209,11 +210,14 @@ const QUOTA_STARTER_PINS: i64 = 50;
 const QUOTA_STARTER_BYTES: i64 = 5 * 1024 * 1024 * 1024;
 const QUOTA_PRO_PINS: i64 = 500;
 const QUOTA_PRO_BYTES: i64 = 50 * 1024 * 1024 * 1024;
+const QUOTA_ENTERPRISE_PINS: i64 = 5000;
+const QUOTA_ENTERPRISE_BYTES: i64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 
 fn quota_for_tier(tier: &str) -> (i64, i64) {
     match tier {
         "starter" => (QUOTA_STARTER_PINS, QUOTA_STARTER_BYTES),
         "pro" => (QUOTA_PRO_PINS, QUOTA_PRO_BYTES),
+        "enterprise" => (QUOTA_ENTERPRISE_PINS, QUOTA_ENTERPRISE_BYTES),
         _ => (QUOTA_FREE_PINS, QUOTA_FREE_BYTES),
     }
 }
@@ -646,7 +650,7 @@ pub async fn handle_account_create(
         ));
     }
     let tier = match tier_raw {
-        "free" | "starter" | "pro" => tier_raw.to_string(),
+        "free" | "starter" | "pro" | "enterprise" => tier_raw.to_string(),
         other => return Err((StatusCode::BAD_REQUEST, format!("unknown tier: {other:?}"))),
     };
     let now = now_unix_str();
@@ -1259,8 +1263,15 @@ mod tests {
     }
 
     #[test]
-    fn quota_unknown_tier_falls_back_to_free() {
+    fn quota_enterprise_tier() {
         let (pins, bytes) = quota_for_tier("enterprise");
+        assert_eq!(pins, QUOTA_ENTERPRISE_PINS);
+        assert_eq!(bytes, QUOTA_ENTERPRISE_BYTES);
+    }
+
+    #[test]
+    fn quota_unknown_tier_falls_back_to_free() {
+        let (pins, bytes) = quota_for_tier("platinum");
         assert_eq!(pins, QUOTA_FREE_PINS);
         assert_eq!(bytes, QUOTA_FREE_BYTES);
     }
