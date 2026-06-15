@@ -608,8 +608,8 @@ impl Node {
                 actual.to_multibase()
             ));
         }
-        let view: CommitIndexRootsView = ciborium::from_reader(bytes)
-            .map_err(|e| format!("decode commit DAG-CBOR: {e}"))?;
+        let view: CommitIndexRootsView =
+            ciborium::from_reader(bytes).map_err(|e| format!("decode commit DAG-CBOR: {e}"))?;
         if view.index_roots.is_empty() {
             return Err("commit block has no index_roots".to_string());
         }
@@ -1171,7 +1171,11 @@ mod wasm {
         /// Lets the browser derive the EAVT root from the verified head instead
         /// of trusting `datomic.sync` (closes `hydrate-and-query-verified!`).
         #[wasm_bindgen(js_name = commitIndexRoots)]
-        pub fn commit_index_roots(&self, commit_cid: &str, bytes: &[u8]) -> Result<String, JsValue> {
+        pub fn commit_index_roots(
+            &self,
+            commit_cid: &str,
+            bytes: &[u8],
+        ) -> Result<String, JsValue> {
             Node::commit_index_roots(commit_cid, bytes).map_err(|e| JsValue::from_str(&e))
         }
     }

@@ -1499,6 +1499,7 @@ async fn require_datomic_read_any_operation(
     since: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
     use crate::graph_auth::{check_read_access, AccessDenied};
+    use kotoba_core::named_graph::GraphVisibility;
 
     let graph_scope = graph.to_multibase();
     let visibility = state.graph_visibility(graph).await;
@@ -1512,6 +1513,34 @@ async fn require_datomic_read_any_operation(
                 cacao_b64,
                 operations,
             ) {
+                // ADR-2606131600 P1 — owner-binding for Private graphs. The CACAO
+                // grant path verifies capability + graph scope + aud==operator +
+                // signature, but historically did NOT check WHO signed it. A
+                // self-signed CACAO scoped to another tenant's graph CID (the CID
+                // is derivable from a known DID) therefore passed, letting any
+                // did:key read any Private graph — the cross-tenant read leak.
+                // Mirror check_read_access's invariant: for a Private graph the
+                // verified issuer must be the graph owner (delegation to others is
+                // the owner's prerogative, expressed as a chain rooted at owner;
+                // here payload.iss is that root). Public/Authenticated graphs are
+                // unaffected — they have no owner to bind to.
+                if let GraphVisibility::Private { owner_did } = &visibility {
+                    if &payload.iss != owner_did {
+                        tracing::warn!(
+                            issuer = %payload.iss,
+                            owner = %owner_did,
+                            graph = %graph_scope,
+                            "datomic read: CACAO issuer is not the graph owner"
+                        );
+                        return Err((
+                            StatusCode::UNAUTHORIZED,
+                            format!(
+                                "CACAO issuer {:?} is not the owner of private graph {graph_scope}",
+                                payload.iss
+                            ),
+                        ));
+                    }
+                }
                 enforce_datomic_temporal_tx_scope(&payload, as_of, since)?;
                 break 'authorized;
             }
