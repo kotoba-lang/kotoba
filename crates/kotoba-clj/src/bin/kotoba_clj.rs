@@ -85,8 +85,13 @@ fn positional(args: &[String]) -> Option<&str> {
             // flags that take a value
             if matches!(
                 a.as_str(),
-                "-o" | "--wit" | "--ctx" | "--ctx-file" | "--snapshot" | "--snapshot-file"
-                    | "--gas" | "--agent"
+                "-o" | "--wit"
+                    | "--ctx"
+                    | "--ctx-file"
+                    | "--snapshot"
+                    | "--snapshot-file"
+                    | "--gas"
+                    | "--agent"
             ) {
                 skip_next = true;
             }
@@ -107,8 +112,8 @@ fn cmd_build(args: &[String]) -> Result<()> {
 
     let body = std::fs::read_to_string(cell).with_context(|| format!("read {cell}"))?;
     let src = format!("{}\n{}", prelude(), body);
-    let wasm = compile_kais_component_str(&src, wit)
-        .map_err(|e| anyhow!("compile {cell}: {e:?}"))?;
+    let wasm =
+        compile_kais_component_str(&src, wit).map_err(|e| anyhow!("compile {cell}: {e:?}"))?;
     std::fs::write(&out, &wasm).with_context(|| format!("write {out}"))?;
     eprintln!("[build] {cell} -> {out} ({} bytes)", wasm.len());
     Ok(())
