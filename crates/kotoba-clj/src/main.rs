@@ -1,6 +1,24 @@
 use std::path::PathBuf;
 
 fn main() {
+    // `cli` feature: the `kotoba-clj build|run …` toolchain subcommands share this
+    // binary with the legacy file runner. A first arg of `build`/`run` routes to the
+    // subcommand dispatcher; anything else (a source file) falls through to the runner.
+    #[cfg(feature = "cli")]
+    {
+        let mut args = std::env::args().skip(1);
+        if let Some(sub) = args.next() {
+            if sub == "build" || sub == "run" {
+                let rest: Vec<String> = args.collect();
+                if let Err(err) = kotoba_clj::cli::run(&sub, &rest) {
+                    eprintln!("kotoba-clj: {err:#}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+        }
+    }
+
     if let Err(err) = real_main() {
         eprintln!("kotoba-clj: {err}");
         std::process::exit(1);
@@ -144,14 +162,21 @@ fn is_supported_source_ext(path: &std::path::Path) -> bool {
 }
 
 fn usage() -> String {
-    "usage: kotoba-clj [--func NAME|-f NAME] [--no-prelude] [--reader-target kotoba|clj|cljs] [--source-path DIR|-S DIR] [--wasm-out OUT.wasm] [--allow-any-ext] FILE.{kotoba,clj,cljc,cljs} [i64 args...]\n\
+    #[allow(unused_mut)]
+    let mut s = "usage: kotoba-clj [--func NAME|-f NAME] [--no-prelude] [--reader-target kotoba|clj|cljs] [--source-path DIR|-S DIR] [--wasm-out OUT.wasm] [--allow-any-ext] FILE.{kotoba,clj,cljc,cljs} [i64 args...]\n\
      examples:\n\
        kotoba-clj app.kotoba\n\
        kotoba-clj --func fact math.kotoba 10\n\
        kotoba-clj -S src app.clj\n\
        kotoba-clj --reader-target kotoba agent.cljc\n\
        chmod +x app.kotoba && ./app.kotoba"
-        .to_string()
+        .to_string();
+    #[cfg(feature = "cli")]
+    {
+        s.push_str("\n\n  ");
+        s.push_str(kotoba_clj::cli::SUBCOMMAND_USAGE);
+    }
+    s
 }
 
 #[cfg(test)]

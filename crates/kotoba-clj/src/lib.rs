@@ -116,6 +116,8 @@
 //! loops + byte-building (CBOR decode). See `docs/ADR-clojure-wasm.md`.
 
 pub mod ast;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod codegen;
 pub mod compat;
 #[cfg(feature = "component")]

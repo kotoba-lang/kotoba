@@ -309,7 +309,7 @@ pub enum Expr {
     },
     /// An anonymous function `(fn [params…] body…)` (also the target of the
     /// `#(…)` reader macro). This is a *transient* node: the lambda-lifting pass
-    /// ([`lift_program`]) rewrites every `Fn` site into a [`Expr::MakeClosure`]
+    /// (`lift_program`) rewrites every `Fn` site into a [`Expr::MakeClosure`]
     /// plus a synthetic top-level [`Function`], so codegen never sees a raw `Fn`.
     Fn {
         params: Vec<String>,
@@ -600,9 +600,9 @@ fn free_walk(
     seen: &mut std::collections::HashSet<String>,
 ) {
     let refer = |name: &str,
-                     bound: &Vec<String>,
-                     acc: &mut Vec<String>,
-                     seen: &mut std::collections::HashSet<String>| {
+                 bound: &Vec<String>,
+                 acc: &mut Vec<String>,
+                 seen: &mut std::collections::HashSet<String>| {
         if !bound.iter().any(|b| b == name)
             && scope_get(scope, name).is_some()
             && seen.insert(name.to_string())
@@ -630,26 +630,32 @@ fn free_walk(
             bound.truncate(depth);
         }
         Expr::Do(es) | Expr::Recur(es) | Expr::Builtin { args: es, .. } => {
-            es.iter().for_each(|e| free_walk(e, bound, scope, acc, seen));
+            es.iter()
+                .for_each(|e| free_walk(e, bound, scope, acc, seen));
         }
         Expr::Call { name, args } => {
             refer(name, bound, acc, seen); // a call head may be a closure value
-            args.iter().for_each(|a| free_walk(a, bound, scope, acc, seen));
+            args.iter()
+                .for_each(|a| free_walk(a, bound, scope, acc, seen));
         }
         Expr::CallValue { f, args } => {
             free_walk(f, bound, scope, acc, seen);
-            args.iter().for_each(|a| free_walk(a, bound, scope, acc, seen));
+            args.iter()
+                .for_each(|a| free_walk(a, bound, scope, acc, seen));
         }
         // A nested `(fn …)` captures from us too, so descend with its params
         // added to `bound` (its own params are not our free vars).
         Expr::Fn { params, body } => {
             let depth = bound.len();
             bound.extend(params.iter().cloned());
-            body.iter().for_each(|e| free_walk(e, bound, scope, acc, seen));
+            body.iter()
+                .for_each(|e| free_walk(e, bound, scope, acc, seen));
             bound.truncate(depth);
         }
         Expr::MakeClosure { captures, .. } => {
-            captures.iter().for_each(|e| free_walk(e, bound, scope, acc, seen));
+            captures
+                .iter()
+                .for_each(|e| free_walk(e, bound, scope, acc, seen));
         }
     }
 }
@@ -1790,7 +1796,8 @@ fn lower_fn(args: &[EdnValue]) -> Result<Expr, CljError> {
     };
     if param_vec.iter().any(is_amp_symbol) {
         return Err(CljError::Lower(
-            "variadic `& rest` params in `(fn …)` / `#(… %&)` are not yet supported in kotoba-clj".into(),
+            "variadic `& rest` params in `(fn …)` / `#(… %&)` are not yet supported in kotoba-clj"
+                .into(),
         ));
     }
     let (params, destructured) = lower_param_list(param_vec, "fn parameter")?;
