@@ -309,7 +309,7 @@ pub enum Expr {
     },
     /// An anonymous function `(fn [params…] body…)` (also the target of the
     /// `#(…)` reader macro). This is a *transient* node: the lambda-lifting pass
-    /// ([`lift_program`]) rewrites every `Fn` site into a [`Expr::MakeClosure`]
+    /// (`lift_program`) rewrites every `Fn` site into a [`Expr::MakeClosure`]
     /// plus a synthetic top-level [`Function`], so codegen never sees a raw `Fn`.
     Fn {
         params: Vec<String>,
