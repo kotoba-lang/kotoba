@@ -29,12 +29,18 @@ fn map_reader_macro() {
 
 #[test]
 fn filter_even_count() {
-    assert_eq!(eval("(vec-count (filter (fn [x] (even? x)) (vector 1 2 3 4)))"), 2);
+    assert_eq!(
+        eval("(vec-count (filter (fn [x] (even? x)) (vector 1 2 3 4)))"),
+        2
+    );
 }
 
 #[test]
 fn remove_even_count() {
-    assert_eq!(eval("(vec-count (remove (fn [x] (even? x)) (vector 1 2 3 4)))"), 2);
+    assert_eq!(
+        eval("(vec-count (remove (fn [x] (even? x)) (vector 1 2 3 4)))"),
+        2
+    );
 }
 
 #[test]
@@ -87,10 +93,7 @@ fn every_true_and_false() {
 #[test]
 fn comp_composes_two_fns() {
     // ((comp *2 +1) 10) = (10+1)*2 = 22 — comp itself returns a closure
-    assert_eq!(
-        eval("((comp (fn [x] (* x 2)) (fn [x] (+ x 1))) 10)"),
-        22
-    );
+    assert_eq!(eval("((comp (fn [x] (* x 2)) (fn [x] (+ x 1))) 10)"), 22);
 }
 
 #[test]

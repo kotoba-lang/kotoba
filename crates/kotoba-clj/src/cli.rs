@@ -21,44 +21,34 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use kotoba_clj::component::compile_kais_component_str;
-use kotoba_clj::prelude;
 use kotoba_runtime::host::WitQuad;
 use kotoba_runtime::WasmExecutor;
+
+use crate::component::compile_kais_component_str;
+use crate::prelude;
 
 const DEFAULT_WIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../kotoba-runtime/wit");
 const DEFAULT_GAS: u64 = 10_000_000;
 
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
-    }
-}
+/// One-line summary of the `build`/`run` subcommands, surfaced by `src/main.rs`
+/// in the binary's `--help` output.
+pub const SUBCOMMAND_USAGE: &str = "\
+     kotoba-clj build <cell.clj> [-o <out.wasm>] [--wit <dir>]\n  \
+     kotoba-clj run <component.wasm> [--ctx <json> | --ctx-file <path>] \
+     [--snapshot <json> | --snapshot-file <path>] [--gas <n>] [--agent <did>] [--echo-llm]";
 
-fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("build") => cmd_build(&args[1..]),
-        Some("run") => cmd_run(&args[1..]),
-        Some("-h") | Some("--help") | None => {
-            print_usage();
-            Ok(())
-        }
-        Some(other) => {
-            bail!("unknown subcommand '{other}' (expected: build | run)");
-        }
+/// Dispatch the `kotoba-clj <subcommand> …` interface.
+///
+/// `subcommand` is the already-matched `build`|`run` token and `argv` is the
+/// process arguments that follow it; `src/main.rs` routes here when the first
+/// argument is a recognised subcommand, otherwise it runs the legacy file
+/// runner.
+pub fn run(subcommand: &str, argv: &[String]) -> Result<()> {
+    match subcommand {
+        "build" => cmd_build(argv),
+        "run" => cmd_run(argv),
+        other => bail!("unknown subcommand '{other}' (expected: build | run)"),
     }
-}
-
-fn print_usage() {
-    eprintln!(
-        "kotoba-clj — Clojure→WASM cell toolchain\n\n\
-         USAGE:\n  \
-         kotoba-clj build <cell.clj> [-o <out.wasm>] [--wit <dir>]\n  \
-         kotoba-clj run <component.wasm> [--ctx <json> | --ctx-file <path>]\n                 \
-         [--snapshot <json> | --snapshot-file <path>] [--gas <n>] [--agent <did>] [--echo-llm]"
-    );
 }
 
 /// Pull `--flag value` out of args; returns the value if present.
