@@ -7161,6 +7161,22 @@ fn effective_replication_policy(
     kotoba_dht::ReplicationPolicy::new(min_replicas).with_min_bond(min_bond_mkoto)
 }
 
+/// The owed-retainer view (ADR-002 p3) for `node.status`, from a settlement
+/// sink's pending intents. Reward-only, per-peer + total USDC micros. Pure over
+/// the snapshot (non-draining) so reading status never consumes the settle queue.
+fn owed_retainer_json(
+    sink: &kotoba_dht::SettlementIntentSink,
+) -> serde_json::Value {
+    let owed = kotoba_dht::RetainerOwed::from_intents(
+        &sink.snapshot(),
+        kotoba_dht::SettlementSchedule::new(1),
+    );
+    serde_json::json!({
+        "total_micros": owed.total_micros,
+        "peers": owed.per_peer.len(),
+    })
+}
+
 /// GET /xrpc/com.etzhayyim.apps.kotoba.node.status
 /// Operator-only: exposes peer topology that aids targeted DHT attacks.
 pub async fn node_status(
@@ -7194,6 +7210,9 @@ pub async fn node_status(
             "min_replicas": policy.min_replicas,
             "min_bond_mkoto": policy.min_bond_mkoto,
             "stake_to_replicate": stake_to_replicate,
+            // Owed retainer accrued by the availability-audit loop (ADR-002 p3).
+            // Reward-only view; the on-chain settle stays operator-side.
+            "owed_retainer": owed_retainer_json(&state.dht_audit_sink),
         },
         "envelope_manifest_cleanup": {
             "attempts": 0,
@@ -9450,7 +9469,7 @@ mod tests {
         datomic_pull, datomic_pull_many, datomic_q, datomic_q_emit_cids, datomic_seek_datoms,
         datomic_sync, datomic_transact, datomic_tx_range, datomic_with, did_document_publish,
         didcomm_send, distributed_graph_ipns_name, effective_replication_policy,
-        enforce_datomic_range_tx_scope,
+        enforce_datomic_range_tx_scope, owed_retainer_json,
         is_did_web_ip_host, protocol_payload_tx_cid, vc_issue, vp_capability_projection,
         warm_datomic_resident_cache, AtprotoRepoWriteReq, AuthCapabilityProjection,
         DatomicBasisTReq, DatomicDatomsIndex, DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq,
@@ -9497,6 +9516,30 @@ mod tests {
         assert_eq!(bad.min_bond_mkoto, 0);
         // min_replicas is clamped to ≥ 1 even if env says 0.
         assert_eq!(effective_replication_policy(Some("0"), None, 0).min_replicas, 1);
+    }
+
+    #[test]
+    fn owed_retainer_json_reflects_pending_reward_intents() {
+        use kotoba_dht::{AuditAction, NodeId, PeerAudit, SettlementIntentSink, VerdictSink};
+        let sink = SettlementIntentSink::new(10, 5);
+        // empty sink → zero owed.
+        let empty = owed_retainer_json(&sink);
+        assert_eq!(empty["total_micros"], 0);
+        assert_eq!(empty["peers"], 0);
+        // a reward verdict accrues owed retainer (10 units × 1 micro/unit).
+        sink.record(
+            1,
+            &PeerAudit {
+                peer: NodeId::from_pubkey(b"peer"),
+                result: None,
+                action: AuditAction::Reward,
+            },
+        );
+        let owed = owed_retainer_json(&sink);
+        assert_eq!(owed["total_micros"], 10);
+        assert_eq!(owed["peers"], 1);
+        // snapshot is non-draining: status read did not consume the queue.
+        assert_eq!(sink.pending_len(), 1);
     }
 
     // `emit_cid` provenance: result_cid is content-derived (tamper-evident),

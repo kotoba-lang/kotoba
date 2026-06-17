@@ -298,6 +298,11 @@ pub struct KotobaState {
     // ── Agent Sessions ───────────────────────────────────────────────────────
     /// Active SyncWindow sessions keyed by session_id.
     pub agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, SyncWindow>>>,
+    // ── DHT availability audit ─────────────────────────────────────────────────
+    /// Pending reward/slash intents accrued by the periodic availability-audit
+    /// loop (GROWTH p4). Surfaced as owed retainer in `node.status`; drained by
+    /// the operator-side settlement path. Empty until the opt-in loop runs.
+    pub dht_audit_sink: Arc<kotoba_dht::SettlementIntentSink>,
     // ── CC Vector Search ─────────────────────────────────────────────────────
     /// Optional embed client for CC vector search (KOTOBA_EMBED_URL).
     pub cc_embed_client: Option<Arc<dyn EmbedClient>>,
@@ -896,6 +901,16 @@ impl KotobaState {
             crypto: None,
             kse_store,
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dht_audit_sink: Arc::new(kotoba_dht::SettlementIntentSink::new(
+                std::env::var("KOTOBA_DHT_AUDIT_REWARD_UNITS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1),
+                std::env::var("KOTOBA_DHT_AUDIT_SLASH_UNITS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1),
+            )),
             cc_embed_client,
             media_embed_client,
             pre_key_registry: None,

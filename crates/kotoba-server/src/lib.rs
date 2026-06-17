@@ -1010,21 +1010,13 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     // node's own blocks, and logs the reward/slash tally; verdicts accrue into a
     // local settlement sink. On-chain settlement stays operator-side (Mishmar).
     if let Some(cfg) = dht_audit::AuditLoopConfig::from_env() {
-        let reward_units = std::env::var("KOTOBA_DHT_AUDIT_REWARD_UNITS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        let slash_units = std::env::var("KOTOBA_DHT_AUDIT_SLASH_UNITS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        let sink = Arc::new(kotoba_dht::SettlementIntentSink::new(reward_units, slash_units));
         tracing::info!(
             peers = cfg.peer_urls.len(),
             interval_secs = cfg.interval.as_secs(),
             "DHT availability audit loop ENABLED"
         );
-        dht_audit::spawn_audit_loop(cfg, state.block_store.clone(), sink);
+        // Feed the state's shared sink so owed retainer is observable in node.status.
+        dht_audit::spawn_audit_loop(cfg, state.block_store.clone(), state.dht_audit_sink.clone());
     }
     // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
     // game snapshots are content-addressed into the block store + announced on
