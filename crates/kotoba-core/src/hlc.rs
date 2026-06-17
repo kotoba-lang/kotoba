@@ -47,14 +47,16 @@ impl Hlc {
 
     /// Stamp a local event: advance past both the previous clock and `wall_ms`.
     /// If wall time moved the physical part forward the counter resets to 0; if it
-    /// did not (clock stalled or jumped back) the counter increments — so the
-    /// result is always strictly greater than `self`.
+    /// did not (clock stalled or jumped back) the packed value increments — so the
+    /// result is always strictly greater than `self`, and a counter that overflows
+    /// its 16 bits carries cleanly into the physical part (monotonicity over
+    /// pathological throughput beats a perfectly-shaped counter).
     pub fn send(self, wall_ms: u64) -> Hlc {
-        let wall = Hlc::new(wall_ms, 0);
-        if wall.phys_ms() > self.phys_ms() {
-            wall
+        let wall = wall_ms << COUNTER_BITS;
+        if wall > self.0 {
+            Hlc(wall)
         } else {
-            Hlc::new(self.phys_ms(), self.counter() + 1)
+            Hlc(self.0 + 1)
         }
     }
 
