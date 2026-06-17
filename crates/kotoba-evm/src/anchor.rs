@@ -118,6 +118,40 @@ pub fn verify_finality(
     }
 }
 
+/// `committerOf(bytes32)` view selector.
+pub fn committer_of_selector() -> [u8; 4] {
+    let h = keccak256(b"committerOf(bytes32)");
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// ABI-encode the `AnchorBridge.committerOf(rootHash)` view calldata — the
+/// read-only `eth_call` that returns who anchored `root_hash` (zero address if
+/// none). selector ++ rootHash(32).
+pub fn committer_of_calldata(root_hash: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(&committer_of_selector());
+    out.extend_from_slice(root_hash);
+    out
+}
+
+/// Decode an `address`-returning `eth_call` result (a 32-byte ABI word, address
+/// in the low 20 bytes). `None` if the result is too short (reverted / empty).
+pub fn decode_address_result(result: &[u8]) -> Option<[u8; 20]> {
+    if result.len() < 32 {
+        return None;
+    }
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&result[12..32]);
+    Some(addr)
+}
+
+/// Turn a raw `committerOf` `eth_call` result into a [`FinalityStatus`] for
+/// `local_head`: decode the address word, then [`verify_finality`]. An empty /
+/// short / zero-address result is not final.
+pub fn finality_from_call_result(local_head: &KotobaCid, result: &[u8]) -> FinalityStatus {
+    verify_finality(local_head, decode_address_result(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +247,40 @@ mod tests {
         let mut a = [0u8; 20];
         a[0] = 1;
         assert!(!is_zero_address(&a));
+    }
+
+    #[test]
+    fn committer_of_calldata_is_selector_plus_root_word() {
+        let root = [0x22u8; 32];
+        let data = committer_of_calldata(&root);
+        assert_eq!(data.len(), 4 + 32);
+        assert_eq!(&data[0..4], &committer_of_selector());
+        assert_eq!(&data[4..36], &root);
+    }
+
+    #[test]
+    fn decode_address_result_takes_low_20_bytes() {
+        // ABI address word: 12 zero bytes ++ 20 address bytes.
+        let mut word = [0u8; 32];
+        word[12..32].copy_from_slice(&[0xCD; 20]);
+        assert_eq!(decode_address_result(&word), Some([0xCD; 20]));
+        // short/empty result → None.
+        assert_eq!(decode_address_result(&[]), None);
+        assert_eq!(decode_address_result(&[0u8; 31]), None);
+    }
+
+    #[test]
+    fn finality_from_call_result_end_to_end() {
+        let head = KotobaCid::from_bytes(b"head-7");
+        // zero-address word → not final.
+        assert!(!finality_from_call_result(&head, &[0u8; 32]).is_final);
+        // empty (reverted) → not final.
+        assert!(!finality_from_call_result(&head, &[]).is_final);
+        // non-zero committer word → final, and root hash matches the head.
+        let mut word = [0u8; 32];
+        word[31] = 0x09;
+        let st = finality_from_call_result(&head, &word);
+        assert!(st.is_final);
+        assert_eq!(st.root_hash, root_hash_of(&head));
     }
 }

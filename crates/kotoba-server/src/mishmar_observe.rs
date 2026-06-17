@@ -305,6 +305,29 @@ pub fn parse_kaizen_wellbecoming(
     out
 }
 
+/// Observe a graph head's finality via a read-only `eth_call` to
+/// `AnchorBridge.committerOf(rootHash)` over an injected transport (GROWTH p8).
+/// kotoba stays read+verify — this only reads. Transport errors or an
+/// undecodable result resolve to "not anchored" (not final), never panic.
+pub fn observe_finality<T: JsonRpcTransport>(
+    transport: &T,
+    anchor_address: &str,
+    head: &KotobaCid,
+) -> kotoba_evm::anchor::FinalityStatus {
+    let root = kotoba_evm::anchor::root_hash_of(head);
+    let calldata = kotoba_evm::anchor::committer_of_calldata(&root);
+    let data_hex = format!("0x{}", hex::encode(&calldata));
+    let params = serde_json::json!([{ "to": anchor_address, "data": data_hex }, "latest"]);
+    let result_bytes = match transport.call("eth_call", params) {
+        Ok(v) => v
+            .as_str()
+            .and_then(|s| hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    kotoba_evm::anchor::finality_from_call_result(head, &result_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +351,51 @@ mod tests {
 
     fn topic_str(bytes: &[u8; 32]) -> String {
         format!("0x{}", hex::encode(bytes))
+    }
+
+    /// Fake transport returning a canned `eth_call` result word.
+    struct FakeCall {
+        result: serde_json::Value,
+    }
+    impl JsonRpcTransport for FakeCall {
+        fn call(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            assert_eq!(method, "eth_call");
+            Ok(self.result.clone())
+        }
+    }
+
+    fn address_word(low_byte: u8) -> serde_json::Value {
+        let mut w = [0u8; 32];
+        w[31] = low_byte;
+        json!(format!("0x{}", hex::encode(w)))
+    }
+
+    #[test]
+    fn observe_finality_reads_committer_over_eth_call() {
+        let head = KotobaCid::from_bytes(b"final-head");
+        // non-zero committer → final.
+        let st = observe_finality(&FakeCall { result: address_word(0xAA) }, "0xanchor", &head);
+        assert!(st.is_final);
+        assert_eq!(st.root_hash, kotoba_evm::anchor::root_hash_of(&head));
+        // zero committer (never anchored) → not final.
+        let zero = observe_finality(&FakeCall { result: address_word(0) }, "0xanchor", &head);
+        assert!(!zero.is_final);
+    }
+
+    #[test]
+    fn observe_finality_transport_error_is_not_final() {
+        struct ErrRpc;
+        impl JsonRpcTransport for ErrRpc {
+            fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Err("rpc down".into())
+            }
+        }
+        let head = KotobaCid::from_bytes(b"h");
+        assert!(!observe_finality(&ErrRpc, "0xanchor", &head).is_final);
     }
 
     // a 32-byte topic from a short label (left-padded), mimicking an indexed bytes32/address.
