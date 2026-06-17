@@ -292,6 +292,47 @@ mod tests {
     }
 
     #[test]
+    fn rulespec_wire_format_is_stable_across_all_variants() {
+        // RuleSpec blobs are content-addressed and fetched/decoded by load_rules,
+        // so their CBOR is a wire contract: every variant must CBOR round-trip to
+        // an equal value, content_cid must be deterministic, and into_rule must
+        // preserve the id + accept/reject semantics.
+        let specs = vec![
+            RuleSpec::AllowedAttributes { id: "schema".into(), allowed: vec!["name".into()] },
+            RuleSpec::ForbiddenAttribute { id: "noroot".into(), attr: "system/root".into() },
+            RuleSpec::MaxTxSize { id: "size".into(), max: 2 },
+        ];
+        for spec in specs {
+            // CBOR round-trips to an equal RuleSpec.
+            let back: RuleSpec = ciborium::from_reader(spec.to_cbor().as_slice()).unwrap();
+            assert_eq!(back, spec, "RuleSpec wire round-trip changed the value");
+            // content id is deterministic and = hash of the canonical CBOR.
+            assert_eq!(spec.content_cid(), back.content_cid());
+            assert_eq!(spec.content_cid(), KotobaCid::from_bytes(&spec.to_cbor()));
+            // into_rule preserves the id.
+            let id = match &spec {
+                RuleSpec::AllowedAttributes { id, .. }
+                | RuleSpec::ForbiddenAttribute { id, .. }
+                | RuleSpec::MaxTxSize { id, .. } => id.clone(),
+            };
+            assert_eq!(spec.into_rule().id(), id);
+        }
+        // a decoded spec enforces identically to the original (semantics preserved).
+        let orig = RuleSpec::ForbiddenAttribute { id: "f".into(), attr: "x".into() };
+        let decoded: RuleSpec =
+            ciborium::from_reader(orig.clone().to_cbor().as_slice()).unwrap();
+        let ro: Vec<Box<dyn PhysicsRule>> = vec![orig.into_rule()];
+        let rd: Vec<Box<dyn PhysicsRule>> = vec![decoded.into_rule()];
+        for tx in [vec![assert_d("x")], vec![assert_d("ok")], vec![retract_d("x")]] {
+            assert_eq!(
+                validate_tx(&ro, &tx).is_valid(),
+                validate_tx(&rd, &tx).is_valid(),
+                "decoded rule enforces differently"
+            );
+        }
+    }
+
+    #[test]
     fn load_rules_resolves_a_dna_end_to_end() {
         // Build specs, address them, assemble a DNA referencing those CIDs.
         let schema = RuleSpec::AllowedAttributes {
