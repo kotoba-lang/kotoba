@@ -297,4 +297,62 @@ mod tests {
         assert_eq!(selected.len(), 2, "membrane off admits all");
         assert_eq!(selected[0], b, "higher reputation preferred first");
     }
+
+    #[test]
+    fn select_replicas_admission_is_bond_only_adversarially() {
+        // THE Sybil-resistance property: with the membrane ON, no amount of
+        // reputation gets an unbonded / under-bonded DID selected. Sweep peer
+        // mixes (bonded/unbonded × varied reputation) × bond floors.
+        use crate::neighborhood::K;
+        use crate::replication::ReplicationPolicy;
+        use std::collections::HashSet;
+        let root = did("root");
+        let addr = crate::neighborhood_store::cid_address(&root);
+
+        // 8 peers: even indices bonded at 5000, odd indices unbonded; reputation
+        // deliberately INVERTED (unbonded peers get the highest reputation).
+        let mut pins = PinIndex::new();
+        let mut peers = Vec::new();
+        for i in 0..8u8 {
+            let d = did(&format!("did{i}"));
+            let bonded = i % 2 == 0;
+            if bonded {
+                bonded_pin(&mut pins, &format!("pin{i}"), &d, &root, 5_000);
+            }
+            let reputation = if bonded { i as u64 } else { 1_000 + i as u64 };
+            peers.push((nid(&[i; 6]), d, reputation));
+        }
+        for floor in [1i64, 5_000, 5_001] {
+            // the eligible node set for THIS floor (bond-only admission).
+            let eligible: HashSet<NodeId> = peers
+                .iter()
+                .filter(|(_, d, _)| eligible_replica(d, &root, floor, &pins))
+                .map(|(n, _, _)| n.clone())
+                .collect();
+            let policy = ReplicationPolicy::new(3).with_min_bond(floor);
+            let selected = select_replicas(&root, &addr, &peers, &policy, &pins, true);
+            assert!(selected.len() <= K, "never exceeds K");
+            assert_eq!(
+                selected.iter().collect::<HashSet<_>>().len(),
+                selected.len(),
+                "no duplicates"
+            );
+            for n in &selected {
+                assert!(eligible.contains(n), "selected a non-eligible node (Sybil leak!)");
+            }
+            if floor > 5_000 {
+                assert!(selected.is_empty(), "floor above all bonds admits nobody");
+            }
+        }
+        // membrane OFF: the bond floor is ignored entirely (open neighbourhood).
+        let open = select_replicas(
+            &root,
+            &addr,
+            &peers,
+            &ReplicationPolicy::new(3).with_min_bond(5_001),
+            &pins,
+            false,
+        );
+        assert!(!open.is_empty(), "membrane off ignores the bond floor");
+    }
 }
