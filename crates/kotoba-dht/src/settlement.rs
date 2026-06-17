@@ -106,6 +106,42 @@ impl SettlementBatch {
     }
 }
 
+/// The unpaid **retainer owed** to bonded replicas — the `node.status`-facing
+/// view (ADR-002 p3). It is the reward-only projection of a settlement batch:
+/// how much USDC each peer is owed but not yet settled, aggregated per peer and
+/// sorted deterministically. Slash lines are excluded — this is what the node
+/// owes *out* for availability served, not what it claws back.
+///
+/// Pure: built from a non-draining [`SettlementIntentSink::snapshot`] so reading
+/// the owed retainer never consumes the settle hand-off queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainerOwed {
+    /// Reward-kind lines only, sorted (the per-peer owed retainer).
+    pub per_peer: Vec<SettlementLine>,
+    /// Total owed across all peers, in USDC micros.
+    pub total_micros: u64,
+}
+
+impl RetainerOwed {
+    /// Project the reward-owed view from pending intents under `schedule`.
+    pub fn from_intents(intents: &[SettlementIntent], schedule: SettlementSchedule) -> Self {
+        let batch = SettlementBatch::from_intents(intents, schedule);
+        let per_peer: Vec<SettlementLine> = batch
+            .lines
+            .into_iter()
+            .filter(|l| l.kind == SettlementKind::Reward)
+            .collect();
+        Self {
+            per_peer,
+            total_micros: batch.total_reward_micros,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.per_peer.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +219,72 @@ mod tests {
         let b1 = SettlementBatch::from_intents(&intents, schedule);
         let b2 = SettlementBatch::from_intents(&intents, schedule);
         assert_eq!(b1, b2, "same intents → byte-identical signable proposal");
+    }
+
+    // ── RetainerOwed (node.status owed-retainer view, ADR-002 p3) ──────────
+
+    #[test]
+    fn retainer_owed_excludes_slash_and_aggregates_reward() {
+        let schedule = SettlementSchedule::new(100);
+        let intents = vec![
+            intent(b"alice", SettlementKind::Reward, 3, 0), // 300
+            intent(b"alice", SettlementKind::Reward, 2, 1), // +200 → 500
+            intent(b"bob", SettlementKind::Reward, 1, 0),   // 100
+            intent(b"mallory", SettlementKind::Slash, 9, 0), // excluded
+        ];
+        let owed = RetainerOwed::from_intents(&intents, schedule);
+        assert_eq!(owed.total_micros, 600, "reward only; slash excluded");
+        assert_eq!(owed.per_peer.len(), 2, "alice aggregated, mallory dropped");
+        assert!(owed.per_peer.iter().all(|l| l.kind == SettlementKind::Reward));
+        let alice = NodeId::from_pubkey(b"alice");
+        let alice_line = owed.per_peer.iter().find(|l| l.peer == alice).unwrap();
+        assert_eq!(alice_line.usdc_micros, 500);
+    }
+
+    #[test]
+    fn retainer_owed_empty_when_no_rewards() {
+        let schedule = SettlementSchedule::new(10);
+        let owed = RetainerOwed::from_intents(
+            &[intent(b"x", SettlementKind::Slash, 5, 0)],
+            schedule,
+        );
+        assert!(owed.is_empty());
+        assert_eq!(owed.total_micros, 0);
+    }
+
+    #[test]
+    fn retainer_owed_is_deterministic() {
+        let schedule = SettlementSchedule::new(7);
+        let intents = vec![
+            intent(b"z", SettlementKind::Reward, 1, 0),
+            intent(b"a", SettlementKind::Reward, 1, 0),
+        ];
+        assert_eq!(
+            RetainerOwed::from_intents(&intents, schedule),
+            RetainerOwed::from_intents(&intents, schedule)
+        );
+    }
+
+    #[test]
+    fn intent_sink_snapshot_is_non_draining() {
+        use crate::audit::SettlementIntentSink;
+        use crate::audit::{AuditAction, PeerAudit, VerdictSink};
+        let sink = SettlementIntentSink::new(5, 2);
+        let audit = PeerAudit {
+            peer: NodeId::from_pubkey(b"peggy"),
+            result: None,
+            action: AuditAction::Reward,
+        };
+        sink.record(0, &audit);
+        sink.record(1, &audit);
+        // snapshot observes without consuming...
+        let snap = sink.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(sink.pending_len(), 2, "snapshot must not drain");
+        // ...and the owed view is derivable from it; drain still works after.
+        let owed = RetainerOwed::from_intents(&snap, SettlementSchedule::new(10));
+        assert_eq!(owed.total_micros, 100); // 2 rewards × 5 units × 10 micros
+        assert_eq!(sink.drain().len(), 2);
+        assert_eq!(sink.pending_len(), 0);
     }
 }

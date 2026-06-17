@@ -278,6 +278,14 @@ impl SettlementIntentSink {
         self.pending.lock().unwrap().len()
     }
 
+    /// Non-draining clone of the pending intents — for read-only surfaces like
+    /// `node.status` (owed-retainer view, ADR-002 p3) that must observe what is
+    /// owed without consuming the hand-off queue. Use [`drain`](Self::drain) for
+    /// the settle path.
+    pub fn snapshot(&self) -> Vec<SettlementIntent> {
+        self.pending.lock().unwrap().clone()
+    }
+
     /// Take all pending intents (hand-off to the gated on-chain executor).
     pub fn drain(&self) -> Vec<SettlementIntent> {
         std::mem::take(&mut *self.pending.lock().unwrap())

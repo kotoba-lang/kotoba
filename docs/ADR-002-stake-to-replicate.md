@@ -130,7 +130,14 @@ slash. Bond is necessary; reputation is ordering.
    env gate); membrane-off path is byte-for-byte today's open `k_nearest`.
 3. **Reward intents** — wire `eligible_for_reward()` → `SettlementIntent` →
    `SettlementBatch`; surface unpaid/owed retainer in `node.status`. (Routing
-   stays operator-side; kotoba only emits the batch.)
+   stays operator-side; kotoba only emits the batch.) — **done (data layer)**:
+   the `eligible_for_reward → SettlementIntent → SettlementBatch` chain already
+   existed (`kotoba-dht` `audit` + `settlement`); added `RetainerOwed`
+   (reward-only owed view, the `node.status` artifact) + non-draining
+   `SettlementIntentSink::snapshot`. Wiring the owed-retainer block into the
+   server `node.status` is deferred to p4, when the audit loop is connected to a
+   live `ProofFetcher` and actually produces intents (an always-empty status
+   block would be hollow until then).
 4. **Slash warrants** — `trigger_slash()` → signed warrant + pinned evidence;
    `mishmar.verifySlash` confirms the on-chain `Slashed` + `TitheRouter` split.
    Reuse the custody warrant/evidence path verbatim.
