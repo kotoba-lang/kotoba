@@ -15,11 +15,14 @@ Env vars:
 from __future__ import annotations
 from kotodama.kotoba_datomic import get_kotoba_client
 
+import datetime as _dt
+import hashlib
 import json
 import os
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any
 
 from kotodama import llm as _llm
@@ -109,6 +112,105 @@ def _h3_to_bbox(tile_h3: str) -> tuple[float, float, float, float]:
     lat_raw = ((idx >> 4) & 0xFFFFFF) / 0xFFFFFF * 180.0 - 90.0
     lng_raw = ((idx >> 28) & 0xFFFFFF) / 0xFFFFFF * 360.0 - 180.0
     return lng_raw - deg_pad, lat_raw - deg_pad, lng_raw + deg_pad, lat_raw + deg_pad
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Datom-log persistence (ADR-2605262130 / 2605312345: the kotoba Datom log
+# is first-class canonical state — Datomic-isomorphic EAVT, no RisingWave).
+#
+# processTile.bpmn's "mark tile done" step documents that "the worker tasks
+# have already INSERT-ed into vertex_spatial / vertex_vision_result / edge_*".
+# These helpers make that contract true: visionAnnotate lands its detections
+# in vertex_vision_result and linkActor lands its edges in
+# edge_maps3d_actor_link, both via the kotoba Datomic client's upsert surface
+# (:db.unique/identity on vertex_id → re-transact is idempotent).
+# ──────────────────────────────────────────────────────────────────────
+
+DEFAULT_REPO = "did:web:maps.etzhayyim.com"
+COLLECTION_VISION = "com.etzhayyim.apps.maps3d.visionResult"
+COLLECTION_ACTOR_LINK = "com.etzhayyim.apps.maps3d.actorLink"
+
+
+def _now_iso() -> str:
+    return (
+        _dt.datetime.now(tz=_dt.UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _stable_rkey(*parts: str) -> str:
+    """Deterministic rkey so re-running a tile upserts instead of duplicating."""
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _persist_vision_results(tile_h3: str, detections: list[dict]) -> int:
+    """Upsert vision detections into vertex_vision_result. Returns rows written.
+
+    Fail-open (matches the maps actor's kotoba-first/fail-open posture): a
+    substrate outage logs nothing-special and returns the count written so far
+    rather than failing the pipeline task.
+    """
+    if not tile_h3 or not detections:
+        return 0
+    client = get_kotoba_client()
+    now = _now_iso()
+    written = 0
+    for det in detections:
+        label = str(det.get("label") or "").strip()
+        if not label:
+            continue
+        image_ref = str(det.get("imageRef") or "")
+        rkey = _stable_rkey(tile_h3, label, image_ref)
+        row = {
+            "vertex_id": f"at://{DEFAULT_REPO}/{COLLECTION_VISION}/{rkey}",
+            "tile_h3": tile_h3,
+            "label": label,
+            "confidence": float(det.get("confidence") or 0),
+            "category": str(det.get("category") or "building"),
+            "image_ref": image_ref,
+            "source": "murakumo-vision",
+            "ingest_at": now,
+            "owner_did": DEFAULT_REPO,
+        }
+        try:
+            client.insert_row("vertex_vision_result", row)
+            written += 1
+        except Exception:
+            break  # substrate unavailable — fail-open, keep what landed
+    return written
+
+
+def _persist_actor_links(tile_h3: str, links: list[dict]) -> int:
+    """Upsert resolved actor links into edge_maps3d_actor_link. Returns rows written."""
+    if not tile_h3 or not links:
+        return 0
+    client = get_kotoba_client()
+    now = _now_iso()
+    written = 0
+    for lk in links:
+        actor_did = str(lk.get("actorDid") or "")
+        if not actor_did:
+            continue
+        label = str(lk.get("label") or lk.get("detectionId") or "")
+        rkey = _stable_rkey(tile_h3, label, actor_did)
+        row = {
+            "vertex_id": f"at://{DEFAULT_REPO}/{COLLECTION_ACTOR_LINK}/{rkey}",
+            "tile_h3": tile_h3,
+            "label": label,
+            "actor_did": actor_did,
+            "confidence": float(lk.get("confidence") or 0),
+            "source": str(lk.get("source") or "llm-disambiguate"),
+            "ingest_at": now,
+            "owner_did": DEFAULT_REPO,
+        }
+        try:
+            client.insert_row("edge_maps3d_actor_link", row)
+            written += 1
+        except Exception:
+            break  # fail-open
+    return written
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -512,7 +614,8 @@ async def task_maps3d_vision_annotate(
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
 
-    return {"ok": True, "detections": all_detections}
+    persisted = _persist_vision_results(tileH3, all_detections)
+    return {"ok": True, "detections": all_detections, "persisted": persisted}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -540,20 +643,18 @@ async def task_maps3d_link_actor(
         return {"ok": True, "links": []}
 
 
-    # Query actor_registry for nearby/relevant actors.
+    # Query the actor registry for candidate actors. Uses the kotoba Datomic
+    # client's Datalog-backed select shim (the prior SELECT-string passed to the
+    # Datalog `q()` endpoint never parsed, and its column list was always empty).
     registry_rows: list[dict] = []
     try:
-        if True:
-            client = get_kotoba_client()
-            _res = client.q(
-                "SELECT did, handle, display_name "
-                "FROM actor_registry "
-                "WHERE status = 'active' "
-                "LIMIT 200"
-            )
-            cols = [d[0] for d in ([] or [])]
-            for row in (_res or []):
-                registry_rows.append(dict(zip(cols, row)))
+        registry_rows = get_kotoba_client().select_where(
+            "vertex_actor_registry",
+            "status",
+            "active",
+            ["did", "handle", "display_name"],
+            limit=200,
+        )
     except Exception:
         pass  # registry unavailable; proceed with detection-only linkage
 
@@ -586,9 +687,10 @@ async def task_maps3d_link_actor(
             if float(lk.get("confidence") or 0) >= minConfidence
                and lk.get("actorDid")
         ]
-        return {"ok": True, "links": links}
+        persisted = _persist_actor_links(tileH3, links)
+        return {"ok": True, "links": links, "persisted": persisted}
 
-    return {"ok": True, "links": []}
+    return {"ok": True, "links": [], "persisted": 0}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -596,7 +698,16 @@ async def task_maps3d_link_actor(
 # ──────────────────────────────────────────────────────────────────────
 
 def register(worker: Any, *, timeout_ms: int = 120_000) -> None:
-    """Wire all maps3d task types onto the shared LangServer worker."""
+    """Wire all maps3d task types onto the shared LangServer worker.
+
+    DEPRECATED (Zeebe path): the Zeebe/BPMN-engine execution of processTile is
+    being retired in favour of the kotoba + Datomic engine
+    ``maps.methods.maps3d-bpmn`` (Clojure), which drives the same flow over the
+    Datom log with no external workflow engine. These task *implementations*
+    stay live and are reused as injected handlers by the Datomic engine; only
+    the Zeebe *worker registration* is deprecated. Do not add new Zeebe-only
+    task types here — model new steps in the BPMN process-def datoms instead.
+    """
 
     def t(name: str, fn: Any, *, ms: int | None = None) -> None:
         worker.task(task_type=name, single_value=False, timeout_ms=ms or timeout_ms)(fn)
