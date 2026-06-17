@@ -111,6 +111,55 @@ pub fn audit_replication(
     }
 }
 
+/// Enforcement decision (ADR-001 p4): given an audit `status`, the current
+/// `holders`, and admission-ordered `candidates` (e.g. from
+/// [`crate::membrane::select_replicas`] — already bond-gated and
+/// reputation-ranked), return the prioritised set of peers to **push the block
+/// to** so the pin contract is met. Priority:
+///
+/// 1. every missing declared `pin_peer` (contractual — must hold it), then
+/// 2. enough additional fresh candidates (in their given order) to close the
+///    remaining replica shortfall.
+///
+/// Targets are deduped and never include a current holder. Empty when the
+/// contract is already satisfied. Pure: the actual push is the caller's
+/// `NeighborhoodBlockStore::replicate`.
+pub fn replication_plan(
+    status: &ReplicationStatus,
+    holders: &[NodeId],
+    candidates: &[NodeId],
+) -> Vec<NodeId> {
+    if status.satisfied {
+        return Vec::new();
+    }
+    let held: std::collections::HashSet<&NodeId> = holders.iter().collect();
+    let mut targets: Vec<NodeId> = Vec::new();
+    let mut chosen: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+
+    // 1. contracted pin_peers that are missing — always pushed.
+    for p in &status.missing_pin_peers {
+        if !held.contains(p) && chosen.insert(p.clone()) {
+            targets.push(p.clone());
+        }
+    }
+
+    // 2. close the remaining replica shortfall with fresh candidates. Each pin
+    //    peer added above also becomes a replica, so it counts toward the floor.
+    let mut still_needed = status.under_replicated_by.saturating_sub(targets.len());
+    for c in candidates {
+        if still_needed == 0 {
+            break;
+        }
+        if held.contains(c) || chosen.contains(c) {
+            continue;
+        }
+        chosen.insert(c.clone());
+        targets.push(c.clone());
+        still_needed -= 1;
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +235,62 @@ mod tests {
         let st = audit_replication(&policy, 2, &holders);
         assert!(st.satisfied);
         assert!(st.missing_pin_peers.is_empty());
+    }
+
+    // ── replication_plan — the enforcement decision (ADR-001 p4) ───────────
+
+    #[test]
+    fn plan_is_empty_when_contract_satisfied() {
+        let policy = ReplicationPolicy::new(2);
+        let holders = vec![nid(b"a"), nid(b"b")];
+        let st = audit_replication(&policy, 2, &holders);
+        assert!(replication_plan(&st, &holders, &[nid(b"c"), nid(b"d")]).is_empty());
+    }
+
+    #[test]
+    fn plan_fills_shortfall_from_candidates_skipping_holders() {
+        // need 3, have 1 (a). candidates b,c,d (a is a holder, must be skipped).
+        let policy = ReplicationPolicy::new(3);
+        let holders = vec![nid(b"a")];
+        let st = audit_replication(&policy, 1, &holders);
+        assert_eq!(st.under_replicated_by, 2);
+        let plan = replication_plan(&st, &holders, &[nid(b"a"), nid(b"b"), nid(b"c"), nid(b"d")]);
+        assert_eq!(plan, vec![nid(b"b"), nid(b"c")], "two fresh candidates, in order");
+    }
+
+    #[test]
+    fn plan_pushes_missing_pinners_first_then_counts_them_toward_floor() {
+        // need 3, have 1 (a). a contracted pin_peer P is missing.
+        // P must be pushed (contractual) AND it counts toward the floor, so only
+        // 1 more candidate is needed after P → [P, b].
+        let pinner = nid(b"P");
+        let policy = ReplicationPolicy::new(3).with_pin_peers(vec![pinner.clone()]);
+        let holders = vec![nid(b"a")];
+        let st = audit_replication(&policy, 1, &holders);
+        assert_eq!(st.under_replicated_by, 2);
+        assert_eq!(st.missing_pin_peers, vec![pinner.clone()]);
+        let plan = replication_plan(&st, &holders, &[nid(b"b"), nid(b"c")]);
+        assert_eq!(plan, vec![pinner, nid(b"b")]);
+    }
+
+    #[test]
+    fn plan_pushes_pinner_even_when_floor_otherwise_met() {
+        // floor met (2/2) but contracted pinner missing → push just the pinner.
+        let pinner = nid(b"P");
+        let policy = ReplicationPolicy::new(2).with_pin_peers(vec![pinner.clone()]);
+        let holders = vec![nid(b"a"), nid(b"b")];
+        let st = audit_replication(&policy, 2, &holders);
+        assert!(!st.satisfied);
+        let plan = replication_plan(&st, &holders, &[nid(b"c")]);
+        assert_eq!(plan, vec![pinner], "only the missing pinner; no extra replicas");
+    }
+
+    #[test]
+    fn plan_stops_when_candidates_exhausted() {
+        // need 3, have 0, only one candidate available → plan is best-effort.
+        let policy = ReplicationPolicy::new(3);
+        let st = audit_replication(&policy, 0, &[]);
+        let plan = replication_plan(&st, &[], &[nid(b"only")]);
+        assert_eq!(plan, vec![nid(b"only")]);
     }
 }
