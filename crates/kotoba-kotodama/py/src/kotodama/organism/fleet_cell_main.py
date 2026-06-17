@@ -1,6 +1,6 @@
-"""fleet_cell_main — UnispscOrganismFleetCell entry (lan-api trigger).
+"""fleet_cell_main — OrganismFleetCell entry (lan-api trigger).
 
-Per ADR-2605240000. Hosts N UnispscOrganism instances for a shard's
+Per ADR-2605240000. Hosts N Organism instances for a shard's
 segment range, ticks all of them every ``tick_interval_s`` (default 300 s),
 exposes ``/healthz`` for fleet observability.
 
@@ -36,9 +36,9 @@ from typing import Any
 from kotodama.organism.followers import follower_score_provider
 from kotodama.organism.personality import joucho_personality_provider
 from kotodama.organism.post_sink import PostSink, resolve_post_sink
-from kotodama.organism.unispsc_organism import UnispscOrganism
+from kotodama.organism.organism import Organism
 
-logger = logging.getLogger("UnispscOrganismFleetCell")
+logger = logging.getLogger("OrganismFleetCell")
 
 _REGISTRY_REL = Path("00-contracts") / "actor-registry" / "unispsc.json"
 
@@ -101,7 +101,7 @@ def _owns(code: str, seg_lo: int, seg_hi: int) -> bool:
 
 
 class OrganismCache:
-    """LRU cache of UnispscOrganism instances keyed by code.
+    """LRU cache of Organism instances keyed by code.
 
     Mirrors the shape of UnispscAgentExecutorCell.GraphCache but holds the
     full organism (CadenceState + InboxBuffer + classify graph reference)
@@ -113,7 +113,7 @@ class OrganismCache:
 
     def __init__(self, capacity: int = 4096, *, post_sink: PostSink | None = None):
         self.capacity = max(16, capacity)
-        self._d: OrderedDict[str, UnispscOrganism] = OrderedDict()
+        self._d: OrderedDict[str, Organism] = OrderedDict()
         self.hits = 0
         self.misses = 0
         self.import_failures: dict[str, str] = {}
@@ -122,7 +122,7 @@ class OrganismCache:
     def __len__(self) -> int:
         return len(self._d)
 
-    def get_or_create(self, code: str, title: str = "") -> UnispscOrganism | None:
+    def get_or_create(self, code: str, title: str = "") -> Organism | None:
         if code in self._d:
             self._d.move_to_end(code)
             self.hits += 1
@@ -130,7 +130,7 @@ class OrganismCache:
         if code in self.import_failures:
             return None
         try:
-            organism = UnispscOrganism.for_code(
+            organism = Organism.for_code(
                 code,
                 title=title,
                 joucho_provider=joucho_personality_provider,
@@ -234,7 +234,7 @@ def _bind_handlers(app: "web.Application", state: FleetState) -> None:
         return web.json_response(
             {
                 "ok": True,
-                "service": "UnispscOrganismFleetCell",
+                "service": "OrganismFleetCell",
                 "shard": state.shard_index,
                 "owns": f"segments {state.seg_lo}-{state.seg_hi}",
                 "ownedCount": len(state.owned_codes),
@@ -296,7 +296,7 @@ async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> 
     heartbeat_task = asyncio.create_task(_heartbeat_loop(state, stop_event, tick_interval_s))
 
     logger.info(
-        "UnispscOrganismFleetCell shard-%s serving 0.0.0.0:%d (healthz=%d) — %d owned, tick=%ds",
+        "OrganismFleetCell shard-%s serving 0.0.0.0:%d (healthz=%d) — %d owned, tick=%ds",
         state.shard_index,
         api_port,
         healthz_port,
@@ -312,7 +312,7 @@ async def serve(stop_event: asyncio.Event, healthz_port: int, api_port: int) -> 
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
         await runner.cleanup()
-        logger.info("UnispscOrganismFleetCell shard-%s shut down", state.shard_index)
+        logger.info("OrganismFleetCell shard-%s shut down", state.shard_index)
 
 
 __all__ = [

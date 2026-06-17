@@ -23,34 +23,34 @@ from typing import Any
 from kotodama.organism.inbox import InboundCommit
 from kotodama.organism.lifecycle import OrganismState
 from kotodama.organism.post_sink import resolve_post_sink
-from kotodama.organism.unispsc_organism import UnispscOrganism
+from kotodama.organism.organism import Organism
 
 logger = logging.getLogger("kotodama.organism.cell_main")
 
-_organism: UnispscOrganism | None = None
+_organism: Organism | None = None
 
 
 def _resolve_code() -> str:
     return os.environ.get("UNISPSC_ORGANISM_CODE", "10101500")
 
 
-def _build_organism() -> UnispscOrganism:
+def _build_organism() -> Organism:
     """Build the reference organism with the env-resolved post sink.
 
     UNISPSC_ORGANISM_POST_SINK=ndjson activates the substrate-bound NDJSON
     queue sink (ADR-2605240100); default ``logger`` writes to stdout.
     """
-    return UnispscOrganism.for_code(_resolve_code(), post_sink=resolve_post_sink())
+    return Organism.for_code(_resolve_code(), post_sink=resolve_post_sink())
 
 
-def _ensure_organism() -> UnispscOrganism:
+def _ensure_organism() -> Organism:
     global _organism
     if _organism is None:
         level = os.environ.get("UNISPSC_ORGANISM_LOG_LEVEL", "INFO").upper()
         logging.basicConfig(level=getattr(logging, level, logging.INFO))
         _organism = _build_organism()
         # Birth the organism so its lifecycle is ACTIVE — without this the
-        # tick gate (UnispscOrganism.tick early-returns a no-op dummy cadence
+        # tick gate (Organism.tick early-returns a no-op dummy cadence
         # while the lifecycle is INACTIVE) would make a fired cell never post.
         # The cell-runner firing a cell IS the spawn event in production.
         if _organism.lifecycle.state is OrganismState.INACTIVE:
@@ -65,7 +65,7 @@ def _ensure_organism() -> UnispscOrganism:
     return _organism
 
 
-def _seed_self_inbox(organism: UnispscOrganism, now_ms: int) -> None:
+def _seed_self_inbox(organism: Organism, now_ms: int) -> None:
     """Until MST subscription is wired (ADR-2605232345 §Phase 6), seed one
     synthetic inbound commit per tick so the heartbeat exercises the
     classify path. Real deployment replaces this with MST listener pushes.

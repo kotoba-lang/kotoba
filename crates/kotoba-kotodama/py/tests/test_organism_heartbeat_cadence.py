@@ -8,7 +8,7 @@ from kotodama.organism import (
     CadenceState,
     InboxBuffer,
     JouchoScores,
-    UnispscOrganism,
+    Organism,
     determine_mood,
     resolve_heartbeat_cadence,
 )
@@ -233,14 +233,14 @@ def test_three_consecutive_record_analysis_posts_get_suppressed():
     assert r3.content_source.kind != "recordAnalysis"
 
 
-# ── UnispscOrganism end-to-end ─────────────────────────────────────────
+# ── Organism end-to-end ─────────────────────────────────────────
 
 
 def test_organism_for_code_uses_default_graph_after_per_code_retirement():
     # The per-code unispsc_agents.c{code} agents were retired (superseded by
     # the clj actor); for_code now builds a generic organism with a default
     # no-op classify graph and generic title/DID.
-    organism = UnispscOrganism.for_code("10101500")
+    organism = Organism.for_code("10101500")
     assert organism.code == "10101500"
     assert organism.title == "c10101500"
     assert organism.actor_did == "did:web:etzhayyim.com:actor:c10101500"
@@ -251,7 +251,7 @@ def test_organism_for_code_uses_default_graph_after_per_code_retirement():
 
 
 def test_organism_tick_with_empty_inbox_produces_cadence():
-    organism = UnispscOrganism.for_code("10101500")
+    organism = Organism.for_code("10101500")
     # First tick: cooldowns all zero, so neutral mood will permit some action.
     result = organism.tick(now_ms=3 * 3_600_000 + 1)
     assert result.cadence.mood in ("neutral", "calm", "joyful", "grateful", "focused", "stressed")
@@ -261,7 +261,7 @@ def test_organism_tick_with_empty_inbox_produces_cadence():
 
 def test_organism_tick_with_inbound_commit_runs_classify():
     captured: list[str] = []
-    organism = UnispscOrganism.for_code(
+    organism = Organism.for_code(
         "10101500",
         classify_input_factory=lambda _c: {
             "input": {"species": "ovis aries", "health_data": {"certified": True}},
@@ -284,7 +284,7 @@ def test_organism_tick_with_inbound_commit_runs_classify():
 
 
 def test_organism_classify_failure_does_not_crash_tick():
-    organism = UnispscOrganism.for_code(
+    organism = Organism.for_code(
         "10101500",
         classify_input_factory=lambda _c: (_ for _ in ()).throw(RuntimeError("boom")),
     )

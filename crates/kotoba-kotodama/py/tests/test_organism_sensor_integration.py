@@ -1,4 +1,4 @@
-"""UnispscOrganism sensor integration (ADR-2605262400 §4.3).
+"""Organism sensor integration (ADR-2605262400 §4.3).
 
 Verifies that the organism polls its DatasetSensors on tick, honors
 each sensor's `refresh_cadence_sec`, and stores observations in a
@@ -23,8 +23,8 @@ from kotodama.organism.sensors.base import (
     SensorObservation,
     Tier,
 )
-from kotodama.organism.unispsc_organism import (
-    UnispscOrganism,
+from kotodama.organism.organism import (
+    Organism,
     _MAX_SENSOR_OBSERVATIONS,
 )
 
@@ -66,15 +66,15 @@ class _StubSensor:
         ]
 
 
-def _make_organism(sensors: tuple = (), sample_size: int = 4) -> UnispscOrganism:
-    """Build a UnispscOrganism with a no-op graph stub.
+def _make_organism(sensors: tuple = (), sample_size: int = 4) -> Organism:
+    """Build a Organism with a no-op graph stub.
 
     Birthed to ACTIVE so ``tick()`` exercises the real heartbeat path:
     the lifecycle R1 state machine (commit c0d1099f5) gates ``tick()``
     behind ACTIVE/CLONED, and an INACTIVE organism legitimately skips
     polling. A live organism is what these integration tests intend.
     """
-    org = UnispscOrganism(
+    org = Organism(
         code="99999999",
         graph=MagicMock(),
         sensors=sensors,

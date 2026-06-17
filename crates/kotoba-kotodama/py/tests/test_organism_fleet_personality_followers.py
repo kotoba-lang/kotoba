@@ -3,7 +3,7 @@
 Covers:
   - joucho_personality_provider determinism + distribution + segment bias
   - file_follower_score_provider + default stub
-  - UnispscOrganismFleetCell shard ownership + tick sweep
+  - OrganismFleetCell shard ownership + tick sweep
 """
 
 from __future__ import annotations
@@ -150,7 +150,7 @@ def test_file_seeded_followers_feed_reward_detector(tmp_path: Path):
     assert rewards[0].reward_type == "love"  # +10 wellness ≥ 10 threshold
 
 
-# ── UnispscOrganismFleetCell — sharding + tick sweep ───────────────────
+# ── OrganismFleetCell — sharding + tick sweep ───────────────────
 
 
 def test_shard_ranges_match_executor_cell():
