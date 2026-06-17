@@ -62,6 +62,62 @@ pub fn anchor_block_calldata(
     commit_root_calldata(&root_hash, block_cid.to_multibase().as_bytes(), batch_size)
 }
 
+// ── Finality verification (read+verify side, GROWTH p8 / MISHMAR §1) ──────────
+//
+// The write side above CONSTRUCTS the anchor calldata. This side VERIFIES it: a
+// graph head is *final* once its CommitDag root is observed anchored on Base.
+// kotoba never submits the tx; it observes `AnchorBridge.committerOf[rootHash]`
+// (read-only) and checks the three-way match (local head ↔ anchored root ↔ a
+// non-zero committer). Pure — chain observation is the caller's; this is the verdict.
+
+/// The 32-byte root commitment derived from a graph head CID — the value
+/// `AnchorBridge.commitRoot` anchors and `committerOf` is keyed by (the low 32
+/// bytes of the CIDv1 36-byte content hash).
+pub fn root_hash_of(head: &KotobaCid) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&head.0[4..36]);
+    h
+}
+
+/// True for the zero / unset Ethereum address (`committerOf` returns this when a
+/// root hash has never been anchored).
+pub fn is_zero_address(addr: &[u8; 20]) -> bool {
+    addr.iter().all(|&b| b == 0)
+}
+
+/// Finality verdict for a graph head (read+verify; GROWTH p8 / MISHMAR §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalityStatus {
+    /// The local head's root commitment that was checked on-chain.
+    pub root_hash: [u8; 32],
+    /// A non-zero committer was observed for this exact root hash.
+    pub anchored: bool,
+    /// `true` iff the head's root is anchored by a non-zero committer — the
+    /// objective finality point. (Querying `committerOf` by the *local* root hash
+    /// makes the three-way match hold by construction: a hit means the chain
+    /// recorded exactly this root.)
+    pub is_final: bool,
+}
+
+/// Verify a graph head's finality against an observed `AnchorBridge.committerOf`
+/// lookup keyed by the head's own root hash. `committer_of_local_root` is the
+/// observed committer address (`None` if the call reverted / no record). Final
+/// iff that committer exists and is non-zero.
+pub fn verify_finality(
+    local_head: &KotobaCid,
+    committer_of_local_root: Option<[u8; 20]>,
+) -> FinalityStatus {
+    let root_hash = root_hash_of(local_head);
+    let anchored = committer_of_local_root
+        .map(|a| !is_zero_address(&a))
+        .unwrap_or(false);
+    FinalityStatus {
+        root_hash,
+        anchored,
+        is_final: anchored,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +167,51 @@ mod tests {
         let len = mb.len();
         assert_eq!(data[4 + 32 * 3 + 31] as usize, len);
         assert_eq!(&data[4 + 32 * 4..4 + 32 * 4 + len], mb.as_bytes());
+    }
+
+    // ── finality verification ────────────────────────────────────────────
+
+    #[test]
+    fn root_hash_is_the_low_32_bytes_and_matches_anchor_calldata() {
+        let head = KotobaCid::from_bytes(b"graph-head");
+        assert_eq!(root_hash_of(&head), {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&head.0[4..36]);
+            h
+        });
+        // the same root hash the write side anchors.
+        let data = anchor_block_calldata(&head, &head, 1);
+        assert_eq!(&data[4..36], &root_hash_of(&head));
+    }
+
+    #[test]
+    fn unanchored_head_is_not_final() {
+        let head = KotobaCid::from_bytes(b"unanchored");
+        // no committerOf record at all.
+        let st = verify_finality(&head, None);
+        assert!(!st.anchored);
+        assert!(!st.is_final);
+        assert_eq!(st.root_hash, root_hash_of(&head));
+        // a zero-address committer (root never anchored) is also not final.
+        let zero = verify_finality(&head, Some([0u8; 20]));
+        assert!(!zero.is_final);
+    }
+
+    #[test]
+    fn head_anchored_by_nonzero_committer_is_final() {
+        let head = KotobaCid::from_bytes(b"anchored");
+        let mut committer = [0u8; 20];
+        committer[19] = 0xAB; // a real relayer address
+        let st = verify_finality(&head, Some(committer));
+        assert!(st.anchored);
+        assert!(st.is_final, "a non-zero committer at the local root = finality");
+    }
+
+    #[test]
+    fn is_zero_address_detects_unset() {
+        assert!(is_zero_address(&[0u8; 20]));
+        let mut a = [0u8; 20];
+        a[0] = 1;
+        assert!(!is_zero_address(&a));
     }
 }
