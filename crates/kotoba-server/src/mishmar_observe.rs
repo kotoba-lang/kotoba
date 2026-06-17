@@ -343,6 +343,80 @@ pub fn observe_finalities<T: JsonRpcTransport>(
         .collect()
 }
 
+/// Configuration for the periodic finality-checkpoint observation loop (GROWTH
+/// p8), read from the environment. Disabled (`None`) unless an interval > 0 and
+/// both the anchor RPC URL and contract address are set — strictly opt-in.
+#[derive(Debug, Clone)]
+pub struct FinalityLoopConfig {
+    pub interval: std::time::Duration,
+    pub rpc_url: String,
+    pub anchor_address: String,
+}
+
+impl FinalityLoopConfig {
+    /// From env: `KOTOBA_FINALITY_INTERVAL_SECS` (> 0 enables),
+    /// `KOTOBA_ANCHOR_RPC_URL`, `KOTOBA_ANCHOR_ADDRESS` (both required non-empty).
+    pub fn from_env() -> Option<Self> {
+        let secs: u64 = std::env::var("KOTOBA_FINALITY_INTERVAL_SECS")
+            .ok()?
+            .parse()
+            .ok()?;
+        if secs == 0 {
+            return None;
+        }
+        let rpc_url = std::env::var("KOTOBA_ANCHOR_RPC_URL").ok()?;
+        let anchor_address = std::env::var("KOTOBA_ANCHOR_ADDRESS").ok()?;
+        if rpc_url.trim().is_empty() || anchor_address.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            interval: std::time::Duration::from_secs(secs),
+            rpc_url,
+            anchor_address,
+        })
+    }
+}
+
+/// Spawn the periodic finality-checkpoint observer (opt-in via
+/// [`FinalityLoopConfig`]). Each tick reads the node's graph heads, observes each
+/// head's `committerOf` finality over `ReqwestRpc` (off-runtime), and writes the
+/// aggregate [`kotoba_evm::anchor::FinalitySummary`] into `cache` (surfaced in
+/// node.status). Read-only — kotoba never submits the anchor tx.
+pub fn spawn_finality_loop(
+    config: FinalityLoopConfig,
+    quad_store: std::sync::Arc<kotoba_graph::QuadStore>,
+    cache: std::sync::Arc<tokio::sync::RwLock<kotoba_evm::anchor::FinalitySummary>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(config.interval);
+        loop {
+            ticker.tick().await;
+            let heads = quad_store.all_graph_cids().await;
+            let url = config.rpc_url.clone();
+            let anchor = config.anchor_address.clone();
+            let summary = tokio::task::spawn_blocking(move || {
+                let rpc = ReqwestRpc { url };
+                let pairs = observe_finalities(&rpc, &anchor, &heads);
+                let statuses: Vec<_> = pairs.into_iter().map(|(_, s)| s).collect();
+                kotoba_evm::anchor::finality_summary(&statuses)
+            })
+            .await;
+            match summary {
+                Ok(s) => {
+                    tracing::info!(
+                        tracked = s.tracked,
+                        finalized = s.finalized,
+                        pending = s.pending,
+                        "graph-head finality checkpoint"
+                    );
+                    *cache.write().await = s;
+                }
+                Err(e) => tracing::warn!(error = %e, "finality observation task failed"),
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +485,35 @@ mod tests {
         }
         let head = KotobaCid::from_bytes(b"h");
         assert!(!observe_finality(&ErrRpc, "0xanchor", &head).is_final);
+    }
+
+    #[test]
+    fn finality_loop_config_is_opt_in() {
+        for k in [
+            "KOTOBA_FINALITY_INTERVAL_SECS",
+            "KOTOBA_ANCHOR_RPC_URL",
+            "KOTOBA_ANCHOR_ADDRESS",
+        ] {
+            std::env::remove_var(k);
+        }
+        assert!(FinalityLoopConfig::from_env().is_none(), "unset → disabled");
+        std::env::set_var("KOTOBA_FINALITY_INTERVAL_SECS", "60");
+        assert!(FinalityLoopConfig::from_env().is_none(), "no rpc/anchor → disabled");
+        std::env::set_var("KOTOBA_ANCHOR_RPC_URL", "http://base-rpc:8545");
+        std::env::set_var("KOTOBA_ANCHOR_ADDRESS", "0xanchor");
+        let cfg = FinalityLoopConfig::from_env().expect("enabled");
+        assert_eq!(cfg.interval, std::time::Duration::from_secs(60));
+        assert_eq!(cfg.anchor_address, "0xanchor");
+        // interval 0 disables even with rpc/anchor set.
+        std::env::set_var("KOTOBA_FINALITY_INTERVAL_SECS", "0");
+        assert!(FinalityLoopConfig::from_env().is_none(), "interval 0 → disabled");
+        for k in [
+            "KOTOBA_FINALITY_INTERVAL_SECS",
+            "KOTOBA_ANCHOR_RPC_URL",
+            "KOTOBA_ANCHOR_ADDRESS",
+        ] {
+            std::env::remove_var(k);
+        }
     }
 
     #[test]

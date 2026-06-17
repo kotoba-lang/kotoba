@@ -7191,6 +7191,7 @@ pub async fn node_status(
     let nb = state.neighborhood.read().await;
     let did_document = state.local_did_document().await;
     let stake_to_replicate = kotoba_dht::stake_to_replicate_enabled();
+    let finality = *state.finality_summary.read().await;
     let policy = effective_replication_policy(
         std::env::var("KOTOBA_DHT_MIN_REPLICAS").ok().as_deref(),
         std::env::var("KOTOBA_DHT_MIN_BOND_MKOTO").ok().as_deref(),
@@ -7213,6 +7214,14 @@ pub async fn node_status(
             // Owed retainer accrued by the availability-audit loop (ADR-002 p3).
             // Reward-only view; the on-chain settle stays operator-side.
             "owed_retainer": owed_retainer_json(&state.dht_audit_sink),
+        },
+        // Graph-head finality checkpoint (GROWTH p8): how many of this node's
+        // heads are anchored on Base (committerOf observed). Zeroed until the
+        // opt-in finality loop runs. Read+verify — kotoba never submits the tx.
+        "finality": {
+            "tracked": finality.tracked,
+            "finalized": finality.finalized,
+            "pending": finality.pending,
         },
         "envelope_manifest_cleanup": {
             "attempts": 0,

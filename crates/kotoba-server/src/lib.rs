@@ -1018,6 +1018,22 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         // Feed the state's shared sink so owed retainer is observable in node.status.
         dht_audit::spawn_audit_loop(cfg, state.block_store.clone(), state.dht_audit_sink.clone());
     }
+    // Periodic finality-checkpoint observer (GROWTH p8) — opt-in via
+    // KOTOBA_FINALITY_INTERVAL_SECS + KOTOBA_ANCHOR_RPC_URL + KOTOBA_ANCHOR_ADDRESS.
+    // Observes each graph head's committerOf finality on Base (read-only) and
+    // refreshes the node.status summary; kotoba never submits the anchor tx.
+    if let Some(cfg) = mishmar_observe::FinalityLoopConfig::from_env() {
+        tracing::info!(
+            interval_secs = cfg.interval.as_secs(),
+            anchor = %cfg.anchor_address,
+            "finality checkpoint loop ENABLED"
+        );
+        mishmar_observe::spawn_finality_loop(
+            cfg,
+            state.quad_store.clone(),
+            state.finality_summary.clone(),
+        );
+    }
     // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
     // game snapshots are content-addressed into the block store + announced on
     // the KSE LiveBus. Idempotent; per-frame traffic never touches either.

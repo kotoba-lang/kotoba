@@ -303,6 +303,10 @@ pub struct KotobaState {
     /// loop (GROWTH p4). Surfaced as owed retainer in `node.status`; drained by
     /// the operator-side settlement path. Empty until the opt-in loop runs.
     pub dht_audit_sink: Arc<kotoba_dht::SettlementIntentSink>,
+    /// Latest graph-head finality checkpoint summary (GROWTH p8), refreshed by
+    /// the opt-in finality loop and surfaced in `node.status`. Default-zero until
+    /// the loop runs.
+    pub finality_summary: Arc<tokio::sync::RwLock<kotoba_evm::anchor::FinalitySummary>>,
     // ── CC Vector Search ─────────────────────────────────────────────────────
     /// Optional embed client for CC vector search (KOTOBA_EMBED_URL).
     pub cc_embed_client: Option<Arc<dyn EmbedClient>>,
@@ -910,6 +914,9 @@ impl KotobaState {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1),
+            )),
+            finality_summary: Arc::new(tokio::sync::RwLock::new(
+                kotoba_evm::anchor::FinalitySummary::default(),
             )),
             cc_embed_client,
             media_embed_client,
