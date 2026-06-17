@@ -128,6 +128,27 @@ where
     all
 }
 
+/// Resume a causal firehose from a `cursor`: keep only items strictly after it
+/// (by [`Hlc`]) and return them in causal order (GROWTH p11 resumable
+/// subscription). The cursor is the consumer's last-seen Hlc, so a reconnecting
+/// subscriber gets exactly the unseen tail, deterministically — pass [`Hlc::ZERO`]
+/// for a fresh subscription (the whole stream).
+pub fn causal_after<T, K, FH, FK>(
+    items: Vec<T>,
+    cursor: Hlc,
+    hlc_of: FH,
+    tiebreak_of: FK,
+) -> Vec<T>
+where
+    K: Ord,
+    FH: Fn(&T) -> Hlc,
+    FK: Fn(&T) -> K,
+{
+    let mut tail: Vec<T> = items.into_iter().filter(|i| hlc_of(i) > cursor).collect();
+    causal_sort_by(&mut tail, &hlc_of, &tiebreak_of);
+    tail
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +257,22 @@ mod tests {
         let merged = causal_merge_dedup(vec![g1, g2], |e| e.0, |e| e.1.clone());
         let ids: Vec<String> = merged.into_iter().map(|e| e.1).collect();
         assert_eq!(ids, vec!["a", "c", "b"], "interleaved by hlc, 'b' deduped");
+    }
+
+    #[test]
+    fn causal_after_returns_only_the_unseen_tail_in_order() {
+        let events = vec![ev(10, 0, "a"), ev(20, 0, "b"), ev(10, 1, "c"), ev(30, 0, "d")];
+        let ids = |v: Vec<(Hlc, String)>| v.into_iter().map(|e| e.1).collect::<Vec<_>>();
+        // cursor at the "c" event (hlc 10/1): only strictly-later events, ordered.
+        let cursor = Hlc::new(10, 1);
+        assert_eq!(ids(causal_after(events.clone(), cursor, |e| e.0, |e| e.1.clone())), vec!["b", "d"]);
+        // ZERO cursor → whole stream, causally ordered.
+        assert_eq!(
+            ids(causal_after(events.clone(), Hlc::ZERO, |e| e.0, |e| e.1.clone())),
+            vec!["a", "c", "b", "d"]
+        );
+        // cursor past the end → empty (caller is fully caught up).
+        assert!(causal_after(events, Hlc::new(99, 0), |e| e.0, |e| e.1.clone()).is_empty());
     }
 
     #[test]

@@ -3,7 +3,7 @@ pub mod cid;
 pub mod foreign;
 pub mod frame;
 pub mod hlc;
-pub use hlc::{causal_merge_dedup, causal_sort_by, Hlc};
+pub use hlc::{causal_after, causal_merge_dedup, causal_sort_by, Hlc};
 pub mod named_graph;
 pub mod policy;
 pub mod prolly;
