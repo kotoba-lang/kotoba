@@ -342,6 +342,39 @@ mod tests {
     }
 
     #[test]
+    fn closed_schema_never_admits_an_out_of_schema_assert() {
+        // Safety completeness: whatever the tx mixes in — allowed asserts,
+        // retracts of anything, repeats — a closed-schema rule MUST reject the
+        // moment any asserted attribute is outside the schema, and accept only
+        // when every asserted attribute is allowed. Adversarial sweep.
+        let allowed: std::collections::HashSet<String> =
+            ["name", "role"].iter().map(|s| s.to_string()).collect();
+        let rule: Vec<Box<dyn PhysicsRule>> = vec![Box::new(AllowedAttributes {
+            id: "schema".into(),
+            allowed: allowed.clone(),
+        })];
+        let universe = ["name", "role", "evil", "system/x"];
+        // every subset (as a bitmask) of asserts, plus a retract of "evil".
+        for mask in 0u32..(1 << universe.len()) {
+            let mut tx = vec![retract_d("evil")]; // a retract must never cause rejection
+            let mut has_forbidden_assert = false;
+            for (i, a) in universe.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    tx.push(assert_d(a));
+                    if !allowed.contains(*a) {
+                        has_forbidden_assert = true;
+                    }
+                }
+            }
+            let valid = validate_tx(&rule, &tx).is_valid();
+            assert_eq!(
+                valid, !has_forbidden_assert,
+                "closed-schema verdict wrong for mask {mask:#b}"
+            );
+        }
+    }
+
+    #[test]
     fn enforce_loads_then_validates_in_one_call() {
         let schema = RuleSpec::AllowedAttributes {
             id: "schema".into(),

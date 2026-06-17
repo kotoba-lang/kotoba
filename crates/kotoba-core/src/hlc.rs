@@ -286,6 +286,74 @@ mod tests {
     }
 
     #[test]
+    fn send_is_strictly_monotonic_over_any_wall_sequence() {
+        // Thread one clock through an adversarial wall-time sequence (forward
+        // jumps, stalls, and backward jumps) — every stamp must strictly exceed
+        // the previous, the property the whole causal ordering rests on.
+        let walls = [100u64, 100, 50, 100, 100, 200, 0, 200, 201, 1, 201, 5_000, 5_000];
+        let mut clk = Hlc::ZERO;
+        for w in walls {
+            let next = clk.send(w);
+            assert!(next > clk, "send not strictly monotonic at wall={w}: {clk:?} -> {next:?}");
+            clk = next;
+        }
+    }
+
+    #[test]
+    fn recv_always_dominates_both_inputs() {
+        // The HLC receive rule must produce a clock strictly greater than both the
+        // local and the remote it merged, with physical >= max of the three
+        // inputs. Sweep the combination space deterministically.
+        for lp in [0u64, 5, 10] {
+            for lc in [0u64, 1, 7] {
+                for rp in [0u64, 5, 10] {
+                    for rc in [0u64, 1, 7] {
+                        for w in [0u64, 5, 10] {
+                            let local = Hlc::new(lp, lc);
+                            let remote = Hlc::new(rp, rc);
+                            let m = local.recv(remote, w);
+                            assert!(m > local, "recv !> local: {local:?} {remote:?} w={w} -> {m:?}");
+                            assert!(m > remote, "recv !> remote: {local:?} {remote:?} w={w} -> {m:?}");
+                            assert!(
+                                m.phys_ms() >= lp.max(rp).max(w),
+                                "recv physical below max input"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn causal_sort_is_total_and_permutation_invariant() {
+        // Any permutation of the same event set sorts to the identical sequence
+        // (deterministic total order across replicas). Sweep several rotations.
+        let base = vec![
+            ev(10, 0, "a"), ev(10, 1, "b"), ev(20, 0, "c"),
+            ev(5, 3, "d"), ev(20, 0, "c"), ev(7, 0, "e"),
+        ];
+        let canonical = order(&base);
+        for rot in 0..base.len() {
+            let mut perm = base.clone();
+            perm.rotate_left(rot);
+            assert_eq!(order(&perm), canonical, "rotation {rot} changed the order");
+        }
+        // canonical order is non-decreasing by (hlc, id).
+        let keys: Vec<(Hlc, String)> = {
+            let mut v = base.clone();
+            causal_sort_by(&mut v, |e| e.0, |e| e.1.clone());
+            v
+        };
+        for w in keys.windows(2) {
+            assert!(
+                (w[0].0, &w[0].1) <= (w[1].0, &w[1].1),
+                "not sorted by (hlc, id)"
+            );
+        }
+    }
+
+    #[test]
     fn zero_is_the_minimum() {
         assert_eq!(Hlc::ZERO, Hlc::new(0, 0));
         assert!(Hlc::ZERO < Hlc::new(1, 0));
