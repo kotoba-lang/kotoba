@@ -21,6 +21,19 @@ use std::sync::Arc;
 pub const NSID_AVAILABILITY_CHALLENGE: &str =
     "com.etzhayyim.apps.kotoba.dht.availability_challenge";
 
+/// Open endpoint advertising this node's DHT routing id, so a peer that only
+/// knows a base URL can resolve its `NodeId` before challenging it (closes the
+/// "peers advertise their node id" gap the audit loop needs — GROWTH p4). The
+/// node id is public routing information (the XOR address), not a secret — the
+/// same value the operator-gated `node.status` reports, exposed unauthenticated
+/// like the availability protocol itself.
+pub const NSID_DHT_INFO: &str = "com.etzhayyim.apps.kotoba.dht.info";
+
+/// GET handler for [`NSID_DHT_INFO`]: returns `{ "node_id": "<hex>" }`.
+pub async fn dht_info(State(state): State<Arc<KotobaState>>) -> impl IntoResponse {
+    Json(serde_json::json!({ "node_id": hex::encode(state.local_node_id.0) }))
+}
+
 const MAX_CHALLENGE_CIDS: usize = 1024;
 const KOTOBA_CID_BYTES: usize = 36;
 const NODE_ID_BYTES: usize = 32;

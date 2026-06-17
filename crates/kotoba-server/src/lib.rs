@@ -1602,6 +1602,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             ),
             post(crate::availability_xrpc::availability_challenge),
         )
+        .route(
+            &format!("/xrpc/{}", crate::availability_xrpc::NSID_DHT_INFO),
+            get(crate::availability_xrpc::dht_info),
+        )
         .route("/xrpc/:nsid", post(xrpc::generic_invoke))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),

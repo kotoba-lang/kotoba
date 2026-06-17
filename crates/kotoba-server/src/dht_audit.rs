@@ -78,6 +78,51 @@ pub fn audit_epoch_dyn(
     summarize(&scheduler.run_epoch(epoch, cids, &peers))
 }
 
+/// Resolve a list of peer base URLs into the `NodeId → URL` map the auditor
+/// needs, by GETting each peer's open `dht.info` endpoint to learn its routing
+/// id (GROWTH p4 — peer identity advertisement). Peers that are unreachable or
+/// return a malformed node id are skipped (best-effort discovery). Synchronous
+/// (`reqwest::blocking`) — call from `spawn_blocking`.
+pub fn resolve_endpoints(urls: &[String]) -> HashMap<NodeId, String> {
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for url in urls {
+        let base = url.trim().trim_end_matches('/');
+        if base.is_empty() {
+            continue;
+        }
+        let info_url = format!(
+            "{base}/xrpc/{}",
+            crate::availability_xrpc::NSID_DHT_INFO
+        );
+        let Ok(resp) = client.get(&info_url).send() else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.json::<serde_json::Value>() else {
+            continue;
+        };
+        let Some(hex_id) = body.get("node_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(bytes) = hex::decode(hex_id) else { continue };
+        let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+            continue;
+        };
+        out.insert(NodeId(arr), base.to_string());
+    }
+    out
+}
+
 fn summarize(verdicts: &[kotoba_dht::PeerAudit]) -> AuditEpochSummary {
     let mut s = AuditEpochSummary::default();
     for v in verdicts {
@@ -199,5 +244,55 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.rewarded, 1, "dyn store path rewards a holding peer");
+    }
+
+    /// End-to-end peer discovery: resolve a peer's NodeId from just its URL via
+    /// the open dht.info endpoint, then audit it — no pre-shared node id.
+    #[tokio::test]
+    async fn resolve_endpoints_then_audit_from_url_only() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = Arc::new(KotobaState::new(None).expect("state"));
+        let block = KotobaCid::from_bytes(b"discovery-block");
+        state.block_store.put(&block, b"discovery-block").unwrap();
+        let server_node = state.local_node_id.clone();
+
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (resolved, summary) = tokio::task::spawn_blocking(move || {
+            // Discover NodeId from the URL alone — no pre-shared id.
+            let endpoints = resolve_endpoints(&[format!("http://{addr}")]);
+            let resolved = endpoints.clone();
+            let mem = Arc::new(kotoba_store::MemoryBlockStore::new());
+            mem.put(&block, b"discovery-block").unwrap();
+            let local: Arc<dyn BlockStore + Send + Sync> = mem;
+            let sink = Arc::new(SettlementIntentSink::new(10, 5));
+            let summary = audit_epoch_dyn(local, endpoints, 1, std::slice::from_ref(&block), sink);
+            (resolved, summary)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.len(), 1, "discovered exactly one peer from its URL");
+        assert!(
+            resolved.contains_key(&server_node),
+            "resolved node id matches the server's real local_node_id"
+        );
+        assert_eq!(summary.rewarded, 1, "discovered peer proves possession");
+    }
+
+    #[tokio::test]
+    async fn resolve_endpoints_skips_unreachable() {
+        let resolved = tokio::task::spawn_blocking(|| {
+            resolve_endpoints(&["http://127.0.0.1:1".to_string(), "  ".to_string()])
+        })
+        .await
+        .unwrap();
+        assert!(resolved.is_empty(), "unreachable / blank URLs are skipped");
     }
 }
