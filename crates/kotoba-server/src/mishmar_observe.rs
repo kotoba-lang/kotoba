@@ -16,7 +16,7 @@
 use kotoba_auth::eth::keccak256;
 use kotoba_core::cid::KotobaCid;
 use kotoba_query::datom::{Datom, Value};
-use kotoba_query::social::{PIN_PINNER_PRED, PIN_ROOT_PRED};
+use kotoba_query::social::{PIN_BOND_PRED, PIN_PINNER_PRED, PIN_ROOT_PRED};
 
 /// `event Pinned(bytes32 indexed pinId, bytes32 indexed rootCid, address indexed pinner, bytes32 didHash, uint256 bond, uint64 expiresAt)`
 const PINNED_SIG: &[u8] = b"Pinned(bytes32,bytes32,address,bytes32,uint256,uint64)";
@@ -71,9 +71,16 @@ pub struct ObservedSlash {
 }
 
 /// Decode `Pinned` logs from an `eth_getLogs` result array → the
-/// `mishmar/pin/{pinner,root}` Datoms that feed `PinIndex`. `graph` is the graph
-/// CID the projected Datoms are written under. Non-`Pinned` / malformed logs are
-/// skipped. `logs` is the JSON array (the `result` field of an `eth_getLogs` reply).
+/// `mishmar/pin/{pinner,root,bond}` Datoms that feed `PinIndex`. `graph` is the
+/// graph CID the projected Datoms are written under. Non-`Pinned` / malformed logs
+/// are skipped. `logs` is the JSON array (the `result` field of an `eth_getLogs`
+/// reply).
+///
+/// The indexed topics carry pinId/rootCid/pinner; the non-indexed `data` carries
+/// `didHash(32) ++ bond(32) ++ expiresAt(32)`. The bond (`uint256`) is projected
+/// as a `mishmar/pin/bond` `Integer` (saturating into i64 — the smic/Mkoto Quad
+/// convention) so the replica membrane ([`eligible_replica`]) can gate on it. A
+/// log whose `data` is missing/short still yields root+pinner (bond omitted).
 pub fn decode_pinned_logs(logs: &serde_json::Value, graph: &KotobaCid) -> Vec<Datom> {
     let want = topic0_hex(PINNED_SIG);
     let mut out = Vec::new();
@@ -101,13 +108,38 @@ pub fn decode_pinned_logs(logs: &serde_json::Value, graph: &KotobaCid) -> Vec<Da
             graph.clone(),
         ));
         out.push(Datom::assert(
-            pin_cid,
+            pin_cid.clone(),
             PIN_PINNER_PRED.to_string(),
             Value::Cid(pinner_cid),
             graph.clone(),
         ));
+        // data = didHash(32) ++ bond(32) ++ expiresAt(32); bond is word(1).
+        if let Some(bond) = pinned_bond_mkoto(log) {
+            out.push(Datom::assert(
+                pin_cid,
+                PIN_BOND_PRED.to_string(),
+                Value::Integer(bond),
+                graph.clone(),
+            ));
+        }
     }
     out
+}
+
+/// Extract the `bond` (`uint256`, mKOTO) from a `Pinned` log's non-indexed `data`,
+/// saturating into i64. Returns `None` if `data` is absent / unparseable / too
+/// short to contain the bond word.
+fn pinned_bond_mkoto(log: &serde_json::Value) -> Option<i64> {
+    let data_str = log.get("data").and_then(|d| d.as_str())?;
+    let body = data_str.strip_prefix("0x").unwrap_or(data_str);
+    let bytes = hex::decode(body).ok()?;
+    // need at least didHash(32) + bond(32) = 64 bytes to read word(1).
+    if bytes.len() < 64 {
+        return None;
+    }
+    let mut w = [0u8; 32];
+    w.copy_from_slice(&bytes[32..64]);
+    Some(i64::try_from(word_u128(&w)).unwrap_or(i64::MAX))
 }
 
 /// Decode `Slashed` logs from an `eth_getLogs` result array. data layout =
@@ -336,6 +368,46 @@ mod tests {
             idx.pinner_of(&pin_cid),
             Some(KotobaCid::from_bytes(&addr20(&pinner_topic)))
         );
+    }
+
+    #[test]
+    fn decodes_pinned_bond_from_data_and_gates_eligibility() {
+        use kotoba_query::social::eligible_replica;
+        // data = didHash(32) ++ bond(32) ++ expiresAt(32); bond is word(1).
+        fn word(n: u128) -> String {
+            hex::encode({
+                let mut a = [0u8; 32];
+                a[16..32].copy_from_slice(&n.to_be_bytes());
+                a
+            })
+        }
+        let graph = KotobaCid::from_bytes(b"g:social");
+        let pin = b32(0x11);
+        let root = b32(0x22);
+        let mut pinner_topic = [0u8; 32];
+        pinner_topic[31] = 0x33;
+        let data = format!("0x{}{}{}", word(0xdead), word(5_000), word(99));
+        let logs = json!([{
+            "topics": [ topic0_hex(PINNED_SIG), topic_str(&pin), topic_str(&root), topic_str(&pinner_topic) ],
+            "data": data
+        }]);
+
+        let datoms = decode_pinned_logs(&logs, &graph);
+        assert_eq!(datoms.len(), 3, "root + pinner + bond");
+
+        let mut idx = PinIndex::new();
+        let deltas: Vec<_> = datoms
+            .into_iter()
+            .map(kotoba_query::delta::Delta::assert_datom)
+            .collect();
+        idx.apply(&deltas);
+        let pin_cid = KotobaCid::from_bytes(&pin);
+        let root_cid = KotobaCid::from_bytes(&root);
+        let pinner_cid = KotobaCid::from_bytes(&addr20(&pinner_topic));
+        assert_eq!(idx.bond_of(&pin_cid), Some(5_000));
+        // the observed bond gates replica admission end-to-end.
+        assert!(eligible_replica(&pinner_cid, &root_cid, 5_000, &idx));
+        assert!(!eligible_replica(&pinner_cid, &root_cid, 5_001, &idx));
     }
 
     #[test]

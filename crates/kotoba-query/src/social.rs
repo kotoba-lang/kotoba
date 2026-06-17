@@ -851,15 +851,21 @@ pub fn apply_retainer_credits(balances: &mut HashMap<KotobaCid, i64>, credits: &
 pub const PIN_PINNER_PRED: &str = "mishmar/pin/pinner";
 /// Predicate: a pin's rootCid. `Datom{ e: pinId, a: PIN_ROOT_PRED, v: Cid(rootCid) }`.
 pub const PIN_ROOT_PRED: &str = "mishmar/pin/root";
+/// Predicate: a pin's posted bond, in mKOTO. `Datom{ e: pinId, a: PIN_BOND_PRED, v: Integer(bond) }`.
+/// Observed from the `Pinned` event's `uint256 bond` field (saturating into i64,
+/// same convention as the smic ledger). Feeds [`eligible_replica`] (ADR-002 §1).
+pub const PIN_BOND_PRED: &str = "mishmar/pin/bond";
 /// Predicate: a root's originating DID (many per root). `Datom{ e: rootCid, a: ORIGIN_PRED, v: Cid(did) }`.
 pub const ORIGIN_PRED: &str = "social/origin";
 
-/// pin → (pinner, rootCid), projected from observed `Pinned` events. Feeds
-/// [`settle_retainer`] (`pinner_of`) and [`build_pin_origins`] (`root_of`).
+/// pin → (pinner, rootCid, bond), projected from observed `Pinned` events. Feeds
+/// [`settle_retainer`] (`pinner_of`), [`build_pin_origins`] (`root_of`), and
+/// [`eligible_replica`] (`bond_of`, ADR-002).
 #[derive(Default)]
 pub struct PinIndex {
     pinner: HashMap<KotobaCid, KotobaCid>,
     root: HashMap<KotobaCid, KotobaCid>,
+    bond: HashMap<KotobaCid, i64>,
 }
 
 impl PinIndex {
@@ -872,15 +878,21 @@ impl PinIndex {
             if !d.is_assert() {
                 continue;
             }
-            let Value::Cid(target) = &d.datom.v else {
-                continue;
-            };
             match d.attribute() {
                 PIN_PINNER_PRED => {
-                    self.pinner.insert(d.entity().clone(), target.clone());
+                    if let Value::Cid(target) = &d.datom.v {
+                        self.pinner.insert(d.entity().clone(), target.clone());
+                    }
                 }
                 PIN_ROOT_PRED => {
-                    self.root.insert(d.entity().clone(), target.clone());
+                    if let Value::Cid(target) = &d.datom.v {
+                        self.root.insert(d.entity().clone(), target.clone());
+                    }
+                }
+                PIN_BOND_PRED => {
+                    if let Value::Integer(n) = &d.datom.v {
+                        self.bond.insert(d.entity().clone(), *n);
+                    }
                 }
                 _ => {}
             }
@@ -895,10 +907,39 @@ impl PinIndex {
         self.root.get(pin_id).cloned()
     }
 
+    /// Observed bond (mKOTO) for a pin, if a `mishmar/pin/bond` Datom was seen.
+    pub fn bond_of(&self, pin_id: &KotobaCid) -> Option<i64> {
+        self.bond.get(pin_id).copied()
+    }
+
     /// Pins with a known root (eligible for retainer allocation).
     pub fn pin_ids(&self) -> Vec<KotobaCid> {
         self.root.keys().cloned().collect()
     }
+}
+
+/// ADR-002 §1 — the replica-admission membrane, as a pure predicate over the
+/// already-projected `mishmar/pin/*` Datoms (read+verify; no chain access here).
+///
+/// A DID is an **eligible replica** for `root` iff it holds at least one observed
+/// pin on that root whose bond ≥ `min_bond_mkoto`. This is *admission* only:
+/// reputation (social capital) ranks among the eligible but never widens this set.
+///
+/// `min_bond_mkoto == 0` ⇒ open neighbourhood (today's behaviour, the default in
+/// the ADR-001 replication policy): any pinner of `root` qualifies. A pin with no
+/// observed bond Datom counts as bond `0`, so it only qualifies when the floor is
+/// itself `0`.
+pub fn eligible_replica(
+    did: &KotobaCid,
+    root: &KotobaCid,
+    min_bond_mkoto: i64,
+    pins: &PinIndex,
+) -> bool {
+    pins.pin_ids().into_iter().any(|pin| {
+        pins.root_of(&pin).as_ref() == Some(root)
+            && pins.pinner_of(&pin).as_ref() == Some(did)
+            && pins.bond_of(&pin).unwrap_or(0) >= min_bond_mkoto
+    })
 }
 
 /// rootCid → originating DIDs (deduped, insertion order), projected from
@@ -1254,6 +1295,88 @@ mod tests {
         assert_eq!(idx.root_of(&pin), Some(root));
         assert_eq!(idx.pinner_of(&did("unknown")), None);
         assert_eq!(idx.pin_ids(), vec![pin]);
+    }
+
+    fn int_datom(e: &KotobaCid, attr: &str, v: i64) -> Delta {
+        Delta::assert_datom(Datom::assert(
+            e.clone(),
+            attr.to_string(),
+            Value::Integer(v),
+            did("g"),
+        ))
+    }
+
+    fn bonded_pin(idx: &mut PinIndex, pin: &str, pinner: &KotobaCid, root: &KotobaCid, bond: i64) {
+        let p = did(pin);
+        idx.apply(&[
+            cid_datom(&p, PIN_PINNER_PRED, pinner),
+            cid_datom(&p, PIN_ROOT_PRED, root),
+            int_datom(&p, PIN_BOND_PRED, bond),
+        ]);
+    }
+
+    #[test]
+    fn pin_index_tracks_bond() {
+        let pin = did("pinA");
+        let mut idx = PinIndex::new();
+        idx.apply(&[int_datom(&pin, PIN_BOND_PRED, 5_000)]);
+        assert_eq!(idx.bond_of(&pin), Some(5_000));
+        assert_eq!(idx.bond_of(&did("unknown")), None);
+    }
+
+    #[test]
+    fn eligible_replica_admits_when_bond_meets_floor() {
+        let peggy = did("did:key:peggy");
+        let root = did("rootA");
+        let mut idx = PinIndex::new();
+        bonded_pin(&mut idx, "pinA", &peggy, &root, 5_000);
+        // exactly-at and above the floor admit; below rejects.
+        assert!(eligible_replica(&peggy, &root, 5_000, &idx));
+        assert!(eligible_replica(&peggy, &root, 1, &idx));
+        assert!(!eligible_replica(&peggy, &root, 5_001, &idx));
+    }
+
+    #[test]
+    fn eligible_replica_open_neighbourhood_when_floor_zero() {
+        // min_bond == 0 ⇒ today's open behaviour: any pinner of root qualifies,
+        // even with no observed bond Datom (bond defaults to 0).
+        let peggy = did("did:key:peggy");
+        let root = did("rootA");
+        let pin = did("pinA");
+        let mut idx = PinIndex::new();
+        idx.apply(&[
+            cid_datom(&pin, PIN_PINNER_PRED, &peggy),
+            cid_datom(&pin, PIN_ROOT_PRED, &root),
+        ]);
+        assert!(eligible_replica(&peggy, &root, 0, &idx));
+        // ...but a positive floor rejects the unbonded pin.
+        assert!(!eligible_replica(&peggy, &root, 1, &idx));
+    }
+
+    #[test]
+    fn eligible_replica_is_scoped_to_root_and_did() {
+        let peggy = did("did:key:peggy");
+        let mallory = did("did:key:mallory");
+        let root_a = did("rootA");
+        let root_b = did("rootB");
+        let mut idx = PinIndex::new();
+        bonded_pin(&mut idx, "pinA", &peggy, &root_a, 5_000);
+        // peggy is bonded on root_a, not root_b; mallory is bonded nowhere.
+        assert!(eligible_replica(&peggy, &root_a, 5_000, &idx));
+        assert!(!eligible_replica(&peggy, &root_b, 5_000, &idx));
+        assert!(!eligible_replica(&mallory, &root_a, 5_000, &idx));
+    }
+
+    #[test]
+    fn eligible_replica_takes_max_bond_across_pins() {
+        // Two pins by the same DID on the same root: the larger bond decides.
+        let peggy = did("did:key:peggy");
+        let root = did("rootA");
+        let mut idx = PinIndex::new();
+        bonded_pin(&mut idx, "pinSmall", &peggy, &root, 1_000);
+        bonded_pin(&mut idx, "pinBig", &peggy, &root, 9_000);
+        assert!(eligible_replica(&peggy, &root, 9_000, &idx));
+        assert!(!eligible_replica(&peggy, &root, 9_001, &idx));
     }
 
     #[test]
