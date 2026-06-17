@@ -180,6 +180,24 @@ where
     Ok(rules)
 }
 
+/// Enforce a DNA over a proposed transaction in one call — the single entry
+/// point the transact (and merge-result) path invokes. Loads the DNA's rules via
+/// `fetch`, then validates `tx`. A DNA that fails to load is itself a rejection:
+/// you must never enforce a DNA you cannot fully assemble (partial physics is no
+/// physics). Pure + deterministic, so every replica reaches the same verdict.
+pub fn enforce<F>(dna: &DnaManifest, fetch: F, tx: &[Datom]) -> ValidationOutcome
+where
+    F: Fn(&KotobaCid) -> Option<Vec<u8>>,
+{
+    match load_rules(dna, fetch) {
+        Ok(rules) => validate_tx(&rules, tx),
+        Err(reason) => ValidationOutcome::Rejected {
+            rule_id: "<dna-load>".to_string(),
+            reason,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +339,31 @@ mod tests {
             panic!("expected integrity error");
         };
         assert!(err.contains("mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn enforce_loads_then_validates_in_one_call() {
+        let schema = RuleSpec::AllowedAttributes {
+            id: "schema".into(),
+            allowed: vec!["name".into()],
+        };
+        let dna = DnaManifest::new("d", "1").with_rule("schema", schema.content_cid());
+        let store: std::collections::HashMap<KotobaCid, Vec<u8>> =
+            [(schema.content_cid(), schema.to_cbor())].into_iter().collect();
+        let fetch = |c: &KotobaCid| store.get(c).cloned();
+
+        assert!(enforce(&dna, fetch, &[assert_d("name")]).is_valid());
+        assert!(!enforce(&dna, fetch, &[assert_d("evil")]).is_valid());
+    }
+
+    #[test]
+    fn enforce_rejects_when_dna_cannot_load() {
+        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 1 };
+        let dna = DnaManifest::new("d", "1").with_rule("size", spec.content_cid());
+        // content missing → enforce rejects (not silently accepts).
+        match enforce(&dna, |_| None, &[assert_d("x")]) {
+            ValidationOutcome::Rejected { rule_id, .. } => assert_eq!(rule_id, "<dna-load>"),
+            ValidationOutcome::Valid => panic!("must not enforce a DNA it can't load"),
+        }
     }
 }
