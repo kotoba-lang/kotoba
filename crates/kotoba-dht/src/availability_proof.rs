@@ -53,7 +53,7 @@ pub struct AvailabilityProof {
 }
 
 /// The outcome of verifying an `AvailabilityProof` against its challenge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerificationResult {
     pub epoch: u64,
     pub prover_peer: Vec<u8>,

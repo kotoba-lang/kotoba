@@ -22,8 +22,10 @@ use crate::availability_proof::{
     verify_proof, AvailabilityChallenge, AvailabilityProof, VerificationResult,
 };
 use crate::node_id::NodeId;
+use crate::warrant::{warrant_signing_bytes, ValidationRule, Warrant};
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Supplies a peer's `AvailabilityProof` for a challenge. In production this is
@@ -374,6 +376,85 @@ impl<F: ProofFetcher, S: VerdictSink> AuditScheduler<F, S> {
     }
 }
 
+// ── Slash warrants (ADR-002 p4) ───────────────────────────────────────────────
+//
+// When a bonded replica fails its availability proof (`trigger_slash`), kotoba
+// emits a *signed warrant + pinned evidence* — the same accuse-with-evidence
+// shape as the custody R3d path (`CustodyUnreceiptedRelease`). kotoba never
+// settles the slash on-chain (Mishmar read+verify boundary): the warrant is the
+// artifact the operating entity presents to `MishmarBondEscrow`.
+
+/// The pinned evidence block backing an [`ValidationRule::AvailabilityProofFailed`]
+/// warrant: the failed verification result. Content-addressed via its CBOR — the
+/// warrant's `evidence` field is exactly [`AvailabilityEvidence::cid`], so anyone
+/// can fetch the block and recompute the verdict.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AvailabilityEvidence {
+    pub epoch: u64,
+    pub prover_peer: Vec<u8>,
+    pub score: f64,
+    pub challenged: usize,
+    pub proven: usize,
+}
+
+impl AvailabilityEvidence {
+    pub fn from_result(r: &VerificationResult) -> Self {
+        Self {
+            epoch: r.epoch,
+            prover_peer: r.prover_peer.clone(),
+            score: r.score,
+            challenged: r.challenged,
+            proven: r.proven,
+        }
+    }
+
+    /// Deterministic CBOR encoding of the evidence (the pinned block bytes).
+    pub fn to_cbor(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("evidence cbor");
+        buf
+    }
+
+    /// Content-address of the evidence block (CIDv1 dag-cbor sha2-256 over the CBOR).
+    pub fn cid(&self) -> KotobaCid {
+        KotobaCid::from_bytes(&self.to_cbor())
+    }
+}
+
+/// Build a signed availability slash warrant from a Slash verdict (ADR-002 p4).
+///
+/// Returns `None` unless `audit.action == Slash` with a `VerificationResult`
+/// (only a checkable failed proof warrants a slash — `Unreachable`/`None` do not).
+/// The evidence block ([`AvailabilityEvidence`]) is built from the result; the
+/// caller pins it so the warrant's `evidence` CID resolves. `sign` is the
+/// validator's Ed25519 signer over [`warrant_signing_bytes`] — kotoba-dht stays
+/// signer-agnostic; the server/custody layer injects the real key.
+pub fn availability_slash_warrant<F>(
+    audit: &PeerAudit,
+    validator: &NodeId,
+    ts: u64,
+    sign: F,
+) -> Option<(Warrant, AvailabilityEvidence)>
+where
+    F: FnOnce(&[u8]) -> Vec<u8>,
+{
+    if audit.action != AuditAction::Slash {
+        return None;
+    }
+    let result = audit.result.as_ref()?;
+    let evidence = AvailabilityEvidence::from_result(result);
+    let mut warrant = Warrant {
+        accused: audit.peer.0.to_vec(),
+        evidence: evidence.cid(),
+        rule_id: ValidationRule::AvailabilityProofFailed as u8,
+        validator: validator.0.to_vec(),
+        ts,
+        sig: Vec::new(),
+    };
+    warrant.sig = sign(&warrant_signing_bytes(&warrant));
+    Some((warrant, evidence))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,5 +789,87 @@ mod tests {
         assert!(intents
             .iter()
             .all(|i| i.kind == SettlementKind::Reward && i.units == 10));
+    }
+
+    // ── Slash warrants (ADR-002 p4) ──────────────────────────────────────
+
+    fn slash_audit(peer: &NodeId, score: f64) -> PeerAudit {
+        PeerAudit {
+            peer: peer.clone(),
+            result: Some(VerificationResult {
+                epoch: 7,
+                prover_peer: peer.0.to_vec(),
+                score,
+                challenged: 10,
+                proven: (score * 10.0) as usize,
+            }),
+            action: AuditAction::Slash,
+        }
+    }
+
+    #[test]
+    fn slash_warrant_built_signed_and_evidence_content_addressed() {
+        let peer = NodeId::from_pubkey(b"failing-peer");
+        let validator = NodeId::from_pubkey(b"auditor");
+        let audit = slash_audit(&peer, 0.2);
+        // signer is injected: here a trivial "hash" so the test stays key-free.
+        let (warrant, evidence) =
+            availability_slash_warrant(&audit, &validator, 1234, |msg| {
+                crate::availability_proof::hash_block(msg)
+            })
+            .expect("slash verdict yields a warrant");
+
+        assert_eq!(warrant.rule_id, ValidationRule::AvailabilityProofFailed as u8);
+        assert_eq!(warrant.accused, peer.0.to_vec());
+        assert_eq!(warrant.validator, validator.0.to_vec());
+        assert_eq!(warrant.ts, 1234);
+        // evidence is content-addressed: warrant points at the pinned block's CID.
+        assert_eq!(warrant.evidence, evidence.cid());
+        assert_eq!(evidence.cid(), KotobaCid::from_bytes(&evidence.to_cbor()));
+        // signature is over the canonical payload (recomputable by a verifier).
+        let expect_sig = crate::availability_proof::hash_block(&warrant_signing_bytes(
+            &Warrant { sig: Vec::new(), ..warrant.clone() },
+        ));
+        assert_eq!(warrant.sig, expect_sig);
+        // evidence round-trips and reflects the failed result.
+        let back: AvailabilityEvidence =
+            ciborium::from_reader(evidence.to_cbor().as_slice()).unwrap();
+        assert_eq!(back, evidence);
+        assert_eq!(back.epoch, 7);
+        assert!(back.score < 0.5);
+    }
+
+    #[test]
+    fn no_warrant_for_non_slash_verdicts() {
+        let peer = NodeId::from_pubkey(b"p");
+        let validator = NodeId::from_pubkey(b"v");
+        for action in [AuditAction::Reward, AuditAction::None, AuditAction::Unreachable] {
+            let audit = PeerAudit {
+                peer: peer.clone(),
+                result: Some(VerificationResult {
+                    epoch: 0,
+                    prover_peer: peer.0.to_vec(),
+                    score: 0.95,
+                    challenged: 4,
+                    proven: 4,
+                }),
+                action,
+            };
+            assert!(availability_slash_warrant(&audit, &validator, 0, |m| m.to_vec()).is_none());
+        }
+        // Slash without a result (shouldn't happen, but guard it) → no warrant.
+        let no_result = PeerAudit { peer, result: None, action: AuditAction::Slash };
+        assert!(availability_slash_warrant(&no_result, &validator, 0, |m| m.to_vec()).is_none());
+    }
+
+    #[test]
+    fn distinct_failures_yield_distinct_evidence_cids() {
+        let peer = NodeId::from_pubkey(b"peer");
+        let validator = NodeId::from_pubkey(b"val");
+        let (w1, _) = availability_slash_warrant(&slash_audit(&peer, 0.1), &validator, 1, |m| m.to_vec()).unwrap();
+        let (w2, _) = availability_slash_warrant(&slash_audit(&peer, 0.4), &validator, 1, |m| m.to_vec()).unwrap();
+        // different scores ⇒ different evidence ⇒ different CIDs ⇒ different sigs.
+        assert_ne!(w1.evidence, w2.evidence);
+        assert_ne!(w1.sig, w2.sig);
     }
 }

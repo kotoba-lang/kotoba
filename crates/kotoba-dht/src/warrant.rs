@@ -27,6 +27,28 @@ pub enum ValidationRule {
     /// (R3d): a custodian-signed grant exists with no matching key:requestShare
     /// receipt in the audit log within the window. Evidence = the signed grant.
     CustodyUnreceiptedRelease = 8,
+    /// A bonded replica failed its availability proof (ADR-002 p4): the audit
+    /// `VerificationResult` scored below the slash threshold. Evidence = the
+    /// pinned `AvailabilityEvidence` block (the failed result). The on-chain
+    /// `MishmarBondEscrow` slash is performed by the operating entity from this
+    /// warrant — kotoba accuses with evidence; the chain punishes.
+    AvailabilityProofFailed = 9,
+}
+
+/// Canonical bytes a validator signs for a [`Warrant`] (and that a verifier
+/// recomputes): length-framed `accused ‖ evidence(36) ‖ rule_id ‖ validator ‖
+/// ts_be`, excluding `sig` itself. Length-framing the variable fields keeps
+/// distinct fields from colliding at a concatenation boundary.
+pub fn warrant_signing_bytes(w: &Warrant) -> Vec<u8> {
+    let mut b = Vec::with_capacity(w.accused.len() + 36 + 1 + w.validator.len() + 16);
+    b.extend_from_slice(&(w.accused.len() as u32).to_be_bytes());
+    b.extend_from_slice(&w.accused);
+    b.extend_from_slice(&w.evidence.0);
+    b.push(w.rule_id);
+    b.extend_from_slice(&(w.validator.len() as u32).to_be_bytes());
+    b.extend_from_slice(&w.validator);
+    b.extend_from_slice(&w.ts.to_be_bytes());
+    b
 }
 
 #[cfg(test)]

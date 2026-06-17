@@ -140,7 +140,13 @@ slash. Bond is necessary; reputation is ordering.
    block would be hollow until then).
 4. **Slash warrants** — `trigger_slash()` → signed warrant + pinned evidence;
    `mishmar.verifySlash` confirms the on-chain `Slashed` + `TitheRouter` split.
-   Reuse the custody warrant/evidence path verbatim.
+   Reuse the custody warrant/evidence path verbatim. — **done (core)**:
+   `kotoba-dht` `ValidationRule::AvailabilityProofFailed` (=9) +
+   `availability_slash_warrant` (Slash verdict → signed `Warrant` +
+   content-addressed `AvailabilityEvidence`, signer injected so the crate stays
+   key-free) + canonical `warrant_signing_bytes`. The on-chain `verifySlash`
+   confirmation stays server-side (Mishmar boundary) and lands with the relayer
+   wiring.
 5. **Reputation weighting** — placement preference + earn-rate multiplier over
    the bonded set; Council-bounded band; property test that reputation never
    changes the *admission* boolean.

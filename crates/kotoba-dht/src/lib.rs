@@ -18,9 +18,9 @@ pub mod source_chain;
 pub mod warrant;
 
 pub use audit::{
-    AuditAction, AuditScheduler, AvailabilityAuditor, InMemoryVerdictSink, PeerAudit,
-    PeerReputation, ProofFetcher, SettlementIntent, SettlementIntentSink, SettlementKind,
-    VerdictSink,
+    availability_slash_warrant, AuditAction, AuditScheduler, AvailabilityAuditor,
+    AvailabilityEvidence, InMemoryVerdictSink, PeerAudit, PeerReputation, ProofFetcher,
+    SettlementIntent, SettlementIntentSink, SettlementKind, VerdictSink,
 };
 pub use commit_chain::CommitChain;
 pub use membrane::{bonded_candidates, stake_to_replicate_enabled};
@@ -31,4 +31,4 @@ pub use neighborhood_store::{
 pub use node_id::NodeId;
 pub use settlement::{RetainerOwed, SettlementBatch, SettlementLine, SettlementSchedule};
 pub use source_chain::{ChainContent, ChainEntry, SourceChain};
-pub use warrant::Warrant;
+pub use warrant::{warrant_signing_bytes, ValidationRule, Warrant};
