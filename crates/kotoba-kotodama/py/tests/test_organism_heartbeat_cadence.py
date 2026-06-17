@@ -236,17 +236,18 @@ def test_three_consecutive_record_analysis_posts_get_suppressed():
 # ── UnispscOrganism end-to-end ─────────────────────────────────────────
 
 
-def test_organism_wraps_c10101500_without_modifying_graph():
+def test_organism_for_code_uses_default_graph_after_per_code_retirement():
+    # The per-code unispsc_agents.c{code} agents were retired (superseded by
+    # the clj actor); for_code now builds a generic organism with a default
+    # no-op classify graph and generic title/DID.
     organism = UnispscOrganism.for_code("10101500")
     assert organism.code == "10101500"
-    assert organism.title == "Live Animal"
+    assert organism.title == "c10101500"
     assert organism.actor_did == "did:web:etzhayyim.com:actor:c10101500"
 
-    # Graph remains the original — invoke still works directly.
-    terminal = organism.graph.invoke({"input": {"species": "ovis aries", "health_data": {"certified": True}}})
-    assert terminal["health_certified"] is True
-    assert terminal["quarantine_status"] == "cleared"
-    assert terminal["result"]["status"] == "authorized"
+    # Default graph: every code resolves to "no custom agent".
+    terminal = organism.graph.invoke({"input": {"species": "ovis aries"}})
+    assert terminal == {"result": "no_custom_agent"}
 
 
 def test_organism_tick_with_empty_inbox_produces_cadence():
@@ -276,8 +277,9 @@ def test_organism_tick_with_inbound_commit_runs_classify():
     assert result.cadence.should_post is True
     assert result.cadence.content_source.kind == "inbound"
     assert len(result.classifications) == 1
-    assert result.classifications[0]["result"]["status"] == "authorized"
-    assert any("[10101500/Live Animal]" in p for p in result.posts)
+    # Default (retired per-code) graph returns the no-custom-agent marker.
+    assert result.classifications[0]["result"] == "no_custom_agent"
+    assert any("[10101500/c10101500]" in p for p in result.posts)
     assert captured  # post_sink was invoked
 
 
