@@ -219,6 +219,23 @@ pub fn spawn_audit_loop(
     })
 }
 
+/// Merge newly `discovered` peer base URLs into a `known` roster (GROWTH p7
+/// bootstrap): normalise (trim + strip trailing `/`), keep only http(s) URLs,
+/// union, dedup, and sort for a deterministic roster. This is the pure core a
+/// `kotoba join` / bootstrap routine uses after pulling a seed's peer list — the
+/// network transport (which endpoint advertises peers, and whether it should) is
+/// a separate, policy-gated decision.
+pub fn merge_bootstrap_peers(known: &[String], discovered: &[String]) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for url in known.iter().chain(discovered.iter()) {
+        let u = url.trim().trim_end_matches('/');
+        if (u.starts_with("http://") || u.starts_with("https://")) && u.len() > "https://".len() {
+            set.insert(u.to_string());
+        }
+    }
+    set.into_iter().collect()
+}
+
 fn summarize(verdicts: &[kotoba_dht::PeerAudit]) -> AuditEpochSummary {
     let mut s = AuditEpochSummary::default();
     for v in verdicts {
@@ -419,6 +436,36 @@ mod tests {
         .unwrap();
         assert_eq!(summary.rewarded, 1, "peer mirrors our block → rewarded");
         assert_eq!(summary.audited(), 1);
+    }
+
+    #[test]
+    fn merge_bootstrap_peers_normalizes_dedups_sorts_and_filters() {
+        let known = vec!["http://a:1".to_string(), "http://b:2/".to_string()];
+        let discovered = vec![
+            "http://b:2".to_string(),      // dup of known (trailing slash normalised)
+            "  http://c:3/  ".to_string(), // whitespace + trailing slash
+            "ftp://bad:9".to_string(),     // non-http → dropped
+            "".to_string(),                // empty → dropped
+            "https://".to_string(),        // too short → dropped
+        ];
+        let merged = merge_bootstrap_peers(&known, &discovered);
+        assert_eq!(
+            merged,
+            vec![
+                "http://a:1".to_string(),
+                "http://b:2".to_string(),
+                "http://c:3".to_string(),
+            ],
+            "normalised, deduped, sorted, http-only"
+        );
+    }
+
+    #[test]
+    fn merge_bootstrap_peers_is_idempotent() {
+        let seed = vec!["https://x:1".to_string()];
+        let once = merge_bootstrap_peers(&seed, &[]);
+        let twice = merge_bootstrap_peers(&once, &once);
+        assert_eq!(once, twice, "re-merging a roster is a no-op");
     }
 
     #[test]
