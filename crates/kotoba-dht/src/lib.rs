@@ -18,6 +18,7 @@ pub mod replication;
 pub mod reputation;
 pub mod settlement;
 pub mod source_chain;
+pub mod validation;
 pub mod warrant;
 
 pub use audit::{
@@ -28,6 +29,7 @@ pub use audit::{
 };
 pub use commit_chain::CommitChain;
 pub use dna::{DnaManifest, ValidationRuleRef};
+pub use validation::{validate_tx, PhysicsRule, ValidationOutcome};
 pub use membrane::{bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate};
 pub use neighborhood::Neighborhood;
 pub use replication::{
