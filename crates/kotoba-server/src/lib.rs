@@ -1004,6 +1004,28 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     // Access-receipt writer (ADR-sealed-cold-tier R1): single background task
     // batching read receipts into audit-graph commits. Idempotent.
     access_receipt::spawn_receipt_writer(Arc::clone(&state));
+    // Periodic DHT availability audit (GROWTH p4 / ADR-2606011330) — strictly
+    // opt-in via KOTOBA_DHT_AUDIT_INTERVAL_SECS + KOTOBA_DHT_AUDIT_PEERS, off by
+    // default. Each tick discovers peers (dht.info), challenges them for the
+    // node's own blocks, and logs the reward/slash tally; verdicts accrue into a
+    // local settlement sink. On-chain settlement stays operator-side (Mishmar).
+    if let Some(cfg) = dht_audit::AuditLoopConfig::from_env() {
+        let reward_units = std::env::var("KOTOBA_DHT_AUDIT_REWARD_UNITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let slash_units = std::env::var("KOTOBA_DHT_AUDIT_SLASH_UNITS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let sink = Arc::new(kotoba_dht::SettlementIntentSink::new(reward_units, slash_units));
+        tracing::info!(
+            peers = cfg.peer_urls.len(),
+            interval_secs = cfg.interval.as_secs(),
+            "DHT availability audit loop ENABLED"
+        );
+        dht_audit::spawn_audit_loop(cfg, state.block_store.clone(), sink);
+    }
     // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
     // game snapshots are content-addressed into the block store + announced on
     // the KSE LiveBus. Idempotent; per-frame traffic never touches either.

@@ -123,6 +123,102 @@ pub fn resolve_endpoints(urls: &[String]) -> HashMap<NodeId, String> {
     out
 }
 
+/// One full audit round (the periodic-loop body): pick up to `cap` of this
+/// node's own blocks (`all_cids`), discover peer node ids from `peer_urls`, and
+/// challenge them — "are my peers mirroring the blocks I hold?". Synchronous;
+/// call via `spawn_blocking`.
+pub fn audit_round(
+    local: Arc<dyn BlockStore + Send + Sync>,
+    peer_urls: &[String],
+    epoch: u64,
+    cap: usize,
+    sink: Arc<SettlementIntentSink>,
+) -> AuditEpochSummary {
+    let mut cids = local.all_cids();
+    cids.truncate(cap);
+    let endpoints = resolve_endpoints(peer_urls);
+    audit_epoch_dyn(local, endpoints, epoch, &cids, sink)
+}
+
+/// Configuration for the periodic availability-audit background loop, read from
+/// the environment. Disabled (returns `None`) unless an interval > 0 and at
+/// least one peer URL are set — the loop is strictly opt-in.
+#[derive(Debug, Clone)]
+pub struct AuditLoopConfig {
+    pub interval: std::time::Duration,
+    pub peer_urls: Vec<String>,
+    pub max_cids: usize,
+}
+
+impl AuditLoopConfig {
+    /// From env: `KOTOBA_DHT_AUDIT_INTERVAL_SECS` (> 0 enables),
+    /// `KOTOBA_DHT_AUDIT_PEERS` (space-separated base URLs, required non-empty),
+    /// `KOTOBA_DHT_AUDIT_MAX_CIDS` (cap, default 64).
+    pub fn from_env() -> Option<Self> {
+        let secs: u64 = std::env::var("KOTOBA_DHT_AUDIT_INTERVAL_SECS")
+            .ok()?
+            .parse()
+            .ok()?;
+        if secs == 0 {
+            return None;
+        }
+        let peer_urls: Vec<String> = std::env::var("KOTOBA_DHT_AUDIT_PEERS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        if peer_urls.is_empty() {
+            return None;
+        }
+        let max_cids = std::env::var("KOTOBA_DHT_AUDIT_MAX_CIDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64);
+        Some(Self {
+            interval: std::time::Duration::from_secs(secs),
+            peer_urls,
+            max_cids,
+        })
+    }
+}
+
+/// Spawn the periodic availability-audit loop (opt-in via [`AuditLoopConfig`]).
+/// Each tick runs one [`audit_round`] off the runtime (`spawn_blocking`) against
+/// the node's `local` store and logs the tally; verdicts accrue into `sink`
+/// (drainable for settlement / observable as owed retainer). Returns the task
+/// handle. The on-chain move of any slash stays operator-side (Mishmar boundary).
+pub fn spawn_audit_loop(
+    config: AuditLoopConfig,
+    local: Arc<dyn BlockStore + Send + Sync>,
+    sink: Arc<SettlementIntentSink>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(config.interval);
+        let mut epoch: u64 = 0;
+        loop {
+            ticker.tick().await;
+            epoch += 1;
+            let local = local.clone();
+            let urls = config.peer_urls.clone();
+            let sink = sink.clone();
+            let cap = config.max_cids;
+            match tokio::task::spawn_blocking(move || audit_round(local, &urls, epoch, cap, sink))
+                .await
+            {
+                Ok(summary) => tracing::info!(
+                    epoch,
+                    rewarded = summary.rewarded,
+                    slashed = summary.slashed,
+                    unreachable = summary.unreachable,
+                    "dht availability audit round"
+                ),
+                Err(e) => tracing::warn!(epoch, error = %e, "audit round task failed"),
+            }
+        }
+    })
+}
+
 fn summarize(verdicts: &[kotoba_dht::PeerAudit]) -> AuditEpochSummary {
     let mut s = AuditEpochSummary::default();
     for v in verdicts {
@@ -294,5 +390,67 @@ mod tests {
         .await
         .unwrap();
         assert!(resolved.is_empty(), "unreachable / blank URLs are skipped");
+    }
+
+    /// audit_round (the loop body) picks the node's own blocks and audits a peer
+    /// discovered from its URL — the full periodic-loop iteration, end to end.
+    #[tokio::test]
+    async fn audit_round_audits_own_blocks_against_discovered_peer() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = Arc::new(KotobaState::new(None).expect("state"));
+        let block = KotobaCid::from_bytes(b"round-block");
+        state.block_store.put(&block, b"round-block").unwrap();
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let summary = tokio::task::spawn_blocking(move || {
+            let mem = Arc::new(kotoba_store::MemoryBlockStore::new());
+            mem.put(&block, b"round-block").unwrap(); // node holds it; all_cids → [block]
+            let local: Arc<dyn BlockStore + Send + Sync> = mem;
+            let sink = Arc::new(SettlementIntentSink::new(10, 5));
+            audit_round(local, &[format!("http://{addr}")], 1, 64, sink)
+        })
+        .await
+        .unwrap();
+        assert_eq!(summary.rewarded, 1, "peer mirrors our block → rewarded");
+        assert_eq!(summary.audited(), 1);
+    }
+
+    #[test]
+    fn audit_loop_config_is_opt_in() {
+        // Disabled when the interval is unset/0 or no peers are configured.
+        std::env::remove_var("KOTOBA_DHT_AUDIT_INTERVAL_SECS");
+        std::env::remove_var("KOTOBA_DHT_AUDIT_PEERS");
+        assert!(AuditLoopConfig::from_env().is_none(), "unset → disabled");
+
+        std::env::set_var("KOTOBA_DHT_AUDIT_INTERVAL_SECS", "0");
+        std::env::set_var("KOTOBA_DHT_AUDIT_PEERS", "http://p:1");
+        assert!(AuditLoopConfig::from_env().is_none(), "interval 0 → disabled");
+
+        std::env::set_var("KOTOBA_DHT_AUDIT_INTERVAL_SECS", "30");
+        std::env::remove_var("KOTOBA_DHT_AUDIT_PEERS");
+        assert!(AuditLoopConfig::from_env().is_none(), "no peers → disabled");
+
+        std::env::set_var("KOTOBA_DHT_AUDIT_INTERVAL_SECS", "30");
+        std::env::set_var("KOTOBA_DHT_AUDIT_PEERS", "http://a:1 http://b:2");
+        std::env::set_var("KOTOBA_DHT_AUDIT_MAX_CIDS", "10");
+        let cfg = AuditLoopConfig::from_env().expect("enabled");
+        assert_eq!(cfg.interval, std::time::Duration::from_secs(30));
+        assert_eq!(cfg.peer_urls.len(), 2);
+        assert_eq!(cfg.max_cids, 10);
+
+        // clean up so other tests see a pristine env.
+        for k in [
+            "KOTOBA_DHT_AUDIT_INTERVAL_SECS",
+            "KOTOBA_DHT_AUDIT_PEERS",
+            "KOTOBA_DHT_AUDIT_MAX_CIDS",
+        ] {
+            std::env::remove_var(k);
+        }
     }
 }
