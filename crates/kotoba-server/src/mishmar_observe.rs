@@ -417,6 +417,20 @@ pub fn spawn_finality_loop(
     })
 }
 
+/// Observe whether the **active governance params** (GROWTH p12) are anchored on
+/// Base — composing the p8 finality check with the p12 active-params pointer. A
+/// param change is Council-ratified the moment [`kotoba_dht::ActiveParams`]
+/// advances; this adds the objective on-chain confirmation (its
+/// [`ParamVersion::id`](kotoba_dht::ParamVersion::id) observed via `committerOf`).
+/// Read-only — the anchor tx is the operating entity's.
+pub fn observe_params_finality<T: JsonRpcTransport>(
+    transport: &T,
+    anchor_address: &str,
+    params: &kotoba_dht::ActiveParams,
+) -> kotoba_evm::anchor::FinalityStatus {
+    observe_finality(transport, anchor_address, &params.current_id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +528,30 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+    }
+
+    #[test]
+    fn observe_params_finality_checks_the_active_version_id() {
+        use kotoba_dht::{ActiveParams, ParamVersion};
+        let active = ActiveParams::new(ParamVersion::new(
+            "1.0.0",
+            KotobaCid::from_bytes(b"params-blob"),
+        ));
+        // a non-zero committer at the active version id → params anchored/final.
+        let st = observe_params_finality(
+            &FakeCall { result: address_word(0xAB) },
+            "0xanchor",
+            &active,
+        );
+        assert!(st.is_final);
+        assert_eq!(st.root_hash, kotoba_evm::anchor::root_hash_of(&active.current_id()));
+        // zero committer → not yet anchored.
+        let pending = observe_params_finality(
+            &FakeCall { result: address_word(0) },
+            "0xanchor",
+            &active,
+        );
+        assert!(!pending.is_final);
     }
 
     #[test]
