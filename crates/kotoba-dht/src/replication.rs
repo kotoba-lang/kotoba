@@ -291,6 +291,19 @@ mod tests {
         assert!(st.missing_pin_peers.is_empty());
     }
 
+    #[test]
+    fn replication_status_serde_round_trips() {
+        // ReplicationStatus is the node.status availability surface — lock its
+        // wire form: it CBOR round-trips, missing_pin_peers (NodeId list) included.
+        let policy = ReplicationPolicy::new(3).with_pin_peers(vec![nid(b"pinner")]);
+        let st = audit_replication(&policy, 1, &[nid(b"a")]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&st, &mut buf).unwrap();
+        let back: ReplicationStatus = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, st);
+        assert!(!back.satisfied && back.under_replicated_by == 2 && back.missing_pin_peers.len() == 1);
+    }
+
     // ── replication_plan — the enforcement decision (ADR-001 p4) ───────────
 
     #[test]

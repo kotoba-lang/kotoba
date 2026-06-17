@@ -916,6 +916,28 @@ mod tests {
     }
 
     #[test]
+    fn verification_result_serde_round_trips() {
+        // VerificationResult is pinned as slash evidence — lock its wire form.
+        let r = VerificationResult {
+            epoch: 42,
+            prover_peer: vec![0xAB; 32],
+            score: 0.375,
+            challenged: 8,
+            proven: 3,
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&r, &mut buf).unwrap();
+        let back: VerificationResult = ciborium::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back, r);
+        // the evidence wrapper (also pinned) round-trips too.
+        let ev = AvailabilityEvidence::from_result(&r);
+        let back_ev: AvailabilityEvidence =
+            ciborium::from_reader(ev.to_cbor().as_slice()).unwrap();
+        assert_eq!(back_ev, ev);
+        assert_eq!(back_ev.cid(), ev.cid(), "evidence CID stable across round-trip");
+    }
+
+    #[test]
     fn slash_warrant_built_signed_and_evidence_content_addressed() {
         let peer = NodeId::from_pubkey(b"failing-peer");
         let validator = NodeId::from_pubkey(b"auditor");
