@@ -916,6 +916,23 @@ impl PinIndex {
     pub fn pin_ids(&self) -> Vec<KotobaCid> {
         self.root.keys().cloned().collect()
     }
+
+    /// The largest observed bond (mKOTO) backing `did`'s pins on `root` — the
+    /// stake exposed to a slash for that replica (ADR-002 p4). `0` if `did` has
+    /// no pin on `root` (a pin with no observed bond Datom contributes `0`).
+    /// `eligible_replica` decides admission; this sizes the slash for an
+    /// already-admitted replica.
+    pub fn max_bond_for(&self, did: &KotobaCid, root: &KotobaCid) -> i64 {
+        self.pin_ids()
+            .into_iter()
+            .filter(|pin| {
+                self.root_of(pin).as_ref() == Some(root)
+                    && self.pinner_of(pin).as_ref() == Some(did)
+            })
+            .map(|pin| self.bond_of(&pin).unwrap_or(0))
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// ADR-002 §1 — the replica-admission membrane, as a pure predicate over the
@@ -1365,6 +1382,20 @@ mod tests {
         assert!(eligible_replica(&peggy, &root_a, 5_000, &idx));
         assert!(!eligible_replica(&peggy, &root_b, 5_000, &idx));
         assert!(!eligible_replica(&mallory, &root_a, 5_000, &idx));
+    }
+
+    #[test]
+    fn max_bond_for_returns_largest_matching_pin_and_zero_otherwise() {
+        let peggy = did("did:key:peggy");
+        let other = did("did:key:other");
+        let root = did("rootA");
+        let root_b = did("rootB");
+        let mut idx = PinIndex::new();
+        bonded_pin(&mut idx, "pinSmall", &peggy, &root, 1_000);
+        bonded_pin(&mut idx, "pinBig", &peggy, &root, 7_000);
+        assert_eq!(idx.max_bond_for(&peggy, &root), 7_000, "largest pin wins");
+        assert_eq!(idx.max_bond_for(&peggy, &root_b), 0, "no pin on that root");
+        assert_eq!(idx.max_bond_for(&other, &root), 0, "no pin by that did");
     }
 
     #[test]
