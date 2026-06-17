@@ -109,6 +109,41 @@ mod tests {
     }
 
     #[test]
+    fn earn_rate_band_bounds_hold_adversarially() {
+        // earn-rate is a bounded flow knob: the multiplier always stays within the
+        // band, is monotonic non-decreasing in reputation, NaN/out-of-range clamp,
+        // and scaling never overflows. Sweep bands × reputations × units.
+        let bands = [
+            EarnRateBand::new(5_000, 20_000),
+            EarnRateBand::new(10_000, 10_000), // identity
+            EarnRateBand::new(0, 30_000),
+            EarnRateBand::new(20_000, 5_000), // reversed → normalised
+        ];
+        let reps = [f64::NAN, -1.0, 0.0, 0.25, 0.5, 0.99, 1.0, 2.0];
+        for b in bands {
+            assert!(b.min_bps <= b.max_bps, "band not normalised");
+            let mut prev = b.min_bps;
+            for &r in &reps {
+                let m = b.multiplier_bps(r);
+                assert!(b.min_bps <= m && m <= b.max_bps, "multiplier {m} outside band");
+                // monotonic across the in-range, ascending reps (skip NaN/negatives
+                // which clamp to the floor).
+                if r >= 0.0 && !r.is_nan() {
+                    assert!(m >= prev, "multiplier not monotonic in reputation");
+                    prev = m;
+                }
+                // scaling stays within [units*min, units*max]/10000, no panic.
+                for &units in &[0u64, 1, 1_000, u64::MAX] {
+                    let scaled = b.scale_units(units, r);
+                    let lo = (units as u128 * b.min_bps as u128 / 10_000).min(u64::MAX as u128) as u64;
+                    let hi = (units as u128 * b.max_bps as u128 / 10_000).min(u64::MAX as u128) as u64;
+                    assert!(scaled >= lo && scaled <= hi, "scaled {scaled} outside [{lo},{hi}]");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn identity_band_is_always_unit() {
         let band = EarnRateBand::identity();
         assert_eq!(band.scale_units(777, 0.0), 777);

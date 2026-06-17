@@ -348,6 +348,62 @@ mod tests {
         assert_eq!(plan, vec![nid(b"only")]);
     }
 
+    #[test]
+    fn replication_invariants_hold_adversarially() {
+        use std::collections::HashSet;
+        // availability physics: sweep policies × holder sets × candidate sets and
+        // assert the audit + the recovery plan always obey their contracts.
+        let pinner = nid(b"pinner");
+        let holders_opts: [&[&[u8]]; 4] = [&[], &[b"h1"], &[b"h1", b"h2"], &[b"pinner"]];
+        let cand_opts: [&[&[u8]]; 4] =
+            [&[], &[b"c1"], &[b"h1", b"c1", b"c2"], &[b"pinner", b"c1"]];
+        for min in 0usize..4 {
+            for use_pinner in [false, true] {
+                let mut policy = ReplicationPolicy::new(min);
+                if use_pinner {
+                    policy = policy.with_pin_peers(vec![pinner.clone()]);
+                }
+                for hs in holders_opts {
+                    let holders: Vec<_> = hs.iter().map(|t| nid(t)).collect();
+                    let observed = holders.len();
+                    let st = audit_replication(&policy, observed, &holders);
+                    let held: HashSet<&_> = holders.iter().collect();
+
+                    // audit contract.
+                    assert_eq!(st.under_replicated_by, policy.min_replicas.saturating_sub(observed));
+                    for p in &st.missing_pin_peers {
+                        assert!(policy.pin_peers.contains(p), "missing not from pin_peers");
+                        assert!(!held.contains(p), "a held peer reported missing");
+                    }
+                    assert_eq!(
+                        st.satisfied,
+                        st.under_replicated_by == 0 && st.missing_pin_peers.is_empty()
+                    );
+
+                    for cs in cand_opts {
+                        let cands: Vec<_> = cs.iter().map(|t| nid(t)).collect();
+                        let plan = replication_plan(&st, &holders, &cands);
+                        let plan_set: HashSet<&_> = plan.iter().collect();
+                        // plan contract.
+                        assert_eq!(plan_set.len(), plan.len(), "plan has duplicates");
+                        if st.satisfied {
+                            assert!(plan.is_empty(), "satisfied contract needs no plan");
+                        }
+                        for t in &plan {
+                            assert!(!held.contains(t), "plan re-pushes a current holder");
+                            assert!(
+                                st.missing_pin_peers.contains(t) || cands.contains(t),
+                                "plan target came from nowhere"
+                            );
+                        }
+                        // never proposes more than the shortfall needs.
+                        assert!(plan.len() <= st.missing_pin_peers.len() + st.under_replicated_by);
+                    }
+                }
+            }
+        }
+    }
+
     // ── ReplicationPolicyStore — per-graph policies + default (GROWTH p4) ───
 
     fn gcid(seed: &str) -> KotobaCid {
