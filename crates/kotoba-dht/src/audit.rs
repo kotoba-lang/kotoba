@@ -198,6 +198,54 @@ impl PeerReputation {
     pub fn is_distrusted(&self, threshold: u64) -> bool {
         self.consecutive_failures >= threshold
     }
+
+    /// Graduated slash fraction (bps) for this peer's current failure streak
+    /// under `schedule` — see [`SlashSchedule`]. `0` while the streak is zero.
+    pub fn slash_fraction_bps(&self, schedule: &SlashSchedule) -> u32 {
+        schedule.fraction_bps(self.consecutive_failures)
+    }
+}
+
+/// Graduated slash schedule (ADR-002 — resolves the "first-miss full slash is
+/// brittle" open question). A single missed availability proof should not burn
+/// the whole bond — slashing **escalates with consecutive failures** so a blip
+/// is cheap and only sustained unavailability approaches a full slash.
+///
+/// The fraction is `step_bps × consecutive_failures`, capped at `max_bps`
+/// (`10_000` = the full bond). Pure; reads the streak already tracked by
+/// [`PeerReputation::consecutive_failures`] (reset by any Reward / None epoch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashSchedule {
+    /// Slash added per consecutive failure, in basis points of the bond.
+    pub step_bps: u32,
+    /// Cap on the slash fraction (≤ 10_000 = full bond), normalised in `new`.
+    pub max_bps: u32,
+}
+
+impl SlashSchedule {
+    /// A schedule; `max_bps` is clamped to `10_000` (never more than the bond).
+    pub fn new(step_bps: u32, max_bps: u32) -> Self {
+        Self { step_bps, max_bps: max_bps.min(10_000) }
+    }
+
+    /// The slash fraction (bps) for `consecutive_failures`: `0` for a clean peer,
+    /// `step_bps × n` capped at `max_bps`. Saturating — never overflows.
+    pub fn fraction_bps(&self, consecutive_failures: u64) -> u32 {
+        if consecutive_failures == 0 {
+            return 0;
+        }
+        let n = u32::try_from(consecutive_failures).unwrap_or(u32::MAX);
+        self.step_bps.saturating_mul(n).min(self.max_bps)
+    }
+
+    /// The slash amount to apply to `bond` (mKOTO) for `consecutive_failures`,
+    /// saturating and floored at 0. The on-chain move stays operator-side
+    /// (Mishmar boundary) — this is the proposed quantity, not a transfer.
+    pub fn slash_amount(&self, bond: i64, consecutive_failures: u64) -> i64 {
+        let frac = self.fraction_bps(consecutive_failures) as i128;
+        let amount = (bond.max(0) as i128 * frac) / 10_000;
+        amount.min(i64::MAX as i128) as i64
+    }
 }
 
 /// Receives each epoch verdict — the hand-off boundary to the incentive layer.
@@ -871,5 +919,60 @@ mod tests {
         // different scores ⇒ different evidence ⇒ different CIDs ⇒ different sigs.
         assert_ne!(w1.evidence, w2.evidence);
         assert_ne!(w1.sig, w2.sig);
+    }
+
+    // ── Graduated slash schedule (ADR-002 open question) ─────────────────
+
+    #[test]
+    fn graduated_slash_escalates_and_caps() {
+        let sched = SlashSchedule::new(2_500, 10_000); // 25% per miss, cap 100%
+        assert_eq!(sched.fraction_bps(0), 0, "a clean peer is never slashed");
+        assert_eq!(sched.fraction_bps(1), 2_500, "first miss is cheap (25%)");
+        assert_eq!(sched.fraction_bps(2), 5_000);
+        assert_eq!(sched.fraction_bps(4), 10_000, "reaches full at the 4th miss");
+        assert_eq!(sched.fraction_bps(99), 10_000, "capped, never exceeds the bond");
+    }
+
+    #[test]
+    fn graduated_slash_max_bps_clamped_to_full_bond() {
+        let sched = SlashSchedule::new(1_000, 99_999);
+        assert_eq!(sched.max_bps, 10_000, "cap can never exceed the whole bond");
+        assert_eq!(sched.fraction_bps(u64::MAX), 10_000, "saturating, no overflow");
+    }
+
+    #[test]
+    fn graduated_slash_amount_applies_fraction_to_bond() {
+        let sched = SlashSchedule::new(2_500, 10_000);
+        assert_eq!(sched.slash_amount(1_000, 0), 0);
+        assert_eq!(sched.slash_amount(1_000, 1), 250); // 25% of 1000
+        assert_eq!(sched.slash_amount(1_000, 2), 500);
+        assert_eq!(sched.slash_amount(1_000, 4), 1_000); // full
+        // negative / zero bond floors at 0; huge bond saturates without panic.
+        assert_eq!(sched.slash_amount(-5, 4), 0);
+        assert_eq!(sched.slash_amount(i64::MAX, 4), i64::MAX);
+    }
+
+    #[test]
+    fn reputation_slash_fraction_tracks_consecutive_failures() {
+        let sched = SlashSchedule::new(3_000, 9_000);
+        let mut rep = PeerReputation::default();
+        // two slash epochs build a 2-deep streak.
+        for _ in 0..2 {
+            rep.apply(&PeerAudit {
+                peer: NodeId::from_pubkey(b"p"),
+                result: None,
+                action: AuditAction::Slash,
+            });
+        }
+        assert_eq!(rep.consecutive_failures, 2);
+        assert_eq!(rep.slash_fraction_bps(&sched), 6_000);
+        // a Reward resets the streak → no slash next time.
+        rep.apply(&PeerAudit {
+            peer: NodeId::from_pubkey(b"p"),
+            result: None,
+            action: AuditAction::Reward,
+        });
+        assert_eq!(rep.consecutive_failures, 0);
+        assert_eq!(rep.slash_fraction_bps(&sched), 0);
     }
 }

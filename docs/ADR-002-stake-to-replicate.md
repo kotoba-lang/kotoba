@@ -201,6 +201,11 @@ membrane is ready for it.
 - `min_bond_mkoto` denomination & calibration vs. graph size / duration (defer to
   a Council param blob like `social/capital/params/active`).
 - Bond *top-up / partial-slash* curve: full slash on first miss is brittle;
-  prefer graduated slash on repeated `Challenged` misses within an epoch.
+  prefer graduated slash on repeated `Challenged` misses within an epoch. —
+  **resolved**: `kotoba-dht` `SlashSchedule` (`step_bps × consecutive_failures`,
+  capped at the full bond) over the streak already tracked by
+  `PeerReputation::consecutive_failures` (reset by any Reward/None epoch); a
+  single blip is cheap, only sustained unavailability approaches a full slash.
+  Bond *top-up* still open.
 - Challenge issuance authority & frequency (verifier = any witness-quorum member?
   rate-limited by reputation to bound challenge spam).

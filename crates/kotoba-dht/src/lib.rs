@@ -22,7 +22,7 @@ pub mod warrant;
 pub use audit::{
     availability_slash_warrant, AuditAction, AuditScheduler, AvailabilityAuditor,
     AvailabilityEvidence, InMemoryVerdictSink, PeerAudit, PeerReputation, ProofFetcher,
-    SettlementIntent, SettlementIntentSink, SettlementKind, VerdictSink,
+    SettlementIntent, SettlementIntentSink, SettlementKind, SlashSchedule, VerdictSink,
 };
 pub use commit_chain::CommitChain;
 pub use membrane::{bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate};
