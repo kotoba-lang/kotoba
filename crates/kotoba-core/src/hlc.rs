@@ -81,6 +81,53 @@ impl Hlc {
     }
 }
 
+/// Order HLC-stamped items into the cross-graph causal sequence (ADR-001 p1 /
+/// GROWTH p11 firehose): ascending [`Hlc`], ties broken by `tiebreak` (e.g. the
+/// event CID). The order is **total and deterministic** — every replica yields
+/// the identical sequence regardless of the order events/streams arrived in.
+pub fn causal_sort_by<T, K, FH, FK>(items: &mut [T], hlc_of: FH, tiebreak_of: FK)
+where
+    K: Ord,
+    FH: Fn(&T) -> Hlc,
+    FK: Fn(&T) -> K,
+{
+    items.sort_by(|a, b| {
+        hlc_of(a)
+            .cmp(&hlc_of(b))
+            .then_with(|| tiebreak_of(a).cmp(&tiebreak_of(b)))
+    });
+}
+
+/// Merge several per-graph event `streams` into one causally-ordered firehose,
+/// deduping events that appear in more than one stream by their `tiebreak` key
+/// (overlapping subscriptions must not emit an event twice). Result is the same
+/// total causal order as [`causal_sort_by`]. Deterministic across stream order.
+pub fn causal_merge_dedup<T, K, FH, FK>(
+    streams: Vec<Vec<T>>,
+    hlc_of: FH,
+    tiebreak_of: FK,
+) -> Vec<T>
+where
+    K: Ord + Clone,
+    FH: Fn(&T) -> Hlc,
+    FK: Fn(&T) -> K,
+{
+    let mut all: Vec<T> = streams.into_iter().flatten().collect();
+    causal_sort_by(&mut all, &hlc_of, &tiebreak_of);
+    // adjacent dedup by key (sort grouped equal keys together).
+    let mut seen_prev: Option<K> = None;
+    all.retain(|item| {
+        let k = tiebreak_of(item);
+        if seen_prev.as_ref() == Some(&k) {
+            false
+        } else {
+            seen_prev = Some(k);
+            true
+        }
+    });
+    all
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +196,56 @@ mod tests {
         let b1 = b0.recv(a0, 150); // b sees a
         assert!(a1 > b0, "a moved past b's observed clock");
         assert!(b1 >= a0, "b stayed ahead of a's observed clock");
+    }
+
+    // ── firehose causal ordering ──────────────────────────────────────────
+
+    // (hlc, id) events; id doubles as the tiebreak / dedup key.
+    fn ev(phys: u64, ctr: u64, id: &str) -> (Hlc, String) {
+        (Hlc::new(phys, ctr), id.to_string())
+    }
+
+    fn order(items: &[(Hlc, String)]) -> Vec<String> {
+        let mut v = items.to_vec();
+        causal_sort_by(&mut v, |e| e.0, |e| e.1.clone());
+        v.into_iter().map(|e| e.1).collect()
+    }
+
+    #[test]
+    fn causal_sort_is_deterministic_across_input_order() {
+        let a = vec![ev(10, 0, "a"), ev(20, 0, "b"), ev(10, 1, "c")];
+        let mut b = a.clone();
+        b.reverse();
+        // both permutations → identical causal sequence (by hlc, then id).
+        assert_eq!(order(&a), vec!["a", "c", "b"]);
+        assert_eq!(order(&b), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn causal_sort_breaks_ties_by_tiebreak() {
+        // same hlc, different ids → ordered by id deterministically.
+        let items = vec![ev(5, 0, "z"), ev(5, 0, "a"), ev(5, 0, "m")];
+        assert_eq!(order(&items), vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn merge_dedup_interleaves_streams_and_drops_duplicates() {
+        // two graph streams, each HLC-ordered, sharing one event ("b").
+        let g1 = vec![ev(10, 0, "a"), ev(30, 0, "b")];
+        let g2 = vec![ev(20, 0, "c"), ev(30, 0, "b")];
+        let merged = causal_merge_dedup(vec![g1, g2], |e| e.0, |e| e.1.clone());
+        let ids: Vec<String> = merged.into_iter().map(|e| e.1).collect();
+        assert_eq!(ids, vec!["a", "c", "b"], "interleaved by hlc, 'b' deduped");
+    }
+
+    #[test]
+    fn merge_dedup_is_order_independent() {
+        let g1 = vec![ev(10, 0, "a"), ev(30, 0, "b")];
+        let g2 = vec![ev(20, 0, "c")];
+        let m1 = causal_merge_dedup(vec![g1.clone(), g2.clone()], |e| e.0, |e| e.1.clone());
+        let m2 = causal_merge_dedup(vec![g2, g1], |e| e.0, |e| e.1.clone());
+        let ids = |m: Vec<(Hlc, String)>| m.into_iter().map(|e| e.1).collect::<Vec<_>>();
+        assert_eq!(ids(m1), ids(m2), "stream order does not change the firehose");
     }
 
     #[test]
