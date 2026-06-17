@@ -7143,6 +7143,24 @@ pub async fn atproto_repo_write(
     Ok((StatusCode::OK, Json(resp)))
 }
 
+/// The node's effective default replication policy (the pin contract it enforces)
+/// for the `node.status` availability surface — GROWTH p4 / ADR-001 phase 4.
+/// Pure over its inputs so it is unit-tested without booting a server:
+/// `min_replicas` defaults exactly as `server.rs` (`2` with peers, else `1`) and
+/// is overridable; `min_bond_mkoto` is the configured floor; `pin_peers` are
+/// per-graph, not node-level, so the node default carries none.
+fn effective_replication_policy(
+    min_replicas_env: Option<&str>,
+    min_bond_env: Option<&str>,
+    peer_count: usize,
+) -> kotoba_dht::ReplicationPolicy {
+    let min_replicas = min_replicas_env
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(if peer_count > 0 { 2 } else { 1 });
+    let min_bond_mkoto = min_bond_env.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    kotoba_dht::ReplicationPolicy::new(min_replicas).with_min_bond(min_bond_mkoto)
+}
+
 /// GET /xrpc/com.etzhayyim.apps.kotoba.node.status
 /// Operator-only: exposes peer topology that aids targeted DHT attacks.
 pub async fn node_status(
@@ -7156,6 +7174,12 @@ pub async fn node_status(
     }
     let nb = state.neighborhood.read().await;
     let did_document = state.local_did_document().await;
+    let stake_to_replicate = kotoba_dht::stake_to_replicate_enabled();
+    let policy = effective_replication_policy(
+        std::env::var("KOTOBA_DHT_MIN_REPLICAS").ok().as_deref(),
+        std::env::var("KOTOBA_DHT_MIN_BOND_MKOTO").ok().as_deref(),
+        nb.peers.len(),
+    );
     Json(serde_json::json!({
         "node_id":    hex::encode(state.local_node_id.0),
         "operator_did": state.operator_did.as_str(),
@@ -7163,6 +7187,14 @@ pub async fn node_status(
         "peer_count": nb.peers.len(),
         "peers":      nb.peers.iter().map(|p| hex::encode(p.0)).collect::<Vec<_>>(),
         "k":          kotoba_dht::neighborhood::K,
+        // Declared replication / pin contract this node enforces (ADR-001 p4 /
+        // ADR-002). `stake_to_replicate` reports whether the bond floor is
+        // actually enforced on admission (KOTOBA_STAKE_TO_REPLICATE).
+        "replication": {
+            "min_replicas": policy.min_replicas,
+            "min_bond_mkoto": policy.min_bond_mkoto,
+            "stake_to_replicate": stake_to_replicate,
+        },
         "envelope_manifest_cleanup": {
             "attempts": 0,
             "successes": 0,
@@ -9417,7 +9449,8 @@ mod tests {
         datomic_history, datomic_ident, datomic_index_pull, datomic_index_range, datomic_log,
         datomic_pull, datomic_pull_many, datomic_q, datomic_q_emit_cids, datomic_seek_datoms,
         datomic_sync, datomic_transact, datomic_tx_range, datomic_with, did_document_publish,
-        didcomm_send, distributed_graph_ipns_name, enforce_datomic_range_tx_scope,
+        didcomm_send, distributed_graph_ipns_name, effective_replication_policy,
+        enforce_datomic_range_tx_scope,
         is_did_web_ip_host, protocol_payload_tx_cid, vc_issue, vp_capability_projection,
         warm_datomic_resident_cache, AtprotoRepoWriteReq, AuthCapabilityProjection,
         DatomicBasisTReq, DatomicDatomsIndex, DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq,
@@ -9446,6 +9479,25 @@ mod tests {
     use kotoba_ipfs::{InMemoryIpnsRegistry, IpfsConfig};
     use kotoba_store::MemoryBlockStore;
     use std::sync::Arc;
+
+    #[test]
+    fn effective_replication_policy_defaults_and_overrides() {
+        // default: solo node → floor 1, no bond; with peers → floor 2.
+        let solo = effective_replication_policy(None, None, 0);
+        assert_eq!(solo.min_replicas, 1);
+        assert_eq!(solo.min_bond_mkoto, 0);
+        assert_eq!(effective_replication_policy(None, None, 3).min_replicas, 2);
+        // env overrides parse; bond floor flows through.
+        let p = effective_replication_policy(Some("5"), Some("5000"), 0);
+        assert_eq!(p.min_replicas, 5);
+        assert_eq!(p.min_bond_mkoto, 5_000);
+        // garbage env falls back to the defaults (never panics).
+        let bad = effective_replication_policy(Some("xyz"), Some("nope"), 2);
+        assert_eq!(bad.min_replicas, 2);
+        assert_eq!(bad.min_bond_mkoto, 0);
+        // min_replicas is clamped to ≥ 1 even if env says 0.
+        assert_eq!(effective_replication_policy(Some("0"), None, 0).min_replicas, 1);
+    }
 
     // `emit_cid` provenance: result_cid is content-derived (tamper-evident),
     // deterministic, basis-sensitive, formatting-invariant on the query, PUT and
