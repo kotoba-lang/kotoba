@@ -56,18 +56,39 @@ where
     let auditor = AvailabilityAuditor::new(local);
     let fetcher = HttpProofFetcher::new(endpoints);
     let scheduler = AuditScheduler::new(auditor, fetcher, sink);
-    let verdicts = scheduler.run_epoch(epoch, cids, &peers);
+    summarize(&scheduler.run_epoch(epoch, cids, &peers))
+}
 
-    let mut summary = AuditEpochSummary::default();
-    for v in &verdicts {
+/// Type-erased entry point: audit using a `dyn` block store, e.g. a running
+/// node's `KotobaState::block_store` (`Arc<dyn BlockStore + Send + Sync>`) — so a
+/// periodic background loop can challenge peers against the node's real store
+/// without threading a concrete type. (`BlockStore: Send + Sync`, so the
+/// auditor's `Arc<dyn BlockStore>` accepts it directly — no adapter, no upcast.)
+pub fn audit_epoch_dyn(
+    local: Arc<dyn BlockStore + Send + Sync>,
+    endpoints: HashMap<NodeId, String>,
+    epoch: u64,
+    cids: &[KotobaCid],
+    sink: Arc<SettlementIntentSink>,
+) -> AuditEpochSummary {
+    let peers: Vec<NodeId> = endpoints.keys().cloned().collect();
+    let auditor = AvailabilityAuditor::new(local);
+    let fetcher = HttpProofFetcher::new(endpoints);
+    let scheduler = AuditScheduler::new(auditor, fetcher, sink);
+    summarize(&scheduler.run_epoch(epoch, cids, &peers))
+}
+
+fn summarize(verdicts: &[kotoba_dht::PeerAudit]) -> AuditEpochSummary {
+    let mut s = AuditEpochSummary::default();
+    for v in verdicts {
         match v.action {
-            AuditAction::Reward => summary.rewarded += 1,
-            AuditAction::Slash => summary.slashed += 1,
-            AuditAction::Unreachable => summary.unreachable += 1,
-            AuditAction::None => summary.none += 1,
+            AuditAction::Reward => s.rewarded += 1,
+            AuditAction::Slash => s.slashed += 1,
+            AuditAction::Unreachable => s.unreachable += 1,
+            AuditAction::None => s.none += 1,
         }
     }
-    summary
+    s
 }
 
 #[cfg(test)]
@@ -143,5 +164,40 @@ mod tests {
         .unwrap();
         assert_eq!(summary.unreachable, 1);
         assert_eq!(summary.audited(), 1);
+    }
+
+    /// The type-erased entry (the one a server background loop uses with
+    /// `KotobaState::block_store`) audits over a `dyn` store — confirming no
+    /// concrete-handle / coercion seam: `Arc<dyn BlockStore + Send + Sync>` flows
+    /// straight into the auditor.
+    #[tokio::test]
+    async fn audit_epoch_dyn_works_over_type_erased_store() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        let state = Arc::new(KotobaState::new(None).expect("state"));
+        let block = KotobaCid::from_bytes(b"dyn-audit-block");
+        state.block_store.put(&block, b"dyn-audit-block").unwrap();
+        let server_node: NodeId = state.local_node_id.clone();
+
+        let app = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let summary = tokio::task::spawn_blocking(move || {
+            let mem = Arc::new(kotoba_store::MemoryBlockStore::new());
+            mem.put(&block, b"dyn-audit-block").unwrap();
+            // erase to exactly KotobaState::block_store's type.
+            let local: Arc<dyn BlockStore + Send + Sync> = mem;
+            let endpoints = HashMap::from([(server_node.clone(), format!("http://{addr}"))]);
+            let sink = Arc::new(SettlementIntentSink::new(10, 5));
+            audit_epoch_dyn(local, endpoints, 1, std::slice::from_ref(&block), sink)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(summary.rewarded, 1, "dyn store path rewards a holding peer");
     }
 }
