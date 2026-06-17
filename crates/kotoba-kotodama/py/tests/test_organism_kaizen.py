@@ -274,7 +274,7 @@ def test_proposal_serialization_matches_schema():
 def _fake_healthz(shard: int, **overrides) -> dict:
     body = {
         "ok": True,
-        "service": "UnispscOrganismFleetCell",
+        "service": "OrganismFleetCell",
         "shard": shard,
         "ownedCount": 4000 + shard * 1000,
         "warmCount": 2000,

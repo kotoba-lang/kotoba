@@ -51,9 +51,9 @@ from kotodama.organism.post_sink import (
     PostSink,
     resolve_post_sink,
 )
-from kotodama.organism.unispsc_organism import (
+from kotodama.organism.organism import (
     OrganismTickResult,
-    UnispscOrganism,
+    Organism,
 )
 
 __all__ = [
@@ -82,7 +82,7 @@ __all__ = [
     "SensorHealth",
     "StaleSensorPinRule",
     "TierCLeakBackstopRule",
-    "UnispscOrganism",
+    "Organism",
     "apply_stress_scaling",
     "determine_mood",
     "mood_to_cadence",

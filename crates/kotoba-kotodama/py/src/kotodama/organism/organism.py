@@ -1,4 +1,4 @@
-"""UnispscOrganism — wrap a classify graph into a tick-able organism.
+"""Organism — wrap a classify graph into a tick-able organism.
 
 Per ADR-2605232345. Combines:
   - a caller-supplied classify ``graph`` (``.invoke(state) -> dict``)
@@ -133,7 +133,7 @@ def _format_post(
     return None
 
 
-class UnispscOrganism:
+class Organism:
     """Wrap one classify ``graph`` into a tick-able organism.
 
     The classify engine is the caller-supplied ``graph`` (``.invoke(state)``).
@@ -219,7 +219,7 @@ class UnispscOrganism:
         sensor_sample_size: int = 8,
         messaging_receiver: "OrganismMessageReceiver | None" = None,
         lifecycle_event_queue_path: "Path | None" = None,
-    ) -> "UnispscOrganism":
+    ) -> "Organism":
         """Build a generic organism for ``code`` with a default classify graph.
 
         The per-code ``c{code}`` agents were retired (superseded by the clj
@@ -476,5 +476,5 @@ __all__ = [
     "JouchoProvider",
     "OrganismTickResult",
     "PostSink",
-    "UnispscOrganism",
+    "Organism",
 ]

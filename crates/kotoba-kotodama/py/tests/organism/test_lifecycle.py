@@ -13,7 +13,7 @@ from kotodama.organism.lifecycle import (
     event_from_lexicon,
     lifecycle_event_to_lexicon,
 )
-from kotodama.organism.unispsc_organism import UnispscOrganism
+from kotodama.organism.organism import Organism
 from kotodama.organism.cadence import ContentSource
 
 def test_lifecycle_4_events_normal_transitions():
@@ -76,13 +76,13 @@ def test_excommunication_requires_4_attestations():
     lifecycle.handle_excommunication("bafy...excom", ["a1", "a2", "a3", "a4"])
     assert lifecycle.state == OrganismState.EXCOMMUNICATED
 
-def test_unispsc_organism_tick_lifecycle_skips():
+def test_organism_tick_lifecycle_skips():
     class DummyGraph:
         def invoke(self, state: Any) -> dict:
             return {"result": "ok"}
 
     # Active -> normal tick
-    org = UnispscOrganism(code="12345678", graph=DummyGraph())
+    org = Organism(code="12345678", graph=DummyGraph())
     org.lifecycle.handle_birth("did:test")
 
     result = org.tick(now_ms=1000)
@@ -95,12 +95,12 @@ def test_unispsc_organism_tick_lifecycle_skips():
     assert "skipped" in result2.cadence.reason
     assert result2.cadence.should_post is False
 
-def test_unispsc_organism_cloned_metadata():
+def test_organism_cloned_metadata():
     class DummyGraph:
         def invoke(self, state: Any) -> dict:
             return {"result": "ok"}
 
-    org = UnispscOrganism(code="12345678", graph=DummyGraph())
+    org = Organism(code="12345678", graph=DummyGraph())
     org.lifecycle.handle_birth("did:test")
     org.lifecycle.handle_clone("did:web:source", "did:web:target", "shard-2")
 

@@ -1,6 +1,6 @@
 """TierGate auto-wiring tests (ADR-2605262400 §4.3 Wave-3).
 
-Verifies that UnispscOrganism:
+Verifies that Organism:
   - Owns a TierGate bound to its actor_did.
   - Drains LeakAttempts on each tick via pop_leaks().
   - Routes the per-tick leak count into apply_sensor_delta → joucho
@@ -24,11 +24,11 @@ from kotodama.organism.sensors.tier_gate import (
     SinkClassification,
     TierGate,
 )
-from kotodama.organism.unispsc_organism import UnispscOrganism
+from kotodama.organism.organism import Organism
 
 
 def _make_organism(actor_did: str = "did:web:etzhayyim.com:actor:test"):
-    org = UnispscOrganism(
+    org = Organism(
         code="99999999",
         graph=MagicMock(),
         actor_did=actor_did,
