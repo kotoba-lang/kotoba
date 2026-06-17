@@ -244,6 +244,34 @@ mod tests {
     }
 
     #[test]
+    fn ratify_invariants_hold_adversarially() {
+        // Security: approvals always equal the count of DISTINCT council members
+        // among the attesters (duplicates and non-members never inflate it), and
+        // ratified iff that reaches the (>=1-clamped) threshold — no mix of
+        // padding attesters can ever cross the quorum. Deterministic sweep.
+        let c = council(&["alice", "bob", "carol"]);
+        let pool = [
+            did("alice"), did("alice"), did("bob"),       // dups
+            did("mallory"), did("eve"), did("carol"),     // non-members + member
+        ];
+        for take in 0..=pool.len() {
+            let attesters = &pool[..take];
+            for threshold in 0usize..6 {
+                let r = ratify(attesters, &c, threshold);
+                let distinct_members = attesters
+                    .iter()
+                    .filter(|a| c.contains(*a))
+                    .collect::<HashSet<_>>()
+                    .len();
+                assert_eq!(r.approvals, distinct_members, "approvals must be distinct members only");
+                assert!(r.approvals <= c.len(), "can't exceed the council size");
+                assert_eq!(r.threshold, threshold.max(1), "threshold clamped to >=1");
+                assert_eq!(r.ratified, distinct_members >= threshold.max(1));
+            }
+        }
+    }
+
+    #[test]
     fn threshold_is_clamped_to_one() {
         let c = council(&["alice"]);
         // threshold 0 would auto-ratify anything; clamp to 1.

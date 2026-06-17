@@ -1074,6 +1074,39 @@ mod tests {
     }
 
     #[test]
+    fn graduated_slash_invariants_hold_adversarially() {
+        // Economic safety: a slash can never exceed the bond, never go negative,
+        // and never shrinks as the failure streak grows. Sweep schedules × bonds
+        // × streaks (deterministic, no proptest dep).
+        for &step in &[1u32, 250, 2_500, 10_000, 60_000] {
+            for &cap in &[0u32, 1, 5_000, 10_000, 99_999] {
+                let sched = SlashSchedule::new(step, cap);
+                // cap is always clamped within the full bond.
+                assert!(sched.max_bps <= 10_000);
+                for &bond in &[0i64, 1, 1_000, 1_000_000, i64::MAX] {
+                    let mut prev = 0i64;
+                    for streak in 0u64..12 {
+                        let amt = sched.slash_amount(bond, streak);
+                        // 0 ≤ amount ≤ bond (for non-negative bond).
+                        assert!(amt >= 0, "slash went negative: {amt}");
+                        assert!(amt <= bond, "slash {amt} exceeded bond {bond}");
+                        // monotonic non-decreasing in the failure streak.
+                        assert!(amt >= prev, "slash shrank as streak grew: {prev}->{amt}");
+                        prev = amt;
+                    }
+                    // a clean peer (streak 0) is never slashed.
+                    assert_eq!(sched.slash_amount(bond, 0), 0);
+                }
+                // negative bond never yields a positive slash, at any streak.
+                for streak in 0u64..12 {
+                    assert_eq!(sched.slash_amount(-1, streak), 0);
+                    assert_eq!(sched.slash_amount(i64::MIN, streak), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reputation_slash_fraction_tracks_consecutive_failures() {
         let sched = SlashSchedule::new(3_000, 9_000);
         let mut rep = PeerReputation::default();
