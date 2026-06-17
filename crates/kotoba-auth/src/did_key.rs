@@ -14,11 +14,35 @@ pub enum DidKeyError {
     InvalidKeyLength(usize),
 }
 
-/// Extract the raw 32-byte Ed25519 public key from a `did:key:z6Mk...` DID.
+/// Extract the raw 32-byte Ed25519 public key from a `did:key` DID.
+///
+/// Accepts BOTH encodings kotoba emits for the same key:
+///   - W3C standard `did:key:z6Mk…` — multibase(base58btc) of `[0xed,0x01]||pubkey`.
+///   - kotoba-wasm `did:key:z<64-hex>` — `'z'` followed by `hex(pubkey32)`, no
+///     multicodec (`WriteCrypto::did`; agent identities and `KOTOBA_OPERATOR_DID`
+///     use this form). This form previously failed to parse, so an operator/agent
+///     DID minted by the wasm path could not be verified against a CACAO produced
+///     by `kotoba cacao-sign` (standard form) — see kyber-plm `live/LIVE.md`.
+///     Accepting both unifies the two encodings for the same key.
 pub fn parse_ed25519_did_key(did: &str) -> Result<[u8; 32], DidKeyError> {
     let key_str = did
         .strip_prefix("did:key:")
         .ok_or_else(|| DidKeyError::NotDidKey(did.to_string()))?;
+
+    // kotoba-wasm hex form: 'z' + exactly 64 hex chars = the raw 32-byte pubkey.
+    // Checked before multibase: an ed25519 base58btc did:key is ~47 chars and
+    // carries the 0xed01 multicodec, so a 64-char hex body is unambiguous.
+    if let Some(hex_body) = key_str.strip_prefix('z') {
+        if hex_body.len() == 64 && hex_body.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut arr = [0u8; 32];
+            for (i, chunk) in hex_body.as_bytes().chunks(2).enumerate() {
+                let s = std::str::from_utf8(chunk).expect("ascii hex chunk");
+                arr[i] = u8::from_str_radix(s, 16)
+                    .map_err(|e| DidKeyError::MultibaseDecode(e.to_string()))?;
+            }
+            return Ok(arr);
+        }
+    }
 
     let (_, bytes) =
         multibase::decode(key_str).map_err(|e| DidKeyError::MultibaseDecode(e.to_string()))?;
@@ -36,6 +60,30 @@ pub fn parse_ed25519_did_key(did: &str) -> Result<[u8; 32], DidKeyError> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(key_bytes);
     Ok(arr)
+}
+
+/// kotoba-wasm hex-form encoder: `did:key:z<hex(pubkey32)>`. The non-standard
+/// form used by agent identities; kept so callers can produce a DID that matches
+/// `KOTOBA_AGENT_DID` / `KOTOBA_OPERATOR_DID`.
+pub fn ed25519_pubkey_to_did_key_hex(pubkey: &[u8; 32]) -> String {
+    let hex: String = pubkey.iter().map(|b| format!("{b:02x}")).collect();
+    format!("did:key:z{hex}")
+}
+
+/// Canonicalise any accepted `did:key` form (standard or kotoba-wasm hex) to the
+/// W3C standard `did:key:z6Mk…`. Use this to compare DIDs by identity rather than
+/// by surface string, so `aud == operator_did` / `iss == owner` checks succeed
+/// regardless of which encoding each side used.
+pub fn to_canonical_did_key(did: &str) -> Result<String, DidKeyError> {
+    Ok(ed25519_pubkey_to_did_key(&parse_ed25519_did_key(did)?))
+}
+
+/// True if two `did:key` DIDs denote the same Ed25519 key, across encodings.
+pub fn did_keys_equal(a: &str, b: &str) -> bool {
+    match (parse_ed25519_did_key(a), parse_ed25519_did_key(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Build a `did:key:z6Mk...` DID from a raw 32-byte Ed25519 public key.
@@ -130,5 +178,47 @@ mod tests {
             did.starts_with("did:key:z6Mk"),
             "expected did:key:z6Mk prefix, got: {did}"
         );
+    }
+
+    #[test]
+    fn parses_kotoba_wasm_hex_form() {
+        // 'z' + hex(pubkey32), no multicodec — the agent/operator identity form.
+        let pubkey = [0xABu8; 32];
+        let hex_did = ed25519_pubkey_to_did_key_hex(&pubkey);
+        assert!(hex_did.starts_with("did:key:z"));
+        assert_eq!(hex_did.len(), "did:key:z".len() + 64);
+        assert_eq!(parse_ed25519_did_key(&hex_did).unwrap(), pubkey);
+    }
+
+    #[test]
+    fn hex_and_standard_forms_decode_to_same_key() {
+        let sk = test_keypair();
+        let pk = *sk.verifying_key().as_bytes();
+        let std_did = ed25519_pubkey_to_did_key(&pk);
+        let hex_did = ed25519_pubkey_to_did_key_hex(&pk);
+        assert_ne!(std_did, hex_did, "two distinct surface encodings");
+        assert_eq!(parse_ed25519_did_key(&std_did).unwrap(), pk);
+        assert_eq!(parse_ed25519_did_key(&hex_did).unwrap(), pk);
+        // …and canonicalisation collapses them to one identity.
+        assert_eq!(to_canonical_did_key(&hex_did).unwrap(), std_did);
+        assert_eq!(to_canonical_did_key(&std_did).unwrap(), std_did);
+        assert!(did_keys_equal(&hex_did, &std_did));
+    }
+
+    #[test]
+    fn known_operator_did_hex_form_round_trips() {
+        // The production KOTOBA_OPERATOR_DID is stored in hex form; it must parse
+        // and canonicalise to its standard form (and back via the hex encoder).
+        let op = "did:key:z35dec6b49a374eec5711a4f3ccaf66b944ecae6773766e62d71c86ff8e3b5a37";
+        let pk = parse_ed25519_did_key(op).expect("hex operator DID must parse");
+        assert_eq!(ed25519_pubkey_to_did_key_hex(&pk), op);
+        assert_eq!(to_canonical_did_key(op).unwrap(), ed25519_pubkey_to_did_key(&pk));
+    }
+
+    #[test]
+    fn hex_form_with_bad_length_falls_through_to_multibase_err() {
+        // 'z' + 63 hex chars is neither the hex form (needs 64) nor valid base58btc.
+        let did = format!("did:key:z{}", "a".repeat(63));
+        assert!(parse_ed25519_did_key(&did).is_err());
     }
 }
