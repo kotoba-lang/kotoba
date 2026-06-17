@@ -124,6 +124,61 @@ pub fn verify_and_ratify(
     }
 }
 
+/// The `social/capital/params/active` pointer with ratified transitions (GROWTH
+/// p12): the active [`ParamVersion`] advances only when a Council quorum's
+/// ed25519 attestations over the proposal verify. An operator cannot move the
+/// pointer alone. The prior version id is recorded so the change history is
+/// auditable (and each id is anchorable on Base for objective finality, p8).
+#[derive(Debug, Clone)]
+pub struct ActiveParams {
+    current: ParamVersion,
+    history: Vec<KotobaCid>,
+}
+
+impl ActiveParams {
+    pub fn new(initial: ParamVersion) -> Self {
+        Self {
+            current: initial,
+            history: Vec::new(),
+        }
+    }
+
+    pub fn current(&self) -> &ParamVersion {
+        &self.current
+    }
+
+    /// Content id of the active params — the value the active pointer holds.
+    pub fn current_id(&self) -> KotobaCid {
+        self.current.id()
+    }
+
+    /// Prior version ids, oldest first (the ratified change history).
+    pub fn history(&self) -> &[KotobaCid] {
+        &self.history
+    }
+
+    /// Attempt to make `proposed` the active params: verify the `attestations`
+    /// against `council` at `threshold` and, **iff ratified**, advance the
+    /// pointer (recording the superseded id in history). Returns the
+    /// [`Ratification`] either way — the pointer is unchanged when it is not
+    /// ratified. Re-activating the already-active version is a no-op (but still
+    /// requires a fresh quorum, since attestations are over the version id).
+    pub fn try_activate(
+        &mut self,
+        proposed: ParamVersion,
+        attestations: &[Attestation],
+        council: &HashSet<[u8; 32]>,
+        threshold: usize,
+    ) -> Ratification {
+        let r = verify_and_ratify(&proposed, attestations, council, threshold);
+        if r.ratified && proposed.id() != self.current.id() {
+            self.history.push(self.current.id());
+            self.current = proposed;
+        }
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +298,46 @@ mod tests {
         let r = verify_and_ratify(&v, &[attest(&a, &v), attest(&a, &v)], &council, 2);
         assert_eq!(r.approvals, 1, "same valid signer twice is one approval");
         assert!(!r.ratified);
+    }
+
+    // ── ActiveParams pointer ──────────────────────────────────────────────
+
+    #[test]
+    fn active_params_advances_only_on_ratified_change() {
+        let (a, b) = (key(1), key(2));
+        let council: HashSet<[u8; 32]> =
+            [a.verifying_key().to_bytes(), b.verifying_key().to_bytes()].into_iter().collect();
+        let v0 = ParamVersion::new("1.0.0", did("p0"));
+        let mut active = ActiveParams::new(v0.clone());
+        assert_eq!(active.current_id(), v0.id());
+        assert!(active.history().is_empty());
+
+        // a quorum-ratified proposal advances the pointer + records history.
+        let v1 = ParamVersion::new("2.0.0", did("p1"));
+        let r = active.try_activate(v1.clone(), &[attest(&a, &v1), attest(&b, &v1)], &council, 2);
+        assert!(r.ratified);
+        assert_eq!(active.current_id(), v1.id());
+        assert_eq!(active.history(), &[v0.id()]);
+
+        // an UNratified proposal (only one approval, threshold 2) is rejected:
+        // the pointer does not move.
+        let v2 = ParamVersion::new("3.0.0", did("p2"));
+        let r2 = active.try_activate(v2.clone(), &[attest(&a, &v2)], &council, 2);
+        assert!(!r2.ratified);
+        assert_eq!(active.current_id(), v1.id(), "pointer unchanged on rejection");
+        assert_eq!(active.history(), &[v0.id()], "history unchanged");
+    }
+
+    #[test]
+    fn active_params_reactivating_current_is_a_noop() {
+        let a = key(1);
+        let council: HashSet<[u8; 32]> = [a.verifying_key().to_bytes()].into_iter().collect();
+        let v0 = ParamVersion::new("1.0.0", did("p0"));
+        let mut active = ActiveParams::new(v0.clone());
+        // ratified, but it's the already-active version → no history churn.
+        let r = active.try_activate(v0.clone(), &[attest(&a, &v0)], &council, 1);
+        assert!(r.ratified);
+        assert_eq!(active.current_id(), v0.id());
+        assert!(active.history().is_empty(), "re-activating current adds no history");
     }
 }
