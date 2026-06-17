@@ -150,11 +150,9 @@ def gateway_thread() -> Any:
     line items with ``error`` but the graphs still terminate). This keeps
     tests deterministic and offline.
     """
-    # Point shards at an unreachable port so fan-out fails fast (~1 s) and
-    # the graph still terminates with synthesized fallbacks.
-    os.environ["UNISPSC_EXECUTOR_SHARD_0"] = "http://127.0.0.1:1"
-    os.environ["UNISPSC_EXECUTOR_SHARD_1"] = "http://127.0.0.1:1"
-    os.environ["UNISPSC_EXECUTOR_SHARD_2"] = "http://127.0.0.1:1"
+    # Point the UNSPSC XRPC gateway at an unreachable port so fan-out fails
+    # fast (~1 s) and the graph still terminates with synthesized fallbacks.
+    os.environ["UNISPSC_XRPC_ENDPOINT"] = "http://127.0.0.1:1"
     # Ensure dev mode is on.
     os.environ.pop("ETZHAYYIM_ENV", None)
     os.environ.pop("KUNI_UMI_API_DEV_MODE", None)
