@@ -328,6 +328,21 @@ pub fn observe_finality<T: JsonRpcTransport>(
     kotoba_evm::anchor::finality_from_call_result(head, &result_bytes)
 }
 
+/// Observe finality for a batch of graph `heads` via `committerOf` `eth_call`s
+/// over an injected transport (GROWTH p8 checkpoint observation). Returns one
+/// `(head, FinalityStatus)` per input; pair with [`kotoba_evm::anchor::finality_summary`]
+/// for the node.status counts. Read-only; per-head transport errors are not final.
+pub fn observe_finalities<T: JsonRpcTransport>(
+    transport: &T,
+    anchor_address: &str,
+    heads: &[KotobaCid],
+) -> Vec<(KotobaCid, kotoba_evm::anchor::FinalityStatus)> {
+    heads
+        .iter()
+        .map(|h| (h.clone(), observe_finality(transport, anchor_address, h)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +411,24 @@ mod tests {
         }
         let head = KotobaCid::from_bytes(b"h");
         assert!(!observe_finality(&ErrRpc, "0xanchor", &head).is_final);
+    }
+
+    #[test]
+    fn observe_finalities_batches_and_summarizes() {
+        // a fake where every committerOf returns the same non-zero committer.
+        let heads = [
+            KotobaCid::from_bytes(b"head-a"),
+            KotobaCid::from_bytes(b"head-b"),
+        ];
+        let pairs =
+            observe_finalities(&FakeCall { result: address_word(0xAB) }, "0xanchor", &heads);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, heads[0]); // order + head preserved
+        let statuses: Vec<_> = pairs.iter().map(|(_, s)| *s).collect();
+        let summary = kotoba_evm::anchor::finality_summary(&statuses);
+        assert_eq!(summary.tracked, 2);
+        assert_eq!(summary.finalized, 2);
+        assert_eq!(summary.pending, 0);
     }
 
     // a 32-byte topic from a short label (left-padded), mimicking an indexed bytes32/address.

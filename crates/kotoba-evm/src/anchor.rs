@@ -118,6 +118,29 @@ pub fn verify_finality(
     }
 }
 
+/// Aggregate finality across a node's tracked graph heads — the checkpoint
+/// observability surface (GROWTH p8). `finalized + pending == tracked`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FinalitySummary {
+    /// Heads observed.
+    pub tracked: usize,
+    /// Heads whose root is anchored by a non-zero committer (final).
+    pub finalized: usize,
+    /// Heads not yet anchored.
+    pub pending: usize,
+}
+
+/// Summarize a batch of [`FinalityStatus`] (e.g. one per graph head this node
+/// holds) into counts for `node.status`.
+pub fn finality_summary(statuses: &[FinalityStatus]) -> FinalitySummary {
+    let finalized = statuses.iter().filter(|s| s.is_final).count();
+    FinalitySummary {
+        tracked: statuses.len(),
+        finalized,
+        pending: statuses.len() - finalized,
+    }
+}
+
 /// `committerOf(bytes32)` view selector.
 pub fn committer_of_selector() -> [u8; 4] {
     let h = keccak256(b"committerOf(bytes32)");
@@ -267,6 +290,19 @@ mod tests {
         // short/empty result → None.
         assert_eq!(decode_address_result(&[]), None);
         assert_eq!(decode_address_result(&[0u8; 31]), None);
+    }
+
+    #[test]
+    fn finality_summary_counts_finalized_and_pending() {
+        let head = KotobaCid::from_bytes(b"h");
+        let final_st = verify_finality(&head, Some({ let mut a = [0u8; 20]; a[19] = 1; a }));
+        let pending_st = verify_finality(&head, None);
+        assert_eq!(finality_summary(&[]), FinalitySummary::default());
+        let s = finality_summary(&[final_st, pending_st, final_st]);
+        assert_eq!(s.tracked, 3);
+        assert_eq!(s.finalized, 2);
+        assert_eq!(s.pending, 1);
+        assert_eq!(s.finalized + s.pending, s.tracked);
     }
 
     #[test]
