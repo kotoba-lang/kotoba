@@ -12,7 +12,9 @@
 //! is met and what is missing.
 
 use crate::node_id::NodeId;
+use kotoba_core::cid::KotobaCid;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 fn one() -> usize {
     1
@@ -160,6 +162,58 @@ pub fn replication_plan(
     targets
 }
 
+/// Per-graph replication policies with a node-wide default fallback (GROWTH p4
+/// "per-graph policy store"). A graph that has not declared its own pin contract
+/// inherits the node default, so callers can always resolve a policy with
+/// [`policy_for`](Self::policy_for) without special-casing absence.
+#[derive(Debug, Clone, Default)]
+pub struct ReplicationPolicyStore {
+    default: ReplicationPolicy,
+    per_graph: HashMap<KotobaCid, ReplicationPolicy>,
+}
+
+impl ReplicationPolicyStore {
+    /// A store whose unset graphs resolve to `default`.
+    pub fn new(default: ReplicationPolicy) -> Self {
+        Self {
+            default,
+            per_graph: HashMap::new(),
+        }
+    }
+
+    /// The node-wide default contract.
+    pub fn default_policy(&self) -> &ReplicationPolicy {
+        &self.default
+    }
+
+    /// Declare (or replace) a graph's own pin contract.
+    pub fn set(&mut self, graph: KotobaCid, policy: ReplicationPolicy) {
+        self.per_graph.insert(graph, policy);
+    }
+
+    /// Drop a graph's override; it reverts to the default. Returns the removed
+    /// policy if one was set.
+    pub fn remove(&mut self, graph: &KotobaCid) -> Option<ReplicationPolicy> {
+        self.per_graph.remove(graph)
+    }
+
+    /// `true` if `graph` has its own declared contract (not just the default).
+    pub fn has_override(&self, graph: &KotobaCid) -> bool {
+        self.per_graph.contains_key(graph)
+    }
+
+    /// The effective policy for `graph`: its own override if declared, else the
+    /// node default. Always resolves.
+    pub fn policy_for(&self, graph: &KotobaCid) -> &ReplicationPolicy {
+        self.per_graph.get(graph).unwrap_or(&self.default)
+    }
+
+    /// Number of graphs with an explicit override.
+    pub fn override_count(&self) -> usize {
+        self.per_graph.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +346,46 @@ mod tests {
         let st = audit_replication(&policy, 0, &[]);
         let plan = replication_plan(&st, &[], &[nid(b"only")]);
         assert_eq!(plan, vec![nid(b"only")]);
+    }
+
+    // ── ReplicationPolicyStore — per-graph policies + default (GROWTH p4) ───
+
+    fn gcid(seed: &str) -> KotobaCid {
+        KotobaCid::from_bytes(seed.as_bytes())
+    }
+
+    #[test]
+    fn store_falls_back_to_default_for_unknown_graph() {
+        let store = ReplicationPolicyStore::new(ReplicationPolicy::new(2));
+        // an undeclared graph resolves to the default — always resolvable.
+        assert_eq!(store.policy_for(&gcid("graphX")).min_replicas, 2);
+        assert!(!store.has_override(&gcid("graphX")));
+        assert_eq!(store.override_count(), 0);
+    }
+
+    #[test]
+    fn store_override_takes_precedence_over_default() {
+        let mut store = ReplicationPolicyStore::new(ReplicationPolicy::new(1));
+        let g = gcid("hot-graph");
+        store.set(g.clone(), ReplicationPolicy::new(5).with_min_bond(9_000));
+        let p = store.policy_for(&g);
+        assert_eq!(p.min_replicas, 5);
+        assert_eq!(p.min_bond_mkoto, 9_000);
+        assert!(store.has_override(&g));
+        assert_eq!(store.override_count(), 1);
+        // a different graph still gets the default.
+        assert_eq!(store.policy_for(&gcid("cold-graph")).min_replicas, 1);
+    }
+
+    #[test]
+    fn store_remove_reverts_to_default() {
+        let mut store = ReplicationPolicyStore::new(ReplicationPolicy::new(1));
+        let g = gcid("g");
+        store.set(g.clone(), ReplicationPolicy::new(4));
+        assert_eq!(store.policy_for(&g).min_replicas, 4);
+        let removed = store.remove(&g).expect("override existed");
+        assert_eq!(removed.min_replicas, 4);
+        assert_eq!(store.policy_for(&g).min_replicas, 1, "reverts to default");
+        assert!(store.remove(&g).is_none(), "second remove is a no-op");
     }
 }
