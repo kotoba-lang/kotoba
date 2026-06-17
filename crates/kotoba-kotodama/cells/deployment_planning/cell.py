@@ -65,7 +65,7 @@ logger = logging.getLogger("DeploymentPlanningCell")
 UNISPSC_XRPC_ENDPOINT = os.environ.get(
     "UNISPSC_XRPC_ENDPOINT", "https://unispsc.etzhayyim.com"
 )
-UNISPSC_COMMODITY_NSID = "com.etzhayyim.etzhayyim.apps.openUnispsc.commodity"
+UNISPSC_COMMODITY_NSID = "com.etzhayyim.apps.openUnispsc.commodity"
 
 # Default UNSPSC code mapping per utility class. Codes target realistic
 # mid-segment commodities (8-digit) rather than bare segment roots; the
