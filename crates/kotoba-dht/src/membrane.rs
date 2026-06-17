@@ -14,9 +14,53 @@
 //! kotoba stays read+verify: eligibility is a pure function over already-observed
 //! `mishmar/pin/*` Datoms — no chain access happens here.
 
+use crate::neighborhood::K;
 use crate::node_id::NodeId;
+use crate::replication::ReplicationPolicy;
+use crate::reputation::prefer_by_reputation;
 use kotoba_core::cid::KotobaCid;
 use kotoba_query::social::{eligible_replica, PinIndex};
+
+/// A peer offered for replica selection: its DHT node id, the DID whose bond
+/// gates its admission, and its current reputation (social capital, higher =
+/// preferred). Reputation is preference only — it never admits.
+pub type ReplicaCandidate = (NodeId, KotobaCid, u64);
+
+/// End-to-end replica selection for a graph `root` (ADR-002, the single entry
+/// point the server calls). Composes the three ledgers in order:
+///
+/// 1. **admission** — bond-gated: only DIDs that are `eligible_replica` for
+///    `root` under `policy.min_bond_mkoto` survive (skipped when the membrane is
+///    off, leaving today's open neighbourhood);
+/// 2. **placement** — XOR proximity to `cid_address(root)` picks the `K`
+///    responsible cells from the admitted pool;
+/// 3. **preference** — reputation reorders that `K`-set (highest first), with
+///    proximity preserved as the tie-breaker (stable sort).
+///
+/// Returns the ordered replica set (closest-preferred first). Admission is bond;
+/// reputation can only reorder what bond already let in — it never widens the
+/// set, which the `reputation_never_admits_a_non_eligible_node` property pins.
+pub fn select_replicas(
+    root: &KotobaCid,
+    address: &NodeId,
+    peers: &[ReplicaCandidate],
+    policy: &ReplicationPolicy,
+    pins: &PinIndex,
+    membrane_on: bool,
+) -> Vec<NodeId> {
+    // 1+2: admission (bond) then XOR-proximity K-set.
+    let nd: Vec<(NodeId, KotobaCid)> =
+        peers.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
+    let bonded = bonded_candidates(address, &nd, root, policy.min_bond_mkoto, pins, K, membrane_on);
+    // 3: reorder the admitted K-set by reputation (proximity = stable tie-break).
+    let rep: std::collections::HashMap<&NodeId, u64> =
+        peers.iter().map(|(n, _, r)| (n, *r)).collect();
+    let ranked: Vec<(NodeId, u64)> = bonded
+        .iter()
+        .map(|n| (n.clone(), rep.get(n).copied().unwrap_or(0)))
+        .collect();
+    prefer_by_reputation(&ranked, bonded.len())
+}
 
 /// Env gate for the stake-to-replicate membrane (ADR-002 p2). Default **off**:
 /// only `1`/`true`/`on`/`yes` (case-insensitive) enable it. Read this once at the
@@ -199,5 +243,58 @@ mod tests {
                 assert!(addr.xor_distance(n) >= max_sel);
             }
         }
+    }
+
+    // ── select_replicas — the composed admission → proximity → preference path ─
+
+    #[test]
+    fn select_replicas_composes_bond_admission_and_reputation_preference() {
+        use crate::replication::ReplicationPolicy;
+        let root = did("rootA");
+        let addr = crate::neighborhood_store::cid_address(&root);
+        let policy = ReplicationPolicy::new(2).with_min_bond(5_000);
+
+        // peggy + quinn are bonded to floor; sybil has a fresh key and no bond.
+        let peggy = did("did:key:peggy");
+        let quinn = did("did:key:quinn");
+        let sybil = did("did:key:sybil");
+        let peggy_n = nid(b"peggy-node");
+        let quinn_n = nid(b"quinn-node");
+        let sybil_n = nid(b"sybil-node");
+        let mut pins = PinIndex::new();
+        bonded_pin(&mut pins, "pinP", &peggy, &root, 5_000);
+        bonded_pin(&mut pins, "pinQ", &quinn, &root, 5_000);
+
+        // reputation: quinn > peggy. sybil's reputation is high but must not save it.
+        let peers = vec![
+            (peggy_n.clone(), peggy, 10u64),
+            (quinn_n.clone(), quinn, 99u64),
+            (sybil_n.clone(), sybil, 1_000_000u64),
+        ];
+
+        let selected = select_replicas(&root, &addr, &peers, &policy, &pins, true);
+        // admission: sybil (no bond) is excluded despite huge reputation.
+        assert!(!selected.contains(&sybil_n), "unbonded Sybil must not be admitted");
+        // both bonded peers are in; quinn is preferred (higher reputation) first.
+        assert_eq!(selected, vec![quinn_n, peggy_n]);
+    }
+
+    #[test]
+    fn select_replicas_membrane_off_admits_all_and_still_ranks() {
+        use crate::replication::ReplicationPolicy;
+        let root = did("rootB");
+        let addr = crate::neighborhood_store::cid_address(&root);
+        // membrane off + open policy → bond ignored, all peers admitted.
+        let policy = ReplicationPolicy::default();
+        let pins = PinIndex::new();
+        let a = nid(b"a-node");
+        let b = nid(b"b-node");
+        let peers = vec![
+            (a.clone(), did("did:a"), 5u64),
+            (b.clone(), did("did:b"), 50u64),
+        ];
+        let selected = select_replicas(&root, &addr, &peers, &policy, &pins, false);
+        assert_eq!(selected.len(), 2, "membrane off admits all");
+        assert_eq!(selected[0], b, "higher reputation preferred first");
     }
 }

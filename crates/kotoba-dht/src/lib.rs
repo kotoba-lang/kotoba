@@ -25,7 +25,7 @@ pub use audit::{
     SettlementIntent, SettlementIntentSink, SettlementKind, VerdictSink,
 };
 pub use commit_chain::CommitChain;
-pub use membrane::{bonded_candidates, stake_to_replicate_enabled};
+pub use membrane::{bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate};
 pub use neighborhood::Neighborhood;
 pub use replication::{audit_replication, ReplicationPolicy, ReplicationStatus};
 pub use reputation::{prefer_by_reputation, EarnRateBand};

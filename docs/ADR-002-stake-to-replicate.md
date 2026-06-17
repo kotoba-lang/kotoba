@@ -160,7 +160,10 @@ slash. Bond is necessary; reputation is ordering.
 
 ### Status (2026-06-17)
 All five phases have landed at the crate level (`kotoba-query` + `kotoba-dht`,
-read+verify, fully unit-tested). What remains is **integration, not design**:
+read+verify, fully unit-tested), composed behind one server-facing entry point
+`kotoba-dht::select_replicas(root, address, peers, policy, pins, membrane_on)` —
+admission (bond) → placement (XOR proximity) → preference (reputation) in a
+single call. What remains is **integration, not design**:
 wiring the audit loop to a live `ProofFetcher`, surfacing owed-retainer + bond
 floors in the server `node.status`, and the relayer that carries warrants to
 `MishmarBondEscrow`. Those land with GROWTH **p4** (declared replication) — the
