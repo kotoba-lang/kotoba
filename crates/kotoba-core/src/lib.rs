@@ -10,7 +10,7 @@ pub mod prolly;
 pub mod store;
 
 pub use async_store::AsyncBlockStore;
-pub use cid::{CidError, KotobaCid};
+pub use cid::{unverified_blocks, CidError, KotobaCid};
 pub use foreign::{ForeignBridge, ForeignCall, ForeignCallType, ForeignError};
 pub use frame::{Frame, FrameFlags, FrameType};
 pub use named_graph::{classify as classify_graph_visibility, GraphVisibility, NamedGraph};

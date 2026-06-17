@@ -78,15 +78,14 @@ impl BlockCache {
         Self::default()
     }
 
-    /// Insert a block under its claimed CID, rejecting it unless
-    /// `KotobaCid::from_bytes(bytes) == cid` (content-address re-verification).
+    /// Insert a block under its claimed CID, rejecting it unless the bytes
+    /// content-address to `cid` (the light-client trust check, `KotobaCid::verifies`).
     pub fn insert_verified(&self, cid: &KotobaCid, bytes: &[u8]) -> Result<(), String> {
-        let actual = KotobaCid::from_bytes(bytes);
-        if &actual != cid {
+        if !cid.verifies(bytes) {
             return Err(format!(
                 "CID mismatch: claimed {} != actual {}",
                 cid.to_multibase(),
-                actual.to_multibase()
+                KotobaCid::from_bytes(bytes).to_multibase()
             ));
         }
         self.blocks.lock().unwrap().insert(cid.0, bytes.to_vec());
