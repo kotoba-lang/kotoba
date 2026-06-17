@@ -354,6 +354,25 @@ mod tests {
     }
 
     #[test]
+    fn hlc_serializes_transparently_as_u64() {
+        // Hlc is persisted in commits (the `hlc: u64` field). Its serde MUST be
+        // wire-compatible with a bare u64 so the newtype never breaks the commit
+        // format. Verify (format-agnostic, via dag-cbor) that an Hlc encodes to
+        // the SAME bytes as its inner u64, a raw u64 decodes into an Hlc, and the
+        // Hlc round-trips.
+        let h = Hlc::new(1_700_000_000_000, 7);
+        let hlc_bytes = serde_ipld_dagcbor::to_vec(&h).unwrap();
+        let u64_bytes = serde_ipld_dagcbor::to_vec(&h.0).unwrap();
+        assert_eq!(hlc_bytes, u64_bytes, "Hlc must encode identically to a bare u64");
+        // a raw u64 decodes straight into an Hlc.
+        let from_u64: Hlc = serde_ipld_dagcbor::from_slice(&u64_bytes).unwrap();
+        assert_eq!(from_u64, h);
+        // and the Hlc round-trips.
+        let back: Hlc = serde_ipld_dagcbor::from_slice(&hlc_bytes).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
     fn zero_is_the_minimum() {
         assert_eq!(Hlc::ZERO, Hlc::new(0, 0));
         assert!(Hlc::ZERO < Hlc::new(1, 0));
