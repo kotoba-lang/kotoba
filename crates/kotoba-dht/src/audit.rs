@@ -503,6 +503,66 @@ where
     Some((warrant, evidence))
 }
 
+/// A produced slash warrant with its graduated amount — the composed audit→slash
+/// artifact (ADR-002 p4 + the graduated-slash open question). The on-chain move
+/// of `slash_amount_mkoto` stays operator-side (Mishmar boundary); this bundles
+/// the accusation, its evidence, the failure streak it is based on, and the
+/// proposed bond-proportional amount.
+#[derive(Debug, Clone)]
+pub struct SlashWarrant {
+    pub warrant: Warrant,
+    pub evidence: AvailabilityEvidence,
+    /// Consecutive-failure streak the graduated slash is based on.
+    pub consecutive_failures: u64,
+    /// Proposed slash amount (mKOTO): `schedule.slash_amount(bond, streak)`.
+    pub slash_amount_mkoto: i64,
+}
+
+impl<F: ProofFetcher, S: VerdictSink> AuditScheduler<F, S> {
+    /// Compose `Slash` verdicts into graduated slash warrants (the server's slash
+    /// path). For each `Slash` verdict: build the signed warrant + pinned
+    /// evidence, read the peer's current failure streak (accumulated by
+    /// [`run_epoch`](Self::run_epoch)), and size the slash from its observed bond
+    /// via `schedule`. `bond_of` resolves a peer's bond (e.g. from the social
+    /// `PinIndex` through the DID bridge); `sign` signs each warrant. Reward /
+    /// None / Unreachable verdicts (and result-less slashes) produce nothing.
+    ///
+    /// Call after [`run_epoch`](Self::run_epoch) so the streak reflects this epoch.
+    pub fn slash_warrants<B, G>(
+        &self,
+        verdicts: &[PeerAudit],
+        validator: &NodeId,
+        ts: u64,
+        schedule: &SlashSchedule,
+        bond_of: B,
+        sign: G,
+    ) -> Vec<SlashWarrant>
+    where
+        B: Fn(&NodeId) -> i64,
+        G: Fn(&[u8]) -> Vec<u8>,
+    {
+        verdicts
+            .iter()
+            .filter_map(|v| {
+                let (warrant, evidence) =
+                    availability_slash_warrant(v, validator, ts, |m| sign(m))?;
+                let streak = self
+                    .reputation(&v.peer)
+                    .map(|r| r.consecutive_failures)
+                    .unwrap_or(1)
+                    .max(1);
+                let slash_amount_mkoto = schedule.slash_amount(bond_of(&v.peer), streak);
+                Some(SlashWarrant {
+                    warrant,
+                    evidence,
+                    consecutive_failures: streak,
+                    slash_amount_mkoto,
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -919,6 +979,67 @@ mod tests {
         // different scores ⇒ different evidence ⇒ different CIDs ⇒ different sigs.
         assert_ne!(w1.evidence, w2.evidence);
         assert_ne!(w1.sig, w2.sig);
+    }
+
+    #[test]
+    fn scheduler_slash_warrants_compose_audit_streak_and_graduated_amount() {
+        // A peer that holds nothing is slashed every epoch; after N epochs its
+        // streak is N, and slash_warrants sizes the slash from streak × bond.
+        let blocks = cids(&[b"a", b"b"]);
+        let payloads: [&[u8]; 2] = [b"a", b"b"];
+        let auditor = auditor_holding(&blocks, &payloads);
+        let (pid, pstore, _bk) = peer_store(b"deadbeat"); // holds nothing
+        let fetcher = LocalFetcher {
+            stores: HashMap::from([(pid.clone(), pstore)]),
+        };
+        let sched = AuditScheduler::new(auditor, fetcher, InMemoryVerdictSink::default());
+
+        let validator = NodeId::from_pubkey(b"auditor");
+        let schedule = SlashSchedule::new(2_500, 10_000); // 25%/miss, cap 100%
+
+        // epoch 0: streak 1 → 25% of a 1000 bond = 250.
+        let v0 = sched.run_epoch(0, &blocks, std::slice::from_ref(&pid));
+        let w0 = sched.slash_warrants(&v0, &validator, 100, &schedule, |_| 1_000, |m| m.to_vec());
+        assert_eq!(w0.len(), 1);
+        assert_eq!(w0[0].consecutive_failures, 1);
+        assert_eq!(w0[0].slash_amount_mkoto, 250);
+        assert_eq!(
+            w0[0].warrant.rule_id,
+            ValidationRule::AvailabilityProofFailed as u8
+        );
+
+        // epoch 1: streak 2 → 50% of 1000 = 500 (escalation from the streak).
+        let v1 = sched.run_epoch(1, &blocks, std::slice::from_ref(&pid));
+        let w1 = sched.slash_warrants(&v1, &validator, 101, &schedule, |_| 1_000, |m| m.to_vec());
+        assert_eq!(w1[0].consecutive_failures, 2);
+        assert_eq!(w1[0].slash_amount_mkoto, 500);
+    }
+
+    #[test]
+    fn scheduler_slash_warrants_skips_healthy_peers() {
+        // A peer that holds everything is rewarded → no slash warrant produced.
+        let blocks = cids(&[b"a"]);
+        let payloads: [&[u8]; 1] = [b"a"];
+        let auditor = auditor_holding(&blocks, &payloads);
+        let (pid, pstore, _bk) = peer_store(b"reliable");
+        for c in &blocks {
+            pstore.put(c, b"a").unwrap();
+        }
+        let fetcher = LocalFetcher {
+            stores: HashMap::from([(pid.clone(), pstore)]),
+        };
+        let sched = AuditScheduler::new(auditor, fetcher, InMemoryVerdictSink::default());
+        let v = sched.run_epoch(0, &blocks, std::slice::from_ref(&pid));
+        let schedule = SlashSchedule::new(2_500, 10_000);
+        let w = sched.slash_warrants(
+            &v,
+            &NodeId::from_pubkey(b"auditor"),
+            0,
+            &schedule,
+            |_| 1_000,
+            |m| m.to_vec(),
+        );
+        assert!(w.is_empty(), "a rewarded peer yields no slash warrant");
     }
 
     // ── Graduated slash schedule (ADR-002 open question) ─────────────────
