@@ -306,6 +306,38 @@ mod tests {
     }
 
     #[test]
+    fn finality_invariants_hold_adversarially() {
+        // verify_finality: final iff a non-zero committer is observed for the
+        // head's own root hash; root_hash always = the head's low-32. And the
+        // summary partition finalized+pending==tracked always holds. Sweep
+        // committer shapes × batch compositions.
+        let head = KotobaCid::from_bytes(b"head");
+        let committers = [
+            None,                                   // no record → pending
+            Some([0u8; 20]),                        // zero address → pending
+            Some({ let mut a = [0u8; 20]; a[0] = 1; a }),  // non-zero → final
+            Some({ let mut a = [0u8; 20]; a[19] = 1; a }), // non-zero → final
+            Some([0xFF; 20]),                       // non-zero → final
+        ];
+        let mut statuses = Vec::new();
+        for c in committers {
+            let st = verify_finality(&head, c);
+            assert_eq!(st.root_hash, root_hash_of(&head));
+            assert_eq!(st.is_final, st.anchored, "is_final tracks anchored");
+            let expect_final = matches!(c, Some(a) if !is_zero_address(&a));
+            assert_eq!(st.is_final, expect_final, "final iff non-zero committer");
+            statuses.push(st);
+        }
+        // every prefix of the batch keeps the partition invariant.
+        for n in 0..=statuses.len() {
+            let s = finality_summary(&statuses[..n]);
+            assert_eq!(s.tracked, n);
+            assert_eq!(s.finalized + s.pending, s.tracked, "partition must hold");
+            assert_eq!(s.finalized, statuses[..n].iter().filter(|x| x.is_final).count());
+        }
+    }
+
+    #[test]
     fn finality_from_call_result_end_to_end() {
         let head = KotobaCid::from_bytes(b"head-7");
         // zero-address word → not final.

@@ -342,6 +342,36 @@ mod tests {
     }
 
     #[test]
+    fn load_rules_is_tamper_evident_under_any_byte_mutation() {
+        // Shared physics must be unforgeable: ANY single-byte change to a rule
+        // blob the DNA references is caught by content-address verification — no
+        // mutation yields a loadable-but-different ruleset. Sweep every byte.
+        let spec = RuleSpec::AllowedAttributes {
+            id: "schema".into(),
+            allowed: vec!["name".into(), "role".into()],
+        };
+        let dna = DnaManifest::new("d", "1").with_rule("schema", spec.content_cid());
+        let good = spec.to_cbor();
+
+        // the untouched blob loads.
+        assert!(load_rules(&dna, |_| Some(good.clone())).is_ok());
+
+        // flipping the low bit of any byte must make load_rules reject.
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            if bad == good {
+                continue;
+            }
+            let res = load_rules(&dna, |_| Some(bad.clone()));
+            assert!(
+                res.is_err(),
+                "byte {i} mutation slipped past content-address verification"
+            );
+        }
+    }
+
+    #[test]
     fn closed_schema_never_admits_an_out_of_schema_assert() {
         // Safety completeness: whatever the tx mixes in — allowed asserts,
         // retracts of anything, repeats — a closed-schema rule MUST reject the
