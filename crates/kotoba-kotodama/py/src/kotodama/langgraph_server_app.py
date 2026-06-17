@@ -379,18 +379,6 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
-# XRPC façade routers (one per NSID family).
-#
-# Mounted here so that every actor's procedures/queries are served from the
-# same FastAPI app and reachable through the unified etzhayyim.com/xrpc/
-# gateway (CF Worker at 50-infra/etzhayyim-did-web). No per-actor subdomain.
-# ---------------------------------------------------------------------------
-from kotodama.xrpc.unispsc import router as _unispsc_xrpc_router  # noqa: E402
-
-app.include_router(_unispsc_xrpc_router)
-
-
-# ---------------------------------------------------------------------------
 # /runs API
 # ---------------------------------------------------------------------------
 
