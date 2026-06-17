@@ -52,7 +52,7 @@ logger = logging.getLogger("SiteSurveyCell")
 UNISPSC_XRPC_ENDPOINT = os.environ.get(
     "UNISPSC_XRPC_ENDPOINT", "https://unispsc.etzhayyim.com"
 )
-UNISPSC_COMMODITY_NSID = "com.etzhayyim.etzhayyim.apps.openUnispsc.commodity"
+UNISPSC_COMMODITY_NSID = "com.etzhayyim.apps.openUnispsc.commodity"
 
 UTILITY_TO_UNSPSC_SEGMENTS: dict[str, list[str]] = {
     # Maps the lexicon's utilityClass → likely UNSPSC segment prefixes that
