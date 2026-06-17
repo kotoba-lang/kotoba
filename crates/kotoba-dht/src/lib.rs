@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod availability_proof;
 pub mod commit_chain;
+pub mod dna;
 pub mod gossip;
 pub mod membrane;
 pub mod neighborhood;
@@ -26,6 +27,7 @@ pub use audit::{
     VerdictSink,
 };
 pub use commit_chain::CommitChain;
+pub use dna::{DnaManifest, ValidationRuleRef};
 pub use membrane::{bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate};
 pub use neighborhood::Neighborhood;
 pub use replication::{
