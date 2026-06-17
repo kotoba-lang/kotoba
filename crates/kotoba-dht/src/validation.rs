@@ -11,7 +11,10 @@
 //! [`crate::dna::ValidationRuleRef`]) is the next layer; these built-ins are the
 //! interpreter targets and are useful on their own.
 
+use crate::dna::DnaManifest;
+use kotoba_core::cid::KotobaCid;
 use kotoba_query::datom::Datom;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// The verdict of validating a proposed transaction.
@@ -112,10 +115,74 @@ impl PhysicsRule for MaxTxSize {
     }
 }
 
+// ── Content-addressed rule specs (bridge manifest → engine) ───────────────────
+
+/// The serializable form of a built-in rule — the content a DNA's
+/// [`crate::dna::ValidationRuleRef`] points at (CBOR, content-addressed). New
+/// rule kinds (EDN Datalog, WASM validators) become additional variants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RuleSpec {
+    AllowedAttributes { id: String, allowed: Vec<String> },
+    ForbiddenAttribute { id: String, attr: String },
+    MaxTxSize { id: String, max: usize },
+}
+
+impl RuleSpec {
+    /// Canonical CBOR — the bytes a `ValidationRuleRef.content` CID addresses.
+    pub fn to_cbor(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("rulespec cbor");
+        buf
+    }
+
+    /// Content address of this rule spec (what the DNA references it by).
+    pub fn content_cid(&self) -> KotobaCid {
+        KotobaCid::from_bytes(&self.to_cbor())
+    }
+
+    /// Interpret into a runnable [`PhysicsRule`].
+    pub fn into_rule(self) -> Box<dyn PhysicsRule> {
+        match self {
+            RuleSpec::AllowedAttributes { id, allowed } => Box::new(AllowedAttributes {
+                id,
+                allowed: allowed.into_iter().collect(),
+            }),
+            RuleSpec::ForbiddenAttribute { id, attr } => Box::new(ForbiddenAttribute { id, attr }),
+            RuleSpec::MaxTxSize { id, max } => Box::new(MaxTxSize { id, max }),
+        }
+    }
+}
+
+/// Load a DNA's rules into runnable [`PhysicsRule`]s by resolving each
+/// [`crate::dna::ValidationRuleRef`]'s content CID via `fetch` (e.g. a block
+/// store) and decoding it as a [`RuleSpec`]. Rules come out in the manifest's
+/// canonical order (so `validate_tx`'s failing-rule report is stable).
+///
+/// Integrity-checked: a fetched blob whose recomputed CID ≠ the referenced CID is
+/// rejected (content-addressing means the DNA pins exact rule bytes). Missing or
+/// undecodable content is an error — a DNA you can't fully load you must not
+/// enforce partially.
+pub fn load_rules<F>(dna: &DnaManifest, fetch: F) -> Result<Vec<Box<dyn PhysicsRule>>, String>
+where
+    F: Fn(&KotobaCid) -> Option<Vec<u8>>,
+{
+    let mut rules = Vec::with_capacity(dna.rules().len());
+    for r in dna.rules() {
+        let bytes = fetch(&r.content)
+            .ok_or_else(|| format!("rule `{}`: content {} not found", r.id, r.content.to_multibase()))?;
+        if KotobaCid::from_bytes(&bytes) != r.content {
+            return Err(format!("rule `{}`: content CID mismatch (tampered blob)", r.id));
+        }
+        let spec: RuleSpec = ciborium::from_reader(bytes.as_slice())
+            .map_err(|e| format!("rule `{}`: undecodable RuleSpec: {e}", r.id))?;
+        rules.push(spec.into_rule());
+    }
+    Ok(rules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kotoba_core::cid::KotobaCid;
     use kotoba_query::datom::{Datom, Value};
 
     fn cid(s: &str) -> KotobaCid {
@@ -192,5 +259,67 @@ mod tests {
             ValidationOutcome::Rejected { rule_id, .. } => assert_eq!(rule_id, "size"),
             ValidationOutcome::Valid => panic!("expected rejection"),
         }
+    }
+
+    // ── RuleSpec + load_rules (manifest → engine bridge) ──────────────────
+
+    #[test]
+    fn rulespec_content_cid_is_deterministic_and_interprets() {
+        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 5 };
+        assert_eq!(spec.content_cid(), spec.content_cid());
+        assert_eq!(spec.content_cid(), KotobaCid::from_bytes(&spec.to_cbor()));
+        let rule = spec.into_rule();
+        assert_eq!(rule.id(), "size");
+        assert!(rule.check(&[assert_d("a")]).is_ok());
+    }
+
+    #[test]
+    fn load_rules_resolves_a_dna_end_to_end() {
+        // Build specs, address them, assemble a DNA referencing those CIDs.
+        let schema = RuleSpec::AllowedAttributes {
+            id: "schema".into(),
+            allowed: vec!["name".into(), "role".into()],
+        };
+        let size = RuleSpec::MaxTxSize { id: "size".into(), max: 3 };
+        let dna = DnaManifest::new("market", "1.0.0")
+            .with_rule("schema", schema.content_cid())
+            .with_rule("size", size.content_cid());
+        // in-memory content store: CID → CBOR.
+        let store: std::collections::HashMap<KotobaCid, Vec<u8>> = [
+            (schema.content_cid(), schema.to_cbor()),
+            (size.content_cid(), size.to_cbor()),
+        ]
+        .into_iter()
+        .collect();
+
+        let rules = load_rules(&dna, |c| store.get(c).cloned()).expect("load");
+        assert_eq!(rules.len(), 2);
+        // the loaded rules actually enforce the DNA's physics.
+        assert!(validate_tx(&rules, &[assert_d("name"), assert_d("role")]).is_valid());
+        assert!(!validate_tx(&rules, &[assert_d("evil")]).is_valid()); // schema
+        let big: Vec<Datom> = (0..4).map(|_| assert_d("name")).collect();
+        assert!(!validate_tx(&rules, &big).is_valid()); // size
+    }
+
+    #[test]
+    fn load_rules_errors_on_missing_content() {
+        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 1 };
+        let dna = DnaManifest::new("d", "1").with_rule("size", spec.content_cid());
+        let Err(err) = load_rules(&dna, |_| None) else {
+            panic!("expected missing-content error");
+        };
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn load_rules_rejects_tampered_content() {
+        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 1 };
+        let dna = DnaManifest::new("d", "1").with_rule("size", spec.content_cid());
+        // serve different bytes than the referenced CID addresses → integrity fail.
+        let tampered = RuleSpec::MaxTxSize { id: "size".into(), max: 999 }.to_cbor();
+        let Err(err) = load_rules(&dna, |_| Some(tampered.clone())) else {
+            panic!("expected integrity error");
+        };
+        assert!(err.contains("mismatch"), "got: {err}");
     }
 }

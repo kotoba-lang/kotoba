@@ -29,7 +29,7 @@ pub use audit::{
 };
 pub use commit_chain::CommitChain;
 pub use dna::{DnaManifest, ValidationRuleRef};
-pub use validation::{validate_tx, PhysicsRule, ValidationOutcome};
+pub use validation::{load_rules, validate_tx, PhysicsRule, RuleSpec, ValidationOutcome};
 pub use membrane::{bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate};
 pub use neighborhood::Neighborhood;
 pub use replication::{
