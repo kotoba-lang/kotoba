@@ -9,6 +9,7 @@ pub mod audit;
 pub mod availability_proof;
 pub mod commit_chain;
 pub mod gossip;
+pub mod membrane;
 pub mod neighborhood;
 pub mod neighborhood_store;
 pub mod node_id;
@@ -22,6 +23,7 @@ pub use audit::{
     VerdictSink,
 };
 pub use commit_chain::CommitChain;
+pub use membrane::{bonded_candidates, stake_to_replicate_enabled};
 pub use neighborhood::Neighborhood;
 pub use neighborhood_store::{
     cid_address, proof_from_store, NeighborhoodBlockStore, PeerTransport,

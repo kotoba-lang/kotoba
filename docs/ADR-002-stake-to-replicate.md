@@ -119,10 +119,15 @@ slash. Bond is necessary; reputation is ordering.
 
 1. **`min_bond_mkoto` in the replication policy** + `eligible_replica(D,g)` as a
    pure predicate over already-projected `:mishmar/pin/*` datoms. No network
-   change; default `0` = current behaviour. *(foundation)*
+   change; default `0` = current behaviour. *(foundation)* — **done**:
+   `kotoba-query` `social::eligible_replica` + `PinIndex::bond_of` /
+   `PIN_BOND_PRED`; `kotoba-server` `mishmar_observe` now projects the `Pinned`
+   bond into `mishmar/pin/bond`.
 2. **Bonded candidate filter** — `candidates(cid)` filters the neighbourhood by
    `eligible_replica` before `k_nearest`. Behind `KOTOBA_STAKE_TO_REPLICATE`
-   until p4 (declared replication) integration test is green; default off.
+   until p4 (declared replication) integration test is green; default off. —
+   **done**: `kotoba-dht` `membrane::bonded_candidates` (+ `stake_to_replicate_enabled`
+   env gate); membrane-off path is byte-for-byte today's open `k_nearest`.
 3. **Reward intents** — wire `eligible_for_reward()` → `SettlementIntent` →
    `SettlementBatch`; surface unpaid/owed retainer in `node.status`. (Routing
    stays operator-side; kotoba only emits the batch.)
