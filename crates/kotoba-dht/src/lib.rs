@@ -30,7 +30,7 @@ pub use audit::{
 };
 pub use commit_chain::CommitChain;
 pub use dna::{DnaManifest, ValidationRuleRef};
-pub use governance::{ratify, ParamVersion, Ratification};
+pub use governance::{ratify, verify_and_ratify, Attestation, ParamVersion, Ratification};
 pub use validation::{
     enforce, load_rules, validate_tx, PhysicsRule, RuleSpec, ValidationOutcome,
 };
