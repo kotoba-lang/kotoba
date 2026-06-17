@@ -2,6 +2,7 @@ pub mod async_store;
 pub mod cid;
 pub mod foreign;
 pub mod frame;
+pub mod hlc;
 pub mod named_graph;
 pub mod policy;
 pub mod prolly;
