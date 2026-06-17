@@ -257,6 +257,28 @@ impl NeighborhoodBlockStore {
     pub fn respond_to_challenge(&self, challenge: &AvailabilityChallenge) -> AvailabilityProof {
         proof_from_store(self.local.as_ref(), &self.local_id, challenge)
     }
+
+    /// Audit a block against a declared [`crate::replication::ReplicationPolicy`]
+    /// (pin contract) — the `node.status` availability surface (ADR-001 p4 /
+    /// GROWTH p4). Holders are gathered across **all** peers (not just the
+    /// XOR-closest `K`), so a contracted `pin_peer` outside the proximity set is
+    /// still detected.
+    pub fn replication_status(
+        &self,
+        cid: &KotobaCid,
+        policy: &crate::replication::ReplicationPolicy,
+    ) -> crate::replication::ReplicationStatus {
+        let mut holders = Vec::new();
+        if self.local.has(cid) {
+            holders.push(self.local_id.clone());
+        }
+        for p in &self.peers {
+            if p.has(cid) {
+                holders.push(p.node_id().clone());
+            }
+        }
+        crate::replication::audit_replication(policy, holders.len(), &holders)
+    }
 }
 
 impl BlockStore for NeighborhoodBlockStore {
@@ -630,5 +652,34 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         assert!(p1.fetch(&cid).is_some(), "peer received the async replica");
+    }
+
+    #[test]
+    fn replication_status_reports_contract_against_holders() {
+        use crate::replication::ReplicationPolicy;
+        let (local, id) = local_node(b"local");
+        let p1 = MemPeer::new(b"peer-1");
+        let p2 = MemPeer::new(b"peer-2");
+        let store = NeighborhoodBlockStore::new(local.clone(), id)
+            .with_peers(vec![p1.clone(), p2.clone()]);
+        let cid = KotobaCid::from_bytes(b"graph-head");
+        // local + p1 hold it; p2 (a contracted pinner) does not yet.
+        local.put(&cid, b"graph-head").unwrap();
+        p1.replicate(&cid, b"graph-head");
+
+        let policy = ReplicationPolicy::new(3).with_pin_peers(vec![p2.node_id().clone()]);
+        let st = store.replication_status(&cid, &policy);
+        assert_eq!(st.observed_replicas, 2, "local + p1");
+        assert_eq!(st.under_replicated_by, 1, "needs 3, has 2");
+        assert_eq!(st.missing_pin_peers, vec![p2.node_id().clone()]);
+        assert!(!st.satisfied);
+
+        // p2 picks it up and the floor is 2 → contract satisfied.
+        p2.replicate(&cid, b"graph-head");
+        let policy2 = ReplicationPolicy::new(2).with_pin_peers(vec![p2.node_id().clone()]);
+        let st2 = store.replication_status(&cid, &policy2);
+        assert_eq!(st2.observed_replicas, 3);
+        assert!(st2.missing_pin_peers.is_empty());
+        assert!(st2.satisfied);
     }
 }
