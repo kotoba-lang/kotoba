@@ -1,17 +1,21 @@
-"""UnispscOrganism — wrap a UNSPSC LangGraph code into a tick-able organism.
+"""UnispscOrganism — wrap a classify graph into a tick-able organism.
 
 Per ADR-2605232345. Combines:
-  - ``kotodama.langgraph_graphs.unispsc_agents.c{code}.graph`` (classify)
+  - a caller-supplied classify ``graph`` (``.invoke(state) -> dict``)
   - ``kotodama.organism.cadence.resolve_heartbeat_cadence`` (heartbeat)
 
 The class is substrate-agnostic by design. ``post_sink`` and
 ``follower_score_provider`` are caller-supplied so the same class runs in
 unit tests, the cell-runner LAN cell, and K8s Pods without modification.
+
+The per-code ``unispsc_agents.c{code}`` generated agents were retired in
+favour of the clj actor (etzhayyim/root@20-actors/unspsc); ``for_code`` now
+builds a generic organism with a default no-op classify graph (every code
+behaves as "no custom agent"), mirroring the runtime's prior fallback.
 """
 
 from __future__ import annotations
 
-import importlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,7 +53,18 @@ _MAX_SENSOR_OBSERVATIONS = 256
 
 logger = logging.getLogger("kotodama.organism")
 
-_AGENTS_PKG = "kotodama.langgraph_graphs.unispsc_agents"
+
+class _DefaultClassifyGraph:
+    """No-op classify graph used when a code has no bespoke agent.
+
+    The per-code ``unispsc_agents.c{code}`` modules were retired (the clj
+    actor supersedes them); every code now resolves to this generic graph,
+    mirroring the loader's prior ``no_custom_agent_found`` fallback.
+    """
+
+    def invoke(self, state: Any) -> dict[str, Any]:
+        return {"result": "no_custom_agent"}
+
 
 ClassifyInputFactory = Callable[["object"], dict[str, Any]]
 # Legacy sink shape (text only). New code should pass a ``PostSink`` from
@@ -119,12 +134,12 @@ def _format_post(
 
 
 class UnispscOrganism:
-    """Wrap one UNSPSC code into a tick-able organism.
+    """Wrap one classify ``graph`` into a tick-able organism.
 
-    Underlying classify engine is the LangGraph at
-    ``kotodama.langgraph_graphs.unispsc_agents.c{code}``. The organism
-    layer adds joucho mood + InboxBuffer + Shinka emission on top, without
-    modifying the generated agent file.
+    The classify engine is the caller-supplied ``graph`` (``.invoke(state)``).
+    The organism layer adds joucho mood + InboxBuffer + Shinka emission on
+    top. ``for_code`` supplies a generic default graph (the per-code
+    ``unispsc_agents.c{code}`` agents were retired for the clj actor).
     """
 
     def __init__(
@@ -205,14 +220,14 @@ class UnispscOrganism:
         messaging_receiver: "OrganismMessageReceiver | None" = None,
         lifecycle_event_queue_path: "Path | None" = None,
     ) -> "UnispscOrganism":
-        """Lazy-import the underlying ``c{code}`` LangGraph and wrap it."""
-        module_name = f"{_AGENTS_PKG}.c{code}"
-        mod = importlib.import_module(module_name)
-        graph = getattr(mod, "graph", None)
-        if graph is None:
-            raise ImportError(f"{module_name} has no `graph` attribute")
-        resolved_title = title or getattr(mod, "UNISPSC_TITLE", "") or f"c{code}"
-        resolved_did = actor_did or getattr(mod, "UNISPSC_DID", "") or f"did:web:etzhayyim.com:actor:c{code}"
+        """Build a generic organism for ``code`` with a default classify graph.
+
+        The per-code ``c{code}`` agents were retired (superseded by the clj
+        actor); every code now wraps the no-op :class:`_DefaultClassifyGraph`.
+        """
+        graph = _DefaultClassifyGraph()
+        resolved_title = title or f"c{code}"
+        resolved_did = actor_did or f"did:web:etzhayyim.com:actor:c{code}"
         return cls(
             code=code,
             graph=graph,
