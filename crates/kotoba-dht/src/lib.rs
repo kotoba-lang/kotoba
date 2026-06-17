@@ -13,6 +13,7 @@ pub mod membrane;
 pub mod neighborhood;
 pub mod neighborhood_store;
 pub mod node_id;
+pub mod reputation;
 pub mod settlement;
 pub mod source_chain;
 pub mod warrant;
@@ -25,6 +26,7 @@ pub use audit::{
 pub use commit_chain::CommitChain;
 pub use membrane::{bonded_candidates, stake_to_replicate_enabled};
 pub use neighborhood::Neighborhood;
+pub use reputation::{prefer_by_reputation, EarnRateBand};
 pub use neighborhood_store::{
     cid_address, proof_from_store, NeighborhoodBlockStore, PeerTransport,
 };

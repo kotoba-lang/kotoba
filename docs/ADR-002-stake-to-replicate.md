@@ -1,6 +1,6 @@
 # ADR-002 — Stake-to-replicate: a bonded, reputation-weighted replica membrane
 
-Status: **proposed** · 2026-06-17
+Status: **accepted (phased — crate layer done, integration pending)** · 2026-06-17
 Extends: ADR-001 (five-axis, **availability** axis / phase 4 declared replication)
 Realises: `docs/GROWTH-DECENTRALIZATION.edn` phase **p6**
 Boundary: subject to the **Mishmar read+verify-only invariant** (`docs/MISHMAR-OBSERVATION.md`) — kotoba never signs an on-chain tx, custodies a bond, or settles. It *observes, verifies, gates, and challenges*.
@@ -149,7 +149,22 @@ slash. Bond is necessary; reputation is ordering.
    wiring.
 5. **Reputation weighting** — placement preference + earn-rate multiplier over
    the bonded set; Council-bounded band; property test that reputation never
-   changes the *admission* boolean.
+   changes the *admission* boolean. — **done**: `kotoba-dht` `reputation`
+   module — `EarnRateBand` (Council-bounded retainer earn-rate multiplier; floor
+   > 0 so reputation slows but never stops the flow) + `prefer_by_reputation`
+   (stable reorder of the already-eligible set, XOR proximity stays the
+   tie-breaker). Property test `reputation_never_admits_a_non_eligible_node`
+   pins the invariant: across pseudo-random reputations the preferred set is
+   always a subset of the eligible input, and at `k ≥ len` membership is
+   unchanged.
+
+### Status (2026-06-17)
+All five phases have landed at the crate level (`kotoba-query` + `kotoba-dht`,
+read+verify, fully unit-tested). What remains is **integration, not design**:
+wiring the audit loop to a live `ProofFetcher`, surfacing owed-retainer + bond
+floors in the server `node.status`, and the relayer that carries warrants to
+`MishmarBondEscrow`. Those land with GROWTH **p4** (declared replication) — the
+membrane is ready for it.
 
 ## Consequences
 
