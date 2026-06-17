@@ -169,6 +169,34 @@ mod tests {
     }
 
     #[test]
+    fn verifies_is_tamper_evident_under_any_byte_mutation() {
+        // The light-client trust gate: an untrusted gateway cannot alter a block
+        // under its CID. Flip the low bit of EVERY byte and confirm verification
+        // fails for each; the untouched bytes (and a batch of them) verify.
+        let payload = b"a representative block body of some length".to_vec();
+        let cid = KotobaCid::from_bytes(&payload);
+        assert!(cid.verifies(&payload));
+        for i in 0..payload.len() {
+            let mut bad = payload.clone();
+            bad[i] ^= 0x01;
+            assert!(!cid.verifies(&bad), "byte {i} tamper slipped past verification");
+        }
+        // truncation and extension also fail (length is part of the content).
+        assert!(!cid.verifies(&payload[..payload.len() - 1]));
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(!cid.verifies(&longer));
+        // unverified_blocks over a mixed batch flags exactly the mutated ones.
+        let mut tampered = payload.clone();
+        tampered[0] ^= 0x01;
+        let bad = unverified_blocks(&[
+            (cid.clone(), payload.clone()),  // authentic
+            (cid.clone(), tampered),         // tampered
+        ]);
+        assert_eq!(bad, vec![cid], "exactly the tampered response is flagged");
+    }
+
+    #[test]
     fn unverified_blocks_flags_only_the_tampered() {
         let a = KotobaCid::from_bytes(b"alpha");
         let b = KotobaCid::from_bytes(b"beta");
