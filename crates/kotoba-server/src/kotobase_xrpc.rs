@@ -222,6 +222,34 @@ fn quota_for_tier(tier: &str) -> (i64, i64) {
     }
 }
 
+// ── Datom write quota (ADR-2606201700 follow-up 3) ──────────────────────────
+//
+// Per-transaction datom cap by tenant tier — the write-plane analogue of the
+// pin/byte quotas above. `datomic.transact` enforces it against the resolved
+// datom count (`TransactReport::tx_data.len()`). Caps scale with tier; the
+// operator is exempt (enforced at the call site). Periodic (windowed) write
+// quotas are a further follow-up — this bounds per-transaction size only.
+
+const WRITE_DATOM_CAP_FREE: usize = 1_000;
+const WRITE_DATOM_CAP_STARTER: usize = 10_000;
+const WRITE_DATOM_CAP_PRO: usize = 100_000;
+const WRITE_DATOM_CAP_ENTERPRISE: usize = 1_000_000;
+
+/// Per-transaction datom cap for a tier. `None` => unlimited (quota disabled).
+pub(crate) fn write_datom_cap_for_tier(tier: &str) -> usize {
+    match tier {
+        "starter" => WRITE_DATOM_CAP_STARTER,
+        "pro" => WRITE_DATOM_CAP_PRO,
+        "enterprise" => WRITE_DATOM_CAP_ENTERPRISE,
+        _ => WRITE_DATOM_CAP_FREE,
+    }
+}
+
+/// Read a tenant's tier from `kotobase/accounts/<did>` (defaults to "free").
+pub(crate) async fn tier_for(state: &KotobaState, tenant_did: &str) -> String {
+    read_tier(state, tenant_did).await
+}
+
 // ── CID helpers ────────────────────────────────────────────────────────────
 
 fn cid(s: &str) -> KotobaCid {
@@ -1274,6 +1302,24 @@ mod tests {
         let (pins, bytes) = quota_for_tier("platinum");
         assert_eq!(pins, QUOTA_FREE_PINS);
         assert_eq!(bytes, QUOTA_FREE_BYTES);
+    }
+
+    // ── write_datom_cap_for_tier (ADR-2606201700 f/3) ──────────────────────────
+
+    #[test]
+    fn write_datom_cap_scales_with_tier() {
+        assert_eq!(write_datom_cap_for_tier("free"), WRITE_DATOM_CAP_FREE);
+        assert_eq!(write_datom_cap_for_tier("starter"), WRITE_DATOM_CAP_STARTER);
+        assert_eq!(write_datom_cap_for_tier("pro"), WRITE_DATOM_CAP_PRO);
+        assert_eq!(write_datom_cap_for_tier("enterprise"), WRITE_DATOM_CAP_ENTERPRISE);
+    }
+
+    #[test]
+    fn write_datom_cap_is_monotonic_and_unknown_tier_is_free() {
+        assert!(WRITE_DATOM_CAP_FREE < WRITE_DATOM_CAP_STARTER);
+        assert!(WRITE_DATOM_CAP_STARTER < WRITE_DATOM_CAP_PRO);
+        assert!(WRITE_DATOM_CAP_PRO < WRITE_DATOM_CAP_ENTERPRISE);
+        assert_eq!(write_datom_cap_for_tier("platinum"), WRITE_DATOM_CAP_FREE);
     }
 
     // ── validate_name ─────────────────────────────────────────────────────────

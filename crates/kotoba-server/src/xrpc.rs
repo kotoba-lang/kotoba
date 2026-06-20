@@ -4997,6 +4997,24 @@ pub async fn datomic_transact(
         .transact(tx_data.clone())
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic transact: {e}")))?;
+    // Tier write quota (ADR-2606201700 follow-up 3) — bound the per-transaction
+    // datom count by the writer's tenant tier (kotobase/accounts/<did>). The
+    // operator is exempt; KOTOBA_TIER_WRITE_QUOTA=off disables enforcement.
+    if write_author != state.operator_did
+        && std::env::var("KOTOBA_TIER_WRITE_QUOTA").as_deref() != Ok("off")
+    {
+        let tier = crate::kotobase_xrpc::tier_for(&state, &write_author).await;
+        let cap = crate::kotobase_xrpc::write_datom_cap_for_tier(&tier);
+        let datom_count = tx_preview.tx_data.len();
+        if datom_count > cap {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "QuotaExceeded: tier={tier} datoms={datom_count}>{cap} per transaction"
+                ),
+            ));
+        }
+    }
     if let Some(payload) = &cacao_payload {
         enforce_datomic_write_tx_scope(payload, &tx_preview.tx_cid)?;
     }
