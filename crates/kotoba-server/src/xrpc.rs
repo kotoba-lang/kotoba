@@ -5009,9 +5009,7 @@ pub async fn datomic_transact(
         if datom_count > cap {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "QuotaExceeded: tier={tier} datoms={datom_count}>{cap} per transaction"
-                ),
+                format!("QuotaExceeded: tier={tier} datoms={datom_count}>{cap} per transaction"),
             ));
         }
     }

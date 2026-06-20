@@ -1311,7 +1311,10 @@ mod tests {
         assert_eq!(write_datom_cap_for_tier("free"), WRITE_DATOM_CAP_FREE);
         assert_eq!(write_datom_cap_for_tier("starter"), WRITE_DATOM_CAP_STARTER);
         assert_eq!(write_datom_cap_for_tier("pro"), WRITE_DATOM_CAP_PRO);
-        assert_eq!(write_datom_cap_for_tier("enterprise"), WRITE_DATOM_CAP_ENTERPRISE);
+        assert_eq!(
+            write_datom_cap_for_tier("enterprise"),
+            WRITE_DATOM_CAP_ENTERPRISE
+        );
     }
 
     #[test]
