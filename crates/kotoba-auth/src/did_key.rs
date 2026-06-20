@@ -212,7 +212,10 @@ mod tests {
         let op = "did:key:z35dec6b49a374eec5711a4f3ccaf66b944ecae6773766e62d71c86ff8e3b5a37";
         let pk = parse_ed25519_did_key(op).expect("hex operator DID must parse");
         assert_eq!(ed25519_pubkey_to_did_key_hex(&pk), op);
-        assert_eq!(to_canonical_did_key(op).unwrap(), ed25519_pubkey_to_did_key(&pk));
+        assert_eq!(
+            to_canonical_did_key(op).unwrap(),
+            ed25519_pubkey_to_did_key(&pk)
+        );
     }
 
     #[test]

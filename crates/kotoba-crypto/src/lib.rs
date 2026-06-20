@@ -18,7 +18,6 @@ pub use aead::{
     TAG_LEN,
 };
 pub use agent_crypto::{AgentCrypto, VaultKeyedCrypto};
-pub use proof_of_control::{ActorIdentity, ActorKey, ControlProof};
 pub use envelope::{decode_envelope, encode_envelope, SIGNAL_VAL_PREFIX};
 pub use hkdf::{derive_key, derive_key_with_salt, HKDF_KEY_LEN};
 pub use hpke::{hpke_open, hpke_seal};
@@ -27,3 +26,4 @@ pub use key_tree::{
     wrap_ark, KeyTreeError,
 };
 pub use key_wrap::{unwrap_key, wrap_key};
+pub use proof_of_control::{ActorIdentity, ActorKey, ControlProof};
