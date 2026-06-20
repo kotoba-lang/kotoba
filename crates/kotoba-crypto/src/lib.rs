@@ -11,6 +11,7 @@ pub mod hkdf;
 pub mod hpke;
 pub mod key_tree;
 pub mod key_wrap;
+pub mod proof_of_control;
 
 pub use aead::{
     open, open_with_aad, seal, seal_with_aad, seal_with_aad_nonce, CryptoError, KEY_LEN, NONCE_LEN,
@@ -25,3 +26,4 @@ pub use key_tree::{
     wrap_ark, KeyTreeError,
 };
 pub use key_wrap::{unwrap_key, wrap_key};
+pub use proof_of_control::{ActorIdentity, ActorKey, ControlProof};
