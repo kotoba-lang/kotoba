@@ -11,12 +11,14 @@ pub mod hkdf;
 pub mod hpke;
 pub mod key_tree;
 pub mod key_wrap;
+pub mod proof_of_control;
 
 pub use aead::{
     open, open_with_aad, seal, seal_with_aad, seal_with_aad_nonce, CryptoError, KEY_LEN, NONCE_LEN,
     TAG_LEN,
 };
 pub use agent_crypto::{AgentCrypto, VaultKeyedCrypto};
+pub use proof_of_control::{ActorIdentity, ActorKey, ControlProof};
 pub use envelope::{decode_envelope, encode_envelope, SIGNAL_VAL_PREFIX};
 pub use hkdf::{derive_key, derive_key_with_salt, HKDF_KEY_LEN};
 pub use hpke::{hpke_open, hpke_seal};
