@@ -26,6 +26,7 @@ use curve25519_dalek::{
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
 };
+use multibase::Base;
 use rand_core::{CryptoRng, RngCore};
 use sha2::{Digest, Sha512};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -51,6 +52,20 @@ impl ActorIdentity {
             .ok()?
             .decompress()
             .map(ActorIdentity)
+    }
+
+    /// Canonical multibase (base58btc, `z…`) string — the form to store in a datom or surface in
+    /// a DID document, mirroring the project's `did:key` convention. NOTE: this encodes the raw
+    /// ristretto255 point; it is the kotoba actor-identity form, NOT a W3C `did:key` (ristretto255
+    /// has no registered did:key multicodec — when one lands, a `did:key` variant can wrap this).
+    pub fn to_multibase(&self) -> String {
+        multibase::encode(Base::Base58Btc, self.to_bytes())
+    }
+    /// Parse the multibase form. `None` on bad multibase, wrong length, or an invalid point.
+    pub fn from_multibase(s: &str) -> Option<Self> {
+        let (_, bytes) = multibase::decode(s).ok()?;
+        let arr: [u8; 32] = bytes.try_into().ok()?;
+        Self::from_bytes(&arr)
     }
 }
 
@@ -156,6 +171,18 @@ impl ControlProof {
         sb.copy_from_slice(&bytes[32..]);
         let response = Option::from(Scalar::from_canonical_bytes(sb))?;
         Some(ControlProof { commit, response })
+    }
+
+    /// Canonical multibase (base58btc, `z…`) string form, for transport/storage in the kotoba
+    /// ecosystem (datoms, JSON, DID-document proof values).
+    pub fn to_multibase(&self) -> String {
+        multibase::encode(Base::Base58Btc, self.to_bytes())
+    }
+    /// Parse the multibase form. `None` on bad multibase, wrong length, or malformed proof.
+    pub fn from_multibase(s: &str) -> Option<Self> {
+        let (_, bytes) = multibase::decode(s).ok()?;
+        let arr: [u8; 64] = bytes.try_into().ok()?;
+        Self::from_bytes(&arr)
     }
 }
 
@@ -286,6 +313,28 @@ mod tests {
         let id = key.identity();
         let b = id.to_bytes();
         assert_eq!(ActorIdentity::from_bytes(&b), Some(id));
+    }
+
+    #[test]
+    fn identity_multibase_roundtrip() {
+        let id = ActorKey::issue(&mut OsRng).identity();
+        let s = id.to_multibase();
+        assert!(s.starts_with('z')); // base58btc multibase prefix
+        assert_eq!(ActorIdentity::from_multibase(&s), Some(id));
+        assert!(ActorIdentity::from_multibase("not-multibase").is_none());
+        assert!(ActorIdentity::from_multibase("z11111").is_none()); // valid mb, wrong length
+    }
+
+    #[test]
+    fn proof_multibase_roundtrip() {
+        let key = ActorKey::issue(&mut OsRng);
+        let id = key.identity();
+        let proof = key.prove_control(b"ctx", &mut OsRng);
+        let s = proof.to_multibase();
+        assert!(s.starts_with('z'));
+        let parsed = ControlProof::from_multibase(&s).unwrap();
+        assert!(parsed.verify(&id, b"ctx"));
+        assert!(ControlProof::from_multibase("znope").is_none());
     }
 
     #[test]
