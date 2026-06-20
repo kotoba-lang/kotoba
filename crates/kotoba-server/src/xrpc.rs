@@ -4864,6 +4864,37 @@ pub async fn datomic_transact(
                 kotoba_auth::CacaoPayload::OP_TX_CREATE,
             ],
         )?;
+        // ADR-2606131600 P1 owner-binding — write-path mirror (BaaS tenant writes).
+        // The CACAO grant above verifies capability + graph scope + aud==operator +
+        // signature, but not WHO signed it. A self-signed CACAO scoped to another
+        // tenant's graph CID (the CID is derivable from a known DID) would otherwise
+        // authorize a cross-tenant WRITE — the same leak the read path already closes
+        // for reads (see require_datomic_read_any_operation). For a Private graph the
+        // verified issuer must be the graph owner (delegation to others is the owner's
+        // prerogative, expressed as a chain rooted at owner; payload.iss is that root).
+        // Public/Authenticated and not-yet-materialised graphs have no owner to bind to
+        // — the kotobase edge BFF gates those structurally via its
+        // kotobase/db/<tenant_did>/<name> namespace.
+        if let kotoba_core::named_graph::GraphVisibility::Private { owner_did } =
+            &state.graph_visibility(&graph_cid).await
+        {
+            if &payload.iss != owner_did {
+                tracing::warn!(
+                    issuer = %payload.iss,
+                    owner = %owner_did,
+                    graph = %graph_cid.to_multibase(),
+                    "datomic transact: CACAO issuer is not the graph owner"
+                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    format!(
+                        "CACAO issuer {:?} is not the owner of private graph {}",
+                        payload.iss,
+                        graph_cid.to_multibase()
+                    ),
+                ));
+            }
+        }
         write_author = payload.iss.clone();
         cacao_payload = Some(payload);
     } else if let Some(presentation) = &req.presentation {
