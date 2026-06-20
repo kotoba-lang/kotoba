@@ -10007,6 +10007,68 @@ mod tests {
         );
     }
 
+    // ADR-2606201700 f/3: per-tier datom write quota. A free-tier tenant (default,
+    // no kotobase/accounts entry) transacting past the free cap (1000 datoms/tx) is
+    // rejected 429 before commit. Public graph so the owner-binding gate does not
+    // intercept; write_author = the CACAO issuer, so the quota path (operator-exempt)
+    // applies.
+    #[tokio::test]
+    async fn datomic_transact_free_tier_over_cap_is_rejected_429() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        std::env::remove_var("KOTOBA_TIER_WRITE_QUOTA"); // enforcement on (default)
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        let g = KotobaCid::from_bytes(b"transact-quota-graph");
+        state
+            .graph_registry
+            .write()
+            .await
+            .insert(g.clone(), ("pub".into(), GraphVisibility::Public));
+        let g_mb = g.to_multibase();
+
+        // 1500 distinct asserts >> the free-tier cap of 1000 datoms per transaction.
+        let mut tx = String::from("[");
+        for i in 0..1500 {
+            tx.push_str(&format!("[:db/add \"e{i}\" :n {i}]"));
+        }
+        tx.push(']');
+
+        let cacao = signed_cacao_b64(
+            &state,
+            &g_mb,
+            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+            "quota-nonce-1",
+            [format!(
+                "kotoba://op/{}",
+                kotoba_auth::CacaoPayload::OP_TX_CREATE
+            )],
+        );
+
+        let err = datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: g_mb,
+                tx_edn: tx,
+                ipns_name: None,
+                cacao_b64: Some(cacao),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("over-cap free-tier transact must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            err.1.contains("QuotaExceeded"),
+            "deny must be the tier write quota, got: {}",
+            err.1
+        );
+    }
+
     #[test]
     fn datomic_range_tx_scope_requires_requested_start_and_end_scopes() {
         let start = KotobaCid::from_bytes(b"range-start").to_multibase();
