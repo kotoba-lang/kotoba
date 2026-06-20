@@ -10069,6 +10069,66 @@ mod tests {
         );
     }
 
+    // datomic.with is speculative (no commit) and authorised as a READ via
+    // require_datomic_read, which owner-binds Private graphs (ADR-2606131600). Confirm
+    // a non-owner CACAO cannot speculatively read another tenant's private graph — the
+    // .with sibling of the transact owner-binding test.
+    #[tokio::test]
+    async fn datomic_with_private_graph_rejects_non_owner_cacao() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        let owner_did = kotoba_auth::ed25519_pubkey_to_did_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let g = KotobaCid::from_bytes(b"with-owner-bind-graph");
+        state.graph_registry.write().await.insert(
+            g.clone(),
+            (
+                "priv".into(),
+                GraphVisibility::Private {
+                    owner_did: owner_did.clone(),
+                },
+            ),
+        );
+
+        // CACAO signed by [42] but scoped to the [7]-owner's private space.
+        let cacao = signed_cacao_b64(
+            &state,
+            &format!("private/{owner_did}"),
+            kotoba_auth::CacaoPayload::OP_DATOM_READ,
+            "with-nonce-1",
+            Vec::<String>::new(),
+        );
+
+        let err = datomic_with(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicWithReq {
+                graph: g.to_multibase(),
+                tx_edn: "[]".into(),
+                as_of: None,
+                since: None,
+                remote_peer: None,
+                remote_ipns_name: None,
+                cacao_b64: Some(cacao),
+                presentation: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("non-owner speculative with must be rejected on a private graph");
+        assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.1.to_lowercase().contains("issuer mismatch"),
+            "deny must be the owner-binding gate, got: {}",
+            err.1
+        );
+    }
+
     #[test]
     fn datomic_range_tx_scope_requires_requested_start_and_end_scopes() {
         let start = KotobaCid::from_bytes(b"range-start").to_multibase();
