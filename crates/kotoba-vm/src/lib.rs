@@ -30,4 +30,6 @@ pub use state_graph::{
     CompiledGraph, EdgeTarget, NodeFn, NodeKind, NodeOutput, Reducer, RouterFn, State, StateGraph,
     StateSchema, Thread,
 };
-pub use wasm_pregel::{WasmPregelRunner, WasmRunResult};
+pub use wasm_pregel::{
+    wasm_compute_fn, wasm_vertex_gas_and_quads, WasmPregelRunner, WasmRunResult,
+};

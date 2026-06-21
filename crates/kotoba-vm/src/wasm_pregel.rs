@@ -20,7 +20,10 @@ use std::sync::Arc;
 use kotoba_runtime::executor::SerializedQuad;
 use kotoba_runtime::{InvokeResult, RuntimeError, WasmExecutor};
 
-use crate::pregel::{ComputeFn, ComputeOutput, Message, PregelGraph, SuperstepResult, VertexId};
+use crate::distributed::SharedComputeFn;
+use crate::pregel::{
+    ComputeFn, ComputeOutput, Message, PregelGraph, SuperstepResult, Vertex, VertexId,
+};
 
 // ---------------------------------------------------------------------------
 // Vertex state (CBOR-serialised, persisted in PregelGraph)
@@ -117,114 +120,16 @@ impl WasmPregelRunner {
     /// signals `"status": "continue"` in its output CBOR the output becomes
     /// the ctx_cbor for the next superstep. Otherwise the vertex votes halt.
     pub fn run(&self, initial_ctx_cbor: Vec<u8>) -> Result<WasmRunResult, RuntimeError> {
-        let executor = Arc::clone(&self.executor);
-        let program_cid = Arc::new(self.program_cid.clone());
-        let wasm_bytes = Arc::clone(&self.wasm_bytes);
-        let agent_did = Arc::new(self.agent_did.clone());
-
-        let compute: ComputeFn = Box::new(move |vertex, inbox| {
-            // Extract ctx_cbor from inbox (message payload carries it)
-            let ctx_cbor: Vec<u8> = inbox
-                .iter()
-                .find(|_| true)
-                .map(|m| m.payload.clone())
-                .unwrap_or_default();
-
-            if ctx_cbor.is_empty() {
-                // No message → nothing to do, halt immediately
-                return ComputeOutput {
-                    new_state: vertex.state.clone(),
-                    messages: vec![],
-                    vote_halt: true,
-                };
-            }
-
-            // Decode accumulated state from vertex
-            let mut state: WasmVertexState = if vertex.state.is_empty() {
-                WasmVertexState::default()
-            } else {
-                ciborium::from_reader(vertex.state.as_slice()).unwrap_or_default()
-            };
-
-            // Invoke WASM guest
-            let result = executor.execute(
-                &program_cid,
-                &wasm_bytes,
-                &agent_did,
-                ctx_cbor,
-                vec![],
-                HashMap::new(),
-            );
-
-            let invoke: InvokeResult = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    // On error: encode {"err": "..."} as CBOR (matches Python handle_invoke format)
-                    let err_cbor = ciborium::Value::Map(vec![(
-                        ciborium::Value::Text("err".into()),
-                        ciborium::Value::Text(format!("{e:?}")),
-                    )]);
-                    let mut err_buf = Vec::new();
-                    let _ = ciborium::into_writer(&err_cbor, &mut err_buf);
-                    state.final_output_cbor = err_buf;
-                    let mut buf = Vec::new();
-                    let _ = ciborium::into_writer(&state, &mut buf);
-                    return ComputeOutput {
-                        new_state: buf,
-                        messages: vec![],
-                        vote_halt: true,
-                    };
-                }
-            };
-
-            // Accumulate side effects — cap asserts to avoid unbounded memory across supersteps.
-            // The post-run MCP/XRPC layer enforces the hard limit; we stop accumulating
-            // one over that limit so the caller can detect the overflow and reject.
-            const MAX_ACCUMULATED_QUADS: usize = 10_001;
-            state.total_gas_used += invoke.gas_used;
-            state
-                .accumulated_quads
-                .extend(invoke.assert_quads.into_iter().map(Into::into));
-            state
-                .accumulated_retracts
-                .extend(invoke.retract_quads.into_iter().map(Into::into));
-            state.accumulated_publishes.extend(invoke.pending_publishes);
-            // Vote halt immediately if quad budget is exceeded (no point continuing).
-            if state.accumulated_quads.len() >= MAX_ACCUMULATED_QUADS {
-                state.final_output_cbor = br#"{"status":"quota_exceeded"}"#.to_vec();
-                let mut buf = Vec::new();
-                let _ = ciborium::into_writer(&state, &mut buf);
-                return ComputeOutput {
-                    new_state: buf,
-                    messages: vec![],
-                    vote_halt: true,
-                };
-            }
-
-            // Decide continuation: check for "status": "continue" in output CBOR
-            let should_continue = decode_status_continue(&invoke.output_cbor);
-
-            let (messages, vote_halt) = if should_continue {
-                let next_msg = Message {
-                    src: vertex.id.clone(),
-                    dst: vertex.id.clone(),
-                    payload: invoke.output_cbor.clone(),
-                };
-                (vec![next_msg], false)
-            } else {
-                state.final_output_cbor = invoke.output_cbor;
-                (vec![], true)
-            };
-
-            let mut new_state_bytes = Vec::new();
-            let _ = ciborium::into_writer(&state, &mut new_state_bytes);
-
-            ComputeOutput {
-                new_state: new_state_bytes,
-                messages,
-                vote_halt,
-            }
-        });
+        // Reuse the shared per-vertex WASM compute function (also used by the
+        // cross-node `DistributedPregelRunner`). Wrap the `Arc` in a `Box` so it
+        // satisfies the `&ComputeFn` borrow `PregelGraph::run` expects.
+        let shared = wasm_compute_fn(
+            Arc::clone(&self.executor),
+            self.program_cid.clone(),
+            Arc::clone(&self.wasm_bytes),
+            self.agent_did.clone(),
+        );
+        let compute: ComputeFn = Box::new(move |vertex, inbox| shared(vertex, inbox));
 
         // Build graph: one vertex, seeded with initial_ctx_cbor
         let mut graph = PregelGraph::new();
@@ -264,6 +169,156 @@ impl WasmPregelRunner {
             supersteps_run,
         })
     }
+}
+
+/// Build a reusable per-vertex Pregel compute function backed by a compiled
+/// WASM Component Model program.
+///
+/// The returned [`SharedComputeFn`] can be handed to either the in-process
+/// [`WasmPregelRunner`] or the cross-node
+/// [`DistributedPregelRunner`](crate::distributed::DistributedPregelRunner): in
+/// the distributed case each node runs the WASM guest on its locally-owned
+/// vertices, and any message the guest emits for a non-local `dst` is captured
+/// by the runner and gossiped to peers by the server layer
+/// (`KotobaSwarm::send_pregel_message` over libp2p). This is the wiring that
+/// lets WASM compute fan out across instances rather than staying in-process.
+///
+/// Per-vertex semantics (identical to the single-vertex self-loop model used by
+/// `WasmPregelRunner::run`):
+///   * the vertex inbox carries the ctx CBOR in the first message payload;
+///   * the guest is invoked via [`WasmExecutor::execute`];
+///   * side effects (asserts / retracts / publishes / gas) accumulate in the
+///     CBOR-encoded vertex state;
+///   * `{"status":"continue"}` re-queues the guest output as a self-message for
+///     the next superstep, any other status votes the vertex to halt.
+pub fn wasm_compute_fn(
+    executor: Arc<WasmExecutor>,
+    program_cid: impl Into<String>,
+    wasm_bytes: Arc<Vec<u8>>,
+    agent_did: impl Into<String>,
+) -> SharedComputeFn {
+    let program_cid = Arc::new(program_cid.into());
+    let agent_did = Arc::new(agent_did.into());
+
+    Arc::new(move |vertex: &Vertex, inbox: &[Message]| {
+        // Extract ctx_cbor from inbox (message payload carries it)
+        let ctx_cbor: Vec<u8> = inbox
+            .iter()
+            .find(|_| true)
+            .map(|m| m.payload.clone())
+            .unwrap_or_default();
+
+        if ctx_cbor.is_empty() {
+            // No message → nothing to do, halt immediately
+            return ComputeOutput {
+                new_state: vertex.state.clone(),
+                messages: vec![],
+                vote_halt: true,
+            };
+        }
+
+        // Decode accumulated state from vertex
+        let mut state: WasmVertexState = if vertex.state.is_empty() {
+            WasmVertexState::default()
+        } else {
+            ciborium::from_reader(vertex.state.as_slice()).unwrap_or_default()
+        };
+
+        // Invoke WASM guest
+        let result = executor.execute(
+            &program_cid,
+            &wasm_bytes,
+            &agent_did,
+            ctx_cbor,
+            vec![],
+            HashMap::new(),
+        );
+
+        let invoke: InvokeResult = match result {
+            Ok(r) => r,
+            Err(e) => {
+                // On error: encode {"err": "..."} as CBOR (matches Python handle_invoke format)
+                let err_cbor = ciborium::Value::Map(vec![(
+                    ciborium::Value::Text("err".into()),
+                    ciborium::Value::Text(format!("{e:?}")),
+                )]);
+                let mut err_buf = Vec::new();
+                let _ = ciborium::into_writer(&err_cbor, &mut err_buf);
+                state.final_output_cbor = err_buf;
+                let mut buf = Vec::new();
+                let _ = ciborium::into_writer(&state, &mut buf);
+                return ComputeOutput {
+                    new_state: buf,
+                    messages: vec![],
+                    vote_halt: true,
+                };
+            }
+        };
+
+        // Accumulate side effects — cap asserts to avoid unbounded memory across supersteps.
+        // The post-run MCP/XRPC layer enforces the hard limit; we stop accumulating
+        // one over that limit so the caller can detect the overflow and reject.
+        const MAX_ACCUMULATED_QUADS: usize = 10_001;
+        state.total_gas_used += invoke.gas_used;
+        state
+            .accumulated_quads
+            .extend(invoke.assert_quads.into_iter().map(Into::into));
+        state
+            .accumulated_retracts
+            .extend(invoke.retract_quads.into_iter().map(Into::into));
+        state.accumulated_publishes.extend(invoke.pending_publishes);
+        // Vote halt immediately if quad budget is exceeded (no point continuing).
+        if state.accumulated_quads.len() >= MAX_ACCUMULATED_QUADS {
+            state.final_output_cbor = br#"{"status":"quota_exceeded"}"#.to_vec();
+            let mut buf = Vec::new();
+            let _ = ciborium::into_writer(&state, &mut buf);
+            return ComputeOutput {
+                new_state: buf,
+                messages: vec![],
+                vote_halt: true,
+            };
+        }
+
+        // Decide continuation: check for "status": "continue" in output CBOR
+        let should_continue = decode_status_continue(&invoke.output_cbor);
+
+        let (messages, vote_halt) = if should_continue {
+            let next_msg = Message {
+                src: vertex.id.clone(),
+                dst: vertex.id.clone(),
+                payload: invoke.output_cbor.clone(),
+            };
+            (vec![next_msg], false)
+        } else {
+            state.final_output_cbor = invoke.output_cbor;
+            (vec![], true)
+        };
+
+        let mut new_state_bytes = Vec::new();
+        let _ = ciborium::into_writer(&state, &mut new_state_bytes);
+
+        ComputeOutput {
+            new_state: new_state_bytes,
+            messages,
+            vote_halt,
+        }
+    })
+}
+
+/// Decode the gas consumed and accumulated assert-quad count from a finished
+/// Pregel vertex's CBOR state, as produced by [`wasm_compute_fn`].
+///
+/// Useful when the per-vertex state lives inside a
+/// [`DistributedPregelRunner`](crate::distributed::DistributedPregelRunner)
+/// graph (which has no `WasmRunResult` extraction of its own): callers can read
+/// each locally-owned vertex's `(gas_used, assert_quad_count)` after the run.
+/// Returns `None` if the bytes are empty or are not a WASM vertex state.
+pub fn wasm_vertex_gas_and_quads(state: &[u8]) -> Option<(u64, usize)> {
+    if state.is_empty() {
+        return None;
+    }
+    let s: WasmVertexState = ciborium::from_reader(state).ok()?;
+    Some((s.total_gas_used, s.accumulated_quads.len()))
 }
 
 /// Return true iff `cbor` decodes to a CBOR map containing `"status": "continue"`.
