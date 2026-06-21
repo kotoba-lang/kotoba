@@ -4252,6 +4252,88 @@ async fn datomic_q_engi_read_fee_charges_reader_and_blocks_when_broke() {
     assert!(s.state.engi.ledger().await.is_balanced());
 }
 
+/// Coverage for the previously-untested operator-gated ENGI ledger endpoints
+/// (`econ.balance` / `econ.credit`): balance reporting (incl. the `_en` keys and
+/// the deprecated `_mkoto` compat alias), operator credit grant + negative
+/// clawback, the net-zero invariant, operator gating (401), and validation (400).
+#[tokio::test]
+async fn econ_balance_and_credit_endpoints_report_and_grant_en_net_zero() {
+    let s = TestServer::start_with_econ(false, 10, 1000).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let did = "did:key:zEconEndpointAgent";
+
+    // Fresh DID: zero balance, default credit limit, gate parameters echoed.
+    let (status, b) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.econ.balance",
+            json!({ "did": did }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{b}");
+    assert_eq!(b["unit"], "EN", "{b}");
+    assert_eq!(b["balance_en"], 0, "{b}");
+    assert_eq!(b["credit_limit_en"], 1000, "{b}");
+    assert_eq!(b["write_cost_en"], 10, "{b}");
+    assert_eq!(b["enabled"], true, "{b}");
+    assert_eq!(b["ledger_net_en"], 0, "{b}");
+    assert_eq!(b["balance_mkoto"], 0, "deprecated compat key still emitted: {b}");
+
+    // Operator grants 250 EN → recipient rises, operator falls (net-zero).
+    let (status, c) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.econ.credit",
+            json!({ "did": did, "amount": 250 }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{c}");
+    assert_eq!(c["credited_en"], 250, "{c}");
+    assert_eq!(c["balance_en"], 250, "{c}");
+
+    // Balance reflects the grant; ledger still net-zero (did +250, operator -250).
+    let (_, b2) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.econ.balance",
+            json!({ "did": did }),
+            &tok,
+        )
+        .await;
+    assert_eq!(b2["balance_en"], 250, "{b2}");
+    assert_eq!(b2["ledger_net_en"], 0, "{b2}");
+    assert_eq!(s.state.engi.balance(&s.operator_did).await, -250);
+
+    // Clawback: a negative credit takes EN back.
+    let (status, c2) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.econ.credit",
+            json!({ "did": did, "amount": -100 }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "{c2}");
+    assert_eq!(c2["balance_en"], 150, "{c2}");
+
+    // Operator gating: no Bearer → 401.
+    let (status, e) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.econ.balance",
+            json!({ "did": did }),
+        )
+        .await;
+    assert_eq!(status, 401, "operator-gated endpoint must reject anonymous: {e}");
+
+    // Validation: empty DID → 400.
+    let (status, e) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.econ.credit",
+            json!({ "did": "", "amount": 1 }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 400, "empty did must be rejected: {e}");
+}
+
 #[tokio::test]
 async fn datomic_transact_rejects_mismatched_cacao_tx_scope() {
     let s = TestServer::start(false).await;
