@@ -5,34 +5,36 @@
 //! (ADR-2606082100) so the reducer and the ledger share one decay primitive; the
 //! `kotoba_server::social::*` path re-exports it. This module adds the one piece
 //! that is server-specific: writing settled retainer credits into the persisted
-//! [`crate::econ::Econ`] balance store.
+//! [`crate::engi::Engi`] mutual-credit ledger.
 //!
 //! See `docs/SOCIAL-CAPITAL-LEDGER.md` + `docs/MISHMAR-OBSERVATION.md`.
 
 pub use kotoba_query::social::*;
 
-use crate::econ::Econ;
+use crate::engi::Engi;
 // `RetainerCredit` is in scope via the `pub use kotoba_query::social::*` above.
 
-/// Apply an L6 retainer settlement to the live, persisted mKOTO wallet
-/// ([`Econ`]): credit each pinner's balance by its aggregated retainer. mKOTO is
-/// internal accounting — `Econ::credit` only adds (non-transferable), and the
-/// balance is persisted, so earned retainer survives restarts. Returns the total
-/// mKOTO credited.
+/// Apply an L6 retainer settlement to the live, persisted ENGI ledger
+/// ([`Engi`]): transfer each pinner's aggregated retainer from the operator
+/// account into the pinner's balance (net-zero — the node redistributes
+/// collected EN). The balance is persisted, so earned retainer survives
+/// restarts. Returns the total EN settled.
 ///
 /// Pinners are keyed by their DID **CID string** (`KotobaCid::to_string`).
 /// Reconciling that with CACAO-writer DID-string balance keys (a `did ↔ cid`
 /// bridge) is a follow-up; until then retainer balances live under the pinner CID.
-pub async fn settle_retainer_to_econ(econ: &Econ, credits: &[RetainerCredit]) -> i64 {
-    let mut total: i64 = 0;
-    for c in credits {
-        if c.mkoto <= 0 {
-            continue;
-        }
-        econ.credit(&c.pinner_did.to_string(), c.mkoto).await;
-        total = total.saturating_add(c.mkoto);
-    }
-    total
+///
+/// The whole settlement is applied through [`Engi::batch_credit`] — a single
+/// locked, single-persisted batch — so a crash mid-settlement can never leave
+/// some pinners credited and others not (no partial settlement), and the ledger
+/// stays net-zero.
+pub async fn settle_retainer_to_econ(engi: &Engi, credits: &[RetainerCredit]) -> i64 {
+    let batch: Vec<(String, i64)> = credits
+        .iter()
+        .filter(|c| c.mkoto > 0)
+        .map(|c| (c.pinner_did.to_string(), c.mkoto))
+        .collect();
+    engi.batch_credit(&batch).await
 }
 
 use kotoba_query::datom::Datom;
@@ -76,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn settlement_credits_persisted_econ_balances() {
-        let econ = Econ::from_env("did:key:operator".to_string());
+        let econ = Engi::from_env("did:key:operator".to_string());
         let peggy = did("did:key:peggy");
         let quinn = did("did:key:quinn");
         let credits = vec![
@@ -150,7 +152,7 @@ mod tests {
 
     #[tokio::test]
     async fn settlement_is_additive_and_skips_nonpositive() {
-        let econ = Econ::from_env("did:key:operator".to_string());
+        let econ = Engi::from_env("did:key:operator".to_string());
         let p = did("did:key:p");
         // first settlement
         settle_retainer_to_econ(

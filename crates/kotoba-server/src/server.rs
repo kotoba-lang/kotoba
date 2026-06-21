@@ -331,10 +331,11 @@ pub struct KotobaState {
     /// This node's custodian shares, keyed by graph multibase CID. Installed
     /// via `key.depositShare` (operator-gated); consulted by `key.requestShare`.
     pub custody_shares: Arc<tokio::sync::RwLock<HashMap<String, kotoba_custody::CustodianShare>>>,
-    // ── Write-cost economy (ADR-2606013400) ───────────────────────────────────
-    /// Per-DID mKOTO balance ledger. `datomic.transact` debits the writer here;
-    /// the operator is exempt/unlimited. See `crate::econ::Econ`.
-    pub econ: Arc<crate::econ::Econ>,
+    // ── ENGI (縁起) mutual-credit economy (ADR-2606013400, net-zero revision) ──
+    /// Agent-centric mutual-credit ledger, unit EN (縁). `datomic.transact`
+    /// transfers the write fee from writer → operator (net-zero); balances may
+    /// go negative down to each agent's credit limit. See `crate::engi::Engi`.
+    pub engi: Arc<crate::engi::Engi>,
     // ── Outbound HTTP ─────────────────────────────────────────────────────────
     /// Shared HTTP client — used for did:web DID document resolution and other
     /// outbound fetches.  10-second timeout; connection pool reused across requests.
@@ -862,8 +863,8 @@ impl KotobaState {
             Arc::new(tokio::sync::RwLock::new(map))
         };
 
-        // Write-cost economy (ADR-2606013400) — operator-funded mKOTO ledger.
-        let econ = crate::econ::Econ::from_env(operator_did.clone());
+        // ENGI (縁起) mutual-credit economy (ADR-2606013400, net-zero) — unit EN.
+        let engi = crate::engi::Engi::from_env(operator_did.clone());
 
         let (receipt_tx, receipt_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
@@ -900,7 +901,7 @@ impl KotobaState {
             media_embed_client,
             pre_key_registry: None,
             graph_registry,
-            econ,
+            engi,
             nonce_store: Arc::new(crate::nonce_store::NonceStore::new()),
             receipt_tx,
             receipt_rx: std::sync::Mutex::new(Some(receipt_rx)),

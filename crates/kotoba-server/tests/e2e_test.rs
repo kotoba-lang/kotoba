@@ -37,15 +37,37 @@ struct TestServer {
 struct TestServerEnvGuard {
     previous_ipfs: Option<std::ffi::OsString>,
     previous_store_path: Option<std::ffi::OsString>,
+    previous_write_cost: Option<std::ffi::OsString>,
+    previous_credit_limit: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TestServerEnvGuard {
-    fn apply(store_path: Option<&std::path::Path>) -> Self {
+    /// Sets the base server env and, when `econ` is given, the ENGI (縁起)
+    /// write-fee env (`write_cost`, `credit_limit`) inside the same locked
+    /// window. `Engi::from_env` caches these at `KotobaState::new`, so they must
+    /// be live during construction; restoring them on drop keeps the global env
+    /// clean for parallel tests.
+    fn apply_with_econ(
+        store_path: Option<&std::path::Path>,
+        econ: Option<(i64, i64)>,
+    ) -> Self {
         static TEST_SERVER_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let lock = TEST_SERVER_ENV_MUTEX.lock().expect("test server env mutex");
         let previous_ipfs = std::env::var_os("KOTOBA_IPFS");
         let previous_store_path = std::env::var_os("KOTOBA_STORE_PATH");
+        let previous_write_cost = std::env::var_os("KOTOBA_WRITE_COST_EN");
+        let previous_credit_limit = std::env::var_os("KOTOBA_CREDIT_LIMIT_EN");
+        match econ {
+            Some((write_cost, credit_limit)) => {
+                std::env::set_var("KOTOBA_WRITE_COST_EN", write_cost.to_string());
+                std::env::set_var("KOTOBA_CREDIT_LIMIT_EN", credit_limit.to_string());
+            }
+            None => {
+                std::env::remove_var("KOTOBA_WRITE_COST_EN");
+                std::env::remove_var("KOTOBA_CREDIT_LIMIT_EN");
+            }
+        }
         // Tests pre-date the 2026-05-28 default-Private flip; keep the historic
         // Bearer-token-only auth behaviour unless an individual test registers
         // the graph as private. This must persist for request-time visibility
@@ -62,6 +84,8 @@ impl TestServerEnvGuard {
         Self {
             previous_ipfs,
             previous_store_path,
+            previous_write_cost,
+            previous_credit_limit,
             _lock: lock,
         }
     }
@@ -77,6 +101,14 @@ impl Drop for TestServerEnvGuard {
             Some(path) => std::env::set_var("KOTOBA_STORE_PATH", path),
             None => std::env::remove_var("KOTOBA_STORE_PATH"),
         }
+        match self.previous_write_cost.take() {
+            Some(value) => std::env::set_var("KOTOBA_WRITE_COST_EN", value),
+            None => std::env::remove_var("KOTOBA_WRITE_COST_EN"),
+        }
+        match self.previous_credit_limit.take() {
+            Some(value) => std::env::set_var("KOTOBA_CREDIT_LIMIT_EN", value),
+            None => std::env::remove_var("KOTOBA_CREDIT_LIMIT_EN"),
+        }
     }
 }
 
@@ -89,11 +121,17 @@ async fn json_or_text(r: reqwest::Response) -> (u16, Value) {
 
 impl TestServer {
     async fn start(with_inference: bool) -> Self {
-        Self::start_inner(with_inference, false, None).await
+        Self::start_inner(with_inference, false, None, None).await
     }
 
     async fn start_with_crypto(with_inference: bool) -> Self {
-        Self::start_inner(with_inference, true, None).await
+        Self::start_inner(with_inference, true, None, None).await
+    }
+
+    /// Start a server with the ENGI write-fee gate enabled: `write_cost` EN per
+    /// datom and a default per-agent `credit_limit` (max negative balance).
+    async fn start_with_econ(with_inference: bool, write_cost: i64, credit_limit: i64) -> Self {
+        Self::start_inner(with_inference, false, None, Some((write_cost, credit_limit))).await
     }
 
     #[cfg(feature = "wasm-runtime")]
@@ -101,13 +139,14 @@ impl TestServer {
         with_inference: bool,
         store_path: &std::path::Path,
     ) -> Self {
-        Self::start_inner(with_inference, true, Some(store_path)).await
+        Self::start_inner(with_inference, true, Some(store_path), None).await
     }
 
     async fn start_inner(
         with_inference: bool,
         with_crypto: bool,
         store_path: Option<&std::path::Path>,
+        econ: Option<(i64, i64)>,
     ) -> Self {
         let engine = if with_inference {
             Some(stub_engine())
@@ -115,7 +154,7 @@ impl TestServer {
             None
         };
         let state = {
-            let _test_server_env = TestServerEnvGuard::apply(store_path);
+            let _test_server_env = TestServerEnvGuard::apply_with_econ(store_path, econ);
             KotobaState::new(engine).expect("KotobaState::new")
         };
         let state = if with_crypto {
@@ -3983,6 +4022,139 @@ async fn datomic_transact_accepts_cacao_datom_transact_operation_scope() {
             .any(|row| row[0] == format!("\"kotoba://graph/{graph}\"")),
         "{resource_body}"
     );
+}
+
+/// End-to-end proof that the ENGI (縁起) write-fee gate is wired into the live
+/// `datomic.transact` handler — not just unit-tested on the ledger. Drives the
+/// three economic outcomes through real HTTP + CACAO + distributed commit:
+///   1. **block** — a broke writer (zero credit headroom) is rejected with 402
+///      and is NOT debited (a rejected request never moves EN).
+///   2. **charge** — once granted EN, a successful write debits the writer by
+///      the per-datom fee and credits the operator the same amount (net-zero).
+///   3. **refund** — a write whose distributed commit fails (stale parent → 409)
+///      is charged then refunded, leaving the writer's balance untouched.
+/// Fees are derived from observed balance deltas, never hard-coded datom counts.
+#[tokio::test]
+async fn datomic_transact_engi_write_fee_charges_blocks_and_refunds() {
+    // write_cost = 10 EN/datom; default credit_limit = 0 → a non-operator writer
+    // has no inherent headroom, so the very first fee blocks until EN is granted.
+    let s = TestServer::start_with_econ(false, 10, 0).await;
+    assert!(s.state.engi.enabled(), "engi gate must be on");
+    let graph =
+        kotoba_core::cid::KotobaCid::from_bytes(b"datomic-engi-write-fee-e2e").to_multibase();
+    let writer = cacao_signer_did();
+
+    // CACAO scoped to datom:transact, signed by the (non-operator) writer DID, so
+    // the live handler sets write_author = writer and the fee actually applies.
+    // Each request needs a fresh nonce (CAIP-74 single-use replay guard).
+    let writer_cacao = |nonce: &str| {
+        build_ed25519_cacao_for_operation_with_resources(
+            &graph,
+            &s.operator_did,
+            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+            nonce,
+            vec![format!(
+                "kotoba://op/{}",
+                kotoba_auth::CacaoPayload::OP_TX_CREATE
+            )],
+        )
+    };
+
+    // ── 1. block: broke writer is rejected with 402 and stays at 0 ────────────
+    let (status, body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({
+                "graph": graph,
+                "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#,
+                "cacao_b64": writer_cacao("nonce-engi-broke")
+            }),
+        )
+        .await;
+    assert_eq!(status, 402, "broke writer must be payment-required: {body}");
+    assert!(
+        body.as_str().unwrap_or_default().contains("insufficient EN credit"),
+        "402 body should explain the EN shortfall: {body}"
+    );
+    assert_eq!(
+        s.state.engi.balance(&writer).await,
+        0,
+        "a rejected write must not debit the writer"
+    );
+    assert!(s.state.engi.ledger().await.is_balanced());
+
+    // ── 2. charge: operator grants EN, the write succeeds and debits the fee ──
+    s.state.engi.credit(&writer, 100).await; // operator extends 100 EN (net-zero)
+    assert_eq!(s.state.engi.balance(&writer).await, 100);
+    let (status, body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({
+                "graph": graph,
+                "tx_edn": r#"[[:db/add "alice" :person/name "Alice"]]"#,
+                "cacao_b64": writer_cacao("nonce-engi-charge")
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "funded writer should commit: {body}");
+    let parent_c1 = body["commit_cid"]
+        .as_str()
+        .expect("commit cid")
+        .to_string();
+    let bal_after = s.state.engi.balance(&writer).await;
+    let fee = 100 - bal_after;
+    assert!(fee > 0, "a successful write must debit a positive fee");
+    assert!(bal_after < 100, "writer balance must fall by the fee");
+    // Net-zero: the fee the writer paid is exactly the EN the operator earned.
+    assert_eq!(
+        s.state.engi.balance(&writer).await + s.state.engi.balance(&s.operator_did).await,
+        0,
+        "writer + operator balances must sum to zero (mutual credit)"
+    );
+    assert!(s.state.engi.ledger().await.is_balanced());
+
+    // ── 3. refund: a write whose commit fails is charged then refunded ────────
+    // Advance the graph head past parent_c1 with a free operator write, so a
+    // subsequent writer transact pinned to the now-stale parent_c1 loads its
+    // db_before (a real committed parent) — paying the fee — then fails the
+    // head CAS (StaleParent → 409) and is refunded.
+    let optok = tenant_jwt(&s.operator_did);
+    let (status, adv) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({
+                "graph": graph,
+                "tx_edn": r#"[[:db/add "bob" :person/name "Bob"]]"#
+            }),
+            &optok,
+        )
+        .await;
+    assert_eq!(status, 200, "operator head-advance should commit: {adv}");
+    assert_ne!(
+        adv["commit_cid"].as_str(), Some(parent_c1.as_str()),
+        "head must have advanced past the stale parent"
+    );
+
+    let bal_pre = s.state.engi.balance(&writer).await;
+    assert!(bal_pre > 0, "writer needs positive EN so a missing refund would show");
+    let (status, stale) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({
+                "graph": graph,
+                "tx_edn": r#"[[:db/add "carol" :person/name "Carol"]]"#,
+                "expected_parent": parent_c1,
+                "cacao_b64": writer_cacao("nonce-engi-refund")
+            }),
+        )
+        .await;
+    assert_eq!(status, 409, "stale parent must conflict: {stale}");
+    assert_eq!(
+        s.state.engi.balance(&writer).await,
+        bal_pre,
+        "a failed commit must refund the fee (balance unchanged)"
+    );
+    assert!(s.state.engi.ledger().await.is_balanced());
 }
 
 #[tokio::test]

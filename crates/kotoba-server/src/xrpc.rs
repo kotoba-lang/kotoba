@@ -890,12 +890,23 @@ pub async fn econ_balance(
     if req.did.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "did required".to_string()));
     }
-    let balance = state.econ.balance(&req.did).await;
+    let balance = state.engi.balance(&req.did).await;
+    let credit_limit = state.engi.credit_limit(&req.did).await;
+    let ledger = state.engi.ledger().await;
     Ok(Json(serde_json::json!({
         "did": req.did,
+        "unit": "EN",
+        "balance_en": balance,
+        "credit_limit_en": credit_limit,
+        "write_cost_en": state.engi.cost_per_datom(),
+        "read_cost_en": state.engi.read_cost(),
+        "enabled": state.engi.enabled(),
+        // net-zero ledger audit (net is the conservation invariant, always 0)
+        "ledger_net_en": ledger.net,
+        "ledger_outstanding_en": ledger.outstanding,
+        // legacy keys (deprecated — EN replaces mKOTO; kept for client compat)
         "balance_mkoto": balance,
-        "cost_per_datom_mkoto": state.econ.cost_per_datom(),
-        "enabled": state.econ.enabled(),
+        "cost_per_datom_mkoto": state.engi.cost_per_datom(),
     })))
 }
 
@@ -908,9 +919,13 @@ pub async fn econ_credit(
     if req.did.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "did required".to_string()));
     }
-    let balance = state.econ.credit(&req.did, req.amount).await;
+    let balance = state.engi.credit(&req.did, req.amount).await;
     Ok(Json(serde_json::json!({
         "did": req.did,
+        "unit": "EN",
+        "credited_en": req.amount,
+        "balance_en": balance,
+        // legacy keys (deprecated — EN replaces mKOTO; kept for client compat)
         "credited_mkoto": req.amount,
         "balance_mkoto": balance,
     })))
@@ -1503,6 +1518,9 @@ async fn require_datomic_read_any_operation(
 
     let graph_scope = graph.to_multibase();
     let visibility = state.graph_visibility(graph).await;
+    // The authenticated reader DID (if any) — captured so the ENGI read fee can
+    // be charged to it below. Anonymous public reads and operator reads stay free.
+    let mut reader_did: Option<String> = None;
     // Authorize via one of: CACAO operation grant, VC presentation, or the
     // graph-visibility fallback gate.
     'authorized: {
@@ -1542,6 +1560,7 @@ async fn require_datomic_read_any_operation(
                     }
                 }
                 enforce_datomic_temporal_tx_scope(&payload, as_of, since)?;
+                reader_did = Some(payload.iss.clone());
                 break 'authorized;
             }
         }
@@ -1552,6 +1571,7 @@ async fn require_datomic_read_any_operation(
                 presentation,
                 operations,
             )?;
+            reader_did = presentation.holder.clone();
             break 'authorized;
         }
         check_read_access(
@@ -1572,7 +1592,33 @@ async fn require_datomic_read_any_operation(
         graph,
         &visibility,
         operations.first().copied().unwrap_or("datom:read"),
-    )
+    )?;
+    // ENGI (縁起) read fee — transfer EN from the authenticated reader → operator
+    // (net-zero). No-op when KOTOBA_READ_COST_EN is unset/0, for anonymous public
+    // reads (no reader DID), or for the operator (self-transfer = free).
+    charge_engi_read_fee(state, reader_did.as_deref()).await
+}
+
+/// Charge the per-read ENGI fee to `reader` (if any), transferring it to the
+/// operator. Returns an HTTP 402 if the reader is out of credit. A no-op when
+/// reads are free (`KOTOBA_READ_COST_EN` unset/0) or there is no reader DID.
+async fn charge_engi_read_fee(
+    state: &KotobaState,
+    reader: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let cost = state.engi.read_cost();
+    if cost <= 0 {
+        return Ok(());
+    }
+    let Some(did) = reader else {
+        return Ok(());
+    };
+    state.engi.charge(did, cost).await.map(|_| ()).map_err(|(needed, available)| {
+        (
+            StatusCode::PAYMENT_REQUIRED,
+            format!("insufficient EN credit: read needs {needed} EN, {available} EN of credit available for {did}"),
+        )
+    })
 }
 
 async fn require_datomic_read_tx_range(
@@ -1589,6 +1635,7 @@ async fn require_datomic_read_tx_range(
 
     let graph_scope = graph.to_multibase();
     let visibility = state.graph_visibility(graph).await;
+    let mut reader_did: Option<String> = None;
     'authorized: {
         if cacao_b64.is_some() {
             if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
@@ -1598,6 +1645,7 @@ async fn require_datomic_read_tx_range(
                 operations,
             ) {
                 enforce_datomic_range_tx_scope(&payload, start, end)?;
+                reader_did = Some(payload.iss.clone());
                 break 'authorized;
             }
         }
@@ -1618,6 +1666,7 @@ async fn require_datomic_read_tx_range(
                     end,
                 )?;
             }
+            reader_did = presentation.holder.clone();
             break 'authorized;
         }
         check_read_access(
@@ -1638,7 +1687,9 @@ async fn require_datomic_read_tx_range(
         graph,
         &visibility,
         operations.first().copied().unwrap_or("datom:read"),
-    )
+    )?;
+    // ENGI (縁起) read fee (see require_datomic_read_any_operation).
+    charge_engi_read_fee(state, reader_did.as_deref()).await
 }
 
 fn enforce_datomic_temporal_tx_scope(
@@ -5056,8 +5107,34 @@ pub async fn datomic_transact(
         None => None,
     };
     let cacao_proof_cid = auth_proof_cid.clone().or(explicit_cacao_proof_cid);
+
+    // ENGI (縁起) write fee — charged last, right before the commit, after all
+    // auth/scope/quota checks have passed (so a rejected request is never
+    // debited). The fee transfers EN from writer → operator (net-zero); it is a
+    // no-op when the economy is disabled (KOTOBA_WRITE_COST_EN unset/0) or when
+    // the writer is the operator (free node self-write). The writer may run a
+    // negative balance down to their credit limit; once exhausted the write is
+    // rejected with HTTP 402 and they must earn EN (be cited / provide storage
+    // or compute) before writing again. Refunded below if the commit fails.
+    let write_fee = if state.engi.enabled() {
+        let cost = state.engi.cost_for(tx_preview.tx_data.len());
+        match state.engi.charge(&write_author, cost).await {
+            Ok(_) => cost,
+            Err((needed, available)) => {
+                return Err((
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "insufficient EN credit: write needs {needed} EN, {available} EN of credit available for {write_author}"
+                    ),
+                ));
+            }
+        }
+    } else {
+        0
+    };
+
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
-    let distributed = writer
+    let distributed = match writer
         .transact_with_db_before(
             DistributedTransactRequest {
                 ipns_name: ipns_name.clone(),
@@ -5094,18 +5171,28 @@ pub async fn datomic_transact(
             },
         )
         .await
-        .map_err(|e| match e {
-            DistributedCommitError::StaleParent { .. } => {
-                (StatusCode::CONFLICT, format!("distributed commit: {e}"))
+    {
+        Ok(d) => d,
+        Err(e) => {
+            // Commit failed after the fee was charged — refund so a failed write
+            // is supply-neutral (charge + refund nets to zero).
+            if write_fee > 0 {
+                state.engi.refund(&write_author, write_fee).await;
             }
-            DistributedCommitError::Datom(_) => {
-                (StatusCode::BAD_REQUEST, format!("datomic transact: {e}"))
-            }
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("distributed commit: {e}"),
-            ),
-        })?;
+            return Err(match e {
+                DistributedCommitError::StaleParent { .. } => {
+                    (StatusCode::CONFLICT, format!("distributed commit: {e}"))
+                }
+                DistributedCommitError::Datom(_) => {
+                    (StatusCode::BAD_REQUEST, format!("datomic transact: {e}"))
+                }
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("distributed commit: {e}"),
+                ),
+            });
+        }
+    };
     let report = distributed.transact;
     let distributed_commit = distributed.commit;
     let tx_datoms = distributed.datoms;
