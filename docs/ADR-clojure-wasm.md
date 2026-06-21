@@ -537,3 +537,85 @@ new 16-test `tests/hofs.rs` (map→filter→reduce chains, reader-macro callback
 captured-variable callbacks, `comp`/`partial` returning closures, `range`,
 `some`/`every?`/`keep`, `map-indexed`); clippy clean; no regressions across the
 component/kqe/pregel suites that compile with the now-table-bearing prelude.
+
+---
+
+## Coverage batch — clojure.core stdlib + iteration sugars (2026-06-21)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj` (`tests/coverage.rs`, 16 tests).
+
+Broadens Clojure-language coverage with **no new codegen path or runtime node** —
+everything is either a pure-subset `PRELUDE` function (compiled through the
+existing vec/map + closure-table machinery) or an AST desugar into existing
+special forms.
+
+**New special forms (`ast.rs` desugar):**
+
+| form | desugars to |
+|------|-------------|
+| `(while test body…)` | `(loop [_ 0] (if test (do body… (recur 0)) 0))` |
+| `(dotimes [i n] body…)` | `(let [_n n] (loop [i 0] (if (< i _n) (do body… (recur (+ i 1))) 0)))` |
+| `(doseq [x coll] body…)` | `vec-count`/`vec-nth` walk in a `loop` (single binding; needs the prelude) |
+| `(if-some [x e] t e?)` / `(when-some [x e] body…)` | alias `if-let`/`when-let` (nil≡0≡falsy in the i64 model) |
+
+**New `PRELUDE` fns** (all output containers pre-sized; `vec-conj!`/`map-assoc!`
+never grow): `take` `drop` `take-while` `drop-while` `butlast` `take-last`
+`reverse` `concat` `repeat` `interpose` `interleave` `partition` `vec-contains?`
+`distinct` `sort` `sort-by` `vec-swap!` `merge` `merge-with` `select-keys`
+`zipmap` `get-in` `update` `complement` `juxt` `fnil` `max-key` `min-key`; plus
+`vector` arity extended 4→8.
+
+**Honest limits** (the i64 / mutable-bump model, unchanged): `distinct` /
+`vec-contains?` compare scalars by value but collection/string handles by
+identity; map fns assume **string keys** (the `str-eq?` contract); `sort` is
+O(n²) selection sort; there is still no number tower (i64 only), no lazy seqs,
+no persistent-immutable structures, and no dead-code elimination (every prelude
+fn is emitted, so a prelude-on module grew ~5.5 KB → ~8.7 KB — negligible for
+agents, a DCE target later).
+
+Verification: `cargo test -p kotoba-clj` → **209 passed / 0 failed** (193 prior +
+16 new); a combined end-to-end program (`sort`+`take`+`reduce`+`merge`+`dotimes`)
+runs to the same result on **both** wasmtime and V8.
+
+---
+
+## Coverage batch 2 — strings, 2-pass collections, branch peephole (2026-06-21)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj` (`tests/coverage.rs` → 23 tests).
+
+### Strings (PRELUDE, on the byte-builder)
+`str-cat` (concat 2 handles) · `subs` (2/3-arity substring) · `str-starts-with?` ·
+`str-includes?` (naive O(nm)) · `str-join` (single-alloc join of a vector of
+string handles by a separator) · `str-int` (signed integer → decimal string).
+Built on `bytes-alloc`/`byte-append!`/`bytes-finish` + `byte-at`/`str-len`; all
+capacities are computed exactly first (no grow). A generic variadic `str` is
+**not** provided — without runtime type tags the compiler can't tell an int
+handle from a string handle, so int rendering is the explicit `str-int`.
+
+### 2-pass / pre-sized collections (PRELUDE)
+`mapcat` (1st pass sums child lengths, 2nd concats — `f` called twice/elem,
+fine for pure `f`) · `frequencies` (vector of **string** handles → count map) ·
+`group-by` (keyfn → string key → vector; each group pre-sized to n). Map fns
+assume string keys (the `str-eq?` contract).
+
+### Branch peephole (`codegen.rs`)
+`compile_truthy_i32` now feeds a 2-arg comparison (`= != < > <= >=`) **straight
+into the `if`/`br_if`**, dropping the `i64.extend_i32_u; i64.const 0; i64.ne`
+round-trip the i64-everything model emitted. Verified on `fib`: body **20 → 17
+instructions, 34 B → 30 B**.
+
+**Honest perf note (measured):** the peephole shrinks the module and the
+instruction count but **does not change `fib` steady-state runtime on optimizing
+JITs** — wasmtime/Cranelift and V8/TurboFan already fold the round-trip, so the
+dead ops were free at steady state (fib(32) stays ≈2.2× rust `-O3`, unchanged).
+The real wins are (a) **smaller, cleaner modules** (faster parse/load, less to
+content-address) and (b) the **non-optimizing paths** — the browser metered
+interpreter (`kotoba-runtime-web`) and any per-instruction step/gas counting,
+where instruction count *is* the work. The residual fib gap is LLVM's
+recursion→accumulator-loop transform (identified earlier), which a peephole
+cannot reach; closing it needs a real optimizer pass and is out of scope for the
+agent workload (no numeric hot loops).
+
+Verification: `cargo test -p kotoba-clj` → **216 passed / 0 failed** (209 prior +
+7 new). End-to-end `sort`+`take`+`merge`+`dotimes` and the string/`str-int`
+paths run identically on wasmtime and V8.
