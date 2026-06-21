@@ -576,3 +576,46 @@ agents, a DCE target later).
 Verification: `cargo test -p kotoba-clj` → **209 passed / 0 failed** (193 prior +
 16 new); a combined end-to-end program (`sort`+`take`+`reduce`+`merge`+`dotimes`)
 runs to the same result on **both** wasmtime and V8.
+
+---
+
+## Coverage batch 2 — strings, 2-pass collections, branch peephole (2026-06-21)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj` (`tests/coverage.rs` → 23 tests).
+
+### Strings (PRELUDE, on the byte-builder)
+`str-cat` (concat 2 handles) · `subs` (2/3-arity substring) · `str-starts-with?` ·
+`str-includes?` (naive O(nm)) · `str-join` (single-alloc join of a vector of
+string handles by a separator) · `str-int` (signed integer → decimal string).
+Built on `bytes-alloc`/`byte-append!`/`bytes-finish` + `byte-at`/`str-len`; all
+capacities are computed exactly first (no grow). A generic variadic `str` is
+**not** provided — without runtime type tags the compiler can't tell an int
+handle from a string handle, so int rendering is the explicit `str-int`.
+
+### 2-pass / pre-sized collections (PRELUDE)
+`mapcat` (1st pass sums child lengths, 2nd concats — `f` called twice/elem,
+fine for pure `f`) · `frequencies` (vector of **string** handles → count map) ·
+`group-by` (keyfn → string key → vector; each group pre-sized to n). Map fns
+assume string keys (the `str-eq?` contract).
+
+### Branch peephole (`codegen.rs`)
+`compile_truthy_i32` now feeds a 2-arg comparison (`= != < > <= >=`) **straight
+into the `if`/`br_if`**, dropping the `i64.extend_i32_u; i64.const 0; i64.ne`
+round-trip the i64-everything model emitted. Verified on `fib`: body **20 → 17
+instructions, 34 B → 30 B**.
+
+**Honest perf note (measured):** the peephole shrinks the module and the
+instruction count but **does not change `fib` steady-state runtime on optimizing
+JITs** — wasmtime/Cranelift and V8/TurboFan already fold the round-trip, so the
+dead ops were free at steady state (fib(32) stays ≈2.2× rust `-O3`, unchanged).
+The real wins are (a) **smaller, cleaner modules** (faster parse/load, less to
+content-address) and (b) the **non-optimizing paths** — the browser metered
+interpreter (`kotoba-runtime-web`) and any per-instruction step/gas counting,
+where instruction count *is* the work. The residual fib gap is LLVM's
+recursion→accumulator-loop transform (identified earlier), which a peephole
+cannot reach; closing it needs a real optimizer pass and is out of scope for the
+agent workload (no numeric hot loops).
+
+Verification: `cargo test -p kotoba-clj` → **216 passed / 0 failed** (209 prior +
+7 new). End-to-end `sort`+`take`+`merge`+`dotimes` and the string/`str-int`
+paths run identically on wasmtime and V8.

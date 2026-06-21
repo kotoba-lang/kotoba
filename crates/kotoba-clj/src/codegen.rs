@@ -970,10 +970,39 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
 /// Compile `expr` and convert the resulting i64 to an i32 truthiness flag
 /// (1 if non-zero, 0 if zero) suitable as a wasm `if`/`br_if` condition.
 fn compile_truthy_i32(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
+    // Peephole: a binary comparison already yields an i32 0/1 — exactly what a
+    // wasm `if` wants. Emit `a; b; <cmp>` and stop, skipping the default
+    // `extend_i32_u; const 0; i64.ne` round-trip (3 dead ops per branch in the
+    // i64-everything model). Semantically identical: `(x cmp y) != 0` ⇔ `x cmp y`.
+    if let Expr::Builtin { op, args } = expr {
+        if args.len() == 2 {
+            if let Some(cmp) = comparison_i32_instruction(*op) {
+                compile_expr(cg, &args[0])?;
+                compile_expr(cg, &args[1])?;
+                cg.emit(cmp);
+                return Ok(());
+            }
+        }
+    }
     compile_expr(cg, expr)?;
     cg.emit(Instruction::I64Const(0));
     cg.emit(Instruction::I64Ne); // → i32: 1 if non-zero
     Ok(())
+}
+
+/// The i32-producing wasm instruction for a 2-arg comparison builtin, or `None`
+/// for anything else. Used by [`compile_truthy_i32`] to feed a comparison
+/// straight into an `if`/`br_if` condition.
+fn comparison_i32_instruction(op: Builtin) -> Option<Instruction<'static>> {
+    Some(match op {
+        Builtin::Eq => Instruction::I64Eq,
+        Builtin::NotEq => Instruction::I64Ne,
+        Builtin::Lt => Instruction::I64LtS,
+        Builtin::Gt => Instruction::I64GtS,
+        Builtin::Le => Instruction::I64LeS,
+        Builtin::Ge => Instruction::I64GeS,
+        _ => return None,
+    })
 }
 
 /// Compile `expr` to a normalised i64 boolean (1 if truthy, else 0).

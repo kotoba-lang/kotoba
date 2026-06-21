@@ -677,6 +677,108 @@ pub const PRELUDE: &str = r#"
 (defn fnil [f d] (fn [x] (f (if (nil? x) d x))))
 (defn max-key [f a b] (if (>= (f a) (f b)) a b))
 (defn min-key [f a b] (if (<= (f a) (f b)) a b))
+
+;; ---- string building (on the byte-builder; strings = (off<<32)|len handles) -
+;; `bytes-alloc`/`byte-append!`/`bytes-finish` build a fresh region; `byte-at`/
+;; `str-len` read string handles. Capacities are exact, so no grow is needed.
+(defn str-cat [a b]
+  (let [la (str-len a) lb (str-len b)
+        buf (bytes-alloc (+ la lb))]
+    (loop [i 0] (if (>= i la) 0 (do (byte-append! buf (byte-at a i)) (recur (+ i 1)))))
+    (loop [i 0] (if (>= i lb) 0 (do (byte-append! buf (byte-at b i)) (recur (+ i 1)))))
+    (bytes-finish buf)))
+(defn subs
+  ([s start] (subs s start (str-len s)))
+  ([s start end]
+   (let [buf (bytes-alloc (- end start))]
+     (loop [i start] (if (>= i end) 0 (do (byte-append! buf (byte-at s i)) (recur (+ i 1)))))
+     (bytes-finish buf))))
+(defn str-starts-with? [s prefix]
+  (let [lp (str-len prefix)]
+    (if (> lp (str-len s))
+      0
+      (loop [i 0]
+        (if (>= i lp) 1 (if (= (byte-at s i) (byte-at prefix i)) (recur (+ i 1)) 0))))))
+(defn str-includes? [s sub]
+  (let [ls (str-len s) lm (str-len sub)]
+    (if (= lm 0)
+      1
+      (loop [i 0]
+        (if (> (+ i lm) ls)
+          0
+          (if (loop [j 0]
+                (if (>= j lm) 1
+                  (if (= (byte-at s (+ i j)) (byte-at sub j)) (recur (+ j 1)) 0)))
+            1
+            (recur (+ i 1))))))))
+;; join string handles in a vector with a separator string (clojure.string/join)
+(defn str-join [sep v]
+  (let [n (vec-count v)]
+    (if (= n 0)
+      (bytes-finish (bytes-alloc 0))
+      (let [sl (str-len sep)
+            total (loop [i 0 t (* sl (- n 1))]
+                    (if (>= i n) t (recur (+ i 1) (+ t (str-len (vec-nth v i))))))
+            buf (bytes-alloc total)]
+        (loop [i 0]
+          (if (>= i n)
+            (bytes-finish buf)
+            (do
+              (if (> i 0)
+                (loop [j 0]
+                  (if (>= j sl) 0 (do (byte-append! buf (byte-at sep j)) (recur (+ j 1)))))
+                0)
+              (let [e (vec-nth v i) el (str-len e)]
+                (loop [j 0]
+                  (if (>= j el) 0 (do (byte-append! buf (byte-at e j)) (recur (+ j 1))))))
+              (recur (+ i 1)))))))))
+;; render a (possibly negative) integer to its decimal string handle
+(defn str-int [n]
+  (if (= n 0)
+    "0"
+    (let [neg (if (< n 0) 1 0)
+          m0 (if (< n 0) (- 0 n) n)
+          ds (vec-make 20)]
+      (loop [m m0]
+        (if (= m 0) 0 (do (vec-conj! ds (+ 48 (mod m 10))) (recur (/ m 10)))))
+      (let [k (vec-count ds)
+            buf (bytes-alloc (+ k neg))]
+        (if (= neg 1) (byte-append! buf 45) 0)
+        (loop [i (- k 1)]
+          (if (< i 0) 0 (do (byte-append! buf (vec-nth ds i)) (recur (- i 1)))))
+        (bytes-finish buf)))))
+
+;; ---- collection fns needing 2-pass / pre-sizing ---------------------------
+;; `mapcat`: f returns a vector per element; sum the lengths (1st pass) then
+;; concat (2nd pass). f is called twice per element — fine for pure f.
+(defn mapcat [f v]
+  (let [n (vec-count v)
+        total (loop [i 0 t 0]
+                (if (>= i n) t (recur (+ i 1) (+ t (vec-count (f (vec-nth v i)))))))
+        out (vec-make total)]
+    (loop [i 0]
+      (if (>= i n) out (do (vec-extend! out (f (vec-nth v i))) (recur (+ i 1)))))))
+;; `frequencies` of a vector of STRING handles -> map string->count.
+(defn frequencies [v]
+  (let [n (vec-count v) m (map-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        m
+        (let [k (vec-nth v i)]
+          (do (map-assoc! m k (+ 1 (if (contains-key? m k) (map-get m k) 0)))
+              (recur (+ i 1))))))))
+;; `group-by` keyfn over a vector -> map (string key) -> vector of items.
+;; Each group is pre-sized to n (worst case) so vec-conj! never overflows.
+(defn group-by [keyfn v]
+  (let [n (vec-count v) m (map-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        m
+        (let [x (vec-nth v i) k (keyfn x)]
+          (do (if (contains-key? m k)
+                (vec-conj! (map-get m k) x)
+                (map-assoc! m k (let [g (vec-make n)] (vec-conj! g x) g)))
+              (recur (+ i 1))))))))
 "#;
 
 /// An **in-guest CBOR decoder** (subset) written in the kotoba-clj language,

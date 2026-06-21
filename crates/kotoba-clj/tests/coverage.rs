@@ -247,3 +247,88 @@ fn if_some_when_some() {
     // when-some on non-nil runs the body
     assert_eq!(eval("(when-some [x 5] (+ x 1))"), 6);
 }
+
+// ---- strings ---------------------------------------------------------------
+
+#[test]
+fn str_cat_and_subs() {
+    assert_eq!(eval("(str-eq? (str-cat \"ab\" \"cd\") \"abcd\")"), 1);
+    assert_eq!(eval("(str-len (str-cat \"ab\" \"cd\"))"), 4);
+    assert_eq!(eval("(str-eq? (subs \"hello\" 1 4) \"ell\")"), 1);
+    assert_eq!(eval("(str-eq? (subs \"hello\" 2) \"llo\")"), 1);
+}
+
+#[test]
+fn str_predicates() {
+    assert_eq!(eval("(str-starts-with? \"hello\" \"he\")"), 1);
+    assert_eq!(eval("(str-starts-with? \"hello\" \"lo\")"), 0);
+    assert_eq!(eval("(str-includes? \"hello\" \"ell\")"), 1);
+    assert_eq!(eval("(str-includes? \"hello\" \"xyz\")"), 0);
+}
+
+#[test]
+fn str_join_strings() {
+    assert_eq!(
+        eval("(str-eq? (str-join \", \" (vector \"a\" \"b\" \"c\")) \"a, b, c\")"),
+        1
+    );
+    // single element: no separator
+    assert_eq!(eval("(str-eq? (str-join \"-\" (vector \"x\")) \"x\")"), 1);
+}
+
+#[test]
+fn str_int_render() {
+    assert_eq!(eval("(str-eq? (str-int 123) \"123\")"), 1);
+    assert_eq!(eval("(str-eq? (str-int -45) \"-45\")"), 1);
+    assert_eq!(eval("(str-eq? (str-int 0) \"0\")"), 1);
+    // composition: "n=" + str-int
+    assert_eq!(eval("(str-eq? (str-cat \"n=\" (str-int 7)) \"n=7\")"), 1);
+}
+
+// ---- 2-pass / pre-sized collections ----------------------------------------
+
+#[test]
+fn mapcat_concats_results() {
+    // (mapcat (fn [x] [x x]) [1 2 3]) -> [1 1 2 2 3 3], sum 12
+    assert_eq!(
+        eval(&format!(
+            "(reduce {SUMV} 0 (mapcat (fn [x] (vector x x)) (vector 1 2 3)))"
+        )),
+        12
+    );
+    assert_eq!(
+        eval("(vec-count (mapcat (fn [x] (vector x x)) (vector 1 2 3)))"),
+        6
+    );
+}
+
+#[test]
+fn frequencies_string_keyed() {
+    assert_eq!(
+        eval("(map-get (frequencies (vector \"a\" \"b\" \"a\" \"a\")) \"a\")"),
+        3
+    );
+    assert_eq!(
+        eval("(map-get (frequencies (vector \"a\" \"b\" \"a\" \"a\")) \"b\")"),
+        1
+    );
+}
+
+#[test]
+fn group_by_parity() {
+    // group 1..6 by even/odd; "e" group is {2,4,6} -> count 3, sum 12
+    assert_eq!(
+        eval(
+            "(vec-count (map-get (group-by (fn [x] (if (even? x) \"e\" \"o\"))
+                                           (vector 1 2 3 4 5 6)) \"e\"))"
+        ),
+        3
+    );
+    assert_eq!(
+        eval(&format!(
+            "(reduce {SUMV} 0 (map-get (group-by (fn [x] (if (even? x) \"e\" \"o\"))
+                                                 (vector 1 2 3 4 5 6)) \"e\"))"
+        )),
+        12
+    );
+}
