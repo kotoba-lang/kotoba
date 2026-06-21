@@ -38,33 +38,37 @@ struct TestServerEnvGuard {
     previous_ipfs: Option<std::ffi::OsString>,
     previous_store_path: Option<std::ffi::OsString>,
     previous_write_cost: Option<std::ffi::OsString>,
+    previous_read_cost: Option<std::ffi::OsString>,
     previous_credit_limit: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TestServerEnvGuard {
-    /// Sets the base server env and, when `econ` is given, the ENGI (縁起)
-    /// write-fee env (`write_cost`, `credit_limit`) inside the same locked
-    /// window. `Engi::from_env` caches these at `KotobaState::new`, so they must
-    /// be live during construction; restoring them on drop keeps the global env
-    /// clean for parallel tests.
+    /// Sets the base server env and, when `econ` is given, the ENGI (縁起) fee env
+    /// (`write_cost`, `read_cost`, `credit_limit`) inside the same locked window.
+    /// `Engi::from_env` caches these at `KotobaState::new`, so they must be live
+    /// during construction; restoring them on drop keeps the global env clean for
+    /// parallel tests.
     fn apply_with_econ(
         store_path: Option<&std::path::Path>,
-        econ: Option<(i64, i64)>,
+        econ: Option<(i64, i64, i64)>,
     ) -> Self {
         static TEST_SERVER_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let lock = TEST_SERVER_ENV_MUTEX.lock().expect("test server env mutex");
         let previous_ipfs = std::env::var_os("KOTOBA_IPFS");
         let previous_store_path = std::env::var_os("KOTOBA_STORE_PATH");
         let previous_write_cost = std::env::var_os("KOTOBA_WRITE_COST_EN");
+        let previous_read_cost = std::env::var_os("KOTOBA_READ_COST_EN");
         let previous_credit_limit = std::env::var_os("KOTOBA_CREDIT_LIMIT_EN");
         match econ {
-            Some((write_cost, credit_limit)) => {
+            Some((write_cost, read_cost, credit_limit)) => {
                 std::env::set_var("KOTOBA_WRITE_COST_EN", write_cost.to_string());
+                std::env::set_var("KOTOBA_READ_COST_EN", read_cost.to_string());
                 std::env::set_var("KOTOBA_CREDIT_LIMIT_EN", credit_limit.to_string());
             }
             None => {
                 std::env::remove_var("KOTOBA_WRITE_COST_EN");
+                std::env::remove_var("KOTOBA_READ_COST_EN");
                 std::env::remove_var("KOTOBA_CREDIT_LIMIT_EN");
             }
         }
@@ -85,6 +89,7 @@ impl TestServerEnvGuard {
             previous_ipfs,
             previous_store_path,
             previous_write_cost,
+            previous_read_cost,
             previous_credit_limit,
             _lock: lock,
         }
@@ -104,6 +109,10 @@ impl Drop for TestServerEnvGuard {
         match self.previous_write_cost.take() {
             Some(value) => std::env::set_var("KOTOBA_WRITE_COST_EN", value),
             None => std::env::remove_var("KOTOBA_WRITE_COST_EN"),
+        }
+        match self.previous_read_cost.take() {
+            Some(value) => std::env::set_var("KOTOBA_READ_COST_EN", value),
+            None => std::env::remove_var("KOTOBA_READ_COST_EN"),
         }
         match self.previous_credit_limit.take() {
             Some(value) => std::env::set_var("KOTOBA_CREDIT_LIMIT_EN", value),
@@ -131,7 +140,13 @@ impl TestServer {
     /// Start a server with the ENGI write-fee gate enabled: `write_cost` EN per
     /// datom and a default per-agent `credit_limit` (max negative balance).
     async fn start_with_econ(with_inference: bool, write_cost: i64, credit_limit: i64) -> Self {
-        Self::start_inner(with_inference, false, None, Some((write_cost, credit_limit))).await
+        Self::start_inner(with_inference, false, None, Some((write_cost, 0, credit_limit))).await
+    }
+
+    /// Start a server with the ENGI read-fee gate enabled: `read_cost` EN per
+    /// read and a default per-agent `credit_limit`. Write fee is left off.
+    async fn start_with_econ_read(with_inference: bool, read_cost: i64, credit_limit: i64) -> Self {
+        Self::start_inner(with_inference, false, None, Some((0, read_cost, credit_limit))).await
     }
 
     #[cfg(feature = "wasm-runtime")]
@@ -146,7 +161,7 @@ impl TestServer {
         with_inference: bool,
         with_crypto: bool,
         store_path: Option<&std::path::Path>,
-        econ: Option<(i64, i64)>,
+        econ: Option<(i64, i64, i64)>,
     ) -> Self {
         let engine = if with_inference {
             Some(stub_engine())
@@ -4153,6 +4168,86 @@ async fn datomic_transact_engi_write_fee_charges_blocks_and_refunds() {
         s.state.engi.balance(&writer).await,
         bal_pre,
         "a failed commit must refund the fee (balance unchanged)"
+    );
+    assert!(s.state.engi.ledger().await.is_balanced());
+}
+
+/// Symmetric to the write-fee e2e: proves the ENGI read fee is wired into the
+/// live `datomic.q` handler. A CACAO-identified reader with no credit headroom
+/// is blocked with 402 (and not debited); once granted EN the read succeeds and
+/// debits the per-read fee, keeping the ledger net-zero. The read cost is read
+/// off the observed balance delta, not hard-coded.
+#[tokio::test]
+async fn datomic_q_engi_read_fee_charges_reader_and_blocks_when_broke() {
+    // read_cost = 5 EN/read; default credit_limit = 0 → a non-operator reader
+    // has no headroom until granted EN. Write fee is left off (read path only).
+    let s = TestServer::start_with_econ_read(false, 5, 0).await;
+    assert_eq!(s.state.engi.read_cost(), 5, "read fee must be on");
+    let graph =
+        kotoba_core::cid::KotobaCid::from_bytes(b"datomic-engi-read-fee-e2e").to_multibase();
+    let reader = cacao_signer_did();
+
+    // Seed a datom as the operator (operator reads/writes are free self-transfers).
+    let optok = tenant_jwt(&s.operator_did);
+    let (status, seed) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+            json!({
+                "graph": graph,
+                "tx_edn": r#"[{:db/id "alice" :person/name "Alice"}]"#
+            }),
+            &optok,
+        )
+        .await;
+    assert_eq!(status, 200, "seed write should commit: {seed}");
+    // Owner-bind the graph to the reader DID so its self-signed read CACAO is honoured.
+    s.register_private_graph(&graph).await;
+
+    let read_cacao = |nonce: &str| {
+        build_ed25519_cacao_for_operation(
+            &graph,
+            &s.operator_did,
+            kotoba_auth::CacaoPayload::OP_DATOM_READ,
+            nonce,
+        )
+    };
+    let query = r#"{:find [?name] :where [[?e :person/name ?name]]}"#;
+
+    // ── block: broke reader is rejected with 402, no debit ────────────────────
+    let (status, body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
+            json!({ "graph": graph, "query_edn": query, "cacao_b64": read_cacao("nonce-read-broke") }),
+        )
+        .await;
+    assert_eq!(status, 402, "broke reader must be payment-required: {body}");
+    assert!(
+        body.as_str().unwrap_or_default().contains("insufficient EN credit"),
+        "402 body should explain the EN shortfall: {body}"
+    );
+    assert_eq!(
+        s.state.engi.balance(&reader).await,
+        0,
+        "a rejected read must not debit the reader"
+    );
+    assert!(s.state.engi.ledger().await.is_balanced());
+
+    // ── charge: granted EN, the read succeeds and debits the per-read fee ─────
+    s.state.engi.credit(&reader, 100).await;
+    let (status, body) = s
+        .post(
+            "/xrpc/com.etzhayyim.apps.kotoba.datomic.q",
+            json!({ "graph": graph, "query_edn": query, "cacao_b64": read_cacao("nonce-read-charge") }),
+        )
+        .await;
+    assert_eq!(status, 200, "funded reader should read: {body}");
+    assert_eq!(body["rows_edn"], json!([["\"Alice\""]]), "{body}");
+    let bal = s.state.engi.balance(&reader).await;
+    assert_eq!(bal, 100 - s.state.engi.read_cost(), "reader debited exactly the read fee");
+    assert_eq!(
+        s.state.engi.balance(&reader).await + s.state.engi.balance(&s.operator_did).await,
+        0,
+        "reader + operator balances must sum to zero (mutual credit)"
     );
     assert!(s.state.engi.ledger().await.is_balanced());
 }
