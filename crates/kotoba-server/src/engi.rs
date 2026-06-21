@@ -59,6 +59,15 @@ pub const RECOMMENDED_WRITE_COST_EN: i64 = 10;
 /// agent may spend down to `-DEFAULT_CREDIT_LIMIT_EN` before it must earn EN.
 pub const DEFAULT_CREDIT_LIMIT_EN: i64 = 1_000_000;
 
+/// Reputation→credit conversion: mKOTO of **staked attestation reputation** that
+/// grant **1 EN** of additional write credit. Chosen so the self-attestation
+/// floor (`MIN_STAKE_SELF_ATTESTED` = 1,000 KOTO = 1e9 mKOTO) maps to exactly
+/// `DEFAULT_CREDIT_LIMIT_EN`, and a verified-entity stake (5,000 KOTO) to 5×
+/// that. The stake is a reputation signal (an attestation Datom), **not** an EN
+/// transfer — it never moves balances, only widens how far the staked DID may
+/// go into credit. Higher reputation ⇒ more write headroom before a 402.
+pub const STAKE_MKOTO_PER_CREDIT_EN: u64 = 1_000;
+
 /// Snapshot of the ledger's accounting at a point in time.
 ///
 /// Invariant for a correctly-functioning mutual-credit ledger: `net == 0`.
@@ -209,6 +218,33 @@ impl Engi {
         let snapshot = Self::persisted(&g);
         drop(g);
         self.persist(snapshot);
+    }
+
+    /// The credit limit (in EN) earned by a staked attestation reputation of
+    /// `stake_mkoto`. Scales linearly at [`STAKE_MKOTO_PER_CREDIT_EN`] and is
+    /// floored at [`DEFAULT_CREDIT_LIMIT_EN`] so a staked DID never gets *less*
+    /// headroom than an unstaked one. Saturates rather than overflowing on an
+    /// absurd stake.
+    pub fn credit_limit_for_stake(stake_mkoto: u64) -> i64 {
+        let derived = (stake_mkoto / STAKE_MKOTO_PER_CREDIT_EN).min(i64::MAX as u64) as i64;
+        derived.max(DEFAULT_CREDIT_LIMIT_EN)
+    }
+
+    /// Wire a staked attestation into the ledger: raise `did`'s credit limit to
+    /// reflect `stake_mkoto`, **monotonically** — a new (or smaller) attestation
+    /// never claws back headroom the DID already earned, so reputation only
+    /// accrues. Returns the effective limit. This is the reputation → write-
+    /// headroom link the spam bound was designed around (a fresh agent gets the
+    /// default; a staked one earns more before hitting a 402). No EN moves.
+    pub async fn raise_credit_limit_for_stake(&self, did: &str, stake_mkoto: u64) -> i64 {
+        let derived = Self::credit_limit_for_stake(stake_mkoto);
+        let mut g = self.inner.write().await;
+        let new = self.limit_for(&g, did).max(derived);
+        g.limits.insert(did.to_string(), new);
+        let snapshot = Self::persisted(&g);
+        drop(g);
+        self.persist(snapshot);
+        new
     }
 
     fn limit_for(&self, g: &Inner, did: &str) -> i64 {
@@ -500,6 +536,58 @@ mod tests {
         // vip can now spend down to -5000.
         assert_eq!(e.charge("did:key:vip", 5000).await, Ok(-5000));
         assert_eq!(e.charge("did:key:vip", 1).await, Err((1, 0)));
+    }
+
+    #[test]
+    fn credit_limit_for_stake_floors_at_default_and_scales() {
+        // Self-attest floor (1,000 KOTO = 1e9 mKOTO) maps to exactly the default.
+        assert_eq!(
+            Engi::credit_limit_for_stake(1_000 * 1_000_000),
+            DEFAULT_CREDIT_LIMIT_EN
+        );
+        // Verified-entity stake (5,000 KOTO) → 5× the default.
+        assert_eq!(
+            Engi::credit_limit_for_stake(5_000 * 1_000_000),
+            5 * DEFAULT_CREDIT_LIMIT_EN
+        );
+        // Below the floor (or zero stake) still yields the default, never less.
+        assert_eq!(Engi::credit_limit_for_stake(0), DEFAULT_CREDIT_LIMIT_EN);
+        // A huge stake scales up without overflowing into a negative i64.
+        let huge = Engi::credit_limit_for_stake(u64::MAX);
+        assert!(huge > 5 * DEFAULT_CREDIT_LIMIT_EN && huge > 0);
+    }
+
+    #[tokio::test]
+    async fn raise_credit_limit_for_stake_is_monotonic_and_widens_headroom() {
+        // Use the production default so the floor matches the wired behaviour
+        // (the `engi()` helper hard-codes a tiny 1000 default for other tests).
+        let e = Arc::new(Engi {
+            write_cost: 10,
+            read_cost: 0,
+            operator_did: "did:key:op".to_string(),
+            default_credit_limit: DEFAULT_CREDIT_LIMIT_EN,
+            inner: RwLock::new(Inner::default()),
+            persist_path: None,
+        });
+        let agent = "did:key:agent";
+        // Default headroom: can spend to -1_000_000, the 1_000_001st EN blocks.
+        assert_eq!(e.credit_limit(agent).await, DEFAULT_CREDIT_LIMIT_EN);
+
+        // A verified-entity stake lifts the limit to 5× the default.
+        let limit = e.raise_credit_limit_for_stake(agent, 5_000 * 1_000_000).await;
+        assert_eq!(limit, 5 * DEFAULT_CREDIT_LIMIT_EN);
+        assert_eq!(e.credit_limit(agent).await, 5 * DEFAULT_CREDIT_LIMIT_EN);
+        // The widened headroom is real: a charge that would exceed the default
+        // now succeeds, and net-zero still holds.
+        assert_eq!(
+            e.charge(agent, 5 * DEFAULT_CREDIT_LIMIT_EN).await,
+            Ok(-5 * DEFAULT_CREDIT_LIMIT_EN)
+        );
+        assert!(e.ledger().await.is_balanced());
+
+        // A later, smaller attestation never claws back earned headroom.
+        let after = e.raise_credit_limit_for_stake(agent, 1_000 * 1_000_000).await;
+        assert_eq!(after, 5 * DEFAULT_CREDIT_LIMIT_EN, "reputation only accrues");
     }
 
     #[tokio::test]

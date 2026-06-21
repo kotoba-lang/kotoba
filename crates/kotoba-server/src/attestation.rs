@@ -477,6 +477,9 @@ pub struct AttestClaimResp {
     pub ipns_name: String,
     /// Monotonic IPNS sequence for the attestation graph head.
     pub ipns_sequence: u64,
+    /// ENGI write-credit limit (in EN) the attested entity now holds — the
+    /// staked reputation widens how far it may go into credit before a 402.
+    pub credit_limit_en: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -723,12 +726,22 @@ pub async fn attest_claim(
         }
     };
 
+    // Reputation → write headroom: the now-recorded stake widens how far the
+    // attested entity may go into ENGI credit before a 402 (monotonic — a stake
+    // never lowers an existing limit). Done after the commit so a failed claim
+    // grants no headroom. No EN moves; this only sets the entity's credit limit.
+    let credit_limit_en = state
+        .engi
+        .raise_credit_limit_for_stake(&req.entity_did, req.stake_mkoto)
+        .await;
+
     let claim_cid_str = claim_cid.to_multibase();
     tracing::info!(
         entity_did = %req.entity_did,
         attester_did = %req.attester_did,
         claim_type = %req.claim_type,
         stake_mkoto = req.stake_mkoto,
+        credit_limit_en,
         claim_cid = %claim_cid_str,
         "attestation claim recorded"
     );
@@ -746,6 +759,7 @@ pub async fn attest_claim(
             commit_cid: distributed.commit_cid,
             ipns_name: distributed.ipns_name,
             ipns_sequence: distributed.ipns_sequence,
+            credit_limit_en,
         }),
     )
         .into_response()
@@ -1346,6 +1360,50 @@ mod tests {
             datom.a == ":capability/proofFormat"
                 && datom.v == kotoba_edn::EdnValue::string("W3C VerifiablePresentation")
         }));
+    }
+
+    #[tokio::test]
+    async fn attest_claim_raises_engi_credit_limit_from_stake() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+        let graph = attest_graph_cid();
+        let entity = "did:plc:stakedentity";
+
+        // Before any attestation the entity has only the default write headroom.
+        assert_eq!(
+            state.engi.credit_limit(entity).await,
+            crate::engi::DEFAULT_CREDIT_LIMIT_EN
+        );
+
+        let response = attest_claim(
+            State(Arc::clone(&state)),
+            HeaderMap::new(),
+            Json(AttestClaimReq {
+                entity_did: entity.into(),
+                claim_type: "verified_entity".into(),
+                attester_did: state.operator_did.clone(),
+                stake_mkoto: MIN_STAKE_VERIFIED_ENTITY,
+                evidence: None,
+                cacao_b64: None,
+                auth_presentation: Some(signed_capability_presentation(
+                    &state,
+                    &graph,
+                    kotoba_auth::CacaoPayload::OP_VC_ISSUE,
+                    "attest.claim",
+                )),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // The verified-entity stake (5,000 KOTO) widened the entity's ENGI
+        // credit limit to 5× the default — reputation now buys write headroom.
+        assert_eq!(
+            state.engi.credit_limit(entity).await,
+            5 * crate::engi::DEFAULT_CREDIT_LIMIT_EN
+        );
     }
 
     #[test]
