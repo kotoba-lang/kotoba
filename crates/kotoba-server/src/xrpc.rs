@@ -85,6 +85,12 @@ pub const NSID_AGENT_SYNC_ADV: &str = "com.etzhayyim.apps.kotoba.agent.syncadvan
 pub const NSID_AGENT_SYNC_CLOSE: &str = "com.etzhayyim.apps.kotoba.agent.syncclose";
 pub const NSID_VAULT_PUT: &str = "com.etzhayyim.apps.kotoba.vault.put";
 pub const NSID_VAULT_GET: &str = "com.etzhayyim.apps.kotoba.vault.get";
+/// Canonical ENGI (縁起) ledger NSIDs. The `econ.*` names below are kept as
+/// **deprecated wire-compatible aliases** routed to the same handlers, so
+/// existing clients keep working while new ones migrate to `engi.*`.
+pub const NSID_ENGI_BALANCE: &str = "com.etzhayyim.apps.kotoba.engi.balance";
+pub const NSID_ENGI_CREDIT: &str = "com.etzhayyim.apps.kotoba.engi.credit";
+/// Deprecated aliases (pre-ENGI-rename); prefer `NSID_ENGI_*`.
 pub const NSID_ECON_BALANCE: &str = "com.etzhayyim.apps.kotoba.econ.balance";
 pub const NSID_ECON_CREDIT: &str = "com.etzhayyim.apps.kotoba.econ.credit";
 

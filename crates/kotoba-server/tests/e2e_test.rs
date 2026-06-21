@@ -4334,6 +4334,52 @@ async fn econ_balance_and_credit_endpoints_report_and_grant_en_net_zero() {
     assert_eq!(status, 400, "empty did must be rejected: {e}");
 }
 
+/// The canonical `engi.*` ledger NSIDs route to the same handlers/state as the
+/// deprecated `econ.*` aliases — a credit granted via `engi.credit` is visible
+/// through both `engi.balance` and `econ.balance` (one ledger, two names).
+#[tokio::test]
+async fn engi_ledger_nsid_alias_routes_to_same_handler() {
+    let s = TestServer::start_with_econ(false, 10, 1000).await;
+    let tok = tenant_jwt(&s.operator_did);
+    let did = "did:key:zEngiAliasAgent";
+
+    // Grant via the canonical engi.credit alias.
+    let (status, c) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.engi.credit",
+            json!({ "did": did, "amount": 70 }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "engi.credit alias must route: {c}");
+    assert_eq!(c["balance_en"], 70, "{c}");
+
+    // Read it back via the canonical engi.balance alias.
+    let (status, b) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.engi.balance",
+            json!({ "did": did }),
+            &tok,
+        )
+        .await;
+    assert_eq!(status, 200, "engi.balance alias must route: {b}");
+    assert_eq!(b["balance_en"], 70, "{b}");
+    assert_eq!(b["unit"], "EN", "{b}");
+
+    // The deprecated econ.balance alias sees the same balance (shared ledger).
+    let (_, b2) = s
+        .post_auth(
+            "/xrpc/com.etzhayyim.apps.kotoba.econ.balance",
+            json!({ "did": did }),
+            &tok,
+        )
+        .await;
+    assert_eq!(
+        b2["balance_en"], 70,
+        "econ.* and engi.* must share one ledger: {b2}"
+    );
+}
+
 #[tokio::test]
 async fn datomic_transact_rejects_mismatched_cacao_tx_scope() {
     let s = TestServer::start(false).await;

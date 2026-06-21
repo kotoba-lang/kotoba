@@ -1091,6 +1091,15 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", xrpc::NSID_GRAPH_QUERY),
             get(xrpc::graph_query),
         )
+        // Canonical ENGI ledger routes + deprecated `econ.*` aliases (same handlers).
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_ENGI_BALANCE),
+            post(xrpc::econ_balance),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_ENGI_CREDIT),
+            post(xrpc::econ_credit),
+        )
         .route(
             &format!("/xrpc/{}", xrpc::NSID_ECON_BALANCE),
             post(xrpc::econ_balance),
