@@ -537,3 +537,42 @@ new 16-test `tests/hofs.rs` (map→filter→reduce chains, reader-macro callback
 captured-variable callbacks, `comp`/`partial` returning closures, `range`,
 `some`/`every?`/`keep`, `map-indexed`); clippy clean; no regressions across the
 component/kqe/pregel suites that compile with the now-table-bearing prelude.
+
+---
+
+## Coverage batch — clojure.core stdlib + iteration sugars (2026-06-21)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj` (`tests/coverage.rs`, 16 tests).
+
+Broadens Clojure-language coverage with **no new codegen path or runtime node** —
+everything is either a pure-subset `PRELUDE` function (compiled through the
+existing vec/map + closure-table machinery) or an AST desugar into existing
+special forms.
+
+**New special forms (`ast.rs` desugar):**
+
+| form | desugars to |
+|------|-------------|
+| `(while test body…)` | `(loop [_ 0] (if test (do body… (recur 0)) 0))` |
+| `(dotimes [i n] body…)` | `(let [_n n] (loop [i 0] (if (< i _n) (do body… (recur (+ i 1))) 0)))` |
+| `(doseq [x coll] body…)` | `vec-count`/`vec-nth` walk in a `loop` (single binding; needs the prelude) |
+| `(if-some [x e] t e?)` / `(when-some [x e] body…)` | alias `if-let`/`when-let` (nil≡0≡falsy in the i64 model) |
+
+**New `PRELUDE` fns** (all output containers pre-sized; `vec-conj!`/`map-assoc!`
+never grow): `take` `drop` `take-while` `drop-while` `butlast` `take-last`
+`reverse` `concat` `repeat` `interpose` `interleave` `partition` `vec-contains?`
+`distinct` `sort` `sort-by` `vec-swap!` `merge` `merge-with` `select-keys`
+`zipmap` `get-in` `update` `complement` `juxt` `fnil` `max-key` `min-key`; plus
+`vector` arity extended 4→8.
+
+**Honest limits** (the i64 / mutable-bump model, unchanged): `distinct` /
+`vec-contains?` compare scalars by value but collection/string handles by
+identity; map fns assume **string keys** (the `str-eq?` contract); `sort` is
+O(n²) selection sort; there is still no number tower (i64 only), no lazy seqs,
+no persistent-immutable structures, and no dead-code elimination (every prelude
+fn is emitted, so a prelude-on module grew ~5.5 KB → ~8.7 KB — negligible for
+agents, a DCE target later).
+
+Verification: `cargo test -p kotoba-clj` → **209 passed / 0 failed** (193 prior +
+16 new); a combined end-to-end program (`sort`+`take`+`reduce`+`merge`+`dotimes`)
+runs to the same result on **both** wasmtime and V8.

@@ -973,6 +973,18 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
         "do" => Ok(Expr::Do(
             args.iter().map(lower_expr).collect::<Result<_, _>>()?,
         )),
+        // `(if-some [x e] then else?)` / `(when-some [x e] body…)`: in this
+        // i64/nil-as-0 value model a non-nil value is exactly a truthy value, so
+        // some-binding has the same lowering as the let-binding forms.
+        "if-some" => lower_if_let(args),
+        "when-some" => lower_when_let(args),
+        // Iteration sugars — pure desugaring into `loop`/`recur` (no new runtime
+        // node). They evaluate their body for side effects and yield nil (0).
+        // `doseq` walks a vector via the prelude `vec-count`/`vec-nth`, so it
+        // requires the prelude (the default).
+        "while" => lower_while(args),
+        "dotimes" => lower_dotimes(args),
+        "doseq" => lower_doseq(args),
         "comment" => Ok(Expr::Int(0)),
         name => {
             let lowered: Vec<Expr> = args.iter().map(lower_expr).collect::<Result<_, _>>()?;
@@ -1006,6 +1018,137 @@ fn lower_var(args: &[EdnValue]) -> Result<Expr, CljError> {
             "var requires a symbol, found {other:?}"
         ))),
     }
+}
+
+// ---- desugaring helpers for iteration sugars -------------------------------
+// Each builds an equivalent EDN s-expression out of existing special forms and
+// re-lowers it, so no new AST node or codegen path is introduced.
+
+fn dsym(name: &str) -> EdnValue {
+    EdnValue::Symbol(Symbol {
+        namespace: None,
+        name: name.into(),
+    })
+}
+fn dlist(items: Vec<EdnValue>) -> EdnValue {
+    EdnValue::List(items)
+}
+fn dvec(items: Vec<EdnValue>) -> EdnValue {
+    EdnValue::Vector(items)
+}
+
+/// `(while test body…)` → `(loop [_while 0] (if test (do body… (recur 0)) 0))`.
+fn lower_while(args: &[EdnValue]) -> Result<Expr, CljError> {
+    let test = args
+        .first()
+        .ok_or_else(|| CljError::Lower("while takes: (while test body…)".into()))?
+        .clone();
+    let mut do_items = vec![dsym("do")];
+    do_items.extend(args[1..].iter().cloned());
+    do_items.push(dlist(vec![dsym("recur"), EdnValue::Integer(0)]));
+    let if_form = dlist(vec![dsym("if"), test, dlist(do_items), EdnValue::Integer(0)]);
+    let loop_form = dlist(vec![
+        dsym("loop"),
+        dvec(vec![dsym("_while"), EdnValue::Integer(0)]),
+        if_form,
+    ]);
+    lower_expr(&loop_form)
+}
+
+/// `(dotimes [i n] body…)` →
+/// `(let [_dotimes_n n] (loop [i 0] (if (< i _dotimes_n) (do body… (recur (+ i 1))) 0)))`.
+fn lower_dotimes(args: &[EdnValue]) -> Result<Expr, CljError> {
+    let binding = match args.first() {
+        Some(EdnValue::Vector(v)) if v.len() == 2 => v,
+        _ => {
+            return Err(CljError::Lower(
+                "dotimes takes: (dotimes [i n] body…)".into(),
+            ))
+        }
+    };
+    let i = binding[0].clone();
+    let n = binding[1].clone();
+    let limit = dsym("_dotimes_n");
+    let mut do_items = vec![dsym("do")];
+    do_items.extend(args[1..].iter().cloned());
+    do_items.push(dlist(vec![
+        dsym("recur"),
+        dlist(vec![dsym("+"), i.clone(), EdnValue::Integer(1)]),
+    ]));
+    let if_form = dlist(vec![
+        dsym("if"),
+        dlist(vec![dsym("<"), i.clone(), limit.clone()]),
+        dlist(do_items),
+        EdnValue::Integer(0),
+    ]);
+    let loop_form = dlist(vec![
+        dsym("loop"),
+        dvec(vec![i, EdnValue::Integer(0)]),
+        if_form,
+    ]);
+    let let_form = dlist(vec![dsym("let"), dvec(vec![limit, n]), loop_form]);
+    lower_expr(&let_form)
+}
+
+/// `(doseq [x coll] body…)` →
+/// `(let [_doseq_v coll _doseq_n (vec-count _doseq_v)]
+///    (loop [_doseq_i 0]
+///      (if (< _doseq_i _doseq_n)
+///        (do (let [x (vec-nth _doseq_v _doseq_i)] body…) (recur (+ _doseq_i 1)))
+///        0)))`.
+/// Single-binding only; needs the prelude (`vec-count`/`vec-nth`).
+fn lower_doseq(args: &[EdnValue]) -> Result<Expr, CljError> {
+    let binding = match args.first() {
+        Some(EdnValue::Vector(v)) if v.len() == 2 => v,
+        _ => {
+            return Err(CljError::Lower(
+                "doseq takes a single binding: (doseq [x coll] body…)".into(),
+            ))
+        }
+    };
+    let x = binding[0].clone();
+    let coll = binding[1].clone();
+    let v = dsym("_doseq_v");
+    let n = dsym("_doseq_n");
+    let i = dsym("_doseq_i");
+    let mut inner_let = vec![
+        dsym("let"),
+        dvec(vec![
+            x,
+            dlist(vec![dsym("vec-nth"), v.clone(), i.clone()]),
+        ]),
+    ];
+    inner_let.extend(args[1..].iter().cloned());
+    let do_form = dlist(vec![
+        dsym("do"),
+        dlist(inner_let),
+        dlist(vec![
+            dsym("recur"),
+            dlist(vec![dsym("+"), i.clone(), EdnValue::Integer(1)]),
+        ]),
+    ]);
+    let if_form = dlist(vec![
+        dsym("if"),
+        dlist(vec![dsym("<"), i.clone(), n.clone()]),
+        do_form,
+        EdnValue::Integer(0),
+    ]);
+    let loop_form = dlist(vec![
+        dsym("loop"),
+        dvec(vec![i, EdnValue::Integer(0)]),
+        if_form,
+    ]);
+    let let_form = dlist(vec![
+        dsym("let"),
+        dvec(vec![
+            v.clone(),
+            coll,
+            n,
+            dlist(vec![dsym("vec-count"), v]),
+        ]),
+        loop_form,
+    ]);
+    lower_expr(&let_form)
 }
 
 #[derive(Debug, Clone, Copy)]

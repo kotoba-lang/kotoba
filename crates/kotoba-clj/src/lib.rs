@@ -345,7 +345,22 @@ pub const PRELUDE: &str = r#"
   ([x] (let [v (vec-make 1)] (vec-conj! v x) v))
   ([x y] (let [v (vec-make 2)] (vec-conj! v x) (vec-conj! v y) v))
   ([x y z] (let [v (vec-make 3)] (vec-conj! v x) (vec-conj! v y) (vec-conj! v z) v))
-  ([x y z w] (let [v (vec-make 4)] (vec-conj! v x) (vec-conj! v y) (vec-conj! v z) (vec-conj! v w) v)))
+  ([x y z w] (let [v (vec-make 4)] (vec-conj! v x) (vec-conj! v y) (vec-conj! v z) (vec-conj! v w) v))
+  ([a b c d e]
+   (let [v (vec-make 5)]
+     (vec-conj! v a) (vec-conj! v b) (vec-conj! v c) (vec-conj! v d) (vec-conj! v e) v))
+  ([a b c d e f]
+   (let [v (vec-make 6)]
+     (vec-conj! v a) (vec-conj! v b) (vec-conj! v c) (vec-conj! v d) (vec-conj! v e)
+     (vec-conj! v f) v))
+  ([a b c d e f g]
+   (let [v (vec-make 7)]
+     (vec-conj! v a) (vec-conj! v b) (vec-conj! v c) (vec-conj! v d) (vec-conj! v e)
+     (vec-conj! v f) (vec-conj! v g) v))
+  ([a b c d e f g h]
+   (let [v (vec-make 8)]
+     (vec-conj! v a) (vec-conj! v b) (vec-conj! v c) (vec-conj! v d) (vec-conj! v e)
+     (vec-conj! v f) (vec-conj! v g) (vec-conj! v h) v)))
 (defn hash-map
   ([] (map-make 0))
   ([k v] (let [m (map-make 1)] (map-assoc! m k v) m))
@@ -479,6 +494,189 @@ pub const PRELUDE: &str = r#"
 (defn partial
   ([f a] (fn [x] (f a x)))
   ([f a b] (fn [x] (f a b x))))
+
+;; ---- clojure.core coverage batch ------------------------------------------
+;; All pure-subset, built on the vec/map primitives above. Output vectors are
+;; pre-sized to an exact-or-upper-bound count (vec-conj!/map-assoc! never grow).
+;; Scalar equality (`=`) compares i64 handles, so element-membership fns
+;; (`distinct`, `vec-contains?`) compare by value for ints and by identity for
+;; string/collection handles — exact for the scalar case that dominates agents.
+
+;; --- subsequences -----------------------------------------------------------
+(defn take [n v]
+  (let [c (vec-count v)
+        m (if (< n c) n c)
+        out (vec-make m)]
+    (loop [i 0]
+      (if (>= i m) out (do (vec-conj! out (vec-nth v i)) (recur (+ i 1)))))))
+(defn drop [n v]
+  (let [c (vec-count v)
+        s (if (< n c) (if (< n 0) 0 n) c)
+        out (vec-make (- c s))]
+    (loop [i s]
+      (if (>= i c) out (do (vec-conj! out (vec-nth v i)) (recur (+ i 1)))))))
+(defn take-while [pred v]
+  (let [c (vec-count v) out (vec-make c)]
+    (loop [i 0]
+      (if (>= i c)
+        out
+        (let [x (vec-nth v i)]
+          (if (pred x) (do (vec-conj! out x) (recur (+ i 1))) out))))))
+(defn drop-while [pred v]
+  (let [c (vec-count v)]
+    (loop [i 0]
+      (if (>= i c)
+        (vec-make 0)
+        (if (pred (vec-nth v i)) (recur (+ i 1)) (subvec v i))))))
+(defn butlast [v] (take (- (vec-count v) 1) v))
+(defn take-last [n v] (drop (- (vec-count v) n) v))
+(defn reverse [v]
+  (let [c (vec-count v) out (vec-make c)]
+    (loop [i (- c 1)]
+      (if (< i 0) out (do (vec-conj! out (vec-nth v i)) (recur (- i 1)))))))
+(defn concat [a b]
+  (let [out (vec-make (+ (vec-count a) (vec-count b)))]
+    (vec-extend! out a)
+    (vec-extend! out b)
+    out))
+(defn repeat [n x]
+  (let [out (vec-make n)]
+    (loop [i 0] (if (>= i n) out (do (vec-conj! out x) (recur (+ i 1)))))))
+
+;; --- combining --------------------------------------------------------------
+(defn interpose [sep v]
+  (let [c (vec-count v)
+        out (vec-make (if (= c 0) 0 (- (* 2 c) 1)))]
+    (loop [i 0]
+      (if (>= i c)
+        out
+        (do (if (> i 0) (vec-conj! out sep) 0)
+            (vec-conj! out (vec-nth v i))
+            (recur (+ i 1)))))))
+(defn interleave [a b]
+  (let [ca (vec-count a) cb (vec-count b)
+        m (if (< ca cb) ca cb)
+        out (vec-make (* 2 m))]
+    (loop [i 0]
+      (if (>= i m)
+        out
+        (do (vec-conj! out (vec-nth a i))
+            (vec-conj! out (vec-nth b i))
+            (recur (+ i 1)))))))
+(defn partition [n v]
+  (let [c (vec-count v) k (/ c n) out (vec-make k)]
+    (loop [g 0]
+      (if (>= g k)
+        out
+        (let [seg (vec-make n)]
+          (loop [j 0]
+            (if (>= j n)
+              0
+              (do (vec-conj! seg (vec-nth v (+ (* g n) j))) (recur (+ j 1)))))
+          (do (vec-conj! out seg) (recur (+ g 1))))))))
+
+;; --- membership / dedup (scalar) -------------------------------------------
+(defn vec-contains? [v x]
+  (let [c (vec-count v)]
+    (loop [i 0]
+      (if (>= i c) 0 (if (= (vec-nth v i) x) 1 (recur (+ i 1)))))))
+(defn distinct [v]
+  (let [c (vec-count v) out (vec-make c)]
+    (loop [i 0]
+      (if (>= i c)
+        out
+        (let [x (vec-nth v i)]
+          (do (if (vec-contains? out x) 0 (vec-conj! out x))
+              (recur (+ i 1))))))))
+
+;; --- ordering (selection sort; scalar / key-projected) ---------------------
+(defn vec-swap! [v i j]
+  (let [tmp (vec-nth v i)]
+    (store64! (+ v (* 8 (+ 2 i))) (vec-nth v j))
+    (store64! (+ v (* 8 (+ 2 j))) tmp)
+    v))
+(defn sort [v]
+  (let [n (vec-count v) out (vec-make n)]
+    (vec-extend! out v)
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (do (loop [j (+ i 1)]
+              (if (>= j n)
+                0
+                (do (if (< (vec-nth out j) (vec-nth out i)) (vec-swap! out i j) 0)
+                    (recur (+ j 1)))))
+            (recur (+ i 1)))))))
+(defn sort-by [keyfn v]
+  (let [n (vec-count v) out (vec-make n)]
+    (vec-extend! out v)
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (do (loop [j (+ i 1)]
+              (if (>= j n)
+                0
+                (do (if (< (keyfn (vec-nth out j)) (keyfn (vec-nth out i)))
+                      (vec-swap! out i j)
+                      0)
+                    (recur (+ j 1)))))
+            (recur (+ i 1)))))))
+
+;; --- map (string-keyed) ----------------------------------------------------
+(defn merge [a b]
+  (let [out (map-make (+ (map-count a) (map-count b)))]
+    (loop [i 0]
+      (if (>= i (map-count a))
+        0
+        (do (map-assoc! out (map-key-at a i) (map-val-at a i)) (recur (+ i 1)))))
+    (loop [i 0]
+      (if (>= i (map-count b))
+        out
+        (do (map-assoc! out (map-key-at b i) (map-val-at b i)) (recur (+ i 1)))))))
+(defn merge-with [f a b]
+  (let [out (map-make (+ (map-count a) (map-count b)))]
+    (loop [i 0]
+      (if (>= i (map-count a))
+        0
+        (do (map-assoc! out (map-key-at a i) (map-val-at a i)) (recur (+ i 1)))))
+    (loop [i 0]
+      (if (>= i (map-count b))
+        out
+        (let [k (map-key-at b i) bv (map-val-at b i)]
+          (do (if (contains-key? out k)
+                (map-assoc! out k (f (map-get out k) bv))
+                (map-assoc! out k bv))
+              (recur (+ i 1))))))))
+(defn select-keys [m ks]
+  (let [n (vec-count ks) out (map-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        out
+        (let [k (vec-nth ks i)]
+          (do (if (contains-key? m k) (map-assoc! out k (map-get m k)) 0)
+              (recur (+ i 1))))))))
+(defn zipmap [ks vs]
+  (let [n (vec-count ks) m (map-make n)]
+    (loop [i 0]
+      (if (>= i n)
+        m
+        (do (map-assoc! m (vec-nth ks i) (vec-nth vs i)) (recur (+ i 1)))))))
+(defn get-in [m ks]
+  (let [n (vec-count ks)]
+    (loop [i 0 cur m]
+      (if (>= i n)
+        cur
+        (if (nil? cur) 0 (recur (+ i 1) (map-get cur (vec-nth ks i))))))))
+(defn update [m k f] (map-assoc! m k (f (map-get m k))))
+
+;; --- functional combinators -------------------------------------------------
+(defn complement [f] (fn [x] (if (f x) 0 1)))
+(defn juxt
+  ([f g] (fn [x] (vector (f x) (g x))))
+  ([f g h] (fn [x] (vector (f x) (g x) (h x)))))
+(defn fnil [f d] (fn [x] (f (if (nil? x) d x))))
+(defn max-key [f a b] (if (>= (f a) (f b)) a b))
+(defn min-key [f a b] (if (<= (f a) (f b)) a b))
 "#;
 
 /// An **in-guest CBOR decoder** (subset) written in the kotoba-clj language,
