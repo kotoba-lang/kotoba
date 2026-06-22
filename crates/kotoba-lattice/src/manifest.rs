@@ -507,6 +507,28 @@ mod tests {
     }
 
     #[test]
+    fn scale_zero_and_negative_clamp_to_unsigned() {
+        let src = r#"{:kotoba.app/name "a" :kotoba.app/components
+            [{:name "z" :cid "c0" :scale 0}
+             {:name "n" :cid "cn" :scale -5}]}"#;
+        let app = AppManifest::from_edn(src).unwrap();
+        let d = app.desired_by_cid();
+        assert_eq!(d.get("c0"), Some(&0));
+        assert_eq!(d.get("cn"), Some(&0)); // negative clamped, never wraps to huge u32
+    }
+
+    #[test]
+    fn unicode_names_and_cids_roundtrip() {
+        let src = r#"{:kotoba.app/name "言葉ボット"
+            :kotoba.app/components [{:name "返信器" :cid "bafy言" :scale 2 :requires [:cap/言語]}]}"#;
+        let app = AppManifest::from_edn(src).unwrap();
+        assert_eq!(app.name, "言葉ボット");
+        assert_eq!(app.components[0].name, "返信器");
+        assert!(app.components[0].requires.contains(&"cap/言語".to_string()));
+        assert_eq!(app.desired_by_cid().get("bafy言"), Some(&2));
+    }
+
+    #[test]
     fn empty_components_default_and_scale_default() {
         let app = AppManifest::from_edn(r#"{:kotoba.app/name "a"}"#).unwrap();
         assert!(app.components.is_empty());

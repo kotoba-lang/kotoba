@@ -225,6 +225,47 @@ mod tests {
     }
 
     #[test]
+    fn authorize_resolves_among_many_links_and_isolates_sources() {
+        let mut t = LinkTable::new();
+        t.put(link("l1", "did:A", "cap/llm", "infer"));
+        t.put(link("l2", "did:A", "cap/kqe", "read"));
+        t.put(link("l3", "did:B", "cap/llm", "infer"));
+        assert!(t.authorize("did:A", "cap/kqe", "read").allowed);
+        assert!(t.authorize("did:B", "cap/llm", "infer").allowed);
+        // B was never linked to cap/kqe even though A was
+        assert!(!t.authorize("did:B", "cap/kqe", "read").allowed);
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn put_same_id_replaces_the_link() {
+        let mut t = LinkTable::new();
+        t.put(link("l1", "did:A", "cap/llm", "infer"));
+        // same id, narrowed to a different ability → old grant must be gone
+        t.put(link("l1", "did:A", "cap/llm", "train"));
+        assert!(!t.authorize("did:A", "cap/llm", "infer").allowed);
+        assert!(t.authorize("did:A", "cap/llm", "train").allowed);
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn remove_returns_link_and_unknown_is_none() {
+        let mut t = LinkTable::new();
+        t.put(link("l1", "did:A", "cap/llm", "infer"));
+        assert!(t.remove("nope").is_none());
+        assert_eq!(t.remove("l1").map(|l| l.id), Some("l1".to_string()));
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn route_capability_with_empty_fleet_is_unavailable() {
+        let local = hb("did:self", &["cap/kqe"], 100);
+        assert_eq!(route_capability("cap/llm", &local, &[]), ProviderRoute::Unavailable);
+        // but a cap the local node itself supplies is still Local with no fleet
+        assert_eq!(route_capability("cap/kqe", &local, &[]), ProviderRoute::Local);
+    }
+
+    #[test]
     fn link_table_len_is_empty_iter() {
         let mut t = LinkTable::new();
         assert!(t.is_empty() && t.len() == 0);

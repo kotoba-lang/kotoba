@@ -179,4 +179,42 @@ mod tests {
         let app = AppManifest::from_edn(APP).unwrap();
         assert_eq!(app_to_quads(&app, &BTreeMap::new()), app_to_quads(&app, &BTreeMap::new()));
     }
+
+    fn q(s: &str, p: &str, o: &str) -> ControlQuad {
+        ControlQuad { subject: s.into(), predicate: p.into(), object: o.into() }
+    }
+
+    #[test]
+    fn malformed_label_datom_is_ignored() {
+        let quads = vec![
+            q("s", pred::CID, "bafyX"),
+            q("s", pred::LABEL, "no-equals-sign"), // malformed → dropped, no panic
+            q("s", pred::LABEL, "tier=edge"),
+        ];
+        let (d, c) = desired_from_quads(&quads);
+        assert_eq!(d.get("bafyX"), Some(&1)); // scale defaults to 1
+        assert_eq!(c["bafyX"].require_labels.len(), 1);
+        assert_eq!(c["bafyX"].require_labels.get("tier").map(|s| s.as_str()), Some("edge"));
+    }
+
+    #[test]
+    fn non_numeric_scale_defaults_to_one() {
+        let quads = vec![q("s", pred::CID, "bafyX"), q("s", pred::SCALE, "abc")];
+        let (d, _) = desired_from_quads(&quads);
+        assert_eq!(d.get("bafyX"), Some(&1));
+    }
+
+    #[test]
+    fn empty_quads_yield_empty_desired() {
+        let (d, c) = desired_from_quads(&[]);
+        assert!(d.is_empty() && c.is_empty());
+    }
+
+    #[test]
+    fn label_value_with_embedded_equals_keeps_first_split() {
+        // split_once('=') → key before first '=', value is the remainder
+        let quads = vec![q("s", pred::CID, "bafyX"), q("s", pred::LABEL, "url=https://x/y=z")];
+        let (_, c) = desired_from_quads(&quads);
+        assert_eq!(c["bafyX"].require_labels.get("url").map(|s| s.as_str()), Some("https://x/y=z"));
+    }
 }
