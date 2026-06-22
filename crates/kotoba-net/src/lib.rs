@@ -1,6 +1,7 @@
 pub mod behaviour;
 pub mod bitswap;
 pub mod gossipsub;
+pub mod lattice;
 pub mod pregel_msg;
 pub mod protocol;
 pub mod swarm;

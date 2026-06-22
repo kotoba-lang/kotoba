@@ -7,17 +7,33 @@ There is **no central control plane to deploy** (no NATS, no k8s control plane).
 A node *is* `kotoba serve`; the lattice self-forms over libp2p gossipsub. This is
 the no-central-master invariant (CLAUDE.md) carried into hosting.
 
-## Status (M1)
+## Status (M1 + M2)
 
-Implemented now (`kotoba-lattice` crate, pure control-plane core):
+Implemented now:
 
-- `protocol` — gossipsub message types + reserved topics + deterministic auction ids
-- `manifest` — EDN app manifest parser (Clojure-default components, ADR §14)
-- `reconcile` — leader-less reconcile + auction scoring + deterministic award
+- `kotoba-lattice` (pure control-plane core):
+  - `protocol` — gossipsub message types + reserved topics + deterministic auction ids
+  - `manifest` — EDN app manifest parser (Clojure-default components, ADR §14)
+  - `reconcile` — leader-less reconcile + auction scoring + deterministic award
+  - `node` — stateful `LatticeController`: fleet tracking (heartbeat TTL) + the
+    continuous tick→auction→bid→award→place loop + **self-healing** on node loss,
+    behind a transport-agnostic `Transport` trait
+- `kotoba-net::lattice` (M2 gossipsub binding):
+  - `subscribe_lattice` (5 control topics) + `decode_lattice` + `impl Transport
+    for KotobaSwarm` — the swarm IS a lattice transport (no NATS, no central broker)
 
-Wiring to gossipsub (`kotoba-net`), the WASM host (`kotoba-runtime`), and CLI
-(`kotoba-cli`) is the next milestone (ADR §12 M2–M4). Until then, the control
-loop is verifiable via `cargo run -p kotoba-lattice --example mesh_reconcile`.
+Verify without a cluster:
+
+```bash
+cargo run -p kotoba-lattice --example mesh_reconcile   # one-shot placement
+cargo run -p kotoba-lattice --example mesh_node        # control loop + self-heal
+cargo test -p kotoba-lattice                            # 22 tests
+cargo test -p kotoba-net --lib lattice                  # gossipsub binding
+```
+
+Remaining (ADR §12 M3–M4): run the loop inside the `kotoba-server` swarm event
+loop, compile `.clj` → component CID on deploy (`kotoba-clj`), and the
+`kotoba app` / `kotoba lattice` CLI subcommands.
 
 ## Node roles
 

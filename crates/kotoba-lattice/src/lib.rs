@@ -24,11 +24,13 @@
 
 pub mod error;
 pub mod manifest;
+pub mod node;
 pub mod protocol;
 pub mod reconcile;
 
 pub use error::LatticeError;
 pub use manifest::{AppManifest, ComponentSpec, Lang, LinkSpec, Placement, TriggerSpec};
+pub use node::{LatticeController, RecordingTransport, Transport};
 pub use protocol::{
     topic, Auction, Award, Bid, Constraints, Heartbeat, LatticeMessage, Link, NodeRole,
 };

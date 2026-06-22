@@ -17,4 +17,7 @@ pub enum LatticeError {
 
     #[error("unknown component language: {0}")]
     UnknownLang(String),
+
+    #[error("transport error: {0}")]
+    Transport(String),
 }

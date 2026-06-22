@@ -137,8 +137,11 @@ pub enum LatticeMessage {
     Auction(Auction),
     Bid(Bid),
     Award(Award),
-    /// Place `count` instances of `cid` on the receiving node, with `links`.
+    /// Place `count` instances of `cid` on node `node_did`, with `links`.
+    /// Carries the target node DID because the lattice is a broadcast bus
+    /// (gossipsub): the addressed node acts, others ignore.
     StartComponent {
+        node_did: String,
         cid: String,
         count: u32,
         #[serde(default)]

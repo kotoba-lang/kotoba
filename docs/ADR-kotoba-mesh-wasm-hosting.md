@@ -314,9 +314,9 @@ kotoba link put  --source <did> --target cap/llm --cacao <b64>
 - `kotoba-cli` 拡張 — `component / app / lattice / link` サブコマンド。
 
 **ロードマップ（MVP→拡張）**:
-1. **M1 単一ノード host**: `kotoba:mesh` world + HTTP trigger + CID から component 起動（auction なし、手動 start）。Spin 相当の最小形。
-2. **M2 lattice**: Heartbeat/Inventory を gossipsub に流し `kotoba lattice ps`。
-3. **M3 auction 配置**: `AuctionReq/Bid/Award` + StartComponent。マルチノード自動配置。
+1. **M1 単一ノード host**: `kotoba:mesh` world + HTTP trigger + CID から component 起動（auction なし、手動 start）。Spin 相当の最小形。 ✅ 制御面コア実装済(`kotoba-lattice`: protocol/manifest/reconcile)
+2. **M2 lattice + auction loop** ✅: ステートフル `LatticeController`（fleet TTL + tick→auction→bid→award→place + 自己修復）+ `kotoba-net::lattice` gossipsub バインディング（`subscribe_lattice`/`decode_lattice`/`impl Transport for KotobaSwarm`）。`Heartbeat/Auction/Bid/Award/StartComponent` を gossipsub に配線。
+3. **M3 server 統合**: 上記ループを `kotoba-server` の swarm event loop 内で駆動 + StartComponent → WasmExecutor 配備。
 4. **M4 wadm**: `kotoba.app.edn` deploy + reconciler self-healing。wasmCloud 相当。
 5. **M5 link/mesh policy + out-of-proc provider**: CACAO link を実行時 gate、wRPC 転送。
 6. **M6 datom-Δ / room trigger**: kotoba 固有のデータ駆動・リアルタイム配備。
