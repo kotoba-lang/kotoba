@@ -70,6 +70,56 @@ fn set_literal_value_compiles() {
 }
 
 #[test]
+fn input_axes_from_held() {
+    // kami.input/axes-from-held: an axis value from key-set bindings (pos/neg as #{…})
+    // against the held-key set. Exercises get-in + nested set membership + subtraction.
+    assert_eq!(
+        eval(
+            "(let [imap {:axes {:MoveX {:pos #{:d :right} :neg #{:a :left}}}}
+                   held #{:d}
+                   in? (fn [coll x] (if (some (fn [e] (= e x)) coll) 1 0))
+                   any? (fn [ks] (if (some (fn [k] (= 1 (in? held k))) ks) 1 0))
+                   axis (fn [ax] (- (any? (get-in imap [:axes ax :pos]))
+                                    (any? (get-in imap [:axes ax :neg]))))]
+               (axis :MoveX))" // :d held, in :pos → +1, none in :neg → 1
+        ),
+        1
+    );
+}
+
+#[test]
+fn netsync_interp_lerps_fields() {
+    // kami.netsync/interp: blend an entity toward a target. reduce-kv + assoc + integer
+    // lerp (percent t) — the per-field interpolation, as data.
+    assert_eq!(
+        eval(
+            "(let [ent {:x 0 :hp 100}
+                   target {:x 10 :hp 50}
+                   lerped (reduce-kv (fn [acc k v]
+                                       (assoc acc k (+ v (quot (* (- (get target k) v) 50) 100))))
+                                     ent ent)]
+               (+ (get lerped :x) (get lerped :hp)))" // x:0+5=5, hp:100-25=75 → 80
+        ),
+        80
+    );
+}
+
+#[test]
+fn level_zone_membership() {
+    // kami.level/in-zone?: get-in for the zone center/radius + a squared-distance test.
+    assert_eq!(
+        eval(
+            "(let [lvl {:zone {:center [0 0] :radius 100}}
+                   r (get-in lvl [:zone :radius])
+                   cx (nth (get-in lvl [:zone :center]) 0)
+                   in? (fn [x y] (if (<= (+ (* (- x cx) (- x cx)) (* y y)) (* r r)) 1 0))]
+               (+ (in? 50 0) (* 10 (in? 200 0))))" // inside(1) + 10*outside(0) = 1
+        ),
+        1
+    );
+}
+
+#[test]
 fn netsync_snapshot_drops_unsynced() {
     // kami.netsync/snapshot: select only the schema's synced fields from an entity map
     assert_eq!(
