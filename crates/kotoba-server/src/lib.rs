@@ -40,6 +40,7 @@ pub mod nonce_store;
 pub mod pds_session;
 pub mod pds_xrpc;
 pub mod pre_proxy;
+pub mod rate_limit;
 pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
@@ -57,7 +58,39 @@ use axum::{
 use std::sync::Arc;
 
 use crate::server::KotobaState;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+/// CORS policy from `KOTOBA_CORS_ALLOW_ORIGINS` (comma-separated origins, or
+/// `*` for any). Unset/empty → no CORS layer, so browsers apply same-origin by
+/// default (the safe posture behind a CF Worker that owns CORS).
+fn cors_from_env() -> Option<CorsLayer> {
+    let raw = std::env::var("KOTOBA_CORS_ALLOW_ORIGINS").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let origin = if raw == "*" {
+        AllowOrigin::any()
+    } else {
+        let origins: Vec<_> = raw
+            .split(',')
+            .filter_map(|o| o.trim().parse::<axum::http::HeaderValue>().ok())
+            .collect();
+        if origins.is_empty() {
+            return None;
+        }
+        AllowOrigin::list(origins)
+    };
+    tracing::info!(policy = %raw, "CORS enabled");
+    Some(
+        CorsLayer::new()
+            .allow_origin(origin)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1015,7 +1048,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             Err(e) => tracing::warn!(path, error = %e, "KOTOBA_RT_KGE_COMPONENT unreadable"),
         }
     }
-    Router::new()
+    let mut app = Router::new()
         .route("/_app/meta", get(xrpc::health))
         .route(
             &format!("/xrpc/{}", access_receipt::NSID_AUDIT_LIST),
@@ -1615,8 +1648,22 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             Arc::clone(&state),
             fingerprint::fingerprint_middleware,
         ))
-        .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    // Edge hardening (b). All opt-in via env so the default deployment is
+    // behaviourally unchanged. Each layer wraps the previous; the rate limiter
+    // is applied last so it sheds load before any handler work, and TraceLayer
+    // is outermost so even rejected requests are logged.
+    if let Some(cors) = cors_from_env() {
+        app = app.layer(cors);
+    }
+    if let Some(limiter) = rate_limit::RateLimiter::from_env() {
+        app = app.layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit::rate_limit_middleware,
+        ));
+    }
+    app.layer(TraceLayer::new_for_http())
 }
 
 /// Start the kotoba server, blocking until shutdown.
