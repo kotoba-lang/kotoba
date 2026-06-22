@@ -133,3 +133,24 @@ fn netsync_snapshot_drops_unsynced() {
         105
     );
 }
+
+#[test]
+fn map_ops_compile_to_wasm() {
+    // the interpreter plumbing: merge (netsync apply-snapshot), update (per-field), reduce.
+    assert_eq!(
+        eval(
+            "(let [m (merge {:a 1} {:b 2})                  ;; {:a 1 :b 2}
+                   u (update {:x 5} :x (fn [v] (+ v 10)))   ;; {:x 15}
+                   s (reduce (fn [acc x] (+ acc x)) 0 [1 2 3 4])]
+               (+ (get m :a) (get m :b) (get u :x) s))" // 1 + 2 + 15 + 10 = 28
+        ),
+        28
+    );
+}
+
+#[test]
+fn collection_ops_compile_to_wasm() {
+    // vectors built/transformed as data: into (extend) + mapv (transform), summed via reduce
+    assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (into [1 2] [3 4]))"), 10); // 1+2+3+4
+    assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (mapv (fn [x] (* x x)) [1 2 3]))"), 14); // 1+4+9
+}
