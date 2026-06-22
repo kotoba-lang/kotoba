@@ -219,3 +219,18 @@ fn arithmetic_edge_semantics() {
     assert_eq!(eval("(- 0 5)"), -5);
     assert_eq!(eval("(if (< -1 0) 1 0)"), 1, "signed comparison");
 }
+
+// Lookup + keyword semantics the interpreters rely on (get-in paths, keyword =, nested
+// vector-of-maps like fsm :transitions). Boolean/count results so eval can return i64.
+#[test]
+fn lookup_and_keyword_semantics() {
+    assert_eq!(eval("(get-in {:a {:b 5}} [:a :b])"), 5, "present get-in path");
+    assert_eq!(eval("(if (get-in {:a {:b 5}} [:x :y]) 1 0)"), 0, "missing get-in path → falsey");
+    assert_eq!(eval("(get {:a 1} :missing 99)"), 99, "get with default");
+    assert_eq!(eval("(if (= :foo :foo) 1 0)"), 1, "keyword equal");
+    assert_eq!(eval("(if (= :foo :bar) 1 0)"), 0, "keyword not equal");
+    // the fsm :transitions shape: a vector of maps, indexed then keyed
+    assert_eq!(eval("(if (= (get (nth [{:to :a} {:to :b}] 1) :to) :b) 1 0)"), 1, "vec-of-maps lookup");
+    assert_eq!(eval("(count (keys {:a 1 :b 2 :c 3}))"), 3, "keys count");
+    assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (vals {:a 1 :b 2 :c 3}))"), 6, "vals sum");
+}
