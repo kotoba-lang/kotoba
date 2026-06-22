@@ -21,6 +21,8 @@ pub mod topic {
     pub const LINK: &str = "kotoba/lat/link";
     /// Placement auction: request / bid / award.
     pub const AUCTION: &str = "kotoba/lat/auction";
+    /// Out-of-proc capability invocation / result (wRPC, M5).
+    pub const CAP: &str = "kotoba/lat/cap";
 }
 
 /// What a node is willing to do in the lattice. Mirrors `KOTOBA_NODE_ROLES`
@@ -167,6 +169,30 @@ pub enum LatticeMessage {
         desired: std::collections::BTreeMap<String, u32>,
         #[serde(default)]
         constraints: std::collections::BTreeMap<String, Constraints>,
+    },
+    /// Out-of-process capability invocation (wRPC, M5): a component on the
+    /// caller node invokes `ability` on `target_cap` supplied by `provider_did`.
+    /// Routed to that provider node over the lattice; the provider replies with
+    /// a [`LatticeMessage::CapResult`]. `link_id` ties it to the authorizing
+    /// CACAO link (mesh policy gate).
+    CapInvoke {
+        id: String,
+        source: String,
+        provider_did: String,
+        target_cap: String,
+        ability: String,
+        link_id: String,
+        #[serde(default)]
+        args_cbor: Vec<u8>,
+    },
+    /// Reply to a [`LatticeMessage::CapInvoke`].
+    CapResult {
+        id: String,
+        ok: bool,
+        #[serde(default)]
+        payload: Vec<u8>,
+        #[serde(default)]
+        error: Option<String>,
     },
 }
 

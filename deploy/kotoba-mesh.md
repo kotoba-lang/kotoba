@@ -7,6 +7,25 @@ There is **no central control plane to deploy** (no NATS, no k8s control plane).
 A node *is* `kotoba serve`; the lattice self-forms over libp2p gossipsub. This is
 the no-central-master invariant (CLAUDE.md) carried into hosting.
 
+## Status (M1 → M5)
+
+M5 (mesh policy + wRPC) adds:
+
+- `kotoba-lattice::policy` — `LinkTable` (CACAO-rooted capability links = the
+  mesh authorization policy), `authorize(source, target, ability)` runtime gate
+  (denies escalation/unlinked access), a `LinkVerifier` hook (CACAO chain
+  verification injected from `kotoba-auth`; pure core stays I/O-free), and
+  `route_capability` (local host-import vs richest remote provider = wRPC route).
+- `PutLink`/`DelLink` maintain the link table on every node; `CapInvoke`/
+  `CapResult` carry out-of-proc capability calls on topic `kotoba/lat/cap`.
+  `net_actor` policy-gates inbound `CapInvoke` addressed to it and replies.
+
+Verify: `cargo run -p kotoba-lattice --example mesh_policy`.
+
+Remaining (M6+): connect the gate to the runtime host-import enforcement
+(`kotoba-runtime` `has-capability`), execute remote capabilities at the wRPC
+provider, datom-Δ/room triggers, and kotoba-clj multi-export codegen.
+
 ## Status (M1 → M4)
 
 M4 (wadm) adds, on top of M1–M3:

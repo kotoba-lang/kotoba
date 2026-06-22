@@ -16,12 +16,13 @@ use crate::gossipsub::gossipsub_topic;
 use crate::swarm::KotobaSwarm;
 
 /// Every reserved lattice control-plane topic.
-pub const LATTICE_TOPICS: [&str; 5] = [
+pub const LATTICE_TOPICS: [&str; 6] = [
     topic::HEARTBEAT,
     topic::INVENTORY,
     topic::CMD,
     topic::LINK,
     topic::AUCTION,
+    topic::CAP,
 ];
 
 /// Subscribe the swarm to all lattice control-plane topics. Call once after the

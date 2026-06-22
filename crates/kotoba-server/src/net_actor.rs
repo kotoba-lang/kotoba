@@ -354,6 +354,29 @@ pub async fn run(
                                         start_component(&executor, block_store.as_ref(), &node_did, cid, &mut my_heartbeat.hosted);
                                     }
                                 }
+                                // out-of-proc capability call addressed to us (wRPC, M5):
+                                // gate on the mesh policy (CACAO link), then reply.
+                                kotoba_lattice::LatticeMessage::CapInvoke {
+                                    id, source, provider_did, target_cap, ability, ..
+                                } => {
+                                    if provider_did == &node_did {
+                                        let d = lattice.authorize(source, target_cap, ability);
+                                        let result = if d.allowed {
+                                            // remote capability execution wiring is the next increment;
+                                            // the policy gate (link authorization) is enforced here.
+                                            kotoba_lattice::LatticeMessage::CapResult {
+                                                id: id.clone(), ok: true, payload: Vec::new(), error: None,
+                                            }
+                                        } else {
+                                            tracing::warn!(%source, %target_cap, %ability, reason = %d.reason, "wRPC: capability invocation denied by mesh policy");
+                                            kotoba_lattice::LatticeMessage::CapResult {
+                                                id: id.clone(), ok: false, payload: Vec::new(), error: Some(d.reason),
+                                            }
+                                        };
+                                        <KotobaSwarm as kotoba_lattice::Transport>::publish(
+                                            &mut swarm, kotoba_lattice::protocol::topic::CAP, &result).ok();
+                                    }
+                                }
                                 _ => {}
                             }
                             lattice.on_message(lmsg, lattice_now_ms());

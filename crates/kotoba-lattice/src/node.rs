@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use crate::error::LatticeError;
 use crate::manifest::AppManifest;
+use crate::policy::{LinkDecision, LinkTable};
 use crate::protocol::{auction_id, Auction, Award, Bid, Constraints, Heartbeat, LatticeMessage};
 use crate::reconcile::{award_winners, need_actions, observed_counts, score_bid};
 
@@ -61,6 +62,8 @@ pub struct LatticeController {
     fleet: BTreeMap<String, (Heartbeat, u64)>,
     /// Open auctions, keyed by component cid (at most one open per component).
     open: BTreeMap<String, OpenAuction>,
+    /// Active capability links — the mesh authorization policy (M5).
+    links: LinkTable,
     /// A node is considered gone if its last heartbeat is older than this.
     ttl_ms: u64,
     /// How long to collect bids before awarding.
@@ -75,9 +78,21 @@ impl LatticeController {
             constraints: BTreeMap::new(),
             fleet: BTreeMap::new(),
             open: BTreeMap::new(),
+            links: LinkTable::new(),
             ttl_ms,
             bid_window_ms,
         }
+    }
+
+    /// Mesh policy gate: may `source` invoke `ability` on `target`? (M5)
+    /// Consulted before a component is allowed to reach a capability/provider.
+    pub fn authorize(&self, source: &str, target: &str, ability: &str) -> LinkDecision {
+        self.links.authorize(source, target, ability)
+    }
+
+    /// Read-only access to the active link table.
+    pub fn links(&self) -> &LinkTable {
+        &self.links
     }
 
     /// Load desired state + per-component constraints from an app manifest.
@@ -134,6 +149,12 @@ impl LatticeController {
             LatticeMessage::Bid(b) => self.on_bid(b),
             LatticeMessage::PutApp { desired, constraints, .. } => {
                 self.set_desired(desired, constraints)
+            }
+            // Mesh policy updates (M5). Links arrive pre-verified over the
+            // lattice (the originating node ran the CACAO check at ingest).
+            LatticeMessage::PutLink(link) => self.links.put(link),
+            LatticeMessage::DelLink { id } => {
+                self.links.remove(&id);
             }
             _ => {}
         }
@@ -415,6 +436,30 @@ mod tests {
         c.on_message(put, 10);
         let msgs = c.tick(20);
         assert!(msgs.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
+    }
+
+    #[test]
+    fn put_link_and_del_link_gate_capability_access() {
+        let mut c = LatticeController::new(1000, 100);
+        // no link yet → denied
+        assert!(!c.authorize("did:A", "cap/llm", "infer").allowed);
+        // PutLink over the lattice → authorized
+        c.on_message(
+            LatticeMessage::PutLink(crate::protocol::Link {
+                id: "l1".into(),
+                source: "did:A".into(),
+                target: "cap/llm".into(),
+                config: None,
+                cacao: "bafyCacao".into(),
+                ability: "infer".into(),
+            }),
+            0,
+        );
+        assert!(c.authorize("did:A", "cap/llm", "infer").allowed);
+        assert_eq!(c.links().len(), 1);
+        // DelLink revokes
+        c.on_message(LatticeMessage::DelLink { id: "l1".into() }, 0);
+        assert!(!c.authorize("did:A", "cap/llm", "infer").allowed);
     }
 
     #[test]
