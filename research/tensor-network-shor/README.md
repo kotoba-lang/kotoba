@@ -73,39 +73,92 @@ This maps directly onto the design note's seven points:
 - **§7 the circularity** — recovering the period from the MPS still requires a
   bond dimension that already encodes `r`. No free lunch.
 
+## Pushing toward RSA scale
+
+`python3 run_rsa_scale.py` takes the honest scaling story all the way up. The key
+upgrade is a **gate-free, statevector-free** construction: the pre-QFT state
+`|x>|a^x mod N>` is written *directly* as an MPS of bond dimension exactly `r`
+(a finite-state automaton along the qubit chain — see `tnshor/scalable.py`).
+Cost is `O((t+m)·r²)`, polynomial in qubit count and in the period.
+
+**Result A — breaking the 2ⁿ wall.** When `r` is small (which we *engineer*, since
+finding a small-order base for a given modulus requires its factorisation), Shor
+also only needs a small control register `t ≈ 2·log₂ r`. We factor large
+semiprimes by simulating Shor circuits far beyond any state-vector simulator:
+
+| bits(N) | qubits n | state-vector would need | χ | factored | time |
+|--------:|---------:|------------------------:|--:|:--------:|-----:|
+| 48 | 61 | 2⁶¹ amps | 6 | ✓ | 0.4 s |
+| 96 | 111 | 2¹¹¹ amps | 12 | ✓ | 1.4 s |
+| 128 | 141 | 2¹⁴¹ amps | 6 | ✓ | 0.9 s |
+| 160 | 173 | 2¹⁷³ amps | 6 | ✓ | 0.9 s |
+
+A **160-bit semiprime factored via a ~173-qubit Shor circuit on a laptop in under
+a second** — `2¹⁷³` amplitudes is utterly impossible to store; the MPS uses
+kilobytes because χ = r.
+
+**The two RSA walls (both measured, then extrapolated).**
+
+- **Wall 1 — period.** For a *random* base, `r = ord_N(a) ~ Θ(N)`, so the
+  control|work bond `χ = r` is exponential in the qubit count. Measured:
+  `log₂(r)` tracks `log₂(N)`.
+- **Wall 2 — QFT.** If you do *not* know `r` is small you must use the full
+  `t = 2·log₂ N` register, and the QFT's **intermediate** bond dimension explodes
+  `~2^{0.6t}` even though the input (χ=r) and output are low rank. Measured
+  directly: peak QFT bond 32 → 1080 as `t` goes 8 → 20 at fixed `r=6`.
+
+![rsa scale](rsa_scale.png)
+
+**Extrapolation to RSA-2048:** best case `χ ~ 2²⁰⁴⁷`, MPS `~2⁴¹⁰⁸` bytes — versus
+`~2²⁶⁶` atoms in the observable universe. Classically impossible. Tensor networks
+move the wall from *qubit count* to *period r* (plus QFT depth); RSA stays safe
+because you cannot get a small-`r` handle, or shrink `t`, without already knowing
+`p` and `q`.
+
 ## Layout
 
 ```
 tnshor/
   mps.py          MPS engine: exact build, Schmidt spectra, gates (1q/2q/long-range
                   swap network), entropy, exact perfect sampling
-  shor.py         wavefunction construction, QFT (gates + reference matrix),
-                  continued-fraction period recovery, factoring
+  shor.py         wavefunction construction, QFT (gates: O(t^3) swap-network +
+                  O(t^2) linear-nearest-neighbor), continued-fraction recovery
+                  (denominator bound min(N, sqrt(Q))), factoring
+  scalable.py     gate-free MPS build of |x>|a^x mod N> (bond == r, no 2^n),
+                  factor_scalable(), resource models
+  numtheory.py    Miller-Rabin, primes p≡1 mod d, element_of_order, CRT, and
+                  make_small_order_instance() (engineered factorable small-r N)
   experiment.py   analyze(), bond_sweep(), truncation_study()
-tests/test_core.py  MPS↔statevector roundtrip, gate/QFT equivalence to machine
-                    precision, sampling-distribution check, full Shor on N=15
-run_demo.py       the four experiments + figure
+tests/
+  test_core.py      MPS↔statevector roundtrip, gate/QFT equivalence, sampling, N=15
+  test_scalable.py  direct build == statevector, large-bit-width engineered factor
+run_demo.py       four small-scale experiments + bond_vs_period.png
+run_rsa_scale.py  scalable large-N factoring, the two walls, RSA-2048 extrapolation
 ```
 
 ## Run
 
 ```bash
-pip install numpy           # matplotlib optional, only for the figure
-python3 tests/test_core.py  # all green
+pip install numpy           # matplotlib optional, only for the figures
+python3 tests/test_core.py
+python3 tests/test_scalable.py
 python3 run_demo.py
+python3 run_rsa_scale.py
 ```
 
 ## Scope / honesty
 
-- Exact statevector reference caps practical sizes at ~20 qubits (`N ≲ 55`),
-  which is plenty to *measure the laws*. The MPS engine itself is not capped —
-  the point is precisely that the required bond dimension, not the code, is the
-  wall.
-- We build the post-modexp wavefunction directly and run the QFT on it as a gate
-  sequence (this is what lets us watch the bond dimension evolve). A full
-  gate-level modular-exponentiation compiler (adder networks) is the natural
-  extension and would let the simulation never touch the `2^n` vector — but it
-  cannot beat the `χ = r` lower bound established here.
-- Noisy-circuit collapse (§5 D) — simulating decoherence to test whether a noisy
-  quantum device retains a Shor advantage — is a clean follow-up: add a
-  truncating/dephasing channel between gates and measure where `χ` stops growing.
+- `run_demo.py` uses an exact state-vector reference (≤ ~20 qubits, `N ≲ 55`) to
+  *prove the laws* and validate the MPS engine to machine precision.
+- `run_rsa_scale.py` never forms a `2^n` vector: `scalable.py` builds the MPS
+  directly, so the only limits are the period `r` and the control size `t`. This
+  is what lets it factor 160-bit semiprimes (~173 qubits).
+- The large-`N` wins are **engineered** small-order instances. This is not a
+  crack: obtaining a small-order base for a *given* RSA modulus requires its
+  factorisation already (the circularity from the design note's §7). For a random
+  base both walls are exponential, as measured and extrapolated.
+- The scalable path replaces a full gate-level modular-exponentiation compiler
+  (adder networks) with an exact automaton construction of the same state — it
+  cannot beat the `χ = r` lower bound, which is the whole point.
+- Noisy-circuit collapse (§5 D) — add a truncating/dephasing channel between gates
+  and measure where `χ` stops growing — is the natural next experiment.
