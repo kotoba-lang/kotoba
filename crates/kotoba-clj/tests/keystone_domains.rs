@@ -163,3 +163,16 @@ fn into_does_not_overflow_capacity() {
     assert_eq!(eval("(nth (into [1 2] [3 4]) 3)"), 4, "into preserves order");
     assert_eq!(eval("(nth (mapv (fn [x] (* x x)) [1 2 3]) 2)"), 9, "mapv/nth correct");
 }
+
+// Audit: the same capacity/count class of bug across prelude vector-builders.
+#[test]
+fn collection_ops_count_audit() {
+    assert_eq!(eval("(count (concat [1 2] [3 4]))"), 4, "concat");
+    assert_eq!(eval("(count (mapcat (fn [x] [x x]) [1 2 3]))"), 6, "mapcat");
+    assert_eq!(eval("(count (interpose 0 [1 2 3]))"), 5, "interpose");
+    assert_eq!(eval("(count (distinct [1 1 2 3 3]))"), 3, "distinct");
+    assert_eq!(eval("(count (reverse [1 2 3]))"), 3, "reverse");
+    assert_eq!(eval("(count (take 2 [1 2 3 4]))"), 2, "take");
+    assert_eq!(eval("(count (drop 1 [1 2 3 4]))"), 3, "drop");
+    assert_eq!(eval("(count (filterv (fn [x] (> x 1)) [1 2 3]))"), 2, "filterv");
+}
