@@ -179,6 +179,42 @@ never enumerating the amplitude. The tensor network is a faithful classical
 *simulator* of that sampling — and simulating it costs `χ = r`. The continued
 fraction was always the easy part.
 
+## Learning / inferring the interference with a tensor network
+
+`python3 tn_learn_infer.py`. Two regimes, both measured.
+
+**One instance.** A tensor network *can* learn the interference — but only with
+capacity (bond dimension) `r`: the optimal MPS fit reaches fidelity 1 only at
+`χ = r` (e.g. N=21, r=6: fidelity 0.16 → 0.53 → 0.94 at χ = 1 → 3 → 6). That just
+reproduces the simulation, and reading `r` off the learned model is still the
+`m/Q ≈ s/r` continued fraction. Learning one instance costs what simulating it
+costs (`χ = r`); it is no shortcut.
+
+**Across instances.** The real question: can a model *learn to infer* the period
+`r` (hence factor) from cheap, poly-time features of `(N, a)`? We give ML its best
+shot — a factorised low-rank **tensor-network regressor** and gradient-boosted
+trees — on fixed-size keys so magnitude carries no signal:
+
+| target | model | train R² | test R² |
+|---|---|--:|--:|
+| log₂(period r) | tensor-net | 0.47 | **−0.84** |
+| | grad-boost | 0.87 | **−0.13** |
+| factor balance log₂(p/√N) | grad-boost | 0.85 | **0.02** |
+| log₂(base a) — control | tensor-net | 0.99 | **0.97** |
+| | grad-boost | 1.00 | **0.99** |
+
+![tn learn infer](tn_learn_infer.png)
+
+The control is recovered perfectly (pipeline and models work). The period and the
+factor: train memorises, **test is chance**. No model — tensor network or
+otherwise — can infer the peak spacing `Q/r` for an unseen key, because `r` is
+pseudorandom in `N`. A model that generalised here would *be* a polynomial-time
+factoring algorithm, contradicting the hardness assumption (and Shoup's `√r`
+generic-group bound). So learning does not relocate the wall: single-instance
+learning costs `χ = r`; cross-instance inference is impossible. The QFT's
+advantage is in physically *realising* the interference once, not in a reusable
+pattern a model could amortise across keys.
+
 ## Using RSA's own structure to make the interference (and how far it goes)
 
 `python3 interference_structure.py`. The period comes from the homomorphism
@@ -321,6 +357,7 @@ analyze_scale.py     RSA-2048-dimension circuit on a laptop; hardware/universe s
 learn_period.py      learning framing: sample-complexity + model-capacity walls
 sample_histogram.py  post-QFT histogram sampling + m/Q~s/r continued-fraction readout
 interference_structure.py  BSGS/meet-in-the-middle period-finding (sqrt r) + landscape
+tn_learn_infer.py    learn the interference (capacity=r) + cross-instance inference fails
 ```
 
 ## Run
@@ -336,6 +373,7 @@ python3 analyze_scale.py
 python3 learn_period.py
 python3 sample_histogram.py
 python3 interference_structure.py
+python3 tn_learn_infer.py
 ```
 
 ## Scope / honesty
