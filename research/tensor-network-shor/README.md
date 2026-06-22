@@ -179,6 +179,48 @@ never enumerating the amplitude. The tensor network is a faithful classical
 *simulator* of that sampling — and simulating it costs `χ = r`. The continued
 fraction was always the easy part.
 
+## Using RSA's own structure to make the interference (and how far it goes)
+
+`python3 interference_structure.py`. The period comes from the homomorphism
+`a^{x+y} = aˣ·aʸ (mod N)`. The classical way to *manufacture the
+period-revealing interference* from that structure is a meet-in-the-middle
+collision: precompute baby phases `aʲ`, take giant strides `a^{i·m}`, and a
+collision `a^{i·m} = aʲ` is two ways to write the same group element —
+constructive interference revealing `i·m − j = r` **without enumerating all `r`**.
+That is Baby-Step Giant-Step (and Pollard rho/kangaroo).
+
+**It works, and it crushes the tensor-network simulator:**
+
+| bits | r ~ N | BSGS ops | factored |
+|--:|--:|--:|:--|
+| 24 | 1.4·10⁵ | 3 083 | (2381, 3877) |
+| 32 | 1.2·10⁸ | 49 922 | (61547, 36343) |
+| 42 | 1.4·10¹² | 2 508 185 | (1737679, 1609043) |
+
+A random **42-bit** key factored in ~10⁶ group multiplications (~1.5 s) — where
+the MPS died near **12 bits**. The collision is *quadratically* cheaper than
+representing the amplitude: `O(√r)` vs `O(r)`.
+
+![interference structure](interference_structure.png)
+
+**But √r is a provable floor.** Shoup's generic-group lower bound (1997): any
+algorithm using only the group operations needs `Ω(√r)`. BSGS/rho *meet* it — the
+collision interferes `√r` precomputed elements; it cannot interfere all `r` at
+once. The reach ladder is exactly "how much structure you use":
+
+| method | exploits | cost | real reach |
+|---|---|---|---|
+| sequential / MPS | nothing / amplitude | `O(r)` | ~12-bit |
+| BSGS / Pollard rho | group homomorphism | `O(√r)` | ~50–100-bit |
+| GNFS (number field sieve) | the integer ring ℤ | `L_N[1/3]` sub-exp | RSA-250 = 829-bit (2020) |
+| Shor (quantum) | global interference | poly(log N) | RSA-2048 (with a QC) |
+
+So your instinct is right: RSA's structure *does* generate the interference more
+cheaply — turning `r` into `√r` (and, with the integer ring, into sub-exponential
+GNFS, the actual classical record). What it cannot do is close the last gap:
+**only the QFT interferes all `Q` evaluations of `aˣ` simultaneously**, and that
+exponential-to-polynomial jump is exactly what stays quantum.
+
 ## The learning framing: learn the period, identify the amplitude peaks
 
 `python3 learn_period.py`. The intended design is not "build the state from a
@@ -278,6 +320,7 @@ analyze_real_rsa.py  RSA Challenge resource wall, random-key frontier, Pollard p
 analyze_scale.py     RSA-2048-dimension circuit on a laptop; hardware/universe scaling
 learn_period.py      learning framing: sample-complexity + model-capacity walls
 sample_histogram.py  post-QFT histogram sampling + m/Q~s/r continued-fraction readout
+interference_structure.py  BSGS/meet-in-the-middle period-finding (sqrt r) + landscape
 ```
 
 ## Run
@@ -292,6 +335,7 @@ python3 analyze_real_rsa.py
 python3 analyze_scale.py
 python3 learn_period.py
 python3 sample_histogram.py
+python3 interference_structure.py
 ```
 
 ## Scope / honesty
