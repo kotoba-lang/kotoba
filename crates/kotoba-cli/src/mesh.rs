@@ -22,6 +22,12 @@ fn default_wit_dir() -> String {
     std::env::var("KOTOBA_WIT_DIR").unwrap_or_else(|_| "crates/kotoba-runtime/wit".to_string())
 }
 
+/// Canonical content-address of a compiled component (CIDv1 dag-cbor sha2-256,
+/// IPFS-compatible) — the same scheme kotoba uses for program CIDs.
+fn component_cid(wasm: &[u8]) -> String {
+    KotobaCid::from_bytes(wasm).to_multibase()
+}
+
 #[derive(Subcommand)]
 pub enum ComponentCmd {
     /// Compile a component source file to a WASM component and print its CID.
@@ -81,7 +87,7 @@ pub fn run_component(cmd: ComponentCmd) -> Result<()> {
     match cmd {
         ComponentCmd::Build { file, wit_dir, out } => {
             let (wasm, lang) = compile_source(&file, &wit_dir)?;
-            let cid = KotobaCid::from_bytes(&wasm).to_multibase();
+            let cid = component_cid(&wasm);
             eprintln!(
                 "built {} ({:?}) → {} bytes",
                 file.display(),
@@ -129,7 +135,7 @@ pub fn run_app(cmd: AppCmd) -> Result<()> {
                     let path = base.join(src_file);
                     let (wasm, _) = compile_source(&path, &wit_dir)
                         .with_context(|| format!("compile component {}", c.name))?;
-                    KotobaCid::from_bytes(&wasm).to_multibase()
+                    component_cid(&wasm)
                 } else {
                     bail!("component {} has neither :cid nor :src", c.name);
                 };
@@ -184,5 +190,41 @@ pub fn run_lattice(cmd: LatticeCmd) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_cid_is_deterministic_and_canonical() {
+        let a = component_cid(b"\0asm hello");
+        // deterministic
+        assert_eq!(a, component_cid(b"\0asm hello"));
+        // distinct inputs → distinct CIDs
+        assert_ne!(a, component_cid(b"\0asm world"));
+        // canonical kotoba CID (matches KotobaCid scheme) + round-trips + IPFS-compatible
+        let kc = KotobaCid::from_bytes(b"\0asm hello");
+        assert_eq!(a, kc.to_multibase());
+        let parsed = KotobaCid::from_multibase(&a).expect("parse back");
+        assert!(parsed.is_ipfs_compatible());
+    }
+
+    #[test]
+    fn compile_source_bails_on_non_clojure_language() {
+        // a .py source dispatches to Python and bails (only Clojure is wired)
+        let p = std::env::temp_dir().join("kotoba_mesh_cli_test.py");
+        std::fs::write(&p, b"print('hi')").unwrap();
+        let r = compile_source(&p, "crates/kotoba-runtime/wit");
+        let _ = std::fs::remove_file(&p);
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("Python") || err.contains("not wired"), "got: {err}");
+    }
+
+    #[test]
+    fn compile_source_reports_missing_file() {
+        let r = compile_source(Path::new("/no/such/reply.clj"), "crates/kotoba-runtime/wit");
+        assert!(r.is_err(), "missing source must error, not panic");
     }
 }
