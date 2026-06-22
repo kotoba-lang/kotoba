@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn link_table_len_is_empty_iter() {
         let mut t = LinkTable::new();
-        assert!(t.is_empty() && t.len() == 0);
+        assert!(t.is_empty());
         t.put(link("l1", "did:A", "cap/llm", "infer"));
         t.put(link("l2", "did:B", "cap/kqe", "read"));
         assert_eq!(t.len(), 2);

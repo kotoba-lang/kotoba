@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::LatticeError;
 
 /// Component source language. Clojure (`kotoba-clj`) is the default (§14).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Lang {
     /// `.clj` → `kotoba-clj::compile_kais_component_str` (DEFAULT).
+    #[default]
     Clojure,
     /// `.rs`  → `cargo component build`.
     Rust,
@@ -24,12 +25,6 @@ pub enum Lang {
     Python,
     /// `.js`/`.ts` → `jco componentize`.
     Js,
-}
-
-impl Default for Lang {
-    fn default() -> Self {
-        Lang::Clojure
-    }
 }
 
 impl Lang {
