@@ -98,11 +98,14 @@ pub fn desired_from_quads(
             .find(|q| q.predicate == pred::SCALE)
             .and_then(|q| q.object.parse::<u32>().ok())
             .unwrap_or(1);
-        let requires_caps: Vec<String> = qs
+        // sorted so the result is canonical regardless of datom read order
+        // (datoms arrive from the store / lattice in arbitrary order).
+        let mut requires_caps: Vec<String> = qs
             .iter()
             .filter(|q| q.predicate == pred::REQUIRES)
             .map(|q| q.object.clone())
             .collect();
+        requires_caps.sort();
         let require_labels: BTreeMap<String, String> = qs
             .iter()
             .filter(|q| q.predicate == pred::LABEL)
