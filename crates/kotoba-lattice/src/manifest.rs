@@ -529,6 +529,25 @@ mod tests {
     }
 
     #[test]
+    fn wrong_typed_name_is_treated_as_missing() {
+        // :kotoba.app/name as a non-stringy value (integer) → as_str None → error
+        assert!(matches!(
+            AppManifest::from_edn("{:kotoba.app/name 5}"),
+            Err(LatticeError::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn placement_without_require_defaults_to_empty() {
+        let app = AppManifest::from_edn(
+            r#"{:kotoba.app/name "a" :kotoba.app/placement {:spread :zone}}"#,
+        )
+        .unwrap();
+        assert_eq!(app.placement.spread.as_deref(), Some("zone"));
+        assert!(app.placement.require.is_empty());
+    }
+
+    #[test]
     fn empty_components_default_and_scale_default() {
         let app = AppManifest::from_edn(r#"{:kotoba.app/name "a"}"#).unwrap();
         assert!(app.components.is_empty());
