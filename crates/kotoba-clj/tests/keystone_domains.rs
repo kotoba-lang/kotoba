@@ -154,3 +154,12 @@ fn collection_ops_compile_to_wasm() {
     assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (into [1 2] [3 4]))"), 10); // 1+2+3+4
     assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (mapv (fn [x] (* x x)) [1 2 3]))"), 14); // 1+4+9
 }
+
+// Regression: `into` returns a correctly-sized new vector even when dst is at exact
+// capacity (a vector literal) — previously over-counted because vec-conj! doesn't grow.
+#[test]
+fn into_does_not_overflow_capacity() {
+    assert_eq!(eval("(count (into [1 2] [3 4]))"), 4, "into count");
+    assert_eq!(eval("(nth (into [1 2] [3 4]) 3)"), 4, "into preserves order");
+    assert_eq!(eval("(nth (mapv (fn [x] (* x x)) [1 2 3]) 2)"), 9, "mapv/nth correct");
+}

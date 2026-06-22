@@ -489,7 +489,12 @@ pub const PRELUDE: &str = r#"
           (recur (+ i 1))
           0)))))
 (defn not-any? [pred v] (if (some pred v) 0 1))
-(defn into [dst src] (vec-extend! dst src))
+;; into returns a NEW vector (Clojure semantics) sized for both — vec-conj! never grows,
+;; so extending dst in place overflows when dst is at exact capacity (e.g. a literal).
+(defn into [dst src]
+  (let [out (vec-make (+ (vec-count dst) (vec-count src)))]
+    (vec-extend! out dst)
+    (vec-extend! out src)))
 (defn comp [f g] (fn [x] (f (g x))))
 (defn partial
   ([f a] (fn [x] (f a x)))
