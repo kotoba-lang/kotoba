@@ -179,6 +179,39 @@ never enumerating the amplitude. The tensor network is a faithful classical
 *simulator* of that sampling — and simulating it costs `χ = r`. The continued
 fraction was always the easy part.
 
+## Classical waves / complexification: physical interference, measured
+
+`python3 classical_wave.py`. Classical light, sound, images and complex signals
+*do* have phase, coherence and Fourier transforms — a lens is an optical FT. So
+the intuition "interference is everywhere, use it" is right, up to a point that
+this measures.
+
+**Small N: a real classical spectrum reads the period.** Treating `g(x)=aˣ mod N`
+as a waveform and taking its power spectrum `|FFT(g)|²` (what a lens / sound
+analyser / interferometer computes physically) gives sharp peaks at `s·Q/r`. With
+the same multi-peak continued-fraction readout Shor uses, this factors small
+moduli: N=15→(3,5), N=21→(7,3), N=35→(7,5).
+
+![classical wave](classical_wave.png)
+
+**The sign / phase problem (measured).** Estimating one interference peak (true
+height `1/r`) by complex Monte-Carlo: the relative error at `k = α·r` samples is
+`~1/√α` for *every* `r` — the lines are flat. Error depends on `k/r`, not on `r`,
+so to hold accuracy the sample budget must scale with `r` (linearly to detect a
+peak; `~r²` to resolve the amplitude against phase-cancellation noise). Either
+way exponential in the bit-length.
+
+**Mode counting.** The post-QFT spectrum is exactly `r`-sparse, so a classical
+`M`-mode wave (living in `ℂ^M`) needs `M ≥ r` resolvable modes — for a random RSA
+key `~2^{bits−1}` modes. That is the `χ = r` wall in a different costume.
+Complexification doubles storage (Re+Im); it is not an exponential compressor.
+
+So: classical physics *has* the interference, but not the compact `ℂ^{2ⁿ}`
+state space for free. The quantum advantage is holding `2ⁿ` phase-coherent,
+entangled paths in a small physical system and interfering them once with the QFT
+— unless the modexp structure itself compresses (small / smooth / low-bond
+`r`), which is the only known classical door.
+
 ## Learning / inferring the interference with a tensor network
 
 `python3 tn_learn_infer.py`. Two regimes, both measured.
@@ -358,6 +391,7 @@ learn_period.py      learning framing: sample-complexity + model-capacity walls
 sample_histogram.py  post-QFT histogram sampling + m/Q~s/r continued-fraction readout
 interference_structure.py  BSGS/meet-in-the-middle period-finding (sqrt r) + landscape
 tn_learn_infer.py    learn the interference (capacity=r) + cross-instance inference fails
+classical_wave.py    classical optical/acoustic FFT + the sign/phase problem (~r)
 ```
 
 ## Run
@@ -374,6 +408,7 @@ python3 learn_period.py
 python3 sample_histogram.py
 python3 interference_structure.py
 python3 tn_learn_infer.py
+python3 classical_wave.py
 ```
 
 ## Scope / honesty
