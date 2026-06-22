@@ -164,6 +164,60 @@ def _v2(n):
     return v
 
 
+def largest_prime_factor(n):
+    return max(prime_factors(n))
+
+
+def random_safe_prime(bits):
+    """Safe prime ``p = 2*p' + 1`` with ``p'`` also prime (strong RSA prime)."""
+    while True:
+        pp = random_prime(bits - 1)
+        p = 2 * pp + 1
+        if p.bit_length() == bits and is_prime(p):
+            return p
+
+
+_SMALL_PRIMES = [p for p in range(2, 4096) if is_prime(p)]
+
+
+def random_smooth_prime(bits, smooth_bound):
+    """Prime ``p`` with ``p-1`` ``smooth_bound``-smooth (weak RSA prime).
+
+    Such a prime falls to Pollard's p-1 with bound ``smooth_bound``.
+    """
+    pool = [p for p in _SMALL_PRIMES if p <= smooth_bound]
+    for _ in range(200000):
+        m = 2
+        while m.bit_length() < bits - 1:
+            m *= random.choice(pool)
+        m *= 2  # keep p-1 even
+        p = m + 1
+        if p.bit_length() == bits and is_prime(p):
+            return p
+    raise RuntimeError("no smooth prime found; raise smooth_bound")
+
+
+def pollard_p_minus_1(N, B):
+    """Classical Pollard p-1 (stage 1).  Returns a nontrivial factor or None.
+
+    Succeeds when some prime factor ``p`` of ``N`` has ``p-1`` ``B``-smooth -- the
+    exact weak-key class that the tensor-network 'small order' route also needs.
+    """
+    a = 2
+    for q in _SMALL_PRIMES:
+        if q > B:
+            break
+        qk = q
+        while qk * q <= B:
+            qk *= q
+        a = pow(a, qk, N)
+        g = math.gcd(a - 1, N)
+        if 1 < g < N:
+            return g
+    g = math.gcd(a - 1, N)
+    return g if 1 < g < N else None
+
+
 def make_small_order_instance(bits, order_p, order_q):
     """Build a *factorable* ``N = p*q`` (~``bits`` bits) with base ``a``.
 

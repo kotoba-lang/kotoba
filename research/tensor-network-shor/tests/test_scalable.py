@@ -13,7 +13,10 @@ from tnshor import shor_state, classical_order  # noqa: E402
 from tnshor.scalable import (  # noqa: E402
     build_shor_mps_exact, factor_scalable, small_control_t,
 )
-from tnshor.numtheory import make_small_order_instance, order_mod_n  # noqa: E402
+from tnshor.numtheory import (  # noqa: E402
+    make_small_order_instance, order_mod_n, random_safe_prime,
+    random_smooth_prime, pollard_p_minus_1, is_prime, largest_prime_factor,
+)
 
 
 def test_direct_build_matches_statevector():
@@ -52,8 +55,25 @@ def test_large_bitwidth_engineered():
           f"n={res['n']} qubits chi={res['chi_cut']} -> {res['factors']}  OK")
 
 
+def test_real_rsa_helpers():
+    random.seed(2026)
+    # safe prime: (p-1)/2 is prime; smooth prime: p-1 is 4096-smooth
+    sp = random_safe_prime(24)
+    assert is_prime(sp) and is_prime((sp - 1) // 2)
+    wk = random_smooth_prime(24, 4096)
+    assert is_prime(wk) and largest_prime_factor(wk - 1) <= 4096
+    # Pollard p-1: breaks a smooth-prime semiprime, fails on a safe-prime one
+    Nw = random_smooth_prime(24, 4096) * random_smooth_prime(24, 4096)
+    f = pollard_p_minus_1(Nw, B=8000)
+    assert f and 1 < f < Nw and Nw % f == 0
+    Ns = random_safe_prime(24) * random_safe_prime(24)
+    assert pollard_p_minus_1(Ns, B=8000) is None
+    print("real-RSA helpers: safe/smooth primes + Pollard p-1 reach   OK")
+
+
 if __name__ == "__main__":
     test_direct_build_matches_statevector()
     test_scalable_factor_small()
     test_large_bitwidth_engineered()
+    test_real_rsa_helpers()
     print("\nALL SCALABLE TESTS PASSED")
