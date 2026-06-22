@@ -336,6 +336,68 @@ mod tests {
         assert!(LatticeMessage::from_cbor(&[0xff, 0x00, 0x13, 0x37]).is_err());
     }
 
+    /// Forward-compat: an OLD node must still decode a message a NEWER node sent
+    /// with an extra field it doesn't know about (rolling upgrades).
+    #[test]
+    fn decode_ignores_unknown_future_fields() {
+        use ciborium::value::{Integer, Value};
+        let v = Value::Map(vec![
+            (Value::Text("t".into()), Value::Text("heartbeat".into())),
+            (Value::Text("node_did".into()), Value::Text("n".into())),
+            (Value::Text("roles".into()), Value::Array(vec![Value::Text("compute".into())])),
+            (Value::Text("free_gas".into()), Value::Integer(Integer::from(5u64))),
+            // a field a future kotoba version added — the old decoder must ignore it
+            (Value::Text("future_field".into()), Value::Bool(true)),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v, &mut buf).unwrap();
+        match LatticeMessage::from_cbor(&buf).expect("forward-compatible decode") {
+            LatticeMessage::Heartbeat(hb) => {
+                assert_eq!(hb.node_did, "n");
+                assert_eq!(hb.roles, vec![NodeRole::Compute]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Backward-compat: a NEW node must decode a message an OLDER node sent that
+    /// omits fields later marked `#[serde(default)]`.
+    #[test]
+    fn decode_fills_defaults_for_missing_optional_fields() {
+        use ciborium::value::{Integer, Value};
+        let v = Value::Map(vec![
+            (Value::Text("t".into()), Value::Text("heartbeat".into())),
+            (Value::Text("node_did".into()), Value::Text("n".into())),
+            (Value::Text("roles".into()), Value::Array(vec![])),
+            (Value::Text("free_gas".into()), Value::Integer(Integer::from(0u64))),
+            // labels / caps / hosted / lat_ms omitted → must use serde defaults
+        ]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v, &mut buf).unwrap();
+        match LatticeMessage::from_cbor(&buf).expect("backward-compatible decode") {
+            LatticeMessage::Heartbeat(hb) => {
+                assert!(hb.labels.is_empty() && hb.caps.is_empty() && hb.hosted.is_empty());
+                assert_eq!(hb.lat_ms, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn auction_id_format_and_grid_has_no_collisions() {
+        let id = auction_id("bafyX", 3, 1);
+        assert!(id.starts_with("auc-"));
+        assert_eq!(id.len(), "auc-".len() + 16); // 16 hex chars of blake3
+        let mut seen = std::collections::HashSet::new();
+        for cid in ["a", "b", "c", "bafyReply"] {
+            for want in 0..16u32 {
+                for have in 0..16u32 {
+                    assert!(seen.insert(auction_id(cid, want, have)), "id collision");
+                }
+            }
+        }
+    }
+
     #[test]
     fn node_role_serde_lowercase() {
         // tag stability matters for the wire format
