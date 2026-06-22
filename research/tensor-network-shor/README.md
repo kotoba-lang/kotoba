@@ -145,6 +145,40 @@ method's reach on real RSA equals the classical smooth-key reach, and adds
 nothing on properly generated keys. Tensor networks re-express RSA's hardness as
 "the period `r` is exponentially large" — which is exactly why RSA is secure.
 
+## The readout: sampling the post-QFT histogram → m/Q ≈ s/r → r
+
+`python3 sample_histogram.py`. This is the exact Shor readout: sample the
+post-QFT control-register histogram `P(m)` (peaks at `m ≈ s·Q/r`), and recover
+`r` by `m/Q ≈ s/r` + continued fractions. Run on a **64-bit** modulus
+(engineered small `r=12`) by simulating the histogram directly:
+
+```
+expected peaks s*Q/r:  [0, 2731, 5461, 8192, 10923, 13653, ...]
+sampled m=2731  m/Q=0.08334  ->  CF 1/12  -> denominator 12
+recovered r = 12  ->  factors = (2494741741, 3848977777)   correct
+```
+
+![post-QFT histogram](post_qft_histogram.png)
+
+**The readout is free; producing the histogram is the wall.** Timed on the same
+case: producing one honest sample (build + QFT + measure) = **681 ms**; the
+continued-fraction readout of that sample = **29 µs** — a ~2·10⁴× ratio. The
+`m/Q → s/r` step is `O(polylog)`; it was never the bottleneck.
+
+**Why you can't sample `P(m)` cheaply.** The histogram is *sparse* — only `r`
+peaks — but its peaks sit at `s·Q/r`, so **the support locations literally encode
+`r`**. To write down or evaluate `P(m)` you need the period structure; to draw an
+honest sample without it you must simulate the post-QFT amplitude, whose bond
+dimension is exactly `r`. For a random RSA base `r ~ N`: ~`N` peaks at unknown
+locations, simulation cost ~`N`. Sparsity does not help when *locating the peaks
+is the very thing you are solving for*.
+
+This is exactly where the quantum advantage lives: a quantum computer **prepares
+and samples this histogram physically in poly(log N) time** via interference,
+never enumerating the amplitude. The tensor network is a faithful classical
+*simulator* of that sampling — and simulating it costs `χ = r`. The continued
+fraction was always the easy part.
+
 ## The learning framing: learn the period, identify the amplitude peaks
 
 `python3 learn_period.py`. The intended design is not "build the state from a
@@ -243,6 +277,7 @@ run_rsa_scale.py   scalable large-N factoring, the two walls, RSA-2048 extrapola
 analyze_real_rsa.py  RSA Challenge resource wall, random-key frontier, Pollard p-1
 analyze_scale.py     RSA-2048-dimension circuit on a laptop; hardware/universe scaling
 learn_period.py      learning framing: sample-complexity + model-capacity walls
+sample_histogram.py  post-QFT histogram sampling + m/Q~s/r continued-fraction readout
 ```
 
 ## Run
@@ -256,6 +291,7 @@ python3 run_rsa_scale.py
 python3 analyze_real_rsa.py
 python3 analyze_scale.py
 python3 learn_period.py
+python3 sample_histogram.py
 ```
 
 ## Scope / honesty

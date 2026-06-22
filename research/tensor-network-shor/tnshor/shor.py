@@ -180,7 +180,7 @@ def order_from_samples(samples, geom, N, a):
     verified = set()
     raw = []
     for y in samples:
-        cand = continued_fraction_order(y, Q, N)
+        cand = continued_fraction_order(int(y), Q, N)
         if cand and 1 < cand <= N:
             raw.append(cand)
             if pow(a, cand, N) == 1:
