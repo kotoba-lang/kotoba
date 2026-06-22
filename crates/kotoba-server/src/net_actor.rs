@@ -92,6 +92,8 @@ pub async fn run(
     quad_store: Arc<QuadStore>,
     pre_key_registry: Option<Arc<kotoba_vault::PreKeyRegistry>>,
     relay: bool,
+    // WASM host for lattice component placement (StartComponent → execute).
+    executor: Arc<kotoba_runtime::WasmExecutor>,
 ) {
     swarm.subscribe("quad/assert").ok();
     swarm.subscribe("quad/retract").ok();
@@ -142,31 +144,89 @@ pub async fn run(
     if relay {
         node_roles.push(kotoba_lattice::NodeRole::Relay);
     }
-    let my_heartbeat = kotoba_lattice::Heartbeat {
+    // `my_heartbeat.hosted` grows as this node places components (M4).
+    let mut my_heartbeat = kotoba_lattice::Heartbeat {
         node_did: node_did.clone(),
         roles: node_roles,
         labels: node_labels,
         caps: node_caps,
         free_gas: 10_000_000,
-        hosted: Vec::new(), // StartComponent → WasmExecutor wiring is the next increment
+        hosted: Vec::new(),
         lat_ms: 0,
     };
     let mut lattice = kotoba_lattice::LatticeController::new(/*ttl*/ 15_000, /*bid_window*/ 3_000);
     let mut lattice_hb = tokio::time::interval(std::time::Duration::from_secs(5));
     tracing::info!(node_did = %node_did, "net_actor: lattice participation active");
 
+    // Place a component on THIS node: fetch its artifact by CID and execute it
+    // on the WASM host. On success the node starts advertising it as `hosted`,
+    // which closes the reconcile loop (observed rises to meet desired). If the
+    // artifact is not in the local store yet, skip — bitswap will pull it and a
+    // later auction round retries.
+    fn start_component(
+        executor: &kotoba_runtime::WasmExecutor,
+        block_store: &(dyn BlockStore + Send + Sync),
+        node_did: &str,
+        cid: &str,
+        hosted: &mut Vec<String>,
+    ) {
+        if hosted.iter().any(|c| c == cid) {
+            return;
+        }
+        let Some(kcid) = KotobaCid::from_multibase(cid) else {
+            tracing::warn!(%cid, "lattice start: malformed component CID");
+            return;
+        };
+        let wasm = match block_store.get(&kcid) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                tracing::info!(%cid, "lattice start: artifact not local yet (awaiting bitswap) — not hosting");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(%cid, err = %e, "lattice start: artifact fetch failed");
+                return;
+            }
+        };
+        match executor.execute(
+            cid,
+            &wasm,
+            node_did,
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        ) {
+            Ok(res) => {
+                tracing::info!(%cid, gas = res.gas_used, "lattice start: component placed and executed");
+                hosted.push(cid.to_string());
+            }
+            Err(e) => tracing::warn!(%cid, err = %e, "lattice start: component execution failed"),
+        }
+    }
+
     loop {
         tokio::select! {
-            // ── Lattice: advertise Heartbeat + close due auctions ────────
+            // ── Lattice: reconcile (auctions), close auctions (place), advertise ──
             _ = lattice_hb.tick() => {
                 let now = lattice_now_ms();
+                // emit auctions for any desired-vs-observed shortfall
+                for (t, m) in lattice.tick(now) {
+                    <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
+                }
+                // close due auctions → awards + StartComponent; act on any addressed to us
+                for (t, m) in lattice.close_due(now) {
+                    if let kotoba_lattice::LatticeMessage::StartComponent { node_did: target, cid, .. } = &m {
+                        if target == &node_did {
+                            start_component(&executor, block_store.as_ref(), &node_did, cid, &mut my_heartbeat.hosted);
+                        }
+                    }
+                    <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
+                }
+                // advertise our (possibly updated) heartbeat
                 let hb = kotoba_lattice::LatticeMessage::Heartbeat(my_heartbeat.clone());
                 <KotobaSwarm as kotoba_lattice::Transport>::publish(
                     &mut swarm, kotoba_lattice::protocol::topic::HEARTBEAT, &hb).ok();
                 lattice.on_heartbeat(my_heartbeat.clone(), now);
-                for (t, m) in lattice.close_due(now) {
-                    <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
-                }
             }
             // ── KSE outbound: forward journal publish requests ───────────
             msg = publish_rx.recv() => {
@@ -273,17 +333,28 @@ pub async fn run(
                         if let Some(lmsg) = kotoba_net::lattice::decode_lattice(&topic, &data) {
                             // Lattice control plane: ingest, and auto-bid on any
                             // auction this node is eligible for.
-                            if let kotoba_lattice::LatticeMessage::Auction(auction) = &lmsg {
-                                if let Some(bid) =
-                                    kotoba_lattice::LatticeController::bid_for(auction, &my_heartbeat)
-                                {
-                                    <KotobaSwarm as kotoba_lattice::Transport>::publish(
-                                        &mut swarm,
-                                        kotoba_lattice::protocol::topic::AUCTION,
-                                        &kotoba_lattice::LatticeMessage::Bid(bid),
-                                    )
-                                    .ok();
+                            match &lmsg {
+                                // auto-bid on any auction we're eligible for
+                                kotoba_lattice::LatticeMessage::Auction(auction) => {
+                                    if let Some(bid) = kotoba_lattice::LatticeController::bid_for(
+                                        auction,
+                                        &my_heartbeat,
+                                    ) {
+                                        <KotobaSwarm as kotoba_lattice::Transport>::publish(
+                                            &mut swarm,
+                                            kotoba_lattice::protocol::topic::AUCTION,
+                                            &kotoba_lattice::LatticeMessage::Bid(bid),
+                                        )
+                                        .ok();
+                                    }
                                 }
+                                // a reconciler awarded a component to us → place it
+                                kotoba_lattice::LatticeMessage::StartComponent { node_did: target, cid, .. } => {
+                                    if target == &node_did {
+                                        start_component(&executor, block_store.as_ref(), &node_did, cid, &mut my_heartbeat.hosted);
+                                    }
+                                }
+                                _ => {}
                             }
                             lattice.on_message(lmsg, lattice_now_ms());
                         } else if topic == pregel_full_topic

@@ -158,6 +158,16 @@ pub enum LatticeMessage {
     DelLink {
         id: String,
     },
+    /// Announce an application's desired state onto the lattice (wadm, M4).
+    /// The durable SSOT is the control-graph datoms (see `crate::control`); this
+    /// message is the live propagation of that desired state to every node's
+    /// reconciler. `desired`: cid → instance count. `constraints`: cid → where.
+    PutApp {
+        app: String,
+        desired: std::collections::BTreeMap<String, u32>,
+        #[serde(default)]
+        constraints: std::collections::BTreeMap<String, Constraints>,
+    },
 }
 
 impl LatticeMessage {

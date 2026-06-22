@@ -1858,6 +1858,7 @@ pub async fn run() -> anyhow::Result<()> {
                     quad_store_arc,
                     state.pre_key_registry.clone(),
                     relay,
+                    Arc::clone(&state.executor),
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");

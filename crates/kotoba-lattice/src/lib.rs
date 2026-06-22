@@ -22,12 +22,14 @@
 //! *reconcile + auction* logic. The transport wiring lives in kotoba-net /
 //! kotoba-server which depend on this.
 
+pub mod control;
 pub mod error;
 pub mod manifest;
 pub mod node;
 pub mod protocol;
 pub mod reconcile;
 
+pub use control::{app_to_quads, desired_from_quads, ControlQuad};
 pub use error::LatticeError;
 pub use manifest::{AppManifest, ComponentSpec, Lang, LinkSpec, Placement, TriggerSpec};
 pub use node::{LatticeController, RecordingTransport, Transport};

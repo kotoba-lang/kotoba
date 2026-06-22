@@ -120,6 +120,7 @@ pub fn run_app(cmd: AppCmd) -> Result<()> {
             println!("components ({}):", app.components.len());
 
             let mut resolved: BTreeMap<String, u32> = BTreeMap::new();
+            let mut resolved_by_name: BTreeMap<String, String> = BTreeMap::new();
             for c in &app.components {
                 // resolve the artifact CID: explicit :cid wins, else compile :src
                 let cid = if let Some(cid) = &c.cid {
@@ -137,17 +138,28 @@ pub fn run_app(cmd: AppCmd) -> Result<()> {
                     "  • {:<10} lang={:?} scale={} cid={} requires={:?} triggers={:?}",
                     c.name, c.lang, c.scale, cid, c.requires, triggers
                 );
-                resolved.insert(cid, c.scale);
+                resolved.insert(cid.clone(), c.scale);
+                resolved_by_name.insert(c.name.clone(), cid);
             }
 
             println!(
                 "\nresolved desired state (content-addressed):\n  {:?}",
                 resolved
             );
+
+            // Control-graph datoms — the durable wadm SSOT (ADR §7/§14, M4).
+            // Ingest these into the control graph; every node's reconciler reads
+            // them (or receives them live via a PutApp lattice message).
+            let datoms = kotoba_lattice::control::app_to_quads(&app, &resolved_by_name);
+            println!("\ncontrol-graph datoms ({}):", datoms.len());
+            for q in &datoms {
+                println!("  ({}  {}  {})", q.subject, q.predicate, q.object);
+            }
             println!(
-                "\nThis is the desired state the lattice reconciler converges on.\n\
+                "\nThese datoms are the desired state the lattice reconciler converges on.\n\
                  Bring up nodes (`kotoba serve`, KOTOBA_NODE_ROLES=compute) — each\n\
-                 advertises a Heartbeat and bids on auctions for these components."
+                 advertises a Heartbeat, bids on auctions, and places (executes) the\n\
+                 components it wins via the WASM host."
             );
             Ok(())
         }

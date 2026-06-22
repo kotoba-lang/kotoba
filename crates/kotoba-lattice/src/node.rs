@@ -114,6 +114,17 @@ impl LatticeController {
         }
     }
 
+    /// Set desired state + constraints directly (e.g. from control-graph datoms
+    /// via `crate::control::desired_from_quads`, or an inbound `PutApp`).
+    pub fn set_desired(
+        &mut self,
+        desired: BTreeMap<String, u32>,
+        constraints: BTreeMap<String, Constraints>,
+    ) {
+        self.desired = desired;
+        self.constraints = constraints;
+    }
+
     /// Convenience dispatch for any inbound [`LatticeMessage`].
     pub fn on_message(&mut self, msg: LatticeMessage, now_ms: u64) {
         match msg {
@@ -121,6 +132,9 @@ impl LatticeController {
                 self.on_heartbeat(hb, now_ms)
             }
             LatticeMessage::Bid(b) => self.on_bid(b),
+            LatticeMessage::PutApp { desired, constraints, .. } => {
+                self.set_desired(desired, constraints)
+            }
             _ => {}
         }
     }
@@ -380,6 +394,27 @@ mod tests {
         let n = c.step(0, &mut tx).unwrap();
         assert_eq!(n, tx.sent.len());
         assert!(tx.sent.iter().any(|(t, _)| t == crate::protocol::topic::AUCTION));
+    }
+
+    #[test]
+    fn put_app_sets_desired_and_drives_auctions() {
+        // a node that starts with NO desired state receives a PutApp and then
+        // begins emitting auctions for the announced components (wadm, M4).
+        let mut c = LatticeController::new(1000, 100);
+        c.on_heartbeat(hb("nA", &["cap/kqe"], 100, &[]), 0);
+        assert!(c.tick(0).is_empty(), "no desired yet → no auctions");
+
+        let put = LatticeMessage::PutApp {
+            app: "bot".into(),
+            desired: BTreeMap::from([("bafyX".to_string(), 1u32)]),
+            constraints: BTreeMap::from([(
+                "bafyX".to_string(),
+                Constraints { require_labels: BTreeMap::new(), requires_caps: vec!["cap/kqe".into()] },
+            )]),
+        };
+        c.on_message(put, 10);
+        let msgs = c.tick(20);
+        assert!(msgs.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
     }
 
     #[test]

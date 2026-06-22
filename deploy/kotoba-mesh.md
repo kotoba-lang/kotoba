@@ -7,6 +7,31 @@ There is **no central control plane to deploy** (no NATS, no k8s control plane).
 A node *is* `kotoba serve`; the lattice self-forms over libp2p gossipsub. This is
 the no-central-master invariant (CLAUDE.md) carried into hosting.
 
+## Status (M1 → M4)
+
+M4 (wadm) adds, on top of M1–M3:
+
+- `kotoba-lattice::control` — desired state as **control-graph datoms**
+  (`app_to_quads` / `desired_from_quads`); the durable wadm SSOT.
+- `LatticeMessage::PutApp` — live propagation of desired state to every node's
+  reconciler (`LatticeController::set_desired`).
+- `kotoba-server::net_actor` — the reconcile loop runs on the node: emits
+  auctions for shortfalls, closes them (awards), and **places winners by
+  executing the component on the WASM host** (`StartComponent` → fetch artifact
+  by CID → `WasmExecutor::execute` → advertise as `hosted`). Missing artifacts
+  are skipped (bitswap pulls them; a later round retries).
+- `kotoba app deploy` prints the content-addressed control datoms to ingest.
+
+Verify the full wadm loop (no cluster):
+
+```bash
+cargo run -p kotoba-lattice --example mesh_wadm   # manifest→datoms→desired→auction→place→converge
+```
+
+Remaining (M5+): auto-ingest deploy datoms / PutApp into a running node,
+`kotoba component push` (artifact → block store), CACAO link gating, and
+kotoba-clj multi-export (`on-http`/`on-kse`) codegen.
+
 ## Status (M1 + M2 + M3)
 
 M3 adds, on top of the core below:
