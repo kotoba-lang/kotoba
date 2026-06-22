@@ -145,6 +145,38 @@ method's reach on real RSA equals the classical smooth-key reach, and adds
 nothing on properly generated keys. Tensor networks re-express RSA's hardness as
 "the period `r` is exponentially large" — which is exactly why RSA is secure.
 
+## The learning framing: learn the period, identify the amplitude peaks
+
+`python3 learn_period.py`. The intended design is not "build the state from a
+known `r`" — it's to **learn the periodic pattern** of `aˣ mod N` and let a model
+**identify where the amplitude peaks sit** (at `y ≈ s·Q/r`), recovering `r`
+without knowing it. Taken at face value, a classical learner can touch the
+problem through exactly three channels, and all three were measured:
+
+| channel | what it costs | measured |
+|---|---|---|
+| observe the pattern sequentially | Θ(r) — first repeat of `aˣ` is at `x=r` | window = r exactly |
+| query at random `x` (birthday / Pollard-rho) | Θ(√r) — residue collision reveals a multiple of r | ~1.5·√r |
+| fit a tensor-network model of the amplitude | capacity (bond dim) = r; a χ-model captures χ/r | exactly χ/r |
+
+![learn period](learn_period.png)
+
+The one genuinely easy step — turning a *true* amplitude sample into `r` by
+continued fractions — needs only O(1) samples. But producing a genuine sample
+means sampling the simulated amplitude (bond dimension r), and observing the
+pattern means seeing Θ(√r) of it. **Learning relocates "find r" into "see / store
+/ sample something of size r."** For a random RSA base `r ~ N`, so every route is
+exponential (the √r route is exactly Pollard-rho — the best classical
+period-finder, sub-exponential, never polynomial).
+
+**Where learning genuinely helps:** a *structured* period (smooth `r`) is
+detectable from few samples — the Pollard p−1/rho regime that strong keys avoid.
+And the reason quantum Shor is different *in kind*: the QFT interferes all `Q`
+evaluations of `aˣ` at once, so it never observes Θ(r) of the pattern. A classical
+learner only sees samples, and samples of a period-`r` signal carry at most
+O(√r) of period information. The tensor network is a faithful *simulator* of that
+interference — but simulating it is exactly the χ = r cost.
+
 ## Frontier-LLM scale: does more compute change anything?
 
 `python3 analyze_scale.py`. Short answer: **no** — and the reason is that the cost
@@ -210,6 +242,7 @@ run_demo.py        four small-scale experiments + bond_vs_period.png
 run_rsa_scale.py   scalable large-N factoring, the two walls, RSA-2048 extrapolation
 analyze_real_rsa.py  RSA Challenge resource wall, random-key frontier, Pollard p-1
 analyze_scale.py     RSA-2048-dimension circuit on a laptop; hardware/universe scaling
+learn_period.py      learning framing: sample-complexity + model-capacity walls
 ```
 
 ## Run
@@ -222,6 +255,7 @@ python3 run_demo.py
 python3 run_rsa_scale.py
 python3 analyze_real_rsa.py
 python3 analyze_scale.py
+python3 learn_period.py
 ```
 
 ## Scope / honesty
