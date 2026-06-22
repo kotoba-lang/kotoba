@@ -36,6 +36,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures::stream::{self, Stream};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use kotoba_core::cid::KotobaCid;
@@ -62,6 +63,51 @@ pub const NSID_SYNC_EVENTS_ALL_GRAPHS: &str = "com.etzhayyim.apps.kotoba.sync.ev
 const MAX_PAGE_LIMIT: usize = 1000;
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_TOPIC_PREFIX_LEN: usize = 256;
+/// Default cap on how far behind `current_seq` a `cursor` may resume. A cursor
+/// far in the past would force `read_since` to walk a huge backlog (cold-store
+/// fetches) in one request — an amplification/OOM vector. Overridable with
+/// `KOTOBA_MAX_FIREHOSE_BACKFILL`; deep history belongs to
+/// `sync.eventsFromCommits` (paged from the CommitDag), not the live tail.
+const MAX_BACKFILL_SPAN: u64 = 100_000;
+
+fn max_backfill_span() -> u64 {
+    std::env::var("KOTOBA_MAX_FIREHOSE_BACKFILL")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_BACKFILL_SPAN)
+}
+
+/// Reject a cursor that is too far behind the head to backfill in one shot.
+fn check_backfill_span(
+    cursor: Option<u64>,
+    current_seq: u64,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(c) = cursor {
+        let span = current_seq.saturating_sub(c);
+        let max = max_backfill_span();
+        if span > max {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "cursor {c} is {span} behind head (max {max}); \
+                     use sync.eventsFromCommits for deep history"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Optional absolute lifetime for an SSE connection (`KOTOBA_SSE_MAX_SECS`).
+/// When set, the stream ends after this many seconds and the client resumes via
+/// `?cursor=` — bounding how long a slow/idle reader can hold a connection.
+fn sse_max_secs() -> Option<u64> {
+    std::env::var("KOTOBA_SSE_MAX_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n| n > 0)
+}
 
 fn validate_cursor(cursor: Option<u64>) -> Result<(), (StatusCode, String)> {
     if cursor == Some(u64::MAX) {
@@ -262,6 +308,7 @@ pub async fn subscribe(
     // de-duplicated by `last_seq` below.
     let live = journal.subscribe();
     let baseline = journal.current_seq().await;
+    check_backfill_span(params.cursor, baseline)?;
 
     let (backlog, last_seq) = match params.cursor {
         Some(c) => (journal.read_since(c + 1).await, c),
@@ -275,7 +322,7 @@ pub async fn subscribe(
         prefix: params.topic_prefix,
     };
 
-    let stream = stream::unfold(init, |mut st| async move {
+    let base = stream::unfold(init, |mut st| async move {
         loop {
             let entry = match st.backlog.pop_front() {
                 Some(e) => e,
@@ -307,6 +354,16 @@ pub async fn subscribe(
         }
     });
 
+    // Optionally cap the connection lifetime so a slow/idle reader can't hold a
+    // connection forever — the client resumes from its last `id` via `?cursor=`.
+    let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        match sse_max_secs() {
+            Some(secs) => {
+                Box::pin(base.take_until(tokio::time::sleep(Duration::from_secs(secs))))
+            }
+            None => Box::pin(base),
+        };
+
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -327,6 +384,7 @@ pub async fn events(
 
     let journal = &state.journal;
     let current_seq = journal.current_seq().await;
+    check_backfill_span(params.cursor, current_seq)?;
 
     let from = params.cursor.map(|c| c + 1).unwrap_or(1);
     let limit = params

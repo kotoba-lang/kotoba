@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod mesh;
 mod word;
 
 // ── NSIDs (mirror kotoba-server::xrpc constants) ─────────────────────────────
@@ -64,6 +65,18 @@ enum Cmd {
     /// kotoba words — agent-callable units (list/invoke/manifest/lexicons/MCP)
     #[command(subcommand)]
     Word(word::WordCmd),
+
+    /// KOTOBA Mesh — compile a WASM component (Clojure default) to a CID.
+    #[command(subcommand)]
+    Component(mesh::ComponentCmd),
+
+    /// KOTOBA Mesh — resolve & deploy an EDN app manifest.
+    #[command(subcommand)]
+    App(mesh::AppCmd),
+
+    /// KOTOBA Mesh — lattice participation status.
+    #[command(subcommand)]
+    Lattice(mesh::LatticeCmd),
 
     /// SPARQL query (SELECT / DESCRIBE / CONSTRUCT / ASK) over the running
     /// server's direct-SPARQL endpoint.  Auto-detects the form from the
@@ -402,6 +415,10 @@ async fn main() -> Result<()> {
         Cmd::Word(cmd) => {
             word::run(cmd).await?;
         }
+
+        Cmd::Component(cmd) => mesh::run_component(cmd)?,
+        Cmd::App(cmd) => mesh::run_app(cmd)?,
+        Cmd::Lattice(cmd) => mesh::run_lattice(cmd)?,
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,
 
