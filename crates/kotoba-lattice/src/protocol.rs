@@ -194,6 +194,14 @@ pub enum LatticeMessage {
         #[serde(default)]
         error: Option<String>,
     },
+    /// Announce an app's datom-Δ triggers onto the lattice (M6). Every node
+    /// installs them; a node firing a matching datom places the component (same
+    /// `StartComponent` → WASM-host path as auction placement).
+    PutTriggers {
+        app: String,
+        #[serde(default)]
+        triggers: Vec<crate::trigger::DeltaTrigger>,
+    },
 }
 
 impl LatticeMessage {
@@ -328,6 +336,14 @@ mod tests {
             ok: false,
             payload: vec![],
             error: Some("denied".into()),
+        });
+        roundtrip(LatticeMessage::PutTriggers {
+            app: "app".into(),
+            triggers: vec![crate::trigger::DeltaTrigger {
+                component: "bafyAudit".into(),
+                predicate: "kg/claim/role".into(),
+                value: Some("admin".into()),
+            }],
         });
     }
 

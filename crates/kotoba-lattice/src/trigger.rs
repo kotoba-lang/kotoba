@@ -8,11 +8,13 @@
 
 use std::collections::BTreeSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::manifest::AppManifest;
 
 /// A resolved datom-Δ trigger: fire `component` when a datom with `predicate`
 /// (and, if set, object == `value`) is asserted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeltaTrigger {
     /// Component key (artifact CID when known, else `clj:<name>`).
     pub component: String,

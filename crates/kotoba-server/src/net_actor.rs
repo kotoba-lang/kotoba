@@ -2,7 +2,7 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
 use kotoba_graph::QuadStore;
 use kotoba_net::{KotobaNetEvent, KotobaSwarm, PREGEL_GOSSIP_TOPIC};
-use kotoba_query::{quad::LegacyQuad as Quad, Datom};
+use kotoba_query::{quad::LegacyQuad as Quad, quad::LegacyQuadObject, Datom};
 use kotoba_vault::LiveBusEntry;
 use kotoba_vm::distributed::DistributedMessage;
 use std::collections::{HashSet, VecDeque};
@@ -201,6 +201,9 @@ pub async fn run(
         lat_ms: 0,
     };
     let mut lattice = kotoba_lattice::LatticeController::new(/*ttl*/ 15_000, /*bid_window*/ 3_000);
+    // datom-Δ triggers installed via PutTriggers (M6): a matching asserted datom
+    // places the component on this node (same path as auction placement).
+    let mut delta_triggers: Vec<kotoba_lattice::DeltaTrigger> = Vec::new();
     let mut lattice_hb = tokio::time::interval(std::time::Duration::from_secs(5));
     tracing::info!(node_did = %node_did, "net_actor: lattice participation active");
 
@@ -377,6 +380,11 @@ pub async fn run(
                                             &mut swarm, kotoba_lattice::protocol::topic::CAP, &result).ok();
                                     }
                                 }
+                                // install datom-Δ triggers (M6)
+                                kotoba_lattice::LatticeMessage::PutTriggers { triggers, .. } => {
+                                    delta_triggers = triggers.clone();
+                                    tracing::info!(n = delta_triggers.len(), "lattice: datom-Δ triggers installed");
+                                }
                                 _ => {}
                             }
                             lattice.on_message(lmsg, lattice_now_ms());
@@ -446,10 +454,25 @@ pub async fn run(
                                 let kse_topic = kotoba_vault::Topic(kse_name);
                                 let entry = journal.publish(kse_topic, bytes::Bytes::from(data)).await;
                                 if let Some((quad, op)) = maybe_quad_op {
+                                    // capture predicate + (text) object before the move, for M6 Δ-triggers
+                                    let delta_pred = quad.predicate.clone();
+                                    let delta_obj = match &quad.object {
+                                        LegacyQuadObject::Text(s) => s.clone(),
+                                        _ => String::new(),
+                                    };
                                     let graph_cid = quad.graph.clone();
                                     let mut datom = Datom::from_legacy_quad(quad, op);
                                     datom.tx = entry.cid.clone();
                                     quad_store.apply_journaled_datom(graph_cid, datom).await;
+
+                                    // datom-Δ trigger (M6): an *assertion* matching a registered
+                                    // trigger places that component on this node.
+                                    if op && !delta_triggers.is_empty() {
+                                        for cid in kotoba_lattice::fired_by_datom(&delta_triggers, &delta_pred, &delta_obj) {
+                                            tracing::info!(%cid, predicate = %delta_pred, "datom-Δ trigger fired — placing component");
+                                            start_component(&executor, block_store.as_ref(), &node_did, cid, &mut my_heartbeat.hosted);
+                                        }
+                                    }
                                 }
                             }
                         }
