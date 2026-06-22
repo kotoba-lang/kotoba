@@ -517,6 +517,76 @@ mod tests {
         assert_eq!(hosted, vec!["bafyAlready".to_string()], "must not double-add");
     }
 
+    /// Loop-body coverage: spawn the real `net_actor::run` task for one node and
+    /// assert a *separate* observer swarm receives that node's auto-published
+    /// Heartbeat over real QUIC gossipsub. This drives the actual `select!`
+    /// loop — the heartbeat-interval arm, `subscribe_lattice`, and the in-loop
+    /// `Transport::publish` — not just the extracted helpers.
+    #[tokio::test]
+    async fn run_loop_publishes_heartbeat_observed_by_a_peer() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // observer node: subscribes to the lattice and just listens
+        let mut observer =
+            KotobaSwarm::new("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).await.unwrap();
+        kotoba_net::lattice::subscribe_lattice(&mut observer).unwrap();
+        let obs_addr = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(KotobaNetEvent::ListenAddr(a)) = observer.next_event().await {
+                    return a;
+                }
+            }
+        })
+        .await
+        .expect("observer listen addr");
+        let obs_peer = observer.local_peer_id;
+
+        // run-node swarm: dial the observer BEFORE handing it to run()
+        let mut node =
+            KotobaSwarm::new("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).await.unwrap();
+        let expected_did = format!("did:key:{}", node.local_peer_id);
+        node.add_peer(obs_peer, obs_addr);
+
+        // assemble run()'s dependencies
+        let (_pub_tx, pub_rx) = tokio::sync::mpsc::channel(8);
+        let (pin_tx, _pin_rx) = tokio::sync::mpsc::channel(8);
+        let (_pout_tx, pout_rx) = tokio::sync::mpsc::channel(8);
+        let journal = Arc::new(kotoba_vault::LiveBus::new());
+        let store: Arc<dyn BlockStore + Send + Sync> =
+            Arc::new(kotoba_store::MemoryBlockStore::new());
+        let quad_store = Arc::new(QuadStore::new(Arc::clone(&journal), Arc::clone(&store)));
+        let executor = Arc::new(kotoba_runtime::WasmExecutor::new(10_000_000).unwrap());
+
+        tokio::spawn(run(
+            node, pub_rx, journal, pin_tx, pout_rx, store, quad_store, None, false, executor,
+        ));
+
+        // observer waits for the run-node's heartbeat (interval is 5 s; first
+        // tick races mesh formation, so allow up to 12 s for a delivered one)
+        let hb = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if let Some(KotobaNetEvent::GossipMessage { topic, data, .. }) =
+                    observer.next_event().await
+                {
+                    if let Some(kotoba_lattice::LatticeMessage::Heartbeat(hb)) =
+                        kotoba_net::lattice::decode_lattice(&topic, &data)
+                    {
+                        if hb.node_did == expected_did {
+                            return hb;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("run-node never published an observable heartbeat within 12s");
+
+        // the loop advertised this node's real capabilities + compute role
+        assert!(hb.caps.iter().any(|c| c == "cap/kqe"));
+        assert!(hb.roles.contains(&kotoba_lattice::NodeRole::Compute));
+    }
+
     #[test]
     fn firehose_seen_dedups_and_evicts_fifo() {
         let mut seen = FirehoseSeen::new(2);
