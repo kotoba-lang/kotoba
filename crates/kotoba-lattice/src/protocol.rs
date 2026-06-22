@@ -265,4 +265,89 @@ mod tests {
         assert_eq!(auction_id("bafy", 3, 1), auction_id("bafy", 3, 1));
         assert_ne!(auction_id("bafy", 3, 1), auction_id("bafy", 4, 1));
     }
+
+    fn roundtrip(m: LatticeMessage) {
+        assert_eq!(LatticeMessage::from_cbor(&m.to_cbor().unwrap()).unwrap(), m);
+    }
+
+    #[test]
+    fn cbor_roundtrip_all_remaining_variants() {
+        roundtrip(LatticeMessage::InventoryReq { node_did: "n".into() });
+        roundtrip(LatticeMessage::InventoryAck(Heartbeat {
+            node_did: "n".into(),
+            roles: vec![NodeRole::Relay],
+            labels: BTreeMap::new(),
+            caps: vec![],
+            free_gas: 0,
+            hosted: vec![],
+            lat_ms: 5,
+        }));
+        roundtrip(LatticeMessage::Award(Award {
+            auction_id: "a".into(),
+            node_did: "n".into(),
+        }));
+        roundtrip(LatticeMessage::StartComponent {
+            node_did: "n".into(),
+            cid: "c".into(),
+            count: 2,
+            links: vec!["l1".into()],
+        });
+        roundtrip(LatticeMessage::StopComponent { instance: "i".into() });
+        roundtrip(LatticeMessage::ScaleTo { cid: "c".into(), n: 3 });
+        roundtrip(LatticeMessage::PutLink(Link {
+            id: "l".into(),
+            source: "s".into(),
+            target: "cap/llm".into(),
+            config: Some("cfg".into()),
+            cacao: "z".into(),
+            ability: "infer".into(),
+        }));
+        roundtrip(LatticeMessage::DelLink { id: "l".into() });
+        roundtrip(LatticeMessage::PutApp {
+            app: "app".into(),
+            desired: BTreeMap::from([("c".into(), 2u32)]),
+            constraints: BTreeMap::from([(
+                "c".into(),
+                Constraints {
+                    require_labels: BTreeMap::from([("z".into(), "1".into())]),
+                    requires_caps: vec!["cap/kqe".into()],
+                },
+            )]),
+        });
+        roundtrip(LatticeMessage::CapInvoke {
+            id: "id".into(),
+            source: "s".into(),
+            provider_did: "p".into(),
+            target_cap: "cap/llm".into(),
+            ability: "infer".into(),
+            link_id: "l".into(),
+            args_cbor: vec![1, 2, 3],
+        });
+        roundtrip(LatticeMessage::CapResult {
+            id: "id".into(),
+            ok: false,
+            payload: vec![],
+            error: Some("denied".into()),
+        });
+    }
+
+    #[test]
+    fn from_cbor_rejects_garbage() {
+        assert!(LatticeMessage::from_cbor(&[0xff, 0x00, 0x13, 0x37]).is_err());
+    }
+
+    #[test]
+    fn node_role_serde_lowercase() {
+        // tag stability matters for the wire format
+        let m = LatticeMessage::Heartbeat(Heartbeat {
+            node_did: "n".into(),
+            roles: vec![NodeRole::Pin, NodeRole::Compute, NodeRole::Relay],
+            labels: BTreeMap::new(),
+            caps: vec![],
+            free_gas: 1,
+            hosted: vec![],
+            lat_ms: 0,
+        });
+        roundtrip(m);
+    }
 }

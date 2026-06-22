@@ -439,6 +439,51 @@ mod tests {
     }
 
     #[test]
+    fn on_message_dispatches_heartbeat_inventory_bid_and_ignores_others() {
+        let mut c = controller();
+        c.on_message(LatticeMessage::Heartbeat(hb("nA", &["cap/kqe"], 100, &[])), 0);
+        let a = match &c.tick(0)[0].1 {
+            LatticeMessage::Auction(a) => a.clone(),
+            _ => panic!(),
+        };
+        // Bid arm via on_message
+        c.on_message(
+            LatticeMessage::Bid(LatticeController::bid_for(&a, &hb("nA", &["cap/kqe"], 100, &[])).unwrap()),
+            0,
+        );
+        // InventoryAck arm via on_message (counts toward observed)
+        c.on_message(
+            LatticeMessage::InventoryAck(hb("nB", &["cap/kqe"], 100, &["bafyReply"])),
+            0,
+        );
+        assert_eq!(c.observed(0).get("bafyReply"), Some(&1));
+        // ignored variant must be a harmless no-op
+        c.on_message(
+            LatticeMessage::CapResult { id: "x".into(), ok: true, payload: vec![], error: None },
+            0,
+        );
+    }
+
+    #[test]
+    fn on_bid_dedupes_by_node_last_wins() {
+        let mut c = controller();
+        c.on_heartbeat(hb("nA", &["cap/kqe"], 100, &[]), 0);
+        let a = match &c.tick(0)[0].1 {
+            LatticeMessage::Auction(a) => a.clone(),
+            _ => panic!(),
+        };
+        c.on_bid(Bid { auction_id: a.id.clone(), node_did: "nA".into(), score: 10 });
+        c.on_bid(Bid { auction_id: a.id.clone(), node_did: "nA".into(), score: 999 });
+        // one bidder de-duped → exactly one StartComponent (not two)
+        let starts = c
+            .close_due(120)
+            .iter()
+            .filter(|(_, m)| matches!(m, LatticeMessage::StartComponent { .. }))
+            .count();
+        assert_eq!(starts, 1);
+    }
+
+    #[test]
     fn put_link_and_del_link_gate_capability_access() {
         let mut c = LatticeController::new(1000, 100);
         // no link yet → denied

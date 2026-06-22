@@ -405,4 +405,117 @@ mod tests {
         assert_eq!(Lang::from_ext("foo.py"), Lang::Python);
         assert_eq!(Lang::from_ext("foo.ts"), Lang::Js);
     }
+
+    #[test]
+    fn lang_from_token_all_aliases_and_unknown() {
+        for t in ["clojure", "clj", "edn", ":clojure"] {
+            assert_eq!(Lang::from_token(t).unwrap(), Lang::Clojure);
+        }
+        assert_eq!(Lang::from_token("rs").unwrap(), Lang::Rust);
+        assert_eq!(Lang::from_token("python").unwrap(), Lang::Python);
+        assert_eq!(Lang::from_token("typescript").unwrap(), Lang::Js);
+        assert!(matches!(Lang::from_token("cobol"), Err(LatticeError::UnknownLang(_))));
+    }
+
+    #[test]
+    fn from_json_parses_and_matches_edn() {
+        let json = r#"{
+            "name": "j",
+            "version": "1.0",
+            "components": [
+                {"name": "c", "lang": "rust", "cid": "bafyC", "scale": 4,
+                 "triggers": [{"kind": "http", "route": "/x"}],
+                 "requires": ["cap/kqe"], "links": []}
+            ],
+            "placement": {"require": {"tier": "edge"}}
+        }"#;
+        let app = AppManifest::from_json(json).unwrap();
+        assert_eq!(app.name, "j");
+        assert_eq!(app.components[0].lang, Lang::Rust);
+        assert_eq!(app.components[0].scale, 4);
+        assert_eq!(app.desired_by_cid().get("bafyC"), Some(&4));
+    }
+
+    #[test]
+    fn from_json_rejects_garbage() {
+        assert!(matches!(
+            AppManifest::from_json("not json"),
+            Err(LatticeError::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn from_edn_errors_are_descriptive() {
+        // top-level not a map
+        assert!(matches!(AppManifest::from_edn("[1 2 3]"), Err(LatticeError::Schema(_))));
+        // missing :kotoba.app/name
+        assert!(matches!(AppManifest::from_edn("{:x 1}"), Err(LatticeError::Schema(_))));
+        // components not a seq
+        assert!(matches!(
+            AppManifest::from_edn(r#"{:kotoba.app/name "a" :kotoba.app/components 5}"#),
+            Err(LatticeError::Schema(_))
+        ));
+        // component missing :name
+        assert!(matches!(
+            AppManifest::from_edn(r#"{:kotoba.app/name "a" :kotoba.app/components [{:cid "x"}]}"#),
+            Err(LatticeError::Schema(_))
+        ));
+        // trigger missing :type
+        assert!(matches!(
+            AppManifest::from_edn(
+                r#"{:kotoba.app/name "a" :kotoba.app/components [{:name "c" :triggers [{:route "/x"}]}]}"#
+            ),
+            Err(LatticeError::Schema(_))
+        ));
+        // link missing :target
+        assert!(matches!(
+            AppManifest::from_edn(
+                r#"{:kotoba.app/name "a" :kotoba.app/components [{:name "c" :links [{:cacao "x"}]}]}"#
+            ),
+            Err(LatticeError::Schema(_))
+        ));
+        // unknown :lang
+        assert!(matches!(
+            AppManifest::from_edn(
+                r#"{:kotoba.app/name "a" :kotoba.app/components [{:name "c" :lang :cobol}]}"#
+            ),
+            Err(LatticeError::UnknownLang(_))
+        ));
+        // placement :require not a map
+        assert!(matches!(
+            AppManifest::from_edn(r#"{:kotoba.app/name "a" :kotoba.app/placement {:require 5}}"#),
+            Err(LatticeError::Schema(_))
+        ));
+    }
+
+    #[test]
+    fn from_json_uses_serde_defaults() {
+        // scale + lang omitted → default_scale() and Lang::default()
+        let json = r#"{"name":"j","components":[{"name":"c","cid":"bafyC"}]}"#;
+        let app = AppManifest::from_json(json).unwrap();
+        assert_eq!(app.components[0].scale, 1);
+        assert_eq!(app.components[0].lang, Lang::Clojure);
+    }
+
+    #[test]
+    fn requires_accepts_bare_symbols() {
+        // a `:requires` element written as a bare EDN symbol (not keyword/string)
+        let src = r#"{:kotoba.app/name "a"
+            :kotoba.app/components [{:name "c" :cid "x" :requires [cap-kqe]}]}"#;
+        let app = AppManifest::from_edn(src).unwrap();
+        assert!(app.components[0].requires.contains(&"cap-kqe".to_string()));
+    }
+
+    #[test]
+    fn empty_components_default_and_scale_default() {
+        let app = AppManifest::from_edn(r#"{:kotoba.app/name "a"}"#).unwrap();
+        assert!(app.components.is_empty());
+        assert!(app.desired_by_cid().is_empty());
+        // scale defaults to 1 when omitted
+        let app2 = AppManifest::from_edn(
+            r#"{:kotoba.app/name "a" :kotoba.app/components [{:name "c" :cid "x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(app2.components[0].scale, 1);
+    }
 }

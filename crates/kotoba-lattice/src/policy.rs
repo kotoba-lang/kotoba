@@ -225,6 +225,31 @@ mod tests {
     }
 
     #[test]
+    fn link_table_len_is_empty_iter() {
+        let mut t = LinkTable::new();
+        assert!(t.is_empty() && t.len() == 0);
+        t.put(link("l1", "did:A", "cap/llm", "infer"));
+        t.put(link("l2", "did:B", "cap/kqe", "read"));
+        assert_eq!(t.len(), 2);
+        assert!(!t.is_empty());
+        let ids: Vec<&str> = t.iter().map(|l| l.id.as_str()).collect();
+        assert!(ids.contains(&"l1") && ids.contains(&"l2"));
+    }
+
+    #[test]
+    fn route_remote_tie_break_is_by_did_when_gas_equal() {
+        let local = hb("did:self", &["cap/kqe"], 100);
+        let fleet = vec![
+            hb("did:zzz", &["cap/llm"], 500),
+            hb("did:aaa", &["cap/llm"], 500),
+        ];
+        assert_eq!(
+            route_capability("cap/llm", &local, &fleet),
+            ProviderRoute::Remote("did:aaa".into())
+        );
+    }
+
+    #[test]
     fn route_prefers_local_then_richest_remote() {
         let local = hb("did:self", &["cap/kqe"], 100);
         let fleet = vec![
