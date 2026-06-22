@@ -109,8 +109,65 @@ pub async fn run(
         tracing::info!("net_actor: relay role active — bridging KSE LiveBus ↔ gossip firehose");
     }
 
+    // ── KOTOBA Mesh lattice participation (M3) ───────────────────────────
+    // Join the lattice control plane: subscribe to the control topics, then
+    // periodically advertise a Heartbeat and auto-bid on placement auctions.
+    // No central master — every node is a leader-less peer.
+    fn lattice_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    kotoba_net::lattice::subscribe_lattice(&mut swarm).ok();
+    let node_did = format!("did:key:{}", swarm.local_peer_id);
+    let node_labels: std::collections::BTreeMap<String, String> =
+        std::env::var("KOTOBA_NODE_LABELS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                Some((k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+    // Capabilities the runtime supplies to hosted components (kotoba:kais/*).
+    let node_caps: Vec<String> = ["kqe", "kse", "auth", "llm", "chain", "egress", "evm", "btc"]
+        .iter()
+        .map(|c| format!("cap/{c}"))
+        .collect();
+    let mut node_roles = vec![
+        kotoba_lattice::NodeRole::Pin,
+        kotoba_lattice::NodeRole::Compute,
+    ];
+    if relay {
+        node_roles.push(kotoba_lattice::NodeRole::Relay);
+    }
+    let my_heartbeat = kotoba_lattice::Heartbeat {
+        node_did: node_did.clone(),
+        roles: node_roles,
+        labels: node_labels,
+        caps: node_caps,
+        free_gas: 10_000_000,
+        hosted: Vec::new(), // StartComponent → WasmExecutor wiring is the next increment
+        lat_ms: 0,
+    };
+    let mut lattice = kotoba_lattice::LatticeController::new(/*ttl*/ 15_000, /*bid_window*/ 3_000);
+    let mut lattice_hb = tokio::time::interval(std::time::Duration::from_secs(5));
+    tracing::info!(node_did = %node_did, "net_actor: lattice participation active");
+
     loop {
         tokio::select! {
+            // ── Lattice: advertise Heartbeat + close due auctions ────────
+            _ = lattice_hb.tick() => {
+                let now = lattice_now_ms();
+                let hb = kotoba_lattice::LatticeMessage::Heartbeat(my_heartbeat.clone());
+                <KotobaSwarm as kotoba_lattice::Transport>::publish(
+                    &mut swarm, kotoba_lattice::protocol::topic::HEARTBEAT, &hb).ok();
+                lattice.on_heartbeat(my_heartbeat.clone(), now);
+                for (t, m) in lattice.close_due(now) {
+                    <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
+                }
+            }
             // ── KSE outbound: forward journal publish requests ───────────
             msg = publish_rx.recv() => {
                 let Some((kse_topic, data)) = msg else { break };
@@ -213,7 +270,23 @@ pub async fn run(
                             .ok();
                     }
                     KotobaNetEvent::GossipMessage { topic, data, .. } => {
-                        if topic == pregel_full_topic
+                        if let Some(lmsg) = kotoba_net::lattice::decode_lattice(&topic, &data) {
+                            // Lattice control plane: ingest, and auto-bid on any
+                            // auction this node is eligible for.
+                            if let kotoba_lattice::LatticeMessage::Auction(auction) = &lmsg {
+                                if let Some(bid) =
+                                    kotoba_lattice::LatticeController::bid_for(auction, &my_heartbeat)
+                                {
+                                    <KotobaSwarm as kotoba_lattice::Transport>::publish(
+                                        &mut swarm,
+                                        kotoba_lattice::protocol::topic::AUCTION,
+                                        &kotoba_lattice::LatticeMessage::Bid(bid),
+                                    )
+                                    .ok();
+                                }
+                            }
+                            lattice.on_message(lmsg, lattice_now_ms());
+                        } else if topic == pregel_full_topic
                             || topic.ends_with(PREGEL_GOSSIP_TOPIC)
                         {
                             // Decode Pregel gossip message and forward to runner

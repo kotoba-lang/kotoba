@@ -7,7 +7,26 @@ There is **no central control plane to deploy** (no NATS, no k8s control plane).
 A node *is* `kotoba serve`; the lattice self-forms over libp2p gossipsub. This is
 the no-central-master invariant (CLAUDE.md) carried into hosting.
 
-## Status (M1 + M2)
+## Status (M1 + M2 + M3)
+
+M3 adds, on top of the core below:
+
+- **server participation** (`kotoba-server::net_actor`, `--features p2p`): joins
+  the lattice — `subscribe_lattice`, periodic Heartbeat publish, and auto-bid on
+  auctions over gossipsub. Node DID from the libp2p peer id; labels from
+  `KOTOBA_NODE_LABELS`; advertised caps = the kotoba:kais host-imports.
+- **CLI** (`kotoba` binary):
+  - `kotoba component build <file.clj>` — Clojure (default) → WASM component →
+    canonical CID (CIDv1 dag-cbor sha2-256). Verified: `reply.clj` → 1511-byte
+    component → `bafyrei…`.
+  - `kotoba app deploy <manifest.edn>` — compile every component, print the
+    fully content-addressed desired state.
+  - `kotoba lattice ps` — local lattice participation config.
+
+Remaining (M4): `StartComponent → WasmExecutor` execution + pushing desired
+state into the control graph for cross-node reconciliation.
+
+### Core (M1 + M2)
 
 Implemented now:
 
