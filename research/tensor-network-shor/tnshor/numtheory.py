@@ -117,17 +117,35 @@ def order_mod_prime(a, p):
     return order
 
 
+def has_order(a, n, d, dfac=None):
+    """True iff ``a`` has multiplicative order exactly ``d`` modulo ``n``.
+
+    Only ``d`` is factored (it is small), never ``n-1`` -- so this stays fast even
+    for cryptographic-size ``n``.
+    """
+    if pow(a, d, n) != 1:
+        return False
+    for ell in (dfac if dfac is not None else prime_factors(d)):
+        if pow(a, d // ell, n) == 1:
+            return False
+    return True
+
+
 def element_of_order(p, d):
-    """Return an element of ``Z_p^*`` of order exactly ``d`` (requires d | p-1)."""
+    """Return an element of ``Z_p^*`` of order exactly ``d`` (requires d | p-1).
+
+    Factors only ``d`` (small), not ``p-1`` -- fast at cryptographic sizes.
+    """
     if (p - 1) % d != 0:
         raise ValueError("d must divide p-1")
     cofactor = (p - 1) // d
+    dfac = prime_factors(d)
     for _ in range(100000):
         g = random.randrange(2, p - 1)
         h = pow(g, cofactor, p)
         if h <= 1:
             continue
-        if order_mod_prime(h, p) == d:
+        if has_order(h, p, d, dfac):
             return h
     raise RuntimeError("could not find element of requested order")
 
@@ -245,7 +263,8 @@ def make_small_order_instance(bits, order_p, order_q):
         aq = element_of_order(q, order_q)
         a = crt([ap, aq], [p, q])
         N = p * q
-        if (order_mod_n(a, {p: 1, q: 1}) == r and math.gcd(a, N) == 1
+        # validate ord_N(a) == r by factoring only r (small), never p-1 or q-1
+        if (has_order(a, N, r) and math.gcd(a, N) == 1
                 and pow(a, r // 2, N) != N - 1):
             return N, a, r, (p, q)
     raise RuntimeError("failed to build a factorable small-order instance")

@@ -134,6 +134,44 @@ def mps_bytes(n, chi, dtype_bytes=16):
     return n * 2 * chi * chi * dtype_bytes
 
 
+def random_rsa_memory(bits):
+    """Fundamental MPS memory (bytes) to run Shor on a *random* ``bits``-bit RSA
+    modulus: chi = r ~ 2^(bits-1), n = 3*bits sites.  This is the irreducible
+    period wall (an ideal QFT-free method still needs chi = r)."""
+    n = 3 * bits
+    chi = 1 << (bits - 1)
+    return mps_bytes(n, chi)
+
+
+def bits_frontier_from_memory(mem_bytes):
+    """Largest random-RSA bit-width whose MPS fits in ``mem_bytes`` (period wall)."""
+    lo, hi = 1, 1 << 16
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        # log2 of memory to avoid building giant ints
+        log2_mem = math.log2(3 * mid) + 1 + 2 * (mid - 1) + 4
+        if log2_mem <= math.log2(mem_bytes):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def bits_frontier_from_compute(flops_per_s, seconds):
+    """Largest random-RSA bit-width whose contraction (~b^2 * chi^3 ops, chi=2^(b-1))
+    finishes within the given compute budget."""
+    budget_log2 = math.log2(flops_per_s) + math.log2(seconds)
+    lo, hi = 1, 1 << 16
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        ops_log2 = 2 * math.log2(mid) + 3 * (mid - 1)
+        if ops_log2 <= budget_log2:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def rsa_resource_estimate(bit_width, r):
     """Resource estimate to run scalable Shor on an N of ``bit_width`` bits with
     period ``r`` (chi == r).  Returns a dict of human-readable figures."""

@@ -145,6 +145,49 @@ method's reach on real RSA equals the classical smooth-key reach, and adds
 nothing on properly generated keys. Tensor networks re-express RSA's hardness as
 "the period `r` is exponentially large" — which is exactly why RSA is secure.
 
+## Frontier-LLM scale: does more compute change anything?
+
+`python3 analyze_scale.py`. Short answer: **no** — and the reason is that the cost
+is set entirely by the bond dimension `χ = r`, not by circuit size.
+
+**Circuit size is free.** We factor an **RSA-2048-*dimension* (~2061-qubit) Shor
+circuit on a laptop in ~6 seconds** — the MPS is 2.3 MB — because the engineered
+period is `r = 6`. A state vector would need `2²⁰⁶⁰` amplitudes.
+
+| dim(N) | qubits | r | χ | MPS | state-vector | time |
+|------:|------:|--:|--:|----:|--:|----:|
+| 512 | 524 | 6 | 6 | 590 KB | 2⁵²⁴ | 1.6 s |
+| 1024 | 1036 | 6 | 6 | 1.2 MB | 2¹⁰³⁶ | 2.9 s |
+| 2048 | 2060 | 6 | 6 | 2.3 MB | 2²⁰⁶⁰ | 5.7 s |
+
+**Hardware barely moves the random-RSA frontier** (where `χ = r ~ 2^{bits-1}`, so
+memory grows as `4^{bits}`):
+
+| machine | RSA bits reachable |
+|---|--:|
+| laptop (16 GB) | 12 |
+| frontier LLM cluster (~100k H100, 8 PB) | **21** |
+| hyperscale (~1M accelerators, 80 PB) | 23 |
+| entire world's data (~200 ZB) | 33 |
+| atoms in the observable universe | 127 |
+| holographic bound of the universe (~10¹²³ bits) | **196** |
+
+![scale frontier](scale_frontier.png)
+
+Going from a laptop to a frontier-LLM training cluster moves the frontier from
+~12-bit to ~21-bit semiprimes (both factored instantly by trial division). Even
+the **information bound of the observable universe** only reaches ~196-bit. RSA-2048
+needs `χ ~ 2²⁰⁴⁷` and `~2⁴¹⁰⁸` bytes — about `2³⁹⁰⁰` beyond the universe's total
+capacity.
+
+**Why the same tensor networks *do* scale to frontier LLMs.** Tensor-train / MPS
+weight factorisation, LoRA, and FP8 compression are tensor networks at
+10⁹–10¹² parameters — they work because those objects are **low-rank**: the bond
+dimension (adapter rank) needed is tens to thousands, so cost stays linear in
+parameters. The Shor state is the opposite regime — its entanglement *is* the
+period, `χ = r`, which is exponential for real RSA. Same tool; opposite side of the
+entanglement wall. Hardware scale cannot move you across it.
+
 ## Layout
 
 ```
@@ -166,6 +209,7 @@ tests/
 run_demo.py        four small-scale experiments + bond_vs_period.png
 run_rsa_scale.py   scalable large-N factoring, the two walls, RSA-2048 extrapolation
 analyze_real_rsa.py  RSA Challenge resource wall, random-key frontier, Pollard p-1
+analyze_scale.py     RSA-2048-dimension circuit on a laptop; hardware/universe scaling
 ```
 
 ## Run
@@ -177,6 +221,7 @@ python3 tests/test_scalable.py
 python3 run_demo.py
 python3 run_rsa_scale.py
 python3 analyze_real_rsa.py
+python3 analyze_scale.py
 ```
 
 ## Scope / honesty
