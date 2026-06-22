@@ -179,6 +179,41 @@ never enumerating the amplitude. The tensor network is a faithful classical
 *simulator* of that sampling — and simulating it costs `χ = r`. The continued
 fraction was always the easy part.
 
+## Dimension / Attention / Transformers for RSA order finding
+
+`python3 transformer_modexp.py`. Raising dimension and using attention *do* add
+classical expressivity — measured — but not the kind RSA-2048 needs.
+
+**A neural net learns modular exponentiation in-distribution.** Trained on bits
+of `x` → `aˣ mod N` for a fixed N (r=100): accuracy climbs from chance (1/r) to
+**0.77** once the training set covers the `r` residue classes (~a few hundred
+points). Neural nets genuinely capture the periodic/Fourier structure (grokking).
+
+![transformer modexp](transformer_modexp.png)
+
+**But it gives no shortcut to the period.** Out-of-range accuracy is poor and only
+improves as the model is shown a *larger fraction* of the sequence — it never
+beats simply observing it. And across moduli the period is not inferable
+(`tn_learn_infer.py`). To find `r` you still pay `~r` to observe it (or `√r` via
+the group law), never `poly(log N)`.
+
+**Attention is all-to-all — but over `L` explicit tokens, at O(L²).** Measured:
+~4× per doubling of `L`. To build Shor's interference by tokenising every
+`x = 0..Q−1` you need `L = Q = N²`, so attention costs `N⁴ = 2^{4·bits}` — worse
+than the state vector:
+
+| RSA-bits | tokens L = Q = N² | attention O(L²) | qubit dim 2^{3b} |
+|--:|--:|--:|--:|
+| 1024 | 2²⁰⁴⁸ | 2⁴⁰⁹⁶ | 2³⁰⁷² |
+| 2048 | 2⁴⁰⁹⁶ | 2⁸¹⁹² | 2⁶¹⁴⁴ |
+
+"Increasing `d`" and "tensor product gives `2ⁿ`" are different things: a classical
+model lives in `ℝ^{L·d}`, qubits in `ℂ^{2ⁿ}`. The quantum advantage is the compact
+exponential *entangled* state space, not all-to-all mixing of an enumerated token
+set. Realistic ML value here is **auxiliary** — learning tensor-network contraction
+orders / cut choices, ranking period candidates, tuning GNFS — targets that are
+cheap to verify and are *not* the period itself.
+
 ## Classical waves / complexification: physical interference, measured
 
 `python3 classical_wave.py`. Classical light, sound, images and complex signals
@@ -392,6 +427,7 @@ sample_histogram.py  post-QFT histogram sampling + m/Q~s/r continued-fraction re
 interference_structure.py  BSGS/meet-in-the-middle period-finding (sqrt r) + landscape
 tn_learn_infer.py    learn the interference (capacity=r) + cross-instance inference fails
 classical_wave.py    classical optical/acoustic FFT + the sign/phase problem (~r)
+transformer_modexp.py  neural net learns modexp (in-dist) + attention O(L^2) wall
 ```
 
 ## Run
@@ -409,6 +445,7 @@ python3 sample_histogram.py
 python3 interference_structure.py
 python3 tn_learn_infer.py
 python3 classical_wave.py
+python3 transformer_modexp.py
 ```
 
 ## Scope / honesty
