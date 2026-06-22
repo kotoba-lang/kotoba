@@ -1028,7 +1028,25 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
             }
         }
         Builtin::Div => binop(cg, args, Instruction::I64DivS),
-        Builtin::Mod => binop(cg, args, Instruction::I64RemS),
+        Builtin::Rem => binop(cg, args, Instruction::I64RemS),
+        Builtin::Mod => {
+            // Clojure floored mod: ((a rem b) + b) rem b — result has the sign of b.
+            // Evaluate a and b once into scratch locals (no side-effect duplication).
+            compile_expr(cg, &args[0])?;
+            let a = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(a));
+            compile_expr(cg, &args[1])?;
+            let bl = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(bl));
+            cg.emit(Instruction::LocalGet(a));
+            cg.emit(Instruction::LocalGet(bl));
+            cg.emit(Instruction::I64RemS);
+            cg.emit(Instruction::LocalGet(bl));
+            cg.emit(Instruction::I64Add);
+            cg.emit(Instruction::LocalGet(bl));
+            cg.emit(Instruction::I64RemS);
+            Ok(())
+        }
         Builtin::Inc => {
             compile_expr(cg, &args[0])?;
             cg.emit(Instruction::I64Const(1));
@@ -1808,9 +1826,16 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Div => v[0]
             .checked_div(v[1])
             .ok_or_else(|| CljError::Codegen("division by zero in const".into()))?,
-        Builtin::Mod => v[0]
+        Builtin::Rem => v[0]
             .checked_rem(v[1])
             .ok_or_else(|| CljError::Codegen("rem by zero in const".into()))?,
+        Builtin::Mod => {
+            // floored: ((a rem b) + b) rem b — matches the runtime + Clojure semantics
+            let r = v[0]
+                .checked_rem(v[1])
+                .ok_or_else(|| CljError::Codegen("mod by zero in const".into()))?;
+            (r + v[1]) % v[1]
+        }
         Builtin::Inc => v[0] + 1,
         Builtin::Dec => v[0] - 1,
         Builtin::Abs => v[0].abs(),

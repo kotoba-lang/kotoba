@@ -63,7 +63,8 @@ pub enum Builtin {
     Sub,
     Mul,
     Div,
-    Mod,
+    Mod, // Clojure floored mod (sign of divisor)
+    Rem, // truncated remainder (sign of dividend)
     Inc,
     Dec,
     Abs,
@@ -222,7 +223,8 @@ impl Builtin {
             "-" => Builtin::Sub,
             "*" => Builtin::Mul,
             "/" | "quot" => Builtin::Div,
-            "mod" | "rem" => Builtin::Mod,
+            "mod" => Builtin::Mod,
+            "rem" => Builtin::Rem,
             "inc" => Builtin::Inc,
             "dec" => Builtin::Dec,
             "abs" => Builtin::Abs,
@@ -2313,7 +2315,7 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         Builtin::Sub => n >= 1, // unary negate or n-ary subtract
         Builtin::Min | Builtin::Max => n >= 1,
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,
-        Builtin::Div | Builtin::Mod | Builtin::ByteAt | Builtin::ByteAppend => n == 2,
+        Builtin::Div | Builtin::Mod | Builtin::Rem | Builtin::ByteAt | Builtin::ByteAppend => n == 2,
         Builtin::Eq | Builtin::NotEq => n >= 1,
         Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n >= 1,
         Builtin::KqeAssert | Builtin::KqeRetract => n == 4,

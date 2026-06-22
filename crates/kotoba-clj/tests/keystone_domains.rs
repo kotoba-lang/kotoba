@@ -205,3 +205,17 @@ fn netsync_synced_fields_accumulator() {
     assert_eq!(eval("(count (into [] []))"), 0, "into empty");
     assert_eq!(eval("(count (into [] [1 2 3]))"), 3, "into onto empty acc");
 }
+
+// Arithmetic semantics the game logic relies on (spawn = mod, AI = signed deltas). Negative
+// mod/quot/rem are a classic compiler divergence point — assert Clojure semantics.
+#[test]
+fn arithmetic_edge_semantics() {
+    assert_eq!(eval("(mod 7 3)"), 1);
+    assert_eq!(eval("(mod -7 3)"), 2, "Clojure mod is floored (sign of divisor)");
+    assert_eq!(eval("(quot 7 3)"), 2);
+    assert_eq!(eval("(quot -7 3)"), -2, "quot truncates toward zero");
+    assert_eq!(eval("(rem -7 3)"), -1, "rem keeps sign of dividend");
+    assert_eq!(eval("(* -3 4)"), -12);
+    assert_eq!(eval("(- 0 5)"), -5);
+    assert_eq!(eval("(if (< -1 0) 1 0)"), 1, "signed comparison");
+}
