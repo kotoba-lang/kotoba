@@ -865,8 +865,11 @@ fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
         EdnValue::List(items) => lower_call(items),
         EdnValue::Vector(items) => lower_vector_literal(items),
         EdnValue::Map(items) => lower_map_literal(items),
+        // set literals (e.g. `#{:bot}`) lower to the same growable container as vectors;
+        // membership is `(some #(= % x) the-set)` (or `vec-contains?`) in the subset.
+        EdnValue::Set(items) => lower_vector_literal(&items.iter().cloned().collect::<Vec<_>>()),
         other => Err(CljError::Lower(format!(
-            "unsupported expression: {other:?} (only integers, booleans, strings, keywords, symbols, lists, vectors and maps are supported)"
+            "unsupported expression: {other:?} (only integers, booleans, strings, keywords, symbols, lists, vectors, maps and sets are supported)"
         ))),
     }
 }

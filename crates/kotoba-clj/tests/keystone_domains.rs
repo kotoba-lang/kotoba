@@ -55,6 +55,21 @@ fn fsm_advance_transitions() {
 }
 
 #[test]
+fn set_literal_value_compiles() {
+    // set *values* (`#{…}`) now lower (to a growable vector); membership via `some`. This
+    // closes the residual data-subset gap — the physics matrix can use sets directly.
+    assert_eq!(
+        eval(
+            "(let [s #{:bot :prop}
+                   member? (fn [coll x] (if (some (fn [e] (= e x)) coll) 1 0))]
+               (+ (member? s :bot)              ;; 1
+                  (* 10 (member? s :player))))" // 0
+        ),
+        1
+    );
+}
+
+#[test]
 fn netsync_snapshot_drops_unsynced() {
     // kami.netsync/snapshot: select only the schema's synced fields from an entity map
     assert_eq!(
