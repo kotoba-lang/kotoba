@@ -29,6 +29,7 @@ pub mod node;
 pub mod policy;
 pub mod protocol;
 pub mod reconcile;
+pub mod trigger;
 
 pub use control::{app_to_quads, desired_from_quads, ControlQuad};
 pub use error::LatticeError;
@@ -39,3 +40,4 @@ pub use protocol::{
     topic, Auction, Award, Bid, Constraints, Heartbeat, LatticeMessage, Link, NodeRole,
 };
 pub use reconcile::{award_winners, need_actions, observed_counts, score_bid, NeedAction};
+pub use trigger::{delta_triggers, fired_by_batch, fired_by_datom, DeltaTrigger};

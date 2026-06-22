@@ -67,6 +67,13 @@ pub struct TriggerSpec {
     pub topic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
+    /// `datom-delta` trigger: fire when a new datom with this predicate appears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// `datom-delta` trigger: optional value filter (fire only when the datom's
+    /// object equals this). `None` = any value for the predicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// A capability link (ADR §5): CACAO-rooted binding to a capability/provider.
@@ -284,6 +291,8 @@ fn trigger_from_edn(v: &EdnValue) -> Result<TriggerSpec, LatticeError> {
         route: get_str(m, "route"),
         topic: get_str(m, "topic"),
         schedule: get_str(m, "schedule"),
+        predicate: get_str(m, "predicate"),
+        value: get_str(m, "value"),
     })
 }
 
