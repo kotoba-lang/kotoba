@@ -82,6 +82,52 @@ impl FirehoseSeen {
 /// When `relay` is true (NodeRole::Relay), the node additionally bridges its
 /// full KSE LiveBus onto the `firehose` gossip topic and re-logs peers' firehose
 /// entries — the mesh half of the D+E federation surface (2026-05-30).
+/// Place a component on THIS node (KOTOBA Mesh M4): fetch its artifact by CID
+/// and execute it on the WASM host. On success the node records it in `hosted`
+/// (advertised on the next heartbeat), which closes the reconcile loop. If the
+/// artifact is not local yet, or the CID is malformed, or execution fails, the
+/// node skips it gracefully (a later auction round retries once bitswap pulls it).
+pub(crate) fn start_component(
+    executor: &kotoba_runtime::WasmExecutor,
+    block_store: &(dyn BlockStore + Send + Sync),
+    node_did: &str,
+    cid: &str,
+    hosted: &mut Vec<String>,
+) {
+    if hosted.iter().any(|c| c == cid) {
+        return;
+    }
+    let Some(kcid) = KotobaCid::from_multibase(cid) else {
+        tracing::warn!(%cid, "lattice start: malformed component CID");
+        return;
+    };
+    let wasm = match block_store.get(&kcid) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            tracing::info!(%cid, "lattice start: artifact not local yet (awaiting bitswap) — not hosting");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(%cid, err = %e, "lattice start: artifact fetch failed");
+            return;
+        }
+    };
+    match executor.execute(
+        cid,
+        &wasm,
+        node_did,
+        Vec::new(),
+        Vec::new(),
+        std::collections::HashMap::new(),
+    ) {
+        Ok(res) => {
+            tracing::info!(%cid, gas = res.gas_used, "lattice start: component placed and executed");
+            hosted.push(cid.to_string());
+        }
+        Err(e) => tracing::warn!(%cid, err = %e, "lattice start: component execution failed"),
+    }
+}
+
 pub async fn run(
     mut swarm: KotobaSwarm,
     mut publish_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
@@ -157,52 +203,6 @@ pub async fn run(
     let mut lattice = kotoba_lattice::LatticeController::new(/*ttl*/ 15_000, /*bid_window*/ 3_000);
     let mut lattice_hb = tokio::time::interval(std::time::Duration::from_secs(5));
     tracing::info!(node_did = %node_did, "net_actor: lattice participation active");
-
-    // Place a component on THIS node: fetch its artifact by CID and execute it
-    // on the WASM host. On success the node starts advertising it as `hosted`,
-    // which closes the reconcile loop (observed rises to meet desired). If the
-    // artifact is not in the local store yet, skip — bitswap will pull it and a
-    // later auction round retries.
-    fn start_component(
-        executor: &kotoba_runtime::WasmExecutor,
-        block_store: &(dyn BlockStore + Send + Sync),
-        node_did: &str,
-        cid: &str,
-        hosted: &mut Vec<String>,
-    ) {
-        if hosted.iter().any(|c| c == cid) {
-            return;
-        }
-        let Some(kcid) = KotobaCid::from_multibase(cid) else {
-            tracing::warn!(%cid, "lattice start: malformed component CID");
-            return;
-        };
-        let wasm = match block_store.get(&kcid) {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                tracing::info!(%cid, "lattice start: artifact not local yet (awaiting bitswap) — not hosting");
-                return;
-            }
-            Err(e) => {
-                tracing::warn!(%cid, err = %e, "lattice start: artifact fetch failed");
-                return;
-            }
-        };
-        match executor.execute(
-            cid,
-            &wasm,
-            node_did,
-            Vec::new(),
-            Vec::new(),
-            std::collections::HashMap::new(),
-        ) {
-            Ok(res) => {
-                tracing::info!(%cid, gas = res.gas_used, "lattice start: component placed and executed");
-                hosted.push(cid.to_string());
-            }
-            Err(e) => tracing::warn!(%cid, err = %e, "lattice start: component execution failed"),
-        }
-    }
 
     loop {
         tokio::select! {
@@ -467,6 +467,54 @@ mod tests {
 
     fn cid(byte: u8) -> KotobaCid {
         KotobaCid([byte; 36])
+    }
+
+    // ── KOTOBA Mesh M4: component placement path (start_component) ──
+    // The success path (real component → execute → hosted) is covered by the
+    // end-to-end `kotoba app deploy` run; here we lock down the defensive
+    // branches that keep a node from wedging on bad/missing artifacts.
+
+    fn test_executor() -> kotoba_runtime::WasmExecutor {
+        kotoba_runtime::WasmExecutor::new(10_000_000).unwrap()
+    }
+
+    #[test]
+    fn start_component_skips_malformed_cid() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let mut hosted = Vec::new();
+        start_component(&test_executor(), &store, "did:self", "not-a-real-cid", &mut hosted);
+        assert!(hosted.is_empty(), "malformed CID must not be hosted");
+    }
+
+    #[test]
+    fn start_component_skips_when_artifact_absent() {
+        // valid CID, but the artifact is not in the local store yet (bitswap
+        // hasn't pulled it) → skip, do not host, do not panic.
+        let store = kotoba_store::MemoryBlockStore::new();
+        let absent = KotobaCid::from_bytes(b"some component bytes").to_multibase();
+        let mut hosted = Vec::new();
+        start_component(&test_executor(), &store, "did:self", &absent, &mut hosted);
+        assert!(hosted.is_empty(), "absent artifact must not be hosted");
+    }
+
+    #[test]
+    fn start_component_handles_non_wasm_artifact_gracefully() {
+        // artifact present but not a valid component → execute fails → skip.
+        let store = kotoba_store::MemoryBlockStore::new();
+        let garbage = b"this is definitely not a wasm component";
+        let kc = KotobaCid::from_bytes(garbage);
+        store.put(&kc, garbage).unwrap();
+        let mut hosted = Vec::new();
+        start_component(&test_executor(), &store, "did:self", &kc.to_multibase(), &mut hosted);
+        assert!(hosted.is_empty(), "uncompilable artifact must not be hosted");
+    }
+
+    #[test]
+    fn start_component_is_idempotent_for_already_hosted() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let mut hosted = vec!["bafyAlready".to_string()];
+        start_component(&test_executor(), &store, "did:self", "bafyAlready", &mut hosted);
+        assert_eq!(hosted, vec!["bafyAlready".to_string()], "must not double-add");
     }
 
     #[test]
