@@ -186,3 +186,22 @@ fn map_builders_count_audit() {
     assert_eq!(eval("(get (frequencies [:a :a :b]) :a)"), 2, "frequencies tally");
     assert_eq!(eval("(count (group-by (fn [x] x) [:a :b :a]))"), 2, "group-by groups");
 }
+
+// The actual kami.netsync/synced-fields: reduce-kv over :components, into-accumulating the
+// per-component :fields. This is the accumulator pattern where the `into` capacity bug lived
+// — a strong regression test for the fix in a real interpreter shape.
+#[test]
+fn netsync_synced_fields_accumulator() {
+    assert_eq!(
+        eval(
+            "(let [schema {:components {:transform {:fields [:x :y]} :health {:fields [:hp]}}}
+                   fields (reduce-kv (fn [acc _ comp] (into acc (get comp :fields)))
+                                     [] (get schema :components))]
+               (count fields))" // :x :y :hp → 3
+        ),
+        3
+    );
+    // into with an empty source and an empty accumulator stay well-defined
+    assert_eq!(eval("(count (into [] []))"), 0, "into empty");
+    assert_eq!(eval("(count (into [] [1 2 3]))"), 3, "into onto empty acc");
+}
