@@ -179,6 +179,42 @@ never enumerating the amplitude. The tensor network is a faithful classical
 *simulator* of that sampling — and simulating it costs `χ = r`. The continued
 fraction was always the easy part.
 
+## Continuous-variable (CV) quantum modes + classical
+
+`python3 cv_quantum.py`. A CV mode has an in-principle infinite Fock space, so a
+few hundred high-dimensional modes could in principle carry RSA-2048's `2⁴⁰⁹⁶`.
+Measured catches:
+
+**Mode counting.** `D = d^M`, so reaching `2⁴⁰⁹⁶` needs `M = 4096/log₂d` modes —
+e.g. `d=10⁶` (a 20-bit-precise mode) → ~206 modes. The infinite dimension is not
+free: each bit of per-mode capacity is energy + precision you must buy.
+
+**Classical simulation cost: Gaussian O(M²) vs Fock d^M.** A Gaussian /
+linear-optical state (mean + covariance, evolved by an M×M transfer matrix on the
+mode amplitudes) is polynomial — *milliseconds for 2048 modes*. A general
+(non-Gaussian) state truncated to `d` Fock levels needs `d^M` amplitudes — `10²⁰⁴⁸`
+at M=2048.
+
+**The dividing line = Wigner negativity.** The efficiently-simulable CV regime is
+exactly the weak one:
+
+| state | min Wigner | negative? | classical cost |
+|---|--:|:--:|---|
+| coherent (Gaussian) | 0.000 | no | O(M²) covariance |
+| Fock \|1⟩ | −0.318 (=−1/π) | **yes** | d^M Fock |
+| cat | −0.219 | **yes** | d^M Fock |
+
+![cv quantum](cv_quantum.png)
+
+Positive Wigner (Gaussian) = a genuine probability distribution → classically
+sampleable (Mari–Eisert) → no speedup. The **negative** Wigner regions (the blue
+fringes above) are necessary for a speedup and are exactly what the covariance
+description cannot hold, forcing the `d^M` Fock cost. CV quantum is a real
+*alternative substrate* for an exponential entangled state space — but bolting
+classical modes onto it is no free pass to RSA-2048. The resource that gives the
+speedup (negativity / entanglement / period structure) is, once again, exactly the
+thing that is classically expensive to hold.
+
 ## Dimension / Attention / Transformers for RSA order finding
 
 `python3 transformer_modexp.py`. Raising dimension and using attention *do* add
@@ -428,6 +464,7 @@ interference_structure.py  BSGS/meet-in-the-middle period-finding (sqrt r) + lan
 tn_learn_infer.py    learn the interference (capacity=r) + cross-instance inference fails
 classical_wave.py    classical optical/acoustic FFT + the sign/phase problem (~r)
 transformer_modexp.py  neural net learns modexp (in-dist) + attention O(L^2) wall
+cv_quantum.py        continuous-variable modes: Gaussian O(M^2) vs Fock d^M + Wigner
 ```
 
 ## Run
@@ -446,6 +483,7 @@ python3 interference_structure.py
 python3 tn_learn_infer.py
 python3 classical_wave.py
 python3 transformer_modexp.py
+python3 cv_quantum.py
 ```
 
 ## Scope / honesty
