@@ -87,4 +87,55 @@ mod tests {
         let bytes = LatticeMessage::DelLink { id: "x".into() }.to_cbor().unwrap();
         assert!(decode_lattice("kotoba/kse/some/topic", &bytes).is_none());
     }
+
+    /// Regression guard: every reserved control topic must be in the subscribe
+    /// set. Adding a new `topic::*` without extending `LATTICE_TOPICS` would
+    /// silently drop that traffic (the exact trap hit when `CAP` was added).
+    #[test]
+    fn lattice_topics_cover_all_protocol_constants() {
+        for t in [
+            topic::HEARTBEAT,
+            topic::INVENTORY,
+            topic::CMD,
+            topic::LINK,
+            topic::AUCTION,
+            topic::CAP,
+        ] {
+            assert!(LATTICE_TOPICS.contains(&t), "topic {t} not in LATTICE_TOPICS");
+        }
+        assert_eq!(LATTICE_TOPICS.len(), 6);
+    }
+
+    #[test]
+    fn decode_works_on_every_lattice_topic() {
+        let msg = LatticeMessage::DelLink { id: "x".into() };
+        let bytes = msg.to_cbor().unwrap();
+        for t in LATTICE_TOPICS {
+            let wire = gossipsub_topic(t);
+            assert_eq!(decode_lattice(&wire, &bytes), Some(msg.clone()), "topic {t}");
+        }
+    }
+
+    #[test]
+    fn decode_returns_none_on_malformed_lattice_payload() {
+        // garbage on a *valid* lattice topic must fail gracefully (no panic)
+        let wire = gossipsub_topic(topic::AUCTION);
+        assert!(decode_lattice(&wire, &[0xff, 0x00, 0x99]).is_none());
+        assert!(decode_lattice(&wire, &[]).is_none());
+    }
+
+    #[test]
+    fn decode_cap_invoke_on_cap_topic() {
+        let m = LatticeMessage::CapInvoke {
+            id: "i".into(),
+            source: "s".into(),
+            provider_did: "p".into(),
+            target_cap: "cap/llm".into(),
+            ability: "infer".into(),
+            link_id: "l".into(),
+            args_cbor: vec![1, 2],
+        };
+        let wire = gossipsub_topic(topic::CAP);
+        assert_eq!(decode_lattice(&wire, &m.to_cbor().unwrap()), Some(m));
+    }
 }
