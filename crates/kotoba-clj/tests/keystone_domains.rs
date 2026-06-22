@@ -176,3 +176,13 @@ fn collection_ops_count_audit() {
     assert_eq!(eval("(count (drop 1 [1 2 3 4]))"), 3, "drop");
     assert_eq!(eval("(count (filterv (fn [x] (> x 1)) [1 2 3]))"), 2, "filterv");
 }
+
+// Audit: the map-builder side of the same capacity/count class (map-assoc! never grows).
+#[test]
+fn map_builders_count_audit() {
+    assert_eq!(eval("(count (zipmap [:a :b] [1 2]))"), 2, "zipmap count");
+    assert_eq!(eval("(get (zipmap [:a :b] [10 20]) :b)"), 20, "zipmap get");
+    assert_eq!(eval("(count (frequencies [:a :a :b :c :c :c]))"), 3, "frequencies distinct count");
+    assert_eq!(eval("(get (frequencies [:a :a :b]) :a)"), 2, "frequencies tally");
+    assert_eq!(eval("(count (group-by (fn [x] x) [:a :b :a]))"), 2, "group-by groups");
+}
