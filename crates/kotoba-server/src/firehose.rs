@@ -79,10 +79,7 @@ fn max_backfill_span() -> u64 {
 }
 
 /// Reject a cursor that is too far behind the head to backfill in one shot.
-fn check_backfill_span(
-    cursor: Option<u64>,
-    current_seq: u64,
-) -> Result<(), (StatusCode, String)> {
+fn check_backfill_span(cursor: Option<u64>, current_seq: u64) -> Result<(), (StatusCode, String)> {
     if let Some(c) = cursor {
         let span = current_seq.saturating_sub(c);
         let max = max_backfill_span();
@@ -358,9 +355,7 @@ pub async fn subscribe(
     // connection forever — the client resumes from its last `id` via `?cursor=`.
     let stream: std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
         match sse_max_secs() {
-            Some(secs) => {
-                Box::pin(base.take_until(tokio::time::sleep(Duration::from_secs(secs))))
-            }
+            Some(secs) => Box::pin(base.take_until(tokio::time::sleep(Duration::from_secs(secs)))),
             None => Box::pin(base),
         };
 

@@ -84,7 +84,9 @@ mod tests {
 
     #[test]
     fn decode_ignores_non_lattice_topic() {
-        let bytes = LatticeMessage::DelLink { id: "x".into() }.to_cbor().unwrap();
+        let bytes = LatticeMessage::DelLink { id: "x".into() }
+            .to_cbor()
+            .unwrap();
         assert!(decode_lattice("kotoba/kse/some/topic", &bytes).is_none());
     }
 
@@ -101,7 +103,10 @@ mod tests {
             topic::AUCTION,
             topic::CAP,
         ] {
-            assert!(LATTICE_TOPICS.contains(&t), "topic {t} not in LATTICE_TOPICS");
+            assert!(
+                LATTICE_TOPICS.contains(&t),
+                "topic {t} not in LATTICE_TOPICS"
+            );
         }
         assert_eq!(LATTICE_TOPICS.len(), 6);
     }
@@ -112,7 +117,11 @@ mod tests {
         let bytes = msg.to_cbor().unwrap();
         for t in LATTICE_TOPICS {
             let wire = gossipsub_topic(t);
-            assert_eq!(decode_lattice(&wire, &bytes), Some(msg.clone()), "topic {t}");
+            assert_eq!(
+                decode_lattice(&wire, &bytes),
+                Some(msg.clone()),
+                "topic {t}"
+            );
         }
     }
 

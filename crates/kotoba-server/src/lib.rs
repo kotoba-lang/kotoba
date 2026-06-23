@@ -91,7 +91,6 @@ fn cors_from_env() -> Option<CorsLayer> {
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::xrpc::*;

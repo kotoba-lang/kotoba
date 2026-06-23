@@ -91,7 +91,10 @@ pub fn desired_from_quads(
     let mut constraints = BTreeMap::new();
 
     for (_subj, qs) in by_subject {
-        let cid = qs.iter().find(|q| q.predicate == pred::CID).map(|q| q.object.clone());
+        let cid = qs
+            .iter()
+            .find(|q| q.predicate == pred::CID)
+            .map(|q| q.object.clone());
         let Some(cid) = cid else { continue };
         let scale = qs
             .iter()
@@ -109,7 +112,11 @@ pub fn desired_from_quads(
         let require_labels: BTreeMap<String, String> = qs
             .iter()
             .filter(|q| q.predicate == pred::LABEL)
-            .filter_map(|q| q.object.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .filter_map(|q| {
+                q.object
+                    .split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
             .collect();
 
         desired.insert(cid.clone(), scale);
@@ -140,16 +147,31 @@ mod tests {
         let quads = app_to_quads(&app, &resolved);
 
         // datoms are present for cid/scale/requires/label
-        assert!(quads.iter().any(|q| q.predicate == pred::CID && q.object == "bafyReply"));
-        assert!(quads.iter().any(|q| q.predicate == pred::SCALE && q.object == "3"));
-        assert_eq!(quads.iter().filter(|q| q.predicate == pred::REQUIRES).count(), 2);
-        assert!(quads.iter().any(|q| q.predicate == pred::LABEL && q.object == "tier=edge"));
+        assert!(quads
+            .iter()
+            .any(|q| q.predicate == pred::CID && q.object == "bafyReply"));
+        assert!(quads
+            .iter()
+            .any(|q| q.predicate == pred::SCALE && q.object == "3"));
+        assert_eq!(
+            quads
+                .iter()
+                .filter(|q| q.predicate == pred::REQUIRES)
+                .count(),
+            2
+        );
+        assert!(quads
+            .iter()
+            .any(|q| q.predicate == pred::LABEL && q.object == "tier=edge"));
 
         let (desired, constraints) = desired_from_quads(&quads);
         assert_eq!(desired.get("bafyReply"), Some(&3));
         let c = &constraints["bafyReply"];
         assert!(c.requires_caps.contains(&"cap/llm".to_string()));
-        assert_eq!(c.require_labels.get("tier").map(|s| s.as_str()), Some("edge"));
+        assert_eq!(
+            c.require_labels.get("tier").map(|s| s.as_str()),
+            Some("edge")
+        );
     }
 
     #[test]
@@ -177,11 +199,18 @@ mod tests {
     #[test]
     fn quads_are_deterministic() {
         let app = AppManifest::from_edn(APP).unwrap();
-        assert_eq!(app_to_quads(&app, &BTreeMap::new()), app_to_quads(&app, &BTreeMap::new()));
+        assert_eq!(
+            app_to_quads(&app, &BTreeMap::new()),
+            app_to_quads(&app, &BTreeMap::new())
+        );
     }
 
     fn q(s: &str, p: &str, o: &str) -> ControlQuad {
-        ControlQuad { subject: s.into(), predicate: p.into(), object: o.into() }
+        ControlQuad {
+            subject: s.into(),
+            predicate: p.into(),
+            object: o.into(),
+        }
     }
 
     #[test]
@@ -194,7 +223,10 @@ mod tests {
         let (d, c) = desired_from_quads(&quads);
         assert_eq!(d.get("bafyX"), Some(&1)); // scale defaults to 1
         assert_eq!(c["bafyX"].require_labels.len(), 1);
-        assert_eq!(c["bafyX"].require_labels.get("tier").map(|s| s.as_str()), Some("edge"));
+        assert_eq!(
+            c["bafyX"].require_labels.get("tier").map(|s| s.as_str()),
+            Some("edge")
+        );
     }
 
     #[test]
@@ -213,8 +245,14 @@ mod tests {
     #[test]
     fn label_value_with_embedded_equals_keeps_first_split() {
         // split_once('=') → key before first '=', value is the remainder
-        let quads = vec![q("s", pred::CID, "bafyX"), q("s", pred::LABEL, "url=https://x/y=z")];
+        let quads = vec![
+            q("s", pred::CID, "bafyX"),
+            q("s", pred::LABEL, "url=https://x/y=z"),
+        ];
         let (_, c) = desired_from_quads(&quads);
-        assert_eq!(c["bafyX"].require_labels.get("url").map(|s| s.as_str()), Some("https://x/y=z"));
+        assert_eq!(
+            c["bafyX"].require_labels.get("url").map(|s| s.as_str()),
+            Some("https://x/y=z")
+        );
     }
 }

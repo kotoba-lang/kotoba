@@ -95,10 +95,7 @@ pub fn score_bid(hb: &Heartbeat, constraints: &Constraints) -> Option<u64> {
 /// tie-break), and take the top `auction.n`. Every reconciler that sees the
 /// same bid set returns the same winners — no leader needed.
 pub fn award_winners(auction: &Auction, bids: &[Bid]) -> Vec<String> {
-    let mut eligible: Vec<&Bid> = bids
-        .iter()
-        .filter(|b| b.auction_id == auction.id)
-        .collect();
+    let mut eligible: Vec<&Bid> = bids.iter().filter(|b| b.auction_id == auction.id).collect();
     eligible.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
@@ -130,10 +127,7 @@ mod tests {
 
     #[test]
     fn observed_counts_tallies_fleet() {
-        let fleet = vec![
-            hb("n1", &[], 0, &["A", "B"]),
-            hb("n2", &[], 0, &["A"]),
-        ];
+        let fleet = vec![hb("n1", &[], 0, &["A", "B"]), hb("n2", &[], 0, &["A"])];
         let c = observed_counts(&fleet);
         assert_eq!(c.get("A"), Some(&2));
         assert_eq!(c.get("B"), Some(&1));
@@ -148,9 +142,18 @@ mod tests {
         assert_eq!(
             acts,
             vec![
-                NeedAction { cid: "A".into(), delta: 2 },
-                NeedAction { cid: "B".into(), delta: 1 },
-                NeedAction { cid: "C".into(), delta: -2 },
+                NeedAction {
+                    cid: "A".into(),
+                    delta: 2
+                },
+                NeedAction {
+                    cid: "B".into(),
+                    delta: 1
+                },
+                NeedAction {
+                    cid: "C".into(),
+                    delta: -2
+                },
             ]
         );
     }
@@ -202,15 +205,34 @@ mod tests {
             constraints: Constraints::default(),
         };
         let bids = vec![
-            Bid { auction_id: "auc-1".into(), node_did: "nB".into(), score: 100 },
-            Bid { auction_id: "auc-1".into(), node_did: "nA".into(), score: 100 },
-            Bid { auction_id: "auc-1".into(), node_did: "nC".into(), score: 50 },
+            Bid {
+                auction_id: "auc-1".into(),
+                node_did: "nB".into(),
+                score: 100,
+            },
+            Bid {
+                auction_id: "auc-1".into(),
+                node_did: "nA".into(),
+                score: 100,
+            },
+            Bid {
+                auction_id: "auc-1".into(),
+                node_did: "nC".into(),
+                score: 50,
+            },
             // wrong auction — must be ignored
-            Bid { auction_id: "auc-2".into(), node_did: "nZ".into(), score: 999 },
+            Bid {
+                auction_id: "auc-2".into(),
+                node_did: "nZ".into(),
+                score: 999,
+            },
         ];
         // tie at 100 → nA before nB; take top 2
         assert_eq!(award_winners(&auction, &bids), vec!["nA", "nB"]);
         // recompute → identical (leader-less convergence)
-        assert_eq!(award_winners(&auction, &bids), award_winners(&auction, &bids));
+        assert_eq!(
+            award_winners(&auction, &bids),
+            award_winners(&auction, &bids)
+        );
     }
 }

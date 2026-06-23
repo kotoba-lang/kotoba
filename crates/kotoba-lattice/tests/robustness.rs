@@ -28,7 +28,10 @@ fn put_app(cid: &str, n: u32, cap: &str) -> LatticeMessage {
         desired: BTreeMap::from([(cid.to_string(), n)]),
         constraints: BTreeMap::from([(
             cid.to_string(),
-            Constraints { require_labels: BTreeMap::new(), requires_caps: vec![cap.to_string()] },
+            Constraints {
+                require_labels: BTreeMap::new(),
+                requires_caps: vec![cap.to_string()],
+            },
         )]),
     }
 }
@@ -40,15 +43,21 @@ fn auction_with_no_bids_awards_nothing() {
     let mut c = LatticeController::new(15_000, 3_000);
     c.on_message(put_app("bafyX", 2, "cap/kqe"), 0);
     let opened = c.tick(100);
-    assert!(opened.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
+    assert!(opened
+        .iter()
+        .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
     let closed = c.close_due(4_000);
     assert!(
-        !closed.iter().any(|(_, m)| matches!(m, LatticeMessage::StartComponent { .. })),
+        !closed
+            .iter()
+            .any(|(_, m)| matches!(m, LatticeMessage::StartComponent { .. })),
         "no bids → no placement"
     );
     // still short → a later round re-auctions
     let again = c.tick(8_000);
-    assert!(again.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
+    assert!(again
+        .iter()
+        .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
 }
 
 #[test]
@@ -94,7 +103,10 @@ fn award_is_capped_at_available_bids() {
         .into_iter()
         .filter(|(_, m)| matches!(m, LatticeMessage::StartComponent { .. }))
         .count();
-    assert_eq!(starts, 2, "cannot place more instances than there are bidders");
+    assert_eq!(
+        starts, 2,
+        "cannot place more instances than there are bidders"
+    );
 }
 
 #[test]
@@ -130,10 +142,23 @@ fn award_winners_is_deterministic_and_sorted_on_a_large_fleet() {
 
 #[test]
 fn award_winners_ignores_foreign_auction_bids() {
-    let auction = Auction { id: "mine".into(), cid: "x".into(), n: 3, constraints: Constraints::default() };
+    let auction = Auction {
+        id: "mine".into(),
+        cid: "x".into(),
+        n: 3,
+        constraints: Constraints::default(),
+    };
     let bids = vec![
-        Bid { auction_id: "mine".into(), node_did: "a".into(), score: 10 },
-        Bid { auction_id: "other".into(), node_did: "b".into(), score: 999 },
+        Bid {
+            auction_id: "mine".into(),
+            node_did: "a".into(),
+            score: 10,
+        },
+        Bid {
+            auction_id: "other".into(),
+            node_did: "b".into(),
+            score: 999,
+        },
     ];
     assert_eq!(award_winners(&auction, &bids), vec!["a".to_string()]);
 }
@@ -159,7 +184,10 @@ fn control_roundtrip_is_order_independent_and_multi_component() {
     assert_eq!(d1.get("bafyA"), Some(&3));
     assert_eq!(d1.get("bafyB"), Some(&1));
     assert!(c1["bafyB"].requires_caps.contains(&"cap/llm".to_string()));
-    assert_eq!(c1["bafyA"].require_labels.get("tier").map(|s| s.as_str()), Some("edge"));
+    assert_eq!(
+        c1["bafyA"].require_labels.get("tier").map(|s| s.as_str()),
+        Some("edge")
+    );
 }
 
 #[test]

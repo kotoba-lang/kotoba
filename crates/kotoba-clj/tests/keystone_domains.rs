@@ -152,7 +152,10 @@ fn map_ops_compile_to_wasm() {
 fn collection_ops_compile_to_wasm() {
     // vectors built/transformed as data: into (extend) + mapv (transform), summed via reduce
     assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (into [1 2] [3 4]))"), 10); // 1+2+3+4
-    assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (mapv (fn [x] (* x x)) [1 2 3]))"), 14); // 1+4+9
+    assert_eq!(
+        eval("(reduce (fn [a x] (+ a x)) 0 (mapv (fn [x] (* x x)) [1 2 3]))"),
+        14
+    ); // 1+4+9
 }
 
 // Regression: `into` returns a correctly-sized new vector even when dst is at exact
@@ -160,8 +163,16 @@ fn collection_ops_compile_to_wasm() {
 #[test]
 fn into_does_not_overflow_capacity() {
     assert_eq!(eval("(count (into [1 2] [3 4]))"), 4, "into count");
-    assert_eq!(eval("(nth (into [1 2] [3 4]) 3)"), 4, "into preserves order");
-    assert_eq!(eval("(nth (mapv (fn [x] (* x x)) [1 2 3]) 2)"), 9, "mapv/nth correct");
+    assert_eq!(
+        eval("(nth (into [1 2] [3 4]) 3)"),
+        4,
+        "into preserves order"
+    );
+    assert_eq!(
+        eval("(nth (mapv (fn [x] (* x x)) [1 2 3]) 2)"),
+        9,
+        "mapv/nth correct"
+    );
 }
 
 // Audit: the same capacity/count class of bug across prelude vector-builders.
@@ -174,7 +185,11 @@ fn collection_ops_count_audit() {
     assert_eq!(eval("(count (reverse [1 2 3]))"), 3, "reverse");
     assert_eq!(eval("(count (take 2 [1 2 3 4]))"), 2, "take");
     assert_eq!(eval("(count (drop 1 [1 2 3 4]))"), 3, "drop");
-    assert_eq!(eval("(count (filterv (fn [x] (> x 1)) [1 2 3]))"), 2, "filterv");
+    assert_eq!(
+        eval("(count (filterv (fn [x] (> x 1)) [1 2 3]))"),
+        2,
+        "filterv"
+    );
 }
 
 // Audit: the map-builder side of the same capacity/count class (map-assoc! never grows).
@@ -182,9 +197,21 @@ fn collection_ops_count_audit() {
 fn map_builders_count_audit() {
     assert_eq!(eval("(count (zipmap [:a :b] [1 2]))"), 2, "zipmap count");
     assert_eq!(eval("(get (zipmap [:a :b] [10 20]) :b)"), 20, "zipmap get");
-    assert_eq!(eval("(count (frequencies [:a :a :b :c :c :c]))"), 3, "frequencies distinct count");
-    assert_eq!(eval("(get (frequencies [:a :a :b]) :a)"), 2, "frequencies tally");
-    assert_eq!(eval("(count (group-by (fn [x] x) [:a :b :a]))"), 2, "group-by groups");
+    assert_eq!(
+        eval("(count (frequencies [:a :a :b :c :c :c]))"),
+        3,
+        "frequencies distinct count"
+    );
+    assert_eq!(
+        eval("(get (frequencies [:a :a :b]) :a)"),
+        2,
+        "frequencies tally"
+    );
+    assert_eq!(
+        eval("(count (group-by (fn [x] x) [:a :b :a]))"),
+        2,
+        "group-by groups"
+    );
 }
 
 // The actual kami.netsync/synced-fields: reduce-kv over :components, into-accumulating the
@@ -211,7 +238,11 @@ fn netsync_synced_fields_accumulator() {
 #[test]
 fn arithmetic_edge_semantics() {
     assert_eq!(eval("(mod 7 3)"), 1);
-    assert_eq!(eval("(mod -7 3)"), 2, "Clojure mod is floored (sign of divisor)");
+    assert_eq!(
+        eval("(mod -7 3)"),
+        2,
+        "Clojure mod is floored (sign of divisor)"
+    );
     assert_eq!(eval("(quot 7 3)"), 2);
     assert_eq!(eval("(quot -7 3)"), -2, "quot truncates toward zero");
     assert_eq!(eval("(rem -7 3)"), -1, "rem keeps sign of dividend");
@@ -224,13 +255,29 @@ fn arithmetic_edge_semantics() {
 // vector-of-maps like fsm :transitions). Boolean/count results so eval can return i64.
 #[test]
 fn lookup_and_keyword_semantics() {
-    assert_eq!(eval("(get-in {:a {:b 5}} [:a :b])"), 5, "present get-in path");
-    assert_eq!(eval("(if (get-in {:a {:b 5}} [:x :y]) 1 0)"), 0, "missing get-in path → falsey");
+    assert_eq!(
+        eval("(get-in {:a {:b 5}} [:a :b])"),
+        5,
+        "present get-in path"
+    );
+    assert_eq!(
+        eval("(if (get-in {:a {:b 5}} [:x :y]) 1 0)"),
+        0,
+        "missing get-in path → falsey"
+    );
     assert_eq!(eval("(get {:a 1} :missing 99)"), 99, "get with default");
     assert_eq!(eval("(if (= :foo :foo) 1 0)"), 1, "keyword equal");
     assert_eq!(eval("(if (= :foo :bar) 1 0)"), 0, "keyword not equal");
     // the fsm :transitions shape: a vector of maps, indexed then keyed
-    assert_eq!(eval("(if (= (get (nth [{:to :a} {:to :b}] 1) :to) :b) 1 0)"), 1, "vec-of-maps lookup");
+    assert_eq!(
+        eval("(if (= (get (nth [{:to :a} {:to :b}] 1) :to) :b) 1 0)"),
+        1,
+        "vec-of-maps lookup"
+    );
     assert_eq!(eval("(count (keys {:a 1 :b 2 :c 3}))"), 3, "keys count");
-    assert_eq!(eval("(reduce (fn [a x] (+ a x)) 0 (vals {:a 1 :b 2 :c 3}))"), 6, "vals sum");
+    assert_eq!(
+        eval("(reduce (fn [a x] (+ a x)) 0 (vals {:a 1 :b 2 :c 3}))"),
+        6,
+        "vals sum"
+    );
 }

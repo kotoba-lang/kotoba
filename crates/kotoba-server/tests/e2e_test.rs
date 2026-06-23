@@ -140,13 +140,25 @@ impl TestServer {
     /// Start a server with the ENGI write-fee gate enabled: `write_cost` EN per
     /// datom and a default per-agent `credit_limit` (max negative balance).
     async fn start_with_econ(with_inference: bool, write_cost: i64, credit_limit: i64) -> Self {
-        Self::start_inner(with_inference, false, None, Some((write_cost, 0, credit_limit))).await
+        Self::start_inner(
+            with_inference,
+            false,
+            None,
+            Some((write_cost, 0, credit_limit)),
+        )
+        .await
     }
 
     /// Start a server with the ENGI read-fee gate enabled: `read_cost` EN per
     /// read and a default per-agent `credit_limit`. Write fee is left off.
     async fn start_with_econ_read(with_inference: bool, read_cost: i64, credit_limit: i64) -> Self {
-        Self::start_inner(with_inference, false, None, Some((0, read_cost, credit_limit))).await
+        Self::start_inner(
+            with_inference,
+            false,
+            None,
+            Some((0, read_cost, credit_limit)),
+        )
+        .await
     }
 
     #[cfg(feature = "wasm-runtime")]
@@ -4088,7 +4100,9 @@ async fn datomic_transact_engi_write_fee_charges_blocks_and_refunds() {
         .await;
     assert_eq!(status, 402, "broke writer must be payment-required: {body}");
     assert!(
-        body.as_str().unwrap_or_default().contains("insufficient EN credit"),
+        body.as_str()
+            .unwrap_or_default()
+            .contains("insufficient EN credit"),
         "402 body should explain the EN shortfall: {body}"
     );
     assert_eq!(
@@ -4112,10 +4126,7 @@ async fn datomic_transact_engi_write_fee_charges_blocks_and_refunds() {
         )
         .await;
     assert_eq!(status, 200, "funded writer should commit: {body}");
-    let parent_c1 = body["commit_cid"]
-        .as_str()
-        .expect("commit cid")
-        .to_string();
+    let parent_c1 = body["commit_cid"].as_str().expect("commit cid").to_string();
     let bal_after = s.state.engi.balance(&writer).await;
     let fee = 100 - bal_after;
     assert!(fee > 0, "a successful write must debit a positive fee");
@@ -4146,12 +4157,16 @@ async fn datomic_transact_engi_write_fee_charges_blocks_and_refunds() {
         .await;
     assert_eq!(status, 200, "operator head-advance should commit: {adv}");
     assert_ne!(
-        adv["commit_cid"].as_str(), Some(parent_c1.as_str()),
+        adv["commit_cid"].as_str(),
+        Some(parent_c1.as_str()),
         "head must have advanced past the stale parent"
     );
 
     let bal_pre = s.state.engi.balance(&writer).await;
-    assert!(bal_pre > 0, "writer needs positive EN so a missing refund would show");
+    assert!(
+        bal_pre > 0,
+        "writer needs positive EN so a missing refund would show"
+    );
     let (status, stale) = s
         .post(
             "/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
@@ -4222,7 +4237,9 @@ async fn datomic_q_engi_read_fee_charges_reader_and_blocks_when_broke() {
         .await;
     assert_eq!(status, 402, "broke reader must be payment-required: {body}");
     assert!(
-        body.as_str().unwrap_or_default().contains("insufficient EN credit"),
+        body.as_str()
+            .unwrap_or_default()
+            .contains("insufficient EN credit"),
         "402 body should explain the EN shortfall: {body}"
     );
     assert_eq!(
@@ -4243,7 +4260,11 @@ async fn datomic_q_engi_read_fee_charges_reader_and_blocks_when_broke() {
     assert_eq!(status, 200, "funded reader should read: {body}");
     assert_eq!(body["rows_edn"], json!([["\"Alice\""]]), "{body}");
     let bal = s.state.engi.balance(&reader).await;
-    assert_eq!(bal, 100 - s.state.engi.read_cost(), "reader debited exactly the read fee");
+    assert_eq!(
+        bal,
+        100 - s.state.engi.read_cost(),
+        "reader debited exactly the read fee"
+    );
     assert_eq!(
         s.state.engi.balance(&reader).await + s.state.engi.balance(&s.operator_did).await,
         0,
@@ -4277,7 +4298,10 @@ async fn econ_balance_and_credit_endpoints_report_and_grant_en_net_zero() {
     assert_eq!(b["write_cost_en"], 10, "{b}");
     assert_eq!(b["enabled"], true, "{b}");
     assert_eq!(b["ledger_net_en"], 0, "{b}");
-    assert_eq!(b["balance_mkoto"], 0, "deprecated compat key still emitted: {b}");
+    assert_eq!(
+        b["balance_mkoto"], 0,
+        "deprecated compat key still emitted: {b}"
+    );
 
     // Operator grants 250 EN → recipient rises, operator falls (net-zero).
     let (status, c) = s
@@ -4321,7 +4345,10 @@ async fn econ_balance_and_credit_endpoints_report_and_grant_en_net_zero() {
             json!({ "did": did }),
         )
         .await;
-    assert_eq!(status, 401, "operator-gated endpoint must reject anonymous: {e}");
+    assert_eq!(
+        status, 401,
+        "operator-gated endpoint must reject anonymous: {e}"
+    );
 
     // Validation: empty DID → 400.
     let (status, e) = s

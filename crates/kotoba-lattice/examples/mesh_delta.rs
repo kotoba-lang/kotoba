@@ -44,9 +44,14 @@ fn main() {
         println!("  ({p} = {o}) → {:?}", fired_by_datom(&triggers, p, o));
     }
 
-    let batch: Vec<(String, String)> =
-        stream.iter().map(|(p, o)| (p.to_string(), o.to_string())).collect();
-    println!("\nbatch firing (deduped): {:?}", fired_by_batch(&triggers, &batch));
+    let batch: Vec<(String, String)> = stream
+        .iter()
+        .map(|(p, o)| (p.to_string(), o.to_string()))
+        .collect();
+    println!(
+        "\nbatch firing (deduped): {:?}",
+        fired_by_batch(&triggers, &batch)
+    );
     println!(
         "\nThe host fires these components by placing them (StartComponent →\n\
          WasmExecutor), the same path as auction placement. Wiring the live Δ\n\
