@@ -1532,3 +1532,34 @@ fn diag_filterv_map_get() {
     println!("s4 filterv 3arg = {s4} (expect 1)");
     println!("s5 filterv or   = {s5} (expect 1)");
 }
+
+// ── STEP 4: Prove `(or (get state "key") default)` compiles NATURALLY ────────
+//
+// Before FIX 1, `(or expr default)` returned a boolean 1/0 instead of the
+// actual value of `expr`.  The himawari rewrite worked around this by using
+// `(get state "need" {})` (3-arg get with default), but the natural cell form
+// `(or (get state "need") {})` would have given the wrong semantics (1 instead
+// of the map value).
+//
+// After FIX 1, `(or (get state "key") default)` compiles and returns the
+// VALUE present in the map when the key is found — no rewrite needed.
+
+const NATURAL_OR_GET_CELL: &str = r#"
+(ns himawari.cells.or-get-probe)
+
+;; Natural himawari pattern: (or (get state "need") {})
+;; Returns gross minor if present, else the default 0.
+(defn probe [state]
+  (let [need (or (get state "need") {"grossMinor" 0})
+        gross (get need "grossMinor" 0)]
+    gross))
+"#;
+
+#[test]
+fn natural_or_get_pattern_compiles() {
+    let wasm = compile_str_with_prelude(NATURAL_OR_GET_CELL)
+        .expect("(or (get state \"need\") {}) should compile without rewrites");
+    println!("NATURAL OR-GET COMPILE: SUCCESS — {} bytes", wasm.len());
+    assert_eq!(&wasm[..4], b"\0asm");
+    assert!(wasm.len() > 100);
+}

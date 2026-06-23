@@ -92,7 +92,7 @@ pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, Clj
     let literals = collect_literals(program);
 
     // ---- Pass 1: constants + function signatures ---------------------------
-    let consts = eval_consts(program)?;
+    let consts = eval_consts(program, &literals)?;
 
     // ---- Host imports -------------------------------------------------------
     // Any used host-call builtin (e.g. `has-capability?`) becomes a wasm import.
@@ -1011,13 +1011,6 @@ fn comparison_i32_instruction(op: Builtin) -> Option<Instruction<'static>> {
     })
 }
 
-/// Compile `expr` to a normalised i64 boolean (1 if truthy, else 0).
-fn compile_truthy_i64(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
-    compile_truthy_i32(cg, expr)?;
-    cg.emit(Instruction::I64ExtendI32U);
-    Ok(())
-}
-
 fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), CljError> {
     match op {
         Builtin::Add => fold(cg, args, Instruction::I64Add),
@@ -1740,29 +1733,62 @@ fn compile_not_eq(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
     Ok(())
 }
 
-/// Short-circuit `and`, returning a normalised i64 boolean (0/1).
+/// Short-circuit `and` with Clojure value-return semantics.
+///
+/// Clojure: `(and a b c)` returns the first falsy value, or the last value if
+/// all are truthy.  It does NOT normalise to a 0/1 boolean.
+///
+/// **Value model note**: in kotoba-clj every i64 value is either a number, a
+/// string handle, or the `false`/`nil` sentinel `0`.  The truthiness check
+/// (`expr != 0`) therefore treats integer `0` as falsy — the same as Clojure
+/// `false`/`nil`.  Integer `0` cannot be distinguished from `false` without an
+/// additional tag bit, which is outside the current value-model scope.
 fn compile_and(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
     if args.len() == 1 {
-        return compile_truthy_i64(cg, &args[0]);
+        // Single-operand: return the value itself (truthy or not).
+        return compile_expr(cg, &args[0]);
     }
-    compile_truthy_i32(cg, &args[0])?;
+    // Evaluate the first arg and store its value in a local so we can both
+    // test its truthiness *and* return it when it is falsy.
+    compile_expr(cg, &args[0])?;
+    let tmp = cg.alloc_local();
+    cg.emit(Instruction::LocalTee(tmp));
+    // truthy test: tmp != 0  (i32 for the wasm `if` condition)
+    cg.emit(Instruction::I64Const(0));
+    cg.emit(Instruction::I64Ne);
     cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+    // if truthy: evaluate the rest; that result is the return value of `and`
     compile_and(cg, &args[1..])?;
     cg.emit(Instruction::Else);
-    cg.emit(Instruction::I64Const(0));
+    // if falsy: return the VALUE of this (falsy) operand, not a hardcoded 0
+    cg.emit(Instruction::LocalGet(tmp));
     cg.close_frame();
     Ok(())
 }
 
-/// Short-circuit `or`, returning a normalised i64 boolean (0/1).
+/// Short-circuit `or` with Clojure value-return semantics.
+///
+/// Clojure: `(or a b c)` returns the first truthy value, or the last value if
+/// all are falsy.  It does NOT normalise to a 0/1 boolean.
+///
+/// **Value model note**: the same `0 == falsy` caveat as `compile_and` applies.
 fn compile_or(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
     if args.len() == 1 {
-        return compile_truthy_i64(cg, &args[0]);
+        // Single-operand: return the value itself.
+        return compile_expr(cg, &args[0]);
     }
-    compile_truthy_i32(cg, &args[0])?;
+    // Evaluate the first arg and tee its value into a local.
+    compile_expr(cg, &args[0])?;
+    let tmp = cg.alloc_local();
+    cg.emit(Instruction::LocalTee(tmp));
+    // truthy test: tmp != 0  (i32 for the wasm `if` condition)
+    cg.emit(Instruction::I64Const(0));
+    cg.emit(Instruction::I64Ne);
     cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
-    cg.emit(Instruction::I64Const(1));
+    // if truthy: return the VALUE of this operand (not a hardcoded 1)
+    cg.emit(Instruction::LocalGet(tmp));
     cg.emit(Instruction::Else);
+    // if falsy: evaluate the rest; that result is the return value of `or`
     compile_or(cg, &args[1..])?;
     cg.close_frame();
     Ok(())
@@ -1770,41 +1796,56 @@ fn compile_or(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
 
 // ---- compile-time constant evaluation (for `def`) ---------------------------
 
-fn eval_consts(program: &Program) -> Result<HashMap<String, i64>, CljError> {
+/// Evaluate all `def` constants to i64 values.
+///
+/// String-literal `def`s (e.g. `(def ^:private S "abc")`) are allowed: their
+/// value is the packed string handle `(abs_offset << 32) | len` computed from
+/// the already-interned [`Literals`] table.  This lets a `def`-bound name be
+/// resolved at every use site by the normal `Var` path in [`compile_expr`],
+/// just like an integer constant.
+fn eval_consts(program: &Program, literals: &Literals) -> Result<HashMap<String, i64>, CljError> {
     let mut consts = HashMap::new();
     for d in &program.defs {
-        let v = eval_const(&d.value, &consts)?;
+        let v = eval_const(&d.value, &consts, literals)?;
         consts.insert(d.name.clone(), v);
     }
     Ok(consts)
 }
 
-fn eval_const(expr: &Expr, consts: &HashMap<String, i64>) -> Result<i64, CljError> {
+fn eval_const(
+    expr: &Expr,
+    consts: &HashMap<String, i64>,
+    literals: &Literals,
+) -> Result<i64, CljError> {
     Ok(match expr {
         Expr::Int(i) => *i,
-        Expr::Str(_) => {
-            return Err(CljError::Codegen(
-                "string literals are not allowed in a `def` initialiser".into(),
-            ))
+        Expr::Str(bytes) => {
+            // A string-literal `def` is allowed.  Resolve the handle from the
+            // interned literals blob (populated by `collect_literals` before us).
+            literals.handle(bytes).ok_or_else(|| {
+                CljError::Codegen(
+                    "string literal in `def` was not interned (internal error)".into(),
+                )
+            })?
         }
         Expr::Var(name) => *consts
             .get(name)
             .ok_or_else(|| CljError::Codegen(format!("def references non-constant `{name}`")))?,
         Expr::If { cond, then, els } => {
-            if eval_const(cond, consts)? != 0 {
-                eval_const(then, consts)?
+            if eval_const(cond, consts, literals)? != 0 {
+                eval_const(then, consts, literals)?
             } else {
-                eval_const(els, consts)?
+                eval_const(els, consts, literals)?
             }
         }
         Expr::Builtin { op, args } => {
             let v: Vec<i64> = args
                 .iter()
-                .map(|a| eval_const(a, consts))
+                .map(|a| eval_const(a, consts, literals))
                 .collect::<Result<_, _>>()?;
             eval_const_builtin(*op, &v)?
         }
-        Expr::Do(body) => eval_const(body.last().unwrap(), consts)?,
+        Expr::Do(body) => eval_const(body.last().unwrap(), consts, literals)?,
         Expr::Let { .. } => {
             return Err(CljError::Codegen(
                 "`let` is not supported in a `def` initialiser".into(),
@@ -1869,8 +1910,29 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Even => b(v[0] & 1 == 0),
         Builtin::Odd => b(v[0] & 1 != 0),
         Builtin::Not => b(v[0] == 0),
-        Builtin::And => b(v.iter().all(|x| *x != 0)),
-        Builtin::Or => b(v.iter().any(|x| *x != 0)),
+        // `and`/`or` return values (Clojure semantics), not booleans.
+        // `and`: first falsy value, or the last value when all truthy.
+        Builtin::And => {
+            let mut result = 1i64; // identity for `and` with zero args (vacuously true)
+            for &x in v.iter() {
+                result = x;
+                if x == 0 {
+                    break;
+                }
+            }
+            result
+        }
+        // `or`: first truthy value, or the last value when all falsy.
+        Builtin::Or => {
+            let mut result = 0i64; // identity for `or` with zero args (vacuously false)
+            for &x in v.iter() {
+                result = x;
+                if x != 0 {
+                    break;
+                }
+            }
+            result
+        }
         Builtin::BitAnd => v.iter().copied().reduce(|a, b| a & b).unwrap_or(0),
         Builtin::BitOr => v.iter().copied().reduce(|a, b| a | b).unwrap_or(0),
         Builtin::BitXor => v.iter().copied().reduce(|a, b| a ^ b).unwrap_or(0),
