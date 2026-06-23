@@ -1,5 +1,9 @@
 pub mod btc;
 pub mod cacao;
+// commit_sig imports kotoba_datomic::distributed, which is gated off wasm32
+// (native/server-only commit import-check). The CACAO path (cacao/delegation/
+// did_key) does not use it, so exclude it on wasm32 to keep kotoba-auth wasm-clean.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod commit_sig;
 pub mod delegation;
 pub mod did_document;
@@ -13,6 +17,7 @@ pub use btc::{
     signed_message_hash, verify_message, AddressKind, BtcAddress, BtcError, BtcNetwork,
 };
 pub use cacao::{Cacao, CacaoError, CacaoHeader, CacaoPayload, CacaoSig};
+#[cfg(not(target_arch = "wasm32"))]
 pub use commit_sig::{commit_import_check, verify_commit_author_sig, CommitSigVerdict};
 pub use delegation::{DelegationChain, DelegationError};
 pub use did_document::{

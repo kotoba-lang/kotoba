@@ -18,6 +18,19 @@ impl DelegationChain {
         Ok(Self { chain: vec![cacao] })
     }
 
+    /// Parse a multi-link chain from a CBOR **array** of CACAOs `[root, leaf]`
+    /// (depth-2 delegation). A single CACAO serializes as a CBOR map, a chain as a
+    /// CBOR array — structurally distinct, so a decoder can try `from_cbor` (map)
+    /// then `from_cbor_chain` (array) without ambiguity. Order is root→leaf.
+    pub fn from_cbor_chain(bytes: &[u8]) -> Result<Self, DelegationError> {
+        let chain: Vec<Cacao> = ciborium::from_reader(bytes)
+            .map_err(|e| DelegationError::Cacao(CacaoError::ParseError(e.to_string())))?;
+        if chain.is_empty() {
+            return Err(DelegationError::EmptyChain);
+        }
+        Ok(Self { chain })
+    }
+
     pub fn new(invocation: Cacao) -> Self {
         Self {
             chain: vec![invocation],
@@ -529,7 +542,9 @@ impl DelegationChain {
         expected_aud: &str,
     ) -> Result<String, DelegationError> {
         // Audience check before signature to fail fast on misrouted tokens.
-        let cacao = self.chain.first().ok_or(DelegationError::EmptyChain)?;
+        // The LEAF (last link) is the invocation presented to this audience; for a
+        // depth-2 chain the root's aud is the delegate, not the server.
+        let cacao = self.chain.last().ok_or(DelegationError::EmptyChain)?;
         // A CACAO with an empty (absent) `aud` field has no audience binding.
         // When the caller explicitly requests audience enforcement, an unbound
         // CACAO is treated as a mismatch — otherwise a bearer token issued without
@@ -551,7 +566,9 @@ impl DelegationChain {
         expected_aud: &str,
         resolver: &dyn DidDocumentResolver,
     ) -> Result<String, DelegationError> {
-        let cacao = self.chain.first().ok_or(DelegationError::EmptyChain)?;
+        // Audience binds to the LEAF (the invocation presented to this server); a
+        // depth-2 root delegates to the member, whose leaf names the server as aud.
+        let cacao = self.chain.last().ok_or(DelegationError::EmptyChain)?;
         if cacao.p.aud.is_empty() || cacao.p.aud != expected_aud {
             return Err(DelegationError::AudienceMismatch {
                 expected: expected_aud.to_string(),

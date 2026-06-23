@@ -1753,6 +1753,13 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     // behaviourally unchanged. Each layer wraps the previous; the rate limiter
     // is applied last so it sheds load before any handler work, and TraceLayer
     // is outermost so even rejected requests are logged.
+    // Same-origin static delivery (docs/gftd-office): when KOTOBA_STATIC_DIR is set,
+    // serve the browser app (editor.html, pkg/, cljs-out/) from the SAME origin as
+    // /xrpc, so the production deployment needs no CORS / --disable-web-security.
+    if let Ok(dir) = std::env::var("KOTOBA_STATIC_DIR") {
+        tracing::info!(dir, "serving static app dir (same-origin)");
+        app = app.fallback_service(tower_http::services::ServeDir::new(dir));
+    }
     if let Some(cors) = cors_from_env() {
         app = app.layer(cors);
     }

@@ -730,6 +730,146 @@ impl WriteCrypto {
         Ok(rec)
     }
 
+    /// Mint a server-verifiable **CACAO** signed by this identity (doc b bridge).
+    /// Returns `base64(dag-cbor(Cacao))` for the `cacao_b64` field of
+    /// `datomic.transact` / read endpoints. Reuses kotoba-auth's exact `Cacao` type,
+    /// `did:key` derivation, and `siwe_message()` so the bytes verify byte-identically
+    /// under `DelegationChain::verify` (no parallel format).
+    ///
+    /// `capabilities` are datomic op tokens granted (each → `kotoba://op/{cap}`).
+    /// A WRITE must grant BOTH `datom:transact` AND `tx:create` (the server verifies
+    /// both, xrpc.rs datomic_transact); a READ grants `datom:read`. `graph_scope` is
+    /// the `kotoba://graph/{scope}` value the server checks: the graph CID for a
+    /// transact, or `private/{owner_did}` for a private read.
+    pub fn mint_cacao(
+        &self,
+        aud: &str,
+        graph_scope: &str,
+        capabilities: &[String],
+        nonce: &str,
+        issued_at: &str,
+        expiry: Option<&str>,
+    ) -> Result<String, String> {
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine,
+        };
+        use ed25519_dalek::Signer;
+        use kotoba_auth::{ed25519_pubkey_to_did_key, Cacao, CacaoHeader, CacaoPayload, CacaoSig};
+        let vk = ed25519_dalek::VerifyingKey::from(&self.signing_key);
+        let iss = ed25519_pubkey_to_did_key(vk.as_bytes());
+        let mut resources: Vec<String> = capabilities
+            .iter()
+            .map(|c| format!("kotoba://op/{c}"))
+            .collect();
+        resources.push(format!("kotoba://graph/{graph_scope}"));
+        let mut cacao = Cacao {
+            h: CacaoHeader {
+                t: "eip4361".to_string(),
+            },
+            p: CacaoPayload {
+                iss,
+                aud: aud.to_string(),
+                issued_at: issued_at.to_string(),
+                expiry: expiry.map(|s| s.to_string()),
+                nonce: nonce.to_string(),
+                domain: "gftd.office".to_string(),
+                statement: None,
+                version: "1".to_string(),
+                resources,
+            },
+            s: CacaoSig {
+                t: "EdDSA".to_string(),
+                s: String::new(),
+            },
+        };
+        let msg = cacao.siwe_message();
+        cacao.s.s = URL_SAFE_NO_PAD.encode(self.signing_key.sign(msg.as_bytes()).to_bytes());
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&cacao, &mut cbor).map_err(|e| e.to_string())?;
+        Ok(STANDARD.encode(cbor))
+    }
+
+    /// Build a depth-2 delegation chain `[root, leaf]` as the delegate (member).
+    /// `root_grant_b64` is a CACAO the OWNER minted with `mint_cacao(aud = this DID, …)`
+    /// (the owner delegating a capability on its graph to this member). This signs a
+    /// leaf (iss = self/member, aud = server) attenuated to `capabilities`/`graph_scope`,
+    /// then serializes `[root, leaf]` as a CBOR array → base64 for `cacao_b64`. The
+    /// server verifies attenuation and binds the write to the ROOT issuer (the owner),
+    /// so a team member can write to the org's graph (docs/gftd-office team sharing).
+    pub fn mint_delegated(
+        &self,
+        root_grant_b64: &str,
+        aud: &str,
+        graph_scope: &str,
+        capabilities: &[String],
+        nonce: &str,
+        issued_at: &str,
+        expiry: Option<&str>,
+    ) -> Result<String, String> {
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine,
+        };
+        use ed25519_dalek::Signer;
+        use kotoba_auth::{ed25519_pubkey_to_did_key, Cacao, CacaoHeader, CacaoPayload, CacaoSig};
+        let root_cbor = STANDARD
+            .decode(root_grant_b64)
+            .map_err(|e| format!("root grant b64: {e}"))?;
+        let root = Cacao::from_cbor(&root_cbor).map_err(|e| format!("root grant parse: {e}"))?;
+        let vk = ed25519_dalek::VerifyingKey::from(&self.signing_key);
+        let iss = ed25519_pubkey_to_did_key(vk.as_bytes());
+        let mut resources: Vec<String> = capabilities
+            .iter()
+            .map(|c| format!("kotoba://op/{c}"))
+            .collect();
+        resources.push(format!("kotoba://graph/{graph_scope}"));
+        let mut leaf = Cacao {
+            h: CacaoHeader {
+                t: "eip4361".to_string(),
+            },
+            p: CacaoPayload {
+                iss,
+                aud: aud.to_string(),
+                issued_at: issued_at.to_string(),
+                expiry: expiry.map(|s| s.to_string()),
+                nonce: nonce.to_string(),
+                domain: "gftd.office".to_string(),
+                statement: None,
+                version: "1".to_string(),
+                resources,
+            },
+            s: CacaoSig {
+                t: "EdDSA".to_string(),
+                s: String::new(),
+            },
+        };
+        leaf.s.s =
+            URL_SAFE_NO_PAD.encode(self.signing_key.sign(leaf.siwe_message().as_bytes()).to_bytes());
+        let chain = vec![root, leaf];
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&chain, &mut cbor).map_err(|e| e.to_string())?;
+        Ok(STANDARD.encode(cbor))
+    }
+
+    /// Canonical W3C `did:key:z6Mk…` for this identity (multibase multicodec ed25519),
+    /// the form CACAO / DID resolution use. NOTE: `did()` returns a simpler hex shim
+    /// used by the IPNS head path; for the office/sovereignty model use this one.
+    pub fn account_did(&self) -> String {
+        let vk = ed25519_dalek::VerifyingKey::from(&self.signing_key);
+        kotoba_auth::ed25519_pubkey_to_did_key(vk.as_bytes())
+    }
+
+    /// Multibase CID of this account's OWN private graph
+    /// (`NamedGraph::private_for(account_did)`). Deterministic from the DID, so the
+    /// server can auto-register it Private{owner=account} on first CACAO write
+    /// (docs/gftd-office). This is the `graph` the browser passes to datomic.transact.
+    pub fn private_graph_id(&self) -> String {
+        kotoba_core::named_graph::NamedGraph::private_for(&self.account_did())
+            .cid
+            .to_multibase()
+    }
+
     /// Encrypt plaintext under the vault key → `signal:v1:<hex(nonce||ct)>`.
     /// The server/IndexedDB only ever sees this ciphertext.
     pub fn encrypt(&self, plaintext: &str) -> Result<String, String> {
@@ -943,6 +1083,18 @@ mod wasm {
                 .map_err(|e| JsValue::from_str(&e))
         }
 
+        /// Encrypt plaintext under the agent's vault key → `signal:v1:<ct>` envelope
+        /// (string value). Lets the office layer encrypt a field ONCE and use the same
+        /// envelope for both the local store and the server sync (docs/gftd-office).
+        #[wasm_bindgen(js_name = encrypt)]
+        pub fn encrypt(&self, plaintext: &str) -> Result<String, JsValue> {
+            let c = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("no identity — call useIdentity first"))?;
+            c.encrypt(plaintext).map_err(|e| JsValue::from_str(&e))
+        }
+
         /// Decrypt a `signal:v1:` envelope with the agent's vault key.
         pub fn decrypt(&self, envelope: &str) -> Result<String, JsValue> {
             let c = self
@@ -964,6 +1116,87 @@ mod wasm {
                 "root": root.to_multibase(), "did": did, "sig": sig,
             }))
             .map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        /// Canonical W3C did:key:z6Mk… for this identity (the CACAO/sovereignty DID).
+        #[wasm_bindgen(js_name = accountDid)]
+        pub fn account_did(&self) -> Result<String, JsValue> {
+            let c = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("no identity — call useIdentity first"))?;
+            Ok(c.account_did())
+        }
+
+        /// Multibase CID of this account's own private graph (the `graph` for sync).
+        #[wasm_bindgen(js_name = privateGraphId)]
+        pub fn private_graph_id(&self) -> Result<String, JsValue> {
+            let c = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("no identity — call useIdentity first"))?;
+            Ok(c.private_graph_id())
+        }
+
+        /// Mint a server-verifiable CACAO signed by the agent identity → base64
+        /// `cacao_b64` (doc b: membership grant → capability). `capabilities` is a
+        /// JS array of op tokens: `["datom:transact","tx:create"]` for a write,
+        /// `["datom:read"]` for a read. `graphScope` = graph CID (write) or
+        /// `private/{ownerDid}` (private read).
+        #[wasm_bindgen(js_name = mintCacao)]
+        pub fn mint_cacao(
+            &self,
+            aud: String,
+            graph_scope: String,
+            capabilities: Vec<String>,
+            nonce: String,
+            issued_at: String,
+            expiry: Option<String>,
+        ) -> Result<String, JsValue> {
+            let c = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("no identity — call useIdentity first"))?;
+            c.mint_cacao(
+                &aud,
+                &graph_scope,
+                &capabilities,
+                &nonce,
+                &issued_at,
+                expiry.as_deref(),
+            )
+            .map_err(|e| JsValue::from_str(&e))
+        }
+
+        /// Build a depth-2 delegation chain (team sharing): the OWNER first mints a
+        /// root grant via `mintCacao(aud = memberDid, …)`; the MEMBER calls this with
+        /// that `rootGrantB64` to produce the `[root, leaf]` chain base64 for
+        /// `cacao_b64`. `capabilities` must be ⊆ the root's. (doc b / d)
+        #[wasm_bindgen(js_name = mintDelegated)]
+        pub fn mint_delegated(
+            &self,
+            root_grant_b64: String,
+            aud: String,
+            graph_scope: String,
+            capabilities: Vec<String>,
+            nonce: String,
+            issued_at: String,
+            expiry: Option<String>,
+        ) -> Result<String, JsValue> {
+            let c = self
+                .crypto
+                .as_ref()
+                .ok_or_else(|| JsValue::from_str("no identity — call useIdentity first"))?;
+            c.mint_delegated(
+                &root_grant_b64,
+                &aud,
+                &graph_scope,
+                &capabilities,
+                &nonce,
+                &issued_at,
+                expiry.as_deref(),
+            )
+            .map_err(|e| JsValue::from_str(&e))
         }
 
         /// `commit()` + emit a member-signed **kotoba IPNS head record**
@@ -1337,6 +1570,132 @@ mod tests {
         let vk = VerifyingKey::from(&c.signing_key);
         let sig = Signature::from_slice(&hex::decode(sig_hex).unwrap()).unwrap();
         assert!(vk.verify(msg, &sig).is_ok(), "signature must verify");
+    }
+
+    #[test]
+    fn mint_cacao_verifies_through_server_delegation_chain() {
+        // The browser-minted CACAO must verify byte-identically under the SAME
+        // verifier the server runs (kotoba-auth DelegationChain::verify) — proving
+        // the doc-b grant→capability bridge end to end without a browser.
+        let c = WriteCrypto::from_seed(&[7u8; 32]);
+        let graph = "bafy2bzaced-office-graph";
+        // A WRITE CACAO must grant BOTH datom:transact AND tx:create (server checks both).
+        let caps = vec!["datom:transact".to_string(), "tx:create".to_string()];
+        let b64 = c
+            .mint_cacao(
+                "https://kotoba.test",
+                graph,
+                &caps,
+                "office-nonce-1",
+                "2026-01-01T00:00:00Z",
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let cbor = STANDARD.decode(b64).unwrap();
+        let cacao = kotoba_auth::Cacao::from_cbor(&cbor).unwrap();
+
+        // Issuer is a real did:key:z6Mk... (not the hex shim) and the sig verifies.
+        let did = cacao.verify_signature().expect("EdDSA sig must verify");
+        assert!(did.starts_with("did:key:z6Mk"), "real did:key, got {did}");
+
+        // The server loops both write ops — BOTH must verify on the same chain.
+        for op in ["datom:transact", "tx:create"] {
+            kotoba_auth::DelegationChain::new(kotoba_auth::Cacao::from_cbor(&cbor).unwrap())
+                .verify(graph, op)
+                .unwrap_or_else(|e| panic!("server verifier must accept op {op}: {e:?}"));
+        }
+
+        // Wrong capability / wrong graph are rejected.
+        assert!(kotoba_auth::DelegationChain::new(
+            kotoba_auth::Cacao::from_cbor(&cbor).unwrap()
+        )
+        .verify(graph, "datom:read")
+        .is_err());
+        assert!(kotoba_auth::DelegationChain::new(
+            kotoba_auth::Cacao::from_cbor(&cbor).unwrap()
+        )
+        .verify("bafy-other-graph", "datom:transact")
+        .is_err());
+    }
+
+    #[test]
+    fn mint_delegated_depth2_binds_to_root_owner_and_attenuates() {
+        // Team sharing: an org owner delegates a capability on its graph to a member,
+        // who presents a depth-2 chain. The server-side verifier returns the ROOT
+        // (owner) as the authority, and rejects any capability the member did not
+        // receive (attenuation).
+        let owner = WriteCrypto::from_seed(&[7u8; 32]); // org
+        let member = WriteCrypto::from_seed(&[9u8; 32]); // team member
+        let graph = "bafy2bzaced-org-graph";
+        let server = "https://kotoba.test";
+        let caps = vec!["datom:transact".to_string(), "tx:create".to_string()];
+
+        // owner → member root grant (aud = member DID)
+        let root = owner
+            .mint_cacao(
+                &member.account_did(),
+                graph,
+                &caps,
+                "root-n-1",
+                "2026-01-01T00:00:00Z",
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        // member assembles [root, leaf] (leaf aud = server)
+        let chain_b64 = member
+            .mint_delegated(
+                &root,
+                server,
+                graph,
+                &caps,
+                "leaf-n-1",
+                "2026-01-01T00:00:00Z",
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .unwrap();
+
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let cbor = STANDARD.decode(chain_b64).unwrap();
+        // a chain is a CBOR array → single-decode fails, chain-decode yields 2 links
+        assert!(kotoba_auth::Cacao::from_cbor(&cbor).is_err());
+        let chain = kotoba_auth::DelegationChain::from_cbor_chain(&cbor).unwrap();
+        assert_eq!(chain.chain.len(), 2);
+        // server verify (leaf aud == server) → authority is the ROOT owner (the org)
+        let authority = kotoba_auth::DelegationChain::from_cbor_chain(&cbor)
+            .unwrap()
+            .verify_with_aud(graph, "datom:transact", server)
+            .expect("depth-2 chain must verify");
+        assert_eq!(authority, owner.account_did(), "authority is the org owner");
+
+        // attenuation: member cannot escalate beyond what the owner granted.
+        let root_read = owner
+            .mint_cacao(
+                &member.account_did(),
+                graph,
+                &["datom:read".to_string()],
+                "root-n-2",
+                "2026-01-01T00:00:00Z",
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        let escalated = member
+            .mint_delegated(
+                &root_read,
+                server,
+                graph,
+                &["datom:transact".to_string()],
+                "leaf-n-2",
+                "2026-01-01T00:00:00Z",
+                Some("2099-01-01T00:00:00Z"),
+            )
+            .unwrap();
+        let ebytes = STANDARD.decode(escalated).unwrap();
+        assert!(kotoba_auth::DelegationChain::from_cbor_chain(&ebytes)
+            .unwrap()
+            .verify_with_aud(graph, "datom:transact", server)
+            .is_err());
     }
 
     #[test]
