@@ -34,7 +34,7 @@
 //! linear-memory foundation that the future `list<u8>` Component export and
 //! CBOR `InvokeContext` decode will build on (see `docs/ADR-clojure-wasm.md`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
@@ -99,6 +99,7 @@ pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, Clj
 
     // ---- Pass 1: constants + function signatures ---------------------------
     let consts = eval_consts(program, &literals)?;
+    let float_defs = float_def_names(program);
 
     // ---- Host imports -------------------------------------------------------
     // Any used host-call builtin (e.g. `has-capability?`) becomes a wasm import.
@@ -274,6 +275,7 @@ pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, Clj
                 .enumerate()
                 .map(|(i, p)| (p.clone(), i as u32))
                 .collect(),
+            float_env: FloatEnv::new(float_defs.clone()),
             next_local: f.params.len() as u32,
             arity: f.params.len() as u32,
             realloc_index: realloc_fn_index,
@@ -702,6 +704,49 @@ struct LoopTarget {
     frame_depth: u32,
 }
 
+/// Tracks which symbols (`def` globals and `let`-bound locals) carry a float
+/// value (IEEE-754 bit pattern in the i64 slot). Used by [`is_float_expr`] to
+/// decide whether a variable reference resolves to a float.
+///
+/// `defs` is computed once from the program's top-level `def` forms and
+/// shared across all function bodies. `locals` is a scope-stack of
+/// `(name, is_float)` pairs with the same push/pop discipline as
+/// `FnCtx::scope`.
+struct FloatEnv {
+    /// Names of top-level `def` constants whose initialiser is a float.
+    defs: HashSet<String>,
+    /// `(name, is_float)` pairs for `let`/`loop` bindings in scope.
+    /// Latest binding for a given name shadows earlier ones (same as `scope`).
+    locals: Vec<(String, bool)>,
+}
+
+impl FloatEnv {
+    fn new(defs: HashSet<String>) -> Self {
+        Self {
+            defs,
+            locals: Vec::new(),
+        }
+    }
+    /// Push a `let`/`loop` binding. `is_float` should be the result of
+    /// `is_float_expr` evaluated on the binding's init expression.
+    fn push(&mut self, name: String, is_float: bool) {
+        self.locals.push((name, is_float));
+    }
+    /// Pop `n` bindings (restore scope to a saved depth).
+    fn truncate(&mut self, saved: usize) {
+        self.locals.truncate(saved);
+    }
+    /// Look up whether `name` is a float — checks locals (innermost first),
+    /// then defs; unknown symbols return `false` (conservative).
+    fn is_float(&self, name: &str) -> bool {
+        // locals: scan in reverse so the innermost binding wins.
+        if let Some((_, f)) = self.locals.iter().rev().find(|(n, _)| n == name) {
+            return *f;
+        }
+        self.defs.contains(name)
+    }
+}
+
 /// Per-function compilation context.
 struct FnCtx<'a> {
     consts: &'a HashMap<String, i64>,
@@ -715,6 +760,10 @@ struct FnCtx<'a> {
     literals: &'a Literals,
     /// (name, local-index) pairs; latest binding shadows earlier ones.
     scope: Vec<(String, u32)>,
+    /// Float-type environment: tracks which `def` globals and `let`/`loop`
+    /// locals carry a float value (so `is_float_expr` can infer float-ness of
+    /// variable references).
+    float_env: FloatEnv,
     next_local: u32,
     arity: u32,
     /// Function index of the module's `cabi_realloc`, so `bytes-alloc` can call
@@ -778,13 +827,16 @@ fn compile_loop(
     body: &[Expr],
 ) -> Result<(), CljError> {
     let saved_scope = cg.scope.len();
+    let saved_float = cg.float_env.locals.len();
     // Sequential init: each binding sees the previous ones (identical to `let`).
     let mut locals = Vec::with_capacity(bindings.len());
     for (name, val) in bindings {
+        let is_float = is_float_expr(val, &cg.float_env);
         compile_expr(cg, val)?;
         let idx = cg.alloc_local();
         cg.emit(Instruction::LocalSet(idx));
         cg.scope.push((name.clone(), idx));
+        cg.float_env.push(name.clone(), is_float);
         locals.push(idx);
     }
 
@@ -798,6 +850,7 @@ fn compile_loop(
     cg.close_frame();
 
     cg.scope.truncate(saved_scope); // loop bindings leave scope; slots stay
+    cg.float_env.truncate(saved_float);
     Ok(())
 }
 
@@ -869,15 +922,19 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
         }
 
         Expr::Let { bindings, body } => {
-            let saved = cg.scope.len();
+            let saved_scope = cg.scope.len();
+            let saved_float = cg.float_env.locals.len();
             for (name, val) in bindings {
+                let is_float = is_float_expr(val, &cg.float_env);
                 compile_expr(cg, val)?;
                 let idx = cg.alloc_local();
                 cg.emit(Instruction::LocalSet(idx));
                 cg.scope.push((name.clone(), idx));
+                cg.float_env.push(name.clone(), is_float);
             }
             compile_body(cg, body)?;
-            cg.scope.truncate(saved); // bindings leave scope; local slots stay allocated
+            cg.scope.truncate(saved_scope); // bindings leave scope; local slots stay allocated
+            cg.float_env.truncate(saved_float);
         }
 
         Expr::Loop { bindings, body } => compile_loop(cg, bindings, body)?,
@@ -1025,7 +1082,7 @@ fn comparison_i32_instruction(op: Builtin) -> Option<Instruction<'static>> {
 fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), CljError> {
     // Arithmetic on any float operand runs the whole op in f64 (int operands
     // promoted). `is_float_op` short-circuits to the integer paths below.
-    let is_float_op = args.iter().any(is_float_expr);
+    let is_float_op = args.iter().any(|a| is_float_expr(a, &cg.float_env));
     match op {
         Builtin::Add if is_float_op => fold_f64(cg, args, Instruction::F64Add),
         Builtin::Mul if is_float_op => fold_f64(cg, args, Instruction::F64Mul),
@@ -1118,7 +1175,7 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         // so a NaN/overflow yields a defined value instead of trapping); int
         // passthrough.
         Builtin::Int => {
-            if is_float_expr(&args[0]) {
+            if is_float_expr(&args[0], &cg.float_env) {
                 compile_expr_as_f64(cg, &args[0])?;
                 cg.emit(Instruction::I64TruncSatF64S);
             } else {
@@ -1176,7 +1233,7 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         // `(Math/abs x)` — preserves float-ness: f64.abs for a float operand,
         // integer abs otherwise.
         Builtin::MathAbs => {
-            if is_float_expr(&args[0]) {
+            if is_float_expr(&args[0], &cg.float_env) {
                 compile_expr_as_f64(cg, &args[0])?;
                 cg.emit(Instruction::F64Abs);
                 cg.emit(Instruction::I64ReinterpretF64);
@@ -1733,22 +1790,25 @@ fn compile_bytes_finish(cg: &mut FnCtx, buf_expr: &Expr) -> Result<(), CljError>
 /// (variables, calls, host ops, closures) is treated as an integer — mixing a
 /// runtime-float-bearing variable into float math is out of R0 scope and would
 /// need a runtime tag.
-fn is_float_expr(expr: &Expr) -> bool {
+fn is_float_expr(expr: &Expr, env: &FloatEnv) -> bool {
     match expr {
         Expr::Float(_) => true,
+        // A named symbol is float if the env records it as float — either a
+        // `def` global or a `let`/`loop` binding whose init was a float.
+        Expr::Var(name) => env.is_float(name),
         Expr::Builtin { op, args } => match op {
             // Coercions whose result is a float by construction.
             Builtin::Double | Builtin::MathFloor | Builtin::MathCeil | Builtin::MathSqrt => true,
             // Arithmetic is float iff any operand is float (mixed int/float promotes).
             Builtin::Add | Builtin::Sub | Builtin::Mul | Builtin::Div => {
-                args.iter().any(is_float_expr)
+                args.iter().any(|a| is_float_expr(a, env))
             }
             // `(Math/abs x)` preserves the operand's float-ness.
-            Builtin::MathAbs => args.first().map(is_float_expr).unwrap_or(false),
+            Builtin::MathAbs => args.first().map(|a| is_float_expr(a, env)).unwrap_or(false),
             _ => false,
         },
         // `(if c a b)` is float iff both branches are float.
-        Expr::If { then, els, .. } => is_float_expr(then) && is_float_expr(els),
+        Expr::If { then, els, .. } => is_float_expr(then, env) && is_float_expr(els, env),
         _ => false,
     }
 }
@@ -1758,7 +1818,7 @@ fn is_float_expr(expr: &Expr) -> bool {
 /// from its bit pattern; an integer expr is converted with `f64.convert_i64_s`
 /// (int→float promotion for mixed arithmetic).
 fn compile_expr_as_f64(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
-    if is_float_expr(expr) {
+    if is_float_expr(expr, &cg.float_env) {
         compile_expr(cg, expr)?;
         cg.emit(Instruction::F64ReinterpretI64);
     } else {
@@ -2047,6 +2107,20 @@ fn compile_or(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
 ///
 /// String-literal `def`s (e.g. `(def ^:private S "abc")`) are allowed: their
 /// value is the packed string handle `(abs_offset << 32) | len` computed from
+/// Build the set of `def` names whose initialiser is a float expression.
+/// Defs are processed in order (sequential binding semantics): each new def
+/// sees the float-types of the preceding ones.
+fn float_def_names(program: &Program) -> HashSet<String> {
+    let mut float_defs: HashSet<String> = HashSet::new();
+    for d in &program.defs {
+        let env = FloatEnv::new(float_defs.clone());
+        if is_float_expr(&d.value, &env) {
+            float_defs.insert(d.name.clone());
+        }
+    }
+    float_defs
+}
+
 /// the already-interned [`Literals`] table.  This lets a `def`-bound name be
 /// resolved at every use site by the normal `Var` path in [`compile_expr`],
 /// just like an integer constant.
