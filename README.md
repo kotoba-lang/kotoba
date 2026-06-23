@@ -59,7 +59,7 @@ brew install --build-from-source ./Formula/kotoba.rb
 ### From source (any platform)
 
 ```bash
-git clone https://github.com/etzhayyim/kotoba.git
+git clone https://github.com/com-junkawasaki/kotoba.git
 cd kotoba
 cargo install --locked --path crates/kotoba-cli --bin kotoba
 ```
