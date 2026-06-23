@@ -256,6 +256,9 @@ pub async fn run(
     // datom-Δ triggers installed via PutTriggers (M6): a matching asserted datom
     // places the component on this node (same path as auction placement).
     let mut delta_triggers: Vec<kotoba_lattice::DeltaTrigger> = Vec::new();
+    // event-source routes installed via PutRoutes (M13): KSE topic → component,
+    // cron components, HTTP route → component.
+    let mut routes = kotoba_lattice::TriggerRoutes::default();
     let mut lattice_hb = tokio::time::interval(std::time::Duration::from_secs(5));
     tracing::info!(node_did = %node_did, "net_actor: lattice participation active");
 
@@ -276,6 +279,17 @@ pub async fn run(
                         }
                     }
                     <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
+                }
+                // cron trigger (M13): fire on-tick for hosted components that
+                // declared a cron trigger (coarse: this 5s tick; finer schedule
+                // parsing is a follow-up).
+                for (cid, _schedule) in &routes.cron {
+                    if my_heartbeat.hosted.iter().any(|h| h == cid) {
+                        invoke_trigger(
+                            &executor, block_store.as_ref(), &node_did, cid,
+                            ComponentTrigger::Tick(now),
+                        );
+                    }
                 }
                 // advertise our (possibly updated) heartbeat
                 let hb = kotoba_lattice::LatticeMessage::Heartbeat(my_heartbeat.clone());
@@ -437,6 +451,17 @@ pub async fn run(
                                     delta_triggers = triggers.clone();
                                     tracing::info!(n = delta_triggers.len(), "lattice: datom-Δ triggers installed");
                                 }
+                                // install event-source routes (M13) + subscribe KSE topics
+                                kotoba_lattice::LatticeMessage::PutRoutes { routes: r, .. } => {
+                                    for topic in r.kse_topics() {
+                                        swarm.subscribe(topic).ok();
+                                    }
+                                    tracing::info!(
+                                        kse = r.kse.len(), cron = r.cron.len(), http = r.http.len(),
+                                        "lattice: event-source routes installed"
+                                    );
+                                    routes = r.clone();
+                                }
                                 _ => {}
                             }
                             lattice.on_message(lmsg, lattice_now_ms());
@@ -503,8 +528,31 @@ pub async fn run(
                                 } else {
                                     None
                                 };
+                                // KSE-topic trigger (M13): components hosted here
+                                // and routed to this topic get on-kse fired.
+                                let kse_targets: Vec<String> = routes
+                                    .kse_targets(&kse_name)
+                                    .iter()
+                                    .filter(|cid| my_heartbeat.hosted.iter().any(|h| h == *cid))
+                                    .cloned()
+                                    .collect();
+                                let kse_payload = if kse_targets.is_empty() {
+                                    None
+                                } else {
+                                    Some(data.clone())
+                                };
+                                let kse_topic_str = kse_name.clone();
                                 let kse_topic = kotoba_vault::Topic(kse_name);
                                 let entry = journal.publish(kse_topic, bytes::Bytes::from(data)).await;
+                                if let Some(payload) = kse_payload {
+                                    for cid in &kse_targets {
+                                        tracing::info!(%cid, topic = %kse_topic_str, "KSE trigger fired — invoking on-kse");
+                                        invoke_trigger(
+                                            &executor, block_store.as_ref(), &node_did, cid,
+                                            ComponentTrigger::Kse(kse_topic_str.clone(), payload.clone()),
+                                        );
+                                    }
+                                }
                                 if let Some((quad, op)) = maybe_quad_op {
                                     // capture predicate + (text) object before the move, for M6 Δ-triggers
                                     let delta_pred = quad.predicate.clone();
