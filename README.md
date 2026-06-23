@@ -282,6 +282,7 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | doc | topic |
 |---|---|
 | [`docs/index.html`](docs/index.html) | docs-site landing page (hub) |
+| [`docs/paper/`](docs/paper/) | arXiv-style research paper (LaTeX source) — full system description |
 | [`docs/explainer/`](docs/explainer/) | the two interactive explainer videos |
 | [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md) | X-Road-style accountability, R0–R3 custody, threat model |
 | [`docs/ADR-001-five-axis-distributed-redesign.md`](docs/ADR-001-five-axis-distributed-redesign.md) | five-axis distributed redesign |
@@ -290,6 +291,7 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |
 | [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC |
 | [`docs/ADR-kotoba-word.md`](docs/ADR-kotoba-word.md) | word/root registry + capability boundary |
+| [`docs/ADR-research-paper-arxiv.md`](docs/ADR-research-paper-arxiv.md) | arXiv paper as a grounded, derived artifact |
 | [`docs/WASI-HTTP-EGRESS-XRPC-INGRESS.md`](docs/WASI-HTTP-EGRESS-XRPC-INGRESS.md) | I/O boundary (egress/ingress) |
 
 The cross-cutting design SSoT remains the parent-monorepo ADR (see [ADR](#adr) below).
