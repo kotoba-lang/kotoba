@@ -126,6 +126,8 @@ pub mod component;
 pub mod run;
 
 pub use compat::ReaderTarget;
+#[cfg(feature = "component")]
+pub use component::compile_component_str_with_prelude;
 
 use std::path::Path;
 use thiserror::Error;

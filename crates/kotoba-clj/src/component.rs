@@ -16,7 +16,7 @@ use wit_parser::Resolve;
 
 use crate::codegen::{Entry, EntryAbi};
 use crate::compat::{self, ReaderTarget};
-use crate::CljError;
+use crate::{CljError, CBOR_ENC_PRELUDE, CBOR_PRELUDE, KQE_PRELUDE, PRELUDE};
 
 /// The WIT world every kotoba-clj program component targets.
 const PROGRAM_WIT: &str = r#"
@@ -50,6 +50,28 @@ pub fn compile_component_str_with_reader_target(
         }],
     )?;
     encode_component(core)
+}
+
+/// Compile Clojure-subset source into a WASM **Component** (same as
+/// [`compile_component_str`]) WITH the combined container + CBOR prelude
+/// ([`crate::PRELUDE`], [`crate::CBOR_PRELUDE`], [`crate::CBOR_ENC_PRELUDE`],
+/// [`crate::KQE_PRELUDE`]) prepended — so the program can call `merge`,
+/// `str`, `get`, `mapv`, `vec-make`, `map-make`, `cbor-*`, `kqe-*` etc.
+///
+/// The source must still define `(defn run [input] …)` as its entry point.
+pub fn compile_component_str_with_prelude(src: &str) -> Result<Vec<u8>, CljError> {
+    compile_component_str_with_prelude_and_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Compile source with the combined prelude into a WASM **Component**, after
+/// applying Clojure reader compatibility for `target`.
+pub fn compile_component_str_with_prelude_and_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    let with_prelude =
+        format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}\n{src}");
+    compile_component_str_with_reader_target(&with_prelude, target)
 }
 
 /// Wrap a core module (already containing the `run`/`memory`/`cabi_realloc`
