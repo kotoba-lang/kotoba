@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(Engi::credit_limit_for_stake(0), DEFAULT_CREDIT_LIMIT_EN);
         // A huge stake scales up without overflowing into a negative i64.
         let huge = Engi::credit_limit_for_stake(u64::MAX);
-        assert!(huge > 5 * DEFAULT_CREDIT_LIMIT_EN && huge > 0);
+        assert!(huge > 5 * DEFAULT_CREDIT_LIMIT_EN);
     }
 
     #[tokio::test]
