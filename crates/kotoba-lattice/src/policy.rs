@@ -114,9 +114,7 @@ impl LinkTable {
                 return LinkDecision::allow(&l.id);
             }
         }
-        LinkDecision::deny(format!(
-            "no link grants {source} → {target} ({ability})"
-        ))
+        LinkDecision::deny(format!("no link grants {source} → {target} ({ability})"))
     }
 }
 
@@ -203,7 +201,9 @@ mod tests {
     #[test]
     fn put_verified_runs_the_hook_and_remove_revokes() {
         let mut t = LinkTable::new();
-        let did = t.put_verified(link("l1", "did:A", "cap/llm", "infer"), &TrustOnIngest).unwrap();
+        let did = t
+            .put_verified(link("l1", "did:A", "cap/llm", "infer"), &TrustOnIngest)
+            .unwrap();
         assert_eq!(did, "did:A");
         assert!(t.authorize("did:A", "cap/llm", "infer").allowed);
         t.remove("l1");
@@ -260,9 +260,15 @@ mod tests {
     #[test]
     fn route_capability_with_empty_fleet_is_unavailable() {
         let local = hb("did:self", &["cap/kqe"], 100);
-        assert_eq!(route_capability("cap/llm", &local, &[]), ProviderRoute::Unavailable);
+        assert_eq!(
+            route_capability("cap/llm", &local, &[]),
+            ProviderRoute::Unavailable
+        );
         // but a cap the local node itself supplies is still Local with no fleet
-        assert_eq!(route_capability("cap/kqe", &local, &[]), ProviderRoute::Local);
+        assert_eq!(
+            route_capability("cap/kqe", &local, &[]),
+            ProviderRoute::Local
+        );
     }
 
     #[test]
@@ -299,13 +305,19 @@ mod tests {
             hb("did:p2", &["cap/llm"], 900),
         ];
         // local supplies kqe
-        assert_eq!(route_capability("cap/kqe", &local, &fleet), ProviderRoute::Local);
+        assert_eq!(
+            route_capability("cap/kqe", &local, &fleet),
+            ProviderRoute::Local
+        );
         // llm only remote → richest (p2)
         assert_eq!(
             route_capability("cap/llm", &local, &fleet),
             ProviderRoute::Remote("did:p2".into())
         );
         // nobody supplies evm
-        assert_eq!(route_capability("cap/evm", &local, &fleet), ProviderRoute::Unavailable);
+        assert_eq!(
+            route_capability("cap/evm", &local, &fleet),
+            ProviderRoute::Unavailable
+        );
     }
 }

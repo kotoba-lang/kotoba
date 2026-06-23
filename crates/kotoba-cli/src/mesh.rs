@@ -66,8 +66,8 @@ pub enum LatticeCmd {
 fn compile_source(file: &Path, wit_dir: &str) -> Result<(Vec<u8>, Lang)> {
     let path = file.to_string_lossy();
     let lang = Lang::from_ext(&path);
-    let src = std::fs::read_to_string(file)
-        .with_context(|| format!("read component source {}", path))?;
+    let src =
+        std::fs::read_to_string(file).with_context(|| format!("read component source {}", path))?;
 
     let wasm = match lang {
         Lang::Clojure => kotoba_clj::component::compile_kais_component_str(&src, wit_dir)
@@ -182,7 +182,10 @@ pub fn run_lattice(cmd: LatticeCmd) -> Result<()> {
             let labels = std::env::var("KOTOBA_NODE_LABELS").unwrap_or_default();
             println!("lattice participation (local config):");
             println!("  roles  : {roles}");
-            println!("  labels : {}", if labels.is_empty() { "(none)" } else { &labels });
+            println!(
+                "  labels : {}",
+                if labels.is_empty() { "(none)" } else { &labels }
+            );
             println!(
                 "\nA running `kotoba serve` node subscribes to the lattice topics,\n\
                  publishes Heartbeats, and auto-bids on auctions over gossipsub.\n\
@@ -219,7 +222,10 @@ mod tests {
         let r = compile_source(&p, "crates/kotoba-runtime/wit");
         let _ = std::fs::remove_file(&p);
         let err = r.unwrap_err().to_string();
-        assert!(err.contains("Python") || err.contains("not wired"), "got: {err}");
+        assert!(
+            err.contains("Python") || err.contains("not wired"),
+            "got: {err}"
+        );
     }
 
     #[test]

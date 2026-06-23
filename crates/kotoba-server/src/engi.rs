@@ -254,7 +254,10 @@ impl Engi {
             // overflowing i64 even when the operator is deep in credit).
             return i64::MAX / 4;
         }
-        g.limits.get(did).copied().unwrap_or(self.default_credit_limit)
+        g.limits
+            .get(did)
+            .copied()
+            .unwrap_or(self.default_credit_limit)
     }
 
     /// The mutual-credit primitive: move `amount` EN from `from` to `to`.
@@ -277,7 +280,8 @@ impl Engi {
         let new_from = from_bal - amount;
         let to_bal = g.balances.get(to).copied().unwrap_or(0);
         g.balances.insert(from.to_string(), new_from);
-        g.balances.insert(to.to_string(), to_bal.saturating_add(amount));
+        g.balances
+            .insert(to.to_string(), to_bal.saturating_add(amount));
         let snapshot = Self::persisted(&g);
         drop(g);
         self.persist(snapshot);
@@ -338,7 +342,8 @@ impl Engi {
                 continue;
             }
             let to_bal = g.balances.get(did).copied().unwrap_or(0);
-            g.balances.insert(did.clone(), to_bal.saturating_add(*amount));
+            g.balances
+                .insert(did.clone(), to_bal.saturating_add(*amount));
             // Operator extends the credit (its balance falls); ledger stays net-zero.
             let op_bal = g.balances.get(&op).copied().unwrap_or(0);
             g.balances.insert(op.clone(), op_bal - *amount);
@@ -433,7 +438,10 @@ mod tests {
         assert!(l.is_balanced());
         assert_eq!(l.outstanding, 600);
         // a can send 400 more (down to -1000), but not 401.
-        assert_eq!(e.transfer("did:key:a", "did:key:b", 401).await, Err((401, 400)));
+        assert_eq!(
+            e.transfer("did:key:a", "did:key:b", 401).await,
+            Err((401, 400))
+        );
         assert_eq!(e.transfer("did:key:a", "did:key:b", 400).await, Ok(-1000));
         assert!(e.ledger().await.is_balanced());
     }
@@ -461,7 +469,7 @@ mod tests {
     async fn charge_blocked_when_credit_limit_exhausted() {
         let e = engi(10, "did:key:op"); // default limit 1000
         assert!(e.charge("did:key:ext", 1000).await.is_ok()); // ext now at -1000
-        // Over the limit — rejected, balances unchanged.
+                                                              // Over the limit — rejected, balances unchanged.
         assert_eq!(e.charge("did:key:ext", 1).await, Err((1, 0)));
         assert_eq!(e.balance("did:key:ext").await, -1000);
         assert!(e.ledger().await.is_balanced());
@@ -574,7 +582,9 @@ mod tests {
         assert_eq!(e.credit_limit(agent).await, DEFAULT_CREDIT_LIMIT_EN);
 
         // A verified-entity stake lifts the limit to 5× the default.
-        let limit = e.raise_credit_limit_for_stake(agent, 5_000 * 1_000_000).await;
+        let limit = e
+            .raise_credit_limit_for_stake(agent, 5_000 * 1_000_000)
+            .await;
         assert_eq!(limit, 5 * DEFAULT_CREDIT_LIMIT_EN);
         assert_eq!(e.credit_limit(agent).await, 5 * DEFAULT_CREDIT_LIMIT_EN);
         // The widened headroom is real: a charge that would exceed the default
@@ -586,8 +596,14 @@ mod tests {
         assert!(e.ledger().await.is_balanced());
 
         // A later, smaller attestation never claws back earned headroom.
-        let after = e.raise_credit_limit_for_stake(agent, 1_000 * 1_000_000).await;
-        assert_eq!(after, 5 * DEFAULT_CREDIT_LIMIT_EN, "reputation only accrues");
+        let after = e
+            .raise_credit_limit_for_stake(agent, 1_000 * 1_000_000)
+            .await;
+        assert_eq!(
+            after,
+            5 * DEFAULT_CREDIT_LIMIT_EN,
+            "reputation only accrues"
+        );
     }
 
     #[tokio::test]
@@ -620,8 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_ledger_file_is_backed_up_not_lost() {
-        let dir =
-            std::env::temp_dir().join(format!("kotoba-engi-corrupt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kotoba-engi-corrupt-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let pp = dir.join("engi-ledger.json");
         std::fs::write(&pp, b"{ not valid json").unwrap();

@@ -56,7 +56,9 @@ async fn drive_until_lattice(
 
 /// Connect `s2 → s1` and wait until both report the connection.
 async fn connect(s1: &mut KotobaSwarm, s2: &mut KotobaSwarm) {
-    let listen = get_listen_addr(s1).await.expect("swarm1 ListenAddr timeout");
+    let listen = get_listen_addr(s1)
+        .await
+        .expect("swarm1 ListenAddr timeout");
     s2.add_peer(s1.local_peer_id, listen);
     let connected = timeout(Duration::from_secs(5), async {
         loop {
@@ -121,7 +123,11 @@ async fn lattice_heartbeat_round_trips_over_quic_gossipsub() {
     );
 
     let got = drive_until_lattice(&mut s1, &mut s2, Duration::from_secs(5)).await;
-    assert_eq!(got, Some(hb), "peer must decode the exact heartbeat sent over QUIC");
+    assert_eq!(
+        got,
+        Some(hb),
+        "peer must decode the exact heartbeat sent over QUIC"
+    );
 }
 
 #[tokio::test]
