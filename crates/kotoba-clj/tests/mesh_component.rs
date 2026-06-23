@@ -133,3 +133,24 @@ fn on_kse_routes_to_kse_world_by_arity2() {
     let src = "(ns m) (defn run [c] c) (defn on-kse [t p] p)";
     assert!(compile_kais_mesh_component_str(src, WIT).is_ok());
 }
+
+// ── M10: combined kotoba-mesh world — multiple triggers in one component ──
+
+#[test]
+fn mesh_component_with_all_three_triggers_loads_under_wasmtime() {
+    let src = "(ns m) (defn run [c] c) \
+               (defn on-http [r] r) \
+               (defn on-tick [e] \"\") \
+               (defn on-kse [t p] p)";
+    let wasm = compile_kais_mesh_component_str(src, WIT).expect("compile combined component");
+    assert_eq!(&wasm[0..4], b"\0asm");
+    assert_loads(&wasm).expect("run + on-http + on-tick + on-kse must load");
+}
+
+#[test]
+fn mesh_component_two_triggers_synthesizes_stub_for_the_third() {
+    // on-http + on-tick defined; on-kse auto-stubbed → kotoba-mesh world
+    let src = "(ns m) (defn run [c] c) (defn on-http [r] r) (defn on-tick [e] \"\")";
+    let wasm = compile_kais_mesh_component_str(src, WIT).expect("compile 2-trigger component");
+    assert_loads(&wasm).expect("2 real triggers + 1 synthesized stub must load");
+}

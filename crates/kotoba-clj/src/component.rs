@@ -196,52 +196,66 @@ pub fn compile_kais_component_str_with_reader_target(
 /// unaffected. `wit_dir` is `crates/kotoba-runtime/wit`.
 pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u8>, CljError> {
     let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
-    let program = crate::ast::parse_program(&normalized)?;
+    let mut program = crate::ast::parse_program(&normalized)?;
 
-    // detect optional trigger handlers (`defn`s of a given arity) in the guest
-    let has_arity = |name: &str, n: usize| {
+    // detect handlers (`defn`s of a given arity) in the guest
+    let has_arity = |program: &crate::ast::Program, name: &str, n: usize| {
         program
             .functions
             .iter()
             .any(|f| f.name == name && f.params.len() == n)
     };
-    let has = |name: &str| has_arity(name, 1);
-    if !has("run") {
+    if !has_arity(&program, "run", 1) {
         return Err(CljError::Codegen(
             "mesh component must define `(defn run [ctx] …)`".into(),
         ));
     }
+
+    // The three optional trigger handlers: (name, guest arity, export ABI).
+    let triggers = [
+        ("on-http", 1usize, EntryAbi::BytesToResultBytes),
+        ("on-tick", 1usize, EntryAbi::I64ToResultBytes),
+        ("on-kse", 2usize, EntryAbi::StringBytesToResultBytes),
+    ];
+    let defined: Vec<_> = triggers
+        .iter()
+        .filter(|(n, a, _)| has_arity(&program, n, *a))
+        .collect();
 
     let mut entries = vec![Entry {
         name: "run",
         abi: EntryAbi::BytesToResultBytes,
         export_name: "run",
     }];
-    // Pick the world by which trigger handler the guest defines (M7/M8). on-http
-    // and on-tick are currently distinct worlds; combining them is a future variant.
-    let world_name = if has("on-http") {
-        entries.push(Entry {
-            name: "on-http",
-            abi: EntryAbi::BytesToResultBytes,
-            export_name: "on-http",
-        });
-        "kotoba-component"
-    } else if has("on-tick") {
-        entries.push(Entry {
-            name: "on-tick",
-            abi: EntryAbi::I64ToResultBytes,
-            export_name: "on-tick",
-        });
-        "kotoba-cron"
-    } else if has_arity("on-kse", 2) {
-        entries.push(Entry {
-            name: "on-kse",
-            abi: EntryAbi::StringBytesToResultBytes,
-            export_name: "on-kse",
-        });
-        "kotoba-kse"
-    } else {
-        "kotoba-node"
+
+    let world_name = match defined.len() {
+        // no triggers → plain run-only node
+        0 => "kotoba-node",
+        // exactly one → its dedicated world (M7/M8/M9), no stubs
+        1 => {
+            let (n, _, abi) = defined[0];
+            entries.push(Entry { name: n, abi: *abi, export_name: n });
+            match *n {
+                "on-http" => "kotoba-component",
+                "on-tick" => "kotoba-cron",
+                _ => "kotoba-kse",
+            }
+        }
+        // 2+ → the combined kotoba-mesh world; export ALL three triggers,
+        // synthesizing empty `(defn …)` stubs for any the guest didn't define
+        // (M10). The host dispatches the matching export per incoming trigger.
+        _ => {
+            for (n, arity, abi) in triggers {
+                if !has_arity(&program, n, arity) {
+                    let params: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
+                    let stub = format!("(defn {n} [{}] \"\")", params.join(" "));
+                    let p = crate::ast::parse_program(&stub)?;
+                    program.functions.extend(p.functions.into_iter().filter(|f| f.name == n));
+                }
+                entries.push(Entry { name: n, abi, export_name: n });
+            }
+            "kotoba-mesh"
+        }
     };
 
     let core = crate::codegen::compile_core(&program, &entries)?;
