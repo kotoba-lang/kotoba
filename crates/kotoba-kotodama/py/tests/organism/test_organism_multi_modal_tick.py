@@ -14,7 +14,7 @@ from kotodama.organism.observation import (
     NumericObservation,
     TextObservation,
 )
-from kotodama.organism.unispsc_organism import UnispscOrganism
+from kotodama.organism.organism import Organism
 
 
 def _make_stub_graph() -> Any:
@@ -25,8 +25,8 @@ def _make_stub_graph() -> Any:
     return StubGraph()
 
 
-def _make_organism() -> UnispscOrganism:
-    org = UnispscOrganism(
+def _make_organism() -> Organism:
+    org = Organism(
         code="stub",
         graph=_make_stub_graph(),
     )
@@ -101,7 +101,7 @@ def test_internal_only_tier_c_no_leak():
     def mock_sink(text: str, **kwargs: Any) -> None:
         posts.append(text)
 
-    org = UnispscOrganism(
+    org = Organism(
         code="stub",
         graph=_make_stub_graph(),
         post_sink=mock_sink,

@@ -10,15 +10,15 @@ from pathlib import Path
 from kotodama.organism.joucho import JouchoScores
 from kotodama.organism.lifecycle import OrganismState
 from kotodama.organism.messaging import MockPdsReceiver, OrganismMessage
-from kotodama.organism.unispsc_organism import OrganismTickResult, UnispscOrganism
+from kotodama.organism.organism import OrganismTickResult, Organism
 
 
 @dataclass
 class E2EMessagingHarness:
     """A test harness for simulating messaging between two organisms, A and B."""
 
-    organism_a: UnispscOrganism
-    organism_b: UnispscOrganism
+    organism_a: Organism
+    organism_b: Organism
     pds_receiver_b: MockPdsReceiver
 
     @classmethod
@@ -26,11 +26,11 @@ class E2EMessagingHarness:
         """Factory method to set up two organisms in a temporary directory."""
         pds_receiver = MockPdsReceiver()
 
-        org_a = UnispscOrganism.for_code(code=code_a)
+        org_a = Organism.for_code(code=code_a)
         # Birth organism A so it's active
         org_a.lifecycle.handle_birth(actor_did=org_a.actor_did)
 
-        org_b = UnispscOrganism.for_code(
+        org_b = Organism.for_code(
             code=code_b,
             messaging_receiver=pds_receiver
         )

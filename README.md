@@ -12,6 +12,27 @@ for decentralized AI agent systems.  It combines Datomic-style immutable
 datoms, Pregel BSP graph computation, an auxiliary SPARQL 1.1 executor over IPFS
 storage, native CACAO authentication, and WASM Component Model execution.
 
+## 📺 Explainers & Docs site
+
+A static documentation site (landing page + **two interactive, auto-playing
+explainer videos** with Japanese narration) lives under [`docs/`](docs/) and is
+published via GitHub Pages:
+
+> **🌐 [com-junkawasaki.github.io/kotoba](https://com-junkawasaki.github.io/kotoba/)**
+
+| explainer | what it covers |
+|---|---|
+| **Part 1 — [Datomic × IPFS × Prolly Tree](https://com-junkawasaki.github.io/kotoba/explainer/kotoba-datomic-ipfs-explainer.html)** | how a Datomic-style query runs over a Prolly-Tree index that is DAG-CBOR/IPLD content-addressed and pinned to IPFS — write → 4-index build → CID → CommitDag → query `scan_prefix` → result provenance CID |
+| **Part 2 — [Query / CACAO / Signal](https://com-junkawasaki.github.io/kotoba/explainer/kotoba-query-auth-signal-explainer.html)** | complex/large queries (BGP join, MaterializedView), multihop (property paths, Pregel BSP), federation (`SERVICE`), the transact write path, CACAO auth/authz (depth-2 delegation), and Signal E2E (X3DH → Double Ratchet) + t-of-N custody |
+
+> These are self-contained HTML (open the Pages links above, or open the files
+> in [`docs/explainer/`](docs/explainer/) directly in a browser). GitHub does not
+> render the interactive HTML inline in this README. Every claim is grounded in
+> the actual source (`prolly.rs`, `arrangement.rs`, `cacao.rs`, `delegation.rs`,
+> `x3dh.rs`, `ratchet.rs`, `shares.rs`).
+
+See [**Documentation**](#documentation) below for the full ADR / design index.
+
 ## Install
 
 ### Homebrew (macOS / Linux)
@@ -38,7 +59,7 @@ brew install --build-from-source ./Formula/kotoba.rb
 ### From source (any platform)
 
 ```bash
-git clone https://github.com/etzhayyim/kotoba.git
+git clone https://github.com/com-junkawasaki/kotoba.git
 cd kotoba
 cargo install --locked --path crates/kotoba-cli --bin kotoba
 ```
@@ -250,6 +271,30 @@ Measurements taken on M4 Mac, release build, `KOTOBA_IPFS=off`,
 | 32          | **12753**   | 2.15 ms  |
 
 Trust-boundary throughput **12.8K QPS** at c=32, 100% replay-protected.
+
+## Documentation
+
+The published docs site — [**com-junkawasaki.github.io/kotoba**](https://com-junkawasaki.github.io/kotoba/)
+— is the entry point (overview, the two explainers, architecture, crates,
+security, and this index). It is the static site under [`docs/`](docs/), served
+by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
+
+| doc | topic |
+|---|---|
+| [`docs/index.html`](docs/index.html) | docs-site landing page (hub) |
+| [`docs/paper/`](docs/paper/) | arXiv-style research paper (LaTeX source) — full system description |
+| [`docs/explainer/`](docs/explainer/) | the two interactive explainer videos |
+| [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md) | X-Road-style accountability, R0–R3 custody, threat model |
+| [`docs/ADR-001-five-axis-distributed-redesign.md`](docs/ADR-001-five-axis-distributed-redesign.md) | five-axis distributed redesign |
+| [`docs/ADR-sealed-cold-tier.md`](docs/ADR-sealed-cold-tier.md) | encrypted cold tier + t-of-N custody |
+| [`docs/ADR-clojure-wasm.md`](docs/ADR-clojure-wasm.md) | Clojure/EDN-subset → WebAssembly compiler |
+| [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |
+| [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC |
+| [`docs/ADR-kotoba-word.md`](docs/ADR-kotoba-word.md) | word/root registry + capability boundary |
+| [`docs/ADR-research-paper-arxiv.md`](docs/ADR-research-paper-arxiv.md) | arXiv paper as a grounded, derived artifact |
+| [`docs/WASI-HTTP-EGRESS-XRPC-INGRESS.md`](docs/WASI-HTTP-EGRESS-XRPC-INGRESS.md) | I/O boundary (egress/ingress) |
+
+The cross-cutting design SSoT remains the parent-monorepo ADR (see [ADR](#adr) below).
 
 ## Build
 

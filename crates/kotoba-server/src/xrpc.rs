@@ -85,6 +85,12 @@ pub const NSID_AGENT_SYNC_ADV: &str = "com.etzhayyim.apps.kotoba.agent.syncadvan
 pub const NSID_AGENT_SYNC_CLOSE: &str = "com.etzhayyim.apps.kotoba.agent.syncclose";
 pub const NSID_VAULT_PUT: &str = "com.etzhayyim.apps.kotoba.vault.put";
 pub const NSID_VAULT_GET: &str = "com.etzhayyim.apps.kotoba.vault.get";
+/// Canonical ENGI (縁起) ledger NSIDs. The `econ.*` names below are kept as
+/// **deprecated wire-compatible aliases** routed to the same handlers, so
+/// existing clients keep working while new ones migrate to `engi.*`.
+pub const NSID_ENGI_BALANCE: &str = "com.etzhayyim.apps.kotoba.engi.balance";
+pub const NSID_ENGI_CREDIT: &str = "com.etzhayyim.apps.kotoba.engi.credit";
+/// Deprecated aliases (pre-ENGI-rename); prefer `NSID_ENGI_*`.
 pub const NSID_ECON_BALANCE: &str = "com.etzhayyim.apps.kotoba.econ.balance";
 pub const NSID_ECON_CREDIT: &str = "com.etzhayyim.apps.kotoba.econ.credit";
 
@@ -890,12 +896,23 @@ pub async fn econ_balance(
     if req.did.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "did required".to_string()));
     }
-    let balance = state.econ.balance(&req.did).await;
+    let balance = state.engi.balance(&req.did).await;
+    let credit_limit = state.engi.credit_limit(&req.did).await;
+    let ledger = state.engi.ledger().await;
     Ok(Json(serde_json::json!({
         "did": req.did,
+        "unit": "EN",
+        "balance_en": balance,
+        "credit_limit_en": credit_limit,
+        "write_cost_en": state.engi.cost_per_datom(),
+        "read_cost_en": state.engi.read_cost(),
+        "enabled": state.engi.enabled(),
+        // net-zero ledger audit (net is the conservation invariant, always 0)
+        "ledger_net_en": ledger.net,
+        "ledger_outstanding_en": ledger.outstanding,
+        // legacy keys (deprecated — EN replaces mKOTO; kept for client compat)
         "balance_mkoto": balance,
-        "cost_per_datom_mkoto": state.econ.cost_per_datom(),
-        "enabled": state.econ.enabled(),
+        "cost_per_datom_mkoto": state.engi.cost_per_datom(),
     })))
 }
 
@@ -908,9 +925,13 @@ pub async fn econ_credit(
     if req.did.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "did required".to_string()));
     }
-    let balance = state.econ.credit(&req.did, req.amount).await;
+    let balance = state.engi.credit(&req.did, req.amount).await;
     Ok(Json(serde_json::json!({
         "did": req.did,
+        "unit": "EN",
+        "credited_en": req.amount,
+        "balance_en": balance,
+        // legacy keys (deprecated — EN replaces mKOTO; kept for client compat)
         "credited_mkoto": req.amount,
         "balance_mkoto": balance,
     })))
@@ -1503,6 +1524,9 @@ async fn require_datomic_read_any_operation(
 
     let graph_scope = graph.to_multibase();
     let visibility = state.graph_visibility(graph).await;
+    // The authenticated reader DID (if any) — captured so the ENGI read fee can
+    // be charged to it below. Anonymous public reads and operator reads stay free.
+    let mut reader_did: Option<String> = None;
     // Authorize via one of: CACAO operation grant, VC presentation, or the
     // graph-visibility fallback gate.
     'authorized: {
@@ -1542,6 +1566,7 @@ async fn require_datomic_read_any_operation(
                     }
                 }
                 enforce_datomic_temporal_tx_scope(&payload, as_of, since)?;
+                reader_did = Some(payload.iss.clone());
                 break 'authorized;
             }
         }
@@ -1552,6 +1577,7 @@ async fn require_datomic_read_any_operation(
                 presentation,
                 operations,
             )?;
+            reader_did = presentation.holder.clone();
             break 'authorized;
         }
         check_read_access(
@@ -1572,7 +1598,33 @@ async fn require_datomic_read_any_operation(
         graph,
         &visibility,
         operations.first().copied().unwrap_or("datom:read"),
-    )
+    )?;
+    // ENGI (縁起) read fee — transfer EN from the authenticated reader → operator
+    // (net-zero). No-op when KOTOBA_READ_COST_EN is unset/0, for anonymous public
+    // reads (no reader DID), or for the operator (self-transfer = free).
+    charge_engi_read_fee(state, reader_did.as_deref()).await
+}
+
+/// Charge the per-read ENGI fee to `reader` (if any), transferring it to the
+/// operator. Returns an HTTP 402 if the reader is out of credit. A no-op when
+/// reads are free (`KOTOBA_READ_COST_EN` unset/0) or there is no reader DID.
+async fn charge_engi_read_fee(
+    state: &KotobaState,
+    reader: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let cost = state.engi.read_cost();
+    if cost <= 0 {
+        return Ok(());
+    }
+    let Some(did) = reader else {
+        return Ok(());
+    };
+    state.engi.charge(did, cost).await.map(|_| ()).map_err(|(needed, available)| {
+        (
+            StatusCode::PAYMENT_REQUIRED,
+            format!("insufficient EN credit: read needs {needed} EN, {available} EN of credit available for {did}"),
+        )
+    })
 }
 
 async fn require_datomic_read_tx_range(
@@ -1589,6 +1641,7 @@ async fn require_datomic_read_tx_range(
 
     let graph_scope = graph.to_multibase();
     let visibility = state.graph_visibility(graph).await;
+    let mut reader_did: Option<String> = None;
     'authorized: {
         if cacao_b64.is_some() {
             if let Ok(payload) = verify_datomic_cacao_payload_with_any_operation(
@@ -1598,6 +1651,7 @@ async fn require_datomic_read_tx_range(
                 operations,
             ) {
                 enforce_datomic_range_tx_scope(&payload, start, end)?;
+                reader_did = Some(payload.iss.clone());
                 break 'authorized;
             }
         }
@@ -1618,6 +1672,7 @@ async fn require_datomic_read_tx_range(
                     end,
                 )?;
             }
+            reader_did = presentation.holder.clone();
             break 'authorized;
         }
         check_read_access(
@@ -1638,7 +1693,9 @@ async fn require_datomic_read_tx_range(
         graph,
         &visibility,
         operations.first().copied().unwrap_or("datom:read"),
-    )
+    )?;
+    // ENGI (縁起) read fee (see require_datomic_read_any_operation).
+    charge_engi_read_fee(state, reader_did.as_deref()).await
 }
 
 fn enforce_datomic_temporal_tx_scope(
@@ -4864,6 +4921,37 @@ pub async fn datomic_transact(
                 kotoba_auth::CacaoPayload::OP_TX_CREATE,
             ],
         )?;
+        // ADR-2606131600 P1 owner-binding — write-path mirror (BaaS tenant writes).
+        // The CACAO grant above verifies capability + graph scope + aud==operator +
+        // signature, but not WHO signed it. A self-signed CACAO scoped to another
+        // tenant's graph CID (the CID is derivable from a known DID) would otherwise
+        // authorize a cross-tenant WRITE — the same leak the read path already closes
+        // for reads (see require_datomic_read_any_operation). For a Private graph the
+        // verified issuer must be the graph owner (delegation to others is the owner's
+        // prerogative, expressed as a chain rooted at owner; payload.iss is that root).
+        // Public/Authenticated and not-yet-materialised graphs have no owner to bind to
+        // — the kotobase edge BFF gates those structurally via its
+        // kotobase/db/<tenant_did>/<name> namespace.
+        if let kotoba_core::named_graph::GraphVisibility::Private { owner_did } =
+            &state.graph_visibility(&graph_cid).await
+        {
+            if &payload.iss != owner_did {
+                tracing::warn!(
+                    issuer = %payload.iss,
+                    owner = %owner_did,
+                    graph = %graph_cid.to_multibase(),
+                    "datomic transact: CACAO issuer is not the graph owner"
+                );
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    format!(
+                        "CACAO issuer {:?} is not the owner of private graph {}",
+                        payload.iss,
+                        graph_cid.to_multibase()
+                    ),
+                ));
+            }
+        }
         write_author = payload.iss.clone();
         cacao_payload = Some(payload);
     } else if let Some(presentation) = &req.presentation {
@@ -4966,6 +5054,22 @@ pub async fn datomic_transact(
         .transact(tx_data.clone())
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("datomic transact: {e}")))?;
+    // Tier write quota (ADR-2606201700 follow-up 3) — bound the per-transaction
+    // datom count by the writer's tenant tier (kotobase/accounts/<did>). The
+    // operator is exempt; KOTOBA_TIER_WRITE_QUOTA=off disables enforcement.
+    if write_author != state.operator_did
+        && std::env::var("KOTOBA_TIER_WRITE_QUOTA").as_deref() != Ok("off")
+    {
+        let tier = crate::kotobase_xrpc::tier_for(&state, &write_author).await;
+        let cap = crate::kotobase_xrpc::write_datom_cap_for_tier(&tier);
+        let datom_count = tx_preview.tx_data.len();
+        if datom_count > cap {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("QuotaExceeded: tier={tier} datoms={datom_count}>{cap} per transaction"),
+            ));
+        }
+    }
     if let Some(payload) = &cacao_payload {
         enforce_datomic_write_tx_scope(payload, &tx_preview.tx_cid)?;
     }
@@ -5009,8 +5113,34 @@ pub async fn datomic_transact(
         None => None,
     };
     let cacao_proof_cid = auth_proof_cid.clone().or(explicit_cacao_proof_cid);
+
+    // ENGI (縁起) write fee — charged last, right before the commit, after all
+    // auth/scope/quota checks have passed (so a rejected request is never
+    // debited). The fee transfers EN from writer → operator (net-zero); it is a
+    // no-op when the economy is disabled (KOTOBA_WRITE_COST_EN unset/0) or when
+    // the writer is the operator (free node self-write). The writer may run a
+    // negative balance down to their credit limit; once exhausted the write is
+    // rejected with HTTP 402 and they must earn EN (be cited / provide storage
+    // or compute) before writing again. Refunded below if the commit fails.
+    let write_fee = if state.engi.enabled() {
+        let cost = state.engi.cost_for(tx_preview.tx_data.len());
+        match state.engi.charge(&write_author, cost).await {
+            Ok(_) => cost,
+            Err((needed, available)) => {
+                return Err((
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "insufficient EN credit: write needs {needed} EN, {available} EN of credit available for {write_author}"
+                    ),
+                ));
+            }
+        }
+    } else {
+        0
+    };
+
     let writer = DistributedCommitWriter::new(&*state.block_store, &*state.ipns_registry);
-    let distributed = writer
+    let distributed = match writer
         .transact_with_db_before(
             DistributedTransactRequest {
                 ipns_name: ipns_name.clone(),
@@ -5047,18 +5177,28 @@ pub async fn datomic_transact(
             },
         )
         .await
-        .map_err(|e| match e {
-            DistributedCommitError::StaleParent { .. } => {
-                (StatusCode::CONFLICT, format!("distributed commit: {e}"))
+    {
+        Ok(d) => d,
+        Err(e) => {
+            // Commit failed after the fee was charged — refund so a failed write
+            // is supply-neutral (charge + refund nets to zero).
+            if write_fee > 0 {
+                state.engi.refund(&write_author, write_fee).await;
             }
-            DistributedCommitError::Datom(_) => {
-                (StatusCode::BAD_REQUEST, format!("datomic transact: {e}"))
-            }
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("distributed commit: {e}"),
-            ),
-        })?;
+            return Err(match e {
+                DistributedCommitError::StaleParent { .. } => {
+                    (StatusCode::CONFLICT, format!("distributed commit: {e}"))
+                }
+                DistributedCommitError::Datom(_) => {
+                    (StatusCode::BAD_REQUEST, format!("datomic transact: {e}"))
+                }
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("distributed commit: {e}"),
+                ),
+            });
+        }
+    };
     let report = distributed.transact;
     let distributed_commit = distributed.commit;
     let tx_datoms = distributed.datoms;
@@ -9998,6 +10138,191 @@ mod tests {
             rows(resp).await,
             expected,
             "authorized private read returns the seeded rows"
+        );
+    }
+
+    // ADR-2606201700: the transact CACAO path binds the issuer to the graph owner
+    // for Private graphs — a self-signed CACAO scoped to ANOTHER tenant's graph CID
+    // must not authorize a cross-tenant WRITE (the write analogue of the read gate
+    // above). Verified by signing with key [42] while the graph is owned by key [7].
+    #[tokio::test]
+    async fn datomic_transact_private_graph_rejects_non_owner_cacao() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        let owner_did = kotoba_auth::ed25519_pubkey_to_did_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let g = KotobaCid::from_bytes(b"transact-owner-bind-graph");
+        state.graph_registry.write().await.insert(
+            g.clone(),
+            (
+                "priv".into(),
+                GraphVisibility::Private {
+                    owner_did: owner_did.clone(),
+                },
+            ),
+        );
+        let g_mb = g.to_multibase();
+
+        // CACAO signed by [42] (issuer != the [7] owner), granting datom:transact + tx:create.
+        let cacao = signed_cacao_b64(
+            &state,
+            &g_mb,
+            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+            "tob-nonce-1",
+            [format!(
+                "kotoba://op/{}",
+                kotoba_auth::CacaoPayload::OP_TX_CREATE
+            )],
+        );
+
+        let err = datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: g_mb,
+                tx_edn: "[]".into(),
+                ipns_name: None,
+                cacao_b64: Some(cacao),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("non-owner CACAO must be rejected on a private graph");
+        assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.1.to_lowercase().contains("owner"),
+            "deny must be the owner-binding gate, got: {}",
+            err.1
+        );
+    }
+
+    // ADR-2606201700 f/3: per-tier datom write quota. A free-tier tenant (default,
+    // no kotobase/accounts entry) transacting past the free cap (1000 datoms/tx) is
+    // rejected 429 before commit. Public graph so the owner-binding gate does not
+    // intercept; write_author = the CACAO issuer, so the quota path (operator-exempt)
+    // applies.
+    #[tokio::test]
+    async fn datomic_transact_free_tier_over_cap_is_rejected_429() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        std::env::remove_var("KOTOBA_TIER_WRITE_QUOTA"); // enforcement on (default)
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        let g = KotobaCid::from_bytes(b"transact-quota-graph");
+        state
+            .graph_registry
+            .write()
+            .await
+            .insert(g.clone(), ("pub".into(), GraphVisibility::Public));
+        let g_mb = g.to_multibase();
+
+        // 1500 distinct asserts >> the free-tier cap of 1000 datoms per transaction.
+        let mut tx = String::from("[");
+        for i in 0..1500 {
+            tx.push_str(&format!("[:db/add \"e{i}\" :n {i}]"));
+        }
+        tx.push(']');
+
+        let cacao = signed_cacao_b64(
+            &state,
+            &g_mb,
+            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+            "quota-nonce-1",
+            [format!(
+                "kotoba://op/{}",
+                kotoba_auth::CacaoPayload::OP_TX_CREATE
+            )],
+        );
+
+        let err = datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: g_mb,
+                tx_edn: tx,
+                ipns_name: None,
+                cacao_b64: Some(cacao),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("over-cap free-tier transact must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            err.1.contains("QuotaExceeded"),
+            "deny must be the tier write quota, got: {}",
+            err.1
+        );
+    }
+
+    // datomic.with is speculative (no commit) and authorised as a READ via
+    // require_datomic_read, which owner-binds Private graphs (ADR-2606131600). Confirm
+    // a non-owner CACAO cannot speculatively read another tenant's private graph — the
+    // .with sibling of the transact owner-binding test.
+    #[tokio::test]
+    async fn datomic_with_private_graph_rejects_non_owner_cacao() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        let owner_did = kotoba_auth::ed25519_pubkey_to_did_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let g = KotobaCid::from_bytes(b"with-owner-bind-graph");
+        state.graph_registry.write().await.insert(
+            g.clone(),
+            (
+                "priv".into(),
+                GraphVisibility::Private {
+                    owner_did: owner_did.clone(),
+                },
+            ),
+        );
+
+        // CACAO signed by [42] but scoped to the [7]-owner's private space.
+        let cacao = signed_cacao_b64(
+            &state,
+            &format!("private/{owner_did}"),
+            kotoba_auth::CacaoPayload::OP_DATOM_READ,
+            "with-nonce-1",
+            Vec::<String>::new(),
+        );
+
+        let err = datomic_with(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicWithReq {
+                graph: g.to_multibase(),
+                tx_edn: "[]".into(),
+                as_of: None,
+                since: None,
+                remote_peer: None,
+                remote_ipns_name: None,
+                cacao_b64: Some(cacao),
+                presentation: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("non-owner speculative with must be rejected on a private graph");
+        assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(
+            err.1.to_lowercase().contains("issuer mismatch"),
+            "deny must be the owner-binding gate, got: {}",
+            err.1
         );
     }
 

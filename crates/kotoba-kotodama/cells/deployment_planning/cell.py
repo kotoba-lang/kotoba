@@ -25,7 +25,7 @@ keys.
 LangGraph nodes (super-step semantics):
 
   START → parse_survey_record    → load submitSiteSurvey record
-        → compute_bom            → fan-out to UnispscAgentExecutorCell
+        → compute_bom            → validate each code via openUnispsc XRPC
         →                            shards 0/1/2 for code-level qty +
         →                            USDC cost (LAN HTTP)
         → estimate_cost          → aggregate BoM cost + slack envelope
@@ -57,14 +57,15 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 logger = logging.getLogger("DeploymentPlanningCell")
 
-# UnispscAgentExecutorCell LAN endpoints — re-declared locally to keep
-# the cell independent of SiteSurveyCell (cells are decoupled units of
-# deployment per ADR-2605192415 §3). Same defaults as Phase 1.
-EXECUTOR_SHARDS = {
-    0: os.environ.get("UNISPSC_EXECUTOR_SHARD_0", "http://josephnomac-mini.local:16100"),
-    1: os.environ.get("UNISPSC_EXECUTOR_SHARD_1", "http://issacharnomac-mini.local:16101"),
-    2: os.environ.get("UNISPSC_EXECUTOR_SHARD_2", "http://dannomac-mini.local:16102"),
-}
+# Canonical UNSPSC commodity XRPC gateway. The per-code Python executor
+# shards (UnispscAgentExecutorCell) were retired — their per-code agents are
+# superseded by the clj unspsc actor (etzhayyim/root@20-actors/unspsc). BoM
+# lines now validate against the canonical openUnispsc XRPC service
+# (unispsc.etzhayyim.com → lg-open-unispsc), not the dead LAN shards.
+UNISPSC_XRPC_ENDPOINT = os.environ.get(
+    "UNISPSC_XRPC_ENDPOINT", "https://unispsc.etzhayyim.com"
+)
+UNISPSC_COMMODITY_NSID = "com.etzhayyim.apps.openUnispsc.commodity"
 
 # Default UNSPSC code mapping per utility class. Codes target realistic
 # mid-segment commodities (8-digit) rather than bare segment roots; the
@@ -189,19 +190,6 @@ class DeploymentPlanningState(TypedDict, total=False):
 # ── helpers ─────────────────────────────────────────────────────────
 
 
-def _shard_for_code(code: str) -> int | None:
-    if not code or len(code) < 2 or not code[:2].isdigit():
-        return None
-    seg = int(code[:2])
-    if 10 <= seg <= 29:
-        return 0
-    if 30 <= seg <= 44:
-        return 1
-    if 45 <= seg <= 60:
-        return 2
-    return None
-
-
 def _synthetic_cid(label: str, payload: dict[str, Any]) -> str:
     """Placeholder CID for XChaCha20-Poly1305 envelope payload.
 
@@ -241,12 +229,14 @@ def parse_survey_record(state: DeploymentPlanningState) -> dict[str, Any]:
 
 
 def compute_bom(state: DeploymentPlanningState) -> dict[str, Any]:
-    """Fan out to UnispscAgentExecutorCell shards to materialize the BoM.
+    """Validate each candidate UNSPSC code against the canonical openUnispsc
+    XRPC service to materialize the BoM.
 
-    Each candidate UNSPSC code is routed to the segment-owning shard
-    (10-29 → 0, 30-44 → 1, 45-60 → 2). The executor returns the agent's
-    canonical quantity hint + per-unit USDC cost. Scaffold falls back to
-    a synthesized line item if the executor is unreachable.
+    Each candidate code is POSTed to ``openUnispsc.commodity`` at the
+    canonical gateway (the per-code LAN executor shards were retired; the
+    clj unspsc actor is the canonical backend). The service returns the
+    commodity's quantity hint + per-unit USDC cost. Falls back to a
+    synthesized line item if the service is unreachable.
     """
     import urllib.request
 
@@ -254,15 +244,11 @@ def compute_bom(state: DeploymentPlanningState) -> dict[str, Any]:
     codes = UTILITY_TO_UNSPSC_CODES.get(utility, UTILITY_TO_UNSPSC_CODES["multi"])
     codes = codes[:DEFAULT_FAN_OUT_LIMIT]
 
+    url = f"{UNISPSC_XRPC_ENDPOINT.rstrip('/')}/xrpc/{UNISPSC_COMMODITY_NSID}"
     items: list[dict[str, Any]] = []
     for code in codes:
-        shard = _shard_for_code(code)
-        if shard is None:
-            continue
-        url = f"{EXECUTOR_SHARDS[shard]}/api/invoke"
         line = {
             "code": code,
-            "shard": shard,
             "qty": 1,
             "unitCostUsdc": 0,
             "lineCostUsdc": 0,
@@ -272,26 +258,24 @@ def compute_bom(state: DeploymentPlanningState) -> dict[str, Any]:
                 url,
                 data=json.dumps({
                     "code": code,
-                    "input": {
-                        "site_did": state.get("site_did", ""),
-                        "utility_class": utility,
-                        "intended_use": state.get("intended_use", ""),
-                        "phase": "kuni-umi-2-planning",
-                    },
+                    "currency": "USDC",
+                    "dryRun": True,
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-            agent_state = payload.get("state", {}) if isinstance(payload, dict) else {}
+            result = payload if isinstance(payload, dict) else {}
+            agent_state = result.get("state", result)
             qty = int(agent_state.get("qty") or agent_state.get("recommendedQty") or 1)
             unit_cost = int(agent_state.get("unitCostUsdc") or agent_state.get("estimatedUnitUsdc") or 0)
             line.update({
                 "qty": qty,
                 "unitCostUsdc": unit_cost,
                 "lineCostUsdc": qty * unit_cost,
-                "ok": bool(payload.get("ok")),
+                "ok": bool(result.get("ok", True)),
+                "title": agent_state.get("title") or result.get("title"),
             })
         except Exception as exc:  # noqa: BLE001 — record + continue
             line["error"] = str(exc)
@@ -551,7 +535,7 @@ def healthz() -> dict[str, Any]:
         "ok": True,
         "service": "DeploymentPlanningCell",
         "phase": "kuni-umi-2",
-        "executorShards": {k: v for k, v in EXECUTOR_SHARDS.items()},
+        "unispscXrpcEndpoint": UNISPSC_XRPC_ENDPOINT,
         "proportionality": {
             "costUsdc": PROPORTIONALITY_COST_USDC,
             "robotHours": PROPORTIONALITY_ROBOT_HOURS,
@@ -604,7 +588,7 @@ __all__ = [
     "thread_id_from_event",
     "handle_mst_event",
     "healthz",
-    "EXECUTOR_SHARDS",
+    "UNISPSC_XRPC_ENDPOINT",
     "UTILITY_TO_UNSPSC_CODES",
     "PROPORTIONALITY_COST_USDC",
     "PROPORTIONALITY_ROBOT_HOURS",

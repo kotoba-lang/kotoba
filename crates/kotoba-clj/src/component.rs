@@ -16,7 +16,7 @@ use wit_parser::Resolve;
 
 use crate::codegen::{Entry, EntryAbi};
 use crate::compat::{self, ReaderTarget};
-use crate::CljError;
+use crate::{CljError, CBOR_ENC_PRELUDE, CBOR_PRELUDE, KQE_PRELUDE, PRELUDE};
 
 /// The WIT world every kotoba-clj program component targets.
 const PROGRAM_WIT: &str = r#"
@@ -43,12 +43,35 @@ pub fn compile_component_str_with_reader_target(
     let program = crate::ast::parse_program(&src)?;
     let core = crate::codegen::compile_core(
         &program,
-        Some(Entry {
+        &[Entry {
             name: "run",
             abi: EntryAbi::BytesToBytes,
-        }),
+            export_name: "run",
+        }],
     )?;
     encode_component(core)
+}
+
+/// Compile Clojure-subset source into a WASM **Component** (same as
+/// [`compile_component_str`]) WITH the combined container + CBOR prelude
+/// ([`crate::PRELUDE`], [`crate::CBOR_PRELUDE`], [`crate::CBOR_ENC_PRELUDE`],
+/// [`crate::KQE_PRELUDE`]) prepended — so the program can call `merge`,
+/// `str`, `get`, `mapv`, `vec-make`, `map-make`, `cbor-*`, `kqe-*` etc.
+///
+/// The source must still define `(defn run [input] …)` as its entry point.
+pub fn compile_component_str_with_prelude(src: &str) -> Result<Vec<u8>, CljError> {
+    compile_component_str_with_prelude_and_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Compile source with the combined prelude into a WASM **Component**, after
+/// applying Clojure reader compatibility for `target`.
+pub fn compile_component_str_with_prelude_and_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    let with_prelude =
+        format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}\n{src}");
+    compile_component_str_with_reader_target(&with_prelude, target)
 }
 
 /// Wrap a core module (already containing the `run`/`memory`/`cabi_realloc`
@@ -140,10 +163,11 @@ pub fn compile_kais_component_str_with_reader_target(
     let program = crate::ast::parse_program(&src)?;
     let core = crate::codegen::compile_core(
         &program,
-        Some(Entry {
+        &[Entry {
             name: "run",
             abi: EntryAbi::BytesToResultBytes,
-        }),
+            export_name: "run",
+        }],
     )?;
 
     let mut resolve = Resolve::new();
@@ -163,6 +187,96 @@ pub fn compile_kais_component_str_with_reader_target(
         .validate(true)
         .encode()
         .map_err(|e| CljError::Codegen(format!("kotoba-node encode: {e}")))
+}
+
+/// Compile a KOTOBA Mesh component (M7): exports `run`, plus `on-http` when the
+/// guest defines `(defn on-http [req] …)`. With an `on-http` handler the output
+/// targets the `kotoba-component` world (run + on-http); otherwise it falls back
+/// to the `kotoba-node` world (run only) — so existing run-only guests are
+/// unaffected. `wit_dir` is `crates/kotoba-runtime/wit`.
+pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u8>, CljError> {
+    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    let mut program = crate::ast::parse_program(&normalized)?;
+
+    // detect handlers (`defn`s of a given arity) in the guest
+    let has_arity = |program: &crate::ast::Program, name: &str, n: usize| {
+        program
+            .functions
+            .iter()
+            .any(|f| f.name == name && f.params.len() == n)
+    };
+    if !has_arity(&program, "run", 1) {
+        return Err(CljError::Codegen(
+            "mesh component must define `(defn run [ctx] …)`".into(),
+        ));
+    }
+
+    // The three optional trigger handlers: (name, guest arity, export ABI).
+    let triggers = [
+        ("on-http", 1usize, EntryAbi::BytesToResultBytes),
+        ("on-tick", 1usize, EntryAbi::I64ToResultBytes),
+        ("on-kse", 2usize, EntryAbi::StringBytesToResultBytes),
+    ];
+    let defined: Vec<_> = triggers
+        .iter()
+        .filter(|(n, a, _)| has_arity(&program, n, *a))
+        .collect();
+
+    let mut entries = vec![Entry {
+        name: "run",
+        abi: EntryAbi::BytesToResultBytes,
+        export_name: "run",
+    }];
+
+    let world_name = match defined.len() {
+        // no triggers → plain run-only node
+        0 => "kotoba-node",
+        // exactly one → its dedicated world (M7/M8/M9), no stubs
+        1 => {
+            let (n, _, abi) = defined[0];
+            entries.push(Entry { name: n, abi: *abi, export_name: n });
+            match *n {
+                "on-http" => "kotoba-component",
+                "on-tick" => "kotoba-cron",
+                _ => "kotoba-kse",
+            }
+        }
+        // 2+ → the combined kotoba-mesh world; export ALL three triggers,
+        // synthesizing empty `(defn …)` stubs for any the guest didn't define
+        // (M10). The host dispatches the matching export per incoming trigger.
+        _ => {
+            for (n, arity, abi) in triggers {
+                if !has_arity(&program, n, arity) {
+                    let params: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
+                    let stub = format!("(defn {n} [{}] \"\")", params.join(" "));
+                    let p = crate::ast::parse_program(&stub)?;
+                    program.functions.extend(p.functions.into_iter().filter(|f| f.name == n));
+                }
+                entries.push(Entry { name: n, abi, export_name: n });
+            }
+            "kotoba-mesh"
+        }
+    };
+
+    let core = crate::codegen::compile_core(&program, &entries)?;
+
+    let mut resolve = Resolve::new();
+    let (pkg, _src) = resolve
+        .push_dir(wit_dir)
+        .map_err(|e| CljError::Codegen(format!("WIT push_dir({wit_dir}): {e}")))?;
+    let world = resolve
+        .select_world(pkg, Some(world_name))
+        .map_err(|e| CljError::Codegen(format!("select {world_name} world: {e}")))?;
+
+    let mut module = core;
+    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+        .map_err(|e| CljError::Codegen(format!("embed {world_name} metadata: {e}")))?;
+    ComponentEncoder::default()
+        .module(&module)
+        .map_err(|e| CljError::Codegen(format!("{world_name} encode (module): {e}")))?
+        .validate(true)
+        .encode()
+        .map_err(|e| CljError::Codegen(format!("{world_name} encode: {e}")))
 }
 
 /// Load-proof: does this component compile under wasmtime's Component Model

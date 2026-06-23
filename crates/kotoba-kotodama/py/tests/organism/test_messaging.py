@@ -11,7 +11,7 @@ from kotodama.organism.messaging import (
     MockPdsReceiver,
 )
 from kotodama.organism.inbox import InboxBuffer
-from kotodama.organism.unispsc_organism import UnispscOrganism
+from kotodama.organism.organism import Organism
 from kotodama.organism.lifecycle import OrganismState
 
 def test_organism_message_ndjson():
@@ -103,13 +103,13 @@ class DummyGraph:
     def invoke(self, state: dict):
         return {"value": "dummy"}
 
-def test_unispsc_organism_messaging_lifecycle():
+def test_organism_messaging_lifecycle():
     receiver = MockPdsReceiver()
     dt = datetime.now(timezone.utc)
     msg = OrganismMessage("did:web:a", "did:web:etzhayyim.com:actor:c123", "hi", dt)
     receiver.messages["did:web:etzhayyim.com:actor:c123"] = [msg]
 
-    org = UnispscOrganism(
+    org = Organism(
         code="123",
         graph=DummyGraph(),
         messaging_receiver=receiver,

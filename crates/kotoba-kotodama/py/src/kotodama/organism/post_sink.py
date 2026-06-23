@@ -1,4 +1,4 @@
-"""Post-sink implementations for UnispscOrganism.
+"""Post-sink implementations for Organism.
 
 Per ADR-2605240100. Substrate-boundary-honoring: the Python side writes
 to a queue (file or logger); the TS-side drainer (@etzhayyim/sdk) reads
@@ -34,7 +34,7 @@ DEFAULT_LEXICON = "app.bsky.feed.post"
 class PostSinkContext(Protocol):
     """Minimal protocol an organism passes when emitting a post.
 
-    Kept narrow so sinks don't need a UnispscOrganism reference.
+    Kept narrow so sinks don't need a Organism reference.
     """
 
     code: str
@@ -182,7 +182,7 @@ def _default_queue_path() -> Path:
     return home / f"shard-{shard}.ndjson"
 
 
-# Compat alias matching the existing UnispscOrganism contract (text-only sink)
+# Compat alias matching the existing Organism contract (text-only sink)
 LegacyTextSink = Callable[[str], None]
 
 
@@ -206,7 +206,7 @@ def resolve_post_sink() -> PostSink:
 def adapt_legacy_text_sink(sink: PostSink) -> LegacyTextSink:
     """Wrap a context-aware sink into the legacy ``Callable[[str], None]``.
 
-    The pre-ADR-2605240100 UnispscOrganism.post_sink signature is text-only.
+    The pre-ADR-2605240100 Organism.post_sink signature is text-only.
     Until the wrapper is migrated end-to-end, we provide a closure that
     captures organism context from the call site.
     """

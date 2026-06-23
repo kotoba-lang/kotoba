@@ -1,12 +1,13 @@
-"""kotodama.organism — joucho heartbeat-cadence + UNSPSC actor wrapper.
+"""kotodama.organism — joucho heartbeat-cadence + generic actor wrapper.
 
-Per ADR-2605232345 (UNSPSC actor as ecosystem organism).
+Per ADR-2605232345 (actor as ecosystem organism).
 
 Python port of the TS heartbeat-cadence pattern in
-``@etzhayyim/kotoba-kotodama-host-sdk/src/heartbeat-cadence.ts``. Wraps a UNSPSC
-LangGraph code (from ``kotodama.langgraph_graphs.unispsc_agents``) into
-a tick-able organism with joucho 情緒 mood, InboxBuffer, FollowerReward,
-Shannon content diversity, and Shinka post emission.
+``@etzhayyim/kotoba-kotodama-host-sdk/src/heartbeat-cadence.ts``. Wraps a
+caller-supplied classify ``graph`` into a tick-able organism with joucho 情緒
+mood, InboxBuffer, FollowerReward, Shannon content diversity, and Shinka post
+emission. (The per-code UNSPSC agents this once wrapped were retired for the
+clj unspsc actor; ``Organism.for_code`` now supplies a generic default graph.)
 """
 
 from __future__ import annotations
@@ -51,9 +52,9 @@ from kotodama.organism.post_sink import (
     PostSink,
     resolve_post_sink,
 )
-from kotodama.organism.unispsc_organism import (
+from kotodama.organism.organism import (
     OrganismTickResult,
-    UnispscOrganism,
+    Organism,
 )
 
 __all__ = [
@@ -82,7 +83,7 @@ __all__ = [
     "SensorHealth",
     "StaleSensorPinRule",
     "TierCLeakBackstopRule",
-    "UnispscOrganism",
+    "Organism",
     "apply_stress_scaling",
     "determine_mood",
     "mood_to_cadence",

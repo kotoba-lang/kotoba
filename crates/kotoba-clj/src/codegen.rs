@@ -9,9 +9,15 @@
 //!
 //! ## Value model
 //!
-//! Every value on the operand stack is an `i64`. Two interpretations:
+//! Every value on the operand stack is an `i64`. Three interpretations:
 //!   - **number / boolean**: the i64 is the value; booleans are `1`/`0`, truthy
 //!     ⇔ non-zero.
+//!   - **float**: the i64 holds the IEEE-754 **bit pattern** of an f64 (no
+//!     runtime tag). Float-ness is inferred *statically* per expression
+//!     (`is_float_expr`); arithmetic/comparison sites reinterpret the bits to
+//!     f64 (`f64.reinterpret_i64`), run the `f64.*` op, and (for arithmetic)
+//!     repack the result with `i64.reinterpret_f64`. Mixed int/float arithmetic
+//!     promotes the int operand with `f64.convert_i64_s`.
 //!   - **string handle**: a packed `(offset << 32) | (len & 0xFFFF_FFFF)` where
 //!     `offset` is a byte offset into linear memory and `len` the byte length.
 //!     `str-len` / `byte-at` operate on this handle.
@@ -28,7 +34,7 @@
 //! linear-memory foundation that the future `list<u8>` Component export and
 //! CBOR `InvokeContext` decode will build on (see `docs/ADR-clojure-wasm.md`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, ElementSection, Elements, EntityType,
@@ -53,7 +59,7 @@ const CLOSURE_TABLE: u32 = 0;
 /// Compile a parsed [`Program`] into WebAssembly bytes (core module; every
 /// `defn` exported by name).
 pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
-    compile_core(program, None)
+    compile_core(program, &[])
 }
 
 /// The Canonical-ABI shape of the generated `run` entry wrapper's return value.
@@ -64,13 +70,52 @@ pub enum EntryAbi {
     /// `run: func(list<u8>) -> result<list<u8>, string>` — always `ok`; 12-byte
     /// return area `[tag:u8 @0, ptr:i32 @4, len:i32 @8]` (the kotoba-node shape).
     BytesToResultBytes,
+    /// `on-tick: func(epoch-ms: u64) -> result<list<u8>, string>` (M8). Input is
+    /// a single `i64` value passed straight to the guest fn (no handle build);
+    /// the return area is the same 12-byte `result<list<u8>,string>` shape.
+    I64ToResultBytes,
+    /// `on-kse: func(topic: string, payload: list<u8>) -> result<list<u8>, string>`
+    /// (M9). Two (ptr,len) inputs → two guest handles; same 12-byte return area.
+    StringBytesToResultBytes,
 }
 
-/// A component entry point: the user `defn` to wrap and the ABI of its export.
+impl EntryAbi {
+    /// The core wrapper function's wasm signature `(params) -> [i32 ret-area]`.
+    fn wrapper_params(self) -> &'static [ValType] {
+        match self {
+            // (in_ptr, in_len)
+            EntryAbi::BytesToBytes | EntryAbi::BytesToResultBytes => {
+                &[ValType::I32, ValType::I32]
+            }
+            // (epoch: u64)
+            EntryAbi::I64ToResultBytes => &[ValType::I64],
+            // (topic_ptr, topic_len, payload_ptr, payload_len)
+            EntryAbi::StringBytesToResultBytes => {
+                &[ValType::I32, ValType::I32, ValType::I32, ValType::I32]
+            }
+        }
+    }
+
+    /// Number of params the wrapped guest `defn` must declare.
+    fn guest_arity(self) -> usize {
+        match self {
+            EntryAbi::StringBytesToResultBytes => 2, // (topic, payload)
+            // list<u8>/u64 inputs are a single guest value
+            EntryAbi::BytesToBytes
+            | EntryAbi::BytesToResultBytes
+            | EntryAbi::I64ToResultBytes => 1,
+        }
+    }
+}
+
+/// A component entry point: the user `defn` to wrap, the ABI of its export, and
+/// the WIT export name to bind it to. Multiple entries (e.g. `run` + `on-http`,
+/// M7) can be emitted in one component, each wrapped under its own export name.
 #[derive(Debug, Clone, Copy)]
 pub struct Entry<'a> {
     pub name: &'a str,
     pub abi: EntryAbi,
+    pub export_name: &'a str,
 }
 
 /// Compile a [`Program`] into a core module, optionally adding a Canonical-ABI
@@ -84,12 +129,13 @@ pub struct Entry<'a> {
 /// area's pointer. In this mode the user `defn`s are not exported by name (only
 /// `run`, `memory`, `cabi_realloc` are), so the wrapper owns the `run` export
 /// name unambiguously.
-pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, CljError> {
+pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, CljError> {
     // ---- Pass 0: collect string literals into one data blob ----------------
     let literals = collect_literals(program);
 
     // ---- Pass 1: constants + function signatures ---------------------------
-    let consts = eval_consts(program)?;
+    let consts = eval_consts(program, &literals)?;
+    let float_defs = float_def_names(program);
 
     // ---- Host imports -------------------------------------------------------
     // Any used host-call builtin (e.g. `has-capability?`) becomes a wasm import.
@@ -141,21 +187,23 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         }
     }
 
-    // Validate the entry point up front.
-    let entry_target = match entry {
-        Some(Entry { name, abi }) => {
+    // Validate every entry point up front → (user fn index, abi, export name).
+    let entry_targets: Vec<(u32, EntryAbi, &str)> = entries
+        .iter()
+        .map(|e| {
+            let arity = e.abi.guest_arity();
             let idx = fn_index
-                .get(&(name.to_string(), 1))
+                .get(&(e.name.to_string(), arity))
                 .copied()
                 .ok_or_else(|| {
                     CljError::Codegen(format!(
-                        "component entry `(defn {name} [input] …)` not found"
+                        "component entry `(defn {} [{} args] …)` not found",
+                        e.name, arity
                     ))
                 })?;
-            Some((idx, abi))
-        }
-        None => None,
-    };
+            Ok((idx, e.abi, e.export_name))
+        })
+        .collect::<Result<_, CljError>>()?;
 
     // Distinct function types, keyed by arity (params: arity×i64 → i64).
     let mut type_for_arity: HashMap<usize, u32> = HashMap::new();
@@ -173,7 +221,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         funcs.function(type_idx);
         // In component mode the wrapper owns the export names; don't leak the
         // raw i64 functions (avoids a clash on the `run` name).
-        if entry.is_none() {
+        if entry_targets.is_empty() {
             if let Some(export_name) = &f.export_name {
                 exports.export(export_name, ExportKind::Func, import_base + i as u32);
             }
@@ -208,17 +256,17 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     funcs.function(realloc_type);
     exports.export("cabi_realloc", ExportKind::Func, realloc_fn_index);
 
-    // Canonical-ABI `run` wrapper (only in component mode).
-    if let Some((user_idx, _abi)) = entry_target {
+    // Canonical-ABI entry wrappers (component mode): one per entry, each under
+    // its own WIT export name. The wrapper signature depends on the entry ABI
+    // (e.g. `on-tick` takes one i64, others take (i32,i32)). All return one i32
+    // (the return-area pointer).
+    for (i, (user_idx, abi, export_name)) in entry_targets.iter().enumerate() {
         let wrapper_type = types.len();
-        types
-            .ty()
-            .function([ValType::I32, ValType::I32], [ValType::I32]);
+        types.ty().function(abi.wrapper_params().iter().copied(), [ValType::I32]);
         funcs.function(wrapper_type);
-        let wrapper_index = realloc_fn_index + 1;
-        exports.export("run", ExportKind::Func, wrapper_index);
-        // user_idx / realloc_fn_index captured for the code section below.
-        debug_assert!(user_idx < realloc_fn_index);
+        let wrapper_index = realloc_fn_index + 1 + i as u32;
+        exports.export(export_name, ExportKind::Func, wrapper_index);
+        debug_assert!(*user_idx < realloc_fn_index);
     }
 
     // ---- Memory + heap global ----------------------------------------------
@@ -262,6 +310,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
                 .enumerate()
                 .map(|(i, p)| (p.clone(), i as u32))
                 .collect(),
+            float_env: FloatEnv::new(float_defs.clone()),
             next_local: f.params.len() as u32,
             arity: f.params.len() as u32,
             realloc_index: realloc_fn_index,
@@ -279,8 +328,8 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         code.function(&func);
     }
     code.function(&cabi_realloc_fn(HEAP_GLOBAL));
-    if let Some((user_idx, abi)) = entry_target {
-        code.function(&entry_wrapper_fn(user_idx, realloc_fn_index, abi));
+    for (user_idx, abi, _export_name) in &entry_targets {
+        code.function(&entry_wrapper_fn(*user_idx, realloc_fn_index, *abi));
     }
 
     // ---- Data segment -------------------------------------------------------
@@ -419,7 +468,7 @@ fn collect_host_imports(program: &Program) -> Vec<HostImport> {
     };
     fn walk(expr: &Expr, note: &mut impl FnMut(HostImport)) {
         match expr {
-            Expr::Int(_) | Expr::Str(_) | Expr::Var(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Var(_) => {}
             Expr::If { cond, then, els } => {
                 walk(cond, note);
                 walk(then, note);
@@ -466,7 +515,7 @@ fn collect_call_value_arities(program: &Program) -> std::collections::HashSet<us
     let mut out = std::collections::HashSet::new();
     fn walk(e: &Expr, out: &mut std::collections::HashSet<usize>) {
         match e {
-            Expr::Int(_) | Expr::Str(_) | Expr::Var(_) | Expr::ClosureRef(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Var(_) | Expr::ClosureRef(_) => {}
             Expr::If { cond, then, els } => {
                 walk(cond, out);
                 walk(then, out);
@@ -521,7 +570,7 @@ fn collect_literals(program: &Program) -> Literals {
 fn walk_strings(expr: &Expr, f: &mut impl FnMut(&[u8])) {
     match expr {
         Expr::Str(b) => f(b),
-        Expr::Int(_) | Expr::Var(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::Var(_) => {}
         Expr::If { cond, then, els } => {
             walk_strings(cond, f);
             walk_strings(then, f);
@@ -615,6 +664,14 @@ fn cabi_realloc_fn(heap_global: u32) -> Function {
 /// - [`EntryAbi::BytesToResultBytes`]: 12-byte area for `result<list<u8>,string>`
 ///   in the `ok` case — `[tag:u8=0 @0, out_ptr:i32 @4, out_len:i32 @8]`.
 fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Function {
+    // `on-tick` has a distinct (i64)->i32 shape: pass the epoch value straight
+    // to the guest fn (no input-handle build), then pack result<list<u8>,string>.
+    if matches!(abi, EntryAbi::I64ToResultBytes) {
+        return tick_wrapper_fn(user_fn_index, realloc_index);
+    }
+    if matches!(abi, EntryAbi::StringBytesToResultBytes) {
+        return kse_wrapper_fn(user_fn_index, realloc_index);
+    }
     // params: 0=in_ptr 1=in_len ; locals: 2=ret_handle(i64) 3=area(i32)
     let mut f = Function::new([(1, ValType::I64), (1, ValType::I32)]);
     let store32 = |offset: u64| MemArg {
@@ -631,6 +688,11 @@ fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Fu
     let (ptr_off, len_off, area_size) = match abi {
         EntryAbi::BytesToBytes => (0u64, 4u64, 8i32),
         EntryAbi::BytesToResultBytes => (4u64, 8u64, 12i32),
+        // handled by early-returns to dedicated wrappers above
+        EntryAbi::I64ToResultBytes => unreachable!("I64 ABI uses tick_wrapper_fn"),
+        EntryAbi::StringBytesToResultBytes => {
+            unreachable!("string+bytes ABI uses kse_wrapper_fn")
+        }
     };
 
     // handle = (in_ptr as u64 << 32) | (in_len as u64)
@@ -682,12 +744,169 @@ fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Fu
     f
 }
 
+/// `on-tick` wrapper (M8): `(epoch:i64) -> i32` returning a 12-byte
+/// `result<list<u8>,string>` area `[tag:u8=0 @0, out_ptr @4, out_len @8]`.
+/// The epoch value is passed straight to the guest fn (no input-handle build).
+fn tick_wrapper_fn(user_fn_index: u32, realloc_index: u32) -> Function {
+    // param 0 = epoch(i64) ; locals: 1=ret_handle(i64) 2=area(i32)
+    let mut f = Function::new([(1, ValType::I64), (1, ValType::I32)]);
+    let store32 = |offset: u64| MemArg { offset, align: 2, memory_index: 0 };
+    let store8 = |offset: u64| MemArg { offset, align: 0, memory_index: 0 };
+
+    // ret_handle = user_fn(epoch)   — epoch is the guest fn's i64 value arg
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::Call(user_fn_index));
+    f.instruction(&Instruction::LocalSet(1));
+
+    // area = cabi_realloc(0, 0, align=4, new_sz=12)
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Const(12));
+    f.instruction(&Instruction::Call(realloc_index));
+    f.instruction(&Instruction::LocalSet(2));
+
+    // area[0] = ok discriminant (0)
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Store8(store8(0)));
+
+    // area[4] = out_ptr = ret_handle >>> 32
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64Const(32));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(4)));
+
+    // area[8] = out_len = ret_handle & 0xFFFF_FFFF
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64Const(0xFFFF_FFFF));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(8)));
+
+    // return area
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// `on-kse` wrapper (M9): `(topic_ptr, topic_len, payload_ptr, payload_len) -> i32`.
+/// Builds two guest handles `(ptr<<32)|len` (topic, payload), calls the arity-2
+/// guest fn, and packs `result<list<u8>,string>` (ok) into a 12-byte area.
+fn kse_wrapper_fn(user_fn_index: u32, realloc_index: u32) -> Function {
+    // params: 0=topic_ptr 1=topic_len 2=payload_ptr 3=payload_len
+    // locals:  4=ret_handle(i64) 5=area(i32)
+    let mut f = Function::new([(1, ValType::I64), (1, ValType::I32)]);
+    let store32 = |offset: u64| MemArg { offset, align: 2, memory_index: 0 };
+    let store8 = |offset: u64| MemArg { offset, align: 0, memory_index: 0 };
+
+    // topic handle = (topic_ptr << 32) | topic_len
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Const(32));
+    f.instruction(&Instruction::I64Shl);
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Or);
+    // payload handle = (payload_ptr << 32) | payload_len
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Const(32));
+    f.instruction(&Instruction::I64Shl);
+    f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::I64ExtendI32U);
+    f.instruction(&Instruction::I64Or);
+    // ret_handle = on-kse(topic, payload)   (args consumed in push order)
+    f.instruction(&Instruction::Call(user_fn_index));
+    f.instruction(&Instruction::LocalSet(4));
+
+    // area = cabi_realloc(0, 0, align=4, new_sz=12)
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Const(12));
+    f.instruction(&Instruction::Call(realloc_index));
+    f.instruction(&Instruction::LocalSet(5));
+
+    // area[0] = ok discriminant (0)
+    f.instruction(&Instruction::LocalGet(5));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Store8(store8(0)));
+
+    // area[4] = out_ptr = ret_handle >>> 32
+    f.instruction(&Instruction::LocalGet(5));
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I64Const(32));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(4)));
+
+    // area[8] = out_len = ret_handle & 0xFFFF_FFFF
+    f.instruction(&Instruction::LocalGet(5));
+    f.instruction(&Instruction::LocalGet(4));
+    f.instruction(&Instruction::I64Const(0xFFFF_FFFF));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(8)));
+
+    // return area
+    f.instruction(&Instruction::LocalGet(5));
+    f.instruction(&Instruction::End);
+    f
+}
+
 /// A live `loop` target: the local slots holding its bindings, and the wasm
 /// control depth at the point just inside its `loop` block. A `recur` rebinds
 /// these locals and `br`s by `current_depth - frame_depth`.
 struct LoopTarget {
     locals: Vec<u32>,
     frame_depth: u32,
+}
+
+/// Tracks which symbols (`def` globals and `let`-bound locals) carry a float
+/// value (IEEE-754 bit pattern in the i64 slot). Used by [`is_float_expr`] to
+/// decide whether a variable reference resolves to a float.
+///
+/// `defs` is computed once from the program's top-level `def` forms and
+/// shared across all function bodies. `locals` is a scope-stack of
+/// `(name, is_float)` pairs with the same push/pop discipline as
+/// `FnCtx::scope`.
+struct FloatEnv {
+    /// Names of top-level `def` constants whose initialiser is a float.
+    defs: HashSet<String>,
+    /// `(name, is_float)` pairs for `let`/`loop` bindings in scope.
+    /// Latest binding for a given name shadows earlier ones (same as `scope`).
+    locals: Vec<(String, bool)>,
+}
+
+impl FloatEnv {
+    fn new(defs: HashSet<String>) -> Self {
+        Self {
+            defs,
+            locals: Vec::new(),
+        }
+    }
+    /// Push a `let`/`loop` binding. `is_float` should be the result of
+    /// `is_float_expr` evaluated on the binding's init expression.
+    fn push(&mut self, name: String, is_float: bool) {
+        self.locals.push((name, is_float));
+    }
+    /// Pop `n` bindings (restore scope to a saved depth).
+    fn truncate(&mut self, saved: usize) {
+        self.locals.truncate(saved);
+    }
+    /// Look up whether `name` is a float — checks locals (innermost first),
+    /// then defs; unknown symbols return `false` (conservative).
+    fn is_float(&self, name: &str) -> bool {
+        // locals: scan in reverse so the innermost binding wins.
+        if let Some((_, f)) = self.locals.iter().rev().find(|(n, _)| n == name) {
+            return *f;
+        }
+        self.defs.contains(name)
+    }
 }
 
 /// Per-function compilation context.
@@ -703,6 +922,10 @@ struct FnCtx<'a> {
     literals: &'a Literals,
     /// (name, local-index) pairs; latest binding shadows earlier ones.
     scope: Vec<(String, u32)>,
+    /// Float-type environment: tracks which `def` globals and `let`/`loop`
+    /// locals carry a float value (so `is_float_expr` can infer float-ness of
+    /// variable references).
+    float_env: FloatEnv,
     next_local: u32,
     arity: u32,
     /// Function index of the module's `cabi_realloc`, so `bytes-alloc` can call
@@ -766,13 +989,16 @@ fn compile_loop(
     body: &[Expr],
 ) -> Result<(), CljError> {
     let saved_scope = cg.scope.len();
+    let saved_float = cg.float_env.locals.len();
     // Sequential init: each binding sees the previous ones (identical to `let`).
     let mut locals = Vec::with_capacity(bindings.len());
     for (name, val) in bindings {
+        let is_float = is_float_expr(val, &cg.float_env);
         compile_expr(cg, val)?;
         let idx = cg.alloc_local();
         cg.emit(Instruction::LocalSet(idx));
         cg.scope.push((name.clone(), idx));
+        cg.float_env.push(name.clone(), is_float);
         locals.push(idx);
     }
 
@@ -786,6 +1012,7 @@ fn compile_loop(
     cg.close_frame();
 
     cg.scope.truncate(saved_scope); // loop bindings leave scope; slots stay
+    cg.float_env.truncate(saved_float);
     Ok(())
 }
 
@@ -824,6 +1051,11 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
     match expr {
         Expr::Int(i) => cg.emit(Instruction::I64Const(*i)),
 
+        // A float literal is stored in the uniform i64 slot as its IEEE-754 bit
+        // pattern (no runtime tag). Float-arithmetic sites reinterpret it back
+        // to f64 via `f64.reinterpret_i64` (see `compile_expr_as_f64`).
+        Expr::Float(f) => cg.emit(Instruction::I64Const(f.to_bits() as i64)),
+
         Expr::Str(bytes) => {
             let handle = cg
                 .literals
@@ -852,15 +1084,19 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
         }
 
         Expr::Let { bindings, body } => {
-            let saved = cg.scope.len();
+            let saved_scope = cg.scope.len();
+            let saved_float = cg.float_env.locals.len();
             for (name, val) in bindings {
+                let is_float = is_float_expr(val, &cg.float_env);
                 compile_expr(cg, val)?;
                 let idx = cg.alloc_local();
                 cg.emit(Instruction::LocalSet(idx));
                 cg.scope.push((name.clone(), idx));
+                cg.float_env.push(name.clone(), is_float);
             }
             compile_body(cg, body)?;
-            cg.scope.truncate(saved); // bindings leave scope; local slots stay allocated
+            cg.scope.truncate(saved_scope); // bindings leave scope; local slots stay allocated
+            cg.float_env.truncate(saved_float);
         }
 
         Expr::Loop { bindings, body } => compile_loop(cg, bindings, body)?,
@@ -970,21 +1206,62 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
 /// Compile `expr` and convert the resulting i64 to an i32 truthiness flag
 /// (1 if non-zero, 0 if zero) suitable as a wasm `if`/`br_if` condition.
 fn compile_truthy_i32(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
+    // Peephole: a binary comparison already yields an i32 0/1 — exactly what a
+    // wasm `if` wants. Emit `a; b; <cmp>` and stop, skipping the default
+    // `extend_i32_u; const 0; i64.ne` round-trip (3 dead ops per branch in the
+    // i64-everything model). Semantically identical: `(x cmp y) != 0` ⇔ `x cmp y`.
+    if let Expr::Builtin { op, args } = expr {
+        if args.len() == 2 {
+            if let Some(cmp) = comparison_i32_instruction(*op) {
+                compile_expr(cg, &args[0])?;
+                compile_expr(cg, &args[1])?;
+                cg.emit(cmp);
+                return Ok(());
+            }
+        }
+    }
     compile_expr(cg, expr)?;
     cg.emit(Instruction::I64Const(0));
     cg.emit(Instruction::I64Ne); // → i32: 1 if non-zero
     Ok(())
 }
 
-/// Compile `expr` to a normalised i64 boolean (1 if truthy, else 0).
-fn compile_truthy_i64(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
-    compile_truthy_i32(cg, expr)?;
-    cg.emit(Instruction::I64ExtendI32U);
-    Ok(())
+/// The i32-producing wasm instruction for a 2-arg comparison builtin, or `None`
+/// for anything else. Used by [`compile_truthy_i32`] to feed a comparison
+/// straight into an `if`/`br_if` condition.
+fn comparison_i32_instruction(op: Builtin) -> Option<Instruction<'static>> {
+    Some(match op {
+        Builtin::Eq => Instruction::I64Eq,
+        Builtin::NotEq => Instruction::I64Ne,
+        Builtin::Lt => Instruction::I64LtS,
+        Builtin::Gt => Instruction::I64GtS,
+        Builtin::Le => Instruction::I64LeS,
+        Builtin::Ge => Instruction::I64GeS,
+        _ => return None,
+    })
 }
 
 fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), CljError> {
+    // Arithmetic on any float operand runs the whole op in f64 (int operands
+    // promoted). `is_float_op` short-circuits to the integer paths below.
+    let is_float_op = args.iter().any(|a| is_float_expr(a, &cg.float_env));
     match op {
+        Builtin::Add if is_float_op => fold_f64(cg, args, Instruction::F64Add),
+        Builtin::Mul if is_float_op => fold_f64(cg, args, Instruction::F64Mul),
+        Builtin::Div if is_float_op => fold_f64(cg, args, Instruction::F64Div),
+        Builtin::Sub if is_float_op => {
+            if args.len() == 1 {
+                // unary float negate: 0.0 - x
+                cg.emit(Instruction::F64Const(0.0));
+                compile_expr_as_f64(cg, &args[0])?;
+                cg.emit(Instruction::F64Sub);
+                cg.emit(Instruction::I64ReinterpretF64);
+                Ok(())
+            } else {
+                fold_f64(cg, args, Instruction::F64Sub)
+            }
+        }
+
         Builtin::Add => fold(cg, args, Instruction::I64Add),
         Builtin::Mul => fold(cg, args, Instruction::I64Mul),
         Builtin::Sub => {
@@ -999,7 +1276,25 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
             }
         }
         Builtin::Div => binop(cg, args, Instruction::I64DivS),
-        Builtin::Mod => binop(cg, args, Instruction::I64RemS),
+        Builtin::Rem => binop(cg, args, Instruction::I64RemS),
+        Builtin::Mod => {
+            // Clojure floored mod: ((a rem b) + b) rem b — result has the sign of b.
+            // Evaluate a and b once into scratch locals (no side-effect duplication).
+            compile_expr(cg, &args[0])?;
+            let a = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(a));
+            compile_expr(cg, &args[1])?;
+            let bl = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(bl));
+            cg.emit(Instruction::LocalGet(a));
+            cg.emit(Instruction::LocalGet(bl));
+            cg.emit(Instruction::I64RemS);
+            cg.emit(Instruction::LocalGet(bl));
+            cg.emit(Instruction::I64Add);
+            cg.emit(Instruction::LocalGet(bl));
+            cg.emit(Instruction::I64RemS);
+            Ok(())
+        }
         Builtin::Inc => {
             compile_expr(cg, &args[0])?;
             cg.emit(Instruction::I64Const(1));
@@ -1030,6 +1325,100 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         }
         Builtin::Min => compile_min_max(cg, args, true),
         Builtin::Max => compile_min_max(cg, args, false),
+
+        // `(double x)` — int→f64 (promote) or float passthrough; the result
+        // slot holds the IEEE-754 bits.
+        Builtin::Double => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+        // `(int x)` / `(long x)` — float→int truncate toward zero (saturating,
+        // so a NaN/overflow yields a defined value instead of trapping); int
+        // passthrough.
+        Builtin::Int => {
+            if is_float_expr(&args[0], &cg.float_env) {
+                compile_expr_as_f64(cg, &args[0])?;
+                cg.emit(Instruction::I64TruncSatF64S);
+            } else {
+                compile_expr(cg, &args[0])?;
+            }
+            Ok(())
+        }
+        // `(Math/round x)` — round to nearest, ties away from zero (Clojure):
+        // `trunc(x + copysign(0.5, x))`. Emitted as `floor(x + 0.5)` for x≥0
+        // and `ceil(x - 0.5)` for x<0, selected at runtime; result is an int.
+        Builtin::MathRound => {
+            // Stash the operand's f64 bits in an i64 local (all locals are i64;
+            // we reinterpret on each read) so we can branch on its sign.
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::I64ReinterpretF64);
+            let bits = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(bits));
+            // x >= 0 ?
+            cg.emit(Instruction::LocalGet(bits));
+            cg.emit(Instruction::F64ReinterpretI64);
+            cg.emit(Instruction::F64Const(0.0));
+            cg.emit(Instruction::F64Ge);
+            cg.open_frame(Instruction::If(BlockType::Result(ValType::F64)));
+            // floor(x + 0.5)
+            cg.emit(Instruction::LocalGet(bits));
+            cg.emit(Instruction::F64ReinterpretI64);
+            cg.emit(Instruction::F64Const(0.5));
+            cg.emit(Instruction::F64Add);
+            cg.emit(Instruction::F64Floor);
+            cg.emit(Instruction::Else);
+            // ceil(x - 0.5)
+            cg.emit(Instruction::LocalGet(bits));
+            cg.emit(Instruction::F64ReinterpretI64);
+            cg.emit(Instruction::F64Const(0.5));
+            cg.emit(Instruction::F64Sub);
+            cg.emit(Instruction::F64Ceil);
+            cg.close_frame();
+            cg.emit(Instruction::I64TruncSatF64S);
+            Ok(())
+        }
+        // `(Math/floor x)` — f64 floor, yields a float (Clojure returns double).
+        Builtin::MathFloor => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::F64Floor);
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+        // `(Math/ceil x)` — f64 ceil, yields a float.
+        Builtin::MathCeil => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::F64Ceil);
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+        // `(Math/abs x)` — preserves float-ness: f64.abs for a float operand,
+        // integer abs otherwise.
+        Builtin::MathAbs => {
+            if is_float_expr(&args[0], &cg.float_env) {
+                compile_expr_as_f64(cg, &args[0])?;
+                cg.emit(Instruction::F64Abs);
+                cg.emit(Instruction::I64ReinterpretF64);
+                Ok(())
+            } else {
+                compile_builtin(cg, Builtin::Abs, args)
+            }
+        }
+        // `(Math/sqrt x)` — f64 square root, yields a float.
+        Builtin::MathSqrt => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::F64Sqrt);
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+
+        // Float comparisons: any float operand → compare the f64
+        // interpretation (int operands promoted). `=`/`<`/`>`/`<=`/`>=` supported.
+        Builtin::Eq if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Eq),
+        Builtin::Lt if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Lt),
+        Builtin::Gt if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Gt),
+        Builtin::Le if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Le),
+        Builtin::Ge if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Ge),
 
         Builtin::Eq => pairwise_cmp(cg, args, Instruction::I64Eq),
         Builtin::NotEq => compile_not_eq(cg, args),
@@ -1090,6 +1479,12 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         }
         Builtin::And => compile_and(cg, args),
         Builtin::Or => compile_or(cg, args),
+
+        Builtin::BitAnd => fold(cg, args, Instruction::I64And),
+        Builtin::BitOr => fold(cg, args, Instruction::I64Or),
+        Builtin::BitXor => fold(cg, args, Instruction::I64Xor),
+        Builtin::BitShiftLeft => binop(cg, args, Instruction::I64Shl),
+        Builtin::BitShiftRight => binop(cg, args, Instruction::I64ShrS),
 
         // len = handle & 0xFFFF_FFFF
         Builtin::StrLen => {
@@ -1540,6 +1935,73 @@ fn compile_bytes_finish(cg: &mut FnCtx, buf_expr: &Expr) -> Result<(), CljError>
     Ok(())
 }
 
+// ── f64 floating-point support ──────────────────────────────────────────────
+//
+// The value model has a single 64-bit slot per value (everything is an `i64`
+// on the operand stack). A float occupies that slot as its IEEE-754 **bit
+// pattern**; there is no runtime tag. "Is this value a float?" is therefore
+// answered *statically*, per-expression, by [`is_float_expr`]. Arithmetic and
+// comparison builtins inspect their operands: if any operand is statically a
+// float, the whole operation runs on the f64 interpretation (int operands are
+// promoted with `f64.convert_i64_s`) and — for arithmetic — the f64 result is
+// repacked into the i64 slot with `i64.reinterpret_f64`.
+
+/// Statically decide whether `expr` evaluates to a float value (an IEEE-754 bit
+/// pattern in the i64 slot) rather than an integer/handle. Conservative: only
+/// forms whose float-ness is statically certain return `true`. Anything else
+/// (variables, calls, host ops, closures) is treated as an integer — mixing a
+/// runtime-float-bearing variable into float math is out of R0 scope and would
+/// need a runtime tag.
+fn is_float_expr(expr: &Expr, env: &FloatEnv) -> bool {
+    match expr {
+        Expr::Float(_) => true,
+        // A named symbol is float if the env records it as float — either a
+        // `def` global or a `let`/`loop` binding whose init was a float.
+        Expr::Var(name) => env.is_float(name),
+        Expr::Builtin { op, args } => match op {
+            // Coercions whose result is a float by construction.
+            Builtin::Double | Builtin::MathFloor | Builtin::MathCeil | Builtin::MathSqrt => true,
+            // Arithmetic is float iff any operand is float (mixed int/float promotes).
+            Builtin::Add | Builtin::Sub | Builtin::Mul | Builtin::Div => {
+                args.iter().any(|a| is_float_expr(a, env))
+            }
+            // `(Math/abs x)` preserves the operand's float-ness.
+            Builtin::MathAbs => args.first().map(|a| is_float_expr(a, env)).unwrap_or(false),
+            _ => false,
+        },
+        // `(if c a b)` is float iff both branches are float.
+        Expr::If { then, els, .. } => is_float_expr(then, env) && is_float_expr(els, env),
+        _ => false,
+    }
+}
+
+/// Compile `expr`, leaving an **f64** on the operand stack (not the packed i64
+/// slot). A statically-float expr is compiled then `f64.reinterpret_i64`'d back
+/// from its bit pattern; an integer expr is converted with `f64.convert_i64_s`
+/// (int→float promotion for mixed arithmetic).
+fn compile_expr_as_f64(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
+    if is_float_expr(expr, &cg.float_env) {
+        compile_expr(cg, expr)?;
+        cg.emit(Instruction::F64ReinterpretI64);
+    } else {
+        compile_expr(cg, expr)?;
+        cg.emit(Instruction::F64ConvertI64S);
+    }
+    Ok(())
+}
+
+/// Fold a non-empty arg list with an f64 binary instruction, repacking the f64
+/// result into the i64 slot via `i64.reinterpret_f64`.
+fn fold_f64(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), CljError> {
+    compile_expr_as_f64(cg, &args[0])?;
+    for a in &args[1..] {
+        compile_expr_as_f64(cg, a)?;
+        cg.emit(ins.clone());
+    }
+    cg.emit(Instruction::I64ReinterpretF64);
+    Ok(())
+}
+
 /// Left-fold a non-empty arg list with a binary instruction.
 fn fold(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), CljError> {
     compile_expr(cg, &args[0])?;
@@ -1641,6 +2103,65 @@ fn pairwise_cmp(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Res
     Ok(())
 }
 
+/// f64 sibling of [`pairwise_cmp`]: each operand is compiled as an f64 (int
+/// operands promoted), `ins` is an `f64.*` comparison producing i32 0/1, and
+/// the i64 result is the 0/1 boolean in the uniform slot. n-ary chains store
+/// the rolling `prev`/`cur` operands as their f64 bit pattern in i64 locals.
+fn pairwise_cmp_f64(
+    cg: &mut FnCtx,
+    args: &[Expr],
+    ins: Instruction<'static>,
+) -> Result<(), CljError> {
+    if args.len() == 1 {
+        cg.emit(Instruction::I64Const(1));
+        return Ok(());
+    }
+    if args.len() == 2 {
+        compile_expr_as_f64(cg, &args[0])?;
+        compile_expr_as_f64(cg, &args[1])?;
+        cg.emit(ins);
+        cg.emit(Instruction::I64ExtendI32U);
+        return Ok(());
+    }
+
+    let prev = cg.alloc_local();
+    let cur = cg.alloc_local();
+    let acc = cg.alloc_local();
+    // store f64 operands as their bit pattern (locals are i64).
+    compile_expr_as_f64(cg, &args[0])?;
+    cg.emit(Instruction::I64ReinterpretF64);
+    cg.emit(Instruction::LocalSet(prev));
+    cg.emit(Instruction::I64Const(1));
+    cg.emit(Instruction::LocalSet(acc));
+
+    for arg in &args[1..] {
+        compile_expr_as_f64(cg, arg)?;
+        cg.emit(Instruction::I64ReinterpretF64);
+        cg.emit(Instruction::LocalSet(cur));
+
+        cg.emit(Instruction::LocalGet(acc));
+        cg.emit(Instruction::I64Const(0));
+        cg.emit(Instruction::I64Ne);
+        cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+        cg.emit(Instruction::LocalGet(prev));
+        cg.emit(Instruction::F64ReinterpretI64);
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::F64ReinterpretI64);
+        cg.emit(ins.clone());
+        cg.emit(Instruction::I64ExtendI32U);
+        cg.emit(Instruction::Else);
+        cg.emit(Instruction::I64Const(0));
+        cg.close_frame();
+        cg.emit(Instruction::LocalSet(acc));
+
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::LocalSet(prev));
+    }
+
+    cg.emit(Instruction::LocalGet(acc));
+    Ok(())
+}
+
 /// Clojure `not=` means pairwise distinct for all operands.
 fn compile_not_eq(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
     if args.len() == 1 {
@@ -1681,29 +2202,62 @@ fn compile_not_eq(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
     Ok(())
 }
 
-/// Short-circuit `and`, returning a normalised i64 boolean (0/1).
+/// Short-circuit `and` with Clojure value-return semantics.
+///
+/// Clojure: `(and a b c)` returns the first falsy value, or the last value if
+/// all are truthy.  It does NOT normalise to a 0/1 boolean.
+///
+/// **Value model note**: in kotoba-clj every i64 value is either a number, a
+/// string handle, or the `false`/`nil` sentinel `0`.  The truthiness check
+/// (`expr != 0`) therefore treats integer `0` as falsy — the same as Clojure
+/// `false`/`nil`.  Integer `0` cannot be distinguished from `false` without an
+/// additional tag bit, which is outside the current value-model scope.
 fn compile_and(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
     if args.len() == 1 {
-        return compile_truthy_i64(cg, &args[0]);
+        // Single-operand: return the value itself (truthy or not).
+        return compile_expr(cg, &args[0]);
     }
-    compile_truthy_i32(cg, &args[0])?;
+    // Evaluate the first arg and store its value in a local so we can both
+    // test its truthiness *and* return it when it is falsy.
+    compile_expr(cg, &args[0])?;
+    let tmp = cg.alloc_local();
+    cg.emit(Instruction::LocalTee(tmp));
+    // truthy test: tmp != 0  (i32 for the wasm `if` condition)
+    cg.emit(Instruction::I64Const(0));
+    cg.emit(Instruction::I64Ne);
     cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+    // if truthy: evaluate the rest; that result is the return value of `and`
     compile_and(cg, &args[1..])?;
     cg.emit(Instruction::Else);
-    cg.emit(Instruction::I64Const(0));
+    // if falsy: return the VALUE of this (falsy) operand, not a hardcoded 0
+    cg.emit(Instruction::LocalGet(tmp));
     cg.close_frame();
     Ok(())
 }
 
-/// Short-circuit `or`, returning a normalised i64 boolean (0/1).
+/// Short-circuit `or` with Clojure value-return semantics.
+///
+/// Clojure: `(or a b c)` returns the first truthy value, or the last value if
+/// all are falsy.  It does NOT normalise to a 0/1 boolean.
+///
+/// **Value model note**: the same `0 == falsy` caveat as `compile_and` applies.
 fn compile_or(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
     if args.len() == 1 {
-        return compile_truthy_i64(cg, &args[0]);
+        // Single-operand: return the value itself.
+        return compile_expr(cg, &args[0]);
     }
-    compile_truthy_i32(cg, &args[0])?;
+    // Evaluate the first arg and tee its value into a local.
+    compile_expr(cg, &args[0])?;
+    let tmp = cg.alloc_local();
+    cg.emit(Instruction::LocalTee(tmp));
+    // truthy test: tmp != 0  (i32 for the wasm `if` condition)
+    cg.emit(Instruction::I64Const(0));
+    cg.emit(Instruction::I64Ne);
     cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
-    cg.emit(Instruction::I64Const(1));
+    // if truthy: return the VALUE of this operand (not a hardcoded 1)
+    cg.emit(Instruction::LocalGet(tmp));
     cg.emit(Instruction::Else);
+    // if falsy: evaluate the rest; that result is the return value of `or`
     compile_or(cg, &args[1..])?;
     cg.close_frame();
     Ok(())
@@ -1711,41 +2265,75 @@ fn compile_or(cg: &mut FnCtx, args: &[Expr]) -> Result<(), CljError> {
 
 // ---- compile-time constant evaluation (for `def`) ---------------------------
 
-fn eval_consts(program: &Program) -> Result<HashMap<String, i64>, CljError> {
+/// Evaluate all `def` constants to i64 values.
+///
+/// String-literal `def`s (e.g. `(def ^:private S "abc")`) are allowed: their
+/// value is the packed string handle `(abs_offset << 32) | len` computed from
+/// Build the set of `def` names whose initialiser is a float expression.
+/// Defs are processed in order (sequential binding semantics): each new def
+/// sees the float-types of the preceding ones.
+fn float_def_names(program: &Program) -> HashSet<String> {
+    let mut float_defs: HashSet<String> = HashSet::new();
+    for d in &program.defs {
+        let env = FloatEnv::new(float_defs.clone());
+        if is_float_expr(&d.value, &env) {
+            float_defs.insert(d.name.clone());
+        }
+    }
+    float_defs
+}
+
+/// the already-interned [`Literals`] table.  This lets a `def`-bound name be
+/// resolved at every use site by the normal `Var` path in [`compile_expr`],
+/// just like an integer constant.
+fn eval_consts(program: &Program, literals: &Literals) -> Result<HashMap<String, i64>, CljError> {
     let mut consts = HashMap::new();
     for d in &program.defs {
-        let v = eval_const(&d.value, &consts)?;
+        let v = eval_const(&d.value, &consts, literals)?;
         consts.insert(d.name.clone(), v);
     }
     Ok(consts)
 }
 
-fn eval_const(expr: &Expr, consts: &HashMap<String, i64>) -> Result<i64, CljError> {
+fn eval_const(
+    expr: &Expr,
+    consts: &HashMap<String, i64>,
+    literals: &Literals,
+) -> Result<i64, CljError> {
     Ok(match expr {
         Expr::Int(i) => *i,
-        Expr::Str(_) => {
-            return Err(CljError::Codegen(
-                "string literals are not allowed in a `def` initialiser".into(),
-            ))
+        // A float `def` initialiser stores the f64 bit pattern as its constant
+        // i64 slot value; references emit it verbatim (the float bits) and
+        // float-arithmetic sites reinterpret. Constant-float folding (e.g.
+        // `(def x (* 2.0 3.0))`) is deferred — see `eval_const_builtin`.
+        Expr::Float(f) => f.to_bits() as i64,
+        Expr::Str(bytes) => {
+            // A string-literal `def` is allowed.  Resolve the handle from the
+            // interned literals blob (populated by `collect_literals` before us).
+            literals.handle(bytes).ok_or_else(|| {
+                CljError::Codegen(
+                    "string literal in `def` was not interned (internal error)".into(),
+                )
+            })?
         }
         Expr::Var(name) => *consts
             .get(name)
             .ok_or_else(|| CljError::Codegen(format!("def references non-constant `{name}`")))?,
         Expr::If { cond, then, els } => {
-            if eval_const(cond, consts)? != 0 {
-                eval_const(then, consts)?
+            if eval_const(cond, consts, literals)? != 0 {
+                eval_const(then, consts, literals)?
             } else {
-                eval_const(els, consts)?
+                eval_const(els, consts, literals)?
             }
         }
         Expr::Builtin { op, args } => {
             let v: Vec<i64> = args
                 .iter()
-                .map(|a| eval_const(a, consts))
+                .map(|a| eval_const(a, consts, literals))
                 .collect::<Result<_, _>>()?;
             eval_const_builtin(*op, &v)?
         }
-        Expr::Do(body) => eval_const(body.last().unwrap(), consts)?,
+        Expr::Do(body) => eval_const(body.last().unwrap(), consts, literals)?,
         Expr::Let { .. } => {
             return Err(CljError::Codegen(
                 "`let` is not supported in a `def` initialiser".into(),
@@ -1779,9 +2367,16 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Div => v[0]
             .checked_div(v[1])
             .ok_or_else(|| CljError::Codegen("division by zero in const".into()))?,
-        Builtin::Mod => v[0]
+        Builtin::Rem => v[0]
             .checked_rem(v[1])
             .ok_or_else(|| CljError::Codegen("rem by zero in const".into()))?,
+        Builtin::Mod => {
+            // floored: ((a rem b) + b) rem b — matches the runtime + Clojure semantics
+            let r = v[0]
+                .checked_rem(v[1])
+                .ok_or_else(|| CljError::Codegen("mod by zero in const".into()))?;
+            (r + v[1]) % v[1]
+        }
         Builtin::Inc => v[0] + 1,
         Builtin::Dec => v[0] - 1,
         Builtin::Abs => v[0].abs(),
@@ -1803,8 +2398,34 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Even => b(v[0] & 1 == 0),
         Builtin::Odd => b(v[0] & 1 != 0),
         Builtin::Not => b(v[0] == 0),
-        Builtin::And => b(v.iter().all(|x| *x != 0)),
-        Builtin::Or => b(v.iter().any(|x| *x != 0)),
+        // `and`/`or` return values (Clojure semantics), not booleans.
+        // `and`: first falsy value, or the last value when all truthy.
+        Builtin::And => {
+            let mut result = 1i64; // identity for `and` with zero args (vacuously true)
+            for &x in v.iter() {
+                result = x;
+                if x == 0 {
+                    break;
+                }
+            }
+            result
+        }
+        // `or`: first truthy value, or the last value when all falsy.
+        Builtin::Or => {
+            let mut result = 0i64; // identity for `or` with zero args (vacuously false)
+            for &x in v.iter() {
+                result = x;
+                if x != 0 {
+                    break;
+                }
+            }
+            result
+        }
+        Builtin::BitAnd => v.iter().copied().reduce(|a, b| a & b).unwrap_or(0),
+        Builtin::BitOr => v.iter().copied().reduce(|a, b| a | b).unwrap_or(0),
+        Builtin::BitXor => v.iter().copied().reduce(|a, b| a ^ b).unwrap_or(0),
+        Builtin::BitShiftLeft => v[0].wrapping_shl(v[1] as u32),
+        Builtin::BitShiftRight => v[0].wrapping_shr(v[1] as u32),
         Builtin::StrLen
         | Builtin::ByteAt
         | Builtin::BytesAlloc
@@ -1828,6 +2449,21 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         | Builtin::KqeQuery => {
             return Err(CljError::Codegen(
                 "host calls are not allowed in a `def` initialiser".into(),
+            ))
+        }
+        // Float coercions in a compile-time-constant `def` are not folded yet
+        // (the const evaluator is integer-only). Use them in function bodies.
+        Builtin::Double
+        | Builtin::Int
+        | Builtin::MathRound
+        | Builtin::MathFloor
+        | Builtin::MathCeil
+        | Builtin::MathAbs
+        | Builtin::MathSqrt => {
+            return Err(CljError::Codegen(
+                "float coercions are not yet supported in a `def` initialiser \
+                 (use them inside a function body)"
+                    .into(),
             ))
         }
     })

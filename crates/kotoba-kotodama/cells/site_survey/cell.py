@@ -8,8 +8,8 @@ Bridges the 18,342-actor UNSPSC catalog to the physical-deployment
 workflow: when a ``defineDeploymentSite`` MST record lands, the cell
 geo-validates the site against the LandRegistry / OceanStewardship /
 RiverStewardship / AtmosphereStewardship / OrbitalSlot substrate, fans
-out to the relevant UNSPSC specialist agents via UnispscAgentExecutor-
-Cell (LAN HTTP, port 16100/16101/16102) for commodity-specific feedback,
+out to the relevant UNSPSC commodity data via the openUnispsc XRPC
+service (unispsc.etzhayyim.com) for commodity-specific feedback,
 collects ≥2 witness attestations (constitutional invariant per
 ADR-2605201400 §9), then emits a ``submitSiteSurvey`` record to MST.
 
@@ -18,7 +18,7 @@ LangGraph nodes (super-step semantics):
   START → parse_site_definition  → load defineDeploymentSite record
         → jurisdiction_dmn        → ADR-2605192245/2605192330 sovereignty + Charter Rider §2 gate
         → unispsc_lookup          → derive applicable UNSPSC codes from utilityClass / intendedUse
-        → fan_out_specialists     → invoke UnispscAgentExecutorCell per code (parallel)
+        → fan_out_specialists     → resolve each code via openUnispsc XRPC
         → ecology_assessment      → impactScore / protectedSpecies / culturalHeritage
         → witness_attestation     → wait for N ≥ 2 robot Ed25519 sigs
         → synthesize_survey       → assemble submitSiteSurvey input
@@ -44,59 +44,15 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 logger = logging.getLogger("SiteSurveyCell")
 
-# UnispscAgentExecutorCell LAN endpoints. Each shard owns a segment-prefix
-# range — caller must route by code. Default reads from env so the cell
-# is portable across the 10-node Murakumo fleet + local dev.
-EXECUTOR_SHARDS = {
-    0: os.environ.get("UNISPSC_EXECUTOR_SHARD_0", "http://josephnomac-mini.local:16100"),
-    1: os.environ.get("UNISPSC_EXECUTOR_SHARD_1", "http://issacharnomac-mini.local:16101"),
-    2: os.environ.get("UNISPSC_EXECUTOR_SHARD_2", "http://dannomac-mini.local:16102"),
-}
-
-# libp2p transport — when these env vars are set, fan_out_specialists
-# uses kotodama.transport.libp2p to dial the shard peer instead of
-# direct LAN HTTP. Each peer is tunneled to a local TCP port (chosen
-# in EXECUTOR_LIBP2P_LOCAL_PORTS) which the cell then curls.
-EXECUTOR_SHARD_PEER_IDS: dict[int, str] = {
-    0: os.environ.get("UNISPSC_SHARD_0_PEER_ID", ""),
-    1: os.environ.get("UNISPSC_SHARD_1_PEER_ID", ""),
-    2: os.environ.get("UNISPSC_SHARD_2_PEER_ID", ""),
-}
-EXECUTOR_LIBP2P_LOCAL_PORTS: dict[int, int] = {0: 29100, 1: 29101, 2: 29102}
-LIBP2P_TRANSPORT_VERSION = os.environ.get("UNISPSC_LIBP2P_VERSION", "1.0")
-
-# Cache: shard_idx → "ok" once we've successfully dialed.
-_LIBP2P_DIAL_CACHE: dict[int, bool] = {}
-
-
-def _ensure_libp2p_tunnel(shard: int) -> str | None:
-    """If a peer id is configured for this shard, ensure the libp2p
-    tunnel is up and return ``http://127.0.0.1:<local_port>``.
-    Return None when libp2p mode is not configured for this shard;
-    caller should fall back to EXECUTOR_SHARDS plain HTTP."""
-    peer_id = EXECUTOR_SHARD_PEER_IDS.get(shard, "")
-    if not peer_id:
-        return None
-    local_port = EXECUTOR_LIBP2P_LOCAL_PORTS[shard]
-    if _LIBP2P_DIAL_CACHE.get(shard):
-        return f"http://127.0.0.1:{local_port}"
-    try:
-        from kotodama.transport import libp2p as _l
-    except ImportError as exc:
-        logger.warning("libp2p module not available; shard-%d falls back to LAN HTTP: %s", shard, exc)
-        return None
-    result = _l.dial_peer(peer_id, local_port, version=LIBP2P_TRANSPORT_VERSION)
-    if not result.ok:
-        logger.warning("libp2p dial shard-%d (peer=%s) failed: %s", shard, peer_id, result.error)
-        return None
-    _LIBP2P_DIAL_CACHE[shard] = True
-    logger.info("libp2p dial shard-%d (peer=%s) → local port %d", shard, peer_id, local_port)
-    return f"http://127.0.0.1:{local_port}"
-
-
-def reset_libp2p_dial_cache() -> None:
-    """Clear the per-process tunnel cache. Mainly for tests / cell-runner shutdown."""
-    _LIBP2P_DIAL_CACHE.clear()
+# Canonical UNSPSC commodity XRPC gateway. The per-code Python executor
+# shards (UnispscAgentExecutorCell — LAN HTTP + libp2p transport) were
+# retired; their per-code agents are superseded by the clj unspsc actor
+# (etzhayyim/root@20-actors/unspsc). Specialists now resolve against the
+# canonical openUnispsc XRPC service (unispsc.etzhayyim.com → lg-open-unispsc).
+UNISPSC_XRPC_ENDPOINT = os.environ.get(
+    "UNISPSC_XRPC_ENDPOINT", "https://unispsc.etzhayyim.com"
+)
+UNISPSC_COMMODITY_NSID = "com.etzhayyim.apps.openUnispsc.commodity"
 
 UTILITY_TO_UNSPSC_SEGMENTS: dict[str, list[str]] = {
     # Maps the lexicon's utilityClass → likely UNSPSC segment prefixes that
@@ -210,46 +166,26 @@ def unispsc_lookup(state: SiteSurveyState) -> dict[str, Any]:
     return {"unispsc_candidate_codes": candidates}
 
 
-def _shard_for_code(code: str) -> int | None:
-    if not code or not code[:2].isdigit():
-        return None
-    seg = int(code[:2])
-    if 10 <= seg <= 29:
-        return 0
-    if 30 <= seg <= 44:
-        return 1
-    if 45 <= seg <= 60:
-        return 2
-    return None
-
-
 def fan_out_specialists(state: SiteSurveyState) -> dict[str, Any]:
-    """Invoke UnispscAgentExecutorCell over LAN for each candidate code.
+    """Resolve each candidate UNSPSC code via the canonical openUnispsc XRPC.
 
-    Sync fan-out (per LangGraph node contract). Real swarm fan-out would
-    use activity-parallel + future joins. For the scaffold we serialize +
-    rely on the executor's sub-ms invoke latency.
+    The per-code LAN/libp2p executor shards were retired (their per-code
+    agents are superseded by the clj unspsc actor); each candidate code is
+    POSTed to ``openUnispsc.commodity`` at the canonical gateway. Sync fan-out
+    (per LangGraph node contract); unreachable service degrades per-code.
     """
     import urllib.request
 
+    url = f"{UNISPSC_XRPC_ENDPOINT.rstrip('/')}/xrpc/{UNISPSC_COMMODITY_NSID}"
     results: list[dict[str, Any]] = []
     for code in state.get("unispsc_candidate_codes") or []:
-        shard = _shard_for_code(code)
-        if shard is None:
-            continue
-        tunnel_url = _ensure_libp2p_tunnel(shard)
-        url_base = tunnel_url or EXECUTOR_SHARDS[shard]
-        url = f"{url_base.rstrip('/')}/api/invoke"
         try:
             req = urllib.request.Request(
                 url,
                 data=json.dumps({
                     "code": code,
-                    "input": {
-                        "site_did": state.get("site_did", ""),
-                        "utility_class": state.get("utility_class", ""),
-                        "intended_use": state.get("intended_use", ""),
-                    },
+                    "currency": "USDC",
+                    "dryRun": True,
                 }).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -257,15 +193,15 @@ def fan_out_specialists(state: SiteSurveyState) -> dict[str, Any]:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:  # noqa: BLE001 — record + continue
-            results.append({"code": code, "shard": shard, "error": str(exc), "transport": "libp2p" if tunnel_url else "lan-http"})
+            results.append({"code": code, "error": str(exc), "transport": "xrpc"})
             continue
+        result = payload if isinstance(payload, dict) else {}
         results.append({
             "code": code,
-            "shard": shard,
-            "ok": bool(payload.get("ok")),
-            "state": payload.get("state", {}),
-            "latencyMs": payload.get("latencyMs"),
-            "transport": "libp2p" if tunnel_url else "lan-http",
+            "ok": bool(result.get("ok", True)),
+            "state": result.get("state", result),
+            "latencyMs": result.get("latencyMs"),
+            "transport": "xrpc",
         })
     return {"specialist_results": results}
 
@@ -418,10 +354,7 @@ def healthz() -> dict[str, Any]:
         "service": "SiteSurveyCell",
         "phase": "kuni-umi-1",
         "witnessMin": WITNESS_MIN,
-        "executorShards": {k: v for k, v in EXECUTOR_SHARDS.items()},
-        "executorShardPeerIds": {k: v[:16]+"..." if v else "" for k, v in EXECUTOR_SHARD_PEER_IDS.items()},
-        "libp2pVersion": LIBP2P_TRANSPORT_VERSION,
-        "libp2pDialCache": dict(_LIBP2P_DIAL_CACHE),
+        "unispscXrpcEndpoint": UNISPSC_XRPC_ENDPOINT,
     }
 
 
@@ -468,11 +401,6 @@ __all__ = [
     "handle_mst_event",
     "healthz",
     "WITNESS_MIN",
-    "EXECUTOR_SHARDS",
-    "EXECUTOR_SHARD_PEER_IDS",
-    "EXECUTOR_LIBP2P_LOCAL_PORTS",
-    "LIBP2P_TRANSPORT_VERSION",
+    "UNISPSC_XRPC_ENDPOINT",
     "UTILITY_TO_UNSPSC_SEGMENTS",
-    "_ensure_libp2p_tunnel",
-    "reset_libp2p_dial_cache",
 ]

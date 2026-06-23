@@ -1,8 +1,7 @@
 """Dynamic loader for the per-adherent PhenotypeAgent fleet.
 
-Mirrors ``kotodama.langgraph_graphs.unispsc_agents`` ``dynamic_runner``:
-each agent file is a self-contained Python module that exports a
-compiled ``graph`` and a ``META`` dict.
+Each agent file is a self-contained Python module that exports a
+compiled ``graph`` and a ``META`` dict, loaded dynamically by name.
 
 This module is **not** the generator — it only loads what has already
 been emitted. See ``scripts/gen_phenotype_agent.py`` for the generator.

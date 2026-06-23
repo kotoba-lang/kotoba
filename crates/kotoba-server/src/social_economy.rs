@@ -17,7 +17,7 @@
 //! Datoms returned by `mint`/`tick` MUST be transacted to the canonical Datom log
 //! by the caller (which is how they survive restart — the view rebuilds from the log).
 
-use crate::econ::Econ;
+use crate::engi::Engi;
 use crate::mishmar_observe::{
     parse_kaizen_wellbecoming, EvmLogObservationSource, JsonRpcTransport, ReqwestRpc,
 };
@@ -134,9 +134,9 @@ impl SocialEconomyDriver {
         Ok((minted, result))
     }
 
-    /// Apply a settlement's credits to the live, persisted mKOTO wallet.
-    pub async fn settle_to_wallet(econ: &Econ, result: &SettlementResult) -> i64 {
-        settle_retainer_to_econ(econ, &result.credits).await
+    /// Apply a settlement's credits to the live, persisted ENGI ledger (EN).
+    pub async fn settle_to_wallet(engi: &Engi, result: &SettlementResult) -> i64 {
+        settle_retainer_to_econ(engi, &result.credits).await
     }
 }
 
@@ -325,7 +325,7 @@ mod tests {
         let _ = v;
 
         let result = d.settle(0, 1_000);
-        let econ = Econ::from_env("did:key:operator".to_string());
+        let econ = Engi::from_env("did:key:operator".to_string());
         let credited = SocialEconomyDriver::settle_to_wallet(&econ, &result).await;
         assert_eq!(credited, 1_000);
         assert_eq!(econ.balance(&peggy.to_string()).await, 1_000);

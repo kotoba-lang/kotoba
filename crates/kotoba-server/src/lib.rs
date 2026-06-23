@@ -22,8 +22,8 @@ pub mod dht_audit;
 pub mod dht_transport;
 pub mod did_bridge;
 pub mod dna_integrity;
-pub mod econ;
 pub mod email_xrpc;
+pub mod engi;
 pub mod evm_rpc;
 pub mod fingerprint;
 pub mod firehose;
@@ -41,6 +41,7 @@ pub mod nonce_store;
 pub mod pds_session;
 pub mod pds_xrpc;
 pub mod pre_proxy;
+pub mod rate_limit;
 pub mod realtime;
 pub mod server;
 pub mod signal_xrpc;
@@ -58,7 +59,38 @@ use axum::{
 use std::sync::Arc;
 
 use crate::server::KotobaState;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+
+/// CORS policy from `KOTOBA_CORS_ALLOW_ORIGINS` (comma-separated origins, or
+/// `*` for any). Unset/empty → no CORS layer, so browsers apply same-origin by
+/// default (the safe posture behind a CF Worker that owns CORS).
+fn cors_from_env() -> Option<CorsLayer> {
+    let raw = std::env::var("KOTOBA_CORS_ALLOW_ORIGINS").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let origin = if raw == "*" {
+        AllowOrigin::any()
+    } else {
+        let origins: Vec<_> = raw
+            .split(',')
+            .filter_map(|o| o.trim().parse::<axum::http::HeaderValue>().ok())
+            .collect();
+        if origins.is_empty() {
+            return None;
+        }
+        AllowOrigin::list(origins)
+    };
+    tracing::info!(policy = %raw, "CORS enabled");
+    Some(
+        CorsLayer::new()
+            .allow_origin(origin)
+            .allow_methods(Any)
+            .allow_headers(Any),
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -1000,6 +1032,93 @@ mod tests {
     }
 }
 
+/// KOTOBA Mesh HTTP trigger handler (M15): looks up the component bound to the
+/// request route in the swarm-installed mesh routes, invokes its `on-http`
+/// export on the WASM host, and returns the component's output as the response.
+#[cfg(feature = "p2p")]
+async fn mesh_http(
+    axum::extract::State(state): axum::extract::State<Arc<KotobaState>>,
+    axum::extract::Path(route): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let full = format!("/{route}");
+    let cid = state
+        .mesh_routes
+        .read()
+        .await
+        .http_target(&full)
+        .map(str::to_string);
+    let Some(cid) = cid else {
+        return (StatusCode::NOT_FOUND, format!("no mesh component for route {full}"))
+            .into_response();
+    };
+    match net_actor::invoke_trigger(
+        &state.executor,
+        state.block_store.as_ref(),
+        &state.operator_did,
+        &cid,
+        net_actor::ComponentTrigger::Http(body.to_vec()),
+    ) {
+        Some(out) => (StatusCode::OK, out).into_response(),
+        None => (
+            StatusCode::BAD_GATEWAY,
+            format!("mesh component {cid} unavailable or failed"),
+        )
+            .into_response(),
+    }
+}
+
+/// KOTOBA Mesh deploy handler (M16 + R0): accepts the app's already-resolved
+/// lattice control messages as a CBOR `Vec<(topic, lattice_message_cbor)>` (the
+/// CLI builds these with compiled component CIDs, so `:src` components work). It
+/// (1) gossips each onto the lattice for peers and (2) feeds each into the local
+/// swarm actor's inject channel so THIS node installs its own triggers/routes +
+/// subscribes the app's KSE topics (gossipsub does not deliver to self).
+#[cfg(feature = "p2p")]
+async fn mesh_deploy(
+    axum::extract::State(state): axum::extract::State<Arc<KotobaState>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let msgs: Vec<(String, Vec<u8>)> = match ciborium::from_reader(&body[..]) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("expected CBOR Vec<(topic, lattice_msg_cbor)>: {e}"),
+            )
+                .into_response()
+        }
+    };
+    let mut gossiped = 0usize;
+    let mut injected = 0usize;
+    for (topic, cbor) in &msgs {
+        // peers
+        if let Some(tx) = &state.gossip_tx {
+            if tx.try_send((topic.clone(), cbor.clone())).is_ok() {
+                gossiped += 1;
+            }
+        }
+        // self
+        if let Some(tx) = &state.lattice_inject_tx {
+            if tx.try_send(cbor.clone()).is_ok() {
+                injected += 1;
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        format!(
+            "deployed: {} message(s) gossiped, {} installed locally",
+            gossiped, injected
+        ),
+    )
+        .into_response()
+}
+
 pub fn build_router(state: Arc<KotobaState>) -> Router {
     // Access-receipt writer (ADR-sealed-cold-tier R1): single background task
     // batching read receipts into audit-graph commits. Idempotent.
@@ -1046,7 +1165,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             Err(e) => tracing::warn!(path, error = %e, "KOTOBA_RT_KGE_COMPONENT unreadable"),
         }
     }
-    Router::new()
+    let app = Router::new()
         .route("/_app/meta", get(xrpc::health))
         .route(
             &format!("/xrpc/{}", access_receipt::NSID_AUDIT_LIST),
@@ -1121,6 +1240,15 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", xrpc::NSID_GRAPH_QUERY),
             get(xrpc::graph_query),
+        )
+        // Canonical ENGI ledger routes + deprecated `econ.*` aliases (same handlers).
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_ENGI_BALANCE),
+            post(xrpc::econ_balance),
+        )
+        .route(
+            &format!("/xrpc/{}", xrpc::NSID_ENGI_CREDIT),
+            post(xrpc::econ_credit),
         )
         .route(
             &format!("/xrpc/{}", xrpc::NSID_ECON_BALANCE),
@@ -1636,13 +1764,40 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             &format!("/xrpc/{}", crate::availability_xrpc::NSID_DHT_INFO),
             get(crate::availability_xrpc::dht_info),
         )
-        .route("/xrpc/:nsid", post(xrpc::generic_invoke))
+        .route("/xrpc/:nsid", post(xrpc::generic_invoke));
+
+    // KOTOBA Mesh HTTP trigger (M15): POST /mesh/http/<route> dispatches the
+    // bound component's `on-http` export. p2p-gated (uses the swarm-installed
+    // mesh routes + the lattice invoke path).
+    #[cfg(feature = "p2p")]
+    let app = app.route("/mesh/http/*route", post(mesh_http));
+    #[cfg(feature = "p2p")]
+    let app = app.route(
+        "/xrpc/com.etzhayyim.apps.kotoba.mesh.deploy",
+        post(mesh_deploy),
+    );
+
+    let mut app = app
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             fingerprint::fingerprint_middleware,
         ))
-        .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    // Edge hardening (b). All opt-in via env so the default deployment is
+    // behaviourally unchanged. Each layer wraps the previous; the rate limiter
+    // is applied last so it sheds load before any handler work, and TraceLayer
+    // is outermost so even rejected requests are logged.
+    if let Some(cors) = cors_from_env() {
+        app = app.layer(cors);
+    }
+    if let Some(limiter) = rate_limit::RateLimiter::from_env() {
+        app = app.layer(middleware::from_fn_with_state(
+            limiter,
+            rate_limit::rate_limit_middleware,
+        ));
+    }
+    app.layer(TraceLayer::new_for_http())
 }
 
 /// Start the kotoba server, blocking until shutdown.
@@ -1866,6 +2021,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                 let (publish_tx, publish_rx) =
                     tokio::sync::mpsc::channel::<(String, Vec<u8>)>(1024);
+                let (inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
 
                 let journal_arc = Arc::clone(&state.journal);
                 let block_store_arc = Arc::clone(&state.block_store);
@@ -1884,10 +2040,13 @@ pub async fn run() -> anyhow::Result<()> {
                     quad_store_arc,
                     state.pre_key_registry.clone(),
                     relay,
+                    Arc::clone(&state.executor),
+                    Arc::clone(&state.mesh_routes),
+                    inject_rx,
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");
-                state.attach_gossip(publish_tx)
+                state.attach_gossip(publish_tx).attach_lattice_inject(inject_tx)
             }
             Err(e) => {
                 tracing::warn!(err = %e, "swarm init failed — running without p2p");

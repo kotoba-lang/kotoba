@@ -47,10 +47,21 @@ const NONCE_INFO: &[u8] = b"kotoba/sealed-block/nonce/v1";
 const INDEX_RECORD_LEN: usize = 72;
 pub const SEALED_INDEX_FILE: &str = "sealed_index.bin";
 
-/// The 32-byte block key, parsed from the environment.
-/// `KOTOBA_BLOCK_KEY` = 64 hex chars, or `KOTOBA_BLOCK_KEY_FILE` = path to a
-/// file containing the hex string (trailing whitespace ignored). Neither set →
-/// `Ok(None)` (sealing disabled, current plaintext behaviour).
+/// The 32-byte block key, resolved from the environment. In precedence order:
+///   * `KOTOBA_BLOCK_KEY`      = 64 hex chars inline.
+///   * `KOTOBA_BLOCK_KEY_FILE` = path to a file holding the hex string.
+///   * `KOTOBA_BLOCK_KEY_CMD`  = a shell command whose stdout is the hex key.
+///
+/// The `_CMD` form is the vendor-neutral KMS / HSM / Vault hook (enterprise key
+/// management, c): kotoba takes no cloud SDK dependency — the operator wires any
+/// secrets backend by writing a command that prints the 64-hex key, e.g.
+///   `KOTOBA_BLOCK_KEY_CMD='aws kms decrypt --ciphertext-blob fileb://k.enc \
+///       --query Plaintext --output text | base64 -d | xxd -p -c64'`
+///   `KOTOBA_BLOCK_KEY_CMD='vault kv get -field=hex secret/kotoba/block-key'`
+///   `KOTOBA_BLOCK_KEY_CMD='gcloud kms decrypt … | xxd -p -c64'`
+/// The key never lands in an env var or on disk — it is fetched at boot, held in
+/// memory, and (with custody) can be Shamir-split for recovery (see ADR-sealed-
+/// cold-tier R3a). None set → `Ok(None)` (sealing disabled, plaintext behaviour).
 pub struct SealedKeyConfig {
     key: [u8; 32],
 }
@@ -64,10 +75,46 @@ impl SealedKeyConfig {
                     .with_context(|| format!("read KOTOBA_BLOCK_KEY_FILE {path}"))?
                     .trim()
                     .to_string(),
-                _ => return Ok(None),
+                _ => match std::env::var("KOTOBA_BLOCK_KEY_CMD") {
+                    Ok(cmd) if !cmd.trim().is_empty() => Self::run_key_cmd(cmd.trim())?,
+                    _ => return Ok(None),
+                },
             },
         };
         Ok(Some(Self::from_hex(&hex_str)?))
+    }
+
+    /// Run the operator-supplied key command through the system shell and return
+    /// its trimmed stdout. The command is expected to print the 64-hex block key
+    /// (a KMS/HSM/Vault fetch). A non-zero exit or empty output is a hard error
+    /// — we must not silently fall back to plaintext when sealing was requested.
+    fn run_key_cmd(cmd: &str) -> Result<String> {
+        let (shell, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        let output = std::process::Command::new(shell)
+            .arg(flag)
+            .arg(cmd)
+            .output()
+            .with_context(|| format!("spawn KOTOBA_BLOCK_KEY_CMD ({shell} {flag} …)"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "KOTOBA_BLOCK_KEY_CMD exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+        let out = String::from_utf8(output.stdout)
+            .context("KOTOBA_BLOCK_KEY_CMD stdout is not valid UTF-8")?
+            .trim()
+            .to_string();
+        if out.is_empty() {
+            bail!("KOTOBA_BLOCK_KEY_CMD produced empty output");
+        }
+        Ok(out)
     }
 
     pub fn from_hex(hex_str: &str) -> Result<Self> {
@@ -349,6 +396,31 @@ mod tests {
         store.put(&cid, data).unwrap();
         let got = store.get(&cid).unwrap().unwrap();
         assert_eq!(got.as_ref(), data);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn key_cmd_resolves_hex_from_stdout() {
+        // The KMS/HSM hook (c): a command that prints the 64-hex key resolves
+        // to a usable 32-byte key.
+        let hex = "11".repeat(32);
+        let out = SealedKeyConfig::run_key_cmd(&format!("printf %s {hex}")).unwrap();
+        assert_eq!(out, hex);
+        let cfg = SealedKeyConfig::from_hex(&out).unwrap();
+        assert_eq!(cfg.key, [0x11u8; 32]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn key_cmd_nonzero_exit_is_hard_error() {
+        // A failed secrets fetch must NOT silently disable sealing.
+        assert!(SealedKeyConfig::run_key_cmd("exit 3").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn key_cmd_empty_output_is_hard_error() {
+        assert!(SealedKeyConfig::run_key_cmd("true").is_err());
     }
 
     #[test]

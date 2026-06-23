@@ -98,12 +98,83 @@ impl WasmExecutor {
         skip(self, agent_did, wasm_bytes, ctx_cbor, quad_snapshot, head_commits),
         fields(program_cid)
     )]
+    /// Invoke the `run` export (kotoba-node world): `run(ctx-cbor) -> result`.
     pub fn execute(
         &self,
         program_cid: &str,
         wasm_bytes: &[u8],
         agent_did: &str,
         ctx_cbor: Vec<u8>,
+        quad_snapshot: Vec<WitQuad>,
+        head_commits: std::collections::HashMap<String, String>,
+    ) -> Result<InvokeResult, RuntimeError> {
+        use wasmtime::component::Val;
+        let args = vec![Val::List(ctx_cbor.iter().map(|b| Val::U8(*b)).collect())];
+        self.invoke(program_cid, wasm_bytes, agent_did, "run", args, quad_snapshot, head_commits)
+    }
+
+    /// HTTP trigger (M11): `on-http(req-cbor) -> result` — same ABI as `run`.
+    pub fn execute_on_http(
+        &self,
+        program_cid: &str,
+        wasm_bytes: &[u8],
+        agent_did: &str,
+        req_cbor: Vec<u8>,
+        quad_snapshot: Vec<WitQuad>,
+        head_commits: std::collections::HashMap<String, String>,
+    ) -> Result<InvokeResult, RuntimeError> {
+        use wasmtime::component::Val;
+        let args = vec![Val::List(req_cbor.iter().map(|b| Val::U8(*b)).collect())];
+        self.invoke(program_cid, wasm_bytes, agent_did, "on-http", args, quad_snapshot, head_commits)
+    }
+
+    /// Cron trigger (M11): `on-tick(epoch-ms: u64) -> result`.
+    pub fn execute_on_tick(
+        &self,
+        program_cid: &str,
+        wasm_bytes: &[u8],
+        agent_did: &str,
+        epoch_ms: u64,
+        quad_snapshot: Vec<WitQuad>,
+        head_commits: std::collections::HashMap<String, String>,
+    ) -> Result<InvokeResult, RuntimeError> {
+        use wasmtime::component::Val;
+        let args = vec![Val::U64(epoch_ms)];
+        self.invoke(program_cid, wasm_bytes, agent_did, "on-tick", args, quad_snapshot, head_commits)
+    }
+
+    /// KSE-topic trigger (M11): `on-kse(topic: string, payload: list<u8>) -> result`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_on_kse(
+        &self,
+        program_cid: &str,
+        wasm_bytes: &[u8],
+        agent_did: &str,
+        topic: String,
+        payload: Vec<u8>,
+        quad_snapshot: Vec<WitQuad>,
+        head_commits: std::collections::HashMap<String, String>,
+    ) -> Result<InvokeResult, RuntimeError> {
+        use wasmtime::component::Val;
+        let args = vec![
+            Val::String(topic),
+            Val::List(payload.iter().map(|b| Val::U8(*b)).collect()),
+        ];
+        self.invoke(program_cid, wasm_bytes, agent_did, "on-kse", args, quad_snapshot, head_commits)
+    }
+
+    /// Invoke a named component export via dynamic `Val` dispatch, applying the
+    /// shared host setup (HostState, gas, snapshot, head commits) and parsing a
+    /// `result<list<u8>, string>` return. The trigger-specific methods above are
+    /// thin wrappers that build the right export name + args.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke(
+        &self,
+        program_cid: &str,
+        wasm_bytes: &[u8],
+        agent_did: &str,
+        export_name: &str,
+        args: Vec<wasmtime::component::Val>,
         quad_snapshot: Vec<WitQuad>,
         head_commits: std::collections::HashMap<String, String>,
     ) -> Result<InvokeResult, RuntimeError> {
@@ -136,20 +207,16 @@ impl WasmExecutor {
             .instantiate(&mut store, &component)
             .map_err(RuntimeError::InstantiateFailed)?;
 
-        // Locate the `run` export (kotoba-node world)
-        let run_func: Func = instance
-            .get_func(&mut store, "run")
-            .ok_or_else(|| RuntimeError::GuestError("missing `run` export".into()))?;
+        // Locate the requested export (run / on-http / on-tick / on-kse, …)
+        let func: Func = instance
+            .get_func(&mut store, export_name)
+            .ok_or_else(|| RuntimeError::GuestError(format!("missing `{export_name}` export")))?;
 
         // Call via dynamic Val dispatch (avoids wit-bindgen dependency at call site)
         use wasmtime::component::Val;
-        let args = [Val::List(
-            ctx_cbor.iter().map(|b| Val::U8(*b)).collect::<Vec<_>>(),
-        )];
         let mut results = vec![Val::Bool(false)];
 
-        run_func
-            .call(&mut store, &args, &mut results)
+        func.call(&mut store, &args, &mut results)
             .map_err(|e| RuntimeError::Trap(e.to_string()))?;
 
         // Parse result<list<u8>, string> from Val

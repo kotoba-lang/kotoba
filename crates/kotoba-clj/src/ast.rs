@@ -63,7 +63,8 @@ pub enum Builtin {
     Sub,
     Mul,
     Div,
-    Mod,
+    Mod, // Clojure floored mod (sign of divisor)
+    Rem, // truncated remainder (sign of dividend)
     Inc,
     Dec,
     Abs,
@@ -151,6 +152,42 @@ pub enum Builtin {
     /// object-cbor), or `0` on err. Read with `kqe-count` /
     /// `kqe-quad-{graph,subject,predicate,object}`.
     KqeQuery,
+    /// `(bit-and a b …)` — bitwise AND of all arguments (Clojure `bit-and`).
+    /// Maps to WASM `i64.and` folded left over the arg list.
+    BitAnd,
+    /// `(bit-or a b …)` — bitwise OR of all arguments (Clojure `bit-or`).
+    /// Maps to WASM `i64.or` folded left over the arg list.
+    BitOr,
+    /// `(bit-xor a b …)` — bitwise XOR of all arguments (Clojure `bit-xor`).
+    /// Maps to WASM `i64.xor` folded left over the arg list.
+    BitXor,
+    /// `(bit-shift-left x n)` — left-shift `x` by `n` bits (Clojure `bit-shift-left`).
+    /// Maps to WASM `i64.shl`. Exactly 2 args.
+    BitShiftLeft,
+    /// `(bit-shift-right x n)` — arithmetic right-shift `x` by `n` bits
+    /// (Clojure `bit-shift-right`). Maps to WASM `i64.shr_s`. Exactly 2 args.
+    BitShiftRight,
+    /// `(double x)` — coerce `x` to an f64 value. An int is converted with
+    /// `f64.convert_i64_s`; a float passes through. The result occupies the
+    /// uniform i64 slot as the IEEE-754 bit pattern.
+    Double,
+    /// `(int x)` / `(long x)` — coerce `x` to an integer. A float is truncated
+    /// toward zero (`i64.trunc_sat_f64_s`); an int passes through.
+    Int,
+    /// `(Math/round x)` — round `x` to the nearest integer (ties away from
+    /// zero, Clojure semantics), returned as an integer value.
+    MathRound,
+    /// `(Math/floor x)` — largest integer ≤ `x`, returned as an f64 value
+    /// (`f64.floor`, matching Clojure which yields a double).
+    MathFloor,
+    /// `(Math/ceil x)` — smallest integer ≥ `x`, returned as an f64 value
+    /// (`f64.ceil`).
+    MathCeil,
+    /// `(Math/abs x)` — absolute value preserving the operand's float-ness
+    /// (`f64.abs` for a float; integer abs otherwise).
+    MathAbs,
+    /// `(Math/sqrt x)` — square root as an f64 value (`f64.sqrt`).
+    MathSqrt,
 }
 
 impl Builtin {
@@ -222,7 +259,8 @@ impl Builtin {
             "-" => Builtin::Sub,
             "*" => Builtin::Mul,
             "/" | "quot" => Builtin::Div,
-            "mod" | "rem" => Builtin::Mod,
+            "mod" => Builtin::Mod,
+            "rem" => Builtin::Rem,
             "inc" => Builtin::Inc,
             "dec" => Builtin::Dec,
             "abs" => Builtin::Abs,
@@ -260,6 +298,18 @@ impl Builtin {
             "kqe-retract!" => Builtin::KqeRetract,
             "kqe-get-objects" => Builtin::KqeGetObjects,
             "kqe-query" => Builtin::KqeQuery,
+            "bit-and" => Builtin::BitAnd,
+            "bit-or" => Builtin::BitOr,
+            "bit-xor" => Builtin::BitXor,
+            "bit-shift-left" => Builtin::BitShiftLeft,
+            "bit-shift-right" => Builtin::BitShiftRight,
+            "double" => Builtin::Double,
+            "int" | "long" => Builtin::Int,
+            "Math/round" | "java.lang.Math/round" => Builtin::MathRound,
+            "Math/floor" | "java.lang.Math/floor" => Builtin::MathFloor,
+            "Math/ceil" | "java.lang.Math/ceil" => Builtin::MathCeil,
+            "Math/abs" | "java.lang.Math/abs" => Builtin::MathAbs,
+            "Math/sqrt" | "java.lang.Math/sqrt" => Builtin::MathSqrt,
             _ => return None,
         })
     }
@@ -270,6 +320,12 @@ impl Builtin {
 pub enum Expr {
     /// Integer literal (booleans lower to 1/0 here).
     Int(i64),
+    /// Float literal. Carried as a native `f64`; codegen stores its IEEE-754
+    /// bit pattern in the uniform i64 value slot (`i64.reinterpret_f64`) and
+    /// reinterprets it back (`f64.reinterpret_i64`) at float-arithmetic
+    /// boundaries. There is no runtime tag — float-ness is inferred
+    /// *statically* (see `codegen::is_float_expr`).
+    Float(f64),
     /// String literal — stored in a data segment; the value on the stack is a
     /// packed `(offset << 32) | len` i64 handle (see codegen).
     Str(Vec<u8>),
@@ -445,7 +501,7 @@ impl Lifter {
 
     fn lift_expr(&mut self, e: Expr, scope: &LiftScope) -> Result<Expr, CljError> {
         Ok(match e {
-            Expr::Int(_) | Expr::Str(_) | Expr::ClosureRef(_) => e,
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::ClosureRef(_) => e,
 
             // A bare symbol that names a lexical binding is read through that
             // binding's current access path (`Var` for a local, `ClosureRef` for
@@ -611,7 +667,7 @@ fn free_walk(
         }
     };
     match e {
-        Expr::Int(_) | Expr::Str(_) | Expr::ClosureRef(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::ClosureRef(_) => {}
         Expr::Var(n) => refer(n, bound, acc, seen),
         Expr::If { cond, then, els } => {
             free_walk(cond, bound, scope, acc, seen);
@@ -858,6 +914,7 @@ fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
     match v {
         EdnValue::Nil => Ok(Expr::Int(0)),
         EdnValue::Integer(i) => Ok(Expr::Int(*i)),
+        EdnValue::Float(f) => Ok(Expr::Float(f.into_inner())),
         EdnValue::Bool(b) => Ok(Expr::Int(if *b { 1 } else { 0 })),
         EdnValue::String(s) => Ok(Expr::Str(s.clone().into_bytes())),
         EdnValue::Keyword(_) => Ok(Expr::Str(edn_to_string(v).into_bytes())),
@@ -865,8 +922,11 @@ fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
         EdnValue::List(items) => lower_call(items),
         EdnValue::Vector(items) => lower_vector_literal(items),
         EdnValue::Map(items) => lower_map_literal(items),
+        // set literals (e.g. `#{:bot}`) lower to the same growable container as vectors;
+        // membership is `(some #(= % x) the-set)` (or `vec-contains?`) in the subset.
+        EdnValue::Set(items) => lower_vector_literal(&items.iter().cloned().collect::<Vec<_>>()),
         other => Err(CljError::Lower(format!(
-            "unsupported expression: {other:?} (only integers, booleans, strings, keywords, symbols, lists, vectors and maps are supported)"
+            "unsupported expression: {other:?} (only integers, booleans, strings, keywords, symbols, lists, vectors, maps and sets are supported)"
         ))),
     }
 }
@@ -973,10 +1033,56 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
         "do" => Ok(Expr::Do(
             args.iter().map(lower_expr).collect::<Result<_, _>>()?,
         )),
+        // `(if-some [x e] then else?)` / `(when-some [x e] body…)`: in this
+        // i64/nil-as-0 value model a non-nil value is exactly a truthy value, so
+        // some-binding has the same lowering as the let-binding forms.
+        "if-some" => lower_if_let(args),
+        "when-some" => lower_when_let(args),
+        // Iteration sugars — pure desugaring into `loop`/`recur` (no new runtime
+        // node). They evaluate their body for side effects and yield nil (0).
+        // `doseq` walks a vector via the prelude `vec-count`/`vec-nth`, so it
+        // requires the prelude (the default).
+        "while" => lower_while(args),
+        "dotimes" => lower_dotimes(args),
+        "doseq" => lower_doseq(args),
         "comment" => Ok(Expr::Int(0)),
+        // `(str ...)` desugar: 0 args → "" literal; 1 arg → the arg; n≥2 args →
+        // left-fold of `str-cat` calls (prelude function). This avoids adding a
+        // codegen case that would need to emit a function-call into the prelude.
+        "str" => {
+            let lowered: Vec<Expr> = args.iter().map(lower_expr).collect::<Result<_, _>>()?;
+            if lowered.is_empty() {
+                Ok(Expr::Str(vec![]))
+            } else if lowered.len() == 1 {
+                Ok(lowered.into_iter().next().unwrap())
+            } else {
+                // fold: str-cat(str-cat(a, b), c) …
+                let mut acc = Expr::Call {
+                    name: "str-cat".to_string(),
+                    args: vec![lowered[0].clone(), lowered[1].clone()],
+                };
+                for extra in &lowered[2..] {
+                    acc = Expr::Call {
+                        name: "str-cat".to_string(),
+                        args: vec![acc, extra.clone()],
+                    };
+                }
+                Ok(acc)
+            }
+        }
         name => {
             let lowered: Vec<Expr> = args.iter().map(lower_expr).collect::<Result<_, _>>()?;
-            if let Some(op) = Builtin::from_name(name) {
+            // Builtins keyed by bare name (`+`, `inc`, …) try `name`; builtins
+            // keyed by a host-class-qualified name (`Math/round`, `Math/abs`)
+            // need the fully-qualified form. When the head IS namespaced (e.g.
+            // `Math/abs`) the qualified lookup must win — otherwise `Math/abs`
+            // would collide with the bare `abs` (integer) builtin.
+            let builtin = if head.namespace.is_some() {
+                Builtin::from_name(&head.to_qualified()).or_else(|| Builtin::from_name(name))
+            } else {
+                Builtin::from_name(name)
+            };
+            if let Some(op) = builtin {
                 check_builtin_arity(op, lowered.len())?;
                 Ok(Expr::Builtin { op, args: lowered })
             } else {
@@ -1006,6 +1112,134 @@ fn lower_var(args: &[EdnValue]) -> Result<Expr, CljError> {
             "var requires a symbol, found {other:?}"
         ))),
     }
+}
+
+// ---- desugaring helpers for iteration sugars -------------------------------
+// Each builds an equivalent EDN s-expression out of existing special forms and
+// re-lowers it, so no new AST node or codegen path is introduced.
+
+fn dsym(name: &str) -> EdnValue {
+    EdnValue::Symbol(Symbol {
+        namespace: None,
+        name: name.into(),
+    })
+}
+fn dlist(items: Vec<EdnValue>) -> EdnValue {
+    EdnValue::List(items)
+}
+fn dvec(items: Vec<EdnValue>) -> EdnValue {
+    EdnValue::Vector(items)
+}
+
+/// `(while test body…)` → `(loop [_while 0] (if test (do body… (recur 0)) 0))`.
+fn lower_while(args: &[EdnValue]) -> Result<Expr, CljError> {
+    let test = args
+        .first()
+        .ok_or_else(|| CljError::Lower("while takes: (while test body…)".into()))?
+        .clone();
+    let mut do_items = vec![dsym("do")];
+    do_items.extend(args[1..].iter().cloned());
+    do_items.push(dlist(vec![dsym("recur"), EdnValue::Integer(0)]));
+    let if_form = dlist(vec![
+        dsym("if"),
+        test,
+        dlist(do_items),
+        EdnValue::Integer(0),
+    ]);
+    let loop_form = dlist(vec![
+        dsym("loop"),
+        dvec(vec![dsym("_while"), EdnValue::Integer(0)]),
+        if_form,
+    ]);
+    lower_expr(&loop_form)
+}
+
+/// `(dotimes [i n] body…)` →
+/// `(let [_dotimes_n n] (loop [i 0] (if (< i _dotimes_n) (do body… (recur (+ i 1))) 0)))`.
+fn lower_dotimes(args: &[EdnValue]) -> Result<Expr, CljError> {
+    let binding = match args.first() {
+        Some(EdnValue::Vector(v)) if v.len() == 2 => v,
+        _ => {
+            return Err(CljError::Lower(
+                "dotimes takes: (dotimes [i n] body…)".into(),
+            ))
+        }
+    };
+    let i = binding[0].clone();
+    let n = binding[1].clone();
+    let limit = dsym("_dotimes_n");
+    let mut do_items = vec![dsym("do")];
+    do_items.extend(args[1..].iter().cloned());
+    do_items.push(dlist(vec![
+        dsym("recur"),
+        dlist(vec![dsym("+"), i.clone(), EdnValue::Integer(1)]),
+    ]));
+    let if_form = dlist(vec![
+        dsym("if"),
+        dlist(vec![dsym("<"), i.clone(), limit.clone()]),
+        dlist(do_items),
+        EdnValue::Integer(0),
+    ]);
+    let loop_form = dlist(vec![
+        dsym("loop"),
+        dvec(vec![i, EdnValue::Integer(0)]),
+        if_form,
+    ]);
+    let let_form = dlist(vec![dsym("let"), dvec(vec![limit, n]), loop_form]);
+    lower_expr(&let_form)
+}
+
+/// `(doseq [x coll] body…)` →
+/// `(let [_doseq_v coll _doseq_n (vec-count _doseq_v)]
+///    (loop [_doseq_i 0]
+///      (if (< _doseq_i _doseq_n)
+///        (do (let [x (vec-nth _doseq_v _doseq_i)] body…) (recur (+ _doseq_i 1)))
+///        0)))`.
+/// Single-binding only; needs the prelude (`vec-count`/`vec-nth`).
+fn lower_doseq(args: &[EdnValue]) -> Result<Expr, CljError> {
+    let binding = match args.first() {
+        Some(EdnValue::Vector(v)) if v.len() == 2 => v,
+        _ => {
+            return Err(CljError::Lower(
+                "doseq takes a single binding: (doseq [x coll] body…)".into(),
+            ))
+        }
+    };
+    let x = binding[0].clone();
+    let coll = binding[1].clone();
+    let v = dsym("_doseq_v");
+    let n = dsym("_doseq_n");
+    let i = dsym("_doseq_i");
+    let mut inner_let = vec![
+        dsym("let"),
+        dvec(vec![x, dlist(vec![dsym("vec-nth"), v.clone(), i.clone()])]),
+    ];
+    inner_let.extend(args[1..].iter().cloned());
+    let do_form = dlist(vec![
+        dsym("do"),
+        dlist(inner_let),
+        dlist(vec![
+            dsym("recur"),
+            dlist(vec![dsym("+"), i.clone(), EdnValue::Integer(1)]),
+        ]),
+    ]);
+    let if_form = dlist(vec![
+        dsym("if"),
+        dlist(vec![dsym("<"), i.clone(), n.clone()]),
+        do_form,
+        EdnValue::Integer(0),
+    ]);
+    let loop_form = dlist(vec![
+        dsym("loop"),
+        dvec(vec![i, EdnValue::Integer(0)]),
+        if_form,
+    ]);
+    let let_form = dlist(vec![
+        dsym("let"),
+        dvec(vec![v.clone(), coll, n, dlist(vec![dsym("vec-count"), v])]),
+        loop_form,
+    ]);
+    lower_expr(&let_form)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2160,6 +2394,13 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         | Builtin::Neg
         | Builtin::Even
         | Builtin::Odd
+        | Builtin::Double
+        | Builtin::Int
+        | Builtin::MathRound
+        | Builtin::MathFloor
+        | Builtin::MathCeil
+        | Builtin::MathAbs
+        | Builtin::MathSqrt
         | Builtin::StrLen => n == 1,
         Builtin::BytesAlloc | Builtin::BytesLen | Builtin::BytesFinish => n == 1,
         Builtin::Alloc | Builtin::Load64 | Builtin::Load32 => n == 1,
@@ -2167,7 +2408,11 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         Builtin::Sub => n >= 1, // unary negate or n-ary subtract
         Builtin::Min | Builtin::Max => n >= 1,
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,
-        Builtin::Div | Builtin::Mod | Builtin::ByteAt | Builtin::ByteAppend => n == 2,
+        Builtin::BitAnd | Builtin::BitOr | Builtin::BitXor => n >= 1,
+        Builtin::BitShiftLeft | Builtin::BitShiftRight => n == 2,
+        Builtin::Div | Builtin::Mod | Builtin::Rem | Builtin::ByteAt | Builtin::ByteAppend => {
+            n == 2
+        }
         Builtin::Eq | Builtin::NotEq => n >= 1,
         Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n >= 1,
         Builtin::KqeAssert | Builtin::KqeRetract => n == 4,

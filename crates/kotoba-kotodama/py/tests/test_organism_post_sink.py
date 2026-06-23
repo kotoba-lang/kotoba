@@ -17,7 +17,7 @@ from kotodama.organism.post_sink import (
     NullPostSink,
     resolve_post_sink,
 )
-from kotodama.organism.unispsc_organism import UnispscOrganism
+from kotodama.organism.organism import Organism
 
 
 class _Ctx:
@@ -133,7 +133,7 @@ def test_resolve_ndjson_with_explicit_path(monkeypatch: pytest.MonkeyPatch, tmp_
 def test_organism_emits_post_to_ndjson_queue(tmp_path: Path):
     queue = tmp_path / "shard-0.ndjson"
     sink = NdjsonQueuePostSink(queue)
-    organism = UnispscOrganism.for_code(
+    organism = Organism.for_code(
         "10101500",
         classify_input_factory=lambda _c: {
             "input": {"species": "ovis aries", "health_data": {"certified": True}},
@@ -161,7 +161,7 @@ def test_organism_emits_post_to_ndjson_queue(tmp_path: Path):
 def test_organism_legacy_text_sink_still_supported():
     """Backwards-compat: a Callable[[str], None] sink still works."""
     captured: list[str] = []
-    organism = UnispscOrganism.for_code(
+    organism = Organism.for_code(
         "10101500",
         classify_input_factory=lambda _c: {
             "input": {"species": "ovis aries", "health_data": {"certified": True}},
