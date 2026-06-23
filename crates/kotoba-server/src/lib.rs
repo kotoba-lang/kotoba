@@ -1085,7 +1085,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             Err(e) => tracing::warn!(path, error = %e, "KOTOBA_RT_KGE_COMPONENT unreadable"),
         }
     }
-    let mut app = Router::new()
+    let app = Router::new()
         .route("/_app/meta", get(xrpc::health))
         .route(
             &format!("/xrpc/{}", access_receipt::NSID_AUDIT_LIST),
@@ -1686,9 +1686,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     // bound component's `on-http` export. p2p-gated (uses the swarm-installed
     // mesh routes + the lattice invoke path).
     #[cfg(feature = "p2p")]
-    {
-        app = app.route("/mesh/http/*route", post(mesh_http));
-    }
+    let app = app.route("/mesh/http/*route", post(mesh_http));
 
     let mut app = app
         .route_layer(middleware::from_fn_with_state(
