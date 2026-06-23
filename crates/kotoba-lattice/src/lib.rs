@@ -23,6 +23,7 @@
 //! kotoba-server which depend on this.
 
 pub mod control;
+pub mod deploy;
 pub mod error;
 pub mod manifest;
 pub mod node;
@@ -33,6 +34,7 @@ pub mod routes;
 pub mod trigger;
 
 pub use control::{app_to_quads, desired_from_quads, ControlQuad};
+pub use deploy::deploy_messages;
 pub use routes::TriggerRoutes;
 pub use error::LatticeError;
 pub use manifest::{AppManifest, ComponentSpec, Lang, LinkSpec, Placement, TriggerSpec};

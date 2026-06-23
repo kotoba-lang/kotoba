@@ -417,7 +417,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Component(cmd) => mesh::run_component(cmd)?,
-        Cmd::App(cmd) => mesh::run_app(cmd)?,
+        Cmd::App(cmd) => mesh::run_app(cmd).await?,
         Cmd::Lattice(cmd) => mesh::run_lattice(cmd)?,
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,

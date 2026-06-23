@@ -1069,6 +1069,52 @@ async fn mesh_http(
     }
 }
 
+/// KOTOBA Mesh deploy handler (M16): accepts an app manifest (EDN body), builds
+/// its lattice control messages (`PutTriggers` + `PutRoutes`) and publishes them
+/// onto the lattice via the node's gossip channel so every node installs the
+/// app's triggers/routes. The local node also updates its shared `mesh_routes`
+/// immediately so its HTTP layer can serve the app's routes without waiting for
+/// the gossip round-trip. Components must carry an explicit `:cid` (deploy-time
+/// `:src` compilation is a follow-up).
+#[cfg(feature = "p2p")]
+async fn mesh_deploy(
+    axum::extract::State(state): axum::extract::State<Arc<KotobaState>>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let edn = String::from_utf8_lossy(&body);
+    let app = match kotoba_lattice::AppManifest::from_edn(&edn) {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("manifest parse: {e}")).into_response(),
+    };
+    let msgs = kotoba_lattice::deploy_messages(&app, &std::collections::BTreeMap::new());
+    // apply routes locally so this node's HTTP layer serves them right away
+    for (_t, m) in &msgs {
+        if let kotoba_lattice::LatticeMessage::PutRoutes { routes, .. } = m {
+            *state.mesh_routes.write().await = routes.clone();
+        }
+    }
+    let mut published = 0usize;
+    if let Some(tx) = &state.gossip_tx {
+        for (topic, m) in &msgs {
+            if let Ok(cbor) = m.to_cbor() {
+                if tx.try_send((topic.to_string(), cbor)).is_ok() {
+                    published += 1;
+                }
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        format!(
+            "deployed app `{}`: {} lattice control message(s) published",
+            app.name, published
+        ),
+    )
+        .into_response()
+}
+
 pub fn build_router(state: Arc<KotobaState>) -> Router {
     // Access-receipt writer (ADR-sealed-cold-tier R1): single background task
     // batching read receipts into audit-graph commits. Idempotent.
@@ -1687,6 +1733,11 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     // mesh routes + the lattice invoke path).
     #[cfg(feature = "p2p")]
     let app = app.route("/mesh/http/*route", post(mesh_http));
+    #[cfg(feature = "p2p")]
+    let app = app.route(
+        "/xrpc/com.etzhayyim.apps.kotoba.mesh.deploy",
+        post(mesh_deploy),
+    );
 
     let mut app = app
         .route_layer(middleware::from_fn_with_state(
