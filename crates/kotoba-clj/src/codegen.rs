@@ -53,7 +53,7 @@ const CLOSURE_TABLE: u32 = 0;
 /// Compile a parsed [`Program`] into WebAssembly bytes (core module; every
 /// `defn` exported by name).
 pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
-    compile_core(program, None)
+    compile_core(program, &[])
 }
 
 /// The Canonical-ABI shape of the generated `run` entry wrapper's return value.
@@ -66,11 +66,14 @@ pub enum EntryAbi {
     BytesToResultBytes,
 }
 
-/// A component entry point: the user `defn` to wrap and the ABI of its export.
+/// A component entry point: the user `defn` to wrap, the ABI of its export, and
+/// the WIT export name to bind it to. Multiple entries (e.g. `run` + `on-http`,
+/// M7) can be emitted in one component, each wrapped under its own export name.
 #[derive(Debug, Clone, Copy)]
 pub struct Entry<'a> {
     pub name: &'a str,
     pub abi: EntryAbi,
+    pub export_name: &'a str,
 }
 
 /// Compile a [`Program`] into a core module, optionally adding a Canonical-ABI
@@ -84,7 +87,7 @@ pub struct Entry<'a> {
 /// area's pointer. In this mode the user `defn`s are not exported by name (only
 /// `run`, `memory`, `cabi_realloc` are), so the wrapper owns the `run` export
 /// name unambiguously.
-pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, CljError> {
+pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, CljError> {
     // ---- Pass 0: collect string literals into one data blob ----------------
     let literals = collect_literals(program);
 
@@ -141,21 +144,22 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         }
     }
 
-    // Validate the entry point up front.
-    let entry_target = match entry {
-        Some(Entry { name, abi }) => {
+    // Validate every entry point up front → (user fn index, abi, export name).
+    let entry_targets: Vec<(u32, EntryAbi, &str)> = entries
+        .iter()
+        .map(|e| {
             let idx = fn_index
-                .get(&(name.to_string(), 1))
+                .get(&(e.name.to_string(), 1))
                 .copied()
                 .ok_or_else(|| {
                     CljError::Codegen(format!(
-                        "component entry `(defn {name} [input] …)` not found"
+                        "component entry `(defn {} [input] …)` not found",
+                        e.name
                     ))
                 })?;
-            Some((idx, abi))
-        }
-        None => None,
-    };
+            Ok((idx, e.abi, e.export_name))
+        })
+        .collect::<Result<_, CljError>>()?;
 
     // Distinct function types, keyed by arity (params: arity×i64 → i64).
     let mut type_for_arity: HashMap<usize, u32> = HashMap::new();
@@ -173,7 +177,7 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         funcs.function(type_idx);
         // In component mode the wrapper owns the export names; don't leak the
         // raw i64 functions (avoids a clash on the `run` name).
-        if entry.is_none() {
+        if entry_targets.is_empty() {
             if let Some(export_name) = &f.export_name {
                 exports.export(export_name, ExportKind::Func, import_base + i as u32);
             }
@@ -208,17 +212,19 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
     funcs.function(realloc_type);
     exports.export("cabi_realloc", ExportKind::Func, realloc_fn_index);
 
-    // Canonical-ABI `run` wrapper (only in component mode).
-    if let Some((user_idx, _abi)) = entry_target {
+    // Canonical-ABI entry wrappers (component mode): one per entry, each under
+    // its own WIT export name. All share one wrapper type `(i32,i32) -> i32`.
+    if !entry_targets.is_empty() {
         let wrapper_type = types.len();
         types
             .ty()
             .function([ValType::I32, ValType::I32], [ValType::I32]);
-        funcs.function(wrapper_type);
-        let wrapper_index = realloc_fn_index + 1;
-        exports.export("run", ExportKind::Func, wrapper_index);
-        // user_idx / realloc_fn_index captured for the code section below.
-        debug_assert!(user_idx < realloc_fn_index);
+        for (i, (user_idx, _abi, export_name)) in entry_targets.iter().enumerate() {
+            funcs.function(wrapper_type);
+            let wrapper_index = realloc_fn_index + 1 + i as u32;
+            exports.export(export_name, ExportKind::Func, wrapper_index);
+            debug_assert!(*user_idx < realloc_fn_index);
+        }
     }
 
     // ---- Memory + heap global ----------------------------------------------
@@ -279,8 +285,8 @@ pub fn compile_core(program: &Program, entry: Option<Entry>) -> Result<Vec<u8>, 
         code.function(&func);
     }
     code.function(&cabi_realloc_fn(HEAP_GLOBAL));
-    if let Some((user_idx, abi)) = entry_target {
-        code.function(&entry_wrapper_fn(user_idx, realloc_fn_index, abi));
+    for (user_idx, abi, _export_name) in &entry_targets {
+        code.function(&entry_wrapper_fn(*user_idx, realloc_fn_index, *abi));
     }
 
     // ---- Data segment -------------------------------------------------------
