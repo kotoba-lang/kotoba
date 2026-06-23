@@ -83,17 +83,21 @@ fn comparisons_and_logic() {
         compile_and_run("(defn a [x y] (and x y))", "a", &[1, 0]).unwrap(),
         0
     );
+    // (and 3 4) → 4  — Clojure `and` returns the last value when all are truthy
+    // (was incorrectly 1 when `and` normalised to a boolean; fixed by FIX 1)
     assert_eq!(
         compile_and_run("(defn a [x y] (and x y))", "a", &[3, 4]).unwrap(),
-        1
+        4
     );
     assert_eq!(
         compile_and_run("(defn o [x y] (or x y))", "o", &[0, 0]).unwrap(),
         0
     );
+    // (or 0 7) → 7  — Clojure `or` returns the first truthy value
+    // (was incorrectly 1 when `or` normalised to a boolean; fixed by FIX 1)
     assert_eq!(
         compile_and_run("(defn o [x y] (or x y))", "o", &[0, 7]).unwrap(),
-        1
+        7
     );
     assert_eq!(
         compile_and_run("(defn p [x] (even? x))", "p", &[-4]).unwrap(),
@@ -479,4 +483,141 @@ fn errors_are_reported() {
         compile_str("(frobnicate)"),
         Err(CljError::Lower(_))
     ));
+}
+
+// ── FIX 1: `or` / `and` return the VALUE, not a boolean ─────────────────────
+//
+// These tests assert Clojure's VALUE-return semantics for `or` and `and`.
+// They were the failing cases before the fix — the compiler was returning
+// a normalised 0/1 boolean instead of the actual operand value.
+//
+// NOTE: In kotoba-clj's i64-everything value model, integer `0` is the same
+// bit-pattern as `false`/`nil` (both are i64 0).  Therefore `(or 0 9)`
+// correctly returns `9` in this model — `0` is the falsy sentinel.
+// True integer-0-is-truthy would require a separate nil/false tag bit, which
+// is outside the current value-model scope.  We document this honestly.
+
+#[test]
+fn or_returns_first_truthy_value_not_boolean() {
+    // (or "x" "y") → "x"  — first truthy string value, not 1
+    // We test with integers since the wasm export returns i64.
+    // (or 5 9) → 5  (first operand is truthy → returned as-is)
+    assert_eq!(
+        compile_and_run("(defn f [x y] (or x y))", "f", &[5, 9]).unwrap(),
+        5,
+        "(or 5 9) should return 5 (first truthy), not 1"
+    );
+    // (or nil 5) → 5  — nil (0) is falsy, fall through to 5
+    assert_eq!(
+        compile_and_run("(defn f [x y] (or x y))", "f", &[0, 5]).unwrap(),
+        5,
+        "(or nil 5) should return 5"
+    );
+    // (or false 7) → 7  — false (0) is falsy, fall through to 7
+    assert_eq!(
+        compile_and_run("(defn f [x y] (or x y))", "f", &[0, 7]).unwrap(),
+        7,
+        "(or false 7) should return 7"
+    );
+    // (or nil nil) → nil (0)  — all falsy, return the last
+    assert_eq!(
+        compile_and_run("(defn f [x y] (or x y))", "f", &[0, 0]).unwrap(),
+        0,
+        "(or nil nil) should return 0 (nil)"
+    );
+    // n-ary: (or 0 0 42 99) → 42  (first truthy)
+    assert_eq!(
+        compile_and_run("(defn f [a b c d] (or a b c d))", "f", &[0, 0, 42, 99]).unwrap(),
+        42,
+        "(or 0 0 42 99) should return 42"
+    );
+}
+
+#[test]
+fn and_returns_first_falsy_or_last_value() {
+    // (and 1 2 3) → 3  — all truthy, return the last
+    assert_eq!(
+        compile_and_run("(defn f [a b c] (and a b c))", "f", &[1, 2, 3]).unwrap(),
+        3,
+        "(and 1 2 3) should return 3 (last truthy), not 1"
+    );
+    // (and 1 nil 3) → 0  — nil (0) is falsy → return it
+    assert_eq!(
+        compile_and_run("(defn f [a b c] (and a b c))", "f", &[1, 0, 3]).unwrap(),
+        0,
+        "(and 1 nil 3) should return nil (0)"
+    );
+    // (and 7 8) → 8  — all truthy, return last
+    assert_eq!(
+        compile_and_run("(defn f [x y] (and x y))", "f", &[7, 8]).unwrap(),
+        8,
+        "(and 7 8) should return 8"
+    );
+    // (and nil 99) → nil  — first arg is falsy → return it without evaluating rest
+    assert_eq!(
+        compile_and_run("(defn f [x y] (and x y))", "f", &[0, 99]).unwrap(),
+        0,
+        "(and nil 99) should return 0 (nil)"
+    );
+}
+
+#[test]
+fn or_get_with_default_pattern() {
+    // This is the key himawari pattern: (or (get state "key") default-value)
+    // Before the fix the compiler returned 1 (truthy bool) instead of the map value.
+    // After the fix it returns the actual value stored in the map.
+    //
+    // We test with an integer map value since the i64 return is the map's VALUE.
+    // In the cell code: (or (get state "need") {})
+    // — if "need" is present and non-nil, `or` must return THAT value, not 1.
+    let src = r#"
+        (defn probe [present? v]
+          ;; Simulate: if present? != 0 return v, else return 0 (like map-get miss)
+          ;; then (or that-result default-42) must return v when v != 0.
+          (let [looked-up (if (= present? 1) v 0)]
+            (or looked-up 42)))
+    "#;
+    // present, value=99 → (or 99 42) → 99
+    assert_eq!(
+        compile_and_run(src, "probe", &[1, 99]).unwrap(),
+        99,
+        "(or 99 42) should return 99 (the present value, not the default)"
+    );
+    // absent → (or 0 42) → 42 (default)
+    assert_eq!(
+        compile_and_run(src, "probe", &[0, 0]).unwrap(),
+        42,
+        "(or nil 42) should return 42 (the default)"
+    );
+}
+
+// ── FIX 2: `def` with string-literal initialiser ─────────────────────────────
+
+#[test]
+fn def_string_literal_allowed() {
+    // (def ^:private S "abc") is now valid — the string handle is stored in the
+    // const map and references to S in function bodies emit the handle.
+    let src = r#"
+        (def ^:private GREETING "hello")
+        (defn greet-len [] (str-len GREETING))
+    "#;
+    assert_eq!(
+        compile_and_run(src, "greet-len", &[]).unwrap(),
+        5,
+        "(str-len GREETING) where GREETING=\"hello\" should be 5"
+    );
+}
+
+#[test]
+fn def_string_literal_used_in_comparison() {
+    // A `def`-bound string constant can be passed to str-len and compared.
+    let src = r#"
+        (def ^:private TAG "abc")
+        (defn tag-len [] (str-len TAG))
+    "#;
+    assert_eq!(
+        compile_and_run(src, "tag-len", &[]).unwrap(),
+        3,
+        "(str-len TAG) where TAG=\"abc\" should be 3"
+    );
 }
