@@ -70,8 +70,19 @@ fn compile_source(file: &Path, wit_dir: &str) -> Result<(Vec<u8>, Lang)> {
         std::fs::read_to_string(file).with_context(|| format!("read component source {}", path))?;
 
     let wasm = match lang {
-        Lang::Clojure => kotoba_clj::component::compile_kais_component_str(&src, wit_dir)
-            .map_err(|e| anyhow!("kotoba-clj compile {}: {e:?}", path))?,
+        // Mesh build path (M7): exports `run`, plus `on-http` when the guest
+        // defines `(defn on-http [req] …)` — targeting the `kotoba-component`
+        // world. Run-only guests fall back to the `kotoba-node` world, so
+        // existing components are unaffected. The kotoba-clj prelude (dynamic
+        // vector/map containers + CBOR encode/decode + kqe accessors) is
+        // prepended so guests can use those helpers — mirrors `kotoba-clj`'s
+        // own build CLI; direct host-import builtins (kqe-assert!/kqe-query)
+        // work with or without it.
+        Lang::Clojure => {
+            let with_prelude = format!("{}\n{}", kotoba_clj::prelude(), src);
+            kotoba_clj::component::compile_kais_mesh_component_str(&with_prelude, wit_dir)
+                .map_err(|e| anyhow!("kotoba-clj compile {}: {e:?}", path))?
+        }
         other => bail!(
             "language {:?} not wired into `kotoba component build` yet — \
              Clojure (.clj) is the default; build {:?} components with their \
