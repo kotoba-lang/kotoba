@@ -45,13 +45,21 @@ pub enum ComponentCmd {
 
 #[derive(Subcommand)]
 pub enum AppCmd {
-    /// Parse an EDN manifest, compile its components, print the resolved plan.
+    /// Parse an EDN manifest, compile its components, print the resolved plan,
+    /// and (with `--publish`) announce its triggers/routes to a running node.
     Deploy {
         /// Path to `kotoba.app.edn`.
         manifest: PathBuf,
         /// Path to the kotoba-node WIT dir.
         #[arg(long, env = "KOTOBA_WIT_DIR", default_value_t = default_wit_dir())]
         wit_dir: String,
+        /// Publish the app's PutTriggers/PutRoutes to a running node's lattice
+        /// (via the `mesh.deploy` endpoint). Without this, deploy is a dry-run.
+        #[arg(long)]
+        publish: bool,
+        /// Server base URL for `--publish`.
+        #[arg(long, env = "KOTOBA_URL", default_value = "http://localhost:8080")]
+        url: String,
     },
 }
 
@@ -116,9 +124,14 @@ pub fn run_component(cmd: ComponentCmd) -> Result<()> {
     }
 }
 
-pub fn run_app(cmd: AppCmd) -> Result<()> {
+pub async fn run_app(cmd: AppCmd) -> Result<()> {
     match cmd {
-        AppCmd::Deploy { manifest, wit_dir } => {
+        AppCmd::Deploy {
+            manifest,
+            wit_dir,
+            publish,
+            url,
+        } => {
             let src = std::fs::read_to_string(&manifest)
                 .with_context(|| format!("read manifest {}", manifest.display()))?;
             let app = AppManifest::from_edn(&src)
@@ -178,6 +191,48 @@ pub fn run_app(cmd: AppCmd) -> Result<()> {
                  advertises a Heartbeat, bids on auctions, and places (executes) the\n\
                  components it wins via the WASM host."
             );
+
+            // Lattice control messages (M16): PutTriggers (datom-Δ) + PutRoutes
+            // (KSE topic / cron / HTTP route), resolved to compiled CIDs.
+            let msgs = kotoba_lattice::deploy_messages(&app, &resolved_by_name);
+            println!("\nlattice control messages ({}):", msgs.len());
+            for (topic, m) in &msgs {
+                let kind = match m {
+                    kotoba_lattice::LatticeMessage::PutTriggers { triggers, .. } => {
+                        format!("PutTriggers ({} datom-Δ)", triggers.len())
+                    }
+                    kotoba_lattice::LatticeMessage::PutRoutes { routes, .. } => format!(
+                        "PutRoutes (kse={} cron={} http={})",
+                        routes.kse.len(),
+                        routes.cron.len(),
+                        routes.http.len()
+                    ),
+                    _ => "?".into(),
+                };
+                println!("  → {topic}  {kind}");
+            }
+
+            if publish {
+                let endpoint = format!("{}/xrpc/com.etzhayyim.apps.kotoba.mesh.deploy", url.trim_end_matches('/'));
+                let resp = reqwest::Client::new()
+                    .post(&endpoint)
+                    .header("content-type", "application/edn")
+                    .body(src.clone())
+                    .send()
+                    .await
+                    .with_context(|| format!("POST {endpoint}"))?;
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("\npublished → {endpoint}\n  {text}");
+                } else {
+                    bail!("publish failed ({status}): {text}");
+                }
+            } else {
+                println!(
+                    "\n(dry-run — re-run with `--publish` to announce these to a running node's lattice)"
+                );
+            }
             Ok(())
         }
     }
