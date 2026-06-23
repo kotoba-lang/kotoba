@@ -182,10 +182,7 @@ impl AppManifest {
     pub fn desired_by_cid(&self) -> BTreeMap<String, u32> {
         let mut out = BTreeMap::new();
         for c in &self.components {
-            let key = c
-                .cid
-                .clone()
-                .unwrap_or_else(|| format!("clj:{}", c.name));
+            let key = c.cid.clone().unwrap_or_else(|| format!("clj:{}", c.name));
             out.insert(key, c.scale);
         }
         out
@@ -236,13 +233,15 @@ fn str_seq(v: &EdnValue) -> Vec<String> {
 
 fn component_from_edn(v: &EdnValue) -> Result<ComponentSpec, LatticeError> {
     let m = map_of(v).ok_or_else(|| LatticeError::Schema("component must be a map".into()))?;
-    let name = get_str(m, "name")
-        .ok_or_else(|| LatticeError::Schema("component missing :name".into()))?;
+    let name =
+        get_str(m, "name").ok_or_else(|| LatticeError::Schema("component missing :name".into()))?;
 
     // :lang omitted ⇒ infer from :src extension ⇒ Clojure default (§14.1).
     let lang = match get_str(m, "lang") {
         Some(tok) => Lang::from_token(&tok)?,
-        None => get_str(m, "src").map(|s| Lang::from_ext(&s)).unwrap_or_default(),
+        None => get_str(m, "src")
+            .map(|s| Lang::from_ext(&s))
+            .unwrap_or_default(),
     };
 
     let scale = get(m, "scale")
@@ -284,8 +283,8 @@ fn component_from_edn(v: &EdnValue) -> Result<ComponentSpec, LatticeError> {
 
 fn trigger_from_edn(v: &EdnValue) -> Result<TriggerSpec, LatticeError> {
     let m = map_of(v).ok_or_else(|| LatticeError::Schema("trigger must be a map".into()))?;
-    let kind = get_str(m, "type")
-        .ok_or_else(|| LatticeError::Schema("trigger missing :type".into()))?;
+    let kind =
+        get_str(m, "type").ok_or_else(|| LatticeError::Schema("trigger missing :type".into()))?;
     Ok(TriggerSpec {
         kind,
         route: get_str(m, "route"),
@@ -298,8 +297,8 @@ fn trigger_from_edn(v: &EdnValue) -> Result<TriggerSpec, LatticeError> {
 
 fn link_from_edn(v: &EdnValue) -> Result<LinkSpec, LatticeError> {
     let m = map_of(v).ok_or_else(|| LatticeError::Schema("link must be a map".into()))?;
-    let target = get_str(m, "target")
-        .ok_or_else(|| LatticeError::Schema("link missing :target".into()))?;
+    let target =
+        get_str(m, "target").ok_or_else(|| LatticeError::Schema("link missing :target".into()))?;
     Ok(LinkSpec {
         target,
         config: get_str(m, "config"),
@@ -312,8 +311,8 @@ fn placement_from_edn(v: &EdnValue) -> Result<Placement, LatticeError> {
     let m = map_of(v).ok_or_else(|| LatticeError::Schema("placement must be a map".into()))?;
     let require = match get(m, "require") {
         Some(r) => {
-            let rm = map_of(r)
-                .ok_or_else(|| LatticeError::Schema(":require must be a map".into()))?;
+            let rm =
+                map_of(r).ok_or_else(|| LatticeError::Schema(":require must be a map".into()))?;
             rm.iter()
                 .filter_map(|(k, val)| Some((as_str(k)?, as_str(val)?)))
                 .collect()
@@ -351,7 +350,10 @@ mod tests {
         assert_eq!(app.version.as_deref(), Some("0.3.0"));
         assert_eq!(app.components.len(), 2);
         assert_eq!(app.placement.spread.as_deref(), Some("zone"));
-        assert_eq!(app.placement.require.get("tier").map(|s| s.as_str()), Some("edge"));
+        assert_eq!(
+            app.placement.require.get("tier").map(|s| s.as_str()),
+            Some("edge")
+        );
     }
 
     #[test]
@@ -418,7 +420,10 @@ mod tests {
         assert_eq!(Lang::from_token("rs").unwrap(), Lang::Rust);
         assert_eq!(Lang::from_token("python").unwrap(), Lang::Python);
         assert_eq!(Lang::from_token("typescript").unwrap(), Lang::Js);
-        assert!(matches!(Lang::from_token("cobol"), Err(LatticeError::UnknownLang(_))));
+        assert!(matches!(
+            Lang::from_token("cobol"),
+            Err(LatticeError::UnknownLang(_))
+        ));
     }
 
     #[test]
@@ -451,9 +456,15 @@ mod tests {
     #[test]
     fn from_edn_errors_are_descriptive() {
         // top-level not a map
-        assert!(matches!(AppManifest::from_edn("[1 2 3]"), Err(LatticeError::Schema(_))));
+        assert!(matches!(
+            AppManifest::from_edn("[1 2 3]"),
+            Err(LatticeError::Schema(_))
+        ));
         // missing :kotoba.app/name
-        assert!(matches!(AppManifest::from_edn("{:x 1}"), Err(LatticeError::Schema(_))));
+        assert!(matches!(
+            AppManifest::from_edn("{:x 1}"),
+            Err(LatticeError::Schema(_))
+        ));
         // components not a seq
         assert!(matches!(
             AppManifest::from_edn(r#"{:kotoba.app/name "a" :kotoba.app/components 5}"#),

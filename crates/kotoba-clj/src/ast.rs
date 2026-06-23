@@ -1051,7 +1051,12 @@ fn lower_while(args: &[EdnValue]) -> Result<Expr, CljError> {
     let mut do_items = vec![dsym("do")];
     do_items.extend(args[1..].iter().cloned());
     do_items.push(dlist(vec![dsym("recur"), EdnValue::Integer(0)]));
-    let if_form = dlist(vec![dsym("if"), test, dlist(do_items), EdnValue::Integer(0)]);
+    let if_form = dlist(vec![
+        dsym("if"),
+        test,
+        dlist(do_items),
+        EdnValue::Integer(0),
+    ]);
     let loop_form = dlist(vec![
         dsym("loop"),
         dvec(vec![dsym("_while"), EdnValue::Integer(0)]),
@@ -1118,10 +1123,7 @@ fn lower_doseq(args: &[EdnValue]) -> Result<Expr, CljError> {
     let i = dsym("_doseq_i");
     let mut inner_let = vec![
         dsym("let"),
-        dvec(vec![
-            x,
-            dlist(vec![dsym("vec-nth"), v.clone(), i.clone()]),
-        ]),
+        dvec(vec![x, dlist(vec![dsym("vec-nth"), v.clone(), i.clone()])]),
     ];
     inner_let.extend(args[1..].iter().cloned());
     let do_form = dlist(vec![
@@ -1145,12 +1147,7 @@ fn lower_doseq(args: &[EdnValue]) -> Result<Expr, CljError> {
     ]);
     let let_form = dlist(vec![
         dsym("let"),
-        dvec(vec![
-            v.clone(),
-            coll,
-            n,
-            dlist(vec![dsym("vec-count"), v]),
-        ]),
+        dvec(vec![v.clone(), coll, n, dlist(vec![dsym("vec-count"), v])]),
         loop_form,
     ]);
     lower_expr(&let_form)
@@ -2315,7 +2312,9 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         Builtin::Sub => n >= 1, // unary negate or n-ary subtract
         Builtin::Min | Builtin::Max => n >= 1,
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,
-        Builtin::Div | Builtin::Mod | Builtin::Rem | Builtin::ByteAt | Builtin::ByteAppend => n == 2,
+        Builtin::Div | Builtin::Mod | Builtin::Rem | Builtin::ByteAt | Builtin::ByteAppend => {
+            n == 2
+        }
         Builtin::Eq | Builtin::NotEq => n >= 1,
         Builtin::Lt | Builtin::Gt | Builtin::Le | Builtin::Ge => n >= 1,
         Builtin::KqeAssert | Builtin::KqeRetract => n == 4,

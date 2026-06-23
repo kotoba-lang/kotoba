@@ -134,7 +134,9 @@ pub struct Link {
 #[serde(tag = "t", rename_all = "kebab-case")]
 pub enum LatticeMessage {
     Heartbeat(Heartbeat),
-    InventoryReq { node_did: String },
+    InventoryReq {
+        node_did: String,
+    },
     InventoryAck(Heartbeat),
     Auction(Auction),
     Bid(Bid),
@@ -208,7 +210,8 @@ impl LatticeMessage {
     /// Serialize to CBOR for gossipsub publication.
     pub fn to_cbor(&self) -> Result<Vec<u8>, LatticeError> {
         let mut buf = Vec::new();
-        ciborium::into_writer(self, &mut buf).map_err(|e| LatticeError::CborEncode(e.to_string()))?;
+        ciborium::into_writer(self, &mut buf)
+            .map_err(|e| LatticeError::CborEncode(e.to_string()))?;
         Ok(buf)
     }
 
@@ -280,7 +283,9 @@ mod tests {
 
     #[test]
     fn cbor_roundtrip_all_remaining_variants() {
-        roundtrip(LatticeMessage::InventoryReq { node_did: "n".into() });
+        roundtrip(LatticeMessage::InventoryReq {
+            node_did: "n".into(),
+        });
         roundtrip(LatticeMessage::InventoryAck(Heartbeat {
             node_did: "n".into(),
             roles: vec![NodeRole::Relay],
@@ -300,8 +305,13 @@ mod tests {
             count: 2,
             links: vec!["l1".into()],
         });
-        roundtrip(LatticeMessage::StopComponent { instance: "i".into() });
-        roundtrip(LatticeMessage::ScaleTo { cid: "c".into(), n: 3 });
+        roundtrip(LatticeMessage::StopComponent {
+            instance: "i".into(),
+        });
+        roundtrip(LatticeMessage::ScaleTo {
+            cid: "c".into(),
+            n: 3,
+        });
         roundtrip(LatticeMessage::PutLink(Link {
             id: "l".into(),
             source: "s".into(),
@@ -360,8 +370,14 @@ mod tests {
         let v = Value::Map(vec![
             (Value::Text("t".into()), Value::Text("heartbeat".into())),
             (Value::Text("node_did".into()), Value::Text("n".into())),
-            (Value::Text("roles".into()), Value::Array(vec![Value::Text("compute".into())])),
-            (Value::Text("free_gas".into()), Value::Integer(Integer::from(5u64))),
+            (
+                Value::Text("roles".into()),
+                Value::Array(vec![Value::Text("compute".into())]),
+            ),
+            (
+                Value::Text("free_gas".into()),
+                Value::Integer(Integer::from(5u64)),
+            ),
             // a field a future kotoba version added — the old decoder must ignore it
             (Value::Text("future_field".into()), Value::Bool(true)),
         ]);
@@ -385,7 +401,10 @@ mod tests {
             (Value::Text("t".into()), Value::Text("heartbeat".into())),
             (Value::Text("node_did".into()), Value::Text("n".into())),
             (Value::Text("roles".into()), Value::Array(vec![])),
-            (Value::Text("free_gas".into()), Value::Integer(Integer::from(0u64))),
+            (
+                Value::Text("free_gas".into()),
+                Value::Integer(Integer::from(0u64)),
+            ),
             // labels / caps / hosted / lat_ms omitted → must use serde defaults
         ]);
         let mut buf = Vec::new();

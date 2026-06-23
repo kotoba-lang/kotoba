@@ -55,9 +55,7 @@ fn take_while_drop_while() {
 fn butlast_take_last() {
     assert_eq!(eval("(vec-count (butlast (vector 1 2 3 4)))"), 3);
     assert_eq!(
-        eval(&format!(
-            "(reduce {SUMV} 0 (take-last 2 (vector 1 2 3 4)))"
-        )),
+        eval(&format!("(reduce {SUMV} 0 (take-last 2 (vector 1 2 3 4)))")),
         7
     );
 }
@@ -67,7 +65,9 @@ fn reverse_concat_repeat() {
     assert_eq!(eval("(vec-nth (reverse (vector 1 2 3)) 0)"), 3);
     assert_eq!(eval("(vec-count (concat (vector 1 2) (vector 3 4 5)))"), 5);
     assert_eq!(
-        eval(&format!("(reduce {SUMV} 0 (concat (vector 1 2) (vector 3 4)))")),
+        eval(&format!(
+            "(reduce {SUMV} 0 (concat (vector 1 2) (vector 3 4)))"
+        )),
         10
     );
     assert_eq!(eval(&format!("(reduce {SUMV} 0 (repeat 4 3))")), 12);
@@ -84,7 +84,10 @@ fn interpose_interleave_partition() {
         15
     );
     // interleave [1 2] [3 4 5] -> [1 3 2 4], count 4
-    assert_eq!(eval("(vec-count (interleave (vector 1 2) (vector 3 4 5)))"), 4);
+    assert_eq!(
+        eval("(vec-count (interleave (vector 1 2) (vector 3 4 5)))"),
+        4
+    );
     // partition 2 [1 2 3 4 5] -> [[1 2] [3 4]], 2 groups, first group sums 3
     assert_eq!(eval("(vec-count (partition 2 (vector 1 2 3 4 5)))"), 2);
     assert_eq!(
@@ -169,9 +172,7 @@ fn select_keys_zipmap_update() {
 #[test]
 fn get_in_nested() {
     assert_eq!(
-        eval(
-            "(get-in (hash-map \"a\" (hash-map \"b\" 42)) (vector \"a\" \"b\"))"
-        ),
+        eval("(get-in (hash-map \"a\" (hash-map \"b\" 42)) (vector \"a\" \"b\"))"),
         42
     );
 }

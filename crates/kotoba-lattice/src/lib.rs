@@ -35,7 +35,9 @@ pub use control::{app_to_quads, desired_from_quads, ControlQuad};
 pub use error::LatticeError;
 pub use manifest::{AppManifest, ComponentSpec, Lang, LinkSpec, Placement, TriggerSpec};
 pub use node::{LatticeController, RecordingTransport, Transport};
-pub use policy::{route_capability, LinkDecision, LinkTable, LinkVerifier, ProviderRoute, TrustOnIngest};
+pub use policy::{
+    route_capability, LinkDecision, LinkTable, LinkVerifier, ProviderRoute, TrustOnIngest,
+};
 pub use protocol::{
     topic, Auction, Award, Bid, Constraints, Heartbeat, LatticeMessage, Link, NodeRole,
 };

@@ -21,8 +21,8 @@ pub mod cc_xrpc;
 pub mod dht_transport;
 pub mod did_bridge;
 pub mod dna_integrity;
-pub mod engi;
 pub mod email_xrpc;
+pub mod engi;
 pub mod evm_rpc;
 pub mod fingerprint;
 pub mod firehose;
@@ -90,7 +90,6 @@ fn cors_from_env() -> Option<CorsLayer> {
             .allow_headers(Any),
     )
 }
-
 
 #[cfg(test)]
 mod tests {

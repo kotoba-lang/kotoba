@@ -147,9 +147,11 @@ impl LatticeController {
                 self.on_heartbeat(hb, now_ms)
             }
             LatticeMessage::Bid(b) => self.on_bid(b),
-            LatticeMessage::PutApp { desired, constraints, .. } => {
-                self.set_desired(desired, constraints)
-            }
+            LatticeMessage::PutApp {
+                desired,
+                constraints,
+                ..
+            } => self.set_desired(desired, constraints),
             // Mesh policy updates (M5). Links arrive pre-verified over the
             // lattice (the originating node ran the CACAO check at ingest).
             LatticeMessage::PutLink(link) => self.links.put(link),
@@ -223,13 +225,19 @@ impl LatticeController {
                         opened_ms: now_ms,
                     },
                 );
-                out.push((crate::protocol::topic::AUCTION.to_string(), LatticeMessage::Auction(auction)));
+                out.push((
+                    crate::protocol::topic::AUCTION.to_string(),
+                    LatticeMessage::Auction(auction),
+                ));
             } else {
                 // over-provisioned or undesired → request scale to the target
                 let n = self.desired.get(&a.cid).copied().unwrap_or(0);
                 out.push((
                     crate::protocol::topic::CMD.to_string(),
-                    LatticeMessage::ScaleTo { cid: a.cid.clone(), n },
+                    LatticeMessage::ScaleTo {
+                        cid: a.cid.clone(),
+                        n,
+                    },
                 ));
             }
         }
@@ -354,7 +362,16 @@ mod tests {
         };
         // each eligible node bids
         for did in ["nA", "nB", "nC"] {
-            let my = hb(did, if did == "nC" { &["cap/other"] } else { &["cap/kqe"] }, if did=="nB"{200}else{100}, &[]);
+            let my = hb(
+                did,
+                if did == "nC" {
+                    &["cap/other"]
+                } else {
+                    &["cap/kqe"]
+                },
+                if did == "nB" { 200 } else { 100 },
+                &[],
+            );
             if let Some(b) = LatticeController::bid_for(&auction, &my) {
                 c.on_bid(b);
             }
@@ -364,7 +381,9 @@ mod tests {
         let starts: Vec<_> = closed
             .iter()
             .filter_map(|(_, m)| match m {
-                LatticeMessage::StartComponent { node_did, cid, .. } => Some((node_did.clone(), cid.clone())),
+                LatticeMessage::StartComponent { node_did, cid, .. } => {
+                    Some((node_did.clone(), cid.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -402,7 +421,9 @@ mod tests {
         assert_eq!(c.observed(2000).get("bafyReply"), Some(&1));
         let healing = c.tick(2000);
         assert!(
-            healing.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))),
+            healing
+                .iter()
+                .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))),
             "lost instance must trigger a new auction (self-heal)"
         );
     }
@@ -414,7 +435,10 @@ mod tests {
         let mut tx = RecordingTransport::default();
         let n = c.step(0, &mut tx).unwrap();
         assert_eq!(n, tx.sent.len());
-        assert!(tx.sent.iter().any(|(t, _)| t == crate::protocol::topic::AUCTION));
+        assert!(tx
+            .sent
+            .iter()
+            .any(|(t, _)| t == crate::protocol::topic::AUCTION));
     }
 
     #[test]
@@ -430,25 +454,35 @@ mod tests {
             desired: BTreeMap::from([("bafyX".to_string(), 1u32)]),
             constraints: BTreeMap::from([(
                 "bafyX".to_string(),
-                Constraints { require_labels: BTreeMap::new(), requires_caps: vec!["cap/kqe".into()] },
+                Constraints {
+                    require_labels: BTreeMap::new(),
+                    requires_caps: vec!["cap/kqe".into()],
+                },
             )]),
         };
         c.on_message(put, 10);
         let msgs = c.tick(20);
-        assert!(msgs.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
+        assert!(msgs
+            .iter()
+            .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
     }
 
     #[test]
     fn on_message_dispatches_heartbeat_inventory_bid_and_ignores_others() {
         let mut c = controller();
-        c.on_message(LatticeMessage::Heartbeat(hb("nA", &["cap/kqe"], 100, &[])), 0);
+        c.on_message(
+            LatticeMessage::Heartbeat(hb("nA", &["cap/kqe"], 100, &[])),
+            0,
+        );
         let a = match &c.tick(0)[0].1 {
             LatticeMessage::Auction(a) => a.clone(),
             _ => panic!(),
         };
         // Bid arm via on_message
         c.on_message(
-            LatticeMessage::Bid(LatticeController::bid_for(&a, &hb("nA", &["cap/kqe"], 100, &[])).unwrap()),
+            LatticeMessage::Bid(
+                LatticeController::bid_for(&a, &hb("nA", &["cap/kqe"], 100, &[])).unwrap(),
+            ),
             0,
         );
         // InventoryAck arm via on_message (counts toward observed)
@@ -459,7 +493,12 @@ mod tests {
         assert_eq!(c.observed(0).get("bafyReply"), Some(&1));
         // ignored variant must be a harmless no-op
         c.on_message(
-            LatticeMessage::CapResult { id: "x".into(), ok: true, payload: vec![], error: None },
+            LatticeMessage::CapResult {
+                id: "x".into(),
+                ok: true,
+                payload: vec![],
+                error: None,
+            },
             0,
         );
     }
@@ -472,8 +511,16 @@ mod tests {
             LatticeMessage::Auction(a) => a.clone(),
             _ => panic!(),
         };
-        c.on_bid(Bid { auction_id: a.id.clone(), node_did: "nA".into(), score: 10 });
-        c.on_bid(Bid { auction_id: a.id.clone(), node_did: "nA".into(), score: 999 });
+        c.on_bid(Bid {
+            auction_id: a.id.clone(),
+            node_did: "nA".into(),
+            score: 10,
+        });
+        c.on_bid(Bid {
+            auction_id: a.id.clone(),
+            node_did: "nA".into(),
+            score: 999,
+        });
         // one bidder de-duped → exactly one StartComponent (not two)
         let starts = c
             .close_due(120)
