@@ -1069,13 +1069,12 @@ async fn mesh_http(
     }
 }
 
-/// KOTOBA Mesh deploy handler (M16): accepts an app manifest (EDN body), builds
-/// its lattice control messages (`PutTriggers` + `PutRoutes`) and publishes them
-/// onto the lattice via the node's gossip channel so every node installs the
-/// app's triggers/routes. The local node also updates its shared `mesh_routes`
-/// immediately so its HTTP layer can serve the app's routes without waiting for
-/// the gossip round-trip. Components must carry an explicit `:cid` (deploy-time
-/// `:src` compilation is a follow-up).
+/// KOTOBA Mesh deploy handler (M16 + R0): accepts the app's already-resolved
+/// lattice control messages as a CBOR `Vec<(topic, lattice_message_cbor)>` (the
+/// CLI builds these with compiled component CIDs, so `:src` components work). It
+/// (1) gossips each onto the lattice for peers and (2) feeds each into the local
+/// swarm actor's inject channel so THIS node installs its own triggers/routes +
+/// subscribes the app's KSE topics (gossipsub does not deliver to self).
 #[cfg(feature = "p2p")]
 async fn mesh_deploy(
     axum::extract::State(state): axum::extract::State<Arc<KotobaState>>,
@@ -1083,33 +1082,37 @@ async fn mesh_deploy(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    let edn = String::from_utf8_lossy(&body);
-    let app = match kotoba_lattice::AppManifest::from_edn(&edn) {
-        Ok(a) => a,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("manifest parse: {e}")).into_response(),
-    };
-    let msgs = kotoba_lattice::deploy_messages(&app, &std::collections::BTreeMap::new());
-    // apply routes locally so this node's HTTP layer serves them right away
-    for (_t, m) in &msgs {
-        if let kotoba_lattice::LatticeMessage::PutRoutes { routes, .. } = m {
-            *state.mesh_routes.write().await = routes.clone();
+    let msgs: Vec<(String, Vec<u8>)> = match ciborium::from_reader(&body[..]) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("expected CBOR Vec<(topic, lattice_msg_cbor)>: {e}"),
+            )
+                .into_response()
         }
-    }
-    let mut published = 0usize;
-    if let Some(tx) = &state.gossip_tx {
-        for (topic, m) in &msgs {
-            if let Ok(cbor) = m.to_cbor() {
-                if tx.try_send((topic.to_string(), cbor)).is_ok() {
-                    published += 1;
-                }
+    };
+    let mut gossiped = 0usize;
+    let mut injected = 0usize;
+    for (topic, cbor) in &msgs {
+        // peers
+        if let Some(tx) = &state.gossip_tx {
+            if tx.try_send((topic.clone(), cbor.clone())).is_ok() {
+                gossiped += 1;
+            }
+        }
+        // self
+        if let Some(tx) = &state.lattice_inject_tx {
+            if tx.try_send(cbor.clone()).is_ok() {
+                injected += 1;
             }
         }
     }
     (
         StatusCode::OK,
         format!(
-            "deployed app `{}`: {} lattice control message(s) published",
-            app.name, published
+            "deployed: {} message(s) gossiped, {} installed locally",
+            gossiped, injected
         ),
     )
         .into_response()
@@ -1983,6 +1986,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                 let (publish_tx, publish_rx) =
                     tokio::sync::mpsc::channel::<(String, Vec<u8>)>(1024);
+                let (inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
 
                 let journal_arc = Arc::clone(&state.journal);
                 let block_store_arc = Arc::clone(&state.block_store);
@@ -2003,10 +2007,11 @@ pub async fn run() -> anyhow::Result<()> {
                     relay,
                     Arc::clone(&state.executor),
                     Arc::clone(&state.mesh_routes),
+                    inject_rx,
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");
-                state.attach_gossip(publish_tx)
+                state.attach_gossip(publish_tx).attach_lattice_inject(inject_tx)
             }
             Err(e) => {
                 tracing::warn!(err = %e, "swarm init failed — running without p2p");
