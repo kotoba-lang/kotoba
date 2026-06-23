@@ -104,6 +104,14 @@ impl KotobaCid {
             && self.0[3] == Self::DIGEST_LEN_SHA2_256
     }
 
+    /// Content-address re-verification — the light-client trust check (GROWTH
+    /// p10): `bytes` is the block this CID names iff recomputing the CID from
+    /// `bytes` yields `self`. A gateway / peer cannot serve wrong or tampered
+    /// bytes under a CID without this returning `false`.
+    pub fn verifies(&self, bytes: &[u8]) -> bool {
+        Self::from_bytes(bytes) == *self
+    }
+
     pub fn to_standard_cid(&self) -> Result<::cid::Cid, CidError> {
         if !self.is_ipfs_compatible() {
             return Err(CidError::InvalidBytes);
@@ -129,6 +137,19 @@ impl KotobaCid {
     }
 }
 
+/// Light-client batch trust gate (GROWTH p10): given `(claimed_cid, bytes)`
+/// responses from an untrusted gateway/peer, return the claimed CIDs whose bytes
+/// fail content-address verification (tampered / wrong block). Empty ⇒ every
+/// block is authentic, so a light client can trust the whole fetch without a
+/// full node.
+pub fn unverified_blocks(responses: &[(KotobaCid, Vec<u8>)]) -> Vec<KotobaCid> {
+    responses
+        .iter()
+        .filter(|(cid, bytes)| !cid.verifies(bytes))
+        .map(|(cid, _)| cid.clone())
+        .collect()
+}
+
 impl std::fmt::Display for KotobaCid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_multibase())
@@ -138,6 +159,59 @@ impl std::fmt::Display for KotobaCid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_accepts_authentic_rejects_tampered() {
+        let cid = KotobaCid::from_bytes(b"hello block");
+        assert!(cid.verifies(b"hello block"), "authentic bytes verify");
+        assert!(!cid.verifies(b"hello blocl"), "one-byte tamper fails");
+        assert!(!cid.verifies(b""), "empty bytes fail");
+    }
+
+    #[test]
+    fn verifies_is_tamper_evident_under_any_byte_mutation() {
+        // The light-client trust gate: an untrusted gateway cannot alter a block
+        // under its CID. Flip the low bit of EVERY byte and confirm verification
+        // fails for each; the untouched bytes (and a batch of them) verify.
+        let payload = b"a representative block body of some length".to_vec();
+        let cid = KotobaCid::from_bytes(&payload);
+        assert!(cid.verifies(&payload));
+        for i in 0..payload.len() {
+            let mut bad = payload.clone();
+            bad[i] ^= 0x01;
+            assert!(!cid.verifies(&bad), "byte {i} tamper slipped past verification");
+        }
+        // truncation and extension also fail (length is part of the content).
+        assert!(!cid.verifies(&payload[..payload.len() - 1]));
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(!cid.verifies(&longer));
+        // unverified_blocks over a mixed batch flags exactly the mutated ones.
+        let mut tampered = payload.clone();
+        tampered[0] ^= 0x01;
+        let bad = unverified_blocks(&[
+            (cid.clone(), payload.clone()),  // authentic
+            (cid.clone(), tampered),         // tampered
+        ]);
+        assert_eq!(bad, vec![cid], "exactly the tampered response is flagged");
+    }
+
+    #[test]
+    fn unverified_blocks_flags_only_the_tampered() {
+        let a = KotobaCid::from_bytes(b"alpha");
+        let b = KotobaCid::from_bytes(b"beta");
+        let c = KotobaCid::from_bytes(b"gamma");
+        let responses = vec![
+            (a.clone(), b"alpha".to_vec()),       // authentic
+            (b.clone(), b"WRONG".to_vec()),       // gateway lied
+            (c.clone(), b"gamma".to_vec()),       // authentic
+        ];
+        let bad = unverified_blocks(&responses);
+        assert_eq!(bad, vec![b], "only the tampered block is flagged");
+        // an all-authentic fetch is fully trusted (empty).
+        let good = vec![(a.clone(), b"alpha".to_vec()), (c, b"gamma".to_vec())];
+        assert!(unverified_blocks(&good).is_empty());
+    }
 
     #[test]
     fn from_bytes_header_is_cidv1_dag_cbor_sha2_256() {

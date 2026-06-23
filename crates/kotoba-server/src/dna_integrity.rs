@@ -33,6 +33,32 @@ pub struct IntegrityRuleset {
     pub closed_attrs: Option<HashSet<String>>,
 }
 
+impl IntegrityRuleset {
+    /// Content-address the *rules* — a stable DNA id so a ruleset can be
+    /// published, pinned, and matched across nodes: "same DNA id = same shared
+    /// physics = same network" (GROWTH p9, the Holochain DNA-hash property).
+    ///
+    /// Independent of `graph` (which graph the ruleset is bound to — two graphs
+    /// running identical rules share a DNA id) and of attribute insertion order
+    /// (the sets are sorted into a canonical form before hashing).
+    pub fn dna_id(&self) -> kotoba_core::cid::KotobaCid {
+        let mut deny: Vec<&str> = self.deny_attrs.iter().map(String::as_str).collect();
+        deny.sort_unstable();
+        let closed = self.closed_attrs.as_ref().map(|c| {
+            let mut v: Vec<&str> = c.iter().map(String::as_str).collect();
+            v.sort_unstable();
+            v.join(",")
+        });
+        let canon = format!(
+            "{SPEC}\nappend_only={}\ndeny={}\nclosed={}\n",
+            self.append_only,
+            deny.join(","),
+            closed.as_deref().unwrap_or("<open>"),
+        );
+        kotoba_core::cid::KotobaCid::from_bytes(canon.as_bytes())
+    }
+}
+
 /// Render a keyword back to its `:ns/name` (or `:name`) textual form for rule matching.
 fn kw_str(k: &Keyword) -> String {
     match &k.0.namespace {
@@ -178,6 +204,42 @@ mod tests {
         assert!(rs.append_only);
         assert!(rs.deny_attrs.contains(":published"));
         assert!(rs.closed_attrs.as_ref().unwrap().contains(":joucho/mood"));
+    }
+
+    #[test]
+    fn dna_id_is_stable_graph_independent_and_order_independent() {
+        // same rules, different attr order in the EDN → same DNA id.
+        let a = parse_ruleset(
+            r#"{:integrity/spec "kotoba-integrity/v0" :integrity/graph "g1"
+                :integrity/append-only true
+                :integrity/closed-attrs [:b/y :a/x]}"#,
+        )
+        .unwrap();
+        let b = parse_ruleset(
+            r#"{:integrity/spec "kotoba-integrity/v0" :integrity/graph "g2"
+                :integrity/append-only true
+                :integrity/closed-attrs [:a/x :b/y]}"#,
+        )
+        .unwrap();
+        assert_eq!(a.dna_id(), b.dna_id(), "same physics → same DNA id (graph-independent)");
+        assert_eq!(a.dna_id(), a.dna_id(), "deterministic");
+    }
+
+    #[test]
+    fn dna_id_changes_with_the_rules() {
+        let base = rules();
+        let mut stricter = base.clone();
+        stricter.deny_attrs.insert(":secret".into());
+        assert_ne!(base.dna_id(), stricter.dna_id(), "an added deny changes the DNA id");
+
+        let mut not_append = base.clone();
+        not_append.append_only = false;
+        assert_ne!(base.dna_id(), not_append.dna_id(), "append-only flag changes id");
+
+        // open (no closed-attrs) differs from any closed schema.
+        let mut open = base.clone();
+        open.closed_attrs = None;
+        assert_ne!(base.dna_id(), open.dna_id(), "open vs closed schema differ");
     }
 
     #[test]

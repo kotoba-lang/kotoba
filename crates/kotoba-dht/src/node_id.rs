@@ -1,8 +1,9 @@
 use blake3::Hasher;
+use serde::{Deserialize, Serialize};
 
 /// NodeId = blake3(did_public_key) — 256-bit DHT address
 /// XOR metric for neighborhood routing
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub [u8; 32]);
 
 impl NodeId {

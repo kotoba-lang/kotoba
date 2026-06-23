@@ -18,6 +18,7 @@ pub mod account_xrpc;
 pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
+pub mod dht_audit;
 pub mod dht_transport;
 pub mod did_bridge;
 pub mod dna_integrity;
@@ -1122,6 +1123,36 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     // Access-receipt writer (ADR-sealed-cold-tier R1): single background task
     // batching read receipts into audit-graph commits. Idempotent.
     access_receipt::spawn_receipt_writer(Arc::clone(&state));
+    // Periodic DHT availability audit (GROWTH p4 / ADR-2606011330) — strictly
+    // opt-in via KOTOBA_DHT_AUDIT_INTERVAL_SECS + KOTOBA_DHT_AUDIT_PEERS, off by
+    // default. Each tick discovers peers (dht.info), challenges them for the
+    // node's own blocks, and logs the reward/slash tally; verdicts accrue into a
+    // local settlement sink. On-chain settlement stays operator-side (Mishmar).
+    if let Some(cfg) = dht_audit::AuditLoopConfig::from_env() {
+        tracing::info!(
+            peers = cfg.peer_urls.len(),
+            interval_secs = cfg.interval.as_secs(),
+            "DHT availability audit loop ENABLED"
+        );
+        // Feed the state's shared sink so owed retainer is observable in node.status.
+        dht_audit::spawn_audit_loop(cfg, state.block_store.clone(), state.dht_audit_sink.clone());
+    }
+    // Periodic finality-checkpoint observer (GROWTH p8) — opt-in via
+    // KOTOBA_FINALITY_INTERVAL_SECS + KOTOBA_ANCHOR_RPC_URL + KOTOBA_ANCHOR_ADDRESS.
+    // Observes each graph head's committerOf finality on Base (read-only) and
+    // refreshes the node.status summary; kotoba never submits the anchor tx.
+    if let Some(cfg) = mishmar_observe::FinalityLoopConfig::from_env() {
+        tracing::info!(
+            interval_secs = cfg.interval.as_secs(),
+            anchor = %cfg.anchor_address,
+            "finality checkpoint loop ENABLED"
+        );
+        mishmar_observe::spawn_finality_loop(
+            cfg,
+            state.quad_store.clone(),
+            state.finality_summary.clone(),
+        );
+    }
     // Wire the realtime cold-lane bridge (ADR-2606060001): periodic durable
     // game snapshots are content-addressed into the block store + announced on
     // the KSE LiveBus. Idempotent; per-frame traffic never touches either.
@@ -1728,6 +1759,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
                 crate::availability_xrpc::NSID_AVAILABILITY_CHALLENGE
             ),
             post(crate::availability_xrpc::availability_challenge),
+        )
+        .route(
+            &format!("/xrpc/{}", crate::availability_xrpc::NSID_DHT_INFO),
+            get(crate::availability_xrpc::dht_info),
         )
         .route("/xrpc/:nsid", post(xrpc::generic_invoke));
 

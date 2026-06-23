@@ -8,25 +8,45 @@
 pub mod audit;
 pub mod availability_proof;
 pub mod commit_chain;
+pub mod dna;
 pub mod gossip;
+pub mod governance;
+pub mod membrane;
 pub mod neighborhood;
 pub mod neighborhood_store;
 pub mod node_id;
+pub mod replication;
+pub mod reputation;
 pub mod settlement;
 pub mod source_chain;
+pub mod validation;
 pub mod warrant;
 
 pub use audit::{
-    AuditAction, AuditScheduler, AvailabilityAuditor, InMemoryVerdictSink, PeerAudit,
-    PeerReputation, ProofFetcher, SettlementIntent, SettlementIntentSink, SettlementKind,
+    availability_slash_warrant, AuditAction, AuditScheduler, AvailabilityAuditor,
+    AvailabilityEvidence, InMemoryVerdictSink, PeerAudit, PeerReputation, ProofFetcher,
+    SettlementIntent, SettlementIntentSink, SettlementKind, SlashSchedule, SlashWarrant,
     VerdictSink,
 };
 pub use commit_chain::CommitChain;
+pub use dna::{DnaManifest, ValidationRuleRef};
+pub use governance::{
+    ratify, verify_and_ratify, ActiveParams, Attestation, ParamVersion, Ratification,
+};
+pub use validation::{
+    enforce, load_rules, validate_tx, PhysicsRule, RuleSpec, ValidationOutcome,
+};
+pub use membrane::{bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate};
 pub use neighborhood::Neighborhood;
+pub use replication::{
+    audit_replication, replication_plan, ReplicationPolicy, ReplicationPolicyStore,
+    ReplicationStatus,
+};
+pub use reputation::{prefer_by_reputation, EarnRateBand};
 pub use neighborhood_store::{
     cid_address, proof_from_store, NeighborhoodBlockStore, PeerTransport,
 };
 pub use node_id::NodeId;
-pub use settlement::{SettlementBatch, SettlementLine, SettlementSchedule};
+pub use settlement::{RetainerOwed, SettlementBatch, SettlementLine, SettlementSchedule};
 pub use source_chain::{ChainContent, ChainEntry, SourceChain};
-pub use warrant::Warrant;
+pub use warrant::{warrant_signing_bytes, ValidationRule, Warrant};

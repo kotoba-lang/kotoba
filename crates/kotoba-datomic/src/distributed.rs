@@ -107,17 +107,17 @@ pub struct DistributedDatomCommit {
     pub author_sig: Option<Vec<u8>>,
 }
 
-/// Process Hybrid Logical Clock. Packs `physical_ms << 16 | counter`; advances to
-/// `max(physical, last+1)` so it is monotonic even if the wall clock jumps back.
-/// The cross-graph ordering key + merge tiebreak (ADR-001). Single-node variant
-/// (a multi-node deployment also merges observed peer HLCs on read — later phase).
+/// Process Hybrid Logical Clock — the per-commit stamp, cross-graph ordering key,
+/// and merge tiebreak (ADR-001). The clock computation is the canonical
+/// [`kotoba_core::hlc::Hlc`] (`physical_ms << 16 | counter`, monotonic even when
+/// the wall clock jumps back); this wraps it in the process-global atomic with a
+/// CAS retry. Peer-HLC merge on read uses `Hlc::recv` (multi-node phase).
 pub(crate) fn next_hlc(phys_ms: u64) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static HLC: AtomicU64 = AtomicU64::new(0);
-    let phys = phys_ms << 16;
     loop {
         let last = HLC.load(Ordering::Relaxed);
-        let next = if phys > last { phys } else { last + 1 };
+        let next = kotoba_core::hlc::Hlc(last).send(phys_ms).0;
         if HLC
             .compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()

@@ -16,7 +16,7 @@
 use kotoba_auth::eth::keccak256;
 use kotoba_core::cid::KotobaCid;
 use kotoba_query::datom::{Datom, Value};
-use kotoba_query::social::{PIN_PINNER_PRED, PIN_ROOT_PRED};
+use kotoba_query::social::{PIN_BOND_PRED, PIN_PINNER_PRED, PIN_ROOT_PRED};
 
 /// `event Pinned(bytes32 indexed pinId, bytes32 indexed rootCid, address indexed pinner, bytes32 didHash, uint256 bond, uint64 expiresAt)`
 const PINNED_SIG: &[u8] = b"Pinned(bytes32,bytes32,address,bytes32,uint256,uint64)";
@@ -71,9 +71,16 @@ pub struct ObservedSlash {
 }
 
 /// Decode `Pinned` logs from an `eth_getLogs` result array → the
-/// `mishmar/pin/{pinner,root}` Datoms that feed `PinIndex`. `graph` is the graph
-/// CID the projected Datoms are written under. Non-`Pinned` / malformed logs are
-/// skipped. `logs` is the JSON array (the `result` field of an `eth_getLogs` reply).
+/// `mishmar/pin/{pinner,root,bond}` Datoms that feed `PinIndex`. `graph` is the
+/// graph CID the projected Datoms are written under. Non-`Pinned` / malformed logs
+/// are skipped. `logs` is the JSON array (the `result` field of an `eth_getLogs`
+/// reply).
+///
+/// The indexed topics carry pinId/rootCid/pinner; the non-indexed `data` carries
+/// `didHash(32) ++ bond(32) ++ expiresAt(32)`. The bond (`uint256`) is projected
+/// as a `mishmar/pin/bond` `Integer` (saturating into i64 — the smic/Mkoto Quad
+/// convention) so the replica membrane ([`eligible_replica`]) can gate on it. A
+/// log whose `data` is missing/short still yields root+pinner (bond omitted).
 pub fn decode_pinned_logs(logs: &serde_json::Value, graph: &KotobaCid) -> Vec<Datom> {
     let want = topic0_hex(PINNED_SIG);
     let mut out = Vec::new();
@@ -101,13 +108,38 @@ pub fn decode_pinned_logs(logs: &serde_json::Value, graph: &KotobaCid) -> Vec<Da
             graph.clone(),
         ));
         out.push(Datom::assert(
-            pin_cid,
+            pin_cid.clone(),
             PIN_PINNER_PRED.to_string(),
             Value::Cid(pinner_cid),
             graph.clone(),
         ));
+        // data = didHash(32) ++ bond(32) ++ expiresAt(32); bond is word(1).
+        if let Some(bond) = pinned_bond_mkoto(log) {
+            out.push(Datom::assert(
+                pin_cid,
+                PIN_BOND_PRED.to_string(),
+                Value::Integer(bond),
+                graph.clone(),
+            ));
+        }
     }
     out
+}
+
+/// Extract the `bond` (`uint256`, mKOTO) from a `Pinned` log's non-indexed `data`,
+/// saturating into i64. Returns `None` if `data` is absent / unparseable / too
+/// short to contain the bond word.
+fn pinned_bond_mkoto(log: &serde_json::Value) -> Option<i64> {
+    let data_str = log.get("data").and_then(|d| d.as_str())?;
+    let body = data_str.strip_prefix("0x").unwrap_or(data_str);
+    let bytes = hex::decode(body).ok()?;
+    // need at least didHash(32) + bond(32) = 64 bytes to read word(1).
+    if bytes.len() < 64 {
+        return None;
+    }
+    let mut w = [0u8; 32];
+    w.copy_from_slice(&bytes[32..64]);
+    Some(i64::try_from(word_u128(&w)).unwrap_or(i64::MAX))
 }
 
 /// Decode `Slashed` logs from an `eth_getLogs` result array. data layout =
@@ -273,6 +305,132 @@ pub fn parse_kaizen_wellbecoming(
     out
 }
 
+/// Observe a graph head's finality via a read-only `eth_call` to
+/// `AnchorBridge.committerOf(rootHash)` over an injected transport (GROWTH p8).
+/// kotoba stays read+verify — this only reads. Transport errors or an
+/// undecodable result resolve to "not anchored" (not final), never panic.
+pub fn observe_finality<T: JsonRpcTransport>(
+    transport: &T,
+    anchor_address: &str,
+    head: &KotobaCid,
+) -> kotoba_evm::anchor::FinalityStatus {
+    let root = kotoba_evm::anchor::root_hash_of(head);
+    let calldata = kotoba_evm::anchor::committer_of_calldata(&root);
+    let data_hex = format!("0x{}", hex::encode(&calldata));
+    let params = serde_json::json!([{ "to": anchor_address, "data": data_hex }, "latest"]);
+    let result_bytes = match transport.call("eth_call", params) {
+        Ok(v) => v
+            .as_str()
+            .and_then(|s| hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    kotoba_evm::anchor::finality_from_call_result(head, &result_bytes)
+}
+
+/// Observe finality for a batch of graph `heads` via `committerOf` `eth_call`s
+/// over an injected transport (GROWTH p8 checkpoint observation). Returns one
+/// `(head, FinalityStatus)` per input; pair with [`kotoba_evm::anchor::finality_summary`]
+/// for the node.status counts. Read-only; per-head transport errors are not final.
+pub fn observe_finalities<T: JsonRpcTransport>(
+    transport: &T,
+    anchor_address: &str,
+    heads: &[KotobaCid],
+) -> Vec<(KotobaCid, kotoba_evm::anchor::FinalityStatus)> {
+    heads
+        .iter()
+        .map(|h| (h.clone(), observe_finality(transport, anchor_address, h)))
+        .collect()
+}
+
+/// Configuration for the periodic finality-checkpoint observation loop (GROWTH
+/// p8), read from the environment. Disabled (`None`) unless an interval > 0 and
+/// both the anchor RPC URL and contract address are set — strictly opt-in.
+#[derive(Debug, Clone)]
+pub struct FinalityLoopConfig {
+    pub interval: std::time::Duration,
+    pub rpc_url: String,
+    pub anchor_address: String,
+}
+
+impl FinalityLoopConfig {
+    /// From env: `KOTOBA_FINALITY_INTERVAL_SECS` (> 0 enables),
+    /// `KOTOBA_ANCHOR_RPC_URL`, `KOTOBA_ANCHOR_ADDRESS` (both required non-empty).
+    pub fn from_env() -> Option<Self> {
+        let secs: u64 = std::env::var("KOTOBA_FINALITY_INTERVAL_SECS")
+            .ok()?
+            .parse()
+            .ok()?;
+        if secs == 0 {
+            return None;
+        }
+        let rpc_url = std::env::var("KOTOBA_ANCHOR_RPC_URL").ok()?;
+        let anchor_address = std::env::var("KOTOBA_ANCHOR_ADDRESS").ok()?;
+        if rpc_url.trim().is_empty() || anchor_address.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            interval: std::time::Duration::from_secs(secs),
+            rpc_url,
+            anchor_address,
+        })
+    }
+}
+
+/// Spawn the periodic finality-checkpoint observer (opt-in via
+/// [`FinalityLoopConfig`]). Each tick reads the node's graph heads, observes each
+/// head's `committerOf` finality over `ReqwestRpc` (off-runtime), and writes the
+/// aggregate [`kotoba_evm::anchor::FinalitySummary`] into `cache` (surfaced in
+/// node.status). Read-only — kotoba never submits the anchor tx.
+pub fn spawn_finality_loop(
+    config: FinalityLoopConfig,
+    quad_store: std::sync::Arc<kotoba_graph::QuadStore>,
+    cache: std::sync::Arc<tokio::sync::RwLock<kotoba_evm::anchor::FinalitySummary>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(config.interval);
+        loop {
+            ticker.tick().await;
+            let heads = quad_store.all_graph_cids().await;
+            let url = config.rpc_url.clone();
+            let anchor = config.anchor_address.clone();
+            let summary = tokio::task::spawn_blocking(move || {
+                let rpc = ReqwestRpc { url };
+                let pairs = observe_finalities(&rpc, &anchor, &heads);
+                let statuses: Vec<_> = pairs.into_iter().map(|(_, s)| s).collect();
+                kotoba_evm::anchor::finality_summary(&statuses)
+            })
+            .await;
+            match summary {
+                Ok(s) => {
+                    tracing::info!(
+                        tracked = s.tracked,
+                        finalized = s.finalized,
+                        pending = s.pending,
+                        "graph-head finality checkpoint"
+                    );
+                    *cache.write().await = s;
+                }
+                Err(e) => tracing::warn!(error = %e, "finality observation task failed"),
+            }
+        }
+    })
+}
+
+/// Observe whether the **active governance params** (GROWTH p12) are anchored on
+/// Base — composing the p8 finality check with the p12 active-params pointer. A
+/// param change is Council-ratified the moment [`kotoba_dht::ActiveParams`]
+/// advances; this adds the objective on-chain confirmation (its
+/// [`ParamVersion::id`](kotoba_dht::ParamVersion::id) observed via `committerOf`).
+/// Read-only — the anchor tx is the operating entity's.
+pub fn observe_params_finality<T: JsonRpcTransport>(
+    transport: &T,
+    anchor_address: &str,
+    params: &kotoba_dht::ActiveParams,
+) -> kotoba_evm::anchor::FinalityStatus {
+    observe_finality(transport, anchor_address, &params.current_id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +454,122 @@ mod tests {
 
     fn topic_str(bytes: &[u8; 32]) -> String {
         format!("0x{}", hex::encode(bytes))
+    }
+
+    /// Fake transport returning a canned `eth_call` result word.
+    struct FakeCall {
+        result: serde_json::Value,
+    }
+    impl JsonRpcTransport for FakeCall {
+        fn call(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            assert_eq!(method, "eth_call");
+            Ok(self.result.clone())
+        }
+    }
+
+    fn address_word(low_byte: u8) -> serde_json::Value {
+        let mut w = [0u8; 32];
+        w[31] = low_byte;
+        json!(format!("0x{}", hex::encode(w)))
+    }
+
+    #[test]
+    fn observe_finality_reads_committer_over_eth_call() {
+        let head = KotobaCid::from_bytes(b"final-head");
+        // non-zero committer → final.
+        let st = observe_finality(&FakeCall { result: address_word(0xAA) }, "0xanchor", &head);
+        assert!(st.is_final);
+        assert_eq!(st.root_hash, kotoba_evm::anchor::root_hash_of(&head));
+        // zero committer (never anchored) → not final.
+        let zero = observe_finality(&FakeCall { result: address_word(0) }, "0xanchor", &head);
+        assert!(!zero.is_final);
+    }
+
+    #[test]
+    fn observe_finality_transport_error_is_not_final() {
+        struct ErrRpc;
+        impl JsonRpcTransport for ErrRpc {
+            fn call(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value, String> {
+                Err("rpc down".into())
+            }
+        }
+        let head = KotobaCid::from_bytes(b"h");
+        assert!(!observe_finality(&ErrRpc, "0xanchor", &head).is_final);
+    }
+
+    #[test]
+    fn finality_loop_config_is_opt_in() {
+        for k in [
+            "KOTOBA_FINALITY_INTERVAL_SECS",
+            "KOTOBA_ANCHOR_RPC_URL",
+            "KOTOBA_ANCHOR_ADDRESS",
+        ] {
+            std::env::remove_var(k);
+        }
+        assert!(FinalityLoopConfig::from_env().is_none(), "unset → disabled");
+        std::env::set_var("KOTOBA_FINALITY_INTERVAL_SECS", "60");
+        assert!(FinalityLoopConfig::from_env().is_none(), "no rpc/anchor → disabled");
+        std::env::set_var("KOTOBA_ANCHOR_RPC_URL", "http://base-rpc:8545");
+        std::env::set_var("KOTOBA_ANCHOR_ADDRESS", "0xanchor");
+        let cfg = FinalityLoopConfig::from_env().expect("enabled");
+        assert_eq!(cfg.interval, std::time::Duration::from_secs(60));
+        assert_eq!(cfg.anchor_address, "0xanchor");
+        // interval 0 disables even with rpc/anchor set.
+        std::env::set_var("KOTOBA_FINALITY_INTERVAL_SECS", "0");
+        assert!(FinalityLoopConfig::from_env().is_none(), "interval 0 → disabled");
+        for k in [
+            "KOTOBA_FINALITY_INTERVAL_SECS",
+            "KOTOBA_ANCHOR_RPC_URL",
+            "KOTOBA_ANCHOR_ADDRESS",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn observe_params_finality_checks_the_active_version_id() {
+        use kotoba_dht::{ActiveParams, ParamVersion};
+        let active = ActiveParams::new(ParamVersion::new(
+            "1.0.0",
+            KotobaCid::from_bytes(b"params-blob"),
+        ));
+        // a non-zero committer at the active version id → params anchored/final.
+        let st = observe_params_finality(
+            &FakeCall { result: address_word(0xAB) },
+            "0xanchor",
+            &active,
+        );
+        assert!(st.is_final);
+        assert_eq!(st.root_hash, kotoba_evm::anchor::root_hash_of(&active.current_id()));
+        // zero committer → not yet anchored.
+        let pending = observe_params_finality(
+            &FakeCall { result: address_word(0) },
+            "0xanchor",
+            &active,
+        );
+        assert!(!pending.is_final);
+    }
+
+    #[test]
+    fn observe_finalities_batches_and_summarizes() {
+        // a fake where every committerOf returns the same non-zero committer.
+        let heads = [
+            KotobaCid::from_bytes(b"head-a"),
+            KotobaCid::from_bytes(b"head-b"),
+        ];
+        let pairs =
+            observe_finalities(&FakeCall { result: address_word(0xAB) }, "0xanchor", &heads);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, heads[0]); // order + head preserved
+        let statuses: Vec<_> = pairs.iter().map(|(_, s)| *s).collect();
+        let summary = kotoba_evm::anchor::finality_summary(&statuses);
+        assert_eq!(summary.tracked, 2);
+        assert_eq!(summary.finalized, 2);
+        assert_eq!(summary.pending, 0);
     }
 
     // a 32-byte topic from a short label (left-padded), mimicking an indexed bytes32/address.
@@ -336,6 +610,46 @@ mod tests {
             idx.pinner_of(&pin_cid),
             Some(KotobaCid::from_bytes(&addr20(&pinner_topic)))
         );
+    }
+
+    #[test]
+    fn decodes_pinned_bond_from_data_and_gates_eligibility() {
+        use kotoba_query::social::eligible_replica;
+        // data = didHash(32) ++ bond(32) ++ expiresAt(32); bond is word(1).
+        fn word(n: u128) -> String {
+            hex::encode({
+                let mut a = [0u8; 32];
+                a[16..32].copy_from_slice(&n.to_be_bytes());
+                a
+            })
+        }
+        let graph = KotobaCid::from_bytes(b"g:social");
+        let pin = b32(0x11);
+        let root = b32(0x22);
+        let mut pinner_topic = [0u8; 32];
+        pinner_topic[31] = 0x33;
+        let data = format!("0x{}{}{}", word(0xdead), word(5_000), word(99));
+        let logs = json!([{
+            "topics": [ topic0_hex(PINNED_SIG), topic_str(&pin), topic_str(&root), topic_str(&pinner_topic) ],
+            "data": data
+        }]);
+
+        let datoms = decode_pinned_logs(&logs, &graph);
+        assert_eq!(datoms.len(), 3, "root + pinner + bond");
+
+        let mut idx = PinIndex::new();
+        let deltas: Vec<_> = datoms
+            .into_iter()
+            .map(kotoba_query::delta::Delta::assert_datom)
+            .collect();
+        idx.apply(&deltas);
+        let pin_cid = KotobaCid::from_bytes(&pin);
+        let root_cid = KotobaCid::from_bytes(&root);
+        let pinner_cid = KotobaCid::from_bytes(&addr20(&pinner_topic));
+        assert_eq!(idx.bond_of(&pin_cid), Some(5_000));
+        // the observed bond gates replica admission end-to-end.
+        assert!(eligible_replica(&pinner_cid, &root_cid, 5_000, &idx));
+        assert!(!eligible_replica(&pinner_cid, &root_cid, 5_001, &idx));
     }
 
     #[test]

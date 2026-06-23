@@ -302,6 +302,15 @@ pub struct KotobaState {
     // ── Agent Sessions ───────────────────────────────────────────────────────
     /// Active SyncWindow sessions keyed by session_id.
     pub agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, SyncWindow>>>,
+    // ── DHT availability audit ─────────────────────────────────────────────────
+    /// Pending reward/slash intents accrued by the periodic availability-audit
+    /// loop (GROWTH p4). Surfaced as owed retainer in `node.status`; drained by
+    /// the operator-side settlement path. Empty until the opt-in loop runs.
+    pub dht_audit_sink: Arc<kotoba_dht::SettlementIntentSink>,
+    /// Latest graph-head finality checkpoint summary (GROWTH p8), refreshed by
+    /// the opt-in finality loop and surfaced in `node.status`. Default-zero until
+    /// the loop runs.
+    pub finality_summary: Arc<tokio::sync::RwLock<kotoba_evm::anchor::FinalitySummary>>,
     /// KOTOBA Mesh event-source routes (M13–M15): installed by the swarm actor
     /// from `PutRoutes`; the HTTP layer reads it to dispatch `on-http` for a
     /// matched route. Shared so both tasks see the same routing table.
@@ -907,6 +916,19 @@ impl KotobaState {
             crypto: None,
             kse_store,
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dht_audit_sink: Arc::new(kotoba_dht::SettlementIntentSink::new(
+                std::env::var("KOTOBA_DHT_AUDIT_REWARD_UNITS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1),
+                std::env::var("KOTOBA_DHT_AUDIT_SLASH_UNITS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1),
+            )),
+            finality_summary: Arc::new(tokio::sync::RwLock::new(
+                kotoba_evm::anchor::FinalitySummary::default(),
+            )),
             #[cfg(feature = "p2p")]
             mesh_routes: Arc::new(tokio::sync::RwLock::new(
                 kotoba_lattice::TriggerRoutes::default(),
