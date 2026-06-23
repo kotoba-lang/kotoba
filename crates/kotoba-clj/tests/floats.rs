@@ -249,3 +249,65 @@ fn himawari_ingot_wafer_thickness_cm() {
         10.5
     );
 }
+
+// ── symbol type env: def and let propagate float-ness ───────────────────────
+
+#[test]
+fn float_def_constant_in_expr() {
+    // (def ^:private MIN_DRE 0.99) used in a comparison with a float literal.
+    // MIN_DRE must be recognised as float so (>= 0.995 MIN_DRE) uses f64 GE.
+    let src = r#"
+        (def ^:private MIN_DRE 0.99)
+        (defn f [] (if (>= 0.995 MIN_DRE) 1 0))
+    "#;
+    // 0.995 >= 0.99 → true → 1
+    assert_eq!(compile_and_run(src, "f", &[]).unwrap(), 1);
+
+    let src2 = r#"
+        (def ^:private MIN_DRE 0.99)
+        (defn f [] (if (>= 0.5 MIN_DRE) 1 0))
+    "#;
+    // 0.5 < 0.99 → false → 0
+    assert_eq!(compile_and_run(src2, "f", &[]).unwrap(), 0);
+}
+
+#[test]
+fn float_let_binding_propagates() {
+    // (let [r 0.99] (* 100.0 r)) → 99.0
+    let bits = compile_and_run("(defn f [] (let [r 0.99] (* 100.0 r)))", "f", &[]).unwrap();
+    let v = f64::from_bits(bits as u64);
+    assert!((v - 99.0).abs() < 1e-9, "expected 99.0, got {v}");
+}
+
+#[test]
+fn float_def_constant_arithmetic() {
+    // (def K 0.4) ; K/(1-K) = 0.666...
+    let src = r#"
+        (def K 0.4)
+        (defn f [] (/ K (- 1.0 K)))
+    "#;
+    let bits = compile_and_run(src, "f", &[]).unwrap();
+    let v = f64::from_bits(bits as u64);
+    assert!((v - (0.4 / 0.6)).abs() < 1e-9, "expected 0.666..., got {v}");
+}
+
+#[test]
+fn int_let_binding_not_promoted() {
+    // (let [n 5] (+ n 1)) → 6 (integer, not float)
+    assert_eq!(
+        compile_and_run("(defn f [] (let [n 5] (+ n 1)))", "f", &[]).unwrap(),
+        6
+    );
+}
+
+#[test]
+fn float_let_shadows_def() {
+    // A let binding with the same name as a float def but integer value
+    // should shadow the def and NOT be treated as float.
+    let src = r#"
+        (def K 0.4)
+        (defn f [] (let [K 5] (+ K 1)))
+    "#;
+    // Should be integer 6, not float
+    assert_eq!(compile_and_run(src, "f", &[]).unwrap(), 6);
+}
