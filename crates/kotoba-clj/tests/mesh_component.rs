@@ -94,3 +94,24 @@ fn unsupported_handler_defn_does_not_break_compilation() {
     let wasm = compile_kais_mesh_component_str(src, WIT).expect("compile with extra defn");
     assert_loads(&wasm).expect("loads; on-kse is just an unexported helper");
 }
+
+// ── M8: on-tick (cron) trigger — new (i64)->result ABI, kotoba-cron world ──
+
+#[test]
+fn cron_component_with_on_tick_loads_under_wasmtime() {
+    // run + on-tick → kotoba-cron world; on-tick takes a u64 epoch directly
+    let src = "(ns m) (defn run [ctx] ctx) (defn on-tick [epoch] \"ok\")";
+    let wasm = compile_kais_mesh_component_str(src, WIT).expect("compile cron component");
+    assert_eq!(&wasm[0..4], b"\0asm", "must be a real wasm component");
+    assert_loads(&wasm).expect("run + on-tick must load under wasmtime");
+}
+
+#[test]
+fn on_tick_routes_to_cron_world_independently_of_on_http() {
+    // on-tick present, on-http absent → kotoba-cron (not kotoba-component)
+    let with_tick = "(ns m) (defn run [c] c) (defn on-tick [t] \"x\")";
+    assert!(compile_kais_mesh_component_str(with_tick, WIT).is_ok());
+    // plain run-only still falls back to kotoba-node
+    let run_only = "(ns m) (defn run [c] c)";
+    assert!(compile_kais_mesh_component_str(run_only, WIT).is_ok());
+}

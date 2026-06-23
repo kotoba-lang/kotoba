@@ -216,6 +216,8 @@ pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u
         abi: EntryAbi::BytesToResultBytes,
         export_name: "run",
     }];
+    // Pick the world by which trigger handler the guest defines (M7/M8). on-http
+    // and on-tick are currently distinct worlds; combining them is a future variant.
     let world_name = if has("on-http") {
         entries.push(Entry {
             name: "on-http",
@@ -223,6 +225,13 @@ pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u
             export_name: "on-http",
         });
         "kotoba-component"
+    } else if has("on-tick") {
+        entries.push(Entry {
+            name: "on-tick",
+            abi: EntryAbi::I64ToResultBytes,
+            export_name: "on-tick",
+        });
+        "kotoba-cron"
     } else {
         "kotoba-node"
     };

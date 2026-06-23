@@ -64,6 +64,24 @@ pub enum EntryAbi {
     /// `run: func(list<u8>) -> result<list<u8>, string>` — always `ok`; 12-byte
     /// return area `[tag:u8 @0, ptr:i32 @4, len:i32 @8]` (the kotoba-node shape).
     BytesToResultBytes,
+    /// `on-tick: func(epoch-ms: u64) -> result<list<u8>, string>` (M8). Input is
+    /// a single `i64` value passed straight to the guest fn (no handle build);
+    /// the return area is the same 12-byte `result<list<u8>,string>` shape.
+    I64ToResultBytes,
+}
+
+impl EntryAbi {
+    /// The core wrapper function's wasm signature `(params) -> [i32 ret-area]`.
+    fn wrapper_params(self) -> &'static [ValType] {
+        match self {
+            // (in_ptr, in_len)
+            EntryAbi::BytesToBytes | EntryAbi::BytesToResultBytes => {
+                &[ValType::I32, ValType::I32]
+            }
+            // (epoch: u64)
+            EntryAbi::I64ToResultBytes => &[ValType::I64],
+        }
+    }
 }
 
 /// A component entry point: the user `defn` to wrap, the ABI of its export, and
@@ -213,18 +231,16 @@ pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, Clj
     exports.export("cabi_realloc", ExportKind::Func, realloc_fn_index);
 
     // Canonical-ABI entry wrappers (component mode): one per entry, each under
-    // its own WIT export name. All share one wrapper type `(i32,i32) -> i32`.
-    if !entry_targets.is_empty() {
+    // its own WIT export name. The wrapper signature depends on the entry ABI
+    // (e.g. `on-tick` takes one i64, others take (i32,i32)). All return one i32
+    // (the return-area pointer).
+    for (i, (user_idx, abi, export_name)) in entry_targets.iter().enumerate() {
         let wrapper_type = types.len();
-        types
-            .ty()
-            .function([ValType::I32, ValType::I32], [ValType::I32]);
-        for (i, (user_idx, _abi, export_name)) in entry_targets.iter().enumerate() {
-            funcs.function(wrapper_type);
-            let wrapper_index = realloc_fn_index + 1 + i as u32;
-            exports.export(export_name, ExportKind::Func, wrapper_index);
-            debug_assert!(*user_idx < realloc_fn_index);
-        }
+        types.ty().function(abi.wrapper_params().iter().copied(), [ValType::I32]);
+        funcs.function(wrapper_type);
+        let wrapper_index = realloc_fn_index + 1 + i as u32;
+        exports.export(export_name, ExportKind::Func, wrapper_index);
+        debug_assert!(*user_idx < realloc_fn_index);
     }
 
     // ---- Memory + heap global ----------------------------------------------
@@ -621,6 +637,11 @@ fn cabi_realloc_fn(heap_global: u32) -> Function {
 /// - [`EntryAbi::BytesToResultBytes`]: 12-byte area for `result<list<u8>,string>`
 ///   in the `ok` case — `[tag:u8=0 @0, out_ptr:i32 @4, out_len:i32 @8]`.
 fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Function {
+    // `on-tick` has a distinct (i64)->i32 shape: pass the epoch value straight
+    // to the guest fn (no input-handle build), then pack result<list<u8>,string>.
+    if matches!(abi, EntryAbi::I64ToResultBytes) {
+        return tick_wrapper_fn(user_fn_index, realloc_index);
+    }
     // params: 0=in_ptr 1=in_len ; locals: 2=ret_handle(i64) 3=area(i32)
     let mut f = Function::new([(1, ValType::I64), (1, ValType::I32)]);
     let store32 = |offset: u64| MemArg {
@@ -637,6 +658,8 @@ fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Fu
     let (ptr_off, len_off, area_size) = match abi {
         EntryAbi::BytesToBytes => (0u64, 4u64, 8i32),
         EntryAbi::BytesToResultBytes => (4u64, 8u64, 12i32),
+        // handled by the early-return to tick_wrapper_fn above
+        EntryAbi::I64ToResultBytes => unreachable!("I64 ABI uses tick_wrapper_fn"),
     };
 
     // handle = (in_ptr as u64 << 32) | (in_len as u64)
@@ -684,6 +707,55 @@ fn entry_wrapper_fn(user_fn_index: u32, realloc_index: u32, abi: EntryAbi) -> Fu
 
     // return area
     f.instruction(&Instruction::LocalGet(3));
+    f.instruction(&Instruction::End);
+    f
+}
+
+/// `on-tick` wrapper (M8): `(epoch:i64) -> i32` returning a 12-byte
+/// `result<list<u8>,string>` area `[tag:u8=0 @0, out_ptr @4, out_len @8]`.
+/// The epoch value is passed straight to the guest fn (no input-handle build).
+fn tick_wrapper_fn(user_fn_index: u32, realloc_index: u32) -> Function {
+    // param 0 = epoch(i64) ; locals: 1=ret_handle(i64) 2=area(i32)
+    let mut f = Function::new([(1, ValType::I64), (1, ValType::I32)]);
+    let store32 = |offset: u64| MemArg { offset, align: 2, memory_index: 0 };
+    let store8 = |offset: u64| MemArg { offset, align: 0, memory_index: 0 };
+
+    // ret_handle = user_fn(epoch)   — epoch is the guest fn's i64 value arg
+    f.instruction(&Instruction::LocalGet(0));
+    f.instruction(&Instruction::Call(user_fn_index));
+    f.instruction(&Instruction::LocalSet(1));
+
+    // area = cabi_realloc(0, 0, align=4, new_sz=12)
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Const(4));
+    f.instruction(&Instruction::I32Const(12));
+    f.instruction(&Instruction::Call(realloc_index));
+    f.instruction(&Instruction::LocalSet(2));
+
+    // area[0] = ok discriminant (0)
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::I32Const(0));
+    f.instruction(&Instruction::I32Store8(store8(0)));
+
+    // area[4] = out_ptr = ret_handle >>> 32
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64Const(32));
+    f.instruction(&Instruction::I64ShrU);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(4)));
+
+    // area[8] = out_len = ret_handle & 0xFFFF_FFFF
+    f.instruction(&Instruction::LocalGet(2));
+    f.instruction(&Instruction::LocalGet(1));
+    f.instruction(&Instruction::I64Const(0xFFFF_FFFF));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(store32(8)));
+
+    // return area
+    f.instruction(&Instruction::LocalGet(2));
     f.instruction(&Instruction::End);
     f
 }
