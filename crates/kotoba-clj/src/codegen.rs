@@ -1144,6 +1144,12 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         Builtin::And => compile_and(cg, args),
         Builtin::Or => compile_or(cg, args),
 
+        Builtin::BitAnd => fold(cg, args, Instruction::I64And),
+        Builtin::BitOr => fold(cg, args, Instruction::I64Or),
+        Builtin::BitXor => fold(cg, args, Instruction::I64Xor),
+        Builtin::BitShiftLeft => binop(cg, args, Instruction::I64Shl),
+        Builtin::BitShiftRight => binop(cg, args, Instruction::I64ShrS),
+
         // len = handle & 0xFFFF_FFFF
         Builtin::StrLen => {
             compile_expr(cg, &args[0])?;
@@ -1865,6 +1871,11 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         Builtin::Not => b(v[0] == 0),
         Builtin::And => b(v.iter().all(|x| *x != 0)),
         Builtin::Or => b(v.iter().any(|x| *x != 0)),
+        Builtin::BitAnd => v.iter().copied().reduce(|a, b| a & b).unwrap_or(0),
+        Builtin::BitOr => v.iter().copied().reduce(|a, b| a | b).unwrap_or(0),
+        Builtin::BitXor => v.iter().copied().reduce(|a, b| a ^ b).unwrap_or(0),
+        Builtin::BitShiftLeft => v[0].wrapping_shl(v[1] as u32),
+        Builtin::BitShiftRight => v[0].wrapping_shr(v[1] as u32),
         Builtin::StrLen
         | Builtin::ByteAt
         | Builtin::BytesAlloc

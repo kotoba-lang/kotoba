@@ -152,6 +152,21 @@ pub enum Builtin {
     /// object-cbor), or `0` on err. Read with `kqe-count` /
     /// `kqe-quad-{graph,subject,predicate,object}`.
     KqeQuery,
+    /// `(bit-and a b …)` — bitwise AND of all arguments (Clojure `bit-and`).
+    /// Maps to WASM `i64.and` folded left over the arg list.
+    BitAnd,
+    /// `(bit-or a b …)` — bitwise OR of all arguments (Clojure `bit-or`).
+    /// Maps to WASM `i64.or` folded left over the arg list.
+    BitOr,
+    /// `(bit-xor a b …)` — bitwise XOR of all arguments (Clojure `bit-xor`).
+    /// Maps to WASM `i64.xor` folded left over the arg list.
+    BitXor,
+    /// `(bit-shift-left x n)` — left-shift `x` by `n` bits (Clojure `bit-shift-left`).
+    /// Maps to WASM `i64.shl`. Exactly 2 args.
+    BitShiftLeft,
+    /// `(bit-shift-right x n)` — arithmetic right-shift `x` by `n` bits
+    /// (Clojure `bit-shift-right`). Maps to WASM `i64.shr_s`. Exactly 2 args.
+    BitShiftRight,
 }
 
 impl Builtin {
@@ -262,6 +277,11 @@ impl Builtin {
             "kqe-retract!" => Builtin::KqeRetract,
             "kqe-get-objects" => Builtin::KqeGetObjects,
             "kqe-query" => Builtin::KqeQuery,
+            "bit-and" => Builtin::BitAnd,
+            "bit-or" => Builtin::BitOr,
+            "bit-xor" => Builtin::BitXor,
+            "bit-shift-left" => Builtin::BitShiftLeft,
+            "bit-shift-right" => Builtin::BitShiftRight,
             _ => return None,
         })
     }
@@ -991,6 +1011,30 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
         "dotimes" => lower_dotimes(args),
         "doseq" => lower_doseq(args),
         "comment" => Ok(Expr::Int(0)),
+        // `(str ...)` desugar: 0 args → "" literal; 1 arg → the arg; n≥2 args →
+        // left-fold of `str-cat` calls (prelude function). This avoids adding a
+        // codegen case that would need to emit a function-call into the prelude.
+        "str" => {
+            let lowered: Vec<Expr> = args.iter().map(lower_expr).collect::<Result<_, _>>()?;
+            if lowered.is_empty() {
+                Ok(Expr::Str(vec![]))
+            } else if lowered.len() == 1 {
+                Ok(lowered.into_iter().next().unwrap())
+            } else {
+                // fold: str-cat(str-cat(a, b), c) …
+                let mut acc = Expr::Call {
+                    name: "str-cat".to_string(),
+                    args: vec![lowered[0].clone(), lowered[1].clone()],
+                };
+                for extra in &lowered[2..] {
+                    acc = Expr::Call {
+                        name: "str-cat".to_string(),
+                        args: vec![acc, extra.clone()],
+                    };
+                }
+                Ok(acc)
+            }
+        }
         name => {
             let lowered: Vec<Expr> = args.iter().map(lower_expr).collect::<Result<_, _>>()?;
             if let Some(op) = Builtin::from_name(name) {
@@ -2312,6 +2356,8 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         Builtin::Sub => n >= 1, // unary negate or n-ary subtract
         Builtin::Min | Builtin::Max => n >= 1,
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,
+        Builtin::BitAnd | Builtin::BitOr | Builtin::BitXor => n >= 1,
+        Builtin::BitShiftLeft | Builtin::BitShiftRight => n == 2,
         Builtin::Div | Builtin::Mod | Builtin::Rem | Builtin::ByteAt | Builtin::ByteAppend => {
             n == 2
         }
