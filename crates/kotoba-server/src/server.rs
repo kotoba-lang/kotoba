@@ -298,6 +298,11 @@ pub struct KotobaState {
     // ── Agent Sessions ───────────────────────────────────────────────────────
     /// Active SyncWindow sessions keyed by session_id.
     pub agent_sessions: Arc<tokio::sync::RwLock<HashMap<String, SyncWindow>>>,
+    /// KOTOBA Mesh event-source routes (M13–M15): installed by the swarm actor
+    /// from `PutRoutes`; the HTTP layer reads it to dispatch `on-http` for a
+    /// matched route. Shared so both tasks see the same routing table.
+    #[cfg(feature = "p2p")]
+    pub mesh_routes: Arc<tokio::sync::RwLock<kotoba_lattice::TriggerRoutes>>,
     // ── CC Vector Search ─────────────────────────────────────────────────────
     /// Optional embed client for CC vector search (KOTOBA_EMBED_URL).
     pub cc_embed_client: Option<Arc<dyn EmbedClient>>,
@@ -897,6 +902,10 @@ impl KotobaState {
             crypto: None,
             kse_store,
             agent_sessions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            #[cfg(feature = "p2p")]
+            mesh_routes: Arc::new(tokio::sync::RwLock::new(
+                kotoba_lattice::TriggerRoutes::default(),
+            )),
             cc_embed_client,
             media_embed_client,
             pre_key_registry: None,

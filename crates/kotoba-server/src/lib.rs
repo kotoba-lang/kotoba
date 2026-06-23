@@ -1031,6 +1031,44 @@ mod tests {
     }
 }
 
+/// KOTOBA Mesh HTTP trigger handler (M15): looks up the component bound to the
+/// request route in the swarm-installed mesh routes, invokes its `on-http`
+/// export on the WASM host, and returns the component's output as the response.
+#[cfg(feature = "p2p")]
+async fn mesh_http(
+    axum::extract::State(state): axum::extract::State<Arc<KotobaState>>,
+    axum::extract::Path(route): axum::extract::Path<String>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let full = format!("/{route}");
+    let cid = state
+        .mesh_routes
+        .read()
+        .await
+        .http_target(&full)
+        .map(str::to_string);
+    let Some(cid) = cid else {
+        return (StatusCode::NOT_FOUND, format!("no mesh component for route {full}"))
+            .into_response();
+    };
+    match net_actor::invoke_trigger(
+        &state.executor,
+        state.block_store.as_ref(),
+        &state.operator_did,
+        &cid,
+        net_actor::ComponentTrigger::Http(body.to_vec()),
+    ) {
+        Some(out) => (StatusCode::OK, out).into_response(),
+        None => (
+            StatusCode::BAD_GATEWAY,
+            format!("mesh component {cid} unavailable or failed"),
+        )
+            .into_response(),
+    }
+}
+
 pub fn build_router(state: Arc<KotobaState>) -> Router {
     // Access-receipt writer (ADR-sealed-cold-tier R1): single background task
     // batching read receipts into audit-graph commits. Idempotent.
@@ -1642,7 +1680,17 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             ),
             post(crate::availability_xrpc::availability_challenge),
         )
-        .route("/xrpc/:nsid", post(xrpc::generic_invoke))
+        .route("/xrpc/:nsid", post(xrpc::generic_invoke));
+
+    // KOTOBA Mesh HTTP trigger (M15): POST /mesh/http/<route> dispatches the
+    // bound component's `on-http` export. p2p-gated (uses the swarm-installed
+    // mesh routes + the lattice invoke path).
+    #[cfg(feature = "p2p")]
+    {
+        app = app.route("/mesh/http/*route", post(mesh_http));
+    }
+
+    let mut app = app
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             fingerprint::fingerprint_middleware,
@@ -1905,6 +1953,7 @@ pub async fn run() -> anyhow::Result<()> {
                     state.pre_key_registry.clone(),
                     relay,
                     Arc::clone(&state.executor),
+                    Arc::clone(&state.mesh_routes),
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");

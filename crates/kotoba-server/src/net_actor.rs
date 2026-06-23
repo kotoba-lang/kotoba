@@ -85,9 +85,8 @@ impl FirehoseSeen {
 /// A trigger to invoke on a hosted component (KOTOBA Mesh M12). Every event
 /// source (placement, HTTP route, cron tick, KSE-topic gossip) funnels through
 /// [`invoke_trigger`] with one of these. `Run` is wired now (placement);
-/// `Http`/`Tick`/`Kse` are exercised by tests and wired to real event sources
-/// (HTTP route / cron timer / KSE gossip) in the M13 increment.
-#[allow(dead_code)]
+/// All variants are wired: `Run` (placement), `Tick` (cron), `Kse` (KSE gossip),
+/// `Http` (HTTP route handler).
 pub(crate) enum ComponentTrigger {
     /// Generic invoke / placement — `run(ctx)`.
     Run,
@@ -110,28 +109,29 @@ fn trigger_name(t: &ComponentTrigger) -> &'static str {
 
 /// Fetch a component's artifact by CID and invoke the given trigger's export on
 /// the WASM host (M12) — the single server-side path all trigger sources use.
-/// Returns `true` on successful execution. Missing/malformed artifacts are
-/// skipped gracefully (a later round retries once bitswap pulls it).
+/// Returns `Some(output_cbor)` on success (used by HTTP to form the response),
+/// `None` when skipped/failed (missing/malformed artifact or guest error). The
+/// caller decides what to do (placement marks `hosted`; cron/KSE ignore output).
 pub(crate) fn invoke_trigger(
     executor: &kotoba_runtime::WasmExecutor,
     block_store: &(dyn BlockStore + Send + Sync),
     node_did: &str,
     cid: &str,
     trigger: ComponentTrigger,
-) -> bool {
+) -> Option<Vec<u8>> {
     let Some(kcid) = KotobaCid::from_multibase(cid) else {
         tracing::warn!(%cid, "trigger: malformed component CID");
-        return false;
+        return None;
     };
     let wasm = match block_store.get(&kcid) {
         Ok(Some(b)) => b,
         Ok(None) => {
             tracing::info!(%cid, "trigger: artifact not local yet (awaiting bitswap)");
-            return false;
+            return None;
         }
         Err(e) => {
             tracing::warn!(%cid, err = %e, "trigger: artifact fetch failed");
-            return false;
+            return None;
         }
     };
     let snap = Vec::new();
@@ -152,11 +152,11 @@ pub(crate) fn invoke_trigger(
     match res {
         Ok(r) => {
             tracing::info!(%cid, trigger = kind, gas = r.gas_used, "trigger: executed");
-            true
+            Some(r.output_cbor)
         }
         Err(e) => {
             tracing::warn!(%cid, trigger = kind, err = %e, "trigger: execution failed");
-            false
+            None
         }
     }
 }
@@ -174,7 +174,7 @@ pub(crate) fn start_component(
     if hosted.iter().any(|c| c == cid) {
         return;
     }
-    if invoke_trigger(executor, block_store, node_did, cid, ComponentTrigger::Run) {
+    if invoke_trigger(executor, block_store, node_did, cid, ComponentTrigger::Run).is_some() {
         hosted.push(cid.to_string());
     }
 }
@@ -191,6 +191,8 @@ pub async fn run(
     relay: bool,
     // WASM host for lattice component placement (StartComponent → execute).
     executor: Arc<kotoba_runtime::WasmExecutor>,
+    // Shared mesh routes (M15): the HTTP layer reads this to dispatch on-http.
+    mesh_routes: Arc<tokio::sync::RwLock<kotoba_lattice::TriggerRoutes>>,
 ) {
     swarm.subscribe("quad/assert").ok();
     swarm.subscribe("quad/retract").ok();
@@ -294,7 +296,7 @@ pub async fn run(
                         kotoba_lattice::routes::parse_schedule_ms(schedule).unwrap_or(CRON_DEFAULT_MS);
                     let last = cron_last.get(cid).copied().unwrap_or(0);
                     if now.saturating_sub(last) >= interval {
-                        invoke_trigger(
+                        let _ = invoke_trigger(
                             &executor, block_store.as_ref(), &node_did, cid,
                             ComponentTrigger::Tick(now),
                         );
@@ -471,6 +473,8 @@ pub async fn run(
                                         "lattice: event-source routes installed"
                                     );
                                     routes = r.clone();
+                                    // share with the HTTP layer (M15)
+                                    *mesh_routes.write().await = r.clone();
                                 }
                                 _ => {}
                             }
@@ -557,7 +561,7 @@ pub async fn run(
                                 if let Some(payload) = kse_payload {
                                     for cid in &kse_targets {
                                         tracing::info!(%cid, topic = %kse_topic_str, "KSE trigger fired — invoking on-kse");
-                                        invoke_trigger(
+                                        let _ = invoke_trigger(
                                             &executor, block_store.as_ref(), &node_did, cid,
                                             ComponentTrigger::Kse(kse_topic_str.clone(), payload.clone()),
                                         );
@@ -622,13 +626,14 @@ mod tests {
         let exec = test_executor();
         let cid = KotobaCid::from_bytes(b"absent-component").to_multibase();
         let did = "did:self";
-        assert!(!invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Run));
-        assert!(!invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Http(b"req".to_vec())));
-        assert!(!invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Tick(1_700_000_000_000)));
-        assert!(!invoke_trigger(
+        assert!(invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Run).is_none());
+        assert!(invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Http(b"req".to_vec())).is_none());
+        assert!(invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Tick(1_700_000_000_000)).is_none());
+        assert!(invoke_trigger(
             &exec, &store, did, &cid,
             ComponentTrigger::Kse("kotoba/mail/in".into(), b"payload".to_vec())
-        ));
+        )
+        .is_none());
     }
 
     #[test]
@@ -641,7 +646,7 @@ mod tests {
             ComponentTrigger::Tick(0),
             ComponentTrigger::Kse(String::new(), vec![]),
         ] {
-            assert!(!invoke_trigger(&exec, &store, "did:self", "not-a-cid", t));
+            assert!(invoke_trigger(&exec, &store, "did:self", "not-a-cid", t).is_none());
         }
     }
 
@@ -653,12 +658,13 @@ mod tests {
         store.put(&kc, garbage).unwrap();
         let exec = test_executor();
         let cid = kc.to_multibase();
-        // present but uncompilable → every variant returns false (no panic)
-        assert!(!invoke_trigger(&exec, &store, "did:self", &cid, ComponentTrigger::Tick(5)));
-        assert!(!invoke_trigger(
+        // present but uncompilable → every variant returns None (no panic)
+        assert!(invoke_trigger(&exec, &store, "did:self", &cid, ComponentTrigger::Tick(5)).is_none());
+        assert!(invoke_trigger(
             &exec, &store, "did:self", &cid,
             ComponentTrigger::Kse("t".into(), b"p".to_vec())
-        ));
+        )
+        .is_none());
     }
 
     #[test]
@@ -767,9 +773,12 @@ mod tests {
             Arc::new(kotoba_store::MemoryBlockStore::new());
         let quad_store = Arc::new(QuadStore::new(Arc::clone(&journal), Arc::clone(&store)));
         let executor = Arc::new(kotoba_runtime::WasmExecutor::new(10_000_000).unwrap());
+        let mesh_routes =
+            Arc::new(tokio::sync::RwLock::new(kotoba_lattice::TriggerRoutes::default()));
 
         tokio::spawn(run(
             node, pub_rx, journal, pin_tx, pout_rx, store, quad_store, None, false, executor,
+            mesh_routes,
         ));
 
         // observer waits for the run-node's heartbeat (interval is 5 s; first
