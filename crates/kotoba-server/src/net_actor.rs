@@ -82,11 +82,88 @@ impl FirehoseSeen {
 /// When `relay` is true (NodeRole::Relay), the node additionally bridges its
 /// full KSE LiveBus onto the `firehose` gossip topic and re-logs peers' firehose
 /// entries — the mesh half of the D+E federation surface (2026-05-30).
-/// Place a component on THIS node (KOTOBA Mesh M4): fetch its artifact by CID
-/// and execute it on the WASM host. On success the node records it in `hosted`
-/// (advertised on the next heartbeat), which closes the reconcile loop. If the
-/// artifact is not local yet, or the CID is malformed, or execution fails, the
-/// node skips it gracefully (a later auction round retries once bitswap pulls it).
+/// A trigger to invoke on a hosted component (KOTOBA Mesh M12). Every event
+/// source (placement, HTTP route, cron tick, KSE-topic gossip) funnels through
+/// [`invoke_trigger`] with one of these. `Run` is wired now (placement);
+/// `Http`/`Tick`/`Kse` are exercised by tests and wired to real event sources
+/// (HTTP route / cron timer / KSE gossip) in the M13 increment.
+#[allow(dead_code)]
+pub(crate) enum ComponentTrigger {
+    /// Generic invoke / placement — `run(ctx)`.
+    Run,
+    /// HTTP trigger — `on-http(req)`.
+    Http(Vec<u8>),
+    /// Cron trigger — `on-tick(epoch_ms)`.
+    Tick(u64),
+    /// KSE-topic trigger — `on-kse(topic, payload)`.
+    Kse(String, Vec<u8>),
+}
+
+fn trigger_name(t: &ComponentTrigger) -> &'static str {
+    match t {
+        ComponentTrigger::Run => "run",
+        ComponentTrigger::Http(_) => "on-http",
+        ComponentTrigger::Tick(_) => "on-tick",
+        ComponentTrigger::Kse(..) => "on-kse",
+    }
+}
+
+/// Fetch a component's artifact by CID and invoke the given trigger's export on
+/// the WASM host (M12) — the single server-side path all trigger sources use.
+/// Returns `true` on successful execution. Missing/malformed artifacts are
+/// skipped gracefully (a later round retries once bitswap pulls it).
+pub(crate) fn invoke_trigger(
+    executor: &kotoba_runtime::WasmExecutor,
+    block_store: &(dyn BlockStore + Send + Sync),
+    node_did: &str,
+    cid: &str,
+    trigger: ComponentTrigger,
+) -> bool {
+    let Some(kcid) = KotobaCid::from_multibase(cid) else {
+        tracing::warn!(%cid, "trigger: malformed component CID");
+        return false;
+    };
+    let wasm = match block_store.get(&kcid) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            tracing::info!(%cid, "trigger: artifact not local yet (awaiting bitswap)");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(%cid, err = %e, "trigger: artifact fetch failed");
+            return false;
+        }
+    };
+    let snap = Vec::new();
+    let head = std::collections::HashMap::new();
+    let kind = trigger_name(&trigger);
+    let res = match trigger {
+        ComponentTrigger::Run => executor.execute(cid, &wasm, node_did, Vec::new(), snap, head),
+        ComponentTrigger::Http(req) => {
+            executor.execute_on_http(cid, &wasm, node_did, req, snap, head)
+        }
+        ComponentTrigger::Tick(epoch) => {
+            executor.execute_on_tick(cid, &wasm, node_did, epoch, snap, head)
+        }
+        ComponentTrigger::Kse(topic, payload) => {
+            executor.execute_on_kse(cid, &wasm, node_did, topic, payload, snap, head)
+        }
+    };
+    match res {
+        Ok(r) => {
+            tracing::info!(%cid, trigger = kind, gas = r.gas_used, "trigger: executed");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(%cid, trigger = kind, err = %e, "trigger: execution failed");
+            false
+        }
+    }
+}
+
+/// Place a component on THIS node (M4): fetch + `run`, then advertise as
+/// `hosted` (advertised on the next heartbeat, closing the reconcile loop).
+/// Built on [`invoke_trigger`] with the generic `Run` trigger.
 pub(crate) fn start_component(
     executor: &kotoba_runtime::WasmExecutor,
     block_store: &(dyn BlockStore + Send + Sync),
@@ -97,34 +174,8 @@ pub(crate) fn start_component(
     if hosted.iter().any(|c| c == cid) {
         return;
     }
-    let Some(kcid) = KotobaCid::from_multibase(cid) else {
-        tracing::warn!(%cid, "lattice start: malformed component CID");
-        return;
-    };
-    let wasm = match block_store.get(&kcid) {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            tracing::info!(%cid, "lattice start: artifact not local yet (awaiting bitswap) — not hosting");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(%cid, err = %e, "lattice start: artifact fetch failed");
-            return;
-        }
-    };
-    match executor.execute(
-        cid,
-        &wasm,
-        node_did,
-        Vec::new(),
-        Vec::new(),
-        std::collections::HashMap::new(),
-    ) {
-        Ok(res) => {
-            tracing::info!(%cid, gas = res.gas_used, "lattice start: component placed and executed");
-            hosted.push(cid.to_string());
-        }
-        Err(e) => tracing::warn!(%cid, err = %e, "lattice start: component execution failed"),
+    if invoke_trigger(executor, block_store, node_did, cid, ComponentTrigger::Run) {
+        hosted.push(cid.to_string());
     }
 }
 
@@ -500,6 +551,56 @@ mod tests {
 
     fn test_executor() -> kotoba_runtime::WasmExecutor {
         kotoba_runtime::WasmExecutor::new(10_000_000).unwrap()
+    }
+
+    // ── M12: unified invoke_trigger dispatcher (all 4 trigger variants) ──
+    // The success path (correct export per trigger) is proven by kotoba-clj's
+    // mesh_dispatch test against the real executor; here we lock down that the
+    // server-side dispatcher handles every variant on the defensive paths.
+
+    #[test]
+    fn invoke_trigger_all_variants_skip_when_artifact_absent() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let exec = test_executor();
+        let cid = KotobaCid::from_bytes(b"absent-component").to_multibase();
+        let did = "did:self";
+        assert!(!invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Run));
+        assert!(!invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Http(b"req".to_vec())));
+        assert!(!invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Tick(1_700_000_000_000)));
+        assert!(!invoke_trigger(
+            &exec, &store, did, &cid,
+            ComponentTrigger::Kse("kotoba/mail/in".into(), b"payload".to_vec())
+        ));
+    }
+
+    #[test]
+    fn invoke_trigger_all_variants_false_on_malformed_cid() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let exec = test_executor();
+        for t in [
+            ComponentTrigger::Run,
+            ComponentTrigger::Http(vec![]),
+            ComponentTrigger::Tick(0),
+            ComponentTrigger::Kse(String::new(), vec![]),
+        ] {
+            assert!(!invoke_trigger(&exec, &store, "did:self", "not-a-cid", t));
+        }
+    }
+
+    #[test]
+    fn invoke_trigger_non_wasm_artifact_fails_gracefully_per_variant() {
+        let store = kotoba_store::MemoryBlockStore::new();
+        let garbage = b"not a wasm component";
+        let kc = KotobaCid::from_bytes(garbage);
+        store.put(&kc, garbage).unwrap();
+        let exec = test_executor();
+        let cid = kc.to_multibase();
+        // present but uncompilable → every variant returns false (no panic)
+        assert!(!invoke_trigger(&exec, &store, "did:self", &cid, ComponentTrigger::Tick(5)));
+        assert!(!invoke_trigger(
+            &exec, &store, "did:self", &cid,
+            ComponentTrigger::Kse("t".into(), b"p".to_vec())
+        ));
     }
 
     #[test]
