@@ -198,13 +198,14 @@ pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u
     let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
     let program = crate::ast::parse_program(&normalized)?;
 
-    // detect optional trigger handlers (arity-1 `defn`s) in the guest
-    let has = |name: &str| {
+    // detect optional trigger handlers (`defn`s of a given arity) in the guest
+    let has_arity = |name: &str, n: usize| {
         program
             .functions
             .iter()
-            .any(|f| f.name == name && f.params.len() == 1)
+            .any(|f| f.name == name && f.params.len() == n)
     };
+    let has = |name: &str| has_arity(name, 1);
     if !has("run") {
         return Err(CljError::Codegen(
             "mesh component must define `(defn run [ctx] …)`".into(),
@@ -232,6 +233,13 @@ pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u
             export_name: "on-tick",
         });
         "kotoba-cron"
+    } else if has_arity("on-kse", 2) {
+        entries.push(Entry {
+            name: "on-kse",
+            abi: EntryAbi::StringBytesToResultBytes,
+            export_name: "on-kse",
+        });
+        "kotoba-kse"
     } else {
         "kotoba-node"
     };

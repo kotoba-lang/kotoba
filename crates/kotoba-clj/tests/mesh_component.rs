@@ -115,3 +115,21 @@ fn on_tick_routes_to_cron_world_independently_of_on_http() {
     let run_only = "(ns m) (defn run [c] c)";
     assert!(compile_kais_mesh_component_str(run_only, WIT).is_ok());
 }
+
+// ── M9: on-kse (KSE topic) trigger — 2-arg (string,list<u8>)->result ABI ──
+
+#[test]
+fn kse_component_with_on_kse_loads_under_wasmtime() {
+    // run + on-kse (arity 2) → kotoba-kse world
+    let src = "(ns m) (defn run [c] c) (defn on-kse [topic payload] payload)";
+    let wasm = compile_kais_mesh_component_str(src, WIT).expect("compile kse component");
+    assert_eq!(&wasm[0..4], b"\0asm", "must be a real wasm component");
+    assert_loads(&wasm).expect("run + on-kse must load under wasmtime");
+}
+
+#[test]
+fn on_kse_routes_to_kse_world_by_arity2() {
+    // on-kse (arity 2), no on-http/on-tick → kotoba-kse
+    let src = "(ns m) (defn run [c] c) (defn on-kse [t p] p)";
+    assert!(compile_kais_mesh_component_str(src, WIT).is_ok());
+}
