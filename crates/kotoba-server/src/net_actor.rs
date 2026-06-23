@@ -179,6 +179,38 @@ pub(crate) fn start_component(
     }
 }
 
+/// Apply a deploy-time lattice message (`PutTriggers` / `PutRoutes`) to this
+/// node's live state (R0): installs datom-Δ triggers, event-source routes, the
+/// shared HTTP routing table, and subscribes the node to the app's KSE topics.
+/// Shared by the gossip-receive path (peers' deploys) and the local inject path
+/// (this node's own `mesh.deploy`). Non-deploy messages are ignored.
+async fn apply_deploy_msg(
+    lmsg: &kotoba_lattice::LatticeMessage,
+    routes: &mut kotoba_lattice::TriggerRoutes,
+    delta_triggers: &mut Vec<kotoba_lattice::DeltaTrigger>,
+    swarm: &mut KotobaSwarm,
+    mesh_routes: &tokio::sync::RwLock<kotoba_lattice::TriggerRoutes>,
+) {
+    match lmsg {
+        kotoba_lattice::LatticeMessage::PutTriggers { triggers, .. } => {
+            *delta_triggers = triggers.clone();
+            tracing::info!(n = delta_triggers.len(), "lattice: datom-Δ triggers installed");
+        }
+        kotoba_lattice::LatticeMessage::PutRoutes { routes: r, .. } => {
+            for topic in r.kse_topics() {
+                swarm.subscribe(topic).ok();
+            }
+            tracing::info!(
+                kse = r.kse.len(), cron = r.cron.len(), http = r.http.len(),
+                "lattice: event-source routes installed"
+            );
+            *routes = r.clone();
+            *mesh_routes.write().await = r.clone();
+        }
+        _ => {}
+    }
+}
+
 pub async fn run(
     mut swarm: KotobaSwarm,
     mut publish_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
@@ -193,6 +225,10 @@ pub async fn run(
     executor: Arc<kotoba_runtime::WasmExecutor>,
     // Shared mesh routes (M15): the HTTP layer reads this to dispatch on-http.
     mesh_routes: Arc<tokio::sync::RwLock<kotoba_lattice::TriggerRoutes>>,
+    // Local lattice inject (R0): deploy messages originated on THIS node (via the
+    // mesh.deploy endpoint) are fed here so the node installs its own triggers/
+    // routes + subscribes KSE topics — gossipsub does not deliver to self.
+    mut lattice_inject_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     swarm.subscribe("quad/assert").ok();
     swarm.subscribe("quad/retract").ok();
@@ -313,6 +349,18 @@ pub async fn run(
             msg = publish_rx.recv() => {
                 let Some((kse_topic, data)) = msg else { break };
                 swarm.publish(&kse_topic, data).ok();
+            }
+
+            // ── Local lattice inject: this node's own deploy (R0) ─────────
+            inj = lattice_inject_rx.recv() => {
+                let Some(data) = inj else { break };
+                if let Ok(lmsg) = kotoba_lattice::LatticeMessage::from_cbor(&data) {
+                    apply_deploy_msg(
+                        &lmsg, &mut routes, &mut delta_triggers,
+                        &mut swarm, &mesh_routes,
+                    )
+                    .await;
+                }
             }
 
             // ── Pregel outbound: forward runner messages to gossip ───────
@@ -458,23 +506,15 @@ pub async fn run(
                                             &mut swarm, kotoba_lattice::protocol::topic::CAP, &result).ok();
                                     }
                                 }
-                                // install datom-Δ triggers (M6)
-                                kotoba_lattice::LatticeMessage::PutTriggers { triggers, .. } => {
-                                    delta_triggers = triggers.clone();
-                                    tracing::info!(n = delta_triggers.len(), "lattice: datom-Δ triggers installed");
-                                }
-                                // install event-source routes (M13) + subscribe KSE topics
-                                kotoba_lattice::LatticeMessage::PutRoutes { routes: r, .. } => {
-                                    for topic in r.kse_topics() {
-                                        swarm.subscribe(topic).ok();
-                                    }
-                                    tracing::info!(
-                                        kse = r.kse.len(), cron = r.cron.len(), http = r.http.len(),
-                                        "lattice: event-source routes installed"
-                                    );
-                                    routes = r.clone();
-                                    // share with the HTTP layer (M15)
-                                    *mesh_routes.write().await = r.clone();
+                                // install datom-Δ triggers (M6) / event-source
+                                // routes (M13) — shared with the local inject path (R0)
+                                kotoba_lattice::LatticeMessage::PutTriggers { .. }
+                                | kotoba_lattice::LatticeMessage::PutRoutes { .. } => {
+                                    apply_deploy_msg(
+                                        &lmsg, &mut routes, &mut delta_triggers,
+                                        &mut swarm, &mesh_routes,
+                                    )
+                                    .await;
                                 }
                                 _ => {}
                             }
@@ -775,10 +815,11 @@ mod tests {
         let executor = Arc::new(kotoba_runtime::WasmExecutor::new(10_000_000).unwrap());
         let mesh_routes =
             Arc::new(tokio::sync::RwLock::new(kotoba_lattice::TriggerRoutes::default()));
+        let (_inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
 
         tokio::spawn(run(
             node, pub_rx, journal, pin_tx, pout_rx, store, quad_store, None, false, executor,
-            mesh_routes,
+            mesh_routes, inject_rx,
         ));
 
         // observer waits for the run-node's heartbeat (interval is 5 s; first

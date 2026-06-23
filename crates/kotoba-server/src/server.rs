@@ -256,6 +256,10 @@ pub struct KotobaState {
     // ── P2P / Gossip ─────────────────────────────────────────────────────
     /// GossipSub outbound channel — `Some(tx)` when the swarm actor is running.
     pub gossip_tx: Option<tokio::sync::mpsc::Sender<(String, Vec<u8>)>>,
+    /// Local lattice inject (R0): feeds deploy messages (CBOR `LatticeMessage`)
+    /// to THIS node's swarm actor so it installs its own triggers/routes —
+    /// gossipsub does not loop back to the publisher. `Some` when swarm running.
+    pub lattice_inject_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     // ── Distributed Pregel ───────────────────────────────────────────────
     /// Pregel runner — `Some` after swarm is attached.
     /// Lock to inject messages or trigger a superstep from XRPC handlers.
@@ -890,6 +894,7 @@ impl KotobaState {
             #[cfg(feature = "wasm-runtime")]
             router,
             gossip_tx: None,
+            lattice_inject_tx: None,
             #[cfg(feature = "wasm-runtime")]
             pregel_runner: None,
             inference_engine,
@@ -1160,6 +1165,12 @@ impl KotobaState {
     /// Attach a GossipSub outbound channel after construction.
     pub fn attach_gossip(mut self, tx: tokio::sync::mpsc::Sender<(String, Vec<u8>)>) -> Self {
         self.gossip_tx = Some(tx);
+        self
+    }
+
+    /// Attach the local lattice-inject channel (R0) after construction.
+    pub fn attach_lattice_inject(mut self, tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        self.lattice_inject_tx = Some(tx);
         self
     }
 

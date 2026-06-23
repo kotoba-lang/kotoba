@@ -213,11 +213,25 @@ pub async fn run_app(cmd: AppCmd) -> Result<()> {
             }
 
             if publish {
-                let endpoint = format!("{}/xrpc/com.etzhayyim.apps.kotoba.mesh.deploy", url.trim_end_matches('/'));
+                // Serialize the RESOLVED messages (compiled CIDs included) as
+                // CBOR Vec<(topic, lattice_msg_cbor)> so :src components deploy
+                // with their real artifact CID (R0).
+                let mut wire: Vec<(String, Vec<u8>)> = Vec::with_capacity(msgs.len());
+                for (topic, m) in &msgs {
+                    let cbor = m.to_cbor().map_err(|e| anyhow!("encode lattice msg: {e}"))?;
+                    wire.push((topic.to_string(), cbor));
+                }
+                let mut body = Vec::new();
+                ciborium::into_writer(&wire, &mut body)
+                    .map_err(|e| anyhow!("cbor encode deploy body: {e}"))?;
+                let endpoint = format!(
+                    "{}/xrpc/com.etzhayyim.apps.kotoba.mesh.deploy",
+                    url.trim_end_matches('/')
+                );
                 let resp = reqwest::Client::new()
                     .post(&endpoint)
-                    .header("content-type", "application/edn")
-                    .body(src.clone())
+                    .header("content-type", "application/cbor")
+                    .body(body)
                     .send()
                     .await
                     .with_context(|| format!("POST {endpoint}"))?;
