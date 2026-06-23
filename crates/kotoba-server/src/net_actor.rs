@@ -259,6 +259,10 @@ pub async fn run(
     // event-source routes installed via PutRoutes (M13): KSE topic → component,
     // cron components, HTTP route → component.
     let mut routes = kotoba_lattice::TriggerRoutes::default();
+    // last on-tick fire time (epoch ms) per cron component — for schedule-aware
+    // firing (M14). Default interval when a schedule is empty/unparseable.
+    let mut cron_last: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    const CRON_DEFAULT_MS: u64 = 60_000;
     let mut lattice_hb = tokio::time::interval(std::time::Duration::from_secs(5));
     tracing::info!(node_did = %node_did, "net_actor: lattice participation active");
 
@@ -280,15 +284,21 @@ pub async fn run(
                     }
                     <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
                 }
-                // cron trigger (M13): fire on-tick for hosted components that
-                // declared a cron trigger (coarse: this 5s tick; finer schedule
-                // parsing is a follow-up).
-                for (cid, _schedule) in &routes.cron {
-                    if my_heartbeat.hosted.iter().any(|h| h == cid) {
+                // cron trigger (M14): fire on-tick for hosted cron components
+                // whose schedule interval has elapsed since their last fire.
+                for (cid, schedule) in &routes.cron {
+                    if !my_heartbeat.hosted.iter().any(|h| h == cid) {
+                        continue;
+                    }
+                    let interval =
+                        kotoba_lattice::routes::parse_schedule_ms(schedule).unwrap_or(CRON_DEFAULT_MS);
+                    let last = cron_last.get(cid).copied().unwrap_or(0);
+                    if now.saturating_sub(last) >= interval {
                         invoke_trigger(
                             &executor, block_store.as_ref(), &node_did, cid,
                             ComponentTrigger::Tick(now),
                         );
+                        cron_last.insert(cid.clone(), now);
                     }
                 }
                 // advertise our (possibly updated) heartbeat

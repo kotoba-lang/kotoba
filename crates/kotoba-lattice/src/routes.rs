@@ -81,6 +81,25 @@ impl TriggerRoutes {
     }
 }
 
+/// Parse a cron trigger `:schedule` string into a fire interval in milliseconds
+/// (M14). Accepts `"every <N><unit>"` or bare `"<N><unit>"`, unit ∈
+/// s/sec/second(s), m/min/minute(s), h/hr/hour(s), d/day(s). Returns `None` for
+/// an empty/unrecognized schedule (callers fall back to a node default).
+pub fn parse_schedule_ms(schedule: &str) -> Option<u64> {
+    let s = schedule.trim();
+    let s = s.strip_prefix("every").map(str::trim).unwrap_or(s);
+    let split = s.find(|c: char| c.is_ascii_alphabetic())?;
+    let n: u64 = s[..split].trim().parse().ok()?;
+    let mult = match s[split..].trim() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60_000,
+        "h" | "hr" | "hour" | "hours" => 3_600_000,
+        "d" | "day" | "days" => 86_400_000,
+        _ => return None,
+    };
+    n.checked_mul(mult)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +154,23 @@ mod tests {
     fn empty_app_has_empty_routes() {
         let r = TriggerRoutes::from_app(&AppManifest::from_edn(r#"{:kotoba.app/name "x"}"#).unwrap(), &BTreeMap::new());
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn parse_schedule_ms_units_and_every_prefix() {
+        assert_eq!(parse_schedule_ms("every 5m"), Some(300_000));
+        assert_eq!(parse_schedule_ms("30s"), Some(30_000));
+        assert_eq!(parse_schedule_ms("every 5 minutes"), Some(300_000));
+        assert_eq!(parse_schedule_ms("1 h"), Some(3_600_000));
+        assert_eq!(parse_schedule_ms("2d"), Some(172_800_000));
+        assert_eq!(parse_schedule_ms("  every  10 sec  "), Some(10_000));
+    }
+
+    #[test]
+    fn parse_schedule_ms_rejects_garbage() {
+        assert_eq!(parse_schedule_ms(""), None);
+        assert_eq!(parse_schedule_ms("soon"), None);
+        assert_eq!(parse_schedule_ms("5 lightyears"), None);
+        assert_eq!(parse_schedule_ms("m"), None); // no number
     }
 }
