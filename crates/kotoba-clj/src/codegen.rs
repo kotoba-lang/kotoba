@@ -148,12 +148,15 @@ pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, Clj
     let entry_targets: Vec<(u32, EntryAbi, &str)> = entries
         .iter()
         .map(|e| {
-            let idx = fn_index.get(&(e.name.to_string(), 1)).copied().ok_or_else(|| {
-                CljError::Codegen(format!(
-                    "component entry `(defn {} [input] …)` not found",
-                    e.name
-                ))
-            })?;
+            let idx = fn_index
+                .get(&(e.name.to_string(), 1))
+                .copied()
+                .ok_or_else(|| {
+                    CljError::Codegen(format!(
+                        "component entry `(defn {} [input] …)` not found",
+                        e.name
+                    ))
+                })?;
             Ok((idx, e.abi, e.export_name))
         })
         .collect::<Result<_, CljError>>()?;
