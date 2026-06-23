@@ -167,6 +167,27 @@ pub enum Builtin {
     /// `(bit-shift-right x n)` — arithmetic right-shift `x` by `n` bits
     /// (Clojure `bit-shift-right`). Maps to WASM `i64.shr_s`. Exactly 2 args.
     BitShiftRight,
+    /// `(double x)` — coerce `x` to an f64 value. An int is converted with
+    /// `f64.convert_i64_s`; a float passes through. The result occupies the
+    /// uniform i64 slot as the IEEE-754 bit pattern.
+    Double,
+    /// `(int x)` / `(long x)` — coerce `x` to an integer. A float is truncated
+    /// toward zero (`i64.trunc_sat_f64_s`); an int passes through.
+    Int,
+    /// `(Math/round x)` — round `x` to the nearest integer (ties away from
+    /// zero, Clojure semantics), returned as an integer value.
+    MathRound,
+    /// `(Math/floor x)` — largest integer ≤ `x`, returned as an f64 value
+    /// (`f64.floor`, matching Clojure which yields a double).
+    MathFloor,
+    /// `(Math/ceil x)` — smallest integer ≥ `x`, returned as an f64 value
+    /// (`f64.ceil`).
+    MathCeil,
+    /// `(Math/abs x)` — absolute value preserving the operand's float-ness
+    /// (`f64.abs` for a float; integer abs otherwise).
+    MathAbs,
+    /// `(Math/sqrt x)` — square root as an f64 value (`f64.sqrt`).
+    MathSqrt,
 }
 
 impl Builtin {
@@ -282,6 +303,13 @@ impl Builtin {
             "bit-xor" => Builtin::BitXor,
             "bit-shift-left" => Builtin::BitShiftLeft,
             "bit-shift-right" => Builtin::BitShiftRight,
+            "double" => Builtin::Double,
+            "int" | "long" => Builtin::Int,
+            "Math/round" | "java.lang.Math/round" => Builtin::MathRound,
+            "Math/floor" | "java.lang.Math/floor" => Builtin::MathFloor,
+            "Math/ceil" | "java.lang.Math/ceil" => Builtin::MathCeil,
+            "Math/abs" | "java.lang.Math/abs" => Builtin::MathAbs,
+            "Math/sqrt" | "java.lang.Math/sqrt" => Builtin::MathSqrt,
             _ => return None,
         })
     }
@@ -292,6 +320,12 @@ impl Builtin {
 pub enum Expr {
     /// Integer literal (booleans lower to 1/0 here).
     Int(i64),
+    /// Float literal. Carried as a native `f64`; codegen stores its IEEE-754
+    /// bit pattern in the uniform i64 value slot (`i64.reinterpret_f64`) and
+    /// reinterprets it back (`f64.reinterpret_i64`) at float-arithmetic
+    /// boundaries. There is no runtime tag — float-ness is inferred
+    /// *statically* (see `codegen::is_float_expr`).
+    Float(f64),
     /// String literal — stored in a data segment; the value on the stack is a
     /// packed `(offset << 32) | len` i64 handle (see codegen).
     Str(Vec<u8>),
@@ -467,7 +501,7 @@ impl Lifter {
 
     fn lift_expr(&mut self, e: Expr, scope: &LiftScope) -> Result<Expr, CljError> {
         Ok(match e {
-            Expr::Int(_) | Expr::Str(_) | Expr::ClosureRef(_) => e,
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::ClosureRef(_) => e,
 
             // A bare symbol that names a lexical binding is read through that
             // binding's current access path (`Var` for a local, `ClosureRef` for
@@ -633,7 +667,7 @@ fn free_walk(
         }
     };
     match e {
-        Expr::Int(_) | Expr::Str(_) | Expr::ClosureRef(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::ClosureRef(_) => {}
         Expr::Var(n) => refer(n, bound, acc, seen),
         Expr::If { cond, then, els } => {
             free_walk(cond, bound, scope, acc, seen);
@@ -880,6 +914,7 @@ fn lower_expr(v: &EdnValue) -> Result<Expr, CljError> {
     match v {
         EdnValue::Nil => Ok(Expr::Int(0)),
         EdnValue::Integer(i) => Ok(Expr::Int(*i)),
+        EdnValue::Float(f) => Ok(Expr::Float(f.into_inner())),
         EdnValue::Bool(b) => Ok(Expr::Int(if *b { 1 } else { 0 })),
         EdnValue::String(s) => Ok(Expr::Str(s.clone().into_bytes())),
         EdnValue::Keyword(_) => Ok(Expr::Str(edn_to_string(v).into_bytes())),
@@ -1037,7 +1072,17 @@ fn lower_call(items: &[EdnValue]) -> Result<Expr, CljError> {
         }
         name => {
             let lowered: Vec<Expr> = args.iter().map(lower_expr).collect::<Result<_, _>>()?;
-            if let Some(op) = Builtin::from_name(name) {
+            // Builtins keyed by bare name (`+`, `inc`, …) try `name`; builtins
+            // keyed by a host-class-qualified name (`Math/round`, `Math/abs`)
+            // need the fully-qualified form. When the head IS namespaced (e.g.
+            // `Math/abs`) the qualified lookup must win — otherwise `Math/abs`
+            // would collide with the bare `abs` (integer) builtin.
+            let builtin = if head.namespace.is_some() {
+                Builtin::from_name(&head.to_qualified()).or_else(|| Builtin::from_name(name))
+            } else {
+                Builtin::from_name(name)
+            };
+            if let Some(op) = builtin {
                 check_builtin_arity(op, lowered.len())?;
                 Ok(Expr::Builtin { op, args: lowered })
             } else {
@@ -2349,6 +2394,13 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         | Builtin::Neg
         | Builtin::Even
         | Builtin::Odd
+        | Builtin::Double
+        | Builtin::Int
+        | Builtin::MathRound
+        | Builtin::MathFloor
+        | Builtin::MathCeil
+        | Builtin::MathAbs
+        | Builtin::MathSqrt
         | Builtin::StrLen => n == 1,
         Builtin::BytesAlloc | Builtin::BytesLen | Builtin::BytesFinish => n == 1,
         Builtin::Alloc | Builtin::Load64 | Builtin::Load32 => n == 1,

@@ -9,9 +9,15 @@
 //!
 //! ## Value model
 //!
-//! Every value on the operand stack is an `i64`. Two interpretations:
+//! Every value on the operand stack is an `i64`. Three interpretations:
 //!   - **number / boolean**: the i64 is the value; booleans are `1`/`0`, truthy
 //!     ⇔ non-zero.
+//!   - **float**: the i64 holds the IEEE-754 **bit pattern** of an f64 (no
+//!     runtime tag). Float-ness is inferred *statically* per expression
+//!     (`is_float_expr`); arithmetic/comparison sites reinterpret the bits to
+//!     f64 (`f64.reinterpret_i64`), run the `f64.*` op, and (for arithmetic)
+//!     repack the result with `i64.reinterpret_f64`. Mixed int/float arithmetic
+//!     promotes the int operand with `f64.convert_i64_s`.
 //!   - **string handle**: a packed `(offset << 32) | (len & 0xFFFF_FFFF)` where
 //!     `offset` is a byte offset into linear memory and `len` the byte length.
 //!     `str-len` / `byte-at` operate on this handle.
@@ -425,7 +431,7 @@ fn collect_host_imports(program: &Program) -> Vec<HostImport> {
     };
     fn walk(expr: &Expr, note: &mut impl FnMut(HostImport)) {
         match expr {
-            Expr::Int(_) | Expr::Str(_) | Expr::Var(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Var(_) => {}
             Expr::If { cond, then, els } => {
                 walk(cond, note);
                 walk(then, note);
@@ -472,7 +478,7 @@ fn collect_call_value_arities(program: &Program) -> std::collections::HashSet<us
     let mut out = std::collections::HashSet::new();
     fn walk(e: &Expr, out: &mut std::collections::HashSet<usize>) {
         match e {
-            Expr::Int(_) | Expr::Str(_) | Expr::Var(_) | Expr::ClosureRef(_) => {}
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Var(_) | Expr::ClosureRef(_) => {}
             Expr::If { cond, then, els } => {
                 walk(cond, out);
                 walk(then, out);
@@ -527,7 +533,7 @@ fn collect_literals(program: &Program) -> Literals {
 fn walk_strings(expr: &Expr, f: &mut impl FnMut(&[u8])) {
     match expr {
         Expr::Str(b) => f(b),
-        Expr::Int(_) | Expr::Var(_) => {}
+        Expr::Int(_) | Expr::Float(_) | Expr::Var(_) => {}
         Expr::If { cond, then, els } => {
             walk_strings(cond, f);
             walk_strings(then, f);
@@ -830,6 +836,11 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
     match expr {
         Expr::Int(i) => cg.emit(Instruction::I64Const(*i)),
 
+        // A float literal is stored in the uniform i64 slot as its IEEE-754 bit
+        // pattern (no runtime tag). Float-arithmetic sites reinterpret it back
+        // to f64 via `f64.reinterpret_i64` (see `compile_expr_as_f64`).
+        Expr::Float(f) => cg.emit(Instruction::I64Const(f.to_bits() as i64)),
+
         Expr::Str(bytes) => {
             let handle = cg
                 .literals
@@ -1012,7 +1023,26 @@ fn comparison_i32_instruction(op: Builtin) -> Option<Instruction<'static>> {
 }
 
 fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), CljError> {
+    // Arithmetic on any float operand runs the whole op in f64 (int operands
+    // promoted). `is_float_op` short-circuits to the integer paths below.
+    let is_float_op = args.iter().any(is_float_expr);
     match op {
+        Builtin::Add if is_float_op => fold_f64(cg, args, Instruction::F64Add),
+        Builtin::Mul if is_float_op => fold_f64(cg, args, Instruction::F64Mul),
+        Builtin::Div if is_float_op => fold_f64(cg, args, Instruction::F64Div),
+        Builtin::Sub if is_float_op => {
+            if args.len() == 1 {
+                // unary float negate: 0.0 - x
+                cg.emit(Instruction::F64Const(0.0));
+                compile_expr_as_f64(cg, &args[0])?;
+                cg.emit(Instruction::F64Sub);
+                cg.emit(Instruction::I64ReinterpretF64);
+                Ok(())
+            } else {
+                fold_f64(cg, args, Instruction::F64Sub)
+            }
+        }
+
         Builtin::Add => fold(cg, args, Instruction::I64Add),
         Builtin::Mul => fold(cg, args, Instruction::I64Mul),
         Builtin::Sub => {
@@ -1076,6 +1106,100 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         }
         Builtin::Min => compile_min_max(cg, args, true),
         Builtin::Max => compile_min_max(cg, args, false),
+
+        // `(double x)` — int→f64 (promote) or float passthrough; the result
+        // slot holds the IEEE-754 bits.
+        Builtin::Double => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+        // `(int x)` / `(long x)` — float→int truncate toward zero (saturating,
+        // so a NaN/overflow yields a defined value instead of trapping); int
+        // passthrough.
+        Builtin::Int => {
+            if is_float_expr(&args[0]) {
+                compile_expr_as_f64(cg, &args[0])?;
+                cg.emit(Instruction::I64TruncSatF64S);
+            } else {
+                compile_expr(cg, &args[0])?;
+            }
+            Ok(())
+        }
+        // `(Math/round x)` — round to nearest, ties away from zero (Clojure):
+        // `trunc(x + copysign(0.5, x))`. Emitted as `floor(x + 0.5)` for x≥0
+        // and `ceil(x - 0.5)` for x<0, selected at runtime; result is an int.
+        Builtin::MathRound => {
+            // Stash the operand's f64 bits in an i64 local (all locals are i64;
+            // we reinterpret on each read) so we can branch on its sign.
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::I64ReinterpretF64);
+            let bits = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(bits));
+            // x >= 0 ?
+            cg.emit(Instruction::LocalGet(bits));
+            cg.emit(Instruction::F64ReinterpretI64);
+            cg.emit(Instruction::F64Const(0.0));
+            cg.emit(Instruction::F64Ge);
+            cg.open_frame(Instruction::If(BlockType::Result(ValType::F64)));
+            // floor(x + 0.5)
+            cg.emit(Instruction::LocalGet(bits));
+            cg.emit(Instruction::F64ReinterpretI64);
+            cg.emit(Instruction::F64Const(0.5));
+            cg.emit(Instruction::F64Add);
+            cg.emit(Instruction::F64Floor);
+            cg.emit(Instruction::Else);
+            // ceil(x - 0.5)
+            cg.emit(Instruction::LocalGet(bits));
+            cg.emit(Instruction::F64ReinterpretI64);
+            cg.emit(Instruction::F64Const(0.5));
+            cg.emit(Instruction::F64Sub);
+            cg.emit(Instruction::F64Ceil);
+            cg.close_frame();
+            cg.emit(Instruction::I64TruncSatF64S);
+            Ok(())
+        }
+        // `(Math/floor x)` — f64 floor, yields a float (Clojure returns double).
+        Builtin::MathFloor => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::F64Floor);
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+        // `(Math/ceil x)` — f64 ceil, yields a float.
+        Builtin::MathCeil => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::F64Ceil);
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+        // `(Math/abs x)` — preserves float-ness: f64.abs for a float operand,
+        // integer abs otherwise.
+        Builtin::MathAbs => {
+            if is_float_expr(&args[0]) {
+                compile_expr_as_f64(cg, &args[0])?;
+                cg.emit(Instruction::F64Abs);
+                cg.emit(Instruction::I64ReinterpretF64);
+                Ok(())
+            } else {
+                compile_builtin(cg, Builtin::Abs, args)
+            }
+        }
+        // `(Math/sqrt x)` — f64 square root, yields a float.
+        Builtin::MathSqrt => {
+            compile_expr_as_f64(cg, &args[0])?;
+            cg.emit(Instruction::F64Sqrt);
+            cg.emit(Instruction::I64ReinterpretF64);
+            Ok(())
+        }
+
+        // Float comparisons: any float operand → compare the f64
+        // interpretation (int operands promoted). `=`/`<`/`>`/`<=`/`>=` supported.
+        Builtin::Eq if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Eq),
+        Builtin::Lt if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Lt),
+        Builtin::Gt if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Gt),
+        Builtin::Le if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Le),
+        Builtin::Ge if is_float_op => pairwise_cmp_f64(cg, args, Instruction::F64Ge),
 
         Builtin::Eq => pairwise_cmp(cg, args, Instruction::I64Eq),
         Builtin::NotEq => compile_not_eq(cg, args),
@@ -1592,6 +1716,70 @@ fn compile_bytes_finish(cg: &mut FnCtx, buf_expr: &Expr) -> Result<(), CljError>
     Ok(())
 }
 
+// ── f64 floating-point support ──────────────────────────────────────────────
+//
+// The value model has a single 64-bit slot per value (everything is an `i64`
+// on the operand stack). A float occupies that slot as its IEEE-754 **bit
+// pattern**; there is no runtime tag. "Is this value a float?" is therefore
+// answered *statically*, per-expression, by [`is_float_expr`]. Arithmetic and
+// comparison builtins inspect their operands: if any operand is statically a
+// float, the whole operation runs on the f64 interpretation (int operands are
+// promoted with `f64.convert_i64_s`) and — for arithmetic — the f64 result is
+// repacked into the i64 slot with `i64.reinterpret_f64`.
+
+/// Statically decide whether `expr` evaluates to a float value (an IEEE-754 bit
+/// pattern in the i64 slot) rather than an integer/handle. Conservative: only
+/// forms whose float-ness is statically certain return `true`. Anything else
+/// (variables, calls, host ops, closures) is treated as an integer — mixing a
+/// runtime-float-bearing variable into float math is out of R0 scope and would
+/// need a runtime tag.
+fn is_float_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Float(_) => true,
+        Expr::Builtin { op, args } => match op {
+            // Coercions whose result is a float by construction.
+            Builtin::Double | Builtin::MathFloor | Builtin::MathCeil | Builtin::MathSqrt => true,
+            // Arithmetic is float iff any operand is float (mixed int/float promotes).
+            Builtin::Add | Builtin::Sub | Builtin::Mul | Builtin::Div => {
+                args.iter().any(is_float_expr)
+            }
+            // `(Math/abs x)` preserves the operand's float-ness.
+            Builtin::MathAbs => args.first().map(is_float_expr).unwrap_or(false),
+            _ => false,
+        },
+        // `(if c a b)` is float iff both branches are float.
+        Expr::If { then, els, .. } => is_float_expr(then) && is_float_expr(els),
+        _ => false,
+    }
+}
+
+/// Compile `expr`, leaving an **f64** on the operand stack (not the packed i64
+/// slot). A statically-float expr is compiled then `f64.reinterpret_i64`'d back
+/// from its bit pattern; an integer expr is converted with `f64.convert_i64_s`
+/// (int→float promotion for mixed arithmetic).
+fn compile_expr_as_f64(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
+    if is_float_expr(expr) {
+        compile_expr(cg, expr)?;
+        cg.emit(Instruction::F64ReinterpretI64);
+    } else {
+        compile_expr(cg, expr)?;
+        cg.emit(Instruction::F64ConvertI64S);
+    }
+    Ok(())
+}
+
+/// Fold a non-empty arg list with an f64 binary instruction, repacking the f64
+/// result into the i64 slot via `i64.reinterpret_f64`.
+fn fold_f64(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), CljError> {
+    compile_expr_as_f64(cg, &args[0])?;
+    for a in &args[1..] {
+        compile_expr_as_f64(cg, a)?;
+        cg.emit(ins.clone());
+    }
+    cg.emit(Instruction::I64ReinterpretF64);
+    Ok(())
+}
+
 /// Left-fold a non-empty arg list with a binary instruction.
 fn fold(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Result<(), CljError> {
     compile_expr(cg, &args[0])?;
@@ -1678,6 +1866,65 @@ fn pairwise_cmp(cg: &mut FnCtx, args: &[Expr], ins: Instruction<'static>) -> Res
         cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
         cg.emit(Instruction::LocalGet(prev));
         cg.emit(Instruction::LocalGet(cur));
+        cg.emit(ins.clone());
+        cg.emit(Instruction::I64ExtendI32U);
+        cg.emit(Instruction::Else);
+        cg.emit(Instruction::I64Const(0));
+        cg.close_frame();
+        cg.emit(Instruction::LocalSet(acc));
+
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::LocalSet(prev));
+    }
+
+    cg.emit(Instruction::LocalGet(acc));
+    Ok(())
+}
+
+/// f64 sibling of [`pairwise_cmp`]: each operand is compiled as an f64 (int
+/// operands promoted), `ins` is an `f64.*` comparison producing i32 0/1, and
+/// the i64 result is the 0/1 boolean in the uniform slot. n-ary chains store
+/// the rolling `prev`/`cur` operands as their f64 bit pattern in i64 locals.
+fn pairwise_cmp_f64(
+    cg: &mut FnCtx,
+    args: &[Expr],
+    ins: Instruction<'static>,
+) -> Result<(), CljError> {
+    if args.len() == 1 {
+        cg.emit(Instruction::I64Const(1));
+        return Ok(());
+    }
+    if args.len() == 2 {
+        compile_expr_as_f64(cg, &args[0])?;
+        compile_expr_as_f64(cg, &args[1])?;
+        cg.emit(ins);
+        cg.emit(Instruction::I64ExtendI32U);
+        return Ok(());
+    }
+
+    let prev = cg.alloc_local();
+    let cur = cg.alloc_local();
+    let acc = cg.alloc_local();
+    // store f64 operands as their bit pattern (locals are i64).
+    compile_expr_as_f64(cg, &args[0])?;
+    cg.emit(Instruction::I64ReinterpretF64);
+    cg.emit(Instruction::LocalSet(prev));
+    cg.emit(Instruction::I64Const(1));
+    cg.emit(Instruction::LocalSet(acc));
+
+    for arg in &args[1..] {
+        compile_expr_as_f64(cg, arg)?;
+        cg.emit(Instruction::I64ReinterpretF64);
+        cg.emit(Instruction::LocalSet(cur));
+
+        cg.emit(Instruction::LocalGet(acc));
+        cg.emit(Instruction::I64Const(0));
+        cg.emit(Instruction::I64Ne);
+        cg.open_frame(Instruction::If(BlockType::Result(ValType::I64)));
+        cg.emit(Instruction::LocalGet(prev));
+        cg.emit(Instruction::F64ReinterpretI64);
+        cg.emit(Instruction::LocalGet(cur));
+        cg.emit(Instruction::F64ReinterpretI64);
         cg.emit(ins.clone());
         cg.emit(Instruction::I64ExtendI32U);
         cg.emit(Instruction::Else);
@@ -1819,6 +2066,11 @@ fn eval_const(
 ) -> Result<i64, CljError> {
     Ok(match expr {
         Expr::Int(i) => *i,
+        // A float `def` initialiser stores the f64 bit pattern as its constant
+        // i64 slot value; references emit it verbatim (the float bits) and
+        // float-arithmetic sites reinterpret. Constant-float folding (e.g.
+        // `(def x (* 2.0 3.0))`) is deferred — see `eval_const_builtin`.
+        Expr::Float(f) => f.to_bits() as i64,
         Expr::Str(bytes) => {
             // A string-literal `def` is allowed.  Resolve the handle from the
             // interned literals blob (populated by `collect_literals` before us).
@@ -1961,6 +2213,21 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         | Builtin::KqeQuery => {
             return Err(CljError::Codegen(
                 "host calls are not allowed in a `def` initialiser".into(),
+            ))
+        }
+        // Float coercions in a compile-time-constant `def` are not folded yet
+        // (the const evaluator is integer-only). Use them in function bodies.
+        Builtin::Double
+        | Builtin::Int
+        | Builtin::MathRound
+        | Builtin::MathFloor
+        | Builtin::MathCeil
+        | Builtin::MathAbs
+        | Builtin::MathSqrt => {
+            return Err(CljError::Codegen(
+                "float coercions are not yet supported in a `def` initialiser \
+                 (use them inside a function body)"
+                    .into(),
             ))
         }
     })
