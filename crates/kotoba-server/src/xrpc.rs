@@ -2161,11 +2161,17 @@ fn verify_datomic_cacao_payload_with_operations(
     let cbor = B64
         .decode(b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao_b64 decode: {e}")))?;
-    let cacao = kotoba_auth::Cacao::from_cbor(&cbor)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao parse: {e}")))?;
-    let nonce = cacao.p.nonce.clone();
-    let payload = cacao.p.clone();
-    let chain = kotoba_auth::DelegationChain::new(cacao);
+    let chain = decode_cacao_chain(&cbor)?;
+    // The leaf (last link) is the invocation presented now: its nonce gates replay.
+    // The verified issuer is the ULTIMATE authority (root for a depth-2 delegation,
+    // self for depth-1) — owner-binding + auto-registration compare against it, so a
+    // team member can write to the org's graph under a chain rooted at the org owner.
+    let leaf = chain
+        .chain
+        .last()
+        .cloned()
+        .ok_or((StatusCode::BAD_REQUEST, "empty cacao chain".to_string()))?;
+    let nonce = leaf.p.nonce.clone();
     let resolver = local_first_did_resolver(state);
     let mut issuer = None;
     for operation in operations {
@@ -2174,7 +2180,7 @@ fn verify_datomic_cacao_payload_with_operations(
             .map_err(|e| (StatusCode::UNAUTHORIZED, format!("cacao delegation: {e}")))?;
         issuer = Some(verified_issuer);
     }
-    let issuer = issuer.unwrap_or_else(|| payload.iss.clone());
+    let issuer = issuer.unwrap_or_else(|| leaf.p.iss.clone());
     if nonce.is_empty() {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -2194,7 +2200,23 @@ fn verify_datomic_cacao_payload_with_operations(
         ));
     }
     tracing::debug!(issuer = %issuer, operations = %operations.join(","), graph, "datomic CACAO accepted");
+    // Return the leaf payload but with iss = the verified ultimate authority, so the
+    // caller binds the write/read to the graph owner (the org), not the delegate.
+    let mut payload = leaf.p;
+    payload.iss = issuer;
     Ok(payload)
+}
+
+/// Decode a `cacao_b64`-derived CBOR blob into a delegation chain: a single CACAO
+/// (CBOR map, depth-1) or a `[root, leaf]` array (depth-2 team delegation).
+fn decode_cacao_chain(
+    cbor: &[u8],
+) -> Result<kotoba_auth::DelegationChain, (StatusCode, String)> {
+    match kotoba_auth::Cacao::from_cbor(cbor) {
+        Ok(cacao) => Ok(kotoba_auth::DelegationChain::new(cacao)),
+        Err(_) => kotoba_auth::DelegationChain::from_cbor_chain(cbor)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao parse: {e}"))),
+    }
 }
 
 fn verify_datomic_cacao_payload_with_any_operation(
@@ -2222,11 +2244,13 @@ fn verify_datomic_cacao_payload_with_any_operation(
     let cbor = B64
         .decode(b64)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao_b64 decode: {e}")))?;
-    let cacao = kotoba_auth::Cacao::from_cbor(&cbor)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("cacao parse: {e}")))?;
-    let nonce = cacao.p.nonce.clone();
-    let payload = cacao.p.clone();
-    let chain = kotoba_auth::DelegationChain::new(cacao);
+    let chain = decode_cacao_chain(&cbor)?;
+    let leaf = chain
+        .chain
+        .last()
+        .cloned()
+        .ok_or((StatusCode::BAD_REQUEST, "empty cacao chain".to_string()))?;
+    let nonce = leaf.p.nonce.clone();
     let resolver = local_first_did_resolver(state);
     let mut issuer = None;
     let mut last_error = None;
@@ -2275,6 +2299,8 @@ fn verify_datomic_cacao_payload_with_any_operation(
         ));
     }
     tracing::debug!(issuer = %issuer, operations = %operations.join(","), graph, "datomic CACAO accepted");
+    let mut payload = leaf.p;
+    payload.iss = issuer;
     Ok(payload)
 }
 
@@ -4921,6 +4947,26 @@ pub async fn datomic_transact(
                 kotoba_auth::CacaoPayload::OP_TX_CREATE,
             ],
         )?;
+        // Account-owned private graph auto-registration (data sovereignty,
+        // docs/gftd-office). If this graph is not yet registered and its CID is the
+        // deterministic private-graph CID derived from the CACAO issuer's DID
+        // (NamedGraph::private_for → KotobaCid::from_bytes("kotoba://graph/private/{did}")),
+        // register it Private{owner=issuer}. The CID binds to the DID, so only the
+        // issuer whose DID derives THIS exact CID can claim it — it can never grant
+        // ownership of another tenant's graph. Without this, an account could never own
+        // its own graph over the wire (unregistered graphs default to operator-owned),
+        // which would block the org-first sovereignty model.
+        if !state.graph_registry.read().await.contains_key(&graph_cid) {
+            let derived = kotoba_core::named_graph::NamedGraph::private_for(&payload.iss);
+            if derived.cid == graph_cid {
+                tracing::info!(
+                    owner = %payload.iss,
+                    graph = %graph_cid.to_multibase(),
+                    "datomic transact: auto-registered account-owned private graph"
+                );
+                state.register_graph(derived).await;
+            }
+        }
         // ADR-2606131600 P1 owner-binding — write-path mirror (BaaS tenant writes).
         // The CACAO grant above verifies capability + graph scope + aud==operator +
         // signature, but not WHO signed it. A self-signed CACAO scoped to another
@@ -10202,6 +10248,305 @@ mod tests {
             "deny must be the owner-binding gate, got: {}",
             err.1
         );
+    }
+
+    // docs/gftd-office: an account writes office datoms to ITS OWN private graph over
+    // the wire (the CACAO-authed sync path). The graph is unregistered; its CID is the
+    // deterministic NamedGraph::private_for(issuer) CID, so the transact auto-registers
+    // it Private{owner=issuer} and the write succeeds. A write by the same account to a
+    // graph CID that is NOT derived from its DID must be rejected (cannot claim others').
+    #[tokio::test]
+    async fn datomic_transact_auto_registers_account_owned_private_graph() {
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        // signed_cacao_b64 signs with key [42] — the account identity.
+        let account_did = kotoba_auth::ed25519_pubkey_to_did_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let g = kotoba_core::named_graph::NamedGraph::private_for(&account_did).cid;
+        let g_mb = g.to_multibase();
+        assert!(
+            !state.graph_registry.read().await.contains_key(&g),
+            "graph starts unregistered"
+        );
+
+        // Write CACAO: datom:transact + tx:create, scoped to the account's own graph CID.
+        let cacao = signed_cacao_b64(
+            &state,
+            &g_mb,
+            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+            "auto-reg-nonce-1",
+            [format!(
+                "kotoba://op/{}",
+                kotoba_auth::CacaoPayload::OP_TX_CREATE
+            )],
+        );
+        datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: g_mb.clone(),
+                tx_edn: "[[:db/add \"doc1\" :doc/title \"Hello\"]]".into(),
+                ipns_name: None,
+                cacao_b64: Some(cacao),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .expect("account must be able to write its own DID-derived private graph");
+
+        // The graph is now registered Private{owner = account}.
+        match state.graph_registry.read().await.get(&g) {
+            Some((_, GraphVisibility::Private { owner_did })) => {
+                assert_eq!(owner_did, &account_did, "owner must be the account DID")
+            }
+            other => panic!("graph must be auto-registered private to the account: {other:?}"),
+        }
+
+        // The same account cannot claim a graph CID NOT derived from its DID.
+        let foreign = KotobaCid::from_bytes(b"not-derived-from-account-did");
+        let foreign_mb = foreign.to_multibase();
+        let cacao2 = signed_cacao_b64(
+            &state,
+            &foreign_mb,
+            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+            "auto-reg-nonce-2",
+            [format!(
+                "kotoba://op/{}",
+                kotoba_auth::CacaoPayload::OP_TX_CREATE
+            )],
+        );
+        let err = datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: foreign_mb,
+                tx_edn: "[[:db/add \"doc1\" :doc/title \"Hello\"]]".into(),
+                ipns_name: None,
+                cacao_b64: Some(cacao2),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("account cannot claim a graph CID not derived from its DID");
+        assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // docs/gftd-office: read-back. After an account syncs office datoms to its own
+    // private graph, it reads them back over the wire with a READ CACAO (datom:read,
+    // scoped to the graph CID — require_datomic_read uses graph.to_multibase()). No
+    // CACAO → denied; owner CACAO → the written datom is returned (v_edn = EDN form).
+    #[tokio::test]
+    async fn datomic_datoms_reads_back_account_private_graph_with_cacao() {
+        use axum::response::IntoResponse as _;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        let account_did = kotoba_auth::ed25519_pubkey_to_did_key(
+            &ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])
+                .verifying_key()
+                .to_bytes(),
+        );
+        let g = kotoba_core::named_graph::NamedGraph::private_for(&account_did).cid;
+        let g_mb = g.to_multibase();
+
+        // write (auto-registers the account's private graph)
+        let wcacao = signed_cacao_b64(
+            &state,
+            &g_mb,
+            kotoba_auth::CacaoPayload::OP_DATOM_TRANSACT,
+            "rb-w-1",
+            [format!(
+                "kotoba://op/{}",
+                kotoba_auth::CacaoPayload::OP_TX_CREATE
+            )],
+        );
+        datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: g_mb.clone(),
+                tx_edn: "[[:db/add \"doc1\" :doc/title \"Hello\"]]".into(),
+                ipns_name: None,
+                cacao_b64: Some(wcacao),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .expect("owner write must succeed");
+
+        let datoms_req = |cacao: Option<String>| DatomicDatomsReq {
+            graph: g_mb.clone(),
+            index: "eavt".into(),
+            components_edn: vec![],
+            as_of: None,
+            since: None,
+            remote_peer: None,
+            remote_ipns_name: None,
+            cacao_b64: cacao,
+            presentation: None,
+            limit: None,
+        };
+
+        // no CACAO → denied (the read gate is real)
+        let denied = datomic_datoms(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(datoms_req(None)),
+        )
+        .await
+        .err()
+        .expect("private read without cacao must be denied");
+        assert_eq!(denied.0, axum::http::StatusCode::UNAUTHORIZED);
+
+        // owner read CACAO (datom:read, scope = graph CID) → OK + returns the datom
+        let rcacao = signed_cacao_b64(
+            &state,
+            &g_mb,
+            kotoba_auth::CacaoPayload::OP_DATOM_READ,
+            "rb-r-1",
+            Vec::<String>::new(),
+        );
+        let resp = datomic_datoms(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(datoms_req(Some(rcacao))),
+        )
+        .await
+        .expect("owner read must be allowed")
+        .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let datoms = v["datoms"].as_array().expect("datoms array in response");
+        assert!(
+            datoms
+                .iter()
+                .any(|d| d["a"] == ":doc/title" && d["v_edn"] == "\"Hello\""),
+            "read-back must contain the written title datom, got: {v}"
+        );
+    }
+
+    // docs/gftd-office team sharing: a team MEMBER writes to the ORG's private graph
+    // via a depth-2 delegation chain [root(org→member), leaf(member→server)]. The
+    // server binds the write to the ROOT authority (the org owner), so it passes
+    // owner-binding and auto-registers the graph to the org. A member WITHOUT a
+    // delegation (a bare single CACAO) is rejected.
+    #[tokio::test]
+    async fn datomic_transact_accepts_depth2_team_delegation() {
+        use base64::Engine as _;
+        std::env::set_var("KOTOBA_IPFS", "off");
+        std::env::set_var("KOTOBA_IPNS_REQUIRE_SIGNATURE", "false");
+        let state = Arc::new(KotobaState::new(None).unwrap());
+
+        let owner_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]); // org
+        let member_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]); // member
+        let owner_did =
+            kotoba_auth::ed25519_pubkey_to_did_key(&owner_key.verifying_key().to_bytes());
+        let member_did =
+            kotoba_auth::ed25519_pubkey_to_did_key(&member_key.verifying_key().to_bytes());
+        let g = kotoba_core::named_graph::NamedGraph::private_for(&owner_did).cid;
+        let g_mb = g.to_multibase();
+        let aud = state.operator_did.clone();
+
+        let sign = |key: &ed25519_dalek::SigningKey,
+                    iss: &str,
+                    cacao_aud: &str,
+                    nonce: &str,
+                    caps: &[&str]| {
+            use ed25519_dalek::Signer as _;
+            let mut resources: Vec<String> =
+                caps.iter().map(|c| format!("kotoba://op/{c}")).collect();
+            resources.push(format!("kotoba://graph/{g_mb}"));
+            let mut c = kotoba_auth::Cacao {
+                h: kotoba_auth::CacaoHeader {
+                    t: "eip4361".into(),
+                },
+                p: kotoba_auth::CacaoPayload {
+                    iss: iss.into(),
+                    aud: cacao_aud.into(),
+                    issued_at: "2026-05-30T00:00:00Z".into(),
+                    expiry: Some("2099-01-01T00:00:00Z".into()),
+                    nonce: nonce.into(),
+                    domain: "kotoba.test".into(),
+                    statement: None,
+                    version: "1".into(),
+                    resources,
+                },
+                s: kotoba_auth::CacaoSig {
+                    t: "EdDSA".into(),
+                    s: String::new(),
+                },
+            };
+            c.s.s = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(key.sign(c.siwe_message().as_bytes()).to_bytes());
+            c
+        };
+
+        // root: org → member ; leaf: member → server. Serialize [root, leaf] as a CBOR array.
+        let root = sign(&owner_key, &owner_did, &member_did, "d2-root-1", &["datom:transact", "tx:create"]);
+        let leaf = sign(&member_key, &member_did, &aud, "d2-leaf-1", &["datom:transact", "tx:create"]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&vec![root, leaf], &mut cbor).unwrap();
+        let chain_b64 = base64::engine::general_purpose::STANDARD.encode(cbor);
+
+        datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: g_mb.clone(),
+                tx_edn: "[[:db/add \"doc1\" :doc/title \"Team\"]]".into(),
+                ipns_name: None,
+                cacao_b64: Some(chain_b64),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .expect("delegated member write must succeed");
+
+        // bound to the ORG owner, not the member
+        match state.graph_registry.read().await.get(&g) {
+            Some((_, GraphVisibility::Private { owner_did: o })) => assert_eq!(o, &owner_did),
+            other => panic!("graph must be private to the org owner: {other:?}"),
+        }
+
+        // a member WITHOUT delegation (bare single CACAO) cannot write the org graph
+        let solo = sign(&member_key, &member_did, &aud, "d2-solo-1", &["datom:transact", "tx:create"]);
+        let mut sb = Vec::new();
+        ciborium::into_writer(&solo, &mut sb).unwrap();
+        let solo_b64 = base64::engine::general_purpose::STANDARD.encode(sb);
+        let err = datomic_transact(
+            axum::extract::State(Arc::clone(&state)),
+            axum::http::HeaderMap::new(),
+            axum::Json(DatomicTransactReq {
+                graph: g_mb.clone(),
+                tx_edn: "[[:db/add \"x\" :n 1]]".into(),
+                ipns_name: None,
+                cacao_b64: Some(solo_b64),
+                cacao_proof_cid: None,
+                expected_parent: None,
+                presentation: None,
+            }),
+        )
+        .await
+        .err()
+        .expect("non-delegated member must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
     }
 
     // ADR-2606201700 f/3: per-tier datom write quota. A free-tier tenant (default,
