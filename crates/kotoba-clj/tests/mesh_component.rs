@@ -73,6 +73,18 @@ fn export_mapping_is_independent_of_defn_order() {
 }
 
 #[test]
+fn mesh_component_using_host_imports_compiles() {
+    // both entries call a kotoba:kais/kqe host import — this proves the new
+    // `kotoba-component` world declares the IMPORTS correctly (the encoder
+    // matches the module's kqe import against the world), not just the exports.
+    let src = "(ns m) \
+               (defn run [ctx] (kqe-assert! \"g\" \"run\" \"k\" \"v\")) \
+               (defn on-http [req] (kqe-assert! \"g\" \"http\" \"k\" \"v\"))";
+    let wasm = compile_kais_mesh_component_str(src, WIT).expect("compile with host imports");
+    assert_loads(&wasm).expect("multi-export component using a kqe import must load");
+}
+
+#[test]
 fn unsupported_handler_defn_does_not_break_compilation() {
     // on-kse isn't a wired export yet (different arity); as a plain defn it must
     // not be exported, and the component still compiles as run + on-http.
