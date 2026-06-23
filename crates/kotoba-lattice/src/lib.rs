@@ -29,9 +29,11 @@ pub mod node;
 pub mod policy;
 pub mod protocol;
 pub mod reconcile;
+pub mod routes;
 pub mod trigger;
 
 pub use control::{app_to_quads, desired_from_quads, ControlQuad};
+pub use routes::TriggerRoutes;
 pub use error::LatticeError;
 pub use manifest::{AppManifest, ComponentSpec, Lang, LinkSpec, Placement, TriggerSpec};
 pub use node::{LatticeController, RecordingTransport, Transport};

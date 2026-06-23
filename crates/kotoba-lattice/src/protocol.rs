@@ -204,6 +204,15 @@ pub enum LatticeMessage {
         #[serde(default)]
         triggers: Vec<crate::trigger::DeltaTrigger>,
     },
+    /// Announce an app's event-source routes (M13): KSE topic → component, cron,
+    /// HTTP route → component. Each node installs them and, on a matching event
+    /// (KSE gossip / cron tick / HTTP route), invokes the bound component's
+    /// `on-kse`/`on-tick`/`on-http` export.
+    PutRoutes {
+        app: String,
+        #[serde(default)]
+        routes: crate::routes::TriggerRoutes,
+    },
 }
 
 impl LatticeMessage {
