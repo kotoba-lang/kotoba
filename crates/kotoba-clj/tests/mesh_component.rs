@@ -56,3 +56,29 @@ fn mesh_component_compile_is_byte_deterministic() {
     let b = compile_kais_mesh_component_str(src, WIT).unwrap();
     assert_eq!(a, b, "mesh component compile must be deterministic");
 }
+
+#[test]
+fn export_mapping_is_independent_of_defn_order() {
+    // entries are resolved by name lookup, so defining on-http BEFORE run must
+    // still bind each export to the correct user fn (loads = encoder validated
+    // both exports against the kotoba-component world).
+    let reversed = "(ns m) (defn on-http [req] req) (defn run [ctx] ctx)";
+    let normal = "(ns m) (defn run [ctx] ctx) (defn on-http [req] req)";
+    let a = compile_kais_mesh_component_str(reversed, WIT).expect("reversed-order compile");
+    assert_loads(&a).expect("reversed-order component loads");
+    // declaration order changes the module's fn layout, but both are valid
+    // kotoba-component components exporting run + on-http
+    let b = compile_kais_mesh_component_str(normal, WIT).expect("normal-order compile");
+    assert_loads(&b).expect("normal-order component loads");
+}
+
+#[test]
+fn unsupported_handler_defn_does_not_break_compilation() {
+    // on-kse isn't a wired export yet (different arity); as a plain defn it must
+    // not be exported, and the component still compiles as run + on-http.
+    let src = "(ns m) (defn run [ctx] ctx) \
+               (defn on-http [req] req) \
+               (defn on-kse [topic payload] payload)";
+    let wasm = compile_kais_mesh_component_str(src, WIT).expect("compile with extra defn");
+    assert_loads(&wasm).expect("loads; on-kse is just an unexported helper");
+}
