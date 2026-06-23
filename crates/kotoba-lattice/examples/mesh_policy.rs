@@ -48,11 +48,17 @@ fn main() {
 
     // escalation attempt: same link does NOT grant a different ability
     let esc = c.authorize(source, target, "train");
-    println!("escalation (infer→train): allowed={} ({})", esc.allowed, esc.reason);
+    println!(
+        "escalation (infer→train): allowed={} ({})",
+        esc.allowed, esc.reason
+    );
 
     // revoke
     c.on_message(LatticeMessage::DelLink { id: "lnk-1".into() }, 0);
-    println!("after revoke: allowed={}", c.authorize(source, target, ability).allowed);
+    println!(
+        "after revoke: allowed={}",
+        c.authorize(source, target, ability).allowed
+    );
 
     // == out-of-proc provider routing (wRPC) ==
     println!("\n== wRPC routing ==");
@@ -62,11 +68,23 @@ fn main() {
         hb("did:gpu-a", &["cap/llm"], 400),
         hb("did:gpu-b", &["cap/llm"], 900),
     ];
-    println!("cap/kqe → {:?}", route_capability("cap/kqe", &local, &fleet)); // Local
-    println!("cap/llm → {:?}", route_capability("cap/llm", &local, &fleet)); // Remote(gpu-b, richest)
-    println!("cap/evm → {:?}", route_capability("cap/evm", &local, &fleet)); // Unavailable
+    println!(
+        "cap/kqe → {:?}",
+        route_capability("cap/kqe", &local, &fleet)
+    ); // Local
+    println!(
+        "cap/llm → {:?}",
+        route_capability("cap/llm", &local, &fleet)
+    ); // Remote(gpu-b, richest)
+    println!(
+        "cap/evm → {:?}",
+        route_capability("cap/evm", &local, &fleet)
+    ); // Unavailable
 
-    assert_eq!(route_capability("cap/kqe", &local, &fleet), ProviderRoute::Local);
+    assert_eq!(
+        route_capability("cap/kqe", &local, &fleet),
+        ProviderRoute::Local
+    );
     assert_eq!(
         route_capability("cap/llm", &local, &fleet),
         ProviderRoute::Remote("did:gpu-b".into())

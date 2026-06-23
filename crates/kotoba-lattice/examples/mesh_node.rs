@@ -28,7 +28,11 @@ fn hb(did: &str, free_gas: u64, hosted: &[&str]) -> Heartbeat {
     }
 }
 
-fn collect_bids(c: &mut LatticeController, msgs: &[(String, LatticeMessage)], nodes: &[(&str, u64)]) {
+fn collect_bids(
+    c: &mut LatticeController,
+    msgs: &[(String, LatticeMessage)],
+    nodes: &[(&str, u64)],
+) {
     for (_, m) in msgs {
         if let LatticeMessage::Auction(a) = m {
             let a: &Auction = a;
@@ -53,7 +57,10 @@ fn main() {
     c.on_heartbeat(hb("nTokyo", 200, &[]), 0);
     c.on_heartbeat(hb("nOsaka", 100, &[]), 0);
     let opened = c.tick(0);
-    println!("t=0   tick     → {} msg (auction opened, observed=0/2)", opened.len());
+    println!(
+        "t=0   tick     → {} msg (auction opened, observed=0/2)",
+        opened.len()
+    );
     collect_bids(&mut c, &opened, &[("nTokyo", 200), ("nOsaka", 100)]);
 
     // t=120: bid window elapsed → award + place
@@ -68,15 +75,26 @@ fn main() {
     c.on_heartbeat(hb("nTokyo", 150, &["bafyReply"]), 130);
     c.on_heartbeat(hb("nOsaka", 80, &["bafyReply"]), 130);
     let conv = c.step(140, &mut tx).unwrap();
-    println!("t=140 reconcile→ {} msg, observed={:?} (✓ converged)", conv, c.observed(140));
+    println!(
+        "t=140 reconcile→ {} msg, observed={:?} (✓ converged)",
+        conv,
+        c.observed(140)
+    );
 
     // t=2000: nOsaka goes silent → pruned → observed drops → self-heal
     c.on_heartbeat(hb("nTokyo", 150, &["bafyReply"]), 2000); // nTokyo still alive
     c.on_heartbeat(hb("nKyoto", 90, &[]), 2000); // a fresh node joins to take over
     let pruned = c.prune(2000);
-    println!("\nt=2000 lost {:?}; observed now {:?}", pruned, c.observed(2000));
+    println!(
+        "\nt=2000 lost {:?}; observed now {:?}",
+        pruned,
+        c.observed(2000)
+    );
     let heal = c.tick(2000);
-    println!("t=2000 tick     → {} msg (re-auction the lost instance)", heal.len());
+    println!(
+        "t=2000 tick     → {} msg (re-auction the lost instance)",
+        heal.len()
+    );
     // bids reflect real load: nTokyo already hosts one (load-penalised), nKyoto is idle
     for (_, m) in &heal {
         if let LatticeMessage::Auction(a) = m {
@@ -91,7 +109,10 @@ fn main() {
     let replaced = c.close_due(2200);
     for (_, m) in &replaced {
         if let LatticeMessage::StartComponent { node_did, cid, .. } = m {
-            println!("t=2200 replace  → start {} on {} (self-healed)", cid, node_did);
+            println!(
+                "t=2200 replace  → start {} on {} (self-healed)",
+                cid, node_did
+            );
         }
     }
 }

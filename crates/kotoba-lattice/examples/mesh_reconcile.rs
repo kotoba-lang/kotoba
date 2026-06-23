@@ -35,27 +35,55 @@ fn node(did: &str, zone: &str, caps: &[&str], free_gas: u64, hosted: &[&str]) ->
 fn main() {
     let app = AppManifest::from_edn(MANIFEST).expect("parse manifest");
 
-    println!("== app: {} v{} ==", app.name, app.version.as_deref().unwrap_or("?"));
+    println!(
+        "== app: {} v{} ==",
+        app.name,
+        app.version.as_deref().unwrap_or("?")
+    );
     for c in &app.components {
         println!(
             "  component {:8} lang={:?} scale={} requires={:?}",
             c.name, c.lang, c.scale, c.requires
         );
     }
-    println!("  placement spread={:?} require={:?}\n", app.placement.spread, app.placement.require);
+    println!(
+        "  placement spread={:?} require={:?}\n",
+        app.placement.spread, app.placement.require
+    );
 
     // ── observed state from a 3-node fleet (nothing hosted yet) ──
     let mut fleet = vec![
-        node("did:key:zTokyo", "jp", &["cap/kqe", "cap/egress", "cap/llm"], 9_000_000, &[]),
-        node("did:key:zOsaka", "jp", &["cap/kqe", "cap/egress"], 8_000_000, &[]),
-        node("did:key:zNara", "jp", &["cap/kqe", "cap/egress", "cap/llm"], 5_000_000, &[]),
+        node(
+            "did:key:zTokyo",
+            "jp",
+            &["cap/kqe", "cap/egress", "cap/llm"],
+            9_000_000,
+            &[],
+        ),
+        node(
+            "did:key:zOsaka",
+            "jp",
+            &["cap/kqe", "cap/egress"],
+            8_000_000,
+            &[],
+        ),
+        node(
+            "did:key:zNara",
+            "jp",
+            &["cap/kqe", "cap/egress", "cap/llm"],
+            5_000_000,
+            &[],
+        ),
     ];
 
     let desired = app.desired_by_cid();
     let observed = observed_counts(&fleet);
     let actions = need_actions(&desired, &observed);
 
-    println!("== reconcile: desired={:?} observed={:?} ==", desired, observed);
+    println!(
+        "== reconcile: desired={:?} observed={:?} ==",
+        desired, observed
+    );
     for a in &actions {
         println!("  need {:+} of {}", a.delta, a.cid);
     }

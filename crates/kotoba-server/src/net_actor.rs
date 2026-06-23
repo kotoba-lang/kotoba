@@ -200,7 +200,8 @@ pub async fn run(
         hosted: Vec::new(),
         lat_ms: 0,
     };
-    let mut lattice = kotoba_lattice::LatticeController::new(/*ttl*/ 15_000, /*bid_window*/ 3_000);
+    let mut lattice =
+        kotoba_lattice::LatticeController::new(/*ttl*/ 15_000, /*bid_window*/ 3_000);
     // datom-Δ triggers installed via PutTriggers (M6): a matching asserted datom
     // places the component on this node (same path as auction placement).
     let mut delta_triggers: Vec<kotoba_lattice::DeltaTrigger> = Vec::new();
@@ -505,7 +506,13 @@ mod tests {
     fn start_component_skips_malformed_cid() {
         let store = kotoba_store::MemoryBlockStore::new();
         let mut hosted = Vec::new();
-        start_component(&test_executor(), &store, "did:self", "not-a-real-cid", &mut hosted);
+        start_component(
+            &test_executor(),
+            &store,
+            "did:self",
+            "not-a-real-cid",
+            &mut hosted,
+        );
         assert!(hosted.is_empty(), "malformed CID must not be hosted");
     }
 
@@ -528,16 +535,35 @@ mod tests {
         let kc = KotobaCid::from_bytes(garbage);
         store.put(&kc, garbage).unwrap();
         let mut hosted = Vec::new();
-        start_component(&test_executor(), &store, "did:self", &kc.to_multibase(), &mut hosted);
-        assert!(hosted.is_empty(), "uncompilable artifact must not be hosted");
+        start_component(
+            &test_executor(),
+            &store,
+            "did:self",
+            &kc.to_multibase(),
+            &mut hosted,
+        );
+        assert!(
+            hosted.is_empty(),
+            "uncompilable artifact must not be hosted"
+        );
     }
 
     #[test]
     fn start_component_is_idempotent_for_already_hosted() {
         let store = kotoba_store::MemoryBlockStore::new();
         let mut hosted = vec!["bafyAlready".to_string()];
-        start_component(&test_executor(), &store, "did:self", "bafyAlready", &mut hosted);
-        assert_eq!(hosted, vec!["bafyAlready".to_string()], "must not double-add");
+        start_component(
+            &test_executor(),
+            &store,
+            "did:self",
+            "bafyAlready",
+            &mut hosted,
+        );
+        assert_eq!(
+            hosted,
+            vec!["bafyAlready".to_string()],
+            "must not double-add"
+        );
     }
 
     /// Loop-body coverage: spawn the real `net_actor::run` task for one node and
@@ -551,8 +577,9 @@ mod tests {
         use std::time::Duration;
 
         // observer node: subscribes to the lattice and just listens
-        let mut observer =
-            KotobaSwarm::new("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).await.unwrap();
+        let mut observer = KotobaSwarm::new("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .await
+            .unwrap();
         kotoba_net::lattice::subscribe_lattice(&mut observer).unwrap();
         let obs_addr = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -566,8 +593,9 @@ mod tests {
         let obs_peer = observer.local_peer_id;
 
         // run-node swarm: dial the observer BEFORE handing it to run()
-        let mut node =
-            KotobaSwarm::new("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()).await.unwrap();
+        let mut node = KotobaSwarm::new("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .await
+            .unwrap();
         let expected_did = format!("did:key:{}", node.local_peer_id);
         node.add_peer(obs_peer, obs_addr);
 

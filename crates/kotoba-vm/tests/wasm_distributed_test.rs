@@ -21,10 +21,10 @@
 
 use std::sync::Arc;
 
+use kotoba_runtime::WasmExecutor;
 use kotoba_vm::distributed::{DistributedMessage, DistributedPregelRunner};
 use kotoba_vm::pregel::{Message, VertexId};
 use kotoba_vm::{wasm_compute_fn, wasm_vertex_gas_and_quads};
-use kotoba_runtime::WasmExecutor;
 
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
@@ -84,7 +84,10 @@ async fn wasm_runs_on_distributed_runner_single_node() {
     let (gas, quads) =
         wasm_vertex_gas_and_quads(&state).expect("vertex state must decode as WASM state");
     assert!(gas > 0, "WASM execution should consume gas, got {gas}");
-    assert_eq!(quads, 1, "echo-assert guest should accumulate exactly 1 quad");
+    assert_eq!(
+        quads, 1,
+        "echo-assert guest should accumulate exactly 1 quad"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -152,10 +155,7 @@ async fn wasm_compute_distributed_across_two_nodes() {
 
     // Both nodes computed WASM locally — proof that compute is distributed across
     // instances (each node ran the guest only for the vertex it owns).
-    for (label, runner, vid) in [
-        ("node1", &runner1, &vid_a),
-        ("node2", &runner2, &vid_b),
-    ] {
+    for (label, runner, vid) in [("node1", &runner1, &vid_a), ("node2", &runner2, &vid_b)] {
         let state = runner
             .graph
             .vertex(vid)
@@ -174,8 +174,14 @@ async fn wasm_compute_distributed_across_two_nodes() {
     let f2 = relay_2to1.await.expect("relay 2→1 joins");
     // echo-assert emits no remote messages; true cross-node WASM message-passing
     // is gated on a guest ABI that lets a guest address other vertices (follow-up).
-    assert_eq!(f1, 0, "echo-assert guest emits no remote messages (node1→node2)");
-    assert_eq!(f2, 0, "echo-assert guest emits no remote messages (node2→node1)");
+    assert_eq!(
+        f1, 0,
+        "echo-assert guest emits no remote messages (node1→node2)"
+    );
+    assert_eq!(
+        f2, 0,
+        "echo-assert guest emits no remote messages (node2→node1)"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -99,8 +99,12 @@ mod tests {
         let t = triggers();
         // audit (value-filtered) + indexer (any value); the http `web` is excluded
         assert_eq!(t.len(), 2);
-        assert!(t.iter().any(|d| d.component == "bafyAudit" && d.value.as_deref() == Some("admin")));
-        assert!(t.iter().any(|d| d.component == "bafyIndex" && d.value.is_none()));
+        assert!(t
+            .iter()
+            .any(|d| d.component == "bafyAudit" && d.value.as_deref() == Some("admin")));
+        assert!(t
+            .iter()
+            .any(|d| d.component == "bafyIndex" && d.value.is_none()));
     }
 
     #[test]
@@ -111,7 +115,10 @@ mod tests {
         fired.sort();
         assert_eq!(fired, vec!["bafyAudit", "bafyIndex"]);
         // role=user → only indexer (audit is admin-only)
-        assert_eq!(fired_by_datom(&t, "kg/claim/role", "user"), vec!["bafyIndex"]);
+        assert_eq!(
+            fired_by_datom(&t, "kg/claim/role", "user"),
+            vec!["bafyIndex"]
+        );
         // different predicate → nothing
         assert!(fired_by_datom(&t, "kg/claim/name", "admin").is_empty());
     }

@@ -10,9 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kotoba_lattice::protocol::{Auction, LatticeMessage, NodeRole};
-use kotoba_lattice::{
-    app_to_quads, desired_from_quads, AppManifest, Heartbeat, LatticeController,
-};
+use kotoba_lattice::{app_to_quads, desired_from_quads, AppManifest, Heartbeat, LatticeController};
 
 const APP: &str = r#"{:kotoba.app/name "wadm-demo"
     :kotoba.app/components
@@ -46,7 +44,11 @@ fn main() {
 
     let mut c = LatticeController::new(1000, 100);
     c.on_message(
-        LatticeMessage::PutApp { app: app.name.clone(), desired, constraints },
+        LatticeMessage::PutApp {
+            app: app.name.clone(),
+            desired,
+            constraints,
+        },
         0,
     );
 
@@ -65,7 +67,10 @@ fn main() {
             _ => None,
         })
         .expect("auction opened");
-    println!("\nauction {} for {} (n={})", auction.id, auction.cid, auction.n);
+    println!(
+        "\nauction {} for {} (n={})",
+        auction.id, auction.cid, auction.n
+    );
     c.on_bid(LatticeController::bid_for(&auction, &hb("nA", &hosted_a)).unwrap());
     c.on_bid(LatticeController::bid_for(&auction, &hb("nB", &hosted_b)).unwrap());
 
@@ -75,8 +80,12 @@ fn main() {
         if let LatticeMessage::StartComponent { node_did, cid, .. } = m {
             println!("  start {cid} on {node_did}");
             match node_did.as_str() {
-                "nA" => { hosted_a.insert(cid); }
-                "nB" => { hosted_b.insert(cid); }
+                "nA" => {
+                    hosted_a.insert(cid);
+                }
+                "nB" => {
+                    hosted_b.insert(cid);
+                }
                 _ => {}
             }
         }

@@ -22,8 +22,7 @@ fn hb(did: &str, caps: &[&str], free_gas: u64, hosted: &[&str]) -> Heartbeat {
 }
 
 fn put_app(desired: &[(&str, u32)], cap: &str) -> LatticeMessage {
-    let desired: BTreeMap<String, u32> =
-        desired.iter().map(|(c, n)| (c.to_string(), *n)).collect();
+    let desired: BTreeMap<String, u32> = desired.iter().map(|(c, n)| (c.to_string(), *n)).collect();
     let constraints = desired
         .keys()
         .cloned()
@@ -37,7 +36,11 @@ fn put_app(desired: &[(&str, u32)], cap: &str) -> LatticeMessage {
             )
         })
         .collect();
-    LatticeMessage::PutApp { app: "app".into(), desired, constraints }
+    LatticeMessage::PutApp {
+        app: "app".into(),
+        desired,
+        constraints,
+    }
 }
 
 /// Build a fresh controller fed an identical message stream.
@@ -66,7 +69,9 @@ fn two_reconcilers_emit_identical_auctions_and_awards() {
     let ta = a.tick(100);
     let tb = b.tick(100);
     assert_eq!(ta, tb, "auctions must be identical across reconcilers");
-    assert!(ta.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
+    assert!(ta
+        .iter()
+        .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
 
     // identical bid stream → identical awards + StartComponents
     let auction: Auction = ta
@@ -100,7 +105,10 @@ fn two_reconcilers_emit_identical_auctions_and_awards() {
 fn bid_order_does_not_change_the_award() {
     // award must depend only on (score, did) — not on bid arrival order.
     let auction = {
-        let fleet = vec![hb("nA", &["cap/kqe"], 300, &[]), hb("nB", &["cap/kqe"], 200, &[])];
+        let fleet = vec![
+            hb("nA", &["cap/kqe"], 300, &[]),
+            hb("nB", &["cap/kqe"], 200, &[]),
+        ];
         let app = put_app(&[("bafyX", 1)], "cap/kqe");
         let mut c = controller_seeded(&fleet, &app);
         match c.tick(100).into_iter().find_map(|(_, m)| match m {
@@ -113,8 +121,16 @@ fn bid_order_does_not_change_the_award() {
     };
 
     let bids = [
-        Bid { auction_id: auction.id.clone(), node_did: "nA".into(), score: 300 },
-        Bid { auction_id: auction.id.clone(), node_did: "nB".into(), score: 200 },
+        Bid {
+            auction_id: auction.id.clone(),
+            node_did: "nA".into(),
+            score: 300,
+        },
+        Bid {
+            auction_id: auction.id.clone(),
+            node_did: "nB".into(),
+            score: 200,
+        },
     ];
 
     // auction is opened lazily on tick, so seed identically first, then feed
@@ -137,7 +153,10 @@ fn bid_order_does_not_change_the_award() {
         c.on_bid(bids[0].clone());
         c.close_due(4_000)
     };
-    assert_eq!(forward, reverse, "award must be independent of bid arrival order");
+    assert_eq!(
+        forward, reverse,
+        "award must be independent of bid arrival order"
+    );
 }
 
 #[test]
@@ -147,13 +166,17 @@ fn reannouncing_same_app_does_not_double_auction() {
     let mut c = controller_seeded(&fleet, &app);
 
     let first = c.tick(100);
-    assert!(first.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
+    assert!(first
+        .iter()
+        .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
 
     // a duplicate PutApp (same desired) must not reopen an in-flight auction
     c.on_message(app.clone(), 110);
     let second = c.tick(120);
     assert!(
-        !second.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))),
+        !second
+            .iter()
+            .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))),
         "an auction is already in flight — must not duplicate"
     );
 }
@@ -161,7 +184,10 @@ fn reannouncing_same_app_does_not_double_auction() {
 #[test]
 fn fleet_converges_and_self_heals_identically_on_two_reconcilers() {
     let app = put_app(&[("bafyX", 2)], "cap/kqe");
-    let fleet0 = vec![hb("nA", &["cap/kqe"], 300, &[]), hb("nB", &["cap/kqe"], 200, &[])];
+    let fleet0 = vec![
+        hb("nA", &["cap/kqe"], 300, &[]),
+        hb("nB", &["cap/kqe"], 200, &[]),
+    ];
 
     let mut a = controller_seeded(&fleet0, &app);
     let mut b = controller_seeded(&fleet0, &app);
@@ -185,7 +211,10 @@ fn fleet_converges_and_self_heals_identically_on_two_reconcilers() {
     assert_eq!(a.close_due(4_000), b.close_due(4_000));
 
     // both observe the winners now hosting → both converge (no more auctions)
-    let hosted = [hb("nA", &["cap/kqe"], 280, &["bafyX"]), hb("nB", &["cap/kqe"], 180, &["bafyX"])];
+    let hosted = [
+        hb("nA", &["cap/kqe"], 280, &["bafyX"]),
+        hb("nB", &["cap/kqe"], 180, &["bafyX"]),
+    ];
     for h in &hosted {
         a.on_heartbeat(h.clone(), 5_000);
         b.on_heartbeat(h.clone(), 5_000);
@@ -198,6 +227,11 @@ fn fleet_converges_and_self_heals_identically_on_two_reconcilers() {
     b.on_heartbeat(hb("nA", &["cap/kqe"], 280, &["bafyX"]), 30_000);
     let ha = a.tick(30_000);
     let hb_ = b.tick(30_000);
-    assert_eq!(ha, hb_, "self-heal re-auction must be identical across reconcilers");
-    assert!(ha.iter().any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
+    assert_eq!(
+        ha, hb_,
+        "self-heal re-auction must be identical across reconcilers"
+    );
+    assert!(ha
+        .iter()
+        .any(|(_, m)| matches!(m, LatticeMessage::Auction(_))));
 }
