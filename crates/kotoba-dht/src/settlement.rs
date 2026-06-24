@@ -112,7 +112,7 @@ impl SettlementBatch {
 /// sorted deterministically. Slash lines are excluded — this is what the node
 /// owes *out* for availability served, not what it claws back.
 ///
-/// Pure: built from a non-draining [`SettlementIntentSink::snapshot`] so reading
+/// Pure: built from a non-draining [`crate::audit::SettlementIntentSink::snapshot`] so reading
 /// the owed retainer never consumes the settle hand-off queue.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetainerOwed {

@@ -1,7 +1,7 @@
 //! # Validation hook — enforcing a DNA's shared physics (ADR-001 phase 3 / GROWTH p9)
 //!
 //! The enforcement side of [`crate::dna`]: a proposed transaction is checked
-//! against the DNA's [`ValidationRule`]s before it commits (and on merge results).
+//! against the DNA's `ValidationRule`s before it commits (and on merge results).
 //! Validation is **pure and deterministic** — the same transaction under the same
 //! rules yields the same verdict on every replica, which is what lets a
 //! merge-on-conflict Merkle-CRDT converge without coordination (ADR-001).
