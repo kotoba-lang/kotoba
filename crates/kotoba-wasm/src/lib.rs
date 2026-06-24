@@ -796,6 +796,9 @@ impl WriteCrypto {
     /// then serializes `[root, leaf]` as a CBOR array → base64 for `cacao_b64`. The
     /// server verifies attenuation and binds the write to the ROOT issuer (the owner),
     /// so a team member can write to the org's graph (docs/gftd-office team sharing).
+    // CACAO delegation needs every field of the leaf claim; bundling them into a
+    // struct would not improve clarity at this single call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn mint_delegated(
         &self,
         root_grant_b64: &str,

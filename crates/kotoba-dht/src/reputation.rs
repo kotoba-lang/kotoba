@@ -78,7 +78,7 @@ impl EarnRateBand {
 /// an XOR-sorted eligible set and proximity remains the tie-breaker.
 pub fn prefer_by_reputation(eligible: &[(NodeId, u64)], k: usize) -> Vec<NodeId> {
     let mut ranked: Vec<&(NodeId, u64)> = eligible.iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1)); // stable; reputation descending
+    ranked.sort_by_key(|b| std::cmp::Reverse(b.1)); // stable; reputation descending
     ranked.into_iter().take(k).map(|(n, _)| n.clone()).collect()
 }
 
