@@ -17,6 +17,17 @@ use crate::protocol::KOTOBA_SYNC_PROTOCOL;
 
 pub type KotobaSwarmType = Swarm<KotobaBehaviour>;
 
+/// True if a multiaddr's IP component is loopback (127.0.0.0/8 or ::1). Used to
+/// drop loopback addresses a peer advertises via Identify — dialing them reaches
+/// the dialer's own localhost (a WrongPeerId storm), never the remote peer.
+pub(crate) fn multiaddr_is_loopback(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        Protocol::Ip4(ip) => ip.is_loopback(),
+        Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
+}
+
 /// NAT-traversal configuration (clean-room WireGuard/Tailscale-equivalent over
 /// libp2p — AutoNAT + Circuit Relay v2 + DCUtR).
 ///
@@ -350,9 +361,11 @@ impl KotobaSwarm {
 
                 // Connection events
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    tracing::info!(peer = %peer_id, "kotoba-net: peer connected");
                     return Some(KotobaNetEvent::PeerConnected(peer_id));
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    tracing::info!(peer = %peer_id, "kotoba-net: peer disconnected");
                     return Some(KotobaNetEvent::PeerDisconnected(peer_id));
                 }
 
@@ -374,6 +387,13 @@ impl KotobaSwarm {
                     identify::Event::Received { peer_id, info, .. },
                 )) => {
                     for addr in info.listen_addrs {
+                        // Skip loopback addresses a peer advertises (a node listening
+                        // on 0.0.0.0 advertises 127.0.0.1 too): dialing those reaches
+                        // the DIALER's own localhost → a WrongPeerId storm. Only
+                        // routable addresses (LAN / Tailscale / public) are useful.
+                        if multiaddr_is_loopback(&addr) {
+                            continue;
+                        }
                         self.swarm
                             .behaviour_mut()
                             .kademlia
