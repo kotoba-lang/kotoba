@@ -1062,10 +1062,13 @@ async fn mesh_http(
     match net_actor::invoke_trigger(
         &state.executor,
         state.block_store.as_ref(),
+        &state.quad_store,
         &state.operator_did,
         &cid,
         net_actor::ComponentTrigger::Http(body.to_vec()),
-    ) {
+    )
+    .await
+    {
         Some(out) => (StatusCode::OK, out).into_response(),
         None => (
             StatusCode::BAD_GATEWAY,

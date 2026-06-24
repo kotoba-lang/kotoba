@@ -27,6 +27,23 @@ pub fn deploy_messages(
 ) -> Vec<(&'static str, LatticeMessage)> {
     let mut msgs = Vec::new();
 
+    // Desired placement state (scale per resolved CID) → drives the auction so
+    // that *hosted-only* triggers (cron `on-tick`) actually fire. Without this a
+    // deployed app is merely ROUTED (http/kse dispatch by CID) but never PLACED,
+    // so a node never adds the component to `hosted` and the cron loop skips it.
+    let quads = crate::control::app_to_quads(app, resolved);
+    let (desired, constraints) = crate::control::desired_from_quads(&quads);
+    if !desired.is_empty() {
+        msgs.push((
+            topic::CMD,
+            LatticeMessage::PutApp {
+                app: app.name.clone(),
+                desired,
+                constraints,
+            },
+        ));
+    }
+
     let triggers = delta_triggers(app);
     if !triggers.is_empty() {
         msgs.push((
@@ -71,11 +88,16 @@ mod tests {
     }
 
     #[test]
-    fn deploy_emits_puttriggers_and_putroutes() {
+    fn deploy_emits_putapp_puttriggers_and_putroutes() {
         let msgs = deploy_messages(&app(), &BTreeMap::new());
-        assert_eq!(msgs.len(), 2);
-        // both go on the CMD control topic
+        // PutApp (desired placement) + PutTriggers (datom-Δ) + PutRoutes (event src)
+        assert_eq!(msgs.len(), 3);
+        // all go on the CMD control topic
         assert!(msgs.iter().all(|(t, _)| *t == topic::CMD));
+        let has_app = msgs.iter().any(|(_, m)| {
+            matches!(m, LatticeMessage::PutApp { app, desired, .. }
+                if app == "bot" && !desired.is_empty())
+        });
         let has_triggers = msgs.iter().any(|(_, m)| {
             matches!(m, LatticeMessage::PutTriggers { app, triggers }
                 if app == "bot" && !triggers.is_empty())
@@ -84,18 +106,25 @@ mod tests {
             matches!(m, LatticeMessage::PutRoutes { app, routes }
                 if app == "bot" && !routes.kse.is_empty() && !routes.http.is_empty() && !routes.cron.is_empty())
         });
+        assert!(has_app, "expected a PutApp message (desired placement)");
         assert!(has_triggers, "expected a PutTriggers message");
         assert!(has_routes, "expected a PutRoutes message");
     }
 
     #[test]
-    fn deploy_routes_only_app_emits_one_message() {
+    fn deploy_routes_only_app_emits_putapp_and_putroutes() {
         let src = r#"{:kotoba.app/name "r"
             :kotoba.app/components
             [{:name "h" :cid "bafyH" :triggers [{:type :http :route "/x"}]}]}"#;
         let msgs = deploy_messages(&AppManifest::from_edn(src).unwrap(), &BTreeMap::new());
-        assert_eq!(msgs.len(), 1);
-        assert!(matches!(msgs[0].1, LatticeMessage::PutRoutes { .. }));
+        // a component with a CID is placeable → PutApp + PutRoutes
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs
+            .iter()
+            .any(|(_, m)| matches!(m, LatticeMessage::PutApp { .. })));
+        assert!(msgs
+            .iter()
+            .any(|(_, m)| matches!(m, LatticeMessage::PutRoutes { .. })));
     }
 
     #[test]
@@ -114,13 +143,20 @@ mod tests {
             [{:name "h" :src "h.clj" :triggers [{:type :kse :topic "t"}]}]}"#;
         let resolved = BTreeMap::from([("h".to_string(), "bafyCompiled".to_string())]);
         let msgs = deploy_messages(&AppManifest::from_edn(src).unwrap(), &resolved);
-        match &msgs[0].1 {
-            LatticeMessage::PutRoutes { routes, .. } => {
-                assert!(routes
-                    .kse_targets("t")
-                    .contains(&"bafyCompiled".to_string()));
-            }
-            _ => panic!("expected PutRoutes"),
-        }
+        let routes_msg = msgs
+            .iter()
+            .find_map(|(_, m)| match m {
+                LatticeMessage::PutRoutes { routes, .. } => Some(routes),
+                _ => None,
+            })
+            .expect("expected a PutRoutes message");
+        assert!(routes_msg
+            .kse_targets("t")
+            .contains(&"bafyCompiled".to_string()));
+        // the compiled CID is also the placement target in PutApp
+        assert!(msgs.iter().any(|(_, m)| matches!(
+            m,
+            LatticeMessage::PutApp { desired, .. } if desired.contains_key("bafyCompiled")
+        )));
     }
 }

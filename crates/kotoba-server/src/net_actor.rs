@@ -110,11 +110,14 @@ fn trigger_name(t: &ComponentTrigger) -> &'static str {
 /// Fetch a component's artifact by CID and invoke the given trigger's export on
 /// the WASM host (M12) — the single server-side path all trigger sources use.
 /// Returns `Some(output_cbor)` on success (used by HTTP to form the response),
-/// `None` when skipped/failed (missing/malformed artifact or guest error). The
-/// caller decides what to do (placement marks `hosted`; cron/KSE ignore output).
-pub(crate) fn invoke_trigger(
+/// `None` when skipped/failed (missing/malformed artifact or guest error). On
+/// success the component's `kqe-assert!` / `kqe-retract!` output is PERSISTED to
+/// the canonical Datom log (`quad_store`) — so a mesh component (run/on-tick/
+/// on-http/on-kse) is a real writer to the kotoba graph, not a no-op sandbox.
+pub(crate) async fn invoke_trigger(
     executor: &kotoba_runtime::WasmExecutor,
     block_store: &(dyn BlockStore + Send + Sync),
+    quad_store: &QuadStore,
     node_did: &str,
     cid: &str,
     trigger: ComponentTrigger,
@@ -151,7 +154,44 @@ pub(crate) fn invoke_trigger(
     };
     match res {
         Ok(r) => {
-            tracing::info!(%cid, trigger = kind, gas = r.gas_used, "trigger: executed");
+            // Persist the component's Datom writes to the canonical graph. Graph
+            // and subject arrive as plain names (e.g. "social" / "post:tick") —
+            // map them to CIDs exactly as the WIT host maps the read snapshot
+            // (`KotobaCid::from_bytes(name)`), so writes are readable back by the
+            // same name. The mesh node IS the PDS: this is the durable write.
+            let n_assert = r.assert_quads.len();
+            for sq in &r.assert_quads {
+                let graph_cid = KotobaCid::from_bytes(sq.graph.as_bytes());
+                let subject_cid = KotobaCid::from_bytes(sq.subject.as_bytes());
+                let tx_cid = KotobaCid::from_bytes(
+                    format!("mesh-tick:{cid}:{}:{}", sq.subject, sq.predicate).as_bytes(),
+                );
+                let datom = kotoba_query::Datom::assert(
+                    subject_cid,
+                    sq.predicate.clone(),
+                    kotoba_query::Value::Bytes(sq.object_cbor.clone()),
+                    tx_cid,
+                );
+                quad_store.assert_datom(graph_cid, datom).await;
+            }
+            for sq in &r.retract_quads {
+                let graph_cid = KotobaCid::from_bytes(sq.graph.as_bytes());
+                let subject_cid = KotobaCid::from_bytes(sq.subject.as_bytes());
+                let tx_cid = KotobaCid::from_bytes(
+                    format!("mesh-retract:{cid}:{}:{}", sq.subject, sq.predicate).as_bytes(),
+                );
+                let datom = kotoba_query::Datom::retract(
+                    subject_cid,
+                    sq.predicate.clone(),
+                    kotoba_query::Value::Bytes(sq.object_cbor.clone()),
+                    tx_cid,
+                );
+                quad_store.assert_datom(graph_cid, datom).await;
+            }
+            tracing::info!(
+                %cid, trigger = kind, gas = r.gas_used, datoms = n_assert,
+                "trigger: executed"
+            );
             Some(r.output_cbor)
         }
         Err(e) => {
@@ -164,9 +204,10 @@ pub(crate) fn invoke_trigger(
 /// Place a component on THIS node (M4): fetch + `run`, then advertise as
 /// `hosted` (advertised on the next heartbeat, closing the reconcile loop).
 /// Built on [`invoke_trigger`] with the generic `Run` trigger.
-pub(crate) fn start_component(
+pub(crate) async fn start_component(
     executor: &kotoba_runtime::WasmExecutor,
     block_store: &(dyn BlockStore + Send + Sync),
+    quad_store: &QuadStore,
     node_did: &str,
     cid: &str,
     hosted: &mut Vec<String>,
@@ -174,7 +215,17 @@ pub(crate) fn start_component(
     if hosted.iter().any(|c| c == cid) {
         return;
     }
-    if invoke_trigger(executor, block_store, node_did, cid, ComponentTrigger::Run).is_some() {
+    if invoke_trigger(
+        executor,
+        block_store,
+        quad_store,
+        node_did,
+        cid,
+        ComponentTrigger::Run,
+    )
+    .await
+    .is_some()
+    {
         hosted.push(cid.to_string());
     }
 }
@@ -316,13 +367,25 @@ pub async fn run(
                 let now = lattice_now_ms();
                 // emit auctions for any desired-vs-observed shortfall
                 for (t, m) in lattice.tick(now) {
+                    // Self-bid: gossipsub does not echo our own publish back to
+                    // us, so a node would never bid on an auction it opened. For
+                    // single-node (and to let any opener also be a candidate),
+                    // register our own bid locally on every auction we're eligible
+                    // for, mirroring the gossip Auction→Bid auto-bid path.
+                    if let kotoba_lattice::LatticeMessage::Auction(auction) = &m {
+                        if let Some(bid) =
+                            kotoba_lattice::LatticeController::bid_for(auction, &my_heartbeat)
+                        {
+                            lattice.on_bid(bid);
+                        }
+                    }
                     <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
                 }
                 // close due auctions → awards + StartComponent; act on any addressed to us
                 for (t, m) in lattice.close_due(now) {
                     if let kotoba_lattice::LatticeMessage::StartComponent { node_did: target, cid, .. } = &m {
                         if target == &node_did {
-                            start_component(&executor, block_store.as_ref(), &node_did, cid, &mut my_heartbeat.hosted);
+                            start_component(&executor, block_store.as_ref(), &quad_store, &node_did, cid, &mut my_heartbeat.hosted).await;
                         }
                     }
                     <KotobaSwarm as kotoba_lattice::Transport>::publish(&mut swarm, &t, &m).ok();
@@ -338,9 +401,10 @@ pub async fn run(
                     let last = cron_last.get(cid).copied().unwrap_or(0);
                     if now.saturating_sub(last) >= interval {
                         let _ = invoke_trigger(
-                            &executor, block_store.as_ref(), &node_did, cid,
+                            &executor, block_store.as_ref(), &quad_store, &node_did, cid,
                             ComponentTrigger::Tick(now),
-                        );
+                        )
+                        .await;
                         cron_last.insert(cid.clone(), now);
                     }
                 }
@@ -360,6 +424,13 @@ pub async fn run(
             inj = lattice_inject_rx.recv() => {
                 let Some(data) = inj else { break };
                 if let Ok(lmsg) = kotoba_lattice::LatticeMessage::from_cbor(&data) {
+                    // PutApp carries the desired placement state — feed it to the
+                    // reconciler so the next `lattice.tick` auctions + places the
+                    // component (enabling cron `on-tick`, which only fires for
+                    // HOSTED components). Routes/triggers go to apply_deploy_msg.
+                    if let kotoba_lattice::LatticeMessage::PutApp { .. } = &lmsg {
+                        lattice.on_message(lmsg.clone(), lattice_now_ms());
+                    }
                     apply_deploy_msg(
                         &lmsg, &mut routes, &mut delta_triggers,
                         &mut swarm, &mesh_routes,
@@ -485,7 +556,7 @@ pub async fn run(
                                 // a reconciler awarded a component to us → place it
                                 kotoba_lattice::LatticeMessage::StartComponent { node_did: target, cid, .. } => {
                                     if target == &node_did {
-                                        start_component(&executor, block_store.as_ref(), &node_did, cid, &mut my_heartbeat.hosted);
+                                        start_component(&executor, block_store.as_ref(), &quad_store, &node_did, cid, &mut my_heartbeat.hosted).await;
                                     }
                                 }
                                 // out-of-proc capability call addressed to us (wRPC, M5):
@@ -510,6 +581,12 @@ pub async fn run(
                                         <KotobaSwarm as kotoba_lattice::Transport>::publish(
                                             &mut swarm, kotoba_lattice::protocol::topic::CAP, &result).ok();
                                     }
+                                }
+                                // desired placement state (PutApp) → feed the
+                                // reconciler so this node auctions/places + hosts
+                                // the component (cron on-tick fires only on hosted).
+                                kotoba_lattice::LatticeMessage::PutApp { .. } => {
+                                    lattice.on_message(lmsg.clone(), lattice_now_ms());
                                 }
                                 // install datom-Δ triggers (M6) / event-source
                                 // routes (M13) — shared with the local inject path (R0)
@@ -607,9 +684,10 @@ pub async fn run(
                                     for cid in &kse_targets {
                                         tracing::info!(%cid, topic = %kse_topic_str, "KSE trigger fired — invoking on-kse");
                                         let _ = invoke_trigger(
-                                            &executor, block_store.as_ref(), &node_did, cid,
+                                            &executor, block_store.as_ref(), &quad_store, &node_did, cid,
                                             ComponentTrigger::Kse(kse_topic_str.clone(), payload.clone()),
-                                        );
+                                        )
+                                        .await;
                                     }
                                 }
                                 if let Some((quad, op)) = maybe_quad_op {
@@ -629,7 +707,7 @@ pub async fn run(
                                     if op && !delta_triggers.is_empty() {
                                         for cid in kotoba_lattice::fired_by_datom(&delta_triggers, &delta_pred, &delta_obj) {
                                             tracing::info!(%cid, predicate = %delta_pred, "datom-Δ trigger fired — placing component");
-                                            start_component(&executor, block_store.as_ref(), &node_did, cid, &mut my_heartbeat.hosted);
+                                            start_component(&executor, block_store.as_ref(), &quad_store, &node_did, cid, &mut my_heartbeat.hosted).await;
                                         }
                                     }
                                 }
@@ -660,47 +738,66 @@ mod tests {
         kotoba_runtime::WasmExecutor::new(10_000_000).unwrap()
     }
 
+    fn test_quad_store() -> QuadStore {
+        let journal = Arc::new(kotoba_vault::LiveBus::new());
+        let store: Arc<dyn BlockStore + Send + Sync> =
+            Arc::new(kotoba_store::MemoryBlockStore::new());
+        QuadStore::new(journal, store)
+    }
+
     // ── M12: unified invoke_trigger dispatcher (all 4 trigger variants) ──
     // The success path (correct export per trigger) is proven by kotoba-clj's
     // mesh_dispatch test against the real executor; here we lock down that the
     // server-side dispatcher handles every variant on the defensive paths.
 
-    #[test]
-    fn invoke_trigger_all_variants_skip_when_artifact_absent() {
+    #[tokio::test]
+    async fn invoke_trigger_all_variants_skip_when_artifact_absent() {
         let store = kotoba_store::MemoryBlockStore::new();
+        let qs = test_quad_store();
         let exec = test_executor();
         let cid = KotobaCid::from_bytes(b"absent-component").to_multibase();
         let did = "did:self";
-        assert!(invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Run).is_none());
+        assert!(
+            invoke_trigger(&exec, &store, &qs, did, &cid, ComponentTrigger::Run)
+                .await
+                .is_none()
+        );
         assert!(invoke_trigger(
             &exec,
             &store,
+            &qs,
             did,
             &cid,
             ComponentTrigger::Http(b"req".to_vec())
         )
+        .await
         .is_none());
         assert!(invoke_trigger(
             &exec,
             &store,
+            &qs,
             did,
             &cid,
             ComponentTrigger::Tick(1_700_000_000_000)
         )
+        .await
         .is_none());
         assert!(invoke_trigger(
             &exec,
             &store,
+            &qs,
             did,
             &cid,
             ComponentTrigger::Kse("kotoba/mail/in".into(), b"payload".to_vec())
         )
+        .await
         .is_none());
     }
 
-    #[test]
-    fn invoke_trigger_all_variants_false_on_malformed_cid() {
+    #[tokio::test]
+    async fn invoke_trigger_all_variants_false_on_malformed_cid() {
         let store = kotoba_store::MemoryBlockStore::new();
+        let qs = test_quad_store();
         let exec = test_executor();
         for t in [
             ComponentTrigger::Run,
@@ -708,61 +805,88 @@ mod tests {
             ComponentTrigger::Tick(0),
             ComponentTrigger::Kse(String::new(), vec![]),
         ] {
-            assert!(invoke_trigger(&exec, &store, "did:self", "not-a-cid", t).is_none());
+            assert!(
+                invoke_trigger(&exec, &store, &qs, "did:self", "not-a-cid", t)
+                    .await
+                    .is_none()
+            );
         }
     }
 
-    #[test]
-    fn invoke_trigger_non_wasm_artifact_fails_gracefully_per_variant() {
+    #[tokio::test]
+    async fn invoke_trigger_non_wasm_artifact_fails_gracefully_per_variant() {
         let store = kotoba_store::MemoryBlockStore::new();
+        let qs = test_quad_store();
         let garbage = b"not a wasm component";
         let kc = KotobaCid::from_bytes(garbage);
         store.put(&kc, garbage).unwrap();
         let exec = test_executor();
         let cid = kc.to_multibase();
         // present but uncompilable → every variant returns None (no panic)
-        assert!(
-            invoke_trigger(&exec, &store, "did:self", &cid, ComponentTrigger::Tick(5)).is_none()
-        );
         assert!(invoke_trigger(
             &exec,
             &store,
+            &qs,
+            "did:self",
+            &cid,
+            ComponentTrigger::Tick(5)
+        )
+        .await
+        .is_none());
+        assert!(invoke_trigger(
+            &exec,
+            &store,
+            &qs,
             "did:self",
             &cid,
             ComponentTrigger::Kse("t".into(), b"p".to_vec())
         )
+        .await
         .is_none());
     }
 
-    #[test]
-    fn start_component_skips_malformed_cid() {
+    #[tokio::test]
+    async fn start_component_skips_malformed_cid() {
         let store = kotoba_store::MemoryBlockStore::new();
+        let qs = test_quad_store();
         let mut hosted = Vec::new();
         start_component(
             &test_executor(),
             &store,
+            &qs,
             "did:self",
             "not-a-real-cid",
             &mut hosted,
-        );
+        )
+        .await;
         assert!(hosted.is_empty(), "malformed CID must not be hosted");
     }
 
-    #[test]
-    fn start_component_skips_when_artifact_absent() {
+    #[tokio::test]
+    async fn start_component_skips_when_artifact_absent() {
         // valid CID, but the artifact is not in the local store yet (bitswap
         // hasn't pulled it) → skip, do not host, do not panic.
         let store = kotoba_store::MemoryBlockStore::new();
+        let qs = test_quad_store();
         let absent = KotobaCid::from_bytes(b"some component bytes").to_multibase();
         let mut hosted = Vec::new();
-        start_component(&test_executor(), &store, "did:self", &absent, &mut hosted);
+        start_component(
+            &test_executor(),
+            &store,
+            &qs,
+            "did:self",
+            &absent,
+            &mut hosted,
+        )
+        .await;
         assert!(hosted.is_empty(), "absent artifact must not be hosted");
     }
 
-    #[test]
-    fn start_component_handles_non_wasm_artifact_gracefully() {
+    #[tokio::test]
+    async fn start_component_handles_non_wasm_artifact_gracefully() {
         // artifact present but not a valid component → execute fails → skip.
         let store = kotoba_store::MemoryBlockStore::new();
+        let qs = test_quad_store();
         let garbage = b"this is definitely not a wasm component";
         let kc = KotobaCid::from_bytes(garbage);
         store.put(&kc, garbage).unwrap();
@@ -770,27 +894,32 @@ mod tests {
         start_component(
             &test_executor(),
             &store,
+            &qs,
             "did:self",
             &kc.to_multibase(),
             &mut hosted,
-        );
+        )
+        .await;
         assert!(
             hosted.is_empty(),
             "uncompilable artifact must not be hosted"
         );
     }
 
-    #[test]
-    fn start_component_is_idempotent_for_already_hosted() {
+    #[tokio::test]
+    async fn start_component_is_idempotent_for_already_hosted() {
         let store = kotoba_store::MemoryBlockStore::new();
+        let qs = test_quad_store();
         let mut hosted = vec!["bafyAlready".to_string()];
         start_component(
             &test_executor(),
             &store,
+            &qs,
             "did:self",
             "bafyAlready",
             &mut hosted,
-        );
+        )
+        .await;
         assert_eq!(
             hosted,
             vec!["bafyAlready".to_string()],
