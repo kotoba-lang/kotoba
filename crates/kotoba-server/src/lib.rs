@@ -34,6 +34,8 @@ pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
 pub mod media_xrpc;
+#[cfg(feature = "clj-mesh")]
+pub mod mesh_xrpc;
 pub mod mishmar_observe;
 #[cfg(feature = "p2p")]
 pub mod net_actor;
@@ -1776,6 +1778,20 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         "/xrpc/com.etzhayyim.apps.kotoba.mesh.deploy",
         post(mesh_deploy),
     );
+
+    // `.kotoba` source → wasm (compile) / → i64 (compile+run). Off unless built
+    // with `--features clj-mesh` (pulls kotoba-clj + wasmtime).
+    #[cfg(feature = "clj-mesh")]
+    let app = app
+        .route(
+            &format!("/xrpc/{}", mesh_xrpc::NSID_MESH_COMPILE),
+            post(mesh_xrpc::mesh_compile)
+                .layer(DefaultBodyLimit::max(mesh_xrpc::MESH_BODY_LIMIT)),
+        )
+        .route(
+            &format!("/xrpc/{}", mesh_xrpc::NSID_MESH_RUN),
+            post(mesh_xrpc::mesh_run).layer(DefaultBodyLimit::max(mesh_xrpc::MESH_BODY_LIMIT)),
+        );
 
     let mut app = app
         .route_layer(middleware::from_fn_with_state(

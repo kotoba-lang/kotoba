@@ -31,7 +31,7 @@ impl Lang {
     /// Parse a `:lang` keyword/string. Empty/unknown handled by caller.
     pub fn from_token(s: &str) -> Result<Lang, LatticeError> {
         match s.trim_start_matches(':') {
-            "clojure" | "clj" | "edn" => Ok(Lang::Clojure),
+            "clojure" | "clj" | "edn" | "kotoba" => Ok(Lang::Clojure),
             "rust" | "rs" => Ok(Lang::Rust),
             "python" | "py" => Ok(Lang::Python),
             "js" | "javascript" | "ts" | "typescript" => Ok(Lang::Js),
@@ -50,7 +50,9 @@ impl Lang {
             "rs" => Lang::Rust,
             "py" => Lang::Python,
             "js" | "ts" | "mjs" => Lang::Js,
-            // ".clj" and everything else → Clojure default
+            // `.kotoba` is the canonical Clojure-subset source extension; `.clj`
+            // and everything else also fall through to the Clojure default (§14.1).
+            "kotoba" | "clj" | "cljc" | "cljs" => Lang::Clojure,
             _ => Lang::Clojure,
         }
     }
@@ -405,7 +407,10 @@ mod tests {
 
     #[test]
     fn from_ext_defaults_to_clojure() {
+        assert_eq!(Lang::from_ext("foo.kotoba"), Lang::Clojure);
         assert_eq!(Lang::from_ext("foo.clj"), Lang::Clojure);
+        assert_eq!(Lang::from_ext("foo.cljc"), Lang::Clojure);
+        assert_eq!(Lang::from_ext("foo.cljs"), Lang::Clojure);
         assert_eq!(Lang::from_ext("foo"), Lang::Clojure);
         assert_eq!(Lang::from_ext("foo.rs"), Lang::Rust);
         assert_eq!(Lang::from_ext("foo.py"), Lang::Python);
@@ -414,7 +419,7 @@ mod tests {
 
     #[test]
     fn lang_from_token_all_aliases_and_unknown() {
-        for t in ["clojure", "clj", "edn", ":clojure"] {
+        for t in ["clojure", "clj", "edn", "kotoba", ":kotoba", ":clojure"] {
             assert_eq!(Lang::from_token(t).unwrap(), Lang::Clojure);
         }
         assert_eq!(Lang::from_token("rs").unwrap(), Lang::Rust);

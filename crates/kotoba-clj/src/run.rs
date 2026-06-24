@@ -32,6 +32,35 @@ pub fn run(wasm: &[u8], func: &str, args: &[i64]) -> Result<i64, CljError> {
     }
 }
 
+/// Like [`run`], but bounds execution with wasmtime **fuel** so an unbounded
+/// loop in untrusted source cannot hang the host. One fuel unit is consumed per
+/// executed wasm instruction; exhausting `fuel` traps with an out-of-fuel error
+/// (surfaced as [`CljError::Run`]). Use this on any path that compiles+runs
+/// caller-supplied source (e.g. a network endpoint).
+pub fn run_with_fuel(wasm: &[u8], func: &str, args: &[i64], fuel: u64) -> Result<i64, CljError> {
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    let engine = Engine::new(&config).map_err(|e| CljError::Run(e.to_string()))?;
+    let module = Module::new(&engine, wasm).map_err(|e| CljError::Run(e.to_string()))?;
+    let mut store = Store::new(&engine, ());
+    store.set_fuel(fuel).map_err(|e| CljError::Run(e.to_string()))?;
+    let instance =
+        Instance::new(&mut store, &module, &[]).map_err(|e| CljError::Run(e.to_string()))?;
+    let f = instance
+        .get_func(&mut store, func)
+        .ok_or_else(|| CljError::Run(format!("module has no exported function `{func}`")))?;
+
+    let params: Vec<Val> = args.iter().map(|a| Val::I64(*a)).collect();
+    let mut results = vec![Val::I64(0)];
+    f.call(&mut store, &params, &mut results)
+        .map_err(|e| CljError::Run(e.to_string()))?;
+
+    match results.first() {
+        Some(Val::I64(v)) => Ok(*v),
+        other => Err(CljError::Run(format!("unexpected result kind: {other:?}"))),
+    }
+}
+
 /// Convenience: compile `src` and immediately run `func(args)`.
 pub fn compile_and_run(src: &str, func: &str, args: &[i64]) -> Result<i64, CljError> {
     let wasm = crate::compile_str(src)?;
