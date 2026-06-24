@@ -96,14 +96,29 @@ fn observed_bond_drives_both_admission_and_slash() {
         warrant.rule_id,
         ValidationRule::AvailabilityProofFailed as u8
     );
-    assert_eq!(warrant.evidence, evidence.cid(), "evidence is content-addressed");
+    assert_eq!(
+        warrant.evidence,
+        evidence.cid(),
+        "evidence is content-addressed"
+    );
 
     // The slash is sized from the SAME observed bond that admitted peggy.
     let schedule = SlashSchedule::new(2_500, 10_000); // 25% per consecutive miss
     let bond = pins.max_bond_for(&peggy_did, &root);
-    assert_eq!(bond, 6_000, "slash reads the very bond that gated admission");
-    assert_eq!(schedule.slash_amount(bond, 1), 1_500, "first miss → 25% of 6000");
-    assert_eq!(schedule.slash_amount(bond, 4), 6_000, "sustained failure → full bond");
+    assert_eq!(
+        bond, 6_000,
+        "slash reads the very bond that gated admission"
+    );
+    assert_eq!(
+        schedule.slash_amount(bond, 1),
+        1_500,
+        "first miss → 25% of 6000"
+    );
+    assert_eq!(
+        schedule.slash_amount(bond, 4),
+        6_000,
+        "sustained failure → full bond"
+    );
 }
 
 #[test]
@@ -120,7 +135,11 @@ fn membrane_off_admits_unbonded_and_slash_reads_zero_bond() {
     let peers = vec![(node_a.clone(), did_a.clone(), 0u64)];
 
     let selected = select_replicas(&root, &addr, &peers, &policy, &pins, false);
-    assert_eq!(selected, vec![node_a], "membrane off admits the unbonded peer");
+    assert_eq!(
+        selected,
+        vec![node_a],
+        "membrane off admits the unbonded peer"
+    );
 
     let schedule = SlashSchedule::new(2_500, 10_000);
     assert_eq!(

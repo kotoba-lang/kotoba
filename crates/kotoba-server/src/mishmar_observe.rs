@@ -481,11 +481,23 @@ mod tests {
     fn observe_finality_reads_committer_over_eth_call() {
         let head = KotobaCid::from_bytes(b"final-head");
         // non-zero committer → final.
-        let st = observe_finality(&FakeCall { result: address_word(0xAA) }, "0xanchor", &head);
+        let st = observe_finality(
+            &FakeCall {
+                result: address_word(0xAA),
+            },
+            "0xanchor",
+            &head,
+        );
         assert!(st.is_final);
         assert_eq!(st.root_hash, kotoba_evm::anchor::root_hash_of(&head));
         // zero committer (never anchored) → not final.
-        let zero = observe_finality(&FakeCall { result: address_word(0) }, "0xanchor", &head);
+        let zero = observe_finality(
+            &FakeCall {
+                result: address_word(0),
+            },
+            "0xanchor",
+            &head,
+        );
         assert!(!zero.is_final);
     }
 
@@ -512,7 +524,10 @@ mod tests {
         }
         assert!(FinalityLoopConfig::from_env().is_none(), "unset → disabled");
         std::env::set_var("KOTOBA_FINALITY_INTERVAL_SECS", "60");
-        assert!(FinalityLoopConfig::from_env().is_none(), "no rpc/anchor → disabled");
+        assert!(
+            FinalityLoopConfig::from_env().is_none(),
+            "no rpc/anchor → disabled"
+        );
         std::env::set_var("KOTOBA_ANCHOR_RPC_URL", "http://base-rpc:8545");
         std::env::set_var("KOTOBA_ANCHOR_ADDRESS", "0xanchor");
         let cfg = FinalityLoopConfig::from_env().expect("enabled");
@@ -520,7 +535,10 @@ mod tests {
         assert_eq!(cfg.anchor_address, "0xanchor");
         // interval 0 disables even with rpc/anchor set.
         std::env::set_var("KOTOBA_FINALITY_INTERVAL_SECS", "0");
-        assert!(FinalityLoopConfig::from_env().is_none(), "interval 0 → disabled");
+        assert!(
+            FinalityLoopConfig::from_env().is_none(),
+            "interval 0 → disabled"
+        );
         for k in [
             "KOTOBA_FINALITY_INTERVAL_SECS",
             "KOTOBA_ANCHOR_RPC_URL",
@@ -539,15 +557,22 @@ mod tests {
         ));
         // a non-zero committer at the active version id → params anchored/final.
         let st = observe_params_finality(
-            &FakeCall { result: address_word(0xAB) },
+            &FakeCall {
+                result: address_word(0xAB),
+            },
             "0xanchor",
             &active,
         );
         assert!(st.is_final);
-        assert_eq!(st.root_hash, kotoba_evm::anchor::root_hash_of(&active.current_id()));
+        assert_eq!(
+            st.root_hash,
+            kotoba_evm::anchor::root_hash_of(&active.current_id())
+        );
         // zero committer → not yet anchored.
         let pending = observe_params_finality(
-            &FakeCall { result: address_word(0) },
+            &FakeCall {
+                result: address_word(0),
+            },
             "0xanchor",
             &active,
         );
@@ -561,8 +586,13 @@ mod tests {
             KotobaCid::from_bytes(b"head-a"),
             KotobaCid::from_bytes(b"head-b"),
         ];
-        let pairs =
-            observe_finalities(&FakeCall { result: address_word(0xAB) }, "0xanchor", &heads);
+        let pairs = observe_finalities(
+            &FakeCall {
+                result: address_word(0xAB),
+            },
+            "0xanchor",
+            &heads,
+        );
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, heads[0]); // order + head preserved
         let statuses: Vec<_> = pairs.iter().map(|(_, s)| *s).collect();

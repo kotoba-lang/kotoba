@@ -843,8 +843,11 @@ impl WriteCrypto {
                 s: String::new(),
             },
         };
-        leaf.s.s =
-            URL_SAFE_NO_PAD.encode(self.signing_key.sign(leaf.siwe_message().as_bytes()).to_bytes());
+        leaf.s.s = URL_SAFE_NO_PAD.encode(
+            self.signing_key
+                .sign(leaf.siwe_message().as_bytes())
+                .to_bytes(),
+        );
         let chain = vec![root, leaf];
         let mut cbor = Vec::new();
         ciborium::into_writer(&chain, &mut cbor).map_err(|e| e.to_string())?;
@@ -1607,16 +1610,16 @@ mod tests {
         }
 
         // Wrong capability / wrong graph are rejected.
-        assert!(kotoba_auth::DelegationChain::new(
-            kotoba_auth::Cacao::from_cbor(&cbor).unwrap()
-        )
-        .verify(graph, "datom:read")
-        .is_err());
-        assert!(kotoba_auth::DelegationChain::new(
-            kotoba_auth::Cacao::from_cbor(&cbor).unwrap()
-        )
-        .verify("bafy-other-graph", "datom:transact")
-        .is_err());
+        assert!(
+            kotoba_auth::DelegationChain::new(kotoba_auth::Cacao::from_cbor(&cbor).unwrap())
+                .verify(graph, "datom:read")
+                .is_err()
+        );
+        assert!(
+            kotoba_auth::DelegationChain::new(kotoba_auth::Cacao::from_cbor(&cbor).unwrap())
+                .verify("bafy-other-graph", "datom:transact")
+                .is_err()
+        );
     }
 
     #[test]

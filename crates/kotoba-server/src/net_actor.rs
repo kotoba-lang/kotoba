@@ -194,14 +194,19 @@ async fn apply_deploy_msg(
     match lmsg {
         kotoba_lattice::LatticeMessage::PutTriggers { triggers, .. } => {
             *delta_triggers = triggers.clone();
-            tracing::info!(n = delta_triggers.len(), "lattice: datom-Δ triggers installed");
+            tracing::info!(
+                n = delta_triggers.len(),
+                "lattice: datom-Δ triggers installed"
+            );
         }
         kotoba_lattice::LatticeMessage::PutRoutes { routes: r, .. } => {
             for topic in r.kse_topics() {
                 swarm.subscribe(topic).ok();
             }
             tracing::info!(
-                kse = r.kse.len(), cron = r.cron.len(), http = r.http.len(),
+                kse = r.kse.len(),
+                cron = r.cron.len(),
+                http = r.http.len(),
                 "lattice: event-source routes installed"
             );
             *routes = r.clone();
@@ -667,10 +672,27 @@ mod tests {
         let cid = KotobaCid::from_bytes(b"absent-component").to_multibase();
         let did = "did:self";
         assert!(invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Run).is_none());
-        assert!(invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Http(b"req".to_vec())).is_none());
-        assert!(invoke_trigger(&exec, &store, did, &cid, ComponentTrigger::Tick(1_700_000_000_000)).is_none());
         assert!(invoke_trigger(
-            &exec, &store, did, &cid,
+            &exec,
+            &store,
+            did,
+            &cid,
+            ComponentTrigger::Http(b"req".to_vec())
+        )
+        .is_none());
+        assert!(invoke_trigger(
+            &exec,
+            &store,
+            did,
+            &cid,
+            ComponentTrigger::Tick(1_700_000_000_000)
+        )
+        .is_none());
+        assert!(invoke_trigger(
+            &exec,
+            &store,
+            did,
+            &cid,
             ComponentTrigger::Kse("kotoba/mail/in".into(), b"payload".to_vec())
         )
         .is_none());
@@ -699,9 +721,14 @@ mod tests {
         let exec = test_executor();
         let cid = kc.to_multibase();
         // present but uncompilable → every variant returns None (no panic)
-        assert!(invoke_trigger(&exec, &store, "did:self", &cid, ComponentTrigger::Tick(5)).is_none());
+        assert!(
+            invoke_trigger(&exec, &store, "did:self", &cid, ComponentTrigger::Tick(5)).is_none()
+        );
         assert!(invoke_trigger(
-            &exec, &store, "did:self", &cid,
+            &exec,
+            &store,
+            "did:self",
+            &cid,
             ComponentTrigger::Kse("t".into(), b"p".to_vec())
         )
         .is_none());
@@ -813,13 +840,24 @@ mod tests {
             Arc::new(kotoba_store::MemoryBlockStore::new());
         let quad_store = Arc::new(QuadStore::new(Arc::clone(&journal), Arc::clone(&store)));
         let executor = Arc::new(kotoba_runtime::WasmExecutor::new(10_000_000).unwrap());
-        let mesh_routes =
-            Arc::new(tokio::sync::RwLock::new(kotoba_lattice::TriggerRoutes::default()));
+        let mesh_routes = Arc::new(tokio::sync::RwLock::new(
+            kotoba_lattice::TriggerRoutes::default(),
+        ));
         let (_inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
 
         tokio::spawn(run(
-            node, pub_rx, journal, pin_tx, pout_rx, store, quad_store, None, false, executor,
-            mesh_routes, inject_rx,
+            node,
+            pub_rx,
+            journal,
+            pin_tx,
+            pout_rx,
+            store,
+            quad_store,
+            None,
+            false,
+            executor,
+            mesh_routes,
+            inject_rx,
         ));
 
         // observer waits for the run-node's heartbeat (interval is 5 s; first

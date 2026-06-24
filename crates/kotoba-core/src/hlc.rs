@@ -102,11 +102,7 @@ where
 /// deduping events that appear in more than one stream by their `tiebreak` key
 /// (overlapping subscriptions must not emit an event twice). Result is the same
 /// total causal order as [`causal_sort_by`]. Deterministic across stream order.
-pub fn causal_merge_dedup<T, K, FH, FK>(
-    streams: Vec<Vec<T>>,
-    hlc_of: FH,
-    tiebreak_of: FK,
-) -> Vec<T>
+pub fn causal_merge_dedup<T, K, FH, FK>(streams: Vec<Vec<T>>, hlc_of: FH, tiebreak_of: FK) -> Vec<T>
 where
     K: Ord + Clone,
     FH: Fn(&T) -> Hlc,
@@ -133,12 +129,7 @@ where
 /// subscription). The cursor is the consumer's last-seen Hlc, so a reconnecting
 /// subscriber gets exactly the unseen tail, deterministically — pass [`Hlc::ZERO`]
 /// for a fresh subscription (the whole stream).
-pub fn causal_after<T, K, FH, FK>(
-    items: Vec<T>,
-    cursor: Hlc,
-    hlc_of: FH,
-    tiebreak_of: FK,
-) -> Vec<T>
+pub fn causal_after<T, K, FH, FK>(items: Vec<T>, cursor: Hlc, hlc_of: FH, tiebreak_of: FK) -> Vec<T>
 where
     K: Ord,
     FH: Fn(&T) -> Hlc,
@@ -159,7 +150,11 @@ mod tests {
         assert_eq!(h.phys_ms(), 1_700_000_000_000);
         assert_eq!(h.counter(), 42);
         // counter is masked to 16 bits.
-        assert_eq!(Hlc::new(5, 0x1_0000).counter(), 0, "counter wraps at 16 bits");
+        assert_eq!(
+            Hlc::new(5, 0x1_0000).counter(),
+            0,
+            "counter wraps at 16 bits"
+        );
     }
 
     #[test]
@@ -261,14 +256,32 @@ mod tests {
 
     #[test]
     fn causal_after_returns_only_the_unseen_tail_in_order() {
-        let events = vec![ev(10, 0, "a"), ev(20, 0, "b"), ev(10, 1, "c"), ev(30, 0, "d")];
+        let events = vec![
+            ev(10, 0, "a"),
+            ev(20, 0, "b"),
+            ev(10, 1, "c"),
+            ev(30, 0, "d"),
+        ];
         let ids = |v: Vec<(Hlc, String)>| v.into_iter().map(|e| e.1).collect::<Vec<_>>();
         // cursor at the "c" event (hlc 10/1): only strictly-later events, ordered.
         let cursor = Hlc::new(10, 1);
-        assert_eq!(ids(causal_after(events.clone(), cursor, |e| e.0, |e| e.1.clone())), vec!["b", "d"]);
+        assert_eq!(
+            ids(causal_after(
+                events.clone(),
+                cursor,
+                |e| e.0,
+                |e| e.1.clone()
+            )),
+            vec!["b", "d"]
+        );
         // ZERO cursor → whole stream, causally ordered.
         assert_eq!(
-            ids(causal_after(events.clone(), Hlc::ZERO, |e| e.0, |e| e.1.clone())),
+            ids(causal_after(
+                events.clone(),
+                Hlc::ZERO,
+                |e| e.0,
+                |e| e.1.clone()
+            )),
             vec!["a", "c", "b", "d"]
         );
         // cursor past the end → empty (caller is fully caught up).
@@ -282,7 +295,11 @@ mod tests {
         let m1 = causal_merge_dedup(vec![g1.clone(), g2.clone()], |e| e.0, |e| e.1.clone());
         let m2 = causal_merge_dedup(vec![g2, g1], |e| e.0, |e| e.1.clone());
         let ids = |m: Vec<(Hlc, String)>| m.into_iter().map(|e| e.1).collect::<Vec<_>>();
-        assert_eq!(ids(m1), ids(m2), "stream order does not change the firehose");
+        assert_eq!(
+            ids(m1),
+            ids(m2),
+            "stream order does not change the firehose"
+        );
     }
 
     #[test]
@@ -290,11 +307,16 @@ mod tests {
         // Thread one clock through an adversarial wall-time sequence (forward
         // jumps, stalls, and backward jumps) — every stamp must strictly exceed
         // the previous, the property the whole causal ordering rests on.
-        let walls = [100u64, 100, 50, 100, 100, 200, 0, 200, 201, 1, 201, 5_000, 5_000];
+        let walls = [
+            100u64, 100, 50, 100, 100, 200, 0, 200, 201, 1, 201, 5_000, 5_000,
+        ];
         let mut clk = Hlc::ZERO;
         for w in walls {
             let next = clk.send(w);
-            assert!(next > clk, "send not strictly monotonic at wall={w}: {clk:?} -> {next:?}");
+            assert!(
+                next > clk,
+                "send not strictly monotonic at wall={w}: {clk:?} -> {next:?}"
+            );
             clk = next;
         }
     }
@@ -312,8 +334,14 @@ mod tests {
                             let local = Hlc::new(lp, lc);
                             let remote = Hlc::new(rp, rc);
                             let m = local.recv(remote, w);
-                            assert!(m > local, "recv !> local: {local:?} {remote:?} w={w} -> {m:?}");
-                            assert!(m > remote, "recv !> remote: {local:?} {remote:?} w={w} -> {m:?}");
+                            assert!(
+                                m > local,
+                                "recv !> local: {local:?} {remote:?} w={w} -> {m:?}"
+                            );
+                            assert!(
+                                m > remote,
+                                "recv !> remote: {local:?} {remote:?} w={w} -> {m:?}"
+                            );
                             assert!(
                                 m.phys_ms() >= lp.max(rp).max(w),
                                 "recv physical below max input"
@@ -330,8 +358,12 @@ mod tests {
         // Any permutation of the same event set sorts to the identical sequence
         // (deterministic total order across replicas). Sweep several rotations.
         let base = vec![
-            ev(10, 0, "a"), ev(10, 1, "b"), ev(20, 0, "c"),
-            ev(5, 3, "d"), ev(20, 0, "c"), ev(7, 0, "e"),
+            ev(10, 0, "a"),
+            ev(10, 1, "b"),
+            ev(20, 0, "c"),
+            ev(5, 3, "d"),
+            ev(20, 0, "c"),
+            ev(7, 0, "e"),
         ];
         let canonical = order(&base);
         for rot in 0..base.len() {
@@ -363,7 +395,10 @@ mod tests {
         let h = Hlc::new(1_700_000_000_000, 7);
         let hlc_bytes = serde_ipld_dagcbor::to_vec(&h).unwrap();
         let u64_bytes = serde_ipld_dagcbor::to_vec(&h.0).unwrap();
-        assert_eq!(hlc_bytes, u64_bytes, "Hlc must encode identically to a bare u64");
+        assert_eq!(
+            hlc_bytes, u64_bytes,
+            "Hlc must encode identically to a bare u64"
+        );
         // a raw u64 decodes straight into an Hlc.
         let from_u64: Hlc = serde_ipld_dagcbor::from_slice(&u64_bytes).unwrap();
         assert_eq!(from_u64, h);

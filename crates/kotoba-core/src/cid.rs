@@ -179,7 +179,10 @@ mod tests {
         for i in 0..payload.len() {
             let mut bad = payload.clone();
             bad[i] ^= 0x01;
-            assert!(!cid.verifies(&bad), "byte {i} tamper slipped past verification");
+            assert!(
+                !cid.verifies(&bad),
+                "byte {i} tamper slipped past verification"
+            );
         }
         // truncation and extension also fail (length is part of the content).
         assert!(!cid.verifies(&payload[..payload.len() - 1]));
@@ -190,8 +193,8 @@ mod tests {
         let mut tampered = payload.clone();
         tampered[0] ^= 0x01;
         let bad = unverified_blocks(&[
-            (cid.clone(), payload.clone()),  // authentic
-            (cid.clone(), tampered),         // tampered
+            (cid.clone(), payload.clone()), // authentic
+            (cid.clone(), tampered),        // tampered
         ]);
         assert_eq!(bad, vec![cid], "exactly the tampered response is flagged");
     }
@@ -202,9 +205,9 @@ mod tests {
         let b = KotobaCid::from_bytes(b"beta");
         let c = KotobaCid::from_bytes(b"gamma");
         let responses = vec![
-            (a.clone(), b"alpha".to_vec()),       // authentic
-            (b.clone(), b"WRONG".to_vec()),       // gateway lied
-            (c.clone(), b"gamma".to_vec()),       // authentic
+            (a.clone(), b"alpha".to_vec()), // authentic
+            (b.clone(), b"WRONG".to_vec()), // gateway lied
+            (c.clone(), b"gamma".to_vec()), // authentic
         ];
         let bad = unverified_blocks(&responses);
         assert_eq!(bad, vec![b], "only the tampered block is flagged");

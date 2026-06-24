@@ -218,7 +218,9 @@ pub async fn run_app(cmd: AppCmd) -> Result<()> {
                 // with their real artifact CID (R0).
                 let mut wire: Vec<(String, Vec<u8>)> = Vec::with_capacity(msgs.len());
                 for (topic, m) in &msgs {
-                    let cbor = m.to_cbor().map_err(|e| anyhow!("encode lattice msg: {e}"))?;
+                    let cbor = m
+                        .to_cbor()
+                        .map_err(|e| anyhow!("encode lattice msg: {e}"))?;
                     wire.push((topic.to_string(), cbor));
                 }
                 let mut body = Vec::new();

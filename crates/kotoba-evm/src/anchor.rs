@@ -261,7 +261,10 @@ mod tests {
         committer[19] = 0xAB; // a real relayer address
         let st = verify_finality(&head, Some(committer));
         assert!(st.anchored);
-        assert!(st.is_final, "a non-zero committer at the local root = finality");
+        assert!(
+            st.is_final,
+            "a non-zero committer at the local root = finality"
+        );
     }
 
     #[test]
@@ -295,7 +298,14 @@ mod tests {
     #[test]
     fn finality_summary_counts_finalized_and_pending() {
         let head = KotobaCid::from_bytes(b"h");
-        let final_st = verify_finality(&head, Some({ let mut a = [0u8; 20]; a[19] = 1; a }));
+        let final_st = verify_finality(
+            &head,
+            Some({
+                let mut a = [0u8; 20];
+                a[19] = 1;
+                a
+            }),
+        );
         let pending_st = verify_finality(&head, None);
         assert_eq!(finality_summary(&[]), FinalitySummary::default());
         let s = finality_summary(&[final_st, pending_st, final_st]);
@@ -313,11 +323,19 @@ mod tests {
         // committer shapes × batch compositions.
         let head = KotobaCid::from_bytes(b"head");
         let committers = [
-            None,                                   // no record → pending
-            Some([0u8; 20]),                        // zero address → pending
-            Some({ let mut a = [0u8; 20]; a[0] = 1; a }),  // non-zero → final
-            Some({ let mut a = [0u8; 20]; a[19] = 1; a }), // non-zero → final
-            Some([0xFF; 20]),                       // non-zero → final
+            None,            // no record → pending
+            Some([0u8; 20]), // zero address → pending
+            Some({
+                let mut a = [0u8; 20];
+                a[0] = 1;
+                a
+            }), // non-zero → final
+            Some({
+                let mut a = [0u8; 20];
+                a[19] = 1;
+                a
+            }), // non-zero → final
+            Some([0xFF; 20]), // non-zero → final
         ];
         let mut statuses = Vec::new();
         for c in committers {
@@ -333,7 +351,10 @@ mod tests {
             let s = finality_summary(&statuses[..n]);
             assert_eq!(s.tracked, n);
             assert_eq!(s.finalized + s.pending, s.tracked, "partition must hold");
-            assert_eq!(s.finalized, statuses[..n].iter().filter(|x| x.is_final).count());
+            assert_eq!(
+                s.finalized,
+                statuses[..n].iter().filter(|x| x.is_final).count()
+            );
         }
     }
 

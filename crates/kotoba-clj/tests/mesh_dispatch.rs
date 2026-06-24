@@ -27,22 +27,34 @@ fn host_dispatches_each_trigger_to_its_own_export() {
 
     let run = exec
         .execute(cid, &comp, did, b"x".to_vec(), q(), h())
-        .expect("run").output_cbor;
+        .expect("run")
+        .output_cbor;
     assert_eq!(run, b"RUN", "run export");
 
     let http = exec
         .execute_on_http(cid, &comp, did, b"req".to_vec(), q(), h())
-        .expect("on-http").output_cbor;
+        .expect("on-http")
+        .output_cbor;
     assert_eq!(http, b"HTTP", "on-http export");
 
     let tick = exec
         .execute_on_tick(cid, &comp, did, 1_700_000_000_000, q(), h())
-        .expect("on-tick").output_cbor;
+        .expect("on-tick")
+        .output_cbor;
     assert_eq!(tick, b"TICK", "on-tick export");
 
     let kse = exec
-        .execute_on_kse(cid, &comp, did, "kotoba/mail/in".into(), b"payload".to_vec(), q(), h())
-        .expect("on-kse").output_cbor;
+        .execute_on_kse(
+            cid,
+            &comp,
+            did,
+            "kotoba/mail/in".into(),
+            b"payload".to_vec(),
+            q(),
+            h(),
+        )
+        .expect("on-kse")
+        .output_cbor;
     assert_eq!(kse, b"KSE", "on-kse export");
 }
 
@@ -52,8 +64,12 @@ fn missing_trigger_export_errors_cleanly() {
     let comp = compile_kais_mesh_component_str("(ns m) (defn run [c] c)", WIT).expect("compile");
     let exec = WasmExecutor::new(GAS).expect("executor");
     let r = exec.execute_on_http(
-        "clj-runonly", &comp, "did:key:z", b"req".to_vec(),
-        Vec::<WitQuad>::new(), HashMap::<String, String>::new(),
+        "clj-runonly",
+        &comp,
+        "did:key:z",
+        b"req".to_vec(),
+        Vec::<WitQuad>::new(),
+        HashMap::<String, String>::new(),
     );
     assert!(r.is_err(), "missing on-http export must error");
 }

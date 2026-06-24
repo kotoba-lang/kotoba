@@ -1053,7 +1053,10 @@ async fn mesh_http(
         .http_target(&full)
         .map(str::to_string);
     let Some(cid) = cid else {
-        return (StatusCode::NOT_FOUND, format!("no mesh component for route {full}"))
+        return (
+            StatusCode::NOT_FOUND,
+            format!("no mesh component for route {full}"),
+        )
             .into_response();
     };
     match net_actor::invoke_trigger(
@@ -2068,7 +2071,9 @@ pub async fn run() -> anyhow::Result<()> {
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");
-                state.attach_gossip(publish_tx).attach_lattice_inject(inject_tx)
+                state
+                    .attach_gossip(publish_tx)
+                    .attach_lattice_inject(inject_tx)
             }
             Err(e) => {
                 tracing::warn!(err = %e, "swarm init failed — running without p2p");

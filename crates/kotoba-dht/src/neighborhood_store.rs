@@ -660,8 +660,8 @@ mod tests {
         let (local, id) = local_node(b"local");
         let p1 = MemPeer::new(b"peer-1");
         let p2 = MemPeer::new(b"peer-2");
-        let store = NeighborhoodBlockStore::new(local.clone(), id)
-            .with_peers(vec![p1.clone(), p2.clone()]);
+        let store =
+            NeighborhoodBlockStore::new(local.clone(), id).with_peers(vec![p1.clone(), p2.clone()]);
         let cid = KotobaCid::from_bytes(b"graph-head");
         // local + p1 hold it; p2 (a contracted pinner) does not yet.
         local.put(&cid, b"graph-head").unwrap();

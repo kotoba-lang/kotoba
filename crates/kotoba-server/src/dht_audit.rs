@@ -14,9 +14,7 @@
 use crate::dht_transport::HttpProofFetcher;
 use kotoba_core::cid::KotobaCid;
 use kotoba_core::store::BlockStore;
-use kotoba_dht::{
-    AuditAction, AuditScheduler, AvailabilityAuditor, NodeId, SettlementIntentSink,
-};
+use kotoba_dht::{AuditAction, AuditScheduler, AvailabilityAuditor, NodeId, SettlementIntentSink};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -98,10 +96,7 @@ pub fn resolve_endpoints(urls: &[String]) -> HashMap<NodeId, String> {
         if base.is_empty() {
             continue;
         }
-        let info_url = format!(
-            "{base}/xrpc/{}",
-            crate::availability_xrpc::NSID_DHT_INFO
-        );
+        let info_url = format!("{base}/xrpc/{}", crate::availability_xrpc::NSID_DHT_INFO);
         let Ok(resp) = client.get(&info_url).send() else {
             continue;
         };
@@ -114,7 +109,9 @@ pub fn resolve_endpoints(urls: &[String]) -> HashMap<NodeId, String> {
         let Some(hex_id) = body.get("node_id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let Ok(bytes) = hex::decode(hex_id) else { continue };
+        let Ok(bytes) = hex::decode(hex_id) else {
+            continue;
+        };
         let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) else {
             continue;
         };
@@ -264,7 +261,10 @@ mod tests {
         std::env::set_var("KOTOBA_IPFS", "off");
         let state = Arc::new(KotobaState::new(None).expect("state"));
         let block = KotobaCid::from_bytes(b"audit-runner-block");
-        state.block_store.put(&block, b"audit-runner-block").unwrap();
+        state
+            .block_store
+            .put(&block, b"audit-runner-block")
+            .unwrap();
         let server_node: NodeId = state.local_node_id.clone();
 
         let app = build_router(state.clone());
@@ -279,10 +279,15 @@ mod tests {
             // Auditor holds its own copy so it can verify the peer's proof.
             let local = Arc::new(kotoba_store::MemoryBlockStore::new());
             local.put(&block, b"audit-runner-block").unwrap();
-            let endpoints =
-                HashMap::from([(server_node.clone(), format!("http://{addr}"))]);
+            let endpoints = HashMap::from([(server_node.clone(), format!("http://{addr}"))]);
             let sink = Arc::new(SettlementIntentSink::new(10, 5));
-            let summary = audit_epoch(local, endpoints, 1, std::slice::from_ref(&block), sink.clone());
+            let summary = audit_epoch(
+                local,
+                endpoints,
+                1,
+                std::slice::from_ref(&block),
+                sink.clone(),
+            );
 
             // the reward verdict became a pending settlement intent...
             let pending = sink.snapshot();
@@ -313,8 +318,13 @@ mod tests {
             // endpoint points nowhere listening.
             let endpoints = HashMap::from([(dead, "http://127.0.0.1:1".to_string())]);
             let sink = Arc::new(SettlementIntentSink::new(10, 5));
-            let summary =
-                audit_epoch(local, endpoints, 1, std::slice::from_ref(&block), sink.clone());
+            let summary = audit_epoch(
+                local,
+                endpoints,
+                1,
+                std::slice::from_ref(&block),
+                sink.clone(),
+            );
             assert_eq!(sink.snapshot().len(), 0, "unreachable → no intent");
             summary
         })
@@ -391,7 +401,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(resolved.len(), 1, "discovered exactly one peer from its URL");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "discovered exactly one peer from its URL"
+        );
         assert!(
             resolved.contains_key(&server_node),
             "resolved node id matches the server's real local_node_id"
@@ -477,7 +491,10 @@ mod tests {
 
         std::env::set_var("KOTOBA_DHT_AUDIT_INTERVAL_SECS", "0");
         std::env::set_var("KOTOBA_DHT_AUDIT_PEERS", "http://p:1");
-        assert!(AuditLoopConfig::from_env().is_none(), "interval 0 → disabled");
+        assert!(
+            AuditLoopConfig::from_env().is_none(),
+            "interval 0 → disabled"
+        );
 
         std::env::set_var("KOTOBA_DHT_AUDIT_INTERVAL_SECS", "30");
         std::env::remove_var("KOTOBA_DHT_AUDIT_PEERS");
