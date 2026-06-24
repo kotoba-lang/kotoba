@@ -110,7 +110,15 @@ impl WasmExecutor {
     ) -> Result<InvokeResult, RuntimeError> {
         use wasmtime::component::Val;
         let args = vec![Val::List(ctx_cbor.iter().map(|b| Val::U8(*b)).collect())];
-        self.invoke(program_cid, wasm_bytes, agent_did, "run", args, quad_snapshot, head_commits)
+        self.invoke(
+            program_cid,
+            wasm_bytes,
+            agent_did,
+            "run",
+            args,
+            quad_snapshot,
+            head_commits,
+        )
     }
 
     /// HTTP trigger (M11): `on-http(req-cbor) -> result` — same ABI as `run`.
@@ -125,7 +133,15 @@ impl WasmExecutor {
     ) -> Result<InvokeResult, RuntimeError> {
         use wasmtime::component::Val;
         let args = vec![Val::List(req_cbor.iter().map(|b| Val::U8(*b)).collect())];
-        self.invoke(program_cid, wasm_bytes, agent_did, "on-http", args, quad_snapshot, head_commits)
+        self.invoke(
+            program_cid,
+            wasm_bytes,
+            agent_did,
+            "on-http",
+            args,
+            quad_snapshot,
+            head_commits,
+        )
     }
 
     /// Cron trigger (M11): `on-tick(epoch-ms: u64) -> result`.
@@ -140,7 +156,15 @@ impl WasmExecutor {
     ) -> Result<InvokeResult, RuntimeError> {
         use wasmtime::component::Val;
         let args = vec![Val::U64(epoch_ms)];
-        self.invoke(program_cid, wasm_bytes, agent_did, "on-tick", args, quad_snapshot, head_commits)
+        self.invoke(
+            program_cid,
+            wasm_bytes,
+            agent_did,
+            "on-tick",
+            args,
+            quad_snapshot,
+            head_commits,
+        )
     }
 
     /// KSE-topic trigger (M11): `on-kse(topic: string, payload: list<u8>) -> result`.
@@ -160,7 +184,15 @@ impl WasmExecutor {
             Val::String(topic),
             Val::List(payload.iter().map(|b| Val::U8(*b)).collect()),
         ];
-        self.invoke(program_cid, wasm_bytes, agent_did, "on-kse", args, quad_snapshot, head_commits)
+        self.invoke(
+            program_cid,
+            wasm_bytes,
+            agent_did,
+            "on-kse",
+            args,
+            quad_snapshot,
+            head_commits,
+        )
     }
 
     /// Invoke a named component export via dynamic `Val` dispatch, applying the

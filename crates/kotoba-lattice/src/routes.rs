@@ -47,7 +47,8 @@ impl TriggerRoutes {
                         }
                     }
                     "cron" => {
-                        r.cron.push((cid.clone(), t.schedule.clone().unwrap_or_default()));
+                        r.cron
+                            .push((cid.clone(), t.schedule.clone().unwrap_or_default()));
                     }
                     "http" => {
                         if let Some(route) = &t.route {
@@ -133,7 +134,10 @@ mod tests {
         let r = routes();
         assert_eq!(r.http_target("/reply"), Some("bafyReply"));
         assert_eq!(r.http_target("/nope"), None);
-        assert_eq!(r.cron, vec![("bafyReply".to_string(), "every 5m".to_string())]);
+        assert_eq!(
+            r.cron,
+            vec![("bafyReply".to_string(), "every 5m".to_string())]
+        );
     }
 
     #[test]
@@ -147,12 +151,17 @@ mod tests {
     fn resolved_cid_overrides_placeholder() {
         let resolved = BTreeMap::from([("fanout".to_string(), "bafyFanout".to_string())]);
         let r = TriggerRoutes::from_app(&AppManifest::from_edn(APP).unwrap(), &resolved);
-        assert!(r.kse_targets("kotoba/mail/in").contains(&"bafyFanout".to_string()));
+        assert!(r
+            .kse_targets("kotoba/mail/in")
+            .contains(&"bafyFanout".to_string()));
     }
 
     #[test]
     fn empty_app_has_empty_routes() {
-        let r = TriggerRoutes::from_app(&AppManifest::from_edn(r#"{:kotoba.app/name "x"}"#).unwrap(), &BTreeMap::new());
+        let r = TriggerRoutes::from_app(
+            &AppManifest::from_edn(r#"{:kotoba.app/name "x"}"#).unwrap(),
+            &BTreeMap::new(),
+        );
         assert!(r.is_empty());
     }
 

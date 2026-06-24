@@ -112,7 +112,7 @@ impl SettlementBatch {
 /// sorted deterministically. Slash lines are excluded — this is what the node
 /// owes *out* for availability served, not what it claws back.
 ///
-/// Pure: built from a non-draining [`SettlementIntentSink::snapshot`] so reading
+/// Pure: built from a non-draining [`crate::audit::SettlementIntentSink::snapshot`] so reading
 /// the owed retainer never consumes the settle hand-off queue.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetainerOwed {
@@ -227,15 +227,18 @@ mod tests {
     fn retainer_owed_excludes_slash_and_aggregates_reward() {
         let schedule = SettlementSchedule::new(100);
         let intents = vec![
-            intent(b"alice", SettlementKind::Reward, 3, 0), // 300
-            intent(b"alice", SettlementKind::Reward, 2, 1), // +200 → 500
-            intent(b"bob", SettlementKind::Reward, 1, 0),   // 100
+            intent(b"alice", SettlementKind::Reward, 3, 0),  // 300
+            intent(b"alice", SettlementKind::Reward, 2, 1),  // +200 → 500
+            intent(b"bob", SettlementKind::Reward, 1, 0),    // 100
             intent(b"mallory", SettlementKind::Slash, 9, 0), // excluded
         ];
         let owed = RetainerOwed::from_intents(&intents, schedule);
         assert_eq!(owed.total_micros, 600, "reward only; slash excluded");
         assert_eq!(owed.per_peer.len(), 2, "alice aggregated, mallory dropped");
-        assert!(owed.per_peer.iter().all(|l| l.kind == SettlementKind::Reward));
+        assert!(owed
+            .per_peer
+            .iter()
+            .all(|l| l.kind == SettlementKind::Reward));
         let alice = NodeId::from_pubkey(b"alice");
         let alice_line = owed.per_peer.iter().find(|l| l.peer == alice).unwrap();
         assert_eq!(alice_line.usdc_micros, 500);
@@ -244,10 +247,8 @@ mod tests {
     #[test]
     fn retainer_owed_empty_when_no_rewards() {
         let schedule = SettlementSchedule::new(10);
-        let owed = RetainerOwed::from_intents(
-            &[intent(b"x", SettlementKind::Slash, 5, 0)],
-            schedule,
-        );
+        let owed =
+            RetainerOwed::from_intents(&[intent(b"x", SettlementKind::Slash, 5, 0)], schedule);
         assert!(owed.is_empty());
         assert_eq!(owed.total_micros, 0);
     }

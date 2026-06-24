@@ -99,7 +99,11 @@ mod tests {
         let more_rules = base.clone().with_rule("bond", cid("r2"));
         let bumped = DnaManifest::new("market", "1.1.0").with_rule("role", cid("r1"));
         let renamed = DnaManifest::new("forum", "1.0.0").with_rule("role", cid("r1"));
-        assert_ne!(base.dna_id(), more_rules.dna_id(), "adding a rule changes id");
+        assert_ne!(
+            base.dna_id(),
+            more_rules.dna_id(),
+            "adding a rule changes id"
+        );
         assert_ne!(base.dna_id(), bumped.dna_id(), "version bump changes id");
         assert_ne!(base.dna_id(), renamed.dna_id(), "rename changes id");
     }

@@ -225,7 +225,10 @@ pub struct SlashSchedule {
 impl SlashSchedule {
     /// A schedule; `max_bps` is clamped to `10_000` (never more than the bond).
     pub fn new(step_bps: u32, max_bps: u32) -> Self {
-        Self { step_bps, max_bps: max_bps.min(10_000) }
+        Self {
+            step_bps,
+            max_bps: max_bps.min(10_000),
+        }
     }
 
     /// The slash fraction (bps) for `consecutive_failures`: `0` for a clean peer,
@@ -931,10 +934,13 @@ mod tests {
         assert_eq!(back, r);
         // the evidence wrapper (also pinned) round-trips too.
         let ev = AvailabilityEvidence::from_result(&r);
-        let back_ev: AvailabilityEvidence =
-            ciborium::from_reader(ev.to_cbor().as_slice()).unwrap();
+        let back_ev: AvailabilityEvidence = ciborium::from_reader(ev.to_cbor().as_slice()).unwrap();
         assert_eq!(back_ev, ev);
-        assert_eq!(back_ev.cid(), ev.cid(), "evidence CID stable across round-trip");
+        assert_eq!(
+            back_ev.cid(),
+            ev.cid(),
+            "evidence CID stable across round-trip"
+        );
     }
 
     #[test]
@@ -943,13 +949,15 @@ mod tests {
         let validator = NodeId::from_pubkey(b"auditor");
         let audit = slash_audit(&peer, 0.2);
         // signer is injected: here a trivial "hash" so the test stays key-free.
-        let (warrant, evidence) =
-            availability_slash_warrant(&audit, &validator, 1234, |msg| {
-                crate::availability_proof::hash_block(msg)
-            })
-            .expect("slash verdict yields a warrant");
+        let (warrant, evidence) = availability_slash_warrant(&audit, &validator, 1234, |msg| {
+            crate::availability_proof::hash_block(msg)
+        })
+        .expect("slash verdict yields a warrant");
 
-        assert_eq!(warrant.rule_id, ValidationRule::AvailabilityProofFailed as u8);
+        assert_eq!(
+            warrant.rule_id,
+            ValidationRule::AvailabilityProofFailed as u8
+        );
         assert_eq!(warrant.accused, peer.0.to_vec());
         assert_eq!(warrant.validator, validator.0.to_vec());
         assert_eq!(warrant.ts, 1234);
@@ -957,9 +965,10 @@ mod tests {
         assert_eq!(warrant.evidence, evidence.cid());
         assert_eq!(evidence.cid(), KotobaCid::from_bytes(&evidence.to_cbor()));
         // signature is over the canonical payload (recomputable by a verifier).
-        let expect_sig = crate::availability_proof::hash_block(&warrant_signing_bytes(
-            &Warrant { sig: Vec::new(), ..warrant.clone() },
-        ));
+        let expect_sig = crate::availability_proof::hash_block(&warrant_signing_bytes(&Warrant {
+            sig: Vec::new(),
+            ..warrant.clone()
+        }));
         assert_eq!(warrant.sig, expect_sig);
         // evidence round-trips and reflects the failed result.
         let back: AvailabilityEvidence =
@@ -973,7 +982,11 @@ mod tests {
     fn no_warrant_for_non_slash_verdicts() {
         let peer = NodeId::from_pubkey(b"p");
         let validator = NodeId::from_pubkey(b"v");
-        for action in [AuditAction::Reward, AuditAction::None, AuditAction::Unreachable] {
+        for action in [
+            AuditAction::Reward,
+            AuditAction::None,
+            AuditAction::Unreachable,
+        ] {
             let audit = PeerAudit {
                 peer: peer.clone(),
                 result: Some(VerificationResult {
@@ -988,7 +1001,11 @@ mod tests {
             assert!(availability_slash_warrant(&audit, &validator, 0, |m| m.to_vec()).is_none());
         }
         // Slash without a result (shouldn't happen, but guard it) → no warrant.
-        let no_result = PeerAudit { peer, result: None, action: AuditAction::Slash };
+        let no_result = PeerAudit {
+            peer,
+            result: None,
+            action: AuditAction::Slash,
+        };
         assert!(availability_slash_warrant(&no_result, &validator, 0, |m| m.to_vec()).is_none());
     }
 
@@ -996,8 +1013,12 @@ mod tests {
     fn distinct_failures_yield_distinct_evidence_cids() {
         let peer = NodeId::from_pubkey(b"peer");
         let validator = NodeId::from_pubkey(b"val");
-        let (w1, _) = availability_slash_warrant(&slash_audit(&peer, 0.1), &validator, 1, |m| m.to_vec()).unwrap();
-        let (w2, _) = availability_slash_warrant(&slash_audit(&peer, 0.4), &validator, 1, |m| m.to_vec()).unwrap();
+        let (w1, _) =
+            availability_slash_warrant(&slash_audit(&peer, 0.1), &validator, 1, |m| m.to_vec())
+                .unwrap();
+        let (w2, _) =
+            availability_slash_warrant(&slash_audit(&peer, 0.4), &validator, 1, |m| m.to_vec())
+                .unwrap();
         // different scores ⇒ different evidence ⇒ different CIDs ⇒ different sigs.
         assert_ne!(w1.evidence, w2.evidence);
         assert_ne!(w1.sig, w2.sig);
@@ -1072,15 +1093,27 @@ mod tests {
         assert_eq!(sched.fraction_bps(0), 0, "a clean peer is never slashed");
         assert_eq!(sched.fraction_bps(1), 2_500, "first miss is cheap (25%)");
         assert_eq!(sched.fraction_bps(2), 5_000);
-        assert_eq!(sched.fraction_bps(4), 10_000, "reaches full at the 4th miss");
-        assert_eq!(sched.fraction_bps(99), 10_000, "capped, never exceeds the bond");
+        assert_eq!(
+            sched.fraction_bps(4),
+            10_000,
+            "reaches full at the 4th miss"
+        );
+        assert_eq!(
+            sched.fraction_bps(99),
+            10_000,
+            "capped, never exceeds the bond"
+        );
     }
 
     #[test]
     fn graduated_slash_max_bps_clamped_to_full_bond() {
         let sched = SlashSchedule::new(1_000, 99_999);
         assert_eq!(sched.max_bps, 10_000, "cap can never exceed the whole bond");
-        assert_eq!(sched.fraction_bps(u64::MAX), 10_000, "saturating, no overflow");
+        assert_eq!(
+            sched.fraction_bps(u64::MAX),
+            10_000,
+            "saturating, no overflow"
+        );
     }
 
     #[test]
@@ -1090,7 +1123,7 @@ mod tests {
         assert_eq!(sched.slash_amount(1_000, 1), 250); // 25% of 1000
         assert_eq!(sched.slash_amount(1_000, 2), 500);
         assert_eq!(sched.slash_amount(1_000, 4), 1_000); // full
-        // negative / zero bond floors at 0; huge bond saturates without panic.
+                                                         // negative / zero bond floors at 0; huge bond saturates without panic.
         assert_eq!(sched.slash_amount(-5, 4), 0);
         assert_eq!(sched.slash_amount(i64::MAX, 4), i64::MAX);
     }

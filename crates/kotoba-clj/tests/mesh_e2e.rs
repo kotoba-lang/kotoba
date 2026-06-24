@@ -52,7 +52,8 @@ fn full_pipeline_compile_deploy_route_execute() {
         "deploy must emit PutTriggers for the datom-Δ trigger"
     );
     assert!(
-        msgs.iter().any(|(_, m)| matches!(m, LatticeMessage::PutRoutes { .. })),
+        msgs.iter()
+            .any(|(_, m)| matches!(m, LatticeMessage::PutRoutes { .. })),
         "deploy must emit PutRoutes for kse/cron/http"
     );
 
@@ -80,7 +81,15 @@ fn full_pipeline_compile_deploy_route_execute() {
     // KSE topic → on-kse
     let kse_cid = &routes.kse_targets("kotoba/mail/in")[0];
     let out = exec
-        .execute_on_kse(kse_cid, &component, did, "kotoba/mail/in".into(), b"payload".to_vec(), q(), h())
+        .execute_on_kse(
+            kse_cid,
+            &component,
+            did,
+            "kotoba/mail/in".into(),
+            b"payload".to_vec(),
+            q(),
+            h(),
+        )
         .expect("on-kse")
         .output_cbor;
     assert_eq!(out, b"KSE");

@@ -2209,9 +2209,7 @@ fn verify_datomic_cacao_payload_with_operations(
 
 /// Decode a `cacao_b64`-derived CBOR blob into a delegation chain: a single CACAO
 /// (CBOR map, depth-1) or a `[root, leaf]` array (depth-2 team delegation).
-fn decode_cacao_chain(
-    cbor: &[u8],
-) -> Result<kotoba_auth::DelegationChain, (StatusCode, String)> {
+fn decode_cacao_chain(cbor: &[u8]) -> Result<kotoba_auth::DelegationChain, (StatusCode, String)> {
     match kotoba_auth::Cacao::from_cbor(cbor) {
         Ok(cacao) => Ok(kotoba_auth::DelegationChain::new(cacao)),
         Err(_) => kotoba_auth::DelegationChain::from_cbor_chain(cbor)
@@ -7343,16 +7341,16 @@ fn effective_replication_policy(
     let min_replicas = min_replicas_env
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(if peer_count > 0 { 2 } else { 1 });
-    let min_bond_mkoto = min_bond_env.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let min_bond_mkoto = min_bond_env
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
     kotoba_dht::ReplicationPolicy::new(min_replicas).with_min_bond(min_bond_mkoto)
 }
 
 /// The owed-retainer view (ADR-002 p3) for `node.status`, from a settlement
 /// sink's pending intents. Reward-only, per-peer + total USDC micros. Pure over
 /// the snapshot (non-draining) so reading status never consumes the settle queue.
-fn owed_retainer_json(
-    sink: &kotoba_dht::SettlementIntentSink,
-) -> serde_json::Value {
+fn owed_retainer_json(sink: &kotoba_dht::SettlementIntentSink) -> serde_json::Value {
     let owed = kotoba_dht::RetainerOwed::from_intents(
         &sink.snapshot(),
         kotoba_dht::SettlementSchedule::new(1),
@@ -9664,16 +9662,16 @@ mod tests {
         datomic_pull, datomic_pull_many, datomic_q, datomic_q_emit_cids, datomic_seek_datoms,
         datomic_sync, datomic_transact, datomic_tx_range, datomic_with, did_document_publish,
         didcomm_send, distributed_graph_ipns_name, effective_replication_policy,
-        enforce_datomic_range_tx_scope, owed_retainer_json,
-        is_did_web_ip_host, protocol_payload_tx_cid, vc_issue, vp_capability_projection,
-        warm_datomic_resident_cache, AtprotoRepoWriteReq, AuthCapabilityProjection,
-        DatomicBasisTReq, DatomicDatomsIndex, DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq,
-        DatomicEntityReq, DatomicHistoryReq, DatomicIdentReq, DatomicIndexPullReq,
-        DatomicIndexRangeReq, DatomicLogReq, DatomicPullManyReq, DatomicPullReq, DatomicQReq,
-        DatomicSeekDatomsReq, DatomicSyncReq, DatomicTransactReq, DatomicTxRangeReq,
-        DatomicWarmOutcome, DatomicWithReq, DidCommSendReq, DidDocumentPublishReq, VcIssueReq,
-        ZCAP_ALLOWED_ACTION_IRI, ZCAP_CAPABILITY_INVOCATION_IRI, ZCAP_CONTROLLER_IRI,
-        ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI, ZCAP_INVOKER_IRI,
+        enforce_datomic_range_tx_scope, is_did_web_ip_host, owed_retainer_json,
+        protocol_payload_tx_cid, vc_issue, vp_capability_projection, warm_datomic_resident_cache,
+        AtprotoRepoWriteReq, AuthCapabilityProjection, DatomicBasisTReq, DatomicDatomsIndex,
+        DatomicDatomsReq, DatomicDbStatsReq, DatomicEntidReq, DatomicEntityReq, DatomicHistoryReq,
+        DatomicIdentReq, DatomicIndexPullReq, DatomicIndexRangeReq, DatomicLogReq,
+        DatomicPullManyReq, DatomicPullReq, DatomicQReq, DatomicSeekDatomsReq, DatomicSyncReq,
+        DatomicTransactReq, DatomicTxRangeReq, DatomicWarmOutcome, DatomicWithReq, DidCommSendReq,
+        DidDocumentPublishReq, VcIssueReq, ZCAP_ALLOWED_ACTION_IRI, ZCAP_CAPABILITY_INVOCATION_IRI,
+        ZCAP_CONTROLLER_IRI, ZCAP_INVOCATION_PROOF_IRI, ZCAP_INVOCATION_TARGET_IRI,
+        ZCAP_INVOKER_IRI,
     };
     use crate::server::KotobaState;
     use axum::response::IntoResponse;
@@ -9710,7 +9708,10 @@ mod tests {
         assert_eq!(bad.min_replicas, 2);
         assert_eq!(bad.min_bond_mkoto, 0);
         // min_replicas is clamped to ≥ 1 even if env says 0.
-        assert_eq!(effective_replication_policy(Some("0"), None, 0).min_replicas, 1);
+        assert_eq!(
+            effective_replication_policy(Some("0"), None, 0).min_replicas,
+            1
+        );
     }
 
     #[test]
@@ -10497,8 +10498,20 @@ mod tests {
         };
 
         // root: org → member ; leaf: member → server. Serialize [root, leaf] as a CBOR array.
-        let root = sign(&owner_key, &owner_did, &member_did, "d2-root-1", &["datom:transact", "tx:create"]);
-        let leaf = sign(&member_key, &member_did, &aud, "d2-leaf-1", &["datom:transact", "tx:create"]);
+        let root = sign(
+            &owner_key,
+            &owner_did,
+            &member_did,
+            "d2-root-1",
+            &["datom:transact", "tx:create"],
+        );
+        let leaf = sign(
+            &member_key,
+            &member_did,
+            &aud,
+            "d2-leaf-1",
+            &["datom:transact", "tx:create"],
+        );
         let mut cbor = Vec::new();
         ciborium::into_writer(&vec![root, leaf], &mut cbor).unwrap();
         let chain_b64 = base64::engine::general_purpose::STANDARD.encode(cbor);
@@ -10526,7 +10539,13 @@ mod tests {
         }
 
         // a member WITHOUT delegation (bare single CACAO) cannot write the org graph
-        let solo = sign(&member_key, &member_did, &aud, "d2-solo-1", &["datom:transact", "tx:create"]);
+        let solo = sign(
+            &member_key,
+            &member_did,
+            &aud,
+            "d2-solo-1",
+            &["datom:transact", "tx:create"],
+        );
         let mut sb = Vec::new();
         ciborium::into_writer(&solo, &mut sb).unwrap();
         let solo_b64 = base64::engine::general_purpose::STANDARD.encode(sb);

@@ -33,20 +33,20 @@ pub use dna::{DnaManifest, ValidationRuleRef};
 pub use governance::{
     ratify, verify_and_ratify, ActiveParams, Attestation, ParamVersion, Ratification,
 };
-pub use validation::{
-    enforce, load_rules, validate_tx, PhysicsRule, RuleSpec, ValidationOutcome,
+pub use membrane::{
+    bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate,
 };
-pub use membrane::{bonded_candidates, select_replicas, stake_to_replicate_enabled, ReplicaCandidate};
 pub use neighborhood::Neighborhood;
+pub use neighborhood_store::{
+    cid_address, proof_from_store, NeighborhoodBlockStore, PeerTransport,
+};
+pub use node_id::NodeId;
 pub use replication::{
     audit_replication, replication_plan, ReplicationPolicy, ReplicationPolicyStore,
     ReplicationStatus,
 };
 pub use reputation::{prefer_by_reputation, EarnRateBand};
-pub use neighborhood_store::{
-    cid_address, proof_from_store, NeighborhoodBlockStore, PeerTransport,
-};
-pub use node_id::NodeId;
 pub use settlement::{RetainerOwed, SettlementBatch, SettlementLine, SettlementSchedule};
 pub use source_chain::{ChainContent, ChainEntry, SourceChain};
+pub use validation::{enforce, load_rules, validate_tx, PhysicsRule, RuleSpec, ValidationOutcome};
 pub use warrant::{warrant_signing_bytes, ValidationRule, Warrant};

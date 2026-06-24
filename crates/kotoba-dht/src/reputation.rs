@@ -31,19 +31,29 @@ impl EarnRateBand {
         if min_bps <= max_bps {
             Self { min_bps, max_bps }
         } else {
-            Self { min_bps: max_bps, max_bps: min_bps }
+            Self {
+                min_bps: max_bps,
+                max_bps: min_bps,
+            }
         }
     }
 
     /// The identity band (always ×1.0) — reputation weighting off.
     pub fn identity() -> Self {
-        Self { min_bps: 10_000, max_bps: 10_000 }
+        Self {
+            min_bps: 10_000,
+            max_bps: 10_000,
+        }
     }
 
     /// Multiplier in bps for a reputation fraction `r ∈ [0,1]` (clamped): linear
     /// interpolation across the band. `r = 0 → min_bps`, `r = 1 → max_bps`.
     pub fn multiplier_bps(&self, rep_fraction: f64) -> u32 {
-        let r = if rep_fraction.is_nan() { 0.0 } else { rep_fraction.clamp(0.0, 1.0) };
+        let r = if rep_fraction.is_nan() {
+            0.0
+        } else {
+            rep_fraction.clamp(0.0, 1.0)
+        };
         let span = (self.max_bps - self.min_bps) as f64;
         self.min_bps + (span * r).round() as u32
     }
@@ -68,7 +78,7 @@ impl EarnRateBand {
 /// an XOR-sorted eligible set and proximity remains the tie-breaker.
 pub fn prefer_by_reputation(eligible: &[(NodeId, u64)], k: usize) -> Vec<NodeId> {
     let mut ranked: Vec<&(NodeId, u64)> = eligible.iter().collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1)); // stable; reputation descending
+    ranked.sort_by_key(|b| std::cmp::Reverse(b.1)); // stable; reputation descending
     ranked.into_iter().take(k).map(|(n, _)| n.clone()).collect()
 }
 
@@ -82,7 +92,10 @@ mod tests {
 
     #[test]
     fn band_normalises_reversed_bounds() {
-        assert_eq!(EarnRateBand::new(20_000, 5_000), EarnRateBand::new(5_000, 20_000));
+        assert_eq!(
+            EarnRateBand::new(20_000, 5_000),
+            EarnRateBand::new(5_000, 20_000)
+        );
     }
 
     #[test]
@@ -125,7 +138,10 @@ mod tests {
             let mut prev = b.min_bps;
             for &r in &reps {
                 let m = b.multiplier_bps(r);
-                assert!(b.min_bps <= m && m <= b.max_bps, "multiplier {m} outside band");
+                assert!(
+                    b.min_bps <= m && m <= b.max_bps,
+                    "multiplier {m} outside band"
+                );
                 // monotonic across the in-range, ascending reps (skip NaN/negatives
                 // which clamp to the floor).
                 if r >= 0.0 && !r.is_nan() {
@@ -135,9 +151,14 @@ mod tests {
                 // scaling stays within [units*min, units*max]/10000, no panic.
                 for &units in &[0u64, 1, 1_000, u64::MAX] {
                     let scaled = b.scale_units(units, r);
-                    let lo = (units as u128 * b.min_bps as u128 / 10_000).min(u64::MAX as u128) as u64;
-                    let hi = (units as u128 * b.max_bps as u128 / 10_000).min(u64::MAX as u128) as u64;
-                    assert!(scaled >= lo && scaled <= hi, "scaled {scaled} outside [{lo},{hi}]");
+                    let lo =
+                        (units as u128 * b.min_bps as u128 / 10_000).min(u64::MAX as u128) as u64;
+                    let hi =
+                        (units as u128 * b.max_bps as u128 / 10_000).min(u64::MAX as u128) as u64;
+                    assert!(
+                        scaled >= lo && scaled <= hi,
+                        "scaled {scaled} outside [{lo},{hi}]"
+                    );
                 }
             }
         }
@@ -152,11 +173,7 @@ mod tests {
 
     #[test]
     fn prefer_orders_by_reputation_desc_and_caps_k() {
-        let pool = vec![
-            (nid(b"low"), 10u64),
-            (nid(b"high"), 100),
-            (nid(b"mid"), 50),
-        ];
+        let pool = vec![(nid(b"low"), 10u64), (nid(b"high"), 100), (nid(b"mid"), 50)];
         let got = prefer_by_reputation(&pool, 2);
         assert_eq!(got, vec![nid(b"high"), nid(b"mid")]);
     }
@@ -166,7 +183,10 @@ mod tests {
         // Equal reputation ⇒ input order preserved (input is XOR-sorted upstream,
         // so proximity stays the tie-breaker).
         let pool = vec![(nid(b"near"), 7u64), (nid(b"far"), 7)];
-        assert_eq!(prefer_by_reputation(&pool, 2), vec![nid(b"near"), nid(b"far")]);
+        assert_eq!(
+            prefer_by_reputation(&pool, 2),
+            vec![nid(b"near"), nid(b"far")]
+        );
     }
 
     #[test]
@@ -181,7 +201,12 @@ mod tests {
             let pool: Vec<(NodeId, u64)> = eligible
                 .iter()
                 .enumerate()
-                .map(|(i, n)| (n.clone(), (seed.wrapping_mul(31).wrapping_add(i as u64)) % 97))
+                .map(|(i, n)| {
+                    (
+                        n.clone(),
+                        (seed.wrapping_mul(31).wrapping_add(i as u64)) % 97,
+                    )
+                })
                 .collect();
             let preferred = prefer_by_reputation(&pool, 8);
             // never invents a node...

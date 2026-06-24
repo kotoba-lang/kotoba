@@ -230,7 +230,10 @@ mod tests {
     fn duplicate_attestations_count_once() {
         let c = council(&["alice", "bob"]);
         let r = ratify(&[did("alice"), did("alice"), did("alice")], &c, 2);
-        assert_eq!(r.approvals, 1, "the same member attesting thrice is one approval");
+        assert_eq!(
+            r.approvals, 1,
+            "the same member attesting thrice is one approval"
+        );
         assert!(!r.ratified);
     }
 
@@ -251,8 +254,12 @@ mod tests {
         // padding attesters can ever cross the quorum. Deterministic sweep.
         let c = council(&["alice", "bob", "carol"]);
         let pool = [
-            did("alice"), did("alice"), did("bob"),       // dups
-            did("mallory"), did("eve"), did("carol"),     // non-members + member
+            did("alice"),
+            did("alice"),
+            did("bob"), // dups
+            did("mallory"),
+            did("eve"),
+            did("carol"), // non-members + member
         ];
         for take in 0..=pool.len() {
             let attesters = &pool[..take];
@@ -263,7 +270,10 @@ mod tests {
                     .filter(|a| c.contains(*a))
                     .collect::<HashSet<_>>()
                     .len();
-                assert_eq!(r.approvals, distinct_members, "approvals must be distinct members only");
+                assert_eq!(
+                    r.approvals, distinct_members,
+                    "approvals must be distinct members only"
+                );
                 assert!(r.approvals <= c.len(), "can't exceed the council size");
                 assert_eq!(r.threshold, threshold.max(1), "threshold clamped to >=1");
                 assert_eq!(r.ratified, distinct_members >= threshold.max(1));
@@ -285,7 +295,9 @@ mod tests {
     fn verify_and_ratify_accepts_quorum_of_valid_member_sigs() {
         let (a, b) = (key(1), key(2));
         let council: HashSet<[u8; 32]> =
-            [a.verifying_key().to_bytes(), b.verifying_key().to_bytes()].into_iter().collect();
+            [a.verifying_key().to_bytes(), b.verifying_key().to_bytes()]
+                .into_iter()
+                .collect();
         let v = ParamVersion::new("2.0.0", did("params"));
         let r = verify_and_ratify(&v, &[attest(&a, &v), attest(&b, &v)], &council, 2);
         assert_eq!(r.approvals, 2);
@@ -296,7 +308,9 @@ mod tests {
     fn verify_and_ratify_rejects_forged_wrong_message_and_nonmember() {
         let (a, b, mallory) = (key(1), key(2), key(9));
         let council: HashSet<[u8; 32]> =
-            [a.verifying_key().to_bytes(), b.verifying_key().to_bytes()].into_iter().collect();
+            [a.verifying_key().to_bytes(), b.verifying_key().to_bytes()]
+                .into_iter()
+                .collect();
         let v = ParamVersion::new("2.0.0", did("params"));
         let other = ParamVersion::new("2.0.1", did("params"));
 
@@ -334,7 +348,9 @@ mod tests {
     fn active_params_advances_only_on_ratified_change() {
         let (a, b) = (key(1), key(2));
         let council: HashSet<[u8; 32]> =
-            [a.verifying_key().to_bytes(), b.verifying_key().to_bytes()].into_iter().collect();
+            [a.verifying_key().to_bytes(), b.verifying_key().to_bytes()]
+                .into_iter()
+                .collect();
         let v0 = ParamVersion::new("1.0.0", did("p0"));
         let mut active = ActiveParams::new(v0.clone());
         assert_eq!(active.current_id(), v0.id());
@@ -352,7 +368,11 @@ mod tests {
         let v2 = ParamVersion::new("3.0.0", did("p2"));
         let r2 = active.try_activate(v2.clone(), &[attest(&a, &v2)], &council, 2);
         assert!(!r2.ratified);
-        assert_eq!(active.current_id(), v1.id(), "pointer unchanged on rejection");
+        assert_eq!(
+            active.current_id(),
+            v1.id(),
+            "pointer unchanged on rejection"
+        );
         assert_eq!(active.history(), &[v0.id()], "history unchanged");
     }
 
@@ -366,6 +386,9 @@ mod tests {
         let r = active.try_activate(v0.clone(), &[attest(&a, &v0)], &council, 1);
         assert!(r.ratified);
         assert_eq!(active.current_id(), v0.id());
-        assert!(active.history().is_empty(), "re-activating current adds no history");
+        assert!(
+            active.history().is_empty(),
+            "re-activating current adds no history"
+        );
     }
 }

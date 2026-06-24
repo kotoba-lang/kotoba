@@ -49,9 +49,19 @@ pub fn select_replicas(
     membrane_on: bool,
 ) -> Vec<NodeId> {
     // 1+2: admission (bond) then XOR-proximity K-set.
-    let nd: Vec<(NodeId, KotobaCid)> =
-        peers.iter().map(|(n, d, _)| (n.clone(), d.clone())).collect();
-    let bonded = bonded_candidates(address, &nd, root, policy.min_bond_mkoto, pins, K, membrane_on);
+    let nd: Vec<(NodeId, KotobaCid)> = peers
+        .iter()
+        .map(|(n, d, _)| (n.clone(), d.clone()))
+        .collect();
+    let bonded = bonded_candidates(
+        address,
+        &nd,
+        root,
+        policy.min_bond_mkoto,
+        pins,
+        K,
+        membrane_on,
+    );
     // 3: reorder the admitted K-set by reputation (proximity = stable tie-break).
     let rep: std::collections::HashMap<&NodeId, u64> =
         peers.iter().map(|(n, _, r)| (n, *r)).collect();
@@ -68,7 +78,12 @@ pub fn select_replicas(
 /// itself stays pure and testable.
 pub fn stake_to_replicate_enabled() -> bool {
     std::env::var("KOTOBA_STAKE_TO_REPLICATE")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -148,8 +163,9 @@ mod tests {
     fn membrane_off_is_plain_k_nearest() {
         let root = did("rootA");
         let addr = nid(b"rootA-addr");
-        let peers: Vec<(NodeId, KotobaCid)> =
-            (0..10u8).map(|i| (nid(&[i; 4]), did(&format!("did{i}")))).collect();
+        let peers: Vec<(NodeId, KotobaCid)> = (0..10u8)
+            .map(|i| (nid(&[i; 4]), did(&format!("did{i}"))))
+            .collect();
         // empty PinIndex + high floor: with the membrane ON nobody qualifies...
         let pins = PinIndex::new();
         assert!(bonded_candidates(&addr, &peers, &root, 5_000, &pins, 7, true).is_empty());
@@ -157,7 +173,10 @@ mod tests {
         let got = bonded_candidates(&addr, &peers, &root, 5_000, &pins, 7, false);
         let want: Vec<NodeId> = {
             let all: Vec<NodeId> = peers.iter().map(|(n, _)| n.clone()).collect();
-            NodeId::k_nearest(&addr, &all, 7).into_iter().cloned().collect()
+            NodeId::k_nearest(&addr, &all, 7)
+                .into_iter()
+                .cloned()
+                .collect()
         };
         assert_eq!(got, want);
         assert_eq!(got.len(), 7);
@@ -274,7 +293,10 @@ mod tests {
 
         let selected = select_replicas(&root, &addr, &peers, &policy, &pins, true);
         // admission: sybil (no bond) is excluded despite huge reputation.
-        assert!(!selected.contains(&sybil_n), "unbonded Sybil must not be admitted");
+        assert!(
+            !selected.contains(&sybil_n),
+            "unbonded Sybil must not be admitted"
+        );
         // both bonded peers are in; quinn is preferred (higher reputation) first.
         assert_eq!(selected, vec![quinn_n, peggy_n]);
     }
@@ -338,7 +360,10 @@ mod tests {
                 "no duplicates"
             );
             for n in &selected {
-                assert!(eligible.contains(n), "selected a non-eligible node (Sybil leak!)");
+                assert!(
+                    eligible.contains(n),
+                    "selected a non-eligible node (Sybil leak!)"
+                );
             }
             if floor > 5_000 {
                 assert!(selected.is_empty(), "floor above all bonds admits nobody");

@@ -234,7 +234,11 @@ pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u
         // exactly one → its dedicated world (M7/M8/M9), no stubs
         1 => {
             let (n, _, abi) = defined[0];
-            entries.push(Entry { name: n, abi: *abi, export_name: n });
+            entries.push(Entry {
+                name: n,
+                abi: *abi,
+                export_name: n,
+            });
             match *n {
                 "on-http" => "kotoba-component",
                 "on-tick" => "kotoba-cron",
@@ -250,9 +254,15 @@ pub fn compile_kais_mesh_component_str(src: &str, wit_dir: &str) -> Result<Vec<u
                     let params: Vec<String> = (0..arity).map(|i| format!("a{i}")).collect();
                     let stub = format!("(defn {n} [{}] \"\")", params.join(" "));
                     let p = crate::ast::parse_program(&stub)?;
-                    program.functions.extend(p.functions.into_iter().filter(|f| f.name == n));
+                    program
+                        .functions
+                        .extend(p.functions.into_iter().filter(|f| f.name == n));
                 }
-                entries.push(Entry { name: n, abi, export_name: n });
+                entries.push(Entry {
+                    name: n,
+                    abi,
+                    export_name: n,
+                });
             }
             "kotoba-mesh"
         }

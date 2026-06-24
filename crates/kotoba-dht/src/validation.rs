@@ -1,7 +1,7 @@
 //! # Validation hook — enforcing a DNA's shared physics (ADR-001 phase 3 / GROWTH p9)
 //!
 //! The enforcement side of [`crate::dna`]: a proposed transaction is checked
-//! against the DNA's [`ValidationRule`]s before it commits (and on merge results).
+//! against the DNA's `ValidationRule`s before it commits (and on merge results).
 //! Validation is **pure and deterministic** — the same transaction under the same
 //! rules yields the same verdict on every replica, which is what lets a
 //! merge-on-conflict Merkle-CRDT converge without coordination (ADR-001).
@@ -22,7 +22,10 @@ use std::collections::HashSet;
 pub enum ValidationOutcome {
     Valid,
     /// Rejected by `rule_id` with a human-readable `reason`.
-    Rejected { rule_id: String, reason: String },
+    Rejected {
+        rule_id: String,
+        reason: String,
+    },
 }
 
 impl ValidationOutcome {
@@ -109,7 +112,11 @@ impl PhysicsRule for MaxTxSize {
     }
     fn check(&self, tx: &[Datom]) -> Result<(), String> {
         if tx.len() > self.max {
-            return Err(format!("transaction has {} datoms, max is {}", tx.len(), self.max));
+            return Err(format!(
+                "transaction has {} datoms, max is {}",
+                tx.len(),
+                self.max
+            ));
         }
         Ok(())
     }
@@ -168,10 +175,18 @@ where
 {
     let mut rules = Vec::with_capacity(dna.rules().len());
     for r in dna.rules() {
-        let bytes = fetch(&r.content)
-            .ok_or_else(|| format!("rule `{}`: content {} not found", r.id, r.content.to_multibase()))?;
+        let bytes = fetch(&r.content).ok_or_else(|| {
+            format!(
+                "rule `{}`: content {} not found",
+                r.id,
+                r.content.to_multibase()
+            )
+        })?;
         if KotobaCid::from_bytes(&bytes) != r.content {
-            return Err(format!("rule `{}`: content CID mismatch (tampered blob)", r.id));
+            return Err(format!(
+                "rule `{}`: content CID mismatch (tampered blob)",
+                r.id
+            ));
         }
         let spec: RuleSpec = ciborium::from_reader(bytes.as_slice())
             .map_err(|e| format!("rule `{}`: undecodable RuleSpec: {e}", r.id))?;
@@ -258,7 +273,10 @@ mod tests {
 
     #[test]
     fn max_tx_size_caps_transaction() {
-        let r = rules(vec![Box::new(MaxTxSize { id: "size".into(), max: 2 })]);
+        let r = rules(vec![Box::new(MaxTxSize {
+            id: "size".into(),
+            max: 2,
+        })]);
         assert!(validate_tx(&r, &[assert_d("a"), assert_d("b")]).is_valid());
         assert!(!validate_tx(&r, &[assert_d("a"), assert_d("b"), assert_d("c")]).is_valid());
     }
@@ -267,7 +285,10 @@ mod tests {
     fn first_failing_rule_is_reported_deterministically() {
         // size runs first and fails; schema would also fail but size short-circuits.
         let r = rules(vec![
-            Box::new(MaxTxSize { id: "size".into(), max: 0 }),
+            Box::new(MaxTxSize {
+                id: "size".into(),
+                max: 0,
+            }),
             Box::new(AllowedAttributes {
                 id: "schema".into(),
                 allowed: HashSet::new(),
@@ -283,7 +304,10 @@ mod tests {
 
     #[test]
     fn rulespec_content_cid_is_deterministic_and_interprets() {
-        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 5 };
+        let spec = RuleSpec::MaxTxSize {
+            id: "size".into(),
+            max: 5,
+        };
         assert_eq!(spec.content_cid(), spec.content_cid());
         assert_eq!(spec.content_cid(), KotobaCid::from_bytes(&spec.to_cbor()));
         let rule = spec.into_rule();
@@ -298,9 +322,18 @@ mod tests {
         // an equal value, content_cid must be deterministic, and into_rule must
         // preserve the id + accept/reject semantics.
         let specs = vec![
-            RuleSpec::AllowedAttributes { id: "schema".into(), allowed: vec!["name".into()] },
-            RuleSpec::ForbiddenAttribute { id: "noroot".into(), attr: "system/root".into() },
-            RuleSpec::MaxTxSize { id: "size".into(), max: 2 },
+            RuleSpec::AllowedAttributes {
+                id: "schema".into(),
+                allowed: vec!["name".into()],
+            },
+            RuleSpec::ForbiddenAttribute {
+                id: "noroot".into(),
+                attr: "system/root".into(),
+            },
+            RuleSpec::MaxTxSize {
+                id: "size".into(),
+                max: 2,
+            },
         ];
         for spec in specs {
             // CBOR round-trips to an equal RuleSpec.
@@ -318,12 +351,18 @@ mod tests {
             assert_eq!(spec.into_rule().id(), id);
         }
         // a decoded spec enforces identically to the original (semantics preserved).
-        let orig = RuleSpec::ForbiddenAttribute { id: "f".into(), attr: "x".into() };
-        let decoded: RuleSpec =
-            ciborium::from_reader(orig.clone().to_cbor().as_slice()).unwrap();
+        let orig = RuleSpec::ForbiddenAttribute {
+            id: "f".into(),
+            attr: "x".into(),
+        };
+        let decoded: RuleSpec = ciborium::from_reader(orig.clone().to_cbor().as_slice()).unwrap();
         let ro: Vec<Box<dyn PhysicsRule>> = vec![orig.into_rule()];
         let rd: Vec<Box<dyn PhysicsRule>> = vec![decoded.into_rule()];
-        for tx in [vec![assert_d("x")], vec![assert_d("ok")], vec![retract_d("x")]] {
+        for tx in [
+            vec![assert_d("x")],
+            vec![assert_d("ok")],
+            vec![retract_d("x")],
+        ] {
             assert_eq!(
                 validate_tx(&ro, &tx).is_valid(),
                 validate_tx(&rd, &tx).is_valid(),
@@ -339,7 +378,10 @@ mod tests {
             id: "schema".into(),
             allowed: vec!["name".into(), "role".into()],
         };
-        let size = RuleSpec::MaxTxSize { id: "size".into(), max: 3 };
+        let size = RuleSpec::MaxTxSize {
+            id: "size".into(),
+            max: 3,
+        };
         let dna = DnaManifest::new("market", "1.0.0")
             .with_rule("schema", schema.content_cid())
             .with_rule("size", size.content_cid());
@@ -362,7 +404,10 @@ mod tests {
 
     #[test]
     fn load_rules_errors_on_missing_content() {
-        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 1 };
+        let spec = RuleSpec::MaxTxSize {
+            id: "size".into(),
+            max: 1,
+        };
         let dna = DnaManifest::new("d", "1").with_rule("size", spec.content_cid());
         let Err(err) = load_rules(&dna, |_| None) else {
             panic!("expected missing-content error");
@@ -372,10 +417,17 @@ mod tests {
 
     #[test]
     fn load_rules_rejects_tampered_content() {
-        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 1 };
+        let spec = RuleSpec::MaxTxSize {
+            id: "size".into(),
+            max: 1,
+        };
         let dna = DnaManifest::new("d", "1").with_rule("size", spec.content_cid());
         // serve different bytes than the referenced CID addresses → integrity fail.
-        let tampered = RuleSpec::MaxTxSize { id: "size".into(), max: 999 }.to_cbor();
+        let tampered = RuleSpec::MaxTxSize {
+            id: "size".into(),
+            max: 999,
+        }
+        .to_cbor();
         let Err(err) = load_rules(&dna, |_| Some(tampered.clone())) else {
             panic!("expected integrity error");
         };
@@ -453,7 +505,9 @@ mod tests {
         };
         let dna = DnaManifest::new("d", "1").with_rule("schema", schema.content_cid());
         let store: std::collections::HashMap<KotobaCid, Vec<u8>> =
-            [(schema.content_cid(), schema.to_cbor())].into_iter().collect();
+            [(schema.content_cid(), schema.to_cbor())]
+                .into_iter()
+                .collect();
         let fetch = |c: &KotobaCid| store.get(c).cloned();
 
         assert!(enforce(&dna, fetch, &[assert_d("name")]).is_valid());
@@ -462,7 +516,10 @@ mod tests {
 
     #[test]
     fn enforce_rejects_when_dna_cannot_load() {
-        let spec = RuleSpec::MaxTxSize { id: "size".into(), max: 1 };
+        let spec = RuleSpec::MaxTxSize {
+            id: "size".into(),
+            max: 1,
+        };
         let dna = DnaManifest::new("d", "1").with_rule("size", spec.content_cid());
         // content missing → enforce rejects (not silently accepts).
         match enforce(&dna, |_| None, &[assert_d("x")]) {

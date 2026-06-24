@@ -301,7 +301,9 @@ mod tests {
         ciborium::into_writer(&st, &mut buf).unwrap();
         let back: ReplicationStatus = ciborium::from_reader(buf.as_slice()).unwrap();
         assert_eq!(back, st);
-        assert!(!back.satisfied && back.under_replicated_by == 2 && back.missing_pin_peers.len() == 1);
+        assert!(
+            !back.satisfied && back.under_replicated_by == 2 && back.missing_pin_peers.len() == 1
+        );
     }
 
     // ── replication_plan — the enforcement decision (ADR-001 p4) ───────────
@@ -322,7 +324,11 @@ mod tests {
         let st = audit_replication(&policy, 1, &holders);
         assert_eq!(st.under_replicated_by, 2);
         let plan = replication_plan(&st, &holders, &[nid(b"a"), nid(b"b"), nid(b"c"), nid(b"d")]);
-        assert_eq!(plan, vec![nid(b"b"), nid(b"c")], "two fresh candidates, in order");
+        assert_eq!(
+            plan,
+            vec![nid(b"b"), nid(b"c")],
+            "two fresh candidates, in order"
+        );
     }
 
     #[test]
@@ -349,7 +355,11 @@ mod tests {
         let st = audit_replication(&policy, 2, &holders);
         assert!(!st.satisfied);
         let plan = replication_plan(&st, &holders, &[nid(b"c")]);
-        assert_eq!(plan, vec![pinner], "only the missing pinner; no extra replicas");
+        assert_eq!(
+            plan,
+            vec![pinner],
+            "only the missing pinner; no extra replicas"
+        );
     }
 
     #[test]
@@ -368,8 +378,7 @@ mod tests {
         // assert the audit + the recovery plan always obey their contracts.
         let pinner = nid(b"pinner");
         let holders_opts: [&[&[u8]]; 4] = [&[], &[b"h1"], &[b"h1", b"h2"], &[b"pinner"]];
-        let cand_opts: [&[&[u8]]; 4] =
-            [&[], &[b"c1"], &[b"h1", b"c1", b"c2"], &[b"pinner", b"c1"]];
+        let cand_opts: [&[&[u8]]; 4] = [&[], &[b"c1"], &[b"h1", b"c1", b"c2"], &[b"pinner", b"c1"]];
         for min in 0usize..4 {
             for use_pinner in [false, true] {
                 let mut policy = ReplicationPolicy::new(min);
@@ -383,7 +392,10 @@ mod tests {
                     let held: HashSet<&_> = holders.iter().collect();
 
                     // audit contract.
-                    assert_eq!(st.under_replicated_by, policy.min_replicas.saturating_sub(observed));
+                    assert_eq!(
+                        st.under_replicated_by,
+                        policy.min_replicas.saturating_sub(observed)
+                    );
                     for p in &st.missing_pin_peers {
                         assert!(policy.pin_peers.contains(p), "missing not from pin_peers");
                         assert!(!held.contains(p), "a held peer reported missing");

@@ -221,7 +221,11 @@ mod tests {
                 :integrity/closed-attrs [:a/x :b/y]}"#,
         )
         .unwrap();
-        assert_eq!(a.dna_id(), b.dna_id(), "same physics → same DNA id (graph-independent)");
+        assert_eq!(
+            a.dna_id(),
+            b.dna_id(),
+            "same physics → same DNA id (graph-independent)"
+        );
         assert_eq!(a.dna_id(), a.dna_id(), "deterministic");
     }
 
@@ -230,11 +234,19 @@ mod tests {
         let base = rules();
         let mut stricter = base.clone();
         stricter.deny_attrs.insert(":secret".into());
-        assert_ne!(base.dna_id(), stricter.dna_id(), "an added deny changes the DNA id");
+        assert_ne!(
+            base.dna_id(),
+            stricter.dna_id(),
+            "an added deny changes the DNA id"
+        );
 
         let mut not_append = base.clone();
         not_append.append_only = false;
-        assert_ne!(base.dna_id(), not_append.dna_id(), "append-only flag changes id");
+        assert_ne!(
+            base.dna_id(),
+            not_append.dna_id(),
+            "append-only flag changes id"
+        );
 
         // open (no closed-attrs) differs from any closed schema.
         let mut open = base.clone();

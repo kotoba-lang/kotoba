@@ -796,6 +796,9 @@ impl WriteCrypto {
     /// then serializes `[root, leaf]` as a CBOR array → base64 for `cacao_b64`. The
     /// server verifies attenuation and binds the write to the ROOT issuer (the owner),
     /// so a team member can write to the org's graph (docs/gftd-office team sharing).
+    // CACAO delegation needs every field of the leaf claim; bundling them into a
+    // struct would not improve clarity at this single call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn mint_delegated(
         &self,
         root_grant_b64: &str,
@@ -843,8 +846,11 @@ impl WriteCrypto {
                 s: String::new(),
             },
         };
-        leaf.s.s =
-            URL_SAFE_NO_PAD.encode(self.signing_key.sign(leaf.siwe_message().as_bytes()).to_bytes());
+        leaf.s.s = URL_SAFE_NO_PAD.encode(
+            self.signing_key
+                .sign(leaf.siwe_message().as_bytes())
+                .to_bytes(),
+        );
         let chain = vec![root, leaf];
         let mut cbor = Vec::new();
         ciborium::into_writer(&chain, &mut cbor).map_err(|e| e.to_string())?;
@@ -1607,16 +1613,16 @@ mod tests {
         }
 
         // Wrong capability / wrong graph are rejected.
-        assert!(kotoba_auth::DelegationChain::new(
-            kotoba_auth::Cacao::from_cbor(&cbor).unwrap()
-        )
-        .verify(graph, "datom:read")
-        .is_err());
-        assert!(kotoba_auth::DelegationChain::new(
-            kotoba_auth::Cacao::from_cbor(&cbor).unwrap()
-        )
-        .verify("bafy-other-graph", "datom:transact")
-        .is_err());
+        assert!(
+            kotoba_auth::DelegationChain::new(kotoba_auth::Cacao::from_cbor(&cbor).unwrap())
+                .verify(graph, "datom:read")
+                .is_err()
+        );
+        assert!(
+            kotoba_auth::DelegationChain::new(kotoba_auth::Cacao::from_cbor(&cbor).unwrap())
+                .verify("bafy-other-graph", "datom:transact")
+                .is_err()
+        );
     }
 
     #[test]

@@ -116,7 +116,9 @@ mod tests {
         let msgs = deploy_messages(&AppManifest::from_edn(src).unwrap(), &resolved);
         match &msgs[0].1 {
             LatticeMessage::PutRoutes { routes, .. } => {
-                assert!(routes.kse_targets("t").contains(&"bafyCompiled".to_string()));
+                assert!(routes
+                    .kse_targets("t")
+                    .contains(&"bafyCompiled".to_string()));
             }
             _ => panic!("expected PutRoutes"),
         }
