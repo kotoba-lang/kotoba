@@ -4,13 +4,28 @@
 //! mutual recursion). A flat `(+ a b)` proves almost nothing about call/local/
 //! branch codegen — recursion exercises all three.
 
-use kotoba_clj::run::{alloc_probe, compile_and_run};
+use kotoba_clj::run::{alloc_probe, compile_and_run, run_with_fuel};
 use kotoba_clj::{compile_str, CljError};
 
 #[test]
 fn wasm_magic_header() {
     let wasm = compile_str("(defn id [x] x)").unwrap();
     assert_eq!(&wasm[..4], b"\0asm", "must be a real wasm module");
+}
+
+#[test]
+fn run_with_fuel_executes_within_budget() {
+    let wasm = compile_str("(defn add [a b] (+ a b))").unwrap();
+    assert_eq!(run_with_fuel(&wasm, "add", &[2, 3], 1_000_000).unwrap(), 5);
+}
+
+#[test]
+fn run_with_fuel_traps_on_unbounded_loop() {
+    // A recursion that never bottoms out burns instructions forever; a small
+    // fuel budget must trap rather than hang the host.
+    let wasm = compile_str("(defn spin [x] (spin (+ x 1)))").unwrap();
+    let err = run_with_fuel(&wasm, "spin", &[0], 10_000).unwrap_err();
+    assert!(matches!(err, CljError::Run(_)), "expected a run/trap error");
 }
 
 #[test]

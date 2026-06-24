@@ -7,12 +7,72 @@
   (:require [kotoba.office :as office]
             [kotoba.passkey :as passkey]
             [kotoba.syncq :as syncq]
-            [kotoba.hiccup :as h]))
+            [kotoba.hiccup :as h]
+            [clojure.string :as str]))
 
 (defn- el [id] (js/document.getElementById id))
 (defn- getv [id] (let [e (el id)] (if e (.-value e) "")))
 (defn- setv! [id v] (when-let [e (el id)] (set! (.-value e) (or v ""))))
 (defn- sett! [id v] (when-let [e (el id)] (set! (.-textContent e) v)))
+
+;; ── .kotoba source recognition + runner ──────────────────────────────────────
+;; A filename ending in .kotoba (or the .clj family) is recognised as a
+;; Clojure-subset cell; "Run" compiles+runs it server-side via the operator-gated
+;; mesh.run XRPC (kotoba-clj on wasmtime, fuel-bounded). See crates/kotoba-server
+;; mesh_xrpc.rs.
+
+(def ^:private kotoba-exts #{"kotoba" "clj" "cljc" "cljs"})
+
+(defn- file-ext [fname]
+  (let [i (.lastIndexOf (str fname) ".")]
+    (when (pos? i) (str/lower-case (subs fname (inc i))))))
+
+(defn- kotoba-file?
+  "True when `fname` carries a recognised Clojure-subset source extension."
+  [fname]
+  (contains? kotoba-exts (file-ext fname)))
+
+(defn- kotoba-mode-label [fname]
+  (if (kotoba-file? fname)
+    (str "認識: kotoba (Clojure-subset) · ." (file-ext fname))
+    "未対応の拡張子（.kotoba/.clj/.cljc/.cljs）"))
+
+(defn- parse-args
+  "Parse a comma/whitespace-separated list of i64 args, dropping non-numbers."
+  [s]
+  (->> (str/split (str s) #"[,\s]+")
+       (remove str/blank?)
+       (map js/parseInt)
+       (remove js/isNaN)
+       vec))
+
+(defn- run-kotoba!
+  "Recognise the .kotoba filename, then compile+run its source via mesh.run."
+  [remote]
+  (let [fname (getv "kfile")
+        src   (getv "ksrc")]
+    (cond
+      (not (kotoba-file? fname)) (sett! "kout" (kotoba-mode-label fname))
+      (str/blank? src)           (sett! "kout" "ソースが空です")
+      :else
+      (do
+        (sett! "kout" "running…")
+        (-> (js/fetch (str remote "/xrpc/com.etzhayyim.apps.kotoba.mesh.run")
+                      #js {:method  "POST"
+                           :headers #js {"content-type" "application/json"}
+                           :body    (js/JSON.stringify
+                                      #js {:source src
+                                           :func   "main"
+                                           :args   (clj->js (parse-args (getv "kargs")))})})
+            (.then (fn [^js r]
+                     (-> (.json r)
+                         (.then (fn [^js j]
+                                  (sett! "kout"
+                                         (if (.-ok r)
+                                           (str "=> " (.-result j) "  ·  cid " (.-cid j))
+                                           (str "error: "
+                                                (or (.-error j) (str "HTTP " (.-status r)))))))))))
+            (.catch (fn [e] (sett! "kout" (str "fetch failed: " e)))))))))
 
 (defn- read-model []
   {:id "doc1" :kind :doc/document :title (getv "title") :owner-org "self"
@@ -55,7 +115,20 @@
    [:div.bar
     [:button#save {:onclick (fn [_] (save! node remote))} "保存 + 同期"]
     [:span#status "booting…"]
-    [:span#sync "—"]]])
+    [:span#sync "—"]]
+   ;; ── .kotoba code cell (Clojure-subset → wasm) ──────────────────────────────
+   [:hr]
+   [:h1 ".kotoba runner "
+    [:span.meta "Clojure-subset → wasm · mesh.run（operator 認証が必要）"]]
+   [:input#kfile {:placeholder "main.kotoba"
+                  :value       "main.kotoba"
+                  :oninput     (fn [_] (sett! "kmode" (kotoba-mode-label (getv "kfile"))))}]
+   [:span#kmode (kotoba-mode-label "main.kotoba")]
+   [:textarea#ksrc {:placeholder "(defn main [a b] (+ a b))"}]
+   [:input#kargs {:placeholder "args（カンマ区切り i64）: 20, 22"}]
+   [:div.bar
+    [:button#krun {:onclick (fn [_] (run-kotoba! remote))} "実行 (compile+run)"]
+    [:span#kout "—"]]])
 
 (defn- register-sw! []
   ;; Register the Background-Sync SW + reflect its drain reports in the UI.
