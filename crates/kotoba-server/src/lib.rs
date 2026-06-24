@@ -1785,8 +1785,7 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     let app = app
         .route(
             &format!("/xrpc/{}", mesh_xrpc::NSID_MESH_COMPILE),
-            post(mesh_xrpc::mesh_compile)
-                .layer(DefaultBodyLimit::max(mesh_xrpc::MESH_BODY_LIMIT)),
+            post(mesh_xrpc::mesh_compile).layer(DefaultBodyLimit::max(mesh_xrpc::MESH_BODY_LIMIT)),
         )
         .route(
             &format!("/xrpc/{}", mesh_xrpc::NSID_MESH_RUN),

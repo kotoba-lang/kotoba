@@ -43,7 +43,9 @@ pub fn run_with_fuel(wasm: &[u8], func: &str, args: &[i64], fuel: u64) -> Result
     let engine = Engine::new(&config).map_err(|e| CljError::Run(e.to_string()))?;
     let module = Module::new(&engine, wasm).map_err(|e| CljError::Run(e.to_string()))?;
     let mut store = Store::new(&engine, ());
-    store.set_fuel(fuel).map_err(|e| CljError::Run(e.to_string()))?;
+    store
+        .set_fuel(fuel)
+        .map_err(|e| CljError::Run(e.to_string()))?;
     let instance =
         Instance::new(&mut store, &module, &[]).map_err(|e| CljError::Run(e.to_string()))?;
     let f = instance

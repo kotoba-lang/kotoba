@@ -69,7 +69,10 @@ fn resolve_reader_target(
 
 fn validate_source(src: &str) -> Result<(), (StatusCode, String)> {
     if src.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "source must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "source must not be empty".to_string(),
+        ));
     }
     if src.len() > MAX_SOURCE_LEN {
         return Err((
@@ -228,7 +231,9 @@ pub async fn mesh_run(
     .await;
 
     match run {
-        Ok(Ok(result)) => Json(json!({ "result": result, "cid": cid, "fuel": fuel })).into_response(),
+        Ok(Ok(result)) => {
+            Json(json!({ "result": result, "cid": cid, "fuel": fuel })).into_response()
+        }
         Ok(Err(e)) => (
             // A trap / out-of-fuel / missing-export is the caller's program at
             // fault, not a server fault.
@@ -301,7 +306,8 @@ mod tests {
 
     #[test]
     fn compile_surfaces_source_error_as_bad_request() {
-        let (code, _) = compile("(defn main [", true, kotoba_clj::ReaderTarget::Kotoba).unwrap_err();
+        let (code, _) =
+            compile("(defn main [", true, kotoba_clj::ReaderTarget::Kotoba).unwrap_err();
         assert_eq!(code, StatusCode::BAD_REQUEST);
     }
 }
