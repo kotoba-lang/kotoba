@@ -619,3 +619,65 @@ agent workload (no numeric hot loops).
 Verification: `cargo test -p kotoba-clj` → **216 passed / 0 failed** (209 prior +
 7 new). End-to-end `sort`+`take`+`merge`+`dotimes` and the string/`str-int`
 paths run identically on wasmtime and V8.
+
+## R2 — explicit `.kotoba` recognition + server `mesh.compile`/`mesh.run` + editor cell (DONE, 2026-06-24)
+
+Status: **Accepted.** Crates: `kotoba-lattice`, `kotoba-clj`, `kotoba-server`,
+`kotoba-wasm` (cljs). PR #206.
+
+R1 made the `kotoba-clj` CLI/compiler accept `.kotoba`. R2 closes the remaining
+recognition/processing gaps so `.kotoba` is first-class **end-to-end**:
+
+### Explicit language recognition (`kotoba-lattice/src/manifest.rs`)
+The mesh build path (`kotoba component build x.kotoba`) previously routed
+`.kotoba` to `Lang::Clojure` only via the wildcard fallback. `Lang::from_ext`
+now matches `kotoba` / `clj` / `cljc` / `cljs` explicitly, and `Lang::from_token`
+accepts the `:kotoba` token — same behavior (compiled by `kotoba-clj`), but the
+intent is no longer implicit. Tests extended.
+
+### Fuel-bounded standalone run (`kotoba-clj/src/run.rs`)
+`run::run_with_fuel(wasm, func, args, fuel)` instantiates the emitted core module
+on a wasmtime engine with `consume_fuel(true)` and a per-call fuel budget, so
+caller-supplied source can't hang the host — an unbounded loop traps with an
+out-of-fuel error instead. This is the runner any network/RCE-shaped path must
+use (the plain `run` stays for trusted in-process callers). +2 tests
+(within-budget success, unbounded-loop trap).
+
+### Server compile/run XRPC (`kotoba-server/src/mesh_xrpc.rs`, feature `clj-mesh`)
+Two operator-gated endpoints take raw `.kotoba` *source* over HTTP:
+
+```text
+com.etzhayyim.apps.kotoba.mesh.compile  source → { wasmB64, cid, bytes }
+com.etzhayyim.apps.kotoba.mesh.run      source → compile → run → { result, cid, fuel }
+```
+
+- Source is compiled via the **string** API (`compile_str_with[_prelude]_and_reader_target`)
+  — no file-graph / `require` filesystem resolution from network input.
+- `mesh.run` is **fuel-bounded** (`run_with_fuel`) and CPU work is offloaded to
+  `spawn_blocking` so it never stalls the async runtime. The core module has **no
+  host imports** (no kqe/kse/auth/llm) → pure i64 compute over the args.
+- **Operator-gated** (`require_operator_auth`, same as `media.*`); source/func/arg
+  validation; a compile/trap is reported as `400` (caller's program at fault).
+- Gated behind the **off-by-default `clj-mesh`** feature with `kotoba-clj` as an
+  *optional* dep, so the default server build does **not** pull in wasmtime.
+  6 unit tests (NSID shape, reader-target/source/func validation, compile+run
+  roundtrip = 41, compile-error → 400).
+
+Phase boundary (unchanged from R1): these run on a plain wasmtime engine, **not**
+the kotoba-runtime Component-Model host — binding to the `kotoba:kais` WIT world
+(kqe/kse/auth/llm) remains the Component path (`compile_kais_component_str` +
+`WasmExecutor`), out of scope here.
+
+### Editor `.kotoba` cell (`kotoba-wasm/web/cljs/src/kotoba/editor.cljs`)
+A `.kotoba` code cell in the existing hiccup (no-React) editor: filename
+extension recognition with a live mode label (`kotoba-file?` over
+`{kotoba,clj,cljc,cljs}`) + a Run button that compiles+runs the source via
+`mesh.run` and shows `result`/`cid`. Run requires operator auth (it calls the
+operator-gated endpoint), so it is an operator/dev console surface.
+
+Verification: `cargo test -p kotoba-clj` / `-p kotoba-lattice --lib` green
+(incl. fuel + explicit-recognition tests); `kotoba-server` builds **with and
+without** `clj-mesh`; `mesh_xrpc` unit tests pass (compile+run roundtrip = 41);
+`npx shadow-cljs release web` compiles with 0 warnings.
+
+Build/run the surface: `cargo run -p kotoba-server --features clj-mesh`.
