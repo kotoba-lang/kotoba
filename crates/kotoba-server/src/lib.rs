@@ -1263,6 +1263,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
             post(xrpc::econ_transfer),
         )
         .route(
+            &format!("/xrpc/{}", xrpc::NSID_ENGI_AUDIT),
+            post(xrpc::econ_audit),
+        )
+        .route(
             &format!("/xrpc/{}", xrpc::NSID_ECON_BALANCE),
             post(xrpc::econ_balance),
         )

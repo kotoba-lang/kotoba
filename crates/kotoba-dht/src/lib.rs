@@ -32,9 +32,10 @@ pub use audit::{
 pub use commit_chain::CommitChain;
 pub use dna::{DnaManifest, ValidationRuleRef};
 pub use engi_chain::{
-    audit_peer_chain, detect_fork, mutual_credit_warrant, replay_balance, validate_chain_transfers,
-    EngiChain, EngiChainError, MutualCreditTransfer, SeenTransfers, TransferAccusation,
-    TransferBody, TransferViolation, ENGI_TRANSFER_TOPIC, SEEN_TRANSFERS_CAP,
+    audit_peer_chain, audit_transfers, detect_fork, mutual_credit_warrant, replay_balance,
+    validate_chain_transfers, EngiChain, EngiChainError, InsolvencyFinding, MutualCreditTransfer,
+    SeenTransfers, TransferAccusation, TransferBody, TransferViolation, ENGI_TRANSFER_TOPIC,
+    SEEN_TRANSFERS_CAP,
 };
 pub use governance::{
     ratify, verify_and_ratify, ActiveParams, Attestation, ParamVersion, Ratification,

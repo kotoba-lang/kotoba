@@ -559,6 +559,68 @@ pub fn detect_fork(a: &ChainEntry, b: &ChainEntry) -> bool {
     a.agent == b.agent && a.seq == b.seq && a.cid != b.cid
 }
 
+/// A solvency violation found by [`audit_transfers`]: spending agent `did`'s
+/// running balance fell to `balance_after` — below `−credit_limit` — at the
+/// transfer identified by `transfer_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InsolvencyFinding {
+    /// The overspending agent (the transfer's spender).
+    pub did: String,
+    /// CID of the offending transfer (its `transfer_id`, the audit evidence).
+    pub transfer_id: KotobaCid,
+    /// The spender's running balance after this debit (more negative than allowed).
+    pub balance_after: i64,
+    /// The spender's effective credit limit (max negative) it breached.
+    pub credit_limit: i64,
+}
+
+/// Audit a flat, time-ordered list of countersigned transfers for **insolvency**:
+/// replay every agent's running balance in arrival order and report each spend
+/// that drives the spender below `−credit_limit(spender)`.
+///
+/// Unlike the chain-entry path ([`validate_chain_transfers`]) this needs no
+/// `prev`/`seq` — it audits the transfer *record* (e.g. the Engi durable transfer
+/// log), which is exactly what the unconditional projection accumulates. It
+/// therefore catches **overspend / double-spend-by-accumulation** (an agent that
+/// gossiped more spending than its credit allows) but NOT chain *forks* (those
+/// need per-DID `ChainEntry`s — see [`detect_fork`] / [`audit_peer_chain`]).
+///
+/// The over-limit debit is still applied to the running balance (mirroring the
+/// projection, which applies unconditionally), so every subsequent over-limit
+/// spend by the same agent is also reported. An empty result = solvent.
+pub fn audit_transfers<F>(
+    transfers: &[MutualCreditTransfer],
+    credit_limit: F,
+) -> Vec<InsolvencyFinding>
+where
+    F: Fn(&str) -> i64,
+{
+    let mut bal: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for t in transfers {
+        if t.body.amount <= 0 || t.body.spender == t.body.receiver {
+            continue;
+        }
+        // Receiver is credited (you can always receive).
+        let rb = bal.entry(t.body.receiver.as_str()).or_insert(0);
+        *rb = rb.saturating_add(t.body.amount);
+        // Spender is debited; flag if the debit breaches its credit limit.
+        let limit = credit_limit(&t.body.spender);
+        let sb = bal.entry(t.body.spender.as_str()).or_insert(0);
+        let after = sb.saturating_sub(t.body.amount);
+        if after < -limit {
+            out.push(InsolvencyFinding {
+                did: t.body.spender.clone(),
+                transfer_id: t.body.transfer_id(),
+                balance_after: after,
+                credit_limit: limit,
+            });
+        }
+        *sb = after;
+    }
+    out
+}
+
 /// Bounded dedup guard for gossiped transfers, keyed by
 /// [`TransferBody::transfer_id`]. Mirrors the firehose seen-guard: a transfer
 /// re-gossiped around the mesh is projected at most once per node. Ring-buffer
@@ -1100,5 +1162,62 @@ mod tests {
         assert!(seen.contains(&id2) && seen.contains(&id3));
         // id1 re-seen after eviction counts as new again (harmless, idempotent proj).
         assert!(seen.insert(id1));
+    }
+
+    // ── transfer-record solvency audit (audit_transfers) ──────────────────────
+
+    /// A transfer with arbitrary parties/amount (sigs irrelevant to the audit).
+    fn flat(spender: &str, receiver: &str, amount: i64, nonce: u64) -> MutualCreditTransfer {
+        MutualCreditTransfer {
+            body: TransferBody {
+                spender: spender.to_string(),
+                receiver: receiver.to_string(),
+                amount,
+                spender_prev: None,
+                receiver_prev: None,
+                nonce,
+                ts: 0,
+            },
+            spender_sig: Vec::new(),
+            receiver_sig: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn audit_transfers_flags_overspend_against_per_agent_limit() {
+        // a spends 100 three times; under a 150 limit the 2nd and 3rd breach it.
+        let transfers = vec![
+            flat("a", "b", 100, 1),
+            flat("a", "b", 100, 2),
+            flat("a", "b", 100, 3),
+        ];
+        let findings = audit_transfers(&transfers, |did| if did == "a" { 150 } else { 1_000_000 });
+        assert_eq!(findings.len(), 2, "2nd and 3rd debits overspend");
+        assert!(findings.iter().all(|f| f.did == "a"));
+        assert_eq!(findings[0].balance_after, -200);
+        assert_eq!(findings[0].credit_limit, 150);
+        // A generous limit makes the same record solvent.
+        assert!(audit_transfers(&transfers, |_| 1_000_000).is_empty());
+    }
+
+    #[test]
+    fn audit_transfers_never_flags_a_pure_receiver() {
+        // b only ever receives — even at credit limit 0 it is never insolvent
+        // (a has headroom to fund the transfer).
+        let transfers = vec![flat("a", "b", 500, 1)];
+        assert!(audit_transfers(&transfers, |did| if did == "b" { 0 } else { 1_000 }).is_empty());
+        // Received EN funds a later spend: b receives 500 then spends 400 at
+        // limit 0 — solvent because the received credit covers it.
+        let chain = vec![flat("a", "b", 500, 1), flat("b", "c", 400, 2)];
+        assert!(
+            audit_transfers(&chain, |did| if did == "a" { 1_000 } else { 0 }).is_empty(),
+            "spending within received funds is solvent even at limit 0"
+        );
+        // But b spending 600 (more than the 500 it received) at limit 0 is insolvent.
+        let over = vec![flat("a", "b", 500, 1), flat("b", "c", 600, 2)];
+        let f = audit_transfers(&over, |did| if did == "a" { 1_000 } else { 0 });
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].did, "b");
+        assert_eq!(f[0].balance_after, -100);
     }
 }

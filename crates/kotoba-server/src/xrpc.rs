@@ -95,6 +95,10 @@ pub const NSID_ENGI_CREDIT: &str = "com.etzhayyim.apps.kotoba.engi.credit";
 /// `engi/transfer` (ADR-engi-mutual-credit-on-chain R2). Self-authorizing — the
 /// two signatures ARE the authorization, so there is no operator gate.
 pub const NSID_ENGI_TRANSFER: &str = "com.etzhayyim.apps.kotoba.engi.transfer";
+/// Audit the durable transfer record for **insolvency** (any agent whose
+/// accumulated transfers breached its credit limit). Operator-gated read
+/// (ADR-engi-mutual-credit-on-chain R4).
+pub const NSID_ENGI_AUDIT: &str = "com.etzhayyim.apps.kotoba.engi.audit";
 /// Deprecated aliases (pre-ENGI-rename); prefer `NSID_ENGI_*`.
 pub const NSID_ECON_BALANCE: &str = "com.etzhayyim.apps.kotoba.econ.balance";
 pub const NSID_ECON_CREDIT: &str = "com.etzhayyim.apps.kotoba.econ.credit";
@@ -989,6 +993,37 @@ pub async fn econ_transfer(
         "spender_balance_en": state.engi.balance(&t.body.spender).await,
         "receiver_balance_en": state.engi.balance(&t.body.receiver).await,
         "gossiped": gossiped,
+    })))
+}
+
+/// `engi.audit` — operator-gated insolvency audit of the durable transfer record.
+///
+/// Replays every projected countersigned transfer against each agent's credit
+/// limit and reports any agent that overspent (the projection applies transfers
+/// unconditionally, so insolvency surfaces only here). `insolvent: false` with an
+/// empty `findings` array means the projected ledger is solvent.
+pub async fn econ_audit(
+    State(state): State<Arc<KotobaState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    crate::graph_auth::require_operator_auth(&headers, &state.operator_did)?;
+    let findings = state.engi.audit_solvency().await;
+    let findings_json: Vec<_> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "did": f.did,
+                "transfer_id": f.transfer_id.to_multibase(),
+                "balance_after_en": f.balance_after,
+                "credit_limit_en": f.credit_limit,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "unit": "EN",
+        "transfer_count": state.engi.transfer_count().await,
+        "insolvent": !findings.is_empty(),
+        "findings": findings_json,
     })))
 }
 
