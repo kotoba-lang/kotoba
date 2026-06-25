@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection · R6 durable fees · R7 signed warrants — landed)**
+Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection · R6 durable fees · R7 signed warrants · R8 warrant gossip/K-2 eviction — landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -182,15 +182,27 @@ a JSON view). This closes detection → *signed accusation*; the warrant is the 
 shape the neighborhood already evicts on (K/2). 1 server test (fork → verifiable
 warrant; clean record → none), green.
 
-**Deferred (need new subsystems — not faked):**
+**Landed (R8, warrant gossip + K/2 eviction tally):**
+- `ENGI_WARRANT_TOPIC` (`engi/warrant`) carries signed warrants; `verify_warrant`
+  checks a warrant's signature against its `validator` pubkey (forged warrants
+  dropped at the edge); `WarrantTally` counts **distinct validators** per accused
+  and evicts at `WARRANT_EVICTION_THRESHOLD = K/2` (= 3 for K=7).
+- **Push**: the `engi.transfer` XRPC, after projecting a transfer, gossips a signed
+  warrant about *that spender* iff the transfer made it a violator (targeted; clean
+  transfers emit none) — returns `warrants_emitted`.
+- **Receive + apply**: `net_actor` (feature `p2p`) subscribes the topic and runs
+  `handle_engi_warrant` → verify → `WarrantTally::record`; reaching K/2 logs the
+  eviction decision (the offender's future transfers should be refused).
+- 3 dht tests (verify accept/reject, tally eviction, threshold = K/2) + 1 net
+  handler test (verify/tally/evict/garbage), green.
 
-1. **push warrants onto gossip + neighborhood eviction-apply** — R7 *produces*
-   signed warrants (pulled via `engi.audit`). Auto-*pushing* them on the warrant
-   gossip topic and having peers **apply** them (count K/2 → evict the offender)
-   is the remaining net/DHT wiring — it needs a warrant gossip subscribe/receive
-   arm in `net_actor` and the eviction tally. Catching forks across **non-EN**
-   chain content (full `SourceChain` with `seq`-based entries) still needs the
-   per-DID chain sync (bitswap `want_since`).
+**Deferred (need new subsystems / a design decision — not faked):**
+
+1. **enforce eviction + non-EN fork sync** — R8 *decides* eviction (the tally
+   fires at K/2); making `project_transfer` **refuse** an evicted spender's future
+   transfers (thread the tally into the ledger) is the enforcement step. Catching
+   forks across **non-EN** chain content (full `SourceChain` with `seq`-based
+   entries) still needs the per-DID chain sync (bitswap `want_since`).
 2. **peer-countersigned fees** — turning a write fee into a true 2-party
    countersigned transfer needs the payer's Ed25519 signature in the synchronous
    write path (a countersigning handshake). A deliberate protocol change, not a

@@ -33,9 +33,10 @@ pub use commit_chain::CommitChain;
 pub use dna::{DnaManifest, ValidationRuleRef};
 pub use engi_chain::{
     audit_peer_chain, audit_transfers, detect_fork, detect_transfer_forks, mutual_credit_warrant,
-    replay_balance, validate_chain_transfers, EngiChain, EngiChainError, InsolvencyFinding,
-    MutualCreditTransfer, SeenTransfers, TransferAccusation, TransferBody, TransferFork,
-    TransferViolation, ENGI_TRANSFER_TOPIC, SEEN_TRANSFERS_CAP,
+    replay_balance, validate_chain_transfers, verify_warrant, EngiChain, EngiChainError,
+    InsolvencyFinding, MutualCreditTransfer, SeenTransfers, TransferAccusation, TransferBody,
+    TransferFork, TransferViolation, WarrantTally, ENGI_TRANSFER_TOPIC, ENGI_WARRANT_TOPIC,
+    SEEN_TRANSFERS_CAP, WARRANT_EVICTION_THRESHOLD,
 };
 pub use governance::{
     ratify, verify_and_ratify, ActiveParams, Attestation, ParamVersion, Ratification,
