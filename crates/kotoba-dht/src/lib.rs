@@ -9,6 +9,7 @@ pub mod audit;
 pub mod availability_proof;
 pub mod commit_chain;
 pub mod dna;
+pub mod engi_chain;
 pub mod gossip;
 pub mod governance;
 pub mod membrane;
@@ -30,6 +31,11 @@ pub use audit::{
 };
 pub use commit_chain::CommitChain;
 pub use dna::{DnaManifest, ValidationRuleRef};
+pub use engi_chain::{
+    audit_peer_chain, detect_fork, mutual_credit_warrant, replay_balance, validate_chain_transfers,
+    EngiChain, EngiChainError, MutualCreditTransfer, SeenTransfers, TransferAccusation,
+    TransferBody, TransferViolation, ENGI_TRANSFER_TOPIC, SEEN_TRANSFERS_CAP,
+};
 pub use governance::{
     ratify, verify_and_ratify, ActiveParams, Attestation, ParamVersion, Ratification,
 };
