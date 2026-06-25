@@ -50,6 +50,15 @@ fn check_value(v: &EdnValue) -> Result<(), CljError> {
                 if crate::ast::is_inert_form(&head.name) {
                     return Ok(());
                 }
+                // Host-interop call syntax (no host interop): `(.method obj)` /
+                // the `(. obj …)` member-access form start with `.`; a host
+                // constructor `(Class. args)` ends with `.`.
+                if head.name.starts_with('.') {
+                    return Err(deny(&head.to_qualified(), "host method call / member access"));
+                }
+                if head.name.len() > 1 && head.name.ends_with('.') {
+                    return Err(deny(&head.to_qualified(), "host constructor"));
+                }
                 // Match on the *unqualified* name so `clojure.core/eval` and a
                 // bare `eval` are both caught.
                 if let Some(reason) = forbidden_op(&head.name) {
@@ -150,6 +159,59 @@ fn forbidden_op(name: &str) -> Option<&'static str> {
         "alter-var-root" => "mutates a var root (no dynamic global mutation)",
         "intern" => "interns a var at runtime (no dynamic global mutation)",
 
+        // ── no mutable reference types / STM / agents (no shared mutable state) ─
+        "atom" => "creates a mutable atom (no shared mutable state)",
+        "swap!" => "mutates an atom (no shared mutable state)",
+        "swap-vals!" => "mutates an atom (no shared mutable state)",
+        "reset!" => "mutates an atom (no shared mutable state)",
+        "reset-vals!" => "mutates an atom (no shared mutable state)",
+        "compare-and-set!" => "mutates an atom (no shared mutable state)",
+        "volatile!" => "creates a mutable volatile (no shared mutable state)",
+        "vswap!" => "mutates a volatile (no shared mutable state)",
+        "vreset!" => "mutates a volatile (no shared mutable state)",
+        "ref" => "creates an STM ref (no shared mutable state)",
+        "ref-set" => "mutates an STM ref (no shared mutable state)",
+        "alter" => "mutates an STM ref (no shared mutable state)",
+        "commute" => "mutates an STM ref (no shared mutable state)",
+        "ensure" => "protects an STM ref (no shared mutable state)",
+        "dosync" => "opens an STM transaction (no shared mutable state)",
+        "agent" => "creates an agent (no shared mutable state)",
+        "send" => "dispatches work to an agent (no shared mutable state)",
+        "send-off" => "dispatches work to an agent (no shared mutable state)",
+        "send-via" => "dispatches work to an agent (no shared mutable state)",
+        "add-watch" => "installs a mutation watcher (no shared mutable state)",
+        "remove-watch" => "removes a mutation watcher (no shared mutable state)",
+
+        // ── no ambient I/O (I/O must flow through an explicit capability) ───
+        "slurp" => "reads a file/URL (ambient I/O — use a capability)",
+        "spit" => "writes a file (ambient I/O — use a capability)",
+        "print" => "writes to stdout (ambient I/O — use a capability)",
+        "println" => "writes to stdout (ambient I/O — use a capability)",
+        "pr" => "writes to stdout (ambient I/O — use a capability)",
+        "prn" => "writes to stdout (ambient I/O — use a capability)",
+        "printf" => "writes to stdout (ambient I/O — use a capability)",
+        "print-str" => "renders via the print machinery (ambient I/O)",
+        "read-line" => "reads from stdin (ambient I/O — use a capability)",
+        "flush" => "flushes an output stream (ambient I/O)",
+        "with-out-str" => "captures stdout (ambient I/O)",
+
+        // ── no non-determinism (needs the :random capability) ──────────────
+        "rand" => "draws a random number (non-determinism — needs the :random capability)",
+        "rand-int" => "draws a random integer (non-determinism — needs the :random capability)",
+        "rand-nth" => "picks a random element (non-determinism — needs the :random capability)",
+        "shuffle" => "randomly permutes (non-determinism — needs the :random capability)",
+        "random-uuid" => "draws a random UUID (non-determinism — needs the :random capability)",
+
+        // ── no ambient concurrency ─────────────────────────────────────────
+        "future" => "spawns a concurrent future (no ambient concurrency)",
+        "future-call" => "spawns a concurrent future (no ambient concurrency)",
+        "promise" => "creates a promise (no ambient concurrency)",
+        "deliver" => "delivers a promise (no ambient concurrency)",
+        "pmap" => "parallel map (no ambient concurrency)",
+        "pcalls" => "parallel calls (no ambient concurrency)",
+        "pvalues" => "parallel values (no ambient concurrency)",
+        "locking" => "takes a monitor lock (no ambient concurrency)",
+
         // ── no reflection / runtime resolution ─────────────────────────────
         "resolve" => "resolves a symbol at runtime (no reflection)",
         "ns-resolve" => "resolves a symbol in a namespace at runtime (no reflection)",
@@ -157,6 +219,7 @@ fn forbidden_op(name: &str) -> Option<&'static str> {
         "gen-class" => "generates a host class (no host interop)",
         "proxy" => "generates a host proxy (no host interop)",
         "reify" => "generates an anonymous host type (no host interop)",
+        "new" => "constructs a host object (no host interop)",
 
         // ── restricted hygienic macro: only the built-in allowlist expands ─
         "defmacro" => "defines a macro (only the built-in macro allowlist may expand)",

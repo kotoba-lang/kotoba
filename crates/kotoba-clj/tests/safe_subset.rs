@@ -161,3 +161,89 @@ fn capability_and_subset_gates_compose() {
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
     assert!(compile_safe_clj(src, &policy).is_ok());
 }
+
+// ── no mutable reference types / STM / agents ──────────────────────────────
+
+#[test]
+fn mutable_reference_types_are_denied() {
+    // Each gets a clear Subset error (not a confusing "unknown function").
+    for src in [
+        "(defn run [] (atom 0))",
+        "(defn run [a] (swap! a inc))",
+        "(defn run [a] (reset! a 5))",
+        "(defn run [] (volatile! 0))",
+        "(defn run [a] (vswap! a inc))",
+        "(defn run [] (ref 0))",
+        "(defn run [r] (ref-set r 1))",
+        "(defn run [r] (alter r inc))",
+        "(defn run [] (dosync 1))",
+        "(defn run [] (agent 0))",
+        "(defn run [a] (send a inc))",
+        "(defn run [a] (add-watch a :k f))",
+    ] {
+        assert_subset_denied(compile_safe_clj(src, &Policy::deny_all()));
+    }
+}
+
+#[test]
+fn ordinary_program_with_local_bang_names_still_compiles() {
+    // The denylist targets reference-type ops, not every `!`-suffixed name;
+    // a plain numeric program is unaffected.
+    let wasm = compile_safe_clj("(defn run [n] (inc (* n n)))", &Policy::deny_all())
+        .expect("ordinary program must still compile");
+    assert!(wasm.starts_with(b"\0asm"));
+}
+
+// ── no ambient I/O / non-determinism / concurrency ─────────────────────────
+
+#[test]
+fn ambient_io_is_denied() {
+    for src in [
+        r#"(defn run [] (slurp "/etc/passwd"))"#,
+        r#"(defn run [] (spit "/tmp/x" "d"))"#,
+        r#"(defn run [] (println "hi"))"#,
+        r#"(defn run [] (pr "x"))"#,
+        r#"(defn run [] (read-line))"#,
+    ] {
+        assert_subset_denied(compile_safe_clj(src, &Policy::deny_all()));
+    }
+}
+
+#[test]
+fn non_determinism_is_denied() {
+    for src in [
+        "(defn run [] (rand))",
+        "(defn run [] (rand-int 10))",
+        "(defn run [c] (shuffle c))",
+        "(defn run [] (random-uuid))",
+    ] {
+        assert_subset_denied(compile_safe_clj(src, &Policy::deny_all()));
+    }
+}
+
+#[test]
+fn ambient_concurrency_is_denied() {
+    for src in [
+        "(defn run [] (future (+ 1 1)))",
+        "(defn run [] (promise))",
+        "(defn run [c] (pmap inc c))",
+        "(defn run [a b] (locking a b))",
+    ] {
+        assert_subset_denied(compile_safe_clj(src, &Policy::deny_all()));
+    }
+}
+
+// ── no host interop call syntax ────────────────────────────────────────────
+
+#[test]
+fn host_interop_syntax_is_denied() {
+    for src in [
+        r#"(defn run [x] (.toUpperCase x))"#,   // method call
+        r#"(defn run [x] (. x toString))"#,     // member-access special form
+        r#"(defn run [] (String. "x"))"#,       // constructor (trailing dot)
+        r#"(defn run [] (new String "x"))"#,    // new special form
+        r#"(defn run [x] (.. x foo bar))"#,     // .. interop threading
+    ] {
+        assert_subset_denied(compile_safe_clj(src, &Policy::deny_all()));
+    }
+}
