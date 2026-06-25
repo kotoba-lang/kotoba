@@ -53,10 +53,17 @@
 //! cache** of that replay: [`Engi::project_transfer`] applies one chain-validated
 //! transfer, and [`Engi::rebuild_from_transfers`] reconstructs the cache from a
 //! complete transfer set at boot. The local JSON is a fast read surface and
-//! crash-survivable cache, not the ledger of record. (The legacy `charge` /
-//! `credit` / `batch_credit` fee paths still mutate the cache directly; folding
-//! them onto countersigned transfers is the follow-up that makes the chain the
-//! *sole* source of EN movement.)
+//! crash-survivable cache, not the ledger of record.
+//!
+//! **All EN movement is durable.** Two append-only logs sit beside the cache:
+//! `engi-transfers.jsonl` (peer-countersigned [`kotoba_dht::MutualCreditTransfer`]s)
+//! and `engi-fees.jsonl` (operator fee/settlement moves from `charge` / `credit` /
+//! `batch_credit` / `refund`). A lost or corrupt balance cache is **rebuilt by
+//! replaying both logs**, so the durable record — not the JSON cache — is the sole
+//! source of EN movement. (Fees are operator-attested, not peer-countersigned:
+//! the payer authorizes via its CACAO-authed write, not an Ed25519 transfer
+//! signature. Turning fees into a 2-party countersigning handshake is a separate
+//! protocol change, deliberately not done here.)
 
 use kotoba_dht::MutualCreditTransfer;
 use std::collections::HashMap;
@@ -122,6 +129,22 @@ struct Persisted {
     limits: HashMap<String, i64>,
 }
 
+/// A durable record of an **operator fee / settlement** EN movement — a net-zero
+/// `from → to` move from `charge` / `credit` / `batch_credit` / `refund`. These
+/// are NOT peer-countersigned transfers (the payer authorizes via its CACAO-authed
+/// write, not an Ed25519 transfer signature), so they live in a separate log from
+/// the countersigned transfer record. Logging them makes the durable record the
+/// **sole source of EN movement**: a lost balance cache recovers fee balances too.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct EnFeeMove {
+    from: String,
+    to: String,
+    amount: i64,
+    /// Provenance tag (`charge` / `credit` / `settlement` / `refund`) — metadata
+    /// for audit/debug; recovery only needs `from`/`to`/`amount`.
+    kind: String,
+}
+
 #[derive(Default)]
 struct Inner {
     /// Per-DID balances; may be negative down to the DID's credit limit. Σ == 0.
@@ -149,6 +172,10 @@ pub struct Engi {
     /// JSON: `${KOTOBA_STORE_PATH}/engi-transfers.jsonl`). Durable canonical
     /// record; the balance JSON is a fast cache rebuilt from this if lost.
     transfer_log_path: Option<PathBuf>,
+    /// Append-only JSONL log of operator fee / settlement EN moves
+    /// (`${KOTOBA_STORE_PATH}/engi-fees.jsonl`). Replayed alongside the transfer
+    /// log on cache loss so fee balances recover too.
+    fee_log_path: Option<PathBuf>,
 }
 
 impl Engi {
@@ -181,8 +208,15 @@ impl Engi {
         let transfer_log_path = persist_path
             .as_ref()
             .map(|p| p.with_file_name("engi-transfers.jsonl"));
+        let fee_log_path = persist_path
+            .as_ref()
+            .map(|p| p.with_file_name("engi-fees.jsonl"));
 
-        let inner = Self::load(persist_path.as_ref(), transfer_log_path.as_ref());
+        let inner = Self::load(
+            persist_path.as_ref(),
+            transfer_log_path.as_ref(),
+            fee_log_path.as_ref(),
+        );
 
         Arc::new(Self {
             write_cost,
@@ -192,22 +226,29 @@ impl Engi {
             inner: RwLock::new(inner),
             persist_path,
             transfer_log_path,
+            fee_log_path,
         })
     }
 
     /// Load the persisted ledger at boot: the balance/limit **cache** (fast path)
-    /// plus the durable **transfer log** (canonical mutual-credit record). If the
-    /// balance cache is absent but the transfer log is not, the transfer-derived
-    /// balances are **rebuilt from the log** — the log is the source of record and
-    /// survives a lost/corrupt cache. (Fee balances are not in the log, so they
-    /// are not recovered this way until ADR item 3 folds fees onto transfers.)
-    fn load(persist_path: Option<&PathBuf>, transfer_log_path: Option<&PathBuf>) -> Inner {
+    /// plus the durable record — the **transfer log** (countersigned transfers)
+    /// and the **fee log** (operator fee/settlement moves). If the balance cache
+    /// is absent, the balances are **rebuilt by replaying both logs** — together
+    /// they are the sole source of EN movement, so a lost/corrupt cache fully
+    /// recovers (transfers *and* fee balances).
+    fn load(
+        persist_path: Option<&PathBuf>,
+        transfer_log_path: Option<&PathBuf>,
+        fee_log_path: Option<&PathBuf>,
+    ) -> Inner {
         let (mut balances, limits, had_cache) = Self::load_balances(persist_path);
         let transfers = Self::load_transfer_log(transfer_log_path);
+        let fees = Self::load_fee_log(fee_log_path);
 
-        if !had_cache && !transfers.is_empty() {
-            // Recovery: the fast cache is gone but the durable log isn't —
-            // reconstruct the transfer-derived balances by replaying the log.
+        if !had_cache && (!transfers.is_empty() || !fees.is_empty()) {
+            // Recovery: the fast cache is gone but the durable logs aren't —
+            // reconstruct balances by replaying every EN movement. Order doesn't
+            // matter: each move is an additive net-zero (from −= amt, to += amt).
             for t in &transfers {
                 if t.body.amount > 0 && t.body.spender != t.body.receiver {
                     Self::apply_to_map(
@@ -218,9 +259,15 @@ impl Engi {
                     );
                 }
             }
+            for m in &fees {
+                if m.amount > 0 && m.from != m.to {
+                    Self::apply_to_map(&mut balances, &m.from, &m.to, m.amount);
+                }
+            }
             tracing::info!(
-                n = transfers.len(),
-                "engi: balance cache absent — rebuilt transfer-derived balances from the durable transfer log"
+                transfers = transfers.len(),
+                fees = fees.len(),
+                "engi: balance cache absent — rebuilt all balances from the durable transfer + fee logs"
             );
         }
 
@@ -229,6 +276,31 @@ impl Engi {
             limits,
             transfers,
         }
+    }
+
+    /// Load the durable fee log (append-only JSONL, one [`EnFeeMove`] per line).
+    /// A torn/garbled trailing line (crash mid-append) is skipped with a warning.
+    fn load_fee_log(fee_log_path: Option<&PathBuf>) -> Vec<EnFeeMove> {
+        let Some(lp) = fee_log_path else {
+            return Vec::new();
+        };
+        let Ok(s) = std::fs::read_to_string(lp) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (i, line) in s.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<EnFeeMove>(line) {
+                Ok(m) => out.push(m),
+                Err(e) => tracing::warn!(
+                    line = i + 1, error = %e,
+                    "engi: skipping unparseable fee-log line (likely a torn append)"
+                ),
+            }
+        }
+        out
     }
 
     /// Load the balance/limit cache JSON. Returns `(balances, limits, had_cache)`
@@ -389,6 +461,8 @@ impl Engi {
         let snapshot = Self::persisted(&g);
         drop(g);
         self.persist(snapshot);
+        // Durable fee/settlement record so a lost cache recovers this move too.
+        self.append_fee_log(from, to, amount, "transfer");
         Ok(new_from)
     }
 
@@ -441,6 +515,7 @@ impl Engi {
         let op = self.operator_did.clone();
         let mut g = self.inner.write().await;
         let mut total = 0i64;
+        let mut applied: Vec<(String, i64)> = Vec::new();
         for (did, amount) in credits {
             if did == &op || *amount <= 0 {
                 continue;
@@ -452,10 +527,15 @@ impl Engi {
             let op_bal = g.balances.get(&op).copied().unwrap_or(0);
             g.balances.insert(op.clone(), op_bal - *amount);
             total = total.saturating_add(*amount);
+            applied.push((did.clone(), *amount));
         }
         let snapshot = Self::persisted(&g);
         drop(g);
         self.persist(snapshot);
+        // Durable settlement record (operator → recipient per applied credit).
+        for (did, amount) in &applied {
+            self.append_fee_log(&op, did, *amount, "settlement");
+        }
         total
     }
 
@@ -619,6 +699,45 @@ impl Engi {
         }
     }
 
+    /// Append one fee/settlement move to the durable JSONL fee log (one line per
+    /// move, single `write_all`). Best-effort; a `None` path (no persistence
+    /// configured) is a no-op so in-memory ledgers are unaffected.
+    fn append_fee_log(&self, from: &str, to: &str, amount: i64, kind: &str) {
+        let Some(lp) = &self.fee_log_path else {
+            return;
+        };
+        if amount <= 0 || from == to {
+            return;
+        }
+        let mv = EnFeeMove {
+            from: from.to_string(),
+            to: to.to_string(),
+            amount,
+            kind: kind.to_string(),
+        };
+        let mut line = match serde_json::to_string(&mv) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "engi: failed to serialize fee move — not logged");
+                return;
+            }
+        };
+        line.push('\n');
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(lp)
+        {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(line.as_bytes()) {
+                    tracing::warn!(path = ?lp, error = %e, "engi: failed to append fee log");
+                }
+            }
+            Err(e) => tracing::warn!(path = ?lp, error = %e, "engi: failed to open fee log"),
+        }
+    }
+
     /// Persist atomically: write a sibling temp file, then rename over the live
     /// file (atomic on POSIX), so a concurrent reader or a crash never observes
     /// a half-written file. Failures are logged rather than swallowed.
@@ -674,7 +793,14 @@ mod tests {
         let transfer_log_path = persist_path
             .as_ref()
             .map(|p| p.with_file_name("engi-transfers.jsonl"));
-        let inner = Engi::load(persist_path.as_ref(), transfer_log_path.as_ref());
+        let fee_log_path = persist_path
+            .as_ref()
+            .map(|p| p.with_file_name("engi-fees.jsonl"));
+        let inner = Engi::load(
+            persist_path.as_ref(),
+            transfer_log_path.as_ref(),
+            fee_log_path.as_ref(),
+        );
         Arc::new(Engi {
             write_cost,
             read_cost: 0,
@@ -683,6 +809,7 @@ mod tests {
             inner: RwLock::new(inner),
             persist_path,
             transfer_log_path,
+            fee_log_path,
         })
     }
 
@@ -838,6 +965,7 @@ mod tests {
             inner: RwLock::new(Inner::default()),
             persist_path: None,
             transfer_log_path: None,
+            fee_log_path: None,
         });
         let agent = "did:key:agent";
         // Default headroom: can spend to -1_000_000, the 1_000_001st EN blocks.
@@ -885,7 +1013,7 @@ mod tests {
             );
         }
 
-        let reloaded = Engi::load(Some(&pp), None);
+        let reloaded = Engi::load(Some(&pp), None, None);
         assert_eq!(reloaded.balances.get("did:key:ext").copied(), Some(-120));
         assert_eq!(reloaded.balances.get("did:key:op").copied(), Some(120));
         assert_eq!(reloaded.limits.get("did:key:ext").copied(), Some(9000));
@@ -1044,6 +1172,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fee_balances_rebuild_from_fee_log_when_cache_is_lost() {
+        let dir = tmp_store("feelog");
+        let pp = dir.join("engi-ledger.json");
+        {
+            let e = engi_persisted(10, "did:key:op", Some(pp.clone()));
+            e.charge("did:key:ext", 120).await.unwrap(); // ext -120, op +120
+            e.batch_credit(&[("did:key:r".into(), 40)]).await; // r +40, op -40
+            assert_eq!(e.balance("did:key:ext").await, -120);
+            assert_eq!(e.balance("did:key:r").await, 40);
+            assert_eq!(e.balance("did:key:op").await, 80);
+        }
+        // Lose the fast balance cache but keep the durable fee log.
+        std::fs::remove_file(&pp).unwrap();
+        assert!(pp.with_file_name("engi-fees.jsonl").exists());
+
+        let e2 = engi_persisted(10, "did:key:op", Some(pp.clone()));
+        // Fee + settlement balances recovered from the durable fee log.
+        assert_eq!(e2.balance("did:key:ext").await, -120);
+        assert_eq!(e2.balance("did:key:r").await, 40);
+        assert_eq!(e2.balance("did:key:op").await, 80);
+        assert!(e2.ledger().await.is_balanced());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cache_loss_recovers_both_transfers_and_fees() {
+        let dir = tmp_store("bothlogs");
+        let pp = dir.join("engi-ledger.json");
+        {
+            let e = engi_persisted(10, "did:key:op", Some(pp.clone()));
+            e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 300))
+                .await; // a -300, b +300
+            e.charge("did:key:a", 50).await.unwrap(); // a -50 (fee), op +50
+        }
+        std::fs::remove_file(&pp).unwrap();
+
+        let e2 = engi_persisted(10, "did:key:op", Some(pp.clone()));
+        // Transfer-derived AND fee-derived balances both recovered.
+        assert_eq!(e2.balance("did:key:a").await, -350);
+        assert_eq!(e2.balance("did:key:b").await, 300);
+        assert_eq!(e2.balance("did:key:op").await, 50);
+        assert!(e2.ledger().await.is_balanced());
+        // The countersigned transfer is still in the transfer record (auditable).
+        assert_eq!(e2.transfer_count().await, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn project_transfer_is_net_zero_and_persists() {
         let e = engi(10, "did:key:op");
         e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 300))
@@ -1124,7 +1300,7 @@ mod tests {
         let pp = dir.join("engi-ledger.json");
         std::fs::write(&pp, b"{ not valid json").unwrap();
 
-        let inner = Engi::load(Some(&pp), None);
+        let inner = Engi::load(Some(&pp), None, None);
         assert!(inner.balances.is_empty());
         assert!(
             pp.with_extension("json.corrupt").exists(),
