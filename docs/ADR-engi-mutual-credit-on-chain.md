@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection — landed)**
+Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection · R6 durable fees — landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -162,6 +162,16 @@ returns `forked` + per-fork `{spender, spender_prev, transfer_ids}`. Dups
 (same `transfer_id`) and advancing positions are not forks. 2 dht + 1 server
 tests, green.
 
+**Landed (R6, durable fees — all EN movement recoverable):** the fee/settlement
+paths (`charge` / `credit` / `batch_credit` / `refund`) now append an `EnFeeMove`
+to a durable `engi-fees.jsonl` log, and boot recovery replays **both** the transfer
+log and the fee log — so a lost/corrupt balance cache fully recovers (transfers
+*and* fee balances). The durable record is now the **sole source of EN movement**.
+Fees stay operator-attested (the payer authorizes via its CACAO-authed write, not
+an Ed25519 transfer signature) — a separate log from the peer-countersigned
+transfer record, not masquerading as one. 2 server tests (fee-only recovery +
+combined transfer+fee recovery), green.
+
 **Deferred (need new subsystems / a design decision — not faked):**
 
 1. **auto-emit warrants on detection** — `audit_solvency` / `detect_forks` are
@@ -170,8 +180,7 @@ tests, green.
    neighborhood evicts the offender automatically) is the remaining validator
    step. Catching forks across **non-EN** chain content (full `SourceChain` with
    `seq`-based entries) still needs the per-DID chain sync (bitswap `want_since`).
-2. **fold fees onto transfers** — making `charge` / `batch_credit` countersigned
-   transfers is a write-path + economics change (the operator must co-sign every
-   write fee, and the writer's signature must enter the fee path); deferred as a
-   deliberate protocol change, not a mechanical edit. Also folds fee balances into
-   the durable log so a lost cache recovers them too.
+2. **peer-countersigned fees** — turning a write fee into a true 2-party
+   countersigned transfer needs the payer's Ed25519 signature in the synchronous
+   write path (a countersigning handshake). A deliberate protocol change, not a
+   mechanical edit; R6 makes fees durable & recoverable without it.
