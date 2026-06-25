@@ -40,7 +40,7 @@ Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lat
 | capability の値渡し（S4b）・signed/reproducible（S5） | ⬜ | — | — |
 
 達成: **T2 Effect Soundness ✅ / T3 Capability Confinement ✅（instance 粒度、バイト列検証済み）**。
-残: **T1 Memory Safety**（borrow checker 未）。テスト: safe-mode 約 160（`crates/kotoba-clj/tests/safe_*.rs` + `confinement_property.rs`）+ ast meta-guard、full suite green（38 groups）、clippy clean（default + cli）。
+残: **T1 Memory Safety**（borrow checker 未）。テスト: safe-mode 約 160（`crates/kotoba-clj/tests/safe_*.rs` + `confinement_property.rs`）+ ast meta-guard + **実在の agent cell（`examples/kotoba-langgraph-echo-clj/agent.clj`）への end-to-end 統合テスト**（`safe_integration.rs`: minimal_policy → confined build → audit → per-cid deny を実コードで検証）、full suite green（39 groups）、clippy clean（default + cli）。
 
 ## 1. 背景 — kotoba の現在地
 
