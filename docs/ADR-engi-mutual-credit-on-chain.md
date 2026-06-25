@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 core + R1 net receive + R2 verified outbound + R3 durable transfer log/boot replay landed)**
+Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit — landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -141,14 +141,23 @@ mid-append) is skipped, never fatal. 3 unit tests (restart round-trip / rebuild
 from log when cache lost / torn-line tolerance), green. (Fee balances are not yet
 in the log — recovering those is item 2 below.)
 
+**Landed (R4, insolvency audit):** `kotoba_dht::audit_transfers(transfers,
+credit_limit_fn) -> Vec<InsolvencyFinding>` replays a flat transfer record per
+agent and flags every spend that breaches the spender's credit limit — the
+solvency check the *unconditional* projection needs (it applies transfers without
+re-judging them). `Engi::audit_solvency()` runs it over the R3 durable record with
+each agent's effective limit; the operator-gated `engi.audit` XRPC exposes the
+findings (`insolvent` + per-finding did/transfer_id/balance/limit). Catches
+overspend / double-spend-by-accumulation; chain *forks* remain out of scope (they
+need per-DID `ChainEntry`s). 2 dht + 1 server unit tests, green.
+
 **Deferred (need new subsystems — not faked):**
 
-1. **full neighborhood validator deployment** — the R3 transfer log gives a node
-   the *data* (`Engi::transfers()`), but `audit_peer_chain` validates a per-DID
-   `SourceChain` (`ChainEntry`s), not a flat transfer list. Reconstructing
-   per-agent chains from transfers + syncing a *peer's* chain (bitswap
-   `want_since`) and gossiping `mutual_credit_warrant`s is the remaining work.
-   (The R2 boundary check already verifies single transfers' countersignatures.)
+1. **fork detection over synced peer chains** — the R2 boundary verifies single
+   transfers' countersignatures and R4 audits accumulated solvency, but catching a
+   *fork* (same agent re-spending one chain position) needs per-DID `ChainEntry`s:
+   reconstruct per-agent chains, sync a *peer's* chain (bitswap `want_since`), run
+   `audit_peer_chain` / `detect_fork`, and gossip `mutual_credit_warrant`s.
 2. **fold fees onto transfers** — making `charge` / `batch_credit` countersigned
    transfers is a write-path + economics change (the operator must co-sign every
    write fee, and the writer's signature must enter the fee path); deferred as a

@@ -495,6 +495,19 @@ impl Engi {
         self.inner.read().await.transfers.len()
     }
 
+    /// Audit the durable transfer record for **insolvency** — any agent whose
+    /// accumulated gossiped transfers drove its balance below its credit limit.
+    /// Because `project_transfer` applies transfers unconditionally (it mirrors
+    /// committed facts), a peer that overspends is only caught here, by replaying
+    /// the record against each agent's effective limit. An empty result means the
+    /// projected ledger is solvent. (Chain forks are out of scope — they need
+    /// per-DID `ChainEntry`s, not the flat transfer record.)
+    pub async fn audit_solvency(&self) -> Vec<kotoba_dht::InsolvencyFinding> {
+        let g = self.inner.read().await;
+        let transfers = g.transfers.clone();
+        kotoba_dht::audit_transfers(&transfers, |did| self.limit_for(&g, did))
+    }
+
     /// Rebuild the entire balance cache by replaying `transfers` from an empty
     /// map — the boot-time projection of the EN mutual-credit ledger from the
     /// Source Chains. `transfers` must be the *complete* set of EN movements
@@ -972,6 +985,29 @@ mod tests {
         assert_eq!(e2.balance("did:key:a").await, -10);
         assert!(e2.ledger().await.is_balanced());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn audit_solvency_flags_overspend_in_the_projected_record() {
+        // `engi()` uses default_credit_limit = 1000. Two 700-EN spends drive a to
+        // -1400, past the limit — the projection applied them unconditionally, so
+        // the audit is what catches it.
+        let e = engi(10, "did:key:op");
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 700))
+            .await;
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 700))
+            .await;
+        let findings = e.audit_solvency().await;
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].did, "did:key:a");
+        assert_eq!(findings[0].balance_after, -1400);
+        assert_eq!(findings[0].credit_limit, 1000);
+
+        // A within-limit record audits clean.
+        let e2 = engi(10, "did:key:op");
+        e2.project_transfer(&mk_transfer("did:key:a", "did:key:b", 500))
+            .await;
+        assert!(e2.audit_solvency().await.is_empty());
     }
 
     #[tokio::test]
