@@ -267,30 +267,49 @@ async fn apply_deploy_msg(
     }
 }
 
-/// Project a gossiped countersigned EN transfer into the local ledger cache.
-/// Decodes the CBOR [`kotoba_dht::MutualCreditTransfer`], dedups by `transfer_id`
-/// via `seen` (a re-gossiped transfer is applied at most once), and applies it
-/// through [`crate::engi::Engi::project_transfer`] (an unconditional net-zero
-/// mirror of a committed chain fact). Returns `true` iff newly projected; a
-/// duplicate or undecodable envelope returns `false` without mutating the ledger.
+/// Project a gossiped countersigned EN transfer into the local ledger cache,
+/// after verifying it at the gossip boundary. Decodes the CBOR
+/// [`kotoba_dht::MutualCreditTransfer`], resolves both parties' `did:key`s and
+/// **verifies both countersignatures** (a forged or single-signed transfer is
+/// rejected, never projected), dedups by `transfer_id` via `seen`, then applies
+/// it through [`crate::engi::Engi::project_transfer`] (an unconditional net-zero
+/// mirror of a now-verified fact). Returns `true` iff newly projected; an
+/// undecodable, unresolvable, forged, or duplicate envelope returns `false`
+/// without mutating the ledger.
 async fn handle_engi_transfer(
     data: &[u8],
     seen: &mut kotoba_dht::SeenTransfers,
     engi: &crate::engi::Engi,
 ) -> bool {
-    match ciborium::from_reader::<kotoba_dht::MutualCreditTransfer, _>(data) {
-        Ok(t) => {
-            if !seen.insert(t.body.transfer_id()) {
-                return false; // duplicate gossip — already projected
-            }
-            engi.project_transfer(&t).await;
-            true
-        }
+    let t = match ciborium::from_reader::<kotoba_dht::MutualCreditTransfer, _>(data) {
+        Ok(t) => t,
         Err(e) => {
             tracing::warn!(err = %e, "engi/transfer: bad MutualCreditTransfer envelope — skipped");
-            false
+            return false;
         }
+    };
+    // Validator boundary: only project transfers whose BOTH countersignatures
+    // verify against the resolved did:key pubkeys. This is the gossip-edge guard
+    // that keeps a forged transfer from ever entering the projection.
+    let (Some(spk), Some(rpk)) = (
+        crate::engi::resolve_did_pubkey(&t.body.spender),
+        crate::engi::resolve_did_pubkey(&t.body.receiver),
+    ) else {
+        tracing::warn!(
+            spender = %t.body.spender, receiver = %t.body.receiver,
+            "engi/transfer: unresolvable DID (non-did:key) — skipped"
+        );
+        return false;
+    };
+    if let Err(e) = t.verify(&spk, &rpk) {
+        tracing::warn!(err = %e, "engi/transfer: invalid countersignature — rejected");
+        return false;
     }
+    if !seen.insert(t.body.transfer_id()) {
+        return false; // duplicate gossip — already projected
+    }
+    engi.project_transfer(&t).await;
+    true
 }
 
 pub async fn run(
@@ -769,42 +788,58 @@ mod tests {
         KotobaCid([byte; 36])
     }
 
-    fn engi_transfer_bytes(spender: &str, receiver: &str, amount: i64) -> Vec<u8> {
-        // project_transfer mirrors a committed chain fact and never inspects the
-        // signatures, so a dummy-signed body exercises the gossip-receive path.
-        let t = kotoba_dht::MutualCreditTransfer {
-            body: kotoba_dht::TransferBody {
-                spender: spender.to_string(),
-                receiver: receiver.to_string(),
-                amount,
-                spender_prev: None,
-                receiver_prev: None,
-                nonce: 0,
-                ts: 0,
-            },
-            spender_sig: Vec::new(),
-            receiver_sig: Vec::new(),
-        };
+    /// CBOR bytes of a transfer countersigned by `spender` and `cosigner`. When
+    /// `cosigner` is the real receiver the transfer verifies; passing a third
+    /// identity forges the counter-signature (used to drive the reject path).
+    fn signed_transfer_bytes(
+        spender: &kotoba_vault::AgentIdentity,
+        receiver: &kotoba_vault::AgentIdentity,
+        cosigner: &kotoba_vault::AgentIdentity,
+        amount: i64,
+    ) -> Vec<u8> {
+        let t = kotoba_dht::MutualCreditTransfer::countersign(
+            spender.did.clone(),
+            receiver.did.clone(),
+            amount,
+            None,
+            None,
+            0,
+            0,
+            &spender.signing_key,
+            &cosigner.signing_key,
+        )
+        .unwrap();
         let mut buf = Vec::new();
         ciborium::into_writer(&t, &mut buf).unwrap();
         buf
     }
 
     #[tokio::test]
-    async fn handle_engi_transfer_projects_dedups_and_skips_garbage() {
+    async fn handle_engi_transfer_verifies_projects_dedups_and_rejects() {
+        let a = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let b = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let eve = kotoba_vault::AgentIdentity::generate_ephemeral();
         let engi = crate::engi::Engi::from_env("did:key:op".to_string());
         let mut seen = kotoba_dht::SeenTransfers::default();
-        let bytes = engi_transfer_bytes("did:key:a", "did:key:b", 250);
 
-        // First sighting is decoded, deduped-in, and projected (net-zero).
-        assert!(handle_engi_transfer(&bytes, &mut seen, &engi).await);
-        assert_eq!(engi.balance("did:key:a").await, -250);
-        assert_eq!(engi.balance("did:key:b").await, 250);
+        // A properly countersigned transfer verifies and projects (net-zero).
+        let good = signed_transfer_bytes(&a, &b, &b, 250);
+        assert!(handle_engi_transfer(&good, &mut seen, &engi).await);
+        assert_eq!(engi.balance(&a.did).await, -250);
+        assert_eq!(engi.balance(&b.did).await, 250);
 
         // Re-gossiped duplicate is dropped — not applied twice.
-        assert!(!handle_engi_transfer(&bytes, &mut seen, &engi).await);
-        assert_eq!(engi.balance("did:key:a").await, -250);
-        assert_eq!(engi.balance("did:key:b").await, 250);
+        assert!(!handle_engi_transfer(&good, &mut seen, &engi).await);
+        assert_eq!(engi.balance(&a.did).await, -250);
+
+        // A forged counter-signature (eve, not b) is rejected before projection.
+        let forged = signed_transfer_bytes(&a, &b, &eve, 999);
+        assert!(!handle_engi_transfer(&forged, &mut seen, &engi).await);
+        assert_eq!(
+            engi.balance(&a.did).await,
+            -250,
+            "forged transfer must not apply"
+        );
 
         // Undecodable bytes are skipped without panic or mutation.
         assert!(!handle_engi_transfer(b"not cbor", &mut seen, &engi).await);

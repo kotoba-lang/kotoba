@@ -90,6 +90,11 @@ pub const NSID_VAULT_GET: &str = "com.etzhayyim.apps.kotoba.vault.get";
 /// existing clients keep working while new ones migrate to `engi.*`.
 pub const NSID_ENGI_BALANCE: &str = "com.etzhayyim.apps.kotoba.engi.balance";
 pub const NSID_ENGI_CREDIT: &str = "com.etzhayyim.apps.kotoba.engi.credit";
+/// Submit a **countersigned** mutual-credit transfer: verify both `did:key`
+/// signatures, project it into the local ledger, and gossip it to the mesh on
+/// `engi/transfer` (ADR-engi-mutual-credit-on-chain R2). Self-authorizing — the
+/// two signatures ARE the authorization, so there is no operator gate.
+pub const NSID_ENGI_TRANSFER: &str = "com.etzhayyim.apps.kotoba.engi.transfer";
 /// Deprecated aliases (pre-ENGI-rename); prefer `NSID_ENGI_*`.
 pub const NSID_ECON_BALANCE: &str = "com.etzhayyim.apps.kotoba.econ.balance";
 pub const NSID_ECON_CREDIT: &str = "com.etzhayyim.apps.kotoba.econ.credit";
@@ -934,6 +939,56 @@ pub async fn econ_credit(
         // legacy keys (deprecated — EN replaces mKOTO; kept for client compat)
         "credited_mkoto": req.amount,
         "balance_mkoto": balance,
+    })))
+}
+
+/// `engi.transfer` — submit a countersigned mutual-credit transfer.
+///
+/// Self-authorizing: the two `did:key` signatures over the transfer body ARE the
+/// authorization (no operator gate, unlike `engi.credit`). The handler resolves
+/// both DIDs, verifies BOTH signatures, projects the net-zero move into the local
+/// ledger, and gossips the transfer to the mesh on `engi/transfer` (CBOR) so peer
+/// nodes' [`crate::net_actor`] receive paths project it too. Returns the resulting
+/// balances and whether it was gossiped.
+pub async fn econ_transfer(
+    State(state): State<Arc<KotobaState>>,
+    Json(t): Json<kotoba_dht::MutualCreditTransfer>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let spk = crate::engi::resolve_did_pubkey(&t.body.spender).ok_or((
+        StatusCode::BAD_REQUEST,
+        "spender DID is not a resolvable did:key".to_string(),
+    ))?;
+    let rpk = crate::engi::resolve_did_pubkey(&t.body.receiver).ok_or((
+        StatusCode::BAD_REQUEST,
+        "receiver DID is not a resolvable did:key".to_string(),
+    ))?;
+    // Both countersignatures must verify — the transfer is self-authorizing.
+    t.verify(&spk, &rpk)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid transfer: {e}")))?;
+
+    // Project the verified net-zero move into the local ledger cache.
+    state.engi.project_transfer(&t).await;
+
+    // Gossip to the mesh (bare KSE topic; the swarm adds the `kotoba/` prefix).
+    let gossiped = if let Some(tx) = &state.gossip_tx {
+        let mut buf = Vec::new();
+        ciborium::into_writer(&t, &mut buf)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+        tx.try_send((kotoba_dht::ENGI_TRANSFER_TOPIC.to_string(), buf))
+            .is_ok()
+    } else {
+        false
+    };
+
+    Ok(Json(serde_json::json!({
+        "transfer_id": t.body.transfer_id().to_multibase(),
+        "unit": "EN",
+        "spender": t.body.spender,
+        "receiver": t.body.receiver,
+        "amount_en": t.body.amount,
+        "spender_balance_en": state.engi.balance(&t.body.spender).await,
+        "receiver_balance_en": state.engi.balance(&t.body.receiver).await,
+        "gossiped": gossiped,
     })))
 }
 

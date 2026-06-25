@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 landed: core types + neighborhood validator + projection)**
+Status: **accepted (R0 core types + R1 net receive + R2 verified outbound publish landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -117,19 +117,30 @@ threaded into `net_actor::run`. 1 handler unit test (project / dedup / skip
 garbage) green under `--features p2p`. Topic const corrected to the bare KSE name
 `engi/transfer` (the net layer adds the `kotoba/` prefix).
 
-**Deferred (next increments):**
+**Landed (R2, outbound publish + verified boundary + DID resolution):**
+- `engi::resolve_did_pubkey(did)` resolves `did:key` → Ed25519 pubkey
+  (`kotoba_auth::parse_ed25519_did_key`); the resolver `audit_peer_chain` and the
+  receive path both use.
+- **Inbound gossip is now verified**: `handle_engi_transfer` resolves both DIDs
+  and verifies BOTH countersignatures before projecting — a forged or
+  single-signed transfer is rejected at the gossip edge, never entering the cache.
+- **Outbound publish**: the `engi.transfer` XRPC endpoint (`NSID_ENGI_TRANSFER`,
+  self-authorizing — the two signatures ARE the auth) verifies, projects locally,
+  and gossips the CBOR transfer on `ENGI_TRANSFER_TOPIC` to the mesh.
+- Tests: net_actor verify/project/dedup/reject-forgery (p2p) + `resolve_did_pubkey`
+  round-trip, green.
 
-1. **outbound publish at transfer creation** — an XRPC endpoint / `EngiChain`
-   integration that, when this node records a spend/receive, gossips the
-   countersigned transfer on `ENGI_TRANSFER_TOPIC` via the generic publish
-   channel. (Inbound projection + subscribe already landed in R1.)
-2. **validator deployment** — a neighborhood node syncs a peer's chain via the
-   existing bitswap `want_since`, runs `audit_peer_chain`, and gossips
-   `mutual_credit_warrant`s on violations.
-3. **boot replay** — on startup, load the node's tracked chains and call
-   `Engi::rebuild_from_transfers` so the cache derives from the chains.
-4. **fold fees onto transfers** — make `charge` / `batch_credit` countersigned
-   transfers so the chain is the *sole* source of EN movement (today those legacy
-   paths still mutate the cache directly).
-5. **DID → pubkey resolution** — wire `audit_peer_chain`'s `resolve` to the live
-   DID-document / `did:key` path instead of a test resolver.
+**Deferred (need new subsystems — not faked):**
+
+1. **durable transfer store + boot replay** — there is no durable, queryable log
+   of transfers yet (the balance JSON is a derived cache, not the canonical
+   record). Persisting `ChainContent::Transfer` entries (journal / QuadStore) is
+   the prerequisite; once present, boot calls `Engi::rebuild_from_transfers`.
+2. **full neighborhood validator deployment** — sync a peer's *whole* Source
+   Chain (bitswap `want_since`), run `audit_peer_chain` over it, and gossip
+   `mutual_credit_warrant`s. Needs the peer-chain sync + a per-agent chain store
+   (the R2 boundary check verifies single transfers, not full-chain solvency).
+3. **fold fees onto transfers** — making `charge` / `batch_credit` countersigned
+   transfers is a write-path + economics change (the operator must co-sign every
+   write fee, and the writer's signature must enter the fee path); deferred as a
+   deliberate protocol change, not a mechanical edit.
