@@ -1,7 +1,8 @@
 # ADR — kotoba 言語の安全性設計まとめ直し: capability-confinement を一次原理にする
 
-Status: **Accepted (設計まとめ直し; S0 実装済み・S1〜S5 段階導入)**
-Date: 2026-06-25
+Status: **Accepted・実装進行中** — gating 層は実装完了（capability/per-cid・subset 全 spec・effect interprocedural・S1b literal 型チェック・`:memory-pages` 強制・least-privilege tooling、実 cell で end-to-end 検証）。残務は型システム本体（typed HIR・borrow checker S2/T1・capability 値渡し S4b・supply chain S5）。詳細は §0「実装状況サマリ」と §9 ロードマップ。
+Date: 2026-06-25（設計）/ 実装更新: 2026-06-26
+Implemented: `crates/kotoba-clj`（`policy.rs` / `subset.rs` / `effects.rs` / `ty.rs` / `cli.rs`、safe-mode tests 約 170）
 Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lattice`（runtime 側 enforcement）
 関連: `docs/ADR-clojure-wasm.md`, `docs/ADR-kotoba-word.md`, `docs/ADR-kotoba-mesh-wasm-hosting.md`, `docs/SECURITY-ARCHITECTURE.md`, `docs/ADR-sealed-cold-tier.md`
 
