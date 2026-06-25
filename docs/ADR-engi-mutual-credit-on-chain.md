@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit — landed)**
+Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection — landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -148,16 +148,28 @@ solvency check the *unconditional* projection needs (it applies transfers withou
 re-judging them). `Engi::audit_solvency()` runs it over the R3 durable record with
 each agent's effective limit; the operator-gated `engi.audit` XRPC exposes the
 findings (`insolvent` + per-finding did/transfer_id/balance/limit). Catches
-overspend / double-spend-by-accumulation; chain *forks* remain out of scope (they
-need per-DID `ChainEntry`s). 2 dht + 1 server unit tests, green.
+overspend / double-spend-by-accumulation. 2 dht + 1 server unit tests, green.
 
-**Deferred (need new subsystems — not faked):**
+**Landed (R5, double-spend fork detection):**
+`kotoba_dht::detect_transfer_forks(transfers) -> Vec<TransferFork>` groups spend
+transfers by `(spender, spender_prev)` and reports any position from which a
+spender signed two *distinct* transfers — the double-spend fingerprint, detectable
+from the **gossip-accumulated transfer record alone** (every transfer carries the
+spender's pinned head, so no separate per-DID chain sync is needed). It is the
+transfer-level analog of `detect_fork` (which compares `ChainEntry` `seq`).
+`Engi::detect_forks()` runs it over the durable record and `engi.audit` now also
+returns `forked` + per-fork `{spender, spender_prev, transfer_ids}`. Dups
+(same `transfer_id`) and advancing positions are not forks. 2 dht + 1 server
+tests, green.
 
-1. **fork detection over synced peer chains** — the R2 boundary verifies single
-   transfers' countersignatures and R4 audits accumulated solvency, but catching a
-   *fork* (same agent re-spending one chain position) needs per-DID `ChainEntry`s:
-   reconstruct per-agent chains, sync a *peer's* chain (bitswap `want_since`), run
-   `audit_peer_chain` / `detect_fork`, and gossip `mutual_credit_warrant`s.
+**Deferred (need new subsystems / a design decision — not faked):**
+
+1. **auto-emit warrants on detection** — `audit_solvency` / `detect_forks` are
+   pull-only (via `engi.audit`). Wiring them to *push* a signed
+   `mutual_credit_warrant` onto the warrant gossip on detection (so the
+   neighborhood evicts the offender automatically) is the remaining validator
+   step. Catching forks across **non-EN** chain content (full `SourceChain` with
+   `seq`-based entries) still needs the per-DID chain sync (bitswap `want_since`).
 2. **fold fees onto transfers** — making `charge` / `batch_credit` countersigned
    transfers is a write-path + economics change (the operator must co-sign every
    write fee, and the writer's signature must enter the fee path); deferred as a

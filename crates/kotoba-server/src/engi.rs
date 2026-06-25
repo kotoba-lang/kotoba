@@ -508,6 +508,16 @@ impl Engi {
         kotoba_dht::audit_transfers(&transfers, |did| self.limit_for(&g, did))
     }
 
+    /// Detect **double-spend forks** in the durable transfer record — any agent
+    /// that signed two distinct transfers pinning the same chain position
+    /// (`spender_prev`). Works over the gossip-accumulated record, so it catches a
+    /// peer's double-spend without a separate per-DID chain sync. Empty = no fork
+    /// seen.
+    pub async fn detect_forks(&self) -> Vec<kotoba_dht::TransferFork> {
+        let g = self.inner.read().await;
+        kotoba_dht::detect_transfer_forks(&g.transfers)
+    }
+
     /// Rebuild the entire balance cache by replaying `transfers` from an empty
     /// map — the boot-time projection of the EN mutual-credit ledger from the
     /// Source Chains. `transfers` must be the *complete* set of EN movements
@@ -1008,6 +1018,29 @@ mod tests {
         e2.project_transfer(&mk_transfer("did:key:a", "did:key:b", 500))
             .await;
         assert!(e2.audit_solvency().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detect_forks_catches_double_spend_in_projected_record() {
+        // a projects two DISTINCT transfers both from the genesis position
+        // (mk_transfer pins prev = None) → a double-spend fork.
+        let e = engi(10, "did:key:op");
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 100))
+            .await;
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:c", 100))
+            .await;
+        let forks = e.detect_forks().await;
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].spender, "did:key:a");
+        assert_eq!(forks[0].transfer_ids.len(), 2);
+
+        // A single spender→one-receiver record (even repeated identical gossip)
+        // is not a fork.
+        let e2 = engi(10, "did:key:op");
+        let t = mk_transfer("did:key:a", "did:key:b", 100);
+        e2.project_transfer(&t).await;
+        e2.project_transfer(&t).await; // identical id → deduped, no fork
+        assert!(e2.detect_forks().await.is_empty());
     }
 
     #[tokio::test]

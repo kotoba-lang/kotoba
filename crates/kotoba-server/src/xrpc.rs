@@ -1019,11 +1019,24 @@ pub async fn econ_audit(
             })
         })
         .collect();
+    let forks = state.engi.detect_forks().await;
+    let forks_json: Vec<_> = forks
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "spender": f.spender,
+                "spender_prev": f.spender_prev.as_ref().map(|c| c.to_multibase()),
+                "transfer_ids": f.transfer_ids.iter().map(|c| c.to_multibase()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({
         "unit": "EN",
         "transfer_count": state.engi.transfer_count().await,
         "insolvent": !findings.is_empty(),
         "findings": findings_json,
+        "forked": !forks.is_empty(),
+        "forks": forks_json,
     })))
 }
 
