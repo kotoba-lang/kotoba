@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 core types + R1 net receive + R2 verified outbound publish landed)**
+Status: **accepted (R0 core + R1 net receive + R2 verified outbound + R3 durable transfer log/boot replay landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -130,17 +130,27 @@ garbage) green under `--features p2p`. Topic const corrected to the bare KSE nam
 - Tests: net_actor verify/project/dedup/reject-forgery (p2p) + `resolve_did_pubkey`
   round-trip, green.
 
+**Landed (R3, durable transfer log + boot replay):** `Engi` now keeps a durable
+append-only **transfer log** (`${KOTOBA_STORE_PATH}/engi-transfers.jsonl`, one
+countersigned `MutualCreditTransfer` per line): `project_transfer` appends to it,
+`transfers()` / `transfer_count()` expose the record, and at boot `load` reads it
+into the in-memory record. The transfer log is the **canonical** mutual-credit
+history — if the balance cache JSON is lost or corrupt, boot **rebuilds the
+transfer-derived balances by replaying the log**. A torn trailing line (crash
+mid-append) is skipped, never fatal. 3 unit tests (restart round-trip / rebuild
+from log when cache lost / torn-line tolerance), green. (Fee balances are not yet
+in the log — recovering those is item 2 below.)
+
 **Deferred (need new subsystems — not faked):**
 
-1. **durable transfer store + boot replay** — there is no durable, queryable log
-   of transfers yet (the balance JSON is a derived cache, not the canonical
-   record). Persisting `ChainContent::Transfer` entries (journal / QuadStore) is
-   the prerequisite; once present, boot calls `Engi::rebuild_from_transfers`.
-2. **full neighborhood validator deployment** — sync a peer's *whole* Source
-   Chain (bitswap `want_since`), run `audit_peer_chain` over it, and gossip
-   `mutual_credit_warrant`s. Needs the peer-chain sync + a per-agent chain store
-   (the R2 boundary check verifies single transfers, not full-chain solvency).
-3. **fold fees onto transfers** — making `charge` / `batch_credit` countersigned
+1. **full neighborhood validator deployment** — the R3 transfer log gives a node
+   the *data* (`Engi::transfers()`), but `audit_peer_chain` validates a per-DID
+   `SourceChain` (`ChainEntry`s), not a flat transfer list. Reconstructing
+   per-agent chains from transfers + syncing a *peer's* chain (bitswap
+   `want_since`) and gossiping `mutual_credit_warrant`s is the remaining work.
+   (The R2 boundary check already verifies single transfers' countersignatures.)
+2. **fold fees onto transfers** — making `charge` / `batch_credit` countersigned
    transfers is a write-path + economics change (the operator must co-sign every
    write fee, and the writer's signature must enter the fee path); deferred as a
-   deliberate protocol change, not a mechanical edit.
+   deliberate protocol change, not a mechanical edit. Also folds fee balances into
+   the durable log so a lost cache recovers them too.
