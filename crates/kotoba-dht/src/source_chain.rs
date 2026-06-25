@@ -39,6 +39,15 @@ pub enum ChainContent {
         evidence: KotobaCid,
         rule_id: u8,
     },
+    /// A **countersigned mutual-credit transfer** of EN (縁) — the agent-centric,
+    /// net-zero settlement primitive (ADR engi-mutual-credit-on-chain). Both the
+    /// spender and the receiver append the *same* [`crate::engi_chain::MutualCreditTransfer`]
+    /// to their own Source Chains; the entry's `prev` binds the transfer to a
+    /// unique chain position, so a double-spend can only appear as a chain fork
+    /// (caught by the existing seq/prev linearity → a [`crate::warrant::Warrant`]).
+    /// An agent's balance is the replay of these entries over its chain — there is
+    /// no global ledger (mirrors Holochain HoloFuel). See [`crate::engi_chain`].
+    Transfer(crate::engi_chain::MutualCreditTransfer),
     /// LLM inference request (special Invoke subtype)
     Infer {
         model_cid: KotobaCid,
@@ -249,6 +258,12 @@ impl SourceChain {
 
     pub fn head(&self) -> Option<&ChainEntry> {
         self.entries.last()
+    }
+    /// All entries in append order (oldest-first). Read surface for replaying a
+    /// chain — e.g. [`crate::engi_chain::replay_balance`] folds the
+    /// [`ChainContent::Transfer`] entries here into a mutual-credit balance.
+    pub fn entries(&self) -> &[ChainEntry] {
+        &self.entries
     }
     pub fn len(&self) -> usize {
         self.entries.len()
