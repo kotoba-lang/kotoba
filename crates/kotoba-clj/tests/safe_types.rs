@@ -84,6 +84,16 @@ fn str_len_on_float_literal_is_rejected() {
 }
 
 #[test]
+fn byte_at_with_non_numeric_index_is_rejected() {
+    // The index must be a number — a string/keyword/char literal there is read
+    // as a byte offset (handle bits), silently.
+    for idx in [r#""x""#, ":k", r#"\a"#] {
+        let src = format!(r#"(defn run [] (byte-at "ab" {idx}))"#);
+        denied_type(compile_safe_clj(&src, &Policy::deny_all()));
+    }
+}
+
+#[test]
 fn byte_at_on_string_literal_with_numeric_index_is_fine() {
     // Correct usage: string first, numeric index — must compile.
     let wasm = compile_safe_clj(r#"(defn run [] (byte-at "hi" 0))"#, &Policy::deny_all())
@@ -150,6 +160,11 @@ fn set_literal_in_arithmetic_is_rejected() {
         r#"(defn run [] (- #{1 2} 1))"#,
         &Policy::deny_all(),
     ));
+}
+
+#[test]
+fn char_literal_in_arithmetic_is_rejected() {
+    denied_type(compile_safe_clj(r#"(defn run [] (+ \a 1))"#, &Policy::deny_all()));
 }
 
 #[test]

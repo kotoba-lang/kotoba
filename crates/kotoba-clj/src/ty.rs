@@ -107,6 +107,16 @@ fn check(v: &EdnValue) -> Result<(), CljError> {
                         )));
                     }
                 }
+                if head.name == "byte-at" {
+                    // The index (2nd arg) must be a number — a non-numeric handle
+                    // there is read as a byte offset, silently.
+                    if let Some(desc) = items.get(2).and_then(non_numeric_literal) {
+                        return Err(CljError::Type(format!(
+                            "`byte-at` index is {desc} — it must be a number (the i64 model \
+                             would use the handle as a byte offset) (S1b literal type check)."
+                        )));
+                    }
+                }
             }
             for it in items {
                 check(it)?;
@@ -141,6 +151,7 @@ fn non_numeric_literal(v: &EdnValue) -> Option<String> {
     match v {
         EdnValue::String(s) => Some(format!("a string literal {s:?}")),
         EdnValue::Keyword(k) => Some(format!("a keyword literal `:{}`", k.0.to_qualified())),
+        EdnValue::Char(c) => Some(format!("a character literal `\\{c}`")),
         // Container literals are heap handles, not numbers — arithmetic on them
         // computes on the handle bits, silently.
         EdnValue::Vector(_) => Some("a vector literal".to_string()),

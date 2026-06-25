@@ -163,7 +163,7 @@ Audit/tooling APIs, usable standalone: `embedded_capability_ifaces(wasm)`
 (byte-level capability surface), `infer_effects(src)` (source-level transitive
 effects), `minimal_policy(src)` (least-privilege synthesis), `Policy::to_edn`.
 Status: capability (instance-level), subset, and effect (interprocedural) gates
-implemented and byte-verified (S0–S4) with ~110 safe-mode tests; typed HIR /
+implemented and byte-verified (S0–S4) with ~160 safe-mode tests; typed HIR /
 borrow checker (T1) are on the roadmap in the ADR.
 
 ## Defaults that just work
