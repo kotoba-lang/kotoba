@@ -455,6 +455,15 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
     }
 }
 
+/// The distinct host imports a program uses — i.e. its capability surface.
+///
+/// This is the exact set [`crate::codegen::compile`] would emit into the wasm
+/// import section, so [`crate::compile_safe_clj`] gates *this* set against the
+/// policy: anything denied never reaches the module bytes.
+pub fn used_host_imports(program: &Program) -> Vec<HostImport> {
+    collect_host_imports(program)
+}
+
 /// Collect the distinct host imports the program uses, in first-seen order
 /// (stable so emitted indices are deterministic).
 fn collect_host_imports(program: &Program) -> Vec<HostImport> {

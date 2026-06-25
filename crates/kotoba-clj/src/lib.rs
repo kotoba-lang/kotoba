@@ -120,12 +120,16 @@ pub mod ast;
 pub mod cli;
 pub mod codegen;
 pub mod compat;
+pub mod effects;
+pub mod policy;
+pub mod subset;
 #[cfg(feature = "component")]
 pub mod component;
 #[cfg(feature = "run")]
 pub mod run;
 
 pub use compat::ReaderTarget;
+pub use policy::{CapClass, Limits, Policy};
 #[cfg(feature = "component")]
 pub use component::compile_component_str_with_prelude;
 
@@ -147,6 +151,28 @@ pub enum CljError {
     /// The emitted module failed to instantiate or trapped at run time.
     #[error("runtime error: {0}")]
     Run(String),
+    /// A `compile_safe_clj` build was rejected by its capability [`policy::Policy`]:
+    /// the program requested a host capability the policy does not grant, or the
+    /// policy's resource quotas are invalid. This is the deny-by-default gate of
+    /// kotoba's capability-confinement design (see
+    /// `docs/ADR-safe-capability-language.md`).
+    #[error("policy error: {0}")]
+    Policy(String),
+    /// A `compile_safe_clj` build used a language construct outside the safe
+    /// subset (e.g. `eval`, runtime `require`, dynamic-var mutation, reflection,
+    /// or a user-defined `defmacro`). The legacy path silently ignores these;
+    /// safe mode rejects them, because silent acceptance of `eval`/`require`/etc.
+    /// is itself a confinement hole (see `docs/ADR-safe-capability-language.md`
+    /// §6). This is deny-by-default for *language features*, complementing the
+    /// [`CljError::Policy`] gate for *capabilities*.
+    #[error("subset error: {0}")]
+    Subset(String),
+    /// A `compile_safe_clj` build violated **effect soundness** (theorem T2): a
+    /// function performs an effect outside its declared `{:effects #{…}}` row,
+    /// or declared an unknown effect. See `docs/ADR-safe-capability-language.md`
+    /// §5 and [`effects`].
+    #[error("effect error: {0}")]
+    Effect(String),
 }
 
 /// Compile Clojure-subset source text into WebAssembly bytes.
@@ -162,6 +188,169 @@ pub fn compile_str_with_reader_target(
     let src = compat::normalize_source(src, target)?;
     let program = ast::parse_program(&src)?;
     codegen::compile(&program)
+}
+
+/// Compile safe-clj source against a capability [`Policy`] — the
+/// deny-by-default, capability-confined entry point (phase **S0** of
+/// `docs/ADR-safe-capability-language.md`).
+///
+/// Unlike [`compile_str`], this **refuses to emit a module** that uses any host
+/// capability the policy does not grant. Because the gate runs over the exact
+/// import set the codegen would emit ([`codegen::used_host_imports`]), the
+/// resulting module's import section is a subset of the granted capabilities —
+/// the runtime can never bind ambient authority for it. The policy's resource
+/// quotas are validated too (no gasless execution).
+///
+/// ```
+/// use kotoba_clj::{compile_safe_clj, Policy};
+///
+/// // Pure program + deny-all policy → compiles (no capability needed).
+/// let wasm = compile_safe_clj("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
+/// assert!(wasm.starts_with(b"\0asm"));
+///
+/// // Touching the graph without a grant → rejected.
+/// let denied = compile_safe_clj(
+///     "(defn run [g] (kqe-assert! g \"s\" \"p\" g))",
+///     &Policy::deny_all(),
+/// );
+/// assert!(matches!(denied, Err(kotoba_clj::CljError::Policy(_))));
+/// ```
+pub fn compile_safe_clj(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    safe_compile(src, policy, false)
+}
+
+/// Like [`compile_safe_clj`] but prepends the safe **container/CBOR prelude**.
+///
+/// The prelude is *policy-aware*: the `kqe` accessor layer ([`KQE_PRELUDE`]),
+/// which references graph-read host imports, is only linked in when the policy
+/// grants `:graph-read`. A deny-all policy therefore yields the pure container
+/// substrate with **no host imports at all** — confinement is preserved even
+/// with the prelude.
+pub fn compile_safe_clj_with_prelude(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    safe_compile(src, policy, true)
+}
+
+/// Shared body of the safe-clj entry points: validate quotas, assemble the
+/// (policy-aware) source, parse, gate the capability surface, then emit.
+fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8>, CljError> {
+    policy.validate_limits()?;
+
+    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+
+    // Safe-subset gate (deny-by-default for language features). Runs on the
+    // *user* source only — the trusted prelude is exempt. Catches forms the
+    // legacy path would silently drop (`eval`, `require`, `set!`, `defmacro`, …).
+    let user_forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
+    subset::check_forms(&user_forms)?;
+
+    // Effect-soundness gate (T2): any function declaring an `{:effects …}` row
+    // must not exceed it. Opt-in — un-annotated functions are unaffected.
+    effects::check_forms(&user_forms)?;
+
+    let full = if with_prelude {
+        format!("{}\n{normalized}", safe_prelude(policy))
+    } else {
+        normalized
+    };
+
+    let program = ast::parse_program(&full)?;
+
+    // The capability gate: every host import the program would emit must be
+    // granted. Collect *all* denials so the error names them at once.
+    let denials: Vec<String> = codegen::used_host_imports(&program)
+        .into_iter()
+        .filter_map(|imp| policy.permits(imp).err())
+        .collect();
+    if !denials.is_empty() {
+        return Err(CljError::Policy(format!(
+            "capability confinement rejected {} disallowed host import(s):\n  - {}",
+            denials.len(),
+            denials.join("\n  - ")
+        )));
+    }
+
+    codegen::compile(&program)
+}
+
+/// The distinct `kotoba:kais` host-capability interfaces a compiled module
+/// embeds in its import section — i.e. its **capability surface**.
+///
+/// Import module names are stored UTF-8 in the wasm import section, so this is
+/// a byte-scan: a pure (capability-free) module returns an empty list. Use it
+/// to *audit* a built module against the [`Policy`] it was meant to honour —
+/// the returned set should never exceed what the policy granted. This is the
+/// observable side of the Capability Confinement property (ADR §7, T3).
+///
+/// ```
+/// use kotoba_clj::{compile_safe_clj, embedded_capability_ifaces, Policy};
+///
+/// let pure = compile_safe_clj("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
+/// assert!(embedded_capability_ifaces(&pure).is_empty());
+///
+/// let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
+/// let policy = Policy::deny_all().grant_graph_write(["g"]);
+/// let wasm = compile_safe_clj(src, &policy).unwrap();
+/// assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
+/// ```
+pub fn embedded_capability_ifaces(wasm: &[u8]) -> Vec<&'static str> {
+    // Derive the distinct host-interface set from `HostImport::ALL` (first-seen
+    // order) — single-sourced, so it cannot drift as the host world grows.
+    let mut ifaces: Vec<&'static str> = Vec::new();
+    for imp in ast::HostImport::ALL {
+        let (module, _field) = imp.module_field();
+        if !ifaces.contains(&module) {
+            ifaces.push(module);
+        }
+    }
+    ifaces
+        .into_iter()
+        .filter(|iface| {
+            let needle = iface.as_bytes();
+            wasm.windows(needle.len()).any(|w| w == needle)
+        })
+        .collect()
+}
+
+/// Infer the **transitive effect set** of every function in safe-clj `src` —
+/// what each `defn` actually does (`graph-read` / `graph-write` / `infer` /
+/// `auth`), closing the call graph to a fixpoint so effects routed through
+/// helpers are attributed to their callers.
+///
+/// This ignores any `{:effects …}` annotations — it reports the *inferred*
+/// truth, the source-level companion to [`embedded_capability_ifaces`] (which
+/// audits the compiled bytes). A function absent from the map, or mapped to an
+/// empty set, is pure. Subset-illegal source still parses as EDN, so this never
+/// fails for legal EDN; it returns an empty map for sources with no `defn`.
+///
+/// ```
+/// let src = r#"
+///   (defn helper [] (kqe-assert! "kg" "a" "p" "v"))
+///   (defn run [] (helper))
+/// "#;
+/// let eff = kotoba_clj::infer_effects(src).unwrap();
+/// // `run` inherits graph-write transitively from `helper`.
+/// assert!(eff["run"].contains("graph-write"));
+/// assert!(eff["helper"].contains("graph-write"));
+/// ```
+pub fn infer_effects(
+    src: &str,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, CljError> {
+    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    let forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
+    Ok(effects::infer_effects(&forms))
+}
+
+/// The safe prelude for a given policy. Pure container + CBOR layers are always
+/// included; the `kqe` read-accessor layer is only added when `:graph-read` is
+/// granted (it references graph-read host imports, so including it
+/// unconditionally would force every safe module to request read authority).
+fn safe_prelude(policy: &Policy) -> String {
+    let mut p = format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}");
+    if policy.class_granted(CapClass::GraphRead) {
+        p.push('\n');
+        p.push_str(KQE_PRELUDE);
+    }
+    p
 }
 
 /// Compile a `.kotoba` / `.clj` / `.cljc` / `.cljs` source file into WebAssembly bytes.
