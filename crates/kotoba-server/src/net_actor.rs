@@ -318,7 +318,11 @@ async fn handle_engi_transfer(
 /// (the K/2 threshold was reached) — logged so an operator sees the decision.
 /// Counting distinct validators in the tally means one node re-gossiping cannot
 /// inflate the count.
-fn handle_engi_warrant(data: &[u8], tally: &mut kotoba_dht::WarrantTally) -> bool {
+async fn handle_engi_warrant(
+    data: &[u8],
+    tally: &mut kotoba_dht::WarrantTally,
+    engi: &crate::engi::Engi,
+) -> bool {
     let w: kotoba_dht::Warrant = match ciborium::from_reader(data) {
         Ok(w) => w,
         Err(e) => {
@@ -334,8 +338,10 @@ fn handle_engi_warrant(data: &[u8], tally: &mut kotoba_dht::WarrantTally) -> boo
     if evicted {
         tracing::warn!(
             accused = %hex::encode(&w.accused),
-            "engi/warrant: accused reached the K/2 eviction threshold — its future transfers should be refused"
+            "engi/warrant: accused reached the K/2 eviction threshold — refusing its future transfers"
         );
+        // Enforce: the ledger now refuses transfers from this evicted spender.
+        engi.mark_evicted(w.accused.clone()).await;
     }
     evicted
 }
@@ -748,8 +754,9 @@ pub async fn run(
                                 handle_engi_transfer(&data, &mut engi_seen, &engi).await;
                             } else if kse_name == kotoba_dht::ENGI_WARRANT_TOPIC {
                                 // Mutual-credit warrant: verify the validator's
-                                // signature, then tally toward K/2 eviction.
-                                handle_engi_warrant(&data, &mut engi_warrants);
+                                // signature, tally toward K/2, and on eviction mark
+                                // the ledger to refuse the offender's transfers.
+                                handle_engi_warrant(&data, &mut engi_warrants, &engi).await;
                             } else {
                                 let maybe_quad_op = if kse_name == "quad/assert" {
                                     serde_json::from_slice::<Quad>(&data).ok().map(|quad| (quad, true))
@@ -849,8 +856,8 @@ mod tests {
         buf
     }
 
-    #[test]
-    fn handle_engi_warrant_verifies_tallies_and_evicts() {
+    #[tokio::test]
+    async fn handle_engi_warrant_verifies_tallies_evicts_and_enforces() {
         let accused = kotoba_vault::AgentIdentity::generate_ephemeral();
         let accused_id = accused.verifying_key().to_bytes().to_vec();
         // A signed warrant against `accused` by `validator`, CBOR-encoded.
@@ -870,16 +877,43 @@ mod tests {
         let v1 = kotoba_vault::AgentIdentity::generate_ephemeral();
         let v2 = kotoba_vault::AgentIdentity::generate_ephemeral();
         let mut tally = kotoba_dht::WarrantTally::with_threshold(2);
+        let engi = crate::engi::Engi::from_env("did:key:op".to_string());
 
         // First validator tallies but doesn't reach the threshold.
-        assert!(!handle_engi_warrant(&warrant_bytes(&v1), &mut tally));
+        assert!(!handle_engi_warrant(&warrant_bytes(&v1), &mut tally, &engi).await);
+        assert!(!engi.is_evicted(&accused_id).await);
         // Re-gossip of the SAME validator's warrant makes no progress.
-        assert!(!handle_engi_warrant(&warrant_bytes(&v1), &mut tally));
-        // A second distinct validator crosses threshold 2 → eviction fires once.
-        assert!(handle_engi_warrant(&warrant_bytes(&v2), &mut tally));
+        assert!(!handle_engi_warrant(&warrant_bytes(&v1), &mut tally, &engi).await);
+        // A second distinct validator crosses threshold 2 → eviction fires once,
+        // and the ledger is marked to enforce it.
+        assert!(handle_engi_warrant(&warrant_bytes(&v2), &mut tally, &engi).await);
         assert!(tally.is_evicted(&accused_id));
+        assert!(
+            engi.is_evicted(&accused_id).await,
+            "ledger now enforces the eviction"
+        );
+
+        // Enforcement bites: a transfer from the evicted spender is refused.
+        let receiver = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let t = kotoba_dht::MutualCreditTransfer::countersign(
+            accused.did.clone(),
+            receiver.did.clone(),
+            100,
+            None,
+            None,
+            0,
+            0,
+            &accused.signing_key,
+            &receiver.signing_key,
+        )
+        .unwrap();
+        assert!(
+            !engi.project_transfer(&t).await,
+            "evicted spender's transfer must be refused"
+        );
+
         // Garbage bytes are dropped without panic or tally.
-        assert!(!handle_engi_warrant(b"not a warrant", &mut tally));
+        assert!(!handle_engi_warrant(b"not a warrant", &mut tally, &engi).await);
     }
 
     #[tokio::test]

@@ -66,7 +66,7 @@
 //! protocol change, deliberately not done here.)
 
 use kotoba_dht::MutualCreditTransfer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -159,6 +159,12 @@ struct Inner {
     /// they are not countersigned transfers (folding them in is a deferred ADR
     /// follow-up).
     transfers: Vec<MutualCreditTransfer>,
+    /// Ed25519 pubkeys of agents the neighborhood has **evicted** (reached the
+    /// `K/2` mutual-credit warrant threshold). [`Engi::project_transfer`] refuses
+    /// any transfer whose spender resolves to one of these — the enforcement that
+    /// makes an eviction bite. Live state (rebuilt as warrants re-arrive), not
+    /// persisted.
+    evicted: HashSet<Vec<u8>>,
 }
 
 pub struct Engi {
@@ -275,6 +281,7 @@ impl Engi {
             balances,
             limits,
             transfers,
+            evicted: HashSet::new(),
         }
     }
 
@@ -547,12 +554,26 @@ impl Engi {
     /// must mirror it rather than re-judge it. This is the entry point the gossip
     /// / chain-replay path calls per observed transfer. A non-positive amount or a
     /// self-transfer is a no-op. Persisted so the cache survives restart.
-    pub async fn project_transfer(&self, t: &MutualCreditTransfer) {
+    pub async fn project_transfer(&self, t: &MutualCreditTransfer) -> bool {
         let amount = t.body.amount;
         if amount <= 0 || t.body.spender == t.body.receiver {
-            return;
+            return false;
         }
         let mut g = self.inner.write().await;
+        // Eviction enforcement: refuse a transfer whose spender the neighborhood
+        // has evicted (K/2 mutual-credit warrants). Resolution is only attempted
+        // when some agent is actually evicted, so the common path pays nothing.
+        if !g.evicted.is_empty() {
+            if let Some(pk) = resolve_did_pubkey(&t.body.spender) {
+                if g.evicted.contains(pk.as_slice()) {
+                    tracing::warn!(
+                        spender = %t.body.spender,
+                        "engi: refusing transfer from an evicted spender (K/2 warranted)"
+                    );
+                    return false;
+                }
+            }
+        }
         Self::apply_transfer(&mut g, &t.body.spender, &t.body.receiver, amount);
         // Append to the durable record (in-memory + on-disk log) so the transfer
         // survives a lost balance cache and is auditable / replayable.
@@ -561,6 +582,20 @@ impl Engi {
         drop(g);
         self.persist(snapshot);
         self.append_transfer_log(t);
+        true
+    }
+
+    /// Mark `pubkey` (an Ed25519 agent pubkey) as **evicted** — the neighborhood
+    /// reached the `K/2` warrant threshold against it. After this, every transfer
+    /// whose spender resolves to `pubkey` is refused by [`Engi::project_transfer`].
+    /// Called by the warrant-gossip receive path on a newly-decided eviction.
+    pub async fn mark_evicted(&self, pubkey: Vec<u8>) {
+        self.inner.write().await.evicted.insert(pubkey);
+    }
+
+    /// Whether `pubkey` is currently evicted.
+    pub async fn is_evicted(&self, pubkey: &[u8]) -> bool {
+        self.inner.read().await.evicted.contains(pubkey)
     }
 
     /// Snapshot of the durable transfer record (every countersigned transfer
@@ -1258,6 +1293,58 @@ mod tests {
             .pending_warrants(&validator.signing_key, validator_id, 0)
             .await
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_transfer_refuses_an_evicted_spender() {
+        let a = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let b = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let mk = |amount: i64, nonce: u64| {
+            MutualCreditTransfer::countersign(
+                a.did.clone(),
+                b.did.clone(),
+                amount,
+                None,
+                None,
+                nonce,
+                0,
+                &a.signing_key,
+                &b.signing_key,
+            )
+            .unwrap()
+        };
+        let e = engi(10, "did:key:op");
+        // Before eviction the spender's transfer applies.
+        assert!(e.project_transfer(&mk(100, 1)).await);
+        assert_eq!(e.balance(&a.did).await, -100);
+
+        // Evict `a`; a further transfer from it is refused (balance unchanged).
+        e.mark_evicted(a.verifying_key().to_bytes().to_vec()).await;
+        assert!(e.is_evicted(&a.verifying_key().to_bytes()).await);
+        assert!(
+            !e.project_transfer(&mk(50, 2)).await,
+            "evicted spender must be refused"
+        );
+        assert_eq!(
+            e.balance(&a.did).await,
+            -100,
+            "refused transfer not applied"
+        );
+
+        // A non-evicted spender (b) is unaffected.
+        let t_b = MutualCreditTransfer::countersign(
+            b.did.clone(),
+            a.did.clone(),
+            30,
+            None,
+            None,
+            1,
+            0,
+            &b.signing_key,
+            &a.signing_key,
+        )
+        .unwrap();
+        assert!(e.project_transfer(&t_b).await);
     }
 
     #[tokio::test]

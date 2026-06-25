@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection · R6 durable fees · R7 signed warrants · R8 warrant gossip/K-2 eviction — landed)**
+Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection · R6 durable fees · R7 signed warrants · R8 warrant gossip/K-2 eviction · R9 eviction enforcement — landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -196,13 +196,23 @@ warrant; clean record → none), green.
 - 3 dht tests (verify accept/reject, tally eviction, threshold = K/2) + 1 net
   handler test (verify/tally/evict/garbage), green.
 
+**Landed (R9, eviction enforcement):** an eviction now *bites*. `Engi` holds the
+set of evicted agent pubkeys; `mark_evicted(pubkey)` adds to it, and
+`project_transfer` **refuses** (returns `false`, applies nothing) any transfer
+whose spender resolves to an evicted pubkey — on both the inbound-gossip and the
+`engi.transfer` paths. The warrant-receive path
+(`handle_engi_warrant`) calls `mark_evicted` the moment the K/2 threshold is
+crossed. Resolution is skipped when no one is evicted (the common path pays
+nothing). Eviction is live state (rebuilt as warrants re-arrive), not persisted.
+1 server test (evict → refused, balance unchanged, non-evicted unaffected) + the
+net handler test extended to assert the refusal end-to-end, green.
+
 **Deferred (need new subsystems / a design decision — not faked):**
 
-1. **enforce eviction + non-EN fork sync** — R8 *decides* eviction (the tally
-   fires at K/2); making `project_transfer` **refuse** an evicted spender's future
-   transfers (thread the tally into the ledger) is the enforcement step. Catching
-   forks across **non-EN** chain content (full `SourceChain` with `seq`-based
-   entries) still needs the per-DID chain sync (bitswap `want_since`).
+1. **non-EN fork sync** — EN double-spend forks are caught from the gossip record
+   (R5/R8). Catching forks across **non-EN** chain content (a full `SourceChain`
+   with `seq`-based entries) still needs the per-DID chain sync (bitswap
+   `want_since`) + `audit_peer_chain` over it.
 2. **peer-countersigned fees** — turning a write fee into a true 2-party
    countersigned transfer needs the payer's Ed25519 signature in the synchronous
    write path (a countersigning handshake). A deliberate protocol change, not a
