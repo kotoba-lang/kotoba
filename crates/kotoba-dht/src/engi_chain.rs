@@ -24,8 +24,8 @@
 //!
 //! `TransferBody::spender_prev` pins the transfer to the spender's chain head at
 //! signing time, and when appended the entry's `prev` must equal it. A Source
-//! Chain is **linear** (one entry per seq, [`SourceChain::append`] enforces
-//! seq+prev), so spending the same EN twice forces a *fork* — two entries sharing
+//! Chain is **linear** (one entry per seq; [`SourceChain`] enforces seq+prev on
+//! append), so spending the same EN twice forces a *fork* — two entries sharing
 //! one `prev`. Neighborhood validators holding the chain see the fork and raise a
 //! [`Warrant`] ([`ValidationRule::DoubleSpend`]). An overspend below the credit
 //! limit is caught by [`validate_chain_transfers`] replaying the chain. No total
