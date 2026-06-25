@@ -621,6 +621,66 @@ where
     out
 }
 
+/// A **double-spend fork** found in a transfer record: a spender signed two or
+/// more *distinct* transfers that all pin the same `spender_prev` — i.e. it spent
+/// from one chain position more than once. This is the transfer-level analog of
+/// [`detect_fork`] (which compares `ChainEntry` `seq`), detectable from the flat
+/// gossip-accumulated record alone (no per-DID chain sync needed, because every
+/// transfer carries the spender's pinned head). Any `transfer_id` in the group is
+/// warrant evidence ([`ValidationRule::DoubleSpend`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferFork {
+    /// The double-spending agent.
+    pub spender: String,
+    /// The reused chain position (the `spender_prev` all conflicting transfers pin).
+    pub spender_prev: Option<KotobaCid>,
+    /// The ≥2 distinct conflicting transfer ids, in first-seen order.
+    pub transfer_ids: Vec<KotobaCid>,
+}
+
+/// Detect double-spend forks in a transfer record: group spend-transfers by
+/// `(spender, spender_prev)` and report every position from which the spender
+/// signed two or more **distinct** transfers (the same transfer gossiped twice is
+/// deduped by `transfer_id`, not a fork). Receivers never pin `spender_prev`, so
+/// only spenders can fork. Output is sorted by `(spender, prev-bytes)` for a
+/// deterministic, replica-independent verdict.
+pub fn detect_transfer_forks(transfers: &[MutualCreditTransfer]) -> Vec<TransferFork> {
+    use std::collections::HashMap;
+    // (spender, spender_prev) → distinct transfer_ids (first-seen order).
+    let mut groups: HashMap<(String, Option<KotobaCid>), Vec<KotobaCid>> = HashMap::new();
+    for t in transfers {
+        if t.body.amount <= 0 || t.body.spender == t.body.receiver {
+            continue;
+        }
+        let id = t.body.transfer_id();
+        let ids = groups
+            .entry((t.body.spender.clone(), t.body.spender_prev.clone()))
+            .or_default();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    let mut out: Vec<TransferFork> = groups
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 2)
+        .map(|((spender, spender_prev), transfer_ids)| TransferFork {
+            spender,
+            spender_prev,
+            transfer_ids,
+        })
+        .collect();
+    // Deterministic order: by spender, then by the pinned position's bytes.
+    out.sort_by(|a, b| {
+        a.spender.cmp(&b.spender).then_with(|| {
+            a.spender_prev
+                .as_ref()
+                .map(|c| c.0)
+                .cmp(&b.spender_prev.as_ref().map(|c| c.0))
+        })
+    });
+    out
+}
+
 /// Bounded dedup guard for gossiped transfers, keyed by
 /// [`TransferBody::transfer_id`]. Mirrors the firehose seen-guard: a transfer
 /// re-gossiped around the mesh is projected at most once per node. Ring-buffer
@@ -1219,5 +1279,44 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].did, "b");
         assert_eq!(f[0].balance_after, -100);
+    }
+
+    // ── double-spend fork detection (detect_transfer_forks) ───────────────────
+
+    fn with_prev(mut t: MutualCreditTransfer, prev: Option<KotobaCid>) -> MutualCreditTransfer {
+        t.body.spender_prev = prev;
+        t
+    }
+
+    #[test]
+    fn detect_transfer_forks_finds_double_spend_from_one_position() {
+        // a signs two DISTINCT transfers both pinning prev = None → it spent the
+        // same (genesis) position twice = a fork.
+        let t1 = flat("a", "b", 100, 1);
+        let t2 = flat("a", "c", 100, 2); // distinct receiver → distinct transfer_id
+        let forks = detect_transfer_forks(&[t1.clone(), t2.clone()]);
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].spender, "a");
+        assert_eq!(forks[0].spender_prev, None);
+        assert_eq!(forks[0].transfer_ids.len(), 2);
+        assert!(forks[0].transfer_ids.contains(&t1.body.transfer_id()));
+        assert!(forks[0].transfer_ids.contains(&t2.body.transfer_id()));
+    }
+
+    #[test]
+    fn detect_transfer_forks_ignores_dups_and_advancing_positions() {
+        let t1 = flat("a", "b", 100, 1);
+        // The same transfer gossiped twice is deduped by id — not a fork.
+        assert!(detect_transfer_forks(&[t1.clone(), t1.clone()]).is_empty());
+        // A second spend that pins a DIFFERENT (advanced) position is well-formed.
+        let t_next = with_prev(flat("a", "b", 100, 2), Some(KotobaCid::from_bytes(b"pos1")));
+        assert!(
+            detect_transfer_forks(&[t1.clone(), t_next]).is_empty(),
+            "advancing spender_prev is a normal chain, not a fork"
+        );
+        // A pure receiver never forks (only the spender pins spender_prev).
+        let r1 = flat("x", "a", 10, 1);
+        let r2 = flat("y", "a", 20, 2);
+        assert!(detect_transfer_forks(&[r1, r2]).is_empty());
     }
 }
