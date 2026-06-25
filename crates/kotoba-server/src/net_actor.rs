@@ -312,6 +312,34 @@ async fn handle_engi_transfer(
     true
 }
 
+/// Apply a gossiped mutual-credit `Warrant`: decode it, **verify the validator's
+/// signature** (a forged warrant is dropped at the edge), then record it in the
+/// eviction `tally`. Returns `true` iff this warrant *just* evicted its accused
+/// (the K/2 threshold was reached) — logged so an operator sees the decision.
+/// Counting distinct validators in the tally means one node re-gossiping cannot
+/// inflate the count.
+fn handle_engi_warrant(data: &[u8], tally: &mut kotoba_dht::WarrantTally) -> bool {
+    let w: kotoba_dht::Warrant = match ciborium::from_reader(data) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(err = %e, "engi/warrant: bad Warrant envelope — skipped");
+            return false;
+        }
+    };
+    if !kotoba_dht::verify_warrant(&w) {
+        tracing::warn!("engi/warrant: invalid validator signature — rejected");
+        return false;
+    }
+    let evicted = tally.record(w.accused.clone(), w.validator.clone());
+    if evicted {
+        tracing::warn!(
+            accused = %hex::encode(&w.accused),
+            "engi/warrant: accused reached the K/2 eviction threshold — its future transfers should be refused"
+        );
+    }
+    evicted
+}
+
 pub async fn run(
     mut swarm: KotobaSwarm,
     mut publish_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
@@ -338,10 +366,13 @@ pub async fn run(
     swarm.subscribe("quad/retract").ok();
     swarm.subscribe(REKEY_REVOKE_TOPIC).ok();
     swarm.subscribe(kotoba_dht::ENGI_TRANSFER_TOPIC).ok();
+    swarm.subscribe(kotoba_dht::ENGI_WARRANT_TOPIC).ok();
     swarm.subscribe_pregel().ok();
 
     // Dedup guard for gossiped EN transfers (project each at most once per node).
     let mut engi_seen = kotoba_dht::SeenTransfers::default();
+    // Tally of gossiped mutual-credit warrants toward neighborhood eviction.
+    let mut engi_warrants = kotoba_dht::WarrantTally::default();
 
     // Full gossip topic string as published by KotobaSwarm (has "kotoba/" prefix)
     let pregel_full_topic = format!("kotoba/{PREGEL_GOSSIP_TOPIC}");
@@ -715,6 +746,10 @@ pub async fn run(
                                 // on both parties' Source Chains, so projection is
                                 // an unconditional net-zero mirror.
                                 handle_engi_transfer(&data, &mut engi_seen, &engi).await;
+                            } else if kse_name == kotoba_dht::ENGI_WARRANT_TOPIC {
+                                // Mutual-credit warrant: verify the validator's
+                                // signature, then tally toward K/2 eviction.
+                                handle_engi_warrant(&data, &mut engi_warrants);
                             } else {
                                 let maybe_quad_op = if kse_name == "quad/assert" {
                                     serde_json::from_slice::<Quad>(&data).ok().map(|quad| (quad, true))
@@ -812,6 +847,39 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::into_writer(&t, &mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn handle_engi_warrant_verifies_tallies_and_evicts() {
+        let accused = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let accused_id = accused.verifying_key().to_bytes().to_vec();
+        // A signed warrant against `accused` by `validator`, CBOR-encoded.
+        let warrant_bytes = |validator: &kotoba_vault::AgentIdentity| -> Vec<u8> {
+            let w = kotoba_dht::mutual_credit_warrant(
+                accused_id.clone(),
+                KotobaCid::from_bytes(b"evidence"),
+                kotoba_dht::ValidationRule::DoubleSpend,
+                validator.verifying_key().to_bytes().to_vec(),
+                0,
+                &validator.signing_key,
+            );
+            let mut buf = Vec::new();
+            ciborium::into_writer(&w, &mut buf).unwrap();
+            buf
+        };
+        let v1 = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let v2 = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let mut tally = kotoba_dht::WarrantTally::with_threshold(2);
+
+        // First validator tallies but doesn't reach the threshold.
+        assert!(!handle_engi_warrant(&warrant_bytes(&v1), &mut tally));
+        // Re-gossip of the SAME validator's warrant makes no progress.
+        assert!(!handle_engi_warrant(&warrant_bytes(&v1), &mut tally));
+        // A second distinct validator crosses threshold 2 → eviction fires once.
+        assert!(handle_engi_warrant(&warrant_bytes(&v2), &mut tally));
+        assert!(tally.is_evicted(&accused_id));
+        // Garbage bytes are dropped without panic or tally.
+        assert!(!handle_engi_warrant(b"not a warrant", &mut tally));
     }
 
     #[tokio::test]

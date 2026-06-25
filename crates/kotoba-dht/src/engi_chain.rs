@@ -39,13 +39,14 @@
 //! the scarce, irreversibly-settled asset lives across the boundary (USDC on Base
 //! L2). This layer is internal contribution accounting only.
 
+use crate::neighborhood::K;
 use crate::source_chain::{ChainContent, ChainEntry, ChainError, SourceChain};
 use crate::warrant::{warrant_signing_bytes, ValidationRule, Warrant};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use kotoba_core::cid::KotobaCid;
 use kotoba_vault::agent_identity::AgentIdentity;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// GossipSub **KSE-topic name** carrying countersigned EN transfers across the
 /// mesh. This is the bare name (like `firehose` / `rekey/revoke`); the net layer
@@ -645,7 +646,6 @@ pub struct TransferFork {
 /// only spenders can fork. Output is sorted by `(spender, prev-bytes)` for a
 /// deterministic, replica-independent verdict.
 pub fn detect_transfer_forks(transfers: &[MutualCreditTransfer]) -> Vec<TransferFork> {
-    use std::collections::HashMap;
     // (spender, spender_prev) → distinct transfer_ids (first-seen order).
     let mut groups: HashMap<(String, Option<KotobaCid>), Vec<KotobaCid>> = HashMap::new();
     for t in transfers {
@@ -679,6 +679,96 @@ pub fn detect_transfer_forks(transfers: &[MutualCreditTransfer]) -> Vec<Transfer
         })
     });
     out
+}
+
+/// GossipSub **KSE-topic name** carrying signed `mutual_credit_warrant`s — the
+/// bare name (wire = `kotoba/engi/warrant`). A validator publishes a warrant here
+/// when it detects a violating spender; peers verify and tally it
+/// ([`WarrantTally`]) toward neighborhood eviction.
+pub const ENGI_WARRANT_TOPIC: &str = "engi/warrant";
+
+/// Distinct validators that must warrant one accused before it is **evicted** —
+/// `K/2` (the neighborhood replication factor over two), the same quorum the rest
+/// of KDHT uses for Byzantine eviction. Floored at 1.
+pub const WARRANT_EVICTION_THRESHOLD: usize = if K / 2 > 0 { K / 2 } else { 1 };
+
+/// Verify a `mutual_credit_warrant`: recompute [`warrant_signing_bytes`] and check
+/// `w.sig` against `w.validator` (which for an EN mutual-credit warrant IS the
+/// validating node's 32-byte Ed25519 pubkey). Returns `false` for a malformed
+/// validator key / signature or a signature that does not match — so a forged
+/// warrant is rejected at the gossip edge before it can be tallied.
+pub fn verify_warrant(w: &Warrant) -> bool {
+    let Ok(pk): Result<[u8; 32], _> = w.validator.as_slice().try_into() else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; 64], _> = w.sig.as_slice().try_into() else {
+        return false;
+    };
+    vk.verify(&warrant_signing_bytes(w), &Signature::from_bytes(&sig_arr))
+        .is_ok()
+}
+
+/// Tally of warrants per accused toward neighborhood eviction. A node receiving
+/// gossiped `mutual_credit_warrant`s records each `(accused, validator)` pair;
+/// once **`threshold` distinct validators** have warranted one accused, it is
+/// *evicted* (the offender's future transfers should be refused). Counting
+/// *distinct validators* (not raw warrants) stops one node inflating the tally by
+/// re-gossiping; mirrors the `K/2` Byzantine-eviction rule used across KDHT.
+#[derive(Debug)]
+pub struct WarrantTally {
+    threshold: usize,
+    by_accused: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
+    evicted: HashSet<Vec<u8>>,
+}
+
+impl WarrantTally {
+    /// New tally requiring `threshold` distinct validators to evict (min 1).
+    pub fn with_threshold(threshold: usize) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            by_accused: HashMap::new(),
+            evicted: HashSet::new(),
+        }
+    }
+
+    /// Record one validator's warrant against `accused`. Returns `true` iff this
+    /// warrant *just* pushed the accused over the threshold (a newly-decided
+    /// eviction) — so the caller acts exactly once. A duplicate `(accused,
+    /// validator)` or a warrant against an already-evicted accused returns `false`.
+    pub fn record(&mut self, accused: Vec<u8>, validator: Vec<u8>) -> bool {
+        let already = self.evicted.contains(&accused);
+        let set = self.by_accused.entry(accused.clone()).or_default();
+        set.insert(validator);
+        if !already && set.len() >= self.threshold {
+            self.evicted.insert(accused);
+            return true;
+        }
+        false
+    }
+
+    /// Whether `accused` has reached the eviction threshold.
+    pub fn is_evicted(&self, accused: &[u8]) -> bool {
+        self.evicted.contains(accused)
+    }
+
+    /// Number of distinct validators currently warranting `accused`.
+    pub fn validator_count(&self, accused: &[u8]) -> usize {
+        self.by_accused.get(accused).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Number of evicted accuseds.
+    pub fn evicted_len(&self) -> usize {
+        self.evicted.len()
+    }
+}
+
+impl Default for WarrantTally {
+    fn default() -> Self {
+        Self::with_threshold(WARRANT_EVICTION_THRESHOLD)
+    }
 }
 
 /// Bounded dedup guard for gossiped transfers, keyed by
@@ -1318,5 +1408,62 @@ mod tests {
         let r1 = flat("x", "a", 10, 1);
         let r2 = flat("y", "a", 20, 2);
         assert!(detect_transfer_forks(&[r1, r2]).is_empty());
+    }
+
+    // ── warrant verification + eviction tally ─────────────────────────────────
+
+    #[test]
+    fn verify_warrant_accepts_signed_rejects_tampered_or_malformed() {
+        let validator = ident();
+        let accused = ident();
+        let vk = SigningKey::from_bytes(&validator.signing_key.to_bytes());
+        let w = mutual_credit_warrant(
+            accused.verifying_key().to_bytes().to_vec(),
+            KotobaCid::from_bytes(b"bad-transfer"),
+            ValidationRule::DoubleSpend,
+            validator.verifying_key().to_bytes().to_vec(),
+            42,
+            &vk,
+        );
+        assert!(verify_warrant(&w));
+        // Tampering the accused after signing breaks the signature.
+        let mut tampered = w.clone();
+        tampered.accused = ident().verifying_key().to_bytes().to_vec();
+        assert!(!verify_warrant(&tampered));
+        // A validator field that is not a 32-byte pubkey fails cleanly.
+        let mut malformed = w.clone();
+        malformed.validator = vec![1, 2, 3];
+        assert!(!verify_warrant(&malformed));
+    }
+
+    #[test]
+    fn warrant_tally_evicts_at_threshold_on_distinct_validators() {
+        let mut t = WarrantTally::with_threshold(3);
+        let accused = vec![0xAAu8; 32];
+        let v = |n: u8| vec![n; 32];
+        assert!(!t.record(accused.clone(), v(1)));
+        assert!(
+            !t.record(accused.clone(), v(1)),
+            "dup validator makes no progress"
+        );
+        assert_eq!(t.validator_count(&accused), 1);
+        assert!(!t.record(accused.clone(), v(2)));
+        assert!(
+            t.record(accused.clone(), v(3)),
+            "3rd distinct validator crosses the threshold"
+        );
+        assert!(t.is_evicted(&accused));
+        // Further warrants against an already-evicted accused don't re-fire.
+        assert!(!t.record(accused.clone(), v(4)));
+        assert_eq!(t.evicted_len(), 1);
+        // A different accused tallies independently.
+        let other = vec![0xBBu8; 32];
+        assert!(!t.record(other.clone(), v(1)));
+        assert!(!t.is_evicted(&other));
+    }
+
+    #[test]
+    fn warrant_eviction_threshold_is_k_over_2() {
+        assert_eq!(WARRANT_EVICTION_THRESHOLD, (K / 2).max(1));
     }
 }

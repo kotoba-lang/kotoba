@@ -984,6 +984,36 @@ pub async fn econ_transfer(
         false
     };
 
+    // Auto-emit: if this transfer just made its spender a violator (overspend or
+    // a fork from the same chain position), gossip a signed warrant about THIS
+    // spender so peers tally it toward K/2 eviction. Targeted to the spender; a
+    // clean transfer emits none.
+    let warrants_emitted = if let Some(tx) = &state.gossip_tx {
+        let validator_id = crate::engi::resolve_did_pubkey(&state.operator_did)
+            .map(|p| p.to_vec())
+            .unwrap_or_default();
+        let signing_key = state.ipns_signing_key();
+        let accused = spk.to_vec();
+        let warrants = state
+            .engi
+            .pending_warrants(&signing_key, validator_id, now_ms_epoch())
+            .await;
+        let mut n = 0u32;
+        for w in warrants.iter().filter(|w| w.accused == accused) {
+            let mut buf = Vec::new();
+            if ciborium::into_writer(w, &mut buf).is_ok()
+                && tx
+                    .try_send((kotoba_dht::ENGI_WARRANT_TOPIC.to_string(), buf))
+                    .is_ok()
+            {
+                n += 1;
+            }
+        }
+        n
+    } else {
+        0
+    };
+
     Ok(Json(serde_json::json!({
         "transfer_id": t.body.transfer_id().to_multibase(),
         "unit": "EN",
@@ -993,6 +1023,7 @@ pub async fn econ_transfer(
         "spender_balance_en": state.engi.balance(&t.body.spender).await,
         "receiver_balance_en": state.engi.balance(&t.body.receiver).await,
         "gossiped": gossiped,
+        "warrants_emitted": warrants_emitted,
     })))
 }
 
