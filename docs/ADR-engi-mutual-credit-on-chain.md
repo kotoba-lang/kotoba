@@ -1,6 +1,6 @@
 # ADR — ENGI mutual-credit on the Source Chain (mesh-distributed EN)
 
-Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection · R6 durable fees — landed)**
+Status: **accepted (R0 core · R1 net receive · R2 verified outbound · R3 durable log/boot replay · R4 insolvency audit · R5 fork detection · R6 durable fees · R7 signed warrants — landed)**
 Supersedes the node-local-only ledger posture of `engi.rs` (ADR-2606013400).
 
 ## Context
@@ -172,14 +172,25 @@ an Ed25519 transfer signature) — a separate log from the peer-countersigned
 transfer record, not masquerading as one. 2 server tests (fee-only recovery +
 combined transfer+fee recovery), green.
 
-**Deferred (need new subsystems / a design decision — not faked):**
+**Landed (R7, signed warrant production):** `Engi::pending_warrants(signing_key,
+validator_id, ts)` turns **every** current violation (insolvency + fork) into a
+signed, gossip-ready `kotoba_dht::Warrant` — accused = the offender's resolved
+`did:key` pubkey, evidence = the offending `transfer_id`, rule
+`DoubleSpend`, signed by the validating node. The operator-gated `engi.audit` XRPC
+now returns these (`warrants` with `warrant_b64` = the CBOR a peer would publish +
+a JSON view). This closes detection → *signed accusation*; the warrant is the same
+shape the neighborhood already evicts on (K/2). 1 server test (fork → verifiable
+warrant; clean record → none), green.
 
-1. **auto-emit warrants on detection** — `audit_solvency` / `detect_forks` are
-   pull-only (via `engi.audit`). Wiring them to *push* a signed
-   `mutual_credit_warrant` onto the warrant gossip on detection (so the
-   neighborhood evicts the offender automatically) is the remaining validator
-   step. Catching forks across **non-EN** chain content (full `SourceChain` with
-   `seq`-based entries) still needs the per-DID chain sync (bitswap `want_since`).
+**Deferred (need new subsystems — not faked):**
+
+1. **push warrants onto gossip + neighborhood eviction-apply** — R7 *produces*
+   signed warrants (pulled via `engi.audit`). Auto-*pushing* them on the warrant
+   gossip topic and having peers **apply** them (count K/2 → evict the offender)
+   is the remaining net/DHT wiring — it needs a warrant gossip subscribe/receive
+   arm in `net_actor` and the eviction tally. Catching forks across **non-EN**
+   chain content (full `SourceChain` with `seq`-based entries) still needs the
+   per-DID chain sync (bitswap `want_since`).
 2. **peer-countersigned fees** — turning a write fee into a true 2-party
    countersigned transfer needs the payer's Ed25519 signature in the synchronous
    write path (a countersigning handshake). A deliberate protocol change, not a

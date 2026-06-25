@@ -598,6 +598,51 @@ impl Engi {
         kotoba_dht::detect_transfer_forks(&g.transfers)
     }
 
+    /// Turn every current violation (insolvency + double-spend fork) into a
+    /// **signed, gossip-ready** `kotoba_dht::Warrant`, closing the validator loop:
+    /// detection → an evidence-bearing accusation the neighborhood can act on
+    /// (`ValidationRule::DoubleSpend`, K/2 warrants → eviction). `signing_key` is
+    /// the validating node's key; `validator_id` its NodeId/pubkey bytes. The
+    /// accused is each offender's resolved `did:key` pubkey; the evidence is the
+    /// offending `transfer_id`. Offenders whose DID does not resolve are skipped
+    /// (can't name an accused). Pure over a snapshot — no side effects.
+    pub async fn pending_warrants(
+        &self,
+        signing_key: &ed25519_dalek::SigningKey,
+        validator_id: Vec<u8>,
+        ts: u64,
+    ) -> Vec<kotoba_dht::Warrant> {
+        use kotoba_dht::{mutual_credit_warrant, ValidationRule};
+        let mut out = Vec::new();
+        for f in self.audit_solvency().await {
+            if let Some(pk) = resolve_did_pubkey(&f.did) {
+                out.push(mutual_credit_warrant(
+                    pk.to_vec(),
+                    f.transfer_id,
+                    ValidationRule::DoubleSpend,
+                    validator_id.clone(),
+                    ts,
+                    signing_key,
+                ));
+            }
+        }
+        for fork in self.detect_forks().await {
+            if let (Some(pk), Some(evidence)) =
+                (resolve_did_pubkey(&fork.spender), fork.transfer_ids.first())
+            {
+                out.push(mutual_credit_warrant(
+                    pk.to_vec(),
+                    evidence.clone(),
+                    ValidationRule::DoubleSpend,
+                    validator_id.clone(),
+                    ts,
+                    signing_key,
+                ));
+            }
+        }
+        out
+    }
+
     /// Rebuild the entire balance cache by replaying `transfers` from an empty
     /// map — the boot-time projection of the EN mutual-credit ledger from the
     /// Source Chains. `transfers` must be the *complete* set of EN movements
@@ -1169,6 +1214,50 @@ mod tests {
         e2.project_transfer(&t).await;
         e2.project_transfer(&t).await; // identical id → deduped, no fork
         assert!(e2.detect_forks().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_warrants_signs_a_verifiable_warrant_for_a_fork() {
+        use ed25519_dalek::{Signature, Verifier};
+        let a = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let b = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let c = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let validator = kotoba_vault::AgentIdentity::generate_ephemeral();
+        let e = engi(10, "did:key:op");
+
+        // `a` (a real did:key) double-spends from genesis: two distinct transfers
+        // both pinning prev = None → a fork.
+        e.project_transfer(&mk_transfer(&a.did, &b.did, 100)).await;
+        e.project_transfer(&mk_transfer(&a.did, &c.did, 100)).await;
+        assert_eq!(e.detect_forks().await.len(), 1);
+
+        let validator_id = validator.verifying_key().to_bytes().to_vec();
+        let warrants = e
+            .pending_warrants(&validator.signing_key, validator_id.clone(), 42)
+            .await;
+        assert_eq!(warrants.len(), 1, "one warrant for the fork");
+        let w = &warrants[0];
+        assert_eq!(w.rule_id, kotoba_dht::ValidationRule::DoubleSpend as u8);
+        // accused = a's pubkey, resolved from its did:key.
+        assert_eq!(w.accused, a.verifying_key().to_bytes().to_vec());
+        assert_eq!(w.validator, validator_id);
+        // The signature verifies under the validator's key.
+        let sig: [u8; 64] = w.sig.as_slice().try_into().unwrap();
+        assert!(validator
+            .verifying_key()
+            .verify(
+                &kotoba_dht::warrant_signing_bytes(w),
+                &Signature::from_bytes(&sig)
+            )
+            .is_ok());
+
+        // A clean record (no violation) emits no warrants.
+        let e2 = engi(10, "did:key:op");
+        e2.project_transfer(&mk_transfer(&a.did, &b.did, 100)).await;
+        assert!(e2
+            .pending_warrants(&validator.signing_key, validator_id, 0)
+            .await
+            .is_empty());
     }
 
     #[tokio::test]

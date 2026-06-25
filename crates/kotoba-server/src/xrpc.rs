@@ -1030,6 +1030,32 @@ pub async fn econ_audit(
             })
         })
         .collect();
+    // Turn every violation into a signed, gossip-ready warrant (this node is the
+    // validator). `warrant_b64` is the CBOR a peer would publish on the warrant
+    // gossip; the JSON view is for human/operator inspection.
+    let validator_id = crate::engi::resolve_did_pubkey(&state.operator_did)
+        .map(|p| p.to_vec())
+        .unwrap_or_default();
+    let signing_key = state.ipns_signing_key();
+    let ts = now_ms_epoch();
+    let warrants = state
+        .engi
+        .pending_warrants(&signing_key, validator_id, ts)
+        .await;
+    let warrants_json: Vec<_> = warrants
+        .iter()
+        .map(|w| {
+            let mut cbor = Vec::new();
+            let _ = ciborium::into_writer(w, &mut cbor);
+            serde_json::json!({
+                "rule_id": w.rule_id,
+                "evidence": w.evidence.to_multibase(),
+                "accused_hex": hex::encode(&w.accused),
+                "validator_hex": hex::encode(&w.validator),
+                "warrant_b64": B64.encode(&cbor),
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({
         "unit": "EN",
         "transfer_count": state.engi.transfer_count().await,
@@ -1037,7 +1063,18 @@ pub async fn econ_audit(
         "findings": findings_json,
         "forked": !forks.is_empty(),
         "forks": forks_json,
+        "warrant_count": warrants.len(),
+        "warrants": warrants_json,
     })))
+}
+
+/// Unix-epoch milliseconds (warrant timestamp). A clock read is fine here — this
+/// is a normal server handler, not a deterministic workflow context.
+fn now_ms_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn map_delegation_error(e: kotoba_auth::DelegationError) -> (StatusCode, String) {
