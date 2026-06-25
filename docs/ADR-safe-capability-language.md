@@ -34,6 +34,7 @@ Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lat
 | 監査 `embedded_capability_ifaces` / `Policy::to_edn` | ✅ | — | `lib.rs` / `policy.rs` |
 | CLI `safe-build` / `safe-policy` | ✅ | — | `cli.rs` |
 | literal 型チェック（numeric op に string/keyword literal を拒否） | ✅ | T-lite | `ty.rs` |
+| `:memory-pages` を emit module の memory max に適用（engine が物理的に enforce、static data 超過 / wasm32 max 65536 超過は compile error） | ✅ | — | `codegen.rs` / `lib.rs` / `policy.rs` |
 | 型付き HIR・`Option`/`Result`・no-nil（S1b 残） | ⬜ | — | — |
 | borrow checker（S2） | ⬜ | **T1** | — |
 | capability の値渡し（S4b）・signed/reproducible（S5） | ⬜ | — | — |

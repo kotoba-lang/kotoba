@@ -324,6 +324,16 @@ impl Policy {
                 "policy `:limits :memory-pages` must be > 0 — a module needs a bounded heap".into(),
             ));
         }
+        // wasm32 linear memory tops out at 2^16 pages (4 GiB); a larger cap
+        // would emit an invalid module that fails to instantiate.
+        const WASM32_MAX_PAGES: u32 = 65_536;
+        if self.limits.memory_pages > WASM32_MAX_PAGES {
+            return Err(CljError::Policy(format!(
+                "policy `:limits :memory-pages` = {} exceeds the wasm32 maximum of \
+                 {WASM32_MAX_PAGES} pages (4 GiB)",
+                self.limits.memory_pages
+            )));
+        }
         Ok(())
     }
 

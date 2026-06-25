@@ -287,7 +287,10 @@ fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8
     // fall back to the class-level gate above. Runs on the user source.
     policy.check_resource_targets(&user_forms)?;
 
-    codegen::compile(&program)
+    // Cap the emitted module's linear memory at the policy's `:memory-pages` so
+    // the wasm engine enforces the budget itself (defense-in-depth alongside the
+    // runtime's gas/StoreLimits).
+    codegen::compile_with_memory_max(&program, Some(policy.limits.memory_pages))
 }
 
 /// The distinct `kotoba:kais` host-capability interfaces a compiled module
