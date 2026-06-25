@@ -84,6 +84,16 @@ pub const DEFAULT_CREDIT_LIMIT_EN: i64 = 1_000_000;
 /// go into credit. Higher reputation ⇒ more write headroom before a 402.
 pub const STAKE_MKOTO_PER_CREDIT_EN: u64 = 1_000;
 
+/// Resolve an agent DID to its 32-byte Ed25519 public key for verifying
+/// mutual-credit countersignatures. R2 supports `did:key` (the scheme
+/// `AgentIdentity` mints); other methods (`did:plc`, `did:web`) resolve to
+/// `None` until their resolution is wired. Used by the gossip-receive path and
+/// the `engi.transfer` endpoint to reject forged transfers before projecting,
+/// and as `kotoba_dht::audit_peer_chain`'s `resolve` closure.
+pub fn resolve_did_pubkey(did: &str) -> Option<[u8; 32]> {
+    kotoba_auth::parse_ed25519_did_key(did).ok()
+}
+
 /// Snapshot of the ledger's accounting at a point in time.
 ///
 /// Invariant for a correctly-functioning mutual-credit ledger: `net == 0`.
@@ -484,6 +494,20 @@ mod tests {
 
     fn engi(write_cost: i64, op: &str) -> Arc<Engi> {
         engi_persisted(write_cost, op, None)
+    }
+
+    #[test]
+    fn resolve_did_pubkey_roundtrips_did_key_and_rejects_others() {
+        // An AgentIdentity's DID is a did:key over its Ed25519 key — resolution
+        // must recover exactly that pubkey (the verify path depends on it).
+        let id = kotoba_vault::AgentIdentity::generate_ephemeral();
+        assert_eq!(
+            resolve_did_pubkey(&id.did),
+            Some(id.verifying_key().to_bytes())
+        );
+        // Non-did:key methods are not resolvable in R2.
+        assert!(resolve_did_pubkey("did:plc:abc123").is_none());
+        assert!(resolve_did_pubkey("not-a-did").is_none());
     }
 
     fn engi_persisted(write_cost: i64, op: &str, persist_path: Option<PathBuf>) -> Arc<Engi> {
