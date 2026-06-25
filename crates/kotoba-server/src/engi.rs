@@ -420,7 +420,8 @@ impl Engi {
     /// `receiver += amount` (saturating). Shared by both projection paths.
     fn apply_transfer(g: &mut Inner, spender: &str, receiver: &str, amount: i64) {
         let sb = g.balances.get(spender).copied().unwrap_or(0);
-        g.balances.insert(spender.to_string(), sb.saturating_sub(amount));
+        g.balances
+            .insert(spender.to_string(), sb.saturating_sub(amount));
         let rb = g.balances.get(receiver).copied().unwrap_or(0);
         g.balances
             .insert(receiver.to_string(), rb.saturating_add(amount));

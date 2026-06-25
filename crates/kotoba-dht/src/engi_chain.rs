@@ -969,7 +969,10 @@ mod tests {
             cb.record_receive(t).unwrap();
         }
         let accusations = audit_peer_chain(ca.chain.entries(), &a.did, 10_000, resolver(&[&a, &b]));
-        assert!(accusations.is_empty(), "a solvent, well-signed chain is clean");
+        assert!(
+            accusations.is_empty(),
+            "a solvent, well-signed chain is clean"
+        );
     }
 
     #[test]
@@ -993,8 +996,12 @@ mod tests {
         )
         .unwrap();
         let entry = signed_entry(&a, None, 0, ChainContent::Transfer(forged));
-        let accusations =
-            audit_peer_chain(std::slice::from_ref(&entry), &a.did, 10_000, resolver(&[&a, &b]));
+        let accusations = audit_peer_chain(
+            std::slice::from_ref(&entry),
+            &a.did,
+            10_000,
+            resolver(&[&a, &b]),
+        );
         assert_eq!(accusations.len(), 1);
         assert_eq!(
             accusations[0].rule as u8,
@@ -1019,7 +1026,11 @@ mod tests {
         // debit is not applied, so both flag). Every flagged spend is a
         // DoubleSpend/Overspend.
         let accusations = audit_peer_chain(ca.chain.entries(), &a.did, 150, resolver(&[&a, &b]));
-        assert_eq!(accusations.len(), 2, "the 2nd and 3rd spends both overspend");
+        assert_eq!(
+            accusations.len(),
+            2,
+            "the 2nd and 3rd spends both overspend"
+        );
         for acc in &accusations {
             assert_eq!(acc.rule as u8, ValidationRule::DoubleSpend as u8);
             assert!(matches!(acc.violation, TransferViolation::Overspend { .. }));
