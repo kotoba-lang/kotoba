@@ -47,11 +47,14 @@ use kotoba_vault::agent_identity::AgentIdentity;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
-/// GossipSub topic carrying countersigned EN transfers across the mesh. A node
+/// GossipSub **KSE-topic name** carrying countersigned EN transfers across the
+/// mesh. This is the bare name (like `firehose` / `rekey/revoke`); the net layer
+/// maps it to the wire topic `kotoba/engi/transfer` via `gossipsub_topic`, so it
+/// must NOT carry the `kotoba/` prefix itself (that would double it). A node
 /// receiving a transfer here projects it into its [`crate::engi_chain`] balance
 /// view (after dedup via [`SeenTransfers`]); a *neighborhood validator* holding
 /// the spender's chain additionally audits solvency via [`audit_peer_chain`].
-pub const ENGI_TRANSFER_TOPIC: &str = "kotoba/engi/transfer";
+pub const ENGI_TRANSFER_TOPIC: &str = "engi/transfer";
 
 /// Default bound for [`SeenTransfers`] (matches the firehose seen-guard cap).
 pub const SEEN_TRANSFERS_CAP: usize = 8192;
