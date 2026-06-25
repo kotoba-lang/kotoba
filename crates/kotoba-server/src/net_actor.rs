@@ -267,6 +267,32 @@ async fn apply_deploy_msg(
     }
 }
 
+/// Project a gossiped countersigned EN transfer into the local ledger cache.
+/// Decodes the CBOR [`kotoba_dht::MutualCreditTransfer`], dedups by `transfer_id`
+/// via `seen` (a re-gossiped transfer is applied at most once), and applies it
+/// through [`crate::engi::Engi::project_transfer`] (an unconditional net-zero
+/// mirror of a committed chain fact). Returns `true` iff newly projected; a
+/// duplicate or undecodable envelope returns `false` without mutating the ledger.
+async fn handle_engi_transfer(
+    data: &[u8],
+    seen: &mut kotoba_dht::SeenTransfers,
+    engi: &crate::engi::Engi,
+) -> bool {
+    match ciborium::from_reader::<kotoba_dht::MutualCreditTransfer, _>(data) {
+        Ok(t) => {
+            if !seen.insert(t.body.transfer_id()) {
+                return false; // duplicate gossip — already projected
+            }
+            engi.project_transfer(&t).await;
+            true
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "engi/transfer: bad MutualCreditTransfer envelope — skipped");
+            false
+        }
+    }
+}
+
 pub async fn run(
     mut swarm: KotobaSwarm,
     mut publish_rx: tokio::sync::mpsc::Receiver<(String, Vec<u8>)>,
@@ -285,11 +311,18 @@ pub async fn run(
     // mesh.deploy endpoint) are fed here so the node installs its own triggers/
     // routes + subscribes KSE topics — gossipsub does not deliver to self.
     mut lattice_inject_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    // EN mutual-credit ledger (projection cache): gossiped countersigned transfers
+    // on `engi/transfer` are projected here (ADR-engi-mutual-credit-on-chain).
+    engi: Arc<crate::engi::Engi>,
 ) {
     swarm.subscribe("quad/assert").ok();
     swarm.subscribe("quad/retract").ok();
     swarm.subscribe(REKEY_REVOKE_TOPIC).ok();
+    swarm.subscribe(kotoba_dht::ENGI_TRANSFER_TOPIC).ok();
     swarm.subscribe_pregel().ok();
+
+    // Dedup guard for gossiped EN transfers (project each at most once per node).
+    let mut engi_seen = kotoba_dht::SeenTransfers::default();
 
     // Full gossip topic string as published by KotobaSwarm (has "kotoba/" prefix)
     let pregel_full_topic = format!("kotoba/{PREGEL_GOSSIP_TOPIC}");
@@ -656,6 +689,13 @@ pub async fn run(
                                 if let Some(reg) = &pre_key_registry {
                                     reg.apply_revocation_warrant_bytes(&data).await;
                                 }
+                            } else if kse_name == kotoba_dht::ENGI_TRANSFER_TOPIC {
+                                // Countersigned EN transfer (engi-mutual-credit):
+                                // decode + dedup + project into the local ledger
+                                // cache. The transfer is already a committed fact
+                                // on both parties' Source Chains, so projection is
+                                // an unconditional net-zero mirror.
+                                handle_engi_transfer(&data, &mut engi_seen, &engi).await;
                             } else {
                                 let maybe_quad_op = if kse_name == "quad/assert" {
                                     serde_json::from_slice::<Quad>(&data).ok().map(|quad| (quad, true))
@@ -727,6 +767,48 @@ mod tests {
 
     fn cid(byte: u8) -> KotobaCid {
         KotobaCid([byte; 36])
+    }
+
+    fn engi_transfer_bytes(spender: &str, receiver: &str, amount: i64) -> Vec<u8> {
+        // project_transfer mirrors a committed chain fact and never inspects the
+        // signatures, so a dummy-signed body exercises the gossip-receive path.
+        let t = kotoba_dht::MutualCreditTransfer {
+            body: kotoba_dht::TransferBody {
+                spender: spender.to_string(),
+                receiver: receiver.to_string(),
+                amount,
+                spender_prev: None,
+                receiver_prev: None,
+                nonce: 0,
+                ts: 0,
+            },
+            spender_sig: Vec::new(),
+            receiver_sig: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&t, &mut buf).unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn handle_engi_transfer_projects_dedups_and_skips_garbage() {
+        let engi = crate::engi::Engi::from_env("did:key:op".to_string());
+        let mut seen = kotoba_dht::SeenTransfers::default();
+        let bytes = engi_transfer_bytes("did:key:a", "did:key:b", 250);
+
+        // First sighting is decoded, deduped-in, and projected (net-zero).
+        assert!(handle_engi_transfer(&bytes, &mut seen, &engi).await);
+        assert_eq!(engi.balance("did:key:a").await, -250);
+        assert_eq!(engi.balance("did:key:b").await, 250);
+
+        // Re-gossiped duplicate is dropped — not applied twice.
+        assert!(!handle_engi_transfer(&bytes, &mut seen, &engi).await);
+        assert_eq!(engi.balance("did:key:a").await, -250);
+        assert_eq!(engi.balance("did:key:b").await, 250);
+
+        // Undecodable bytes are skipped without panic or mutation.
+        assert!(!handle_engi_transfer(b"not cbor", &mut seen, &engi).await);
+        assert!(engi.ledger().await.is_balanced());
     }
 
     // ── KOTOBA Mesh M4: component placement path (start_component) ──
@@ -973,6 +1055,7 @@ mod tests {
             kotoba_lattice::TriggerRoutes::default(),
         ));
         let (_inject_tx, inject_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        let engi = crate::engi::Engi::from_env("did:key:test-op".to_string());
 
         tokio::spawn(run(
             node,
@@ -987,6 +1070,7 @@ mod tests {
             executor,
             mesh_routes,
             inject_rx,
+            engi,
         ));
 
         // observer waits for the run-node's heartbeat (interval is 5 s; first

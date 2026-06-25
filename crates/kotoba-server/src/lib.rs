@@ -2071,6 +2071,7 @@ pub async fn run() -> anyhow::Result<()> {
                     Arc::clone(&state.executor),
                     Arc::clone(&state.mesh_routes),
                     inject_rx,
+                    Arc::clone(&state.engi),
                 ));
 
                 tracing::info!("kotoba-net swarm started (QUIC + GossipSub + Kademlia)");

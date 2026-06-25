@@ -88,11 +88,17 @@ etzhayyim-exclusive). EN is internal contribution accounting only.
 
 ## Wire / gossip
 
-- Topic `kotoba/engi/transfer` (`ENGI_TRANSFER_TOPIC`) carries countersigned
-  transfers for projection across the mesh.
+- `ENGI_TRANSFER_TOPIC` is the bare KSE-topic name `engi/transfer` (like
+  `firehose` / `rekey/revoke`); the net layer maps it to the wire topic
+  `kotoba/engi/transfer` via `gossipsub_topic`. It carries countersigned transfers
+  for projection across the mesh.
 - `SeenTransfers` (bounded ring+set keyed by `transfer_id`, cap
   `SEEN_TRANSFERS_CAP = 8192`) dedups re-gossiped transfers — mirrors the
   firehose `FirehoseSeen` guard.
+- `net_actor` (feature `p2p`) subscribes the topic and, on each inbound message,
+  runs `handle_engi_transfer` → decode `MutualCreditTransfer` → `SeenTransfers`
+  dedup → `Engi::project_transfer`. Outbound publish uses the existing generic
+  gossip channel (`(ENGI_TRANSFER_TOPIC, cbor)`).
 
 ## Status & follow-ups
 
@@ -104,13 +110,19 @@ with prev-pin + credit-limit), `replay_balance`, `validate_chain_transfers`,
 `Engi::{project_transfer, rebuild_from_transfers}`. 20 `engi_chain` unit tests +
 6 `Engi` projection tests, all green.
 
+**Landed (R1, net wiring):** `net_actor` (feature `p2p`) subscribes
+`ENGI_TRANSFER_TOPIC`, holds a `SeenTransfers` guard, and projects inbound
+transfers via `handle_engi_transfer` → `Engi::project_transfer`. `Engi` is
+threaded into `net_actor::run`. 1 handler unit test (project / dedup / skip
+garbage) green under `--features p2p`. Topic const corrected to the bare KSE name
+`engi/transfer` (the net layer adds the `kotoba/` prefix).
+
 **Deferred (next increments):**
 
-1. **net wiring** — subscribe/publish `kotoba/engi/transfer` in `net_actor.rs`
-   (one `swarm.subscribe(ENGI_TRANSFER_TOPIC)` + one inbound match arm calling
-   `SeenTransfers::insert` → `Engi::project_transfer`). Held back only because
-   `kotoba-net/src/swarm.rs` is concurrently dirty (background /loop); the wiring
-   is a ~10-line additive change once it lands.
+1. **outbound publish at transfer creation** — an XRPC endpoint / `EngiChain`
+   integration that, when this node records a spend/receive, gossips the
+   countersigned transfer on `ENGI_TRANSFER_TOPIC` via the generic publish
+   channel. (Inbound projection + subscribe already landed in R1.)
 2. **validator deployment** — a neighborhood node syncs a peer's chain via the
    existing bitswap `want_since`, runs `audit_peer_chain`, and gossips
    `mutual_credit_warrant`s on violations.
