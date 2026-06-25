@@ -26,7 +26,10 @@ fn plain_safe_program_compiles() {
 
 #[test]
 fn eval_is_denied() {
-    assert_subset_denied(compile_safe_clj("(defn run [x] (eval x))", &Policy::deny_all()));
+    assert_subset_denied(compile_safe_clj(
+        "(defn run [x] (eval x))",
+        &Policy::deny_all(),
+    ));
 }
 
 #[test]
@@ -155,6 +158,6 @@ fn capability_and_subset_gates_compose() {
         other => panic!("expected Policy denial, got {other:?}"),
     }
     // grant the capability → compiles
-    let policy = Policy::deny_all().grant_graph_write(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     assert!(compile_safe_clj(src, &policy).is_ok());
 }

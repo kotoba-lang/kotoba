@@ -57,10 +57,13 @@ fn pure_module_has_no_kais_imports() {
 #[test]
 fn write_grant_emits_only_the_kqe_import() {
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    let policy = Policy::deny_all().grant_graph_write(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     let wasm = compile_safe_clj(src, &policy).unwrap();
 
-    assert!(embeds(&wasm, "assert-quad"), "graph-write must wire assert-quad");
+    assert!(
+        embeds(&wasm, "assert-quad"),
+        "graph-write must wire assert-quad"
+    );
     // The decisive confinement check: NO llm, NO auth leaked in.
     assert_only_ifaces(&wasm, &["kotoba:kais/kqe@0.1.0"]);
 }
@@ -81,14 +84,18 @@ fn auth_grant_emits_only_the_auth_import() {
     let policy = Policy::deny_all().grant_auth();
     let wasm = compile_safe_clj(src, &policy).unwrap();
 
-    assert!(embeds(&wasm, "has-capability"), "auth grant must wire has-capability");
+    assert!(
+        embeds(&wasm, "has-capability"),
+        "auth grant must wire has-capability"
+    );
     assert_only_ifaces(&wasm, &["kotoba:kais/auth@0.1.0"]);
 }
 
 #[test]
 fn prelude_under_deny_all_leaks_no_capability() {
     // The container/CBOR prelude must add no host import to a pure module.
-    let wasm = compile_safe_clj_with_prelude("(defn run [n] (inc n))", &Policy::deny_all()).unwrap();
+    let wasm =
+        compile_safe_clj_with_prelude("(defn run [n] (inc n))", &Policy::deny_all()).unwrap();
     assert!(
         !embeds(&wasm, "kotoba:kais/"),
         "the prelude must not leak any host-capability import under deny-all"
@@ -100,10 +107,13 @@ fn read_grant_with_prelude_wires_only_kqe() {
     // With graph-read granted, the kqe accessor prelude links in — and ONLY the
     // kqe interface should appear, never llm/auth.
     let src = r#"(defn run [] (kqe-count (kqe-get-objects "kg" "a" "p")))"#;
-    let policy = Policy::deny_all().grant_graph_read(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_read(["kg"]);
     let wasm = compile_safe_clj_with_prelude(src, &policy).unwrap();
 
-    assert!(embeds(&wasm, "get-objects"), "graph-read must wire get-objects");
+    assert!(
+        embeds(&wasm, "get-objects"),
+        "graph-read must wire get-objects"
+    );
     assert_only_ifaces(&wasm, &["kotoba:kais/kqe@0.1.0"]);
 }
 
@@ -114,8 +124,8 @@ fn granting_more_than_used_emits_only_what_is_used() {
     // grant. Here the program only writes, so only kqe should appear.
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
     let policy = Policy::deny_all()
-        .grant_graph_read(["g"])
-        .grant_graph_write(["g"])
+        .grant_graph_read(["kg"])
+        .grant_graph_write(["kg"])
         .grant_infer(["m"])
         .grant_auth();
     let wasm = compile_safe_clj(src, &policy).unwrap();
@@ -133,7 +143,7 @@ fn module_using_all_interfaces_reports_all_three() {
               (has-capability? "g" "read")))
     "#;
     let policy = Policy::deny_all()
-        .grant_graph_write(["g"])
+        .grant_graph_write(["kg"])
         .grant_infer(["m"])
         .grant_auth();
     let wasm = compile_safe_clj(src, &policy).unwrap();
@@ -157,10 +167,16 @@ fn embedded_capability_ifaces_reports_the_audited_surface() {
     assert!(embedded_capability_ifaces(&pure).is_empty());
 
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    let wasm = compile_safe_clj(src, &Policy::deny_all().grant_graph_write(["g"])).unwrap();
-    assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
+    let wasm = compile_safe_clj(src, &Policy::deny_all().grant_graph_write(["kg"])).unwrap();
+    assert_eq!(
+        embedded_capability_ifaces(&wasm),
+        vec!["kotoba:kais/kqe@0.1.0"]
+    );
 
     let src = r#"(defn run [] (llm-infer "m" "x"))"#;
     let wasm = compile_safe_clj(src, &Policy::deny_all().grant_infer(["m"])).unwrap();
-    assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/llm@0.1.0"]);
+    assert_eq!(
+        embedded_capability_ifaces(&wasm),
+        vec!["kotoba:kais/llm@0.1.0"]
+    );
 }

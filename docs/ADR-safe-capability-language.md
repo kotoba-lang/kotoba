@@ -19,6 +19,28 @@ Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lat
 > ```
 > mythos 級の敵対 agent に対して **linter の赤線は親切な看板にすぎない**。壁ごと来る相手には、そもそも壁の外に資源を置かない設計（confinement）でしか勝てない。
 
+### 実装状況サマリ（2026-06-25）
+
+`compile_safe_clj` は `compile_str`（legacy/ambient 経路）と別の deny-by-default プロファイルとして稼働中。
+ゲート層はほぼ完成、型システム層が残務。
+
+| 機能 | 状態 | 定理 | 場所 |
+|---|---|---|---|
+| Capability gate（policy 由来 import、ambient 廃止） | ✅ | T3 | `policy.rs` |
+| per-cid 束縛（graph/model 単位の instance 粒度） | ✅ | T3 | `policy.rs::check_resource_targets` |
+| Subset gate（eval/require/set!/defmacro/reflection 拒否） | ✅ | — | `subset.rs` |
+| Effect gate（宣言 ⊇ 推移的 used、interprocedural） | ✅ | T2 | `effects.rs` |
+| Effect 推論 `infer_effects` / least-privilege `minimal_policy` / over-grant linter `unused_grants` | ✅ | — | `lib.rs` / `policy.rs` |
+| 監査 `embedded_capability_ifaces` / `Policy::to_edn` | ✅ | — | `lib.rs` / `policy.rs` |
+| CLI `safe-build` / `safe-policy` | ✅ | — | `cli.rs` |
+| literal 型チェック（numeric op に string/keyword literal を拒否） | ✅ | T-lite | `ty.rs` |
+| 型付き HIR・`Option`/`Result`・no-nil（S1b 残） | ⬜ | — | — |
+| borrow checker（S2） | ⬜ | **T1** | — |
+| capability の値渡し（S4b）・signed/reproducible（S5） | ⬜ | — | — |
+
+達成: **T2 Effect Soundness ✅ / T3 Capability Confinement ✅（instance 粒度、バイト列検証済み）**。
+残: **T1 Memory Safety**（borrow checker 未）。テスト: safe-mode 約 110（`crates/kotoba-clj/tests/safe_*.rs` + `confinement_property.rs`）+ ast meta-guard、full suite green、clippy clean（default + cli）。
+
 ## 1. 背景 — kotoba の現在地
 
 kotoba には **S級に必要な実行層の部品がすでにほぼ揃っている**。にもかかわらず、言語層（`kotoba-clj`）と import モデルが現状 **C級**に留まっており、ここが弱点になっている。
@@ -253,9 +275,13 @@ kotoba 固有の接続:
 | **S** | capability Wasm + safe static lang + verified policy + deny-by-default + signed/reproducible + OS sandbox 二重化 | **本 ADR の到達目標** |
 | A | Rust/Zig → Wasm（memory-safe だが unsafe/FFI/logic bug/権限ミス残存） | runtime 単体は近い |
 | B | clj syntax + safe subset + borrow checker → Wasm（設計が正しければ A に接近） | safe-clj の設計目標 |
-| C | Clojure/CLJS + linter + convention | **`kotoba-clj` の現在地** |
+| C | Clojure/CLJS + linter + convention | safe-clj 導入前の出発点 |
 
-現在地 C → 目標 S のギャップは「言語層 checker の欠如」＋「ambient import」の 2 点に集約され、本 ADR の §3〜§6 がそれを埋める。
+**現在地（2026-06-25）: C → B/S の間。** ambient import は廃止（policy 由来 import のみ）、
+deny-by-default の **capability gate（instance 粒度・T3）／subset gate／effect gate（interprocedural・T2）**
+が稼働し、T3 はバイト列で検証済み。残るのは **型システム（S1b 型付き HIR）と borrow checker（S2・T1）**、
+および capability の値渡し（S4b）・supply chain（S5）。すなわち「言語層 checker の欠如」と「ambient import」
+という当初 2 ギャップのうち後者は解消、前者は capability/effect 軸で達成・**型/所有権軸が残務**。
 
 ## 9. 段階導入ロードマップ（既存 phase 1–5 / A–E の続き）
 
@@ -264,10 +290,10 @@ kotoba 固有の接続:
 | phase | 内容 | 依存 |
 |---|---|---|
 | **S0 ✅** | `compile_safe_clj(src, &Policy)` + policy EDN パーサ（`crates/kotoba-clj/src/policy.rs`）。コード中で使う host import を **policy に照合し、未許諾なら module を一切 emit しない**（deny-by-default）。emit される import section ⊆ 許諾 capability になるため、**module が宣言した import しか bind できない runtime は ambient authority を張れない**＝コンパイル時に confinement が成立。read/write 分離・quota floor（`fuel`/`memory-pages` > 0 必須）・policy-aware prelude（`:graph-read` 許諾時のみ `KQE_PRELUDE` をリンク）込み。**CLI 露出**: `kotoba-clj safe-build <cell.clj> --policy <p.edn>`（`--features cli`）が gate を通して confined module を emit し、埋め込まれた capability surface を報告（実例 policy `examples/safe-policy.edn`）。**監査 API**: `embedded_capability_ifaces(wasm)` が module の capability surface を返す（built module を policy に照合可能）。test: `safe_policy.rs`(25) + `safe_subset.rs`(17) + `confinement_property.rs`(8, **T3 をバイト列で検証**) + doctest green | — |
-| **S1** | restricted macroexpand / safe-subset gate **✅**（`crates/kotoba-clj/src/subset.rs`）: `eval`/`read-string`/`require`/`use`/`import`/`in-ns`/`set!`/`binding`/`with-redefs`/`alter-var-root`/`resolve`/`gen-class`/`proxy`/`reify`/ユーザー `defmacro` 等を **deny-by-default で拒否**（legacy path は silently ignore する＝それ自体が confinement hole）。`(ns …)` の `:require`/`:import` clause も拒否、bare `(ns foo)` は許可。built-in macro allowlist（`->`/`cond`/`case`/threading）はそのまま展開。user source のみ gate（prelude は trusted）。`crates/kotoba-clj/tests/safe_subset.rs` 17 tests green。**残り（S1b）**: static type 化（i64 一本 → 型付き HIR）・`Option`/`Result`・no-nil | kotoba-edn reader |
+| **S1** | restricted macroexpand / safe-subset gate **✅**（`crates/kotoba-clj/src/subset.rs`）: `eval`/`read-string`/`require`/`use`/`import`/`in-ns`/`set!`/`binding`/`with-redefs`/`alter-var-root`/`resolve`/`gen-class`/`proxy`/`reify`/ユーザー `defmacro` 等を **deny-by-default で拒否**（legacy path は silently ignore する＝それ自体が confinement hole）。`(ns …)` の `:require`/`:import` clause も拒否、bare `(ns foo)` は許可。built-in macro allowlist（`->`/`cond`/`case`/threading）はそのまま展開。user source のみ gate（prelude は trusted）。`crates/kotoba-clj/tests/safe_subset.rs` 17 tests green。**S1b first slice ✅（literal 型チェック, `ty.rs`）**: 双方向の literal 型不一致を静的検出 —（a）numeric op（`+ - * / mod inc dec pos?…`）と numeric 比較（`< > <= >=`、`=` は除外）に **非数値 literal**（string/keyword/vector/map/set — いずれも heap handle で数値でない）、（b）string op（`str-len`/`byte-at` の string 引数）に **numeric literal**。どちらも i64 model が handle を誤演算/誤比較する silent miscompile の bug class。加えて（c）**literal-zero 除算**（`/ mod rem quot` の divisor が literal 0）は実行時 trap 確定なので静的に拒否。literal のみ判定＝false positive なし（変数は実行時不明なので素通り、inert form の中身も解析しない）。typed HIR の足場。`safe_types.rs` 26 tests green。**残り（S1b 本体）**: i64 一本 → 型付き HIR・`Option`/`Result`・no-nil | kotoba-edn reader |
 | **S2** | ownership / borrow checker（safe slice、deterministic drop、no implicit clone）。(T1) を狙う | typed HIR |
 | **S3 ✅** | effect system（`{:effects …}` の検査、`Γ ⊢ e:T!E`）。`effects.rs` が effect row ⊇ **推移的** used-effects を強制（call graph fixpoint、under-declaration / unknown effect 拒否、over-declaration 許可、opt-in、相互再帰収束）。**(T2) Effect Soundness の checking 達成**。**S3b（effect 推論）✅**: `infer_effects(src)` が注釈なしで各関数の推移的 effect を推論（公開 API、`safe-build` が `inferred effects:` として report）。残り（S3c）: 注釈の必須化／自動付与・capability 値保持との一致検査 | S1 |
-| **S4** | capability-passing 化: `kqe`/`llm`/`egress` を `GraphWriteCap`/`InferCap`/`HttpEgressCap` 値に。effect ↔ capability の一致検査。CACAO scope と静的照合。(T3) を狙う | S3 + kotoba-auth |
+| **S4 ✅(per-cid slice)** | **per-cid capability binding**（`policy.rs::check_resource_targets`）: リテラル resource id を policy allowlist と静的照合 → **T3 を class 粒度から instance 粒度へ**。対象: `kqe-assert!`/`kqe-retract!`(graph-write)・`kqe-get-objects`(graph-read)・`llm-infer`(infer = **model-cid 単位**)。graphA への write 許諾は graphB を許さない／modelA の推論許諾は modelB を許さない。`"*"` で any、dynamic 引数は class-level fallback。CACAO の `leaf.graph ⊆ root.graph` のコンパイル時版。`crates/kotoba-clj/tests/safe_percid.rs` 13 tests green。**least-privilege 合成（gate の逆）✅**: `minimal_policy(src)` ／ `kotoba-clj safe-policy <cell>` が cell に必要な最小 policy を合成して EDN 出力（literal は per-cid pin、dynamic は `"*"`）。不変条件: 合成 policy は必ず compile 通過（sufficiency）かつ任意 grant 除去で失敗（minimality）。`Policy::to_edn` が `parse_edn` と round-trip。`safe_minimal.rs` 8 tests green。残り（S4b）: `GraphWriteCap`/`InferCap` を**値として**引数渡し（capability-passing style）・effect↔capability 一致検査・CACAO chain との動的照合 | S3 + kotoba-auth |
 | **S5** | supply chain: signed module、reproducible build、deps allowlist。OS sandbox 二重化（seccomp/gVisor/Firecracker 検討）を runtime 運用に | S0–S4 |
 
 各 phase は「言語層を一段強くする」＋「runtime 側の policy enforcement を一段増やす」の対で進める（片側だけ進めても confinement は完成しないため）。
@@ -302,6 +328,7 @@ safe profile の呼称候補（実装上は `kotoba-clj` の `safe` プロファ
 - gas/memory/output quota 未設定での safe module 実行（既存 `gas_limit=0` 禁止を踏襲）
 - 「Wasm sandbox だから OS sandbox 不要」と判断する
 - 新しい host import（`HostImport` variant）を追加して **`HostImport::ALL` への追加を忘れる**。capability 監査 `embedded_capability_ifaces` は `ALL` から interface 集合を導出するため、漏れると新能力が監査から消える（silent confinement gap）。`CapClass::of` の exhaustive match と `ast::host_import_meta_tests::host_import_all_is_complete` がコンパイル時／テスト時に強制する
+- 新しい EDN walker（subset/type/effect/policy 系の解析）を書くとき **inert form（`quote`/`var`/`comment`）の中身を解析する**。これらは data か compile 時に drop され実行されない（`eval` は subset で禁止済みなので code に昇格しない）ため、解析すると false positive（valid code の誤拒否・effect 誤帰属・不要 capability 要求）を生む。判定は `ast::is_inert_form` に single-source 済み — 全 walker がこれを呼ぶ（`tests/safe_quote.rs` が quote/var/comment の回帰を防ぐ）
 
 ## 13. まとめ
 

@@ -153,12 +153,18 @@ kotoba-clj safe-build cell.clj --policy policy.edn -o cell.wasm
 # [safe-build] inferred effects: run={graph-write}
 ```
 
-Two audit APIs back that report and are usable standalone:
-`embedded_capability_ifaces(wasm)` (byte-level capability surface of a built
-module) and `infer_effects(src)` (source-level, transitive per-function
-effects). Status: capability + subset + effect gates implemented and
-byte-verified (S0–S3); typed HIR / borrow checker (T1) are on the roadmap in
-the ADR.
+Capabilities are scoped **per resource**: granting write to graph A does not
+permit graph B, and granting inference on model M does not permit model N — the
+compile-time twin of CACAO's `leaf.graph ⊆ root.graph` attenuation (T3 at
+instance granularity). `kotoba-clj safe-policy <cell>` runs the inverse of the
+gate, synthesizing the **minimal least-privilege policy** a cell needs.
+
+Audit/tooling APIs, usable standalone: `embedded_capability_ifaces(wasm)`
+(byte-level capability surface), `infer_effects(src)` (source-level transitive
+effects), `minimal_policy(src)` (least-privilege synthesis), `Policy::to_edn`.
+Status: capability (instance-level), subset, and effect (interprocedural) gates
+implemented and byte-verified (S0–S4) with ~110 safe-mode tests; typed HIR /
+borrow checker (T1) are on the roadmap in the ADR.
 
 ## Defaults that just work
 

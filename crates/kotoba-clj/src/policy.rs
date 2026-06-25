@@ -229,6 +229,89 @@ impl Policy {
         ))
     }
 
+    /// Per-cid (instance-level) check of resource-targeting host calls (phase S4).
+    ///
+    /// A host call whose first argument is a **string literal** resource id must
+    /// name a resource the policy grants:
+    /// - `(kqe-assert! <g> …)` / `(kqe-retract! <g> …)` → `:graph-write`
+    /// - `(kqe-get-objects <g> …)` → `:graph-read`
+    /// - `(llm-infer <model> …)` → `:infer`
+    ///
+    /// A `"*"` entry in an allowlist means "any resource of this class" (the
+    /// phase-S0 class-level behaviour). A non-literal (dynamic) argument cannot
+    /// be checked statically and falls back to the class-level
+    /// [`Policy::permits`] gate.
+    ///
+    /// This tightens **T3** from class granularity ("may write *some* graph",
+    /// "may run *some* model") to instance granularity ("may write *only* graph
+    /// X", "may run *only* model M") — the compile-time twin of CACAO's
+    /// `leaf.graph ⊆ root.graph` attenuation.
+    pub fn check_resource_targets(&self, forms: &[EdnValue]) -> Result<(), CljError> {
+        for f in forms {
+            self.check_value_targets(f)?;
+        }
+        Ok(())
+    }
+
+    /// The (`:imports` key, allowlist) a resource-targeting builtin scopes its
+    /// first string-literal argument against.
+    fn resource_target_of(&self, name: &str) -> Option<(&'static str, &BTreeSet<String>)> {
+        match name {
+            "kqe-assert!" | "kqe-retract!" => Some(("graph-write", &self.graph_write)),
+            "kqe-get-objects" => Some(("graph-read", &self.graph_read)),
+            "llm-infer" => Some(("infer", &self.infer)),
+            _ => None,
+        }
+    }
+
+    fn check_value_targets(&self, v: &EdnValue) -> Result<(), CljError> {
+        match v {
+            EdnValue::List(items) => {
+                if let Some(EdnValue::Symbol(head)) = items.first() {
+                    // Inert forms (quote/var/comment) are never executed — no
+                    // resource access; don't gate their contents.
+                    if crate::ast::is_inert_form(&head.name) {
+                        return Ok(());
+                    }
+                    if let Some((key, allow)) = self.resource_target_of(&head.name) {
+                        if let Some(EdnValue::String(cid)) = items.get(1) {
+                            if !(allow.contains("*") || allow.contains(cid)) {
+                                return Err(CljError::Policy(format!(
+                                    "`{cid}` is not in the policy's `:{key}` allowlist — this \
+                                     capability is scoped per resource (T3 instance-level). \
+                                     Grant `:{key} [\"{cid}\"]` (or `\"*\"` for any) to \
+                                     authorize it."
+                                )));
+                            }
+                        }
+                    }
+                }
+                for it in items {
+                    self.check_value_targets(it)?;
+                }
+            }
+            EdnValue::Vector(items) => {
+                for it in items {
+                    self.check_value_targets(it)?;
+                }
+            }
+            EdnValue::Set(items) => {
+                for it in items {
+                    self.check_value_targets(it)?;
+                }
+            }
+            EdnValue::Map(m) => {
+                for (k, val) in m {
+                    self.check_value_targets(k)?;
+                    self.check_value_targets(val)?;
+                }
+            }
+            EdnValue::Tagged { value, .. } => self.check_value_targets(value)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Validate the resource quotas. Rejects a quota-less policy.
     pub fn validate_limits(&self) -> Result<(), CljError> {
         if self.limits.fuel == 0 {
@@ -242,6 +325,48 @@ impl Policy {
             ));
         }
         Ok(())
+    }
+
+    /// Serialize this policy back to EDN (the `policy.edn` form). Round-trips
+    /// with [`Policy::parse_edn`] for the gated fields. Reserved fields (egress,
+    /// secrets, clock, random) are emitted too so the artifact is complete.
+    pub fn to_edn(&self) -> String {
+        let strs = |s: &BTreeSet<String>| {
+            EdnValue::vector(s.iter().map(|x| EdnValue::string(x.clone())))
+        };
+        let imports = EdnValue::map([
+            (EdnValue::kw_bare("graph-read"), strs(&self.graph_read)),
+            (EdnValue::kw_bare("graph-write"), strs(&self.graph_write)),
+            (EdnValue::kw_bare("infer"), strs(&self.infer)),
+            (EdnValue::kw_bare("auth"), EdnValue::bool(self.auth)),
+            (EdnValue::kw_bare("egress"), strs(&self.egress)),
+            (EdnValue::kw_bare("secrets"), strs(&self.secrets)),
+            (EdnValue::kw_bare("clock"), EdnValue::bool(self.clock)),
+            (EdnValue::kw_bare("random"), EdnValue::bool(self.random)),
+        ]);
+        let limits = EdnValue::map([
+            (
+                EdnValue::kw_bare("memory-pages"),
+                EdnValue::int(self.limits.memory_pages as i64),
+            ),
+            (
+                EdnValue::kw_bare("fuel"),
+                EdnValue::int(self.limits.fuel as i64),
+            ),
+            (
+                EdnValue::kw_bare("max-call-depth"),
+                EdnValue::int(self.limits.max_call_depth as i64),
+            ),
+            (
+                EdnValue::kw_bare("max-output-bytes"),
+                EdnValue::int(self.limits.max_output_bytes as i64),
+            ),
+        ]);
+        let top = EdnValue::map([
+            (EdnValue::kw_bare("imports"), imports),
+            (EdnValue::kw_bare("limits"), limits),
+        ]);
+        kotoba_edn::to_string_pretty(&top)
     }
 
     /// Parse a policy from EDN text (the on-disk `policy.edn` form). See the ADR
@@ -278,9 +403,9 @@ impl Policy {
                 policy.secrets = str_set(v, ":imports :secrets")?;
             }
             if let Some(v) = imports.get(&EdnValue::kw_bare("auth")) {
-                policy.auth = v.as_bool().ok_or_else(|| {
-                    CljError::Policy("`:imports :auth` must be a boolean".into())
-                })?;
+                policy.auth = v
+                    .as_bool()
+                    .ok_or_else(|| CljError::Policy("`:imports :auth` must be a boolean".into()))?;
             }
             if let Some(v) = imports.get(&EdnValue::kw_bare("clock")) {
                 policy.clock = v.as_bool().ok_or_else(|| {
@@ -315,6 +440,164 @@ impl Policy {
         }
 
         Ok(policy)
+    }
+}
+
+/// Report this policy's **over-grants** relative to a cell: capabilities it
+/// grants that the cell (`forms`) never targets. The least-privilege linter —
+/// the complement of [`infer_minimal`]. Each finding is a human-readable string
+/// naming the excess grant.
+///
+/// Conservative (no false "unused" claims): if the cell targets a class
+/// *dynamically* (a non-literal resource id), no specific cid in that class is
+/// reported — any of them might be needed at run time. A `"*"` grant is treated
+/// as intentionally broad and never flagged. An empty result means the policy
+/// is already least-privilege for this cell.
+impl Policy {
+    pub fn unused_grants(&self, forms: &[EdnValue]) -> Vec<String> {
+        let needed = infer_minimal(forms);
+        let mut out = Vec::new();
+        diff_class(&mut out, "graph-write", &self.graph_write, &needed.graph_write);
+        diff_class(&mut out, "graph-read", &self.graph_read, &needed.graph_read);
+        diff_class(&mut out, "infer", &self.infer, &needed.infer);
+        if self.auth && !needed.auth {
+            out.push("auth: granted but `has-capability?` is never used".to_string());
+        }
+        out
+    }
+}
+
+/// Append findings for one resource class: an entirely-unused class, or
+/// specific granted cids the cell never targets.
+fn diff_class(out: &mut Vec<String>, key: &str, granted: &BTreeSet<String>, needed: &BTreeSet<String>) {
+    if granted.is_empty() {
+        return; // nothing granted → cannot over-grant
+    }
+    if needed.is_empty() {
+        out.push(format!("{key}: entire capability granted but the cell never uses it"));
+        return;
+    }
+    // Dynamic need (`"*"`) → any cid might be required at run time; don't flag.
+    // A wildcard *grant* is deliberately broad → don't flag.
+    if needed.contains("*") || granted.contains("*") {
+        return;
+    }
+    for cid in granted {
+        if !needed.contains(cid) {
+            out.push(format!("{key}: `{cid}` granted but never targeted by the cell"));
+        }
+    }
+}
+
+/// Synthesize the **minimal** (least-privilege) policy that lets `forms`
+/// compile under safe-clj: it grants exactly the resources the code targets and
+/// nothing more.
+///
+/// - a literal resource id (`(kqe-assert! "graphA" …)`, `(llm-infer "modelA"
+///   …)`) becomes a specific allowlist entry;
+/// - a *dynamic* target for a class (`(kqe-assert! g …)`, or a graph-scope-free
+///   call like `kqe-query`) widens that class to `"*"` — the least we can
+///   statically prove sufficient;
+/// - pure code yields [`Policy::deny_all`].
+///
+/// Invariant: `compile_safe_clj(src, &infer_minimal(parse(src)))` succeeds — the
+/// synthesized policy is sufficient by construction — while removing any grant
+/// makes it fail. This is least-privilege policy generation: point it at an
+/// untrusted cell to see (and pin) exactly what it needs.
+pub fn infer_minimal(forms: &[EdnValue]) -> Policy {
+    let mut acc = MinAcc::default();
+    for f in forms {
+        collect_min(f, &mut acc);
+    }
+    let resolve = |dynamic: bool, cids: BTreeSet<String>| -> BTreeSet<String> {
+        if dynamic {
+            BTreeSet::from(["*".to_string()])
+        } else {
+            cids
+        }
+    };
+    let mut p = Policy::deny_all();
+    p.graph_write = resolve(acc.write_dynamic, acc.write);
+    p.graph_read = resolve(acc.read_dynamic, acc.read);
+    p.infer = resolve(acc.infer_dynamic, acc.infer);
+    p.auth = acc.auth;
+    p
+}
+
+/// Accumulator for [`infer_minimal`]: per-class literal ids + a "saw a dynamic
+/// target" flag (which forces `"*"`).
+#[derive(Default)]
+struct MinAcc {
+    write: BTreeSet<String>,
+    write_dynamic: bool,
+    read: BTreeSet<String>,
+    read_dynamic: bool,
+    infer: BTreeSet<String>,
+    infer_dynamic: bool,
+    auth: bool,
+}
+
+fn collect_min(v: &EdnValue, acc: &mut MinAcc) {
+    match v {
+        EdnValue::List(items) => {
+            if let Some(EdnValue::Symbol(head)) = items.first() {
+                // Inert forms (quote/var/comment) are never executed → no
+                // capability.
+                if crate::ast::is_inert_form(&head.name) {
+                    return;
+                }
+                let literal = match items.get(1) {
+                    Some(EdnValue::String(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                match head.name.as_str() {
+                    "kqe-assert!" | "kqe-retract!" => match literal {
+                        Some(s) => {
+                            acc.write.insert(s);
+                        }
+                        None => acc.write_dynamic = true,
+                    },
+                    "kqe-get-objects" => match literal {
+                        Some(s) => {
+                            acc.read.insert(s);
+                        }
+                        None => acc.read_dynamic = true,
+                    },
+                    // `kqe-query` reads but names no specific graph → needs the
+                    // graph-read class with no pinnable cid.
+                    "kqe-query" => acc.read_dynamic = true,
+                    "llm-infer" => match literal {
+                        Some(s) => {
+                            acc.infer.insert(s);
+                        }
+                        None => acc.infer_dynamic = true,
+                    },
+                    "has-capability?" => acc.auth = true,
+                    _ => {}
+                }
+            }
+            for it in items {
+                collect_min(it, acc);
+            }
+        }
+        EdnValue::Vector(items) => {
+            for it in items {
+                collect_min(it, acc);
+            }
+        }
+        EdnValue::Set(items) => {
+            for it in items {
+                collect_min(it, acc);
+            }
+        }
+        EdnValue::Map(m) => {
+            for (k, val) in m {
+                collect_min(k, acc);
+                collect_min(val, acc);
+            }
+        }
+        EdnValue::Tagged { value, .. } => collect_min(value, acc),
+        _ => {}
     }
 }
 

@@ -120,18 +120,19 @@ pub mod ast;
 pub mod cli;
 pub mod codegen;
 pub mod compat;
-pub mod effects;
-pub mod policy;
-pub mod subset;
 #[cfg(feature = "component")]
 pub mod component;
+pub mod effects;
+pub mod policy;
 #[cfg(feature = "run")]
 pub mod run;
+pub mod subset;
+pub mod ty;
 
 pub use compat::ReaderTarget;
-pub use policy::{CapClass, Limits, Policy};
 #[cfg(feature = "component")]
 pub use component::compile_component_str_with_prelude;
+pub use policy::{CapClass, Limits, Policy};
 
 use std::path::Path;
 use thiserror::Error;
@@ -173,6 +174,12 @@ pub enum CljError {
     /// §5 and [`effects`].
     #[error("effect error: {0}")]
     Effect(String),
+    /// A `compile_safe_clj` build had a statically-detectable type error — e.g.
+    /// a numeric operator applied to a string/keyword literal, which the i64
+    /// value model would silently miscompile. The first slice of static typing
+    /// (S1b); see [`ty`].
+    #[error("type error: {0}")]
+    Type(String),
 }
 
 /// Compile Clojure-subset source text into WebAssembly bytes.
@@ -240,8 +247,13 @@ fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8
     // Safe-subset gate (deny-by-default for language features). Runs on the
     // *user* source only — the trusted prelude is exempt. Catches forms the
     // legacy path would silently drop (`eval`, `require`, `set!`, `defmacro`, …).
-    let user_forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
+    let user_forms =
+        kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
     subset::check_forms(&user_forms)?;
+
+    // Literal type check (S1b first slice): reject numeric ops on string/keyword
+    // literals, which the i64 value model would silently miscompile.
+    ty::check_forms(&user_forms)?;
 
     // Effect-soundness gate (T2): any function declaring an `{:effects …}` row
     // must not exceed it. Opt-in — un-annotated functions are unaffected.
@@ -269,6 +281,12 @@ fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8
         )));
     }
 
+    // Per-cid capability gate (S4, T3 instance-level): a resource-targeting call
+    // (graph write/read, model inference) with a string-literal resource id must
+    // name a granted resource (or the allowlist must hold `"*"`). Dynamic args
+    // fall back to the class-level gate above. Runs on the user source.
+    policy.check_resource_targets(&user_forms)?;
+
     codegen::compile(&program)
 }
 
@@ -288,7 +306,7 @@ fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8
 /// assert!(embedded_capability_ifaces(&pure).is_empty());
 ///
 /// let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
-/// let policy = Policy::deny_all().grant_graph_write(["g"]);
+/// let policy = Policy::deny_all().grant_graph_write(["kg"]);
 /// let wasm = compile_safe_clj(src, &policy).unwrap();
 /// assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
 /// ```
@@ -338,6 +356,50 @@ pub fn infer_effects(
     let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
     let forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
     Ok(effects::infer_effects(&forms))
+}
+
+/// Synthesize the **minimal least-privilege [`Policy`]** that lets safe-clj
+/// `src` compile — it grants exactly the resources the code targets and nothing
+/// more. The inverse of the capability gate: instead of "does this cell fit
+/// this policy?", it answers "what is the least policy this cell needs?".
+///
+/// Use it to bootstrap a deny-by-default policy for an untrusted/AI-generated
+/// cell, then review and tighten by hand. Literal resource ids become specific
+/// allowlist entries; dynamic targets widen a class to `"*"`.
+///
+/// ```
+/// let src = r#"(defn run [] (kqe-assert! "graphA" "s" "p" "v"))"#;
+/// let policy = kotoba_clj::minimal_policy(src).unwrap();
+/// // sufficient by construction:
+/// assert!(kotoba_clj::compile_safe_clj(src, &policy).is_ok());
+/// // and least-privilege: it grants only graphA write, nothing else.
+/// assert!(policy.graph_write.contains("graphA"));
+/// assert!(policy.infer.is_empty() && !policy.auth);
+/// ```
+pub fn minimal_policy(src: &str) -> Result<Policy, CljError> {
+    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    let forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
+    Ok(policy::infer_minimal(&forms))
+}
+
+/// Report `policy`'s **over-grants** relative to safe-clj `src` — capabilities
+/// it grants that the cell never uses. The least-privilege linter (complement of
+/// [`minimal_policy`]); an empty result means `policy` is already minimal for
+/// this cell. See [`Policy::unused_grants`].
+///
+/// ```
+/// let src = r#"(defn run [] (kqe-assert! "gA" "s" "p" "v"))"#;
+/// // policy over-grants infer + a second graph the cell never touches:
+/// let policy = kotoba_clj::Policy::deny_all()
+///     .grant_graph_write(["gA", "gB"])
+///     .grant_infer(["m"]);
+/// let unused = kotoba_clj::unused_grants(src, &policy).unwrap();
+/// assert_eq!(unused.len(), 2); // gB write + infer
+/// ```
+pub fn unused_grants(src: &str, policy: &Policy) -> Result<Vec<String>, CljError> {
+    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    let forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
+    Ok(policy.unused_grants(&forms))
 }
 
 /// The safe prelude for a given policy. Pure container + CBOR layers are always

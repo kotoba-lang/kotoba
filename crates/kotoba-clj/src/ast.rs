@@ -236,6 +236,19 @@ pub enum HostImport {
     KqeQuery,
 }
 
+/// Whether a list head names an **inert form** — one whose body is data or is
+/// dropped at compile time, and is therefore *never executed*:
+/// `quote`/`var` (quoted data) and `comment` (discarded). The safe-clj analysis
+/// walkers (subset / type / effect / capability / policy-synthesis) must not
+/// descend into these, or they raise false positives — rejecting valid code,
+/// mis-attributing effects, or demanding capabilities the cell never uses. This
+/// is sound because `eval` is banned by the subset gate, so quoted data can
+/// never be promoted back to executable code. Single-sourced here so every
+/// walker stays in sync (`tests/safe_quote.rs` guards it).
+pub fn is_inert_form(head_name: &str) -> bool {
+    matches!(head_name, "quote" | "var" | "comment")
+}
+
 impl HostImport {
     /// Every variant, for exhaustive iteration — capability auditing
     /// ([`crate::embedded_capability_ifaces`]) derives the host-interface set

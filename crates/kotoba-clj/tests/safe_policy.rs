@@ -39,7 +39,7 @@ fn graph_write_denied_without_grant() {
 #[test]
 fn graph_write_allowed_with_grant() {
     let src = r#"(defn run [] (kqe-assert! "kg" "alice" "kg/name" "v"))"#;
-    let policy = Policy::deny_all().grant_graph_write(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     let wasm = compile_safe_clj(src, &policy).expect("granted graph-write must compile");
     assert!(is_wasm(&wasm));
 }
@@ -48,7 +48,7 @@ fn graph_write_allowed_with_grant() {
 fn read_grant_does_not_confer_write() {
     // The read/write split is the point: graph-read must NOT authorize a write.
     let src = r#"(defn run [] (kqe-assert! "kg" "alice" "kg/name" "v"))"#;
-    let policy = Policy::deny_all().grant_graph_read(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_read(["kg"]);
     assert_policy_denied(compile_safe_clj(src, &policy));
 }
 
@@ -56,14 +56,14 @@ fn read_grant_does_not_confer_write() {
 fn write_grant_does_not_confer_read() {
     // ...and symmetrically, write authority must not let you read.
     let src = r#"(defn run [] (kqe-get-objects "kg" "alice" "kg/name"))"#;
-    let policy = Policy::deny_all().grant_graph_write(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     assert_policy_denied(compile_safe_clj(src, &policy));
 }
 
 #[test]
 fn graph_read_allowed_with_grant() {
     let src = r#"(defn run [] (kqe-get-objects "kg" "alice" "kg/name"))"#;
-    let policy = Policy::deny_all().grant_graph_read(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_read(["kg"]);
     let wasm = compile_safe_clj(src, &policy).expect("granted graph-read must compile");
     assert!(is_wasm(&wasm));
 }
@@ -151,7 +151,7 @@ fn prelude_kqe_accessors_require_read_grant() {
     // Without read grant the kqe accessor layer is absent AND the call is denied.
     assert_policy_denied(compile_safe_clj_with_prelude(src, &Policy::deny_all()));
     // With read grant the accessor prelude links in and it compiles.
-    let policy = Policy::deny_all().grant_graph_read(["bafyGraphA"]);
+    let policy = Policy::deny_all().grant_graph_read(["kg"]);
     let wasm = compile_safe_clj_with_prelude(src, &policy)
         .expect("granted graph-read must link the kqe prelude and compile");
     assert!(is_wasm(&wasm));
@@ -183,8 +183,9 @@ fn policy_parses_from_edn() {
     assert_eq!(policy.limits.max_call_depth, 64);
     assert_eq!(policy.limits.max_output_bytes, 32_768);
 
-    // And the parsed policy actually gates: write is granted, so this compiles.
-    let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
+    // And the parsed policy actually gates: write to the granted graph compiles
+    // (per-cid: the literal graph must be in the `:graph-write` allowlist).
+    let src = r#"(defn run [] (kqe-assert! "bafyGraphA" "a" "p" "v"))"#;
     assert!(compile_safe_clj(src, &policy).is_ok());
 }
 
@@ -251,9 +252,9 @@ fn retract_is_classified_as_graph_write() {
     // write grant allows it; read grant alone does not.
     assert_policy_denied(compile_safe_clj(
         src,
-        &Policy::deny_all().grant_graph_read(["g"]),
+        &Policy::deny_all().grant_graph_read(["kg"]),
     ));
-    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_write(["g"])).is_ok());
+    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_write(["kg"])).is_ok());
 }
 
 #[test]
@@ -262,9 +263,9 @@ fn query_is_classified_as_graph_read() {
     // read grant allows it; write grant alone does not.
     assert_policy_denied(compile_safe_clj(
         src,
-        &Policy::deny_all().grant_graph_write(["g"]),
+        &Policy::deny_all().grant_graph_write(["kg"]),
     ));
-    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_read(["g"])).is_ok());
+    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_read(["kg"])).is_ok());
 }
 
 // ── doc ↔ code integrity: the example policy must parse and gate ───────────
@@ -283,7 +284,13 @@ fn example_policy_edn_parses_and_gates() {
     assert_eq!(policy.limits.fuel, 1_000_000);
 
     // A write program compiles under it; an inference program does not.
-    assert!(compile_safe_clj(r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#, &policy).is_ok());
+    assert!(
+        compile_safe_clj(
+            r#"(defn run [] (kqe-assert! "bafyGraphReportsA" "a" "p" "v"))"#,
+            &policy
+        )
+        .is_ok()
+    );
     assert_policy_denied(compile_safe_clj(
         r#"(defn run [] (llm-infer "m" "x"))"#,
         &policy,
@@ -313,9 +320,12 @@ fn deny_all_denies_every_capability_class() {
 #[test]
 fn each_grant_flips_exactly_one_class() {
     let cases = [
-        (Policy::deny_all().grant_graph_read(["g"]), CapClass::GraphRead),
         (
-            Policy::deny_all().grant_graph_write(["g"]),
+            Policy::deny_all().grant_graph_read(["kg"]),
+            CapClass::GraphRead,
+        ),
+        (
+            Policy::deny_all().grant_graph_write(["kg"]),
             CapClass::GraphWrite,
         ),
         (Policy::deny_all().grant_infer(["m"]), CapClass::Infer),

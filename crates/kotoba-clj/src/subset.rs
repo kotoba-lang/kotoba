@@ -45,6 +45,11 @@ fn check_value(v: &EdnValue) -> Result<(), CljError> {
     match v {
         EdnValue::List(items) => {
             if let Some(EdnValue::Symbol(head)) = items.first() {
+                // Inert forms (`quote`/`var`/`comment`) are never executed —
+                // don't scan their contents.
+                if crate::ast::is_inert_form(&head.name) {
+                    return Ok(());
+                }
                 // Match on the *unqualified* name so `clojure.core/eval` and a
                 // bare `eval` are both caught.
                 if let Some(reason) = forbidden_op(&head.name) {

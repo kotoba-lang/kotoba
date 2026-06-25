@@ -8,7 +8,7 @@ fn main() {
     {
         let mut args = std::env::args().skip(1);
         if let Some(sub) = args.next() {
-            if sub == "build" || sub == "safe-build" || sub == "run" {
+            if sub == "build" || sub == "safe-build" || sub == "safe-policy" || sub == "run" {
                 let rest: Vec<String> = args.collect();
                 if let Err(err) = kotoba_clj::cli::run(&sub, &rest) {
                     eprintln!("kotoba-clj: {err:#}");

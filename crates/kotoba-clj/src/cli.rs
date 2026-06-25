@@ -35,6 +35,7 @@ const DEFAULT_GAS: u64 = 10_000_000;
 pub const SUBCOMMAND_USAGE: &str = "\
      kotoba-clj build <cell.clj> [-o <out.wasm>] [--wit <dir>]\n  \
      kotoba-clj safe-build <cell.clj> --policy <policy.edn> [-o <out.wasm>]\n  \
+     kotoba-clj safe-policy <cell.clj> [-o <policy.edn>]\n  \
      kotoba-clj run <component.wasm> [--ctx <json> | --ctx-file <path>] \
      [--snapshot <json> | --snapshot-file <path>] [--gas <n>] [--agent <did>] [--echo-llm]";
 
@@ -48,8 +49,11 @@ pub fn run(subcommand: &str, argv: &[String]) -> Result<()> {
     match subcommand {
         "build" => cmd_build(argv),
         "safe-build" => cmd_safe_build(argv),
+        "safe-policy" => cmd_safe_policy(argv),
         "run" => cmd_run(argv),
-        other => bail!("unknown subcommand '{other}' (expected: build | safe-build | run)"),
+        other => {
+            bail!("unknown subcommand '{other}' (expected: build | safe-build | safe-policy | run)")
+        }
     }
 }
 
@@ -150,6 +154,13 @@ fn cmd_safe_build(args: &[String]) -> Result<()> {
     eprintln!("[safe-build] {cell} -> {out} ({} bytes)", wasm.len());
     eprintln!("[safe-build] capability surface: {surface}");
 
+    // Least-privilege lint: warn if the policy grants more than the cell uses.
+    if let Ok(unused) = crate::unused_grants(&body, &policy) {
+        for finding in &unused {
+            eprintln!("[safe-build] warning: over-grant — {finding}");
+        }
+    }
+
     // Source-level effect inference: report what each function actually does.
     if let Ok(effects) = crate::infer_effects(&body) {
         let mut rows: Vec<String> = effects
@@ -167,6 +178,28 @@ fn cmd_safe_build(args: &[String]) -> Result<()> {
             rows.join(" ")
         };
         eprintln!("[safe-build] inferred effects: {report}");
+    }
+    Ok(())
+}
+
+/// `kotoba-clj safe-policy <cell.clj> [-o policy.edn]`
+///
+/// Synthesize and print the **minimal least-privilege policy** a cell needs
+/// (the inverse of `safe-build`): grants exactly the resources the code targets
+/// and nothing more. Pipe it into a `policy.edn`, review, tighten, then feed it
+/// back to `safe-build`.
+fn cmd_safe_policy(args: &[String]) -> Result<()> {
+    let cell = positional(args).ok_or_else(|| anyhow!("safe-policy: missing <cell.clj>"))?;
+    let body = std::fs::read_to_string(cell).with_context(|| format!("read {cell}"))?;
+    let policy =
+        crate::minimal_policy(&body).map_err(|e| anyhow!("analyze {cell}: {e}"))?;
+    let edn = policy.to_edn();
+    match flag(args, "-o") {
+        Some(out) => {
+            std::fs::write(out, &edn).with_context(|| format!("write {out}"))?;
+            eprintln!("[safe-policy] {cell} -> {out} (minimal least-privilege policy)");
+        }
+        None => println!("{edn}"),
     }
     Ok(())
 }

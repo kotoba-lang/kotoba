@@ -158,6 +158,11 @@ pub fn check_forms(forms: &[EdnValue]) -> Result<(), CljError> {
 fn collect_defns<'a>(v: &'a EdnValue, out: &mut Vec<Defn<'a>>) {
     if let EdnValue::List(items) = v {
         if let Some(EdnValue::Symbol(head)) = items.first() {
+            // A `(defn …)` inside an inert form (quote/comment) is not a real
+            // definition.
+            if crate::ast::is_inert_form(&head.name) {
+                return;
+            }
             if head.name == "defn" || head.name == "defn-" {
                 out.push(Defn {
                     name: defn_name(items),
@@ -219,6 +224,10 @@ fn collect(
     match v {
         EdnValue::List(items) => {
             if let Some(EdnValue::Symbol(head)) = items.first() {
+                // Inert forms (quote/var/comment) are never executed — no effects.
+                if crate::ast::is_inert_form(&head.name) {
+                    return;
+                }
                 if let Some(e) = effect_of_call(&head.name) {
                     eff.insert(e.to_string());
                 }
@@ -230,8 +239,12 @@ fn collect(
                 collect(it, user_fns, eff, callees);
             }
         }
-        EdnValue::Vector(items) => items.iter().for_each(|it| collect(it, user_fns, eff, callees)),
-        EdnValue::Set(items) => items.iter().for_each(|it| collect(it, user_fns, eff, callees)),
+        EdnValue::Vector(items) => items
+            .iter()
+            .for_each(|it| collect(it, user_fns, eff, callees)),
+        EdnValue::Set(items) => items
+            .iter()
+            .for_each(|it| collect(it, user_fns, eff, callees)),
         EdnValue::Map(m) => m.iter().for_each(|(k, val)| {
             collect(k, user_fns, eff, callees);
             collect(val, user_fns, eff, callees);

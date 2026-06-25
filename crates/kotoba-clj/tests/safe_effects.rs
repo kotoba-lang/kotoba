@@ -18,11 +18,8 @@ fn is_wasm(b: &[u8]) -> bool {
 
 #[test]
 fn pure_declaration_on_pure_body_compiles() {
-    let wasm = compile_safe_clj(
-        "(defn run {:effects #{}} [n] (* n n))",
-        &Policy::deny_all(),
-    )
-    .expect("a truly pure function may declare no effects");
+    let wasm = compile_safe_clj("(defn run {:effects #{}} [n] (* n n))", &Policy::deny_all())
+        .expect("a truly pure function may declare no effects");
     assert!(is_wasm(&wasm));
 }
 
@@ -33,7 +30,7 @@ fn under_declaration_is_rejected() {
     let src = r#"(defn run {:effects #{}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
     assert_effect_denied(compile_safe_clj(
         src,
-        &Policy::deny_all().grant_graph_write(["g"]),
+        &Policy::deny_all().grant_graph_write(["kg"]),
     ));
 }
 
@@ -41,7 +38,7 @@ fn under_declaration_is_rejected() {
 fn matching_declaration_compiles_when_granted() {
     // Declares graph-write, uses graph-write, and the policy grants it.
     let src = r#"(defn run {:effects #{:graph-write}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    let policy = Policy::deny_all().grant_graph_write(["g"]);
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     let wasm = compile_safe_clj(src, &policy).expect("declared+used+granted must compile");
     assert!(is_wasm(&wasm));
 }
@@ -61,8 +58,9 @@ fn declaration_still_subject_to_capability_gate() {
 fn over_declaration_is_allowed() {
     // Declaring more effects than used is conservative, not unsound → allowed.
     // Only graph-write is used, so only that grant is needed.
-    let src = r#"(defn run {:effects #{:graph-write :infer :auth}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    let policy = Policy::deny_all().grant_graph_write(["g"]);
+    let src =
+        r#"(defn run {:effects #{:graph-write :infer :auth}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     assert!(compile_safe_clj(src, &policy).is_ok());
 }
 
@@ -79,7 +77,9 @@ fn read_declared_as_write_is_under_declaration() {
     let src = r#"(defn run {:effects #{:graph-write}} [] (kqe-query "kg/role"))"#;
     assert_effect_denied(compile_safe_clj(
         src,
-        &Policy::deny_all().grant_graph_read(["g"]).grant_graph_write(["g"]),
+        &Policy::deny_all()
+            .grant_graph_read(["kg"])
+            .grant_graph_write(["kg"]),
     ));
 }
 
@@ -87,7 +87,7 @@ fn read_declared_as_write_is_under_declaration() {
 fn unannotated_function_is_not_effect_checked() {
     // No :effects row → effect gate is skipped; capability gate still applies.
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    let policy = Policy::deny_all().grant_graph_write(["g"]);
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     assert!(compile_safe_clj(src, &policy).is_ok());
 }
 
@@ -99,7 +99,9 @@ fn multiple_effects_all_must_be_declared() {
           (do (kqe-assert! "kg" "a" "p" "v")
               (llm-infer "m" "x")))
     "#;
-    let policy = Policy::deny_all().grant_graph_write(["g"]).grant_infer(["m"]);
+    let policy = Policy::deny_all()
+        .grant_graph_write(["kg"])
+        .grant_infer(["m"]);
     assert_effect_denied(compile_safe_clj(src, &policy));
 
     // Declaring both → compiles (and both grants present).
@@ -122,7 +124,7 @@ fn transitive_effect_through_helper_is_caught() {
     "#;
     assert_effect_denied(compile_safe_clj(
         src,
-        &Policy::deny_all().grant_graph_write(["g"]),
+        &Policy::deny_all().grant_graph_write(["kg"]),
     ));
 }
 
@@ -133,7 +135,7 @@ fn transitive_effect_declared_compiles() {
         (defn helper [] (kqe-assert! "kg" "a" "p" "v"))
         (defn run {:effects #{:graph-write}} [] (helper))
     "#;
-    let policy = Policy::deny_all().grant_graph_write(["g"]);
+    let policy = Policy::deny_all().grant_graph_write(["kg"]);
     assert!(compile_safe_clj(src, &policy).is_ok());
 }
 
@@ -147,7 +149,7 @@ fn two_hop_transitive_effect_is_caught() {
     "#;
     assert_effect_denied(compile_safe_clj(
         src,
-        &Policy::deny_all().grant_graph_write(["g"]),
+        &Policy::deny_all().grant_graph_write(["kg"]),
     ));
 }
 
@@ -173,7 +175,7 @@ fn mutual_recursion_converges_and_propagates() {
     "#;
     assert_effect_denied(compile_safe_clj(
         src,
-        &Policy::deny_all().grant_graph_write(["g"]),
+        &Policy::deny_all().grant_graph_write(["kg"]),
     ));
 }
 
