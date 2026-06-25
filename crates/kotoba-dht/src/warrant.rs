@@ -13,6 +13,7 @@ pub struct Warrant {
     pub sig: Vec<u8>, // validator Ed25519 signature
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ValidationRule {
     InvalidSignature = 1,
@@ -33,6 +34,17 @@ pub enum ValidationRule {
     /// `MishmarBondEscrow` slash is performed by the operating entity from this
     /// warrant — kotoba accuses with evidence; the chain punishes.
     AvailabilityProofFailed = 9,
+    /// A countersigned mutual-credit transfer (`ChainContent::Transfer`) is
+    /// internally invalid: a bad/forged counter-signature, a non-positive amount,
+    /// a self-transfer, or a `prev` that does not bind the spender's declared
+    /// chain head. Evidence = the offending transfer entry CID. (engi-mutual-credit)
+    MutualCreditViolation = 10,
+    /// An agent spent EN it does not have: replaying its Source Chain drives the
+    /// balance below its credit limit, OR two transfer entries fork the chain at
+    /// one `prev` (the same EN spent twice). Evidence = the overspending /
+    /// forking transfer entry CID. The on-chain USDC-on-Base settlement layer is
+    /// unaffected — this bounds *internal* mutual credit only. (engi-mutual-credit)
+    DoubleSpend = 11,
 }
 
 /// Canonical bytes a validator signs for a [`Warrant`] (and that a verifier

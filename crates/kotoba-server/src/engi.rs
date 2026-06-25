@@ -42,7 +42,23 @@
 //! (temp file + rename) to `${KOTOBA_STORE_PATH}/engi-ledger.json` on each
 //! change and reloaded at boot. A file that fails to parse is backed up to
 //! `engi-ledger.json.corrupt` rather than silently discarded.
+//!
+//! ## Source of truth: the Source Chain, not this map (engi-mutual-credit-on-chain)
+//!
+//! As of the mesh-distributed mutual-credit work, the **canonical** record of an
+//! EN movement is a countersigned [`kotoba_dht::MutualCreditTransfer`] appended to
+//! both parties' per-DID Source Chains (`kotoba_dht::engi_chain`), Holochain-
+//! HoloFuel style. A balance is *derived* by replaying those chains — there is no
+//! authoritative global ledger. **This `Engi` map is a materialized projection /
+//! cache** of that replay: [`Engi::project_transfer`] applies one chain-validated
+//! transfer, and [`Engi::rebuild_from_transfers`] reconstructs the cache from a
+//! complete transfer set at boot. The local JSON is a fast read surface and
+//! crash-survivable cache, not the ledger of record. (The legacy `charge` /
+//! `credit` / `batch_credit` fee paths still mutate the cache directly; folding
+//! them onto countersigned transfers is the follow-up that makes the chain the
+//! *sole* source of EN movement.)
 
+use kotoba_dht::MutualCreditTransfer;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -355,6 +371,62 @@ impl Engi {
         total
     }
 
+    /// Project one **chain-validated** countersigned transfer into the cache:
+    /// debit the spender, credit the receiver. Net-zero by construction and
+    /// applied **unconditionally** — the transfer is already a committed fact on
+    /// both parties' Source Chains (its credit-limit/solvency was enforced at
+    /// append time by `kotoba_dht::EngiChain::record_spend`), so the projection
+    /// must mirror it rather than re-judge it. This is the entry point the gossip
+    /// / chain-replay path calls per observed transfer. A non-positive amount or a
+    /// self-transfer is a no-op. Persisted so the cache survives restart.
+    pub async fn project_transfer(&self, t: &MutualCreditTransfer) {
+        let amount = t.body.amount;
+        if amount <= 0 || t.body.spender == t.body.receiver {
+            return;
+        }
+        let mut g = self.inner.write().await;
+        Self::apply_transfer(&mut g, &t.body.spender, &t.body.receiver, amount);
+        let snapshot = Self::persisted(&g);
+        drop(g);
+        self.persist(snapshot);
+    }
+
+    /// Rebuild the entire balance cache by replaying `transfers` from an empty
+    /// map — the boot-time projection of the EN mutual-credit ledger from the
+    /// Source Chains. `transfers` must be the *complete* set of EN movements
+    /// (every countersigned transfer across the agents this node tracks); the
+    /// result is exactly net-zero. Per-agent credit limits are preserved (they are
+    /// reputation state, not EN). One locked, one persisted write.
+    ///
+    /// Note: until the legacy fee paths (`charge` / `batch_credit`) are themselves
+    /// countersigned transfers, a node that uses those must seed `transfers` with
+    /// their equivalents, or call this only on a node whose EN moves are all
+    /// on-chain — otherwise fee balances are not represented here.
+    pub async fn rebuild_from_transfers(&self, transfers: &[MutualCreditTransfer]) {
+        let mut g = self.inner.write().await;
+        g.balances.clear();
+        for t in transfers {
+            if t.body.amount <= 0 || t.body.spender == t.body.receiver {
+                continue;
+            }
+            Self::apply_transfer(&mut g, &t.body.spender, &t.body.receiver, t.body.amount);
+        }
+        let snapshot = Self::persisted(&g);
+        drop(g);
+        self.persist(snapshot);
+    }
+
+    /// Net-zero balance move inside a held write lock: `spender -= amount`,
+    /// `receiver += amount` (saturating). Shared by both projection paths.
+    fn apply_transfer(g: &mut Inner, spender: &str, receiver: &str, amount: i64) {
+        let sb = g.balances.get(spender).copied().unwrap_or(0);
+        g.balances
+            .insert(spender.to_string(), sb.saturating_sub(amount));
+        let rb = g.balances.get(receiver).copied().unwrap_or(0);
+        g.balances
+            .insert(receiver.to_string(), rb.saturating_add(amount));
+    }
+
     /// Ledger snapshot for audit: `{ net (==0), outstanding, accounts }`.
     pub async fn ledger(&self) -> EngiLedger {
         let g = self.inner.read().await;
@@ -632,6 +704,98 @@ mod tests {
         assert_eq!(net, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mk_transfer(spender: &str, receiver: &str, amount: i64) -> MutualCreditTransfer {
+        // Projection mirrors a *committed* chain fact, so it never inspects the
+        // signatures — a dummy-signed body exercises the net-zero cache math.
+        MutualCreditTransfer {
+            body: kotoba_dht::TransferBody {
+                spender: spender.to_string(),
+                receiver: receiver.to_string(),
+                amount,
+                spender_prev: None,
+                receiver_prev: None,
+                nonce: 0,
+                ts: 0,
+            },
+            spender_sig: Vec::new(),
+            receiver_sig: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn project_transfer_is_net_zero_and_persists() {
+        let e = engi(10, "did:key:op");
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 300))
+            .await;
+        assert_eq!(e.balance("did:key:a").await, -300);
+        assert_eq!(e.balance("did:key:b").await, 300);
+        let l = e.ledger().await;
+        assert!(l.is_balanced(), "projection keeps the ledger net-zero");
+        assert_eq!(l.outstanding, 300);
+
+        // A second transfer accumulates; still net-zero.
+        e.project_transfer(&mk_transfer("did:key:b", "did:key:c", 100))
+            .await;
+        assert_eq!(e.balance("did:key:b").await, 200);
+        assert_eq!(e.balance("did:key:c").await, 100);
+        assert!(e.ledger().await.is_balanced());
+    }
+
+    #[tokio::test]
+    async fn project_transfer_bypasses_credit_limit_mirroring_chain_fact() {
+        // The chain already authorised this (possibly via reputation headroom the
+        // local node doesn't track); the projection must apply it regardless of
+        // the tiny default limit, unlike `transfer`/`charge`.
+        let e = engi(10, "did:key:op"); // default limit 1000
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 50_000))
+            .await;
+        assert_eq!(e.balance("did:key:a").await, -50_000);
+        assert_eq!(e.balance("did:key:b").await, 50_000);
+        assert!(e.ledger().await.is_balanced());
+    }
+
+    #[tokio::test]
+    async fn project_transfer_ignores_non_positive_and_self() {
+        let e = engi(10, "did:key:op");
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:b", 0))
+            .await;
+        e.project_transfer(&mk_transfer("did:key:a", "did:key:a", 100))
+            .await;
+        assert_eq!(e.balance("did:key:a").await, 0);
+        assert_eq!(e.balance("did:key:b").await, 0);
+    }
+
+    #[tokio::test]
+    async fn rebuild_from_transfers_replays_to_net_zero_and_keeps_limits() {
+        let e = engi(10, "did:key:op");
+        e.set_credit_limit("did:key:a", 9_000).await; // reputation state, must survive
+        let transfers = vec![
+            mk_transfer("did:key:a", "did:key:b", 300),
+            mk_transfer("did:key:b", "did:key:c", 100),
+            mk_transfer("did:key:a", "did:key:c", 50),
+        ];
+        e.rebuild_from_transfers(&transfers).await;
+        assert_eq!(e.balance("did:key:a").await, -350);
+        assert_eq!(e.balance("did:key:b").await, 200);
+        assert_eq!(e.balance("did:key:c").await, 150);
+        let l = e.ledger().await;
+        assert!(l.is_balanced());
+        assert_eq!(l.outstanding, 350);
+        // Credit limits are reputation, not EN — preserved across a rebuild.
+        assert_eq!(e.credit_limit("did:key:a").await, 9_000);
+    }
+
+    #[tokio::test]
+    async fn rebuild_from_transfers_is_idempotent_from_clean_state() {
+        let e = engi(10, "did:key:op");
+        let transfers = vec![mk_transfer("did:key:a", "did:key:b", 42)];
+        e.rebuild_from_transfers(&transfers).await;
+        e.rebuild_from_transfers(&transfers).await; // replay again — clears first
+        assert_eq!(e.balance("did:key:a").await, -42);
+        assert_eq!(e.balance("did:key:b").await, 42);
+        assert!(e.ledger().await.is_balanced());
     }
 
     #[tokio::test]
