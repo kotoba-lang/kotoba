@@ -45,6 +45,7 @@ pub mod pds_xrpc;
 pub mod pre_proxy;
 pub mod rad_gossip;
 pub mod rad_registry;
+pub mod rad_sync;
 pub mod rate_limit;
 pub mod realtime;
 pub mod server;
