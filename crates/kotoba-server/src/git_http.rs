@@ -134,6 +134,8 @@ pub async fn receive_pack(
             // Persist the updated projection (objects are already durable blocks;
             // this snapshots the oid↔cid index + refs and records the pointer).
             state.git_persist(&repo, &git).await;
+            // A-3: record the new head as a signed rad sigref (best-effort).
+            rad_attest_push(&repo, &headers, &git);
             smart_response("application/x-git-receive-pack-result", out)
         }
         Err(e) => git_error(e),
@@ -166,11 +168,68 @@ async fn read_gate(state: &KotobaState, headers: &HeaderMap) -> Result<(), (Stat
     .map_err(AccessDenied::into_response)
 }
 
+/// The process-wide kotoba-rad delegate registry, projected once from
+/// `KOTOBA_RAD_JOURNAL_DIR` (ADR-2606251200 A-1/A-2). Empty when the var is unset,
+/// in which case the push gate uses the operator-rooted path — purely additive.
+fn rad_registry() -> &'static crate::rad_registry::RadRegistry {
+    static REG: std::sync::OnceLock<crate::rad_registry::RadRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(crate::rad_registry::RadRegistry::from_env)
+}
+
+/// The CACAO issuer DID (`p.iss`), for the `:rad/by` of a sigref attestation.
+fn cacao_issuer(cacao_b64: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let cbor = B64.decode(cacao_b64).ok()?;
+    kotoba_auth::Cacao::from_cbor(&cbor).ok().map(|c| c.p.iss)
+}
+
+/// A-3: record the just-pushed head as a signed rad sigref (ADR-2606251200).
+/// Best-effort — a write-back failure must NEVER fail the push, so this only
+/// logs. Attests only a rad-bound repo (delegates present) pushed with a CACAO:
+/// the CACAO is the member signature (no-server-key — the server only verifies).
+fn rad_attest_push(repo: &str, headers: &HeaderMap, git: &GitStore<'_>) {
+    let Some(cacao_b64) = cacao_header(headers) else {
+        return;
+    };
+    let reg = rad_registry();
+    let Some(rad) = reg.resolve(repo) else {
+        return;
+    };
+    if rad.delegates.is_empty() {
+        return;
+    }
+    let db = git.db();
+    let head_oid = kotoba_git::resolve_ref(&db, "refs/heads/main")
+        .or_else(|| kotoba_git::resolve_ref(&db, "HEAD"));
+    let Some(oid) = head_oid else {
+        return;
+    };
+    let head_cid = match git.object_cid(&db, oid) {
+        Ok(c) => c.to_multibase(),
+        Err(_) => return,
+    };
+    let by = cacao_issuer(cacao_b64).unwrap_or_default();
+    match reg.attest_sigref(repo, &head_cid, &by, cacao_b64) {
+        Ok(tx) => tracing::info!(
+            repo = %repo, rid = %rad.rid, head = %head_cid, tx,
+            "kotoba-rad: sigref attested"
+        ),
+        Err(e) => tracing::warn!(
+            repo = %repo, error = %e,
+            "kotoba-rad: sigref attestation failed (push still succeeded)"
+        ),
+    }
+}
+
 /// Push gate, in precedence order:
 /// 1. `KOTOBA_GIT_ALLOW_ANON_PUSH=1` — open (local dev / tests).
-/// 2. A CACAO granting `git.receive/push` on scope `git/repo/<repo>`, rooted at
-///    the operator DID — capability-based, governance-delegable push authority.
-/// 3. An operator Bearer JWT (`sub == operator_did`).
+/// 2. **Sovereign (rad-rooted)**: if `repo` resolves to a registered kotoba-rad
+///    identity *with delegates*, a CACAO granting `git.receive/push` on scope
+///    `git/repo/<RID>` rooted at one of that repo's own `:rad/delegates`
+///    (ADR-2606251200 A-2) — push authority is the repo's, not the node's.
+/// 3. A CACAO granting `git.receive/push` on `git/repo/<repo>`, rooted at the
+///    operator DID — the legacy operator-delegable path (un-bound repos).
+/// 4. An operator Bearer JWT (`sub == operator_did`).
 fn push_gate(
     state: &KotobaState,
     headers: &HeaderMap,
@@ -180,6 +239,19 @@ fn push_gate(
         return Ok(());
     }
     if let Some(cacao_b64) = cacao_header(headers) {
+        // Sovereign path: a repo with registered rad delegates governs its own push.
+        if let Some(rad) = rad_registry().resolve(repo) {
+            if !rad.delegates.is_empty() {
+                return graph_auth::verify_cacao_rad_push(
+                    cacao_b64,
+                    &rad.rid,
+                    &rad.delegates,
+                    Some(&state.operator_did),
+                    None, // git reuses the credential across info/refs + receive-pack
+                )
+                .map_err(AccessDenied::into_response);
+            }
+        }
         let scope = format!("git/repo/{repo}");
         return graph_auth::verify_cacao_capability(
             cacao_b64,

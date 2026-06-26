@@ -574,6 +574,99 @@ pub fn verify_cacao_capability(
     Ok(())
 }
 
+/// Like [`verify_cacao_capability`] but roots push authority in a repo's
+/// **kotoba-rad delegate set** (`:rad/delegates`, ADR-2606231200) rather than the
+/// node operator — so a repo's own `did:key` holders authorize their pushes, not
+/// the node owner (ADR-2606251200 A-2 "rad-rooted push auth").
+///
+/// Accepts iff the CACAO grants `git.receive/push` on scope `git/repo/<rid>` and
+/// its issuer matches **any** delegate. Cross-encoding `did:key` comparison
+/// (W3C `z6Mk…` vs the kotoba-rad `z<hex>` form) is delegated to
+/// [`kotoba_auth::did_key::did_keys_equal`], so a delegate minted by
+/// `kotoba_rad.cljc` matches a CACAO issuer minted by `cacao-sign` for the same
+/// key — the converter already lives in `kotoba-auth`, nothing new is needed.
+///
+/// Push is **1-of-n**: any single delegate may push data. The `:rad/threshold`
+/// m-of-n governs identity-document mutation (delegate add / key rotation,
+/// recorded as a signed sigref), NOT every data push, so it is not consulted here.
+///
+/// `nonce_store` is `Option` for the same reason as [`verify_cacao_capability`]:
+/// a git op reuses one credential across `info/refs` + the pack request.
+pub fn verify_cacao_rad_push(
+    cacao_b64: &str,
+    rid: &str,
+    delegates: &[String],
+    expected_aud: Option<&str>,
+    nonce_store: Option<&crate::nonce_store::NonceStore>,
+) -> Result<(), AccessDenied> {
+    const MAX_CACAO_B64_LEN: usize = 8 * 1024;
+    if cacao_b64.len() > MAX_CACAO_B64_LEN {
+        return Err(AccessDenied::CacaoDecodeError(format!(
+            "cacao_b64 too large ({} bytes, limit {MAX_CACAO_B64_LEN})",
+            cacao_b64.len()
+        )));
+    }
+    if delegates.is_empty() {
+        return Err(AccessDenied::DelegationError(format!(
+            "no rad delegates registered for repo {rid}"
+        )));
+    }
+    let cbor = B64
+        .decode(cacao_b64)
+        .map_err(|e| AccessDenied::CacaoDecodeError(e.to_string()))?;
+    let cacao =
+        Cacao::from_cbor(&cbor).map_err(|e| AccessDenied::CacaoParseError(e.to_string()))?;
+    let chain = DelegationChain::new(cacao);
+
+    let scope = format!("git/repo/{rid}");
+    let issuer_did = match expected_aud {
+        Some(aud) => chain
+            .verify_with_aud(&scope, "git.receive/push", aud)
+            .map_err(|e| match e {
+                kotoba_auth::DelegationError::AudienceMismatch { expected, got } => {
+                    AccessDenied::AudienceMismatch { expected, got }
+                }
+                other => AccessDenied::DelegationError(other.to_string()),
+            })?,
+        None => chain
+            .verify(&scope, "git.receive/push")
+            .map_err(|e| AccessDenied::DelegationError(e.to_string()))?,
+    };
+
+    // Sovereign root: the issuer must be one of the repo's rad delegates, compared
+    // by KEY (not surface string) so the rad `z<hex>` form and the CACAO `z6Mk…`
+    // form for the same Ed25519 key match.
+    if !delegates
+        .iter()
+        .any(|d| kotoba_auth::did_key::did_keys_equal(d, &issuer_did))
+    {
+        return Err(AccessDenied::IssuerMismatch {
+            expected: format!("one of rad delegates [{}]", delegates.join(", ")),
+            got: issuer_did,
+        });
+    }
+
+    if let Some(store) = nonce_store {
+        let nonce = chain.chain[0].p.nonce.clone();
+        if nonce.is_empty() {
+            return Err(AccessDenied::DelegationError(
+                "CACAO nonce must not be empty".into(),
+            ));
+        }
+        const MAX_CACAO_AGE_SECS: u64 = 7 * 24 * 3600;
+        let expiry_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(MAX_CACAO_AGE_SECS);
+        if !store.check_and_register(&nonce, expiry_unix) {
+            return Err(AccessDenied::ReplayedNonce(nonce));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,5 +1017,120 @@ mod tests {
         let far_future: u64 = 4_102_444_800;
         let h = bearer_headers(&jwt_with_exp(far_future));
         assert!(require_any_bearer_auth(&h, "test").is_ok());
+    }
+
+    // ── rad-rooted git push (verify_cacao_rad_push, ADR-2606251200 A-2) ──────
+
+    const RID: &str = "bafkreigh2akiscaildcqrid000000000000000000000000000000000000";
+
+    fn seed(byte: &str) -> String {
+        byte.repeat(32) // 32 bytes → 64 hex chars
+    }
+
+    /// A real-signed CACAO (DAG-CBOR, base64-standard) granting `capability` on
+    /// `scope`, signed by `seed_hex`. Mirrors `tests/git_cacao_push.rs::build_cacao`.
+    fn signed_cacao(seed_hex: &str, scope: &str, capability: &str, nonce: &str) -> String {
+        use base64::{
+            engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD,
+            Engine as _,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+        use kotoba_auth::did_key::ed25519_pubkey_to_did_key;
+        use kotoba_auth::{CacaoHeader, CacaoSig};
+
+        let sk = SigningKey::from_bytes(&hex::decode(seed_hex).unwrap().try_into().unwrap());
+        let did = ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes());
+        let mut cacao = Cacao {
+            h: CacaoHeader {
+                t: "caip122".into(),
+            },
+            p: CacaoPayload {
+                iss: did,
+                aud: "did:key:zNode".into(),
+                issued_at: "2026-06-25T00:00:00Z".into(),
+                expiry: Some("2099-01-01T00:00:00Z".into()),
+                nonce: nonce.into(),
+                domain: "kotoba.git".into(),
+                statement: None,
+                version: "1".into(),
+                resources: vec![
+                    format!("kotoba://graph/{scope}"),
+                    format!("kotoba://can/{capability}"),
+                ],
+            },
+            s: CacaoSig {
+                t: "EdDSA".into(),
+                s: String::new(),
+            },
+        };
+        let sig: ed25519_dalek::Signature = sk.sign(cacao.siwe_message().as_bytes());
+        cacao.s.s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&cacao, &mut cbor).unwrap();
+        B64.encode(&cbor)
+    }
+
+    fn delegate_did_std(seed_hex: &str) -> String {
+        use ed25519_dalek::SigningKey;
+        use kotoba_auth::did_key::ed25519_pubkey_to_did_key;
+        let sk = SigningKey::from_bytes(&hex::decode(seed_hex).unwrap().try_into().unwrap());
+        ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes())
+    }
+
+    fn delegate_did_hex(seed_hex: &str) -> String {
+        use ed25519_dalek::SigningKey;
+        use kotoba_auth::did_key::ed25519_pubkey_to_did_key_hex;
+        let sk = SigningKey::from_bytes(&hex::decode(seed_hex).unwrap().try_into().unwrap());
+        ed25519_pubkey_to_did_key_hex(sk.verifying_key().as_bytes())
+    }
+
+    #[test]
+    fn rad_push_accepts_delegate_in_standard_form() {
+        let cacao = signed_cacao(&seed("33"), &format!("git/repo/{RID}"), "git.receive/push", "n1");
+        let delegates = vec![delegate_did_std(&seed("33"))];
+        assert!(verify_cacao_rad_push(&cacao, RID, &delegates, None, None).is_ok());
+    }
+
+    #[test]
+    fn rad_push_accepts_delegate_listed_in_rad_hex_form() {
+        // The CACAO issuer is the W3C z6Mk… form; the delegate is registered in the
+        // kotoba-rad z<hex> form for the SAME key — did_keys_equal must bridge them.
+        let cacao = signed_cacao(&seed("33"), &format!("git/repo/{RID}"), "git.receive/push", "n2");
+        let delegates = vec![delegate_did_hex(&seed("33"))];
+        assert!(
+            verify_cacao_rad_push(&cacao, RID, &delegates, None, None).is_ok(),
+            "a delegate in rad hex form must match a CACAO issuer in standard form"
+        );
+    }
+
+    #[test]
+    fn rad_push_rejects_non_delegate_issuer() {
+        let cacao = signed_cacao(&seed("44"), &format!("git/repo/{RID}"), "git.receive/push", "n3");
+        let delegates = vec![delegate_did_std(&seed("33"))]; // signer 0x44 is NOT a delegate
+        let err = verify_cacao_rad_push(&cacao, RID, &delegates, None, None).unwrap_err();
+        assert!(matches!(err, AccessDenied::IssuerMismatch { .. }));
+    }
+
+    #[test]
+    fn rad_push_rejects_wrong_capability() {
+        let cacao = signed_cacao(&seed("33"), &format!("git/repo/{RID}"), "datom:read", "n4");
+        let delegates = vec![delegate_did_std(&seed("33"))];
+        let err = verify_cacao_rad_push(&cacao, RID, &delegates, None, None).unwrap_err();
+        assert!(matches!(err, AccessDenied::DelegationError(_)));
+    }
+
+    #[test]
+    fn rad_push_rejects_wrong_repo_scope() {
+        let cacao = signed_cacao(&seed("33"), "git/repo/otherrid", "git.receive/push", "n5");
+        let delegates = vec![delegate_did_std(&seed("33"))];
+        let err = verify_cacao_rad_push(&cacao, RID, &delegates, None, None).unwrap_err();
+        assert!(matches!(err, AccessDenied::DelegationError(_)));
+    }
+
+    #[test]
+    fn rad_push_rejects_empty_delegate_set() {
+        let cacao = signed_cacao(&seed("33"), &format!("git/repo/{RID}"), "git.receive/push", "n6");
+        let err = verify_cacao_rad_push(&cacao, RID, &[], None, None).unwrap_err();
+        assert!(matches!(err, AccessDenied::DelegationError(_)));
     }
 }
