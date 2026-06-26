@@ -59,6 +59,12 @@ pub struct SigrefAnnounce {
     /// Member signature over `head` — Ed25519-over-head hex OR the push CACAO
     /// (see the module §sig-binding note).
     pub sig: String,
+    /// The kotoba-git snapshot **manifest** CID (multibase), advisory — lets a
+    /// peer fetch the repo's objects for G2 replication. Unsigned: a peer trusts
+    /// it only after the manifest [`crate::rad_sync::Manifest::binds_head`] this
+    /// announcement's verified `head`. Absent on CACAO-backed (local) sigrefs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
 }
 
 impl SigrefAnnounce {
@@ -155,6 +161,7 @@ mod tests {
             head: "bafhead123".into(),
             by: "did:key:z6MkExample".into(),
             sig: "deadbeef".into(),
+            manifest: Some("bafmanifest".into()),
         };
         let bytes = a.encode();
         assert_eq!(SigrefAnnounce::decode(&bytes).unwrap(), a);
@@ -174,6 +181,7 @@ mod tests {
             head: "bafhead".into(),
             by: ed25519_pubkey_to_did_key(pk.as_bytes()), // W3C z6Mk… form
             sig: "sig".into(),
+            manifest: None,
         };
         // delegate registered in the kotoba-rad z<hex> form for the SAME key
         let delegates = vec![ed25519_pubkey_to_did_key_hex(pk.as_bytes())];
@@ -199,6 +207,7 @@ mod tests {
             head: head.into(),
             by: ed25519_pubkey_to_did_key_hex(sk.verifying_key().as_bytes()), // z<hex> form
             sig: hex::encode(sig.to_bytes()),
+            manifest: None,
         }
     }
 

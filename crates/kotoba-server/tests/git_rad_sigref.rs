@@ -273,6 +273,7 @@ async fn rad_delegate_push_writes_sigref() {
         head: head_cid,
         by: did_std(DELEGATE_SEED),
         sig: hsig_hex,
+        manifest: None,
     };
     assert_eq!(
         announce.verify(&[did_hex(DELEGATE_SEED)]),

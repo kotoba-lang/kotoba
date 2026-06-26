@@ -233,6 +233,7 @@ fn rad_attest_push(state: &KotobaState, repo: &str, headers: &HeaderMap, git: &G
                 head: head_cid.clone(),
                 by: by.clone(),
                 sig: hsig.to_string(),
+                manifest: None, // not needed to verify the head signature
             };
             match cand.verify(&rad.delegates) {
                 Ok(()) => (hsig.to_string(), true),
@@ -270,6 +271,8 @@ fn rad_attest_push(state: &KotobaState, repo: &str, headers: &HeaderMap, git: &G
                 head: head_cid.clone(),
                 by: by.clone(),
                 sig: sig.clone(),
+                // G2: carry the snapshot manifest CID so peers can fetch objects.
+                manifest: git.snapshot_manifest().ok().map(|c| c.to_multibase()),
             };
             let _ = tx.try_send((crate::rad_gossip::sigref_topic(&rad.rid), announce.encode()));
         }
