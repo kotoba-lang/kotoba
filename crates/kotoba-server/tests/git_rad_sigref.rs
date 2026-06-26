@@ -227,6 +227,59 @@ async fn rad_delegate_push_writes_sigref() {
         "sigref :rad/by must be the delegate (CACAO issuer)"
     );
 
+    // ── G1 (A path): a push that also carries the canonical Ed25519-over-head
+    // signature (`x-kotoba-rad-head-sig`) records THAT as :rad/sig — making the
+    // sigref gossip-verifiable — instead of the (head-unbound) CACAO. ──────────
+    std::fs::write(src.join("f.txt"), b"head-signed\n").unwrap();
+    git(&src, None, &["add", "."]).unwrap();
+    git(&src, None, &["commit", "-q", "-m", "c2"]).unwrap();
+    let head_hex = git(&src, None, &["rev-parse", "HEAD"]).unwrap();
+
+    // Client-side: compute the head's KotobaCid (same framing the server uses) and
+    // sign its CID bytes with the delegate key — the canonical A-path signature.
+    let oid = kotoba_git::GitOid::from_hex(&head_hex).unwrap();
+    let obj = kotoba_git::repo::read_loose_object(&src.join(".git"), oid).unwrap();
+    let head_cid = kotoba_core::cid::KotobaCid::from_bytes(&obj.framed()).to_multibase();
+    let (_, msg) = multibase::decode(&head_cid).unwrap();
+    let hsig_hex = hex::encode(signing_key(DELEGATE_SEED).sign(&msg).to_bytes());
+
+    let cacao2 = delegate_push_cacao(&operator_did, "headsig-1");
+    let out = Command::new("git")
+        .arg("-c")
+        .arg(format!("http.extraHeader=x-kotoba-cacao: {cacao2}"))
+        .arg("-c")
+        .arg(format!("http.extraHeader=x-kotoba-rad-head-sig: {hsig_hex}"))
+        .args(["push", "-q", &url, "main:refs/heads/main"])
+        .current_dir(&src)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "head-sig push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let after2 = std::fs::read_to_string(&journal).unwrap();
+    assert!(
+        after2.contains(&format!(":rad/sig \"{hsig_hex}\"")),
+        "expected the over-head hex as :rad/sig (not the CACAO), journal:\n{after2}"
+    );
+    // The recorded sigref is gossip-verifiable against the delegate.
+    let announce = kotoba_server::rad_gossip::SigrefAnnounce {
+        rid: RID.into(),
+        head: head_cid,
+        by: did_std(DELEGATE_SEED),
+        sig: hsig_hex,
+    };
+    assert_eq!(
+        announce.verify(&[did_hex(DELEGATE_SEED)]),
+        Ok(()),
+        "the head-signed sigref must be gossip-verifiable"
+    );
+
     let _ = std::fs::remove_dir_all(&work);
     std::env::remove_var("KOTOBA_AGENT_ED25519_HEX");
     std::env::remove_var("KOTOBA_AGENT_X25519_HEX");

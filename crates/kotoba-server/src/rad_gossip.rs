@@ -34,6 +34,10 @@ pub enum AnnounceError {
     BadSig(String),
     /// The signature did not verify over the head bytes.
     SigVerifyFailed,
+    /// An incoming gossip payload did not decode to a [`SigrefAnnounce`].
+    BadPayload(String),
+    /// No registered rad identity (delegates) for the announced RID.
+    UnknownRid(String),
 }
 
 /// gossipsub topic for a repo's signed heads: `rad/sigref/<RID>`. `KotobaSwarm`
@@ -103,6 +107,25 @@ impl SigrefAnnounce {
         vk.verify(&msg, &sig)
             .map_err(|_| AnnounceError::SigVerifyFailed)
     }
+}
+
+/// Subscribe-side decision (ADR-2606251200 G1): decode an incoming gossip
+/// payload, look up the announced RID's delegates in the registry, and verify.
+/// On `Ok`, the caller may advance that repo's head to `announce.head`. Pure —
+/// the swarm I/O (subscribe to `sigref_topic(rid)`, receive bytes) and the head
+/// store are the caller's (a thin `net_actor` wire); the publish side is simply
+/// `swarm.publish(&sigref_topic(&a.rid), a.encode())` on a fresh attestation.
+pub fn handle_incoming_sigref(
+    bytes: &[u8],
+    registry: &crate::rad_registry::RadRegistry,
+) -> Result<SigrefAnnounce, AnnounceError> {
+    let announce = SigrefAnnounce::decode(bytes).map_err(AnnounceError::BadPayload)?;
+    let delegates = registry
+        .resolve(&announce.rid)
+        .map(|r| r.delegates.clone())
+        .ok_or_else(|| AnnounceError::UnknownRid(announce.rid.clone()))?;
+    announce.verify(&delegates)?;
+    Ok(announce)
 }
 
 #[cfg(test)]
@@ -218,5 +241,58 @@ mod tests {
         let sk = SigningKey::from_bytes(&[5u8; 32]);
         let delegates = vec![ed25519_pubkey_to_did_key_hex(sk.verifying_key().as_bytes())];
         assert!(matches!(a.verify(&delegates), Err(AnnounceError::BadSig(_))));
+    }
+
+    // ── subscribe-side: handle_incoming_sigref (registry-driven verify) ───────
+
+    fn registry_with_delegate(seed: [u8; 32]) -> crate::rad_registry::RadRegistry {
+        let mut reg = crate::rad_registry::RadRegistry::default();
+        // delegate registered in the W3C z6Mk… form; signed_announce.by is z<hex>.
+        let dele = ed25519_pubkey_to_did_key(SigningKey::from_bytes(&seed).verifying_key().as_bytes());
+        reg.ingest_journal(&format!(
+            "[{RID:?} :rad/type :identity 1 :add]\n[{RID:?} :rad/delegate {dele:?} 1 :add]\n"
+        ))
+        .unwrap();
+        reg
+    }
+
+    #[test]
+    fn handle_incoming_accepts_verified_announce_for_known_rid() {
+        let head = KotobaCid::from_bytes(b"gossiped-head").to_multibase();
+        let a = signed_announce([5u8; 32], &head);
+        let reg = registry_with_delegate([5u8; 32]);
+        let got = handle_incoming_sigref(&a.encode(), &reg).expect("known rid + valid sig");
+        assert_eq!(got.head, head);
+    }
+
+    #[test]
+    fn handle_incoming_rejects_unknown_rid() {
+        let head = KotobaCid::from_bytes(b"h").to_multibase();
+        let a = signed_announce([5u8; 32], &head);
+        let reg = crate::rad_registry::RadRegistry::default(); // empty
+        assert!(matches!(
+            handle_incoming_sigref(&a.encode(), &reg),
+            Err(AnnounceError::UnknownRid(_))
+        ));
+    }
+
+    #[test]
+    fn handle_incoming_rejects_non_delegate_signer() {
+        let head = KotobaCid::from_bytes(b"h").to_multibase();
+        let a = signed_announce([7u8; 32], &head); // signed by key 7
+        let reg = registry_with_delegate([5u8; 32]); // delegate is key 5
+        assert_eq!(
+            handle_incoming_sigref(&a.encode(), &reg),
+            Err(AnnounceError::NotADelegate)
+        );
+    }
+
+    #[test]
+    fn handle_incoming_rejects_bad_payload() {
+        let reg = crate::rad_registry::RadRegistry::default();
+        assert!(matches!(
+            handle_incoming_sigref(&[0xff, 0x00, 0x13, 0x37], &reg),
+            Err(AnnounceError::BadPayload(_))
+        ));
     }
 }

@@ -183,10 +183,24 @@ fn cacao_issuer(cacao_b64: &str) -> Option<String> {
     kotoba_auth::Cacao::from_cbor(&cbor).ok().map(|c| c.p.iss)
 }
 
+/// The member's Ed25519-over-head signature (hex), if the client sent it. This
+/// is the **canonical, gossip-verifiable** sigref signature (ADR-2606251200 A
+/// path): the member signs the head CID bytes client-side (no-server-key) and
+/// rides the hex in this header alongside the push CACAO.
+fn rad_head_sig_header(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-kotoba-rad-head-sig")
+        .and_then(|v| v.to_str().ok())
+}
+
 /// A-3: record the just-pushed head as a signed rad sigref (ADR-2606251200).
 /// Best-effort — a write-back failure must NEVER fail the push, so this only
-/// logs. Attests only a rad-bound repo (delegates present) pushed with a CACAO:
-/// the CACAO is the member signature (no-server-key — the server only verifies).
+/// logs. Attests only a rad-bound repo (delegates present) pushed with a CACAO.
+///
+/// Prefers the client's **Ed25519-over-head** signature (`x-kotoba-rad-head-sig`,
+/// the A path) when present and valid — it binds `by → head` so the sigref is
+/// gossip-verifiable (G1). Otherwise falls back to recording the push CACAO,
+/// which proves a delegate pushed but is not gossip-verifiable on its own.
 fn rad_attest_push(repo: &str, headers: &HeaderMap, git: &GitStore<'_>) {
     let Some(cacao_b64) = cacao_header(headers) else {
         return;
@@ -209,9 +223,33 @@ fn rad_attest_push(repo: &str, headers: &HeaderMap, git: &GitStore<'_>) {
         Err(_) => return,
     };
     let by = cacao_issuer(cacao_b64).unwrap_or_default();
-    match reg.attest_sigref(repo, &head_cid, &by, cacao_b64) {
+
+    // Prefer the canonical over-head signature; verify it before recording.
+    let (sig, gossipable) = match rad_head_sig_header(headers) {
+        Some(hsig) => {
+            let cand = crate::rad_gossip::SigrefAnnounce {
+                rid: rad.rid.clone(),
+                head: head_cid.clone(),
+                by: by.clone(),
+                sig: hsig.to_string(),
+            };
+            match cand.verify(&rad.delegates) {
+                Ok(()) => (hsig.to_string(), true),
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %repo, ?e,
+                        "kotoba-rad: x-kotoba-rad-head-sig failed verify — recording CACAO instead"
+                    );
+                    (cacao_b64.to_string(), false)
+                }
+            }
+        }
+        None => (cacao_b64.to_string(), false),
+    };
+
+    match reg.attest_sigref(repo, &head_cid, &by, &sig) {
         Ok(tx) => tracing::info!(
-            repo = %repo, rid = %rad.rid, head = %head_cid, tx,
+            repo = %repo, rid = %rad.rid, head = %head_cid, tx, gossipable,
             "kotoba-rad: sigref attested"
         ),
         Err(e) => tracing::warn!(
