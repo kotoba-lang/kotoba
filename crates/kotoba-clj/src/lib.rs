@@ -128,6 +128,7 @@ pub mod policy;
 pub mod run;
 pub mod subset;
 pub mod ty;
+pub mod ty_infer;
 
 pub use compat::ReaderTarget;
 #[cfg(feature = "component")]
@@ -266,6 +267,11 @@ fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8
     };
 
     let program = ast::parse_program(&full)?;
+
+    // Type inference (S1b typed-HIR core): propagate primitive types through
+    // `let`/params and reject operation-boundary mismatches on variables, not
+    // just literals. Complements the literal-level `ty::check_forms` above.
+    ty_infer::check(&program)?;
 
     // The capability gate: every host import the program would emit must be
     // granted. Collect *all* denials so the error names them at once.

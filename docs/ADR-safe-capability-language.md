@@ -34,9 +34,10 @@ Crate: `crates/kotoba-clj`（front-end 拡張）+ `kotoba-runtime` / `kotoba-lat
 | Effect 推論 `infer_effects` / least-privilege `minimal_policy` / over-grant linter `unused_grants` | ✅ | — | `lib.rs` / `policy.rs` |
 | 監査 `embedded_capability_ifaces` / `Policy::to_edn` | ✅ | — | `lib.rs` / `policy.rs` |
 | CLI `safe-build` / `safe-policy` | ✅ | — | `cli.rs` |
-| literal 型チェック（numeric op に string/keyword literal を拒否） | ✅ | T-lite | `ty.rs` |
+| literal 型チェック（numeric/string/比較 op に非数値 literal を拒否） | ✅ | T-lite | `ty.rs` |
+| **型推論（typed-HIR core）**: AST 上で `Num`/`Str`/`Bytes`/`Unknown` を `let`/param 経由で伝播し、変数レベルの op 境界不一致を検出（`Unknown` permissive＝false positive なし、prelude/実 cell で検証） | ✅ | — | `ty_infer.rs` |
 | `:memory-pages` を emit module の memory max に適用（engine が物理的に enforce、static data 超過 / wasm32 max 65536 超過は compile error） | ✅ | — | `codegen.rs` / `lib.rs` / `policy.rs` |
-| 型付き HIR・`Option`/`Result`・no-nil（S1b 残） | ⬜ | — | — |
+| 型付き HIR 本体: 関数 signature 推論（cross-function）・`Option`/`Result`・no-nil（S1b 残） | ⬜ | — | — |
 | borrow checker（S2） | ⬜ | **T1** | — |
 | capability の値渡し（S4b）・signed/reproducible（S5） | ⬜ | — | — |
 
