@@ -3,6 +3,10 @@
 Status: **Accepted (steps 1–3 + 5 done; runs on kotoba-runtime. Only step 4 left)**
 Date: 2026-06-08 (steps 1–2), 2026-06-09 (steps 3 + 5, incl. live invoke)
 Crate: `crates/kotoba-clj`
+Related: [`ADR-safe-capability-language.md`](ADR-safe-capability-language.md) —
+**safe-clj** builds on this compiler, adding a deny-by-default
+capability/subset/effect-confined profile (`compile_safe_clj`) for untrusted /
+AI-generated modules. This ADR is the language; that one is how it is confined.
 
 ## Context
 

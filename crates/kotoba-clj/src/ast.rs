@@ -236,7 +236,34 @@ pub enum HostImport {
     KqeQuery,
 }
 
+/// Whether a list head names an **inert form** — one whose body is data or is
+/// dropped at compile time, and is therefore *never executed*:
+/// `quote`/`var` (quoted data) and `comment` (discarded). The safe-clj analysis
+/// walkers (subset / type / effect / capability / policy-synthesis) must not
+/// descend into these, or they raise false positives — rejecting valid code,
+/// mis-attributing effects, or demanding capabilities the cell never uses. This
+/// is sound because `eval` is banned by the subset gate, so quoted data can
+/// never be promoted back to executable code. Single-sourced here so every
+/// walker stays in sync (`tests/safe_quote.rs` guards it).
+pub fn is_inert_form(head_name: &str) -> bool {
+    matches!(head_name, "quote" | "var" | "comment")
+}
+
 impl HostImport {
+    /// Every variant, for exhaustive iteration — capability auditing
+    /// ([`crate::embedded_capability_ifaces`]) derives the host-interface set
+    /// from this rather than hardcoding it, so the audit cannot drift as the
+    /// host world grows. Kept in sync with the enum by the
+    /// `host_import_all_is_complete` test.
+    pub const ALL: [HostImport; 6] = [
+        HostImport::HasCapability,
+        HostImport::LlmInfer,
+        HostImport::KqeAssertQuad,
+        HostImport::KqeRetractQuad,
+        HostImport::KqeGetObjects,
+        HostImport::KqeQuery,
+    ];
+
     /// The wasm import `(module, field)` the Component encoder matches against
     /// the WIT world's interface import.
     pub fn module_field(self) -> (&'static str, &'static str) {
@@ -247,6 +274,46 @@ impl HostImport {
             HostImport::KqeRetractQuad => ("kotoba:kais/kqe@0.1.0", "retract-quad"),
             HostImport::KqeGetObjects => ("kotoba:kais/kqe@0.1.0", "get-objects"),
             HostImport::KqeQuery => ("kotoba:kais/kqe@0.1.0", "query"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_import_meta_tests {
+    use super::HostImport;
+
+    /// A total match over `HostImport`. Adding a variant breaks compilation
+    /// here, forcing whoever adds it to also extend [`HostImport::ALL`] (and,
+    /// prompted by the failing assert below, the capability/effect mappings).
+    fn tag(h: HostImport) -> u8 {
+        match h {
+            HostImport::HasCapability => 0,
+            HostImport::LlmInfer => 1,
+            HostImport::KqeAssertQuad => 2,
+            HostImport::KqeRetractQuad => 3,
+            HostImport::KqeGetObjects => 4,
+            HostImport::KqeQuery => 5,
+        }
+    }
+
+    #[test]
+    fn host_import_all_is_complete() {
+        let mut tags: Vec<u8> = HostImport::ALL.iter().copied().map(tag).collect();
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(
+            tags,
+            (0..tag(HostImport::KqeQuery) + 1).collect::<Vec<u8>>(),
+            "HostImport::ALL is missing a variant — capability auditing would not see it"
+        );
+    }
+
+    #[test]
+    fn every_host_import_has_a_well_formed_interface() {
+        for imp in HostImport::ALL {
+            let (module, field) = imp.module_field();
+            assert!(module.starts_with("kotoba:kais/"), "bad module {module}");
+            assert!(!field.is_empty());
         }
     }
 }

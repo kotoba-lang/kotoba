@@ -59,7 +59,20 @@ const CLOSURE_TABLE: u32 = 0;
 /// Compile a parsed [`Program`] into WebAssembly bytes (core module; every
 /// `defn` exported by name).
 pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
-    compile_core(program, &[])
+    compile_core_impl(program, &[], None)
+}
+
+/// Like [`compile`], but caps the emitted linear memory's **maximum** at
+/// `max_pages` (64 KiB pages). The wasm engine then enforces the bound itself —
+/// `memory.grow` past it fails — so a safe-clj module physically cannot exceed
+/// its policy's `:memory-pages` budget, independent of any runtime
+/// `StoreLimits`. Errors if the module's static data already needs more than
+/// `max_pages`.
+pub fn compile_with_memory_max(
+    program: &Program,
+    max_pages: Option<u32>,
+) -> Result<Vec<u8>, CljError> {
+    compile_core_impl(program, &[], max_pages)
 }
 
 /// The Canonical-ABI shape of the generated `run` entry wrapper's return value.
@@ -126,6 +139,16 @@ pub struct Entry<'a> {
 /// `run`, `memory`, `cabi_realloc` are), so the wrapper owns the `run` export
 /// name unambiguously.
 pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, CljError> {
+    compile_core_impl(program, entries, None)
+}
+
+/// Implementation of [`compile_core`] with an optional linear-memory page cap
+/// (see [`compile_with_memory_max`]).
+fn compile_core_impl(
+    program: &Program,
+    entries: &[Entry],
+    max_pages: Option<u32>,
+) -> Result<Vec<u8>, CljError> {
     // ---- Pass 0: collect string literals into one data blob ----------------
     let literals = collect_literals(program);
 
@@ -271,10 +294,26 @@ pub fn compile_core(program: &Program, entries: &[Entry]) -> Result<Vec<u8>, Clj
     let heap_start = align_up(DATA_BASE + literals.blob.len() as u32, HEAP_ALIGN);
     let min_pages = heap_start.div_ceil(WASM_PAGE).max(1) as u64;
 
+    // Apply the policy memory cap, if any. The cell's static data already needs
+    // `min_pages`, so a tighter cap is a hard error (the module cannot fit).
+    let maximum = match max_pages {
+        Some(mp) => {
+            let mp = mp as u64;
+            if mp < min_pages {
+                return Err(CljError::Codegen(format!(
+                    "module needs at least {min_pages} memory page(s) for its static \
+                     data, but the policy `:memory-pages` allows only {mp}"
+                )));
+            }
+            Some(mp)
+        }
+        None => None,
+    };
+
     let mut memories = MemorySection::new();
     memories.memory(MemoryType {
         minimum: min_pages,
-        maximum: None,
+        maximum,
         memory64: false,
         shared: false,
         page_size_log2: None,
@@ -453,6 +492,15 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
         //     same variant layout as `llm.infer`).
         HostImport::KqeQuery => (vec![ValType::I32; 3], vec![]),
     }
+}
+
+/// The distinct host imports a program uses — i.e. its capability surface.
+///
+/// This is the exact set [`crate::codegen::compile`] would emit into the wasm
+/// import section, so [`crate::compile_safe_clj`] gates *this* set against the
+/// policy: anything denied never reaches the module bytes.
+pub fn used_host_imports(program: &Program) -> Vec<HostImport> {
+    collect_host_imports(program)
 }
 
 /// Collect the distinct host imports the program uses, in first-seen order

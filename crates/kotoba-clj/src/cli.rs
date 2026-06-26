@@ -34,6 +34,8 @@ const DEFAULT_GAS: u64 = 10_000_000;
 /// in the binary's `--help` output.
 pub const SUBCOMMAND_USAGE: &str = "\
      kotoba-clj build <cell.clj> [-o <out.wasm>] [--wit <dir>]\n  \
+     kotoba-clj safe-build <cell.clj> --policy <policy.edn> [-o <out.wasm>]\n  \
+     kotoba-clj safe-policy <cell.clj> [-o <policy.edn>]\n  \
      kotoba-clj run <component.wasm> [--ctx <json> | --ctx-file <path>] \
      [--snapshot <json> | --snapshot-file <path>] [--gas <n>] [--agent <did>] [--echo-llm]";
 
@@ -46,8 +48,12 @@ pub const SUBCOMMAND_USAGE: &str = "\
 pub fn run(subcommand: &str, argv: &[String]) -> Result<()> {
     match subcommand {
         "build" => cmd_build(argv),
+        "safe-build" => cmd_safe_build(argv),
+        "safe-policy" => cmd_safe_policy(argv),
         "run" => cmd_run(argv),
-        other => bail!("unknown subcommand '{other}' (expected: build | run)"),
+        other => {
+            bail!("unknown subcommand '{other}' (expected: build | safe-build | safe-policy | run)")
+        }
     }
 }
 
@@ -82,6 +88,7 @@ fn positional(args: &[String]) -> Option<&str> {
                     | "--snapshot-file"
                     | "--gas"
                     | "--agent"
+                    | "--policy"
             ) {
                 skip_next = true;
             }
@@ -106,6 +113,94 @@ fn cmd_build(args: &[String]) -> Result<()> {
         compile_kais_component_str(&src, wit).map_err(|e| anyhow!("compile {cell}: {e:?}"))?;
     std::fs::write(&out, &wasm).with_context(|| format!("write {out}"))?;
     eprintln!("[build] {cell} -> {out} ({} bytes)", wasm.len());
+    Ok(())
+}
+
+/// `kotoba-clj safe-build <cell.clj> --policy <p.edn> [-o out.wasm]`
+///
+/// Compile a cell against a deny-by-default capability [`Policy`] (loaded from
+/// `--policy`). Emits the **core** wasm module produced by
+/// [`crate::compile_safe_clj_with_prelude`]: a module whose import section is a
+/// subset of the policy's grants. The build *fails* if the cell uses a
+/// capability the policy does not grant or a form outside the safe subset.
+///
+/// Prints the module's audited capability surface — the `kotoba:kais`
+/// interfaces actually embedded — as confinement evidence.
+fn cmd_safe_build(args: &[String]) -> Result<()> {
+    let cell = positional(args).ok_or_else(|| anyhow!("safe-build: missing <cell.clj>"))?;
+    let policy_path = flag(args, "--policy")
+        .ok_or_else(|| anyhow!("safe-build: missing --policy <policy.edn>"))?;
+    let out = flag(args, "-o")
+        .map(str::to_string)
+        .unwrap_or_else(|| cell.trim_end_matches(".clj").to_string() + ".wasm");
+
+    let policy_src =
+        std::fs::read_to_string(policy_path).with_context(|| format!("read {policy_path}"))?;
+    let policy = crate::Policy::parse_edn(&policy_src)
+        .map_err(|e| anyhow!("parse policy {policy_path}: {e}"))?;
+
+    let body = std::fs::read_to_string(cell).with_context(|| format!("read {cell}"))?;
+    let wasm = crate::compile_safe_clj_with_prelude(&body, &policy)
+        .map_err(|e| anyhow!("safe-build {cell} rejected: {e}"))?;
+
+    std::fs::write(&out, &wasm).with_context(|| format!("write {out}"))?;
+
+    let ifaces = crate::embedded_capability_ifaces(&wasm);
+    let surface = if ifaces.is_empty() {
+        "none (pure)".to_string()
+    } else {
+        ifaces.join(", ")
+    };
+    eprintln!("[safe-build] {cell} -> {out} ({} bytes)", wasm.len());
+    eprintln!("[safe-build] capability surface: {surface}");
+
+    // Least-privilege lint: warn if the policy grants more than the cell uses.
+    if let Ok(unused) = crate::unused_grants(&body, &policy) {
+        for finding in &unused {
+            eprintln!("[safe-build] warning: over-grant — {finding}");
+        }
+    }
+
+    // Source-level effect inference: report what each function actually does.
+    if let Ok(effects) = crate::infer_effects(&body) {
+        let mut rows: Vec<String> = effects
+            .iter()
+            .filter(|(_, e)| !e.is_empty())
+            .map(|(f, e)| {
+                let set = e.iter().cloned().collect::<Vec<_>>().join(",");
+                format!("{f}={{{set}}}")
+            })
+            .collect();
+        rows.sort();
+        let report = if rows.is_empty() {
+            "all pure".to_string()
+        } else {
+            rows.join(" ")
+        };
+        eprintln!("[safe-build] inferred effects: {report}");
+    }
+    Ok(())
+}
+
+/// `kotoba-clj safe-policy <cell.clj> [-o policy.edn]`
+///
+/// Synthesize and print the **minimal least-privilege policy** a cell needs
+/// (the inverse of `safe-build`): grants exactly the resources the code targets
+/// and nothing more. Pipe it into a `policy.edn`, review, tighten, then feed it
+/// back to `safe-build`.
+fn cmd_safe_policy(args: &[String]) -> Result<()> {
+    let cell = positional(args).ok_or_else(|| anyhow!("safe-policy: missing <cell.clj>"))?;
+    let body = std::fs::read_to_string(cell).with_context(|| format!("read {cell}"))?;
+    let policy =
+        crate::minimal_policy(&body).map_err(|e| anyhow!("analyze {cell}: {e}"))?;
+    let edn = policy.to_edn();
+    match flag(args, "-o") {
+        Some(out) => {
+            std::fs::write(out, &edn).with_context(|| format!("write {out}"))?;
+            eprintln!("[safe-policy] {cell} -> {out} (minimal least-privilege policy)");
+        }
+        None => println!("{edn}"),
+    }
     Ok(())
 }
 
