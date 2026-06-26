@@ -16,6 +16,77 @@
 use std::collections::HashMap;
 
 use kotoba_core::cid::KotobaCid;
+use kotoba_git::GitStore;
+use kotoba_store::{put_verified, BlockStore};
+
+/// Outcome of [`sync_repo`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Object/manifest blocks fetched from a peer this run.
+    pub fetched: usize,
+    /// Objects re-projected into the local git index by `rehydrate`.
+    pub restored: usize,
+    /// Objects still missing after the fetch (should be 0 on a healthy peer).
+    pub missing: usize,
+}
+
+/// Replicate a repo from a G1-verified head (ADR-2606251200 G2): fetch the
+/// snapshot manifest + every missing object by CID through `fetch`, then
+/// [`GitStore::rehydrate`] the projection. `fetch(cid) -> Some(bytes)` is the
+/// transport — bitswap `want_block` in production, an in-memory peer in tests.
+/// The manifest is honored only if it [`Manifest::binds_head`] the `verified_head`
+/// (a forged manifest CID cannot redirect the replica). `store` MUST be the same
+/// block store the `git` projection reads from.
+pub async fn sync_repo<Fut, Fetch>(
+    manifest_cid: &KotobaCid,
+    verified_head: &KotobaCid,
+    git: &GitStore<'_>,
+    store: &dyn BlockStore,
+    fetch: Fetch,
+) -> Result<SyncReport, String>
+where
+    Fetch: Fn(KotobaCid) -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    // 1. manifest block (fetch if not already local).
+    let manifest_bytes: Vec<u8> = match store.get(manifest_cid).map_err(|e| e.to_string())? {
+        Some(b) => b.to_vec(),
+        None => {
+            let b = fetch(manifest_cid.clone())
+                .await
+                .ok_or_else(|| "manifest fetch failed".to_string())?;
+            put_verified(store, manifest_cid, &b).map_err(|e| e.to_string())?;
+            b
+        }
+    };
+
+    // 2. parse + trust gate: the manifest must bind the verified head.
+    let m = Manifest::parse(&manifest_bytes)?;
+    if !m.binds_head(verified_head) {
+        return Err("manifest head does not match the G1-verified head".into());
+    }
+
+    // 3. fetch every object CID we don't already hold.
+    let plan = m.fetch_plan(|c| matches!(store.get(c), Ok(Some(_))));
+    let mut fetched = 0usize;
+    for cid in &plan {
+        if let Some(b) = fetch(cid.clone()).await {
+            put_verified(store, cid, &b).map_err(|e| e.to_string())?;
+            fetched += 1;
+        }
+    }
+
+    // 4. rebuild the oid↔cid index + refs from the now-local blocks.
+    let (restored, missing) = git
+        .rehydrate(manifest_cid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(SyncReport {
+        fetched,
+        restored,
+        missing,
+    })
+}
 
 /// A parsed kotoba-git snapshot manifest (`kotoba-git-snapshot v1`).
 #[derive(Debug, Default, Clone)]
@@ -154,5 +225,97 @@ mod tests {
     fn rejects_bad_header_and_cid() {
         assert!(Manifest::parse(b"not a manifest\nO a b\n").is_err());
         assert!(Manifest::parse(b"kotoba-git-snapshot v1\nO aaaa not-a-cid\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn sync_repo_replicates_a_repo_through_fetch() {
+        use kotoba_datomic::Connection;
+        use kotoba_git::object::{GitObject, TreeEntry};
+        use kotoba_store::MemoryBlockStore;
+
+        // SOURCE peer: a blob + a tree referencing it, ref main → tree.
+        let sconn = Connection::new();
+        let sstore = MemoryBlockStore::new();
+        let s = GitStore::new(&sconn, &sstore);
+        s.install_schema().await.unwrap();
+        let (blob_oid, _) = s
+            .put_object(&GitObject::blob(b"hello\n".to_vec()))
+            .await
+            .unwrap();
+        let tree = GitObject::tree(&[TreeEntry {
+            mode: "100644".into(),
+            name: "f".into(),
+            oid: blob_oid,
+        }]);
+        let (tree_oid, tree_cid) = s.put_object(&tree).await.unwrap();
+        s.put_ref("refs/heads/main", tree_oid).await.unwrap();
+        let manifest_cid = s.snapshot_manifest().unwrap();
+
+        // DEST: empty replica with its own store.
+        let dconn = Connection::new();
+        let dstore = MemoryBlockStore::new();
+        let d = GitStore::new(&dconn, &dstore);
+        d.install_schema().await.unwrap();
+
+        // `fetch` reads from the source store (stands in for bitswap want_block).
+        let fetch = |cid: KotobaCid| {
+            let got = sstore.get(&cid).ok().flatten().map(|b| b.to_vec());
+            async move { got }
+        };
+        let report = sync_repo(&manifest_cid, &tree_cid, &d, &dstore, fetch)
+            .await
+            .unwrap();
+        assert!(report.fetched >= 2, "blob + tree fetched, got {report:?}");
+        assert_eq!(report.missing, 0);
+
+        // The replica now resolves the head ref and materializes the blob.
+        assert_eq!(
+            kotoba_git::resolve_ref(&d.db(), "refs/heads/main"),
+            Some(tree_oid)
+        );
+        assert_eq!(
+            d.materialize_object(&d.db(), blob_oid).unwrap(),
+            GitObject::blob(b"hello\n".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_repo_refuses_manifest_not_binding_head() {
+        use kotoba_datomic::Connection;
+        use kotoba_git::object::{GitObject, TreeEntry};
+        use kotoba_store::MemoryBlockStore;
+
+        let sconn = Connection::new();
+        let sstore = MemoryBlockStore::new();
+        let s = GitStore::new(&sconn, &sstore);
+        s.install_schema().await.unwrap();
+        let (blob_oid, _) = s
+            .put_object(&GitObject::blob(b"x".to_vec()))
+            .await
+            .unwrap();
+        let (tree_oid, _) = s
+            .put_object(&GitObject::tree(&[TreeEntry {
+                mode: "100644".into(),
+                name: "f".into(),
+                oid: blob_oid,
+            }]))
+            .await
+            .unwrap();
+        s.put_ref("refs/heads/main", tree_oid).await.unwrap();
+        let manifest_cid = s.snapshot_manifest().unwrap();
+
+        let dstore = MemoryBlockStore::new();
+        let dconn = Connection::new();
+        let d = GitStore::new(&dconn, &dstore);
+        d.install_schema().await.unwrap();
+        let fetch = |cid: KotobaCid| {
+            let got = sstore.get(&cid).ok().flatten().map(|b| b.to_vec());
+            async move { got }
+        };
+        // verified head ≠ the manifest's head → refuse.
+        let wrong = KotobaCid::from_bytes(b"not-the-real-head");
+        assert!(sync_repo(&manifest_cid, &wrong, &d, &dstore, fetch)
+            .await
+            .is_err());
     }
 }
