@@ -18,7 +18,23 @@
 //! sigref to carry the over-head signature; `by_is_delegate` here is the
 //! delegate-membership gate that BOTH forms must pass first.
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+
+/// Why a [`SigrefAnnounce`] failed verification (ADR-2606251200 G1, A path).
+#[derive(Debug, PartialEq, Eq)]
+pub enum AnnounceError {
+    /// `by` is not one of the repo's rad delegates.
+    NotADelegate,
+    /// `by` is not a parseable Ed25519 `did:key`.
+    BadDid(String),
+    /// `head` is not a decodable multibase CID.
+    BadHeadCid(String),
+    /// `sig` is not valid hex or not a 64-byte Ed25519 signature.
+    BadSig(String),
+    /// The signature did not verify over the head bytes.
+    SigVerifyFailed,
+}
 
 /// gossipsub topic for a repo's signed heads: `rad/sigref/<RID>`. `KotobaSwarm`
 /// prefixes `kotoba/`, yielding `kotoba/rad/sigref/<RID>`. The RID is the genesis
@@ -62,6 +78,30 @@ impl SigrefAnnounce {
         delegates
             .iter()
             .any(|d| kotoba_auth::did_key::did_keys_equal(d, &self.by))
+    }
+
+    /// Verify the announcement (ADR-2606251200 G1, the **A** sig-binding):
+    /// `by` is one of the repo's `delegates` AND `sig` is `by`'s Ed25519
+    /// signature over the head's CID bytes — the `kotoba_rad.cljc` / kotoba.cljs
+    /// convention, where the signed message is `multibase::decode(head)` (the
+    /// `b`-prefixed base32lower CID, decoded — exactly cljc's `cid->bytes`). This
+    /// binds `by → head` cryptographically, so any peer can verify offline before
+    /// advancing the repo's head to `self.head` — no node trust, no-server-key.
+    pub fn verify(&self, delegates: &[String]) -> Result<(), AnnounceError> {
+        if !self.by_is_delegate(delegates) {
+            return Err(AnnounceError::NotADelegate);
+        }
+        let pk_bytes = kotoba_auth::did_key::parse_ed25519_did_key(&self.by)
+            .map_err(|e| AnnounceError::BadDid(e.to_string()))?;
+        let vk = VerifyingKey::from_bytes(&pk_bytes)
+            .map_err(|e| AnnounceError::BadDid(e.to_string()))?;
+        let (_, msg) =
+            multibase::decode(&self.head).map_err(|e| AnnounceError::BadHeadCid(e.to_string()))?;
+        let sig_bytes = hex::decode(&self.sig).map_err(|e| AnnounceError::BadSig(e.to_string()))?;
+        let sig =
+            Signature::from_slice(&sig_bytes).map_err(|e| AnnounceError::BadSig(e.to_string()))?;
+        vk.verify(&msg, &sig)
+            .map_err(|_| AnnounceError::SigVerifyFailed)
     }
 }
 
@@ -120,5 +160,63 @@ mod tests {
         let other = ed25519_pubkey_to_did_key(SigningKey::from_bytes(&[1u8; 32]).verifying_key().as_bytes());
         assert!(!announce.by_is_delegate(&[other]));
         assert!(!announce.by_is_delegate(&[]));
+    }
+
+    use ed25519_dalek::Signer;
+    use kotoba_core::cid::KotobaCid;
+
+    /// Build an announcement the way a member git client would: sign the head's
+    /// CID bytes (`multibase::decode`) with the member key — the cljc convention.
+    fn signed_announce(seed: [u8; 32], head: &str) -> SigrefAnnounce {
+        let sk = SigningKey::from_bytes(&seed);
+        let (_, msg) = multibase::decode(head).unwrap();
+        let sig = sk.sign(&msg);
+        SigrefAnnounce {
+            rid: RID.into(),
+            head: head.into(),
+            by: ed25519_pubkey_to_did_key_hex(sk.verifying_key().as_bytes()), // z<hex> form
+            sig: hex::encode(sig.to_bytes()),
+        }
+    }
+
+    #[test]
+    fn verify_accepts_over_head_sig_from_delegate_cross_encoding() {
+        let head = KotobaCid::from_bytes(b"git-head-commit-object").to_multibase();
+        let a = signed_announce([5u8; 32], &head);
+        // delegate registered in the W3C z6Mk… form; announce.by is z<hex> — same key.
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let delegates = vec![ed25519_pubkey_to_did_key(sk.verifying_key().as_bytes())];
+        assert_eq!(a.verify(&delegates), Ok(()));
+    }
+
+    #[test]
+    fn verify_rejects_non_delegate() {
+        let head = KotobaCid::from_bytes(b"h").to_multibase();
+        let a = signed_announce([5u8; 32], &head); // signed by key 5
+        let other = ed25519_pubkey_to_did_key(SigningKey::from_bytes(&[7u8; 32]).verifying_key().as_bytes());
+        assert_eq!(a.verify(&[other]), Err(AnnounceError::NotADelegate));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_head() {
+        // Sign head A, then announce head B with the same sig → sig is over the
+        // wrong message → SigVerifyFailed (a relay cannot swap the head).
+        let head_a = KotobaCid::from_bytes(b"real-head").to_multibase();
+        let head_b = KotobaCid::from_bytes(b"forged-head").to_multibase();
+        let mut a = signed_announce([5u8; 32], &head_a);
+        a.head = head_b;
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let delegates = vec![ed25519_pubkey_to_did_key_hex(sk.verifying_key().as_bytes())];
+        assert_eq!(a.verify(&delegates), Err(AnnounceError::SigVerifyFailed));
+    }
+
+    #[test]
+    fn verify_rejects_bad_sig_hex() {
+        let head = KotobaCid::from_bytes(b"h").to_multibase();
+        let mut a = signed_announce([5u8; 32], &head);
+        a.sig = "not-hex".into();
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let delegates = vec![ed25519_pubkey_to_did_key_hex(sk.verifying_key().as_bytes())];
+        assert!(matches!(a.verify(&delegates), Err(AnnounceError::BadSig(_))));
     }
 }
