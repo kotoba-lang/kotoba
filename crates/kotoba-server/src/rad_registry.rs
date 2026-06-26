@@ -170,6 +170,12 @@ impl RadRegistry {
         self.by_rid.is_empty()
     }
 
+    /// Every registered RID — used by the net actor to `subscribe` each repo's
+    /// `rad/sigref/<RID>` gossip topic at startup (ADR-2606251200 G1).
+    pub fn rids(&self) -> Vec<String> {
+        self.by_rid.keys().cloned().collect()
+    }
+
     /// Append a signed-head attestation (Radicle `rad/sigrefs`) for `repo_seg`'s
     /// identity to its journal (ADR-2606251200 A-3). Re-reads the file from disk
     /// to compute the next `tx` (so concurrent/earlier appends are respected),

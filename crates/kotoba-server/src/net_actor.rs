@@ -321,6 +321,17 @@ pub async fn run(
     swarm.subscribe(kotoba_dht::ENGI_TRANSFER_TOPIC).ok();
     swarm.subscribe_pregel().ok();
 
+    // G1 (ADR-2606251200): subscribe each known rad repo's signed-head topic so
+    // this node receives + verifies peers' sigref announcements. `rad_reg` drives
+    // the per-RID delegate-set lookup on receipt (read-only; from the journal dir
+    // in KOTOBA_RAD_JOURNAL_DIR, empty when unset).
+    let rad_reg = crate::rad_registry::RadRegistry::from_env();
+    for rid in rad_reg.rids() {
+        swarm
+            .subscribe(&crate::rad_gossip::sigref_topic(&rid))
+            .ok();
+    }
+
     // Dedup guard for gossiped EN transfers (project each at most once per node).
     let mut engi_seen = kotoba_dht::SeenTransfers::default();
 
@@ -696,6 +707,25 @@ pub async fn run(
                                 // on both parties' Source Chains, so projection is
                                 // an unconditional net-zero mirror.
                                 handle_engi_transfer(&data, &mut engi_seen, &engi).await;
+                            } else if kse_name.starts_with("rad/sigref/") {
+                                // G1 (ADR-2606251200): a peer announced a signed
+                                // head. Verify it against the repo's delegates and
+                                // record it locally (best-effort). Object fetch is
+                                // G2 (bitswap), not done here.
+                                match crate::rad_gossip::handle_incoming_sigref(&data, &rad_reg) {
+                                    Ok(a) => {
+                                        let _ =
+                                            rad_reg.attest_sigref(&a.rid, &a.head, &a.by, &a.sig);
+                                        tracing::info!(
+                                            rid = %a.rid, head = %a.head, by = %a.by,
+                                            "kotoba-rad G1: accepted gossiped sigref"
+                                        );
+                                    }
+                                    Err(e) => tracing::debug!(
+                                        ?e,
+                                        "kotoba-rad G1: rejected gossiped sigref"
+                                    ),
+                                }
                             } else {
                                 let maybe_quad_op = if kse_name == "quad/assert" {
                                     serde_json::from_slice::<Quad>(&data).ok().map(|quad| (quad, true))

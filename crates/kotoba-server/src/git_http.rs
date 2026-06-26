@@ -134,8 +134,9 @@ pub async fn receive_pack(
             // Persist the updated projection (objects are already durable blocks;
             // this snapshots the oid↔cid index + refs and records the pointer).
             state.git_persist(&repo, &git).await;
-            // A-3: record the new head as a signed rad sigref (best-effort).
-            rad_attest_push(&repo, &headers, &git);
+            // A-3: record the new head as a signed rad sigref (best-effort) and
+            // G1-announce it over gossipsub when over-head-signed.
+            rad_attest_push(&state, &repo, &headers, &git);
             smart_response("application/x-git-receive-pack-result", out)
         }
         Err(e) => git_error(e),
@@ -201,7 +202,7 @@ fn rad_head_sig_header(headers: &HeaderMap) -> Option<&str> {
 /// the A path) when present and valid — it binds `by → head` so the sigref is
 /// gossip-verifiable (G1). Otherwise falls back to recording the push CACAO,
 /// which proves a delegate pushed but is not gossip-verifiable on its own.
-fn rad_attest_push(repo: &str, headers: &HeaderMap, git: &GitStore<'_>) {
+fn rad_attest_push(state: &KotobaState, repo: &str, headers: &HeaderMap, git: &GitStore<'_>) {
     let Some(cacao_b64) = cacao_header(headers) else {
         return;
     };
@@ -256,6 +257,22 @@ fn rad_attest_push(repo: &str, headers: &HeaderMap, git: &GitStore<'_>) {
             repo = %repo, error = %e,
             "kotoba-rad: sigref attestation failed (push still succeeded)"
         ),
+    }
+
+    // G1: broadcast the signed head over gossipsub so peers learn it without a
+    // central node (ADR-2606251200 b). Only the over-head form is announced —
+    // a CACAO-backed sigref is not peer-verifiable, so it stays local. The
+    // channel carries the raw KSE topic (KotobaSwarm adds the `kotoba/` prefix).
+    if gossipable {
+        if let Some(tx) = &state.gossip_tx {
+            let announce = crate::rad_gossip::SigrefAnnounce {
+                rid: rad.rid.clone(),
+                head: head_cid.clone(),
+                by: by.clone(),
+                sig: sig.clone(),
+            };
+            let _ = tx.try_send((crate::rad_gossip::sigref_topic(&rad.rid), announce.encode()));
+        }
     }
 }
 
