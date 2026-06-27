@@ -1,23 +1,16 @@
 # kotoba
 
-**A capability-safe language _and_ a content-addressed distributed Datalog database**
+**Content-Addressed Distributed Datalog Database**
 
 ```
 KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
-          × CACAO × AT Protocol × LLM/Weight × WASM/WIT × safe-clj[cap⊗effect]
+          × CACAO × AT Protocol × LLM/Weight × WASM/WIT
 ```
 
-Kotoba is two things in one system:
-
-- **A database** — a distributed, content-addressed knowledge graph for
-  decentralized AI agent systems, combining Datomic-style immutable datoms,
-  Pregel BSP graph computation, an auxiliary SPARQL 1.1 executor over IPFS
-  storage, native CACAO authentication, and WASM Component Model execution.
-- **A language** — `kotoba-clj` compiles a Clojure/EDN subset directly to
-  **WebAssembly** (a compiler, not an interpreter), and **safe-clj** adds a
-  *capability-confined* profile for running untrusted / AI-generated agents:
-  what a module can touch is whatever it was explicitly handed, and nothing
-  else. See [**Language**](#language--kotoba-clj--safe-clj) below.
+Kotoba is a distributed, content-addressed knowledge graph database designed
+for decentralized AI agent systems.  It combines Datomic-style immutable
+datoms, Pregel BSP graph computation, an auxiliary SPARQL 1.1 executor over IPFS
+storage, native CACAO authentication, and WASM Component Model execution.
 
 ## 📺 Explainers & Docs site
 
@@ -66,7 +59,7 @@ brew install --build-from-source ./Formula/kotoba.rb
 ### From source (any platform)
 
 ```bash
-git clone https://github.com/com-junkawasaki/kotoba.git
+git clone https://github.com/etzhayyim/kotoba.git
 cd kotoba
 cargo install --locked --path crates/kotoba-cli --bin kotoba
 ```
@@ -113,59 +106,6 @@ kotoba cacao-sign <seed> --graph <cid> \
     --capability datom:read [--private] [--aud <did>]
 ```
 
-## Language — kotoba-clj & safe-clj
-
-kotoba is not only a database — it ships its **own language**. `kotoba-clj`
-compiles a Clojure/EDN subset directly to **real WebAssembly**: the Clojure
-source *becomes* a WASM Component that runs on `kotoba-runtime` against the
-`kotoba:kais` host world (graph read/write, streams, LLM inference, CACAO). It
-is a compiler, not an embedded interpreter.
-
-On top of it, **safe-clj** (`compile_safe_clj`) is a *capability-confined*
-profile for running untrusted / AI-generated code. The thesis (see
-[`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md)):
-the strongest safety is not a "strong language" but **an execution environment
-where an attacker can do nothing it was not explicitly handed**. safe-clj
-enforces that with three deny-by-default gates, all at compile time:
-
-| Gate | Guarantee | Theorem |
-|---|---|---|
-| **Capability** (`policy.rs`) | a module's wasm import section ⊆ the policy's grants — an ungranted host capability is *physically absent* from the emitted bytes, so the runtime can never bind it | **T3 — Capability Confinement** |
-| **Subset** (`subset.rs`) | no `eval`, no runtime `require`/`import`, no dynamic-var mutation (`set!`/`binding`), no reflection, no unrestricted `defmacro` — constructs the legacy path silently drops are rejected | no ambient code/effect |
-| **Effect** (`effects.rs`) | a function may not perform an effect outside its declared `{:effects …}` row — checked **interprocedurally** (a write cannot hide behind a helper; mutual recursion converges) | **T2 — Effect Soundness** |
-
-Capabilities are passed as **values**, never summoned by name: a module not
-handed write access to a graph cannot write it — the same attenuation CACAO
-enforces at run time, lifted into the type/compile layer. The policy is
-deny-by-default EDN (`examples/safe-policy.edn`):
-
-```edn
-{:imports {:graph-read ["bafy…"] :graph-write ["bafy…"] :infer [] :auth false}
- :limits  {:memory-pages 4 :fuel 1000000 :max-output-bytes 65536}}
-```
-
-Build a confined module from the CLI — and audit exactly what it can do:
-
-```bash
-kotoba-clj safe-build cell.clj --policy policy.edn -o cell.wasm
-# [safe-build] cell.clj -> cell.wasm (10405 bytes)
-# [safe-build] capability surface: kotoba:kais/kqe@0.1.0
-# [safe-build] inferred effects: run={graph-write}
-```
-
-Capabilities are scoped **per resource**: granting write to graph A does not
-permit graph B, and granting inference on model M does not permit model N — the
-compile-time twin of CACAO's `leaf.graph ⊆ root.graph` attenuation (T3 at
-instance granularity). `kotoba-clj safe-policy <cell>` runs the inverse of the
-gate, synthesizing the **minimal least-privilege policy** a cell needs.
-
-Audit/tooling APIs, usable standalone: `embedded_capability_ifaces(wasm)`
-(byte-level capability surface), `infer_effects(src)` (source-level transitive
-effects), `minimal_policy(src)` (least-privilege synthesis), `Policy::to_edn`.
-Status: capability (instance-level), subset, and effect (interprocedural) gates
-implemented and byte-verified (S0–S4) with ~160 safe-mode tests; typed HIR /
-borrow checker (T1) are on the roadmap in the ADR.
-
 ## Defaults that just work
 
 | Knob                       | Default                                                  | Override                       |
@@ -202,8 +142,6 @@ exactly how to silence or fix it.
 | `kotoba-server`    | XRPC / MCP endpoints (kg.ingest / kg.ingest_batch / kg.query / kg.sparql)  |
 | `kotoba-cli`       | `kotoba` binary (init, serve, demo, bench, sparql, …)                      |
 | `kotoba-guest`     | WASM guest SDK (WIT bindings for kotoba nodes)                             |
-| `kotoba-edn`       | SSoT EDN reader (Clojure/Datomic wire format) — the language front-end     |
-| `kotoba-clj`       | **the language**: Clojure/EDN subset → WebAssembly compiler, plus **safe-clj** (`compile_safe_clj`) — capability / subset / effect gates for confined, untrusted-safe modules |
 
 ## Properties
 
@@ -214,7 +152,6 @@ exactly how to silence or fix it.
 - **Distributed Pregel** — BSP graph computation across nodes via libp2p
 - **AT Protocol native** — Datom projection backed by commit DAG and JetStream
 - **WASM runtime** — arbitrary graph logic as Component Model guests
-- **Capability-safe language** — `kotoba-clj` compiles Clojure/EDN → WASM; **safe-clj** confines untrusted/AI-generated modules by deny-by-default capability, subset, and (interprocedural) effect gates — capability confinement (T3) and effect soundness (T2)
 - **E2E encryption** — Signal Protocol + CACAO auth for consent-gated data
 - **Datomic/Datalog primary, SPARQL auxiliary** — the distributed Datom DB is the source of truth; SPARQL 1.1 reads the same projection for RDF-compatible query and federation
 - **CACAO-native authz** — depth-2 delegation chains, multi-graph grants, anti-replay nonce
@@ -350,8 +287,7 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md) | X-Road-style accountability, R0–R3 custody, threat model |
 | [`docs/ADR-001-five-axis-distributed-redesign.md`](docs/ADR-001-five-axis-distributed-redesign.md) | five-axis distributed redesign |
 | [`docs/ADR-sealed-cold-tier.md`](docs/ADR-sealed-cold-tier.md) | encrypted cold tier + t-of-N custody |
-| [`docs/ADR-clojure-wasm.md`](docs/ADR-clojure-wasm.md) | Clojure/EDN-subset → WebAssembly compiler (the language) |
-| [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe-clj** — capability-confined language design (capability/subset/effect gates, T2/T3) |
+| [`docs/ADR-clojure-wasm.md`](docs/ADR-clojure-wasm.md) | Clojure/EDN-subset → WebAssembly compiler |
 | [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |
 | [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC |
 | [`docs/ADR-kotoba-word.md`](docs/ADR-kotoba-word.md) | word/root registry + capability boundary |
