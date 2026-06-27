@@ -319,6 +319,7 @@ impl KotobaLinker {
         bind_chain(&mut self.0)?;
         bind_evm(&mut self.0)?;
         bind_btc(&mut self.0)?;
+        bind_media(&mut self.0)?;
         bind_http(&mut self.0)?;
         Ok(())
     }
@@ -634,6 +635,43 @@ fn bind_llm(linker: &mut Linker<HostState>) -> Result<()> {
                 .pending_lora_loads
                 .push((base_model_cid, lora_cid));
             Ok((Ok(()),))
+        },
+    )?;
+
+    Ok(())
+}
+
+// ── kotoba:kais/media ──────────────────────────────────────────────────────
+
+/// Bind the media codec boundary (ADR-2606272200 §3, utsushi R1). `decode`/`encode`
+/// share `llm.infer`'s `(string, list<u8>) -> result<list<u8>, string>` ABI and
+/// CALL_FOREIGN-class gas (1000). **R0: opaque passthrough** — the bytes are returned
+/// unchanged; the real native decoders (a pure-Rust codec crate or a `kotoba-llm` WGSL
+/// pipeline) swap in here later via a `HostState::with_codec_fn` hook, mirroring how
+/// `llm.infer` dispatches to `inference_engine`. The capability/effect gate already lives
+/// in `kotoba-clj` (only a policy-granted guest emits these imports), so this host fn is
+/// reached solely by authorized guests.
+fn bind_media(linker: &mut Linker<HostState>) -> Result<()> {
+    let mut inst = linker.instance("kotoba:kais/media@0.1.0")?;
+
+    inst.func_wrap(
+        "decode",
+        |mut ctx: wasmtime::StoreContextMut<HostState>,
+         (_codec, packet): (String, Vec<u8>)|
+         -> Result<(Result<Vec<u8>, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            // R0: opaque passthrough — real decode is the deferred native host word.
+            Ok((Ok(packet),))
+        },
+    )?;
+
+    inst.func_wrap(
+        "encode",
+        |mut ctx: wasmtime::StoreContextMut<HostState>,
+         (_codec, frame): (String, Vec<u8>)|
+         -> Result<(Result<Vec<u8>, String>,)> {
+            ctx.data_mut().charge_gas(1000)?;
+            Ok((Ok(frame),))
         },
     )?;
 
