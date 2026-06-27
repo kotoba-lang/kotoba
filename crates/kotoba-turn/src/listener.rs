@@ -121,7 +121,9 @@ impl Server {
         tuple: FiveTuple,
     ) -> Option<Vec<u8>> {
         let hdr = stun::Header::decode(msg).ok()?;
-        let SocketAddr::V4(src_v4) = src else { return None };
+        let SocketAddr::V4(src_v4) = src else {
+            return None;
+        };
 
         // Send indication is a client→peer data path, not a request — no response.
         if hdr.typ == stun::SEND_INDICATION {
@@ -152,7 +154,11 @@ impl Server {
         let scope = match server::authenticate(msg, &self.cfg.secret, t) {
             Ok(s) => s,
             Err(reject) => {
-                return Some(error_response(err_type(hdr.typ), hdr.txid, reject.error_code()))
+                return Some(error_response(
+                    err_type(hdr.typ),
+                    hdr.txid,
+                    reject.error_code(),
+                ))
             }
         };
         let username = find_attr_str(msg, stun::ATTR_USERNAME)?;
@@ -181,7 +187,10 @@ impl Server {
 
         let expires_at = {
             let mut st = self.state.lock().await;
-            match st.table.allocate(tuple, SocketAddr::V4(relay_v4), scope, requested, t) {
+            match st
+                .table
+                .allocate(tuple, SocketAddr::V4(relay_v4), scope, requested, t)
+            {
                 Ok(exp) => {
                     st.relays.insert(tuple, relay_sock.clone());
                     exp
@@ -208,10 +217,16 @@ impl Server {
     ) -> Option<Vec<u8>> {
         let t = now();
         if let Err(reject) = server::authenticate(msg, &self.cfg.secret, t) {
-            return Some(error_response(err_type(hdr.typ), hdr.txid, reject.error_code()));
+            return Some(error_response(
+                err_type(hdr.typ),
+                hdr.txid,
+                reject.error_code(),
+            ));
         }
-        let key = crate::hmac_sha1_base64(&self.cfg.secret, find_attr_str(msg, stun::ATTR_USERNAME)?);
-        let requested = find_attr_u32(msg, stun::ATTR_LIFETIME).unwrap_or(crate::allocation::DEFAULT_LIFETIME as u32) as u64;
+        let key =
+            crate::hmac_sha1_base64(&self.cfg.secret, find_attr_str(msg, stun::ATTR_USERNAME)?);
+        let requested = find_attr_u32(msg, stun::ATTR_LIFETIME)
+            .unwrap_or(crate::allocation::DEFAULT_LIFETIME as u32) as u64;
         let granted = {
             let mut st = self.state.lock().await;
             match st.table.refresh(&tuple, requested, t) {
@@ -227,7 +242,11 @@ impl Server {
             }
         };
         let mut r = header(stun::REFRESH_RESPONSE, hdr.txid);
-        stun::push_attr(&mut r, stun::ATTR_LIFETIME, &stun::encode_u32(granted as u32));
+        stun::push_attr(
+            &mut r,
+            stun::ATTR_LIFETIME,
+            &stun::encode_u32(granted as u32),
+        );
         seal(&mut r, key.as_bytes());
         Some(r)
     }
@@ -240,13 +259,22 @@ impl Server {
     ) -> Option<Vec<u8>> {
         let t = now();
         if let Err(reject) = server::authenticate(msg, &self.cfg.secret, t) {
-            return Some(error_response(err_type(hdr.typ), hdr.txid, reject.error_code()));
+            return Some(error_response(
+                err_type(hdr.typ),
+                hdr.txid,
+                reject.error_code(),
+            ));
         }
-        let key = crate::hmac_sha1_base64(&self.cfg.secret, find_attr_str(msg, stun::ATTR_USERNAME)?);
+        let key =
+            crate::hmac_sha1_base64(&self.cfg.secret, find_attr_str(msg, stun::ATTR_USERNAME)?);
         let peer = find_attr_peer(msg)?;
         {
             let mut st = self.state.lock().await;
-            if st.table.create_permission(&tuple, (*peer.ip()).into(), t).is_err() {
+            if st
+                .table
+                .create_permission(&tuple, (*peer.ip()).into(), t)
+                .is_err()
+            {
                 return Some(error_response(err_type(hdr.typ), hdr.txid, 437));
             }
         }
@@ -263,14 +291,22 @@ impl Server {
     ) -> Option<Vec<u8>> {
         let t = now();
         if let Err(reject) = server::authenticate(msg, &self.cfg.secret, t) {
-            return Some(error_response(err_type(hdr.typ), hdr.txid, reject.error_code()));
+            return Some(error_response(
+                err_type(hdr.typ),
+                hdr.txid,
+                reject.error_code(),
+            ));
         }
-        let key = crate::hmac_sha1_base64(&self.cfg.secret, find_attr_str(msg, stun::ATTR_USERNAME)?);
+        let key =
+            crate::hmac_sha1_base64(&self.cfg.secret, find_attr_str(msg, stun::ATTR_USERNAME)?);
         let channel = find_attr_u16(msg, stun::ATTR_CHANNEL_NUMBER)?;
         let peer = find_attr_peer(msg)?;
         {
             let mut st = self.state.lock().await;
-            match st.table.bind_channel(&tuple, channel, SocketAddr::V4(peer), t) {
+            match st
+                .table
+                .bind_channel(&tuple, channel, SocketAddr::V4(peer), t)
+            {
                 Ok(()) => {}
                 Err(crate::allocation::AllocError::BadChannel) => {
                     return Some(error_response(err_type(hdr.typ), hdr.txid, 400))
@@ -310,11 +346,21 @@ impl Server {
     /// Client→peer via a STUN Send indication (XOR-PEER-ADDRESS + DATA).
     async fn forward_send_indication(&self, msg: &[u8], tuple: &FiveTuple) {
         let t = now();
-        let Some(peer) = find_attr_peer(msg) else { return };
-        let Some(data) = find_attr(msg, stun::ATTR_DATA) else { return };
+        let Some(peer) = find_attr_peer(msg) else {
+            return;
+        };
+        let Some(data) = find_attr(msg, stun::ATTR_DATA) else {
+            return;
+        };
         let relay = self.state.lock().await.relays.get(tuple).cloned();
         if let Some(relay) = relay {
-            if self.state.lock().await.table.permitted(tuple, (*peer.ip()).into(), t) {
+            if self
+                .state
+                .lock()
+                .await
+                .table
+                .permitted(tuple, (*peer.ip()).into(), t)
+            {
                 let _ = relay.send_to(data, SocketAddr::V4(peer)).await;
             }
         }
@@ -332,7 +378,9 @@ impl Server {
                     Ok(v) => v,
                     Err(_) => break,
                 };
-                let SocketAddr::V4(peer_v4) = peer else { continue };
+                let SocketAddr::V4(peer_v4) = peer else {
+                    continue;
+                };
                 let t = now();
                 let (alive, permitted, chan) = {
                     let st = state.lock().await;
@@ -388,7 +436,13 @@ impl Server {
 // ── response builders (pure) ─────────────────────────────────────────────────
 
 fn header(typ: u16, txid: [u8; 12]) -> Vec<u8> {
-    stun::Header { typ, length: 0, txid }.encode().to_vec()
+    stun::Header {
+        typ,
+        length: 0,
+        txid,
+    }
+    .encode()
+    .to_vec()
 }
 
 /// Finalize an authed response: patch length, append MESSAGE-INTEGRITY (keyed by
@@ -423,7 +477,11 @@ fn allocate_response(
         stun::ATTR_XOR_RELAYED_ADDRESS,
         &stun::encode_xor_mapped_v4(*relay.ip(), relay.port()),
     );
-    stun::push_attr(&mut r, stun::ATTR_LIFETIME, &stun::encode_u32(lifetime as u32));
+    stun::push_attr(
+        &mut r,
+        stun::ATTR_LIFETIME,
+        &stun::encode_u32(lifetime as u32),
+    );
     stun::push_attr(
         &mut r,
         stun::ATTR_XOR_MAPPED_ADDRESS,
@@ -596,7 +654,10 @@ mod tests {
         // 3) peer → relay → client arrives as a Data indication.
         peer.send_to(b"ping", relay_addr).await.unwrap();
         let ind = recv(&client).await;
-        assert_eq!(stun::Header::decode(&ind).unwrap().typ, stun::DATA_INDICATION);
+        assert_eq!(
+            stun::Header::decode(&ind).unwrap().typ,
+            stun::DATA_INDICATION
+        );
         assert_eq!(find_attr(&ind, stun::ATTR_DATA).unwrap(), b"ping");
 
         // 4) ChannelBind, then client → peer via a ChannelData frame.
@@ -606,7 +667,10 @@ mod tests {
                 stun::CHANNEL_BIND_REQUEST,
                 &c,
                 &[
-                    (stun::ATTR_CHANNEL_NUMBER, vec![(chan >> 8) as u8, chan as u8, 0, 0]),
+                    (
+                        stun::ATTR_CHANNEL_NUMBER,
+                        vec![(chan >> 8) as u8, chan as u8, 0, 0],
+                    ),
                     (stun::ATTR_XOR_PEER_ADDRESS, xor_peer(peer_addr)),
                 ],
             ))
@@ -692,7 +756,10 @@ mod tests {
         stun::set_attr_length(&mut req);
         client.send(&req).await.unwrap();
         let resp = recv(&client).await;
-        assert_eq!(stun::Header::decode(&resp).unwrap().typ, stun::BINDING_RESPONSE);
+        assert_eq!(
+            stun::Header::decode(&resp).unwrap().typ,
+            stun::BINDING_RESPONSE
+        );
         // XOR-MAPPED-ADDRESS reflects the client's own port.
         let v = find_attr(&resp, stun::ATTR_XOR_MAPPED_ADDRESS).unwrap();
         let (_ip, port) = stun::decode_xor_mapped_v4(v).unwrap();
