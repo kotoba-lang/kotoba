@@ -255,7 +255,9 @@ impl KotobaSwarm {
                     .parse()
                     .expect("static webrtc-direct multiaddr is valid");
                 match swarm.listen_on(addr) {
-                    Ok(_) => tracing::info!(port, "kotoba-net: listening for WebRTC (webrtc-direct)"),
+                    Ok(_) => {
+                        tracing::info!(port, "kotoba-net: listening for WebRTC (webrtc-direct)")
+                    }
                     Err(e) => tracing::warn!(error = %e, "kotoba-net: webrtc-direct listen failed"),
                 }
             }
