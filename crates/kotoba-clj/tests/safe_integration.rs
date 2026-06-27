@@ -20,7 +20,10 @@ const REPLY: &str = include_str!("../../../examples/kotoba-mesh-app/reply.clj");
 fn agent_minimal_policy_is_exactly_one_graph_write() {
     // The cell's only host effect is a checkpoint write to "lgraph/ckpt".
     let p = minimal_policy(AGENT).unwrap();
-    assert_eq!(p.graph_write.iter().collect::<Vec<_>>(), vec!["lgraph/ckpt"]);
+    assert_eq!(
+        p.graph_write.iter().collect::<Vec<_>>(),
+        vec!["lgraph/ckpt"]
+    );
     assert!(p.graph_read.is_empty(), "cell does not read the graph");
     assert!(p.infer.is_empty(), "cell does not run inference");
     assert!(!p.auth, "cell does not introspect CACAO");
@@ -35,7 +38,10 @@ fn agent_compiles_confined_with_its_minimal_policy() {
 
     // The audited capability surface is exactly the one graph interface — no
     // llm/auth leaked in by the prelude or codegen.
-    assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
+    assert_eq!(
+        embedded_capability_ifaces(&wasm),
+        vec!["kotoba:kais/kqe@0.1.0"]
+    );
 }
 
 #[test]
@@ -93,7 +99,10 @@ fn mesh_cells_compile_confined() {
         let p = minimal_policy(src).unwrap();
         let wasm =
             compile_safe_clj_with_prelude(src, &p).expect("mesh cell must compile under safe-clj");
-        assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
+        assert_eq!(
+            embedded_capability_ifaces(&wasm),
+            vec!["kotoba:kais/kqe@0.1.0"]
+        );
     }
 }
 
@@ -103,7 +112,10 @@ fn mesh_cells_denied_with_write_only() {
     for src in [INGEST, REPLY] {
         let p = Policy::deny_all().grant_graph_write(["g"]);
         assert!(
-            matches!(compile_safe_clj_with_prelude(src, &p), Err(CljError::Policy(_))),
+            matches!(
+                compile_safe_clj_with_prelude(src, &p),
+                Err(CljError::Policy(_))
+            ),
             "a read+write cell needs both grants"
         );
     }

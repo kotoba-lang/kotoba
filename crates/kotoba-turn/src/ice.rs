@@ -5,7 +5,7 @@
 //! `RTCPeerConnection({ iceServers })` config: the STUN/TURN URLs plus a short-lived
 //! TURN credential. This module mints that config from the same ephemeral-credential
 //! scheme the relay verifies ([`crate::mint`]) — so the credential handed to the
-//! browser is exactly what the UDP listener ([`crate::listener`]) accepts. The shared
+//! browser is exactly what the UDP listener (the `listener` module) accepts. The shared
 //! secret stays server-side; only the derived `(username, credential)` reach the tab.
 //!
 //! `kotoba-server` exposes this over an operator-gated XRPC

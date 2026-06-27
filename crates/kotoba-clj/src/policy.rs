@@ -341,9 +341,8 @@ impl Policy {
     /// with [`Policy::parse_edn`] for the gated fields. Reserved fields (egress,
     /// secrets, clock, random) are emitted too so the artifact is complete.
     pub fn to_edn(&self) -> String {
-        let strs = |s: &BTreeSet<String>| {
-            EdnValue::vector(s.iter().map(|x| EdnValue::string(x.clone())))
-        };
+        let strs =
+            |s: &BTreeSet<String>| EdnValue::vector(s.iter().map(|x| EdnValue::string(x.clone())));
         let imports = EdnValue::map([
             (EdnValue::kw_bare("graph-read"), strs(&self.graph_read)),
             (EdnValue::kw_bare("graph-write"), strs(&self.graph_write)),
@@ -467,7 +466,12 @@ impl Policy {
     pub fn unused_grants(&self, forms: &[EdnValue]) -> Vec<String> {
         let needed = infer_minimal(forms);
         let mut out = Vec::new();
-        diff_class(&mut out, "graph-write", &self.graph_write, &needed.graph_write);
+        diff_class(
+            &mut out,
+            "graph-write",
+            &self.graph_write,
+            &needed.graph_write,
+        );
         diff_class(&mut out, "graph-read", &self.graph_read, &needed.graph_read);
         diff_class(&mut out, "infer", &self.infer, &needed.infer);
         if self.auth && !needed.auth {
@@ -479,12 +483,19 @@ impl Policy {
 
 /// Append findings for one resource class: an entirely-unused class, or
 /// specific granted cids the cell never targets.
-fn diff_class(out: &mut Vec<String>, key: &str, granted: &BTreeSet<String>, needed: &BTreeSet<String>) {
+fn diff_class(
+    out: &mut Vec<String>,
+    key: &str,
+    granted: &BTreeSet<String>,
+    needed: &BTreeSet<String>,
+) {
     if granted.is_empty() {
         return; // nothing granted → cannot over-grant
     }
     if needed.is_empty() {
-        out.push(format!("{key}: entire capability granted but the cell never uses it"));
+        out.push(format!(
+            "{key}: entire capability granted but the cell never uses it"
+        ));
         return;
     }
     // Dynamic need (`"*"`) → any cid might be required at run time; don't flag.
@@ -494,7 +505,9 @@ fn diff_class(out: &mut Vec<String>, key: &str, granted: &BTreeSet<String>, need
     }
     for cid in granted {
         if !needed.contains(cid) {
-            out.push(format!("{key}: `{cid}` granted but never targeted by the cell"));
+            out.push(format!(
+                "{key}: `{cid}` granted but never targeted by the cell"
+            ));
         }
     }
 }

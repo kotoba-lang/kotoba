@@ -54,7 +54,10 @@ fn check_value(v: &EdnValue) -> Result<(), CljError> {
                 // the `(. obj …)` member-access form start with `.`; a host
                 // constructor `(Class. args)` ends with `.`.
                 if head.name.starts_with('.') {
-                    return Err(deny(&head.to_qualified(), "host method call / member access"));
+                    return Err(deny(
+                        &head.to_qualified(),
+                        "host method call / member access",
+                    ));
                 }
                 if head.name.len() > 1 && head.name.ends_with('.') {
                     return Err(deny(&head.to_qualified(), "host constructor"));

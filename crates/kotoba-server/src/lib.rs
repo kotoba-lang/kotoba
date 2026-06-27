@@ -18,7 +18,6 @@ pub mod account_xrpc;
 pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
-pub mod turn_xrpc;
 pub mod dht_audit;
 pub mod dht_transport;
 pub mod did_bridge;
@@ -52,6 +51,7 @@ pub mod signal_xrpc;
 pub mod social;
 pub mod social_economy;
 pub mod social_xrpc;
+pub mod turn_xrpc;
 pub mod xrpc;
 
 use axum::{

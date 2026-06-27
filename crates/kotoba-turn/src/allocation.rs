@@ -181,7 +181,7 @@ impl AllocationTable {
     }
 
     /// The channel bound to `peer` on this allocation, if any (the reverse of
-    /// [`channel_peer`]). Lets the relay forward peer→client traffic as a
+    /// [`Self::channel_peer`]). Lets the relay forward peer→client traffic as a
     /// ChannelData frame instead of a Data indication when a channel exists.
     pub fn channel_for_peer(&self, tuple: &FiveTuple, peer: SocketAddr, now: u64) -> Option<u16> {
         self.allocations

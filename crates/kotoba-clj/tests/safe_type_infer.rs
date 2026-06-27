@@ -106,11 +106,8 @@ fn let_bound_string_in_string_op_compiles() {
 #[test]
 fn parameter_typed_values_are_permissive() {
     // `x` is a parameter → Unknown → may be used anywhere without a type error.
-    let wasm = compile_safe_clj(
-        r#"(defn run [x] (+ (str-len x) x))"#,
-        &Policy::deny_all(),
-    )
-    .expect("operations on parameters must not be flagged");
+    let wasm = compile_safe_clj(r#"(defn run [x] (+ (str-len x) x))"#, &Policy::deny_all())
+        .expect("operations on parameters must not be flagged");
     assert!(is_wasm(&wasm));
 }
 
