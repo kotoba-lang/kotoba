@@ -18,6 +18,7 @@ pub mod account_xrpc;
 pub mod attestation;
 pub mod availability_xrpc;
 pub mod cc_xrpc;
+pub mod turn_xrpc;
 pub mod dht_audit;
 pub mod dht_transport;
 pub mod did_bridge;
@@ -1187,6 +1188,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", access_receipt::NSID_AUDIT_VERIFY),
             get(access_receipt::audit_verify_chain),
+        )
+        .route(
+            &format!("/xrpc/{}", turn_xrpc::NSID_TURN_CREDENTIAL),
+            get(turn_xrpc::turn_credential),
         )
         .route(
             &format!("/xrpc/{}", key_share::NSID_KEY_REQUEST_SHARE),
