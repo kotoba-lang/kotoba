@@ -19,6 +19,9 @@
 
 pub mod allocation;
 pub mod channel;
+/// ICE-server config minting for browser WebRTC peers (pure; the `turn.credential`
+/// XRPC surface). See root ADR-2606271800.
+pub mod ice;
 pub mod server;
 pub mod stun;
 
