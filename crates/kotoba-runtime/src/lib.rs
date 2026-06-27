@@ -368,6 +368,67 @@ mod tests {
         );
     }
 
+    /// HostState defaults to no codec (media.* is opaque passthrough until injected).
+    #[test]
+    fn test_host_state_codec_fn_default_is_none() {
+        let state = crate::host::HostState::new("did:test:000", 10_000_000);
+        assert!(
+            state.codec_fn.is_none(),
+            "HostState::new() must leave codec_fn as None (opaque passthrough)"
+        );
+    }
+
+    /// A real injected codec (RLE) round-trips through the `with_codec_fn` hook — the
+    /// boundary `media.decode`/`media.encode` dispatch into (ADR-2606272200 §3).
+    #[test]
+    fn test_host_state_codec_fn_real_codec_round_trips() {
+        use crate::host::MediaOp;
+        use std::sync::Arc;
+
+        // Minimal but real run-length codec: encode → [run, byte]*, decode reverses it.
+        fn rle_encode(input: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < input.len() {
+                let b = input[i];
+                let mut run = 1usize;
+                while i + run < input.len() && input[i + run] == b && run < 255 {
+                    run += 1;
+                }
+                out.push(run as u8);
+                out.push(b);
+                i += run;
+            }
+            out
+        }
+        fn rle_decode(input: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i + 1 < input.len() {
+                out.extend(std::iter::repeat_n(input[i + 1], input[i] as usize));
+                i += 2;
+            }
+            out
+        }
+
+        let codec: crate::host::CodecFn = Arc::new(|op, _codec, bytes| match op {
+            MediaOp::Encode => Ok(rle_encode(bytes)),
+            MediaOp::Decode => Ok(rle_decode(bytes)),
+        });
+        let state = crate::host::HostState::new("did:test:codec", 10_000_000).with_codec_fn(codec);
+
+        let f = state.codec_fn.clone().expect("codec_fn must be set");
+        let frame = b"aaaaabbbc".to_vec();
+        let coded = f(MediaOp::Encode, "rle", &frame).unwrap();
+        // A real transform: repetitive input compresses (not opaque passthrough).
+        assert!(
+            coded.len() < frame.len(),
+            "RLE must shrink repetitive input"
+        );
+        let back = f(MediaOp::Decode, "rle", &coded).unwrap();
+        assert_eq!(back, frame, "decode(encode(x)) must round-trip");
+    }
+
     #[test]
     fn runtime_error_program_not_found_display() {
         let e = crate::error::RuntimeError::ProgramNotFound("cid-abc".to_string());

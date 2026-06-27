@@ -3,7 +3,7 @@ use tracing::instrument;
 use wasmtime::component::Func;
 
 use crate::error::RuntimeError;
-use crate::host::{HostState, InferenceFn, KotobaEngine, PendingQuad, WitQuad};
+use crate::host::{CodecFn, HostState, InferenceFn, KotobaEngine, PendingQuad, WitQuad};
 use crate::program::ProgramStore;
 
 /// InvokeContext is CBOR-decoded from the Invoke ChainEntry input field.
@@ -66,6 +66,7 @@ pub struct WasmExecutor {
     programs: ProgramStore,
     gas_limit: u64,
     inference_engine: Option<InferenceFn>,
+    codec_fn: Option<CodecFn>,
 }
 
 impl WasmExecutor {
@@ -81,6 +82,7 @@ impl WasmExecutor {
             programs,
             gas_limit,
             inference_engine: None,
+            codec_fn: None,
         })
     }
 
@@ -92,6 +94,15 @@ impl WasmExecutor {
         let mut s = Self::new(gas_limit)?;
         s.inference_engine = Some(engine);
         Ok(s)
+    }
+
+    /// Wire in a real native codec, forwarded into every `HostState` at execute time
+    /// so `media.decode`/`media.encode` calls in guest WASM transform real bytes
+    /// (ADR-2606272200 §3). Chainable: `WasmExecutor::new(gas)?.with_codec(codec_fn)`.
+    /// When unset, `media.*` is opaque passthrough.
+    pub fn with_codec(mut self, codec_fn: CodecFn) -> Self {
+        self.codec_fn = Some(codec_fn);
+        self
     }
 
     #[instrument(
@@ -215,7 +226,7 @@ impl WasmExecutor {
             .get_or_compile(program_cid, wasm_bytes)
             .map_err(RuntimeError::CompileFailed)?;
 
-        let state = match &self.inference_engine {
+        let mut state = match &self.inference_engine {
             Some(e) => HostState::with_inference_and_snapshot(
                 agent_did,
                 self.gas_limit,
@@ -227,6 +238,9 @@ impl WasmExecutor {
                 .with_snapshot(quad_snapshot)
                 .with_head_commits(head_commits),
         };
+        if let Some(c) = &self.codec_fn {
+            state = state.with_codec_fn(c.clone());
+        }
         let mut store = self.engine.new_store(state);
 
         let mut linker = self.engine.new_linker();

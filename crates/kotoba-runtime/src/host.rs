@@ -31,6 +31,27 @@ pub type InferenceFn = Arc<dyn Fn(&str, usize) -> anyhow::Result<String> + Send 
 /// Type-erased to avoid kotoba-runtime → kotoba-ingest dependency.
 pub type EmbedFn = Arc<dyn Fn(&str) -> anyhow::Result<Vec<f32>> + Send + Sync>;
 
+/// The operation a [`CodecFn`] performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaOp {
+    /// Coded packet → frame bytes.
+    Decode,
+    /// Frame bytes → coded packet.
+    Encode,
+}
+
+/// Type alias for a synchronous native codec function (ADR-2606272200 §3, utsushi R1).
+///
+/// Signature: `(op, codec, bytes) -> Result<Vec<u8>>` — `op` selects decode/encode,
+/// `codec` is the codec name (e.g. `"h264"`), `bytes` is the packet (decode) or frame
+/// (encode); the result is the transformed bytes.
+///
+/// The concrete decoder/encoder (a pure-Rust codec crate or a `kotoba-llm` WGSL
+/// pipeline) is injected by the caller and **type-erased here so kotoba-runtime carries
+/// no codec dependency** — exactly as [`InferenceFn`] keeps it independent of
+/// kotoba-llm. When unset, `media.decode`/`media.encode` fall back to opaque passthrough.
+pub type CodecFn = Arc<dyn Fn(MediaOp, &str, &[u8]) -> anyhow::Result<Vec<u8>> + Send + Sync>;
+
 /// WIT record type for kotoba:kais/kqe.quad.
 ///
 /// `func_wrap` requires an exact Rust type that mirrors the WIT record layout.
@@ -89,6 +110,9 @@ pub struct HostState {
     /// Dense embedding function — routes to HttpEmbedClient when configured.
     /// Type-erased to avoid kotoba-runtime → kotoba-ingest dependency.
     pub embed_fn: Option<EmbedFn>,
+    /// Native codec function for `media.decode`/`media.encode`. `None` → opaque
+    /// passthrough. Type-erased so kotoba-runtime carries no codec dependency.
+    pub codec_fn: Option<CodecFn>,
     /// WASI HTTP context for wasi:http egress.
     pub wasi_http_ctx: WasiHttpCtx,
     /// Optional allow-list for outbound HTTP host glob patterns (None = allow all).
@@ -132,6 +156,7 @@ impl HostState {
             kse_inbox: Vec::new(),
             source_chain_head: None,
             embed_fn: None,
+            codec_fn: None,
             wasi_http_ctx: WasiHttpCtx::new(),
             http_egress_allow: allow_list,
         }
@@ -146,6 +171,13 @@ impl HostState {
     /// Wire in a real embedding function (e.g. from HttpEmbedClient).
     pub fn with_embed_fn(mut self, f: EmbedFn) -> Self {
         self.embed_fn = Some(f);
+        self
+    }
+
+    /// Wire in a real native codec (decode/encode) for `media.*`. When unset,
+    /// `media.decode`/`media.encode` fall back to opaque passthrough (R0).
+    pub fn with_codec_fn(mut self, f: CodecFn) -> Self {
+        self.codec_fn = Some(f);
         self
     }
 
@@ -645,33 +677,40 @@ fn bind_llm(linker: &mut Linker<HostState>) -> Result<()> {
 
 /// Bind the media codec boundary (ADR-2606272200 §3, utsushi R1). `decode`/`encode`
 /// share `llm.infer`'s `(string, list<u8>) -> result<list<u8>, string>` ABI and
-/// CALL_FOREIGN-class gas (1000). **R0: opaque passthrough** — the bytes are returned
-/// unchanged; the real native decoders (a pure-Rust codec crate or a `kotoba-llm` WGSL
-/// pipeline) swap in here later via a `HostState::with_codec_fn` hook, mirroring how
-/// `llm.infer` dispatches to `inference_engine`. The capability/effect gate already lives
-/// in `kotoba-clj` (only a policy-granted guest emits these imports), so this host fn is
-/// reached solely by authorized guests.
+/// CALL_FOREIGN-class gas (1000). Each dispatches to the injected
+/// [`HostState::codec_fn`] (a real pure-Rust decoder or a `kotoba-llm` WGSL pipeline,
+/// wired by `kotoba-server` — mirroring how `llm.infer` dispatches to
+/// `inference_engine`). When no codec is configured it falls back to **opaque
+/// passthrough** (R0). The capability/effect gate already lives in `kotoba-clj` (only a
+/// policy-granted guest emits these imports), so this host fn is reached solely by
+/// authorized guests.
 fn bind_media(linker: &mut Linker<HostState>) -> Result<()> {
     let mut inst = linker.instance("kotoba:kais/media@0.1.0")?;
 
     inst.func_wrap(
         "decode",
         |mut ctx: wasmtime::StoreContextMut<HostState>,
-         (_codec, packet): (String, Vec<u8>)|
+         (codec, packet): (String, Vec<u8>)|
          -> Result<(Result<Vec<u8>, String>,)> {
             ctx.data_mut().charge_gas(1000)?;
-            // R0: opaque passthrough — real decode is the deferred native host word.
-            Ok((Ok(packet),))
+            // Clone the Arc so the closure doesn't hold a borrow on ctx.
+            match ctx.data().codec_fn.clone() {
+                Some(f) => Ok((f(MediaOp::Decode, &codec, &packet).map_err(|e| e.to_string()),)),
+                None => Ok((Ok(packet),)), // R0 opaque passthrough
+            }
         },
     )?;
 
     inst.func_wrap(
         "encode",
         |mut ctx: wasmtime::StoreContextMut<HostState>,
-         (_codec, frame): (String, Vec<u8>)|
+         (codec, frame): (String, Vec<u8>)|
          -> Result<(Result<Vec<u8>, String>,)> {
             ctx.data_mut().charge_gas(1000)?;
-            Ok((Ok(frame),))
+            match ctx.data().codec_fn.clone() {
+                Some(f) => Ok((f(MediaOp::Encode, &codec, &frame).map_err(|e| e.to_string()),)),
+                None => Ok((Ok(frame),)),
+            }
         },
     )?;
 
