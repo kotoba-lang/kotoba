@@ -241,6 +241,26 @@ impl KotobaSwarm {
 
         swarm.listen_on(listen_addr)?;
 
+        // Browser-dialable WebRTC: when the `webrtc` feature is built AND KOTOBA_WEBRTC
+        // is set, also listen on a /webrtc-direct address so browsers can dial this node
+        // on the Live plane (root ADR-2606271800). KOTOBA_WEBRTC = a UDP port, or
+        // "on"/"1"/"true" for the default (4002). The transport appends the cert hash to
+        // the emitted multiaddr. Off by default → QUIC-only behaviour is unchanged.
+        #[cfg(feature = "webrtc")]
+        if let Ok(v) = std::env::var("KOTOBA_WEBRTC") {
+            let v = v.trim();
+            if !v.is_empty() && !matches!(v, "0" | "off" | "false" | "no") {
+                let port: u16 = v.parse().unwrap_or(4002);
+                let addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{port}/webrtc-direct")
+                    .parse()
+                    .expect("static webrtc-direct multiaddr is valid");
+                match swarm.listen_on(addr) {
+                    Ok(_) => tracing::info!(port, "kotoba-net: listening for WebRTC (webrtc-direct)"),
+                    Err(e) => tracing::warn!(error = %e, "kotoba-net: webrtc-direct listen failed"),
+                }
+            }
+        }
+
         Ok(Self {
             swarm,
             local_peer_id,
