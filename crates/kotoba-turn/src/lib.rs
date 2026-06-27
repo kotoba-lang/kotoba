@@ -22,6 +22,9 @@ pub mod channel;
 /// ICE-server config minting for browser WebRTC peers (pure; the `turn.credential`
 /// XRPC surface). See root ADR-2606271800.
 pub mod ice;
+/// Async UDP relay listener over the socket-free core (feature `listener`).
+#[cfg(feature = "listener")]
+pub mod listener;
 pub mod server;
 pub mod stun;
 
