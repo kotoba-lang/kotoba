@@ -57,6 +57,12 @@ pub enum CapClass {
     /// Introspect the caller's own CACAO: `auth.has-capability`. Granted by
     /// `:auth`.
     Auth,
+    /// Decode media: `media.decode`. Granted by `:media-decode`. The native
+    /// codec boundary (ADR-2606272200 §3) — split from [`CapClass::MediaEncode`]
+    /// so decode-only code never gains encode authority.
+    MediaDecode,
+    /// Encode media: `media.encode`. Granted by `:media-encode`.
+    MediaEncode,
 }
 
 impl CapClass {
@@ -67,6 +73,8 @@ impl CapClass {
             HostImport::KqeAssertQuad | HostImport::KqeRetractQuad => CapClass::GraphWrite,
             HostImport::LlmInfer => CapClass::Infer,
             HostImport::HasCapability => CapClass::Auth,
+            HostImport::MediaDecode => CapClass::MediaDecode,
+            HostImport::MediaEncode => CapClass::MediaEncode,
         }
     }
 
@@ -77,6 +85,8 @@ impl CapClass {
             CapClass::GraphWrite => "graph-write",
             CapClass::Infer => "infer",
             CapClass::Auth => "auth",
+            CapClass::MediaDecode => "media-decode",
+            CapClass::MediaEncode => "media-encode",
         }
     }
 }
@@ -127,6 +137,11 @@ pub struct Policy {
     pub graph_write: BTreeSet<String>,
     /// Model cids the module may run inference against.
     pub infer: BTreeSet<String>,
+    /// Codecs the module may decode (`media.decode`), e.g. `"h264"`. Keyed by
+    /// codec name (the first string-literal arg of `media-decode`).
+    pub media_decode: BTreeSet<String>,
+    /// Codecs the module may encode (`media.encode`).
+    pub media_encode: BTreeSet<String>,
     /// Whether the module may introspect its own CACAO (`has-capability?`).
     pub auth: bool,
     /// Whether the module may observe wall-clock (timing-channel surface).
@@ -151,6 +166,8 @@ impl Policy {
             graph_read: BTreeSet::new(),
             graph_write: BTreeSet::new(),
             infer: BTreeSet::new(),
+            media_decode: BTreeSet::new(),
+            media_encode: BTreeSet::new(),
             auth: false,
             clock: false,
             random: false,
@@ -190,6 +207,26 @@ impl Policy {
         self
     }
 
+    /// Builder: grant decode of the given codecs (e.g. `"h264"`).
+    pub fn grant_media_decode<I, S>(mut self, codecs: I) -> Policy
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.media_decode.extend(codecs.into_iter().map(Into::into));
+        self
+    }
+
+    /// Builder: grant encode of the given codecs.
+    pub fn grant_media_encode<I, S>(mut self, codecs: I) -> Policy
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.media_encode.extend(codecs.into_iter().map(Into::into));
+        self
+    }
+
     /// Builder: allow CACAO self-introspection (`has-capability?`).
     pub fn grant_auth(mut self) -> Policy {
         self.auth = true;
@@ -209,6 +246,8 @@ impl Policy {
             CapClass::GraphWrite => !self.graph_write.is_empty(),
             CapClass::Infer => !self.infer.is_empty(),
             CapClass::Auth => self.auth,
+            CapClass::MediaDecode => !self.media_decode.is_empty(),
+            CapClass::MediaEncode => !self.media_encode.is_empty(),
         }
     }
 
@@ -260,6 +299,8 @@ impl Policy {
             "kqe-assert!" | "kqe-retract!" => Some(("graph-write", &self.graph_write)),
             "kqe-get-objects" => Some(("graph-read", &self.graph_read)),
             "llm-infer" => Some(("infer", &self.infer)),
+            "media-decode" => Some(("media-decode", &self.media_decode)),
+            "media-encode" => Some(("media-encode", &self.media_encode)),
             _ => None,
         }
     }
@@ -347,6 +388,8 @@ impl Policy {
             (EdnValue::kw_bare("graph-read"), strs(&self.graph_read)),
             (EdnValue::kw_bare("graph-write"), strs(&self.graph_write)),
             (EdnValue::kw_bare("infer"), strs(&self.infer)),
+            (EdnValue::kw_bare("media-decode"), strs(&self.media_decode)),
+            (EdnValue::kw_bare("media-encode"), strs(&self.media_encode)),
             (EdnValue::kw_bare("auth"), EdnValue::bool(self.auth)),
             (EdnValue::kw_bare("egress"), strs(&self.egress)),
             (EdnValue::kw_bare("secrets"), strs(&self.secrets)),
@@ -404,6 +447,12 @@ impl Policy {
             }
             if let Some(v) = imports.get(&EdnValue::kw_bare("infer")) {
                 policy.infer = str_set(v, ":imports :infer")?;
+            }
+            if let Some(v) = imports.get(&EdnValue::kw_bare("media-decode")) {
+                policy.media_decode = str_set(v, ":imports :media-decode")?;
+            }
+            if let Some(v) = imports.get(&EdnValue::kw_bare("media-encode")) {
+                policy.media_encode = str_set(v, ":imports :media-encode")?;
             }
             if let Some(v) = imports.get(&EdnValue::kw_bare("egress")) {
                 policy.egress = str_set(v, ":imports :egress")?;
@@ -474,6 +523,18 @@ impl Policy {
         );
         diff_class(&mut out, "graph-read", &self.graph_read, &needed.graph_read);
         diff_class(&mut out, "infer", &self.infer, &needed.infer);
+        diff_class(
+            &mut out,
+            "media-decode",
+            &self.media_decode,
+            &needed.media_decode,
+        );
+        diff_class(
+            &mut out,
+            "media-encode",
+            &self.media_encode,
+            &needed.media_encode,
+        );
         if self.auth && !needed.auth {
             out.push("auth: granted but `has-capability?` is never used".to_string());
         }
@@ -543,6 +604,8 @@ pub fn infer_minimal(forms: &[EdnValue]) -> Policy {
     p.graph_write = resolve(acc.write_dynamic, acc.write);
     p.graph_read = resolve(acc.read_dynamic, acc.read);
     p.infer = resolve(acc.infer_dynamic, acc.infer);
+    p.media_decode = resolve(acc.media_decode_dynamic, acc.media_decode);
+    p.media_encode = resolve(acc.media_encode_dynamic, acc.media_encode);
     p.auth = acc.auth;
     p
 }
@@ -557,6 +620,10 @@ struct MinAcc {
     read_dynamic: bool,
     infer: BTreeSet<String>,
     infer_dynamic: bool,
+    media_decode: BTreeSet<String>,
+    media_decode_dynamic: bool,
+    media_encode: BTreeSet<String>,
+    media_encode_dynamic: bool,
     auth: bool,
 }
 
@@ -594,6 +661,18 @@ fn collect_min(v: &EdnValue, acc: &mut MinAcc) {
                             acc.infer.insert(s);
                         }
                         None => acc.infer_dynamic = true,
+                    },
+                    "media-decode" => match literal {
+                        Some(s) => {
+                            acc.media_decode.insert(s);
+                        }
+                        None => acc.media_decode_dynamic = true,
+                    },
+                    "media-encode" => match literal {
+                        Some(s) => {
+                            acc.media_encode.insert(s);
+                        }
+                        None => acc.media_encode_dynamic = true,
                     },
                     "has-capability?" => acc.auth = true,
                     _ => {}
