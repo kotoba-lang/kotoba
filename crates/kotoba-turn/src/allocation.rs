@@ -180,6 +180,21 @@ impl AllocationTable {
             .map(|&(peer, _)| peer)
     }
 
+    /// The channel bound to `peer` on this allocation, if any (the reverse of
+    /// [`channel_peer`]). Lets the relay forward peer→client traffic as a
+    /// ChannelData frame instead of a Data indication when a channel exists.
+    pub fn channel_for_peer(&self, tuple: &FiveTuple, peer: SocketAddr, now: u64) -> Option<u16> {
+        self.allocations
+            .get(tuple)
+            .filter(|a| a.expires_at > now)
+            .and_then(|a| {
+                a.channels
+                    .iter()
+                    .find(|(_, &(p, exp))| p == peer && exp > now)
+                    .map(|(&c, _)| c)
+            })
+    }
+
     /// The relay address assigned to a live allocation.
     pub fn relay_addr(&self, tuple: &FiveTuple, now: u64) -> Option<SocketAddr> {
         self.allocations

@@ -24,16 +24,62 @@ pub const BINDING_REQUEST: u16 = 0x0001;
 pub const BINDING_RESPONSE: u16 = 0x0101;
 pub const ALLOCATE_REQUEST: u16 = 0x0003;
 pub const ALLOCATE_RESPONSE: u16 = 0x0103;
+/// Allocate error response (class = error, method = Allocate).
+pub const ALLOCATE_ERROR: u16 = 0x0113;
 pub const REFRESH_REQUEST: u16 = 0x0004;
+pub const REFRESH_RESPONSE: u16 = 0x0104;
 pub const CREATE_PERMISSION_REQUEST: u16 = 0x0008;
+pub const CREATE_PERMISSION_RESPONSE: u16 = 0x0108;
 pub const CHANNEL_BIND_REQUEST: u16 = 0x0009;
+pub const CHANNEL_BIND_RESPONSE: u16 = 0x0109;
+/// Send / Data indications (RFC 8656 §10/§11) — class = indication.
+pub const SEND_INDICATION: u16 = 0x0016;
+pub const DATA_INDICATION: u16 = 0x0017;
 
 // Attribute types.
 pub const ATTR_USERNAME: u16 = 0x0006;
 pub const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+pub const ATTR_ERROR_CODE: u16 = 0x0009;
+pub const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
+pub const ATTR_LIFETIME: u16 = 0x000D;
+pub const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
+pub const ATTR_DATA: u16 = 0x0013;
+pub const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
+pub const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
 pub const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 pub const ATTR_SOFTWARE: u16 = 0x8022;
 pub const ATTR_FINGERPRINT: u16 = 0x8028;
+
+/// Append a STUN attribute TLV (type, length, value) with RFC 8489 4-byte padding.
+/// Does not touch the header length — callers patch that via
+/// [`set_attr_length`] / [`append_message_integrity`] / [`append_fingerprint`].
+pub fn push_attr(buf: &mut Vec<u8>, typ: u16, value: &[u8]) {
+    buf.extend_from_slice(&typ.to_be_bytes());
+    buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    buf.extend_from_slice(value);
+    let pad = (4 - (value.len() % 4)) % 4;
+    buf.extend(std::iter::repeat_n(0u8, pad));
+}
+
+/// Patch the header length field to cover all attributes currently in `buf`
+/// (use for responses that carry no MESSAGE-INTEGRITY/FINGERPRINT trailer).
+pub fn set_attr_length(buf: &mut [u8]) {
+    let len = (buf.len() - 20) as u16;
+    buf[2..4].copy_from_slice(&len.to_be_bytes());
+}
+
+/// Encode an ERROR-CODE attribute value (RFC 8489 §14.8): 2 reserved bytes, the
+/// class (hundreds digit), the number (mod 100), then the UTF-8 reason phrase.
+pub fn encode_error_code(code: u16, reason: &str) -> Vec<u8> {
+    let mut v = vec![0u8, 0u8, (code / 100) as u8, (code % 100) as u8];
+    v.extend_from_slice(reason.as_bytes());
+    v
+}
+
+/// Encode a 4-byte LIFETIME / 32-bit attribute value (seconds).
+pub fn encode_u32(value: u32) -> [u8; 4] {
+    value.to_be_bytes()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StunError {

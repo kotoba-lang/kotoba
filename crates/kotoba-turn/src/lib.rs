@@ -19,6 +19,9 @@
 
 pub mod allocation;
 pub mod channel;
+/// Async UDP relay listener over the socket-free core (feature `listener`).
+#[cfg(feature = "listener")]
+pub mod listener;
 pub mod server;
 pub mod stun;
 
