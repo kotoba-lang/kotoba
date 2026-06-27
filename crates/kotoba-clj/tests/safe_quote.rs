@@ -102,6 +102,10 @@ fn comment_host_call_performs_no_effect_and_needs_no_grant() {
         "a commented host call needs no grant"
     );
     let eff = infer_effects(src).unwrap();
-    assert!(eff["run"].is_empty(), "commented call has no effect: {:?}", eff["run"]);
+    assert!(
+        eff["run"].is_empty(),
+        "commented call has no effect: {:?}",
+        eff["run"]
+    );
     assert!(minimal_policy(src).unwrap().graph_write.is_empty());
 }

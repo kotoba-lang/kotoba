@@ -117,10 +117,7 @@ impl RadRegistry {
         };
         for ent in entries.flatten() {
             let path = ent.path();
-            if !path
-                .to_string_lossy()
-                .ends_with(".identity.journal.edn")
-            {
+            if !path.to_string_lossy().ends_with(".identity.journal.edn") {
                 continue;
             }
             if let Ok(src) = std::fs::read_to_string(&path) {
@@ -326,7 +323,8 @@ mod tests {
         .unwrap();
         // last-hyphen splitting would wrongly yield "manager"; prefix strip is correct.
         assert_eq!(
-            r.resolve("com-etzhayyim-business-manager").map(|x| x.rid.as_str()),
+            r.resolve("com-etzhayyim-business-manager")
+                .map(|x| x.rid.as_str()),
             Some("bafX")
         );
     }
@@ -358,7 +356,9 @@ mod tests {
         assert!(after.contains("[\"sigref:bafrid000\" :rad/by \"did:key:zAAA\" 2 :add]"));
         assert!(after.contains("[\"sigref:bafrid000\" :rad/sig \"cacaoB64==\" 2 :add]"));
         let mut check = RadRegistry::default();
-        check.ingest_journal(&after).expect("appended journal must re-parse");
+        check
+            .ingest_journal(&after)
+            .expect("appended journal must re-parse");
 
         // A second attestation increments tx again.
         let tx2 = reg

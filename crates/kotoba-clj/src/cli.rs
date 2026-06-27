@@ -191,8 +191,7 @@ fn cmd_safe_build(args: &[String]) -> Result<()> {
 fn cmd_safe_policy(args: &[String]) -> Result<()> {
     let cell = positional(args).ok_or_else(|| anyhow!("safe-policy: missing <cell.clj>"))?;
     let body = std::fs::read_to_string(cell).with_context(|| format!("read {cell}"))?;
-    let policy =
-        crate::minimal_policy(&body).map_err(|e| anyhow!("analyze {cell}: {e}"))?;
+    let policy = crate::minimal_policy(&body).map_err(|e| anyhow!("analyze {cell}: {e}"))?;
     let edn = policy.to_edn();
     match flag(args, "-o") {
         Some(out) => {

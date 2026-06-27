@@ -153,7 +153,10 @@ fn unused_specific_cid_is_reported() {
     let p = Policy::deny_all().grant_graph_write(["gA", "gB"]);
     let unused = kotoba_clj::unused_grants(src, &p).unwrap();
     assert_eq!(unused.len(), 1);
-    assert!(unused[0].contains("gB") && !unused[0].contains("gA"), "{unused:?}");
+    assert!(
+        unused[0].contains("gB") && !unused[0].contains("gA"),
+        "{unused:?}"
+    );
 }
 
 #[test]

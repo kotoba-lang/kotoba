@@ -34,7 +34,10 @@ fn write_to_ungranted_graph_is_denied_even_with_class_grant() {
     let policy = Policy::deny_all().grant_graph_write(["graphA"]);
     match compile_safe_clj(src, &policy) {
         Err(CljError::Policy(msg)) => {
-            assert!(msg.contains("graphB"), "denial should name the graph: {msg}");
+            assert!(
+                msg.contains("graphB"),
+                "denial should name the graph: {msg}"
+            );
             assert!(msg.contains("graph-write"), "{msg}");
         }
         other => panic!("expected Policy denial, got {other:?}"),
@@ -71,7 +74,10 @@ fn multiple_granted_graphs_each_allowed() {
     let policy = Policy::deny_all().grant_graph_write(["graphA", "graphB"]);
     for g in ["graphA", "graphB"] {
         let src = format!(r#"(defn run [] (kqe-assert! "{g}" "s" "p" "v"))"#);
-        assert!(compile_safe_clj(&src, &policy).is_ok(), "graph {g} should compile");
+        assert!(
+            compile_safe_clj(&src, &policy).is_ok(),
+            "graph {g} should compile"
+        );
     }
     // a third, ungranted graph is still denied
     let src = r#"(defn run [] (kqe-assert! "graphC" "s" "p" "v"))"#;
@@ -118,7 +124,10 @@ fn inference_on_ungranted_model_is_denied_with_class_grant() {
     let policy = Policy::deny_all().grant_infer(["modelA"]);
     match compile_safe_clj(src, &policy) {
         Err(CljError::Policy(msg)) => {
-            assert!(msg.contains("modelB"), "denial should name the model: {msg}");
+            assert!(
+                msg.contains("modelB"),
+                "denial should name the model: {msg}"
+            );
             assert!(msg.contains("infer"), "{msg}");
         }
         other => panic!("expected Policy denial, got {other:?}"),

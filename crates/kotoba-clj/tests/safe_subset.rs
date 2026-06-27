@@ -238,11 +238,11 @@ fn ambient_concurrency_is_denied() {
 #[test]
 fn host_interop_syntax_is_denied() {
     for src in [
-        r#"(defn run [x] (.toUpperCase x))"#,   // method call
-        r#"(defn run [x] (. x toString))"#,     // member-access special form
-        r#"(defn run [] (String. "x"))"#,       // constructor (trailing dot)
-        r#"(defn run [] (new String "x"))"#,    // new special form
-        r#"(defn run [x] (.. x foo bar))"#,     // .. interop threading
+        r#"(defn run [x] (.toUpperCase x))"#, // method call
+        r#"(defn run [x] (. x toString))"#,   // member-access special form
+        r#"(defn run [] (String. "x"))"#,     // constructor (trailing dot)
+        r#"(defn run [] (new String "x"))"#,  // new special form
+        r#"(defn run [x] (.. x foo bar))"#,   // .. interop threading
     ] {
         assert_subset_denied(compile_safe_clj(src, &Policy::deny_all()));
     }

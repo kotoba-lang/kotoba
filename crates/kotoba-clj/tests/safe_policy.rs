@@ -284,13 +284,11 @@ fn example_policy_edn_parses_and_gates() {
     assert_eq!(policy.limits.fuel, 1_000_000);
 
     // A write program compiles under it; an inference program does not.
-    assert!(
-        compile_safe_clj(
-            r#"(defn run [] (kqe-assert! "bafyGraphReportsA" "a" "p" "v"))"#,
-            &policy
-        )
-        .is_ok()
-    );
+    assert!(compile_safe_clj(
+        r#"(defn run [] (kqe-assert! "bafyGraphReportsA" "a" "p" "v"))"#,
+        &policy
+    )
+    .is_ok());
     assert_policy_denied(compile_safe_clj(
         r#"(defn run [] (llm-infer "m" "x"))"#,
         &policy,
