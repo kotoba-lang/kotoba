@@ -1,22 +1,59 @@
 //! kotoba-media — pure-Rust media codecs for the utsushi/kotoba media boundary
-//! (ADR-2606272200 §3). R1: MJPEG decode (Motion JPEG = one JPEG per frame) via the
-//! pure-Rust `zune-jpeg`. **No kotoba-runtime / wasmtime dependency** — kotoba-server
-//! wraps these into a runtime `CodecFn` and injects them via `WasmExecutor::with_codec`.
+//! (ADR-2606272200 §3). R1 image-frame codecs (Motion-JPEG / PNG-per-frame), **no
+//! kotoba-runtime / wasmtime dependency** — kotoba-server wraps these into a runtime
+//! `CodecFn` and injects them via `WasmExecutor::with_codec`.
+//!
+//! Frame interchange format (the bytes that cross the media boundary on decode/encode):
+//! `[width:u32 BE][height:u32 BE][components:u8] ++ interleaved 8-bit pixels`.
+//! The 9-byte header lets a guest read dimensions without a side channel.
 
-/// Decode a coded `codec` packet into a self-describing raw frame:
-/// `[width:u32 BE][height:u32 BE][components:u8] ++ interleaved pixels`.
-/// The 9-byte header lets a guest read dimensions without a side channel.
+/// Decode a coded `codec` packet into a self-describing raw frame.
 pub fn decode(codec: &str, bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     match codec {
         "mjpeg" | "jpeg" => decode_jpeg(bytes),
+        "png" => decode_png(bytes),
         other => anyhow::bail!("kotoba-media: unsupported decode codec {other:?}"),
     }
 }
 
-/// Encode is not yet supported (R1 is decode-first). Returns an error so the guest
-/// sees the boundary honestly rather than receiving silent opaque bytes.
-pub fn encode(codec: &str, _bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
-    anyhow::bail!("kotoba-media: encode not supported in R1 (codec {codec:?})")
+/// Encode a self-describing raw frame into a coded `codec` packet.
+pub fn encode(codec: &str, frame: &[u8]) -> anyhow::Result<Vec<u8>> {
+    match codec {
+        "mjpeg" | "jpeg" => encode_jpeg(frame),
+        "png" => encode_png(frame),
+        other => anyhow::bail!("kotoba-media: unsupported encode codec {other:?}"),
+    }
+}
+
+/// Build the 9-byte frame header for `(w, h, components)`.
+fn frame_header(w: u32, h: u32, comps: u8) -> [u8; 9] {
+    let mut hdr = [0u8; 9];
+    hdr[0..4].copy_from_slice(&w.to_be_bytes());
+    hdr[4..8].copy_from_slice(&h.to_be_bytes());
+    hdr[8] = comps;
+    hdr
+}
+
+/// Parse a self-describing frame into `(width, height, components, pixels)`.
+fn parse_frame(b: &[u8]) -> anyhow::Result<(u32, u32, u8, &[u8])> {
+    if b.len() < 9 {
+        anyhow::bail!(
+            "kotoba-media: frame too short ({} bytes < 9-byte header)",
+            b.len()
+        );
+    }
+    let w = u32::from_be_bytes(b[0..4].try_into().unwrap());
+    let h = u32::from_be_bytes(b[4..8].try_into().unwrap());
+    let comps = b[8];
+    let px = &b[9..];
+    let expect = (w as usize) * (h as usize) * (comps as usize);
+    if px.len() != expect {
+        anyhow::bail!(
+            "kotoba-media: frame pixels {} != {w}x{h}x{comps} = {expect}",
+            px.len()
+        );
+    }
+    Ok((w, h, comps, px))
 }
 
 fn decode_jpeg(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -31,10 +68,71 @@ fn decode_jpeg(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
         .info()
         .ok_or_else(|| anyhow::anyhow!("kotoba-media: jpeg has no frame info"))?;
     let mut out = Vec::with_capacity(9 + pixels.len());
-    out.extend_from_slice(&(w as u32).to_be_bytes());
-    out.extend_from_slice(&(h as u32).to_be_bytes());
-    out.push(info.components);
+    out.extend_from_slice(&frame_header(w as u32, h as u32, info.components));
     out.extend_from_slice(&pixels);
+    Ok(out)
+}
+
+fn encode_jpeg(frame: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let (w, h, comps, px) = parse_frame(frame)?;
+    let color = match comps {
+        3 => jpeg_encoder::ColorType::Rgb,
+        1 => jpeg_encoder::ColorType::Luma,
+        _ => anyhow::bail!("kotoba-media: jpeg encode supports 1 or 3 components, got {comps}"),
+    };
+    let mut out = Vec::new();
+    jpeg_encoder::Encoder::new(&mut out, 90)
+        .encode(px, w as u16, h as u16, color)
+        .map_err(|e| anyhow::anyhow!("kotoba-media: jpeg encode: {e}"))?;
+    Ok(out)
+}
+
+fn decode_png(bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut reader = png::Decoder::new(bytes)
+        .read_info()
+        .map_err(|e| anyhow::anyhow!("kotoba-media: png read_info: {e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| anyhow::anyhow!("kotoba-media: png decode: {e}"))?;
+    if info.bit_depth != png::BitDepth::Eight {
+        anyhow::bail!(
+            "kotoba-media: png bit depth {:?} unsupported (8-bit only)",
+            info.bit_depth
+        );
+    }
+    let comps = match info.color_type {
+        png::ColorType::Grayscale => 1u8,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        ct => anyhow::bail!("kotoba-media: png color {ct:?} unsupported"),
+    };
+    let px = &buf[..info.buffer_size()];
+    let mut out = Vec::with_capacity(9 + px.len());
+    out.extend_from_slice(&frame_header(info.width, info.height, comps));
+    out.extend_from_slice(px);
+    Ok(out)
+}
+
+fn encode_png(frame: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let (w, h, comps, px) = parse_frame(frame)?;
+    let color = match comps {
+        1 => png::ColorType::Grayscale,
+        3 => png::ColorType::Rgb,
+        4 => png::ColorType::Rgba,
+        _ => anyhow::bail!("kotoba-media: png encode supports 1/3/4 components, got {comps}"),
+    };
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut wr = enc
+            .write_header()
+            .map_err(|e| anyhow::anyhow!("kotoba-media: png header: {e}"))?;
+        wr.write_image_data(px)
+            .map_err(|e| anyhow::anyhow!("kotoba-media: png write: {e}"))?;
+    }
     Ok(out)
 }
 
@@ -89,33 +187,67 @@ mod tests {
         0x3c, 0xf3, 0x32, 0xfa, 0xd4, 0xbf, 0x7f, 0x2f, 0xbc, 0xd7, 0x81, 0x78, 0x93, 0x37, 0xfe,
         0xc1, 0xa1, 0xfe, 0xd3, 0x2f, 0xbf, 0xd0, 0xff, 0xd9,
     ];
+    const TEST_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00, 0x00, 0x22,
+        0x66, 0xd9, 0x14, 0x00, 0x00, 0x00, 0x18, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x64,
+        0x60, 0x38, 0xa1, 0xc1, 0xc0, 0x80, 0x8c, 0x58, 0x18, 0x6c, 0x18, 0xd0, 0x00, 0x71, 0x42,
+        0x00, 0x88, 0x48, 0x02, 0x52, 0x5c, 0xc6, 0x90, 0xee, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+        0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn dims(frame: &[u8]) -> (u32, u32, u8) {
+        (
+            u32::from_be_bytes(frame[0..4].try_into().unwrap()),
+            u32::from_be_bytes(frame[4..8].try_into().unwrap()),
+            frame[8],
+        )
+    }
+
     #[test]
-    fn mjpeg_decode_returns_self_describing_frame() {
-        let out = decode("mjpeg", TEST_JPEG).expect("mjpeg decode");
-        assert!(out.len() >= 9, "frame must carry a 9-byte header");
-        let w = u32::from_be_bytes(out[0..4].try_into().unwrap());
-        let h = u32::from_be_bytes(out[4..8].try_into().unwrap());
-        let comps = out[8];
-        assert_eq!((w, h, comps), (7, 5, 3), "7x5 RGB test frame");
+    fn jpeg_decode_frame_shape() {
+        let f = decode("mjpeg", TEST_JPEG).unwrap();
+        assert_eq!(dims(&f), (7, 5, 3));
+        assert_eq!(f.len(), 9 + 7 * 5 * 3);
+    }
+
+    #[test]
+    fn png_decode_frame_shape() {
+        let f = decode("png", TEST_PNG).unwrap();
+        assert_eq!(dims(&f), (6, 4, 3));
+        assert_eq!(f.len(), 9 + 6 * 4 * 3);
+    }
+
+    #[test]
+    fn jpeg_encode_then_decode_roundtrips_dims() {
+        let frame = decode("jpeg", TEST_JPEG).unwrap();
+        let jpg = encode("jpeg", &frame).unwrap();
+        let frame2 = decode("jpeg", &jpg).unwrap();
+        assert_eq!(dims(&frame), dims(&frame2)); // JPEG is lossy → dims, not pixels
+    }
+
+    #[test]
+    fn png_encode_then_decode_is_lossless() {
+        let frame = decode("png", TEST_PNG).unwrap();
+        let png = encode("png", &frame).unwrap();
+        let frame2 = decode("png", &png).unwrap();
         assert_eq!(
-            out.len(),
-            9 + (w * h * comps as u32) as usize,
-            "header + pixels"
+            frame, frame2,
+            "PNG round-trip must be byte-exact (lossless)"
         );
     }
 
     #[test]
-    fn jpeg_alias_works() {
-        assert!(decode("jpeg", TEST_JPEG).is_ok());
+    fn cross_codec_jpeg_to_png() {
+        let frame = decode("jpeg", TEST_JPEG).unwrap();
+        let png = encode("png", &frame).unwrap();
+        assert_eq!(dims(&decode("png", &png).unwrap()), (7, 5, 3));
     }
 
     #[test]
-    fn unsupported_codec_errors() {
+    fn errors_are_honest() {
         assert!(decode("av1", TEST_JPEG).is_err());
-    }
-
-    #[test]
-    fn encode_is_unsupported_in_r1() {
-        assert!(encode("mjpeg", &[1, 2, 3]).is_err());
+        assert!(encode("av1", &[0; 9]).is_err());
+        assert!(encode("png", &[0, 1]).is_err()); // frame too short
     }
 }
