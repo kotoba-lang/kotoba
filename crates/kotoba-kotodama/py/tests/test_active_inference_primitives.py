@@ -565,3 +565,91 @@ def test_adapt_policy_blocks_objective_and_unbounded_change() -> None:
     assert "triple_witness_failed" in result["blockers"]
     assert "weight_delta_exceeds_bound" in result["blockers"]
     assert result["policyProposal"]["proposal_state"] == "blocked"
+
+
+def test_analyze_actor_system_dynamics_projects_stocks_and_feedback() -> None:
+    result = active_inference.analyze_actor_system_dynamics(
+        agent_did="did:web:kami-agent.etzhayyim.com",
+        stocks=[
+            {"id": "knowledge", "value": 4, "capacity": 10, "target": 8, "importance": 0.8},
+            {"id": "trust", "value": 3, "capacity": 5, "target": 5, "importance": 1.0},
+        ],
+        flows=[
+            {
+                "id": "learning",
+                "source": "trust",
+                "target": "knowledge",
+                "rate": 0.6,
+                "controllability": 0.7,
+                "observability": 0.8,
+            },
+            {
+                "id": "explanation",
+                "source": "knowledge",
+                "target": "trust",
+                "rate": 0.2,
+                "delaySteps": 1,
+                "controllability": 0.5,
+                "observability": 0.9,
+            },
+        ],
+        observations=[{"source": "email"}, {"source": "tool-log"}],
+        horizon_steps=3,
+    )
+
+    stocks = {row["stockId"]: row for row in result["stocks"]}
+    assert stocks["knowledge"]["projectedValue"] == 5.5
+    assert stocks["trust"]["projectedValue"] == 1.5
+    assert result["feedbackLoops"][0]["kind"] == "reinforcing"
+    assert result["leveragePoints"][0]["flowId"] == "learning"
+    assert result["systemDynamics"]["actor_id"] == "sys.actor.systemDynamics"
+    assert 0.0 <= result["riskScore"] <= 1.0
+    assert 0.0 <= result["growthCapacity"] <= 1.0
+
+
+def test_plan_actor_self_evolution_requires_witness_and_simulation() -> None:
+    dynamics = active_inference.analyze_actor_system_dynamics(
+        agent_did="did:web:kami-agent.etzhayyim.com",
+        stocks=[{"id": "knowledge", "value": 2, "capacity": 10, "target": 8}],
+        flows=[{"id": "learning", "target": "knowledge", "rate": 0.5}],
+        observations=[{"source": "tool-log"}],
+    )
+
+    blocked = active_inference.plan_actor_self_evolution(
+        agent_did="did:web:kami-agent.etzhayyim.com",
+        system_dynamics=dynamics,
+        candidate_mutations=[
+            {
+                "mutationId": "add-domain-sensor",
+                "risk": 0.1,
+                "ambiguity": 0.1,
+                "simulationRef": "sim://actor/add-domain-sensor",
+                "authorityRef": "capability://actor/self-evolution/low-risk",
+            }
+        ],
+        triple_witness_pass=False,
+    )
+
+    assert blocked["accepted"] is False
+    assert "triple_witness_required_for_self_evolution" in blocked["blockers"]
+    assert blocked["selectedActionId"] == "add-domain-sensor"
+    assert blocked["selfEvolutionPlan"]["plan_state"] == "blocked"
+
+    accepted = active_inference.plan_actor_self_evolution(
+        agent_did="did:web:kami-agent.etzhayyim.com",
+        system_dynamics=dynamics,
+        candidate_mutations=[
+            {
+                "mutationId": "add-domain-sensor",
+                "risk": 0.1,
+                "ambiguity": 0.1,
+                "simulationRef": "sim://actor/add-domain-sensor",
+                "authorityRef": "capability://actor/self-evolution/low-risk",
+            }
+        ],
+        triple_witness_pass=True,
+    )
+
+    assert accepted["accepted"] is True
+    assert accepted["selfEvolutionPlan"]["plan_state"] == "accepted"
+    assert accepted["selfEvolutionPlan"]["actor_id"] == "sys.actor.selfEvolution"
