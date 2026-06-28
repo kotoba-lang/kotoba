@@ -50,6 +50,8 @@ IMMUTABLE_PREFERENCE_PREFIXES = {
 
 LIVE_AUTONOMOUS_CHANNELS = {"email"}
 
+_EPS = 1e-12
+
 CHANNEL_DISPATCH_TARGETS = {
     "email": {
         "taskType": "mailer.sendEmail",
@@ -1209,4 +1211,292 @@ def adapt_policy(
         "policyProposal": policy_proposal,
         "preference": preference if accepted else {},
         "proposalHash": proposal_hash,
+    }
+
+
+def _row_id(row: dict[str, Any], fallback: str) -> str:
+    return _str(row.get("id") or row.get("stockId") or row.get("stock_id") or row.get("name") or fallback)
+
+
+def _normalize_system_stock(row: dict[str, Any], index: int) -> dict[str, Any]:
+    stock_id = _row_id(row, f"stock-{index + 1}")
+    capacity = max(_float(row.get("capacity"), 1.0), _EPS)
+    value = max(0.0, _float(row.get("value", row.get("level")), 0.0))
+    target = max(0.0, _float(row.get("target", row.get("desired")), capacity))
+    importance = clamp01(row.get("importance"), 0.5)
+    pressure = clamp01(value / capacity)
+    target_gap = max(0.0, target - value) / max(target, capacity, _EPS)
+    overflow = max(0.0, value - capacity) / capacity
+    return {
+        "stockId": stock_id,
+        "label": _str(row.get("label") or row.get("name") or stock_id),
+        "value": round(value, 6),
+        "capacity": round(capacity, 6),
+        "target": round(target, 6),
+        "importance": round(importance, 6),
+        "pressure": round(clamp01(pressure), 6),
+        "targetGap": round(clamp01(target_gap), 6),
+        "overflow": round(clamp01(overflow), 6),
+    }
+
+
+def _normalize_system_flow(row: dict[str, Any], index: int) -> dict[str, Any]:
+    flow_id = _row_id(row, f"flow-{index + 1}")
+    source = _str(row.get("source") or row.get("from") or row.get("src") or row.get("sourceStockId"))
+    target = _str(row.get("target") or row.get("to") or row.get("dst") or row.get("targetStockId"))
+    rate = _float(row.get("rate", row.get("strength")), 0.0)
+    delay = max(0, int(_float(row.get("delaySteps", row.get("delay_steps")), 0)))
+    polarity_raw = _str(row.get("polarity"), "+").strip().lower()
+    polarity = -1 if polarity_raw in {"-", "-1", "negative", "balancing"} else 1
+    controllability = clamp01(row.get("controllability"), 0.5)
+    observability = clamp01(row.get("observability"), 0.5)
+    return {
+        "flowId": flow_id,
+        "sourceStockId": source,
+        "targetStockId": target,
+        "rate": round(rate, 6),
+        "delaySteps": delay,
+        "polarity": polarity,
+        "controllability": round(controllability, 6),
+        "observability": round(observability, 6),
+    }
+
+
+def _feedback_kind(edges: list[dict[str, Any]]) -> str:
+    sign = 1
+    for edge in edges:
+        sign *= -1 if int(edge.get("polarity", 1)) < 0 else 1
+    return "reinforcing" if sign > 0 else "balancing"
+
+
+def analyze_actor_system_dynamics(
+    *,
+    agent_did: str,
+    stocks: Any,
+    flows: Any,
+    horizon_steps: Any = 3,
+    observations: Any = None,
+) -> dict[str, Any]:
+    """Analyze an actor as a stock/flow system dynamics model.
+
+    This is intentionally pure: actor runtimes can persist the returned rows to
+    kotoba/datomic, or use the summary directly inside active-inference ticks.
+    """
+    agent = _str(agent_did)
+    stock_rows = [
+        _normalize_system_stock(row, index)
+        for index, row in enumerate(stocks if isinstance(stocks, list) else [])
+        if isinstance(row, dict)
+    ]
+    flow_rows = [
+        _normalize_system_flow(row, index)
+        for index, row in enumerate(flows if isinstance(flows, list) else [])
+        if isinstance(row, dict)
+    ]
+    stock_ids = {row["stockId"] for row in stock_rows}
+    active_flows = [
+        row
+        for row in flow_rows
+        if row["targetStockId"] in stock_ids or row["sourceStockId"] in stock_ids
+    ]
+    deltas = {stock_id: 0.0 for stock_id in stock_ids}
+    leverage_terms: list[dict[str, Any]] = []
+    for flow in active_flows:
+        effective = flow["rate"] * flow["polarity"] / (1 + flow["delaySteps"])
+        if flow["sourceStockId"] in deltas:
+            deltas[flow["sourceStockId"]] -= effective
+        if flow["targetStockId"] in deltas:
+            deltas[flow["targetStockId"]] += effective
+        leverage_terms.append(
+            {
+                "flowId": flow["flowId"],
+                "score": round(
+                    clamp01(abs(effective)) * 0.45
+                    + flow["controllability"] * 0.35
+                    + flow["observability"] * 0.20,
+                    6,
+                ),
+                "delaySteps": flow["delaySteps"],
+            }
+        )
+    step_count = max(1, int(_float(horizon_steps, 3)))
+    projected: list[dict[str, Any]] = []
+    for stock in stock_rows:
+        delta = deltas.get(stock["stockId"], 0.0)
+        projected_value = max(0.0, stock["value"] + delta * step_count)
+        projected_pressure = clamp01(projected_value / max(stock["capacity"], _EPS))
+        projected_gap = clamp01(max(0.0, stock["target"] - projected_value) / max(stock["target"], stock["capacity"], _EPS))
+        projected.append(
+            {
+                **stock,
+                "netFlowPerStep": round(delta, 6),
+                "projectedValue": round(projected_value, 6),
+                "projectedPressure": round(projected_pressure, 6),
+                "projectedTargetGap": round(projected_gap, 6),
+            }
+        )
+
+    observed = observations if isinstance(observations, list) else []
+    observation_count = len([row for row in observed if isinstance(row, dict)])
+    avg_pressure = sum(row["projectedPressure"] for row in projected) / max(len(projected), 1)
+    avg_gap = sum(row["projectedTargetGap"] * row["importance"] for row in projected) / max(
+        sum(row["importance"] for row in projected), _EPS
+    )
+    delay_load = sum(row["delaySteps"] for row in active_flows) / max(len(active_flows), 1)
+    observability = observation_count / max(len(stock_rows) + len(active_flows), 1)
+    risk = clamp01(avg_pressure * 0.35 + avg_gap * 0.35 + min(delay_load / 8.0, 1.0) * 0.20 + (1 - clamp01(observability)) * 0.10)
+    growth_capacity = clamp01((1 - avg_pressure) * 0.45 + (1 - avg_gap) * 0.35 + clamp01(observability) * 0.20)
+
+    adjacency: dict[str, list[dict[str, Any]]] = {}
+    for flow in active_flows:
+        if flow["sourceStockId"] and flow["targetStockId"]:
+            adjacency.setdefault(flow["sourceStockId"], []).append(flow)
+    loops: list[dict[str, Any]] = []
+    for start in sorted(stock_ids):
+        for first in adjacency.get(start, []):
+            mid = first["targetStockId"]
+            if mid == start:
+                continue
+            for second in adjacency.get(mid, []):
+                if second["targetStockId"] == start:
+                    edges = [first, second]
+                    loops.append(
+                        {
+                            "loopId": "system-loop-" + stable_hash([edge["flowId"] for edge in edges])[:16],
+                            "stockIds": [start, mid],
+                            "flowIds": [edge["flowId"] for edge in edges],
+                            "kind": _feedback_kind(edges),
+                            "delaySteps": sum(edge["delaySteps"] for edge in edges),
+                        }
+                    )
+
+    leverage_terms.sort(key=lambda row: (-row["score"], row["delaySteps"], row["flowId"]))
+    now = _now_iso()
+    model = {
+        "vertex_id": "actor-system-dynamics-" + stable_hash(
+            {"agentDid": agent, "stocks": stock_rows, "flows": active_flows}
+        )[:24],
+        "agent_did": agent,
+        "stocks_json": _canonical_json(stock_rows),
+        "flows_json": _canonical_json(active_flows),
+        "loops_json": _canonical_json(loops),
+        "risk_score": round(risk, 6),
+        "growth_capacity": round(growth_capacity, 6),
+        "observation_count": observation_count,
+        "created_at": now,
+        "updated_at": now,
+        "sensitivity_ord": 1,
+        "actor_id": "sys.actor.systemDynamics",
+        "owner_did": agent,
+        "org_id": agent,
+        "user_id": agent,
+    }
+    return {
+        "systemDynamics": model,
+        "stocks": projected,
+        "flows": active_flows,
+        "feedbackLoops": loops,
+        "leveragePoints": leverage_terms[:5],
+        "riskScore": model["risk_score"],
+        "growthCapacity": model["growth_capacity"],
+    }
+
+
+def plan_actor_self_evolution(
+    *,
+    agent_did: str,
+    system_dynamics: dict[str, Any] | None = None,
+    viability: dict[str, Any] | None = None,
+    candidate_mutations: Any = None,
+    mokuteki_gate_pass: bool = True,
+    triple_witness_pass: bool = False,
+) -> dict[str, Any]:
+    dynamics = system_dynamics if isinstance(system_dynamics, dict) else {}
+    viability_row = viability if isinstance(viability, dict) else evaluate_viability()
+    mutations = [row for row in candidate_mutations if isinstance(row, dict)] if isinstance(candidate_mutations, list) else []
+    risk = clamp01(dynamics.get("riskScore", dynamics.get("risk_score")), 0.5)
+    growth = clamp01(dynamics.get("growthCapacity", dynamics.get("growth_capacity")), 0.5)
+    viability_state = _str(viability_row.get("viabilityState") or viability_row.get("viability_state"), "normal")
+    viability_penalty = {
+        "normal": 0.0,
+        "conserve": 0.25,
+        "repair": 0.45,
+        "hibernate": 0.85,
+        "halted": 1.0,
+    }.get(viability_state, 0.4)
+    candidates = []
+    for index, mutation in enumerate(mutations):
+        mutation_id = _str(mutation.get("mutationId") or mutation.get("id") or f"mutation-{index + 1}")
+        candidates.append(
+            {
+                **mutation,
+                "actionId": mutation_id,
+                "risk": max(risk, clamp01(mutation.get("risk"), 0.0)),
+                "ambiguity": clamp01(mutation.get("ambiguity"), 0.2),
+                "epistemicValue": clamp01(mutation.get("epistemicValue", mutation.get("epistemic_value")), 0.1),
+                "viabilityPenalty": max(viability_penalty, clamp01(mutation.get("viabilityPenalty"), 0.0)),
+                "kgDevelopmentGain": clamp01(mutation.get("kgDevelopmentGain", mutation.get("kg_development_gain")), growth),
+                "simulationRequired": True,
+                "simulationRef": _str(mutation.get("simulationRef") or mutation.get("simulation_ref")),
+                "authorityRequired": bool(mutation.get("authorityRequired", mutation.get("authority_required", True))),
+            }
+        )
+    if not candidates:
+        candidates = [
+            {
+                "actionId": "observe-system-dynamics",
+                "risk": risk * 0.3,
+                "ambiguity": 0.25,
+                "epistemicValue": 0.5,
+                "viabilityPenalty": viability_penalty,
+                "kgDevelopmentGain": 0.2,
+            },
+            {
+                "actionId": "repair-bottleneck",
+                "risk": risk,
+                "ambiguity": 0.2,
+                "epistemicValue": 0.2,
+                "viabilityPenalty": viability_penalty,
+                "kgDevelopmentGain": growth,
+                "simulationRequired": True,
+            },
+        ]
+    scored = score_candidate_actions(
+        candidate_actions=candidates,
+        mokuteki_gate_pass=mokuteki_gate_pass,
+    )
+    accepted = bool(scored["selectedActionId"]) and triple_witness_pass and viability_state not in {"halted", "hibernate"}
+    blockers: list[str] = []
+    if not triple_witness_pass:
+        blockers.append("triple_witness_required_for_self_evolution")
+    if viability_state in {"halted", "hibernate"}:
+        blockers.append(f"viability_state_blocks_evolution:{viability_state}")
+    now = _now_iso()
+    plan = {
+        "vertex_id": "actor-self-evolution-plan-" + stable_hash(
+            {"agentDid": agent_did, "selected": scored["selectedActionId"], "at": now}
+        )[:24],
+        "agent_did": _str(agent_did),
+        "system_dynamics_ref": _str(dynamics.get("systemDynamics", {}).get("vertex_id") if isinstance(dynamics.get("systemDynamics"), dict) else dynamics.get("vertex_id")),
+        "selected_action_id": _str(scored["selectedActionId"]),
+        "plan_state": "accepted" if accepted else "blocked",
+        "risk_score": round(risk, 6),
+        "growth_capacity": round(growth, 6),
+        "viability_state": viability_state,
+        "blockers_json": _canonical_json(blockers + [row["reason"] for row in scored.get("rejected", [])]),
+        "expected_free_energy_json": _canonical_json(scored.get("expectedFreeEnergy", {})),
+        "created_at": now,
+        "sensitivity_ord": 1,
+        "actor_id": "sys.actor.selfEvolution",
+        "owner_did": _str(agent_did),
+        "org_id": _str(agent_did),
+        "user_id": _str(agent_did),
+    }
+    return {
+        "accepted": accepted,
+        "blockers": blockers,
+        "selfEvolutionPlan": plan,
+        "selectedActionId": scored["selectedActionId"],
+        "scored": scored["scored"],
+        "rejected": scored["rejected"],
     }
