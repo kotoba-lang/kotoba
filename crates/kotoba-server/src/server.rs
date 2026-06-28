@@ -727,7 +727,10 @@ impl KotobaState {
                 .unwrap_or_else(|_| "http://localhost:9000".into());
             let (executor, router) = match &inference_engine {
                 Some(engine) => (
-                    Arc::new(WasmExecutor::with_inference(10_000_000, engine.clone())?),
+                    Arc::new(
+                        WasmExecutor::with_inference(10_000_000, engine.clone())?
+                            .with_codec(crate::media_codec::codec_fn()),
+                    ),
                     Arc::new(InvokeRouter::with_inference(
                         10_000_000,
                         &gateway_url,
@@ -735,7 +738,9 @@ impl KotobaState {
                     )?),
                 ),
                 None => (
-                    Arc::new(WasmExecutor::new(10_000_000)?),
+                    Arc::new(
+                        WasmExecutor::new(10_000_000)?.with_codec(crate::media_codec::codec_fn()),
+                    ),
                     Arc::new(InvokeRouter::new(10_000_000, gateway_url)?),
                 ),
             };
