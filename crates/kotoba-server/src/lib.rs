@@ -33,6 +33,8 @@ pub mod key_share;
 pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
+#[cfg(feature = "wasm-runtime")]
+pub mod media_codec;
 pub mod media_xrpc;
 #[cfg(feature = "clj-mesh")]
 pub mod mesh_xrpc;
