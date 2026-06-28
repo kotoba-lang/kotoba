@@ -1,5 +1,5 @@
 //! kotoba-rad: sovereign repository identity and ref authorization over
-//! [`kotoba-git`].
+//! `kotoba-git`.
 //!
 //! This crate is the R1 layer from `docs/ADR-kotoba-rad-git-sovereign-repo.md`.
 //! It deliberately does **not** reimplement Git storage. `kotoba-git` remains
