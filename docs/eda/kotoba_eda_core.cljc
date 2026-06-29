@@ -113,6 +113,36 @@
    :report/generic [:signoff/drc-lvs-sta]
    :pdk/rule-deck [:signoff/drc-lvs-sta]})
 
+(def coverage-metrics
+  [{:eda.coverage/id :coverage/rtl-unit
+    :eda.coverage/category :simulation
+    :eda.coverage/runner-ops #{:op/lint :op/simulate}
+    :eda.coverage/tools #{:sw/verilator}}
+   {:eda.coverage/id :coverage/formal-smoke
+    :eda.coverage/category :verification
+    :eda.coverage/runner-ops #{:op/synthesize}
+    :eda.coverage/tools #{:sw/yosys}}
+   {:eda.coverage/id :coverage/mixed-signal
+    :eda.coverage/category :simulation
+    :eda.coverage/runner-ops #{:op/simulate}
+    :eda.coverage/tools #{:sw/ngspice}}
+   {:eda.coverage/id :coverage/timing-corners
+    :eda.coverage/category :signoff
+    :eda.coverage/runner-ops #{:op/analyze-timing}
+    :eda.coverage/tools #{:sw/opensta}}
+   {:eda.coverage/id :coverage/power-activity
+    :eda.coverage/category :signoff
+    :eda.coverage/runner-ops #{:op/analyze-power}
+    :eda.coverage/tools #{:sw/opensta}}
+   {:eda.coverage/id :coverage/drc-lvs
+    :eda.coverage/category :signoff
+    :eda.coverage/runner-ops #{:op/drc :op/lvs}
+    :eda.coverage/tools #{:sw/klayout :sw/netgen}}
+   {:eda.coverage/id :coverage/ate-pattern
+    :eda.coverage/category :manufacturing-test
+    :eda.coverage/runner-ops #{:op/ate}
+    :eda.coverage/tools #{:sw/ate-adapter}}])
+
 (def default-project
   {:eda.project/id :kotoba-eda-demo
    :eda.project/target :sensor-asic
@@ -183,6 +213,17 @@
    :eda.artifact/sha256 sha256
    :eda.artifact/cid (or cid (stable-cid [path format bytes sha256]))
    :eda.artifact/evidence (get artifact-evidence-map format [])})
+
+(defn runner-result-datom
+  [{:keys [adapter tool operation status input-cids output-cid coverage findings]}]
+  {:eda.run/adapter adapter
+   :eda.run/tool tool
+   :eda.run/operation operation
+   :eda.run/status status
+   :eda.run/input-cids input-cids
+   :eda.run/output-cid output-cid
+   :eda.run/coverage coverage
+   :eda.run/findings findings})
 
 (defn run-stage
   [project]
@@ -286,58 +327,95 @@
           readiness-checks))))
 
 (defn simulation-matrix
-  [project]
+  ([project] (simulation-matrix project []))
+  ([project runner-results]
   (let [score (stage-score project)
         stage (:eda.project/stage project 0)
         ip (:eda.project/ip project)
         sim-reached? (>= stage (stage-index :sim))
-        signoff-reached? (>= stage (stage-index :signoff))]
+        signoff-reached? (>= stage (stage-index :signoff))
+        result-for (fn [tool operation]
+                     (first (filter #(and (= tool (:eda.run/tool %))
+                                          (= operation (:eda.run/operation %)))
+                                    runner-results)))
+        status-of (fn [fallback-status tool operation]
+                    (or (:eda.run/status (result-for tool operation)) fallback-status))
+        coverage-of (fn [fallback tool operation]
+                      (or (:eda.run/coverage (result-for tool operation)) fallback))]
     [{:sim/id :sim/rtl-unit
       :sim/tool :sw/verilator
       :sim/input [:rtl/systemverilog :constraint/sdc]
       :sim/output [:wave/vcd :report/generic]
-      :sim/status (if sim-reached? :pass :pending)
-      :sim/coverage (if sim-reached? (min 98 (Math/round (+ 72 (* 20 (:eda.score/signoff score))))) 0)}
+      :sim/status (status-of (if sim-reached? :pass :pending) :sw/verilator :op/simulate)
+      :sim/coverage (coverage-of (if sim-reached? (min 98 (Math/round (+ 72 (* 20 (:eda.score/signoff score))))) 0)
+                                 :sw/verilator :op/simulate)}
      {:sim/id :sim/formal-smoke
       :sim/tool :sw/yosys
       :sim/input [:rtl/verilog :rtl/systemverilog]
       :sim/output [:report/generic]
-      :sim/status (if sim-reached? :pass :pending)
-      :sim/coverage (if sim-reached? 68 0)}
+      :sim/status (status-of (if sim-reached? :pass :pending) :sw/yosys :op/synthesize)
+      :sim/coverage (coverage-of (if sim-reached? 68 0) :sw/yosys :op/synthesize)}
      {:sim/id :sim/mixed-signal
       :sim/tool :sw/ngspice
       :sim/input [:analog/spice :analog/cdl]
       :sim/output [:report/generic]
-      :sim/status (cond
-                    (not (some #{:analog} ip)) :not-applicable
-                    sim-reached? :pass
-                    :else :pending)
-      :sim/coverage (cond
-                      (not (some #{:analog} ip)) 100
-                      sim-reached? 61
-                      :else 0)}
+      :sim/status (status-of (cond
+                               (not (some #{:analog} ip)) :not-applicable
+                               sim-reached? :pass
+                               :else :pending)
+                             :sw/ngspice :op/simulate)
+      :sim/coverage (coverage-of (cond
+                                   (not (some #{:analog} ip)) 100
+                                   sim-reached? 61
+                                   :else 0)
+                                 :sw/ngspice :op/simulate)}
      {:sim/id :sim/timing-corners
       :sim/tool :sw/opensta
       :sim/input [:library/liberty :constraint/sdc :timing/sdf]
       :sim/output [:report/generic]
-      :sim/status (if signoff-reached? :pass :pending)
-      :sim/coverage (if signoff-reached? 84 0)}
+      :sim/status (status-of (if signoff-reached? :pass :pending) :sw/opensta :op/analyze-timing)
+      :sim/coverage (coverage-of (if signoff-reached? 84 0) :sw/opensta :op/analyze-timing)}
      {:sim/id :sim/power-activity
       :sim/tool :sw/opensta
       :sim/input [:power/saif :library/liberty]
       :sim/output [:report/generic]
       :sim/status (if signoff-reached? :pass :pending)
-      :sim/coverage (if signoff-reached? 76 0)}]))
+      :sim/coverage (if signoff-reached? 76 0)}])))
+
+(defn coverage-assessment
+  ([project] (coverage-assessment project []))
+  ([project runner-results]
+   (let [sims (simulation-matrix project runner-results)
+         by-id (into {} (map (juxt :sim/id identity) sims))
+         metric->sim {:coverage/rtl-unit :sim/rtl-unit
+                      :coverage/formal-smoke :sim/formal-smoke
+                      :coverage/mixed-signal :sim/mixed-signal
+                      :coverage/timing-corners :sim/timing-corners
+                      :coverage/power-activity :sim/power-activity}]
+     {:eda.coverage/source (if (seq runner-results) :source/runner-result :source/stage-model)
+      :eda.coverage/metrics
+      (mapv (fn [metric]
+              (let [sim (get by-id (metric->sim (:eda.coverage/id metric)))]
+                (merge metric
+                       {:eda.coverage/status (:sim/status sim :pending)
+                        :eda.coverage/score (:sim/coverage sim 0)
+                        :eda.coverage/tool (:sim/tool sim)})))
+            coverage-metrics)
+      :eda.coverage/score
+      (Math/round (/ (reduce + (map :sim/coverage sims))
+                     (double (count sims))))})))
 
 (defn maturity-assessment
-  ([project] (maturity-assessment project []))
-  ([project artifacts]
+  ([project] (maturity-assessment project [] []))
+  ([project artifacts] (maturity-assessment project artifacts []))
+  ([project artifacts runner-results]
   (let [evidence (readiness-evidence project artifacts)
         passed (count (filter #(= :pass (:readiness/status %)) evidence))
         total (count evidence)
         ratio (/ passed (double total))
-        sims (simulation-matrix project)
-        sim-coverage (Math/round (/ (reduce + (map :sim/coverage sims)) (double (count sims))))
+        coverage (coverage-assessment project runner-results)
+        sims (simulation-matrix project runner-results)
+        sim-coverage (:eda.coverage/score coverage)
         approvals (:eda.project/approvals project)
         score (stage-score project)
         level (cond
@@ -358,6 +436,7 @@
      :eda.maturity/readiness-score (Math/round (* 100 ratio))
      :eda.maturity/simulation-coverage sim-coverage
      :eda.maturity/signoff (:eda.score/signoff score)
+     :eda.maturity/coverage coverage
      :eda.maturity/evidence evidence
      :eda.maturity/simulations sims
      :eda.maturity/blockers blockers
