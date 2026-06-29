@@ -29,6 +29,26 @@
    {:gate/id :foundry-slot  :gate/name "Foundry slot"  :gate/role "lot reservation and upload window"}
    {:gate/id :human-signoff :gate/name "Human signoff" :gate/role "responsible approval, never LLM-owned"}])
 
+(def co-sientist-checks
+  [{:check/id :quality/spec-coverage
+    :check/name "Spec coverage"
+    :check/role "requirements, interfaces, clocks, power domains and test intent are explicit"}
+   {:check/id :quality/signoff-evidence
+    :check/name "Signoff evidence"
+    :check/role "DRC/LVS/STA/SPICE/ATE artifacts have CIDs and policy gates"}
+   {:check/id :quality/reproducibility
+    :check/name "Reproducibility"
+    :check/role "tool versions, inputs, outputs and waiver decisions are replayable"}
+   {:check/id :uiux/operator-scan
+    :check/name "Operator scan"
+    :check/role "stage, risk, next action and blocking gate are visible without reading logs"}
+   {:check/id :uiux/error-recovery
+    :check/name "Error recovery"
+    :check/role "blocked flow gives a concrete next proposal and preserves prior artifacts"}
+   {:check/id :uiux/source-access
+    :check/name "Source access"
+    :check/role "CLJC/EDN source and format registry open in-browser, not as accidental downloads"}])
+
 (def default-project
   {:eda.project/id :kotoba-eda-demo
    :eda.project/target :sensor-asic
@@ -155,6 +175,52 @@
      :eda.manufacturing/ate-coverage (Math/round (* 100 (:eda.score/signoff score)))
      :eda.manufacturing/expected-yield (:eda.score/yield score)}))
 
+(defn co-sientist-review
+  "Proposal-only quality/UIUX review. This is deliberately pure data; it never
+  approves signoff and never mutates project state by itself."
+  [project]
+  (let [score (stage-score project)
+        stage-ratio (:eda.score/signoff score)
+        issue? (boolean (:eda.project/issue project))
+        approvals (:eda.project/approvals project)
+        gate-ratio (/ (count approvals) (double (count gates)))
+        quality (-> (+ (* 55 stage-ratio)
+                       (* 25 gate-ratio)
+                       (if issue? -18 10)
+                       (if (>= (:eda.project/die-mm2 project) 100) -4 6))
+                    (max 0)
+                    (min 100)
+                    Math/round)
+        uiux (-> (+ 72
+                    (* 8 gate-ratio)
+                    (if issue? -10 4)
+                    (if (>= stage-ratio 0.5) 6 0))
+                 (max 0)
+                 (min 100)
+                 Math/round)
+        findings (cond-> []
+                   (< quality 70) (conj {:finding/id :finding/quality-gate
+                                          :finding/severity :high
+                                          :finding/text "Add missing evidence CIDs before release or foundry handoff."})
+                   issue? (conj {:finding/id :finding/blocked-signoff
+                                  :finding/severity :high
+                                  :finding/text "Resolve timing/DRC correlation before tapeout."})
+                   (< gate-ratio 0.8) (conj {:finding/id :finding/policy-gates
+                                             :finding/severity :medium
+                                             :finding/text "Approve remaining policy gates or keep vendor actions disabled."})
+                   (< uiux 82) (conj {:finding/id :finding/operator-clarity
+                                      :finding/severity :medium
+                                      :finding/text "Promote next action, blocking gate and artifact status in the primary scan path."}))]
+    {:eda.review/kind :co-sientist/quality-uiux
+     :eda.review/authority? false
+     :eda.review/checks co-sientist-checks
+     :eda.review/scores {:quality quality :uiux uiux :gate-coverage gate-ratio}
+     :eda.review/findings findings
+     :eda.review/next-actions
+     (if (seq findings)
+       (mapv :finding/text findings)
+       ["Quality and UIUX review is clean enough to continue to the next EDA stage."])}))
+
 (defn kami-render-ir
   "EDA render-IR compatible with the plain-data style of kami.render/frame."
   [project]
@@ -168,6 +234,8 @@
      :eda/stage (:stage/id (current-stage project))
      :eda/signoff (* 100 (:eda.score/signoff score))
      :eda/yield (:eda.score/yield score)
+     :eda/co-sientist (select-keys (co-sientist-review project)
+                                   [:eda.review/scores :eda.review/findings])
      :frame/passes
      [{:pass/id :eda-main
        :pass/target :canvas
