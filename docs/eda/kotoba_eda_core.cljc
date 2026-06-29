@@ -49,6 +49,48 @@
     :check/name "Source access"
     :check/role "CLJC/EDN source and format registry open in-browser, not as accidental downloads"}])
 
+(def readiness-checks
+  [{:readiness/id :design/spec-reviewed
+    :readiness/category :design
+    :readiness/required-stage :arch
+    :readiness/role "requirements, interfaces and power/timing intent reviewed"}
+   {:readiness/id :design/source-frozen
+    :readiness/category :design
+    :readiness/required-stage :source
+    :readiness/role ".kotoba/.cljc/RTL/SPICE sources have CIDs"}
+   {:readiness/id :simulation/rtl
+    :readiness/category :simulation
+    :readiness/required-stage :sim
+    :readiness/role "RTL/unit regression and waveform summary available"}
+   {:readiness/id :simulation/mixed-signal
+    :readiness/category :simulation
+    :readiness/required-stage :sim
+    :readiness/role "SPICE or mixed-signal corner smoke tests available"}
+   {:readiness/id :implementation/synthesis
+    :readiness/category :implementation
+    :readiness/required-stage :synth
+    :readiness/role "synthesis reports, netlist and constraints are reproducible"}
+   {:readiness/id :implementation/pnr
+    :readiness/category :implementation
+    :readiness/required-stage :pnr
+    :readiness/role "DEF, congestion, clock and route reports are reproducible"}
+   {:readiness/id :signoff/drc-lvs-sta
+    :readiness/category :signoff
+    :readiness/required-stage :signoff
+    :readiness/role "DRC/LVS/STA evidence CIDs are present and current"}
+   {:readiness/id :release/tapeout-bundle
+    :readiness/category :release
+    :readiness/required-stage :tapeout
+    :readiness/role "GDS/OASIS, waiver manifest and release packet exist"}
+   {:readiness/id :manufacturing/mask-gated
+    :readiness/category :manufacturing
+    :readiness/required-stage :mask
+    :readiness/role "mask order is explicit, budgeted and human-approved"}
+   {:readiness/id :manufacturing/probe-package-ate
+    :readiness/category :manufacturing
+    :readiness/required-stage :final
+    :readiness/role "probe, package and final ATE plans are traceable"}])
+
 (def default-project
   {:eda.project/id :kotoba-eda-demo
    :eda.project/target :sensor-asic
@@ -175,6 +217,117 @@
      :eda.manufacturing/ate-coverage (Math/round (* 100 (:eda.score/signoff score)))
      :eda.manufacturing/expected-yield (:eda.score/yield score)}))
 
+(defn- stage-index
+  [stage-id]
+  (or (first (keep-indexed (fn [i s] (when (= stage-id (:stage/id s)) i)) stages))
+      0))
+
+(defn readiness-evidence
+  [project]
+  (let [stage (:eda.project/stage project 0)
+        approvals (:eda.project/approvals project)]
+    (mapv (fn [check]
+            (let [required (stage-index (:readiness/required-stage check))
+                  stage-ok? (>= stage required)
+                  gate-ok? (case (:readiness/id check)
+                             :manufacturing/mask-gated (and (approvals :mask-budget)
+                                                            (approvals :human-signoff))
+                             true)
+                  ok? (and stage-ok? gate-ok? (not (:eda.project/issue project)))]
+              (assoc check
+                     :readiness/status (if ok? :pass :block)
+                     :readiness/evidence-cid (when ok? (stable-cid [(:readiness/id check) project]))
+                     :readiness/blocker
+                     (cond
+                       (:eda.project/issue project) :blocked-by-signoff-issue
+                       (not stage-ok?) :stage-not-reached
+                       (not gate-ok?) :policy-gate-missing
+                       :else nil))))
+          readiness-checks)))
+
+(defn simulation-matrix
+  [project]
+  (let [score (stage-score project)
+        stage (:eda.project/stage project 0)
+        ip (:eda.project/ip project)
+        sim-reached? (>= stage (stage-index :sim))
+        signoff-reached? (>= stage (stage-index :signoff))]
+    [{:sim/id :sim/rtl-unit
+      :sim/tool :sw/verilator
+      :sim/input [:rtl/systemverilog :constraint/sdc]
+      :sim/output [:wave/vcd :report/generic]
+      :sim/status (if sim-reached? :pass :pending)
+      :sim/coverage (if sim-reached? (min 98 (Math/round (+ 72 (* 20 (:eda.score/signoff score))))) 0)}
+     {:sim/id :sim/formal-smoke
+      :sim/tool :sw/yosys
+      :sim/input [:rtl/verilog :rtl/systemverilog]
+      :sim/output [:report/generic]
+      :sim/status (if sim-reached? :pass :pending)
+      :sim/coverage (if sim-reached? 68 0)}
+     {:sim/id :sim/mixed-signal
+      :sim/tool :sw/ngspice
+      :sim/input [:analog/spice :analog/cdl]
+      :sim/output [:report/generic]
+      :sim/status (cond
+                    (not (some #{:analog} ip)) :not-applicable
+                    sim-reached? :pass
+                    :else :pending)
+      :sim/coverage (cond
+                      (not (some #{:analog} ip)) 100
+                      sim-reached? 61
+                      :else 0)}
+     {:sim/id :sim/timing-corners
+      :sim/tool :sw/opensta
+      :sim/input [:library/liberty :constraint/sdc :timing/sdf]
+      :sim/output [:report/generic]
+      :sim/status (if signoff-reached? :pass :pending)
+      :sim/coverage (if signoff-reached? 84 0)}
+     {:sim/id :sim/power-activity
+      :sim/tool :sw/opensta
+      :sim/input [:power/saif :library/liberty]
+      :sim/output [:report/generic]
+      :sim/status (if signoff-reached? :pass :pending)
+      :sim/coverage (if signoff-reached? 76 0)}]))
+
+(defn maturity-assessment
+  [project]
+  (let [evidence (readiness-evidence project)
+        passed (count (filter #(= :pass (:readiness/status %)) evidence))
+        total (count evidence)
+        ratio (/ passed (double total))
+        sims (simulation-matrix project)
+        sim-coverage (Math/round (/ (reduce + (map :sim/coverage sims)) (double (count sims))))
+        approvals (:eda.project/approvals project)
+        score (stage-score project)
+        level (cond
+                (and (= passed total)
+                     (>= sim-coverage 85)
+                     (approvals :foundry-slot)
+                     (approvals :human-signoff)) :mrl/release-ready
+                (and (>= ratio 0.8) (>= sim-coverage 75)) :mrl/pilot-ready
+                (and (>= ratio 0.55) (>= sim-coverage 50)) :mrl/engineering-ready
+                (>= ratio 0.3) :mrl/prototype
+                :else :mrl/concept)
+        blockers (->> evidence
+                      (filter #(= :block (:readiness/status %)))
+                      (mapv #(select-keys % [:readiness/id :readiness/category :readiness/blocker])))]
+    {:eda.maturity/level level
+     :eda.maturity/pass-count passed
+     :eda.maturity/total total
+     :eda.maturity/readiness-score (Math/round (* 100 ratio))
+     :eda.maturity/simulation-coverage sim-coverage
+     :eda.maturity/signoff (:eda.score/signoff score)
+     :eda.maturity/evidence evidence
+     :eda.maturity/simulations sims
+     :eda.maturity/blockers blockers
+     :eda.maturity/useable-for
+     (case level
+       :mrl/release-ready [:foundry-handoff :mask-order :pilot-lot :ate-release]
+       :mrl/pilot-ready [:internal-tapeout-review :mpw-precheck :package-planning]
+       :mrl/engineering-ready [:design-review :simulation-regression :pnr-iteration]
+       :mrl/prototype [:architecture-review :source-bringup :testbench-work]
+       [:requirements-work])}))
+
 (defn co-sientist-review
   "Proposal-only quality/UIUX review. This is deliberately pure data; it never
   approves signoff and never mutates project state by itself."
@@ -236,6 +389,11 @@
      :eda/yield (:eda.score/yield score)
      :eda/co-sientist (select-keys (co-sientist-review project)
                                    [:eda.review/scores :eda.review/findings])
+     :eda/maturity (select-keys (maturity-assessment project)
+                                [:eda.maturity/level
+                                 :eda.maturity/readiness-score
+                                 :eda.maturity/simulation-coverage
+                                 :eda.maturity/useable-for])
      :frame/passes
      [{:pass/id :eda-main
        :pass/target :canvas
