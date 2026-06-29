@@ -105,9 +105,9 @@
    [:h2 "Runner Adapter"]
    [:p "ブラウザは EDN job plan を作るだけです。実行は host/murakumo runner が policy gate 後に行います。"]
    [:div.actions
-    (action-button {:id "download-runner-plan" :label "Download runner plan" :wide? true})
+    (action-button {:id "download-runner-plan" :label "Download runner EDN" :wide? true})
     (action-button {:id "murakumo-submit" :label "Build murakumo payload" :wide? true})
-    (action-button {:id "download-murakumo-payload" :label "Download murakumo payload" :wide? true})]
+    (action-button {:id "download-murakumo-payload" :label "Download murakumo EDN" :wide? true})]
    [:div#runner-log.log {:style {:margin-top "10px" :max-height "260px"}}]
    [:div#murakumo-log.log {:style {:margin-top "10px" :max-height "180px"}}]
    [:div.source-links

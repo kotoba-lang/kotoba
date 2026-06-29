@@ -2,7 +2,7 @@
   "Minimal host-side skeleton for executing kotoba EDA runner EDN plans.
 
   Usage:
-    clojure runner_host.clj plan.edn
+    clojure -M runner_host.clj plan.edn
 
   This script is intentionally conservative: default mode prints whitelisted
   commands and emits dry-run datoms. Set EDA_RUNNER_EXEC=1 only inside a prepared
