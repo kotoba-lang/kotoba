@@ -1170,12 +1170,14 @@ fn supervisor_dry_run(
             &wasm,
             &function,
             &request.args,
-            request.fuel,
-            live_adapters,
-            &request.auth_grants,
-            &request.kqe_snapshot,
-            request.llm_echo,
-            &request.llm_responses,
+            SupervisorRunOptions {
+                fuel: request.fuel,
+                live_adapters,
+                auth_grants: &request.auth_grants,
+                kqe_snapshot: &request.kqe_snapshot,
+                llm_echo: request.llm_echo,
+                llm_responses: &request.llm_responses,
+            },
         )
         .with_context(|| format!("supervisor host-bound dry-run {}.{function}", component.id))?;
         return Ok(ComponentDryRunReport {
@@ -1240,28 +1242,34 @@ fn supervisor_dry_run(
     })
 }
 
+struct SupervisorRunOptions<'a> {
+    fuel: u64,
+    live_adapters: Option<SupervisorLiveAdapters>,
+    auth_grants: &'a [String],
+    kqe_snapshot: &'a [ComponentKqeQuad],
+    llm_echo: bool,
+    llm_responses: &'a [ComponentLlmResponse],
+}
+
 fn run_with_supervisor_hosts(
     wasm: &[u8],
     function: &str,
     args: &[i64],
-    fuel: u64,
-    live_adapters: Option<SupervisorLiveAdapters>,
-    auth_grants: &[String],
-    kqe_snapshot: &[ComponentKqeQuad],
-    llm_echo: bool,
-    llm_responses: &[ComponentLlmResponse],
+    options: SupervisorRunOptions<'_>,
 ) -> Result<(i64, Vec<ComponentHostEvent>)> {
     let mut config = wasmtime::Config::new();
     config.consume_fuel(true);
     let engine = wasmtime::Engine::new(&config)?;
     let module = wasmtime::Module::new(&engine, wasm)?;
     let mut linker = wasmtime::Linker::new(&engine);
-    let grants = auth_grants
+    let grants = options
+        .auth_grants
         .iter()
         .filter_map(|grant| grant.split_once(':'))
         .map(|(resource, ability)| (resource.to_string(), ability.to_string()))
         .collect::<BTreeSet<_>>();
-    let llm_responses = llm_responses
+    let llm_responses = options
+        .llm_responses
         .iter()
         .map(|response| (response.model.clone(), response.response.clone()))
         .collect::<BTreeMap<_, _>>();
@@ -1269,14 +1277,14 @@ fn run_with_supervisor_hosts(
         &engine,
         SupervisorHostState {
             auth_grants: grants,
-            kqe_snapshot: kqe_snapshot.to_vec(),
-            llm_echo,
+            kqe_snapshot: options.kqe_snapshot.to_vec(),
+            llm_echo: options.llm_echo,
             llm_responses,
-            live_adapters,
+            live_adapters: options.live_adapters,
             host_events: Vec::new(),
         },
     );
-    store.set_fuel(fuel)?;
+    store.set_fuel(options.fuel)?;
     let auth = wasmtime::Func::wrap(
         &mut store,
         move |mut caller: wasmtime::Caller<'_, SupervisorHostState>,
@@ -4364,7 +4372,7 @@ fn find_android_avdmanager() -> Option<PathBuf> {
 }
 
 fn android_valid_avd_from_avdmanager(avdmanager: &Path) -> Result<Option<String>> {
-    let output = Command::new(&avdmanager)
+    let output = Command::new(avdmanager)
         .arg("list")
         .arg("avd")
         .output()
@@ -6065,7 +6073,7 @@ fn aiueos_shell_surface_edn(plan: &ShellPlan, target: Target) -> String {
                 .as_array()?
                 .iter()
                 .filter_map(|c| c.as_str())
-                .map(|c| format!(":{}", c.replace('/', "/")))
+                .map(|c| format!(":{c}"))
                 .collect::<Vec<_>>()
                 .join(" ");
             Some(format!(
@@ -10994,12 +11002,14 @@ mod tests {
             &wasm,
             "reply-len",
             &[],
-            1_000_000,
-            Some(live_adapters),
-            &[],
-            &[],
-            false,
-            &[],
+            SupervisorRunOptions {
+                fuel: 1_000_000,
+                live_adapters: Some(live_adapters),
+                auth_grants: &[],
+                kqe_snapshot: &[],
+                llm_echo: false,
+                llm_responses: &[],
+            },
         )
         .unwrap();
 
