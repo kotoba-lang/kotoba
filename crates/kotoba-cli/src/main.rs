@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod extension;
 mod mesh;
 mod word;
 
@@ -77,6 +78,10 @@ enum Cmd {
     /// KOTOBA Mesh — lattice participation status.
     #[command(subcommand)]
     Lattice(mesh::LatticeCmd),
+
+    /// Kotoba extensions — evaluate, run, build, and deploy Clojure/EDN packages.
+    #[command(subcommand)]
+    Extension(extension::ExtensionCmd),
 
     /// SPARQL query (SELECT / DESCRIBE / CONSTRUCT / ASK) over the running
     /// server's direct-SPARQL endpoint.  Auto-detects the form from the
@@ -399,6 +404,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args
+        .get(1)
+        .is_some_and(|arg| arg.starts_with("-M") || arg.starts_with("-X"))
+    {
+        return extension::run_clojure_alias_shorthand(&raw_args[1..]);
+    }
+
     let cli = Cli::parse();
 
     match cli.cmd {
@@ -419,6 +432,7 @@ async fn main() -> Result<()> {
         Cmd::Component(cmd) => mesh::run_component(cmd)?,
         Cmd::App(cmd) => mesh::run_app(cmd).await?,
         Cmd::Lattice(cmd) => mesh::run_lattice(cmd)?,
+        Cmd::Extension(cmd) => extension::run(cmd, &cli.url, &cli.token).await?,
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,
 
