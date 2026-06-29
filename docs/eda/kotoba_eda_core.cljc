@@ -91,6 +91,28 @@
     :readiness/required-stage :final
     :readiness/role "probe, package and final ATE plans are traceable"}])
 
+(def artifact-evidence-map
+  {:rtl/verilog [:design/source-frozen :simulation/rtl]
+   :rtl/systemverilog [:design/source-frozen :simulation/rtl]
+   :rtl/vhdl [:design/source-frozen :simulation/rtl]
+   :analog/spice [:design/source-frozen :simulation/mixed-signal]
+   :analog/cdl [:simulation/mixed-signal :signoff/drc-lvs-sta]
+   :constraint/sdc [:design/spec-reviewed :implementation/synthesis]
+   :constraint/upf [:design/spec-reviewed]
+   :library/liberty [:implementation/synthesis :signoff/drc-lvs-sta]
+   :physical/lef [:implementation/pnr]
+   :physical/def [:implementation/pnr]
+   :layout/gdsii [:release/tapeout-bundle :manufacturing/mask-gated]
+   :layout/oasis [:release/tapeout-bundle :manufacturing/mask-gated]
+   :wave/vcd [:simulation/rtl]
+   :wave/fst [:simulation/rtl]
+   :timing/sdf [:signoff/drc-lvs-sta]
+   :power/saif [:signoff/drc-lvs-sta]
+   :test/stil [:manufacturing/probe-package-ate]
+   :test/wgl [:manufacturing/probe-package-ate]
+   :report/generic [:signoff/drc-lvs-sta]
+   :pdk/rule-deck [:signoff/drc-lvs-sta]})
+
 (def default-project
   {:eda.project/id :kotoba-eda-demo
    :eda.project/target :sensor-asic
@@ -152,6 +174,15 @@
           :eda.datom/kind kind
           :eda.stage/id (:stage/id (current-stage project))}
          attrs))
+
+(defn artifact-manifest
+  [{:keys [path format bytes sha256 cid]}]
+  {:eda.artifact/path path
+   :eda.artifact/format format
+   :eda.artifact/bytes bytes
+   :eda.artifact/sha256 sha256
+   :eda.artifact/cid (or cid (stable-cid [path format bytes sha256]))
+   :eda.artifact/evidence (get artifact-evidence-map format [])})
 
 (defn run-stage
   [project]
@@ -223,27 +254,36 @@
       0))
 
 (defn readiness-evidence
-  [project]
+  ([project] (readiness-evidence project []))
+  ([project artifacts]
   (let [stage (:eda.project/stage project 0)
-        approvals (:eda.project/approvals project)]
+        approvals (:eda.project/approvals project)
+        evidence? (fn [id]
+                    (some #(some #{id} (:eda.artifact/evidence %)) artifacts))]
     (mapv (fn [check]
             (let [required (stage-index (:readiness/required-stage check))
                   stage-ok? (>= stage required)
+                  artifact-ok? (boolean (evidence? (:readiness/id check)))
                   gate-ok? (case (:readiness/id check)
                              :manufacturing/mask-gated (and (approvals :mask-budget)
                                                             (approvals :human-signoff))
                              true)
-                  ok? (and stage-ok? gate-ok? (not (:eda.project/issue project)))]
+                  ok? (and (or stage-ok? artifact-ok?) gate-ok? (not (:eda.project/issue project)))]
               (assoc check
                      :readiness/status (if ok? :pass :block)
-                     :readiness/evidence-cid (when ok? (stable-cid [(:readiness/id check) project]))
+                     :readiness/evidence-cid
+                     (when ok?
+                       (or (:eda.artifact/cid (first (filter #(some #{(:readiness/id check)}
+                                                                     (:eda.artifact/evidence %))
+                                                              artifacts)))
+                           (stable-cid [(:readiness/id check) project])))
                      :readiness/blocker
                      (cond
                        (:eda.project/issue project) :blocked-by-signoff-issue
-                       (not stage-ok?) :stage-not-reached
+                       (not (or stage-ok? artifact-ok?)) :stage-or-evidence-missing
                        (not gate-ok?) :policy-gate-missing
                        :else nil))))
-          readiness-checks)))
+          readiness-checks))))
 
 (defn simulation-matrix
   [project]
@@ -290,8 +330,9 @@
       :sim/coverage (if signoff-reached? 76 0)}]))
 
 (defn maturity-assessment
-  [project]
-  (let [evidence (readiness-evidence project)
+  ([project] (maturity-assessment project []))
+  ([project artifacts]
+  (let [evidence (readiness-evidence project artifacts)
         passed (count (filter #(= :pass (:readiness/status %)) evidence))
         total (count evidence)
         ratio (/ passed (double total))
@@ -326,7 +367,7 @@
        :mrl/pilot-ready [:internal-tapeout-review :mpw-precheck :package-planning]
        :mrl/engineering-ready [:design-review :simulation-regression :pnr-iteration]
        :mrl/prototype [:architecture-review :source-bringup :testbench-work]
-       [:requirements-work])}))
+       [:requirements-work])})))
 
 (defn co-sientist-review
   "Proposal-only quality/UIUX review. This is deliberately pure data; it never
