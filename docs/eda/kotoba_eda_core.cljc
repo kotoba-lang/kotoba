@@ -1,0 +1,188 @@
+(ns kotoba.eda.core
+  "Portable CLJC model for the kotoba EDA web workbench.
+
+  The browser page in docs/eda/index.html mirrors these pure functions. The data
+  shape follows kami.render/frame: immutable maps, explicit draw passes, and no
+  renderer-owned truth. Real EDA tools stay behind adapters; this namespace
+  models the workflow, datoms, gates, artifact CIDs and manufacturing handoff."
+  #?(:cljs (:require [cljs.reader :as reader])))
+
+(def stages
+  [{:stage/id :spec     :stage/name "Spec"          :stage/role "requirements, IO, clocks, power, test intent"}
+   {:stage/id :arch     :stage/name "Architecture"  :stage/role "IP blocks, buses, memories, analog boundaries"}
+   {:stage/id :source   :stage/name "Source"        :stage/role ".kotoba, .cljc, RTL, SPICE, constraints"}
+   {:stage/id :sim      :stage/name "Simulation"    :stage/role "unit, mixed-signal, waveform, formal checks"}
+   {:stage/id :synth    :stage/name "Synthesis"     :stage/role "netlist, timing constraints, area and power"}
+   {:stage/id :pnr      :stage/name "Floorplan/P&R" :stage/role "placement, routing, congestion, clocks"}
+   {:stage/id :signoff  :stage/name "Signoff"       :stage/role "DRC, LVS, STA, IR, EM, SPICE reports"}
+   {:stage/id :tapeout  :stage/name "Tapeout"       :stage/role "GDS/OASIS, LEF/DEF, netlist and waiver bundle"}
+   {:stage/id :mask     :stage/name "Mask order"    :stage/role "reticle plan, mask shop package, release gate"}
+   {:stage/id :wafer    :stage/name "Wafer lot"     :stage/role "process traveller, PCM, lot sampling"}
+   {:stage/id :probe    :stage/name "Probe"         :stage/role "wafer sort, binning, known-good die data"}
+   {:stage/id :package  :stage/name "Package"       :stage/role "assembly, substrate, wirebond/flip-chip, thermal"}
+   {:stage/id :final    :stage/name "Final test"    :stage/role "ATE vectors, QA, yield ramp, ship release"}])
+
+(def gates
+  [{:gate/id :pdk-license   :gate/name "PDK license"   :gate/role "PDK and rule deck usage rights"}
+   {:gate/id :nda-export    :gate/name "NDA / export"  :gate/role "external inference and foundry transfer policy"}
+   {:gate/id :mask-budget   :gate/name "Mask budget"   :gate/role "paid mask order authorization"}
+   {:gate/id :foundry-slot  :gate/name "Foundry slot"  :gate/role "lot reservation and upload window"}
+   {:gate/id :human-signoff :gate/name "Human signoff" :gate/role "responsible approval, never LLM-owned"}])
+
+(def default-project
+  {:eda.project/id :kotoba-eda-demo
+   :eda.project/target :sensor-asic
+   :eda.project/process :sky130
+   :eda.project/die-mm2 16
+   :eda.project/volume-k 25
+   :eda.project/ip #{:cpu :sram :otp}
+   :eda.project/stage 0
+   :eda.project/approvals #{:pdk-license}
+   :eda.project/issue nil})
+
+(defn stable-cid
+  "Deterministic browser-safe placeholder CID. Production swaps this for kotoba
+  object-store CID creation."
+  [x]
+  (let [s (pr-str x)
+        h (reduce (fn [h ch]
+                    (mod (* 16777619 (bit-xor h (int ch))) 4294967296))
+                  2166136261
+                  s)]
+    (str "bafyeda" #?(:clj (Long/toString h 36)
+                      :cljs (.toString h 36)))))
+
+(defn stage-score
+  [{:eda.project/keys [die-mm2 process ip stage issue volume-k]}]
+  (let [complexity (+ (/ die-mm2 144.0)
+                      (* 0.055 (count ip))
+                      (case process
+                        :cmos28 0.18
+                        :bcd180 0.10
+                        0.0))
+        issue-penalty (if issue 0.08 0.0)
+        signoff (-> (/ stage (dec (count stages)))
+                    (- issue-penalty)
+                    (max 0.0)
+                    (min 1.0))
+        yield (-> (- 96.0 (* complexity 18.0) (* issue-penalty 100.0))
+                  (+ (* signoff 4.0))
+                  (max 42.0)
+                  (min 98.0))
+        cost (Math/round (* (+ (* die-mm2 2.8)
+                               (* volume-k 0.18)
+                               (* (count ip) 8))
+                            (case process
+                              :cmos28 4.5
+                              :bcd180 2.2
+                              1.0)))]
+    {:eda.score/complexity complexity
+     :eda.score/signoff signoff
+     :eda.score/yield yield
+     :eda.score/cost-k cost}))
+
+(defn current-stage [project]
+  (nth stages (:eda.project/stage project 0)))
+
+(defn datom
+  [project kind attrs]
+  (merge {:db/id (stable-cid [kind attrs])
+          :eda.datom/kind kind
+          :eda.stage/id (:stage/id (current-stage project))}
+         attrs))
+
+(defn run-stage
+  [project]
+  (let [stage (current-stage project)
+        blocked? (and (:eda.project/issue project)
+                      (<= 6 (:eda.project/stage project) 7))
+        cid (stable-cid [(:stage/id stage) project])
+        report (datom project :eda.run/complete
+                      {:eda.run/tool (keyword "murakumo" (name (:stage/id stage)))
+                       :eda.run/status (if blocked? :blocked :passed)
+                       :eda.run/output-cid cid})
+        next-project (if blocked?
+                       project
+                       (update project :eda.project/stage #(min (dec (count stages)) (inc %))))]
+    {:project next-project
+     :datoms (cond-> [report]
+               blocked? (conj (datom project :eda.report/finding
+                                      {:eda.report/severity :high
+                                       :eda.report/rule :timing-drc-correlation
+                                       :eda.report/cid (stable-cid [:finding cid])})))
+     :review {:eda.review/kind :llm-proposal
+              :eda.review/authority? false
+              :eda.review/text (if blocked?
+                                 "Correlate STA critical path with DRC overlay near clock spine before tapeout."
+                                 (str (:stage/name stage) " completed; continue to next gate."))}}))
+
+(defn run-flow
+  [project]
+  (loop [p project
+         acc-datoms []
+         reviews []
+         guard 0]
+    (if (or (= (:eda.project/stage p) (dec (count stages)))
+            (>= guard 20))
+      {:project p :datoms acc-datoms :reviews reviews}
+      (let [{next-project :project
+             step-datoms :datoms
+             review :review} (run-stage p)
+            next-datoms (into acc-datoms step-datoms)
+            next-reviews (conj reviews review)]
+        (if (= p next-project)
+          {:project next-project :datoms next-datoms :reviews next-reviews}
+          (recur next-project next-datoms next-reviews (inc guard)))))))
+
+(defn manufacturing-packet
+  [project]
+  (let [score (stage-score project)
+        approvals (:eda.project/approvals project)]
+    {:eda.release/project (:eda.project/id project)
+     :eda.release/stage (:stage/id (current-stage project))
+     :eda.release/artifacts {:source (stable-cid [:source project])
+                             :netlist (stable-cid [:netlist project])
+                             :gds (stable-cid [:gds project])
+                             :reports (stable-cid [:reports project])
+                             :waivers (stable-cid [:waivers (:eda.project/issue project)])}
+     :eda.manufacturing/mask-order (if (and (approvals :mask-budget)
+                                            (approvals :human-signoff))
+                                     :ready
+                                     :gated)
+     :eda.manufacturing/foundry-upload (if (approvals :foundry-slot) :ready :gated)
+     :eda.manufacturing/wafer-traveller [:lot-start :implant :metallization :pcm :probe]
+     :eda.manufacturing/package-bom [:substrate :die-attach :bond :mold :mark]
+     :eda.manufacturing/ate-coverage (Math/round (* 100 (:eda.score/signoff score)))
+     :eda.manufacturing/expected-yield (:eda.score/yield score)}))
+
+(defn kami-render-ir
+  "EDA render-IR compatible with the plain-data style of kami.render/frame."
+  [project]
+  (let [score (stage-score project)
+        ips (vec (:eda.project/ip project))]
+    {:frame/n (:eda.project/stage project)
+     :frame/clear [0.97 0.98 0.99 1.0]
+     :frame/kami-engine :render-ir-compatible
+     :eda/project (:eda.project/id project)
+     :eda/process (:eda.project/process project)
+     :eda/stage (:stage/id (current-stage project))
+     :eda/signoff (* 100 (:eda.score/signoff score))
+     :eda/yield (:eda.score/yield score)
+     :frame/passes
+     [{:pass/id :eda-main
+       :pass/target :canvas
+       :pass/draws
+       (vec
+        (map-indexed
+         (fn [i ip]
+           {:draw/pipeline :eda-layer-rect
+            :draw/mesh :rect
+            :draw/material (nth [:M1 :M4 :Mtop] (mod i 3))
+            :draw/instances {:count 1
+                             :rect [(+ 90 (* (mod i 3) 210))
+                                    (+ 90 (* (quot i 3) 140))
+                                    (+ 140 (if (= ip :ml) 70 0))
+                                    (+ 80 (if (= ip :sram) 45 0))]
+                             :tint (nth ["#2563eb" "#16825d" "#c2410c" "#0891b2" "#6d28d9" "#b45309"] (mod i 6))
+                             :label (str "macro-" (name ip))}})
+         ips))}]}))
