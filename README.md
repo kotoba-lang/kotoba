@@ -335,6 +335,34 @@ Measurements taken on M4 Mac, release build, `KOTOBA_IPFS=off`,
 
 Trust-boundary throughput **12.8K QPS** at c=32, 100% replay-protected.
 
+## kotoba-shell release pipeline
+
+`kotoba-shell` is the desktop/mobile app shell layer over safe-clj components
+and the aiueos shell surface. It generates target-specific app scaffolds and
+release evidence without requiring users to install global Node, wasmtime, or
+platform runtimes.
+
+```bash
+kotoba shell check examples/kotoba-shell-hello/app.kotoba.edn
+kotoba shell build examples/kotoba-shell-hello/app.kotoba.edn --target macos
+kotoba shell export examples/kotoba-shell-hello/app.kotoba.edn --target macos
+kotoba shell release-check --target macos target/kotoba-shell/release/macos/kotoba-shell-hello
+
+kotoba shell build examples/kotoba-shell-hello/app.kotoba.edn --target windows
+kotoba shell export examples/kotoba-shell-hello/app.kotoba.edn --target windows
+kotoba shell release-check --target windows target/kotoba-shell/release/windows/kotoba-shell-hello
+```
+
+macOS release gates generate Developer ID signing and notarization helpers.
+Windows release gates generate Authenticode signing and SmartScreen reputation
+evidence helpers. The aiueos runtime boundary is explicit: `core` builds verify
+and inspect manifests without `wasm-runtime`; `runner` builds include embedded
+Wasm execution for app launch without a global runtime install.
+
+Desktop exports also generate `aiueos-portable-plan.json`,
+`build-aiueos-core.bb`, and `build-aiueos-runner.bb`. Set `AIUEOS_DIR` when the
+aiueos checkout is not adjacent to the kotoba checkout.
+
 ## Documentation
 
 The published docs site — [**com-junkawasaki.github.io/kotoba**](https://com-junkawasaki.github.io/kotoba/)
@@ -352,6 +380,7 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | [`docs/ADR-sealed-cold-tier.md`](docs/ADR-sealed-cold-tier.md) | encrypted cold tier + t-of-N custody |
 | [`docs/ADR-clojure-wasm.md`](docs/ADR-clojure-wasm.md) | Clojure/EDN-subset → WebAssembly compiler (the language) |
 | [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe-clj** — capability-confined language design (capability/subset/effect gates, T2/T3) |
+| [`docs/ADR-kotoba-shell-aiueos-safety-clj.md`](docs/ADR-kotoba-shell-aiueos-safety-clj.md) | kotoba-shell, aiueos runner integration, and release security gates |
 | [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |
 | [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC |
 | [`docs/ADR-kotoba-word.md`](docs/ADR-kotoba-word.md) | word/root registry + capability boundary |
