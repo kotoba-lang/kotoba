@@ -4,7 +4,7 @@
 
 ```
 KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
-          × CACAO × AT Protocol × LLM/Weight × WASM/WIT × safe-clj[cap⊗effect]
+          × CACAO × AT Protocol × LLM/Weight × WASM/WIT × safe Kotoba[cap⊗effect]
 ```
 
 Kotoba is two things in one system:
@@ -13,11 +13,45 @@ Kotoba is two things in one system:
   decentralized AI agent systems, combining Datomic-style immutable datoms,
   Pregel BSP graph computation, an auxiliary SPARQL 1.1 executor over IPFS
   storage, native CACAO authentication, and WASM Component Model execution.
-- **A language** — `kotoba-clj` compiles a Clojure/EDN subset directly to
-  **WebAssembly** (a compiler, not an interpreter), and **safe-clj** adds a
+- **A language** — `kotoba-lang` defines the source profile (`.kotoba`
+  canonical, portable `.cljc` with `#?(:kotoba ...)` for Kotoba-specific
+  branches), and `kotoba wasm` compiles that Kotoba/EDN subset directly to
+  **WebAssembly** (a compiler, not an interpreter). **safe Kotoba** adds a
   *capability-confined* profile for running untrusted / AI-generated agents:
   what a module can touch is whatever it was explicitly handed, and nothing
-  else. See [**Language**](#language--kotoba-clj--safe-clj) below.
+  else. See [**Language**](#language--kotoba-lang--kotoba-wasm) below.
+
+## Repository boundary
+
+`kotoba-lang/kotoba` is the language and library substrate. Keep generic
+protocols, data structures, compilers, runtimes, storage, crypto, and reusable
+fixtures here. The split policy is recorded in
+[`docs/ADR-repository-boundaries.md`](docs/ADR-repository-boundaries.md).
+
+`kotoba-lang/kotoba-lang` is reserved for the standalone language contract once
+an external compiler/runtime, package, or conformance suite needs it outside
+this workspace. Until then, `crates/kotoba-lang`, `docs/lang`, `kotoba -e`, and
+`kotoba wasm` stay in this repository as the canonical source of truth.
+
+The public `kotoba` crate/CLI also stays here for now because it is an
+integration binary over multiple workspace crates. Publishing it is a packaging
+decision, not a repository split.
+
+`kami-engine` is the strongest future split candidate when the Kami host,
+rendering/devtool SDK, templates, and golden UI verification can build without
+`kotoba-kotodama` path dependencies. After that split, this repository should
+keep only thin WIT/component fixtures and integration tests for Kami surfaces.
+
+Domain actors do not belong in this repository. They live in
+`etzhayyim/com-etzhayyim-*` as `.cljc` actors/cells. AT Protocol actors,
+PDS/AppView handlers, and XRPC application surfaces live in
+`gftdcojp/app-aozora`. Hosting, placement, fleet, gateway, and runtime
+operations live in `kotoba-lang/murakumo`.
+
+The historical `crates/kotoba-kotodama` tree is migration-only. Its generic Rust
+config/inference crates may stay only when they are language/runtime substrate;
+domain cells, Python UDF pools, AT Protocol actors, and hosting code are being
+moved to their canonical owners.
 
 ## 📺 Explainers & Docs site
 
@@ -66,7 +100,7 @@ brew install --build-from-source ./Formula/kotoba.rb
 ### From source (any platform)
 
 ```bash
-git clone https://github.com/com-junkawasaki/kotoba.git
+git clone https://github.com/kotoba-lang/kotoba.git
 cd kotoba
 cargo install --locked --path crates/kotoba-cli --bin kotoba
 ```
@@ -113,19 +147,51 @@ kotoba cacao-sign <seed> --graph <cid> \
     --capability datom:read [--private] [--aud <did>]
 ```
 
-## Language — kotoba-clj & safe-clj
+## Language — kotoba-lang & kotoba wasm
 
-kotoba is not only a database — it ships its **own language**. `kotoba-clj`
-compiles a Clojure/EDN subset directly to **real WebAssembly**: the Clojure
-source *becomes* a WASM Component that runs on `kotoba-runtime` against the
-`kotoba:kais` host world (graph read/write, streams, LLM inference, CACAO). It
-is a compiler, not an embedded interpreter.
+## 言語性（Language-ness）
 
-On top of it, **safe-clj** (`compile_safe_clj`) is a *capability-confined*
+`kotoba` の言語性は、単なる「シンタックス定義」ではなく、次の3点で成立しています。
+
+1. **言語契約の明示化**  
+   `.kotoba` が正規ソース契約、`.clj/.cljc/.cljs` が互換入力という優先順位付きの入力面を持つ。  
+   `#?(:kotoba ...)` と名前空間解決ルールで、Rust 実装に依存しない公開仕様として運用します。
+
+2. **コンパイルの主権移譲**  
+   `kotoba wasm` / `kotoba -e` は `kotoba-lang` の言語面をコンパイラ API として明示し、最終的に
+   **WASM Component** として発行します。実行環境は AST ではなく、コンパイル済みバイナリで評価されます。
+
+3. **実行可能性の拘束化**  
+   `safe` プロファイルは「言語で強く動く」ではなく、**許可されたものしか実行できない** という意味論で安全性を定義します。  
+   capability/subset/effect の3ゲートは、実行前に入口で拒否され、`allow-by-default` ではない言語挙動を採用します。
+
+この `言語性` は `docs/lang/` 配下のプロフィール・互換性仕様と、`docs/ADR-kotoba-lang-profile.md` / `ADR-safe-capability-language.md`
+（および `ADR-kotoba-wasm.md`）で追跡しています。
+
+kotoba is not only a database — it ships its **own language profile**.
+[`kotoba-lang`](crates/kotoba-lang/) defines the source contract: `.kotoba` is
+the canonical Kotoba source extension, portable `.cljc` is for shared
+Clojure-family source, `.clj` / `.cljs` are compatibility inputs, and
+`#?(:kotoba ...)` selects Kotoba-specific code.
+`kotoba wasm` compiles that profile's Kotoba/EDN subset directly to **real
+WebAssembly**: the Kotoba source *becomes* a WASM Component that runs on
+`kotoba-runtime` against the `kotoba:kais` host world (graph read/write,
+streams, LLM inference, CACAO). `.clj` / `.cljc` / `.cljs` remain compatibility
+inputs, but `.kotoba` is the canonical source extension. It is a compiler, not
+an embedded interpreter.
+
+The public CLI path is `kotoba wasm`: it exposes build, safe-build, safe-policy,
+and selfhost inspection over the same compiler APIs without making callers speak
+the implementation crate name. The language gate also pins that public surface:
+`kotoba -e`, `kotoba wasm build`, `safe-policy`, `selfhost-inspect`, and
+`safe-build` all default to the `kotoba` reader target, accept `-S` /
+`--source-path`, and keep `.kotoba` namespace sources ahead of `.clj`
+compatibility files. On top of the compiler, **safe Kotoba**
+(`compile_safe_kotoba`, legacy alias `compile_safe_clj`) is a *capability-confined*
 profile for running untrusted / AI-generated code. The thesis (see
 [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md)):
 the strongest safety is not a "strong language" but **an execution environment
-where an attacker can do nothing it was not explicitly handed**. safe-clj
+where an attacker can do nothing it was not explicitly handed**. safe Kotoba
 enforces that with three deny-by-default gates, all at compile time:
 
 | Gate | Guarantee | Theorem |
@@ -137,7 +203,7 @@ enforces that with three deny-by-default gates, all at compile time:
 Capabilities are passed as **values**, never summoned by name: a module not
 handed write access to a graph cannot write it — the same attenuation CACAO
 enforces at run time, lifted into the type/compile layer. The policy is
-deny-by-default EDN (`examples/safe-policy.edn`):
+deny-by-default EDN (`crates/kotoba-clj/examples/safe-policy.edn`):
 
 ```edn
 {:imports {:graph-read ["bafy…"] :graph-write ["bafy…"] :infer [] :auth false}
@@ -147,24 +213,58 @@ deny-by-default EDN (`examples/safe-policy.edn`):
 Build a confined module from the CLI — and audit exactly what it can do:
 
 ```bash
-kotoba-clj safe-build cell.clj --policy policy.edn -o cell.wasm
-# [safe-build] cell.clj -> cell.wasm (10405 bytes)
-# [safe-build] capability surface: kotoba:kais/kqe@0.1.0
-# [safe-build] inferred effects: run={graph-write}
+kotoba -e '(+ 1 2)'                         # compile Kotoba -> Wasm -> run main
+kotoba wasm safe-build cell.kotoba --policy policy.edn -o cell.wasm
+# [wasm safe-build] cell.kotoba (10405 bytes)
+# [wasm safe-build] admission gate: selfhost/kotoba
+# [wasm safe-build] capability surface: kotoba:kais/kqe@0.1.0
+# [wasm safe-build] inferred effects: run={graph-write}
+```
+
+`--selfhost-gate` is retained only as a compatibility alias; safe-build and
+safe-policy are selfhost-first by default.
+
+To inspect the versioned analyzer request and selfhost summaries without
+compiling, use:
+
+```bash
+kotoba wasm selfhost-inspect cell.kotoba --policy policy.edn --request-hex --json
+# {
+#   "abi": "kotoba.selfhost.safe-analyzer.v1",
+#   "types": {"ok": true, "denials": []},
+#   "admission": {"effects": {"ok": true}, "policy": {"ok": true}},
+#   "functions": [{"name": "run", "effects": ["graph-write"]}]
+# }
 ```
 
 Capabilities are scoped **per resource**: granting write to graph A does not
 permit graph B, and granting inference on model M does not permit model N — the
 compile-time twin of CACAO's `leaf.graph ⊆ root.graph` attenuation (T3 at
-instance granularity). `kotoba-clj safe-policy <cell>` runs the inverse of the
+instance granularity). `kotoba wasm safe-policy <cell>` runs the inverse of the
 gate, synthesizing the **minimal least-privilege policy** a cell needs.
 
 Audit/tooling APIs, usable standalone: `embedded_capability_ifaces(wasm)`
 (byte-level capability surface), `infer_effects(src)` (source-level transitive
 effects), `minimal_policy(src)` (least-privilege synthesis), `Policy::to_edn`.
-Status: capability (instance-level), subset, and effect (interprocedural) gates
-implemented and byte-verified (S0–S4) with ~160 safe-mode tests; typed HIR /
-borrow checker (T1) are on the roadmap in the ADR.
+Self-hosting has started in slices under
+[`crates/kotoba-clj/selfhost/`](crates/kotoba-clj/selfhost/): the
+`safe_analyzer.kotoba` seed is written in Kotoba, compiles as safe Kotoba to a
+Wasm Component, has no embedded host capability imports, and is checked against
+the Rust analyzer for the covered effect/capability/policy surface. Rust callers
+can exercise that path through `kotoba_clj::selfhost::{Analyzer,
+infer_effects, minimal_policy, check_effect_declarations, check_policy,
+check_admission, unused_grants, compile_safe_kotoba}`. Status:
+capability (instance-level), subset, and effect (interprocedural) gates
+implemented and byte-verified (S0–S4) with safe-mode tests; typed HIR / borrow
+checker (T1) and wider self-hosting are tracked in the ADRs.
+
+Current naming: `kotoba` is the language + database + semantic substrate,
+`kotoba wasm` / safe Kotoba is the executable language path that turns Kotoba
+into Wasm, and `aiueos` is the OS/component supervisor and capability broker.
+`kotoba-clj` remains the implementation crate for that compiler path. In that
+split, Rust-free self-hosting means moving authoritative language/admission
+semantics into confined Kotoba components slice by slice, while Rust remains
+the bootstrap/emitter/oracle for unfinished slices.
 
 ## Defaults that just work
 
@@ -202,8 +302,9 @@ exactly how to silence or fix it.
 | `kotoba-server`    | XRPC / MCP endpoints (kg.ingest / kg.ingest_batch / kg.query / kg.sparql)  |
 | `kotoba-cli`       | `kotoba` binary (init, serve, demo, bench, sparql, …)                      |
 | `kotoba-guest`     | WASM guest SDK (WIT bindings for kotoba nodes)                             |
-| `kotoba-edn`       | SSoT EDN reader (Clojure/Datomic wire format) — the language front-end     |
-| `kotoba-clj`       | **the language**: Clojure/EDN subset → WebAssembly compiler, plus **safe-clj** (`compile_safe_clj`) — capability / subset / effect gates for confined, untrusted-safe modules |
+| `kotoba-edn`       | SSoT EDN reader (Clojure/Datomic wire format) — the shared data/source reader |
+| `kotoba-lang`      | **the language profile**: `.kotoba` source contract, `#?(:kotoba ...)` reader target, fixtures, and conformance gates |
+| `kotoba-clj`       | Kotoba/EDN subset → WebAssembly compiler implementation, plus **safe Kotoba** (`compile_safe_kotoba`, legacy `compile_safe_clj`) — capability / subset / effect gates for confined, untrusted-safe modules |
 
 ## Properties
 
@@ -214,7 +315,7 @@ exactly how to silence or fix it.
 - **Distributed Pregel** — BSP graph computation across nodes via libp2p
 - **AT Protocol native** — Datom projection backed by commit DAG and JetStream
 - **WASM runtime** — arbitrary graph logic as Component Model guests
-- **Capability-safe language** — `kotoba-clj` compiles Clojure/EDN → WASM; **safe-clj** confines untrusted/AI-generated modules by deny-by-default capability, subset, and (interprocedural) effect gates — capability confinement (T3) and effect soundness (T2)
+- **Capability-safe language** — `kotoba wasm` compiles Kotoba/EDN → WASM; **safe Kotoba** confines untrusted/AI-generated modules by deny-by-default capability, subset, and (interprocedural) effect gates — capability confinement (T3) and effect soundness (T2)
 - **E2E encryption** — Signal Protocol + CACAO auth for consent-gated data
 - **Datomic/Datalog primary, SPARQL auxiliary** — the distributed Datom DB is the source of truth; SPARQL 1.1 reads the same projection for RDF-compatible query and federation
 - **CACAO-native authz** — depth-2 delegation chains, multi-graph grants, anti-replay nonce
@@ -381,7 +482,9 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | [`docs/ADR-clojure-wasm.md`](docs/ADR-clojure-wasm.md) | Clojure/EDN-subset → WebAssembly compiler (the language) |
 | [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe-clj** — capability-confined language design (capability/subset/effect gates, T2/T3) |
 | [`docs/ADR-kotoba-shell-aiueos-safety-clj.md`](docs/ADR-kotoba-shell-aiueos-safety-clj.md) | kotoba-shell, aiueos runner integration, and release security gates |
+| [`docs/lang/README.md`](docs/lang/README.md) | language profile (`.kotoba`/reader target), conformance fixtures, and gates |
 | [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |
+| [`docs/ADR-wallet-actor-cljs.md`](docs/ADR-wallet-actor-cljs.md) | CLJS wallet actor and Ethereum library surface |
 | [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC |
 | [`docs/ADR-kotoba-word.md`](docs/ADR-kotoba-word.md) | word/root registry + capability boundary |
 | [`docs/ADR-research-paper-arxiv.md`](docs/ADR-research-paper-arxiv.md) | arXiv paper as a grounded, derived artifact |
@@ -396,6 +499,15 @@ cargo build --workspace
 cargo test --workspace                  # ~1184 tests pass
 cargo build --release -p kotoba-cli     # final `kotoba` binary
 ```
+
+Wallet actor/browser maturity gate:
+
+```bash
+cd crates/kotoba-wasm/web/cljs
+npm run test:wallet:all                 # Node + pure + ADR/package-lock/CI/export + browser ESM smoke
+```
+
+The same wallet gate runs in CI as `Wallet CLJS maturity gate`.
 
 ## Coverage
 
