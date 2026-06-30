@@ -152,6 +152,16 @@ pub enum Builtin {
     /// object-cbor), or `0` on err. Read with `kqe-count` /
     /// `kqe-quad-{graph,subject,predicate,object}`.
     KqeQuery,
+    /// `(media-decode codec packet)` — host call into the `kotoba:kais` `media`
+    /// interface (`decode: func(string, list<u8>) -> result<list<u8>, string>`).
+    /// Same core ABI as [`Builtin::LlmInfer`]: a codec-name string handle + a
+    /// packet `list<u8>` (a `(ptr,len)` pair) → the decoded frame bytes as a
+    /// string handle on `ok`, or `0` on `err`. The **capability-gated native codec
+    /// boundary** (ADR-2606272200 §3) — gated by `:media-decode`.
+    MediaDecode,
+    /// `(media-encode codec frame)` — `encode`, the twin of
+    /// [`Builtin::MediaDecode`]; gated by `:media-encode`.
+    MediaEncode,
     /// `(bit-and a b …)` — bitwise AND of all arguments (Clojure `bit-and`).
     /// Maps to WASM `i64.and` folded left over the arg list.
     BitAnd,
@@ -202,6 +212,8 @@ impl Builtin {
             Builtin::KqeRetract => Some(HostImport::KqeRetractQuad),
             Builtin::KqeGetObjects => Some(HostImport::KqeGetObjects),
             Builtin::KqeQuery => Some(HostImport::KqeQuery),
+            Builtin::MediaDecode => Some(HostImport::MediaDecode),
+            Builtin::MediaEncode => Some(HostImport::MediaEncode),
             _ => None,
         }
     }
@@ -234,6 +246,12 @@ pub enum HostImport {
     /// string>`. Indirect result (12-byte return area, same variant layout as
     /// `llm.infer`).
     KqeQuery,
+    /// `kotoba:kais/media@0.1.0` → `decode: func(string, list<u8>) ->
+    /// result<list<u8>, string>`. Identical indirect return-area ABI to
+    /// `llm.infer`. Capability class [`crate::policy::CapClass::MediaDecode`].
+    MediaDecode,
+    /// `kotoba:kais/media@0.1.0` → `encode` — twin of [`HostImport::MediaDecode`].
+    MediaEncode,
 }
 
 /// Whether a list head names an **inert form** — one whose body is data or is
@@ -255,13 +273,15 @@ impl HostImport {
     /// from this rather than hardcoding it, so the audit cannot drift as the
     /// host world grows. Kept in sync with the enum by the
     /// `host_import_all_is_complete` test.
-    pub const ALL: [HostImport; 6] = [
+    pub const ALL: [HostImport; 8] = [
         HostImport::HasCapability,
         HostImport::LlmInfer,
         HostImport::KqeAssertQuad,
         HostImport::KqeRetractQuad,
         HostImport::KqeGetObjects,
         HostImport::KqeQuery,
+        HostImport::MediaDecode,
+        HostImport::MediaEncode,
     ];
 
     /// The wasm import `(module, field)` the Component encoder matches against
@@ -274,6 +294,8 @@ impl HostImport {
             HostImport::KqeRetractQuad => ("kotoba:kais/kqe@0.1.0", "retract-quad"),
             HostImport::KqeGetObjects => ("kotoba:kais/kqe@0.1.0", "get-objects"),
             HostImport::KqeQuery => ("kotoba:kais/kqe@0.1.0", "query"),
+            HostImport::MediaDecode => ("kotoba:kais/media@0.1.0", "decode"),
+            HostImport::MediaEncode => ("kotoba:kais/media@0.1.0", "encode"),
         }
     }
 }
@@ -293,6 +315,8 @@ mod host_import_meta_tests {
             HostImport::KqeRetractQuad => 3,
             HostImport::KqeGetObjects => 4,
             HostImport::KqeQuery => 5,
+            HostImport::MediaDecode => 6,
+            HostImport::MediaEncode => 7,
         }
     }
 
@@ -303,7 +327,7 @@ mod host_import_meta_tests {
         tags.dedup();
         assert_eq!(
             tags,
-            (0..tag(HostImport::KqeQuery) + 1).collect::<Vec<u8>>(),
+            (0..tag(HostImport::MediaEncode) + 1).collect::<Vec<u8>>(),
             "HostImport::ALL is missing a variant — capability auditing would not see it"
         );
     }
@@ -365,6 +389,8 @@ impl Builtin {
             "kqe-retract!" => Builtin::KqeRetract,
             "kqe-get-objects" => Builtin::KqeGetObjects,
             "kqe-query" => Builtin::KqeQuery,
+            "media-decode" => Builtin::MediaDecode,
+            "media-encode" => Builtin::MediaEncode,
             "bit-and" => Builtin::BitAnd,
             "bit-or" => Builtin::BitOr,
             "bit-xor" => Builtin::BitXor,
@@ -2472,6 +2498,7 @@ fn check_builtin_arity(op: Builtin, n: usize) -> Result<(), CljError> {
         Builtin::BytesAlloc | Builtin::BytesLen | Builtin::BytesFinish => n == 1,
         Builtin::Alloc | Builtin::Load64 | Builtin::Load32 => n == 1,
         Builtin::Store64 | Builtin::Store32 | Builtin::HasCapability | Builtin::LlmInfer => n == 2,
+        Builtin::MediaDecode | Builtin::MediaEncode => n == 2,
         Builtin::Sub => n >= 1, // unary negate or n-ary subtract
         Builtin::Min | Builtin::Max => n >= 1,
         Builtin::Add | Builtin::Mul | Builtin::And | Builtin::Or => n >= 1,

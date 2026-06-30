@@ -176,6 +176,42 @@ impl KotobaSwarm {
         // `with_relay_client` injects the Circuit Relay v2 client behaviour into
         // the builder closure; the relayed connection is secured with Noise and
         // multiplexed with Yamux (same upgrades as the base QUIC transport).
+        // The `webrtc` feature composes a libp2p-webrtc (webrtc-direct) transport
+        // alongside QUIC so browsers can dial this node on the Live plane (root
+        // ADR-2606271800). A self-signed cert is generated per process; its hash is
+        // advertised in the /webrtc-direct multiaddr (no CA — matches the Noise/
+        // certhash model). QUIC native↔native is unchanged. The two arms are inlined
+        // (not factored) so the `with_behaviour` closure keeps its type inference.
+        #[cfg(feature = "webrtc")]
+        let mut swarm = {
+            let cert = libp2p_webrtc::tokio::Certificate::generate(&mut rand::thread_rng())?;
+            libp2p::SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_quic()
+                .with_other_transport(move |key| {
+                    libp2p_webrtc::tokio::Transport::new(key.clone(), cert)
+                })?
+                .with_dns()?
+                .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
+                .with_behaviour(move |_keypair, relay_client| {
+                    Ok(KotobaBehaviour {
+                        gossipsub,
+                        kademlia,
+                        identify,
+                        ping,
+                        bitswap,
+                        autonat,
+                        relay_client,
+                        dcutr,
+                        relay_server,
+                    })
+                })?
+                .with_swarm_config(|cfg| {
+                    cfg.with_idle_connection_timeout(std::time::Duration::from_secs(60))
+                })
+                .build()
+        };
+        #[cfg(not(feature = "webrtc"))]
         let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic()
@@ -204,6 +240,28 @@ impl KotobaSwarm {
             .build();
 
         swarm.listen_on(listen_addr)?;
+
+        // Browser-dialable WebRTC: when the `webrtc` feature is built AND KOTOBA_WEBRTC
+        // is set, also listen on a /webrtc-direct address so browsers can dial this node
+        // on the Live plane (root ADR-2606271800). KOTOBA_WEBRTC = a UDP port, or
+        // "on"/"1"/"true" for the default (4002). The transport appends the cert hash to
+        // the emitted multiaddr. Off by default → QUIC-only behaviour is unchanged.
+        #[cfg(feature = "webrtc")]
+        if let Ok(v) = std::env::var("KOTOBA_WEBRTC") {
+            let v = v.trim();
+            if !v.is_empty() && !matches!(v, "0" | "off" | "false" | "no") {
+                let port: u16 = v.parse().unwrap_or(4002);
+                let addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{port}/webrtc-direct")
+                    .parse()
+                    .expect("static webrtc-direct multiaddr is valid");
+                match swarm.listen_on(addr) {
+                    Ok(_) => {
+                        tracing::info!(port, "kotoba-net: listening for WebRTC (webrtc-direct)")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "kotoba-net: webrtc-direct listen failed"),
+                }
+            }
+        }
 
         Ok(Self {
             swarm,

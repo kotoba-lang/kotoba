@@ -1086,7 +1086,12 @@ mod tests {
 
     #[test]
     fn rad_push_accepts_delegate_in_standard_form() {
-        let cacao = signed_cacao(&seed("33"), &format!("git/repo/{RID}"), "git.receive/push", "n1");
+        let cacao = signed_cacao(
+            &seed("33"),
+            &format!("git/repo/{RID}"),
+            "git.receive/push",
+            "n1",
+        );
         let delegates = vec![delegate_did_std(&seed("33"))];
         assert!(verify_cacao_rad_push(&cacao, RID, &delegates, None, None).is_ok());
     }
@@ -1095,7 +1100,12 @@ mod tests {
     fn rad_push_accepts_delegate_listed_in_rad_hex_form() {
         // The CACAO issuer is the W3C z6Mk… form; the delegate is registered in the
         // kotoba-rad z<hex> form for the SAME key — did_keys_equal must bridge them.
-        let cacao = signed_cacao(&seed("33"), &format!("git/repo/{RID}"), "git.receive/push", "n2");
+        let cacao = signed_cacao(
+            &seed("33"),
+            &format!("git/repo/{RID}"),
+            "git.receive/push",
+            "n2",
+        );
         let delegates = vec![delegate_did_hex(&seed("33"))];
         assert!(
             verify_cacao_rad_push(&cacao, RID, &delegates, None, None).is_ok(),
@@ -1105,7 +1115,12 @@ mod tests {
 
     #[test]
     fn rad_push_rejects_non_delegate_issuer() {
-        let cacao = signed_cacao(&seed("44"), &format!("git/repo/{RID}"), "git.receive/push", "n3");
+        let cacao = signed_cacao(
+            &seed("44"),
+            &format!("git/repo/{RID}"),
+            "git.receive/push",
+            "n3",
+        );
         let delegates = vec![delegate_did_std(&seed("33"))]; // signer 0x44 is NOT a delegate
         let err = verify_cacao_rad_push(&cacao, RID, &delegates, None, None).unwrap_err();
         assert!(matches!(err, AccessDenied::IssuerMismatch { .. }));
@@ -1129,7 +1144,12 @@ mod tests {
 
     #[test]
     fn rad_push_rejects_empty_delegate_set() {
-        let cacao = signed_cacao(&seed("33"), &format!("git/repo/{RID}"), "git.receive/push", "n6");
+        let cacao = signed_cacao(
+            &seed("33"),
+            &format!("git/repo/{RID}"),
+            "git.receive/push",
+            "n6",
+        );
         let err = verify_cacao_rad_push(&cacao, RID, &[], None, None).unwrap_err();
         assert!(matches!(err, AccessDenied::DelegationError(_)));
     }

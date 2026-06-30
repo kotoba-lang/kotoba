@@ -491,6 +491,10 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
         //   - indirect 12-byte return area `[tag:u8 @0, ptr @4, len @8]` (the
         //     same variant layout as `llm.infer`).
         HostImport::KqeQuery => (vec![ValType::I32; 3], vec![]),
+        // `decode`/`encode: func(string, list<u8>) -> result<list<u8>, string>`:
+        // identical core ABI to `llm.infer` — `string` + `list<u8>` flatten to
+        // 4 i32 params, the indirect result adds a 5th return-area pointer.
+        HostImport::MediaDecode | HostImport::MediaEncode => (vec![ValType::I32; 5], vec![]),
     }
 }
 
@@ -1609,7 +1613,15 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         Builtin::Store32 => compile_store(cg, &args[0], &args[1], /*word32=*/ true),
 
         Builtin::HasCapability => compile_host_call(cg, HostImport::HasCapability, args),
-        Builtin::LlmInfer => compile_llm_infer(cg, &args[0], &args[1]),
+        Builtin::LlmInfer => {
+            compile_indirect_bytes_call(cg, HostImport::LlmInfer, &args[0], &args[1])
+        }
+        Builtin::MediaDecode => {
+            compile_indirect_bytes_call(cg, HostImport::MediaDecode, &args[0], &args[1])
+        }
+        Builtin::MediaEncode => {
+            compile_indirect_bytes_call(cg, HostImport::MediaEncode, &args[0], &args[1])
+        }
         Builtin::KqeAssert => compile_kqe_mutate(cg, HostImport::KqeAssertQuad, args),
         Builtin::KqeRetract => compile_kqe_mutate(cg, HostImport::KqeRetractQuad, args),
         Builtin::KqeGetObjects => compile_kqe_get_objects(cg, args),
@@ -1753,18 +1765,25 @@ fn compile_kqe_query(cg: &mut FnCtx, filter: &Expr) -> Result<(), CljError> {
     Ok(())
 }
 
-/// Lower `(llm-infer model-cid prompt)` — a host import whose
+/// Lower a 2-arg host import whose signature is `(string, list<u8>) ->
+/// result<list<u8>, string>` — shared by `llm-infer` and `media-decode` /
+/// `media-encode`, which have identical Canonical-ABI shapes. The
 /// `result<list<u8>, string>` return uses the indirect **return-area** ABI:
 ///   1. `cabi_realloc` a 12-byte area (align 4),
-///   2. push `model (ptr,len)`, `prompt (ptr,len)`, then the area pointer,
+///   2. push `a (ptr,len)`, `b (ptr,len)`, then the area pointer,
 ///   3. `call` the import (no core result),
 ///   4. read `tag = mem[area]`; on `ok` (tag 0) rebuild the output string handle
 ///      `(mem[area+4] << 32) | mem[area+8]`, on `err` yield `0`.
-fn compile_llm_infer(cg: &mut FnCtx, model: &Expr, prompt: &Expr) -> Result<(), CljError> {
+fn compile_indirect_bytes_call(
+    cg: &mut FnCtx,
+    imp: HostImport,
+    a: &Expr,
+    b: &Expr,
+) -> Result<(), CljError> {
     let idx = *cg
         .import_index
-        .get(&HostImport::LlmInfer)
-        .ok_or_else(|| CljError::Codegen("host import LlmInfer not registered".into()))?;
+        .get(&imp)
+        .ok_or_else(|| CljError::Codegen(format!("host import {imp:?} not registered")))?;
     let realloc = cg.realloc_index;
     let area = cg.alloc_local(); // i64 local holding the area pointer (extended)
 
@@ -1777,9 +1796,9 @@ fn compile_llm_infer(cg: &mut FnCtx, model: &Expr, prompt: &Expr) -> Result<(), 
     cg.emit(Instruction::I64ExtendI32U);
     cg.emit(Instruction::LocalSet(area));
 
-    // model (ptr,len), prompt (ptr,len)
-    lower_string_arg_to_ptr_len(cg, model)?;
-    lower_string_arg_to_ptr_len(cg, prompt)?;
+    // a (ptr,len), b (ptr,len)
+    lower_string_arg_to_ptr_len(cg, a)?;
+    lower_string_arg_to_ptr_len(cg, b)?;
     // return-area pointer (i32)
     cg.emit(Instruction::LocalGet(area));
     cg.emit(Instruction::I32WrapI64);
@@ -2508,7 +2527,9 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         | Builtin::KqeAssert
         | Builtin::KqeRetract
         | Builtin::KqeGetObjects
-        | Builtin::KqeQuery => {
+        | Builtin::KqeQuery
+        | Builtin::MediaDecode
+        | Builtin::MediaEncode => {
             return Err(CljError::Codegen(
                 "host calls are not allowed in a `def` initialiser".into(),
             ))

@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 mod extension;
 mod mesh;
+mod shell;
 mod word;
 
 // ── NSIDs (mirror kotoba-server::xrpc constants) ─────────────────────────────
@@ -78,6 +79,10 @@ enum Cmd {
     /// KOTOBA Mesh — lattice participation status.
     #[command(subcommand)]
     Lattice(mesh::LatticeCmd),
+
+    /// kotoba-shell — Tauri-shaped CLJS/safe-clj app shell planning.
+    #[command(subcommand)]
+    Shell(shell::ShellCmd),
 
     /// Kotoba extensions — evaluate, run, build, and deploy Clojure/EDN packages.
     #[command(subcommand)]
@@ -432,6 +437,7 @@ async fn main() -> Result<()> {
         Cmd::Component(cmd) => mesh::run_component(cmd)?,
         Cmd::App(cmd) => mesh::run_app(cmd).await?,
         Cmd::Lattice(cmd) => mesh::run_lattice(cmd)?,
+        Cmd::Shell(cmd) => shell::run(cmd)?,
         Cmd::Extension(cmd) => extension::run(cmd, &cli.url, &cli.token).await?,
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,

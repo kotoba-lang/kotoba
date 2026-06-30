@@ -33,6 +33,8 @@ pub mod key_share;
 pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
+#[cfg(feature = "wasm-runtime")]
+pub mod media_codec;
 pub mod media_xrpc;
 #[cfg(feature = "clj-mesh")]
 pub mod mesh_xrpc;
@@ -51,6 +53,7 @@ pub mod signal_xrpc;
 pub mod social;
 pub mod social_economy;
 pub mod social_xrpc;
+pub mod turn_xrpc;
 pub mod xrpc;
 
 use axum::{
@@ -1187,6 +1190,10 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
         .route(
             &format!("/xrpc/{}", access_receipt::NSID_AUDIT_VERIFY),
             get(access_receipt::audit_verify_chain),
+        )
+        .route(
+            &format!("/xrpc/{}", turn_xrpc::NSID_TURN_CREDENTIAL),
+            get(turn_xrpc::turn_credential),
         )
         .route(
             &format!("/xrpc/{}", key_share::NSID_KEY_REQUEST_SHARE),

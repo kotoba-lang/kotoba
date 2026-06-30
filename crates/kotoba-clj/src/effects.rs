@@ -40,7 +40,14 @@ use kotoba_edn::EdnValue;
 use crate::CljError;
 
 /// The effect vocabulary. One-to-one with the host-induced capability classes.
-const KNOWN_EFFECTS: &[&str] = &["graph-read", "graph-write", "infer", "auth"];
+const KNOWN_EFFECTS: &[&str] = &[
+    "graph-read",
+    "graph-write",
+    "infer",
+    "auth",
+    "media-decode",
+    "media-encode",
+];
 
 /// The effect an effectful builtin induces, or `None` for pure builtins. Kept
 /// in sync with `ast::Builtin::host_import` / `policy::CapClass::of`.
@@ -49,6 +56,8 @@ fn effect_of_call(name: &str) -> Option<&'static str> {
         "kqe-assert!" | "kqe-retract!" => "graph-write",
         "kqe-get-objects" | "kqe-query" => "graph-read",
         "llm-infer" => "infer",
+        "media-decode" => "media-decode",
+        "media-encode" => "media-encode",
         "has-capability?" => "auth",
         _ => return None,
     })

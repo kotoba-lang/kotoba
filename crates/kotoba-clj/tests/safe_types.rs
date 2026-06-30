@@ -15,7 +15,10 @@ fn denied_type(res: Result<Vec<u8>, CljError>) {
 
 #[test]
 fn add_string_literal_is_rejected() {
-    denied_type(compile_safe_clj(r#"(defn run [] (+ "a" 1))"#, &Policy::deny_all()));
+    denied_type(compile_safe_clj(
+        r#"(defn run [] (+ "a" 1))"#,
+        &Policy::deny_all(),
+    ));
 }
 
 #[test]
@@ -28,7 +31,9 @@ fn arithmetic_ops_on_string_literal_rejected() {
 
 #[test]
 fn unary_numeric_ops_on_string_literal_rejected() {
-    for op in ["inc", "dec", "abs", "zero?", "pos?", "neg?", "even?", "odd?"] {
+    for op in [
+        "inc", "dec", "abs", "zero?", "pos?", "neg?", "even?", "odd?",
+    ] {
         let src = format!(r#"(defn run [] ({op} "x"))"#);
         denied_type(compile_safe_clj(&src, &Policy::deny_all()));
     }
@@ -63,7 +68,10 @@ fn arithmetic_on_string_literal_anywhere_in_args() {
 
 #[test]
 fn str_len_on_integer_literal_is_rejected() {
-    denied_type(compile_safe_clj(r#"(defn run [] (str-len 5))"#, &Policy::deny_all()));
+    denied_type(compile_safe_clj(
+        r#"(defn run [] (str-len 5))"#,
+        &Policy::deny_all(),
+    ));
 }
 
 #[test]
@@ -164,7 +172,10 @@ fn set_literal_in_arithmetic_is_rejected() {
 
 #[test]
 fn char_literal_in_arithmetic_is_rejected() {
-    denied_type(compile_safe_clj(r#"(defn run [] (+ \a 1))"#, &Policy::deny_all()));
+    denied_type(compile_safe_clj(
+        r#"(defn run [] (+ \a 1))"#,
+        &Policy::deny_all(),
+    ));
 }
 
 #[test]
@@ -212,11 +223,8 @@ fn zero_dividend_is_fine() {
 
 #[test]
 fn arithmetic_on_numbers_compiles() {
-    let wasm = compile_safe_clj(
-        "(defn run [n] (+ (* n n) (- n 1)))",
-        &Policy::deny_all(),
-    )
-    .expect("numeric arithmetic must compile");
+    let wasm = compile_safe_clj("(defn run [n] (+ (* n n) (- n 1)))", &Policy::deny_all())
+        .expect("numeric arithmetic must compile");
     assert!(wasm.starts_with(b"\0asm"));
 }
 

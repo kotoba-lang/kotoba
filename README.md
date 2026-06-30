@@ -438,7 +438,7 @@ Trust-boundary throughput **12.8K QPS** at c=32, 100% replay-protected.
 
 ## kotoba-shell release pipeline
 
-`kotoba-shell` is the desktop/mobile app shell layer over safe Kotoba components
+`kotoba-shell` is the desktop/mobile app shell layer over safe-clj components
 and the aiueos shell surface. It generates target-specific app scaffolds and
 release evidence without requiring users to install global Node, wasmtime, or
 platform runtimes.
@@ -479,10 +479,10 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md) | X-Road-style accountability, R0–R3 custody, threat model |
 | [`docs/ADR-001-five-axis-distributed-redesign.md`](docs/ADR-001-five-axis-distributed-redesign.md) | five-axis distributed redesign |
 | [`docs/ADR-sealed-cold-tier.md`](docs/ADR-sealed-cold-tier.md) | encrypted cold tier + t-of-N custody |
-| [`docs/ADR-kotoba-wasm.md`](docs/ADR-kotoba-wasm.md) | Kotoba/EDN-subset → WebAssembly compiler (`kotoba wasm`, historically `kotoba-clj`) |
-| [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe Kotoba** — capability-confined language design (capability/subset/effect gates, T2/T3) |
-| [`docs/ADR-kotoba-shell-aiueos-safe-kotoba.md`](docs/ADR-kotoba-shell-aiueos-safe-kotoba.md) | kotoba / safe Kotoba / aiueos responsibility split + self-hosting direction |
-| [`docs/ADR-repository-boundaries.md`](docs/ADR-repository-boundaries.md) | repository ownership, split criteria, and extraction order |
+| [`docs/ADR-clojure-wasm.md`](docs/ADR-clojure-wasm.md) | Clojure/EDN-subset → WebAssembly compiler (the language) |
+| [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe-clj** — capability-confined language design (capability/subset/effect gates, T2/T3) |
+| [`docs/ADR-kotoba-shell-aiueos-safety-clj.md`](docs/ADR-kotoba-shell-aiueos-safety-clj.md) | kotoba-shell, aiueos runner integration, and release security gates |
+| [`docs/lang/README.md`](docs/lang/README.md) | language profile (`.kotoba`/reader target), conformance fixtures, and gates |
 | [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |
 | [`docs/ADR-wallet-actor-cljs.md`](docs/ADR-wallet-actor-cljs.md) | CLJS wallet actor and Ethereum library surface |
 | [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC |

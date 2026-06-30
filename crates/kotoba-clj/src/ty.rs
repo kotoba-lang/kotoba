@@ -9,7 +9,7 @@
 //! **numeric operator applied to a string/keyword literal argument**, where the
 //! result is provably meaningless. It works on literals only (an i64-typed
 //! variable could legitimately hold a number at runtime), so it never has false
-//! positives — the certain core a fuller [`Ty`]-based HIR will subsume.
+//! positives — the certain core a fuller `Ty`-based HIR will subsume.
 //!
 //! It runs only on safe-clj (`compile_safe_clj`); the legacy [`crate::compile_str`]
 //! path keeps its permissive behaviour.
