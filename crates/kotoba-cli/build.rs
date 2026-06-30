@@ -45,6 +45,7 @@ fn main() {
 
 fn emit(sha: &str) {
     println!("cargo:rustc-env=KOTOBA_BUILD_COMMIT={sha}");
+    println!("cargo:rerun-if-changed=resources/kotoba/lang/cli.edn");
     println!("cargo:rerun-if-changed=../../.gitrepo");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/heads");
