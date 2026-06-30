@@ -110,9 +110,16 @@
     (action-button {:id "download-murakumo-payload" :label "Download murakumo EDN" :wide? true})]
    [:div#runner-log.log {:style {:margin-top "10px" :max-height "260px"}}]
    [:div#murakumo-log.log {:style {:margin-top "10px" :max-height "180px"}}]
+   [:div.drop {:style {:margin-top "10px"}}
+    [:label "Import signoff evidence JSON"
+     [:input#signoff-evidence-files {:type "file" :multiple true :accept ".json"}]]
+    [:div.actions {:style {:margin-top "8px"}}
+     (action-button {:id "load-sample-signoff" :label "Load sample signoff evidence" :wide? true})
+     (action-button {:id "download-signoff-template" :label "Download evidence template" :wide? true})]]
    [:div.source-links
     [:a {:href "source.html?file=eda_runner_adapters.edn"} "Runner adapters EDN"]
     [:a {:href "source.html?file=kotoba_eda_runner.cljc"} "Runner CLJC"]
+    [:a {:href "source.html?file=eda_signoff_evidence.edn"} "Signoff evidence EDN"]
     [:a {:href "source.html?file=eda_murakumo_job.edn"} "Murakumo job EDN"]
     [:a {:href "source.html?file=kotoba_eda_murakumo.cljc"} "Murakumo CLJC"]
     [:a {:href "source.html?file=runner_host.clj"} "Host runner"]]])
@@ -138,6 +145,10 @@
    [:table.matrix {:aria-label "Coverage matrix"}
     [:thead [:tr [:th "Metric"] [:th "Source"] [:th "Status"] [:th "Score"]]]
     [:tbody#coverage-matrix]]
+   [:h3 "Signoff Evidence Gates"]
+   [:table.matrix {:aria-label "Signoff evidence matrix"}
+    [:thead [:tr [:th "Gate"] [:th "Tool"] [:th "Status"] [:th "Evidence"]]]
+    [:tbody#signoff-evidence-matrix]]
    [:div#runner-result-log.log {:style {:margin-top "10px" :max-height "220px"}}]])
 
 (defn project-panel

@@ -143,6 +143,40 @@
     :eda.coverage/runner-ops #{:op/ate}
     :eda.coverage/tools #{:sw/ate-adapter}}])
 
+(def signoff-evidence-requirements
+  [{:eda.signoff/type :signoff/timing-pvt
+    :eda.signoff/coverage :coverage/timing-corners
+    :eda.signoff/tool :sw/opensta
+    :eda.signoff/operation :op/analyze-timing
+    :eda.signoff/min-corners 3
+    :eda.signoff/role "OpenSTA PVT/corner timing evidence with non-negative worst slack."}
+   {:eda.signoff/type :signoff/route
+    :eda.signoff/coverage :coverage/power-activity
+    :eda.signoff/tool :sw/openroad
+    :eda.signoff/operation :op/route
+    :eda.signoff/role "OpenROAD route evidence with no remaining routing overflow."}
+   {:eda.signoff/type :signoff/drc
+    :eda.signoff/coverage :coverage/drc-lvs
+    :eda.signoff/tool :sw/klayout
+    :eda.signoff/operation :op/drc
+    :eda.signoff/role "KLayout DRC report with zero unwaived violations."}
+   {:eda.signoff/type :signoff/lvs
+    :eda.signoff/coverage :coverage/drc-lvs
+    :eda.signoff/tool :sw/netgen
+    :eda.signoff/operation :op/lvs
+    :eda.signoff/role "Netgen LVS report with zero mismatches."}
+   {:eda.signoff/type :signoff/spice-corner
+    :eda.signoff/coverage :coverage/mixed-signal
+    :eda.signoff/tool :sw/ngspice
+    :eda.signoff/operation :op/simulate
+    :eda.signoff/role "ngspice corner simulation evidence for analog or mixed-signal IP."}
+   {:eda.signoff/type :signoff/ate-pattern
+    :eda.signoff/coverage :coverage/ate-pattern
+    :eda.signoff/tool :sw/ate-adapter
+    :eda.signoff/operation :op/ate
+    :eda.signoff/min-coverage 95
+    :eda.signoff/role "ATE pattern coverage evidence for probe/final test release."}])
+
 (def default-project
   {:eda.project/id :kotoba-eda-demo
    :eda.project/target :sensor-asic
@@ -225,6 +259,26 @@
    :eda.run/coverage coverage
    :eda.run/findings findings})
 
+(defn signoff-evidence-datom
+  [{:keys [type tool operation status coverage corner pvt corners slack-ns violations mismatches
+           overflow vector-coverage evidence-cid waiver-cid metrics]}]
+  {:eda.signoff/type type
+   :eda.signoff/tool tool
+   :eda.signoff/operation operation
+   :eda.signoff/status status
+   :eda.signoff/coverage coverage
+   :eda.signoff/corner corner
+   :eda.signoff/pvt pvt
+   :eda.signoff/corners corners
+   :eda.signoff/slack-ns slack-ns
+   :eda.signoff/violations violations
+   :eda.signoff/mismatches mismatches
+   :eda.signoff/overflow overflow
+   :eda.signoff/vector-coverage vector-coverage
+   :eda.signoff/evidence-cid evidence-cid
+   :eda.signoff/waiver-cid waiver-cid
+   :eda.signoff/metrics metrics})
+
 (defn run-stage
   [project]
   (let [stage (current-stage project)
@@ -296,20 +350,30 @@
 
 (defn readiness-evidence
   ([project] (readiness-evidence project []))
-  ([project artifacts]
+  ([project artifacts] (readiness-evidence project artifacts []))
+  ([project artifacts signoff-evidence]
   (let [stage (:eda.project/stage project 0)
         approvals (:eda.project/approvals project)
         evidence? (fn [id]
-                    (some #(some #{id} (:eda.artifact/evidence %)) artifacts))]
+                    (some #(some #{id} (:eda.artifact/evidence %)) artifacts))
+        signoff-types (set (map :eda.signoff/type signoff-evidence))
+        signoff-pass? (fn [id]
+                        (case id
+                          :signoff/drc-lvs-sta (and (signoff-types :signoff/timing-pvt)
+                                                    (signoff-types :signoff/drc)
+                                                    (signoff-types :signoff/lvs))
+                          :manufacturing/probe-package-ate (signoff-types :signoff/ate-pattern)
+                          false))]
     (mapv (fn [check]
             (let [required (stage-index (:readiness/required-stage check))
                   stage-ok? (>= stage required)
                   artifact-ok? (boolean (evidence? (:readiness/id check)))
+                  signoff-ok? (boolean (signoff-pass? (:readiness/id check)))
                   gate-ok? (case (:readiness/id check)
                              :manufacturing/mask-gated (and (approvals :mask-budget)
                                                             (approvals :human-signoff))
                              true)
-                  ok? (and (or stage-ok? artifact-ok?) gate-ok? (not (:eda.project/issue project)))]
+                  ok? (and (or stage-ok? artifact-ok? signoff-ok?) gate-ok? (not (:eda.project/issue project)))]
               (assoc check
                      :readiness/status (if ok? :pass :block)
                      :readiness/evidence-cid
@@ -317,11 +381,19 @@
                        (or (:eda.artifact/cid (first (filter #(some #{(:readiness/id check)}
                                                                      (:eda.artifact/evidence %))
                                                               artifacts)))
+                           (:eda.signoff/evidence-cid (first (filter #(= (:readiness/id check)
+                                                                         (case (:eda.signoff/type %)
+                                                                           :signoff/timing-pvt :signoff/drc-lvs-sta
+                                                                           :signoff/drc :signoff/drc-lvs-sta
+                                                                           :signoff/lvs :signoff/drc-lvs-sta
+                                                                           :signoff/ate-pattern :manufacturing/probe-package-ate
+                                                                           nil))
+                                                                  signoff-evidence)))
                            (stable-cid [(:readiness/id check) project])))
                      :readiness/blocker
                      (cond
                        (:eda.project/issue project) :blocked-by-signoff-issue
-                       (not (or stage-ok? artifact-ok?)) :stage-or-evidence-missing
+                       (not (or stage-ok? artifact-ok? signoff-ok?)) :stage-or-evidence-missing
                        (not gate-ok?) :policy-gate-missing
                        :else nil))))
           readiness-checks))))
@@ -382,38 +454,115 @@
       :sim/status (if signoff-reached? :pass :pending)
       :sim/coverage (if signoff-reached? 76 0)}])))
 
+(defn- evidence-for
+  [signoff-evidence type]
+  (first (filter #(= type (:eda.signoff/type %)) signoff-evidence)))
+
+(defn signoff-evidence-assessment
+  [signoff-evidence]
+  (let [rows
+        (mapv (fn [req]
+                (let [e (evidence-for signoff-evidence (:eda.signoff/type req))
+                      status (:eda.signoff/status e)
+                      coverage (or (:eda.signoff/coverage e) 0)
+                      pass? (case (:eda.signoff/type req)
+                              :signoff/timing-pvt (and e
+                                                       (= :passed status)
+                                                       (>= (or (:eda.signoff/corners e) 0)
+                                                           (:eda.signoff/min-corners req 1))
+                                                       (>= (or (:eda.signoff/slack-ns e) -9999) 0))
+                              :signoff/route (and e
+                                                  (= :passed status)
+                                                  (<= (or (:eda.signoff/overflow e) 0) 0))
+                              :signoff/drc (and e
+                                                (= :passed status)
+                                                (zero? (or (:eda.signoff/violations e) 1)))
+                              :signoff/lvs (and e
+                                                (= :passed status)
+                                                (zero? (or (:eda.signoff/mismatches e) 1)))
+                              :signoff/spice-corner (and e (= :passed status))
+                              :signoff/ate-pattern (and e
+                                                        (= :passed status)
+                                                        (>= (or (:eda.signoff/vector-coverage e) coverage)
+                                                            (:eda.signoff/min-coverage req 95)))
+                              false)]
+                  (merge req
+                         {:eda.signoff/status (if pass? :passed :blocked)
+                          :eda.signoff/score (if pass? (max coverage 95) coverage)
+                          :eda.signoff/evidence-cid (:eda.signoff/evidence-cid e)
+                          :eda.signoff/blocker (when-not pass?
+                                                 (if e :metric-threshold-not-met :evidence-missing))})))
+              signoff-evidence-requirements)
+        passed (count (filter #(= :passed (:eda.signoff/status %)) rows))]
+    {:eda.signoff/source (if (seq signoff-evidence) :source/signoff-evidence :source/missing)
+     :eda.signoff/pass-count passed
+     :eda.signoff/total (count rows)
+     :eda.signoff/score (Math/round (/ (reduce + (map :eda.signoff/score rows))
+                                       (double (count rows))))
+     :eda.signoff/rows rows}))
+
 (defn coverage-assessment
   ([project] (coverage-assessment project []))
-  ([project runner-results]
+  ([project runner-results] (coverage-assessment project runner-results []))
+  ([project runner-results signoff-evidence]
    (let [sims (simulation-matrix project runner-results)
          by-id (into {} (map (juxt :sim/id identity) sims))
          metric->sim {:coverage/rtl-unit :sim/rtl-unit
                       :coverage/formal-smoke :sim/formal-smoke
                       :coverage/mixed-signal :sim/mixed-signal
                       :coverage/timing-corners :sim/timing-corners
-                      :coverage/power-activity :sim/power-activity}]
-     {:eda.coverage/source (if (seq runner-results) :source/runner-result :source/stage-model)
+                      :coverage/power-activity :sim/power-activity}
+         signoff (signoff-evidence-assessment signoff-evidence)
+         signoff-by-coverage (group-by :eda.signoff/coverage (:eda.signoff/rows signoff))]
+     {:eda.coverage/source (cond
+                             (seq signoff-evidence) :source/signoff-evidence
+                             (seq runner-results) :source/runner-result
+                             :else :source/stage-model)
       :eda.coverage/metrics
       (mapv (fn [metric]
-              (let [sim (get by-id (metric->sim (:eda.coverage/id metric)))]
+              (let [sim (get by-id (metric->sim (:eda.coverage/id metric)))
+                    signoff-rows (get signoff-by-coverage (:eda.coverage/id metric))
+                    signoff-score (when (seq signoff-rows)
+                                    (Math/round (/ (reduce + (map :eda.signoff/score signoff-rows))
+                                                   (double (count signoff-rows)))))
+                    signoff-status (when (seq signoff-rows)
+                                     (if (every? #(= :passed (:eda.signoff/status %)) signoff-rows)
+                                       :pass
+                                       :blocked))]
                 (merge metric
                        {:eda.coverage/status (:sim/status sim :pending)
                         :eda.coverage/score (:sim/coverage sim 0)
-                        :eda.coverage/tool (:sim/tool sim)})))
+                        :eda.coverage/tool (:sim/tool sim)}
+                       (when (seq signoff-rows)
+                         {:eda.coverage/source :source/signoff-evidence
+                          :eda.coverage/status signoff-status
+                          :eda.coverage/score signoff-score
+                          :eda.coverage/evidence-cid (:eda.signoff/evidence-cid (first signoff-rows))
+                          :eda.coverage/corners (reduce + (map #(or (:eda.signoff/corners %) 1) signoff-rows))}))))
             coverage-metrics)
       :eda.coverage/score
-      (Math/round (/ (reduce + (map :sim/coverage sims))
-                     (double (count sims))))})))
+      (let [scores (mapv (fn [metric]
+                           (let [sim (get by-id (metric->sim (:eda.coverage/id metric)))
+                                 signoff-rows (get signoff-by-coverage (:eda.coverage/id metric))]
+                             (if (seq signoff-rows)
+                               (Math/round (/ (reduce + (map :eda.signoff/score signoff-rows))
+                                              (double (count signoff-rows))))
+                               (:sim/coverage sim 0))))
+                         coverage-metrics)]
+        (Math/round (/ (reduce + scores) (double (count scores)))))
+      :eda.coverage/signoff signoff})))
 
 (defn maturity-assessment
   ([project] (maturity-assessment project [] []))
   ([project artifacts] (maturity-assessment project artifacts []))
-  ([project artifacts runner-results]
-  (let [evidence (readiness-evidence project artifacts)
+  ([project artifacts runner-results] (maturity-assessment project artifacts runner-results []))
+  ([project artifacts runner-results signoff-evidence]
+  (let [evidence (readiness-evidence project artifacts signoff-evidence)
         passed (count (filter #(= :pass (:readiness/status %)) evidence))
         total (count evidence)
         ratio (/ passed (double total))
-        coverage (coverage-assessment project runner-results)
+        coverage (coverage-assessment project runner-results signoff-evidence)
+        signoff (:eda.coverage/signoff coverage)
         sims (simulation-matrix project runner-results)
         sim-coverage (:eda.coverage/score coverage)
         approvals (:eda.project/approvals project)
@@ -421,6 +570,7 @@
         level (cond
                 (and (= passed total)
                      (>= sim-coverage 85)
+                     (= (:eda.signoff/pass-count signoff) (:eda.signoff/total signoff))
                      (approvals :foundry-slot)
                      (approvals :human-signoff)) :mrl/release-ready
                 (and (>= ratio 0.8) (>= sim-coverage 75)) :mrl/pilot-ready
@@ -437,6 +587,7 @@
      :eda.maturity/simulation-coverage sim-coverage
      :eda.maturity/signoff (:eda.score/signoff score)
      :eda.maturity/coverage coverage
+     :eda.maturity/signoff-evidence signoff
      :eda.maturity/evidence evidence
      :eda.maturity/simulations sims
      :eda.maturity/blockers blockers
