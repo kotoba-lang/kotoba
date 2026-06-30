@@ -2,14 +2,14 @@
 
 - Status: Accepted (staged execution in progress)
 - Date: 2026-06-17
-- Scope: `crates/kotoba-kotodama/py` (this submodule, `etzhayyim/kotoba`)
+- Scope: `kotoba-lang/kotodama-py` (formerly `crates/kotoba-kotodama/py`)
 - Supersedes the per-code generation pattern of ADR-2605171300
 
 ## Context
 
 The UNSPSC domain was originally materialised in Python as **one generated
 LangGraph agent file per commodity code** under
-`crates/kotoba-kotodama/py/src/kotodama/langgraph_graphs/unispsc_agents/c{code}.py`
+`kotoba-lang/kotodama-py:src/kotodama/langgraph_graphs/unispsc_agents/c{code}.py`
 — **18,343 files, ~1.23M LOC**. They are not statically imported: the package
 `__init__.py` is a one-line docstring, and modules are resolved at runtime by
 `langgraph_graphs/dynamic_runner.py` (and the `unispsc_organism` / `xrpc.unispsc`

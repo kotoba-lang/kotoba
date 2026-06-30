@@ -1,14 +1,23 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub const CANONICAL_REPOSITORIES: &[(&str, &str)] = &[
+    ("inference", "https://github.com/kotoba-lang/inference"),
+    ("host", "https://github.com/kotoba-lang/kotodama-host"),
+    ("mcp", "https://github.com/kotoba-lang/kotodama-mcp"),
+    ("cells", "https://github.com/kotoba-lang/kotodama-cells"),
+    ("py", "https://github.com/kotoba-lang/kotodama-py"),
+    (
+        "holochain",
+        "https://github.com/kotoba-lang/kotodama-holochain",
+    ),
+];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    fn includes_host_redirect() {
+        assert!(CANONICAL_REPOSITORIES
+            .iter()
+            .any(|(name, url)| *name == "host" && url.ends_with("/kotodama-host")));
     }
 }

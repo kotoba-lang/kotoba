@@ -1,16 +1,27 @@
 # 20-actors/kotoba-kotodama
 
-Canonical path: `20-actors/kotoba-kotodama`
+Legacy redirect path: `20-actors/kotoba-kotodama`
+
+Canonical repositories:
+
+- `kotoba-lang/kotodama-host`: host SDK, Rust config, desktop/KAMI hosts
+- `kotoba-lang/inference`: CLJC/num/torch inference runtime
+- `kotoba-lang/kotodama-mcp`: MCP server packages
+- `kotoba-lang/kotodama-cells`: cell manifests and generated cell packages
+- `kotoba-lang/kotodama-py`: Python worker layer
+- `kotoba-lang/kotodama-holochain`: Holochain runtime
 
 Directory layout:
-- `sdk/kotoba-kotodama-host-sdk`
-- `hosts/kotoba-kotodama-desktop-host`
-- `hosts/kotoba-kotodama-kami-host`
-- `inference/kotoba-kotodama-inference`
-- `config/kotoba-kotodama-config`
-- `py/src/kotodama/` — Python worker layer (29 etzhayyim-classified workers
-  + 4 ingest modules + 4 substrate primitives are gate (a) execution targets;
-  see Tranche F dossier)
+- `sdk/README.md` — host SDK moved to `kotoba-lang/kotodama-host`
+- `hosts/README.md` — native hosts moved to `kotoba-lang/kotodama-host`
+- `inference/README.md` — inference moved to `kotoba-lang/inference`
+- `config/README.md` — config crate moved to `kotoba-lang/kotodama-host`
+- `mcp/README.md` — MCP packages moved to `kotoba-lang/kotodama-mcp`
+- `cells/README.md` — cells moved to `kotoba-lang/kotodama-cells`
+- `py/README.md` — Python worker layer moved to `kotoba-lang/kotodama-py`
+- `holochain/README.md` — Holochain runtime moved to `kotoba-lang/kotodama-holochain`
+
+The remaining content below is historical context for the moved code.
 
 ## Tranche F gate (a) — per-worker RW-free port (OPEN execution item)
 
