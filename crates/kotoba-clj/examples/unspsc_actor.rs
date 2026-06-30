@@ -1,8 +1,8 @@
 //! UNSPSC actor micro-kernel — a langgraph-shaped verdict graph compiled to REAL
-//! WebAssembly via kotoba-clj (the Clojure-subset → wasm compiler).
+//! WebAssembly via the Kotoba/EDN-subset → wasm compiler.
 //!
-//! This is the kotoba-clj path for a kotodama UNSPSC actor: the actor's
-//! decision graph (validate → ok? → approve | reject) is declared with the
+//! This is the Kotoba path for a UNSPSC actor: the actor's decision graph
+//! (validate → ok? → approve | reject) is declared with the
 //! `defgraph` DSL — nodes + a conditional `if-edge` branch + run-to-END — and
 //! compiled to a wasm module that runs under plain wasmtime (no host needed).
 //!

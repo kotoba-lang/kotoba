@@ -1,6 +1,6 @@
 //! KOTOBA Mesh M7: multi-export component codegen.
 //!
-//! A Clojure guest that defines `(defn run …)` and `(defn on-http …)` compiles
+//! A Kotoba guest that defines `(defn run …)` and `(defn on-http …)` compiles
 //! to a single WASM component exporting BOTH, targeting the `kotoba-component`
 //! world. A run-only guest falls back to the `kotoba-node` world (unchanged).
 

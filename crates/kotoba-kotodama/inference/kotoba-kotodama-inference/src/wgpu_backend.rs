@@ -134,7 +134,7 @@ impl InferenceEngine {
     pub async fn new() -> Result<Self, EngineError> {
         // Browser: force WebGPU backend. Native: auto-detect (Metal/Vulkan).
         #[cfg(target_arch = "wasm32")]
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
             ..Default::default()
         });

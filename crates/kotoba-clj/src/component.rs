@@ -9,7 +9,7 @@
 //! The source program must define `(defn run [input] …)`: an arity-1 function
 //! whose argument is the input bytes (as a string handle) and whose result is a
 //! string handle for the output bytes. Source text is normalized through the
-//! same Clojure reader compatibility layer as [`crate::compile_str`].
+//! same Kotoba/Clojure-family reader compatibility layer as [`crate::compile_str`].
 
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::Resolve;
@@ -18,23 +18,23 @@ use crate::codegen::{Entry, EntryAbi};
 use crate::compat::{self, ReaderTarget};
 use crate::{CljError, CBOR_ENC_PRELUDE, CBOR_PRELUDE, KQE_PRELUDE, PRELUDE};
 
-/// The WIT world every kotoba-clj program component targets.
+/// The WIT world every Kotoba program component targets.
 const PROGRAM_WIT: &str = r#"
-package kotoba:clj-program;
+package kotoba:program;
 
 world program {
   export run: func(input: list<u8>) -> list<u8>;
 }
 "#;
 
-/// Compile Clojure-subset source into a WASM **Component** exporting
+/// Compile Kotoba/EDN-subset source into a WASM **Component** exporting
 /// `run(list<u8>) -> list<u8>`. Requires a `(defn run [input] …)`.
 pub fn compile_component_str(src: &str) -> Result<Vec<u8>, CljError> {
     compile_component_str_with_reader_target(src, ReaderTarget::Kotoba)
 }
 
-/// Compile source into a WASM **Component** after applying Clojure reader
-/// compatibility for `target`.
+/// Compile source into a WASM **Component** after applying Kotoba/Clojure-family
+/// reader compatibility for `target`.
 pub fn compile_component_str_with_reader_target(
     src: &str,
     target: ReaderTarget,
@@ -52,7 +52,7 @@ pub fn compile_component_str_with_reader_target(
     encode_component(core)
 }
 
-/// Compile Clojure-subset source into a WASM **Component** (same as
+/// Compile Kotoba/EDN-subset source into a WASM **Component** (same as
 /// [`compile_component_str`]) WITH the combined container + CBOR prelude
 /// ([`crate::PRELUDE`], [`crate::CBOR_PRELUDE`], [`crate::CBOR_ENC_PRELUDE`],
 /// [`crate::KQE_PRELUDE`]) prepended — so the program can call `merge`,
@@ -64,7 +64,7 @@ pub fn compile_component_str_with_prelude(src: &str) -> Result<Vec<u8>, CljError
 }
 
 /// Compile source with the combined prelude into a WASM **Component**, after
-/// applying Clojure reader compatibility for `target`.
+/// applying Kotoba/Clojure-family reader compatibility for `target`.
 pub fn compile_component_str_with_prelude_and_reader_target(
     src: &str,
     target: ReaderTarget,
@@ -136,7 +136,7 @@ pub fn compile_and_run_component(src: &str, input: &[u8]) -> Result<Vec<u8>, Clj
 
 // ---- Step 5 (reduced): the real kotoba:kais `kotoba-node` world -------------
 
-/// Compile Clojure-subset source into a Component targeting the **actual**
+/// Compile Kotoba/EDN-subset source into a Component targeting the **actual**
 /// `kotoba:kais` `kotoba-node` world from `kotoba-runtime/wit` — exporting
 /// `run: func(ctx-cbor: list<u8>) -> result<list<u8>, string>`.
 ///

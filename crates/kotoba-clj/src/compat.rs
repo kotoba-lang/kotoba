@@ -1,41 +1,16 @@
-//! Clojure source compatibility helpers that run before the EDN reader.
+//! Kotoba/Clojure-family source compatibility helpers that run before the EDN reader.
 //!
-//! This is deliberately a loader layer, not a second Clojure compiler. It
-//! normalizes source features that decide which forms the existing kotoba-clj
-//! compiler should see.
+//! This is deliberately a loader layer, not a JVM/Clojure compatibility compiler. It
+//! normalizes source features that decide which forms the Kotoba compiler
+//! implementation should see.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use kotoba_edn::{parse_all, to_string, EdnValue, Symbol};
+pub use kotoba_lang::ReaderTarget;
 
 use crate::CljError;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReaderTarget {
-    Kotoba,
-    Clj,
-    Cljs,
-}
-
-impl ReaderTarget {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "kotoba" => Some(Self::Kotoba),
-            "clj" => Some(Self::Clj),
-            "cljs" => Some(Self::Cljs),
-            _ => None,
-        }
-    }
-
-    fn branch_names(self) -> &'static [&'static str] {
-        match self {
-            Self::Kotoba => &["kotoba", "clj", "default"],
-            Self::Clj => &["clj", "default"],
-            Self::Cljs => &["cljs", "default"],
-        }
-    }
-}
 
 pub fn normalize_source(src: &str, target: ReaderTarget) -> Result<String, CljError> {
     let src = expand_discard_syntax(src)?;
@@ -124,6 +99,9 @@ fn source_roots(entry: &Path, explicit: &[PathBuf]) -> Result<Vec<PathBuf>, CljE
     );
     roots.extend(deps_edn_source_roots(entry)?);
     roots.extend(explicit.iter().cloned());
+    if let Some(env_paths) = std::env::var_os("KOTOBA_SOURCE_PATH") {
+        roots.extend(std::env::split_paths(&env_paths));
+    }
     if let Some(env_paths) = std::env::var_os("KOTOBA_CLJ_PATH") {
         roots.extend(std::env::split_paths(&env_paths));
     }
@@ -189,11 +167,7 @@ fn resolve_namespace(roots: &[PathBuf], ns: &str, target: ReaderTarget) -> Optio
         .map(|segment| segment.replace('-', "_"))
         .collect::<Vec<_>>()
         .join("/");
-    let extensions = match target {
-        ReaderTarget::Kotoba => ["kotoba", "cljc", "clj", "cljs"],
-        ReaderTarget::Clj => ["cljc", "clj", "kotoba", "cljs"],
-        ReaderTarget::Cljs => ["cljc", "cljs", "clj", "kotoba"],
-    };
+    let extensions = target.namespace_extension_priority();
     roots.iter().find_map(|root| {
         extensions
             .iter()
@@ -433,7 +407,7 @@ fn select_reader_branch(src: &str, target: ReaderTarget) -> Result<Option<EdnVal
         ));
     }
 
-    for name in target.branch_names() {
+    for name in target.reader_branches() {
         for pair in forms.chunks_exact(2) {
             if keyword_name(&pair[0]) == Some(*name) {
                 return Ok(Some(pair[1].clone()));

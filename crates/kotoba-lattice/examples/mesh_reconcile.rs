@@ -95,7 +95,7 @@ fn main() {
         let comp = app
             .components
             .iter()
-            .find(|c| a.cid == format!("clj:{}", c.name) || Some(&a.cid) == c.cid.as_ref())
+            .find(|c| a.cid == format!("kotoba:{}", c.name) || Some(&a.cid) == c.cid.as_ref())
             .unwrap();
         let constraints = Constraints {
             require_labels: app.placement.require.clone(),

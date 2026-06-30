@@ -1,8 +1,8 @@
 //! KOTOBA Mesh app manifest (ADR §7 / §14).
 //!
 //! The manifest is **EDN** (`kotoba.app.edn`) — the same language family as the
-//! components (Clojure via `kotoba-clj`) and the data (Datomic/Datalog). The
-//! default component language is **Clojure**: `:lang` omitted ⇒ [`Lang::Clojure`].
+//! components (Kotoba via `kotoba component build`) and the data (Datomic/Datalog). The
+//! default component language is **Kotoba**: `:lang` omitted ⇒ [`Lang::Kotoba`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,13 +12,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::LatticeError;
 
-/// Component source language. Clojure (`kotoba-clj`) is the default (§14).
+/// Component source language. Kotoba is the default (§14).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Lang {
-    /// `.clj` → `kotoba-clj::compile_kais_component_str` (DEFAULT).
+    /// `.kotoba` → `kotoba component build` (DEFAULT); `.clj` / `.cljc` / `.cljs` remain compatibility inputs.
+    #[serde(alias = "clojure", alias = "clj", alias = "edn")]
     #[default]
-    Clojure,
+    Kotoba,
     /// `.rs`  → `cargo component build`.
     Rust,
     /// `.py`  → `componentize-py`.
@@ -31,7 +32,7 @@ impl Lang {
     /// Parse a `:lang` keyword/string. Empty/unknown handled by caller.
     pub fn from_token(s: &str) -> Result<Lang, LatticeError> {
         match s.trim_start_matches(':') {
-            "clojure" | "clj" | "edn" | "kotoba" => Ok(Lang::Clojure),
+            "clojure" | "clj" | "edn" | "kotoba" => Ok(Lang::Kotoba),
             "rust" | "rs" => Ok(Lang::Rust),
             "python" | "py" => Ok(Lang::Python),
             "js" | "javascript" | "ts" | "typescript" => Ok(Lang::Js),
@@ -40,7 +41,7 @@ impl Lang {
     }
 
     /// Infer the language from a source filename extension. Anything that is not
-    /// a recognised opt-in extension defaults to Clojure (§14.1).
+    /// a recognised opt-in extension defaults to Kotoba (§14.1).
     pub fn from_ext(path: &str) -> Lang {
         match Path::new(path)
             .extension()
@@ -50,10 +51,10 @@ impl Lang {
             "rs" => Lang::Rust,
             "py" => Lang::Python,
             "js" | "ts" | "mjs" => Lang::Js,
-            // `.kotoba` is the canonical Clojure-subset source extension; `.clj`
-            // and everything else also fall through to the Clojure default (§14.1).
-            "kotoba" | "clj" | "cljc" | "cljs" => Lang::Clojure,
-            _ => Lang::Clojure,
+            // `.kotoba` is the canonical Kotoba source extension; `.clj`,
+            // `.cljc`, and `.cljs` remain compatibility inputs (§14.1).
+            "kotoba" | "clj" | "cljc" | "cljs" => Lang::Kotoba,
+            _ => Lang::Kotoba,
         }
     }
 }
@@ -96,7 +97,7 @@ pub struct ComponentSpec {
     pub name: String,
     #[serde(default)]
     pub lang: Lang,
-    /// Source path (e.g. "reply.clj"). Compiled at deploy time → `cid`.
+    /// Source path (e.g. "reply.kotoba"). Compiled at deploy time → `cid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub src: Option<String>,
     /// Pre-built artifact CID (set directly, or filled in after compiling src).
@@ -179,12 +180,15 @@ impl AppManifest {
     }
 
     /// Desired state for the reconciler: component key → desired instance count.
-    /// Keyed by artifact CID when known, else a stable `clj:<name>` placeholder
+    /// Keyed by artifact CID when known, else a stable `kotoba:<name>` placeholder
     /// (the CID is filled in once `src` is compiled at deploy time).
     pub fn desired_by_cid(&self) -> BTreeMap<String, u32> {
         let mut out = BTreeMap::new();
         for c in &self.components {
-            let key = c.cid.clone().unwrap_or_else(|| format!("clj:{}", c.name));
+            let key = c
+                .cid
+                .clone()
+                .unwrap_or_else(|| format!("kotoba:{}", c.name));
             out.insert(key, c.scale);
         }
         out
@@ -238,7 +242,7 @@ fn component_from_edn(v: &EdnValue) -> Result<ComponentSpec, LatticeError> {
     let name =
         get_str(m, "name").ok_or_else(|| LatticeError::Schema("component missing :name".into()))?;
 
-    // :lang omitted ⇒ infer from :src extension ⇒ Clojure default (§14.1).
+    // :lang omitted ⇒ infer from :src extension ⇒ Kotoba default (§14.1).
     let lang = match get_str(m, "lang") {
         Some(tok) => Lang::from_token(&tok)?,
         None => get_str(m, "src")
@@ -338,7 +342,7 @@ mod tests {
      [{:name "ingest"  :cid "bafyIngest"
        :scale 2 :triggers [{:type :kse :topic "kotoba/mail/in"}]
        :requires #{:cap/kqe :cap/egress}}
-      {:name "reply"   :src "reply.clj"
+      {:name "reply"   :src "reply.kotoba"
        :scale 1 :triggers [{:type :http :route "/reply"}]
        :requires [:cap/kqe :cap/llm]
        :links [{:target :cap/llm :config "bafyGemma" :cacao "bafyGrant" :ability "infer"}]}]
@@ -359,14 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn clojure_is_default_language() {
+    fn kotoba_is_default_language() {
         let app = AppManifest::from_edn(APP).unwrap();
-        // "reply" has :src "reply.clj" and no :lang → Clojure by extension
+        // "reply" has :src "reply.kotoba" and no :lang → Kotoba by extension
         let reply = app.components.iter().find(|c| c.name == "reply").unwrap();
-        assert_eq!(reply.lang, Lang::Clojure);
-        // "ingest" has neither :lang nor :src → Clojure by Default
+        assert_eq!(reply.lang, Lang::Kotoba);
+        // "ingest" has neither :lang nor :src → Kotoba by default
         let ingest = app.components.iter().find(|c| c.name == "ingest").unwrap();
-        assert_eq!(ingest.lang, Lang::Clojure);
+        assert_eq!(ingest.lang, Lang::Kotoba);
     }
 
     #[test]
@@ -392,7 +396,7 @@ mod tests {
     #[test]
     fn explicit_lang_overrides_extension() {
         let src = r#"{:kotoba.app/name "x"
-                      :kotoba.app/components [{:name "n" :src "a.clj" :lang :rust}]}"#;
+                      :kotoba.app/components [{:name "n" :src "a.kotoba" :lang :rust}]}"#;
         let app = AppManifest::from_edn(src).unwrap();
         assert_eq!(app.components[0].lang, Lang::Rust);
     }
@@ -402,16 +406,16 @@ mod tests {
         let app = AppManifest::from_edn(APP).unwrap();
         let d = app.desired_by_cid();
         assert_eq!(d.get("bafyIngest"), Some(&2)); // ingest had a cid
-        assert_eq!(d.get("clj:reply"), Some(&1)); // reply only had src
+        assert_eq!(d.get("kotoba:reply"), Some(&1)); // reply only had src
     }
 
     #[test]
-    fn from_ext_defaults_to_clojure() {
-        assert_eq!(Lang::from_ext("foo.kotoba"), Lang::Clojure);
-        assert_eq!(Lang::from_ext("foo.clj"), Lang::Clojure);
-        assert_eq!(Lang::from_ext("foo.cljc"), Lang::Clojure);
-        assert_eq!(Lang::from_ext("foo.cljs"), Lang::Clojure);
-        assert_eq!(Lang::from_ext("foo"), Lang::Clojure);
+    fn from_ext_prefers_kotoba_canonical_and_keeps_clj_family_compat() {
+        assert_eq!(Lang::from_ext("foo.kotoba"), Lang::Kotoba);
+        assert_eq!(Lang::from_ext("foo.clj"), Lang::Kotoba);
+        assert_eq!(Lang::from_ext("foo.cljc"), Lang::Kotoba);
+        assert_eq!(Lang::from_ext("foo.cljs"), Lang::Kotoba);
+        assert_eq!(Lang::from_ext("foo"), Lang::Kotoba);
         assert_eq!(Lang::from_ext("foo.rs"), Lang::Rust);
         assert_eq!(Lang::from_ext("foo.py"), Lang::Python);
         assert_eq!(Lang::from_ext("foo.ts"), Lang::Js);
@@ -420,7 +424,7 @@ mod tests {
     #[test]
     fn lang_from_token_all_aliases_and_unknown() {
         for t in ["clojure", "clj", "edn", "kotoba", ":kotoba", ":clojure"] {
-            assert_eq!(Lang::from_token(t).unwrap(), Lang::Clojure);
+            assert_eq!(Lang::from_token(t).unwrap(), Lang::Kotoba);
         }
         assert_eq!(Lang::from_token("rs").unwrap(), Lang::Rust);
         assert_eq!(Lang::from_token("python").unwrap(), Lang::Python);
@@ -514,7 +518,38 @@ mod tests {
         let json = r#"{"name":"j","components":[{"name":"c","cid":"bafyC"}]}"#;
         let app = AppManifest::from_json(json).unwrap();
         assert_eq!(app.components[0].scale, 1);
-        assert_eq!(app.components[0].lang, Lang::Clojure);
+        assert_eq!(app.components[0].lang, Lang::Kotoba);
+    }
+
+    #[test]
+    fn from_json_accepts_kotoba_and_legacy_clojure_lang_aliases() {
+        let kotoba = AppManifest::from_json(
+            r#"{"name":"j","components":[{"name":"c","lang":"kotoba","cid":"bafyC"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(kotoba.components[0].lang, Lang::Kotoba);
+
+        let clojure = AppManifest::from_json(
+            r#"{"name":"j","components":[{"name":"c","lang":"clojure","cid":"bafyC"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(clojure.components[0].lang, Lang::Kotoba);
+    }
+
+    #[test]
+    fn json_serializes_kotoba_language_as_kotoba() {
+        let json = serde_json::to_string(&ComponentSpec {
+            name: "c".to_string(),
+            lang: Lang::Kotoba,
+            src: Some("c.kotoba".to_string()),
+            cid: None,
+            scale: 1,
+            triggers: Vec::new(),
+            requires: Vec::new(),
+            links: Vec::new(),
+        })
+        .unwrap();
+        assert!(json.contains(r#""lang":"kotoba""#), "{json}");
     }
 
     #[test]

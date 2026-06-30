@@ -1,5 +1,5 @@
 //! Phase **S0** of the capability-confinement design
-//! (`docs/ADR-safe-capability-language.md`): `compile_safe_clj` is
+//! (`docs/ADR-safe-capability-language.md`): `compile_safe_kotoba` is
 //! deny-by-default. A program may only use a host capability the [`Policy`]
 //! grants; otherwise the module is never emitted.
 //!
@@ -9,7 +9,7 @@
 //! the EDN policy parser all behave.
 
 use kotoba_clj::policy::CapClass;
-use kotoba_clj::{compile_safe_clj, compile_safe_clj_with_prelude, CljError, Limits, Policy};
+use kotoba_clj::{compile_safe_kotoba, compile_safe_kotoba_with_prelude, CljError, Limits, Policy};
 
 fn is_wasm(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\0asm")
@@ -25,7 +25,7 @@ fn assert_policy_denied(res: Result<Vec<u8>, CljError>) {
 #[test]
 fn pure_program_compiles_under_deny_all() {
     // No host capability requested → confined policy still compiles it.
-    let wasm = compile_safe_clj("(defn run [n] (* n n))", &Policy::deny_all())
+    let wasm = compile_safe_kotoba("(defn run [n] (* n n))", &Policy::deny_all())
         .expect("pure program must compile under deny-all");
     assert!(is_wasm(&wasm));
 }
@@ -33,14 +33,14 @@ fn pure_program_compiles_under_deny_all() {
 #[test]
 fn graph_write_denied_without_grant() {
     let src = r#"(defn run [] (kqe-assert! "kg" "alice" "kg/name" "v"))"#;
-    assert_policy_denied(compile_safe_clj(src, &Policy::deny_all()));
+    assert_policy_denied(compile_safe_kotoba(src, &Policy::deny_all()));
 }
 
 #[test]
 fn graph_write_allowed_with_grant() {
     let src = r#"(defn run [] (kqe-assert! "kg" "alice" "kg/name" "v"))"#;
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
-    let wasm = compile_safe_clj(src, &policy).expect("granted graph-write must compile");
+    let wasm = compile_safe_kotoba(src, &policy).expect("granted graph-write must compile");
     assert!(is_wasm(&wasm));
 }
 
@@ -49,7 +49,7 @@ fn read_grant_does_not_confer_write() {
     // The read/write split is the point: graph-read must NOT authorize a write.
     let src = r#"(defn run [] (kqe-assert! "kg" "alice" "kg/name" "v"))"#;
     let policy = Policy::deny_all().grant_graph_read(["kg"]);
-    assert_policy_denied(compile_safe_clj(src, &policy));
+    assert_policy_denied(compile_safe_kotoba(src, &policy));
 }
 
 #[test]
@@ -57,34 +57,34 @@ fn write_grant_does_not_confer_read() {
     // ...and symmetrically, write authority must not let you read.
     let src = r#"(defn run [] (kqe-get-objects "kg" "alice" "kg/name"))"#;
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
-    assert_policy_denied(compile_safe_clj(src, &policy));
+    assert_policy_denied(compile_safe_kotoba(src, &policy));
 }
 
 #[test]
 fn graph_read_allowed_with_grant() {
     let src = r#"(defn run [] (kqe-get-objects "kg" "alice" "kg/name"))"#;
     let policy = Policy::deny_all().grant_graph_read(["kg"]);
-    let wasm = compile_safe_clj(src, &policy).expect("granted graph-read must compile");
+    let wasm = compile_safe_kotoba(src, &policy).expect("granted graph-read must compile");
     assert!(is_wasm(&wasm));
 }
 
 #[test]
 fn infer_denied_then_allowed() {
     let src = r#"(defn run [] (llm-infer "model-cid-xyz" "ping"))"#;
-    assert_policy_denied(compile_safe_clj(src, &Policy::deny_all()));
+    assert_policy_denied(compile_safe_kotoba(src, &Policy::deny_all()));
 
     let policy = Policy::deny_all().grant_infer(["model-cid-xyz"]);
-    let wasm = compile_safe_clj(src, &policy).expect("granted infer must compile");
+    let wasm = compile_safe_kotoba(src, &policy).expect("granted infer must compile");
     assert!(is_wasm(&wasm));
 }
 
 #[test]
 fn auth_introspection_denied_then_allowed() {
     let src = r#"(defn run [] (has-capability? "graph/x" "read"))"#;
-    assert_policy_denied(compile_safe_clj(src, &Policy::deny_all()));
+    assert_policy_denied(compile_safe_kotoba(src, &Policy::deny_all()));
 
     let policy = Policy::deny_all().grant_auth();
-    let wasm = compile_safe_clj(src, &policy).expect("granted auth must compile");
+    let wasm = compile_safe_kotoba(src, &policy).expect("granted auth must compile");
     assert!(is_wasm(&wasm));
 }
 
@@ -98,7 +98,7 @@ fn all_denials_are_reported_at_once() {
             (llm-infer "m" "x")
             (has-capability? "g" "read")))
     "#;
-    match compile_safe_clj(src, &Policy::deny_all()) {
+    match compile_safe_kotoba(src, &Policy::deny_all()) {
         Err(CljError::Policy(msg)) => {
             assert!(msg.contains("graph-write"), "missing graph-write: {msg}");
             assert!(msg.contains("infer"), "missing infer: {msg}");
@@ -116,7 +116,7 @@ fn zero_fuel_policy_is_rejected() {
         max_call_depth: 128,
         max_output_bytes: 65_536,
     });
-    let res = compile_safe_clj("(defn run [n] n)", &policy);
+    let res = compile_safe_kotoba("(defn run [n] n)", &policy);
     match res {
         Err(CljError::Policy(msg)) => assert!(msg.contains("fuel"), "{msg}"),
         other => panic!("expected fuel-quota rejection, got {other:?}"),
@@ -131,7 +131,7 @@ fn zero_memory_policy_is_rejected() {
         max_call_depth: 128,
         max_output_bytes: 65_536,
     });
-    assert_policy_denied(compile_safe_clj("(defn run [n] n)", &policy));
+    assert_policy_denied(compile_safe_kotoba("(defn run [n] n)", &policy));
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn prelude_under_deny_all_stays_pure() {
     // The container/CBOR prelude must NOT drag in any host capability: a
     // deny-all policy with the prelude still compiles a pure module.
     let src = "(defn run [n] (inc n))";
-    let wasm = compile_safe_clj_with_prelude(src, &Policy::deny_all())
+    let wasm = compile_safe_kotoba_with_prelude(src, &Policy::deny_all())
         .expect("pure prelude program must compile under deny-all");
     assert!(is_wasm(&wasm));
 }
@@ -149,10 +149,10 @@ fn prelude_kqe_accessors_require_read_grant() {
     // KQE_PRELUDE accessors are only linked when graph-read is granted.
     let src = r#"(defn run [] (kqe-count (kqe-get-objects "kg" "alice" "kg/name")))"#;
     // Without read grant the kqe accessor layer is absent AND the call is denied.
-    assert_policy_denied(compile_safe_clj_with_prelude(src, &Policy::deny_all()));
+    assert_policy_denied(compile_safe_kotoba_with_prelude(src, &Policy::deny_all()));
     // With read grant the accessor prelude links in and it compiles.
     let policy = Policy::deny_all().grant_graph_read(["kg"]);
-    let wasm = compile_safe_clj_with_prelude(src, &policy)
+    let wasm = compile_safe_kotoba_with_prelude(src, &policy)
         .expect("granted graph-read must link the kqe prelude and compile");
     assert!(is_wasm(&wasm));
 }
@@ -186,7 +186,7 @@ fn policy_parses_from_edn() {
     // And the parsed policy actually gates: write to the granted graph compiles
     // (per-cid: the literal graph must be in the `:graph-write` allowlist).
     let src = r#"(defn run [] (kqe-assert! "bafyGraphA" "a" "p" "v"))"#;
-    assert!(compile_safe_clj(src, &policy).is_ok());
+    assert!(compile_safe_kotoba(src, &policy).is_ok());
 }
 
 #[test]
@@ -194,7 +194,7 @@ fn empty_imports_policy_denies_everything() {
     let policy = Policy::parse_edn("{:limits {:memory-pages 4 :fuel 1000000}}")
         .expect("minimal policy must parse");
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    assert_policy_denied(compile_safe_clj(src, &policy));
+    assert_policy_denied(compile_safe_kotoba(src, &policy));
 }
 
 // ── parse_edn error paths ──────────────────────────────────────────────────
@@ -241,7 +241,7 @@ fn parse_edn_defaults_omitted_limits() {
     // A policy that omits :limits gets the non-zero defaults, so it compiles.
     let policy = Policy::parse_edn("{:imports {}}").expect("policy without :limits must parse");
     assert!(policy.limits.fuel > 0 && policy.limits.memory_pages > 0);
-    assert!(compile_safe_clj("(defn run [n] n)", &policy).is_ok());
+    assert!(compile_safe_kotoba("(defn run [n] n)", &policy).is_ok());
 }
 
 // ── full host-import classification (every kqe verb) ───────────────────────
@@ -250,22 +250,22 @@ fn parse_edn_defaults_omitted_limits() {
 fn retract_is_classified_as_graph_write() {
     let src = r#"(defn run [] (kqe-retract! "kg" "a" "p" "v"))"#;
     // write grant allows it; read grant alone does not.
-    assert_policy_denied(compile_safe_clj(
+    assert_policy_denied(compile_safe_kotoba(
         src,
         &Policy::deny_all().grant_graph_read(["kg"]),
     ));
-    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_write(["kg"])).is_ok());
+    assert!(compile_safe_kotoba(src, &Policy::deny_all().grant_graph_write(["kg"])).is_ok());
 }
 
 #[test]
 fn query_is_classified_as_graph_read() {
     let src = r#"(defn run [] (kqe-query "kg/role"))"#;
     // read grant allows it; write grant alone does not.
-    assert_policy_denied(compile_safe_clj(
+    assert_policy_denied(compile_safe_kotoba(
         src,
         &Policy::deny_all().grant_graph_write(["kg"]),
     ));
-    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_read(["kg"])).is_ok());
+    assert!(compile_safe_kotoba(src, &Policy::deny_all().grant_graph_read(["kg"])).is_ok());
 }
 
 // ── doc ↔ code integrity: the example policy must parse and gate ───────────
@@ -284,14 +284,12 @@ fn example_policy_edn_parses_and_gates() {
     assert_eq!(policy.limits.fuel, 1_000_000);
 
     // A write program compiles under it; an inference program does not.
-    assert!(
-        compile_safe_clj(
-            r#"(defn run [] (kqe-assert! "bafyGraphReportsA" "a" "p" "v"))"#,
-            &policy
-        )
-        .is_ok()
-    );
-    assert_policy_denied(compile_safe_clj(
+    assert!(compile_safe_kotoba(
+        r#"(defn run [] (kqe-assert! "bafyGraphReportsA" "a" "p" "v"))"#,
+        &policy
+    )
+    .is_ok());
+    assert_policy_denied(compile_safe_kotoba(
         r#"(defn run [] (llm-infer "m" "x"))"#,
         &policy,
     ));

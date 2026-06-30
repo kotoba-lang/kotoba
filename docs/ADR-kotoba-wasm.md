@@ -1,12 +1,66 @@
-# ADR — Clojure-on-WASM for kotoba (`kotoba-clj`)
+# ADR — Kotoba to Wasm compiler path (`kotoba wasm`)
 
 Status: **Accepted (steps 1–3 + 5 done; runs on kotoba-runtime. Only step 4 left)**
 Date: 2026-06-08 (steps 1–2), 2026-06-09 (steps 3 + 5, incl. live invoke)
-Crate: `crates/kotoba-clj`
+Implementation crate: `crates/kotoba-clj`
 Related: [`ADR-safe-capability-language.md`](ADR-safe-capability-language.md) —
-**safe-clj** builds on this compiler, adding a deny-by-default
-capability/subset/effect-confined profile (`compile_safe_clj`) for untrusted /
-AI-generated modules. This ADR is the language; that one is how it is confined.
+**safe Kotoba** builds on this compiler, adding a deny-by-default
+capability/subset/effect-confined profile (`compile_safe_kotoba`, legacy alias
+`compile_safe_clj`) for untrusted / AI-generated modules. This ADR defines the
+compiler path for the language profile; that one is how it is confined.
+
+## Vocabulary boundary (2026-06-29)
+
+This ADR now uses the following names consistently:
+
+```text
+kotoba              = language + database + semantic substrate
+kotoba-lang         = source profile / .kotoba contract / conformance
+kotoba wasm         = user-facing compiler command
+kotoba-clj          = implementation crate for the compiler path
+aiueos              = OS / component supervisor / capability broker
+```
+
+Decision: this split is canonical for the current architecture. `kotoba` names
+the language/database meaning space, not merely the compiler crate.
+`kotoba-lang` names the source contract and conformance profile. `kotoba wasm`
+is the user-facing executable language path for compiling Kotoba into Wasm.
+`kotoba-clj` remains the implementation crate for that compiler path.
+`aiueos` names the OS-level supervision layer that verifies, links, schedules,
+audits, and brokers capability-bearing components.
+
+`kotoba wasm` / safe Kotoba turns Kotoba source and policy into confined Wasm
+components. `aiueos` supervises those components, links capabilities, and
+records/mediates the component graph.
+
+This distinction matters for self-hosting. The goal is not to erase Rust in one
+rewrite. Rust remains the bootstrap compiler, Wasm emitter, host substrate, and
+parity oracle while the semantics that define the language/admission boundary
+move into Kotoba slices. The current `crates/kotoba-clj/selfhost` analyzer is
+the first such slice: a safe Kotoba Wasm component that performs covered
+effect, capability, policy, and admission decisions for Kotoba code.
+
+The execution security boundary is Wasm plus an explicit capability broker, not
+generated JavaScript. Browser/Node/JS glue may host the component, but it is a
+broker that binds policy-derived imports only. Raw `fetch`, filesystem, DOM,
+environment, `eval`, or unconstrained message channels are not guest
+capabilities. Host authority reaches a component only through the Wasm import
+table and per-host-call gates.
+
+Identity and authorization are layered. DID identifies principals and
+verification methods. CACAO is the external signed delegation envelope. Kotoba
+Grant is the typed resource/action/constraint capability model. aiueos evaluates
+local policy and materializes the effective capability set as Wasm imports:
+`external_delegation ∩ local_policy ∩ component_manifest ∩ surface_policy ∩
+runtime_limits`. A CACAO resource is never bound directly as a host import.
+
+Content addressing binds the "what" side of authorization. Grants target exact
+`wasm-sha256`, manifest CID, and source CID rather than mutable component names
+alone. Graphs, models, policies, grants, inputs, and outputs are CID-addressed
+when exact bytes define semantics. Run receipts are hash-linked audit DAG nodes
+that record component, manifest, policy, grants, inputs, outputs, and parent
+receipt. CID identity is immutable but not revocation; expiry, key rotation, and
+revocation remain policy-layer checks.
 
 ## Context
 
@@ -16,20 +70,22 @@ kotoba already runs WASM in two senses:
   `kotoba:kais`) that runs guests written in Rust / Python / JS / Go / C.
 - `kotoba-edn` is the SSoT reader for EDN — the Clojure/Datomic wire format.
 
-What did *not* exist was a path where a **Clojure-language program is itself
-compiled to WebAssembly**. "Clojure" appeared in the tree only as (a) the EDN
-data notation and (b) Datalog builtin name aliases (`clojure.string/*`,
-`clojure.set/*`) in `kotoba-datomic`. Neither is a language runtime.
+What did *not* exist was a path where a **Kotoba/EDN profile program is itself
+compiled to WebAssembly**. Before this compiler path, Clojure-family syntax
+appeared in the tree only as (a) the EDN data notation and (b) Datalog builtin
+name aliases (`clojure.string/*`, `clojure.set/*`) in `kotoba-datomic`. Neither
+was a language runtime.
 
-This ADR introduces `kotoba-clj`: a compiler that reads a Clojure/EDN subset and
-emits real WebAssembly bytes. The Clojure source *becomes* the wasm module — it
-is a compiler, not an embedded interpreter.
+This ADR introduced `kotoba-clj`: a compiler that now reads the Kotoba/EDN
+profile (with Clojure-family compatibility inputs) and emits real WebAssembly
+bytes. The Kotoba source *becomes* the wasm module — it is a compiler, not an
+embedded interpreter.
 
 ## Decision
 
 ### Front-end: reuse `kotoba-edn`
 
-Clojure source is read as EDN s-expressions via `kotoba_edn::parse_all`. No
+Kotoba source is read as EDN s-expressions via `kotoba_edn::parse_all`. No
 second reader. The `EdnValue` tree is lowered to a typed AST (`ast.rs`).
 
 ### Value model (phase 1): i64
@@ -96,8 +152,8 @@ module** and runs it on a standalone wasmtime instance. It does **not** yet emit
 a WASM **Component** bound to the `kotoba:kais` WIT world, and it does **not**
 plug into `kotoba-runtime`'s `WasmExecutor`. So:
 
-- ✅ "A Clojure program compiles to real wasm and runs." — **true today.**
-- ❌ "Clojure programs run as first-class kotoba node programs on
+- ✅ "Kotoba/EDN profile source compiles to real wasm and runs." — **true today.**
+- ❌ "Kotoba/EDN profile programs run as first-class kotoba node programs on
   `kotoba-runtime` alongside the Rust/Python/JS/Go/C guests." — **not yet.**
 
 ## Roadmap (corrected dependency order)
@@ -118,7 +174,7 @@ real step order:
    into a data segment; builtins `str-len`, `byte-at`.
 3. ✅ **`list<u8>` in/out Component export** via `wit-component` (module
    `component`): a `(defn run [input] …)` becomes a Component exporting
-   `run: func(list<u8>) -> list<u8>` on a self-owned `kotoba:clj-program` world,
+   `run: func(list<u8>) -> list<u8>` on a self-owned `kotoba:program` world,
    instantiated + invoked through `wasmtime::component`. A hand-emitted
    Canonical-ABI wrapper packs the input `(ptr,len)` into a string handle, calls
    the user function, and writes the returned handle's `(ptr,len)` into a
@@ -140,7 +196,7 @@ real step order:
    path). **`tests/kais_invoke.rs` then drives the runtime's own `WasmExecutor`**
    (a dev-dependency) which binds every `kotoba:kais` interface, instantiates the
    component, calls `run(ctx)` and lifts the `result<list<u8>, string>` — proving
-   compiled Clojure runs end-to-end on kotoba-runtime, and validating the
+   compiled Kotoba/EDN profile source runs end-to-end on kotoba-runtime, and validating the
    hand-emitted variant layout at runtime (a mis-layout would trap the lift).
    **Remaining for full production parity** (not blocking the milestone):
    `program_cid = CIDv1 blake3(wasm)` storage in Vault/Shelf and honouring the
@@ -153,11 +209,11 @@ real step order:
 
 The live invoke proves the *plumbing*, not a functional node program. Be precise:
 
-> Compiled Clojure **computes over bytes and returns bytes, on the real
+> Compiled Kotoba/EDN profile source **computes over bytes and returns bytes, on the real
 > runtime.** It cannot yet (a) **read** its `ctx`/`args` — the wrapper hands the
 > program the raw `ctx-cbor` undecoded; nor (b) **call** any kotoba host service
 > — the emitted guest has *no import section*, so `kqe`/`kse`/`auth`/`llm` are
-> bound by the linker but unreachable from Clojure (no builtin lowers to a WIT
+> bound by the linker but unreachable from this source slice (no builtin lowers to a WIT
 > import).
 
 Both gaps are language-growth, not codegen: (a) needs a CBOR decoder (loops +
@@ -197,7 +253,7 @@ is explicitly **out of scope** until the language grows these primitives.
 Steps **1, 2, 3, 5** are implemented and verified; **step 4** is the single
 remaining item and is deliberately deferred. As of this ADR:
 
-- A Clojure-subset program compiles to a real WASM **Component** and, via the
+- A Kotoba/EDN-subset program compiles to a real WASM **Component** and, via the
   runtime's own `WasmExecutor`, **runs end-to-end on kotoba-runtime** —
   computing over bytes and returning bytes through the actual `kotoba-node`
   `run: func(list<u8>) -> result<list<u8>, string>` export.
@@ -214,8 +270,8 @@ both **language-growth, not codegen**:
    decoder = iteration + byte-building (step 4).
 2. **Calls nothing.** The emitted guest has *no import section*, so
    `kqe`/`kse`/`auth`/`llm` are bound by the host linker but unreachable from
-   Clojure; calling a host service needs builtins that lower to the
-   `kotoba:kais` imports (e.g. `(kqe/assert …)`).
+   this Kotoba/EDN source slice; calling a host service needs builtins that
+   lower to the `kotoba:kais` imports (e.g. `(kqe/assert …)`).
 
 **Next workstream (not started — needs an explicit go-ahead):** grow the
 language — (1) iteration, (2) a mutable byte/string-builder backed by
@@ -259,11 +315,11 @@ Verified end-to-end on wasmtime: Σ/gcd loops, `recur` nested inside
 linear-memory inspection confirming `bytes-finish` yields a real readable
 region (`🐍` U+1F40D bytes round-trip).
 
-## Direction: kotoba-clj → langgraph (Graph-as-data, staged)
+## Direction: Kotoba source → langgraph (Graph-as-data, staged)
 
 Decision (2026-06-09): target a **Graph-as-data** surface mirroring the existing
 kotoba `StateGraph` (ADR-2605250002), **running on kotoba-runtime**. Graph
-topology is declared as EDN; only node *bodies* are clj `defn`s; the state dict,
+topology is declared as EDN; only node *bodies* are Kotoba `defn`s; the state dict,
 reducers, edge routing, run-loop, and CBOR glue are emitted by the compiler / a
 fixed driver. This keeps language growth minimal vs. a full Clojure (no
 closures/GC needed to ship a working agent).
@@ -280,7 +336,7 @@ closures/GC needed to ship a working agent).
 
 Stages (A–D all done; each reuses the prior). A `defgraph` agent now decodes a
 CBOR ctx, runs a node/edge graph, calls the LLM, and returns output — entirely
-in compiled Clojure on kotoba-runtime:
+in compiled Kotoba on kotoba-runtime:
 
 - **A ✅ language core** — `loop`/`recur`, `cond`, byte-builder (this section).
 - **B ✅ heap values** — growable `vector` + string-keyed `map`, enough for a
@@ -318,7 +374,7 @@ in compiled Clojure on kotoba-runtime:
     is the langgraph node primitive. Verified live: `tests/llm_infer.rs` (3
     tests) drives `WasmExecutor::with_inference` (ok: lifts model text, incl. a
     prompt-echo proving the guest lowered the prompt bytes) and the default
-    executor (err → "ERR"). **A compiled-Clojure guest now calls an LLM on
+    executor (err → "ERR"). **A compiled-Kotoba guest now calls an LLM on
     kotoba-runtime and gets text back.**
   - **C-3 ✅ CBOR decode (in-guest)** — `CBOR_PRELUDE`: a CBOR reader written in
     the language (Stage-A `loop`/`recur`+`byte-at`, Stage-B `str-eq?`), **no
@@ -388,7 +444,7 @@ in compiled Clojure on kotoba-runtime:
   **and the Datomic loop**: agent-asserted quads → `kotoba_query::Datom` →
   `kotoba_datomic::Datom::from_kqe` → `Db::from_datoms` → `datoms()` returns
   the agent's facts as EDN (`kg/name = "Alice"`, `kg/role = "admin"`) —
-  **compiled Clojure writes, the Datomic facade reads.**
+  **compiled Kotoba writes, the Datomic facade reads.**
 - **E ✅ Pregel/BSP verification (2026-06-11)** — `tests/pregel.rs` (3 tests)
   drives the compiled component through **`kotoba-vm::WasmPregelRunner`** (the
   Pregel BSP engine, single-vertex self-loop): each superstep the guest
@@ -398,7 +454,7 @@ in compiled Clojure on kotoba-runtime:
   the next superstep's ctx. Verified: a 4-superstep run (n 0→4) accumulates
   exactly 4 Datoms + ≥40 gas across supersteps with a structured `done` output;
   a 1-superstep immediate halt; and the `max_supersteps` cap stopping a
-  continue-loop at the BSP boundary. **A langgraph-shaped compiled-Clojure
+  continue-loop at the BSP boundary. **A langgraph-shaped compiled-Kotoba
   agent runs on Pregel BSP, writing Datoms every superstep.**
 
 ---
@@ -407,26 +463,26 @@ in compiled Clojure on kotoba-runtime:
 
 Status: **Accepted.** Crate: `crates/kotoba-clj`.
 
-`kotoba-clj` now has a file runner for Clojure-subset source files using the
-`.kotoba` extension, matching the operational shape of `clj` / `bb` scripts:
+The compiler path now has a public file entry point for Kotoba/EDN-subset source
+files using the `.kotoba` extension. The canonical user-facing forms are:
 
 ```clojure
-#!/usr/bin/env kotoba-clj
 (defn main [x]
   (clojure.core/inc x))
 ```
 
 ```text
-kotoba-clj app.kotoba 41
-kotoba-clj --func fact math.kotoba 5
-kotoba-clj --wasm-out app.wasm app.kotoba
+kotoba wasm build app.kotoba -o app.wasm
+kotoba -e '(+ 1 2)'
 ```
 
-The runner strips a leading Unix shebang before the EDN reader sees the source,
-prepends the kotoba-clj prelude by default, validates the `.kotoba` extension
-unless `--allow-any-ext` is passed, and invokes exported `main` unless
-`--func` selects another exported function. `compile_file` and
-`compile_file_with_prelude` expose the same behavior to Rust callers.
+The compatibility runner still accepts legacy script-shaped invocations and
+strips a leading Unix shebang before the EDN reader sees the source. The public
+`kotoba wasm` path prepends the Kotoba prelude by default, validates the
+`.kotoba` extension unless compatibility input handling is explicitly requested,
+and invokes exported `main` unless `--func` selects another exported function.
+`compile_file` and `compile_file_with_prelude` expose the same behavior to Rust
+callers.
 
 The supported Clojure-core compatibility surface also grew:
 
@@ -449,7 +505,7 @@ test for `clojure.core/`-qualified collection functions in
 First-class anonymous functions now compile via **lambda lifting** to a WASM
 funcref table + `call_indirect`. This is milestone 1 toward running
 `langgraph-clj` / `langchain-clj` (the portable `.cljc` LangGraph/LangChain
-implementations) on kotoba-clj/WASM, since both lean heavily on `(fn …)`.
+implementations) on Kotoba/WASM, since both lean heavily on `(fn …)`.
 
 ### Reader (`kotoba-edn`)
 
@@ -507,7 +563,7 @@ clean.
 ## Higher-order sequence functions (`map`/`filter`/`reduce`/…) — 2026-06-14
 
 With closures + `call_indirect` in place (previous section), the seq HOFs are
-written as **ordinary prelude `defn`s** in the kotoba-clj subset itself — no new
+written as **ordinary prelude `defn`s** in the Kotoba subset itself — no new
 codegen. Each takes a function argument and invokes it through the closure path
 (`(f x)` → `CallValue` → `call_indirect`), iterating the heap vector with
 `loop`/`recur` + `vec-nth`/`vec-conj!`.
@@ -548,7 +604,7 @@ component/kqe/pregel suites that compile with the now-table-bearing prelude.
 
 Status: **Accepted.** Crate: `crates/kotoba-clj` (`tests/coverage.rs`, 16 tests).
 
-Broadens Clojure-language coverage with **no new codegen path or runtime node** —
+Broadens Kotoba/EDN profile coverage with **no new codegen path or runtime node** —
 everything is either a pure-subset `PRELUDE` function (compiled through the
 existing vec/map + closure-table machinery) or an AST desugar into existing
 special forms.
@@ -629,15 +685,16 @@ paths run identically on wasmtime and V8.
 Status: **Accepted.** Crates: `kotoba-lattice`, `kotoba-clj`, `kotoba-server`,
 `kotoba-wasm` (cljs). PR #206.
 
-R1 made the `kotoba-clj` CLI/compiler accept `.kotoba`. R2 closes the remaining
-recognition/processing gaps so `.kotoba` is first-class **end-to-end**:
+R1 made the compiler implementation accept `.kotoba`. R2 closes the remaining
+recognition/processing gaps so `.kotoba` is first-class **end-to-end** through
+the public Kotoba paths:
 
 ### Explicit language recognition (`kotoba-lattice/src/manifest.rs`)
 The mesh build path (`kotoba component build x.kotoba`) previously routed
-`.kotoba` to `Lang::Clojure` only via the wildcard fallback. `Lang::from_ext`
+`.kotoba` to `Lang::Kotoba` explicitly. `Lang::from_ext`
 now matches `kotoba` / `clj` / `cljc` / `cljs` explicitly, and `Lang::from_token`
-accepts the `:kotoba` token — same behavior (compiled by `kotoba-clj`), but the
-intent is no longer implicit. Tests extended.
+accepts the `:kotoba` token — same compiler implementation behavior, but the
+language intent is no longer implicit. Tests extended.
 
 ### Fuel-bounded standalone run (`kotoba-clj/src/run.rs`)
 `run::run_with_fuel(wasm, func, args, fuel)` instantiates the emitted core module
@@ -647,7 +704,7 @@ out-of-fuel error instead. This is the runner any network/RCE-shaped path must
 use (the plain `run` stays for trusted in-process callers). +2 tests
 (within-budget success, unbounded-loop trap).
 
-### Server compile/run XRPC (`kotoba-server/src/mesh_xrpc.rs`, feature `clj-mesh`)
+### Server compile/run XRPC (`kotoba-server/src/mesh_xrpc.rs`, feature `kotoba-mesh`)
 Two operator-gated endpoints take raw `.kotoba` *source* over HTTP:
 
 ```text
@@ -662,8 +719,9 @@ com.etzhayyim.apps.kotoba.mesh.run      source → compile → run → { result,
   host imports** (no kqe/kse/auth/llm) → pure i64 compute over the args.
 - **Operator-gated** (`require_operator_auth`, same as `media.*`); source/func/arg
   validation; a compile/trap is reported as `400` (caller's program at fault).
-- Gated behind the **off-by-default `clj-mesh`** feature with `kotoba-clj` as an
-  *optional* dep, so the default server build does **not** pull in wasmtime.
+- Gated behind the **off-by-default `kotoba-mesh`** feature with `kotoba-clj` as
+  an *optional* dep, so the default server build does **not** pull in wasmtime.
+  The old `clj-mesh` feature remains as a compatibility alias.
   6 unit tests (NSID shape, reader-target/source/func validation, compile+run
   roundtrip = 41, compile-error → 400).
 
@@ -681,7 +739,240 @@ operator-gated endpoint), so it is an operator/dev console surface.
 
 Verification: `cargo test -p kotoba-clj` / `-p kotoba-lattice --lib` green
 (incl. fuel + explicit-recognition tests); `kotoba-server` builds **with and
-without** `clj-mesh`; `mesh_xrpc` unit tests pass (compile+run roundtrip = 41);
+without** `kotoba-mesh`; `mesh_xrpc` unit tests pass (compile+run roundtrip = 41);
 `npx shadow-cljs release web` compiles with 0 warnings.
 
-Build/run the surface: `cargo run -p kotoba-server --features clj-mesh`.
+Build/run the surface: `cargo run -p kotoba-server --features kotoba-mesh`.
+
+## R2b — inline Kotoba expression compile path (ACCEPTED, 2026-06-29)
+
+Status: **Accepted.** Crate: `crates/kotoba-clj`.
+
+`kotoba -e <expr>` is the user-facing inline source entry point for small Kotoba
+expressions. It is intentionally implemented as source-to-Wasm compile-and-run
+sugar, not runtime `eval`: the expression is wrapped as `(defn main [] <expr>)`,
+compiled through the same Kotoba -> core Wasm path as source files, and then
+run by invoking the exported `main`. The lower-level implementation binary keeps
+a compatibility inline-expression mode, but the canonical user-facing command is
+`kotoba -e`.
+
+The compiler API exposes the same boundary directly:
+
+```rust
+let wasm = kotoba_clj::compile_expr_with_prelude("(+ 1 2)")?;
+```
+
+The CLI can also write the compiled core module without changing the execution
+boundary:
+
+```text
+kotoba -e '(+ 1 2)'
+kotoba -e '(* 6 7)' --wasm-out expr.wasm
+```
+
+This path deliberately stays separate from `kotoba wasm build <cell.kotoba>`,
+which targets the `kotoba-node` Component ABI and expects a `run(ctx)` component entry.
+Inline expressions produce a plain core module with `main`, so mixing `build -e`
+would blur the ABI boundary. Component-form inline workflows should first define
+an explicit `(defn run [ctx] ...)` source form or grow a separate component
+expression wrapper with a documented ABI.
+
+## R3 — self-hosting seed: safe analyzer in Kotoba (ACCEPTED, 2026-06-29)
+
+Status: **Accepted seed.** Crate: `crates/kotoba-clj`.
+Artifacts: `crates/kotoba-clj/selfhost/safe_analyzer.kotoba`,
+`crates/kotoba-clj/src/selfhost.rs`, `crates/kotoba-clj/tests/selfhost.rs`.
+
+The strategic direction is now explicit: Rust remains the substrate and
+bootstrap compiler, but kotoba should progressively move language/admission
+semantics into Kotoba programs that compile to Wasm Components and run under
+the same deny-by-default profile they enforce.
+
+This keeps the architecture aligned with the system vocabulary:
+
+```text
+kotoba               = language + database + semantic substrate
+kotoba-lang          = source profile / .kotoba contract / conformance
+kotoba wasm          = user-facing compiler command
+kotoba-clj           = implementation crate for the compiler path
+aiueos               = OS / component supervisor / capability broker
+```
+
+The first self-hosting seed is intentionally small and verifiable:
+`safe_analyzer.kotoba` reimplements the covered safe Kotoba effect/capability
+analysis, policy checking, minimal-policy synthesis, and unused-grant linting in
+Kotoba itself. Tests compile that analyzer as safe Kotoba under
+`Policy::deny_all()`, verify the emitted component has no embedded host
+capability imports, run it through the Component path, and compare its answers
+against the Rust analyzer for the covered surface.
+The same seed now owns an executable-body subset slice: parser-owned AST facts
+for forbidden calls such as `eval` and raw-memory primitives are rejected by the
+Kotoba component before Rust's full subset fallback handles source-level
+forms outside function bodies. The body-level denylist now also covers
+read-as-code, runtime namespace loading, dynamic var mutation, shared mutable
+references, ambient I/O, nondeterminism, ambient concurrency, and
+reflection/host-object construction for parser-owned body facts; Rust remains
+the fallback for host interop syntax and namespaced variants not normalized in
+the body facts. Top-level `ns` loading clauses are now represented as
+`source-subset` facts, so `:require`, `:use`, and `:import` are rejected by the
+Kotoba analyzer before Rust's full subset fallback. The same source facts
+cover top-level `defmacro`, runtime loading forms, and host constructor/member
+syntax, and can be sent as a subset-only analyzer request even when Rust AST
+lowering fails. The source-level subset walker records non-executable
+declaration heads such as `defmacro` but does not descend into their bodies, so
+macro implementation details do not appear as runtime subset denials.
+It also owns the first parser-owned AST type slice: body AST facts reject
+direct literal kind mismatches for numeric/bitwise/comparison builtins and
+math/conversion builtins, string-first builtins such as `str-len` / `byte-at`,
+and byte-buffer builtins such as `byte-append!`, `bytes-len`, and
+`bytes-finish`, and string-handle host imports such as `kqe-*`, `llm-infer`,
+and `has-capability?`, plus direct literal value traps such as `byte-at`
+out-of-bounds / negative index, negative `bytes-alloc`, and division/mod/rem by
+literal zero.
+The Rust bridge also sends source-level `source-types` facts with small literal
+kind codes (`Num` / `Str` / unknown), so covered direct literal kind mismatches
+can be rejected by the Kotoba analyzer even when Rust AST lowering fails.
+The source-level type walker skips inert forms and non-executable declaration
+bodies such as `defmacro`; those remain subset-gate responsibility.
+Value-dependent literal checks remain parser-owned AST facts.
+When Rust AST lowering fails, the bridge also sends `source-effects` facts for
+direct executable host calls in `defn` bodies. This gives Kotoba tooling
+direct class-level capability and literal resource-target coverage for
+minimal-policy synthesis, policy/admission checks, and unused-grant linting for
+calls such as `(kqe-assert! "graphB" ...)`. Namespaced direct host calls such as
+`(kotoba/kqe-assert! "graphB" ...)` normalize to the same builtin operation in
+source-only tooling; interprocedural propagation, dynamic targets, and effect
+declaration soundness remain parser-owned AST facts.
+The Rust bridge preserves those builtin names in parser-owned AST facts rather
+than collapsing them to `pure-builtin`, and sends a parser-owned `type-body` AST
+copy for a type-only pass. That pass carries `Str`/`Num`/`Bytes` through direct
+`let`/`loop` locals, `do` finals, and same-type `if` joins before checking
+builtin arguments. For cross-function call-argument rows, it records local `Str` facts
+only; local `Num`/`Bytes` facts still collapse to Unknown at the function-call
+boundary, matching Rust's handle-safety rule. The same local pass also checks
+concrete `loop`/`recur` rebinding: if a loop binding's initial fact and the
+corresponding `recur` argument fact are both concrete and differ, the body is
+rejected as `recur`; Unknown values remain permissive. The recursive type walker
+preserves normal effect/capability analysis for nested arguments. The same
+analyzer also
+owns the first cross-function parameter requirement slice: a direct literal
+whose type conflicts with a callee parameter that is directly used in a numeric,
+math/conversion, string, byte-buffer, or string-handle host-import position is
+rejected in Kotoba. Those call-site parameter requirements are resolved by
+`name + arity`, so multi-arity `defn` overloads keep separate signatures. The
+Rust bridge also sends a parser-owned `ret` AST fact
+for the final expression of each function and a parser-owned `ret-call-ast`
+duplicate for deriving direct tail-call return relations in Kotoba; the
+analyzer derives a first return slice from them, so direct `Str` returns from
+string literals, `bytes-finish`, and `llm-infer`, plus `if` joins whose
+`then`/`else` branches both derive direct `Str`, direct `do` final expressions,
+and direct `let`/`loop` sequential direct-`Str` locals, plus direct call returns and
+`do`/`let`/`loop` final tail-call returns whose callee resolves to `Str`, and final
+`if` tail-call branches whose callees both resolve to the same concrete `Str`,
+are rejected
+when they flow into a numeric/math/byte-buffer/host-import position. Direct
+call-return rows used at builtin argument positions resolve callees by
+`name + arity`, and direct tail-call return relations resolve with the same
+`function-key(name, arity)` identity. The Rust bridge does not emit the legacy
+name-only `ret-call` field in normal requests; the analyzer accepts it only for
+external compatibility when the parser-owned `ret-call-ast` key is absent. This
+keeps multi-arity `defn` return signatures separate. Direct `Num`/`Bytes`
+returns, mixed `if` branches, non-final `do` expressions, non-`Str` shadowed
+locals, mixed tail-call branches, direct call cycles, and unknown callees still
+collapse to Unknown at the function boundary and are not propagated by this
+Kotoba slice.
+Rust continues to own typed-HIR inference and dynamic/non-literal flows.
+The analyzer/bridge CBOR boundary is versioned with
+`kotoba.selfhost.safe-analyzer.v1`; Rust bridge inputs and analyzer outputs
+carry that `abi` marker, the analyzer rejects inputs without it, and the Rust
+bridge rejects analyzer output without it before typed decoding.
+
+Covered behavior includes host-call classification, nested form walking,
+parsed-AST derived forms, body-only parser-owned AST facts, transitive
+function-call summaries, `name + arity` call graph resolution for parser-owned
+AST facts, mutual recursion, effect declaration soundness,
+class-level and per-resource policy gates, minimal policy generation,
+dynamic-target widening, unused-grant reporting, and inert forms such as
+`quote` / `var` / `comment`.
+
+This is not yet a Rust-free compiler. The current trust boundary is:
+
+- Rust still owns parsing, lowering, Wasm emission, component instantiation, and
+  the reference implementation used by tests.
+- Kotoba now owns a verified slice of compiler-admission semantics as data
+  and executable Wasm.
+- `kotoba_clj::selfhost` is now the crate-side bridge: Rust callers can compile
+  the bundled analyzer component, run source through the Kotoba analyzer,
+  obtain typed per-function summaries, call `selfhost::infer_effects(src)`, and
+  synthesize `selfhost::minimal_policy(src)` without copying test-only CBOR
+  lowering helpers. `selfhost::Analyzer` is the reusable runtime-shaped handle:
+  it keeps compiled component bytes and can answer repeated admission queries or
+  drive multiple selfhost-backed `compile_safe_kotoba*` / `compile_safe_file*`
+  admission gates without recompiling the analyzer for every call. The bridge
+  lowers source into a single versioned `AnalyzerRequest` before CBOR encoding,
+  using parser-owned `params` and `body` AST facts rather than the older
+  compatibility `forms` stream and carrying declared `{:effects ...}` rows from
+  parser-owned `Function` facts in that same request. This makes the
+  current Rust-owned reader/AST boundary explicit while letting the Kotoba
+  analyzer walk AST-shaped data directly, derive direct-call literal argument
+  facts and parameter-as-resource-target facts itself, and make the
+  one-call-layer per-cid policy decision itself. Those analyzer-derived facts
+  also feed least-privilege policy synthesis and unused-grant linting:
+  literal pass-through such as `(writer "graphA")` is pinned to `graphA`, while
+  dynamic pass-through still widens to wildcard. Resource pass-through is also
+  resolved by `name + arity`, so multi-arity `defn` overloads do not mix policy,
+  minimal-policy, or unused-grant decisions across arities;
+  runtime/tooling callers can serialize and run that request through the same
+  analyzer handle, including `clj` / `cljs` reader-conditional source via
+  `AnalyzerRequest::from_source_with_reader_target` and matching analyzer
+  `*_with_reader_target` query helpers. The bridge still accepts `forms` as a
+  compatibility/test input, but source-backed admission now exercises the AST
+  fact path. The bridge also covers admission decisions:
+  `check_effect_declarations(src)`, `check_policy(src, policy)`,
+  `check_admission(src, policy)` for one-run effect+policy admission,
+  `check_compile_gate(src, policy)` for one-run subset+type+effect+policy
+  compile admission, including a source-only fallback that still returns
+  source-subset, source-level literal-kind type, and direct host-call policy
+  decisions when Rust AST lowering fails,
+  `unused_grant_ids(src, policy)`, and the Rust-compatible
+  `unused_grants(src, policy)`, and
+  `check_types(src)` for the first selfhost-owned parser AST plus source-level
+  literal kind type slice.
+  It now exposes
+  `selfhost::compile_safe_kotoba(src, policy)` /
+  `compile_safe_kotoba_with_prelude(src, policy)` plus
+  `*_with_reader_target` variants for `kotoba` / `clj` / `cljs`
+  reader-conditional source: Rust still performs reader/codegen work and remains
+  fallback for source-level constructs not represented in analyzer facts, wider
+  type checks, typed-HIR inference, and emission, but the covered body-level
+  subset, source-level subset, source-level literal kind, source-level direct
+  host-call policy, literal type, effect/capability, and per-resource policy gates are driven by one
+  `compile-gate` request to the Kotoba analyzer component. On Rust AST
+  lowering failure, compile-gate/minimal-policy/policy/admission/unused-grants
+  tooling degrades to source-only subset/type/effect facts before Rust fallback
+  gates resume. File graph compile entry points keep the same
+  reader target through dependency loading and selfhost-backed admission. CLI
+  dogfood is now selfhost-first by default as `kotoba wasm safe-build <cell>
+  --policy <policy.edn>` and `kotoba wasm safe-policy <cell>`; the legacy
+  `--selfhost-gate` flag is retained only as a compatibility alias. The
+  `safe-build` command reports selfhost admission, over-grant linting, and
+  effect reporting. `kotoba wasm selfhost-inspect
+  <cell> --policy <policy.edn> --request-hex --json` exposes the same
+  versioned request/analyzer-summary/type-gate/admission boundary for
+  runtime/tooling inspection without compiling.
+
+Verification is now an explicit CI gate in addition to local checks:
+`cargo test -p kotoba-clj --features component --test selfhost` proves the
+Kotoba analyzer compiles and runs as a Component and matches the Rust
+analyzer on the covered surface; `cargo test -p kotoba-clj --features cli
+--test kotoba_file selfhost` proves the CLI dogfood path.
+
+The desired end state is not "remove Rust". It is:
+
+- `kotoba` is the source of truth for language/database semantics.
+- `kotoba wasm` / safe Kotoba makes those semantics executable as confined
+  Wasm components, with more admission/type/policy rules written in Kotoba
+  itself over time. `kotoba-clj` remains the implementation crate for now.
+- `aiueos` hosts those executable components as capability-governed OS services.
+- Rust remains the minimal portable substrate, bootstrap, emitter, and parity
+  oracle only for the slices that have not yet moved into Kotoba.

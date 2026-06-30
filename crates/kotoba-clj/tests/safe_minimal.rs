@@ -4,7 +4,7 @@
 //!   (2) **minimality** — it grants only what the cell targets, and removing a
 //!       grant breaks compilation.
 
-use kotoba_clj::{compile_safe_clj, minimal_policy, CljError, Policy};
+use kotoba_clj::{compile_safe_kotoba, minimal_policy, CljError, Policy};
 
 fn denied_policy(res: Result<Vec<u8>, CljError>) {
     assert!(
@@ -21,7 +21,7 @@ fn pure_cell_needs_deny_all() {
     assert!(p.graph_write.is_empty());
     assert!(p.infer.is_empty());
     assert!(!p.auth);
-    assert!(compile_safe_clj(src, &p).is_ok());
+    assert!(compile_safe_kotoba(src, &p).is_ok());
 }
 
 #[test]
@@ -41,7 +41,7 @@ fn minimal_policy_is_sufficient_by_construction() {
     ] {
         let p = minimal_policy(src).unwrap();
         assert!(
-            compile_safe_clj(src, &p).is_ok(),
+            compile_safe_kotoba(src, &p).is_ok(),
             "minimal policy must compile: {src}"
         );
     }
@@ -65,12 +65,12 @@ fn minimal_policy_is_actually_minimal() {
     // Removing the single grant the cell needs must break compilation.
     let src = r#"(defn run [] (kqe-assert! "graphA" "s" "p" "v"))"#;
     let p = minimal_policy(src).unwrap();
-    assert!(compile_safe_clj(src, &p).is_ok());
+    assert!(compile_safe_kotoba(src, &p).is_ok());
 
     // Drop the graph-write grant → no longer compiles.
     let mut stripped = p.clone();
     stripped.graph_write.clear();
-    denied_policy(compile_safe_clj(src, &stripped));
+    denied_policy(compile_safe_kotoba(src, &stripped));
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn dynamic_target_widens_to_wildcard() {
     let src = r#"(defn run [g] (kqe-assert! g "s" "p" "v"))"#;
     let p = minimal_policy(src).unwrap();
     assert!(p.graph_write.contains("*"), "dynamic graph → wildcard");
-    assert!(compile_safe_clj(src, &p).is_ok());
+    assert!(compile_safe_kotoba(src, &p).is_ok());
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn kqe_query_needs_read_class_via_wildcard() {
     let p = minimal_policy(src).unwrap();
     assert!(p.graph_read.contains("*"));
     assert!(p.graph_write.is_empty());
-    assert!(compile_safe_clj(src, &p).is_ok());
+    assert!(compile_safe_kotoba(src, &p).is_ok());
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn synthesized_policy_emits_parseable_edn() {
     let edn = p.to_edn();
     // The emitted artifact is a usable policy.edn that gates the same way.
     let reparsed = Policy::parse_edn(&edn).unwrap();
-    assert!(compile_safe_clj(src, &reparsed).is_ok());
+    assert!(compile_safe_kotoba(src, &reparsed).is_ok());
     assert!(edn.contains("graphA"));
 }
 
@@ -153,7 +153,10 @@ fn unused_specific_cid_is_reported() {
     let p = Policy::deny_all().grant_graph_write(["gA", "gB"]);
     let unused = kotoba_clj::unused_grants(src, &p).unwrap();
     assert_eq!(unused.len(), 1);
-    assert!(unused[0].contains("gB") && !unused[0].contains("gA"), "{unused:?}");
+    assert!(
+        unused[0].contains("gB") && !unused[0].contains("gA"),
+        "{unused:?}"
+    );
 }
 
 #[test]

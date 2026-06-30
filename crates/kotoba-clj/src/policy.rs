@@ -1,6 +1,6 @@
-//! # Capability policy (`compile_safe_clj` phase S0)
+//! # Capability policy (`compile_safe_kotoba` phase S0)
 //!
-//! A [`Policy`] is the *deny-by-default* capability grant a safe-clj module is
+//! A [`Policy`] is the *deny-by-default* capability grant a safe Kotoba module is
 //! compiled against. It is the language-side half of kotoba's
 //! capability-confinement design (see `docs/ADR-safe-capability-language.md`).
 //!
@@ -11,7 +11,7 @@
 //! wasm import wired to the `kotoba:kais` world, and the runtime binds the lot.
 //! A program that can name a capability has it.
 //!
-//! [`crate::compile_safe_clj`] inverts that. It collects the host imports a
+//! [`crate::compile_safe_kotoba`] inverts that. It collects the host imports a
 //! program actually uses ([`crate::codegen::used_host_imports`]) and **refuses
 //! to emit the module** unless every one of them is granted by the policy.
 //! Because the emitted module's import section is therefore a subset of the
@@ -21,20 +21,20 @@
 //! time.
 //!
 //! ```
-//! use kotoba_clj::{compile_safe_clj, policy::Policy};
+//! use kotoba_clj::{compile_safe_kotoba, policy::Policy};
 //!
 //! // deny-all policy: a program that touches the graph will not compile.
 //! let policy = Policy::deny_all();
-//! let denied = compile_safe_clj("(defn run [g] (kqe-assert! g \"s\" \"p\" g))", &policy);
+//! let denied = compile_safe_kotoba("(defn run [g] (kqe-assert! g \"s\" \"p\" g))", &policy);
 //! assert!(denied.is_err());
 //!
 //! // grant graph-write to one graph cid: now it compiles.
 //! let policy = Policy::deny_all().grant_graph_write(["bafyGraphA"]);
-//! let ok = compile_safe_clj("(defn run [g] (kqe-assert! g \"s\" \"p\" g))", &policy);
+//! let ok = compile_safe_kotoba("(defn run [g] (kqe-assert! g \"s\" \"p\" g))", &policy);
 //! assert!(ok.is_ok());
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use kotoba_edn::EdnValue;
 
@@ -82,7 +82,7 @@ impl CapClass {
 }
 
 /// Resource quotas a safe module must declare. There is no permissive default:
-/// [`crate::compile_safe_clj`] rejects a policy whose `fuel` or `memory_pages`
+/// [`crate::compile_safe_kotoba`] rejects a policy whose `fuel` or `memory_pages`
 /// is zero, mirroring the runtime's `gas_limit = 0` ban — gasless/quota-less
 /// execution is forbidden by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +111,7 @@ impl Limits {
     }
 }
 
-/// A deny-by-default capability grant + resource quota a safe-clj module is
+/// A deny-by-default capability grant + resource quota a safe Kotoba module is
 /// compiled against.
 ///
 /// Allowlists (`graph_read`, `graph_write`, `infer`, `egress`, `secrets`) carry
@@ -250,18 +250,73 @@ impl Policy {
         for f in forms {
             self.check_value_targets(f)?;
         }
+        // S4b (1-level interprocedural): a literal cid passed to a user function
+        // that uses *that parameter* directly as a host-call resource target is
+        // checked against the same allowlist — per-cid confinement flows through
+        // one call layer, not just direct host calls. Conservative (single-arity
+        // defns, unshadowed direct param use, literal call arguments only), so a
+        // legitimate call whose cid *is* granted is never flagged.
+        let param_targets = collect_cid_param_targets(forms);
+        if !param_targets.is_empty() {
+            for f in forms {
+                self.check_param_cid_calls(f, &param_targets)?;
+            }
+        }
         Ok(())
     }
 
     /// The (`:imports` key, allowlist) a resource-targeting builtin scopes its
     /// first string-literal argument against.
     fn resource_target_of(&self, name: &str) -> Option<(&'static str, &BTreeSet<String>)> {
-        match name {
-            "kqe-assert!" | "kqe-retract!" => Some(("graph-write", &self.graph_write)),
-            "kqe-get-objects" => Some(("graph-read", &self.graph_read)),
-            "llm-infer" => Some(("infer", &self.infer)),
-            _ => None,
+        resource_target_key(name).map(|key| (key, self.allowlist_for(key)))
+    }
+
+    /// The allowlist for a capability-class key.
+    fn allowlist_for(&self, key: &str) -> &BTreeSet<String> {
+        match key {
+            "graph-write" => &self.graph_write,
+            "graph-read" => &self.graph_read,
+            "infer" => &self.infer,
+            _ => unreachable!("unknown resource-target key {key}"),
         }
+    }
+
+    /// Check each `(fname <literal-cid> …)` call whose callee uses parameter
+    /// `param_idx` as a resource target: the cid must be in that class's
+    /// allowlist (the per-cid rule, one call layer deep).
+    fn check_param_cid_calls(
+        &self,
+        v: &EdnValue,
+        targets: &HashMap<String, Vec<(usize, &'static str)>>,
+    ) -> Result<(), CljError> {
+        if let EdnValue::List(items) = v {
+            if let Some(EdnValue::Symbol(head)) = items.first() {
+                if crate::ast::is_inert_form(&head.name) {
+                    return Ok(());
+                }
+                if let Some(positions) = targets.get(&head.name) {
+                    let args = &items[1..];
+                    for &(idx, key) in positions {
+                        if let Some(EdnValue::String(cid)) = args.get(idx) {
+                            let allow = self.allowlist_for(key);
+                            if !(allow.contains("*") || allow.contains(cid)) {
+                                return Err(CljError::Policy(format!(
+                                    "`{cid}` is not in the policy's `:{key}` allowlist — it is \
+                                     passed to `{}` which uses it as a {key} resource target \
+                                     (T3 instance-level, through a call). Grant `:{key} \
+                                     [\"{cid}\"]` (or `\"*\"`) to authorize it.",
+                                    head.name
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            for it in items {
+                self.check_param_cid_calls(it, targets)?;
+            }
+        }
+        Ok(())
     }
 
     fn check_value_targets(&self, v: &EdnValue) -> Result<(), CljError> {
@@ -341,9 +396,8 @@ impl Policy {
     /// with [`Policy::parse_edn`] for the gated fields. Reserved fields (egress,
     /// secrets, clock, random) are emitted too so the artifact is complete.
     pub fn to_edn(&self) -> String {
-        let strs = |s: &BTreeSet<String>| {
-            EdnValue::vector(s.iter().map(|x| EdnValue::string(x.clone())))
-        };
+        let strs =
+            |s: &BTreeSet<String>| EdnValue::vector(s.iter().map(|x| EdnValue::string(x.clone())));
         let imports = EdnValue::map([
             (EdnValue::kw_bare("graph-read"), strs(&self.graph_read)),
             (EdnValue::kw_bare("graph-write"), strs(&self.graph_write)),
@@ -453,6 +507,192 @@ impl Policy {
     }
 }
 
+fn resource_target_key(name: &str) -> Option<&'static str> {
+    match name.rsplit('/').next().unwrap_or(name) {
+        "kqe-assert!" | "kqe-retract!" => Some("graph-write"),
+        "kqe-get-objects" => Some("graph-read"),
+        "llm-infer" => Some("infer"),
+        _ => None,
+    }
+}
+
+fn collect_cid_param_targets(forms: &[EdnValue]) -> HashMap<String, Vec<(usize, &'static str)>> {
+    let mut out = HashMap::new();
+    for form in forms {
+        collect_defn_cid_param_targets(form, &mut out);
+    }
+    out
+}
+
+fn collect_defn_cid_param_targets(
+    form: &EdnValue,
+    out: &mut HashMap<String, Vec<(usize, &'static str)>>,
+) {
+    let EdnValue::List(items) = form else {
+        return;
+    };
+    if !matches!(
+        items.first(),
+        Some(EdnValue::Symbol(sym)) if sym.name == "defn"
+    ) {
+        return;
+    }
+    let Some(EdnValue::Symbol(name)) = items.get(1) else {
+        return;
+    };
+    let mut params_idx = 2;
+    if matches!(items.get(params_idx), Some(EdnValue::String(_))) {
+        params_idx += 1;
+    }
+    if matches!(items.get(params_idx), Some(EdnValue::Map(_))) {
+        params_idx += 1;
+    }
+    let Some(EdnValue::Vector(params)) = items.get(params_idx) else {
+        return;
+    };
+    let mut params = params
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| match value {
+            EdnValue::Symbol(sym) => Some((sym.name.as_str(), idx)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    if params.is_empty() {
+        return;
+    }
+
+    let body_idx = if matches!(items.get(params_idx + 1), Some(EdnValue::Map(_))) {
+        params_idx + 2
+    } else {
+        params_idx + 1
+    };
+    // Shadow-safe: a parameter rebound by a `let`/`loop`/`fn` in the body no
+    // longer names the caller's argument where that binding is in scope, so it
+    // must not be treated as flowing to a host-call target — else a caller
+    // passing an unrelated cid would be mis-flagged (false positive). Dropping a
+    // shadowed parameter just falls back to the class-level capability gate (the
+    // pre-feature baseline), so it never weakens confinement below that.
+    let mut shadowed = HashSet::new();
+    for body in &items[body_idx..] {
+        collect_bound_names_edn(body, &mut shadowed);
+    }
+    params.retain(|param, _| !shadowed.contains(*param));
+    if params.is_empty() {
+        return;
+    }
+    let mut seen = HashSet::new();
+    for body in &items[body_idx..] {
+        collect_value_cid_param_targets(body, &params, &mut seen);
+    }
+    if !seen.is_empty() {
+        let mut seen = seen.into_iter().collect::<Vec<_>>();
+        seen.sort();
+        out.insert(name.name.clone(), seen);
+    }
+}
+
+fn collect_value_cid_param_targets(
+    value: &EdnValue,
+    params: &HashMap<&str, usize>,
+    out: &mut HashSet<(usize, &'static str)>,
+) {
+    match value {
+        EdnValue::List(items) => {
+            if let Some(EdnValue::Symbol(head)) = items.first() {
+                if crate::ast::is_inert_form(&head.name) {
+                    return;
+                }
+                if let Some(key) = resource_target_key(&head.name) {
+                    if let Some(EdnValue::Symbol(arg)) = items.get(1) {
+                        if let Some(idx) = params.get(arg.name.as_str()) {
+                            out.insert((*idx, key));
+                        }
+                    }
+                }
+            }
+            for item in items {
+                collect_value_cid_param_targets(item, params, out);
+            }
+        }
+        EdnValue::Vector(items) => {
+            for item in items {
+                collect_value_cid_param_targets(item, params, out);
+            }
+        }
+        EdnValue::Set(items) => {
+            for item in items {
+                collect_value_cid_param_targets(item, params, out);
+            }
+        }
+        EdnValue::Map(map) => {
+            for (key, value) in map {
+                collect_value_cid_param_targets(key, params, out);
+                collect_value_cid_param_targets(value, params, out);
+            }
+        }
+        EdnValue::Tagged { value, .. } => collect_value_cid_param_targets(value, params, out),
+        _ => {}
+    }
+}
+
+/// Names introduced anywhere in `v` by a `let`/`loop`/`if-let`/`when-let`
+/// binding vector or an `fn` parameter list — i.e. names that, where they are in
+/// scope, shadow an enclosing parameter of the same spelling.
+fn collect_bound_names_edn<'a>(v: &'a EdnValue, out: &mut HashSet<&'a str>) {
+    if let EdnValue::List(items) = v {
+        if let Some(EdnValue::Symbol(head)) = items.first() {
+            match head.name.as_str() {
+                "let" | "loop" | "if-let" | "when-let" => {
+                    if let Some(EdnValue::Vector(binds)) = items.get(1) {
+                        // Binding names are at even positions: [name val name val …].
+                        let mut k = 0;
+                        while k < binds.len() {
+                            if let EdnValue::Symbol(sym) = &binds[k] {
+                                out.insert(sym.name.as_str());
+                            }
+                            k += 2;
+                        }
+                    }
+                }
+                "fn" => {
+                    for item in items.iter().skip(1) {
+                        if let EdnValue::Vector(ps) = item {
+                            for p in ps {
+                                if let EdnValue::Symbol(sym) = p {
+                                    out.insert(sym.name.as_str());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    match v {
+        EdnValue::List(items) | EdnValue::Vector(items) => {
+            for item in items {
+                collect_bound_names_edn(item, out);
+            }
+        }
+        EdnValue::Set(items) => {
+            for item in items {
+                collect_bound_names_edn(item, out);
+            }
+        }
+        EdnValue::Map(map) => {
+            for (k, val) in map {
+                collect_bound_names_edn(k, out);
+                collect_bound_names_edn(val, out);
+            }
+        }
+        EdnValue::Tagged { value, .. } => collect_bound_names_edn(value, out),
+        _ => {}
+    }
+}
+
 /// Report this policy's **over-grants** relative to a cell: capabilities it
 /// grants that the cell (`forms`) never targets. The least-privilege linter —
 /// the complement of [`infer_minimal`]. Each finding is a human-readable string
@@ -467,7 +707,12 @@ impl Policy {
     pub fn unused_grants(&self, forms: &[EdnValue]) -> Vec<String> {
         let needed = infer_minimal(forms);
         let mut out = Vec::new();
-        diff_class(&mut out, "graph-write", &self.graph_write, &needed.graph_write);
+        diff_class(
+            &mut out,
+            "graph-write",
+            &self.graph_write,
+            &needed.graph_write,
+        );
         diff_class(&mut out, "graph-read", &self.graph_read, &needed.graph_read);
         diff_class(&mut out, "infer", &self.infer, &needed.infer);
         if self.auth && !needed.auth {
@@ -479,12 +724,19 @@ impl Policy {
 
 /// Append findings for one resource class: an entirely-unused class, or
 /// specific granted cids the cell never targets.
-fn diff_class(out: &mut Vec<String>, key: &str, granted: &BTreeSet<String>, needed: &BTreeSet<String>) {
+fn diff_class(
+    out: &mut Vec<String>,
+    key: &str,
+    granted: &BTreeSet<String>,
+    needed: &BTreeSet<String>,
+) {
     if granted.is_empty() {
         return; // nothing granted → cannot over-grant
     }
     if needed.is_empty() {
-        out.push(format!("{key}: entire capability granted but the cell never uses it"));
+        out.push(format!(
+            "{key}: entire capability granted but the cell never uses it"
+        ));
         return;
     }
     // Dynamic need (`"*"`) → any cid might be required at run time; don't flag.
@@ -494,13 +746,15 @@ fn diff_class(out: &mut Vec<String>, key: &str, granted: &BTreeSet<String>, need
     }
     for cid in granted {
         if !needed.contains(cid) {
-            out.push(format!("{key}: `{cid}` granted but never targeted by the cell"));
+            out.push(format!(
+                "{key}: `{cid}` granted but never targeted by the cell"
+            ));
         }
     }
 }
 
 /// Synthesize the **minimal** (least-privilege) policy that lets `forms`
-/// compile under safe-clj: it grants exactly the resources the code targets and
+/// compile under safe Kotoba: it grants exactly the resources the code targets and
 /// nothing more.
 ///
 /// - a literal resource id (`(kqe-assert! "graphA" …)`, `(llm-infer "modelA"
@@ -510,14 +764,19 @@ fn diff_class(out: &mut Vec<String>, key: &str, granted: &BTreeSet<String>, need
 ///   statically prove sufficient;
 /// - pure code yields [`Policy::deny_all`].
 ///
-/// Invariant: `compile_safe_clj(src, &infer_minimal(parse(src)))` succeeds — the
+/// Invariant: `compile_safe_kotoba(src, &infer_minimal(parse(src)))` succeeds — the
 /// synthesized policy is sufficient by construction — while removing any grant
 /// makes it fail. This is least-privilege policy generation: point it at an
 /// untrusted cell to see (and pin) exactly what it needs.
 pub fn infer_minimal(forms: &[EdnValue]) -> Policy {
     let mut acc = MinAcc::default();
+    let param_targets = collect_cid_param_targets(forms);
+    let param_target_names = collect_cid_param_target_names(forms);
     for f in forms {
-        collect_min(f, &mut acc);
+        collect_min(f, None, &param_target_names, &mut acc);
+    }
+    if !param_targets.is_empty() {
+        collect_param_call_min(forms, &param_targets, &mut acc);
     }
     let resolve = |dynamic: bool, cids: BTreeSet<String>| -> BTreeSet<String> {
         if dynamic {
@@ -547,7 +806,32 @@ struct MinAcc {
     auth: bool,
 }
 
-fn collect_min(v: &EdnValue, acc: &mut MinAcc) {
+impl MinAcc {
+    fn add_resource_target(&mut self, key: &str, literal: Option<&str>) {
+        match (key, literal) {
+            ("graph-write", Some(s)) => {
+                self.write.insert(s.to_string());
+            }
+            ("graph-write", None) => self.write_dynamic = true,
+            ("graph-read", Some(s)) => {
+                self.read.insert(s.to_string());
+            }
+            ("graph-read", None) => self.read_dynamic = true,
+            ("infer", Some(s)) => {
+                self.infer.insert(s.to_string());
+            }
+            ("infer", None) => self.infer_dynamic = true,
+            _ => {}
+        }
+    }
+}
+
+fn collect_min(
+    v: &EdnValue,
+    current_fn: Option<&str>,
+    param_targets: &HashMap<String, Vec<(String, &'static str)>>,
+    acc: &mut MinAcc,
+) {
     match v {
         EdnValue::List(items) => {
             if let Some(EdnValue::Symbol(head)) = items.first() {
@@ -557,56 +841,270 @@ fn collect_min(v: &EdnValue, acc: &mut MinAcc) {
                     return;
                 }
                 let literal = match items.get(1) {
-                    Some(EdnValue::String(s)) => Some(s.clone()),
+                    Some(EdnValue::String(s)) => Some(s.as_str()),
                     _ => None,
                 };
+                if head.name == "defn" {
+                    if let Some(EdnValue::Symbol(name)) = items.get(1) {
+                        for it in items.iter().skip(2) {
+                            collect_min(it, Some(name.name.as_str()), param_targets, acc);
+                        }
+                        return;
+                    }
+                }
                 match head.name.as_str() {
-                    "kqe-assert!" | "kqe-retract!" => match literal {
-                        Some(s) => {
-                            acc.write.insert(s);
+                    "kqe-assert!" | "kqe-retract!" => {
+                        if !is_param_resource_target_use(
+                            items,
+                            current_fn,
+                            param_targets,
+                            "graph-write",
+                        ) {
+                            acc.add_resource_target("graph-write", literal);
                         }
-                        None => acc.write_dynamic = true,
-                    },
-                    "kqe-get-objects" => match literal {
-                        Some(s) => {
-                            acc.read.insert(s);
+                    }
+                    "kqe-get-objects" => {
+                        if !is_param_resource_target_use(
+                            items,
+                            current_fn,
+                            param_targets,
+                            "graph-read",
+                        ) {
+                            acc.add_resource_target("graph-read", literal);
                         }
-                        None => acc.read_dynamic = true,
-                    },
+                    }
                     // `kqe-query` reads but names no specific graph → needs the
                     // graph-read class with no pinnable cid.
                     "kqe-query" => acc.read_dynamic = true,
-                    "llm-infer" => match literal {
-                        Some(s) => {
-                            acc.infer.insert(s);
+                    "llm-infer" => {
+                        if !is_param_resource_target_use(items, current_fn, param_targets, "infer")
+                        {
+                            acc.add_resource_target("infer", literal);
                         }
-                        None => acc.infer_dynamic = true,
-                    },
+                    }
                     "has-capability?" => acc.auth = true,
                     _ => {}
                 }
             }
             for it in items {
-                collect_min(it, acc);
+                collect_min(it, current_fn, param_targets, acc);
             }
         }
         EdnValue::Vector(items) => {
             for it in items {
-                collect_min(it, acc);
+                collect_min(it, current_fn, param_targets, acc);
             }
         }
         EdnValue::Set(items) => {
             for it in items {
-                collect_min(it, acc);
+                collect_min(it, current_fn, param_targets, acc);
             }
         }
         EdnValue::Map(m) => {
             for (k, val) in m {
-                collect_min(k, acc);
-                collect_min(val, acc);
+                collect_min(k, current_fn, param_targets, acc);
+                collect_min(val, current_fn, param_targets, acc);
             }
         }
-        EdnValue::Tagged { value, .. } => collect_min(value, acc),
+        EdnValue::Tagged { value, .. } => collect_min(value, current_fn, param_targets, acc),
+        _ => {}
+    }
+}
+
+fn is_param_resource_target_use(
+    items: &[EdnValue],
+    current_fn: Option<&str>,
+    param_targets: &HashMap<String, Vec<(String, &'static str)>>,
+    key: &'static str,
+) -> bool {
+    let Some(current_fn) = current_fn else {
+        return false;
+    };
+    let Some(EdnValue::Symbol(arg)) = items.get(1) else {
+        return false;
+    };
+    let Some(positions) = param_targets.get(current_fn) else {
+        return false;
+    };
+    positions
+        .iter()
+        .any(|(name, target_key)| *target_key == key && name == &arg.name)
+}
+
+fn collect_param_call_min(
+    forms: &[EdnValue],
+    targets: &HashMap<String, Vec<(usize, &'static str)>>,
+    acc: &mut MinAcc,
+) {
+    let mut seen_calls = HashSet::new();
+    for f in forms {
+        collect_param_call_min_value(f, targets, acc, &mut seen_calls);
+    }
+    for (callee, positions) in targets {
+        for &(_, key) in positions {
+            if !seen_calls.contains(&(callee.as_str(), key)) {
+                acc.add_resource_target(key, None);
+            }
+        }
+    }
+}
+
+fn collect_param_call_min_value<'a>(
+    v: &'a EdnValue,
+    targets: &'a HashMap<String, Vec<(usize, &'static str)>>,
+    acc: &mut MinAcc,
+    seen_calls: &mut HashSet<(&'a str, &'static str)>,
+) {
+    match v {
+        EdnValue::List(items) => {
+            if let Some(EdnValue::Symbol(head)) = items.first() {
+                if crate::ast::is_inert_form(&head.name) {
+                    return;
+                }
+                if let Some(positions) = targets.get(&head.name) {
+                    let args = &items[1..];
+                    for &(idx, key) in positions {
+                        seen_calls.insert((head.name.as_str(), key));
+                        match args.get(idx) {
+                            Some(EdnValue::String(cid)) => acc.add_resource_target(key, Some(cid)),
+                            _ => acc.add_resource_target(key, None),
+                        }
+                    }
+                }
+            }
+            for it in items {
+                collect_param_call_min_value(it, targets, acc, seen_calls);
+            }
+        }
+        EdnValue::Vector(items) => {
+            for it in items {
+                collect_param_call_min_value(it, targets, acc, seen_calls);
+            }
+        }
+        EdnValue::Set(items) => {
+            for it in items {
+                collect_param_call_min_value(it, targets, acc, seen_calls);
+            }
+        }
+        EdnValue::Map(m) => {
+            for (k, val) in m {
+                collect_param_call_min_value(k, targets, acc, seen_calls);
+                collect_param_call_min_value(val, targets, acc, seen_calls);
+            }
+        }
+        EdnValue::Tagged { value, .. } => {
+            collect_param_call_min_value(value, targets, acc, seen_calls)
+        }
+        _ => {}
+    }
+}
+
+fn collect_cid_param_target_names(
+    forms: &[EdnValue],
+) -> HashMap<String, Vec<(String, &'static str)>> {
+    let mut out = HashMap::new();
+    for form in forms {
+        collect_defn_cid_param_target_names(form, &mut out);
+    }
+    out
+}
+
+fn collect_defn_cid_param_target_names(
+    form: &EdnValue,
+    out: &mut HashMap<String, Vec<(String, &'static str)>>,
+) {
+    let EdnValue::List(items) = form else {
+        return;
+    };
+    if !matches!(
+        items.first(),
+        Some(EdnValue::Symbol(sym)) if sym.name == "defn"
+    ) {
+        return;
+    }
+    let Some(EdnValue::Symbol(name)) = items.get(1) else {
+        return;
+    };
+    let mut params_idx = 2;
+    if matches!(items.get(params_idx), Some(EdnValue::String(_))) {
+        params_idx += 1;
+    }
+    if matches!(items.get(params_idx), Some(EdnValue::Map(_))) {
+        params_idx += 1;
+    }
+    let Some(EdnValue::Vector(params)) = items.get(params_idx) else {
+        return;
+    };
+    let params = params
+        .iter()
+        .filter_map(|value| match value {
+            EdnValue::Symbol(sym) => Some(sym.name.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    if params.is_empty() {
+        return;
+    }
+
+    let body_idx = if matches!(items.get(params_idx + 1), Some(EdnValue::Map(_))) {
+        params_idx + 2
+    } else {
+        params_idx + 1
+    };
+    let mut seen = HashSet::new();
+    for body in &items[body_idx..] {
+        collect_value_cid_param_target_names(body, &params, &mut seen);
+    }
+    if !seen.is_empty() {
+        let mut seen = seen
+            .into_iter()
+            .map(|(param, key)| (param.to_string(), key))
+            .collect::<Vec<_>>();
+        seen.sort();
+        out.insert(name.name.clone(), seen);
+    }
+}
+
+fn collect_value_cid_param_target_names<'a>(
+    value: &'a EdnValue,
+    params: &HashSet<&'a str>,
+    out: &mut HashSet<(&'a str, &'static str)>,
+) {
+    match value {
+        EdnValue::List(items) => {
+            if let Some(EdnValue::Symbol(head)) = items.first() {
+                if crate::ast::is_inert_form(&head.name) {
+                    return;
+                }
+                if let Some(key) = resource_target_key(&head.name) {
+                    if let Some(EdnValue::Symbol(arg)) = items.get(1) {
+                        if params.contains(arg.name.as_str()) {
+                            out.insert((arg.name.as_str(), key));
+                        }
+                    }
+                }
+            }
+            for item in items {
+                collect_value_cid_param_target_names(item, params, out);
+            }
+        }
+        EdnValue::Vector(items) => {
+            for item in items {
+                collect_value_cid_param_target_names(item, params, out);
+            }
+        }
+        EdnValue::Set(items) => {
+            for item in items {
+                collect_value_cid_param_target_names(item, params, out);
+            }
+        }
+        EdnValue::Map(map) => {
+            for (key, value) in map {
+                collect_value_cid_param_target_names(key, params, out);
+                collect_value_cid_param_target_names(value, params, out);
+            }
+        }
+        EdnValue::Tagged { value, .. } => collect_value_cid_param_target_names(value, params, out),
         _ => {}
     }
 }

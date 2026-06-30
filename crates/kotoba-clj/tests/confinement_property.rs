@@ -14,7 +14,7 @@
 //! the bytes" is the strongest possible form of "cannot reach that resource".
 
 use kotoba_clj::{
-    compile_safe_clj, compile_safe_clj_with_prelude, embedded_capability_ifaces, Policy,
+    compile_safe_kotoba, compile_safe_kotoba_with_prelude, embedded_capability_ifaces, Policy,
 };
 
 /// Does the module embed `needle` as a contiguous byte string? Import
@@ -47,7 +47,7 @@ fn assert_only_ifaces(wasm: &[u8], expected: &[&str]) {
 #[test]
 fn pure_module_has_no_kais_imports() {
     // A pure program must carry ZERO host-capability imports in its bytes.
-    let wasm = compile_safe_clj("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
+    let wasm = compile_safe_kotoba("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
     assert!(
         !embeds(&wasm, "kotoba:kais/"),
         "a pure module must embed no kotoba:kais import at all"
@@ -58,7 +58,7 @@ fn pure_module_has_no_kais_imports() {
 fn write_grant_emits_only_the_kqe_import() {
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
-    let wasm = compile_safe_clj(src, &policy).unwrap();
+    let wasm = compile_safe_kotoba(src, &policy).unwrap();
 
     assert!(
         embeds(&wasm, "assert-quad"),
@@ -72,7 +72,7 @@ fn write_grant_emits_only_the_kqe_import() {
 fn infer_grant_emits_only_the_llm_import() {
     let src = r#"(defn run [] (llm-infer "model-cid-xyz" "ping"))"#;
     let policy = Policy::deny_all().grant_infer(["model-cid-xyz"]);
-    let wasm = compile_safe_clj(src, &policy).unwrap();
+    let wasm = compile_safe_kotoba(src, &policy).unwrap();
 
     assert!(embeds(&wasm, "infer"), "infer grant must wire llm.infer");
     assert_only_ifaces(&wasm, &["kotoba:kais/llm@0.1.0"]);
@@ -82,7 +82,7 @@ fn infer_grant_emits_only_the_llm_import() {
 fn auth_grant_emits_only_the_auth_import() {
     let src = r#"(defn run [] (has-capability? "g" "read"))"#;
     let policy = Policy::deny_all().grant_auth();
-    let wasm = compile_safe_clj(src, &policy).unwrap();
+    let wasm = compile_safe_kotoba(src, &policy).unwrap();
 
     assert!(
         embeds(&wasm, "has-capability"),
@@ -95,7 +95,7 @@ fn auth_grant_emits_only_the_auth_import() {
 fn prelude_under_deny_all_leaks_no_capability() {
     // The container/CBOR prelude must add no host import to a pure module.
     let wasm =
-        compile_safe_clj_with_prelude("(defn run [n] (inc n))", &Policy::deny_all()).unwrap();
+        compile_safe_kotoba_with_prelude("(defn run [n] (inc n))", &Policy::deny_all()).unwrap();
     assert!(
         !embeds(&wasm, "kotoba:kais/"),
         "the prelude must not leak any host-capability import under deny-all"
@@ -108,7 +108,7 @@ fn read_grant_with_prelude_wires_only_kqe() {
     // kqe interface should appear, never llm/auth.
     let src = r#"(defn run [] (kqe-count (kqe-get-objects "kg" "a" "p")))"#;
     let policy = Policy::deny_all().grant_graph_read(["kg"]);
-    let wasm = compile_safe_clj_with_prelude(src, &policy).unwrap();
+    let wasm = compile_safe_kotoba_with_prelude(src, &policy).unwrap();
 
     assert!(
         embeds(&wasm, "get-objects"),
@@ -128,7 +128,7 @@ fn granting_more_than_used_emits_only_what_is_used() {
         .grant_graph_write(["kg"])
         .grant_infer(["m"])
         .grant_auth();
-    let wasm = compile_safe_clj(src, &policy).unwrap();
+    let wasm = compile_safe_kotoba(src, &policy).unwrap();
     assert_only_ifaces(&wasm, &["kotoba:kais/kqe@0.1.0"]);
 }
 
@@ -146,7 +146,7 @@ fn module_using_all_interfaces_reports_all_three() {
         .grant_graph_write(["kg"])
         .grant_infer(["m"])
         .grant_auth();
-    let wasm = compile_safe_clj(src, &policy).unwrap();
+    let wasm = compile_safe_kotoba(src, &policy).unwrap();
 
     let mut got = embedded_capability_ifaces(&wasm);
     got.sort_unstable();
@@ -163,18 +163,18 @@ fn module_using_all_interfaces_reports_all_three() {
 fn embedded_capability_ifaces_reports_the_audited_surface() {
     // The public audit helper must agree with the byte-level reality and be
     // usable to check a built module against its policy.
-    let pure = compile_safe_clj("(defn run [n] (inc n))", &Policy::deny_all()).unwrap();
+    let pure = compile_safe_kotoba("(defn run [n] (inc n))", &Policy::deny_all()).unwrap();
     assert!(embedded_capability_ifaces(&pure).is_empty());
 
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    let wasm = compile_safe_clj(src, &Policy::deny_all().grant_graph_write(["kg"])).unwrap();
+    let wasm = compile_safe_kotoba(src, &Policy::deny_all().grant_graph_write(["kg"])).unwrap();
     assert_eq!(
         embedded_capability_ifaces(&wasm),
         vec!["kotoba:kais/kqe@0.1.0"]
     );
 
     let src = r#"(defn run [] (llm-infer "m" "x"))"#;
-    let wasm = compile_safe_clj(src, &Policy::deny_all().grant_infer(["m"])).unwrap();
+    let wasm = compile_safe_kotoba(src, &Policy::deny_all().grant_infer(["m"])).unwrap();
     assert_eq!(
         embedded_capability_ifaces(&wasm),
         vec!["kotoba:kais/llm@0.1.0"]

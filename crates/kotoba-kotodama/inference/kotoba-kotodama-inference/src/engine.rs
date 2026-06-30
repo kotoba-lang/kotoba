@@ -20,6 +20,7 @@ pub struct InferenceEngine {
 
 impl InferenceEngine {
     pub async fn new() -> Result<Self, EngineError> {
+        #[cfg(not(target_arch = "wasm32"))]
         let forced_backend = std::env::var("KOTODAMA_INFERENCE_BACKEND")
             .or_else(|_| std::env::var("etzhayyim_KOTODAMA_BACKEND"))
             .ok()

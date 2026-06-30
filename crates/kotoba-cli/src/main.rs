@@ -9,11 +9,14 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use tracing_subscriber::EnvFilter;
 
 mod extension;
 mod mesh;
+mod shell;
 mod word;
 
 // ── NSIDs (mirror kotoba-server::xrpc constants) ─────────────────────────────
@@ -22,12 +25,21 @@ const NSID_BLOCK_GET: &str = "com.etzhayyim.apps.kotoba.block.get";
 const NSID_QUAD_CREATE: &str = "com.etzhayyim.apps.kotoba.quad.create";
 const NSID_QUAD_RETRACT: &str = "com.etzhayyim.apps.kotoba.quad.retract";
 const NSID_GRAPH_QUERY: &str = "com.etzhayyim.apps.kotoba.graph.query";
+const DEFAULT_WASM_WIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../kotoba-runtime/wit");
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "kotoba", about = "Kotoba knowledge-graph node CLI", version)]
 struct Cli {
+    /// Compile and run one inline Kotoba expression as `main`.
+    #[arg(short = 'e', long = "eval")]
+    eval: Option<String>,
+
+    /// With -e/--eval, also write the compiled core wasm module to this path.
+    #[arg(long = "wasm-out", requires = "eval")]
+    wasm_out: Option<std::path::PathBuf>,
+
     /// Server base URL (overrides KOTOBA_URL)
     #[arg(
         long,
@@ -42,7 +54,7 @@ struct Cli {
     token: Option<String>,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -67,9 +79,13 @@ enum Cmd {
     #[command(subcommand)]
     Word(word::WordCmd),
 
-    /// KOTOBA Mesh — compile a WASM component (Clojure default) to a CID.
+    /// KOTOBA Mesh — compile a WASM component (Kotoba default) to a CID.
     #[command(subcommand)]
     Component(mesh::ComponentCmd),
+
+    /// Kotoba language → Wasm compiler tools.
+    #[command(subcommand)]
+    Wasm(WasmCmd),
 
     /// KOTOBA Mesh — resolve & deploy an EDN app manifest.
     #[command(subcommand)]
@@ -79,9 +95,34 @@ enum Cmd {
     #[command(subcommand)]
     Lattice(mesh::LatticeCmd),
 
-    /// Kotoba extensions — evaluate, run, build, and deploy Clojure/EDN packages.
+    /// Kotoba extensions — evaluate, run, build, and deploy Kotoba/EDN packages.
     #[command(subcommand)]
     Extension(extension::ExtensionCmd),
+
+    /// kotoba-shell — Tauri-shaped CLJS/safe Kotoba app shell planning.
+    #[command(subcommand)]
+    Shell(shell::ShellCmd),
+
+    /// Run a Kotoba source file like `deno run`.
+    Run(RunCmd),
+
+    /// Check Kotoba source without emitting an artifact.
+    Check(CheckCmd),
+
+    /// Database operations: transact, query, quad, commit, status.
+    #[command(subcommand)]
+    Db(DbCmd),
+
+    /// Git operations through kotoba's smart-HTTP repository endpoint.
+    #[command(subcommand)]
+    Git(GitCmd),
+
+    /// kotoba-rad sovereign repository identity helpers.
+    #[command(subcommand)]
+    Rad(RadCmd),
+
+    /// Deploy an app manifest to the Kotoba mesh.
+    Deploy(DeployCmd),
 
     /// SPARQL query (SELECT / DESCRIBE / CONSTRUCT / ASK) over the running
     /// server's direct-SPARQL endpoint.  Auto-detects the form from the
@@ -320,6 +361,244 @@ enum BlockCmd {
 }
 
 #[derive(Subcommand)]
+enum WasmCmd {
+    /// Compile a Kotoba source file into a kotoba:kais Wasm component.
+    Build {
+        /// Kotoba source file.
+        cell: PathBuf,
+        /// Output Wasm path. Defaults to replacing the Kotoba-family extension with .wasm.
+        #[arg(short = 'o')]
+        out: Option<PathBuf>,
+        /// WIT directory for component wrapping.
+        #[arg(long)]
+        wit: Option<PathBuf>,
+        /// Extra source root for namespace resolution.
+        #[arg(short = 'S', long = "source-path")]
+        source_path: Vec<PathBuf>,
+    },
+    /// Compile a capability-confined Kotoba source file into a core Wasm module.
+    SafeBuild {
+        /// Kotoba source file.
+        cell: PathBuf,
+        /// Deny-by-default capability policy.
+        #[arg(long)]
+        policy: PathBuf,
+        /// Output Wasm path. Defaults to replacing the Kotoba-family extension with .wasm.
+        #[arg(short = 'o')]
+        out: Option<PathBuf>,
+        /// Compatibility alias; safe-build is selfhost-first by default.
+        #[arg(long)]
+        selfhost_gate: bool,
+        /// Reader conditional target.
+        #[arg(long, default_value = "kotoba")]
+        reader_target: String,
+        /// Extra source root for namespace resolution.
+        #[arg(short = 'S', long = "source-path")]
+        source_path: Vec<PathBuf>,
+    },
+    /// Synthesize the minimal least-privilege policy for a Kotoba source file.
+    SafePolicy {
+        /// Kotoba source file.
+        cell: PathBuf,
+        /// Write policy EDN to this path instead of stdout.
+        #[arg(short = 'o')]
+        out: Option<PathBuf>,
+        /// Compatibility alias; safe-policy is selfhost-first by default.
+        #[arg(long)]
+        selfhost_gate: bool,
+        /// Reader conditional target.
+        #[arg(long, default_value = "kotoba")]
+        reader_target: String,
+        /// Extra source root for namespace resolution.
+        #[arg(short = 'S', long = "source-path")]
+        source_path: Vec<PathBuf>,
+    },
+    /// Inspect self-hosted analyzer input/output for a Kotoba source file.
+    SelfhostInspect {
+        /// Kotoba source file.
+        cell: PathBuf,
+        /// Optional policy to include admission results.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Reader conditional target.
+        #[arg(long, default_value = "kotoba")]
+        reader_target: String,
+        /// Extra source root for namespace resolution.
+        #[arg(short = 'S', long = "source-path")]
+        source_path: Vec<PathBuf>,
+        /// Print the analyzer request as CBOR hex.
+        #[arg(long)]
+        request_hex: bool,
+        /// Print JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct RunCmd {
+    /// Kotoba source file.
+    cell: PathBuf,
+    /// Exported function to call.
+    #[arg(long, default_value = "main")]
+    func: String,
+    /// i64 arguments passed to the exported function.
+    args: Vec<i64>,
+    /// Extra source root for namespace resolution.
+    #[arg(short = 'S', long = "source-path")]
+    source_path: Vec<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct CheckCmd {
+    /// Kotoba source file.
+    cell: PathBuf,
+    /// Optional deny-by-default policy. When omitted, check emits a minimal policy.
+    #[arg(long)]
+    policy: Option<PathBuf>,
+    /// Reader conditional target.
+    #[arg(long, default_value = "kotoba")]
+    reader_target: String,
+    /// Extra source root for namespace resolution.
+    #[arg(short = 'S', long = "source-path")]
+    source_path: Vec<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum DbCmd {
+    /// Show node health for the database endpoint.
+    Status,
+    /// Transact Datomic EDN into a named graph.
+    Transact {
+        /// Target graph CID / name.
+        #[arg(long)]
+        graph: String,
+        /// EDN transaction string. If omitted, stdin is read.
+        tx_edn: Option<String>,
+        /// Read transaction EDN from a file.
+        #[arg(long, short)]
+        file: Option<PathBuf>,
+        /// CACAO chain (DAG-CBOR base64) for private/write-scoped graphs.
+        #[arg(long, env = "KOTOBA_CACAO_B64")]
+        cacao: Option<String>,
+    },
+    /// Datomic Datalog query.
+    Q {
+        query: String,
+        #[arg(long)]
+        graph: String,
+        #[arg(long)]
+        emit_cid: bool,
+        #[arg(long)]
+        as_of: Option<String>,
+        #[arg(long, env = "KOTOBA_CACAO_B64")]
+        cacao: Option<String>,
+    },
+    /// SPARQL query.
+    Sparql {
+        query: String,
+        #[arg(long, default_value = "10000")]
+        limit: usize,
+        #[arg(long, env = "KOTOBA_CACAO_B64")]
+        cacao: Option<String>,
+        #[arg(long)]
+        graph: Option<String>,
+        #[arg(long, default_value = "0")]
+        max_hops: usize,
+    },
+    /// Cypher query.
+    Cypher {
+        query: String,
+        #[arg(long, default_value = "1000")]
+        limit: usize,
+        #[arg(long, env = "KOTOBA_CACAO_B64")]
+        cacao: Option<String>,
+    },
+    /// Assert one quad.
+    Put {
+        graph: String,
+        subject: String,
+        predicate: String,
+        object: String,
+    },
+    /// Retract one quad.
+    Retract {
+        graph: String,
+        subject: String,
+        predicate: String,
+        object: String,
+    },
+    /// SPO pattern query over a named graph.
+    Query {
+        #[arg(long)]
+        graph: String,
+        #[arg(long, short)]
+        subject: Option<String>,
+        #[arg(long, short)]
+        predicate: Option<String>,
+        #[arg(long, default_value = "100")]
+        limit: u64,
+    },
+    /// Seal the hot database into durable ProllyTree checkpoints.
+    Commit {
+        #[arg(long)]
+        author: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum GitCmd {
+    /// Print the smart-HTTP URL for a kotoba repo.
+    Url { repo: String },
+    /// Clone a kotoba smart-HTTP repo using the real git CLI.
+    Clone { repo: String, dir: Option<PathBuf> },
+    /// Add or update a git remote pointing at a kotoba repo.
+    Remote {
+        repo: String,
+        #[arg(long, default_value = "kotoba")]
+        name: String,
+    },
+    /// Push using the real git CLI. Defaults to `kotoba HEAD:refs/heads/main`.
+    Push {
+        #[arg(long, default_value = "kotoba")]
+        remote: String,
+        #[arg(default_value = "HEAD:refs/heads/main")]
+        refspec: String,
+    },
+    /// Fetch using the real git CLI.
+    Fetch {
+        #[arg(long, default_value = "kotoba")]
+        remote: String,
+    },
+    /// Run `git status` in the current worktree.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum RadCmd {
+    /// Show the local kotoba-rad journal configuration.
+    Status,
+    /// Print the currently documented R1 CLI shape.
+    Plan,
+}
+
+#[derive(clap::Args)]
+struct DeployCmd {
+    /// Path to `kotoba.app.edn`.
+    manifest: PathBuf,
+    /// Path to the kotoba-node WIT dir.
+    #[arg(
+        long,
+        env = "KOTOBA_WIT_DIR",
+        default_value = "crates/kotoba-runtime/wit"
+    )]
+    wit_dir: String,
+    /// Publish to a running node instead of dry-running.
+    #[arg(long)]
+    publish: bool,
+}
+
+#[derive(Subcommand)]
 enum QuadCmd {
     /// Assert a quad: `<graph-cid> <subject> <predicate> <object>`
     Put {
@@ -414,7 +693,18 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.cmd {
+    if let Some(expr) = cli.eval.as_deref() {
+        run_inline_eval(expr, cli.wasm_out.as_deref())?;
+        return Ok(());
+    }
+
+    let Some(cmd) = cli.cmd else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    match cmd {
         Cmd::Serve => {
             // Fire-and-forget update-check before booting the server.  Cached
             // 24 h to avoid hitting GitHub on every restart.  Result is printed
@@ -430,9 +720,25 @@ async fn main() -> Result<()> {
         }
 
         Cmd::Component(cmd) => mesh::run_component(cmd)?,
+        Cmd::Wasm(cmd) => run_wasm_cmd(cmd)?,
         Cmd::App(cmd) => mesh::run_app(cmd).await?,
         Cmd::Lattice(cmd) => mesh::run_lattice(cmd)?,
         Cmd::Extension(cmd) => extension::run(cmd, &cli.url, &cli.token).await?,
+        Cmd::Shell(cmd) => shell::run(cmd)?,
+        Cmd::Run(cmd) => run_source_cmd(cmd)?,
+        Cmd::Check(cmd) => run_check_cmd(cmd)?,
+        Cmd::Db(cmd) => run_db_cmd(cmd, &cli.url, &cli.token).await?,
+        Cmd::Git(cmd) => run_git_cmd(cmd, &cli.url)?,
+        Cmd::Rad(cmd) => run_rad_cmd(cmd)?,
+        Cmd::Deploy(cmd) => {
+            mesh::run_app(mesh::AppCmd::Deploy {
+                manifest: cmd.manifest,
+                wit_dir: cmd.wit_dir,
+                publish: cmd.publish,
+                url: cli.url.clone(),
+            })
+            .await?
+        }
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,
 
@@ -855,6 +1161,545 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_inline_eval(expr: &str, wasm_out: Option<&Path>) -> Result<()> {
+    let wasm = kotoba_clj::compile_expr_with_prelude(expr)
+        .map_err(|err| anyhow::anyhow!("compile inline Kotoba expression: {err}"))?;
+    if let Some(path) = wasm_out {
+        std::fs::write(path, &wasm).with_context(|| format!("write {}", path.display()))?;
+    }
+    let value = kotoba_clj::run::run(&wasm, "main", &[])
+        .map_err(|err| anyhow::anyhow!("run inline Kotoba expression: {err}"))?;
+    println!("{value}");
+    Ok(())
+}
+
+fn run_source_cmd(cmd: RunCmd) -> Result<()> {
+    let body = load_kotoba_source(
+        &cmd.cell,
+        kotoba_clj::ReaderTarget::Kotoba,
+        &cmd.source_path,
+    )?;
+    let src = format!("{}\n{}", kotoba_clj::prelude(), body);
+    let wasm = kotoba_clj::compile_str(&src)
+        .map_err(|err| anyhow::anyhow!("compile {}: {err}", cmd.cell.display()))?;
+    let value = kotoba_clj::run::run(&wasm, &cmd.func, &cmd.args)
+        .map_err(|err| anyhow::anyhow!("run {}#{}: {err}", cmd.cell.display(), cmd.func))?;
+    println!("{value}");
+    Ok(())
+}
+
+fn run_check_cmd(cmd: CheckCmd) -> Result<()> {
+    let target = parse_reader_target(&cmd.reader_target)?;
+    let body = load_kotoba_source(&cmd.cell, target, &cmd.source_path)?;
+    let analyzer = kotoba_clj::selfhost::Analyzer::new()
+        .map_err(|err| anyhow::anyhow!("selfhost analyzer: {err}"))?;
+    if let Some(policy_path) = cmd.policy {
+        let policy = read_policy(&policy_path)?;
+        let gate = analyzer
+            .check_compile_gate_with_reader_target(&body, target, &policy)
+            .map_err(|err| anyhow::anyhow!("check {}: {err}", cmd.cell.display()))?;
+        if !gate.subset.ok {
+            anyhow::bail!("subset denied: {}", join_set(&gate.subset.denials));
+        }
+        if !gate.types.ok {
+            anyhow::bail!("type denied: {}", join_set(&gate.types.denials));
+        }
+        if !gate.effects.ok {
+            anyhow::bail!(
+                "effect denied: {} violation(s)",
+                gate.effects.violations.len()
+            );
+        }
+        if !gate.policy.ok {
+            anyhow::bail!(
+                "policy denied: caps={} targets={}",
+                join_set(&gate.policy.denials),
+                join_set(&gate.policy.target_denials)
+            );
+        }
+        println!("ok: {}", cmd.cell.display());
+    } else {
+        let policy = analyzer
+            .minimal_policy_with_reader_target(&body, target)
+            .map_err(|err| anyhow::anyhow!("analyze {}: {err}", cmd.cell.display()))?;
+        println!("ok: {}", cmd.cell.display());
+        println!("{}", policy.to_edn());
+    }
+    Ok(())
+}
+
+async fn run_db_cmd(cmd: DbCmd, base_url: &str, token: &Option<String>) -> Result<()> {
+    match cmd {
+        DbCmd::Status => {
+            let url = format!("{}/health", base_url.trim_end_matches('/'));
+            let resp = reqwest::get(&url).await.context("GET /health failed")?;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            println!("{status}  {body}");
+            if !status.is_success() {
+                std::process::exit(1);
+            }
+        }
+        DbCmd::Transact {
+            graph,
+            tx_edn,
+            file,
+            cacao,
+        } => {
+            let tx_edn = read_inline_file_or_stdin(tx_edn, file, "tx_edn")?;
+            run_datomic_transact(base_url, token, &graph, &tx_edn, cacao).await?;
+        }
+        DbCmd::Q {
+            query,
+            graph,
+            emit_cid,
+            as_of,
+            cacao,
+        } => run_datomic_q(base_url, token, &query, &graph, emit_cid, as_of, cacao).await?,
+        DbCmd::Sparql {
+            query,
+            limit,
+            cacao,
+            graph,
+            max_hops,
+        } => run_sparql(base_url, token, &query, limit, cacao, graph, max_hops).await?,
+        DbCmd::Cypher {
+            query,
+            limit,
+            cacao,
+        } => run_kg_query(base_url, token, "cypher", &query, limit, cacao).await?,
+        DbCmd::Put {
+            graph,
+            subject,
+            predicate,
+            object,
+        } => run_quad_put(base_url, token, &graph, &subject, &predicate, &object).await?,
+        DbCmd::Retract {
+            graph,
+            subject,
+            predicate,
+            object,
+        } => run_quad_retract(base_url, token, &graph, &subject, &predicate, &object).await?,
+        DbCmd::Query {
+            graph,
+            subject,
+            predicate,
+            limit,
+        } => {
+            run_quad_query(
+                base_url,
+                token,
+                &graph,
+                subject.as_deref(),
+                predicate.as_deref(),
+                limit,
+            )
+            .await?
+        }
+        DbCmd::Commit { author } => run_commit(base_url, author).await?,
+    }
+    Ok(())
+}
+
+fn run_git_cmd(cmd: GitCmd, base_url: &str) -> Result<()> {
+    match cmd {
+        GitCmd::Url { repo } => {
+            println!("{}", kotoba_git_url(base_url, &repo));
+        }
+        GitCmd::Clone { repo, dir } => {
+            let url = kotoba_git_url(base_url, &repo);
+            let mut git = Command::new("git");
+            git.arg("clone").arg(url);
+            if let Some(dir) = dir {
+                git.arg(dir);
+            }
+            run_process(git, "git clone")?;
+        }
+        GitCmd::Remote { repo, name } => {
+            let url = kotoba_git_url(base_url, &repo);
+            let exists = Command::new("git")
+                .args(["remote", "get-url", &name])
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false);
+            let mut git = Command::new("git");
+            if exists {
+                git.args(["remote", "set-url", &name, &url]);
+            } else {
+                git.args(["remote", "add", &name, &url]);
+            }
+            run_process(git, "git remote")?;
+            println!("{name}\t{url}");
+        }
+        GitCmd::Push { remote, refspec } => {
+            let mut git = Command::new("git");
+            git.args(["push", &remote, &refspec]);
+            run_process(git, "git push")?;
+        }
+        GitCmd::Fetch { remote } => {
+            let mut git = Command::new("git");
+            git.args(["fetch", &remote]);
+            run_process(git, "git fetch")?;
+        }
+        GitCmd::Status => {
+            let mut git = Command::new("git");
+            git.arg("status");
+            run_process(git, "git status")?;
+        }
+    }
+    Ok(())
+}
+
+fn run_rad_cmd(cmd: RadCmd) -> Result<()> {
+    match cmd {
+        RadCmd::Status => {
+            let dir = std::env::var("KOTOBA_RAD_JOURNAL_DIR").unwrap_or_default();
+            if dir.trim().is_empty() {
+                println!("KOTOBA_RAD_JOURNAL_DIR: (unset)");
+                println!("registered identities : 0");
+                return Ok(());
+            }
+            let journal_count = std::fs::read_dir(&dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| {
+                            entry
+                                .path()
+                                .to_string_lossy()
+                                .ends_with(".identity.journal.edn")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            println!("KOTOBA_RAD_JOURNAL_DIR: {dir}");
+            println!("identity journals     : {journal_count}");
+        }
+        RadCmd::Plan => {
+            println!("planned kotoba-rad CLI:");
+            println!("  kotoba rad init --name <owner/repo> --private");
+            println!("  kotoba rad import .git --actor <did>");
+            println!("  kotoba rad refs");
+            println!("  kotoba rad push --to <peer> --ref refs/heads/main");
+            println!("  kotoba rad grant add <did>");
+            println!("  kotoba rad verify --rid <cid>");
+            println!();
+            println!("implemented now:");
+            println!("  kotoba git url|remote|clone|fetch|push|status");
+            println!("  server-side rad delegate gating via KOTOBA_RAD_JOURNAL_DIR");
+        }
+    }
+    Ok(())
+}
+
+fn run_wasm_cmd(cmd: WasmCmd) -> Result<()> {
+    match cmd {
+        WasmCmd::Build {
+            cell,
+            out,
+            wit,
+            source_path,
+        } => {
+            let wit = wit
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| DEFAULT_WASM_WIT_DIR.to_string());
+            let out = out.unwrap_or_else(|| default_wasm_out(&cell));
+            let body = load_kotoba_source(&cell, kotoba_clj::ReaderTarget::Kotoba, &source_path)?;
+            let src = format!("{}\n{}", kotoba_clj::prelude(), body);
+            let wasm = kotoba_clj::component::compile_kais_component_str(&src, &wit)
+                .map_err(|err| anyhow::anyhow!("compile {}: {err}", cell.display()))?;
+            std::fs::write(&out, &wasm).with_context(|| format!("write {}", out.display()))?;
+            eprintln!(
+                "[wasm build] {} -> {} ({} bytes)",
+                cell.display(),
+                out.display(),
+                wasm.len()
+            );
+            Ok(())
+        }
+        WasmCmd::SafeBuild {
+            cell,
+            policy,
+            out,
+            selfhost_gate: _,
+            reader_target,
+            source_path,
+        } => {
+            let target = parse_reader_target(&reader_target)?;
+            let out = out.unwrap_or_else(|| default_wasm_out(&cell));
+            let policy = read_policy(&policy)?;
+            let body = load_kotoba_source(&cell, target, &source_path)?;
+            let wasm = kotoba_clj::compile_safe_kotoba_with_prelude_and_reader_target(
+                &body, target, &policy,
+            )
+            .map_err(|err| anyhow::anyhow!("safe-build {} rejected: {err}", cell.display()))?;
+            std::fs::write(&out, &wasm).with_context(|| format!("write {}", out.display()))?;
+            print_safe_build_evidence(&cell, &body, target, &policy, &wasm);
+            Ok(())
+        }
+        WasmCmd::SafePolicy {
+            cell,
+            out,
+            selfhost_gate: _,
+            reader_target,
+            source_path,
+        } => {
+            let target = parse_reader_target(&reader_target)?;
+            let body = load_kotoba_source(&cell, target, &source_path)?;
+            let policy = kotoba_clj::minimal_policy_with_reader_target(&body, target)
+                .map_err(|err| anyhow::anyhow!("analyze {}: {err}", cell.display()))?;
+            let edn = policy.to_edn();
+            if let Some(out) = out {
+                std::fs::write(&out, &edn).with_context(|| format!("write {}", out.display()))?;
+                eprintln!(
+                    "[wasm safe-policy] {} -> {} (minimal least-privilege policy)",
+                    cell.display(),
+                    out.display()
+                );
+            } else {
+                println!("{edn}");
+            }
+            Ok(())
+        }
+        WasmCmd::SelfhostInspect {
+            cell,
+            policy,
+            reader_target,
+            source_path,
+            request_hex,
+            json,
+        } => {
+            let target = parse_reader_target(&reader_target)?;
+            let body = load_kotoba_source(&cell, target, &source_path)?;
+            let request = kotoba_clj::selfhost::AnalyzerRequest::from_source_with_reader_target(
+                &body, target,
+            )
+            .map_err(|err| {
+                anyhow::anyhow!("build analyzer request for {}: {err}", cell.display())
+            })?;
+            let request_cbor_hex = if request_hex {
+                Some(
+                    request
+                        .to_cbor()
+                        .map(hex::encode)
+                        .map_err(|err| anyhow::anyhow!("serialize analyzer request: {err}"))?,
+                )
+            } else {
+                None
+            };
+            let analyzer = kotoba_clj::selfhost::Analyzer::new()
+                .map_err(|err| anyhow::anyhow!("selfhost analyzer: {err}"))?;
+            let summaries = analyzer
+                .analyze_program_all_with_reader_target(&body, target)
+                .map_err(|err| anyhow::anyhow!("run analyzer for {}: {err}", cell.display()))?;
+            let type_check = analyzer
+                .check_types_with_reader_target(&body, target)
+                .map_err(|err| anyhow::anyhow!("check types for {}: {err}", cell.display()))?;
+            let admission = match policy {
+                Some(policy_path) => {
+                    let policy = read_policy(&policy_path)?;
+                    Some(
+                        analyzer
+                            .check_admission_with_reader_target(&body, target, &policy)
+                            .map_err(|err| {
+                                anyhow::anyhow!("check admission for {}: {err}", cell.display())
+                            })?,
+                    )
+                }
+                None => None,
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&selfhost_inspect_json(
+                        request.abi(),
+                        target,
+                        request.function_count(),
+                        &summaries,
+                        &type_check,
+                        admission.as_ref(),
+                        request_cbor_hex.as_deref(),
+                    ))?
+                );
+            } else {
+                println!("abi: {}", request.abi());
+                println!("reader-target: {}", target.as_str());
+                println!("functions: {}", request.function_count());
+                for (name, summary) in &summaries {
+                    println!(
+                        "{name}: effects={{{}}} caps={{{}}} targets={{{}}}",
+                        join_set(&summary.effects),
+                        join_set(&summary.caps),
+                        join_set(&summary.targets)
+                    );
+                }
+                println!(
+                    "types: {}",
+                    if type_check.ok {
+                        "ok".to_string()
+                    } else {
+                        format!("denied {{{}}}", join_set(&type_check.denials))
+                    }
+                );
+                if let Some(admission) = &admission {
+                    println!(
+                        "admission: effects={} policy={}",
+                        admission.effects.ok, admission.policy.ok
+                    );
+                }
+                if let Some(hex) = request_cbor_hex {
+                    println!("request-cbor-hex: {hex}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_reader_target(target: &str) -> Result<kotoba_clj::ReaderTarget> {
+    kotoba_clj::ReaderTarget::parse(target)
+        .ok_or_else(|| anyhow::anyhow!("unsupported reader target: {target}"))
+}
+
+fn read_policy(path: &Path) -> Result<kotoba_clj::Policy> {
+    let src = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    kotoba_clj::Policy::parse_edn(&src)
+        .map_err(|err| anyhow::anyhow!("parse policy {}: {err}", path.display()))
+}
+
+fn load_kotoba_source(
+    cell: &Path,
+    target: kotoba_clj::ReaderTarget,
+    source_paths: &[PathBuf],
+) -> Result<String> {
+    kotoba_clj::compat::load_file_graph_with_source_paths(cell, target, source_paths)
+        .map_err(|err| anyhow::anyhow!("load {}: {err}", cell.display()))
+}
+
+fn default_wasm_out(cell: &Path) -> PathBuf {
+    let path = cell.to_string_lossy();
+    for ext in [".kotoba", ".clj", ".cljc", ".cljs"] {
+        if let Some(stem) = path.strip_suffix(ext) {
+            return PathBuf::from(format!("{stem}.wasm"));
+        }
+    }
+    PathBuf::from(format!("{path}.wasm"))
+}
+
+fn print_safe_build_evidence(
+    cell: &Path,
+    body: &str,
+    target: kotoba_clj::ReaderTarget,
+    policy: &kotoba_clj::Policy,
+    wasm: &[u8],
+) {
+    let ifaces = kotoba_clj::embedded_capability_ifaces(wasm);
+    let surface = if ifaces.is_empty() {
+        "none (pure)".to_string()
+    } else {
+        ifaces.join(", ")
+    };
+    eprintln!(
+        "[wasm safe-build] {} ({} bytes)",
+        cell.display(),
+        wasm.len()
+    );
+    eprintln!("[wasm safe-build] admission gate: selfhost/kotoba");
+    eprintln!("[wasm safe-build] reader target: {}", target.as_str());
+    eprintln!("[wasm safe-build] capability surface: {surface}");
+
+    let unused = kotoba_clj::unused_grants_with_reader_target(body, target, policy)
+        .map_err(|err| err.to_string());
+    if let Ok(unused) = unused {
+        for finding in &unused {
+            eprintln!("[wasm safe-build] warning: over-grant - {finding}");
+        }
+    }
+
+    if let Ok(effects) = kotoba_clj::infer_effects_with_reader_target(body, target) {
+        let mut rows: Vec<String> = effects
+            .iter()
+            .filter(|(_, effects)| !effects.is_empty())
+            .map(|(function, effects)| format!("{function}={{{}}}", join_set(effects)))
+            .collect();
+        rows.sort();
+        let report = if rows.is_empty() {
+            "all pure".to_string()
+        } else {
+            rows.join(" ")
+        };
+        eprintln!("[wasm safe-build] inferred effects: {report}");
+    }
+}
+
+fn join_set(values: &std::collections::BTreeSet<String>) -> String {
+    values.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+fn set_vec(values: &std::collections::BTreeSet<String>) -> Vec<String> {
+    values.iter().cloned().collect()
+}
+
+fn selfhost_inspect_json(
+    abi: &str,
+    target: kotoba_clj::ReaderTarget,
+    function_count: usize,
+    summaries: &std::collections::BTreeMap<String, kotoba_clj::selfhost::FunctionSummary>,
+    type_check: &kotoba_clj::selfhost::TypeCheck,
+    admission: Option<&kotoba_clj::selfhost::AdmissionCheck>,
+    request_cbor_hex: Option<&str>,
+) -> serde_json::Value {
+    let functions: Vec<serde_json::Value> = summaries
+        .iter()
+        .map(|(name, summary)| {
+            serde_json::json!({
+                "name": name,
+                "effects": set_vec(&summary.effects),
+                "caps": set_vec(&summary.caps),
+                "targets": set_vec(&summary.targets),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "abi": abi,
+        "readerTarget": target.as_str(),
+        "request": {
+            "functions": function_count,
+            "cborHex": request_cbor_hex,
+        },
+        "functions": functions,
+        "types": {
+            "ok": type_check.ok,
+            "denials": set_vec(&type_check.denials),
+        },
+        "admission": admission.map(admission_json),
+    })
+}
+
+fn admission_json(admission: &kotoba_clj::selfhost::AdmissionCheck) -> serde_json::Value {
+    serde_json::json!({
+        "effects": {
+            "ok": admission.effects.ok,
+            "violations": admission.effects.violations.iter().map(|violation| {
+                serde_json::json!({
+                    "name": violation.name,
+                    "used": set_vec(&violation.used),
+                    "declared": set_vec(&violation.declared),
+                    "missing": set_vec(&violation.missing),
+                    "unknown": set_vec(&violation.unknown),
+                })
+            }).collect::<Vec<_>>(),
+        },
+        "policy": {
+            "ok": admission.policy.ok,
+            "used": set_vec(&admission.policy.used),
+            "granted": set_vec(&admission.policy.granted),
+            "denials": set_vec(&admission.policy.denials),
+            "targetDenials": set_vec(&admission.policy.target_denials),
+        },
+    })
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_client(token: &Option<String>) -> Result<reqwest::Client> {
@@ -874,6 +1719,168 @@ fn check_status(resp: &reqwest::Response) -> Result<()> {
     let status = resp.status();
     if !status.is_success() {
         anyhow::bail!("server returned {status}");
+    }
+    Ok(())
+}
+
+fn read_inline_file_or_stdin(
+    inline: Option<String>,
+    file: Option<PathBuf>,
+    label: &str,
+) -> Result<String> {
+    match (inline, file) {
+        (Some(src), None) => Ok(src),
+        (None, Some(path)) => {
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+        }
+        (Some(_), Some(_)) => anyhow::bail!("specify {label} OR --file, not both"),
+        (None, None) => {
+            use std::io::Read;
+            let mut src = String::new();
+            std::io::stdin()
+                .read_to_string(&mut src)
+                .with_context(|| format!("read {label} from stdin"))?;
+            Ok(src)
+        }
+    }
+}
+
+async fn run_datomic_transact(
+    base_url: &str,
+    token: &Option<String>,
+    graph: &str,
+    tx_edn: &str,
+    cacao: Option<String>,
+) -> Result<()> {
+    let client = build_client(token)?;
+    let endpoint = format!(
+        "{}/xrpc/com.etzhayyim.apps.kotoba.datomic.transact",
+        base_url.trim_end_matches('/')
+    );
+    let resp = client
+        .post(&endpoint)
+        .json(&serde_json::json!({
+            "graph": graph,
+            "tx_edn": tx_edn,
+            "cacaoB64": cacao,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("POST {endpoint}"))?;
+    check_status(&resp)?;
+    let json: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(())
+}
+
+async fn run_quad_put(
+    base_url: &str,
+    token: &Option<String>,
+    graph: &str,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+) -> Result<()> {
+    let client = build_client(token)?;
+    let url = format!(
+        "{}/xrpc/{}",
+        base_url.trim_end_matches('/'),
+        NSID_QUAD_CREATE
+    );
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "graph": graph,
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+        }))
+        .send()
+        .await
+        .context("POST quad.create failed")?;
+    check_status(&resp)?;
+    let json: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(())
+}
+
+async fn run_quad_retract(
+    base_url: &str,
+    token: &Option<String>,
+    graph: &str,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+) -> Result<()> {
+    let client = build_client(token)?;
+    let url = format!(
+        "{}/xrpc/{}",
+        base_url.trim_end_matches('/'),
+        NSID_QUAD_RETRACT
+    );
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "graph": graph,
+            "subject": subject,
+            "predicate": predicate,
+            "object": object,
+        }))
+        .send()
+        .await
+        .context("POST quad.retract failed")?;
+    check_status(&resp)?;
+    let json: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(())
+}
+
+async fn run_quad_query(
+    base_url: &str,
+    token: &Option<String>,
+    graph: &str,
+    subject: Option<&str>,
+    predicate: Option<&str>,
+    limit: u64,
+) -> Result<()> {
+    let client = build_client(token)?;
+    let mut url = format!(
+        "{}/xrpc/{}?graph={}&limit={}",
+        base_url.trim_end_matches('/'),
+        NSID_GRAPH_QUERY,
+        urlencoding::encode(graph),
+        limit,
+    );
+    if let Some(s) = subject {
+        url.push_str(&format!("&subject={}", urlencoding::encode(s)));
+    }
+    if let Some(p) = predicate {
+        url.push_str(&format!("&predicate={}", urlencoding::encode(p)));
+    }
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .context("GET graph.query failed")?;
+    check_status(&resp)?;
+    let json: serde_json::Value = resp.json().await?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(())
+}
+
+fn kotoba_git_url(base_url: &str, repo: &str) -> String {
+    format!(
+        "{}/git/{}",
+        base_url.trim_end_matches('/'),
+        repo.trim_matches('/')
+    )
+}
+
+fn run_process(mut cmd: Command, label: &str) -> Result<()> {
+    eprintln!("[kotoba] {label}: {:?}", cmd);
+    let status = cmd.status().with_context(|| format!("spawn {label}"))?;
+    if !status.success() {
+        anyhow::bail!("{label} failed with {status}");
     }
     Ok(())
 }
@@ -1731,6 +2738,200 @@ fn run_key_cmd(cmd: KeyCmd) -> Result<()> {
             println!("{}", hex::encode(*key));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod wasm_cli_tests {
+    use super::*;
+
+    #[test]
+    fn wasm_build_accepts_source_paths() {
+        let cli = Cli::try_parse_from([
+            "kotoba",
+            "wasm",
+            "build",
+            "-S",
+            "src",
+            "--source-path",
+            "vendor",
+            "app/main.kotoba",
+            "-o",
+            "target/app.wasm",
+        ])
+        .unwrap();
+
+        let Some(Cmd::Wasm(WasmCmd::Build {
+            cell,
+            out,
+            wit,
+            source_path,
+        })) = cli.cmd
+        else {
+            panic!("expected wasm build command");
+        };
+
+        assert_eq!(cell, PathBuf::from("app/main.kotoba"));
+        assert_eq!(out, Some(PathBuf::from("target/app.wasm")));
+        assert_eq!(wit, None);
+        assert_eq!(
+            source_path,
+            vec![PathBuf::from("src"), PathBuf::from("vendor")]
+        );
+    }
+
+    #[test]
+    fn wasm_safe_build_accepts_source_paths() {
+        let cli = Cli::try_parse_from([
+            "kotoba",
+            "wasm",
+            "safe-build",
+            "-S",
+            "src",
+            "cell.kotoba",
+            "--policy",
+            "policy.edn",
+        ])
+        .unwrap();
+
+        let Some(Cmd::Wasm(WasmCmd::SafeBuild {
+            cell,
+            policy,
+            source_path,
+            ..
+        })) = cli.cmd
+        else {
+            panic!("expected wasm safe-build command");
+        };
+
+        assert_eq!(cell, PathBuf::from("cell.kotoba"));
+        assert_eq!(policy, PathBuf::from("policy.edn"));
+        assert_eq!(source_path, vec![PathBuf::from("src")]);
+    }
+
+    #[test]
+    fn wasm_safe_policy_defaults_to_kotoba_reader_target_and_accepts_source_paths() {
+        let cli = Cli::try_parse_from([
+            "kotoba",
+            "wasm",
+            "safe-policy",
+            "-S",
+            "src",
+            "cell.kotoba",
+            "-o",
+            "policy.edn",
+        ])
+        .unwrap();
+
+        let Some(Cmd::Wasm(WasmCmd::SafePolicy {
+            cell,
+            out,
+            reader_target,
+            source_path,
+            ..
+        })) = cli.cmd
+        else {
+            panic!("expected wasm safe-policy command");
+        };
+
+        assert_eq!(cell, PathBuf::from("cell.kotoba"));
+        assert_eq!(out, Some(PathBuf::from("policy.edn")));
+        assert_eq!(reader_target, "kotoba");
+        assert_eq!(source_path, vec![PathBuf::from("src")]);
+    }
+
+    #[test]
+    fn wasm_selfhost_inspect_defaults_to_kotoba_reader_target_and_accepts_source_paths() {
+        let cli = Cli::try_parse_from([
+            "kotoba",
+            "wasm",
+            "selfhost-inspect",
+            "cell.kotoba",
+            "--policy",
+            "policy.edn",
+            "--source-path",
+            "src",
+            "--json",
+            "--request-hex",
+        ])
+        .unwrap();
+
+        let Some(Cmd::Wasm(WasmCmd::SelfhostInspect {
+            cell,
+            policy,
+            reader_target,
+            source_path,
+            request_hex,
+            json,
+        })) = cli.cmd
+        else {
+            panic!("expected wasm selfhost-inspect command");
+        };
+
+        assert_eq!(cell, PathBuf::from("cell.kotoba"));
+        assert_eq!(policy, Some(PathBuf::from("policy.edn")));
+        assert_eq!(reader_target, "kotoba");
+        assert_eq!(source_path, vec![PathBuf::from("src")]);
+        assert!(request_hex);
+        assert!(json);
+    }
+
+    #[test]
+    fn top_level_run_check_db_git_rad_and_deploy_parse() {
+        let cli = Cli::try_parse_from(["kotoba", "run", "main.kotoba", "1", "2"]).unwrap();
+        let Some(Cmd::Run(RunCmd {
+            cell, func, args, ..
+        })) = cli.cmd
+        else {
+            panic!("expected run command");
+        };
+        assert_eq!(cell, PathBuf::from("main.kotoba"));
+        assert_eq!(func, "main");
+        assert_eq!(args, vec![1, 2]);
+
+        let cli =
+            Cli::try_parse_from(["kotoba", "check", "main.kotoba", "--policy", "p.edn"]).unwrap();
+        let Some(Cmd::Check(CheckCmd { cell, policy, .. })) = cli.cmd else {
+            panic!("expected check command");
+        };
+        assert_eq!(cell, PathBuf::from("main.kotoba"));
+        assert_eq!(policy, Some(PathBuf::from("p.edn")));
+
+        let cli = Cli::try_parse_from([
+            "kotoba",
+            "db",
+            "transact",
+            "--graph",
+            "g",
+            "[[:db/add \"a\" :name \"A\"]]",
+        ])
+        .unwrap();
+        let Some(Cmd::Db(DbCmd::Transact { graph, tx_edn, .. })) = cli.cmd else {
+            panic!("expected db transact command");
+        };
+        assert_eq!(graph, "g");
+        assert_eq!(tx_edn.as_deref(), Some("[[:db/add \"a\" :name \"A\"]]"));
+
+        let cli =
+            Cli::try_parse_from(["kotoba", "git", "remote", "demo", "--name", "origin"]).unwrap();
+        let Some(Cmd::Git(GitCmd::Remote { repo, name })) = cli.cmd else {
+            panic!("expected git remote command");
+        };
+        assert_eq!(repo, "demo");
+        assert_eq!(name, "origin");
+
+        let cli = Cli::try_parse_from(["kotoba", "rad", "status"]).unwrap();
+        assert!(matches!(cli.cmd, Some(Cmd::Rad(RadCmd::Status))));
+
+        let cli = Cli::try_parse_from(["kotoba", "deploy", "kotoba.app.edn", "--publish"]).unwrap();
+        let Some(Cmd::Deploy(DeployCmd {
+            manifest, publish, ..
+        })) = cli.cmd
+        else {
+            panic!("expected deploy command");
+        };
+        assert_eq!(manifest, PathBuf::from("kotoba.app.edn"));
+        assert!(publish);
     }
 }
 

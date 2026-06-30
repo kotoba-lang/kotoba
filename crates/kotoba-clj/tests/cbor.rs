@@ -172,7 +172,7 @@ mod live {
         let ctx = cbor_map(&[("prompt", "ping"), ("zzz", "ignored")]);
         let out = exec
             .execute(
-                "clj-cbor-agent",
+                "kotoba-cbor-agent",
                 &agent_component(),
                 "did:key:z6MkTestAgent",
                 ctx,
@@ -191,7 +191,7 @@ mod live {
         let ctx = cbor_map(&[("other", "x")]);
         let out = exec
             .execute(
-                "clj-cbor-agent",
+                "kotoba-cbor-agent",
                 &agent_component(),
                 "did:key:z6MkTestAgent",
                 ctx,

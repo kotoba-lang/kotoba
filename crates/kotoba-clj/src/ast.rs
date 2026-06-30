@@ -1,5 +1,5 @@
 //! Lowering from the EDN reader (`kotoba_edn::EdnValue`) into a typed AST for
-//! the i64 Clojure subset this compiler supports.
+//! the i64 Kotoba/EDN subset this compiler supports.
 //!
 //! Subset (everything is a 64-bit signed integer; booleans are 1/0):
 //!   top-level   `(def name <const-expr>)`     compile-time integer constant
@@ -21,6 +21,8 @@
 //!               `if-let`, `when-let`
 //!               builtins: + - * / mod  = < > <= >=  and or not
 //!               `(f args…)`  call a user `defn`
+
+use std::collections::BTreeSet;
 
 use kotoba_edn::{to_string as edn_to_string, EdnValue, Symbol};
 
@@ -48,6 +50,9 @@ pub struct Function {
     pub name: String,
     pub export_name: Option<String>,
     pub params: Vec<String>,
+    /// Optional source-level `{:effects #{...}}` declaration carried from the
+    /// defn attr-map. Generated/lifted functions have no source declaration.
+    pub declared_effects: Option<BTreeSet<String>>,
     /// Implicit `do`: the last expression is the return value.
     pub body: Vec<Expr>,
     /// `Some(slot)` for a lambda-lifted anonymous function: it is reachable via
@@ -238,7 +243,7 @@ pub enum HostImport {
 
 /// Whether a list head names an **inert form** — one whose body is data or is
 /// dropped at compile time, and is therefore *never executed*:
-/// `quote`/`var` (quoted data) and `comment` (discarded). The safe-clj analysis
+/// `quote`/`var` (quoted data) and `comment` (discarded). The safe Kotoba analysis
 /// walkers (subset / type / effect / capability / policy-synthesis) must not
 /// descend into these, or they raise false positives — rejecting valid code,
 /// mis-attributing effects, or demanding capabilities the cell never uses. This
@@ -457,7 +462,7 @@ pub enum Expr {
     },
 }
 
-/// Parse Clojure-subset source text into a [`Program`].
+/// Parse Kotoba/EDN-subset source text into a [`Program`].
 pub fn parse_program(src: &str) -> Result<Program, CljError> {
     let forms = kotoba_edn::parse_all(src).map_err(|e| CljError::Read(e.to_string()))?;
     let mut defs = Vec::new();
@@ -483,16 +488,15 @@ fn parse_top_level_form(
         other => {
             return Err(CljError::Lower(format!(
                 "top-level form must be a list, found: {other:?}"
-            )))
+            )));
         }
     };
     let head = list_head_symbol(items)?;
     match head.name.as_str() {
-        "ns" | "require" | "require-macros" | "use" | "use-macros" | "refer-clojure"
-        | "in-ns" | "alias" | "create-ns" | "remove-ns" | "import" | "gen-class" | "set!"
-        | "defrecord" | "deftype" | "defprotocol" | "extend-type" | "extend-protocol"
-        | "defmulti" | "defmethod" | "defmacro" | "defstruct" | "create-struct" | "comment"
-        | "declare" => {
+        "ns" | "require" | "require-macros" | "use" | "use-macros" | "refer-clojure" | "in-ns"
+        | "alias" | "create-ns" | "remove-ns" | "import" | "gen-class" | "set!" | "defrecord"
+        | "deftype" | "defprotocol" | "extend-type" | "extend-protocol" | "defmulti"
+        | "defmethod" | "defmacro" | "defstruct" | "create-struct" | "comment" | "declare" => {
             /* source-compat declarations — accepted and ignored */
         }
         "do" => {
@@ -506,7 +510,7 @@ fn parse_top_level_form(
         other => {
             return Err(CljError::Lower(format!(
                 "unsupported top-level form `({other} …)` — expected def/defonce/defn/defn-/defmacro/ns/namespace-management/require/use/refer-clojure/import/gen-class/set!/record-type-protocol-multimethod/struct/defgraph/do/comment/declare"
-            )))
+            )));
         }
     }
     Ok(())
@@ -691,6 +695,7 @@ impl Lifter {
             name: fname,
             export_name: None,
             params: fn_params,
+            declared_effects: None,
             body: lifted_body,
             table_slot: Some(slot),
         });
@@ -832,9 +837,13 @@ fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     if matches!(items.get(params_idx), Some(EdnValue::String(_))) {
         params_idx += 1;
     }
-    if matches!(items.get(params_idx), Some(EdnValue::Map(_))) {
+    let declared_effects = if let Some(EdnValue::Map(attrs)) = items.get(params_idx) {
+        let declared = parse_defn_declared_effects(attrs)?;
         params_idx += 1;
-    }
+        declared
+    } else {
+        None
+    };
     if let Some(EdnValue::List(arity)) = items.get(params_idx) {
         if !items[params_idx..]
             .iter()
@@ -845,12 +854,19 @@ fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
             )));
         }
         if items.len() == params_idx + 1 {
-            return Ok(vec![lower_defn_arity(&name, arity, Some(name.clone()))?]);
+            return Ok(vec![lower_defn_arity(
+                &name,
+                arity,
+                Some(name.clone()),
+                declared_effects.clone(),
+            )?]);
         }
         return items[params_idx..]
             .iter()
             .map(|item| match item {
-                EdnValue::List(arity) => lower_defn_arity(&name, arity, None),
+                EdnValue::List(arity) => {
+                    lower_defn_arity(&name, arity, None, declared_effects.clone())
+                }
                 _ => unreachable!("checked above"),
             })
             .collect();
@@ -860,7 +876,7 @@ fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         _ => {
             return Err(CljError::Lower(format!(
                 "defn `{name}` parameter list must be a vector `[…]`"
-            )))
+            )));
         }
     };
     if items.len() <= params_idx + 1 {
@@ -883,6 +899,7 @@ fn lower_defn(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         export_name: Some(name.clone()),
         name,
         params,
+        declared_effects,
         body,
         table_slot: None,
     }])
@@ -892,6 +909,7 @@ fn lower_defn_arity(
     name: &str,
     items: &[EdnValue],
     export_name: Option<String>,
+    declared_effects: Option<BTreeSet<String>>,
 ) -> Result<Function, CljError> {
     if items.len() < 2 {
         return Err(CljError::Lower(format!(
@@ -903,7 +921,7 @@ fn lower_defn_arity(
         _ => {
             return Err(CljError::Lower(format!(
                 "defn `{name}` arity-list must begin with a parameter vector"
-            )))
+            )));
         }
     };
     let body_idx = skip_prepost_map(items, 1);
@@ -921,9 +939,34 @@ fn lower_defn_arity(
         name: name.to_string(),
         export_name,
         params,
+        declared_effects,
         body,
         table_slot: None,
     })
+}
+
+fn parse_defn_declared_effects(
+    attrs: &std::collections::BTreeMap<EdnValue, EdnValue>,
+) -> Result<Option<BTreeSet<String>>, CljError> {
+    let Some(value) = attrs.get(&EdnValue::kw_bare("effects")) else {
+        return Ok(None);
+    };
+    let set = match value {
+        EdnValue::Set(set) => set,
+        _ => {
+            return Err(CljError::Effect(
+                "`:effects` must be a set of keywords (e.g. #{:graph-write})".into(),
+            ));
+        }
+    };
+    let mut declared = BTreeSet::new();
+    for effect in set {
+        let keyword = effect
+            .as_keyword()
+            .ok_or_else(|| CljError::Effect("`:effects` entries must be keywords".into()))?;
+        declared.insert(keyword.0.name.clone());
+    }
+    Ok(Some(declared))
 }
 
 type LoweredBindings = Vec<(String, Expr)>;
@@ -943,7 +986,7 @@ fn lower_param_list(params: &[EdnValue], ctx: &str) -> Result<LoweredParams, Clj
             other => {
                 return Err(CljError::Lower(format!(
                     "{ctx} must be a symbol or destructuring form, found {other:?}"
-                )))
+                )));
             }
         }
     }
@@ -1229,7 +1272,7 @@ fn lower_dotimes(args: &[EdnValue]) -> Result<Expr, CljError> {
         _ => {
             return Err(CljError::Lower(
                 "dotimes takes: (dotimes [i n] body…)".into(),
-            ))
+            ));
         }
     };
     let i = binding[0].clone();
@@ -1269,7 +1312,7 @@ fn lower_doseq(args: &[EdnValue]) -> Result<Expr, CljError> {
         _ => {
             return Err(CljError::Lower(
                 "doseq takes a single binding: (doseq [x coll] body…)".into(),
-            ))
+            ));
         }
     };
     let x = binding[0].clone();
@@ -1568,7 +1611,7 @@ fn lower_single_binding(
         _ => {
             return Err(CljError::Lower(format!(
                 "{form_name} requires a binding vector: ({form_name} [name init] …)"
-            )))
+            )));
         }
     };
     if binding_vec.len() != 2 {
@@ -1592,7 +1635,7 @@ fn lower_let(args: &[EdnValue]) -> Result<Expr, CljError> {
         _ => {
             return Err(CljError::Lower(
                 "let requires a binding vector: (let [b v …] …)".into(),
-            ))
+            ));
         }
     };
     if binding_vec.len() % 2 != 0 {
@@ -1746,7 +1789,7 @@ fn collect_vector_destructuring(
             other => {
                 return Err(CljError::Lower(format!(
                     "{ctx} vector destructuring entries must be symbols or nested destructuring forms, found {other:?}"
-                )))
+                )));
             }
         }
         item_idx += 1;
@@ -1857,7 +1900,7 @@ fn lower_map_destructure_entry(
         other => {
             return Err(CljError::Lower(format!(
                 "{ctx} map destructuring entries must bind symbols or nested destructuring forms, found {other:?}"
-            )))
+            )));
         }
     }
     Ok(())
@@ -2032,7 +2075,7 @@ fn lower_loop(args: &[EdnValue]) -> Result<Expr, CljError> {
         _ => {
             return Err(CljError::Lower(
                 "loop requires a binding vector: (loop [b v …] …)".into(),
-            ))
+            ));
         }
     };
     if binding_vec.len() % 2 != 0 {
@@ -2084,7 +2127,7 @@ fn lower_fn(args: &[EdnValue]) -> Result<Expr, CljError> {
     // Multi-arity `(fn ([a] …) ([a b] …))` is not supported yet.
     if matches!(rest.first(), Some(EdnValue::List(_))) {
         return Err(CljError::Lower(
-            "multi-arity `(fn ([params] …) …)` is not yet supported in kotoba-clj; use a single `[params]` vector".into(),
+            "multi-arity `(fn ([params] …) …)` is not yet supported in the Kotoba compiler; use a single `[params]` vector".into(),
         ));
     }
     let param_vec = match rest.first() {
@@ -2092,12 +2135,12 @@ fn lower_fn(args: &[EdnValue]) -> Result<Expr, CljError> {
         _ => {
             return Err(CljError::Lower(
                 "fn requires a parameter vector: (fn [params…] body…)".into(),
-            ))
+            ));
         }
     };
     if param_vec.iter().any(is_amp_symbol) {
         return Err(CljError::Lower(
-            "variadic `& rest` params in `(fn …)` / `#(… %&)` are not yet supported in kotoba-clj"
+            "variadic `& rest` params in `(fn …)` / `#(… %&)` are not yet supported in the Kotoba compiler"
                 .into(),
         ));
     }
@@ -2146,7 +2189,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         _ => {
             return Err(CljError::Lower(
                 "defgraph requires a name: (defgraph name …)".into(),
-            ))
+            ));
         }
     };
     let kwargs = &items[2..];
@@ -2166,7 +2209,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
             other => {
                 return Err(CljError::Lower(format!(
                     "defgraph option key must be a keyword, found {other:?}"
-                )))
+                )));
             }
         };
         match key.as_str() {
@@ -2177,7 +2220,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
             other => {
                 return Err(CljError::Lower(format!(
                     "unknown defgraph option `:{other}`"
-                )))
+                )));
             }
         }
     }
@@ -2197,7 +2240,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
             other => {
                 return Err(CljError::Lower(format!(
                     "defgraph node `{kw}` must map to a fn symbol, found {other:?}"
-                )))
+                )));
             }
         };
         id_of.insert(kw.clone(), node_order.len() as i64);
@@ -2263,6 +2306,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         name: dispatch_name.clone(),
         export_name: Some(dispatch_name.clone()),
         params: vec!["__nid".into(), "__state".into()],
+        declared_effects: None,
         body: vec![dispatch_body],
         table_slot: None,
     };
@@ -2270,14 +2314,15 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
     // next: nested if over node ids → successor id (static / if-edge); default -1.
     let mut next_body = Expr::Int(-1);
     for (i, (kw, _)) in node_order.iter().enumerate().rev() {
-        let target_expr = match edges.get(&EdnValue::Keyword(kotoba_edn::Keyword::bare(kw.clone()))) {
+        let target_expr = match edges.get(&EdnValue::Keyword(kotoba_edn::Keyword::bare(kw.clone())))
+        {
             None => Expr::Int(-1), // no outgoing edge → terminate
             Some(EdnValue::Keyword(t)) => Expr::Int(resolve_id(t.name())?),
             Some(EdnValue::List(parts)) => lower_if_edge(parts, &resolve_id, &state)?,
             Some(other) => {
                 return Err(CljError::Lower(format!(
                     "defgraph edge for `:{kw}` must be a target keyword or (if-edge …), found {other:?}"
-                )))
+                )));
             }
         };
         next_body = Expr::If {
@@ -2290,6 +2335,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         name: next_name.clone(),
         export_name: Some(next_name.clone()),
         params: vec!["__nid".into(), "__state".into()],
+        declared_effects: None,
         body: vec![next_body],
         table_slot: None,
     };
@@ -2299,6 +2345,7 @@ fn lower_defgraph(items: &[EdnValue]) -> Result<Vec<Function>, CljError> {
         name: name.clone(),
         export_name: Some(name.clone()),
         params: vec!["state".into()],
+        declared_effects: None,
         body: vec![Expr::Loop {
             bindings: vec![
                 ("__nid".into(), Expr::Int(entry_id)),
@@ -2412,7 +2459,7 @@ fn lower_if_edge(
         other => {
             return Err(CljError::Lower(format!(
                 "if-edge predicate must be a fn symbol, found {other:?}"
-            )))
+            )));
         }
     };
     let then_id = resolve_id(&kw_name(&parts[2], "if-edge :then")?)?;

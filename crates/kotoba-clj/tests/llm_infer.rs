@@ -1,4 +1,4 @@
-//! Stage C-2: a Clojure-compiled guest calls `llm.infer` — a host import whose
+//! Stage C-2: a Kotoba-compiled guest calls `llm.infer` — a host import whose
 //! `result<list<u8>, string>` return uses the indirect **return-area** ABI (the
 //! step beyond C-1's direct-result `has-capability`). This is the primitive a
 //! langgraph node needs: `(llm-infer model prompt)` → model output bytes.
@@ -35,7 +35,7 @@ fn component() -> Vec<u8> {
 
 fn run_on(exec: &WasmExecutor) -> Vec<u8> {
     exec.execute(
-        "clj-llm-infer-test",
+        "kotoba-llm-infer-test",
         &component(),
         AGENT,
         b"ctx".to_vec(),

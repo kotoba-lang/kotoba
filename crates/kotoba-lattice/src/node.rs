@@ -101,7 +101,10 @@ impl LatticeController {
         self.desired = app.desired_by_cid();
         self.constraints.clear();
         for c in &app.components {
-            let key = c.cid.clone().unwrap_or_else(|| format!("clj:{}", c.name));
+            let key = c
+                .cid
+                .clone()
+                .unwrap_or_else(|| format!("kotoba:{}", c.name));
             self.constraints.insert(
                 key,
                 Constraints {

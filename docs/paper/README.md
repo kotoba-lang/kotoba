@@ -64,7 +64,7 @@ design records under [`docs/`](../). Key references:
 | Signal X3DH / Double Ratchet | `crates/kotoba-signal/src/{x3dh,ratchet}.rs` |
 | Tiered / sealed store     | `crates/kotoba-store/src/{tiered_store,sealed_store}.rs` |
 | WASM host / WIT           | `crates/kotoba-runtime/src/executor.rs`, `wit/world.wit` |
-| Clojure → WASM            | `crates/kotoba-clj/` |
+| `kotoba wasm` / Kotoba/EDN → WASM | `crates/kotoba-cli/`, `crates/kotoba-clj/` |
 | Five-axis roadmap         | `docs/ADR-001-five-axis-distributed-redesign.md` |
 | Sealed cold tier          | `docs/ADR-sealed-cold-tier.md` |
-| Clojure-WASM ADR          | `docs/ADR-clojure-wasm.md` |
+| Kotoba-WASM ADR           | `docs/ADR-kotoba-wasm.md` |

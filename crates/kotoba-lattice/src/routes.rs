@@ -30,7 +30,7 @@ pub struct TriggerRoutes {
 impl TriggerRoutes {
     /// Build routes from a manifest + resolved component CIDs (name → cid).
     /// Components are keyed by their resolved CID (explicit `:cid`, else the
-    /// `resolved` map, else a `clj:<name>` placeholder — matching the reconciler).
+    /// `resolved` map, else a `kotoba:<name>` placeholder — matching the reconciler).
     pub fn from_app(app: &AppManifest, resolved: &BTreeMap<String, String>) -> Self {
         let mut r = TriggerRoutes::default();
         for c in &app.components {
@@ -38,7 +38,7 @@ impl TriggerRoutes {
                 .get(&c.name)
                 .cloned()
                 .or_else(|| c.cid.clone())
-                .unwrap_or_else(|| format!("clj:{}", c.name));
+                .unwrap_or_else(|| format!("kotoba:{}", c.name));
             for t in &c.triggers {
                 match t.kind.as_str() {
                     "kse" => {
@@ -112,7 +112,7 @@ mod tests {
          {:name "reply" :cid "bafyReply"
           :triggers [{:type :http :route "/reply"}
                      {:type :cron :schedule "every 5m"}]}
-         {:name "fanout" :src "fanout.clj"
+         {:name "fanout" :src "fanout.kotoba"
           :triggers [{:type :kse :topic "kotoba/mail/in"}]}]}"#;
 
     fn routes() -> TriggerRoutes {
@@ -124,8 +124,11 @@ mod tests {
         let r = routes();
         let mut t = r.kse_targets("kotoba/mail/in").to_vec();
         t.sort();
-        // ingest (cid) + fanout (clj:fanout placeholder, no cid)
-        assert_eq!(t, vec!["bafyIngest".to_string(), "clj:fanout".to_string()]);
+        // ingest (cid) + fanout (kotoba:fanout placeholder, no cid)
+        assert_eq!(
+            t,
+            vec!["bafyIngest".to_string(), "kotoba:fanout".to_string()]
+        );
         assert!(r.kse_targets("unknown/topic").is_empty());
     }
 

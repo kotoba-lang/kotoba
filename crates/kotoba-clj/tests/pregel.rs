@@ -1,4 +1,4 @@
-//! Stage E: a compiled-Clojure agent runs on the **Pregel BSP engine**
+//! Stage E: a compiled-Kotoba agent runs on the **Pregel BSP engine**
 //! (`kotoba-vm::WasmPregelRunner`) — closing the "langgraph × Pregel × BSP"
 //! composition. Each BSP superstep invokes the guest's `run(ctx)`:
 //!
@@ -65,7 +65,7 @@ fn runner(max_supersteps: u32) -> WasmPregelRunner {
     let executor = Arc::new(WasmExecutor::new(GAS).expect("executor"));
     WasmPregelRunner::new(
         executor,
-        "clj-bsp-agent-cid",
+        "kotoba-bsp-agent-cid",
         agent_component(),
         AGENT,
         max_supersteps,

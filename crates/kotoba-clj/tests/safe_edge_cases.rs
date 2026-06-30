@@ -1,10 +1,10 @@
-//! Edge-case coverage: the three safe-clj gates must hold in *non-trivial
+//! Edge-case coverage: the three safe Kotoba gates must hold in *non-trivial
 //! syntactic positions* — not just at the top level of a function body, but
 //! nested inside threading macros, data literals, conditional branches, and
 //! arity-list `defn` forms. A gate that only inspected top-level forms would
 //! miss these; these tests lock in the recursive guarantee.
 
-use kotoba_clj::{compile_safe_clj, infer_effects, CljError, Policy};
+use kotoba_clj::{compile_safe_kotoba, infer_effects, CljError, Policy};
 
 fn denied_subset(res: Result<Vec<u8>, CljError>) {
     assert!(
@@ -31,7 +31,7 @@ fn denied_effect(res: Result<Vec<u8>, CljError>) {
 fn forbidden_op_inside_threading_macro_is_caught() {
     // `(-> x (eval))` threads to `(eval x)`. The forbidden call appears as a
     // child list of the `->` form — the recursive gate must catch it.
-    denied_subset(compile_safe_clj(
+    denied_subset(compile_safe_kotoba(
         "(defn run [x] (-> x (eval)))",
         &Policy::deny_all(),
     ));
@@ -39,7 +39,7 @@ fn forbidden_op_inside_threading_macro_is_caught() {
 
 #[test]
 fn forbidden_op_inside_vector_literal_is_caught() {
-    denied_subset(compile_safe_clj(
+    denied_subset(compile_safe_kotoba(
         "(defn run [x] [(eval x) 1 2])",
         &Policy::deny_all(),
     ));
@@ -47,7 +47,7 @@ fn forbidden_op_inside_vector_literal_is_caught() {
 
 #[test]
 fn forbidden_op_inside_map_literal_is_caught() {
-    denied_subset(compile_safe_clj(
+    denied_subset(compile_safe_kotoba(
         "(defn run [x] {:k (resolve x)})",
         &Policy::deny_all(),
     ));
@@ -55,7 +55,7 @@ fn forbidden_op_inside_map_literal_is_caught() {
 
 #[test]
 fn forbidden_op_inside_conditional_branch_is_caught() {
-    denied_subset(compile_safe_clj(
+    denied_subset(compile_safe_kotoba(
         "(defn run [x] (if x (set! *y* 1) 0))",
         &Policy::deny_all(),
     ));
@@ -63,7 +63,7 @@ fn forbidden_op_inside_conditional_branch_is_caught() {
 
 #[test]
 fn forbidden_require_inside_threading_step_is_caught() {
-    denied_subset(compile_safe_clj(
+    denied_subset(compile_safe_kotoba(
         "(defn run [x] (-> x (require [evil.ns])))",
         &Policy::deny_all(),
     ));
@@ -74,15 +74,15 @@ fn forbidden_require_inside_threading_step_is_caught() {
 #[test]
 fn host_call_in_conditional_branch_is_gated() {
     let src = r#"(defn run [x] (if x (kqe-assert! "g" "a" "p" "v") 0))"#;
-    denied_policy(compile_safe_clj(src, &Policy::deny_all()));
-    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_write(["g"])).is_ok());
+    denied_policy(compile_safe_kotoba(src, &Policy::deny_all()));
+    assert!(compile_safe_kotoba(src, &Policy::deny_all().grant_graph_write(["g"])).is_ok());
 }
 
 #[test]
 fn host_call_in_let_binding_is_gated() {
     let src = r#"(defn run [] (let [r (kqe-query "kg/role")] r))"#;
-    denied_policy(compile_safe_clj(src, &Policy::deny_all()));
-    assert!(compile_safe_clj(src, &Policy::deny_all().grant_graph_read(["g"])).is_ok());
+    denied_policy(compile_safe_kotoba(src, &Policy::deny_all()));
+    assert!(compile_safe_kotoba(src, &Policy::deny_all().grant_graph_read(["g"])).is_ok());
 }
 
 // ── effect gate: inference reaches nested + arity-list positions ────────────
@@ -96,7 +96,7 @@ fn effect_in_arity_list_defn_is_inferred() {
           ([] (kqe-assert! "g" "a" "p" "v"))
           ([n] n))
     "#;
-    denied_effect(compile_safe_clj(
+    denied_effect(compile_safe_kotoba(
         src,
         &Policy::deny_all().grant_graph_write(["g"]),
     ));
@@ -132,7 +132,7 @@ fn nested_clean_program_with_grants_compiles() {
     "#;
     let policy = Policy::deny_all().grant_graph_read(["g"]);
     assert!(
-        compile_safe_clj(src, &policy).is_ok(),
+        compile_safe_kotoba(src, &policy).is_ok(),
         "a nested, honestly-declared, granted program must compile"
     );
 }

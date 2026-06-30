@@ -1,10 +1,10 @@
-//! End-to-end: Clojure-subset source → wasm bytes → wasmtime execution.
+//! End-to-end: Kotoba/EDN-subset source → wasm bytes → wasmtime execution.
 //!
 //! The discriminating tests are the recursive ones (factorial, fibonacci,
 //! mutual recursion). A flat `(+ a b)` proves almost nothing about call/local/
 //! branch codegen — recursion exercises all three.
 
-use kotoba_clj::run::{alloc_probe, compile_and_run, run_with_fuel};
+use kotoba_clj::run::{alloc_probe, compile_and_run, run, run_with_fuel};
 use kotoba_clj::{compile_str, CljError};
 
 #[test]
@@ -635,4 +635,136 @@ fn def_string_literal_used_in_comparison() {
         3,
         "(str-len TAG) where TAG=\"abc\" should be 3"
     );
+}
+
+// ── byte-at runtime bounds check (T1 memory safety) ─────────────────────────
+
+#[test]
+fn byte_at_in_bounds_returns_the_byte() {
+    // "ab" = [97, 98]; valid indices read the right byte.
+    let wasm = compile_str(r#"(defn at [i] (byte-at "ab" i))"#).unwrap();
+    assert_eq!(run(&wasm, "at", &[0]).unwrap(), 97); // 'a'
+    assert_eq!(run(&wasm, "at", &[1]).unwrap(), 98); // 'b'
+}
+
+#[test]
+fn byte_at_out_of_bounds_traps_at_runtime() {
+    // The index is a runtime value (so it passes the static literal check), but
+    // an out-of-range read must trap rather than read adjacent memory (T1).
+    let wasm = compile_str(r#"(defn at [i] (byte-at "ab" i))"#).unwrap();
+    assert!(run(&wasm, "at", &[2]).is_err(), "index == len must trap");
+    assert!(
+        run(&wasm, "at", &[5]).is_err(),
+        "index past the end must trap"
+    );
+    assert!(
+        run(&wasm, "at", &[-1]).is_err(),
+        "a negative index must trap"
+    );
+}
+
+// ── byte-append! capacity check (T1 memory safety) ──────────────────────────
+
+#[test]
+fn byte_append_within_capacity_succeeds() {
+    // A buffer sized for 2 bytes accepts exactly 2 appends.
+    let src = r#"(defn fits []
+                   (let [b (bytes-alloc 2)]
+                     (byte-append! b 65)
+                     (byte-append! b 66)
+                     (bytes-len b)))"#;
+    assert_eq!(compile_and_run(src, "fits", &[]).unwrap(), 2);
+}
+
+#[test]
+fn byte_append_past_capacity_traps() {
+    // The third append to a 2-byte buffer would overflow it → trap, not a write
+    // into adjacent linear memory.
+    let src = r#"(defn overflow []
+                   (let [b (bytes-alloc 2)]
+                     (byte-append! b 65)
+                     (byte-append! b 66)
+                     (byte-append! b 67)
+                     (bytes-len b)))"#;
+    let wasm = compile_str(src).unwrap();
+    assert!(
+        run(&wasm, "overflow", &[]).is_err(),
+        "appending past capacity must trap"
+    );
+}
+
+// ── bytes-alloc negative-capacity guard (T1 memory safety) ──────────────────
+
+#[test]
+fn bytes_alloc_negative_capacity_traps_at_runtime() {
+    // A runtime-supplied negative capacity (passes the static literal check)
+    // must trap at allocation, not create a huge-capacity / tiny buffer.
+    let wasm = compile_str(r#"(defn mk [n] (let [b (bytes-alloc n)] (bytes-len b)))"#).unwrap();
+    assert_eq!(run(&wasm, "mk", &[4]).unwrap(), 0); // valid: fresh buffer, len 0
+    assert!(
+        run(&wasm, "mk", &[-1]).is_err(),
+        "negative capacity must trap"
+    );
+}
+
+#[test]
+fn negative_bytes_alloc_cannot_defeat_overflow_guard() {
+    // Regression guard: a negative cap used to be stored as a huge unsigned
+    // capacity, which would let byte-append! overflow the tiny allocation. It
+    // now traps at allocation, before any append can run.
+    let src = r#"(defn ov [n]
+                   (let [b (bytes-alloc n)]
+                     (byte-append! b 1)
+                     (bytes-len b)))"#;
+    let wasm = compile_str(src).unwrap();
+    assert!(
+        run(&wasm, "ov", &[-1]).is_err(),
+        "a negative cap must trap before any append can overflow"
+    );
+}
+
+// ── runtime division-by-zero traps (safety; static check covers only literals) ─
+
+#[test]
+fn runtime_division_by_zero_traps() {
+    // A variable zero divisor passes the static literal-zero check, so the
+    // emitted code must trap (wasm I64DivS / I64RemS) rather than return garbage.
+    for (op, f) in [("/", "d"), ("mod", "m"), ("rem", "r"), ("quot", "q")] {
+        let wasm = compile_str(&format!("(defn {f} [a b] ({op} a b))")).unwrap();
+        assert!(
+            run(&wasm, f, &[10, 2]).is_ok(),
+            "{op} by a non-zero divisor must compute"
+        );
+        assert!(
+            run(&wasm, f, &[10, 0]).is_err(),
+            "{op} by a runtime zero divisor must trap"
+        );
+    }
+}
+
+// ── float→int is saturating: total, no trap, no UB (memory safety) ──────────
+
+#[test]
+fn float_to_int_saturates_and_is_total() {
+    // `int` lowers to `i64.trunc_sat_f64_s`: a *total* conversion — no trap, no
+    // undefined behaviour on any float. NaN → 0, ±Inf and out-of-range values
+    // saturate to i64 MIN/MAX, finite values truncate toward zero. This guards
+    // against a codegen change to the trapping `trunc_f64_s` (or to UB).
+    let cases = [
+        ("(int (Math/sqrt -1.0))", 0i64), // NaN
+        ("(int (/ 1.0 0.0))", i64::MAX),  // +Inf
+        ("(int (/ -1.0 0.0))", i64::MIN), // -Inf
+        ("(int 1.0e30)", i64::MAX),       // beyond +range
+        ("(int -1.0e30)", i64::MIN),      // beyond -range
+        ("(int 2.5)", 2),                 // truncate toward zero
+        ("(int -2.5)", -2),
+    ];
+    for (expr, want) in cases {
+        let wasm = compile_str(&format!("(defn f [] {expr})")).unwrap();
+        assert_eq!(
+            run(&wasm, "f", &[]).unwrap(),
+            want,
+            "int conversion of {expr}"
+        );
+    }
 }

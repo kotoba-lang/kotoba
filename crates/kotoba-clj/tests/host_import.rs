@@ -1,8 +1,8 @@
-//! Stage C-1: a Clojure-compiled guest **calls a `kotoba:kais` host function**.
+//! Stage C-1: a Kotoba-compiled guest **calls a `kotoba:kais` host function**.
 //!
 //! `(has-capability? resource ability)` lowers to a real wasm import wired to
 //! the runtime's `auth.has-capability`. This is the first time a compiled
-//! kotoba-clj guest grows an import section and reaches *out* to the host (prior
+//! Kotoba guest grows an import section and reaches *out* to the host (prior
 //! steps only computed over bytes the host lowered *in*). Two proofs:
 //!
 //!  1. **The Component encoder accepts the import** — `compile_kais_component_str`
@@ -35,7 +35,7 @@ fn invoke_with(snapshot: Vec<WitQuad>) -> Vec<u8> {
     let component = compile_kais_component_str(SRC, KAIS_WIT_DIR).expect("compile + encode");
     let exec = WasmExecutor::new(GAS).expect("executor");
     exec.execute(
-        "clj-host-import-test",
+        "kotoba-host-import-test",
         &component,
         AGENT,
         b"ctx".to_vec(),

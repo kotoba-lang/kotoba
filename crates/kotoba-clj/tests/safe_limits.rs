@@ -4,12 +4,12 @@
 //! grow past its budget, and a budget smaller than the cell's static data is a
 //! hard compile error.
 
-use kotoba_clj::{compile_safe_clj, CljError, Limits, Policy};
+use kotoba_clj::{compile_safe_kotoba, CljError, Limits, Policy};
 
 #[test]
 fn capped_module_is_valid_and_runs() {
     // The memory-capped module must still be valid wasm and execute correctly.
-    let wasm = compile_safe_clj("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
+    let wasm = compile_safe_kotoba("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
     let out = kotoba_clj::run::run(&wasm, "run", &[6]).expect("capped module must run");
     assert_eq!(out, 36);
 }
@@ -19,7 +19,7 @@ fn default_budget_compiles_ordinary_cells() {
     // The default 4-page budget comfortably fits ordinary cells (small static
     // data), including under the prelude.
     let policy = Policy::deny_all();
-    assert!(compile_safe_clj("(defn run [n] (+ (* n n) 1))", &policy).is_ok());
+    assert!(compile_safe_kotoba("(defn run [n] (+ (* n n) 1))", &policy).is_ok());
 }
 
 #[test]
@@ -34,7 +34,7 @@ fn budget_smaller_than_static_data_is_rejected() {
         max_call_depth: 128,
         max_output_bytes: 65_536,
     });
-    match compile_safe_clj(&src, &policy) {
+    match compile_safe_kotoba(&src, &policy) {
         Err(CljError::Codegen(msg)) => {
             assert!(msg.contains("memory page"), "{msg}");
         }
@@ -52,7 +52,7 @@ fn oversized_memory_budget_is_rejected() {
         max_call_depth: 128,
         max_output_bytes: 65_536,
     });
-    match compile_safe_clj("(defn run [n] n)", &policy) {
+    match compile_safe_kotoba("(defn run [n] n)", &policy) {
         Err(CljError::Policy(msg)) => assert!(msg.contains("wasm32 maximum"), "{msg}"),
         other => panic!("expected an over-max Policy error, got {other:?}"),
     }
@@ -67,7 +67,7 @@ fn budget_at_exactly_the_wasm32_max_is_accepted() {
         max_call_depth: 128,
         max_output_bytes: 65_536,
     });
-    assert!(compile_safe_clj("(defn run [n] n)", &policy).is_ok());
+    assert!(compile_safe_kotoba("(defn run [n] n)", &policy).is_ok());
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn generous_budget_fits_the_same_big_cell() {
         max_output_bytes: 65_536,
     });
     assert!(
-        compile_safe_clj(&src, &policy).is_ok(),
+        compile_safe_kotoba(&src, &policy).is_ok(),
         "an 8-page budget must fit a ~70 KiB literal"
     );
 }

@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn resolved_cid_overrides_when_manifest_has_none() {
         let src = r#"{:kotoba.app/name "x"
-            :kotoba.app/components [{:name "n" :src "n.clj" :scale 2 :requires [:cap/kqe]}]}"#;
+            :kotoba.app/components [{:name "n" :src "n.kotoba" :scale 2 :requires [:cap/kqe]}]}"#;
         let app = AppManifest::from_edn(src).unwrap();
         let resolved = BTreeMap::from([("n".to_string(), "bafyBuilt".to_string())]);
         let quads = app_to_quads(&app, &resolved);
@@ -189,7 +189,7 @@ mod tests {
     fn component_without_cid_is_skipped() {
         // a component with neither :cid nor resolved entry → no CID datom → skipped
         let src = r#"{:kotoba.app/name "x"
-            :kotoba.app/components [{:name "n" :src "n.clj" :scale 2}]}"#;
+            :kotoba.app/components [{:name "n" :src "n.kotoba" :scale 2}]}"#;
         let app = AppManifest::from_edn(src).unwrap();
         let quads = app_to_quads(&app, &BTreeMap::new());
         let (desired, _) = desired_from_quads(&quads);

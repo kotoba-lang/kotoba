@@ -6,7 +6,8 @@
 //!
 //! Prior art (ADR §2/§14): control plane = **wasmCloud** (lattice / auction /
 //! link), component+trigger DX = **Spin**, agency model = **Holochain**, and the
-//! default component language = **Clojure/EDN/Datomic** via `kotoba-clj`.
+//! default component language stack = **Kotoba/EDN/Datomic** via
+//! `kotoba component build`.
 //!
 //! ```text
 //! ┌─ L5  manifest (EDN) + reconciler ……… this crate: manifest + reconcile

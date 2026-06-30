@@ -140,7 +140,7 @@ mod tests {
     fn deploy_resolves_compiled_component_cid() {
         let src = r#"{:kotoba.app/name "r"
             :kotoba.app/components
-            [{:name "h" :src "h.clj" :triggers [{:type :kse :topic "t"}]}]}"#;
+            [{:name "h" :src "h.kotoba" :triggers [{:type :kse :topic "t"}]}]}"#;
         let resolved = BTreeMap::from([("h".to_string(), "bafyCompiled".to_string())]);
         let msgs = deploy_messages(&AppManifest::from_edn(src).unwrap(), &resolved);
         let routes_msg = msgs

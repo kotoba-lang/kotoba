@@ -1,4 +1,4 @@
-//! # Safe-subset form gate (`compile_safe_clj` phase S1, first slice)
+//! # Safe-subset form gate (`compile_safe_kotoba` phase S1, first slice)
 //!
 //! Deny-by-default for *language features*, the companion to the
 //! [`crate::policy`] gate's deny-by-default for *capabilities*
@@ -54,7 +54,10 @@ fn check_value(v: &EdnValue) -> Result<(), CljError> {
                 // the `(. obj …)` member-access form start with `.`; a host
                 // constructor `(Class. args)` ends with `.`.
                 if head.name.starts_with('.') {
-                    return Err(deny(&head.to_qualified(), "host method call / member access"));
+                    return Err(deny(
+                        &head.to_qualified(),
+                        "host method call / member access",
+                    ));
                 }
                 if head.name.len() > 1 && head.name.ends_with('.') {
                     return Err(deny(&head.to_qualified(), "host constructor"));
@@ -110,7 +113,7 @@ fn check_ns_clauses(ns_items: &[EdnValue]) -> Result<(), CljError> {
         if let Some(kw) = head_kw {
             if let Some(reason) = forbidden_op(&kw.0.name) {
                 return Err(CljError::Subset(format!(
-                    "forbidden `ns` clause `:{}` — {reason}. safe-clj denies it \
+                    "forbidden `ns` clause `:{}` — {reason}. safe Kotoba denies it \
                      (docs/ADR-safe-capability-language.md §6); a safe module \
                      declares no runtime dependencies or host imports here.",
                     kw.0.name
@@ -123,7 +126,7 @@ fn check_ns_clauses(ns_items: &[EdnValue]) -> Result<(), CljError> {
 
 fn deny(form: &str, reason: &str) -> CljError {
     CljError::Subset(format!(
-        "forbidden form `({form} …)` — {reason}. safe-clj denies it \
+        "forbidden form `({form} …)` — {reason}. safe Kotoba denies it \
          (docs/ADR-safe-capability-language.md §6). Use the safe subset; \
          capabilities are passed as values, not summoned by name.",
     ))
@@ -211,6 +214,23 @@ fn forbidden_op(name: &str) -> Option<&'static str> {
         "pcalls" => "parallel calls (no ambient concurrency)",
         "pvalues" => "parallel values (no ambient concurrency)",
         "locking" => "takes a monitor lock (no ambient concurrency)",
+
+        // ── no raw linear-memory access (T1 memory safety) ─────────────────
+        // These read/write an *arbitrary* offset in the module's linear memory
+        // with no bounds or structure — the one way user safe Kotoba could corrupt
+        // its own heap, string handles, or container records (a `store64!` to a
+        // bad address silently scribbles over another value). Memory is reached
+        // only through the bounds-respecting accessors: `bytes-alloc` /
+        // `byte-append!` / `bytes-finish` / `byte-at` / `str-len` and the vector
+        // / map prelude. The trusted container/CBOR prelude — exempt from this
+        // gate (it runs on user source only) — still builds on these primitives.
+        "alloc" => {
+            "allocates raw linear memory by offset (no raw memory — use bytes-alloc or a container)"
+        }
+        "load64" => "reads an arbitrary 64-bit word from linear memory (no raw memory access)",
+        "store64!" => "writes an arbitrary 64-bit word to linear memory (no raw memory access)",
+        "load32" => "reads an arbitrary 32-bit word from linear memory (no raw memory access)",
+        "store32!" => "writes an arbitrary 32-bit word to linear memory (no raw memory access)",
 
         // ── no reflection / runtime resolution ─────────────────────────────
         "resolve" => "resolves a symbol at runtime (no reflection)",

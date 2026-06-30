@@ -1,6 +1,6 @@
 //! Capstone end-to-end: the whole KOTOBA Mesh pipeline in one test —
 //!
-//!   Clojure source  --kotoba-clj-->  kotoba-mesh WASM component  (M7–M10)
+//!   Kotoba source   --kotoba wasm build-->  kotoba-mesh WASM component  (M7–M10)
 //!        manifest    --kotoba-lattice deploy_messages-->  PutTriggers/PutRoutes (M16)
 //!        routing     --TriggerRoutes--> which component fires for which event   (M13–M15)
 //!        execution   --WasmExecutor.execute_on_*--> the matching guest export   (M11)
@@ -28,7 +28,7 @@ const SRC: &str = "(ns bot) \
 
 #[test]
 fn full_pipeline_compile_deploy_route_execute() {
-    // ── 1. compile Clojure → kotoba-mesh component ────────────────────────
+    // ── 1. compile Kotoba → kotoba-mesh component ─────────────────────────
     let component = compile_kais_mesh_component_str(SRC, WIT).expect("compile mesh component");
     assert_eq!(&component[0..4], b"\0asm");
     let cid = kotoba_core::cid::KotobaCid::from_bytes(&component).to_multibase();

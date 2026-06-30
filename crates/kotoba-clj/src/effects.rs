@@ -1,4 +1,4 @@
-//! # Effect-soundness checking (`compile_safe_clj` phase S3)
+//! # Effect-soundness checking (`compile_safe_kotoba` phase S3)
 //!
 //! Theorem **T2 (Effect Soundness)** from `docs/ADR-safe-capability-language.md`
 //! §5/§7: if a function declares an effect row `{:effects #{…}}`, then the
@@ -189,7 +189,7 @@ fn parse_effect_row(defn_items: &[EdnValue]) -> Result<Option<BTreeSet<String>>,
                     _ => {
                         return Err(CljError::Effect(
                             "`:effects` must be a set of keywords (e.g. #{:graph-write})".into(),
-                        ))
+                        ));
                     }
                 };
                 let mut declared = BTreeSet::new();

@@ -34,7 +34,7 @@ pub mod kg;
 pub mod kotobase_xrpc;
 pub mod mcp;
 pub mod media_xrpc;
-#[cfg(feature = "clj-mesh")]
+#[cfg(any(feature = "kotoba-mesh", feature = "clj-mesh"))]
 pub mod mesh_xrpc;
 pub mod mishmar_observe;
 #[cfg(feature = "p2p")]
@@ -1795,8 +1795,8 @@ pub fn build_router(state: Arc<KotobaState>) -> Router {
     );
 
     // `.kotoba` source → wasm (compile) / → i64 (compile+run). Off unless built
-    // with `--features clj-mesh` (pulls kotoba-clj + wasmtime).
-    #[cfg(feature = "clj-mesh")]
+    // with `--features kotoba-mesh` (legacy alias: clj-mesh).
+    #[cfg(any(feature = "kotoba-mesh", feature = "clj-mesh"))]
     let app = app
         .route(
             &format!("/xrpc/{}", mesh_xrpc::NSID_MESH_COMPILE),

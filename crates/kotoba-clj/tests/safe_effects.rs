@@ -3,7 +3,7 @@
 //! the row omits, and may not declare an unknown effect. Annotations are
 //! opt-in; un-annotated code is unaffected (still capability-gated).
 
-use kotoba_clj::{compile_safe_clj, infer_effects, CljError, Policy};
+use kotoba_clj::{compile_safe_kotoba, infer_effects, CljError, Policy};
 
 fn assert_effect_denied(res: Result<Vec<u8>, CljError>) {
     match res {
@@ -18,7 +18,7 @@ fn is_wasm(b: &[u8]) -> bool {
 
 #[test]
 fn pure_declaration_on_pure_body_compiles() {
-    let wasm = compile_safe_clj("(defn run {:effects #{}} [n] (* n n))", &Policy::deny_all())
+    let wasm = compile_safe_kotoba("(defn run {:effects #{}} [n] (* n n))", &Policy::deny_all())
         .expect("a truly pure function may declare no effects");
     assert!(is_wasm(&wasm));
 }
@@ -28,7 +28,7 @@ fn under_declaration_is_rejected() {
     // Declares pure, but writes the graph → effect-soundness violation. This
     // fires regardless of capability grant (the effect gate runs first).
     let src = r#"(defn run {:effects #{}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    assert_effect_denied(compile_safe_clj(
+    assert_effect_denied(compile_safe_kotoba(
         src,
         &Policy::deny_all().grant_graph_write(["kg"]),
     ));
@@ -39,7 +39,7 @@ fn matching_declaration_compiles_when_granted() {
     // Declares graph-write, uses graph-write, and the policy grants it.
     let src = r#"(defn run {:effects #{:graph-write}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
-    let wasm = compile_safe_clj(src, &policy).expect("declared+used+granted must compile");
+    let wasm = compile_safe_kotoba(src, &policy).expect("declared+used+granted must compile");
     assert!(is_wasm(&wasm));
 }
 
@@ -48,7 +48,7 @@ fn declaration_still_subject_to_capability_gate() {
     // Honest declaration, but the capability is NOT granted → Policy denial.
     // (Effect soundness passes; capability confinement still bites.)
     let src = r#"(defn run {:effects #{:graph-write}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
-    match compile_safe_clj(src, &Policy::deny_all()) {
+    match compile_safe_kotoba(src, &Policy::deny_all()) {
         Err(CljError::Policy(_)) => {}
         other => panic!("expected Policy denial, got {other:?}"),
     }
@@ -61,21 +61,21 @@ fn over_declaration_is_allowed() {
     let src =
         r#"(defn run {:effects #{:graph-write :infer :auth}} [] (kqe-assert! "kg" "a" "p" "v"))"#;
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
-    assert!(compile_safe_clj(src, &policy).is_ok());
+    assert!(compile_safe_kotoba(src, &policy).is_ok());
 }
 
 #[test]
 fn unknown_effect_name_is_rejected() {
     // Typo / non-existent effect → rejected (vocabulary guard).
     let src = "(defn run {:effects #{:graphwrite}} [n] n)";
-    assert_effect_denied(compile_safe_clj(src, &Policy::deny_all()));
+    assert_effect_denied(compile_safe_kotoba(src, &Policy::deny_all()));
 }
 
 #[test]
 fn read_declared_as_write_is_under_declaration() {
     // Uses graph-read but declares only graph-write → read is undeclared.
     let src = r#"(defn run {:effects #{:graph-write}} [] (kqe-query "kg/role"))"#;
-    assert_effect_denied(compile_safe_clj(
+    assert_effect_denied(compile_safe_kotoba(
         src,
         &Policy::deny_all()
             .grant_graph_read(["kg"])
@@ -88,7 +88,7 @@ fn unannotated_function_is_not_effect_checked() {
     // No :effects row → effect gate is skipped; capability gate still applies.
     let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
-    assert!(compile_safe_clj(src, &policy).is_ok());
+    assert!(compile_safe_kotoba(src, &policy).is_ok());
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn multiple_effects_all_must_be_declared() {
     let policy = Policy::deny_all()
         .grant_graph_write(["kg"])
         .grant_infer(["m"]);
-    assert_effect_denied(compile_safe_clj(src, &policy));
+    assert_effect_denied(compile_safe_kotoba(src, &policy));
 
     // Declaring both → compiles (and both grants present).
     let src_ok = r#"
@@ -110,7 +110,7 @@ fn multiple_effects_all_must_be_declared() {
           (do (kqe-assert! "kg" "a" "p" "v")
               (llm-infer "m" "x")))
     "#;
-    assert!(compile_safe_clj(src_ok, &policy).is_ok());
+    assert!(compile_safe_kotoba(src_ok, &policy).is_ok());
 }
 
 // ── interprocedural effect propagation (effects can't hide behind a helper) ─
@@ -122,7 +122,7 @@ fn transitive_effect_through_helper_is_caught() {
         (defn helper [] (kqe-assert! "kg" "a" "p" "v"))
         (defn run {:effects #{}} [] (helper))
     "#;
-    assert_effect_denied(compile_safe_clj(
+    assert_effect_denied(compile_safe_kotoba(
         src,
         &Policy::deny_all().grant_graph_write(["kg"]),
     ));
@@ -136,7 +136,7 @@ fn transitive_effect_declared_compiles() {
         (defn run {:effects #{:graph-write}} [] (helper))
     "#;
     let policy = Policy::deny_all().grant_graph_write(["kg"]);
-    assert!(compile_safe_clj(src, &policy).is_ok());
+    assert!(compile_safe_kotoba(src, &policy).is_ok());
 }
 
 #[test]
@@ -147,7 +147,7 @@ fn two_hop_transitive_effect_is_caught() {
         (defn mid  [] (leaf))
         (defn run {:effects #{}} [] (mid))
     "#;
-    assert_effect_denied(compile_safe_clj(
+    assert_effect_denied(compile_safe_kotoba(
         src,
         &Policy::deny_all().grant_graph_write(["kg"]),
     ));
@@ -160,7 +160,7 @@ fn pure_helper_adds_no_effect() {
         (defn double [n] (* n 2))
         (defn run {:effects #{}} [n] (double n))
     "#;
-    assert!(compile_safe_clj(src, &Policy::deny_all()).is_ok());
+    assert!(compile_safe_kotoba(src, &Policy::deny_all()).is_ok());
 }
 
 #[test]
@@ -173,7 +173,7 @@ fn mutual_recursion_converges_and_propagates() {
         (defn pong [n] (do (kqe-assert! "kg" "a" "p" "v") (ping (- n 1))))
         (defn run {:effects #{}} [n] (ping n))
     "#;
-    assert_effect_denied(compile_safe_clj(
+    assert_effect_denied(compile_safe_kotoba(
         src,
         &Policy::deny_all().grant_graph_write(["kg"]),
     ));

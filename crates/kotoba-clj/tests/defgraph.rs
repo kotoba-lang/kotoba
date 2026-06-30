@@ -183,7 +183,7 @@ mod live {
         let exec = WasmExecutor::with_inference(GAS, engine).expect("executor");
         let out = exec
             .execute(
-                "clj-defgraph-agent",
+                "kotoba-defgraph-agent",
                 &agent_component(),
                 "did:key:z6MkTestAgent",
                 cbor_map(&[("prompt", "hello")]),

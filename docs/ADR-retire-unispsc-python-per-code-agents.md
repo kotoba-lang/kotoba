@@ -1,4 +1,4 @@
-# ADR — Retire the per-code UNSPSC Python agents (superseded by the clj `unspsc` actor)
+# ADR — Retire the per-code UNSPSC Python agents (superseded by the Kotoba `unspsc` actor)
 
 - Status: Accepted (staged execution in progress)
 - Date: 2026-06-17
@@ -15,7 +15,7 @@ LangGraph agent file per commodity code** under
 `langgraph_graphs/dynamic_runner.py` (and the `unispsc_organism` / `xrpc.unispsc`
 loaders) via `importlib.import_module(f"...c{code}")`.
 
-This whole surface is now superseded by the Clojure actor
+This whole surface is now superseded by the Kotoba actor
 `com-junkawasaki/orgs/etzhayyim/root/20-actors/unspsc` (already merged to
 `etzhayyim/root@main`, commit `ce26a8dd6b`): **one framework + one data table**
 (`resources/unspsc-taxonomy.edn`, 18,342 codes) on the `com-junkawasaki/kotodama`
@@ -48,7 +48,7 @@ except ImportError:
 
 Deleting all `c*.py` therefore degrades every code to `no_custom_agent_found`
 without breaking imports or the loaders — exactly the intended end state (bespoke
-Python agents replaced by the clj actor). Step 1 is the bulk (18,343 files) and is
+Python agents replaced by the Kotoba actor). Step 1 is the bulk (18,343 files) and is
 fully reversible on a branch.
 
 ## Staged plan
@@ -73,7 +73,7 @@ fully reversible on a branch.
 ## Consequences
 
 - ~1.23M LOC removed in Step 1 alone; repo clone/index materially lighter.
-- Single source of truth for UNSPSC becomes the clj actor's data table.
+- Single source of truth for UNSPSC becomes the Kotoba actor's data table.
 - Runtime behaviour for UNSPSC commodity execution is unchanged after Step 1
   (already `no_custom_agent_found` for codes without a bespoke agent; now uniform).
 - Layers B–C are a real refactor (8 core modules + 15 tests) and are sequenced

@@ -1,4 +1,4 @@
-//! Step 3: Clojure source → WASM **Component** (`run: func(list<u8>) -> list<u8>`)
+//! Step 3: Kotoba source → WASM **Component** (`run: func(list<u8>) -> list<u8>`)
 //! → instantiated and invoked through `wasmtime::component`.
 //!
 //! Proves the Canonical-ABI `list<u8>` lift/lower path end-to-end — the same

@@ -16,7 +16,7 @@ use crate::manifest::AppManifest;
 /// (and, if set, object == `value`) is asserted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeltaTrigger {
-    /// Component key (artifact CID when known, else `clj:<name>`).
+    /// Component key (artifact CID when known, else `kotoba:<name>`).
     pub component: String,
     pub predicate: String,
     /// Optional object-value filter; `None` matches any value.
@@ -31,12 +31,15 @@ impl DeltaTrigger {
 }
 
 /// Collect every `datom-delta` trigger declared in an app's components, keyed by
-/// the same component key the reconciler uses (cid, else `clj:<name>`).
+/// the same component key the reconciler uses (cid, else `kotoba:<name>`).
 /// Triggers missing a `:predicate` are skipped (nothing to match on).
 pub fn delta_triggers(app: &AppManifest) -> Vec<DeltaTrigger> {
     let mut out = Vec::new();
     for c in &app.components {
-        let key = c.cid.clone().unwrap_or_else(|| format!("clj:{}", c.name));
+        let key = c
+            .cid
+            .clone()
+            .unwrap_or_else(|| format!("kotoba:{}", c.name));
         for t in &c.triggers {
             if t.kind == "datom-delta" {
                 if let Some(predicate) = &t.predicate {
@@ -152,10 +155,10 @@ mod tests {
     fn uses_name_placeholder_when_no_cid() {
         let app = AppManifest::from_edn(
             r#"{:kotoba.app/name "a" :kotoba.app/components
-                [{:name "c" :src "c.clj" :triggers [{:type :datom-delta :predicate "p"}]}]}"#,
+                [{:name "c" :src "c.kotoba" :triggers [{:type :datom-delta :predicate "p"}]}]}"#,
         )
         .unwrap();
         let t = delta_triggers(&app);
-        assert_eq!(t[0].component, "clj:c");
+        assert_eq!(t[0].component, "kotoba:c");
     }
 }

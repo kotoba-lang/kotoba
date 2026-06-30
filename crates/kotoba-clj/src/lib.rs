@@ -1,9 +1,14 @@
-//! # kotoba-clj — Clojure-subset → WebAssembly compiler
+//! # kotoba-clj — Kotoba-subset → WebAssembly compiler
 //!
-//! `kotoba-clj` reads a Clojure/EDN-subset source program (via the SSoT EDN
+//! `kotoba-clj` reads a Kotoba/EDN-subset source program (via the SSoT EDN
 //! reader, [`kotoba_edn`]) and **compiles it to real WebAssembly bytes**. The
-//! Clojure source literally becomes a wasm module — this is a compiler, not an
+//! Kotoba source literally becomes a wasm module — this is a compiler, not an
 //! embedded interpreter.
+//!
+//! New Rust integrations should use the Kotoba-primary safe APIs such as
+//! [`compile_safe_kotoba`] and [`compile_safe_kotoba_with_prelude`]. The
+//! historical `compile_safe_clj*` names remain available as compatibility
+//! aliases.
 //!
 //! ```
 //! let src = r#"
@@ -89,7 +94,7 @@
 //!
 //! ## Roadmap to the kotoba:kais binding
 //!
-//! Making compiled Clojure load in `kotoba-runtime` means satisfying the
+//! Making compiled Kotoba load in `kotoba-runtime` means satisfying the
 //! `kotoba-node` world's `run(ctx-cbor: list<u8>) -> result<list<u8>, string>`
 //! export — which requires linear memory, an allocator, and byte/string values
 //! *in the language*. So the dependency order is:
@@ -109,11 +114,11 @@
 //!    runtime's own `WasmExecutor` (binding all `kotoba:kais` host imports)
 //!    instantiates it and invokes `run(ctx)` end-to-end, lifting the result.
 //!
-//! Steps 1–3 and 5 are implemented: a Clojure program compiles to a Component
+//! Steps 1–3 and 5 are implemented: a Kotoba/EDN profile program compiles to a Component
 //! that **runs on kotoba-runtime's `WasmExecutor`**. The one boundary left is
 //! step 4 — the wrapper passes raw `ctx-cbor` to the program undecoded, so a
 //! program that *meaningfully reads* `ctx`/`args` needs the language to grow
-//! loops + byte-building (CBOR decode). See `docs/ADR-clojure-wasm.md`.
+//! loops + byte-building (CBOR decode). See `docs/ADR-kotoba-wasm.md`.
 
 pub mod ast;
 #[cfg(feature = "cli")]
@@ -126,6 +131,8 @@ pub mod effects;
 pub mod policy;
 #[cfg(feature = "run")]
 pub mod run;
+#[cfg(feature = "component")]
+pub mod selfhost;
 pub mod subset;
 pub mod ty;
 pub mod ty_infer;
@@ -153,14 +160,14 @@ pub enum CljError {
     /// The emitted module failed to instantiate or trapped at run time.
     #[error("runtime error: {0}")]
     Run(String),
-    /// A `compile_safe_clj` build was rejected by its capability [`policy::Policy`]:
+    /// A `compile_safe_kotoba` build was rejected by its capability [`policy::Policy`]:
     /// the program requested a host capability the policy does not grant, or the
     /// policy's resource quotas are invalid. This is the deny-by-default gate of
     /// kotoba's capability-confinement design (see
     /// `docs/ADR-safe-capability-language.md`).
     #[error("policy error: {0}")]
     Policy(String),
-    /// A `compile_safe_clj` build used a language construct outside the safe
+    /// A `compile_safe_kotoba` build used a language construct outside the safe
     /// subset (e.g. `eval`, runtime `require`, dynamic-var mutation, reflection,
     /// or a user-defined `defmacro`). The legacy path silently ignores these;
     /// safe mode rejects them, because silent acceptance of `eval`/`require`/etc.
@@ -169,13 +176,13 @@ pub enum CljError {
     /// [`CljError::Policy`] gate for *capabilities*.
     #[error("subset error: {0}")]
     Subset(String),
-    /// A `compile_safe_clj` build violated **effect soundness** (theorem T2): a
+    /// A `compile_safe_kotoba` build violated **effect soundness** (theorem T2): a
     /// function performs an effect outside its declared `{:effects #{…}}` row,
     /// or declared an unknown effect. See `docs/ADR-safe-capability-language.md`
     /// §5 and [`effects`].
     #[error("effect error: {0}")]
     Effect(String),
-    /// A `compile_safe_clj` build had a statically-detectable type error — e.g.
+    /// A `compile_safe_kotoba` build had a statically-detectable type error — e.g.
     /// a numeric operator applied to a string/keyword literal, which the i64
     /// value model would silently miscompile. The first slice of static typing
     /// (S1b); see [`ty`].
@@ -183,12 +190,12 @@ pub enum CljError {
     Type(String),
 }
 
-/// Compile Clojure-subset source text into WebAssembly bytes.
+/// Compile Kotoba/EDN-subset source text into WebAssembly bytes.
 pub fn compile_str(src: &str) -> Result<Vec<u8>, CljError> {
     compile_str_with_reader_target(src, ReaderTarget::Kotoba)
 }
 
-/// Compile source text after applying Clojure reader compatibility for `target`.
+/// Compile source text after applying Kotoba/Clojure-family reader compatibility for `target`.
 pub fn compile_str_with_reader_target(
     src: &str,
     target: ReaderTarget,
@@ -198,7 +205,28 @@ pub fn compile_str_with_reader_target(
     codegen::compile(&program)
 }
 
-/// Compile safe-clj source against a capability [`Policy`] — the
+/// Wrap a single Kotoba expression as an exported `main` function.
+///
+/// This is the source transformation used by `kotoba-clj -e`: it is
+/// compile-and-run sugar, not runtime `eval`.
+pub fn inline_expr_source(expr: &str) -> String {
+    format!("(defn main [] {expr})")
+}
+
+/// Compile a single Kotoba expression into WebAssembly bytes.
+pub fn compile_expr(expr: &str) -> Result<Vec<u8>, CljError> {
+    compile_expr_with_reader_target(expr, ReaderTarget::Kotoba)
+}
+
+/// Compile a single Kotoba expression with a specific reader target.
+pub fn compile_expr_with_reader_target(
+    expr: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    compile_str_with_reader_target(&inline_expr_source(expr), target)
+}
+
+/// Compile safe Kotoba source against a capability [`Policy`] — the
 /// deny-by-default, capability-confined entry point (phase **S0** of
 /// `docs/ADR-safe-capability-language.md`).
 ///
@@ -210,40 +238,200 @@ pub fn compile_str_with_reader_target(
 /// quotas are validated too (no gasless execution).
 ///
 /// ```
-/// use kotoba_clj::{compile_safe_clj, Policy};
+/// use kotoba_clj::{compile_safe_kotoba, Policy};
 ///
 /// // Pure program + deny-all policy → compiles (no capability needed).
-/// let wasm = compile_safe_clj("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
+/// let wasm = compile_safe_kotoba("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
 /// assert!(wasm.starts_with(b"\0asm"));
 ///
 /// // Touching the graph without a grant → rejected.
-/// let denied = compile_safe_clj(
+/// let denied = compile_safe_kotoba(
 ///     "(defn run [g] (kqe-assert! g \"s\" \"p\" g))",
 ///     &Policy::deny_all(),
 /// );
 /// assert!(matches!(denied, Err(kotoba_clj::CljError::Policy(_))));
 /// ```
-pub fn compile_safe_clj(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
-    safe_compile(src, policy, false)
+/// Compile safe Kotoba source through the capability/subset/effect gate.
+pub fn compile_safe_kotoba(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba_with_reader_target(src, ReaderTarget::Kotoba, policy)
 }
 
-/// Like [`compile_safe_clj`] but prepends the safe **container/CBOR prelude**.
+/// Compatibility alias for [`compile_safe_kotoba`].
+pub fn compile_safe_clj(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba(src, policy)
+}
+
+/// Compile safe Kotoba source with a specific reader target.
+///
+/// With the default `component` feature this routes through the Kotoba
+/// self-hosted analyzer first, then uses Rust only as the bootstrap Wasm emitter.
+pub fn compile_safe_kotoba_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    #[cfg(feature = "component")]
+    {
+        selfhost::Analyzer::new()?.compile_safe_kotoba_with_reader_target(src, target, policy)
+    }
+    #[cfg(not(feature = "component"))]
+    {
+        rust_safe_compile(src, target, policy, false)
+    }
+}
+
+/// Compatibility alias for [`compile_safe_kotoba_with_reader_target`].
+pub fn compile_safe_clj_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba_with_reader_target(src, target, policy)
+}
+
+/// Like [`compile_safe_kotoba`] but prepends the safe **container/CBOR prelude**.
 ///
 /// The prelude is *policy-aware*: the `kqe` accessor layer ([`KQE_PRELUDE`]),
 /// which references graph-read host imports, is only linked in when the policy
 /// grants `:graph-read`. A deny-all policy therefore yields the pure container
 /// substrate with **no host imports at all** — confinement is preserved even
 /// with the prelude.
-pub fn compile_safe_clj_with_prelude(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
-    safe_compile(src, policy, true)
+pub fn compile_safe_kotoba_with_prelude(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba_with_prelude_and_reader_target(src, ReaderTarget::Kotoba, policy)
 }
 
-/// Shared body of the safe-clj entry points: validate quotas, assemble the
-/// (policy-aware) source, parse, gate the capability surface, then emit.
-fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8>, CljError> {
+/// Compatibility alias for [`compile_safe_kotoba_with_prelude`].
+pub fn compile_safe_clj_with_prelude(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba_with_prelude(src, policy)
+}
+
+/// Compile safe Kotoba source with the policy-aware prelude and a specific reader
+/// target.
+pub fn compile_safe_kotoba_with_prelude_and_reader_target(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    #[cfg(feature = "component")]
+    {
+        selfhost::Analyzer::new()?
+            .compile_safe_kotoba_with_prelude_and_reader_target(src, target, policy)
+    }
+    #[cfg(not(feature = "component"))]
+    {
+        rust_safe_compile(src, target, policy, true)
+    }
+}
+
+/// Compatibility alias for [`compile_safe_kotoba_with_prelude_and_reader_target`].
+pub fn compile_safe_clj_with_prelude_and_reader_target(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba_with_prelude_and_reader_target(src, target, policy)
+}
+
+/// Bootstrap-only safe compiler used to build the self-hosted analyzer itself.
+///
+/// Normal callers should use [`compile_safe_kotoba`], which routes through the
+/// Kotoba self-hosted analyzer when the `component` feature is enabled.
+#[doc(hidden)]
+pub fn compile_safe_kotoba_bootstrap(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    rust_safe_compile(src, ReaderTarget::Kotoba, policy, false)
+}
+
+/// Compatibility alias for [`compile_safe_kotoba_bootstrap`].
+#[doc(hidden)]
+pub fn compile_safe_clj_bootstrap(src: &str, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba_bootstrap(src, policy)
+}
+
+/// Bootstrap-only safe Kotoba compiler with the policy-aware prelude.
+#[doc(hidden)]
+pub fn compile_safe_kotoba_with_prelude_bootstrap(
+    src: &str,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    rust_safe_compile(src, ReaderTarget::Kotoba, policy, true)
+}
+
+/// Compatibility alias for [`compile_safe_kotoba_with_prelude_bootstrap`].
+#[doc(hidden)]
+pub fn compile_safe_clj_with_prelude_bootstrap(
+    src: &str,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    compile_safe_kotoba_with_prelude_bootstrap(src, policy)
+}
+
+/// Compile a `.kotoba` / `.clj` / `.cljc` / `.cljs` source file through the
+/// safe Kotoba gate.
+pub fn compile_safe_file(path: impl AsRef<Path>, policy: &Policy) -> Result<Vec<u8>, CljError> {
+    compile_safe_file_with_reader_target(path, ReaderTarget::Kotoba, policy)
+}
+
+/// Compile a source file through safe Kotoba with a specific reader conditional
+/// target.
+pub fn compile_safe_file_with_reader_target(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    compile_safe_file_with_reader_target_and_source_paths(path, target, policy, &[])
+}
+
+/// Compile a source file through safe Kotoba with reader target and source paths.
+pub fn compile_safe_file_with_reader_target_and_source_paths(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+    policy: &Policy,
+    source_paths: &[std::path::PathBuf],
+) -> Result<Vec<u8>, CljError> {
+    let src = compat::load_file_graph_with_source_paths(path.as_ref(), target, source_paths)?;
+    compile_safe_kotoba_with_reader_target(&src, target, policy)
+}
+
+/// Compile a source file through safe Kotoba with the policy-aware prelude.
+pub fn compile_safe_file_with_prelude(
+    path: impl AsRef<Path>,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    compile_safe_file_with_prelude_and_reader_target(path, ReaderTarget::Kotoba, policy)
+}
+
+/// Compile a source file through safe Kotoba with prelude and reader target.
+pub fn compile_safe_file_with_prelude_and_reader_target(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<u8>, CljError> {
+    compile_safe_file_with_prelude_reader_target_and_source_paths(path, target, policy, &[])
+}
+
+/// Compile a source file through safe Kotoba with prelude, reader target, and source
+/// paths.
+pub fn compile_safe_file_with_prelude_reader_target_and_source_paths(
+    path: impl AsRef<Path>,
+    target: ReaderTarget,
+    policy: &Policy,
+    source_paths: &[std::path::PathBuf],
+) -> Result<Vec<u8>, CljError> {
+    let src = compat::load_file_graph_with_source_paths(path.as_ref(), target, source_paths)?;
+    compile_safe_kotoba_with_prelude_and_reader_target(&src, target, policy)
+}
+
+/// Rust bootstrap fallback for safe Kotoba entry points when the self-hosted
+/// analyzer component is not available in this build.
+fn rust_safe_compile(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+    with_prelude: bool,
+) -> Result<Vec<u8>, CljError> {
     policy.validate_limits()?;
 
-    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    let normalized = compat::normalize_source(src, target)?;
 
     // Safe-subset gate (deny-by-default for language features). Runs on the
     // *user* source only — the trusted prelude is exempt. Catches forms the
@@ -309,14 +497,14 @@ fn safe_compile(src: &str, policy: &Policy, with_prelude: bool) -> Result<Vec<u8
 /// observable side of the Capability Confinement property (ADR §7, T3).
 ///
 /// ```
-/// use kotoba_clj::{compile_safe_clj, embedded_capability_ifaces, Policy};
+/// use kotoba_clj::{compile_safe_kotoba, embedded_capability_ifaces, Policy};
 ///
-/// let pure = compile_safe_clj("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
+/// let pure = compile_safe_kotoba("(defn run [n] (* n n))", &Policy::deny_all()).unwrap();
 /// assert!(embedded_capability_ifaces(&pure).is_empty());
 ///
 /// let src = r#"(defn run [] (kqe-assert! "kg" "a" "p" "v"))"#;
 /// let policy = Policy::deny_all().grant_graph_write(["kg"]);
-/// let wasm = compile_safe_clj(src, &policy).unwrap();
+/// let wasm = compile_safe_kotoba(src, &policy).unwrap();
 /// assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
 /// ```
 pub fn embedded_capability_ifaces(wasm: &[u8]) -> Vec<&'static str> {
@@ -338,7 +526,7 @@ pub fn embedded_capability_ifaces(wasm: &[u8]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Infer the **transitive effect set** of every function in safe-clj `src` —
+/// Infer the **transitive effect set** of every function in safe Kotoba `src` —
 /// what each `defn` actually does (`graph-read` / `graph-write` / `infer` /
 /// `auth`), closing the call graph to a fixpoint so effects routed through
 /// helpers are attributed to their callers.
@@ -362,12 +550,48 @@ pub fn embedded_capability_ifaces(wasm: &[u8]) -> Vec<&'static str> {
 pub fn infer_effects(
     src: &str,
 ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, CljError> {
-    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    infer_effects_with_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Infer effects with a specific reader target.
+///
+/// With the default `component` feature this routes through the bundled
+/// Kotoba self-hosted analyzer. Rust remains the bootstrap fallback for
+/// builds without component support.
+pub fn infer_effects_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, CljError> {
+    #[cfg(feature = "component")]
+    {
+        selfhost::Analyzer::new()?.infer_effects_with_reader_target(src, target)
+    }
+    #[cfg(not(feature = "component"))]
+    {
+        infer_effects_bootstrap_with_reader_target(src, target)
+    }
+}
+
+/// Bootstrap-only Rust effect inference used as the parity oracle and fallback.
+#[doc(hidden)]
+pub fn infer_effects_bootstrap(
+    src: &str,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, CljError> {
+    infer_effects_bootstrap_with_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Bootstrap-only Rust effect inference with a specific reader target.
+#[doc(hidden)]
+pub fn infer_effects_bootstrap_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, CljError> {
+    let normalized = compat::normalize_source(src, target)?;
     let forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
     Ok(effects::infer_effects(&forms))
 }
 
-/// Synthesize the **minimal least-privilege [`Policy`]** that lets safe-clj
+/// Synthesize the **minimal least-privilege [`Policy`]** that lets safe Kotoba
 /// `src` compile — it grants exactly the resources the code targets and nothing
 /// more. The inverse of the capability gate: instead of "does this cell fit
 /// this policy?", it answers "what is the least policy this cell needs?".
@@ -380,18 +604,53 @@ pub fn infer_effects(
 /// let src = r#"(defn run [] (kqe-assert! "graphA" "s" "p" "v"))"#;
 /// let policy = kotoba_clj::minimal_policy(src).unwrap();
 /// // sufficient by construction:
-/// assert!(kotoba_clj::compile_safe_clj(src, &policy).is_ok());
+/// assert!(kotoba_clj::compile_safe_kotoba(src, &policy).is_ok());
 /// // and least-privilege: it grants only graphA write, nothing else.
 /// assert!(policy.graph_write.contains("graphA"));
 /// assert!(policy.infer.is_empty() && !policy.auth);
 /// ```
 pub fn minimal_policy(src: &str) -> Result<Policy, CljError> {
-    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    minimal_policy_with_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Synthesize the minimal policy with a specific reader target.
+///
+/// With the default `component` feature this routes through the bundled
+/// Kotoba self-hosted analyzer. Rust remains the bootstrap fallback for
+/// builds without component support.
+pub fn minimal_policy_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<Policy, CljError> {
+    #[cfg(feature = "component")]
+    {
+        selfhost::Analyzer::new()?.minimal_policy_with_reader_target(src, target)
+    }
+    #[cfg(not(feature = "component"))]
+    {
+        minimal_policy_bootstrap_with_reader_target(src, target)
+    }
+}
+
+/// Bootstrap-only Rust minimal-policy synthesis used as the parity oracle and
+/// fallback.
+#[doc(hidden)]
+pub fn minimal_policy_bootstrap(src: &str) -> Result<Policy, CljError> {
+    minimal_policy_bootstrap_with_reader_target(src, ReaderTarget::Kotoba)
+}
+
+/// Bootstrap-only Rust minimal-policy synthesis with a specific reader target.
+#[doc(hidden)]
+pub fn minimal_policy_bootstrap_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+) -> Result<Policy, CljError> {
+    let normalized = compat::normalize_source(src, target)?;
     let forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
     Ok(policy::infer_minimal(&forms))
 }
 
-/// Report `policy`'s **over-grants** relative to safe-clj `src` — capabilities
+/// Report `policy`'s **over-grants** relative to safe Kotoba `src` — capabilities
 /// it grants that the cell never uses. The least-privilege linter (complement of
 /// [`minimal_policy`]); an empty result means `policy` is already minimal for
 /// this cell. See [`Policy::unused_grants`].
@@ -406,7 +665,43 @@ pub fn minimal_policy(src: &str) -> Result<Policy, CljError> {
 /// assert_eq!(unused.len(), 2); // gB write + infer
 /// ```
 pub fn unused_grants(src: &str, policy: &Policy) -> Result<Vec<String>, CljError> {
-    let normalized = compat::normalize_source(src, ReaderTarget::Kotoba)?;
+    unused_grants_with_reader_target(src, ReaderTarget::Kotoba, policy)
+}
+
+/// Report policy over-grants with a specific reader target.
+///
+/// With the default `component` feature this routes through the bundled
+/// Kotoba self-hosted analyzer. Rust remains the bootstrap fallback for
+/// builds without component support.
+pub fn unused_grants_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<String>, CljError> {
+    #[cfg(feature = "component")]
+    {
+        selfhost::Analyzer::new()?.unused_grants_with_reader_target(src, target, policy)
+    }
+    #[cfg(not(feature = "component"))]
+    {
+        unused_grants_bootstrap_with_reader_target(src, target, policy)
+    }
+}
+
+/// Bootstrap-only Rust over-grant lint used as the parity oracle and fallback.
+#[doc(hidden)]
+pub fn unused_grants_bootstrap(src: &str, policy: &Policy) -> Result<Vec<String>, CljError> {
+    unused_grants_bootstrap_with_reader_target(src, ReaderTarget::Kotoba, policy)
+}
+
+/// Bootstrap-only Rust over-grant lint with a specific reader target.
+#[doc(hidden)]
+pub fn unused_grants_bootstrap_with_reader_target(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+) -> Result<Vec<String>, CljError> {
+    let normalized = compat::normalize_source(src, target)?;
     let forms = kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
     Ok(policy.unused_grants(&forms))
 }
@@ -426,7 +721,7 @@ fn safe_prelude(policy: &Policy) -> String {
 
 /// Compile a `.kotoba` / `.clj` / `.cljc` / `.cljs` source file into WebAssembly bytes.
 ///
-/// A leading Unix shebang (`#!...`) is stripped before the EDN/Clojure reader
+/// A leading Unix shebang (`#!...`) is stripped before the EDN reader
 /// sees the source, so executable scripts can start with:
 ///
 /// ```text
@@ -1048,7 +1343,7 @@ pub const PRELUDE: &str = r#"
               (recur (+ i 1))))))))
 "#;
 
-/// An **in-guest CBOR decoder** (subset) written in the kotoba-clj language,
+/// An **in-guest CBOR decoder** (subset) written in Kotoba,
 /// closing the ADR's step-4 gap: a `kotoba-node` `run(ctx-cbor)` can now decode
 /// its `InvokeContext`/args instead of receiving them raw. Built on Stage-A
 /// `loop`/`recur` + `byte-at` and Stage-B `str-eq?` — no bitwise ops needed: a
@@ -1210,9 +1505,38 @@ pub fn compile_str_with_prelude_and_reader_target(
     )
 }
 
+/// Compile a single Kotoba expression with the standard prelude.
+pub fn compile_expr_with_prelude(expr: &str) -> Result<Vec<u8>, CljError> {
+    compile_expr_with_prelude_and_reader_target(expr, ReaderTarget::Kotoba)
+}
+
+/// Compile a single Kotoba expression with the standard prelude and reader target.
+pub fn compile_expr_with_prelude_and_reader_target(
+    expr: &str,
+    target: ReaderTarget,
+) -> Result<Vec<u8>, CljError> {
+    compile_str_with_prelude_and_reader_target(&inline_expr_source(expr), target)
+}
+
 /// The combined prelude text (containers + CBOR decode + CBOR encode + kqe
 /// accessors), for callers that compile via the component/kais path and need to
 /// prepend it to their own `(defn run …)`.
 pub fn prelude() -> String {
     format!("{PRELUDE}\n{CBOR_PRELUDE}\n{CBOR_ENC_PRELUDE}\n{KQE_PRELUDE}")
+}
+
+#[cfg(test)]
+mod inline_expr_tests {
+    use super::*;
+
+    #[test]
+    fn inline_expression_wraps_as_exported_main() {
+        assert_eq!(inline_expr_source("(* 6 7)"), "(defn main [] (* 6 7))");
+    }
+
+    #[test]
+    fn inline_expression_compiles_to_wasm() {
+        let wasm = compile_expr_with_prelude("(+ 1 2)").expect("compile inline expression");
+        assert!(wasm.starts_with(b"\0asm"));
+    }
 }

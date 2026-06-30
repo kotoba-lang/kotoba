@@ -20,7 +20,7 @@ fn host_dispatches_each_trigger_to_its_own_export() {
                (defn on-kse [t p] \"KSE\")";
     let comp = compile_kais_mesh_component_str(src, WIT).expect("compile kotoba-mesh component");
     let exec = WasmExecutor::new(GAS).expect("executor");
-    let cid = "clj-mesh-dispatch";
+    let cid = "kotoba-mesh-dispatch";
     let did = "did:key:zTestAgent";
     let q = Vec::<WitQuad>::new;
     let h = HashMap::<String, String>::new;
@@ -64,7 +64,7 @@ fn missing_trigger_export_errors_cleanly() {
     let comp = compile_kais_mesh_component_str("(ns m) (defn run [c] c)", WIT).expect("compile");
     let exec = WasmExecutor::new(GAS).expect("executor");
     let r = exec.execute_on_http(
-        "clj-runonly",
+        "kotoba-runonly",
         &comp,
         "did:key:z",
         b"req".to_vec(),

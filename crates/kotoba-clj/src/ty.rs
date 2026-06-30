@@ -1,4 +1,4 @@
-//! # Literal type checking (`compile_safe_clj` phase S1b, first slice)
+//! # Literal type checking (`compile_safe_kotoba` phase S1b, first slice)
 //!
 //! The scaffold for a typed HIR. The phase-1 value model is **i64-only**: a
 //! string/keyword is a packed `(offset << 32) | len` *handle*, not a number.
@@ -11,7 +11,7 @@
 //! variable could legitimately hold a number at runtime), so it never has false
 //! positives — the certain core a fuller [`Ty`]-based HIR will subsume.
 //!
-//! It runs only on safe-clj (`compile_safe_clj`); the legacy [`crate::compile_str`]
+//! It runs only on safe Kotoba (`compile_safe_kotoba`); the legacy [`crate::compile_str`]
 //! path keeps its permissive behaviour.
 
 use kotoba_edn::EdnValue;
@@ -21,8 +21,31 @@ use crate::CljError;
 /// Builtins whose every argument must be a number. A string/keyword literal in
 /// any of these positions is a type error.
 const NUMERIC_OPS: &[&str] = &[
-    "+", "-", "*", "/", "quot", "mod", "rem", "inc", "dec", "abs", "min", "max", "pos?", "neg?",
-    "zero?", "even?", "odd?",
+    "+",
+    "-",
+    "*",
+    "/",
+    "quot",
+    "mod",
+    "rem",
+    "inc",
+    "dec",
+    "abs",
+    "min",
+    "max",
+    "pos?",
+    "neg?",
+    "zero?",
+    "even?",
+    "odd?",
+    // Bitwise ops are integer-only; a string/keyword handle in one is the same
+    // silent handle-arithmetic bug as `(+ "a" 1)`. (The prelude packs handles in
+    // codegen, not via these, so user-level bit ops carry no false positives.)
+    "bit-and",
+    "bit-or",
+    "bit-xor",
+    "bit-shift-left",
+    "bit-shift-right",
 ];
 
 /// Ordered numeric comparisons. Their operands must be numbers — comparing a
@@ -61,7 +84,7 @@ fn check(v: &EdnValue) -> Result<(), CljError> {
                         if let Some(desc) = non_numeric_literal(arg) {
                             return Err(CljError::Type(format!(
                                 "numeric operator `{}` applied to {desc} — it is not a number. \
-                                 safe-clj rejects this: the i64 value model would compute on the \
+                                 safe Kotoba rejects this: the i64 value model would compute on the \
                                  string/keyword *handle*, silently (S1b literal type check). \
                                  Use a numeric value, or a string operator like `str-len`.",
                                 head.name
@@ -74,7 +97,7 @@ fn check(v: &EdnValue) -> Result<(), CljError> {
                         if let Some(desc) = non_numeric_literal(arg) {
                             return Err(CljError::Type(format!(
                                 "numeric comparison `{}` applied to {desc} — it is not a number. \
-                                 safe-clj rejects this: the i64 value model would order the \
+                                 safe Kotoba rejects this: the i64 value model would order the \
                                  string/keyword *handle* as an integer, silently (S1b literal \
                                  type check). Compare numbers, or use `str-eq?` for strings.",
                                 head.name
@@ -88,7 +111,7 @@ fn check(v: &EdnValue) -> Result<(), CljError> {
                     for divisor in items.iter().skip(2) {
                         if matches!(divisor, EdnValue::Integer(0)) {
                             return Err(CljError::Type(format!(
-                                "`{}` by a literal zero always traps at run time — safe-clj \
+                                "`{}` by a literal zero always traps at run time — safe Kotoba \
                                  rejects it statically (S1b). Guard the divisor, or use a \
                                  non-zero value.",
                                 head.name
@@ -100,7 +123,7 @@ fn check(v: &EdnValue) -> Result<(), CljError> {
                     if let Some(desc) = items.get(1).and_then(non_numeric_literal_num) {
                         return Err(CljError::Type(format!(
                             "string operator `{}` applied to {desc} as its string argument — \
-                             it is not a string. safe-clj rejects this: the i64 value model \
+                             it is not a string. safe Kotoba rejects this: the i64 value model \
                              would read the number as a string *handle* (garbage offset/len) \
                              (S1b literal type check). Pass a string.",
                             head.name
@@ -115,6 +138,37 @@ fn check(v: &EdnValue) -> Result<(), CljError> {
                             "`byte-at` index is {desc} — it must be a number (the i64 model \
                              would use the handle as a byte offset) (S1b literal type check)."
                         )));
+                    }
+                    // When both the string and the index are literals, an index
+                    // outside `0..len` is a guaranteed out-of-bounds read of the
+                    // module's linear memory (past the string's bytes, into the
+                    // adjacent heap). Reject it at compile time (T1 memory safety,
+                    // literal-only ⇒ no false positives).
+                    if let (Some(EdnValue::String(s)), Some(EdnValue::Integer(i))) =
+                        (items.get(1), items.get(2))
+                    {
+                        let len = s.len() as i64;
+                        if *i < 0 || *i >= len {
+                            return Err(CljError::Type(format!(
+                                "`byte-at` index `{i}` is out of bounds for the {len}-byte string \
+                                 literal {s:?} (valid `0..{len}`) — a guaranteed out-of-bounds \
+                                 read of linear memory. safe Kotoba rejects it statically (S1b / T1)."
+                            )));
+                        }
+                    }
+                }
+                if head.name == "bytes-alloc" {
+                    // A negative capacity is stored as a huge unsigned `cap`,
+                    // defeating `byte-append!`'s overflow guard; reject a literal
+                    // one statically (the runtime also traps on a negative cap).
+                    if let Some(EdnValue::Integer(i)) = items.get(1) {
+                        if *i < 0 {
+                            return Err(CljError::Type(format!(
+                                "`bytes-alloc` capacity `{i}` is negative — a buffer cannot have a \
+                                 negative size, and the i64 model would store it as a huge \
+                                 capacity. safe Kotoba rejects it statically (S1b / T1)."
+                            )));
+                        }
                     }
                 }
             }

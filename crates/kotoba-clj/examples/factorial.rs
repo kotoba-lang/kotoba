@@ -1,10 +1,10 @@
-//! Compile a Clojure-subset program to wasm and run it.
+//! Compile a Kotoba-subset program to wasm and run it.
 //!
 //! Run with: `cargo run -p kotoba-clj --example factorial`
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let src = r#"
-        ;; Clojure source — compiled to a real wasm module, not interpreted.
+        ;; Kotoba source — compiled to a real wasm module, not interpreted.
         (defn fact [n]
           (if (< n 2)
             1

@@ -1,9 +1,9 @@
-//! Step 5b: **live invoke** a Clojure-compiled `kotoba-node` component through
+//! Step 5b: **live invoke** a Kotoba-compiled `kotoba-node` component through
 //! kotoba-runtime's real host (`WasmExecutor`), which binds every `kotoba:kais`
 //! interface, instantiates the component, calls `run(ctx-cbor)`, and lifts the
 //! `result<list<u8>, string>` return.
 //!
-//! This is the end-to-end proof that compiled Clojure runs on kotoba-runtime —
+//! This is the end-to-end proof that compiled Kotoba runs on kotoba-runtime —
 //! and the true test of the hand-emitted Canonical-ABI variant return layout
 //! (`[tag:u8=0 @0, ptr @4, len @8]`): if it were wrong, wasmtime's lift would
 //! trap or mis-read here, where `assert_loads` (compile-only) could not.
@@ -25,7 +25,7 @@ fn invoke(src: &str, ctx: &[u8]) -> Vec<u8> {
     let exec = WasmExecutor::new(GAS).expect("executor");
     let result = exec
         .execute(
-            "clj-test-program",
+            "kotoba-test-program",
             &component,
             "did:key:z6MkTestAgent",
             ctx.to_vec(),

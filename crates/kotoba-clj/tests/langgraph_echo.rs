@@ -1,7 +1,7 @@
-//! The **Clojure-WASM port of the componentize-py LangGraph echo agent**
-//! (`examples/kotoba-langgraph-echo-clj/agent.clj` ⇄
+//! The **Kotoba-WASM port of the componentize-py LangGraph echo agent**
+//! (`examples/kotoba-langgraph-echo-kotoba/agent.kotoba` ⇄
 //! `examples/kotoba-langgraph-echo/agent.py`) — the "Python LangGraph actor →
-//! Clojure WASM actor" migration path, proven end-to-end on the real host:
+//! Kotoba WASM actor" migration path, proven end-to-end on the real host:
 //!
 //!   - the agent source is the *example file itself* (`include_str!`), compiled
 //!     with the full prelude to a `kotoba-node` component;
@@ -22,20 +22,21 @@ use kotoba_runtime::{InvokeResult, WasmExecutor};
 
 const KAIS_WIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../kotoba-runtime/wit");
 const GAS: u64 = 10_000_000;
-const AGENT_DID: &str = "did:key:z6MkLanggraphEchoClj";
+const AGENT_DID: &str = "did:key:z6MkLanggraphEchoKotoba";
 
 /// The example agent source — the file under `examples/` IS what runs here.
-const AGENT_CLJ: &str = include_str!("../../../examples/kotoba-langgraph-echo-clj/agent.clj");
+const AGENT_KOTOBA: &str =
+    include_str!("../../../examples/kotoba-langgraph-echo-kotoba/agent.kotoba");
 
 fn agent_component() -> Vec<u8> {
-    let src = format!("{}\n{}", prelude(), AGENT_CLJ);
-    compile_kais_component_str(&src, KAIS_WIT_DIR).expect("compile agent.clj to kotoba-node")
+    let src = format!("{}\n{}", prelude(), AGENT_KOTOBA);
+    compile_kais_component_str(&src, KAIS_WIT_DIR).expect("compile agent.kotoba to kotoba-node")
 }
 
 fn invoke(ctx: Vec<u8>) -> InvokeResult {
     let exec = WasmExecutor::new(GAS).expect("executor");
     exec.execute(
-        "clj-langgraph-echo",
+        "kotoba-langgraph-echo",
         &agent_component(),
         AGENT_DID,
         ctx,
@@ -172,9 +173,9 @@ fn thread_id_defaults_to_session_cid() {
 #[test]
 fn component_is_orders_of_magnitude_smaller_than_componentize_py() {
     // The componentize-py build of the same agent is ~18 MB (bundled CPython).
-    // The kotoba-clj component must stay under 64 KiB.
+    // The Kotoba wasm component must stay under 64 KiB.
     let component = agent_component();
-    println!("kotoba-clj echo component: {} bytes", component.len());
+    println!("Kotoba wasm echo component: {} bytes", component.len());
     assert!(
         component.len() < 64 * 1024,
         "expected a tiny component, got {} bytes",

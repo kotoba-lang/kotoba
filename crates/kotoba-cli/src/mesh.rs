@@ -1,8 +1,9 @@
 //! `kotoba component` / `kotoba app` / `kotoba lattice` — KOTOBA Mesh CLI (M3).
 //!
 //! - `component build <file>` — compile a component source to a WASM component
-//!   and print its content-address (CID). Clojure (`.clj`) is the default
-//!   language (ADR §14); it compiles via `kotoba-clj` to the `kotoba-node` world.
+//!   and print its content-address (CID). `.kotoba` is the canonical Kotoba
+//!   source extension; `.clj` / `.cljc` / `.cljs` remain compatibility inputs.
+//!   Kotoba compiles to the `kotoba-node` world.
 //! - `app deploy <manifest.edn>` — parse the EDN manifest, compile every
 //!   component's `src` to a CID, and print the resolved content-addressed
 //!   desired state (the input the lattice reconciler converges on).
@@ -32,7 +33,7 @@ fn component_cid(wasm: &[u8]) -> String {
 pub enum ComponentCmd {
     /// Compile a component source file to a WASM component and print its CID.
     Build {
-        /// Source file (`.clj` = Clojure/default, `.rs`/`.py`/`.js` = opt-in).
+        /// Source file (`.kotoba` canonical; `.clj`/`.cljc`/`.cljs` compatibility).
         file: PathBuf,
         /// Path to the kotoba-node WIT dir.
         #[arg(long, env = "KOTOBA_WIT_DIR", default_value_t = default_wit_dir())]
@@ -81,19 +82,19 @@ fn compile_source(file: &Path, wit_dir: &str) -> Result<(Vec<u8>, Lang)> {
         // Mesh build path (M7): exports `run`, plus `on-http` when the guest
         // defines `(defn on-http [req] …)` — targeting the `kotoba-component`
         // world. Run-only guests fall back to the `kotoba-node` world, so
-        // existing components are unaffected. The kotoba-clj prelude (dynamic
+        // existing components are unaffected. The Kotoba prelude (dynamic
         // vector/map containers + CBOR encode/decode + kqe accessors) is
-        // prepended so guests can use those helpers — mirrors `kotoba-clj`'s
+        // prepended so guests can use those helpers — mirrors the compiler's
         // own build CLI; direct host-import builtins (kqe-assert!/kqe-query)
         // work with or without it.
-        Lang::Clojure => {
+        Lang::Kotoba => {
             let with_prelude = format!("{}\n{}", kotoba_clj::prelude(), src);
             kotoba_clj::component::compile_kais_mesh_component_str(&with_prelude, wit_dir)
-                .map_err(|e| anyhow!("kotoba-clj compile {}: {e:?}", path))?
+                .map_err(|e| anyhow!("Kotoba compile {}: {e:?}", path))?
         }
         other => bail!(
             "language {:?} not wired into `kotoba component build` yet — \
-             Clojure (.clj) is the default; build {:?} components with their \
+             Kotoba (.kotoba canonical, .clj/.cljc/.cljs compatibility) is the default; build {:?} components with their \
              native toolchain and reference the resulting CID in the manifest",
             other,
             other
@@ -297,8 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn compile_source_bails_on_non_clojure_language() {
-        // a .py source dispatches to Python and bails (only Clojure is wired)
+    fn compile_source_bails_on_non_kotoba_language() {
+        // a .py source dispatches to Python and bails (only Kotoba is wired)
         let p = std::env::temp_dir().join("kotoba_mesh_cli_test.py");
         std::fs::write(&p, b"print('hi')").unwrap();
         let r = compile_source(&p, "crates/kotoba-runtime/wit");
@@ -311,8 +312,24 @@ mod tests {
     }
 
     #[test]
+    fn non_kotoba_language_error_names_kotoba_canonical_and_clj_family_compat() {
+        let p = std::env::temp_dir().join("kotoba_mesh_cli_test.rs");
+        std::fs::write(&p, b"fn main() {}").unwrap();
+        let r = compile_source(&p, "crates/kotoba-runtime/wit");
+        let _ = std::fs::remove_file(&p);
+        let err = r.unwrap_err().to_string();
+
+        assert!(err.contains(".kotoba canonical"), "got: {err}");
+        assert!(err.contains(".clj/.cljc/.cljs compatibility"), "got: {err}");
+        assert!(!err.contains("Clojure default"), "got: {err}");
+    }
+
+    #[test]
     fn compile_source_reports_missing_file() {
-        let r = compile_source(Path::new("/no/such/reply.clj"), "crates/kotoba-runtime/wit");
+        let r = compile_source(
+            Path::new("/no/such/reply.kotoba"),
+            "crates/kotoba-runtime/wit",
+        );
         assert!(r.is_err(), "missing source must error, not panic");
     }
 }

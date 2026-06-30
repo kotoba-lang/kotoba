@@ -32,7 +32,7 @@
 //! String literals are laid out in an active data segment starting at
 //! `DATA_BASE`; the bump heap starts immediately above them. This is the
 //! linear-memory foundation that the future `list<u8>` Component export and
-//! CBOR `InvokeContext` decode will build on (see `docs/ADR-clojure-wasm.md`).
+//! CBOR `InvokeContext` decode will build on (see `docs/ADR-kotoba-wasm.md`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -64,7 +64,7 @@ pub fn compile(program: &Program) -> Result<Vec<u8>, CljError> {
 
 /// Like [`compile`], but caps the emitted linear memory's **maximum** at
 /// `max_pages` (64 KiB pages). The wasm engine then enforces the bound itself —
-/// `memory.grow` past it fails — so a safe-clj module physically cannot exceed
+/// `memory.grow` past it fails — so a safe Kotoba module physically cannot exceed
 /// its policy's `:memory-pages` budget, independent of any runtime
 /// `StoreLimits`. Errors if the module's static data already needs more than
 /// `max_pages`.
@@ -497,7 +497,7 @@ fn host_import_sig(imp: HostImport) -> (Vec<ValType>, Vec<ValType>) {
 /// The distinct host imports a program uses — i.e. its capability surface.
 ///
 /// This is the exact set [`crate::codegen::compile`] would emit into the wasm
-/// import section, so [`crate::compile_safe_clj`] gates *this* set against the
+/// import section, so [`crate::compile_safe_kotoba`] gates *this* set against the
 /// policy: anything denied never reaches the module bytes.
 pub fn used_host_imports(program: &Program) -> Vec<HostImport> {
     collect_host_imports(program)
@@ -1190,7 +1190,7 @@ fn compile_expr(cg: &mut FnCtx, expr: &Expr) -> Result<(), CljError> {
         Expr::Fn { .. } => {
             return Err(CljError::Codegen(
                 "internal error: `(fn …)` reached codegen un-lifted".into(),
-            ))
+            ));
         }
 
         // Read capture slot `n` from the current closure record. Local 0 is the
@@ -1557,10 +1557,33 @@ fn compile_builtin(cg: &mut FnCtx, op: Builtin, args: &[Expr]) -> Result<(), Clj
         }
         // byte = mem[(handle >>> 32) + i] as u8
         Builtin::ByteAt => {
-            compile_expr(cg, &args[0])?; // handle
+            // Evaluate both operands once into scratch locals so the handle can
+            // be read twice (for its length and its offset).
+            compile_expr(cg, &args[0])?; // handle: (offset << 32) | len
+            let handle = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(handle));
+            compile_expr(cg, &args[1])?; // index (i64)
+            let idx = cg.alloc_local();
+            cg.emit(Instruction::LocalSet(idx));
+
+            // Bounds check (T1 memory safety): trap if `index` is out of range
+            // for the string's byte length. An unsigned compare also rejects a
+            // negative index (it reads as a huge u64). Without this, `byte-at`
+            // would read past the string into adjacent linear memory.
+            cg.emit(Instruction::LocalGet(idx));
+            cg.emit(Instruction::LocalGet(handle));
+            cg.emit(Instruction::I64Const(0xFFFF_FFFF));
+            cg.emit(Instruction::I64And); // len = handle & 0xFFFFFFFF
+            cg.emit(Instruction::I64GeU); // index >=u len ?
+            cg.open_frame(Instruction::If(BlockType::Empty));
+            cg.emit(Instruction::Unreachable); // out-of-bounds → trap
+            cg.close_frame();
+
+            // address = (handle >> 32) + index, then load the byte.
+            cg.emit(Instruction::LocalGet(handle));
             cg.emit(Instruction::I64Const(32));
             cg.emit(Instruction::I64ShrU); // ptr (i64)
-            compile_expr(cg, &args[1])?; // index (i64)
+            cg.emit(Instruction::LocalGet(idx));
             cg.emit(Instruction::I64Add); // address (i64)
             cg.emit(Instruction::I32WrapI64); // address (i32)
             cg.emit(Instruction::I32Load8U(mem8(0)));
@@ -1907,6 +1930,17 @@ fn compile_bytes_alloc(cg: &mut FnCtx, cap_expr: &Expr) -> Result<(), CljError> 
     compile_expr(cg, cap_expr)?; // i64 cap
     cg.emit(Instruction::LocalSet(cap_l));
 
+    // Validity check (T1 memory safety): a negative capacity would be stored in
+    // the `cap` header field as a huge *unsigned* value, defeating
+    // `byte-append!`'s `len >=u cap` overflow guard — while `cap + 8` wraps to a
+    // tiny allocation, so appends would run straight off the end. Trap on it.
+    cg.emit(Instruction::LocalGet(cap_l));
+    cg.emit(Instruction::I64Const(0));
+    cg.emit(Instruction::I64LtS); // cap < 0 ?
+    cg.open_frame(Instruction::If(BlockType::Empty));
+    cg.emit(Instruction::Unreachable);
+    cg.close_frame();
+
     // ptr = cabi_realloc(old=0, old_sz=0, align=16, new_sz=cap+8)
     cg.emit(Instruction::I32Const(0));
     cg.emit(Instruction::I32Const(0));
@@ -1937,7 +1971,8 @@ fn compile_bytes_alloc(cg: &mut FnCtx, cap_expr: &Expr) -> Result<(), CljError> 
 }
 
 /// `(byte-append! buf b)` — write `b & 0xFF` at `buf+8+len`, bump `len`, return
-/// `buf`. No capacity check in this phase (the caller sizes via `bytes-alloc`).
+/// `buf`. Traps if the buffer is already full (`len == cap`), so an append can
+/// never write past the `cap` bytes the caller sized via `bytes-alloc`.
 fn compile_byte_append(cg: &mut FnCtx, buf_expr: &Expr, b_expr: &Expr) -> Result<(), CljError> {
     let buf_l = cg.alloc_local();
     let val_l = cg.alloc_local();
@@ -1946,6 +1981,20 @@ fn compile_byte_append(cg: &mut FnCtx, buf_expr: &Expr, b_expr: &Expr) -> Result
     cg.emit(Instruction::LocalSet(buf_l));
     compile_expr(cg, b_expr)?;
     cg.emit(Instruction::LocalSet(val_l));
+
+    // Capacity check (T1 memory safety): trap if the buffer is full
+    // (`len >= cap`) before writing. The header is `[cap @0, len @4]`; without
+    // this, `byte-append!` would overflow past the buffer into adjacent memory.
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(4))); // len
+    cg.emit(Instruction::LocalGet(buf_l));
+    cg.emit(Instruction::I32WrapI64);
+    cg.emit(Instruction::I32Load(mem32(0))); // cap
+    cg.emit(Instruction::I32GeU); // len >=u cap ?
+    cg.open_frame(Instruction::If(BlockType::Empty));
+    cg.emit(Instruction::Unreachable); // buffer full → trap
+    cg.close_frame();
 
     // data address = (buf as i32) + 8 + len  ; len = mem[buf+4]
     cg.emit(Instruction::LocalGet(buf_l));
@@ -2501,7 +2550,7 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         | Builtin::Store32 => {
             return Err(CljError::Codegen(
                 "string/bytes/memory operations are not allowed in a `def` initialiser".into(),
-            ))
+            ));
         }
         Builtin::HasCapability
         | Builtin::LlmInfer
@@ -2511,7 +2560,7 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
         | Builtin::KqeQuery => {
             return Err(CljError::Codegen(
                 "host calls are not allowed in a `def` initialiser".into(),
-            ))
+            ));
         }
         // Float coercions in a compile-time-constant `def` are not folded yet
         // (the const evaluator is integer-only). Use them in function bodies.
@@ -2526,7 +2575,7 @@ fn eval_const_builtin(op: Builtin, v: &[i64]) -> Result<i64, CljError> {
                 "float coercions are not yet supported in a `def` initialiser \
                  (use them inside a function body)"
                     .into(),
-            ))
+            ));
         }
     })
 }

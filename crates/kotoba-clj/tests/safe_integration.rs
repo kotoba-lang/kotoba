@@ -1,26 +1,29 @@
 //! End-to-end integration on a **real** agent cell — the in-repo LangGraph echo
-//! agent (`examples/kotoba-langgraph-echo-clj/agent.clj`, ~100 lines: CBOR
+//! agent (`examples/kotoba-langgraph-echo-kotoba/agent.kotoba`, ~100 lines: CBOR
 //! decode, byte-building, a `defgraph`, and a checkpoint `kqe-assert!`). It runs
-//! the whole safe-clj pipeline together — subset, type, effect, capability, and
+//! the whole safe Kotoba pipeline together — subset, type, effect, capability, and
 //! per-cid gates plus the least-privilege tooling — on non-synthetic code.
 
 use kotoba_clj::{
-    compile_safe_clj_with_prelude, embedded_capability_ifaces, infer_effects, minimal_policy,
+    compile_safe_kotoba_with_prelude, embedded_capability_ifaces, infer_effects, minimal_policy,
     unused_grants, CljError, Policy,
 };
 
-const AGENT: &str = include_str!("../../../examples/kotoba-langgraph-echo-clj/agent.clj");
+const AGENT: &str = include_str!("../../../examples/kotoba-langgraph-echo-kotoba/agent.kotoba");
 
 /// Mesh cells exercising a read+write profile (kqe-assert! + kqe-query), a bare
 /// `(ns …)`, and multiple entry defns (run + on-kse / on-http).
-const INGEST: &str = include_str!("../../../examples/kotoba-mesh-app/ingest.clj");
-const REPLY: &str = include_str!("../../../examples/kotoba-mesh-app/reply.clj");
+const INGEST: &str = include_str!("../../../examples/kotoba-mesh-app/ingest.kotoba");
+const REPLY: &str = include_str!("../../../examples/kotoba-mesh-app/reply.kotoba");
 
 #[test]
 fn agent_minimal_policy_is_exactly_one_graph_write() {
     // The cell's only host effect is a checkpoint write to "lgraph/ckpt".
     let p = minimal_policy(AGENT).unwrap();
-    assert_eq!(p.graph_write.iter().collect::<Vec<_>>(), vec!["lgraph/ckpt"]);
+    assert_eq!(
+        p.graph_write.iter().collect::<Vec<_>>(),
+        vec!["lgraph/ckpt"]
+    );
     assert!(p.graph_read.is_empty(), "cell does not read the graph");
     assert!(p.infer.is_empty(), "cell does not run inference");
     assert!(!p.auth, "cell does not introspect CACAO");
@@ -29,13 +32,16 @@ fn agent_minimal_policy_is_exactly_one_graph_write() {
 #[test]
 fn agent_compiles_confined_with_its_minimal_policy() {
     let p = minimal_policy(AGENT).unwrap();
-    let wasm =
-        compile_safe_clj_with_prelude(AGENT, &p).expect("real agent must compile under safe-clj");
+    let wasm = compile_safe_kotoba_with_prelude(AGENT, &p)
+        .expect("real agent must compile under safe Kotoba");
     assert!(wasm.starts_with(b"\0asm"));
 
     // The audited capability surface is exactly the one graph interface — no
     // llm/auth leaked in by the prelude or codegen.
-    assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
+    assert_eq!(
+        embedded_capability_ifaces(&wasm),
+        vec!["kotoba:kais/kqe@0.1.0"]
+    );
 }
 
 #[test]
@@ -57,7 +63,7 @@ fn agent_run_effect_is_graph_write() {
 fn agent_is_denied_without_the_write_grant() {
     // deny-all → the checkpoint write is unauthorized.
     assert!(matches!(
-        compile_safe_clj_with_prelude(AGENT, &Policy::deny_all()),
+        compile_safe_kotoba_with_prelude(AGENT, &Policy::deny_all()),
         Err(CljError::Policy(_))
     ));
 }
@@ -68,7 +74,7 @@ fn agent_is_denied_for_the_wrong_graph() {
     // (per-cid scoping on a real cell).
     let p = Policy::deny_all().grant_graph_write(["some/other-graph"]);
     assert!(matches!(
-        compile_safe_clj_with_prelude(AGENT, &p),
+        compile_safe_kotoba_with_prelude(AGENT, &p),
         Err(CljError::Policy(_))
     ));
 }
@@ -91,9 +97,12 @@ fn mesh_cells_need_write_and_read() {
 fn mesh_cells_compile_confined() {
     for src in [INGEST, REPLY] {
         let p = minimal_policy(src).unwrap();
-        let wasm =
-            compile_safe_clj_with_prelude(src, &p).expect("mesh cell must compile under safe-clj");
-        assert_eq!(embedded_capability_ifaces(&wasm), vec!["kotoba:kais/kqe@0.1.0"]);
+        let wasm = compile_safe_kotoba_with_prelude(src, &p)
+            .expect("mesh cell must compile under safe Kotoba");
+        assert_eq!(
+            embedded_capability_ifaces(&wasm),
+            vec!["kotoba:kais/kqe@0.1.0"]
+        );
     }
 }
 
@@ -103,7 +112,10 @@ fn mesh_cells_denied_with_write_only() {
     for src in [INGEST, REPLY] {
         let p = Policy::deny_all().grant_graph_write(["g"]);
         assert!(
-            matches!(compile_safe_clj_with_prelude(src, &p), Err(CljError::Policy(_))),
+            matches!(
+                compile_safe_kotoba_with_prelude(src, &p),
+                Err(CljError::Policy(_))
+            ),
             "a read+write cell needs both grants"
         );
     }

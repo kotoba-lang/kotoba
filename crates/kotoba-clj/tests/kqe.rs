@@ -1,4 +1,4 @@
-//! Stage C-5: a Clojure-compiled guest **reads and writes Datoms** through the
+//! Stage C-5: a Kotoba-compiled guest **reads and writes Datoms** through the
 //! `kotoba:kais/kqe` host interface — the Datomic surface of kotoba.
 //!
 //!   - `(kqe-assert! g s p obj-cbor)` / `(kqe-retract! …)` exercise the
@@ -8,7 +8,7 @@
 //!     lowers `list<list<u8>>` into guest memory via our `cabi_realloc`; the
 //!     guest walks the element array with the `KQE_PRELUDE` accessors.
 //!   - `(kqe-query filter)` lifts `list<quad>` (32-byte records) the same way.
-//!   - The **Datomic loop**: quads asserted by the compiled-Clojure agent are
+//!   - The **Datomic loop**: quads asserted by the compiled-Kotoba agent are
 //!     converted to `kotoba_query::Datom` → `kotoba_datomic::Datom::from_kqe` →
 //!     a `Db`, and queried back — closing agent-writes → Datomic-reads.
 #![cfg(feature = "component")]
@@ -30,7 +30,7 @@ fn invoke(src: &str, snapshot: Vec<WitQuad>) -> InvokeResult {
     let component = compile_kais_component_str(&full, KAIS_WIT_DIR).expect("compile + encode");
     let exec = WasmExecutor::new(GAS).expect("executor");
     exec.execute(
-        "clj-kqe-test",
+        "kotoba-kqe-test",
         &component,
         AGENT,
         b"ctx".to_vec(),
@@ -200,7 +200,7 @@ fn read_modify_write_roundtrip() {
 
 // ---- the Datomic loop ---------------------------------------------------------
 
-/// Quads asserted by the compiled-Clojure agent become Datoms in a
+/// Quads asserted by the compiled-Kotoba agent become Datoms in a
 /// `kotoba_datomic::Db` and are queryable through the Datomic facade —
 /// agent-writes → Datomic-reads, end to end.
 #[test]
@@ -220,7 +220,7 @@ fn agent_asserts_flow_into_datomic_db() {
     assert_eq!(result.assert_quads.len(), 2);
 
     // SerializedQuad → kotoba_query::Datom → kotoba_datomic::Datom (from_kqe)
-    let tx = KotobaCid::from_bytes(b"tx-clj-agent");
+    let tx = KotobaCid::from_bytes(b"tx-kotoba-agent");
     let datoms: Vec<kotoba_datomic::Datom> = result
         .assert_quads
         .iter()

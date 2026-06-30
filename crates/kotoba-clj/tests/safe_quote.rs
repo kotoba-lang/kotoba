@@ -4,14 +4,14 @@
 //! Doing so would be a false positive: rejecting valid code, mis-attributing
 //! effects, or demanding capabilities the cell never exercises.
 
-use kotoba_clj::{compile_safe_clj, infer_effects, minimal_policy, CljError, Policy};
+use kotoba_clj::{compile_safe_kotoba, infer_effects, minimal_policy, CljError, Policy};
 
 #[test]
 fn quoted_arithmetic_on_string_is_not_a_type_error() {
     // The `(+ "a" 1)` is quoted data — must NOT trip the literal type check.
     let src = r#"(defn run [] (str-len (quote (+ "a" 1))))"#;
     assert!(
-        compile_safe_clj(src, &Policy::deny_all()).is_ok(),
+        compile_safe_kotoba(src, &Policy::deny_all()).is_ok(),
         "quoted arithmetic is data, not a type error"
     );
 }
@@ -21,7 +21,7 @@ fn quoted_forbidden_op_is_not_a_subset_violation() {
     // A quoted `(eval …)` is inert data — not the forbidden eval call.
     let src = r#"(defn run [] (str-len (quote (eval x))))"#;
     assert!(
-        compile_safe_clj(src, &Policy::deny_all()).is_ok(),
+        compile_safe_kotoba(src, &Policy::deny_all()).is_ok(),
         "quoted `eval` is data, not an executed eval"
     );
 }
@@ -42,7 +42,7 @@ fn quoted_host_call_needs_no_capability() {
     // A function that only *quotes* a kqe-assert! must compile under deny-all.
     let src = r#"(defn run [] (quote (kqe-assert! "g" "s" "p" "v")))"#;
     assert!(
-        compile_safe_clj(src, &Policy::deny_all()).is_ok(),
+        compile_safe_kotoba(src, &Policy::deny_all()).is_ok(),
         "quoting a host call needs no grant"
     );
 }
@@ -64,12 +64,12 @@ fn real_call_alongside_quoted_call_still_gated() {
                        (quote (kqe-assert! "quotedG" "s" "p" "v"))))"#;
     // deny-all → denied (the real call needs a grant)
     assert!(matches!(
-        compile_safe_clj(src, &Policy::deny_all()),
+        compile_safe_kotoba(src, &Policy::deny_all()),
         Err(CljError::Policy(_))
     ));
     // granting only the real graph is sufficient (quoted graph irrelevant)
     let p = Policy::deny_all().grant_graph_write(["realG"]);
-    assert!(compile_safe_clj(src, &p).is_ok());
+    assert!(compile_safe_kotoba(src, &p).is_ok());
 
     // and the quoted graph is correctly absent from the minimal policy
     let min = minimal_policy(src).unwrap();
@@ -83,7 +83,7 @@ fn real_call_alongside_quoted_call_still_gated() {
 fn comment_body_is_not_type_checked() {
     let src = r#"(defn run [n] (do (comment (+ "a" 1)) n))"#;
     assert!(
-        compile_safe_clj(src, &Policy::deny_all()).is_ok(),
+        compile_safe_kotoba(src, &Policy::deny_all()).is_ok(),
         "a commented-out type error must not be flagged"
     );
 }
@@ -91,17 +91,21 @@ fn comment_body_is_not_type_checked() {
 #[test]
 fn comment_body_is_not_subset_checked() {
     let src = r#"(defn run [n] (do (comment (eval x)) n))"#;
-    assert!(compile_safe_clj(src, &Policy::deny_all()).is_ok());
+    assert!(compile_safe_kotoba(src, &Policy::deny_all()).is_ok());
 }
 
 #[test]
 fn comment_host_call_performs_no_effect_and_needs_no_grant() {
     let src = r#"(defn run [n] (do (comment (kqe-assert! "g" "s" "p" "v")) n))"#;
     assert!(
-        compile_safe_clj(src, &Policy::deny_all()).is_ok(),
+        compile_safe_kotoba(src, &Policy::deny_all()).is_ok(),
         "a commented host call needs no grant"
     );
     let eff = infer_effects(src).unwrap();
-    assert!(eff["run"].is_empty(), "commented call has no effect: {:?}", eff["run"]);
+    assert!(
+        eff["run"].is_empty(),
+        "commented call has no effect: {:?}",
+        eff["run"]
+    );
     assert!(minimal_policy(src).unwrap().graph_write.is_empty());
 }

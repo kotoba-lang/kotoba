@@ -167,6 +167,17 @@ pub struct DecodeStats {
 }
 
 #[derive(Serialize)]
+pub struct GenerateTextResult {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+    pub backend: String,
+    pub session_handle: String,
+    pub model_handle: String,
+    pub prefill_stats: PrefillStats,
+    pub decode_stats: DecodeStats,
+}
+
+#[derive(Serialize)]
 pub struct ReduceResult {
     pub reduced_handle: String,
     pub reduce_stats: ReduceStats,
@@ -532,6 +543,75 @@ impl HostRuntime {
             return Ok(());
         }
         Err(format!("handle not found: {handle}"))
+    }
+
+    /// End-to-end local generation path: load a model, tokenize prompt, run
+    /// prefill, decode one or more tokens, then release temporary handles.
+    ///
+    /// This is intentionally conservative and deterministic. It is enough to
+    /// wire a real locally materialized safetensors model into a kototama
+    /// `llm.infer` host binding while the sampler/KV-cache path matures.
+    pub async fn generate_text(
+        &self,
+        model_id: &str,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<GenerateTextResult, String> {
+        let loaded = self.load_model_session(model_id)?;
+        let token = self.register_prompt_tensor(&loaded.session_handle, prompt)?;
+        let prefill = self.prefill(&loaded.session_handle, &token.tensor_handle).await?;
+        let decode = self.decode_step(
+            &loaded.session_handle,
+            &prefill.hidden_handle,
+            max_new_tokens.max(1).min(64) as u32,
+        )?;
+
+        let _ = self.release_handle(&token.tensor_handle);
+        let _ = self.release_handle(&prefill.hidden_handle);
+
+        Ok(GenerateTextResult {
+            text: decode.decoded_text.clone(),
+            token_ids: decode.token_ids.clone(),
+            backend: loaded.backend.clone(),
+            session_handle: loaded.session_handle,
+            model_handle: loaded.model_handle,
+            prefill_stats: prefill.prefill_stats,
+            decode_stats: decode.decode_stats,
+        })
+    }
+
+    /// Build a synchronous function suitable for `kototama::LocalInferFn`.
+    ///
+    /// It owns a Tokio runtime internally because kototama's current core-wasm
+    /// host import ABI is synchronous. Browser/WebGPU hosts should use the
+    /// async worker path instead.
+    pub fn local_infer_fn(self: Arc<Self>) -> Arc<dyn Fn(&str, usize) -> Result<String, String> + Send + Sync> {
+        Arc::new(move |prompt: &str, max_new_tokens: usize| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("create kotodama inference runtime: {e}"))?;
+            let model_id = std::env::var("KOTODAMA_MODEL_ID")
+                .or_else(|_| std::env::var("KOTODAMA_INFERENCE_MODEL"))
+                .unwrap_or_else(|_| "default".to_string());
+            rt.block_on(self.generate_text(&model_id, prompt, max_new_tokens))
+                .map(|result| result.text)
+        })
+    }
+
+    /// Build a function suitable for `kototama::LocalInferFn`, preserving the
+    /// model id supplied by the guest's `(llm-infer model prompt)` call.
+    pub fn kototama_local_infer_fn(
+        self: Arc<Self>,
+    ) -> Arc<dyn Fn(&str, &str, usize) -> Result<String, String> + Send + Sync> {
+        Arc::new(move |model_id: &str, prompt: &str, max_new_tokens: usize| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("create kotodama inference runtime: {e}"))?;
+            rt.block_on(self.generate_text(model_id, prompt, max_new_tokens))
+                .map(|result| result.text)
+        })
     }
 
     fn register_tensor(

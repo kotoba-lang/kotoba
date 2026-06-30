@@ -1,12 +1,15 @@
 # kotoba-clj
 
-A **Clojure/EDN-subset → WebAssembly compiler** for kotoba. The Clojure source
-literally becomes wasm bytes — this is a compiler, not an embedded interpreter.
+A **Kotoba/EDN-subset → WebAssembly compiler** for the
+[`kotoba-lang`](../kotoba-lang) profile. Kotoba source literally becomes wasm
+bytes — this is a compiler, not an embedded interpreter.
 
 ```rust
 let src = "(defn fact [n] (if (< n 2) 1 (* n (fact (- n 1)))))";
 let wasm = kotoba_clj::compile_str(src)?;          // real wasm module
 let out  = kotoba_clj::run::run(&wasm, "fact", &[5])?;   // 120
+
+let wasm = kotoba_clj::compile_expr_with_prelude("(+ 1 2)")?;
 ```
 
 ```
@@ -18,8 +21,23 @@ n=10  fact=3628800     fib=55
 
 ## `.kotoba` / `.clj` / `.cljc` / `.cljs` files
 
-`kotoba-clj` also installs a runner for Clojure-subset source files. `.kotoba`,
-`.clj`, `.cljc`, and `.cljs` are accepted as source extensions:
+The public CLI surface is `kotoba -e` and `kotoba wasm ...`; `kotoba-clj` is the
+implementation binary kept for crate-local tests and compatibility. Both paths
+use the same compiler APIs for `kotoba-lang` source files. `.kotoba`, `.clj`,
+`.cljc`, and `.cljs` are accepted as source extensions. `.kotoba` is the
+canonical Kotoba authoring surface; portable `.cljc` remains available for
+Clojure-family sharing, with `#?(:kotoba ...)` for Kotoba-specific branches.
+New source should be invoked through the public `kotoba` CLI:
+
+```sh
+$ kotoba -e '(+ 1 2)'
+3
+$ kotoba wasm build app.kotoba -o app.wasm
+$ kotoba wasm safe-build cell.kotoba --policy policy.edn -o cell.wasm
+```
+
+The legacy runner still accepts shebang scripts for compatibility with existing
+crate-local tests and scripts:
 
 ```clojure
 #!/usr/bin/env kotoba-clj
@@ -27,23 +45,39 @@ n=10  fact=3628800     fib=55
   (clojure.core/inc x))
 ```
 
-```
+Lower-level implementation binary, retained for crate-local tests and
+compatibility only:
+
+```sh
 $ kotoba-clj app.kotoba 41
 42
 $ kotoba-clj --func fact math.kotoba 5
 120
-$ kotoba-clj agent.cljc 41
+$ kotoba-clj agent.kotoba 41
 42
+$ kotoba-clj -e '(+ 1 2)'    # prefer: kotoba -e '(+ 1 2)'
+3
 ```
 
-By default the file runner prepends the kotoba-clj prelude, so common
+By default the file runner prepends the Kotoba prelude, so common
 container helpers such as `count`, `nth`, `get`, and `assoc!` are available.
 Use `--no-prelude` for a bare compiler surface.
 
-This is a Clojure compatibility entry point, not JVM Clojure or ClojureScript
-runtime compatibility. `.clj` / `.cljc` / `.cljs` files still need to compile to
-the kotoba-clj subset below. For `.cljc`, reader conditionals are expanded before
-lowering:
+`-e` / `--eval` is compile-and-run sugar for a single inline Kotoba expression:
+the expression is wrapped as `(defn main [] ...)`, compiled by the same
+Kotoba -> Wasm path, optionally written with `--wasm-out`, and then run. It
+is not a dynamic runtime `eval`.
+
+This is a Kotoba compiler with Clojure-family source compatibility, not JVM
+Clojure or ClojureScript runtime compatibility. `.clj` / `.cljc` / `.cljs`
+files still need to compile to the Kotoba subset below. For `.cljc`, reader
+conditionals are expanded before lowering:
+
+Rust callers should use the Kotoba-primary safe APIs for new code:
+`compile_safe_kotoba`, `compile_safe_kotoba_with_reader_target`,
+`compile_safe_kotoba_with_prelude`, or the neutral file APIs
+`compile_safe_file*`. The older `compile_safe_clj*` names remain as compatibility
+aliases for existing integrations.
 
 ```clojure
 #?(:kotoba (defn main [x] (+ x 10))
@@ -57,14 +91,14 @@ different branch.
 `ns` forms may include simple `:require` / `:use` specs; top-level `(require
 '[...])` and `(use '[...])` forms are also accepted for script-style files.
 Neighboring namespaces are loaded from the entry file's directory using
-Clojure-style paths (`demo.util` → `demo/util.clj` / `.cljc` / `.cljs` /
-`.kotoba`), and `:as` / `:refer` calls are rewritten before lowering. When
+Kotoba/Clojure-style paths (`demo.util` → `demo/util.kotoba` / `.cljc` /
+`.clj` / `.cljs`), and `:as` / `:refer` calls are rewritten before lowering. When
 multiple files exist for a namespace, the reader target controls the extension
 priority (`kotoba`: `.kotoba`, `.cljc`, `.clj`, `.cljs`; `clj`: `.cljc`,
 `.clj`, `.kotoba`, `.cljs`; `cljs`: `.cljc`, `.cljs`, `.clj`, `.kotoba`).
 `:as-alias` records a compile-time alias without loading the target namespace.
 `clojure.*` and `cljs.*` requires are also not loaded from files; using functions
-outside the kotoba-clj subset still fails during lowering/codegen:
+outside the Kotoba compiler subset still fails during lowering/codegen:
 
 ```clojure
 (ns demo.main
@@ -99,17 +133,21 @@ The entry file's directory is always searched. If a `deps.edn` is found in the
 entry file's directory or one of its ancestors, its top-level `:paths` vector is
 also searched. Additional source roots can be provided with repeated
 `--source-path` / `-S` flags or the platform path-list environment variable
-`KOTOBA_CLJ_PATH`:
+`KOTOBA_SOURCE_PATH`. The older `KOTOBA_CLJ_PATH` name remains as a
+compatibility alias:
 
 ```sh
-kotoba-clj -S src -S vendor app/main.clj 41
-KOTOBA_CLJ_PATH=src:vendor kotoba-clj app/main.clj 41
+kotoba wasm build -S src -S vendor app/main.kotoba -o app.wasm
+kotoba wasm safe-build -S src -S vendor app/main.kotoba --policy policy.edn -o app.safe.wasm
+KOTOBA_SOURCE_PATH=src:vendor kotoba wasm build app/main.kotoba -o app.wasm
+# Compatibility runner:
+kotoba-clj -S src -S vendor app/main.kotoba 41
 ```
 
 ## Pipeline
 
 ```
-Clojure/EDN source
+Kotoba/EDN source
    │  kotoba_edn::parse_all           (SSoT reader — no second parser)
    ▼
 EdnValue tree
@@ -193,7 +231,7 @@ substrate).
 
 ## Roadmap to the kotoba:kais binding
 
-Loading compiled Clojure in `kotoba-runtime` requires satisfying the
+Loading compiled Kotoba in `kotoba-runtime` requires satisfying the
 `kotoba-node` world's `run(ctx-cbor: list<u8>) -> result<list<u8>, string>`
 export, which needs memory + an allocator + byte/string values first:
 
@@ -216,7 +254,7 @@ let out  = kotoba_clj::component::run_component(&comp, b"hello")?;   // b"hello"
 
 Binding to the actual `kotoba:kais` `kotoba-node` world (and meaningfully
 reading `ctx`) is steps 4–5. See
-[`docs/ADR-clojure-wasm.md`](../../docs/ADR-clojure-wasm.md).
+[`docs/ADR-kotoba-wasm.md`](../../docs/ADR-kotoba-wasm.md).
 
 ## Test
 

@@ -1,8 +1,8 @@
-//! XRPC handlers for compiling and running `.kotoba` (Clojure-subset) source.
+//! XRPC handlers for compiling and running `.kotoba` Kotoba/EDN source.
 //!
 //! Where `mesh.deploy` gossips pre-built lattice messages, these endpoints take
-//! raw `.kotoba` *source* — the same Clojure-subset the `kotoba-clj` CLI accepts
-//! for `app.kotoba` scripts — and turn it into a WebAssembly core module:
+//! raw `.kotoba` *source* — the same Kotoba profile the compiler accepts for
+//! `app.kotoba` scripts — and turn it into a WebAssembly core module:
 //!
 //!   com.etzhayyim.apps.kotoba.mesh.compile — source → wasm bytes (POST)
 //!   com.etzhayyim.apps.kotoba.mesh.run     — source → compile → run → i64 (POST)

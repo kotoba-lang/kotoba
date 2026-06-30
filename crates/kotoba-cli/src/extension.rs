@@ -1,10 +1,10 @@
-//! `kotoba extension` — Clojure/EDN package lifecycle through the kotoba CLI.
+//! `kotoba extension` — Kotoba extension lifecycle through the kotoba CLI.
 //!
 //! This is the compatibility bridge for portable `.cljc` packages that still use
 //! `deps.edn` and `clojure.test`. The operator-facing command is `kotoba`; the
-//! execution host is selected by the extension manifest. Today `:clj/deps` runs
-//! through the Clojure CLI so existing test suites keep working while kotoba-clj
-//! grows enough JVM/Clojure compatibility to take over more of the surface.
+//! execution host is selected by the extension manifest. Today `:clj/deps` remains
+//! an explicit compatibility host that runs through the Clojure CLI so existing
+//! test suites keep working while Kotoba-native extension hosts grow.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ use kotoba_core::cid::KotobaCid;
 use kotoba_edn::{EdnValue, Keyword};
 
 const MANIFEST: &str = "kotoba.extension.edn";
+const DEFAULT_EXTENSION_KIND: &str = "kotoba/library";
+const DEFAULT_EXTENSION_HOST: &str = "clj/deps";
 
 #[derive(Subcommand)]
 pub enum ExtensionCmd {
@@ -197,8 +199,8 @@ fn load_or_infer(path: &Path) -> Result<Extension> {
         .to_string();
     Ok(Extension {
         name,
-        kind: "clj/library".into(),
-        host: "clj/deps".into(),
+        kind: DEFAULT_EXTENSION_KIND.into(),
+        host: DEFAULT_EXTENSION_HOST.into(),
         paths: vec!["src".into()],
         test_paths: vec!["test".into()],
         test_alias: "test".into(),
@@ -217,8 +219,10 @@ fn parse_manifest(src: &str) -> Result<Extension> {
         .ok_or_else(|| anyhow!("missing :kotoba.extension/name"))?;
     Ok(Extension {
         name,
-        kind: get_str(map, "kotoba.extension/type").unwrap_or_else(|| "clj/library".into()),
-        host: get_str(map, "kotoba.extension/host").unwrap_or_else(|| "clj/deps".into()),
+        kind: get_str(map, "kotoba.extension/type")
+            .unwrap_or_else(|| DEFAULT_EXTENSION_KIND.into()),
+        host: get_str(map, "kotoba.extension/host")
+            .unwrap_or_else(|| DEFAULT_EXTENSION_HOST.into()),
         paths: get_strs(map, "kotoba.extension/paths").unwrap_or_else(|| vec!["src".into()]),
         test_paths: get_strs(map, "kotoba.extension/test-paths")
             .unwrap_or_else(|| vec!["test".into()]),
@@ -392,7 +396,7 @@ async fn put_block(url: &str, token: &Option<String>, bytes: &[u8]) -> Result<St
 }
 
 fn ensure_host(ext: &Extension) -> Result<()> {
-    if ext.host == "clj/deps" {
+    if ext.host == DEFAULT_EXTENSION_HOST {
         Ok(())
     } else {
         bail!(
@@ -437,5 +441,18 @@ fn as_str(v: &EdnValue) -> Option<String> {
         EdnValue::Keyword(k) => Some(k.to_qualified()),
         EdnValue::Symbol(s) => Some(s.to_qualified()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_defaults_to_kotoba_extension_kind_with_clj_compat_host() {
+        let ext = parse_manifest(r#"{:kotoba.extension/name "demo"}"#).unwrap();
+
+        assert_eq!(ext.kind, DEFAULT_EXTENSION_KIND);
+        assert_eq!(ext.host, DEFAULT_EXTENSION_HOST);
     }
 }
