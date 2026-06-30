@@ -23,6 +23,17 @@ pub struct ContractCheck {
     pub summary: ContractSummary,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContractConformance {
+    pub ok: bool,
+    pub source: &'static str,
+    pub contract_commands: Vec<String>,
+    pub host_commands: Vec<String>,
+    pub implemented_contract_commands: Vec<String>,
+    pub missing_contract_commands: Vec<String>,
+    pub extra_host_commands: Vec<String>,
+}
+
 #[derive(clap::Subcommand)]
 pub enum ContractCmd {
     /// Validate the bundled kotoba-lang CLI command contract.
@@ -33,9 +44,18 @@ pub enum ContractCmd {
     },
     /// Print the bundled EDN contract snapshot.
     Print,
+    /// Compare the bundled contract with this host CLI's top-level commands.
+    Conformance {
+        /// Emit JSON instead of a human-readable line.
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when the host CLI does not implement every contract command.
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
-pub fn run(cmd: ContractCmd) -> Result<()> {
+pub fn run(cmd: ContractCmd, host_commands: &[String]) -> Result<()> {
     match cmd {
         ContractCmd::Check { json } => {
             let check = check()?;
@@ -54,6 +74,32 @@ pub fn run(cmd: ContractCmd) -> Result<()> {
         }
         ContractCmd::Print => {
             print!("{CLI_CONTRACT_EDN}");
+            Ok(())
+        }
+        ContractCmd::Conformance { json, strict } => {
+            let report = conformance(host_commands)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{} {} contract_commands={} implemented={} missing={} extra_host={}",
+                    if report.ok { "ok" } else { "pending" },
+                    report.source,
+                    report.contract_commands.len(),
+                    report.implemented_contract_commands.len(),
+                    report.missing_contract_commands.len(),
+                    report.extra_host_commands.len()
+                );
+                if !report.missing_contract_commands.is_empty() {
+                    println!("missing: {}", report.missing_contract_commands.join(", "));
+                }
+            }
+            if strict && !report.ok {
+                anyhow::bail!(
+                    "host CLI is missing contract commands: {}",
+                    report.missing_contract_commands.join(", ")
+                );
+            }
             Ok(())
         }
     }
@@ -179,6 +225,35 @@ pub fn check() -> Result<ContractCheck> {
     })
 }
 
+pub fn conformance(host_commands: &[String]) -> Result<ContractConformance> {
+    let contract = check()?;
+    let contract_commands: BTreeSet<String> = contract.summary.commands.iter().cloned().collect();
+    let host_commands_set: BTreeSet<String> = host_commands.iter().cloned().collect();
+    let implemented_contract_commands = contract_commands
+        .intersection(&host_commands_set)
+        .cloned()
+        .collect::<Vec<_>>();
+    let missing_contract_commands = contract_commands
+        .difference(&host_commands_set)
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra_host_commands = host_commands_set
+        .difference(&contract_commands)
+        .filter(|command| command.as_str() != "contract")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok(ContractConformance {
+        ok: missing_contract_commands.is_empty(),
+        source: CLI_CONTRACT_SOURCE,
+        contract_commands: contract.summary.commands,
+        host_commands: host_commands_set.into_iter().collect(),
+        implemented_contract_commands,
+        missing_contract_commands,
+        extra_host_commands,
+    })
+}
+
 fn kw_bare(name: &str) -> EdnValue {
     EdnValue::Keyword(Keyword::bare(name))
 }
@@ -253,5 +328,22 @@ mod tests {
             check.summary.commands,
             ["run", "check", "db", "git", "rad", "deploy"]
         );
+    }
+
+    #[test]
+    fn conformance_reports_missing_host_commands() {
+        let host_commands = vec![
+            "contract".to_string(),
+            "run".to_string(),
+            "check".to_string(),
+        ];
+        let report = conformance(&host_commands).expect("conformance report");
+        assert!(!report.ok);
+        assert_eq!(report.implemented_contract_commands, ["check", "run"]);
+        assert_eq!(
+            report.missing_contract_commands,
+            ["db", "deploy", "git", "rad"]
+        );
+        assert!(report.extra_host_commands.is_empty());
     }
 }
