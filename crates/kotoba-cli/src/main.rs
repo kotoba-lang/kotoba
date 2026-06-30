@@ -1759,11 +1759,16 @@ async fn run_datomic_transact(
     );
     let resp = client
         .post(&endpoint)
-        .json(&serde_json::json!({
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            kotoba_transit::MEDIA_TYPE_JSON,
+        )
+        .header(reqwest::header::ACCEPT, kotoba_transit::MEDIA_TYPE_JSON)
+        .body(kotoba_transit::to_json_bytes(&serde_json::json!({
             "graph": graph,
             "tx_edn": tx_edn,
             "cacaoB64": cacao,
-        }))
+        }))?)
         .send()
         .await
         .with_context(|| format!("POST {endpoint}"))?;
@@ -2273,7 +2278,12 @@ async fn run_datomic_q(
     });
     let resp = client
         .post(&url)
-        .json(&body)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            kotoba_transit::MEDIA_TYPE_JSON,
+        )
+        .header(reqwest::header::ACCEPT, kotoba_transit::MEDIA_TYPE_JSON)
+        .body(kotoba_transit::to_json_bytes(&body)?)
         .send()
         .await
         .context("POST kotoba.datomic.q failed")?;

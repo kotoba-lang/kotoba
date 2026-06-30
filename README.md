@@ -317,7 +317,7 @@ exactly how to silence or fix it.
 - **WASM runtime** — arbitrary graph logic as Component Model guests
 - **Capability-safe language** — `kotoba wasm` compiles Kotoba/EDN → WASM; **safe Kotoba** confines untrusted/AI-generated modules by deny-by-default capability, subset, and (interprocedural) effect gates — capability confinement (T3) and effect soundness (T2)
 - **E2E encryption** — Signal Protocol + CACAO auth for consent-gated data
-- **Datomic/Datalog primary, SPARQL auxiliary** — the distributed Datom DB is the source of truth; SPARQL 1.1 reads the same projection for RDF-compatible query and federation
+- **Datomic/Datalog primary, Transit JSON default wire, SPARQL/Cypher/GraphQL tier-2** — the distributed Datom DB is the source of truth; Transit JSON is the default HTTP media type for Datomic API envelopes; SPARQL 1.1, Cypher, and GraphQL read/compile against the same projection for interop and federation
 - **CACAO-native authz** — depth-2 delegation chains, multi-graph grants, anti-replay nonce
 - **X-Road-style accountability** — ciphertext-only replication, purpose-declared + signed + receipted key release via t-of-N custodians, anchored tamper-evident audit log, slashable unreceipted releases. See [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md)
 
@@ -375,9 +375,11 @@ wire that materializes the log.
 ## Query Surfaces
 
 Primary query/write semantics are Datomic-style Datom APIs and Datalog over
-the immutable `(E,A,V,T,Added)` history. SPARQL is intentionally a secondary
-RDF-compatible query surface over that Datomic/IPLD head, not a competing
-source of truth.
+the immutable `(E,A,V,T,Added)` history. Datomic endpoints use Transit JSON
+(`application/transit+json`) as the default HTTP wire media type while retaining
+EDN/Datomic forms (`tx_edn`, `query_edn`) as the semantic payload. SPARQL,
+Cypher, and GraphQL are intentionally tier-2 query surfaces over that
+Datomic/IPLD head, not competing sources of truth.
 
 Server endpoint: `POST /xrpc/com.etzhayyim.apps.kotoba.graph.sparql`
 
