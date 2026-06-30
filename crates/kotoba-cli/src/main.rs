@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod cli_contract;
 mod extension;
 mod mesh;
 mod shell;
@@ -87,6 +88,10 @@ enum Cmd {
     /// Kotoba extensions — evaluate, run, build, and deploy Clojure/EDN packages.
     #[command(subcommand)]
     Extension(extension::ExtensionCmd),
+
+    /// Data-first Kotoba CLI contract from kotoba-lang/kotoba-lang.
+    #[command(subcommand)]
+    Contract(cli_contract::ContractCmd),
 
     /// SPARQL query (SELECT / DESCRIBE / CONSTRUCT / ASK) over the running
     /// server's direct-SPARQL endpoint.  Auto-detects the form from the
@@ -439,6 +444,7 @@ async fn main() -> Result<()> {
         Cmd::Lattice(cmd) => mesh::run_lattice(cmd)?,
         Cmd::Shell(cmd) => shell::run(cmd)?,
         Cmd::Extension(cmd) => extension::run(cmd, &cli.url, &cli.token).await?,
+        Cmd::Contract(cmd) => cli_contract::run(cmd)?,
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,
 
