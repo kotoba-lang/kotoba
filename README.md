@@ -381,6 +381,11 @@ EDN/Datomic forms (`tx_edn`, `query_edn`) as the semantic payload. SPARQL,
 Cypher, and GraphQL are intentionally tier-2 query surfaces over that
 Datomic/IPLD head, not competing sources of truth.
 
+The authoritative Transit implementation is the Rust-free CLJC library in
+[`kotoba-lang/transit`](https://github.com/kotoba-lang/transit). Rust code in
+this repository is a compatibility host for the existing CLI/server endpoints;
+it must not become the source of truth for Transit semantics.
+
 Server endpoint: `POST /xrpc/com.etzhayyim.apps.kotoba.graph.sparql`
 
 Auto-detects the form from the leading keyword and dispatches to the

@@ -26,6 +26,10 @@ const NSID_QUAD_CREATE: &str = "com.etzhayyim.apps.kotoba.quad.create";
 const NSID_QUAD_RETRACT: &str = "com.etzhayyim.apps.kotoba.quad.retract";
 const NSID_GRAPH_QUERY: &str = "com.etzhayyim.apps.kotoba.graph.query";
 const DEFAULT_WASM_WIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../kotoba-runtime/wit");
+// Migration shim only. The authoritative Transit implementation is CLJC in
+// kotoba-lang/transit; Rust CLI keeps this media type while it remains the
+// compatibility host for existing XRPC Datomic endpoints.
+const TRANSIT_JSON_MEDIA_TYPE: &str = "application/transit+json";
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -1759,12 +1763,9 @@ async fn run_datomic_transact(
     );
     let resp = client
         .post(&endpoint)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            kotoba_transit::MEDIA_TYPE_JSON,
-        )
-        .header(reqwest::header::ACCEPT, kotoba_transit::MEDIA_TYPE_JSON)
-        .body(kotoba_transit::to_json_bytes(&serde_json::json!({
+        .header(reqwest::header::CONTENT_TYPE, TRANSIT_JSON_MEDIA_TYPE)
+        .header(reqwest::header::ACCEPT, TRANSIT_JSON_MEDIA_TYPE)
+        .body(serde_json::to_vec(&serde_json::json!({
             "graph": graph,
             "tx_edn": tx_edn,
             "cacaoB64": cacao,
@@ -2278,12 +2279,9 @@ async fn run_datomic_q(
     });
     let resp = client
         .post(&url)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            kotoba_transit::MEDIA_TYPE_JSON,
-        )
-        .header(reqwest::header::ACCEPT, kotoba_transit::MEDIA_TYPE_JSON)
-        .body(kotoba_transit::to_json_bytes(&body)?)
+        .header(reqwest::header::CONTENT_TYPE, TRANSIT_JSON_MEDIA_TYPE)
+        .header(reqwest::header::ACCEPT, TRANSIT_JSON_MEDIA_TYPE)
+        .body(serde_json::to_vec(&body)?)
         .send()
         .await
         .context("POST kotoba.datomic.q failed")?;
