@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod cli_contract;
@@ -444,7 +444,7 @@ async fn main() -> Result<()> {
         Cmd::Lattice(cmd) => mesh::run_lattice(cmd)?,
         Cmd::Shell(cmd) => shell::run(cmd)?,
         Cmd::Extension(cmd) => extension::run(cmd, &cli.url, &cli.token).await?,
-        Cmd::Contract(cmd) => cli_contract::run(cmd)?,
+        Cmd::Contract(cmd) => cli_contract::run(cmd, &host_command_names())?,
 
         Cmd::Key(key_cmd) => run_key_cmd(key_cmd)?,
 
@@ -865,6 +865,13 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn host_command_names() -> Vec<String> {
+    Cli::command()
+        .get_subcommands()
+        .map(|command| command.get_name().to_string())
+        .collect()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
