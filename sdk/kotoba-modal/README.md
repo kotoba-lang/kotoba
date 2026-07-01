@@ -61,7 +61,8 @@ and unit-tested in pure CPython (no wasm needed to verify it):
 
 - **client** (`Function.remote`) → `_codec.encode_ctx` →
   `{"v":1,"fn","args","kwargs"}` (bundled CBOR, `_cbor.py` — standard CBOR, no
-  third-party dep; readable by the Rust node's `ciborium`).
+  third-party dep; readable by any kotoba host that implements the WIT
+  contract).
 - **guest** (`kotoba_modal.guest.handle_invoke`) → `decode_ctx` → calls the body
   → `encode_result` / `encode_error` → `{"v":1,"ok",...}`.
 - **client** decodes the response with `decode_result` (raises `RemoteError` on
@@ -155,14 +156,13 @@ python examples/infer_app.py "hello"   # uses .local()
 
 ## Verified vs. unverifiable here
 
-- **Verified against the node handler** (`kotoba-server/src/xrpc.rs:6957`,
-  `invoke_run`): wasm bytes are always required, `agent_did` must be a bare DID
-  (`validate_did`), `ctx_b64` is passed to the guest `run` verbatim, and
-  `output_b64` is the guest's raw return — the client matches all four. The
-  request/response **shapes** and these guards are tested in CPython via a node
-  simulator that mirrors the handler's checks, plus the ctx CBOR contract
-  end-to-end (client encode ↔ guest `handle_invoke` decode ↔ client decode), auth
-  headers, the `ToolchainNotFound` gate, and the HTTP `llm` seam.
+- **Verified against the host contract**: wasm bytes are always required,
+  `agent_did` must be a bare DID, `ctx_b64` is passed to the guest `run`
+  verbatim, and `output_b64` is the guest's raw return. The request/response
+  **shapes** and these guards are tested in CPython via a node simulator, plus
+  the ctx CBOR contract end-to-end (client encode ↔ guest `handle_invoke` decode
+  ↔ client decode), auth headers, the `ToolchainNotFound` gate, and the HTTP
+  `llm` seam.
 - **Build verified** (with `pip install '.[build]'`): the bundled
   `wit/` + `scripts/build-pywasm.bb` compile `examples/guest_component.py` to a
   real kotoba-node WASM component (`test_build_sample_component_compiles`).

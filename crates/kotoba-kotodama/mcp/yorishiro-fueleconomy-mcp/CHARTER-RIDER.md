@@ -1,1 +1,0 @@
-../../../../CHARTER-RIDER.md
