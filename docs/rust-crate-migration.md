@@ -1,40 +1,24 @@
 # Rust Crate Migration
 
-The `kotoba` repository is still the active Rust compatibility workspace. The
-target architecture is Kotoba/CLJC as the source of truth for language,
-database, package, git/rad, deploy, and protocol semantics.
+Status: legacy Rust workspace removed from `kotoba-lang/kotoba`.
 
-Rust may remain only as:
+The repository default is now CLJC/EDN-first:
 
-- compatibility CLI/server host
-- native execution backend
-- generated adapter from a Kotoba/CLJC contract
-- legacy implementation during migration
-
-## Initial Classification
-
-| area | current examples | target |
-|---|---|---|
-| language/profile/package | `kotoba-lang`, `kotoba-clj`, `kotoba-edn` | move authority to `kotoba-lang/kotoba-lang` and CLJC libraries |
-| Datomic/db/query | `kotoba-datomic`, `kotoba-query`, `kotoba-graph`, server XRPC | CLJC Datomic/Transit contracts; Rust host is compatibility |
-| CLI | `kotoba-cli` | Kotoba-native CLI surface; Rust CLI remains temporary host |
-| git/rad/deploy | `kotoba-git`, `kotoba-rad`, `kotoba-lattice` | CLJC contracts first, generated/native adapters second |
-| crypto/storage/network | `kotoba-crypto`, `kotoba-store`, `kotoba-net`, `kotoba-ipfs` | native backend adapters behind CLJC protocols |
-| runtime/wasm | `kotoba-runtime`, `kotoba-rt`, `kotoba-wasm`, `kotoba-guest` | host execution backend; semantics in Kotoba/CLJC |
+- `kotoba-lang/kotoba-lang` owns the public CLI contract and language surface.
+- `bin/kotoba-clj`, Homebrew, and npm launchers delegate to that CLJC authority.
+- Default CI no longer installs Rust or runs Cargo gates.
+- Historical Rust crates and server deployment assets are available only through
+  git history.
 
 ## Rule For New Work
 
-New protocol or language behavior must land first in a Kotoba/CLJC contract or
-specification. Rust code can implement, host, or test that contract, but should
-not become the only definition of the behavior.
+New protocol, CLI, database, deploy, git/rad, or language behavior must land
+first as a CLJC/EDN contract. Native adapters can be added later only when they
+host that contract and do not become the semantic authority.
 
-## Next Steps
+## Follow-up Migration Targets
 
-1. Add crate-level `host`, `compat`, `backend`, `legacy`, or `migration-target`
-   labels.
-2. Move Datomic/Transit wire semantics to CLJC repos before expanding endpoints.
-3. Move CLI command schemas to data so Rust, JS, and Kotoba-native hosts share
-   one command contract.
-4. Keep native crypto/storage/network implementations, but bind them through
-   explicit CLJC protocols.
-
+1. Move remaining historical ADR details into owner repos as CLJC contracts land.
+2. Keep `kotoba-lang/kotoba` focused on launchers, packaging, docs, and SDK
+   fixtures.
+3. Avoid reintroducing Cargo or Rust CI into the default repository path.

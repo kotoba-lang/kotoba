@@ -38,7 +38,8 @@ predicate path so the ledger is queryable as-of any epoch via the TEA index.
 |---|---|---|---|
 | `social/mint/disclosure/<epoch>` | smic | mint job | disclosure points minted to DID this epoch |
 | `social/mint/wellbecoming/<epoch>` | smic | mint job | wellbecoming-Δ points minted this epoch |
-| `social/burn/<epoch>` | smic | burn job | points burned this epoch (falsified/harm) |
+| `social/mint/convening/<epoch>` | smic | settle job | convening points minted to the **convener** DID this epoch — from *validated, survived, anti-sybil* tie-formation, NOT turnout (§3c, ADR-2606272100 / `moyoshi 催し`) |
+| `social/burn/<epoch>` | smic | burn job | points burned this epoch (falsified/harm/extractive convening) |
 | `social/capital/<epoch>` | smic | MV step | **decayed running score** of DID at end of `epoch` (the read surface) |
 | `social/capital/params/active` | CID | Council | active param version (see §2) |
 | `social/origin/<rootCid>` | DID-CID (ref) | provenance | an agent DID that originated data under `rootCid` (many per root) |
@@ -54,8 +55,11 @@ mKOTO tariff schedule, ADR-2605282100 L2):
   "half_life_epochs": 30,        // decay half-life (days; EPOCH == 1 day == contract EPOCH)
   "w_disclosure": 1.0,           // points per validated disclosure
   "w_wellbecoming": 2.0,         // points per unit wellbecoming-Δ (long-term > disclosure)
+  "w_convening": 1.5,            // points per validated+survived tie (disclosure < this < wellbecoming)
+  "convening_survival_epochs": 7,// S — a tie must persist this many epochs post-gathering to count
   "citation_bonus_per_hit": 0.1, // extra disclosure points per CitationLedger hit
-  "burn_falsified_mult": 1.5 }   // burn > original mint (asymmetric downside)
+  "burn_falsified_mult": 1.5,    // burn > original mint (asymmetric downside)
+  "burn_extractive_mult": 1.5 }  // engagement-farmed/coerced convening burns > it earns (囲い込みで損)
 ```
 
 ---
@@ -72,7 +76,7 @@ mKOTO tariff schedule, ADR-2605282100 L2):
 ### Closed form (audit / as-of query)
 
 ```
-SC(did, t) = Σ_{e ≤ t} ( mint_disclosure(did,e) + mint_wellbecoming(did,e) − burn(did,e) ) · λ^(t−e)
+SC(did, t) = Σ_{e ≤ t} ( mint_disclosure(did,e) + mint_wellbecoming(did,e) + mint_convening(did,e) − burn(did,e) ) · λ^(t−e)
 ```
 
 ### Incremental recurrence (what the MV actually computes — O(1)/epoch/DID)
@@ -131,6 +135,26 @@ mint_wellbecoming_smic(did, e)
 A negative Δ does NOT mint (it feeds burn, §4). The Council attestation is itself
 a witness-quorum signature observed the same way as disclosure validation.
 
+### 3c. Convening (催し — designed gatherings that form bonds)
+
+Minted by the **`moyoshi 催し`** settle job (ADR-2606272100), attributed to the
+**convener** DID — but, like disclosure, *only after it survives validation*, never
+on the act of hosting. A gathering's points come from the ties it actually formed,
+not from who showed up. A tie counts only if it is (a) **new** vs the pre-event
+baseline (kizuna 絆 graph), (b) **survived** ≥ `convening_survival_epochs` (S) after
+the gathering, and (c) passed the **anti-sybil membrane** (moyai proof-of-contribution
+— distinct, non-colluding DIDs):
+
+```
+mint_convening_smic(convener, e)
+  = SCALE · w_convening · n_validated_ties(convener, e)
+```
+
+`n_validated_ties` is observed via kizuna's reciprocal-tie readout, settled S epochs
+after the gathering. **RSVPs, headcount, reach, and same-epoch likes mint nothing** —
+this is the defining inversion: turnout without bonds = zero social capital. (Mirrors
+disclosure's "validate-before-mint" anti-spam membrane at the convening layer.)
+
 ---
 
 ## 4. Burn rules (symmetric downside)
@@ -139,12 +163,16 @@ a witness-quorum signature observed the same way as disclosure validation.
 burn_smic(did, e)
   = SCALE · burn_falsified_mult · w_disclosure · n_falsified(did, e)   // ClaimStakeEscrow Slashed against did
   + SCALE · w_wellbecoming · |min(0, wellbecoming_Δ(did, e))|          // Council-attested harm
+  + SCALE · burn_extractive_mult · w_convening · n_manipulative(did, e) // Council-attested engagement-farmed/coerced/exclusionary convening
 ```
 
 `n_falsified` = disclosures by `did` that were `Slashed` on the anchor chain
 (the agent's own claim lost a challenge). Burn uses `burn_falsified_mult > 1`
 so lying costs more than the truth earned — the "嘘で損" asymmetry, mirroring the
-contract's game theory at the social-capital layer.
+contract's game theory at the social-capital layer. `n_manipulative` = gatherings
+convened by `did` that the Council attests were engagement-farmed, coerced,
+pay-to-enter, or exclusionary; `burn_extractive_mult > 1` makes faking community a
+net loss ("囲い込みで損"), the same asymmetry at the convening layer.
 
 ---
 

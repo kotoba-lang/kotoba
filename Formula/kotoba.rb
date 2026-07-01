@@ -1,30 +1,26 @@
 class Kotoba < Formula
-  desc "Content-addressed distributed Datalog database with native CACAO auth"
-  homepage "https://github.com/etzhayyim/kotoba"
-  url "https://github.com/etzhayyim/kotoba/archive/refs/tags/v0.1.0.tar.gz"
+  desc "CLJC/EDN-authoritative Kotoba CLI launcher"
+  homepage "https://github.com/kotoba-lang/kotoba"
+  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "cdf1099d970aa6e5be0e88099fc58bcefea58cadec63392863c3b7538a883655"
   license "Apache-2.0"
-  head "https://github.com/etzhayyim/kotoba.git", branch: "main"
+  head "https://github.com/kotoba-lang/kotoba.git", branch: "main"
 
-  depends_on "rust" => :build
+  depends_on "clojure"
 
   def install
-    # The `kotoba` binary lives in the kotoba-cli crate inside the workspace.
-    # `--locked` is enforced via std_cargo_args.
-    system "cargo", "install",
-           *std_cargo_args(path: "crates/kotoba-cli"),
-           "--bin", "kotoba"
+    libexec.install "deps.edn", "src", "bin"
+    (bin/"kotoba").write <<~EOS
+      #!/bin/sh
+      export KOTOBA_CLJ_HOME="#{libexec}"
+      exec "#{libexec}/bin/kotoba-clj" "$@"
+    EOS
   end
 
   test do
-    # `kotoba --help` exits 0 and lists subcommands.  Cheap smoke test that
-    # the binary is on PATH and links against its deps correctly.
-    assert_match "kotoba", shell_output("#{bin}/kotoba --help")
-
-    # `kotoba did-derive` is a pure-computation subcommand — no server, no
-    # IPFS, no keychain — perfect for CI smoke verification.
-    seed = "0000000000000000000000000000000000000000000000000000000000000001"
-    did_out = shell_output("#{bin}/kotoba did-derive #{seed}")
-    assert_match "did:key:z", did_out
+    ENV["KOTOBA_CLJ_HOME"] = libexec
+    out = shell_output("#{bin}/kotoba check --kind cli-contract --json")
+    assert_match "kotoba.cli", out
+    assert_match "command-count", out
   end
 end
