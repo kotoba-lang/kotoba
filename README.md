@@ -517,10 +517,23 @@ The cross-cutting design SSoT remains the parent-monorepo ADR (see [ADR](#adr) b
 ## Build
 
 ```bash
-cargo build --workspace
-cargo test --workspace                  # ~1184 tests pass
-cargo build --release -p kotoba-cli     # final `kotoba` binary
+clojure -M:test
+bin/kotoba-clj check --kind cli-contract --json
 ```
+
+These are the default CI gates for the public CLI path.
+
+Legacy Rust compatibility gates are still available for backend migration work,
+but they are no longer the default release path:
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo build --release -p kotoba-cli
+```
+
+The Rust gates run from the `Rust legacy compatibility` workflow on a manual or
+scheduled basis.
 
 Wallet actor/browser maturity gate:
 

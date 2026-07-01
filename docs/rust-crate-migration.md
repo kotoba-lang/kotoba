@@ -1,8 +1,9 @@
 # Rust Crate Migration
 
-The `kotoba` repository is still the active Rust compatibility workspace. The
-target architecture is Kotoba/CLJC as the source of truth for language,
-database, package, git/rad, deploy, and protocol semantics.
+The `kotoba` repository is now a CLJC-first host repository with a legacy Rust
+compatibility workspace. The target architecture is Kotoba/CLJC as the source
+of truth for language, database, package, git/rad, deploy, and protocol
+semantics.
 
 Rust may remain only as:
 
@@ -22,6 +23,13 @@ Rust may remain only as:
 | crypto/storage/network | `kotoba-crypto`, `kotoba-store`, `kotoba-net`, `kotoba-ipfs` | native backend adapters behind CLJC protocols |
 | runtime/wasm | `kotoba-runtime`, `kotoba-rt`, `kotoba-wasm`, `kotoba-guest` | host execution backend; semantics in Kotoba/CLJC |
 
+## CI Status
+
+Default pull-request CI now gates the CLJ launcher and Python SDK surfaces. Rust
+workspace checks moved to the `Rust legacy compatibility` workflow, which runs
+manually and weekly. This keeps Rust visible while making CLJC/EDN the default
+release path.
+
 ## Rule For New Work
 
 New protocol or language behavior must land first in a Kotoba/CLJC contract or
@@ -37,4 +45,3 @@ not become the only definition of the behavior.
    one command contract.
 4. Keep native crypto/storage/network implementations, but bind them through
    explicit CLJC protocols.
-
