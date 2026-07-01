@@ -124,17 +124,23 @@ Current seed:
   legacy artifact name `kototama-selfhost-analyzer.component.wasm` with an EDN
   manifest, and CLI release evidence requires that manifest, so promotion
   validates the shipped safe Kotoba artifact, not only a fresh bootstrap compile.
-- `provider_surface_policy.kotoba` — executable safe Kotoba oracle for the
-  shell provider/surface policy projection. `kotoba shell
-  provider-contract-check` compiles it to Wasm and checks the provider universe
-  derived from `aiueos_provider_catalog.edn` against the oracle's provider
-  family, command, portable command, and status-class counts before accepting
-  provider contract evidence.
-- `aiueos_provider_catalog.edn` — EDN source of truth for the aiueos shell
-  provider catalog. Rust now reads this seed and filters it by target
-  capabilities instead of constructing the provider catalog from hard-coded
-  provider branches. Release export writes the canonical EDN and an interop JSON
-  projection beside `aiueos-shell-surface.*`.
+- `aiueos_provider_catalog.edn` and `aiueos_provider_catalog.kotoba` — EDN
+  source of truth plus executable safe Kotoba oracle for the aiueos shell
+  provider catalog and provider/surface contract. Rust now reads the EDN seed and
+  filters it by target capabilities instead of constructing the provider catalog
+  from hard-coded provider branches. Rust does not generate the Kotoba oracle;
+  it only compiles the bundled Kotoba source and checks that the EDN seed and
+  oracle exports agree on provider family, command, portable-command,
+  status-class, per-provider score, and catalog digest invariants. Required
+  provider command coverage is also derived from the
+  seed's target-gated `required-targets`, so release provider checks no longer
+  keep their command requirement list in Rust-only branching code. Capability
+  family matching and the provider oracle's universe projection now read the
+  seed's `matches` patterns instead of using Rust-only provider-family tables.
+  Provider catalog digest symbol codes are stored in the seed's `digest` map,
+  removing the Rust-only digest symbol table from the promotion check.
+  Release export writes the canonical EDN and an interop JSON projection beside
+  `aiueos-shell-surface.*`.
   The oracle also exposes per-provider scores encoding command count, portable
   command count, and status code plus a catalog digest covering provider order,
   family id, capability, status, and command sequence for ledger, filesystem,
@@ -181,37 +187,55 @@ Current seed:
   `live-adapter-supervisor-evidence` is required directly by a CI or release
   profile, preserving the source -> policy -> Wasm chain through runtime
   evidence.
-- `app_components_contract.kotoba` — executable safe Kotoba oracle for the
-  shipped safe app component manifest contract. Release export writes it as
+- `app_components_contract.edn` and `app_components_contract.kotoba` — EDN
+  contract seed plus executable safe Kotoba oracle for the shipped safe app
+  component manifest contract. Release export writes it as
   `kototama-app-components-contract.component.wasm` with EDN/JSON manifests.
   `kotoba shell kototama-app-components-check <release-dir>/kototama-app-components.edn`
   requires the sibling `kototama-app-components-contract.edn`, executes that
-  shipped oracle, and checks the manifest schema/admission/analyzer ABI digests,
-  digest modulus, and required top-level/component field counts before accepting
-  `kototama-app-components-ready-evidence`. This moves another release-critical
-  app component invariant out of Rust-only constants while Rust continues to
-  verify source hashes, minimal policy, reproducible Wasm, and artifact bytes.
-- `plugin_contract.kotoba` — executable safe Kotoba oracle for shell plugin
-  registry, plugin SDK, and plugin loader release contracts. Release export
-  writes it as `kototama-plugin-contract.component.wasm` with EDN/JSON
-  manifests. Plugin registry/SDK/load checks execute the shipped oracle when it
-  is present beside the release manifests, and release `evidence-check` requires
-  those bundled oracle markers before accepting plugin promotion evidence. This
-  moves schema, ABI, permission-mode, loader-mode, audit-import, and required
-  field-count invariants out of Rust-only promotion checks.
-- `compatibility_contract.kotoba` — executable safe Kotoba oracle for the shell
-  schema/ABI compatibility policy. Release export writes it as
+  shipped oracle, and reads expected manifest schema/admission/analyzer ABI
+  digests, digest modulus, and required top-level/component field counts from
+  the EDN seed before accepting `kototama-app-components-ready-evidence`. This
+  moves another release-critical app component invariant out of Rust-only
+  constants while Rust continues to verify source hashes, minimal policy,
+  reproducible Wasm, and artifact bytes.
+- `plugin_contract.edn` and `plugin_contract.kotoba` — EDN contract seed plus
+  executable safe Kotoba oracle for shell plugin registry, plugin SDK, and
+  plugin loader release contracts. Rust does not generate this Kotoba source;
+  it only compiles the bundled Kotoba oracle and checks that the EDN seed and
+  oracle exports agree. Release export writes
+  `kototama-plugin-contract.component.wasm` with EDN/JSON manifests. Plugin
+  registry/SDK/load checks execute the shipped oracle when it is present beside
+  the release manifests, with expected oracle exports loaded from the EDN seed.
+  Release `evidence-check` requires those bundled oracle markers before
+  accepting plugin promotion evidence. This moves schema, ABI, permission-mode,
+  loader-mode, audit-import, and required field-count invariants out of
+  Rust-only promotion checks while keeping the executable contract in Kotoba.
+- `native_host_contract.edn` and `native_host_contract.kotoba` — EDN contract
+  seed plus executable safe Kotoba oracle for generated native host bridge
+  dispatch contracts. Shell native-host checks load expected oracle exports from
+  the EDN seed instead of duplicating native host digest/count tables in Rust
+  target branches.
+- `compatibility_contract.edn` and `compatibility_contract.kotoba` — EDN
+  contract seed plus executable safe Kotoba oracle for the shell schema/ABI
+  compatibility policy. Release export writes it as
   `kototama-compatibility-contract.component.wasm` with EDN/JSON manifests.
   `kotoba shell compatibility-check` executes the shipped oracle when present
-  beside `kotoba-shell-compatibility.json`, and release `evidence-check`
-  requires the bundled oracle markers before accepting
-  `compatibility-ready-evidence`. This moves policy version, stability, ABI,
-  bridge/event, schema-compatibility, notice-period, boolean-policy, and known
-  schema-count invariants out of Rust-only promotion checks.
-- `updater_contract.kotoba`, `updater_channel_contract.kotoba`,
-  `updater_ui_contract.kotoba`, and `updater_lifecycle_contract.kotoba` —
-  executable safe Kotoba oracles for the shell updater manifest, channel
-  policy, updater UI contract, and bundle/install/publication lifecycle gates.
+  beside `kotoba-shell-compatibility.json`, and loads expected policy version,
+  stability, ABI, bridge/event, schema-compatibility, notice-period,
+  boolean-policy, and known schema-count exports from the EDN seed. Release
+  `evidence-check` requires the bundled oracle markers before accepting
+  `compatibility-ready-evidence`.
+- Release evidence validators derive plugin, compatibility, updater, and
+  updater-lifecycle oracle marker requirements from these EDN contract seeds
+  instead of keeping a second set of `oracle:name:value` literals in Rust.
+- `updater_contract.edn` / `updater_contract.kotoba`,
+  `updater_channel_contract.edn` / `updater_channel_contract.kotoba`,
+  `updater_ui_contract.edn` / `updater_ui_contract.kotoba`, and
+  `updater_lifecycle_contract.edn` / `updater_lifecycle_contract.kotoba` — EDN
+  contract seeds plus executable safe Kotoba oracles for the shell updater
+  manifest, channel policy, updater UI contract, and bundle/install/publication
+  lifecycle gates.
   Release export
   writes them as `kototama-updater-contract.component.wasm`,
   `kototama-updater-channel-contract.component.wasm`, and
@@ -221,37 +245,54 @@ Current seed:
   `kotoba shell updater-check` executes the shipped oracle when present beside
   `kotoba-shell-updater-manifest.json`; `updater-channel-check` and
   `updater-ui-check` use the same shipped oracle beside their release manifests.
+  Expected oracle exports are read from the EDN seeds instead of being
+  reconstructed from updater JSON fields in Rust.
   Release `evidence-check` requires the bundled oracle markers before accepting
   updater, updater-channel, updater-UI, updater-bundle, updater-install, or
   updater-publication readiness evidence. This moves updater schema, version,
   channel, channel-policy, bridge/audit/UI state/action/event, required contract
   paths, install verification, publication probing, lifecycle evidence schemas,
   and artifact field-count invariants out of Rust-only promotion checks.
-- `signing_contract.kotoba` and `submission_contract.kotoba` — executable safe
-  Kotoba oracles for store signing and submission readiness. Release export
-  writes them as `kototama-signing-contract.component.wasm` and
+- `runtime_contract.edn` and `runtime_contract.kotoba` — EDN contract seed plus
+  executable safe Kotoba oracle for shell runtime checks. Runtime-check project
+  validation loads expected oracle exports from the EDN seed instead of keeping
+  the runtime-check schema/field/target command-plan values in a Rust branch.
+- `sdk_contract.edn` and `sdk_contract.kotoba` — EDN contract seed plus
+  executable safe Kotoba oracle for shell SDK/project checks. SDK project
+  validation loads expected oracle exports from the EDN seed instead of keeping
+  SDK schema/project-file/command-plan values in Rust target branches.
+- `signing_contract.edn` / `signing_contract.kotoba` and
+  `submission_contract.edn` / `submission_contract.kotoba` — EDN contract seeds
+  plus executable safe Kotoba oracles for store signing and submission
+  readiness. Release export writes the Kotoba oracles as
+  `kototama-signing-contract.component.wasm` and
   `kototama-submission-contract.component.wasm` with EDN/JSON manifests.
   `kotoba shell signing-check` and `submission-check` execute the shipped
-  oracles when present beside the release artifacts, and release
-  `evidence-check` requires bundled oracle markers before accepting
-  signing/submission readiness evidence. This moves store schema, helper script,
-  credential-env count, artifact/file count, and signing gate-count invariants
-  out of Rust-only promotion checks.
-- `release_contract.kotoba` and `release_target_contract.kotoba` —
-  executable safe Kotoba oracles for release metadata readiness. Release export
-  writes them as `kototama-release-contract.component.wasm` and
+  oracles when present beside the release artifacts, and load expected oracle
+  exports from the EDN seeds instead of reconstructing store schema, helper
+  script, credential-env count, artifact/file count, and signing gate-count
+  values from Rust.
+- `release_contract.edn` / `release_contract.kotoba` and
+  `release_target_contract.edn` / `release_target_contract.kotoba` — EDN
+  contract seeds plus executable safe Kotoba oracles for release metadata
+  readiness. Release export writes the Kotoba oracles as
+  `kototama-release-contract.component.wasm` and
   `kototama-release-target-contract.component.wasm` with EDN/JSON manifests.
-  `kotoba shell release-check` executes the shipped oracle when present beside
-  the release metadata, and release `evidence-check` requires bundled oracle
-  markers before accepting `release-metadata-ready-evidence`. This moves release
-  schema, permissions schema, evidence profile schema, common release file
-  count, target file count, script count, and credential-env count invariants
-  out of Rust-only promotion checks.
+  `kotoba shell release-check` executes the shipped oracles when present beside
+  the release metadata, and loads expected schema digests, common/target file
+  counts, script counts, and credential-env counts from the EDN seeds instead of
+  owning duplicate Rust literals.
 - Rust bridge inputs and all analyzer outputs carry
   `{"abi": "kotoba.selfhost.safe-analyzer.v1"}`. The analyzer rejects inputs
   without this marker, and the Rust bridge rejects outputs without it before
   decoding typed results. This makes the selfhost CBOR boundary an explicit
   versioned contract instead of an implicit test fixture.
+- Package dependency capability requirements from `kotoba.lock.edn` are encoded
+  as analyzer `dependency-capabilities` facts for the compile gate. CID, signer,
+  and reserved-capability structure checks remain in CLI/bootstrap code, but the
+  executable dependency classes (`graph-read`, `graph-write`, `infer`, `auth`)
+  are merged into the analyzer's policy `used` set before safe-build emits
+  bytes.
 
 The test suite fixes three bootstrap properties:
 
@@ -271,6 +312,8 @@ The test suite fixes three bootstrap properties:
   same source name;
 - all-function summary output over `program` input matches Rust transitive
   `infer_effects` for every parsed function in the test program;
+- compile-gate policy checks account for package dependency capability facts
+  even when the source itself is pure;
 - cyclic call graphs / mutual recursion converge to the same transitive effect
   sets as Rust `infer_effects` for the covered host-call surface;
 - executable-body safe-subset checking rejects covered forbidden forms such as
@@ -301,17 +344,33 @@ The test suite fixes three bootstrap properties:
   division/mod/rem by literal zero from parser-owned AST facts. The Rust bridge
   also sends source-level `source-types` facts with small literal kind codes, so
   covered direct literal kind mismatches can be rejected by safe Kotoba even when
-  Rust AST lowering fails. The source-level type walker skips inert forms and
-  non-executable declarations such as `defmacro`; those constructs are handled
-  by the subset gate instead. Value-dependent literal checks remain AST-owned;
+  Rust AST lowering fails. Source-level facts also preserve simple lexical
+  bindings such as `(let [s "x"] (+ s 1))`, plus conservative `do` final values,
+  same-type `if` joins, and nested direct `let`/`loop` return facts. Short
+  string/small int markers cover `byte-at` out-of-bounds, negative
+  `bytes-alloc`, and literal-zero `/` / `quot` / `mod` / `rem` in source-only
+  fallback. The source-level type walker skips inert forms and non-executable
+  declarations such as `defmacro`; those constructs are handled by the subset
+  gate instead;
 - source-only tooling fallback also carries `source-effects` facts for direct
   executable host calls in `defn` bodies. This lets the safe Kotoba analyzer
   synthesize minimal policy, check policy/admission, and lint over-grants for
   direct calls such as `(kqe-assert! "graphB" ...)` even when a separate source
-  form prevents Rust AST lowering. Namespaced direct calls such as
-  `(kotoba/kqe-assert! "graphB" ...)` are normalized to the same builtin
-  operation for source-only policy tooling. Interprocedural propagation,
-  dynamic targets, and declaration soundness remain parser-owned AST facts;
+  form prevents Rust AST lowering. Source-only host-call targets also resolve
+  simple lexical literal bindings, conservative `do` final values, same-target
+  `if` joins, and nested direct `let`/`loop` return facts before falling back to
+  wildcard targets. Later dynamic rebindings shadow earlier literal targets and
+  widen back to wildcard instead of leaking the old literal. Namespaced direct
+  calls such as `(kotoba/kqe-assert! "graphB" ...)` are normalized to the same
+  builtin operation for source-only policy tooling. Source-only fallback now
+  also keeps `defn`-level `{:effects ...}` rows with those per-function source
+  facts and direct source call edges, so `infer_effects` reports named functions
+  rather than a synthetic `$source` bucket and can close direct source-only
+  function calls through the same Kotoba analyzer fixpoint. Direct source-only
+  declaration under-coverage is rejected by the Kotoba analyzer. Multi-arity
+  source-only declaration checking conservatively unions direct source effects
+  across arities at the function level. Dynamic target flows remain parser-owned
+  AST facts;
   division/mod/rem by literal zero. The Rust bridge preserves these builtin
   names in parser-owned AST facts instead of collapsing them to `pure-builtin`.
   The bridge also sends a parser-owned `type-body` AST copy; the analyzer uses
@@ -351,6 +410,11 @@ The test suite fixes three bootstrap properties:
   numeric/math/byte-buffer/host-import position. Direct call-return checks
   resolve multi-arity callees by `name + arity`, so `(f 1 2)` is typed against
   the arity-2 return signature rather than the first `f` overload.
+  Source-only type facts now carry small literal markers for short string
+  lengths and small integer values, so the analyzer can still reject covered
+  value-dependent cases such as `byte-at` out-of-bounds, negative
+  `bytes-alloc`, and literal-zero `/` / `quot` / `mod` / `rem` divisors even
+  when Rust AST lowering falls back.
   Rust still owns typed-HIR inference and non-literal/runtime-dependent type
   checks, including richer call-site flows;
 - effect declaration checking over `program` input rejects transitive

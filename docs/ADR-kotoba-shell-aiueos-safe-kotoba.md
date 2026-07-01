@@ -472,9 +472,16 @@ Android/iOS の contacts/calendar/SMS は MVP 後。SMS は Android のみ。
   manifest capabilities into a provider catalog, verifying command surfaces for
   each provider, and rejecting capabilities without provider linkage. The catalog
   is now derived from `kotoba-clj/selfhost/aiueos_provider_catalog.edn`, with
-  JSON retained as an exported interop projection. It includes the aiueos
-  ledger/audit provider for `ledger/append` alongside shell providers for
-  notification, clipboard, HTTP, keychain, contacts, and calendar. Generated
+  JSON retained as an exported interop projection. The executable provider
+  oracle lives in `kotoba-clj/selfhost/aiueos_provider_catalog.kotoba`; Rust
+  compiles and checks that bundled Kotoba source instead of generating it.
+  Required provider command coverage, capability-family matching, and the
+  provider oracle's universe projection are also derived from that seed's
+  target-gated provider entries and `matches` patterns. Provider catalog digest
+  symbol codes are stored in the seed's `digest` map rather than a Rust-only
+  table. It includes the aiueos ledger/audit provider for
+  `ledger/append` alongside shell providers for notification, clipboard, HTTP,
+  keychain, contacts, and calendar. Generated
   macOS, iOS, Android, and Windows native hosts now implement
   `ledger/append` as a capability-gated local append-only JSONL ledger under app
   data. `kotoba shell ledger-replay-check` replays that JSONL into a replica,
@@ -489,8 +496,9 @@ Android/iOS の contacts/calendar/SMS は MVP 後。SMS は Android のみ。
   plugin-check --evidence` emits `kotoba-shell.plugin-check.v0` evidence by
   verifying plugin id, target, commands, and deny-by-default permission metadata.
   Release export also writes `kototama-plugin-contract.component.wasm` plus
-  `kototama-plugin-contract.edn` / `.json` from `plugin_contract.kotoba`;
-  plugin-check executes that shipped oracle when present and release
+  `kototama-plugin-contract.edn` / `.json` from
+  `kotoba-clj/selfhost/plugin_contract.kotoba`; plugin-check executes that
+  shipped oracle when present and release
   `evidence-check` requires its bundled oracle markers for plugin promotion
   evidence. This keeps plugin discovery below the kotoba capability graph
   rather than granting ambient Tauri-style native authority.
@@ -510,7 +518,10 @@ Android/iOS の contacts/calendar/SMS は MVP 後。SMS は Android のみ。
   `env.kotoba_host_audit`, which is linked only when the manifest permits it.
   Plugin SDK/load checks use the same shipped `plugin_contract.kotoba` oracle to
   bind schema, ABI, permission-mode, loader-mode, audit-import, and required
-  field-count invariants to Kotoba-owned release evidence.
+  field-count invariants to Kotoba-owned release evidence. The companion
+  `plugin_contract.edn` seed records the same export values for data-level
+  conformance and shell checks read expected plugin oracle exports from that
+  seed instead of reconstructing them from plugin JSON in Rust.
   Broader host imports and third-party plugin execution remain pending, but
   release promotion now has sandbox admission, sample command invocation, and
   host-audit import evidence instead of only an SDK schema.
@@ -547,6 +558,39 @@ Android/iOS の contacts/calendar/SMS は MVP 後。SMS は Android のみ。
   WebView2, `WebMessageReceived`, `window.kotobaShell`, readiness markers,
   lifecycle markers, updater bridge, and ledger append bridge; Windows runner
   execution evidence is still pending until the host is executed on Windows.
+- Native host contract: generated macOS/iOS/Android/Windows host projects bundle
+  `kototama-native-host-contract.component.wasm` plus manifest metadata from
+  `native_host_contract.kotoba`. `kotoba shell native-host-contract-check`
+  executes the shipped oracle and verifies bridge/runtime, provider-command,
+  capability gate, command-surface, and target dispatch digests. Expected oracle
+  exports are read from `native_host_contract.edn`, leaving Rust to parse/check
+  the seed instead of owning a duplicate target digest table.
+- Runtime check contract: generated projects also bundle
+  `kototama-runtime-contract.component.wasm` from `runtime_contract.kotoba`.
+  Runtime-check oracle expectations are read from `runtime_contract.edn`, so
+  Rust no longer owns the runtime-check schema/field/target command-plan export
+  table.
+- SDK contract: generated projects bundle `kototama-sdk-contract.component.wasm`
+  from `sdk_contract.kotoba`. SDK oracle expectations are read from
+  `sdk_contract.edn`, so Rust no longer owns the SDK schema/project-file/command
+  digest export table.
+- Compatibility/app-components contracts: compatibility and safe app component
+  checks execute `compatibility_contract.kotoba` and
+  `app_components_contract.kotoba`, with expected oracle exports read from
+  companion EDN seeds instead of being reconstructed from JSON fields in Rust.
+- Updater contracts: updater manifest, updater channel, updater UI, and updater
+  lifecycle checks execute their Kotoba oracles with expected exports read from
+  companion EDN seeds instead of being reconstructed from updater JSON fields in
+  Rust.
+- Evidence promotion now derives plugin, compatibility, updater, and
+  updater-lifecycle required oracle markers from the same EDN contract seeds,
+  reducing the duplicate Rust-owned `oracle:name:value` marker tables.
+- Release/signing/submission contracts: release export bundles
+  `release_contract.kotoba`, `release_target_contract.kotoba`,
+  `signing_contract.kotoba`, and `submission_contract.kotoba` as executable
+  Kotoba oracles. Their expected schema, file/script/env, signing, and
+  submission exports are read from companion EDN seeds, so Rust no longer
+  reconstructs those expected values from release JSON and target helper tables.
 - Release metadata: `kotoba-shell-release.json`,
   `kotoba-shell-permissions.json`, `kotoba-shell-capabilities.edn`,
   `aiueos-shell-surface.json`, `aiueos-shell-surface.edn`,
@@ -596,10 +640,11 @@ Android/iOS の contacts/calendar/SMS は MVP 後。SMS は Android のみ。
   requires that evidence to prove the bundled oracle path, component source
   marker, component sha marker, and profile/command/evidence digests rather than
   accepting a check-time Rust bootstrap compile.
-  `kotoba shell provider-contract-check` also compiles and runs
-  `provider_surface_policy.kotoba`, checking the generated provider universe's
-  family count, command count, portable command count, and status-class count
-  against a safe Kotoba Wasm oracle before accepting provider contract evidence.
+  `kotoba shell provider-contract-check` also compiles and runs the bundled safe
+  Kotoba provider/surface oracle from
+  `kotoba-clj/selfhost/aiueos_provider_catalog.kotoba`, checking the provider
+  universe's family count, command count, portable command count, and
+  status-class count before accepting provider contract evidence.
   The same oracle now checks per-provider scores encoding command counts,
   portable command counts, and shell/audit status codes, plus a catalog digest
   that covers provider order, family id, capability, status, and command

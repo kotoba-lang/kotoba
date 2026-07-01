@@ -211,3 +211,57 @@ fn kotoba_wasm_safe_build_reports_kotoba_admission_gate() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn kotoba_wasm_safe_build_rejects_package_lock_over_policy() {
+    let dir = temp_dir("safe-build-package-lock");
+    let cell = dir.join("cell.kotoba");
+    let policy = dir.join("policy.edn");
+    let lock = dir.join("kotoba.lock.edn");
+    let out = dir.join("cell.wasm");
+    fs::write(&cell, r#"(defn run [x] (+ x 1))"#).unwrap();
+    fs::write(
+        &policy,
+        r#"{:imports {:graph-read ["graphA"] :graph-write [] :infer [] :auth false :egress [] :secrets [] :clock false :random false}
+            :limits {:memory-pages 4 :fuel 1000000 :max-call-depth 128 :max-output-bytes 65536}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &lock,
+        r#"{:kotoba.lock/version 1
+            :deps
+            [{:dep/name "kotoba-lang/json"
+              :dep/version "0.1.0"
+              :dep/repo-rid "bafyrepojson111111111111111111111111111111111111111111111111"
+              :dep/ref "refs/tags/v0.1.0"
+              :dep/commit "0123456789abcdef0123456789abcdef01234567"
+              :dep/tree-cid "bafytreejson111111111111111111111111111111111111111111111111"
+              :dep/manifest-cid "bafymanifestjson111111111111111111111111111111111111111111"
+              :dep/signers ["did:key:z6Mkpkgjson"]
+              :dep/capabilities [:graph-write]}]}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kotoba"))
+        .arg("wasm")
+        .arg("safe-build")
+        .arg(&cell)
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--package-lock")
+        .arg(&lock)
+        .arg("-S")
+        .arg(&dir)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dependency capability grant exceeds caller policy"));
+    assert!(stderr.contains(":graph-write"));
+    assert!(!out.exists());
+
+    let _ = fs::remove_dir_all(dir);
+}

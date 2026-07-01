@@ -119,21 +119,25 @@ Kotoba component 側へ移った slice が増える」ことで測る。
   同じ slice は direct literal value check として `byte-at` OOB / 負 index、
   `bytes-alloc` 負容量、除算 / `mod` / `rem` の literal zero も拒否する。
   Rust bridge は normalized source から `source-types` facts も渡す。これは
-  small literal kind code (`Num` / `Str` / unknown) に限定した source-level
-  facts で、Rust AST lowering が失敗する構文でも covered direct literal kind
-  mismatch は Kotoba analyzer が拒否できる。source-level type walker は
-  inert form と `defmacro` などの non-executable declaration body には降りず、
-  それらは subset gate の責務に残す。値依存 literal check は引き続き parser-owned
-  AST facts 側に限定する。
-- Rust bridge は Rust AST lowering failure 時の source-only tooling request に
-  `source-effects` facts も載せる。これは `defn` body 内の直接 host call に限定し、
-  `kqe-assert!` / `kqe-retract!` / `kqe-get-objects` / `kqe-query` /
-  `llm-infer` / `has-capability?` の class-level capability と literal
-  resource target を Kotoba analyzer の minimal-policy / policy / admission /
-  unused-grants gate に渡す。`kotoba/kqe-assert!` のような namespaced direct
-  host call も source-only tooling では同じ builtin operation に正規化する。
-  関数間伝播、dynamic target、effect declaration soundness は引き続き
-  parser-owned AST facts 側に限定する。
+  small literal kind code (`Num` / `Str` / unknown) と covered short string /
+  small integer marker に限定した source-level facts で、Rust AST lowering が
+  失敗する構文でも covered direct literal kind mismatch、`byte-at` OOB、
+  negative `bytes-alloc`、literal-zero `/` / `quot` / `mod` / `rem` は Kotoba
+  analyzer が拒否できる。source-level type walker は inert form と `defmacro`
+  などの non-executable declaration body には降りず、それらは subset gate の
+  責務に残す。
+- Rust bridge は Rust AST lowering failure 時の source-only tooling request で、
+  `program[]` の関数ごとに `source-effects` facts と `source-calls` edges を
+  載せる。これは `defn` body 内の直接 host call に限定し、`kqe-assert!` /
+  `kqe-retract!` / `kqe-get-objects` / `kqe-query` / `llm-infer` /
+  `has-capability?` の class-level capability と literal resource target を
+  Kotoba analyzer の minimal-policy / policy / admission / unused-grants gate に
+  渡す。`kotoba/kqe-assert!` のような namespaced direct host call も
+  source-only tooling では同じ builtin operation に正規化する。Source-only
+  fallback は synthetic `$source` bucket ではなく named function ごとの facts を
+  使い、直接 source call edges を Kotoba analyzer の fixpoint で閉じる。
+  Direct source-only declaration under-coverage も Kotoba analyzer が拒否する。
+  Dynamic/non-literal target flow は引き続き wildcard に倒す。
   Rust bridge はこれらの builtin 名を `pure-builtin` に潰さず parser-owned
   AST facts として渡す。さらに parser-owned `type-body` AST copy から、
   direct `let` / `loop` local、`do` final、同型 `if` join の `Str` / `Num` /
@@ -195,8 +199,8 @@ Kotoba component 側へ移った slice が増える」ことで測る。
   selfhost policy の順で同じ gate 結果を消費する。Kotoba 側がまだ
   表現できない source shape は `check_compile_gate` などの tooling API が
   source-only request に fallback して source-subset / source-types /
-  source-effects facts を先に評価し、それでも表現外の部分は Rust の full gates と
-  既存 `check_admission` に戻す。
+  per-function source-effects/source-calls facts を先に評価し、それでも表現外の
+  部分は Rust の full gates と既存 `check_admission` に戻す。
 
 この位置づけでは、capability confinement の正本は `kotoba` の意味論、
 実行体への公開入口は `kotoba wasm` / safe Kotoba、component lifecycle と

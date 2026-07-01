@@ -30,17 +30,24 @@ pub const SHELL_EVIDENCE_PROFILE_SPEC: &str =
 pub const SHELL_EVIDENCE_PROFILE_ORACLE: &str =
     include_str!("../selfhost/shell_evidence_profile.kotoba");
 
-/// Executable Kotoba oracle for shell provider/surface policy projection.
-pub const PROVIDER_SURFACE_POLICY_ORACLE: &str =
-    include_str!("../selfhost/provider_surface_policy.kotoba");
-
 /// EDN source of truth for aiueos shell provider/catalog projection.
 pub const AIUEOS_PROVIDER_CATALOG_SPEC: &str =
     include_str!("../selfhost/aiueos_provider_catalog.edn");
 
+/// Executable Kotoba oracle for aiueos shell provider/catalog projection.
+pub const AIUEOS_PROVIDER_CATALOG_ORACLE: &str =
+    include_str!("../selfhost/aiueos_provider_catalog.kotoba");
+
 /// Executable Kotoba oracle for shipped safe app component manifest contracts.
 pub const APP_COMPONENTS_CONTRACT_ORACLE: &str =
     include_str!("../selfhost/app_components_contract.kotoba");
+
+/// EDN source of truth for shipped safe app component manifest contract exports.
+pub const APP_COMPONENTS_CONTRACT_SPEC: &str =
+    include_str!("../selfhost/app_components_contract.edn");
+
+/// EDN source of truth for shell plugin registry/SDK/loader contract oracle exports.
+pub const PLUGIN_CONTRACT_SPEC: &str = include_str!("../selfhost/plugin_contract.edn");
 
 /// Executable Kotoba oracle for shell plugin registry/SDK/loader contracts.
 pub const PLUGIN_CONTRACT_ORACLE: &str = include_str!("../selfhost/plugin_contract.kotoba");
@@ -49,38 +56,78 @@ pub const PLUGIN_CONTRACT_ORACLE: &str = include_str!("../selfhost/plugin_contra
 pub const COMPATIBILITY_CONTRACT_ORACLE: &str =
     include_str!("../selfhost/compatibility_contract.kotoba");
 
+/// EDN source of truth for shell compatibility policy contract oracle exports.
+pub const COMPATIBILITY_CONTRACT_SPEC: &str =
+    include_str!("../selfhost/compatibility_contract.edn");
+
 /// Executable Kotoba oracle for shell updater manifest contracts.
 pub const UPDATER_CONTRACT_ORACLE: &str = include_str!("../selfhost/updater_contract.kotoba");
+
+/// EDN source of truth for shell updater manifest contract oracle exports.
+pub const UPDATER_CONTRACT_SPEC: &str = include_str!("../selfhost/updater_contract.edn");
 
 /// Executable Kotoba oracle for shell updater channel policy contracts.
 pub const UPDATER_CHANNEL_CONTRACT_ORACLE: &str =
     include_str!("../selfhost/updater_channel_contract.kotoba");
 
+/// EDN source of truth for shell updater channel contract oracle exports.
+pub const UPDATER_CHANNEL_CONTRACT_SPEC: &str =
+    include_str!("../selfhost/updater_channel_contract.edn");
+
 /// Executable Kotoba oracle for shell updater UI contracts.
 pub const UPDATER_UI_CONTRACT_ORACLE: &str = include_str!("../selfhost/updater_ui_contract.kotoba");
+
+/// EDN source of truth for shell updater UI contract oracle exports.
+pub const UPDATER_UI_CONTRACT_SPEC: &str = include_str!("../selfhost/updater_ui_contract.edn");
 
 /// Executable Kotoba oracle for shell updater bundle/install/publication contracts.
 pub const UPDATER_LIFECYCLE_CONTRACT_ORACLE: &str =
     include_str!("../selfhost/updater_lifecycle_contract.kotoba");
 
+/// EDN source of truth for shell updater lifecycle contract oracle exports.
+pub const UPDATER_LIFECYCLE_CONTRACT_SPEC: &str =
+    include_str!("../selfhost/updater_lifecycle_contract.edn");
+
 /// Executable Kotoba oracle for shell signing readiness contracts.
 pub const SIGNING_CONTRACT_ORACLE: &str = include_str!("../selfhost/signing_contract.kotoba");
+
+/// EDN source of truth for shell signing readiness contract oracle exports.
+pub const SIGNING_CONTRACT_SPEC: &str = include_str!("../selfhost/signing_contract.edn");
 
 /// Executable Kotoba oracle for shell submission readiness contracts.
 pub const SUBMISSION_CONTRACT_ORACLE: &str = include_str!("../selfhost/submission_contract.kotoba");
 
+/// EDN source of truth for shell submission readiness contract oracle exports.
+pub const SUBMISSION_CONTRACT_SPEC: &str = include_str!("../selfhost/submission_contract.edn");
+
 /// Executable Kotoba oracle for shell release metadata readiness contracts.
 pub const RELEASE_CONTRACT_ORACLE: &str = include_str!("../selfhost/release_contract.kotoba");
+
+/// EDN source of truth for shell release metadata contract oracle exports.
+pub const RELEASE_CONTRACT_SPEC: &str = include_str!("../selfhost/release_contract.edn");
 
 /// Executable Kotoba oracle for target-specific shell release readiness contracts.
 pub const RELEASE_TARGET_CONTRACT_ORACLE: &str =
     include_str!("../selfhost/release_target_contract.kotoba");
 
+/// EDN source of truth for target-specific shell release contract oracle exports.
+pub const RELEASE_TARGET_CONTRACT_SPEC: &str =
+    include_str!("../selfhost/release_target_contract.edn");
+
 /// Executable Kotoba oracle for shell runtime release/matrix readiness contracts.
 pub const RUNTIME_CONTRACT_ORACLE: &str = include_str!("../selfhost/runtime_contract.kotoba");
 
+/// EDN source of truth for shell runtime check contract oracle exports.
+pub const RUNTIME_CONTRACT_SPEC: &str = include_str!("../selfhost/runtime_contract.edn");
+
 /// Executable Kotoba oracle for shell SDK/project verification contracts.
 pub const SDK_CONTRACT_ORACLE: &str = include_str!("../selfhost/sdk_contract.kotoba");
+
+/// EDN source of truth for shell SDK/project verification contract oracle exports.
+pub const SDK_CONTRACT_SPEC: &str = include_str!("../selfhost/sdk_contract.edn");
+
+/// EDN source of truth for native host bridge contract oracle exports.
+pub const NATIVE_HOST_CONTRACT_SPEC: &str = include_str!("../selfhost/native_host_contract.edn");
 
 /// Executable Kotoba oracle for generated native host bridge dispatch contracts.
 pub const NATIVE_HOST_CONTRACT_ORACLE: &str =
@@ -320,6 +367,23 @@ impl Analyzer {
         compile_gate_check_from_value(&value)
     }
 
+    pub fn check_compile_gate_with_dependency_capabilities(
+        &self,
+        src: &str,
+        target: ReaderTarget,
+        policy: &Policy,
+        dependency_capabilities: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<CompileGateCheck, CljError> {
+        let input = program_compile_gate_input_with_dependency_capabilities(
+            src,
+            target,
+            policy,
+            dependency_capabilities,
+        )?;
+        let value = self.run_value(&input)?;
+        compile_gate_check_from_value(&value)
+    }
+
     pub fn check_subset(&self, src: &str) -> Result<SubsetCheck, CljError> {
         self.check_subset_with_reader_target(src, ReaderTarget::Kotoba)
     }
@@ -524,7 +588,60 @@ pub fn shell_evidence_profile_oracle_wasm() -> Result<Vec<u8>, CljError> {
 
 /// Compile the bundled provider/surface policy oracle as a safe Kotoba Wasm module.
 pub fn provider_surface_policy_oracle_wasm() -> Result<Vec<u8>, CljError> {
-    crate::compile_safe_kotoba_with_prelude(PROVIDER_SURFACE_POLICY_ORACLE, &Policy::deny_all())
+    crate::compile_safe_kotoba_with_prelude(AIUEOS_PROVIDER_CATALOG_ORACLE, &Policy::deny_all())
+}
+
+#[cfg(test)]
+fn edn_get<'a>(
+    value: &'a kotoba_edn::EdnValue,
+    key: &str,
+) -> Result<&'a kotoba_edn::EdnValue, CljError> {
+    let kotoba_edn::EdnValue::Map(map) = value else {
+        return Err(CljError::Read(format!(
+            "expected map while reading key {key}"
+        )));
+    };
+    map.get(&kotoba_edn::EdnValue::kw_bare(key))
+        .ok_or_else(|| CljError::Read(format!("missing key {key}")))
+}
+
+#[cfg(test)]
+fn edn_vec<'a>(
+    value: &'a kotoba_edn::EdnValue,
+    label: &str,
+) -> Result<&'a [kotoba_edn::EdnValue], CljError> {
+    match value {
+        kotoba_edn::EdnValue::Vector(items) => Ok(items.as_slice()),
+        _ => Err(CljError::Read(format!("{label} must be a vector"))),
+    }
+}
+
+#[cfg(test)]
+fn edn_string(value: &kotoba_edn::EdnValue, label: &str) -> Result<String, CljError> {
+    value
+        .as_string()
+        .map(str::to_string)
+        .ok_or_else(|| CljError::Read(format!("{label} must be a string")))
+}
+
+#[cfg(test)]
+fn edn_i64(value: &kotoba_edn::EdnValue, label: &str) -> Result<i64, CljError> {
+    value
+        .as_integer()
+        .ok_or_else(|| CljError::Read(format!("{label} must be an integer")))
+}
+
+#[cfg(test)]
+fn edn_i64_map(
+    value: &kotoba_edn::EdnValue,
+    label: &str,
+) -> Result<BTreeMap<String, i64>, CljError> {
+    let kotoba_edn::EdnValue::Map(map) = value else {
+        return Err(CljError::Read(format!("{label} must be a map")));
+    };
+    map.iter()
+        .map(|(key, value)| Ok((edn_string(key, label)?, edn_i64(value, label)?)))
+        .collect()
 }
 
 /// Compile the bundled app-components contract oracle as a safe Kotoba Wasm module.
@@ -847,6 +964,24 @@ pub fn check_compile_gate_with_reader_target(
     Analyzer::new()?.check_compile_gate_with_reader_target(src, target, policy)
 }
 
+/// Check the compile gate while accounting for CID-locked package dependency
+/// capability requirements. The source still supplies executable effects; the
+/// dependency classes are additional capabilities that the caller policy must
+/// cover before package code may be linked or imported.
+pub fn check_compile_gate_with_dependency_capabilities(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+    dependency_capabilities: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<CompileGateCheck, CljError> {
+    Analyzer::new()?.check_compile_gate_with_dependency_capabilities(
+        src,
+        target,
+        policy,
+        dependency_capabilities,
+    )
+}
+
 /// Check executable-body safe-subset denials with the Kotoba analyzer.
 pub fn check_subset(src: &str) -> Result<SubsetCheck, CljError> {
     Analyzer::new()?.check_subset(src)
@@ -1063,7 +1198,7 @@ fn program_minimal_policy_input(src: &str, target: ReaderTarget) -> Result<Vec<u
 }
 
 fn program_effect_check_input(src: &str, target: ReaderTarget) -> Result<Vec<u8>, CljError> {
-    AnalyzerRequest::from_source_with_reader_target(src, target)?
+    AnalyzerRequest::from_source_or_source_only_with_reader_target(src, target)?
         .with_check("effects")
         .to_cbor()
 }
@@ -1113,6 +1248,19 @@ fn program_compile_gate_input(
         .to_cbor()
 }
 
+fn program_compile_gate_input_with_dependency_capabilities(
+    src: &str,
+    target: ReaderTarget,
+    policy: &Policy,
+    dependency_capabilities: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<Vec<u8>, CljError> {
+    AnalyzerRequest::from_source_or_source_only_with_reader_target(src, target)?
+        .with_check("compile-gate")
+        .with_policy(policy)
+        .with_dependency_capabilities(dependency_capabilities)
+        .to_cbor()
+}
+
 fn program_unused_grants_input(
     src: &str,
     target: ReaderTarget,
@@ -1130,7 +1278,7 @@ pub struct AnalyzerRequest {
     functions: Vec<AnalyzerFunction>,
     source_subset: Vec<SourceSubsetFact>,
     source_types: Vec<SourceTypeFact>,
-    source_effects: Vec<SourceEffectFact>,
+    dependency_capabilities: BTreeSet<String>,
     check: Option<String>,
     policy: Option<Policy>,
     declared: BTreeMap<String, BTreeSet<String>>,
@@ -1161,6 +1309,7 @@ struct AnalyzerFunction {
     params: Vec<String>,
     body: Vec<Expr>,
     source_effects: Vec<SourceEffectFact>,
+    source_calls: Vec<String>,
 }
 
 impl AnalyzerRequest {
@@ -1195,12 +1344,13 @@ impl AnalyzerRequest {
                         params: function.params,
                         body: function.body,
                         source_effects: function_source_effects,
+                        source_calls: Vec::new(),
                     }
                 })
                 .collect(),
             source_subset,
             source_types,
-            source_effects: Vec::new(),
+            dependency_capabilities: BTreeSet::new(),
             check: None,
             policy: None,
             declared,
@@ -1224,14 +1374,36 @@ impl AnalyzerRequest {
         let normalized = compat::normalize_source(src, target)?;
         let source_forms =
             kotoba_edn::parse_all(&normalized).map_err(|e| CljError::Read(e.to_string()))?;
+        let source_effects_by_function = source_effect_facts_by_function(&source_forms);
+        let source_calls_by_function = source_call_facts_by_function(&source_forms);
+        let source_declared = source_declared_effects_by_function(&source_forms)?;
+        let mut function_names = BTreeSet::new();
+        function_names.extend(source_effects_by_function.keys().cloned());
+        function_names.extend(source_calls_by_function.keys().cloned());
+        function_names.extend(source_declared.keys().cloned());
         Ok(Self {
-            functions: Vec::new(),
+            functions: function_names
+                .into_iter()
+                .map(|name| AnalyzerFunction {
+                    source_effects: source_effects_by_function
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default(),
+                    source_calls: source_calls_by_function
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default(),
+                    name,
+                    params: Vec::new(),
+                    body: Vec::new(),
+                })
+                .collect(),
             source_subset: source_subset_facts(&source_forms),
             source_types: source_type_facts(&source_forms),
-            source_effects: source_effect_facts(&source_forms),
+            dependency_capabilities: BTreeSet::new(),
             check: None,
             policy: None,
-            declared: BTreeMap::new(),
+            declared: source_declared,
         })
     }
 
@@ -1259,6 +1431,15 @@ impl AnalyzerRequest {
 
     pub fn with_declared_effects(mut self, declared: BTreeMap<String, BTreeSet<String>>) -> Self {
         self.declared = declared;
+        self
+    }
+
+    pub fn with_dependency_capabilities(
+        mut self,
+        dependency_capabilities: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.dependency_capabilities
+            .extend(dependency_capabilities.into_iter().map(Into::into));
         self
     }
 
@@ -1309,6 +1490,18 @@ impl AnalyzerRequest {
                                             ("target", text(&fact.target)),
                                         ])
                                     })
+                                    .collect(),
+                            ),
+                        ));
+                    }
+                    if !function.source_calls.is_empty() {
+                        entries.push((
+                            Value::Text("source-calls".to_string()),
+                            Value::Array(
+                                function
+                                    .source_calls
+                                    .iter()
+                                    .map(|call| text(call))
                                     .collect(),
                             ),
                         ));
@@ -1379,15 +1572,13 @@ impl AnalyzerRequest {
                 ),
             ));
         }
-        if !self.source_effects.is_empty() {
+        if !self.dependency_capabilities.is_empty() {
             entries.push((
-                Value::Text("source-effects".to_string()),
+                Value::Text("dependency-capabilities".to_string()),
                 Value::Array(
-                    self.source_effects
+                    self.dependency_capabilities
                         .iter()
-                        .map(|fact| {
-                            map(vec![("op", text(&fact.op)), ("target", text(&fact.target))])
-                        })
+                        .map(|cap| text(cap))
                         .collect(),
                 ),
             ));
@@ -1466,47 +1657,80 @@ fn collect_ns_clause_facts(items: &[kotoba_edn::EdnValue], out: &mut Vec<SourceS
 
 fn source_type_facts(forms: &[kotoba_edn::EdnValue]) -> Vec<SourceTypeFact> {
     let mut facts = Vec::new();
+    let mut env = Vec::new();
     for form in forms {
-        collect_source_type_facts(form, &mut facts);
+        collect_source_type_facts(form, &mut facts, &mut env);
     }
     facts
 }
 
-fn collect_source_type_facts(value: &kotoba_edn::EdnValue, out: &mut Vec<SourceTypeFact>) {
+fn collect_source_type_facts(
+    value: &kotoba_edn::EdnValue,
+    out: &mut Vec<SourceTypeFact>,
+    env: &mut Vec<(String, i128)>,
+) {
     match value {
         kotoba_edn::EdnValue::List(items) => {
             if let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() {
                 if crate::ast::is_inert_form(&head.name) || source_non_executable_form(&head.name) {
                     return;
                 }
+                if matches!(head.name.as_str(), "let" | "loop") {
+                    collect_source_let_type_facts(items, out, env);
+                    return;
+                }
                 out.push(SourceTypeFact {
                     op: source_type_op_name(head),
-                    args: items.iter().skip(1).map(source_literal_fact).collect(),
+                    args: items
+                        .iter()
+                        .skip(1)
+                        .map(|item| source_expr_type_fact(item, env))
+                        .collect(),
                 });
             }
             for item in items {
-                collect_source_type_facts(item, out);
+                collect_source_type_facts(item, out, env);
             }
         }
         kotoba_edn::EdnValue::Vector(items) => {
             for item in items {
-                collect_source_type_facts(item, out);
+                collect_source_type_facts(item, out, env);
             }
         }
         kotoba_edn::EdnValue::Set(items) => {
             for item in items {
-                collect_source_type_facts(item, out);
+                collect_source_type_facts(item, out, env);
             }
         }
         kotoba_edn::EdnValue::Map(entries) => {
             for (key, value) in entries {
-                collect_source_type_facts(key, out);
-                collect_source_type_facts(value, out);
+                collect_source_type_facts(key, out, env);
+                collect_source_type_facts(value, out, env);
             }
         }
-        kotoba_edn::EdnValue::Tagged { value, .. } => collect_source_type_facts(value, out),
+        kotoba_edn::EdnValue::Tagged { value, .. } => collect_source_type_facts(value, out, env),
         _ => {}
     }
+}
+
+fn collect_source_let_type_facts(
+    items: &[kotoba_edn::EdnValue],
+    out: &mut Vec<SourceTypeFact>,
+    env: &mut Vec<(String, i128)>,
+) {
+    let base_len = env.len();
+    if let Some(kotoba_edn::EdnValue::Vector(bindings)) = items.get(1) {
+        for pair in bindings.chunks(2) {
+            if let [kotoba_edn::EdnValue::Symbol(name), value] = pair {
+                collect_source_type_facts(value, out, env);
+                env.push((name.to_qualified(), source_expr_type_fact(value, env)));
+            }
+        }
+    }
+    for body in items.iter().skip(2) {
+        collect_source_type_facts(body, out, env);
+    }
+    env.truncate(base_len);
 }
 
 fn source_non_executable_form(name: &str) -> bool {
@@ -1540,34 +1764,162 @@ fn source_non_executable_form(name: &str) -> bool {
 }
 
 fn source_type_op_name(symbol: &kotoba_edn::Symbol) -> String {
-    match symbol.namespace.as_deref() {
-        Some("Math") => symbol.to_qualified(),
+    let name = match symbol.namespace.as_deref() {
+        Some("Math") | Some("java.lang.Math") => format!("Math/{}", symbol.name),
         _ => symbol.name.clone(),
+    };
+    match name.as_str() {
+        "long" => "int".to_string(),
+        other => other.to_string(),
     }
+}
+
+fn source_expr_type_fact(value: &kotoba_edn::EdnValue, env: &[(String, i128)]) -> i128 {
+    match value {
+        kotoba_edn::EdnValue::Symbol(symbol) => source_local_type_fact(env, &symbol.to_qualified()),
+        kotoba_edn::EdnValue::List(items) => {
+            if let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() {
+                match head.name.as_str() {
+                    "do" => source_sequence_type_fact(&items[1..], env),
+                    "if" => source_if_type_fact(items, env),
+                    "let" | "loop" => source_let_expr_type_fact(items, env),
+                    _ => source_builtin_result_fact(&source_type_op_name(head)),
+                }
+            } else {
+                0
+            }
+        }
+        _ => source_literal_fact(value),
+    }
+}
+
+fn source_local_type_fact(env: &[(String, i128)], name: &str) -> i128 {
+    env.iter()
+        .rev()
+        .find_map(|(candidate, fact)| (candidate == name).then_some(*fact))
+        .unwrap_or(0)
+}
+
+fn source_sequence_type_fact(items: &[kotoba_edn::EdnValue], env: &[(String, i128)]) -> i128 {
+    items
+        .last()
+        .map(|item| source_expr_type_fact(item, env))
+        .unwrap_or(0)
+}
+
+fn source_if_type_fact(items: &[kotoba_edn::EdnValue], env: &[(String, i128)]) -> i128 {
+    let then_fact = items
+        .get(2)
+        .map(|item| source_expr_type_fact(item, env))
+        .unwrap_or(0);
+    let else_fact = items
+        .get(3)
+        .map(|item| source_expr_type_fact(item, env))
+        .unwrap_or(0);
+    source_join_type_fact(then_fact, else_fact)
+}
+
+fn source_let_expr_type_fact(items: &[kotoba_edn::EdnValue], env: &[(String, i128)]) -> i128 {
+    let mut scoped = env.to_vec();
+    if let Some(kotoba_edn::EdnValue::Vector(bindings)) = items.get(1) {
+        for pair in bindings.chunks(2) {
+            if let [kotoba_edn::EdnValue::Symbol(name), value] = pair {
+                let fact = source_expr_type_fact(value, &scoped);
+                scoped.push((name.to_qualified(), fact));
+            }
+        }
+    }
+    if items.len() > 2 {
+        source_sequence_type_fact(&items[2..], &scoped)
+    } else {
+        0
+    }
+}
+
+fn source_join_type_fact(left: i128, right: i128) -> i128 {
+    match (source_fact_class(left), source_fact_class(right)) {
+        (Some("str"), Some("str")) => 5,
+        (Some("num"), Some("num")) => 2,
+        (Some("bytes"), Some("bytes")) => 4,
+        _ => 0,
+    }
+}
+
+fn source_fact_class(fact: i128) -> Option<&'static str> {
+    if fact == 4 {
+        Some("bytes")
+    } else if fact == 2 || (3_000_000..5_000_000).contains(&fact) || fact >= 2_000_000_000_000 {
+        Some("num")
+    } else if fact == 5 || (1_000_000..2_000_000).contains(&fact) || fact >= 1_000_000_000_000 {
+        Some("str")
+    } else {
+        None
+    }
+}
+
+fn source_builtin_result_fact(op: &str) -> i128 {
+    if source_numeric_result_op(op) {
+        2
+    } else {
+        match op {
+            "bytes-alloc" => 4,
+            "bytes-finish" | "llm-infer" => 5,
+            _ => 0,
+        }
+    }
+}
+
+fn source_numeric_result_op(op: &str) -> bool {
+    matches!(
+        op,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "quot"
+            | "mod"
+            | "rem"
+            | "inc"
+            | "dec"
+            | "min"
+            | "max"
+            | "bit-and"
+            | "bit-or"
+            | "bit-xor"
+            | "bit-not"
+            | "bit-shift-left"
+            | "bit-shift-right"
+            | "double"
+            | "int"
+            | "str-len"
+            | "byte-at"
+            | "bytes-len"
+            | "has-capability?"
+            | "Math/round"
+            | "Math/floor"
+            | "Math/ceil"
+            | "Math/abs"
+            | "Math/sqrt"
+    )
 }
 
 fn source_literal_fact(value: &kotoba_edn::EdnValue) -> i128 {
     match value {
-        kotoba_edn::EdnValue::Integer(_)
-        | kotoba_edn::EdnValue::Float(_)
+        kotoba_edn::EdnValue::Integer(i) if (-999_999..=999_999).contains(i) => {
+            4_000_000_i128 + i128::from(*i)
+        }
+        kotoba_edn::EdnValue::Integer(_) => 2,
+        kotoba_edn::EdnValue::Float(_)
         | kotoba_edn::EdnValue::BigInt(_)
         | kotoba_edn::EdnValue::BigDec(_) => 2,
-        kotoba_edn::EdnValue::String(_)
-        | kotoba_edn::EdnValue::Keyword(_)
+        kotoba_edn::EdnValue::String(s) if s.len() <= 999_999 => 1_000_000_i128 + s.len() as i128,
+        kotoba_edn::EdnValue::String(_) => 5,
+        kotoba_edn::EdnValue::Keyword(_)
         | kotoba_edn::EdnValue::Char(_)
         | kotoba_edn::EdnValue::Vector(_)
         | kotoba_edn::EdnValue::Map(_)
         | kotoba_edn::EdnValue::Set(_) => 5,
         _ => 0,
     }
-}
-
-fn source_effect_facts(forms: &[kotoba_edn::EdnValue]) -> Vec<SourceEffectFact> {
-    let mut facts = Vec::new();
-    for form in forms {
-        collect_top_level_source_effects(form, &mut facts);
-    }
-    facts
 }
 
 fn source_effect_facts_by_function(
@@ -1578,6 +1930,112 @@ fn source_effect_facts_by_function(
         collect_top_level_source_effects_by_function(form, &mut facts);
     }
     facts
+}
+
+fn source_call_facts_by_function(forms: &[kotoba_edn::EdnValue]) -> BTreeMap<String, Vec<String>> {
+    let mut calls = BTreeMap::new();
+    for form in forms {
+        collect_top_level_source_calls_by_function(form, &mut calls);
+    }
+    calls
+}
+
+fn collect_top_level_source_calls_by_function(
+    value: &kotoba_edn::EdnValue,
+    out: &mut BTreeMap<String, Vec<String>>,
+) {
+    let kotoba_edn::EdnValue::List(items) = value else {
+        return;
+    };
+    let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() else {
+        return;
+    };
+    match head.name.as_str() {
+        "do" => {
+            for item in items.iter().skip(1) {
+                collect_top_level_source_calls_by_function(item, out);
+            }
+        }
+        "defn" | "defn-" => {
+            if let Some(name) = defn_source_name(items) {
+                let mut calls = Vec::new();
+                collect_defn_source_calls(items, &mut calls);
+                if !calls.is_empty() {
+                    out.entry(name).or_default().extend(calls);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn source_declared_effects_by_function(
+    forms: &[kotoba_edn::EdnValue],
+) -> Result<BTreeMap<String, BTreeSet<String>>, CljError> {
+    let mut declared = BTreeMap::new();
+    for form in forms {
+        collect_top_level_source_declared_effects(form, &mut declared)?;
+    }
+    Ok(declared)
+}
+
+fn collect_top_level_source_declared_effects(
+    value: &kotoba_edn::EdnValue,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) -> Result<(), CljError> {
+    let kotoba_edn::EdnValue::List(items) = value else {
+        return Ok(());
+    };
+    let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() else {
+        return Ok(());
+    };
+    match head.name.as_str() {
+        "do" => {
+            for item in items.iter().skip(1) {
+                collect_top_level_source_declared_effects(item, out)?;
+            }
+        }
+        "defn" | "defn-" => {
+            if let (Some(name), Some(effects)) = (
+                defn_source_name(items),
+                source_defn_declared_effects(items)?,
+            ) {
+                out.insert(name, effects);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn source_defn_declared_effects(
+    items: &[kotoba_edn::EdnValue],
+) -> Result<Option<BTreeSet<String>>, CljError> {
+    let mut idx = 2;
+    if matches!(items.get(idx), Some(kotoba_edn::EdnValue::String(_))) {
+        idx += 1;
+    }
+    let Some(kotoba_edn::EdnValue::Map(attrs)) = items.get(idx) else {
+        return Ok(None);
+    };
+    let Some(value) = attrs.get(&kotoba_edn::EdnValue::kw_bare("effects")) else {
+        return Ok(None);
+    };
+    let kotoba_edn::EdnValue::Set(effects) = value else {
+        return Err(CljError::Effect(
+            "`:effects` must be a set of keywords (e.g. #{:graph-write})".into(),
+        ));
+    };
+    effects
+        .iter()
+        .map(|effect| {
+            effect
+                .as_keyword()
+                .map(|keyword| keyword.0.name.clone())
+                .ok_or_else(|| CljError::Effect("`:effects` entries must be keywords".into()))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(Some)
 }
 
 fn collect_top_level_source_effects_by_function(
@@ -1616,24 +2074,6 @@ fn defn_source_name(items: &[kotoba_edn::EdnValue]) -> Option<String> {
     }
 }
 
-fn collect_top_level_source_effects(value: &kotoba_edn::EdnValue, out: &mut Vec<SourceEffectFact>) {
-    let kotoba_edn::EdnValue::List(items) = value else {
-        return;
-    };
-    let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() else {
-        return;
-    };
-    match head.name.as_str() {
-        "do" => {
-            for item in items.iter().skip(1) {
-                collect_top_level_source_effects(item, out);
-            }
-        }
-        "defn" | "defn-" => collect_defn_source_effects(items, out),
-        _ => {}
-    }
-}
-
 fn collect_defn_source_effects(items: &[kotoba_edn::EdnValue], out: &mut Vec<SourceEffectFact>) {
     if items.len() < 3 {
         return;
@@ -1647,13 +2087,40 @@ fn collect_defn_source_effects(items: &[kotoba_edn::EdnValue], out: &mut Vec<Sou
     }
     match items.get(idx) {
         Some(kotoba_edn::EdnValue::Vector(_)) => {
+            let mut env = Vec::new();
             for body in defn_body_after_params(&items[(idx + 1)..]) {
-                collect_source_effect_expr(body, out);
+                collect_source_effect_expr(body, out, &mut env);
             }
         }
         Some(kotoba_edn::EdnValue::List(_)) => {
             for arity in &items[idx..] {
                 collect_defn_arity_source_effects(arity, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_defn_source_calls(items: &[kotoba_edn::EdnValue], out: &mut Vec<String>) {
+    if items.len() < 3 {
+        return;
+    }
+    let mut idx = 2;
+    if matches!(items.get(idx), Some(kotoba_edn::EdnValue::String(_))) {
+        idx += 1;
+    }
+    if matches!(items.get(idx), Some(kotoba_edn::EdnValue::Map(_))) {
+        idx += 1;
+    }
+    match items.get(idx) {
+        Some(kotoba_edn::EdnValue::Vector(_)) => {
+            for body in defn_body_after_params(&items[(idx + 1)..]) {
+                collect_source_call_expr(body, out);
+            }
+        }
+        Some(kotoba_edn::EdnValue::List(_)) => {
+            for arity in &items[idx..] {
+                collect_defn_arity_source_calls(arity, out);
             }
         }
         _ => {}
@@ -1670,8 +2137,21 @@ fn collect_defn_arity_source_effects(
     let Some(kotoba_edn::EdnValue::Vector(_)) = items.first() else {
         return;
     };
+    let mut env = Vec::new();
     for body in defn_body_after_params(&items[1..]) {
-        collect_source_effect_expr(body, out);
+        collect_source_effect_expr(body, out, &mut env);
+    }
+}
+
+fn collect_defn_arity_source_calls(value: &kotoba_edn::EdnValue, out: &mut Vec<String>) {
+    let kotoba_edn::EdnValue::List(items) = value else {
+        return;
+    };
+    let Some(kotoba_edn::EdnValue::Vector(_)) = items.first() else {
+        return;
+    };
+    for body in defn_body_after_params(&items[1..]) {
+        collect_source_call_expr(body, out);
     }
 }
 
@@ -1683,47 +2163,164 @@ fn defn_body_after_params(items: &[kotoba_edn::EdnValue]) -> &[kotoba_edn::EdnVa
     }
 }
 
-fn collect_source_effect_expr(value: &kotoba_edn::EdnValue, out: &mut Vec<SourceEffectFact>) {
+fn collect_source_call_expr(value: &kotoba_edn::EdnValue, out: &mut Vec<String>) {
     match value {
         kotoba_edn::EdnValue::List(items) => {
             let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() else {
                 for item in items {
-                    collect_source_effect_expr(item, out);
+                    collect_source_call_expr(item, out);
                 }
                 return;
             };
             if crate::ast::is_inert_form(&head.name) || source_non_executable_form(&head.name) {
                 return;
             }
-            if source_effect_op(&head.name) {
-                out.push(SourceEffectFact {
-                    op: source_effect_op_name(head),
-                    target: source_effect_target(&head.name, items),
-                });
+            if source_user_call_op(&head.name) {
+                push_unique_string(out, head.name.clone());
             }
             for item in items.iter().skip(1) {
-                collect_source_effect_expr(item, out);
+                collect_source_call_expr(item, out);
             }
         }
         kotoba_edn::EdnValue::Vector(items) => {
             for item in items {
-                collect_source_effect_expr(item, out);
+                collect_source_call_expr(item, out);
             }
         }
         kotoba_edn::EdnValue::Set(items) => {
             for item in items {
-                collect_source_effect_expr(item, out);
+                collect_source_call_expr(item, out);
             }
         }
         kotoba_edn::EdnValue::Map(entries) => {
             for (key, value) in entries {
-                collect_source_effect_expr(key, out);
-                collect_source_effect_expr(value, out);
+                collect_source_call_expr(key, out);
+                collect_source_call_expr(value, out);
             }
         }
-        kotoba_edn::EdnValue::Tagged { value, .. } => collect_source_effect_expr(value, out),
+        kotoba_edn::EdnValue::Tagged { value, .. } => collect_source_call_expr(value, out),
         _ => {}
     }
+}
+
+fn source_user_call_op(name: &str) -> bool {
+    !matches!(
+        name,
+        "do" | "let"
+            | "loop"
+            | "if"
+            | "fn"
+            | "recur"
+            | "quote"
+            | "var"
+            | "comment"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "quot"
+            | "mod"
+            | "rem"
+            | "inc"
+            | "dec"
+            | "min"
+            | "max"
+            | "="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "str-len"
+            | "byte-at"
+            | "bytes-alloc"
+            | "bytes-len"
+            | "bytes-finish"
+            | "byte-append!"
+            | "has-capability?"
+            | "llm-infer"
+            | "kqe-assert!"
+            | "kqe-retract!"
+            | "kqe-get-objects"
+            | "kqe-query"
+    )
+}
+
+fn push_unique_string(out: &mut Vec<String>, value: String) {
+    if !out.iter().any(|existing| existing == &value) {
+        out.push(value);
+    }
+}
+
+fn collect_source_effect_expr(
+    value: &kotoba_edn::EdnValue,
+    out: &mut Vec<SourceEffectFact>,
+    env: &mut Vec<(String, String)>,
+) {
+    match value {
+        kotoba_edn::EdnValue::List(items) => {
+            let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() else {
+                for item in items {
+                    collect_source_effect_expr(item, out, env);
+                }
+                return;
+            };
+            if crate::ast::is_inert_form(&head.name) || source_non_executable_form(&head.name) {
+                return;
+            }
+            if matches!(head.name.as_str(), "let" | "loop") {
+                collect_source_effect_let_expr(items, out, env);
+                return;
+            }
+            if source_effect_op(&head.name) {
+                out.push(SourceEffectFact {
+                    op: source_effect_op_name(head),
+                    target: source_effect_target(&head.name, items, env),
+                });
+            }
+            for item in items.iter().skip(1) {
+                collect_source_effect_expr(item, out, env);
+            }
+        }
+        kotoba_edn::EdnValue::Vector(items) => {
+            for item in items {
+                collect_source_effect_expr(item, out, env);
+            }
+        }
+        kotoba_edn::EdnValue::Set(items) => {
+            for item in items {
+                collect_source_effect_expr(item, out, env);
+            }
+        }
+        kotoba_edn::EdnValue::Map(entries) => {
+            for (key, value) in entries {
+                collect_source_effect_expr(key, out, env);
+                collect_source_effect_expr(value, out, env);
+            }
+        }
+        kotoba_edn::EdnValue::Tagged { value, .. } => collect_source_effect_expr(value, out, env),
+        _ => {}
+    }
+}
+
+fn collect_source_effect_let_expr(
+    items: &[kotoba_edn::EdnValue],
+    out: &mut Vec<SourceEffectFact>,
+    env: &mut Vec<(String, String)>,
+) {
+    let base_len = env.len();
+    if let Some(kotoba_edn::EdnValue::Vector(bindings)) = items.get(1) {
+        for pair in bindings.chunks(2) {
+            if let [kotoba_edn::EdnValue::Symbol(name), value] = pair {
+                collect_source_effect_expr(value, out, env);
+                let target = source_effect_target_expr(value, env);
+                env.push((name.to_qualified(), target));
+            }
+        }
+    }
+    for body in items.iter().skip(2) {
+        collect_source_effect_expr(body, out, env);
+    }
+    env.truncate(base_len);
 }
 
 fn source_effect_op(name: &str) -> bool {
@@ -1745,13 +2342,85 @@ fn source_effect_op_name(symbol: &kotoba_edn::Symbol) -> String {
     }
 }
 
-fn source_effect_target(op: &str, items: &[kotoba_edn::EdnValue]) -> String {
+fn source_effect_target(
+    op: &str,
+    items: &[kotoba_edn::EdnValue],
+    env: &[(String, String)],
+) -> String {
     match op {
-        "kqe-assert!" | "kqe-retract!" | "kqe-get-objects" | "llm-infer" => match items.get(1) {
-            Some(kotoba_edn::EdnValue::String(target)) => target.clone(),
-            _ => String::new(),
-        },
+        "kqe-assert!" | "kqe-retract!" | "kqe-get-objects" | "llm-infer" => items
+            .get(1)
+            .map(|target| source_effect_target_expr(target, env))
+            .unwrap_or_default(),
         _ => String::new(),
+    }
+}
+
+fn source_effect_target_expr(value: &kotoba_edn::EdnValue, env: &[(String, String)]) -> String {
+    match value {
+        kotoba_edn::EdnValue::String(target) => target.clone(),
+        kotoba_edn::EdnValue::Symbol(symbol) => {
+            source_effect_local_target(env, &symbol.to_qualified())
+        }
+        kotoba_edn::EdnValue::List(items) => {
+            let Some(kotoba_edn::EdnValue::Symbol(head)) = items.first() else {
+                return String::new();
+            };
+            match head.name.as_str() {
+                "do" => items
+                    .last()
+                    .map(|item| source_effect_target_expr(item, env))
+                    .unwrap_or_default(),
+                "if" => {
+                    let then_target = items
+                        .get(2)
+                        .map(|item| source_effect_target_expr(item, env))
+                        .unwrap_or_default();
+                    let else_target = items
+                        .get(3)
+                        .map(|item| source_effect_target_expr(item, env))
+                        .unwrap_or_default();
+                    if !then_target.is_empty() && then_target == else_target {
+                        then_target
+                    } else {
+                        String::new()
+                    }
+                }
+                "let" | "loop" => source_effect_let_target_expr(items, env),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn source_effect_local_target(env: &[(String, String)], name: &str) -> String {
+    env.iter()
+        .rev()
+        .find_map(|(candidate, target)| (candidate == name).then_some(target.clone()))
+        .unwrap_or_default()
+}
+
+fn source_effect_let_target_expr(
+    items: &[kotoba_edn::EdnValue],
+    env: &[(String, String)],
+) -> String {
+    let mut scoped = env.to_vec();
+    if let Some(kotoba_edn::EdnValue::Vector(bindings)) = items.get(1) {
+        for pair in bindings.chunks(2) {
+            if let [kotoba_edn::EdnValue::Symbol(name), value] = pair {
+                let target = source_effect_target_expr(value, &scoped);
+                scoped.push((name.to_qualified(), target));
+            }
+        }
+    }
+    if items.len() > 2 {
+        items
+            .last()
+            .map(|item| source_effect_target_expr(item, &scoped))
+            .unwrap_or_default()
+    } else {
+        String::new()
     }
 }
 
@@ -2155,6 +2824,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_surface_policy_oracle_matches_aiueos_catalog_seed_and_runs_as_kotoba() {
+        let catalog = kotoba_edn::parse(AIUEOS_PROVIDER_CATALOG_SPEC).expect("provider catalog");
+        let providers = edn_vec(edn_get(&catalog, "providers").unwrap(), "providers").unwrap();
+        let digest = edn_get(&catalog, "digest").unwrap();
+        let commands = edn_i64_map(edn_get(digest, "commands").unwrap(), "digest.commands")
+            .expect("command digest");
+        let statuses = edn_i64_map(edn_get(digest, "statuses").unwrap(), "digest.statuses")
+            .expect("status digest");
+        assert_eq!(providers.len(), 8);
+        assert_eq!(commands.len(), 13);
+        assert_eq!(statuses.len(), 2);
+        assert!(AIUEOS_PROVIDER_CATALOG_ORACLE.contains("(defn provider-family-count [] 8)"));
+        assert!(AIUEOS_PROVIDER_CATALOG_ORACLE.contains("(defn provider-catalog-digest [] 12688)"));
+        assert!(AIUEOS_PROVIDER_CATALOG_ORACLE.contains("(defn keychain-provider-score [] 331)"));
+
+        let wasm = provider_surface_policy_oracle_wasm().expect("compile provider oracle");
+        assert_eq!(
+            crate::run::run_with_fuel(&wasm, "provider-contract-score", &[], 1_000_000)
+                .expect("run provider oracle"),
+            81302
+        );
+        assert_eq!(
+            crate::run::run_with_fuel(&wasm, "provider-catalog-digest", &[], 1_000_000)
+                .expect("run provider oracle"),
+            12688
+        );
+    }
+
+    #[test]
+    fn plugin_contract_oracle_matches_edn_seed_and_runs_as_kotoba() {
+        let spec = kotoba_edn::parse(PLUGIN_CONTRACT_SPEC).expect("plugin contract spec");
+        let exports = edn_i64_map(edn_get(&spec, "exports").unwrap(), "exports").unwrap();
+        assert_eq!(exports.get("registry-schema-digest"), Some(&13508));
+        assert_eq!(exports.get("required-loader-boolean-count"), Some(&3));
+
+        let wasm = plugin_contract_oracle_wasm().expect("compile plugin oracle");
+        assert_eq!(
+            crate::run::run_with_fuel(&wasm, "permission-mode-digest", &[], 1_000_000)
+                .expect("run plugin oracle"),
+            56568
+        );
+        assert_eq!(
+            crate::run::run_with_fuel(&wasm, "required-plugin-field-count", &[], 1_000_000)
+                .expect("run plugin oracle"),
+            7
+        );
+    }
+
+    #[test]
     fn bridge_program_inputs_include_versioned_abi_marker() {
         let src = r#"
             (defn helper []
@@ -2199,7 +2917,12 @@ mod tests {
             (ns demo.core
               (:require [evil.ns]))
 
-            (defn run [] (+ "x" 1))
+            (defn run []
+              (do
+                (+ "x" 1)
+                (java.lang.Math/sqrt "x")
+                (long "x")
+                (let [n 5] (str-len n))))
         "#;
         let input = program_subset_check_input(src, ReaderTarget::Kotoba)
             .expect("build analyzer subset input");
@@ -2226,6 +2949,24 @@ mod tests {
         assert!(type_facts
             .iter()
             .any(|fact| text_field(fact, "op").ok() == Some("+")));
+        assert!(type_facts
+            .iter()
+            .any(|fact| text_field(fact, "op").ok() == Some("Math/sqrt")));
+        assert!(type_facts
+            .iter()
+            .any(|fact| text_field(fact, "op").ok() == Some("int")));
+        let str_len_args = type_facts
+            .iter()
+            .find(|fact| text_field(fact, "op").ok() == Some("str-len"))
+            .and_then(|fact| map_field(fact, "args").ok())
+            .and_then(Value::as_array)
+            .expect("source-types str-len args");
+        let first_arg = str_len_args
+            .first()
+            .and_then(Value::as_integer)
+            .and_then(|n| i128::try_from(n).ok())
+            .expect("source-types str-len first arg fact");
+        assert_eq!(first_arg, 4_000_005);
 
         let source_only_src = r#"
             (defn run [] (kqe-assert! "graphB" "s" "p" "v"))
@@ -2236,10 +2977,18 @@ mod tests {
                 .expect("build source-only compile gate input");
         let compile_gate_value: Value = ciborium::from_reader(compile_gate_input.as_slice())
             .expect("decode source-only compile gate cbor");
-        let effect_facts = map_field(&compile_gate_value, "source-effects")
-            .expect("source-effects facts")
+        let functions = map_field(&compile_gate_value, "program")
+            .expect("program facts")
             .as_array()
-            .expect("source-effects array");
+            .expect("program array");
+        let run = functions
+            .iter()
+            .find(|function| text_field(function, "name").ok() == Some("run"))
+            .expect("run function");
+        let effect_facts = map_field(run, "source-effects")
+            .expect("run source-effects facts")
+            .as_array()
+            .expect("run source-effects array");
         assert!(effect_facts.iter().any(|fact| {
             text_field(fact, "op").ok() == Some("kqe-assert!")
                 && text_field(fact, "target").ok() == Some("graphB")

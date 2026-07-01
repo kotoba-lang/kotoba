@@ -4,6 +4,8 @@ Status: proposed
 
 Date: 2026-06-29
 
+Canonical implementation repository: `https://github.com/kotoba-lang/inference`
+
 ## Context
 
 kotodama needs a browser/local inference surface that can eventually run real
@@ -104,9 +106,10 @@ checks that `core/forward` can cross the normal runtime port, execute the same
 real GGUF two-block `torch/run` path, and return deterministic candidate logits.
 The adapter now keeps a per-session forward cache keyed by token ids and layer
 count, and the verifier proves the second identical `core/forward` call is a
-cache hit while preserving the same logits. The full block expected summaries
-for `blk.0` and `blk.1` are now derived from that cached `core/forward` block
-result instead of recomputing `blk.1` through a separate verifier loop.
+cache hit while preserving the same logits. When `KOTODAMA_VERIFY_FULL_LAYERS`
+is greater than 1, the full block expected summaries for `blk.0` and `blk.1`
+are derived from that cached `core/forward` block result instead of recomputing
+block full MLP outputs through the legacy standalone verifier path.
 Full 42-layer composition and generation through `torch` to `num` remain the
 next maturity step.
 
@@ -130,13 +133,14 @@ num CPU backend. It also verifies output RMSNorm, tied-embedding candidate and
 full-vocabulary logits, greedy/top-k sampling, FFN RMSNorm, partial gated MLP projection,
 SiLU gated activation, and partial FFN down projection on the same real GGUF
 weights. `KOTODAMA_VERIFY_FULL_MLP=1 clojure -M:verify-gemma-num` additionally
-verifies the fixed full blk.0 MLP contract and the composed blk.0 block output
-contract on the same real GGUF weights.
+verifies the fixed standalone full blk.0 MLP contract and the composed blk.0
+block output contract on the same real GGUF weights.
 `KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 clojure -M:verify-gemma-num`
-also verifies the reusable block composer across `blk.0 -> blk.1`, and checks
-the same real two-block contract through `torch/run` over indexed
-`:gemma4-block` layers and through `core/forward` over the `IModelRuntime` port,
-including the session forward cache hit on a repeated call.
+skips that legacy standalone full MLP output generation, verifies the reusable
+block composer across `blk.0 -> blk.1`, and checks the same real two-block
+contract through `torch/run` over indexed `:gemma4-block` layers and through
+`core/forward` over the `IModelRuntime` port, including the session forward
+cache hit on a repeated call.
 `clojure -M:verify-torch-num` is the minimal proof that a torch-clj graph can be
 executed through a host backend that lowers layers to num-clj tensor ops; it
 now also runs a two-layer `:gemma4-block` graph through a custom num-backed host

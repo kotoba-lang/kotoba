@@ -1042,6 +1042,41 @@ fn selfhost_bridge_infers_effects_from_source_like_rust() {
 }
 
 #[test]
+fn selfhost_source_only_infers_named_function_effects() {
+    let src = r#"
+        (defn writer []
+          (kqe-assert! "graphA" "s" "p" "v"))
+
+        (defn inferer []
+          (llm-infer "modelA" "prompt"))
+
+        (defn run []
+          (do (writer)
+              (inferer)))
+
+        (unsupported-top-level)
+    "#;
+
+    let effects = selfhost::infer_effects(src).expect("selfhost source-only infer_effects");
+    assert_eq!(
+        effects.get("writer"),
+        Some(&BTreeSet::from(["graph-write".to_string()]))
+    );
+    assert_eq!(
+        effects.get("inferer"),
+        Some(&BTreeSet::from(["infer".to_string()]))
+    );
+    assert_eq!(
+        effects.get("run"),
+        Some(&BTreeSet::from([
+            "graph-write".to_string(),
+            "infer".to_string()
+        ]))
+    );
+    assert!(!effects.contains_key("$source"), "{effects:?}");
+}
+
+#[test]
 fn selfhost_bridge_synthesizes_minimal_policy_from_source_like_rust() {
     let src = r#"
         (defn run []
@@ -1079,6 +1114,82 @@ fn selfhost_bridge_checks_effect_declarations_like_rust() {
     );
 
     assert_rust_effect_denied(src, &Policy::deny_all().grant_graph_write(["graphA"]));
+}
+
+#[test]
+fn selfhost_source_only_effect_declarations_use_source_function_facts() {
+    let src = r#"
+        (defn run {:effects #{}} []
+          (kqe-assert! "graphA" "s" "p" "v"))
+        (unsupported-top-level)
+    "#;
+
+    let check = selfhost::check_effect_declarations(src)
+        .expect("selfhost source-only effect declaration check");
+    assert!(!check.ok);
+    assert_eq!(check.violations.len(), 1);
+    assert_eq!(check.violations[0].name, "run");
+    assert_eq!(
+        check.violations[0].missing,
+        BTreeSet::from(["graph-write".to_string()])
+    );
+
+    let declared = r#"
+        (defn run {:effects #{:graph-write}} []
+          (kqe-assert! "graphA" "s" "p" "v"))
+        (unsupported-top-level)
+    "#;
+    let declared_check = selfhost::check_effect_declarations(declared)
+        .expect("selfhost source-only declared effect check");
+    assert!(declared_check.ok);
+    assert!(declared_check.violations.is_empty());
+
+    let multi_arity = r#"
+        (defn run
+          {:effects #{}}
+          ([] 0)
+          ([g] (kqe-assert! g "s" "p" "v")))
+        (unsupported-top-level)
+    "#;
+    let multi_arity_check = selfhost::check_effect_declarations(multi_arity)
+        .expect("selfhost source-only multi-arity effect declaration check");
+    assert!(!multi_arity_check.ok);
+    assert_eq!(multi_arity_check.violations.len(), 1);
+    assert_eq!(multi_arity_check.violations[0].name, "run");
+    assert_eq!(
+        multi_arity_check.violations[0].missing,
+        BTreeSet::from(["graph-write".to_string()])
+    );
+
+    let multi_arity_declared = r#"
+        (defn run
+          {:effects #{:graph-write}}
+          ([] 0)
+          ([g] (kqe-assert! g "s" "p" "v")))
+        (unsupported-top-level)
+    "#;
+    let multi_arity_declared_check = selfhost::check_effect_declarations(multi_arity_declared)
+        .expect("selfhost source-only multi-arity declared effect check");
+    assert!(multi_arity_declared_check.ok);
+    assert!(multi_arity_declared_check.violations.is_empty());
+
+    let transitive = r#"
+        (defn helper []
+          (kqe-assert! "graphA" "s" "p" "v"))
+
+        (defn run {:effects #{}} []
+          (helper))
+        (unsupported-top-level)
+    "#;
+    let transitive_check = selfhost::check_effect_declarations(transitive)
+        .expect("selfhost source-only transitive effect declaration check");
+    assert!(!transitive_check.ok);
+    assert_eq!(transitive_check.violations.len(), 1);
+    assert_eq!(transitive_check.violations[0].name, "run");
+    assert_eq!(
+        transitive_check.violations[0].missing,
+        BTreeSet::from(["graph-write".to_string()])
+    );
 }
 
 #[test]
@@ -1223,6 +1334,107 @@ fn selfhost_bridge_checks_compile_gate_in_one_analyzer_run() {
         source_only_gate.policy.target_denials,
         BTreeSet::from(["graph-write:graphB".to_string()])
     );
+
+    let source_only_lexical_target = r#"
+        (defn run [c]
+          (let [g (if c "graphC" "graphC")]
+            (do
+              (kqe-assert! g "s" "p" "v")
+              (+ "x" 1))))
+        (unsupported-top-level)
+    "#;
+    let lexical_gate =
+        selfhost::check_compile_gate(source_only_lexical_target, &Policy::deny_all())
+            .expect("selfhost source-only lexical compile gate");
+    assert!(lexical_gate.subset.ok);
+    assert!(!lexical_gate.types.ok);
+    assert_eq!(
+        lexical_gate.types.denials,
+        BTreeSet::from(["+".to_string()])
+    );
+    assert!(lexical_gate.effects.ok);
+    assert!(!lexical_gate.policy.ok);
+    assert_eq!(
+        lexical_gate.policy.target_denials,
+        BTreeSet::from(["graph-write:graphC".to_string()])
+    );
+
+    let source_only_shadowed_target = r#"
+        (defn run [g]
+          (let [target "graphC"
+                target g]
+            (kqe-assert! target "s" "p" "v")))
+        (unsupported-top-level)
+    "#;
+    let shadowed_gate =
+        selfhost::check_compile_gate(source_only_shadowed_target, &Policy::deny_all())
+            .expect("selfhost source-only shadowed compile gate");
+    assert!(shadowed_gate.subset.ok);
+    assert!(shadowed_gate.types.ok);
+    assert!(shadowed_gate.effects.ok);
+    assert!(!shadowed_gate.policy.ok);
+    assert_eq!(
+        shadowed_gate.policy.denials,
+        BTreeSet::from(["graph-write".to_string()])
+    );
+    assert!(shadowed_gate.policy.target_denials.is_empty());
+
+    let source_only_declared_effect = r#"
+        (defn run {:effects #{}} []
+          (kqe-assert! "graphD" "s" "p" "v"))
+        (unsupported-top-level)
+    "#;
+    let declared_gate =
+        selfhost::check_compile_gate(source_only_declared_effect, &Policy::deny_all())
+            .expect("selfhost source-only declared-effect compile gate");
+    assert!(declared_gate.subset.ok);
+    assert!(declared_gate.types.ok);
+    assert!(!declared_gate.effects.ok);
+    assert_eq!(declared_gate.effects.violations.len(), 1);
+    assert_eq!(declared_gate.effects.violations[0].name, "run");
+    assert_eq!(
+        declared_gate.effects.violations[0].missing,
+        BTreeSet::from(["graph-write".to_string()])
+    );
+    assert!(!declared_gate.policy.ok);
+    assert_eq!(
+        declared_gate.policy.target_denials,
+        BTreeSet::from(["graph-write:graphD".to_string()])
+    );
+}
+
+#[test]
+fn selfhost_compile_gate_accounts_for_package_dependency_capabilities() {
+    let src = r#"(defn run [] 1)"#;
+    let gate = selfhost::check_compile_gate_with_dependency_capabilities(
+        src,
+        ReaderTarget::Kotoba,
+        &Policy::deny_all(),
+        ["graph-write"],
+    )
+    .expect("selfhost package dependency compile gate");
+
+    assert!(gate.subset.ok);
+    assert!(gate.types.ok);
+    assert!(gate.effects.ok);
+    assert!(!gate.policy.ok);
+    assert_eq!(
+        gate.policy.used,
+        BTreeSet::from(["graph-write".to_string()])
+    );
+    assert_eq!(
+        gate.policy.denials,
+        BTreeSet::from(["graph-write".to_string()])
+    );
+
+    let granted = selfhost::check_compile_gate_with_dependency_capabilities(
+        src,
+        ReaderTarget::Kotoba,
+        &Policy::deny_all().grant_graph_write(["*"]),
+        ["graph-write"],
+    )
+    .expect("selfhost granted package dependency compile gate");
+    assert!(granted.policy.ok);
 }
 
 #[test]
@@ -1330,6 +1542,26 @@ fn selfhost_bridge_checks_executable_body_subset_denials() {
         proxy_reify_check.denials,
         BTreeSet::from(["proxy".to_string(), "reify".to_string()])
     );
+
+    let source_only_dynamic_var_src = r#"
+        (defn run []
+          (do
+            (set! *warn-on-reflection* true)
+            (binding [*out* *out*] 1)
+            (with-redefs [f g] 1)))
+        (unsupported-top-level)
+    "#;
+    let dynamic_var_check =
+        selfhost::check_subset(source_only_dynamic_var_src).expect("selfhost subset check");
+    assert!(!dynamic_var_check.ok);
+    assert_eq!(
+        dynamic_var_check.denials,
+        BTreeSet::from([
+            "binding".to_string(),
+            "set!".to_string(),
+            "with-redefs".to_string()
+        ])
+    );
 }
 
 #[test]
@@ -1407,6 +1639,14 @@ fn selfhost_compile_safe_kotoba_uses_selfhost_subset_slice_before_rust_fallback(
         (r#"(defn run [] (proxy [Runnable] [] (run [] 1)))"#, "proxy"),
         (r#"(defn run [] (reify Runnable (run [_] 1)))"#, "reify"),
         (r#"(defn run [] (new String "x"))"#, "new"),
+        (
+            r#"
+            (defn run []
+              (set! *warn-on-reflection* true))
+            (unsupported-top-level)
+            "#,
+            "set!",
+        ),
     ] {
         match selfhost::compile_safe_kotoba(src, &Policy::deny_all()) {
             Err(CljError::Subset(msg)) => {
@@ -1585,6 +1825,110 @@ fn selfhost_bridge_checks_literal_type_denials() {
     assert!(!source_only_type.ok);
     assert_eq!(source_only_type.denials, BTreeSet::from(["+".to_string()]));
 
+    let source_only_quot = selfhost::check_types(
+        r#"
+        (defn run [] (quot "x" 1))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only quot type check");
+    assert!(!source_only_quot.ok);
+    assert_eq!(
+        source_only_quot.denials,
+        BTreeSet::from(["quot".to_string()])
+    );
+
+    let source_only_java_math = selfhost::check_types(
+        r#"
+        (defn run [] (java.lang.Math/sqrt "x"))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only java.lang.Math type check");
+    assert!(!source_only_java_math.ok);
+    assert_eq!(
+        source_only_java_math.denials,
+        BTreeSet::from(["Math/sqrt".to_string()])
+    );
+
+    let source_only_long_alias = selfhost::check_types(
+        r#"
+        (defn run [] (long "x"))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only long alias type check");
+    assert!(!source_only_long_alias.ok);
+    assert_eq!(
+        source_only_long_alias.denials,
+        BTreeSet::from(["int".to_string()])
+    );
+
+    let source_only_let_string_arithmetic = selfhost::check_types(
+        r#"
+        (defn run [] (let [s "x"] (+ s 1)))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only let literal type check");
+    assert!(!source_only_let_string_arithmetic.ok);
+    assert_eq!(
+        source_only_let_string_arithmetic.denials,
+        BTreeSet::from(["+".to_string()])
+    );
+
+    let source_only_let_number_string_op = selfhost::check_types(
+        r#"
+        (defn run [] (let [n 5] (str-len n)))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only let numeric literal type check");
+    assert!(!source_only_let_number_string_op.ok);
+    assert_eq!(
+        source_only_let_number_string_op.denials,
+        BTreeSet::from(["str-len".to_string()])
+    );
+
+    let source_only_let_do_final = selfhost::check_types(
+        r#"
+        (defn run [] (let [s (do 0 "x")] (+ s 1)))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only let do-final type check");
+    assert!(!source_only_let_do_final.ok);
+    assert_eq!(
+        source_only_let_do_final.denials,
+        BTreeSet::from(["+".to_string()])
+    );
+
+    let source_only_let_if_join = selfhost::check_types(
+        r#"
+        (defn run [c] (let [s (if c "x" "y")] (+ s 1)))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only let if-join type check");
+    assert!(!source_only_let_if_join.ok);
+    assert_eq!(
+        source_only_let_if_join.denials,
+        BTreeSet::from(["+".to_string()])
+    );
+
+    let source_only_nested_let_return = selfhost::check_types(
+        r#"
+        (defn run [] (let [s (let [t "x"] t)] (+ s 1)))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only nested let-return type check");
+    assert!(!source_only_nested_let_return.ok);
+    assert_eq!(
+        source_only_nested_let_return.denials,
+        BTreeSet::from(["+".to_string()])
+    );
+
     let macro_body_is_not_executable = selfhost::check_types(
         r#"
         (defmacro bad [] (+ "x" 1))
@@ -1658,6 +2002,45 @@ fn selfhost_bridge_checks_value_dependent_literal_type_denials() {
     let div_zero = selfhost::check_types(r#"(defn run [] (/ 8 0))"#).expect("selfhost type check");
     assert!(!div_zero.ok);
     assert_eq!(div_zero.denials, BTreeSet::from(["/".to_string()]));
+
+    let source_only_div_zero = selfhost::check_types(
+        r#"
+        (defn run [] (quot 8 0))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only div-zero type check");
+    assert!(!source_only_div_zero.ok);
+    assert_eq!(
+        source_only_div_zero.denials,
+        BTreeSet::from(["quot".to_string()])
+    );
+
+    let source_only_byte_at_oob = selfhost::check_types(
+        r#"
+        (defn run [] (byte-at "ab" 2))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only byte-at type check");
+    assert!(!source_only_byte_at_oob.ok);
+    assert_eq!(
+        source_only_byte_at_oob.denials,
+        BTreeSet::from(["byte-at".to_string()])
+    );
+
+    let source_only_bytes_alloc = selfhost::check_types(
+        r#"
+        (defn run [] (bytes-alloc -1))
+        (unsupported-top-level)
+        "#,
+    )
+    .expect("selfhost source-only bytes-alloc type check");
+    assert!(!source_only_bytes_alloc.ok);
+    assert_eq!(
+        source_only_bytes_alloc.denials,
+        BTreeSet::from(["bytes-alloc".to_string()])
+    );
 
     let valid_last_byte =
         selfhost::check_types(r#"(defn run [] (byte-at "é" 1))"#).expect("selfhost type check");
@@ -3306,6 +3689,58 @@ fn selfhost_source_only_tooling_uses_direct_host_call_facts() {
 }
 
 #[test]
+fn selfhost_source_only_tooling_resolves_lexical_resource_targets() {
+    let src = r#"
+        (defn run [c]
+          (let [write-target (do "ignored" "graphB")
+                infer-target (if c "modelB" "modelB")
+                read-target (let [g "graphR"] g)]
+            (do
+              (kqe-assert! write-target "s" "p" "v")
+              (llm-infer infer-target "prompt")
+              (kqe-get-objects read-target "s" "p"))))
+        (unsupported-top-level)
+    "#;
+
+    let minimal = selfhost::minimal_policy(src).expect("selfhost source-only minimal policy");
+    assert_eq!(minimal.graph_write, BTreeSet::from(["graphB".to_string()]));
+    assert_eq!(minimal.graph_read, BTreeSet::from(["graphR".to_string()]));
+    assert_eq!(minimal.infer, BTreeSet::from(["modelB".to_string()]));
+
+    let denied = selfhost::check_policy(src, &Policy::deny_all())
+        .expect("selfhost source-only lexical policy check");
+    assert!(!denied.ok);
+    assert_eq!(
+        denied.target_denials,
+        BTreeSet::from([
+            "graph-read:graphR".to_string(),
+            "graph-write:graphB".to_string(),
+            "infer:modelB".to_string()
+        ])
+    );
+}
+
+#[test]
+fn selfhost_source_only_tooling_widens_shadowed_resource_targets() {
+    let src = r#"
+        (defn run [dynamic-graph]
+          (let [g "graphB"
+                g dynamic-graph]
+            (kqe-assert! g "s" "p" "v")))
+        (unsupported-top-level)
+    "#;
+
+    let minimal = selfhost::minimal_policy(src).expect("selfhost source-only minimal policy");
+    assert_eq!(minimal.graph_write, BTreeSet::from(["*".to_string()]));
+
+    let denied = selfhost::check_policy(src, &Policy::deny_all())
+        .expect("selfhost source-only shadowed policy check");
+    assert!(!denied.ok);
+    assert_eq!(denied.denials, BTreeSet::from(["graph-write".to_string()]));
+    assert!(denied.target_denials.is_empty());
+}
+
+#[test]
 fn selfhost_bridge_resource_param_pass_through_is_multi_arity_aware() {
     let src = r#"
         (defn writer
@@ -3583,16 +4018,16 @@ fn shell_evidence_profile_oracle_compiles_and_reports_contract_counts() {
     );
     assert_eq!(
         kotoba_clj::run::run_with_fuel(&wasm, "required-command-count", &[], 1_000_000).unwrap(),
-        20
+        25
     );
     assert_eq!(
         kotoba_clj::run::run_with_fuel(&wasm, "required-evidence-stem-count", &[], 1_000_000)
             .unwrap(),
-        26
+        31
     );
     assert_eq!(
         kotoba_clj::run::run_with_fuel(&wasm, "contract-score", &[], 1_000_000).unwrap(),
-        32026
+        32531
     );
     assert_eq!(
         kotoba_clj::run::run_with_fuel(&wasm, "profile-list-digest", &[], 1_000_000).unwrap(),
@@ -3600,12 +4035,12 @@ fn shell_evidence_profile_oracle_compiles_and_reports_contract_counts() {
     );
     assert_eq!(
         kotoba_clj::run::run_with_fuel(&wasm, "required-command-digest", &[], 1_000_000).unwrap(),
-        44870
+        4822
     );
     assert_eq!(
         kotoba_clj::run::run_with_fuel(&wasm, "required-evidence-stem-digest", &[], 1_000_000)
             .unwrap(),
-        50659
+        61285
     );
 }
 

@@ -3058,41 +3058,7 @@ fn validate_release_contract_oracle_if_present(
     release_dir: &Path,
     checks: &mut Vec<String>,
 ) -> Result<()> {
-    let release_json = read_evidence_json(&release_dir.join("kotoba-shell-release.json"))?;
-    let permissions_json = read_evidence_json(&release_dir.join("kotoba-shell-permissions.json"))?;
-    let evidence_profile_json =
-        read_evidence_json(&release_dir.join("kotoba-shell-evidence-profile.json"))?;
-    let common_expected = vec![
-        (
-            "release-schema-digest".to_string(),
-            release_json
-                .get("schema")
-                .and_then(|value| value.as_str())
-                .map(kototama_component_symbol_digest)
-                .unwrap_or(0),
-        ),
-        ("release-check-schema-digest".to_string(), 7_401),
-        (
-            "permissions-schema-digest".to_string(),
-            permissions_json
-                .get("schema")
-                .and_then(|value| value.as_str())
-                .map(kototama_component_symbol_digest)
-                .unwrap_or(0),
-        ),
-        (
-            "evidence-profile-schema-digest".to_string(),
-            evidence_profile_json
-                .get("schema")
-                .and_then(|value| value.as_str())
-                .map(kototama_component_symbol_digest)
-                .unwrap_or(0),
-        ),
-        (
-            "common-release-file-count".to_string(),
-            common_release_files(target).len() as i64,
-        ),
-    ];
+    let common_expected = release_contract_expected_exports(target)?;
     validate_store_contract_oracle_if_present(
         release_dir,
         "kototama-release-contract.edn",
@@ -3101,21 +3067,7 @@ fn validate_release_contract_oracle_if_present(
         &common_expected,
         checks,
     )?;
-    let target_name = target.as_str();
-    let target_expected = vec![
-        (
-            format!("{target_name}-target-file-count"),
-            target_release_files(target).len() as i64,
-        ),
-        (
-            format!("{target_name}-script-count"),
-            target_release_scripts(target).len() as i64,
-        ),
-        (
-            format!("{target_name}-env-count"),
-            target_release_env(target).len() as i64,
-        ),
-    ];
+    let target_expected = release_target_contract_expected_exports(target)?;
     validate_store_contract_oracle_if_present(
         release_dir,
         "kototama-release-target-contract.edn",
@@ -3314,51 +3266,13 @@ fn validate_signing_contract_oracle_if_present(
     release_dir: &Path,
     checks: &mut Vec<String>,
 ) -> Result<()> {
-    let signing_plan = read_evidence_json(&release_dir.join("kotoba-shell-signing-plan.json"))?;
-    let artifact_field_count = signing_plan
-        .get("artifacts")
-        .and_then(|value| value.as_object())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
-    let gate_count = signing_plan
-        .get("gates")
-        .and_then(|value| value.as_array())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
-    let schema_digest = signing_plan
-        .get("schema")
-        .and_then(|value| value.as_str())
-        .map(kototama_component_symbol_digest)
-        .unwrap_or(0);
-    let version_digest = signing_plan
-        .get("version")
-        .and_then(|value| value.as_str())
-        .map(kototama_component_symbol_digest)
-        .unwrap_or(0);
-    let target_name = target.as_str();
-    let signing_script_digest = kototama_component_symbol_digest(target_signing_script(target));
+    let expected = signing_contract_expected_exports(target)?;
     validate_store_contract_oracle_if_present(
         release_dir,
         "kototama-signing-contract.edn",
         "kotoba-clj/selfhost/signing_contract.kotoba",
         "signing-contract-oracle",
-        &[
-            ("signing-schema-digest".to_string(), schema_digest),
-            ("version-digest".to_string(), version_digest),
-            ("signing-gate-count".to_string(), gate_count),
-            (
-                format!("{target_name}-signing-script-digest"),
-                signing_script_digest,
-            ),
-            (
-                format!("{target_name}-env-count"),
-                target_release_env(target).len() as i64,
-            ),
-            (
-                format!("{target_name}-artifact-field-count"),
-                artifact_field_count,
-            ),
-        ],
+        &expected,
         checks,
     )
 }
@@ -3368,60 +3282,7 @@ fn validate_submission_contract_oracle_if_present(
     release_dir: &Path,
     checks: &mut Vec<String>,
 ) -> Result<()> {
-    let target_name = target.as_str();
-    let script = target_submission_script(target).ok_or_else(|| {
-        anyhow!(
-            "submission script is not configured for {}",
-            target.as_str()
-        )
-    })?;
-    let mut expected = vec![
-        (
-            format!("{target_name}-submission-script-digest"),
-            kototama_component_symbol_digest(script),
-        ),
-        (
-            format!("{target_name}-submission-file-count"),
-            target_submission_files(target).len() as i64,
-        ),
-        (
-            format!("{target_name}-env-count"),
-            target_submission_env(target).len() as i64,
-        ),
-    ];
-    match target {
-        Target::Macos => {
-            let json = read_evidence_json(&release_dir.join("app-store-connect-macos.json"))?;
-            expected.push((
-                "apple-store-schema-digest".to_string(),
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ));
-        }
-        Target::Ios => {
-            let json = read_evidence_json(&release_dir.join("app-store-connect-ios.json"))?;
-            expected.push((
-                "apple-store-schema-digest".to_string(),
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ));
-        }
-        Target::Android => {
-            let json = read_evidence_json(&release_dir.join("play-store-data-safety.json"))?;
-            expected.push((
-                "play-store-data-safety-schema-digest".to_string(),
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ));
-        }
-        Target::Windows => {}
-    }
+    let expected = submission_contract_expected_exports(target)?;
     validate_store_contract_oracle_if_present(
         release_dir,
         "kototama-submission-contract.edn",
@@ -3464,7 +3325,7 @@ fn validate_store_contract_oracle_if_present(
         sha256_bytes_hex(&oracle_wasm)
     ));
     for (function, expected) in expected_exports {
-        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, function, &[], 1_000_000)
+        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, &function, &[], 1_000_000)
             .map_err(|err| anyhow!("run {oracle_prefix} Kotoba oracle `{function}`: {err}"))?;
         if actual == *expected {
             checks.push(format!("{oracle_prefix}:{function}:{actual}"));
@@ -3531,7 +3392,7 @@ fn append_bundled_runtime_contract_oracle_checks(
         sha256_bytes_hex(&oracle_wasm)
     ));
     for (function, expected) in expected_exports {
-        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, function, &[], 1_000_000)
+        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, &function, &[], 1_000_000)
             .map_err(|err| anyhow!("run runtime contract Kotoba oracle `{function}`: {err}"))?;
         if actual == *expected {
             checks.push(format!("runtime-contract-oracle:{function}:{actual}"));
@@ -3547,6 +3408,7 @@ fn validate_sdk_contract_oracle_if_present(
     project_dir: &Path,
     checks: &mut Vec<String>,
 ) -> Result<()> {
+    let expected_exports = sdk_contract_expected_exports(target)?;
     for dir in [
         project_dir.to_path_buf(),
         project_dir.join("Resources"),
@@ -3560,7 +3422,7 @@ fn validate_sdk_contract_oracle_if_present(
                 "kototama-sdk-contract.edn",
                 "kotoba-clj/selfhost/sdk_contract.kotoba",
                 "sdk-contract-oracle",
-                &sdk_contract_expected_exports(target),
+                &expected_exports,
                 checks,
             );
         }
@@ -3573,6 +3435,7 @@ fn validate_native_host_contract_oracle_if_present(
     project_dir: &Path,
     checks: &mut Vec<String>,
 ) -> Result<()> {
+    let expected_exports = native_host_contract_expected_exports(target)?;
     for dir in [
         project_dir.to_path_buf(),
         project_dir.join("Resources"),
@@ -3586,7 +3449,7 @@ fn validate_native_host_contract_oracle_if_present(
                 "kototama-native-host-contract.edn",
                 "kotoba-clj/selfhost/native_host_contract.kotoba",
                 "native-host-contract-oracle",
-                &native_host_contract_expected_exports(target),
+                &expected_exports,
                 checks,
             );
         }
@@ -3628,12 +3491,13 @@ pub fn native_host_contract_check(
             detail: "native host contract evidence is missing".to_string(),
         });
     };
+    let expected_exports = native_host_contract_expected_exports(target)?;
     match validate_store_contract_oracle_if_present(
         &contract_dir,
         "kototama-native-host-contract.edn",
         "kotoba-clj/selfhost/native_host_contract.kotoba",
         "native-host-contract-oracle",
-        &native_host_contract_expected_exports(target),
+        &expected_exports,
         &mut checks,
     ) {
         Ok(()) => {}
@@ -3679,75 +3543,260 @@ fn append_project_check_contracts_if_present(
         "kotoba-shell.runtime-check.v0" => validate_runtime_contract_oracle_in_project_if_present(
             project_dir,
             checks,
-            &runtime_check_contract_expected_exports(target),
+            &runtime_check_contract_expected_exports(target)?,
         ),
         _ => Ok(()),
     }
 }
 
-fn native_host_contract_expected_exports(target: Target) -> Vec<(String, i64)> {
-    let mut expected = vec![
-        ("native-host-schema-digest".to_string(), 19_969),
-        ("bridge-runtime-digest".to_string(), 19_507),
-        ("provider-command-count".to_string(), 13),
-        ("capability-gate-count".to_string(), 7),
-        ("native-command-surface-digest".to_string(), 53_766),
-    ];
-    match target {
-        Target::Macos => expected.push(("macos-bridge-dispatch-digest".to_string(), 48_270)),
-        Target::Ios => expected.push(("ios-bridge-dispatch-digest".to_string(), 6_798)),
-        Target::Android => expected.push(("android-bridge-dispatch-digest".to_string(), 46_584)),
-        Target::Windows => expected.push(("windows-bridge-dispatch-digest".to_string(), 25_975)),
-    }
-    expected
+fn contract_expected_exports_from_edn(
+    spec: &str,
+    label: &str,
+    target: Target,
+) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn_for_target(spec, label, Some(target))
 }
 
-fn runtime_check_contract_expected_exports(target: Target) -> Vec<(String, i64)> {
-    let mut expected = vec![
-        ("runtime-check-schema-digest".to_string(), 11_039),
-        ("runtime-check-field-count".to_string(), 9),
-    ];
-    match target {
-        Target::Macos => expected.push(("macos-runtime-command-plan-digest".to_string(), 37_994)),
-        Target::Ios => expected.push(("ios-runtime-command-plan-digest".to_string(), 15_223)),
-        Target::Android => {
-            expected.push(("android-runtime-command-plan-digest".to_string(), 52_053));
-        }
-        Target::Windows => {}
+fn contract_expected_exports_from_edn_for_target(
+    spec: &str,
+    label: &str,
+    target: Option<Target>,
+) -> Result<Vec<(String, i64)>> {
+    let root = kotoba_edn::parse(spec).with_context(|| format!("parse {label} EDN"))?;
+    let mut expected =
+        contract_export_map(contract_edn_field(&root, "common-exports", label)?, label)?;
+    let Some(target) = target else {
+        return Ok(expected);
+    };
+    let target_exports = contract_edn_field(&root, "target-exports", label)?;
+    let target_map = match target_exports {
+        EdnValue::Map(map) => map,
+        _ => bail!("{label} :target-exports must be a map"),
+    };
+    let target_key = EdnValue::Keyword(Keyword::bare(target.as_str()));
+    if let Some(exports) = target_map.get(&target_key) {
+        expected.extend(contract_export_map(exports, label)?);
     }
-    expected
+    Ok(expected)
 }
 
-fn sdk_contract_expected_exports(target: Target) -> Vec<(String, i64)> {
-    let mut expected = vec![
-        ("sdk-check-schema-digest".to_string(), 36_062),
-        ("project-verify-schema-digest".to_string(), 55_643),
-    ];
-    match target {
-        Target::Ios => {
-            expected.push(("ios-project-file-count".to_string(), 14));
-            expected.push(("ios-sdk-command-digest".to_string(), 19_038));
-            expected.push(("ios-sdk-command-plan-digest".to_string(), 7_365));
-        }
-        Target::Android => {
-            expected.push(("android-project-file-count".to_string(), 18));
-            expected.push(("android-gradle-command-digest".to_string(), 59_926));
-            expected.push((
-                "android-generated-gradle-command-digest".to_string(),
-                42_097,
-            ));
-            expected.push(("android-gradle-command-plan-digest".to_string(), 39_518));
-            expected.push((
-                "android-generated-gradle-command-plan-digest".to_string(),
-                49_390,
-            ));
-        }
-        Target::Windows => {
-            expected.push(("windows-project-file-count".to_string(), 18));
-        }
-        Target::Macos => {}
-    }
-    expected
+fn evidence_target_from_json(json: &serde_json::Value) -> Option<Target> {
+    json.get("target")
+        .and_then(|value| value.as_str())
+        .and_then(|target| Target::parse(target).ok())
+}
+
+fn contract_edn_field<'a>(value: &'a EdnValue, key: &str, label: &str) -> Result<&'a EdnValue> {
+    let EdnValue::Map(map) = value else {
+        bail!("{label} EDN root must be a map");
+    };
+    map.get(&EdnValue::Keyword(Keyword::bare(key)))
+        .ok_or_else(|| anyhow!("{label} EDN is missing :{key}"))
+}
+
+fn contract_export_map(value: &EdnValue, label: &str) -> Result<Vec<(String, i64)>> {
+    let EdnValue::Map(map) = value else {
+        bail!("{label} exports must be a map");
+    };
+    map.iter()
+        .map(|(key, value)| {
+            let name = key
+                .as_string()
+                .or_else(|| match key {
+                    EdnValue::Keyword(keyword) => Some(keyword.name()),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow!("{label} export key must be a string or keyword"))?;
+            let number = value
+                .as_integer()
+                .ok_or_else(|| anyhow!("{label} export `{name}` must be an integer"))?;
+            Ok((name.to_string(), number))
+        })
+        .collect()
+}
+
+fn plugin_contract_expected_exports(names: &[&str]) -> Result<Vec<(String, i64)>> {
+    let root = kotoba_edn::parse(kotoba_clj::selfhost::PLUGIN_CONTRACT_SPEC)
+        .context("parse plugin contract EDN")?;
+    let exports = contract_export_map(
+        contract_edn_field(&root, "exports", "plugin contract")?,
+        "plugin contract",
+    )?;
+    let by_name = exports.into_iter().collect::<BTreeMap<_, _>>();
+    names
+        .iter()
+        .map(|name| {
+            by_name
+                .get(*name)
+                .copied()
+                .map(|value| ((*name).to_string(), value))
+                .ok_or_else(|| anyhow!("plugin contract EDN is missing export `{name}`"))
+        })
+        .collect()
+}
+
+fn provider_surface_oracle_expected_exports() -> Result<Vec<(String, i64)>> {
+    let root = kotoba_edn::parse(kotoba_clj::selfhost::AIUEOS_PROVIDER_CATALOG_SPEC)
+        .context("parse aiueos provider catalog EDN")?;
+    contract_export_map(
+        contract_edn_field(&root, "oracle-exports", "aiueos provider catalog")?,
+        "aiueos provider catalog",
+    )
+}
+
+fn selfhost_profile_oracle_expected_exports() -> Result<Vec<(String, i64)>> {
+    let root = kotoba_edn::parse(kotoba_clj::selfhost::SHELL_EVIDENCE_PROFILE_SPEC)
+        .context("parse shell evidence profile EDN")?;
+    contract_export_map(
+        contract_edn_field(&root, "oracle-exports", "shell evidence profile")?,
+        "shell evidence profile",
+    )
+}
+
+fn runtime_contract_evidence_exports(group: &str) -> Result<Vec<(String, i64)>> {
+    let root = kotoba_edn::parse(kotoba_clj::selfhost::RUNTIME_CONTRACT_SPEC)
+        .context("parse runtime contract EDN")?;
+    let groups = contract_edn_field(&root, "evidence-exports", "runtime contract")?;
+    let EdnValue::Map(groups) = groups else {
+        bail!("runtime contract :evidence-exports must be a map");
+    };
+    let group_key = EdnValue::Keyword(Keyword::bare(group));
+    let exports = groups
+        .get(&group_key)
+        .ok_or_else(|| anyhow!("runtime contract EDN is missing evidence group `{group}`"))?;
+    contract_export_map(exports, "runtime contract")
+}
+
+fn oracle_evidence_required_checks(
+    oracle_prefix: &str,
+    exports: Vec<(String, i64)>,
+) -> Vec<String> {
+    exports
+        .into_iter()
+        .map(|(name, value)| format!("{oracle_prefix}:{name}:{value}"))
+        .collect()
+}
+
+fn oracle_evidence_required_checks_for_names(
+    oracle_prefix: &str,
+    exports: Vec<(String, i64)>,
+    names: &[String],
+) -> Result<Vec<String>> {
+    let by_name = exports.into_iter().collect::<BTreeMap<_, _>>();
+    names
+        .iter()
+        .map(|name| {
+            by_name
+                .get(name)
+                .copied()
+                .map(|value| format!("{oracle_prefix}:{name}:{value}"))
+                .ok_or_else(|| anyhow!("{oracle_prefix} EDN seed is missing export `{name}`"))
+        })
+        .collect()
+}
+
+fn native_host_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::NATIVE_HOST_CONTRACT_SPEC,
+        "native host contract",
+        target,
+    )
+}
+
+fn app_components_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::APP_COMPONENTS_CONTRACT_SPEC,
+        "app components contract",
+        target,
+    )
+}
+
+fn compatibility_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::COMPATIBILITY_CONTRACT_SPEC,
+        "compatibility contract",
+        target,
+    )
+}
+
+fn updater_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::UPDATER_CONTRACT_SPEC,
+        "updater contract",
+        target,
+    )
+}
+
+fn updater_channel_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::UPDATER_CHANNEL_CONTRACT_SPEC,
+        "updater channel contract",
+        target,
+    )
+}
+
+fn updater_ui_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::UPDATER_UI_CONTRACT_SPEC,
+        "updater UI contract",
+        target,
+    )
+}
+
+fn updater_lifecycle_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::UPDATER_LIFECYCLE_CONTRACT_SPEC,
+        "updater lifecycle contract",
+        target,
+    )
+}
+
+fn release_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::RELEASE_CONTRACT_SPEC,
+        "release contract",
+        target,
+    )
+}
+
+fn release_target_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::RELEASE_TARGET_CONTRACT_SPEC,
+        "release target contract",
+        target,
+    )
+}
+
+fn signing_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::SIGNING_CONTRACT_SPEC,
+        "signing contract",
+        target,
+    )
+}
+
+fn submission_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::SUBMISSION_CONTRACT_SPEC,
+        "submission contract",
+        target,
+    )
+}
+
+fn runtime_check_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::RUNTIME_CONTRACT_SPEC,
+        "runtime contract",
+        target,
+    )
+}
+
+fn sdk_contract_expected_exports(target: Target) -> Result<Vec<(String, i64)>> {
+    contract_expected_exports_from_edn(
+        kotoba_clj::selfhost::SDK_CONTRACT_SPEC,
+        "sdk contract",
+        target,
+    )
 }
 
 pub fn evidence_check_dir(
@@ -3961,10 +4010,10 @@ fn validate_required_evidence_contract(
             checks,
             missing,
             &[
-                "updater-lifecycle-oracle:bundle-schema-digest:21952",
-                "updater-lifecycle-oracle:updater-schema-digest:11433",
-                "updater-lifecycle-oracle:artifact-field-count:4",
-                "updater-lifecycle-oracle:bundle-required-check-count:3",
+                "bundle-schema-digest",
+                "updater-schema-digest",
+                "artifact-field-count",
+                "bundle-required-check-count",
             ],
         ),
         Some("updater-install-ready-evidence.json") => {
@@ -3973,10 +4022,10 @@ fn validate_required_evidence_contract(
                 checks,
                 missing,
                 &[
-                    "updater-lifecycle-oracle:install-schema-digest:8471",
-                    "updater-lifecycle-oracle:updater-schema-digest:11433",
-                    "updater-lifecycle-oracle:artifact-field-count:4",
-                    "updater-lifecycle-oracle:install-stage-count:2",
+                    "install-schema-digest",
+                    "updater-schema-digest",
+                    "artifact-field-count",
+                    "install-stage-count",
                 ],
             )
         }
@@ -3985,9 +4034,9 @@ fn validate_required_evidence_contract(
             checks,
             missing,
             &[
-                "updater-lifecycle-oracle:publication-schema-digest:62166",
-                "updater-lifecycle-oracle:updater-schema-digest:11433",
-                "updater-lifecycle-oracle:publication-required-check-count:2",
+                "publication-schema-digest",
+                "updater-schema-digest",
+                "publication-required-check-count",
             ],
         ),
         Some("updater-feed-ready-evidence.json") => {
@@ -4064,19 +4113,20 @@ fn validate_selfhost_profile_evidence_contract(
         .map(|file_name| format!("required:{file_name}"))
         .unwrap_or_else(|| format!("required:{}", path.display()));
     let evidence_checks = evidence_checks_array(&json);
-    for required in [
-        "selfhost-profile-oracle:bundled-component",
-        "component:compiled-from:kotoba-clj/selfhost/shell_evidence_profile.kotoba",
-        "component:sha256",
-        "selfhost-profile-oracle:profile-count:3",
-        "selfhost-profile-oracle:required-command-count:25",
-        "selfhost-profile-oracle:required-evidence-stem-count:31",
-        "selfhost-profile-oracle:contract-score:32531",
-        "selfhost-profile-oracle:profile-list-digest:614",
-        "selfhost-profile-oracle:required-command-digest:4822",
-        "selfhost-profile-oracle:required-evidence-stem-digest:61285",
-    ] {
-        if evidence_checks.iter().any(|check| check == required) {
+    let mut required_checks = vec![
+        "selfhost-profile-oracle:bundled-component".to_string(),
+        "component:compiled-from:kotoba-clj/selfhost/shell_evidence_profile.kotoba".to_string(),
+        "component:sha256".to_string(),
+    ];
+    required_checks.extend(oracle_evidence_required_checks(
+        "selfhost-profile-oracle",
+        selfhost_profile_oracle_expected_exports()?,
+    ));
+    for required in required_checks {
+        if evidence_checks
+            .iter()
+            .any(|check| check.as_str() == required)
+        {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -4198,41 +4248,23 @@ fn validate_release_evidence_contract(
     missing: &mut Vec<String>,
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
-    let target = json
-        .get("target")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let required = vec![
-        "release-contract-oracle:release-schema-digest:45606",
-        "release-contract-oracle:release-check-schema-digest:7401",
-        "release-contract-oracle:permissions-schema-digest:17236",
-        "release-contract-oracle:evidence-profile-schema-digest:34024",
-        "release-contract-oracle:common-release-file-count:49",
-    ];
-    let mut target_required = Vec::new();
-    match target {
-        "macos" => target_required.extend([
-            "release-target-contract-oracle:macos-target-file-count:3",
-            "release-target-contract-oracle:macos-script-count:4",
-            "release-target-contract-oracle:macos-env-count:2",
-        ]),
-        "ios" => target_required.extend([
-            "release-target-contract-oracle:ios-target-file-count:4",
-            "release-target-contract-oracle:ios-script-count:2",
-            "release-target-contract-oracle:ios-env-count:2",
-        ]),
-        "android" => target_required.extend([
-            "release-target-contract-oracle:android-target-file-count:4",
-            "release-target-contract-oracle:android-script-count:2",
-            "release-target-contract-oracle:android-env-count:4",
-        ]),
-        "windows" => target_required.extend([
-            "release-target-contract-oracle:windows-target-file-count:2",
-            "release-target-contract-oracle:windows-script-count:4",
-            "release-target-contract-oracle:windows-env-count:3",
-        ]),
-        _ => {}
-    }
+    let target = evidence_target_from_json(&json);
+    let required = oracle_evidence_required_checks(
+        "release-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::RELEASE_CONTRACT_SPEC,
+            "release contract",
+            target,
+        )?,
+    );
+    let target_required = oracle_evidence_required_checks(
+        "release-target-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::RELEASE_TARGET_CONTRACT_SPEC,
+            "release target contract",
+            target,
+        )?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
@@ -4257,24 +4289,14 @@ fn validate_runtime_check_evidence_contract(
     missing: &mut Vec<String>,
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
-    let target = json
-        .get("target")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let mut required = vec![
-        "runtime-contract-oracle:runtime-check-schema-digest:11039",
-        "runtime-contract-oracle:runtime-check-field-count:9",
-    ];
-    match target {
-        "macos" => {
-            required.extend(["runtime-contract-oracle:macos-runtime-command-plan-digest:37994"])
-        }
-        "ios" => required.extend(["runtime-contract-oracle:ios-runtime-command-plan-digest:15223"]),
-        "android" => {
-            required.extend(["runtime-contract-oracle:android-runtime-command-plan-digest:52053"])
-        }
-        _ => {}
-    }
+    let required = oracle_evidence_required_checks(
+        "runtime-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::RUNTIME_CONTRACT_SPEC,
+            "runtime contract",
+            evidence_target_from_json(&json),
+        )?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
@@ -4290,16 +4312,17 @@ fn validate_runtime_doctor_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
+    let required = oracle_evidence_required_checks(
+        "runtime-contract-oracle",
+        runtime_contract_evidence_exports("doctor")?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
         missing,
         "runtime-contract-oracle",
         "kotoba-clj/selfhost/runtime_contract.kotoba",
-        &[
-            "runtime-contract-oracle:runtime-doctor-schema-digest:46621",
-            "runtime-contract-oracle:runtime-doctor-field-count:11",
-        ],
+        &required,
     )
 }
 
@@ -4309,30 +4332,14 @@ fn validate_sdk_evidence_contract(
     missing: &mut Vec<String>,
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
-    let target = json
-        .get("target")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let mut required = vec![
-        "sdk-contract-oracle:sdk-check-schema-digest:36062",
-        "sdk-contract-oracle:project-verify-schema-digest:55643",
-    ];
-    match target {
-        "ios" => required.extend([
-            "sdk-contract-oracle:ios-project-file-count:14",
-            "sdk-contract-oracle:ios-sdk-command-digest:19038",
-            "sdk-contract-oracle:ios-sdk-command-plan-digest:7365",
-        ]),
-        "android" => required.extend([
-            "sdk-contract-oracle:android-project-file-count:18",
-            "sdk-contract-oracle:android-gradle-command-digest:59926",
-            "sdk-contract-oracle:android-generated-gradle-command-digest:42097",
-            "sdk-contract-oracle:android-gradle-command-plan-digest:39518",
-            "sdk-contract-oracle:android-generated-gradle-command-plan-digest:49390",
-        ]),
-        "windows" => required.extend(["sdk-contract-oracle:windows-project-file-count:18"]),
-        _ => {}
-    }
+    let required = oracle_evidence_required_checks(
+        "sdk-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::SDK_CONTRACT_SPEC,
+            "sdk contract",
+            evidence_target_from_json(&json),
+        )?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
@@ -4348,18 +4355,17 @@ fn validate_runtime_release_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
+    let required = oracle_evidence_required_checks(
+        "runtime-contract-oracle",
+        runtime_contract_evidence_exports("release")?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
         missing,
         "runtime-contract-oracle",
         "kotoba-clj/selfhost/runtime_contract.kotoba",
-        &[
-            "runtime-contract-oracle:runtime-doctor-schema-digest:46621",
-            "runtime-contract-oracle:runtime-check-schema-digest:11039",
-            "runtime-contract-oracle:runtime-release-schema-digest:57645",
-            "runtime-contract-oracle:runtime-release-source-count:2",
-        ],
+        &required,
     )
 }
 
@@ -4368,17 +4374,17 @@ fn validate_runtime_matrix_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
+    let required = oracle_evidence_required_checks(
+        "runtime-contract-oracle",
+        runtime_contract_evidence_exports("matrix")?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
         missing,
         "runtime-contract-oracle",
         "kotoba-clj/selfhost/runtime_contract.kotoba",
-        &[
-            "runtime-contract-oracle:runtime-release-schema-digest:57645",
-            "runtime-contract-oracle:runtime-matrix-schema-digest:6769",
-            "runtime-contract-oracle:runtime-matrix-entry-source-count:2",
-        ],
+        &required,
     )
 }
 
@@ -4498,19 +4504,22 @@ fn validate_native_host_contract_evidence(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
+    let json = read_evidence_json(path)?;
+    let required = oracle_evidence_required_checks(
+        "native-host-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::NATIVE_HOST_CONTRACT_SPEC,
+            "native host contract",
+            evidence_target_from_json(&json),
+        )?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
         missing,
         "native-host-contract-oracle",
         "kotoba-clj/selfhost/native_host_contract.kotoba",
-        &[
-            "native-host-contract-oracle:native-host-schema-digest:19969",
-            "native-host-contract-oracle:bridge-runtime-digest:19507",
-            "native-host-contract-oracle:provider-command-count:13",
-            "native-host-contract-oracle:capability-gate-count:7",
-            "native-host-contract-oracle:native-command-surface-digest:53766",
-        ],
+        &required,
     )
 }
 
@@ -4519,15 +4528,11 @@ fn validate_plugin_contract_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
-    validate_plugin_contract_oracle_evidence_checks(
-        path,
-        checks,
-        missing,
-        &[
-            "plugin-contract-oracle:registry-schema-digest:13508",
-            "plugin-contract-oracle:permission-mode-digest:56568",
-        ],
-    )
+    let required_checks = oracle_evidence_required_checks(
+        "plugin-contract-oracle",
+        plugin_contract_expected_exports(&["registry-schema-digest", "permission-mode-digest"])?,
+    );
+    validate_plugin_contract_oracle_evidence_checks(path, checks, missing, &required_checks)
 }
 
 fn validate_plugin_sdk_evidence_contract(
@@ -4535,18 +4540,17 @@ fn validate_plugin_sdk_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
-    validate_plugin_contract_oracle_evidence_checks(
-        path,
-        checks,
-        missing,
-        &[
-            "plugin-contract-oracle:sdk-schema-digest:46569",
-            "plugin-contract-oracle:external-plugin-schema-digest:46258",
-            "plugin-contract-oracle:plugin-abi-digest:51062",
-            "plugin-contract-oracle:permission-mode-digest:56568",
-            "plugin-contract-oracle:required-plugin-field-count:7",
-        ],
-    )
+    let required_checks = oracle_evidence_required_checks(
+        "plugin-contract-oracle",
+        plugin_contract_expected_exports(&[
+            "sdk-schema-digest",
+            "external-plugin-schema-digest",
+            "plugin-abi-digest",
+            "permission-mode-digest",
+            "required-plugin-field-count",
+        ])?,
+    );
+    validate_plugin_contract_oracle_evidence_checks(path, checks, missing, &required_checks)
 }
 
 fn validate_plugin_load_evidence_contract(
@@ -4554,20 +4558,19 @@ fn validate_plugin_load_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
-    validate_plugin_contract_oracle_evidence_checks(
-        path,
-        checks,
-        missing,
-        &[
-            "plugin-contract-oracle:bundle-schema-digest:41260",
-            "plugin-contract-oracle:external-plugin-schema-digest:46258",
-            "plugin-contract-oracle:plugin-abi-digest:51062",
-            "plugin-contract-oracle:permission-mode-digest:56568",
-            "plugin-contract-oracle:audit-import-digest:16187",
-            "plugin-contract-oracle:loader-mode-digest:12233",
-            "plugin-contract-oracle:required-loader-boolean-count:3",
-        ],
-    )
+    let required_checks = oracle_evidence_required_checks(
+        "plugin-contract-oracle",
+        plugin_contract_expected_exports(&[
+            "bundle-schema-digest",
+            "external-plugin-schema-digest",
+            "plugin-abi-digest",
+            "permission-mode-digest",
+            "audit-import-digest",
+            "loader-mode-digest",
+            "required-loader-boolean-count",
+        ])?,
+    );
+    validate_plugin_contract_oracle_evidence_checks(path, checks, missing, &required_checks)
 }
 
 fn validate_compatibility_evidence_contract(
@@ -4582,22 +4585,17 @@ fn validate_compatibility_evidence_contract(
         .map(|file_name| format!("required:{file_name}"))
         .unwrap_or_else(|| format!("required:{}", path.display()));
     let evidence_checks = evidence_checks_array(&json);
-    for required in [
-        "compatibility-contract-oracle:bundled-component",
-        "component:compiled-from:kotoba-clj/selfhost/compatibility_contract.kotoba",
-        "component:sha256",
-        "compatibility-contract-oracle:schema-digest:36465",
-        "compatibility-contract-oracle:policy-version-digest:14299",
-        "compatibility-contract-oracle:stability-digest:1140",
-        "compatibility-contract-oracle:plugin-abi-digest:51062",
-        "compatibility-contract-oracle:shell-bridge-digest:19507",
-        "compatibility-contract-oracle:message-event-digest:20151",
-        "compatibility-contract-oracle:schema-compatibility-digest:12683",
-        "compatibility-contract-oracle:minimum-notice-days:90",
-        "compatibility-contract-oracle:required-policy-boolean-count:5",
-        "compatibility-contract-oracle:known-schema-count:7",
-    ] {
-        if evidence_checks.iter().any(|check| check == required) {
+    let mut required_checks = vec![
+        "compatibility-contract-oracle:bundled-component".to_string(),
+        "component:compiled-from:kotoba-clj/selfhost/compatibility_contract.kotoba".to_string(),
+        "component:sha256".to_string(),
+    ];
+    required_checks.extend(oracle_evidence_required_checks(
+        "compatibility-contract-oracle",
+        compatibility_contract_expected_exports(Target::Macos)?,
+    ));
+    for required in required_checks {
+        if evidence_checks.iter().any(|check| check == &required) {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -4710,19 +4708,17 @@ fn validate_updater_evidence_contract(
         .map(|file_name| format!("required:{file_name}"))
         .unwrap_or_else(|| format!("required:{}", path.display()));
     let evidence_checks = evidence_checks_array(&json);
-    for required in [
-        "updater-contract-oracle:bundled-component",
-        "component:compiled-from:kotoba-clj/selfhost/updater_contract.kotoba",
-        "component:sha256",
-        "updater-contract-oracle:schema-digest:11433",
-        "updater-contract-oracle:version-digest:14299",
-        "updater-contract-oracle:channel-digest:33828",
-        "updater-contract-oracle:aiueos-surface-contract-digest:62980",
-        "updater-contract-oracle:permissions-contract-digest:26486",
-        "updater-contract-oracle:required-boolean-count:1",
-        "updater-contract-oracle:required-artifact-field-count:4",
-    ] {
-        if evidence_checks.iter().any(|check| check == required) {
+    let mut required_checks = vec![
+        "updater-contract-oracle:bundled-component".to_string(),
+        "component:compiled-from:kotoba-clj/selfhost/updater_contract.kotoba".to_string(),
+        "component:sha256".to_string(),
+    ];
+    required_checks.extend(oracle_evidence_required_checks(
+        "updater-contract-oracle",
+        updater_contract_expected_exports(Target::Macos)?,
+    ));
+    for required in required_checks {
+        if evidence_checks.iter().any(|check| check == &required) {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -4746,17 +4742,16 @@ fn validate_updater_channel_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
+    let required_checks = oracle_evidence_required_checks(
+        "updater-contract-oracle",
+        updater_channel_contract_expected_exports(Target::Macos)?,
+    );
     validate_updater_oracle_evidence_checks(
         path,
         checks,
         missing,
         "kotoba-clj/selfhost/updater_channel_contract.kotoba",
-        &[
-            "updater-contract-oracle:channel-schema-digest:17872",
-            "updater-contract-oracle:internal-channel-digest:10417",
-            "updater-contract-oracle:stable-channel-digest:28146",
-            "updater-contract-oracle:channel-policy-boolean-count:7",
-        ],
+        &required_checks,
     )
 }
 
@@ -4765,21 +4760,16 @@ fn validate_updater_ui_evidence_contract(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
+    let required_checks = oracle_evidence_required_checks(
+        "updater-contract-oracle",
+        updater_ui_contract_expected_exports(Target::Macos)?,
+    );
     validate_updater_oracle_evidence_checks(
         path,
         checks,
         missing,
         "kotoba-clj/selfhost/updater_ui_contract.kotoba",
-        &[
-            "updater-contract-oracle:ui-schema-digest:62097",
-            "updater-contract-oracle:bridge-runtime-digest:19507",
-            "updater-contract-oracle:audit-digest:41463",
-            "updater-contract-oracle:ui-manifest-digest:53240",
-            "updater-contract-oracle:ui-channel-policy-digest:46247",
-            "updater-contract-oracle:ui-state-count:8",
-            "updater-contract-oracle:ui-action-count:5",
-            "updater-contract-oracle:ui-event-count:5",
-        ],
+        &required_checks,
     )
 }
 
@@ -4788,7 +4778,7 @@ fn validate_updater_oracle_evidence_checks(
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
     expected_source: &str,
-    required_checks: &[&str],
+    required_checks: &[String],
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
     let label = path
@@ -4810,7 +4800,10 @@ fn validate_updater_oracle_evidence_checks(
         }
     }
     for required in required_checks {
-        if evidence_checks.iter().any(|check| check == *required) {
+        if evidence_checks
+            .iter()
+            .any(|check| check.as_str() == required)
+        {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -4833,7 +4826,7 @@ fn validate_updater_lifecycle_evidence_contract(
     path: &Path,
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
-    required_checks: &[&str],
+    required_export_names: &[&str],
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
     let label = path
@@ -4853,8 +4846,17 @@ fn validate_updater_lifecycle_evidence_contract(
             missing.push(format!("{label} evidence is missing {required}"));
         }
     }
+    let required_names = required_export_names
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    let required_checks = oracle_evidence_required_checks_for_names(
+        "updater-lifecycle-oracle",
+        updater_lifecycle_contract_expected_exports(Target::Macos)?,
+        &required_names,
+    )?;
     for required in required_checks {
-        if evidence_checks.iter().any(|check| check == *required) {
+        if evidence_checks.iter().any(|check| check == &required) {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -4879,38 +4881,14 @@ fn validate_signing_evidence_contract(
     missing: &mut Vec<String>,
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
-    let target = json
-        .get("target")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let mut required = vec![
-        "signing-contract-oracle:signing-schema-digest:18426",
-        "signing-contract-oracle:version-digest:14299",
-        "signing-contract-oracle:signing-gate-count:4",
-    ];
-    match target {
-        "macos" => required.extend([
-            "signing-contract-oracle:macos-signing-script-digest:57095",
-            "signing-contract-oracle:macos-env-count:2",
-            "signing-contract-oracle:macos-artifact-field-count:3",
-        ]),
-        "ios" => required.extend([
-            "signing-contract-oracle:ios-signing-script-digest:10509",
-            "signing-contract-oracle:ios-env-count:2",
-            "signing-contract-oracle:ios-artifact-field-count:4",
-        ]),
-        "android" => required.extend([
-            "signing-contract-oracle:android-signing-script-digest:39302",
-            "signing-contract-oracle:android-env-count:4",
-            "signing-contract-oracle:android-artifact-field-count:3",
-        ]),
-        "windows" => required.extend([
-            "signing-contract-oracle:windows-signing-script-digest:40937",
-            "signing-contract-oracle:windows-env-count:4",
-            "signing-contract-oracle:windows-artifact-field-count:4",
-        ]),
-        _ => {}
-    }
+    let required = oracle_evidence_required_checks(
+        "signing-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::SIGNING_CONTRACT_SPEC,
+            "signing contract",
+            evidence_target_from_json(&json),
+        )?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
@@ -4927,37 +4905,14 @@ fn validate_submission_evidence_contract(
     missing: &mut Vec<String>,
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
-    let target = json
-        .get("target")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    let mut required = Vec::new();
-    match target {
-        "macos" => required.extend([
-            "submission-contract-oracle:apple-store-schema-digest:11082",
-            "submission-contract-oracle:macos-submission-script-digest:11882",
-            "submission-contract-oracle:macos-submission-file-count:2",
-            "submission-contract-oracle:macos-env-count:1",
-        ]),
-        "ios" => required.extend([
-            "submission-contract-oracle:apple-store-schema-digest:11082",
-            "submission-contract-oracle:ios-submission-script-digest:12836",
-            "submission-contract-oracle:ios-submission-file-count:2",
-            "submission-contract-oracle:ios-env-count:3",
-        ]),
-        "android" => required.extend([
-            "submission-contract-oracle:play-store-data-safety-schema-digest:15650",
-            "submission-contract-oracle:android-submission-script-digest:49390",
-            "submission-contract-oracle:android-submission-file-count:3",
-            "submission-contract-oracle:android-env-count:1",
-        ]),
-        "windows" => required.extend([
-            "submission-contract-oracle:windows-submission-script-digest:23984",
-            "submission-contract-oracle:windows-submission-file-count:1",
-            "submission-contract-oracle:windows-env-count:1",
-        ]),
-        _ => {}
-    }
+    let required = oracle_evidence_required_checks(
+        "submission-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::SUBMISSION_CONTRACT_SPEC,
+            "submission contract",
+            evidence_target_from_json(&json),
+        )?,
+    );
     validate_store_oracle_evidence_checks(
         path,
         checks,
@@ -4968,13 +4923,13 @@ fn validate_submission_evidence_contract(
     )
 }
 
-fn validate_store_oracle_evidence_checks(
+fn validate_store_oracle_evidence_checks<S: AsRef<str>>(
     path: &Path,
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
     oracle_prefix: &str,
     expected_source: &str,
-    required_checks: &[&str],
+    required_checks: &[S],
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
     let label = path
@@ -4996,7 +4951,8 @@ fn validate_store_oracle_evidence_checks(
         }
     }
     for required in required_checks {
-        if evidence_checks.iter().any(|check| check == *required) {
+        let required = required.as_ref();
+        if evidence_checks.iter().any(|check| check == required) {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -5020,7 +4976,7 @@ fn validate_plugin_contract_oracle_evidence_checks(
     path: &Path,
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
-    required_checks: &[&str],
+    required_checks: &[String],
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
     let label = path
@@ -5041,7 +4997,7 @@ fn validate_plugin_contract_oracle_evidence_checks(
         }
     }
     for required in required_checks {
-        if evidence_checks.iter().any(|check| check == *required) {
+        if evidence_checks.iter().any(|check| check == required) {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -5072,23 +5028,20 @@ fn validate_provider_surface_oracle_evidence_checks(
         .map(|file_name| format!("required:{file_name}"))
         .unwrap_or_else(|| format!("required:{}", path.display()));
     let evidence_checks = evidence_checks_array(&json);
-    for required in [
-        "provider-surface-oracle:bundled-component",
-        "component:compiled-from:kotoba-clj/selfhost/provider_surface_policy.kotoba",
-        "component:sha256",
-        "provider-surface-oracle:provider-family-count:8",
-        "provider-surface-oracle:provider-command-count:13",
-        "provider-surface-oracle:portable-provider-command-count:10",
-        "provider-surface-oracle:provider-status-class-count:2",
-        "provider-surface-oracle:provider-contract-score:81302",
-        "provider-surface-oracle:provider-catalog-digest:12688",
-        "provider-surface-oracle:ledger-provider-score:112",
-        "provider-surface-oracle:fs-app-data-provider-score:301",
-        "provider-surface-oracle:clipboard-provider-score:221",
-        "provider-surface-oracle:keychain-provider-score:331",
-        "provider-surface-oracle:calendar-provider-score:111",
-    ] {
-        if evidence_checks.iter().any(|check| check == required) {
+    let mut required_checks = vec![
+        "provider-surface-oracle:bundled-component".to_string(),
+        "component:compiled-from:kotoba-clj/selfhost/aiueos_provider_catalog.kotoba".to_string(),
+        "component:sha256".to_string(),
+    ];
+    required_checks.extend(oracle_evidence_required_checks(
+        "provider-surface-oracle",
+        provider_surface_oracle_expected_exports()?,
+    ));
+    for required in required_checks {
+        if evidence_checks
+            .iter()
+            .any(|check| check.as_str() == required)
+        {
             checks.push(format!("{label}:{required}"));
         } else {
             missing.push(format!("{label} evidence is missing {required}"));
@@ -5129,18 +5082,27 @@ fn validate_kototama_app_components_evidence_contract(
 ) -> Result<()> {
     let json = read_evidence_json(path)?;
     let evidence_checks = evidence_checks_array(&json);
-    for required in [
+    let mut required_checks = vec![
         "app-components-contract-oracle:bundled-component",
         "component:compiled-from:kotoba-clj/selfhost/app_components_contract.kotoba",
         "component:sha256",
-        "app-components-contract-oracle:schema-digest:27569",
-        "app-components-contract-oracle:admission-gate-digest:42448",
-        "app-components-contract-oracle:analyzer-abi-digest:58866",
-        "app-components-contract-oracle:contract-modulus:65521",
-        "app-components-contract-oracle:required-manifest-field-count:8",
-        "app-components-contract-oracle:required-component-field-count:12",
-    ] {
-        if evidence_checks.iter().any(|check| check == required) {
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    required_checks.extend(oracle_evidence_required_checks(
+        "app-components-contract-oracle",
+        contract_expected_exports_from_edn_for_target(
+            kotoba_clj::selfhost::APP_COMPONENTS_CONTRACT_SPEC,
+            "app components contract",
+            evidence_target_from_json(&json),
+        )?,
+    ));
+    for required in required_checks {
+        if evidence_checks
+            .iter()
+            .any(|check| check.as_str() == required)
+        {
             checks.push(format!("required:kototama-app-components:{required}"));
         } else {
             missing.push(format!("{} evidence is missing {required}", path.display()));
@@ -6015,7 +5977,7 @@ pub fn kototama_app_components_check_manifest(
 
 fn validate_app_components_contract_oracle(
     release_root: &Path,
-    json: &serde_json::Value,
+    _json: &serde_json::Value,
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
@@ -6039,78 +6001,9 @@ fn validate_app_components_contract_oracle(
         "app-components-contract-oracle:wasm-sha256:{}",
         sha256_bytes_hex(&oracle_wasm)
     ));
-    let required_manifest_fields = [
-        "schema",
-        "admissionGate",
-        "analyzerAbi",
-        "analyzerComponentSha256",
-        "componentCount",
-        "componentContractDigest",
-        "components",
-        "checks",
-    ];
-    let required_component_fields = [
-        "id",
-        "source",
-        "artifact",
-        "admissionGate",
-        "analyzerAbi",
-        "bytes",
-        "sha256",
-        "sourceSha256",
-        "policySha256",
-        "capabilityImports",
-        "exports",
-        "policy",
-    ];
-    let first_component = json
-        .get("components")
-        .and_then(|value| value.as_array())
-        .and_then(|components| components.first());
-    let actuals = [
-        (
-            "schema-digest",
-            json.get("schema")
-                .and_then(|value| value.as_str())
-                .map(kototama_component_symbol_digest)
-                .unwrap_or(0),
-        ),
-        (
-            "admission-gate-digest",
-            json.get("admissionGate")
-                .and_then(|value| value.as_str())
-                .map(kototama_component_symbol_digest)
-                .unwrap_or(0),
-        ),
-        (
-            "analyzer-abi-digest",
-            json.get("analyzerAbi")
-                .and_then(|value| value.as_str())
-                .map(kototama_component_symbol_digest)
-                .unwrap_or(0),
-        ),
-        ("contract-modulus", 65_521),
-        (
-            "required-manifest-field-count",
-            required_manifest_fields
-                .iter()
-                .filter(|field| json.get(**field).is_some())
-                .count() as i64,
-        ),
-        (
-            "required-component-field-count",
-            first_component
-                .map(|component| {
-                    required_component_fields
-                        .iter()
-                        .filter(|field| component.get(**field).is_some())
-                        .count() as i64
-                })
-                .unwrap_or(0),
-        ),
-    ];
-    for (function, expected) in actuals {
-        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, function, &[], 1_000_000)
+    let expected_exports = app_components_contract_expected_exports(Target::Macos)?;
+    for (function, expected) in expected_exports {
+        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, &function, &[], 1_000_000)
             .map_err(|err| {
                 anyhow!("run app components contract Kotoba oracle `{function}`: {err}")
             })?;
@@ -6452,7 +6345,7 @@ pub fn selfhost_profile_check_manifest_with_oracle(
         .get("profiles")
         .and_then(|value| value.as_object())
         .ok_or_else(|| anyhow!("evidence profile is missing profiles map"))?;
-    let selfhost_profiles = json_string_array(selfhost_projection, "profiles")?;
+    let _selfhost_profiles = json_string_array(selfhost_projection, "profiles")?;
     if profiles.contains_key("ci") {
         checks.push("profile:ci".to_string());
     } else {
@@ -6515,33 +6408,8 @@ pub fn selfhost_profile_check_manifest_with_oracle(
         "selfhost-profile-oracle:wasm-sha256:{}",
         sha256_bytes_hex(&oracle_wasm)
     ));
-    for (function, expected) in [
-        ("profile-count", selfhost_profiles.len() as i64),
-        ("required-command-count", required_commands.len() as i64),
-        (
-            "required-evidence-stem-count",
-            required_evidence_stems.len() as i64,
-        ),
-        (
-            "contract-score",
-            (selfhost_profiles.len() as i64 * 10000)
-                + (required_commands.len() as i64 * 100)
-                + required_evidence_stems.len() as i64,
-        ),
-        (
-            "profile-list-digest",
-            selfhost_profile_digest(&selfhost_profiles, 100),
-        ),
-        (
-            "required-command-digest",
-            selfhost_profile_digest(&required_commands, 200),
-        ),
-        (
-            "required-evidence-stem-digest",
-            selfhost_profile_digest(&required_evidence_stems, 500),
-        ),
-    ] {
-        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, function, &[], 1_000_000)
+    for (function, expected) in selfhost_profile_oracle_expected_exports()? {
+        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, &function, &[], 1_000_000)
             .map_err(|err| {
                 anyhow!("run shell evidence profile Kotoba oracle `{function}`: {err}")
             })?;
@@ -6576,82 +6444,6 @@ pub fn selfhost_profile_check_manifest_with_oracle(
         missing,
         detail,
     })
-}
-
-fn selfhost_profile_digest(items: &[String], base: i64) -> i64 {
-    items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            (index as i64 + 1) * selfhost_profile_symbol_code(item, base, index as i64)
-        })
-        .sum::<i64>()
-        % 65_521
-}
-
-fn selfhost_profile_symbol_code(value: &str, base: i64, index: i64) -> i64 {
-    match value {
-        "ci" if base == 100 => 101,
-        "android-release" => 102,
-        "store-release" => 103,
-        "ci" if base == 200 => 201,
-        "coverage" => 202,
-        "coverageCheck" => 203,
-        "providerContract" => 204,
-        "pluginContract" => 205,
-        "pluginSdk" => 206,
-        "pluginLoad" => 207,
-        "compatibility" => 208,
-        "compatibilityMigration" => 223,
-        "appSurface" => 209,
-        "appSurfaceParity" => 210,
-        "doctor" => 211,
-        "runtimeMatrix" => 212,
-        "deviceFarm" => 224,
-        "kototamaWasmCheck" => 213,
-        "kototamaAppComponentsCheck" => 214,
-        "selfhostProfileCheck" => 215,
-        "updaterChannel" => 216,
-        "updaterUi" => 217,
-        "updaterBundle" => 218,
-        "updaterInstall" => 219,
-        "updaterFeed" => 225,
-        "ledgerReplay" => 220,
-        "ledgerRemote" => 221,
-        "release" => 222,
-        "coverage-evidence" => 501,
-        "coverage-check-evidence" => 502,
-        "release-metadata-ready-evidence" => 503,
-        "device-farm-ready-evidence" => 530,
-        "provider-contract-evidence" => 504,
-        "plugin-contract-evidence" => 505,
-        "plugin-sdk-ready-evidence" => 506,
-        "plugin-load-ready-evidence" => 507,
-        "compatibility-ready-evidence" => 508,
-        "compatibility-migration-ready-evidence" => 529,
-        "app-surface-ready-evidence" => 509,
-        "app-surface-parity-ready-evidence" => 510,
-        "hosted-adapter-ready-evidence" => 511,
-        "live-adapter-supervisor-evidence" => 512,
-        "adapter-supervisor-ready-evidence" => 513,
-        "kototama-wasm-ready-evidence" => 514,
-        "kototama-app-components-ready-evidence" => 515,
-        "selfhost-profile-ready-evidence" => 516,
-        "signing-ready-evidence" => 517,
-        "signing-executed-evidence" => 518,
-        "submission-ready-evidence" => 519,
-        "submission-executed-evidence" => 520,
-        "updater-ready-evidence" => 521,
-        "updater-channel-ready-evidence" => 522,
-        "updater-ui-ready-evidence" => 523,
-        "updater-bundle-ready-evidence" => 524,
-        "updater-install-ready-evidence" => 525,
-        "updater-published-evidence" => 526,
-        "updater-feed-ready-evidence" => 531,
-        "ledger-replay-ready-evidence" => 527,
-        "ledger-remote-ready-evidence" => 528,
-        _ => base + index + 1,
-    }
 }
 
 fn json_string_array(json: &serde_json::Value, key: &str) -> Result<Vec<String>> {
@@ -7570,13 +7362,22 @@ pub fn device_farm_evidence_check(
             runtimes.len()
         ));
     }
+    let runtime_matrix_schema_markers = oracle_evidence_required_checks_for_names(
+        "runtime-contract-oracle",
+        runtime_contract_evidence_exports("matrix")?,
+        &["runtime-matrix-schema-digest".to_string()],
+    )?;
     if json
         .get("checks")
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str())
-        .any(|check| check.starts_with("runtime-contract-oracle:runtime-matrix-schema-digest:"))
+        .any(|check| {
+            runtime_matrix_schema_markers
+                .iter()
+                .any(|marker| marker == check)
+        })
     {
         checks.push("device-farm:runtime-matrix-oracle".to_string());
     } else {
@@ -7700,7 +7501,7 @@ fn provider_contract_check_plan_with_oracle(
     }
 
     for required in target_required_provider_commands(target, &capabilities) {
-        if commands.contains(required) {
+        if commands.contains(&required) {
             checks.push(format!("required-command:{required}"));
         } else {
             missing.push(format!("required provider command {required} is missing"));
@@ -7740,25 +7541,11 @@ fn provider_contract_check_plan_with_oracle(
 }
 
 fn provider_covers_capability(provider: &serde_json::Value, capability: &str) -> bool {
-    let Some(provider_capability) = provider.get("capability").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    provider_capability == capability
-        || matches!(
-            (provider_capability, capability),
-            ("clipboard/text", "clipboard/read-text")
-                | ("clipboard/text", "clipboard/write-text")
-                | ("keychain/text", "keychain/read-text")
-                | ("keychain/text", "keychain/write-text")
-                | ("contacts/read", "contacts/read")
-                | ("calendar/read", "calendar/read")
-                | ("ledger/append", "ledger/append")
-        )
-        || (provider_capability == "http/fetch" && is_http_fetch_capability(capability))
-        || (provider_capability == "contacts/read" && is_contacts_capability(capability))
-        || (provider_capability == "calendar/read" && is_calendar_capability(capability))
-        || (provider_capability == "keychain/text" && is_keychain_capability(capability))
-        || (provider_capability == "clipboard/text" && is_clipboard_capability(capability))
+    provider_matches_any_capability(provider, &[capability.to_string()])
+        || provider
+            .get("capability")
+            .and_then(|value| value.as_str())
+            .is_some_and(|provider_capability| provider_capability == capability)
 }
 
 fn validate_provider_surface_policy_oracle(
@@ -7769,7 +7556,7 @@ fn validate_provider_surface_policy_oracle(
     let oracle_wasm = if let Some(manifest) = provider_oracle_manifest {
         let wasm = read_kototama_component_manifest_wasm(
             manifest,
-            "kotoba-clj/selfhost/provider_surface_policy.kotoba",
+            "kotoba-clj/selfhost/aiueos_provider_catalog.kotoba",
             checks,
             missing,
         )?;
@@ -7785,47 +7572,12 @@ fn validate_provider_surface_policy_oracle(
         "provider-surface-oracle:wasm-sha256:{}",
         sha256_bytes_hex(&oracle_wasm)
     ));
-    let universe_capabilities = provider_surface_policy_universe_capabilities();
-    let providers = provider_catalog_json(&universe_capabilities);
-    let provider_count = providers.len() as i64;
-    let commands = providers
-        .iter()
-        .flat_map(|provider| {
-            provider
-                .get("commands")
-                .and_then(|value| value.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|value| value.as_str())
-                .map(str::to_string)
-        })
-        .collect::<BTreeSet<_>>();
-    let portable_commands = commands
-        .iter()
-        .filter(|command| app_surface_portable_command(command))
-        .count() as i64;
-    let statuses = providers
-        .iter()
-        .filter_map(|provider| provider.get("status").and_then(|value| value.as_str()))
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    let expected_contract_score =
-        (provider_count * 10000) + (commands.len() as i64 * 100) + statuses.len() as i64;
-    for (function, expected) in [
-        ("provider-family-count", provider_count),
-        ("provider-command-count", commands.len() as i64),
-        ("portable-provider-command-count", portable_commands),
-        ("provider-status-class-count", statuses.len() as i64),
-        ("provider-contract-score", expected_contract_score),
-        (
-            "provider-catalog-digest",
-            provider_catalog_digest(&providers, missing),
-        ),
-    ] {
-        let actual = kotoba_clj::run::run_with_fuel(&oracle_wasm, function, &[], 1_000_000)
-            .map_err(|err| {
-                anyhow!("run provider surface policy Kotoba oracle `{function}`: {err}")
-            })?;
+    for (function, expected) in provider_surface_oracle_expected_exports()? {
+        let actual =
+            kotoba_clj::run::run_with_fuel(&oracle_wasm, function.as_str(), &[], 1_000_000)
+                .map_err(|err| {
+                    anyhow!("run provider surface policy Kotoba oracle `{function}`: {err}")
+                })?;
         if actual == expected {
             checks.push(format!("provider-surface-oracle:{function}:{actual}"));
         } else {
@@ -7834,217 +7586,64 @@ fn validate_provider_surface_policy_oracle(
             ));
         }
     }
-    for (provider_id, label) in [
-        ("aiueos/ledger-audit", "ledger"),
-        ("shell/fs-app-data", "fs-app-data"),
-        ("shell/notification", "notification"),
-        ("shell/clipboard", "clipboard"),
-        ("shell/http-fetch", "http-fetch"),
-        ("shell/keychain", "keychain"),
-        ("shell/contacts", "contacts"),
-        ("shell/calendar", "calendar"),
-    ] {
-        validate_provider_surface_policy_oracle_family(
-            &oracle_wasm,
-            &providers,
-            provider_id,
-            label,
-            checks,
-            missing,
-        )?;
-    }
     Ok(())
 }
 
-fn provider_catalog_digest(providers: &[serde_json::Value], missing: &mut Vec<String>) -> i64 {
-    providers
-        .iter()
-        .enumerate()
-        .map(|(index, provider)| {
-            (index as i64 + 1) * provider_surface_policy_provider_digest(provider, missing)
-        })
-        .sum::<i64>()
-        % 65_521
+fn target_required_provider_commands(target: Target, capabilities: &[String]) -> Vec<String> {
+    target_required_provider_commands_from_selfhost(target, capabilities)
+        .expect("aiueos provider catalog required command seed is valid")
 }
 
-fn validate_provider_surface_policy_oracle_family(
-    oracle_wasm: &[u8],
-    providers: &[serde_json::Value],
-    provider_id: &str,
-    label: &str,
-    checks: &mut Vec<String>,
-    missing: &mut Vec<String>,
-) -> Result<()> {
-    let Some(provider) = providers
+fn target_required_provider_commands_from_selfhost(
+    target: Target,
+    capabilities: &[String],
+) -> Result<Vec<String>> {
+    let edn = kotoba_edn::parse(kotoba_clj::selfhost::AIUEOS_PROVIDER_CATALOG_SPEC)
+        .context("parse Kotoba selfhost aiueos provider catalog spec")?;
+    let json = edn_to_json(&edn);
+    let providers = json
+        .get("providers")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("aiueos provider catalog is missing providers"))?;
+    let mut commands = Vec::new();
+    for provider in providers
         .iter()
-        .find(|provider| provider.get("id").and_then(|value| value.as_str()) == Some(provider_id))
-    else {
-        missing.push(format!(
-            "provider surface policy oracle provider `{provider_id}` is missing from Rust catalog"
-        ));
-        return Ok(());
-    };
-    let commands = provider
-        .get("commands")
+        .filter(|provider| provider_matches_any_capability(provider, capabilities))
+        .filter(|provider| provider_required_on_target(provider, target))
+    {
+        let id = provider
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<missing-provider-id>");
+        for command in provider
+            .get("commands")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow!("aiueos provider catalog entry `{id}` is missing commands"))?
+            .iter()
+        {
+            commands.push(
+                command
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow!("aiueos provider catalog entry `{id}` has non-string command")
+                    })?
+                    .to_string(),
+            );
+        }
+    }
+    commands.sort();
+    commands.dedup();
+    Ok(commands)
+}
+
+fn provider_required_on_target(provider: &serde_json::Value, target: Target) -> bool {
+    provider
+        .get("required-targets")
         .and_then(|value| value.as_array())
         .into_iter()
         .flatten()
         .filter_map(|value| value.as_str())
-        .collect::<Vec<_>>();
-    let portable_commands = commands
-        .iter()
-        .filter(|command| app_surface_portable_command(command))
-        .count() as i64;
-    let status_code = match provider.get("status").and_then(|value| value.as_str()) {
-        Some("implemented-shell-provider") => 1,
-        Some("aiueos-audit-provider") => 2,
-        Some(status) => {
-            missing.push(format!(
-                "provider surface policy oracle provider `{provider_id}` has unknown status {status}"
-            ));
-            0
-        }
-        None => {
-            missing.push(format!(
-                "provider surface policy oracle provider `{provider_id}` is missing status"
-            ));
-            0
-        }
-    };
-    let expected = (commands.len() as i64 * 100) + (portable_commands * 10) + status_code;
-    let function = format!("{label}-provider-score");
-    let actual = kotoba_clj::run::run_with_fuel(oracle_wasm, &function, &[], 1_000_000)
-        .map_err(|err| anyhow!("run provider surface policy Kotoba oracle `{function}`: {err}"))?;
-    if actual == expected {
-        checks.push(format!("provider-surface-oracle:{function}:{actual}"));
-    } else {
-        missing.push(format!(
-            "provider surface policy oracle `{function}` returned {actual}, expected {expected}"
-        ));
-    }
-    Ok(())
-}
-
-fn provider_surface_policy_provider_digest(
-    provider: &serde_json::Value,
-    missing: &mut Vec<String>,
-) -> i64 {
-    let id = provider.get("id").and_then(|value| value.as_str());
-    let capability = provider.get("capability").and_then(|value| value.as_str());
-    let status = provider.get("status").and_then(|value| value.as_str());
-    let command_digest = provider
-        .get("commands")
-        .and_then(|value| value.as_array())
-        .into_iter()
-        .flatten()
-        .enumerate()
-        .map(|(index, value)| {
-            let Some(command) = value.as_str() else {
-                missing.push("provider surface policy command is not a string".to_string());
-                return 0;
-            };
-            (index as i64 + 1) * provider_surface_policy_symbol_code(command, "command", missing)
-        })
-        .sum::<i64>();
-    (provider_surface_policy_symbol_code(id.unwrap_or_default(), "id", missing) * 1_000_000
-        + provider_surface_policy_symbol_code(
-            capability.unwrap_or_default(),
-            "capability",
-            missing,
-        ) * 10_000
-        + provider_surface_policy_symbol_code(status.unwrap_or_default(), "status", missing) * 100
-        + command_digest)
-        % 65_521
-}
-
-fn provider_surface_policy_symbol_code(value: &str, kind: &str, missing: &mut Vec<String>) -> i64 {
-    match (kind, value) {
-        ("id", "aiueos/ledger-audit") => 101,
-        ("id", "shell/fs-app-data") => 102,
-        ("id", "shell/notification") => 103,
-        ("id", "shell/clipboard") => 104,
-        ("id", "shell/http-fetch") => 105,
-        ("id", "shell/keychain") => 106,
-        ("id", "shell/contacts") => 107,
-        ("id", "shell/calendar") => 108,
-        ("capability", "ledger/append") => 201,
-        ("capability", "fs/app-data") => 202,
-        ("capability", "notify/show") => 203,
-        ("capability", "clipboard/text") => 204,
-        ("capability", "http/fetch") => 205,
-        ("capability", "keychain/text") => 206,
-        ("capability", "contacts/read") => 207,
-        ("capability", "calendar/read") => 208,
-        ("command", "ledger/append") => 301,
-        ("command", "fs/read-text") => 302,
-        ("command", "fs/write-text") => 303,
-        ("command", "fs/append-text") => 304,
-        ("command", "notify/show") => 305,
-        ("command", "clipboard/read-text") => 306,
-        ("command", "clipboard/write-text") => 307,
-        ("command", "http/fetch") => 308,
-        ("command", "keychain/read-text") => 309,
-        ("command", "keychain/write-text") => 310,
-        ("command", "keychain/delete") => 311,
-        ("command", "contacts/list") => 312,
-        ("command", "calendar/list-events") => 313,
-        ("status", "implemented-shell-provider") => 1,
-        ("status", "aiueos-audit-provider") => 2,
-        _ => {
-            missing.push(format!(
-                "provider surface policy has unknown {kind} symbol `{value}`"
-            ));
-            0
-        }
-    }
-}
-
-fn provider_surface_policy_universe_capabilities() -> Vec<String> {
-    [
-        "ledger/append",
-        "fs/app-data",
-        "notify/show",
-        "clipboard/read-text",
-        "http/fetch",
-        "keychain/read-text",
-        "contacts/read",
-        "calendar/read",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
-fn target_required_provider_commands(target: Target, capabilities: &[String]) -> Vec<&'static str> {
-    let mut commands = Vec::new();
-    if capabilities.iter().any(|c| c == "notify/show") {
-        commands.push("notify/show");
-    }
-    if capabilities.iter().any(|c| is_clipboard_capability(c)) {
-        commands.push("clipboard/read-text");
-        commands.push("clipboard/write-text");
-    }
-    if capabilities.iter().any(|c| is_http_fetch_capability(c)) {
-        commands.push("http/fetch");
-    }
-    if capabilities.iter().any(|c| is_keychain_capability(c)) {
-        commands.push("keychain/read-text");
-        commands.push("keychain/write-text");
-    }
-    if matches!(target, Target::Macos | Target::Ios | Target::Android)
-        && capabilities.iter().any(|c| is_contacts_capability(c))
-    {
-        commands.push("contacts/list");
-    }
-    if matches!(target, Target::Macos | Target::Ios | Target::Android)
-        && capabilities.iter().any(|c| is_calendar_capability(c))
-    {
-        commands.push("calendar/list-events");
-    }
-    if capabilities.iter().any(|c| c == "ledger/append") {
-        commands.push("ledger/append");
-    }
-    commands
+        .any(|required| required == target.as_str())
 }
 
 fn json_path_field(json: &serde_json::Value, key: &str) -> Option<PathBuf> {
@@ -8670,70 +8269,13 @@ pub fn updater_check_manifest(
     let mut missing = Vec::new();
     require_json_string(&json, "schema", "kotoba-shell.updater.v0", &mut checks)?;
     require_json_string(&json, "target", target.as_str(), &mut checks)?;
-    let artifact_field_count = json
-        .get("artifact")
-        .and_then(|value| value.as_object())
-        .map(|artifact| {
-            ["fileName", "sha256", "signature", "url"]
-                .iter()
-                .filter(|field| artifact.contains_key(**field))
-                .count() as i64
-        })
-        .unwrap_or(0);
-    let required_boolean_count = if json
-        .pointer("/requirements/verifyBeforeInstall")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
-        1
-    } else {
-        0
-    };
     validate_updater_contract_oracle_if_present(
         manifest_path,
         "kototama-updater-contract.edn",
         "kotoba-clj/selfhost/updater_contract.kotoba",
         &mut checks,
         &mut missing,
-        &[
-            (
-                "schema-digest",
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "version-digest",
-                json.get("version")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "channel-digest",
-                json.get("channel")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "aiueos-surface-contract-digest",
-                json.pointer("/requirements/aiueosSurfaceContract")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "permissions-contract-digest",
-                json.pointer("/requirements/permissionsContract")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            ("required-boolean-count", required_boolean_count),
-            ("required-artifact-field-count", artifact_field_count),
-        ],
+        &updater_contract_expected_exports(target)?,
     )?;
     if json
         .pointer("/requirements/verifyBeforeInstall")
@@ -8825,7 +8367,7 @@ fn validate_updater_contract_oracle_if_present(
     expected_source: &str,
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
-    expected_exports: &[(&str, i64)],
+    expected_exports: &[(String, i64)],
 ) -> Result<()> {
     let Some(root) = manifest.parent() else {
         return Ok(());
@@ -8926,48 +8468,13 @@ pub fn updater_channel_check_manifest(
         Ok(()) => {}
         Err(err) => missing.push(err.to_string()),
     }
-    let channel_policy_boolean_count = [
-        "/policy/verifyBeforeInstall",
-        "/policy/signatureRequired",
-        "/policy/sha256Required",
-        "/policy/httpsRequired",
-        "/policy/rollbackSupported",
-        "/policy/stagedRolloutSupported",
-        "/policy/releaseNotesRequired",
-    ]
-    .iter()
-    .filter(|pointer| json.pointer(pointer).and_then(|value| value.as_bool()) == Some(true))
-    .count() as i64;
     validate_updater_contract_oracle_if_present(
         manifest,
         "kototama-updater-channel-contract.edn",
         "kotoba-clj/selfhost/updater_channel_contract.kotoba",
         &mut checks,
         &mut missing,
-        &[
-            (
-                "channel-schema-digest",
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "internal-channel-digest",
-                json.pointer("/channels/0/id")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "stable-channel-digest",
-                json.pointer("/channels/1/id")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            ("channel-policy-boolean-count", channel_policy_boolean_count),
-        ],
+        &updater_channel_contract_expected_exports(target)?,
     )?;
     require_json_array_non_empty(&json, "channels", &mut checks, &mut missing);
     require_json_object(&json, "policy", &mut checks, &mut missing);
@@ -9132,67 +8639,13 @@ pub fn updater_ui_check_manifest(
         Ok(()) => {}
         Err(err) => missing.push(err.to_string()),
     }
-    let ui_state_count = json
-        .get("states")
-        .and_then(|value| value.as_array())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
-    let ui_action_count = json
-        .get("actions")
-        .and_then(|value| value.as_array())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
-    let ui_event_count = json
-        .get("events")
-        .and_then(|value| value.as_array())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
     validate_updater_contract_oracle_if_present(
         manifest,
         "kototama-updater-ui-contract.edn",
         "kotoba-clj/selfhost/updater_ui_contract.kotoba",
         &mut checks,
         &mut missing,
-        &[
-            (
-                "ui-schema-digest",
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "bridge-runtime-digest",
-                json.pointer("/bridge/runtime")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "audit-digest",
-                json.pointer("/nativeBindings/audit")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "ui-manifest-digest",
-                json.pointer("/nativeBindings/manifest")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "ui-channel-policy-digest",
-                json.pointer("/nativeBindings/channelPolicy")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            ("ui-state-count", ui_state_count),
-            ("ui-action-count", ui_action_count),
-            ("ui-event-count", ui_event_count),
-        ],
+        &updater_ui_contract_expected_exports(target)?,
     )?;
     require_json_array_non_empty(&json, "states", &mut checks, &mut missing);
     require_json_array_non_empty(&json, "actions", &mut checks, &mut missing);
@@ -9430,32 +8883,14 @@ pub fn updater_bundle_evidence_check(
 
 fn validate_updater_lifecycle_contract_oracle_if_present(
     updater_manifest: &Path,
-    updater_manifest_json: &serde_json::Value,
+    _updater_manifest_json: &serde_json::Value,
     checks: &mut Vec<String>,
-    specific_expected_exports: &[(&str, i64)],
+    _specific_expected_exports: &[(&str, i64)],
 ) -> Result<()> {
     let Some(release_dir) = updater_manifest.parent() else {
         return Ok(());
     };
-    let artifact_field_count = updater_manifest_json
-        .get("artifact")
-        .and_then(|value| value.as_object())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
-    let updater_schema_digest = updater_manifest_json
-        .get("schema")
-        .and_then(|value| value.as_str())
-        .map(kototama_component_symbol_digest)
-        .unwrap_or(0);
-    let mut expected = vec![
-        ("updater-schema-digest".to_string(), updater_schema_digest),
-        ("artifact-field-count".to_string(), artifact_field_count),
-    ];
-    expected.extend(
-        specific_expected_exports
-            .iter()
-            .map(|(function, expected)| ((*function).to_string(), *expected)),
-    );
+    let expected = updater_lifecycle_contract_expected_exports(Target::Macos)?;
     validate_store_contract_oracle_if_present(
         release_dir,
         "kototama-updater-lifecycle-contract.edn",
@@ -13788,7 +13223,7 @@ fn write_kototama_component_metadata(out_dir: &Path) -> Result<()> {
     let provider_manifest = kototama_component_manifest_json_with_source(
         provider_component_file,
         &provider_component,
-        "kotoba-clj/selfhost/provider_surface_policy.kotoba",
+        "kotoba-clj/selfhost/aiueos_provider_catalog.kotoba",
     );
     std::fs::write(
         out_dir.join("kototama-provider-surface-policy.json"),
@@ -14644,7 +14079,8 @@ fn release_manifest_json(plan: &ShellPlan, target: Target) -> Result<String> {
                 "mode": "append-only-command-log",
                 "macosDevPath": "Application Support/kotoba-shell-dev/{appId}/audit/commands.jsonl"
             },
-            "surfaceMetadata": ["aiueos-shell-surface.json", "aiueos-shell-surface.edn"]
+            "surfaceMetadata": ["aiueos-shell-surface.json", "aiueos-shell-surface.edn"],
+            "providerCatalog": "aiueos-provider-catalog.edn"
         },
         "kototama": {
             "layer": "kotoba wasm / safe Kotoba",
@@ -14991,46 +14427,17 @@ pub fn plugin_sdk_check_manifest(
         Ok(()) => {}
         Err(err) => missing.push(err.to_string()),
     }
-    let required_plugin_field_count = json
-        .get("requiredPluginFields")
-        .and_then(|value| value.as_array())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
     validate_plugin_contract_oracle_if_present(
         manifest,
         &mut checks,
         &mut missing,
-        &[
-            (
-                "sdk-schema-digest",
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "external-plugin-schema-digest",
-                json.pointer("/samplePlugin/schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "plugin-abi-digest",
-                json.get("abiVersion")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "permission-mode-digest",
-                json.pointer("/samplePlugin/permission/mode")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            ("required-plugin-field-count", required_plugin_field_count),
-        ],
+        &plugin_contract_expected_exports(&[
+            "sdk-schema-digest",
+            "external-plugin-schema-digest",
+            "plugin-abi-digest",
+            "permission-mode-digest",
+            "required-plugin-field-count",
+        ])?,
     )?;
     require_nested_json_string(&json, "abiVersion", &mut checks, &mut missing);
     require_nested_json_string(&json, "pluginManifestSchema", &mut checks, &mut missing);
@@ -15129,63 +14536,19 @@ pub fn plugin_load_check_manifest(
         Ok(()) => {}
         Err(err) => missing.push(err.to_string()),
     }
-    let loader_boolean_count = [
-        "/loader/enabled",
-        "/loader/requireSignature",
-        "/loader/requireSha256",
-    ]
-    .iter()
-    .filter(|pointer| json.pointer(pointer).and_then(|value| value.as_bool()) == Some(true))
-    .count() as i64;
     validate_plugin_contract_oracle_if_present(
         manifest,
         &mut checks,
         &mut missing,
-        &[
-            (
-                "bundle-schema-digest",
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "external-plugin-schema-digest",
-                json.pointer("/bundles/0/schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "plugin-abi-digest",
-                json.pointer("/loader/abiVersion")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "permission-mode-digest",
-                json.pointer("/bundles/0/permission/mode")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "audit-import-digest",
-                json.pointer("/loader/allowedHostImports/0")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "loader-mode-digest",
-                json.pointer("/loader/mode")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            ("required-loader-boolean-count", loader_boolean_count),
-        ],
+        &plugin_contract_expected_exports(&[
+            "bundle-schema-digest",
+            "external-plugin-schema-digest",
+            "plugin-abi-digest",
+            "permission-mode-digest",
+            "audit-import-digest",
+            "loader-mode-digest",
+            "required-loader-boolean-count",
+        ])?,
     )?;
     require_json_object(&json, "loader", &mut checks, &mut missing);
     require_json_array_non_empty(&json, "bundles", &mut checks, &mut missing);
@@ -15509,7 +14872,7 @@ fn validate_plugin_contract_oracle_if_present(
     manifest: &Path,
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
-    expected_exports: &[(&str, i64)],
+    expected_exports: &[(String, i64)],
 ) -> Result<()> {
     let Some(root) = manifest.parent() else {
         return Ok(());
@@ -15553,7 +14916,7 @@ fn validate_compatibility_contract_oracle_if_present(
     manifest: &Path,
     checks: &mut Vec<String>,
     missing: &mut Vec<String>,
-    expected_exports: &[(&str, i64)],
+    expected_exports: &[(String, i64)],
 ) -> Result<()> {
     let Some(root) = manifest.parent() else {
         return Ok(());
@@ -15662,83 +15025,12 @@ pub fn compatibility_check_manifest(
         Ok(()) => {}
         Err(err) => missing.push(err.to_string()),
     }
-    let policy_boolean_count = [
-        "/deprecationPolicy/removalRequiresMajor",
-        "/deprecationPolicy/releaseNotesRequired",
-        "/migrationPolicy/manifestMigrationRequired",
-        "/migrationPolicy/evidenceProfileMigrationRequired",
-        "/migrationPolicy/backwardCompatibilityTestsRequired",
-    ]
-    .iter()
-    .filter(|pointer| json.pointer(pointer).and_then(|value| value.as_bool()) == Some(true))
-    .count() as i64;
-    let known_schema_count = json
-        .get("knownSchemas")
-        .and_then(|value| value.as_array())
-        .map(|values| values.len() as i64)
-        .unwrap_or(0);
-    let minimum_notice_days = json
-        .pointer("/deprecationPolicy/minimumNoticeDays")
-        .and_then(|value| value.as_u64())
-        .unwrap_or_default() as i64;
+    let expected_exports = compatibility_contract_expected_exports(target)?;
     validate_compatibility_contract_oracle_if_present(
         manifest,
         &mut checks,
         &mut missing,
-        &[
-            (
-                "schema-digest",
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "policy-version-digest",
-                json.get("policyVersion")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "stability-digest",
-                json.get("stability")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "plugin-abi-digest",
-                json.pointer("/abi/plugin")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "shell-bridge-digest",
-                json.pointer("/abi/shellBridge")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "message-event-digest",
-                json.pointer("/abi/messageEvent")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "schema-compatibility-digest",
-                json.pointer("/schemaCompatibility/evidence")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            ("minimum-notice-days", minimum_notice_days),
-            ("required-policy-boolean-count", policy_boolean_count),
-            ("known-schema-count", known_schema_count),
-        ],
+        &expected_exports,
     )?;
     require_nested_json_string(&json, "policyVersion", &mut checks, &mut missing);
     require_nested_json_string(&json, "stability", &mut checks, &mut missing);
@@ -15964,22 +15256,7 @@ pub fn plugin_check_manifest(
         manifest,
         &mut checks,
         &mut missing,
-        &[
-            (
-                "registry-schema-digest",
-                json.get("schema")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-            (
-                "permission-mode-digest",
-                json.pointer("/plugins/0/permission/mode")
-                    .and_then(|value| value.as_str())
-                    .map(kototama_component_symbol_digest)
-                    .unwrap_or(0),
-            ),
-        ],
+        &plugin_contract_expected_exports(&["registry-schema-digest", "permission-mode-digest"])?,
     )?;
     require_json_object(&json, "registry", &mut checks, &mut missing);
     require_json_array_non_empty(&json, "plugins", &mut checks, &mut missing);
@@ -16422,6 +15699,7 @@ fn aiueos_shell_surface_json(plan: &ShellPlan, target: Target) -> Result<String>
         "appId": plan.app_id,
         "appName": plan.app_name,
         "target": target.as_str(),
+        "providerCatalog": "aiueos-provider-catalog.edn",
         "broker": {
             "verify": "safe-kotoba-admission-before-provider-link",
             "dispatch": "capability-command",
@@ -16545,9 +15823,21 @@ fn provider_catalog_entry_json(provider: &serde_json::Value) -> Result<serde_jso
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let matches = provider
+        .get("matches")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("aiueos provider catalog entry `{id}` is missing matches"))?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                anyhow!("aiueos provider catalog entry `{id}` has non-string match pattern")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(serde_json::json!({
         "id": id,
         "capability": capability,
+        "matches": matches,
         "commands": commands,
         "status": status
     }))
@@ -21848,7 +21138,7 @@ mod tests {
             .checks
             .contains(&"provider-surface-oracle:bundled-component".to_string()));
         assert!(macos_provider_contract.checks.contains(
-            &"component:compiled-from:kotoba-clj/selfhost/provider_surface_policy.kotoba"
+            &"component:compiled-from:kotoba-clj/selfhost/aiueos_provider_catalog.kotoba"
                 .to_string()
         ));
         let macos_adapter_manifest =
@@ -23710,7 +23000,7 @@ mod tests {
                           "checks":[
                             "schema",
                             "analyzerAbi",
-                            "component:compiled-from:kotoba-clj/selfhost/provider_surface_policy.kotoba",
+                            "component:compiled-from:kotoba-clj/selfhost/aiueos_provider_catalog.kotoba",
                             "component:sha256",
                             "provider-surface-oracle:bundled-component",
                             "provider-surface-oracle:wasm-sha256:7777777777777777777777777777777777777777777777777777777777777777",
@@ -23722,8 +23012,11 @@ mod tests {
                             "provider-surface-oracle:provider-catalog-digest:12688",
                             "provider-surface-oracle:ledger-provider-score:112",
                             "provider-surface-oracle:fs-app-data-provider-score:301",
+                            "provider-surface-oracle:notification-provider-score:111",
                             "provider-surface-oracle:clipboard-provider-score:221",
+                            "provider-surface-oracle:http-fetch-provider-score:111",
                             "provider-surface-oracle:keychain-provider-score:331",
+                            "provider-surface-oracle:contacts-provider-score:111",
                             "provider-surface-oracle:calendar-provider-score:111"
                           ],
                           "detail":"{file} passed"
@@ -24089,7 +23382,7 @@ mod tests {
                           "checks":[
                             "schema",
                             "analyzerAbi",
-                            "component:compiled-from:kotoba-clj/selfhost/provider_surface_policy.kotoba",
+                            "component:compiled-from:kotoba-clj/selfhost/aiueos_provider_catalog.kotoba",
                             "component:sha256",
                             "provider-surface-oracle:bundled-component",
                             "provider-surface-oracle:wasm-sha256:8888888888888888888888888888888888888888888888888888888888888888",
@@ -24101,8 +23394,11 @@ mod tests {
                             "provider-surface-oracle:provider-catalog-digest:12688",
                             "provider-surface-oracle:ledger-provider-score:112",
                             "provider-surface-oracle:fs-app-data-provider-score:301",
+                            "provider-surface-oracle:notification-provider-score:111",
                             "provider-surface-oracle:clipboard-provider-score:221",
+                            "provider-surface-oracle:http-fetch-provider-score:111",
                             "provider-surface-oracle:keychain-provider-score:331",
+                            "provider-surface-oracle:contacts-provider-score:111",
                             "provider-surface-oracle:calendar-provider-score:111"
                           ],
                           "detail":"{file} passed"
@@ -24118,7 +23414,7 @@ mod tests {
                           "checks":[
                             "schema",
                             "analyzerAbi",
-                            "component:compiled-from:kotoba-clj/selfhost/provider_surface_policy.kotoba",
+                            "component:compiled-from:kotoba-clj/selfhost/aiueos_provider_catalog.kotoba",
                             "component:sha256",
                             "provider-surface-oracle:bundled-component",
                             "provider-surface-oracle:wasm-sha256:9999999999999999999999999999999999999999999999999999999999999999",
@@ -24130,8 +23426,11 @@ mod tests {
                             "provider-surface-oracle:provider-catalog-digest:12688",
                             "provider-surface-oracle:ledger-provider-score:112",
                             "provider-surface-oracle:fs-app-data-provider-score:301",
+                            "provider-surface-oracle:notification-provider-score:111",
                             "provider-surface-oracle:clipboard-provider-score:221",
+                            "provider-surface-oracle:http-fetch-provider-score:111",
                             "provider-surface-oracle:keychain-provider-score:331",
+                            "provider-surface-oracle:contacts-provider-score:111",
                             "provider-surface-oracle:calendar-provider-score:111"
                           ],
                           "detail":"{file} passed"
@@ -25594,6 +24893,17 @@ mod tests {
             ids,
             vec!["aiueos/ledger-audit", "shell/clipboard", "shell/keychain"]
         );
+        let clipboard = providers
+            .iter()
+            .find(|provider| {
+                provider.get("id").and_then(|value| value.as_str()) == Some("shell/clipboard")
+            })
+            .unwrap();
+        assert!(provider_covers_capability(
+            clipboard,
+            "clipboard/write-text"
+        ));
+        assert!(provider_covers_capability(clipboard, "clipboard/custom"));
         assert!(providers.iter().any(|provider| {
             provider.get("id").and_then(|value| value.as_str()) == Some("shell/keychain")
                 && provider
@@ -25606,6 +24916,226 @@ mod tests {
         let exported = aiueos_provider_catalog_json_string().unwrap();
         assert!(exported.contains("\"schema\": \"aiueos.provider-catalog.v0\""));
         assert!(exported.contains("\"id\": \"aiueos/ledger-audit\""));
+        assert!(exported.contains("\"digest\""));
+        let oracle_exports = provider_surface_oracle_expected_exports().unwrap();
+        assert!(oracle_exports.contains(&("provider-family-count".to_string(), 8)));
+        assert!(oracle_exports.contains(&("provider-contract-score".to_string(), 81_302)));
+        assert!(oracle_exports.contains(&("provider-catalog-digest".to_string(), 12_688)));
+        assert!(oracle_exports.contains(&("notification-provider-score".to_string(), 111)));
+        assert!(oracle_exports.contains(&("http-fetch-provider-score".to_string(), 111)));
+        assert!(oracle_exports.contains(&("contacts-provider-score".to_string(), 111)));
+
+        let mobile_capabilities = vec![
+            "contacts/read".to_string(),
+            "calendar/read".to_string(),
+            "clipboard/read-text".to_string(),
+        ];
+        let android_required =
+            target_required_provider_commands_from_selfhost(Target::Android, &mobile_capabilities)
+                .unwrap();
+        assert!(android_required.contains(&"contacts/list".to_string()));
+        assert!(android_required.contains(&"calendar/list-events".to_string()));
+        assert!(android_required.contains(&"clipboard/read-text".to_string()));
+        let windows_required =
+            target_required_provider_commands_from_selfhost(Target::Windows, &mobile_capabilities)
+                .unwrap();
+        assert!(!windows_required.contains(&"contacts/list".to_string()));
+        assert!(!windows_required.contains(&"calendar/list-events".to_string()));
+        assert!(windows_required.contains(&"clipboard/read-text".to_string()));
+    }
+
+    #[test]
+    fn native_host_contract_exports_are_loaded_from_selfhost_edn_seed() {
+        let android = native_host_contract_expected_exports(Target::Android).unwrap();
+        assert!(android.contains(&("native-host-schema-digest".to_string(), 19_969)));
+        assert!(android.contains(&("bridge-runtime-digest".to_string(), 19_507)));
+        assert!(android.contains(&("provider-command-count".to_string(), 13)));
+        assert!(android.contains(&("capability-gate-count".to_string(), 7)));
+        assert!(android.contains(&("native-command-surface-digest".to_string(), 53_766)));
+        assert!(android.contains(&("android-bridge-dispatch-digest".to_string(), 46_584)));
+        assert!(!android
+            .iter()
+            .any(|(name, _)| name == "ios-bridge-dispatch-digest"));
+
+        let ios = native_host_contract_expected_exports(Target::Ios).unwrap();
+        assert!(ios.contains(&("ios-bridge-dispatch-digest".to_string(), 6_798)));
+        assert!(!ios
+            .iter()
+            .any(|(name, _)| name == "android-bridge-dispatch-digest"));
+    }
+
+    #[test]
+    fn runtime_check_contract_exports_are_loaded_from_selfhost_edn_seed() {
+        let android = runtime_check_contract_expected_exports(Target::Android).unwrap();
+        assert!(android.contains(&("runtime-check-schema-digest".to_string(), 11_039)));
+        assert!(android.contains(&("runtime-check-field-count".to_string(), 9)));
+        assert!(android.contains(&("android-runtime-command-plan-digest".to_string(), 52_053)));
+        assert!(!android
+            .iter()
+            .any(|(name, _)| name == "ios-runtime-command-plan-digest"));
+
+        let windows = runtime_check_contract_expected_exports(Target::Windows).unwrap();
+        assert!(windows.contains(&("runtime-check-schema-digest".to_string(), 11_039)));
+        assert!(!windows
+            .iter()
+            .any(|(name, _)| name.ends_with("-runtime-command-plan-digest")));
+        let doctor = runtime_contract_evidence_exports("doctor").unwrap();
+        assert!(doctor.contains(&("runtime-doctor-schema-digest".to_string(), 46_621)));
+        assert!(doctor.contains(&("runtime-doctor-field-count".to_string(), 11)));
+        let matrix = runtime_contract_evidence_exports("matrix").unwrap();
+        assert!(matrix.contains(&("runtime-release-schema-digest".to_string(), 57_645)));
+        assert!(matrix.contains(&("runtime-matrix-schema-digest".to_string(), 6_769)));
+        assert!(matrix.contains(&("runtime-matrix-entry-source-count".to_string(), 2)));
+    }
+
+    #[test]
+    fn sdk_contract_exports_are_loaded_from_selfhost_edn_seed() {
+        let android = sdk_contract_expected_exports(Target::Android).unwrap();
+        assert!(android.contains(&("sdk-check-schema-digest".to_string(), 36_062)));
+        assert!(android.contains(&("project-verify-schema-digest".to_string(), 55_643)));
+        assert!(android.contains(&("android-project-file-count".to_string(), 18)));
+        assert!(android.contains(&("android-gradle-command-digest".to_string(), 59_926)));
+        assert!(android.contains(&(
+            "android-generated-gradle-command-plan-digest".to_string(),
+            49_390
+        )));
+        assert!(!android
+            .iter()
+            .any(|(name, _)| name == "ios-sdk-command-digest"));
+
+        let macos = sdk_contract_expected_exports(Target::Macos).unwrap();
+        assert!(macos.contains(&("sdk-check-schema-digest".to_string(), 36_062)));
+        assert!(!macos
+            .iter()
+            .any(|(name, _)| name.ends_with("-project-file-count")));
+    }
+
+    #[test]
+    fn release_signing_submission_contract_exports_are_loaded_from_selfhost_edn_seed() {
+        let release = release_contract_expected_exports(Target::Android).unwrap();
+        assert!(release.contains(&("release-schema-digest".to_string(), 45_606)));
+        assert!(release.contains(&("common-release-file-count".to_string(), 49)));
+
+        let release_target = release_target_contract_expected_exports(Target::Android).unwrap();
+        assert!(release_target.contains(&("android-target-file-count".to_string(), 4)));
+        assert!(release_target.contains(&("android-script-count".to_string(), 2)));
+        assert!(release_target.contains(&("android-env-count".to_string(), 4)));
+        assert!(!release_target
+            .iter()
+            .any(|(name, _)| name == "ios-target-file-count"));
+
+        let signing = signing_contract_expected_exports(Target::Windows).unwrap();
+        assert!(signing.contains(&("signing-schema-digest".to_string(), 18_426)));
+        assert!(signing.contains(&("windows-signing-script-digest".to_string(), 40_937)));
+        assert!(signing.contains(&("windows-artifact-field-count".to_string(), 4)));
+        assert!(!signing
+            .iter()
+            .any(|(name, _)| name == "android-signing-script-digest"));
+
+        let submission = submission_contract_expected_exports(Target::Android).unwrap();
+        assert!(submission.contains(&("play-store-data-safety-schema-digest".to_string(), 15_650)));
+        assert!(submission.contains(&("android-submission-script-digest".to_string(), 49_390)));
+        assert!(submission.contains(&("android-submission-file-count".to_string(), 3)));
+        assert!(!submission
+            .iter()
+            .any(|(name, _)| name == "apple-store-schema-digest"));
+    }
+
+    #[test]
+    fn compatibility_and_app_components_contract_exports_are_loaded_from_selfhost_edn_seed() {
+        let compatibility = compatibility_contract_expected_exports(Target::Android).unwrap();
+        assert!(compatibility.contains(&("schema-digest".to_string(), 36_465)));
+        assert!(compatibility.contains(&("plugin-abi-digest".to_string(), 51_062)));
+        assert!(compatibility.contains(&("minimum-notice-days".to_string(), 90)));
+        assert!(compatibility.contains(&("known-schema-count".to_string(), 7)));
+
+        let app_components = app_components_contract_expected_exports(Target::Android).unwrap();
+        assert!(app_components.contains(&("schema-digest".to_string(), 27_569)));
+        assert!(app_components.contains(&("admission-gate-digest".to_string(), 42_448)));
+        assert!(app_components.contains(&("contract-modulus".to_string(), 65_521)));
+        assert!(app_components.contains(&("required-component-field-count".to_string(), 12)));
+    }
+
+    #[test]
+    fn updater_contract_exports_are_loaded_from_selfhost_edn_seed() {
+        let updater = updater_contract_expected_exports(Target::Android).unwrap();
+        assert!(updater.contains(&("schema-digest".to_string(), 11_433)));
+        assert!(updater.contains(&("channel-digest".to_string(), 33_828)));
+        assert!(updater.contains(&("required-artifact-field-count".to_string(), 4)));
+
+        let channel = updater_channel_contract_expected_exports(Target::Android).unwrap();
+        assert!(channel.contains(&("channel-schema-digest".to_string(), 17_872)));
+        assert!(channel.contains(&("channel-policy-boolean-count".to_string(), 7)));
+
+        let ui = updater_ui_contract_expected_exports(Target::Android).unwrap();
+        assert!(ui.contains(&("ui-schema-digest".to_string(), 62_097)));
+        assert!(ui.contains(&("ui-state-count".to_string(), 8)));
+        assert!(ui.contains(&("ui-event-count".to_string(), 5)));
+
+        let lifecycle = updater_lifecycle_contract_expected_exports(Target::Android).unwrap();
+        assert!(lifecycle.contains(&("bundle-schema-digest".to_string(), 21_952)));
+        assert!(lifecycle.contains(&("install-stage-count".to_string(), 2)));
+        assert!(lifecycle.contains(&("publication-required-check-count".to_string(), 2)));
+    }
+
+    #[test]
+    fn plugin_contract_exports_are_loaded_from_selfhost_edn_seed() {
+        let registry =
+            plugin_contract_expected_exports(&["registry-schema-digest", "permission-mode-digest"])
+                .unwrap();
+        assert_eq!(
+            registry,
+            vec![
+                ("registry-schema-digest".to_string(), 13_508),
+                ("permission-mode-digest".to_string(), 56_568)
+            ]
+        );
+
+        let loader = plugin_contract_expected_exports(&[
+            "bundle-schema-digest",
+            "audit-import-digest",
+            "loader-mode-digest",
+            "required-loader-boolean-count",
+        ])
+        .unwrap();
+        assert!(loader.contains(&("bundle-schema-digest".to_string(), 41_260)));
+        assert!(loader.contains(&("audit-import-digest".to_string(), 16_187)));
+        assert!(loader.contains(&("loader-mode-digest".to_string(), 12_233)));
+        assert!(loader.contains(&("required-loader-boolean-count".to_string(), 3)));
+    }
+
+    #[test]
+    fn evidence_required_oracle_markers_are_derived_from_contract_edn_seeds() {
+        let plugin_markers = oracle_evidence_required_checks(
+            "plugin-contract-oracle",
+            plugin_contract_expected_exports(&["registry-schema-digest", "permission-mode-digest"])
+                .unwrap(),
+        );
+        assert_eq!(
+            plugin_markers,
+            vec![
+                "plugin-contract-oracle:registry-schema-digest:13508".to_string(),
+                "plugin-contract-oracle:permission-mode-digest:56568".to_string()
+            ]
+        );
+
+        let updater_names = vec![
+            "bundle-schema-digest".to_string(),
+            "bundle-required-check-count".to_string(),
+        ];
+        let updater_markers = oracle_evidence_required_checks_for_names(
+            "updater-lifecycle-oracle",
+            updater_lifecycle_contract_expected_exports(Target::Android).unwrap(),
+            &updater_names,
+        )
+        .unwrap();
+        assert_eq!(
+            updater_markers,
+            vec![
+                "updater-lifecycle-oracle:bundle-schema-digest:21952".to_string(),
+                "updater-lifecycle-oracle:bundle-required-check-count:3".to_string()
+            ]
+        );
     }
 
     #[test]

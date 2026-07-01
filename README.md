@@ -215,6 +215,7 @@ Build a confined module from the CLI — and audit exactly what it can do:
 ```bash
 kotoba -e '(+ 1 2)'                         # compile Kotoba -> Wasm -> run main
 kotoba wasm safe-build cell.kotoba --policy policy.edn -o cell.wasm
+kotoba wasm safe-build cell.kotoba --policy policy.edn --package-lock kotoba.lock.edn -o cell.wasm
 # [wasm safe-build] cell.kotoba (10405 bytes)
 # [wasm safe-build] admission gate: selfhost/kotoba
 # [wasm safe-build] capability surface: kotoba:kais/kqe@0.1.0
@@ -243,6 +244,23 @@ compile-time twin of CACAO's `leaf.graph ⊆ root.graph` attenuation (T3 at
 instance granularity). `kotoba wasm safe-policy <cell>` runs the inverse of the
 gate, synthesizing the **minimal least-privilege policy** a cell needs.
 
+Package and dependency safety follows the same rule. Safe Kotoba package
+references are not trusted by `name + version` alone: a dependency must be
+locked by repo RID, signed package manifest CID, source tree CID, signer DID,
+and an explicit capability grant set. CID provides content integrity; repo RID
+and signatures provide authority; the safe-build policy provides the final
+capability subset. The CLI now accepts `--package-lock` on `kotoba wasm
+safe-build` and rejects missing CID/signers or dependency grants outside the
+caller policy before compilation emits bytes. Executable dependency capability
+classes (`graph-read`, `graph-write`, `infer`, `auth`) are fed into the
+self-hosted Kotoba compile gate, so package-lock admission uses the same
+Kotoba-owned policy checker as source capability admission. Reserved host
+classes remain structurally checked by the CLI until executable imports exist
+for them. The broader implementation plan is tracked in
+[`docs/ADR-kotoba-package-cid-lock.md`](docs/ADR-kotoba-package-cid-lock.md),
+which consumes the standalone package contract from `kotoba-lang/kotoba-lang`
+(`lang/package.edn`).
+
 Audit/tooling APIs, usable standalone: `embedded_capability_ifaces(wasm)`
 (byte-level capability surface), `infer_effects(src)` (source-level transitive
 effects), `minimal_policy(src)` (least-privilege synthesis), `Policy::to_edn`.
@@ -253,10 +271,12 @@ Wasm Component, has no embedded host capability imports, and is checked against
 the Rust analyzer for the covered effect/capability/policy surface. Rust callers
 can exercise that path through `kotoba_clj::selfhost::{Analyzer,
 infer_effects, minimal_policy, check_effect_declarations, check_policy,
-check_admission, unused_grants, compile_safe_kotoba}`. Status:
-capability (instance-level), subset, and effect (interprocedural) gates
-implemented and byte-verified (S0–S4) with safe-mode tests; typed HIR / borrow
-checker (T1) and wider self-hosting are tracked in the ADRs.
+check_admission, check_compile_gate_with_dependency_capabilities,
+unused_grants, compile_safe_kotoba}`. Status: capability (instance-level),
+package dependency capability admission, subset, literal type, and effect
+(interprocedural) gates are implemented and byte-verified (S0–S4 plus the
+covered T1 slice) with safe-mode tests; wider self-hosting is tracked in the
+ADRs.
 
 Current naming: `kotoba` is the language + database + semantic substrate,
 `kotoba wasm` / safe Kotoba is the executable language path that turns Kotoba
@@ -488,6 +508,7 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | [`docs/ADR-sealed-cold-tier.md`](docs/ADR-sealed-cold-tier.md) | encrypted cold tier + t-of-N custody |
 | [`docs/ADR-kotoba-wasm.md`](docs/ADR-kotoba-wasm.md) | Kotoba/EDN-subset → WebAssembly compiler (`kotoba wasm`, historically `kotoba-clj`) |
 | [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe Kotoba** — capability-confined language design (capability/subset/effect gates, T2/T3) |
+| [`docs/ADR-kotoba-package-cid-lock.md`](docs/ADR-kotoba-package-cid-lock.md) | package references, CID locks, signatures, and dependency capability grants |
 | [`docs/ADR-kotoba-shell-aiueos-safe-kotoba.md`](docs/ADR-kotoba-shell-aiueos-safe-kotoba.md) | kotoba / safe Kotoba / aiueos responsibility split + self-hosting direction |
 | [`docs/ADR-repository-boundaries.md`](docs/ADR-repository-boundaries.md) | repository ownership, split criteria, and extraction order |
 | [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |

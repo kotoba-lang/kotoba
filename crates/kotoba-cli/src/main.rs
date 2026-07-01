@@ -10,6 +10,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use clap::{CommandFactory, Parser, Subcommand};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing_subscriber::EnvFilter;
@@ -387,6 +388,9 @@ enum WasmCmd {
         /// Deny-by-default capability policy.
         #[arg(long)]
         policy: PathBuf,
+        /// CID-locked package dependency lockfile.
+        #[arg(long = "package-lock")]
+        package_lock: Option<PathBuf>,
         /// Output Wasm path. Defaults to replacing the Kotoba-family extension with .wasm.
         #[arg(short = 'o')]
         out: Option<PathBuf>,
@@ -1424,6 +1428,7 @@ fn run_wasm_cmd(cmd: WasmCmd) -> Result<()> {
         WasmCmd::SafeBuild {
             cell,
             policy,
+            package_lock,
             out,
             selfhost_gate: _,
             reader_target,
@@ -1433,6 +1438,32 @@ fn run_wasm_cmd(cmd: WasmCmd) -> Result<()> {
             let out = out.unwrap_or_else(|| default_wasm_out(&cell));
             let policy = read_policy(&policy)?;
             let body = load_kotoba_source(&cell, target, &source_path)?;
+            let dependency_capabilities = if let Some(package_lock) = &package_lock {
+                check_package_lock(package_lock, &policy)?
+            } else {
+                BTreeSet::new()
+            };
+            if !dependency_capabilities.is_empty() {
+                let gate = kotoba_clj::selfhost::check_compile_gate_with_dependency_capabilities(
+                    &body,
+                    target,
+                    &policy,
+                    dependency_capabilities.iter().cloned(),
+                )
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "safe-build {} rejected by package lock gate: {err}",
+                        cell.display()
+                    )
+                })?;
+                if !gate.policy.ok {
+                    anyhow::bail!(
+                        "safe-build {} rejected: {}",
+                        cell.display(),
+                        format_dependency_policy_error(&gate.policy)
+                    );
+                }
+            }
             let wasm = kotoba_clj::compile_safe_kotoba_with_prelude_and_reader_target(
                 &body, target, &policy,
             )
@@ -1569,6 +1600,208 @@ fn read_policy(path: &Path) -> Result<kotoba_clj::Policy> {
     let src = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     kotoba_clj::Policy::parse_edn(&src)
         .map_err(|err| anyhow::anyhow!("parse policy {}: {err}", path.display()))
+}
+
+fn check_package_lock(path: &Path, policy: &kotoba_clj::Policy) -> Result<BTreeSet<String>> {
+    let src = std::fs::read_to_string(path)
+        .with_context(|| format!("read package lock {}", path.display()))?;
+    let value = kotoba_edn::parse(&src)
+        .map_err(|err| anyhow::anyhow!("parse package lock {}: {err}", path.display()))?;
+    let map = value
+        .as_map()
+        .ok_or_else(|| anyhow::anyhow!("package lock {} must be an EDN map", path.display()))?;
+
+    match get_edn(map, "kotoba.lock/version").and_then(|v| v.as_integer()) {
+        Some(1) => {}
+        _ => anyhow::bail!(
+            "package lock {} rejected: :kotoba.lock/version must be 1",
+            path.display()
+        ),
+    }
+
+    let deps = get_edn(map, "deps")
+        .and_then(|v| v.as_vector())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "package lock {} rejected: :deps vector required",
+                path.display()
+            )
+        })?;
+    if deps.is_empty() {
+        anyhow::bail!(
+            "package lock {} rejected: :deps must not be empty",
+            path.display()
+        );
+    }
+
+    let mut dependency_capabilities = BTreeSet::new();
+    for dep in deps {
+        let dep = dep.as_map().ok_or_else(|| {
+            anyhow::anyhow!(
+                "package lock {} rejected: dependency must be a map",
+                path.display()
+            )
+        })?;
+        dependency_capabilities.extend(check_lock_dep(path, dep, policy)?);
+    }
+
+    eprintln!(
+        "[wasm safe-build] package lock: {} ({} deps)",
+        path.display(),
+        deps.len()
+    );
+    Ok(dependency_capabilities)
+}
+
+fn check_lock_dep(
+    path: &Path,
+    dep: &BTreeMap<kotoba_edn::EdnValue, kotoba_edn::EdnValue>,
+    policy: &kotoba_clj::Policy,
+) -> Result<BTreeSet<String>> {
+    for key in [
+        "dep/name",
+        "dep/version",
+        "dep/repo-rid",
+        "dep/commit",
+        "dep/tree-cid",
+        "dep/manifest-cid",
+        "dep/signers",
+        "dep/capabilities",
+    ] {
+        if get_edn(dep, key).is_none() {
+            anyhow::bail!(
+                "package lock {} rejected: missing required lock field :{}",
+                path.display(),
+                key
+            );
+        }
+    }
+
+    for key in ["dep/repo-rid", "dep/tree-cid", "dep/manifest-cid"] {
+        let val = get_string_like(dep, key).unwrap_or_default();
+        if !val.starts_with("bafy") {
+            anyhow::bail!(
+                "package lock {} rejected: :{} must be a CID",
+                path.display(),
+                key
+            );
+        }
+    }
+
+    let signers = get_edn(dep, "dep/signers")
+        .and_then(|v| v.as_vector())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "package lock {} rejected: :dep/signers vector required",
+                path.display()
+            )
+        })?;
+    if signers.is_empty() {
+        anyhow::bail!("package lock {} rejected: signer required", path.display());
+    }
+    for signer in signers {
+        let Some(signer) = signer.as_string() else {
+            anyhow::bail!(
+                "package lock {} rejected: signer must be a string",
+                path.display()
+            );
+        };
+        if !signer.starts_with("did:") {
+            anyhow::bail!(
+                "package lock {} rejected: signer must be a DID",
+                path.display()
+            );
+        }
+    }
+
+    let caps = get_capability_set(dep, "dep/capabilities")?;
+    let mut executable_caps = BTreeSet::new();
+    for cap in &caps {
+        if dependency_cap_is_selfhost_executable(cap) {
+            executable_caps.insert(cap.clone());
+        } else if !policy_allows_dependency_cap(policy, cap) {
+            anyhow::bail!(
+                "package lock {} rejected: dependency capability grant exceeds caller policy: :{}",
+                path.display(),
+                cap
+            );
+        }
+    }
+    Ok(executable_caps)
+}
+
+fn dependency_cap_is_selfhost_executable(cap: &str) -> bool {
+    matches!(cap, "graph-read" | "graph-write" | "infer" | "auth")
+}
+
+fn policy_allows_dependency_cap(policy: &kotoba_clj::Policy, cap: &str) -> bool {
+    match cap {
+        "graph-read" => !policy.graph_read.is_empty(),
+        "graph-write" => !policy.graph_write.is_empty(),
+        "infer" => !policy.infer.is_empty(),
+        "auth" => policy.auth,
+        "clock" => policy.clock,
+        "random" => policy.random,
+        "egress" => !policy.egress.is_empty(),
+        "secrets" => !policy.secrets.is_empty(),
+        _ => false,
+    }
+}
+
+fn format_dependency_policy_error(check: &kotoba_clj::selfhost::PolicyCheck) -> String {
+    let denials = check
+        .denials
+        .iter()
+        .map(|cap| format!(":{cap}"))
+        .chain(
+            check
+                .target_denials
+                .iter()
+                .map(|target| format!(":{target}")),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("dependency capability grant exceeds caller policy: {denials}")
+}
+
+fn get_capability_set(
+    map: &BTreeMap<kotoba_edn::EdnValue, kotoba_edn::EdnValue>,
+    key: &str,
+) -> Result<BTreeSet<String>> {
+    let vals = get_edn(map, key)
+        .and_then(|v| v.as_vector())
+        .ok_or_else(|| anyhow::anyhow!(":{} must be a vector", key))?;
+    vals.iter()
+        .map(|v| {
+            string_like(v)
+                .ok_or_else(|| anyhow::anyhow!(":{} entries must be keywords or strings", key))
+        })
+        .collect()
+}
+
+fn get_edn<'a>(
+    map: &'a BTreeMap<kotoba_edn::EdnValue, kotoba_edn::EdnValue>,
+    key: &str,
+) -> Option<&'a kotoba_edn::EdnValue> {
+    map.get(&kotoba_edn::EdnValue::Keyword(kotoba_edn::Keyword::parse(
+        key,
+    )))
+}
+
+fn get_string_like(
+    map: &BTreeMap<kotoba_edn::EdnValue, kotoba_edn::EdnValue>,
+    key: &str,
+) -> Option<String> {
+    get_edn(map, key).and_then(string_like)
+}
+
+fn string_like(v: &kotoba_edn::EdnValue) -> Option<String> {
+    match v {
+        kotoba_edn::EdnValue::String(s) => Some(s.clone()),
+        kotoba_edn::EdnValue::Keyword(k) => Some(k.to_qualified()),
+        kotoba_edn::EdnValue::Symbol(s) => Some(s.to_qualified()),
+        _ => None,
+    }
 }
 
 fn load_kotoba_source(

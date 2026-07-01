@@ -832,17 +832,33 @@ literal zero.
 The Rust bridge also sends source-level `source-types` facts with small literal
 kind codes (`Num` / `Str` / unknown), so covered direct literal kind mismatches
 can be rejected by the Kotoba analyzer even when Rust AST lowering fails.
+Those source-level facts also resolve simple lexical bindings, conservative
+`do` final values, same-type `if` joins, and nested direct `let`/`loop` return
+facts, while keeping short string/small integer markers for covered
+value-dependent checks such as `byte-at` out-of-bounds, negative `bytes-alloc`,
+and literal-zero division.
 The source-level type walker skips inert forms and non-executable declaration
 bodies such as `defmacro`; those remain subset-gate responsibility.
-Value-dependent literal checks remain parser-owned AST facts.
-When Rust AST lowering fails, the bridge also sends `source-effects` facts for
-direct executable host calls in `defn` bodies. This gives Kotoba tooling
-direct class-level capability and literal resource-target coverage for
-minimal-policy synthesis, policy/admission checks, and unused-grant linting for
-calls such as `(kqe-assert! "graphB" ...)`. Namespaced direct host calls such as
+When Rust AST lowering fails, the bridge also sends per-function
+`program[].source-effects` facts and `program[].source-calls` edges for direct
+executable host calls in `defn` bodies. This gives Kotoba tooling direct
+class-level capability and literal resource-target coverage for minimal-policy
+synthesis, policy/admission checks, and unused-grant linting for calls such as
+`(kqe-assert! "graphB" ...)`. Source-only host-call targets also resolve simple
+lexical literal bindings, conservative `do` final values, same-target `if`
+joins, and nested direct `let`/`loop` return facts before falling back to
+wildcard targets. Later dynamic rebindings shadow earlier literal targets and
+widen back to wildcard rather than leaking the old literal.
+Namespaced direct host calls such as
 `(kotoba/kqe-assert! "graphB" ...)` normalize to the same builtin operation in
-source-only tooling; interprocedural propagation, dynamic targets, and effect
-declaration soundness remain parser-owned AST facts.
+source-only tooling. Source-only fallback also keeps `defn`-level
+`{:effects ...}` rows with those per-function source facts, so direct
+source-only `infer_effects` reports named functions rather than a synthetic
+`$source` bucket and can close direct source-only function calls through the same
+Kotoba analyzer fixpoint. Declaration under-coverage is rejected by the Kotoba
+analyzer. Multi-arity source-only declaration checking conservatively unions
+direct source effects across arities at the function level. Dynamic target flows
+remain parser-owned AST facts.
 The Rust bridge preserves those builtin names in parser-owned AST facts rather
 than collapsing them to `pure-builtin`, and sends a parser-owned `type-body` AST
 copy for a type-only pass. That pass carries `Str`/`Num`/`Bytes` through direct
@@ -949,8 +965,11 @@ This is not yet a Rust-free compiler. The current trust boundary is:
   host-call policy, literal type, effect/capability, and per-resource policy gates are driven by one
   `compile-gate` request to the Kotoba analyzer component. On Rust AST
   lowering failure, compile-gate/minimal-policy/policy/admission/unused-grants
-  tooling degrades to source-only subset/type/effect facts before Rust fallback
-  gates resume. File graph compile entry points keep the same
+  tooling degrades to source-only subset/type facts plus per-function
+  source-effects/source-calls facts before Rust fallback gates resume; those
+  source type facts now preserve covered small integer values and short string
+  lengths for `byte-at`, `bytes-alloc`, and literal-zero `/` / `quot` / `mod` /
+  `rem` checks. File graph compile entry points keep the same
   reader target through dependency loading and selfhost-backed admission. CLI
   dogfood is now selfhost-first by default as `kotoba wasm safe-build <cell>
   --policy <policy.edn>` and `kotoba wasm safe-policy <cell>`; the legacy
