@@ -224,7 +224,7 @@ is distributed. Acceptance of the License constitutes acceptance of this Rider.
        kami-rtx, utsushimi (写身), wadachi-sim, and murakumo-render — and the
        NVIDIA names are confined to a clearly delimited compatibility facade
        namespace (`20-actors/etzhayyim-sdk/src/nv-compat/` for TypeScript and
-       `20-actors/kotoba-kotodama/py/src/kotodama/nv_compat/` for Python).
+       `kotoba-lang/kotodama-py/src/kotodama/nv_compat/` for Python).
 
 7. SEVERABILITY
 
