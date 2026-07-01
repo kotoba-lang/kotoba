@@ -3,7 +3,7 @@
 - **Status:** accepted (in progress — June 2026)
 - **Date:** 2026-06-23
 - **Topics:** ops, deploy, availability, stability, release, go-to-market
-- **Canonical repo:** `github.com/com-junkawasaki/kotoba`
+- **Canonical repo:** `github.com/kotoba-lang/kotoba`
 
 ## Context
 
@@ -42,7 +42,7 @@ durability, the canonical clone/install path — takes priority over any
 spreading work this month.
 
 Also recorded: the canonical source repository is
-`github.com/com-junkawasaki/kotoba` (origin), superseding stale `etzhayyim/…`
+`github.com/kotoba-lang/kotoba` (origin), superseding stale `etzhayyim/…`
 references that remain in `README.md` (clone URL line ~41; brew tap line ~21).
 Those should be reconciled as part of the stabilization pass.
 

@@ -25,8 +25,8 @@ superseded_by: []
 
 # ADR-2606291100: kotoba-lang EDA — 半導体開発を web で完結する app
 
-**Status**: proposed  
-**Date**: 2026-06-29  
+**Status**: proposed
+**Date**: 2026-06-29
 **Deciders**: Jun Kawasaki
 
 ## Context

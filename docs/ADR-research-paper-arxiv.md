@@ -34,7 +34,7 @@ docs/paper/
 ├── references.bib  # BibTeX (Datomic, IPFS/IPLD, Prolly Tree, Pregel,
 │                   #   differential dataflow, SPARQL, CACAO/CAIP-74, DID,
 │                   #   AT Protocol, Signal X3DH/Double Ratchet, WASM
-│                   #   Component Model, Shamir, Clojure)
+│                   #   Component Model, Shamir, Kotoba/EDN)
 ├── arxiv.yaml      # submission metadata (title, abstract, categories)
 └── README.md       # build + submit instructions + claim→source map
 ```
