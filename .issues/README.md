@@ -32,4 +32,3 @@ gh issue edit <number> --repo kotoba-lang/kotoba \
 
 Do not close the GitHub issue just because the repo copy exists. Close it only
 when the acceptance criteria in the body are implemented and verified.
-
