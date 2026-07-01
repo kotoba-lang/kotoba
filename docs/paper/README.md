@@ -8,16 +8,17 @@ docs/paper/
 ├── kotoba.tex      # main paper (article class, arXiv-ready)
 ├── references.bib  # bibliography (BibTeX)
 ├── arxiv.yaml      # arXiv submission metadata (title, abstract, categories)
+├── Makefile        # PDF/source archive helpers
 └── README.md       # this file
 ```
 
 ## Build
 
-Requires a TeX distribution (TeX Live / MacTeX) with `pdflatex` and `bibtex`.
+Requires either `latexmk` from TeX Live / MacTeX or `tectonic`.
 
 ```bash
 cd docs/paper
-latexmk -pdf kotoba.tex          # preferred (runs bibtex automatically)
+make check                       # builds PDF and arXiv source archive
 ```
 
 Or manually:
@@ -30,9 +31,10 @@ pdflatex kotoba
 ```
 
 The output is `kotoba.pdf`.
+The arXiv source archive is `build/kotoba-arxiv-source.tar.gz`.
 
-> **Note:** no TeX toolchain is installed in the authoring environment, so the
-> PDF is not checked in. Build it locally or in CI. A minimal CI step:
+> **Note:** this environment has `tectonic`, so the PDF build is verified. A
+> minimal CI step using TeX Live:
 >
 > ```yaml
 > - uses: xu-cheng/latex-action@v3
@@ -43,10 +45,21 @@ The output is `kotoba.pdf`.
 ## Submitting to arXiv
 
 arXiv accepts the LaTeX **source**, not a PDF. Upload `kotoba.tex` and
-`references.bib` together (arXiv runs `pdflatex`+`bibtex` on its side). Suggested
-primary category **cs.DB** (Databases) with cross-lists **cs.DC** (Distributed,
-Parallel, and Cluster Computing) and **cs.CR** (Cryptography and Security). See
-`arxiv.yaml` for the prepared title, abstract, and category list.
+`references.bib` together, or upload `build/kotoba-arxiv-source.tar.gz` after
+running `make arxiv`. Suggested primary category **cs.DB** (Databases) with
+cross-lists **cs.DC** (Distributed, Parallel, and Cluster Computing) and
+**cs.CR** (Cryptography and Security). See `arxiv.yaml` for the prepared title,
+abstract, and category list.
+
+Recommended arXiv web-form values:
+
+| Field | Value |
+|---|---|
+| Title | `Kotoba: A Content-Addressed Datalog Substrate for Accountable Decentralized Agent Memory` |
+| Primary category | `cs.DB` |
+| Cross-lists | `cs.DC`, `cs.CR` |
+| Comments | `System description. Source and interactive explainers at https://com-junkawasaki.github.io/kotoba/` |
+| License | `CC BY 4.0` if you want maximum reuse, otherwise arXiv's non-exclusive license |
 
 ## Grounding
 
