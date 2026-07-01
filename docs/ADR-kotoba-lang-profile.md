@@ -24,7 +24,7 @@ small, dependency-free contract crate, not a compiler or runtime.
 
 `kotoba-lang` owns:
 
-- accepted source extensions: `.kotoba`, `.clj`, `.cljc`, `.cljs`
+- accepted source extensions: `.kotoba`, `.cljc`, `.clj`
 - reader targets: `kotoba`, `clj`, `cljs`
 - `.cljc` reader conditional branch order
 - namespace source resolution extension priority
@@ -37,6 +37,8 @@ Kotoba/EDN subset to WebAssembly and applies safe Kotoba admission checks.
 - `.kotoba` is the canonical Kotoba-only source extension.
 - `.cljc` remains the portable sharing format. Kotoba-specific behavior belongs
   in `#?(:kotoba ...)`.
+- Dedicated `.cljs` source files are retired from profile v2; ClojureScript
+  reader behavior remains available inside `.cljc` through `#?(:cljs ...)`.
 - Language profile constants are no longer duplicated inside `kotoba-clj`.
 - The profile stays in the monorepo until an independent compiler, runtime, or
   external conformance suite needs to consume it outside this workspace.

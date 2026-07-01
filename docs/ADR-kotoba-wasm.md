@@ -730,19 +730,16 @@ the kotoba-runtime Component-Model host — binding to the `kotoba:kais` WIT wor
 (kqe/kse/auth/llm) remains the Component path (`compile_kais_component_str` +
 `WasmExecutor`), out of scope here.
 
-### Editor `.kotoba` cell (`kotoba-wasm/web/cljs/src/kotoba/editor.cljs`)
-A `.kotoba` code cell in the existing hiccup (no-React) editor: filename
-extension recognition with a live mode label (`kotoba-file?` over
-`{kotoba,clj,cljc,cljs}`) + a Run button that compiles+runs the source via
-`mesh.run` and shows `result`/`cid`. Run requires operator auth (it calls the
-operator-gated endpoint), so it is an operator/dev console surface.
+### Historical editor `.kotoba` cell
+This section originally described the removed `kotoba-wasm/web/cljs` editor
+prototype. The browser/shadow-cljs surface and Rust server build are no longer
+owned by this repo after the Kotoba/CLJC migration. The remaining contract is the
+`.kotoba` source format and operator-gated compile/run boundary; concrete UI and
+server adapters must live in host-owned repositories.
 
-Verification: `cargo test -p kotoba-clj` / `-p kotoba-lattice --lib` green
-(incl. fuel + explicit-recognition tests); `kotoba-server` builds **with and
-without** `kotoba-mesh`; `mesh_xrpc` unit tests pass (compile+run roundtrip = 41);
-`npx shadow-cljs release web` compiles with 0 warnings.
-
-Build/run the surface: `cargo run -p kotoba-server --features kotoba-mesh`.
+Historical verification for the retired prototype included `kotoba-clj`,
+`kotoba-lattice`, `kotoba-server --features kotoba-mesh`, and shadow-cljs browser
+bundle checks. Those commands are intentionally not current gates for this repo.
 
 ## R2b — inline Kotoba expression compile path (ACCEPTED, 2026-06-29)
 

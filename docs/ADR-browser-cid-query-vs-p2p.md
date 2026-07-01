@@ -1,6 +1,6 @@
 # ADR — Browser query is CID-addressed: read needs reachability, not peers
 
-Status: **Accepted — read plane ships with zero new transport; P2P deferred to an availability layer**
+Status: **Accepted — host-adapter-owned read plane; P2P deferred to an availability layer**
 Date: 2026-06-13
 Supersedes the framing in the earlier "browser participates in the libp2p mesh"
 discussion (it conflated *query* with *peering*).
@@ -11,42 +11,41 @@ discussion (it conflated *query* with *peering*).
 > that is **pinned and reachable by CID** — it does **not** need to be a libp2p
 > peer, join Kademlia, or hold a WebRTC/QUIC connection to anyone.
 
-The browser read engine already verifies every block against its CID
-(`CID == sha2-256(dag-cbor(bytes))`, `crates/kotoba-wasm/src/lib.rs:64`), so
-*whoever serves the bytes is untrusted*. Content-addressing collapses the trust
-question that P2P transport security would otherwise solve. Once trust is moved
-into the CID, "where did the bytes come from" stops mattering for correctness —
-HTTP from a random gateway is exactly as safe as bitswap from a verified peer.
+The browser read engine must verify every block against its CID, so *whoever
+serves the bytes is untrusted*. Content-addressing collapses the trust question
+that P2P transport security would otherwise solve. Once trust is moved into the
+CID, "where did the bytes come from" stops mattering for correctness — HTTP from
+a random gateway is exactly as safe as bitswap from a verified peer.
 
 This ADR records the resulting split:
 
-- **Read plane** — CID-over-HTTP. Works **today**, no libp2p, no WebRTC.
+- **Read plane** — CID-over-HTTP, owned by a host adapter.
 - **持ち合い / live plane** — P2P. An **availability/liveness optimization**,
   not a correctness requirement. Deferred.
 
-## 1. Read plane — already designed and wired
+## 1. Read plane — design contract
 
 The query path for a browser node, end to end, with no peering:
 
 ```
-resolve HEAD          KotobaNode.verifyIpnsRecord(json)         lib.rs:956
+resolve HEAD          verify signed IPNS record
    │                  member-signed IPNS record; the apex/gateway
    │                  serving it is NOT trusted (no-server-key).
    ▼
 root CID
    │
    ▼  ┌── loop until empty ──────────────────────────────────────────┐
-   │  │  missing = node.missingBlockCids(root)        lib.rs:847      │
+   │  │  missing = missingBlockCids(root)                            │
    │  │  for cid in missing:                                          │
-   │  │     bytes = GET /xrpc/com.etzhayyim.apps.kotoba.block.get     │  xrpc.rs:7561
-   │  │            ?cid=<multibase>          (UNAUTH for Public)      │  xrpc.rs:6008
-   │  │     node.ingestBlock(cid, bytes)     CID-verified  lib.rs:819 │
+   │  │     bytes = GET /xrpc/com.etzhayyim.apps.kotoba.block.get     │
+   │  │            ?cid=<multibase>          (UNAUTH for Public)      │
+   │  │     ingestBlock(cid, bytes)          CID-verified             │
    │  └──────────────────────────────────────────────────────────────┘
    ▼
-node.hydrateFromProlly(root)                            lib.rs:829
+hydrateFromProlly(root)
    │  same Prolly/IPLD scan_prefix path as the server
    ▼
-node.datomicQ(query_edn, inputs_json)                   lib.rs:1118
+datomicQ(query_edn, inputs_json)
    │  full Datalog over EAVT/AEVT/AVET/VAET, same engine as datomic.q
    ▼
 results — entirely local, zero round-trips after the blocks are in
@@ -54,18 +53,12 @@ results — entirely local, zero round-trips after the blocks are in
 
 Key properties:
 
-- **Already implemented and shipping — not a plan.** The fetch loop is
-  `hydrateViaBlocks()` in `crates/kotoba-wasm/web/kotoba-blocks.js`, and the
-  Service Worker `crates/kotoba-wasm/web/kotoba-sw.js` already:
-  (a) calls `datomic.sync` for the covering EAVT root,
-  (b) `hydrateViaBlocks(node, eavtRoot, {remote})` — `block.get` loop,
-      CID-verified, persisted to IndexedDB,
-  (c) **intercepts `datomic.q` POST and answers it locally in wasm**
-      (`node.datomicQ`, response tagged `x-kotoba-sw: local-wasm-datomic`).
-  A browser already serves Datalog queries against a pinned graph it pulled
-  purely over `block.get`, with no peer connection.
-- **No new Rust.** `block.get`, `ingestBlock`, `missingBlockCids`,
-  `hydrateFromProlly`, `datomicQ`, `verifyIpnsRecord` all exist.
+- **No query correctness dependency on P2P.** The retired `kotoba-wasm` browser
+  prototype demonstrated this path, but its implementation was removed during
+  the Kotoba/CLJC migration. A current browser adapter must re-implement this
+  contract over CID-verified `block.get` hydration.
+- **No Rust in this repo.** Browser read-plane code belongs to the host adapter;
+  this repo keeps the Kotoba contracts and documentation boundary.
 - **Server is consulted only for what the local engine genuinely can't answer:**
   time-travel (`as_of` / `since` / `history`) and federation (`remote_peer` /
   `remote_ipns_name`) fall through to the server (`kotoba-sw.js:213`); everything
@@ -137,20 +130,18 @@ not the query substrate.
 - The P2P work (WebRTC mesh, gossip subscribe) is now clearly optional and
   independently schedulable, justified only by the three capabilities in §2 —
   not by "let the browser query."
-- Next concrete step is JS, not Rust: wire the fetch loop and demonstrate a
-  browser answering a `datomicQ` against a graph it never had locally, pulled
-  purely over `block.get`.
+- Next concrete step is a host adapter over the CLJC/Kotoba contracts: wire the
+  fetch loop and demonstrate a browser answering a `datomicQ` against a graph it
+  never had locally, pulled purely over `block.get`.
 
 ## 4a. Implementation pointers
 
 - Registry: this ADR is entry `:adr-browser-cid-query` in `docs/adr.edn`
   (machine-readable status + follow-ups).
-- Read-plane glue is **ClojureScript** (per the migration decision): the new
-  IPNS-head resolver and query orchestrator live in
-  `crates/kotoba-wasm/web/cljs/` (`kotoba.ipns` / `kotoba.node`), built by
-  shadow-cljs to ESM at `crates/kotoba-wasm/web/cljs-out/kotoba-node.js`. The
-  existing `kotoba-blocks.js` / `kotoba-sw.js` remain until ported (follow-up
-  `:cljs-port-lower-modules`).
+- Read-plane glue is now a **host-adapter responsibility** over the CLJC/Kotoba
+  contracts. The former `crates/kotoba-wasm/web/cljs` shadow-cljs prototype was
+  retired during the Kotoba/CLJC migration; any browser ESM surface should be
+  rebuilt in the adapter repo that owns browser packaging.
 - The signed-head endpoint **now exists**:
   `GET /xrpc/com.etzhayyim.apps.kotoba.ipns.head?graph=<cid>` (`xrpc::ipns_head`,
   lexicon `ipns/head.json`, e2e `ipns_head_resolves_signed_record_for_committed_graph`).

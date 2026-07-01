@@ -157,17 +157,10 @@
     (-> resource slurp edn/read-string)))
 
 (defn source-contract
-  "Load the Kotoba source-kind contract."
+  "Load the Kotoba source-kind contract. Dedicated .cljs source files are
+  retired from profile v2; the :cljs reader target stays reachable via .cljc."
   []
-  (update-in (core-contracts/source-contract)
-             [:source-kinds]
-             #(cond-> %
-                (not (:cljs %))
-                (assoc :cljs {:extensions [".cljs"]
-                              :reader-target :cljs
-                              :canonical? false
-                              :portable? false
-                              :safe-gate-required? true}))))
+  (core-contracts/source-contract))
 
 (defn source-extension
   "Return the lowercase extension for a path-like string, including the dot."

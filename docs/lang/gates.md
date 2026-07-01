@@ -116,13 +116,12 @@ NODE
 ../shell/bin/kotoba-shell ui smoke --substrate browser --script smoke:visual --execute --strict --json
 ../shell/bin/kotoba-shell ui smoke --substrate browser --script smoke:webgpu --execute --strict --json
 bin/kotoba-clj check src/demo.kotoba --json
-npm pack --dry-run
 ```
 
 These gates verify that:
 
 - the launcher delegates public CLI behavior to the CLJC authority;
-- `.kotoba`, `.clj`, `.cljc`, `.cljs`, and `.edn` source kinds are classified
+- `.kotoba`, `.cljc`, `.clj`, and `.edn` source kinds are classified
   from `resources/kotoba/lang/source_contract.edn`;
 - `.cljc` defaults to reader target `:kotoba` but can be planned for `:clj` or
   `:cljs`;
@@ -239,7 +238,7 @@ These gates verify that:
   E2E gate still requires a booted simulator or connected Android device;
 - selfhost EDN seeds from `../kotoba-selfhost-contracts/resources/kotoba/selfhost/`
   are listable and checkable through CLJ launcher commands;
-- npm packaging includes launcher resources.
+- launcher resources are exercised through `bin/kotoba-clj` and the CLJ test gate.
 
 Cargo/Rust gates are historical for this repository. Implementation-heavy
 compiler conformance belongs in `kotoba-lang/kotoba-lang` or another authority

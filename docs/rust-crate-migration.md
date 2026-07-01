@@ -5,7 +5,7 @@ Status: legacy Rust workspace removed from `kotoba-lang/kotoba`.
 The repository default is now CLJC/EDN-first:
 
 - `kotoba-lang/kotoba-lang` owns the public CLI contract and language surface.
-- `bin/kotoba-clj`, Homebrew, and npm launchers delegate to that CLJC authority.
+- `bin/kotoba-clj` and Homebrew launchers delegate to that CLJC authority.
 - Launcher source plans are passed as data and reflected into delegated argv,
   including explicit `.cljc` reader targets.
 - Selfhost data that used to live under Rust crates now belongs to
