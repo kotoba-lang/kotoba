@@ -40,4 +40,3 @@ untrusted code can run with falsely trusted provenance.
 - `kotoba-lang/security/docs/architecture-review-2026-07-01.md` finding `F-001`
 - `kotoba-lang/kotoba-lang/docs/adr/ADR-kotoba-package-cid-lock.md`
 - `kotoba-lang/security/docs/evidence-gates.md`
-

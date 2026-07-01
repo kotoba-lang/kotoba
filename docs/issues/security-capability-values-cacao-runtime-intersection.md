@@ -34,4 +34,3 @@ privilege and makes runtime receipts less precise.
 
 - `kotoba-lang/security/docs/architecture-review-2026-07-01.md` finding `F-003`
 - `kotoba-lang/kotoba-lang/docs/adr/ADR-safe-capability-language.md`
-
