@@ -2,11 +2,11 @@
 
 `kotoba-lang` uses two related version numbers:
 
-- `:kotoba.lang/profile-version` in `profile.edn`
-- the Rust crate version inherited from the workspace
+- the source contract version in `resources/kotoba/lang/source_contract.edn`
+- the launcher/package version published by the host repository
 
 The profile version is the compatibility contract for source-processing tools.
-The crate version is the packaging version.
+The launcher/package version is the distribution version.
 
 ## Compatibility Rules
 
@@ -25,10 +25,11 @@ The crate version is the packaging version.
 ## External Implementations
 
 An implementation conforms to profile version 1 when it can consume
-`crates/kotoba-lang/resources/kotoba/lang/conformance/manifest.edn`, run all
-`:kind :run` source-file cases and `:kind :compile-expr` inline-expression cases
-for the declared target set, and produce the declared errors for all negative
-cases relevant to its admission mode.
+`resources/kotoba/lang/source_contract.edn`, classify the declared source
+extensions, preserve explicit `.cljc` reader targets, and reject unsupported
+source extensions. The executable compiler/runtime suite is owned by the CLJC
+authority in `kotoba-lang/kotoba-lang`; this repository verifies that host
+launchers pass the normalized source request into that authority.
 
 Implementations may support a subset of targets only if they report unsupported
 targets explicitly. Silent fallback to another target is non-conforming.
