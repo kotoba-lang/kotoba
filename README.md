@@ -17,16 +17,6 @@ brew install kotoba
 kotoba check --kind cli-contract --json
 ```
 
-### npm
-
-The npm package is a CLJC/EDN-backed launcher. It requires a local `clojure`
-command on `PATH`.
-
-```bash
-npm install -g @kotoba-lang/kotoba
-kotoba check --kind cli-contract --json
-```
-
 ### From Source
 
 ```bash
@@ -55,11 +45,9 @@ needed.
 ```bash
 clojure -M:test
 bin/kotoba-clj check --kind cli-contract --json
-npm pack --dry-run
 ```
 
-The default CI gates the CLJ launcher, npm package launcher, and Python SDK
-package surface.
+The default CI gates the CLJ launcher and Python SDK package surface.
 
 ## Docs
 

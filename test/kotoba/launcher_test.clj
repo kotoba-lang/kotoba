@@ -56,7 +56,7 @@
     (is (= :kotoba (launcher/source-kind contract "src/app.kotoba")))
     (is (= :clj (launcher/source-kind contract "src/app.clj")))
     (is (= :cljc (launcher/source-kind contract "src/app.cljc")))
-    (is (= :cljs (launcher/source-kind contract "src/app.cljs")))
+    (is (nil? (launcher/source-kind contract "src/app.cljs")))
     (is (= :edn (launcher/source-kind contract "policy.edn")))
     (is (nil? (launcher/source-kind contract "README.md")))))
 

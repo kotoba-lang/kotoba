@@ -13,15 +13,14 @@ Kotoba-specific behavior is selected with reader conditionals:
 
 ## Source Contract
 
-- Accepted extensions: `.kotoba`, `.clj`, `.cljc`, `.cljs`.
+- Accepted extensions: `.kotoba`, `.cljc`, `.clj`.
 - Default reader target: `kotoba`.
 - `:kotoba` branch fallback order: `:kotoba`, then `:clj`, then `:default`.
-- Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`, `.clj`,
-  `.cljs`.
-- Namespace resolution priority for target `clj`: `.cljc`, `.clj`, `.kotoba`,
-  `.cljs`.
-- Namespace resolution priority for target `cljs`: `.cljc`, `.cljs`, `.clj`,
-  `.kotoba`.
+- Namespace resolution priority for target `kotoba`: `.kotoba`, `.cljc`, `.clj`.
+- Namespace resolution priority for target `clj`: `.cljc`, `.clj`, `.kotoba`.
+- Namespace resolution priority for target `cljs`: `.cljc`, `.clj`, `.kotoba`.
+- Retired legacy extension: `.cljs` source files; use `.cljc` with
+  `#?(:cljs ...)` for ClojureScript-targeted reader behavior.
 
 This is source compatibility, not JVM Clojure or ClojureScript runtime
 compatibility. Code still has to compile to the Kotoba compiler subset.
@@ -50,7 +49,7 @@ alias.
 The current launcher delegates command semantics to the CLJC authority in
 `kotoba-lang/kotoba-lang`. This repository owns the launcher-facing source-kind
 contract at `resources/kotoba/lang/source_contract.edn`, including `.kotoba`,
-`.clj`, `.cljc`, `.cljs`, and `.edn` classification. `.cljc` is evaluated with
+`.cljc`, `.clj`, and `.edn` classification. `.cljc` is evaluated with
 an explicit reader target; the launcher default is `:kotoba`. For `run` and
 `check`, the launcher records a source plan and normalizes delegated argv so the
 CLJC authority receives `--reader-target` when the caller did not provide one.

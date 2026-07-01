@@ -1,7 +1,10 @@
 # WASI-HTTP Egress and XRPC Ingress Implementation
 
 ## Overview
-This document covers the implementation of WASI-HTTP egress for wasm guests in `kotoba-runtime` and generic XRPC→wasm ingress dispatch in `kotoba-server`.
+This historical document covered the Rust `kotoba-runtime` / `kotoba-server`
+WASI-HTTP prototype. Those crates have been retired from this repo during the
+Kotoba/CLJC migration; current runtime ingress/egress must be supplied by
+host-owned adapters.
 
 ## Deliverable 1: WASI-HTTP Egress
 1. Added `wasmtime-wasi-http = "25"` to `kotoba-runtime/Cargo.toml`.
@@ -19,9 +22,11 @@ This document covers the implementation of WASI-HTTP egress for wasm guests in `
 4. Serialized the inbound JSON to CBOR and routed it through `state.router.dispatch_with_snapshot`.
 5. Added `generic_xrpc_dispatch_resolves` test in `kotoba-server/src/lib.rs` to verify that `POST /xrpc/com.etzhayyim.apps.yata.some_method` reaches the handler (asserts response is not 404).
 
-## Verification
-- Both `cargo test` runs in `kotoba-runtime` and `kotoba-server` complete successfully.
-- `cargo build -p kotoba-runtime -p kotoba-server` exits 0.
+## Historical verification
+- Both `cargo test` runs in `kotoba-runtime` and `kotoba-server` completed
+  successfully in the retired prototype.
+- `cargo build -p kotoba-runtime -p kotoba-server` exited 0 in the retired
+  prototype.
 
 ## Next Steps
 - Validate real app deployments by pushing `KOTOBA_HTTP_EGRESS_ALLOW` overrides if specific strict isolation is required.
