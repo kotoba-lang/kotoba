@@ -36,3 +36,4 @@ epoch migration are implemented.
 - `kotoba-lang/security/docs/architecture-review-2026-07-01.md` finding `F-005`
 - `kotoba-lang/security/docs/fips-validation.md`
 - `kotoba-lang/security/docs/pqc-roadmap.md`
+

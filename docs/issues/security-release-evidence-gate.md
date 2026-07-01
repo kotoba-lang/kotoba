@@ -33,3 +33,4 @@ SBOM, provenance, package verification, key status, or risk review is missing.
 - `kotoba-lang/security/docs/architecture-review-2026-07-01.md` finding `F-007`
 - `kotoba-lang/security/docs/operational-evidence.md`
 - `kotoba-lang/security/docs/sbom-slsa.md`
+
