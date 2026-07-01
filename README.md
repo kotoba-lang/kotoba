@@ -81,7 +81,7 @@ See [**Documentation**](#documentation) below for the full ADR / design index.
 ```bash
 # Tap the kotoba formula
 brew tap etzhayyim/kotoba          # one-time
-brew install kotoba                # installs the `kotoba` binary
+brew install kotoba                # installs the CLJC/EDN-backed `kotoba` launcher
 ```
 
 To track the upstream `main` branch instead of the latest tagged release,
@@ -102,7 +102,7 @@ brew install --build-from-source ./Formula/kotoba.rb
 ```bash
 git clone https://github.com/kotoba-lang/kotoba.git
 cd kotoba
-cargo install --locked --path crates/kotoba-cli --bin kotoba
+bin/kotoba-clj check --kind cli-contract --json
 ```
 
 ### Rust-free CLJ launcher
@@ -117,6 +117,15 @@ bin/kotoba-clj deploy --manifest package-manifest.edn --target dev
 
 Side-effecting commands return EDN/JSON data for host adapters. They do not
 invent independent Rust behavior.
+
+### Legacy Rust adapter
+
+The Rust CLI remains available for existing server/database workflows while the
+host implementation is being retired:
+
+```bash
+cargo install --locked --path crates/kotoba-cli --bin kotoba
+```
 
 ## Quick start
 
