@@ -159,7 +159,15 @@
 (defn source-contract
   "Load the Kotoba source-kind contract."
   []
-  (core-contracts/source-contract))
+  (update-in (core-contracts/source-contract)
+             [:source-kinds]
+             #(cond-> %
+                (not (:cljs %))
+                (assoc :cljs {:extensions [".cljs"]
+                              :reader-target :cljs
+                              :canonical? false
+                              :portable? false
+                              :safe-gate-required? true}))))
 
 (defn source-extension
   "Return the lowercase extension for a path-like string, including the dot."
