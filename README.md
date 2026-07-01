@@ -105,6 +105,16 @@ cd kotoba
 bin/kotoba-clj check --kind cli-contract --json
 ```
 
+### npm / npx
+
+The npm package is also a CLJC/EDN-backed launcher. It requires a local
+`clojure` command on `PATH`.
+
+```bash
+npm install -g @kotoba-lang/kotoba
+kotoba check --kind cli-contract --json
+```
+
 ### Rust-free CLJ launcher
 
 The CLJ launcher delegates to `kotoba-lang/kotoba-lang`'s CLJC CLI authority
