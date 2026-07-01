@@ -1,7 +1,8 @@
 # ADR — kotoba-shell: Tauri の kotoba/clj 版と aiueos / kototama の責務分離
 
-Status: Proposed
+Status: Accepted-in-progress
 Date: 2026-06-28
+Updated: 2026-07-01
 
 ## 1. 一行で
 
@@ -514,17 +515,63 @@ Android/iOS の contacts/calendar/SMS は MVP 後。SMS は Android のみ。
 
 This is not yet Tauri-mature. It is a reproducible shell/scaffold and evidence
 generator with an aiueos shell-surface contract and release disclosure evidence.
-Remaining maturity is in real iOS/Android device builds, real Apple/Google
-submission evidence, real credential-backed signing evidence, updater publication,
-and real hosted adapter pass evidence for the aiueos component supervisor. The current SDK gate is callable and
-auditable. iOS now has a generated Xcode project that passes local simulator SDK
-build, and Android now generates SDK/Gradle property files, a lightweight
-`gradlew` helper pinned toward compatible local Gradle candidates, and a Java
-WebView runner that passes local SDK debug APK assembly. Device/emulator runtime
-smoke gates and CI runtime evidence artifacts are now callable, but connected-device pass evidence and CI/release
-builds still need to pass before this can be counted as Tauri-level mature.
+The current SDK gate is callable and auditable. iOS now has a generated Xcode
+project that passes local simulator SDK build, and Android now generates SDK/
+Gradle property files, a lightweight `gradlew` helper pinned toward compatible
+local Gradle candidates, and a Java WebView runner that passes local SDK debug
+APK assembly.
 
-## 11. manimani への適用
+## 11. Closing slice: kotoba-lang/shell authority split
+
+As of 2026-07-01, the implementation authority for the shell adapter has moved
+to `kotoba-lang/shell`. `kotoba-lang/kotoba` keeps language/runtime coverage
+and documentation, but the public shell command surface is now
+`../shell/bin/kotoba-shell`; the old `kotoba-clj shell ...` compatibility shim
+is intentionally removed.
+
+Closed in this slice:
+
+- `kotoba-lang/shell` now owns the Tauri-like shell adapter surface:
+  native-host checks/runs/providers, app scaffold/check/build, policy/surface
+  gates, release connect/verify/sign/submit, updater publish, store
+  request/status, distribution plan/check, API freeze/compat, plugin check,
+  Tauri-plugin compatibility check, doctor/e2e/device-farm/ui gates.
+- Store submit/status can run through the built-in Java HTTP client with
+  `--endpoint-url`, `--auth-token`, `--auth-token-file`,
+  `KOTOBA_STORE_AUTH_TOKEN`, and `--store-header`. Tokens are not emitted in
+  result data; evidence records only whether auth was configured.
+- Release credentials accept `@secret-file` references, so signing/submission
+  gates can consume local or CI-managed secrets without embedding secret values
+  in EDN manifests.
+- Device-farm operation has both a schedule artifact and an executable run-log
+  artifact: `device-farm schedule --write --execute --run-log ...` records the
+  external farm command results as EDN evidence.
+- Stable API evidence is frozen and checked by `api freeze` and `api compat`.
+  Removing a command from the v1 surface without a major-version bump is a
+  compatibility failure.
+- Tauri plugin migration is represented as a mechanical compatibility gate:
+  `plugin tauri-check` maps Tauri-style command manifests to kotoba-shell plugin
+  providers and reports unsupported commands.
+- Canonical shell evidence is EDN-first. JSON remains an interop format for
+  third-party tooling, store helpers, and CI consumers.
+
+Remaining open maturity items:
+
+- Run the store submit/status path against real App Store Connect and Google
+  Play credentials and preserve the resulting request/response evidence.
+- Run signing with real Developer ID/App Store/Android keystore material and
+  preserve detached signature/notarization/store artifacts.
+- Run iOS/Android device-farm schedules continuously on real devices, not only
+  command-level local smoke.
+- Add longer-lived Tauri plugin compatibility fixtures from real plugin
+  manifests and publish migration guidance per plugin class.
+
+Coverage/maturity relative to Tauri after this slice is estimated at roughly
+64% functional coverage and 44% maturity: the shell has executable gates and
+release evidence contracts, but not yet broad ecosystem compatibility, real
+store submission history, or long-running device-farm operations.
+
+## 12. manimani への適用
 
 manimani の既存構造はそのまま移行しやすい。
 
@@ -537,7 +584,7 @@ manimani の既存構造はそのまま移行しやすい。
 最初の移行は「Tauri を消す」ではなく、同じアプリを
 `app.kotoba.edn` で記述し、kotoba-shell で macOS dev 起動すること。
 
-## 12. Open Questions
+## 13. Open Questions
 
 - `kotoba-shell` を `com-junkawasaki/kotoba/crates` に置くか、
   独立 repo にするか。
