@@ -28,14 +28,14 @@ protocols, data structures, compilers, runtimes, storage, crypto, and reusable
 fixtures here. The split policy is recorded in
 [`docs/ADR-repository-boundaries.md`](docs/ADR-repository-boundaries.md).
 
-`kotoba-lang/kotoba-lang` is reserved for the standalone language contract once
-an external compiler/runtime, package, or conformance suite needs it outside
-this workspace. Until then, `crates/kotoba-lang`, `docs/lang`, `kotoba -e`, and
-`kotoba wasm` stay in this repository as the canonical source of truth.
+`kotoba-lang/kotoba-lang` owns the standalone language and public CLI contract.
+This repository keeps host implementations, integration tests, and legacy Rust
+adapters while they are migrated to consume the CLJC/EDN authority there.
 
-The public `kotoba` crate/CLI also stays here for now because it is an
-integration binary over multiple workspace crates. Publishing it is a packaging
-decision, not a repository split.
+The Rust `kotoba` crate/CLI is an integration adapter over multiple workspace
+crates. It is no longer the semantic authority for the public CLI. New command
+shape belongs in `kotoba-lang/kotoba-lang`, and host launchers should delegate
+to that CLJC contract.
 
 `kami-engine` is the strongest future split candidate when the Kami host,
 rendering/devtool SDK, templates, and golden UI verification can build without
@@ -104,6 +104,19 @@ git clone https://github.com/kotoba-lang/kotoba.git
 cd kotoba
 cargo install --locked --path crates/kotoba-cli --bin kotoba
 ```
+
+### Rust-free CLJ launcher
+
+The CLJ launcher delegates to `kotoba-lang/kotoba-lang`'s CLJC CLI authority
+instead of adding new Rust command semantics:
+
+```bash
+clojure -M -m kotoba.launcher check --kind cli-contract --json
+bin/kotoba-clj deploy --manifest package-manifest.edn --target dev
+```
+
+Side-effecting commands return EDN/JSON data for host adapters. They do not
+invent independent Rust behavior.
 
 ## Quick start
 
