@@ -3,6 +3,7 @@
   (:require [clojure.test :refer [run-tests]]
             [kotoba.cacao-run-test]
             [kotoba.cap-passing-test]
+            [kotoba.cap-typed-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
             [kotoba.launcher-test]
@@ -12,6 +13,7 @@
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.cacao-run-test
                                         'kotoba.cap-passing-test
+                                        'kotoba.cap-typed-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
                                         'kotoba.launcher-test

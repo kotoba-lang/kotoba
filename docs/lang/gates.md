@@ -67,6 +67,22 @@ const imports = { kotoba: {
 }};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_cap_passing.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 42n) process.exit(1); });
 NODE
+bin/kotoba-clj run src/demo_cap_threading.kotoba --policy src/demo_cap_threading_policy.edn --json
+bin/kotoba-clj wasm emit src/demo_cap_threading.kotoba --policy src/demo_cap_threading_policy.edn --output target/kotoba/demo_cap_threading.wasm --json
+node - <<'NODE'
+const fs = require('fs');
+let memory;
+const caps = new Map(); let next = 1n;
+const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+const imports = { kotoba: {
+  cap_acquire: (kindId, resPtr, resLen) => {
+    if (kindId !== 201 || text(resPtr, resLen) !== 'ledger:main') return 0n;
+    const handle = next++; caps.set(handle, { kind: kindId }); return handle;
+  },
+  host_i64_roundtrip_with: (cap, code) => caps.has(cap) ? code : -1n
+}};
+WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_cap_threading.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 42n) process.exit(1); });
+NODE
 bin/kotoba-clj wasm emit src/demo_indirect.kotoba --output target/kotoba/demo_indirect.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_indirect.wasm")).then(({instance})=>{if(instance.exports.main()!==42) process.exit(1)})'
 bin/kotoba-clj wasm emit src/demo_alloc.kotoba --output target/kotoba/demo_alloc.wasm --json
@@ -163,6 +179,11 @@ These gates verify that:
   and emit the `kotoba.cap_acquire(i32,i32,i32) -> i64` /
   `kotoba.host_i64_roundtrip_with(i64,i64) -> i64` import shapes whose handle
   argument a standard WebAssembly host resolves at call time;
+- typed capability parameters (S4b): `^{:cap <kind>}` params are statically
+  checked (`:cap-arg-not-capability` / `:cap-kind-mismatch` /
+  interprocedural `:cap-effect-under-declared`), lower to i64 handle slots,
+  and thread cap handles through user-defined function calls in compiled
+  wasm (main -> outer -> inner -> host import, `demo_cap_threading`);
 - `call-indirect` emits a function table, element segment, and `call_indirect`
   for the current `i32 -> i32` table slice;
 - `has-capability?` requires an explicit policy and emits a deterministic
@@ -340,6 +361,59 @@ bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passi
   capability contract stays authoritative for the base ops, and the other
   `<op>-with` variants remain interpreter-only in this slice (the host
   binding that resolves handles is demonstrated by the node gate above).
+
+#### Typed capability parameters + compiled threading
+
+Capability handles are TYPED at function boundaries. The canonical (and
+only) metadata form is a `:cap` entry in the param metadata map:
+
+```clojure
+(defn ^{:i64 true :effects #{:host/ledger-append}} use-ledger
+  [^{:cap :host/ledger-append} c ^:i64 code]
+  (host-i64-roundtrip-with c code))
+```
+
+(A `^:cap/<kind>` reader shorthand is NOT accepted: capability kinds are
+themselves namespaced keywords — `:host/ledger-append` — which a keyword
+shorthand cannot spell.)
+
+Static guarantees, enforced at check/emit time next to the effect gate
+(`kotoba.runtime/cap-typed-problems`, run by `run`, `check`, AND
+`wasm emit` pre-emit):
+
+- a `^{:cap <kind>}` kind must be a known capability kind
+  (`kotoba.lang.capability-values/effect-for-kind` is the vocabulary) —
+  `:unknown-capability-kind` otherwise;
+- the first argument of every `<op>-with` use must be **cap-typed**: the
+  direct result of `(cap-acquire ...)`, a cap-typed param, or a let-bound
+  alias of one. Passing an untyped value / handle-forgeable integer is the
+  static error `:cap-arg-not-capability` (the runtime
+  `:unknown-cap-handle` rejection remains as defense in depth for hosts
+  fed modules that skipped this checker);
+- the cap-typed value's kind must match the op's kind, and a cap argument
+  passed to a user fn must match the callee's declared param kind —
+  `:cap-kind-mismatch` (always decidable in this slice: kinds are static);
+- effect rows: a fn's required kinds are its body's acquire/use kinds PLUS
+  its cap-typed param kinds PLUS — through a fixpoint over direct calls
+  (`kotoba.runtime/fn-required-cap-kinds`) — everything its callees
+  require, so a caller passing its own cap param through inherits the
+  requirement; a declared `:effects` row that under-covers is rejected as
+  `:cap-effect-under-declared`.
+
+In compiled wasm a cap-typed param lowers to an i64 handle slot (the same
+machinery as `^:i64`), so handles flow through user-defined function calls
+end-to-end. `src/demo_cap_threading.kotoba` (gate commands above) threads
+one handle through TWO levels of user fns — `main` acquires, `outer` bumps
+the code, `inner` invokes the `host_i64_roundtrip_with` import with its cap
+param — returning `42` in the interpreter (receipts show the SAME handle at
+acquire and use) and `42n` under the node cap-map host; a forged handle
+constant in a variant module is rejected statically by the launcher and,
+when emitted by a checker-bypassing front end, still fails closed at the
+host binding (`test/kotoba/cap_typed_test.clj`).
+
+In the interpreter, cap-typed params are ordinary handle values;
+`kotoba.cap-table/resolve-use` re-checks kind + expiry at every host call
+regardless (static + dynamic).
 
 ### CACAO delegation chains (`run --cacao`)
 

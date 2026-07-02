@@ -120,22 +120,42 @@
         (is (= :expired (:receipt/denied (last @recorded))))))))
 
 (deftest forged-handle-fails-closed-end-to-end
-  (let [source-path (temp-file "kotoba-cap-forged" ".kotoba"
-                               (str "(ns demo-forged)\n"
-                                    "(defn main []\n"
-                                    "  (host-i64-roundtrip-with (i64 7) (i64 41)))\n"))
-        policy-path (temp-edn-file demo-policy)
-        result (launcher/dispatch ["run" source-path "--policy" policy-path "--json"])
-        runtime-result (get-in result [:kotoba.cli/data :kotoba.runtime/result])
-        receipt (first (get-in result [:kotoba.cli/data :kotoba.host/receipts]))]
-    (is (false? (:kotoba.cli/ok? result)))
-    (is (= [{:kotoba.runtime/problem :host-call-denied
-             :kotoba.runtime/call 'host-i64-roundtrip-with
-             :kotoba.runtime/denied :unknown-cap-handle}]
-           (:kotoba.runtime/problems runtime-result)))
-    (is (= :denied (:receipt/outcome receipt)))
-    (is (= :unknown-cap-handle (:receipt/denied receipt)))
-    (is (= 7 (:receipt/cap-handle receipt)))))
+  (testing "statically: a forgeable integer as the cap argument never reaches execution"
+    ;; Since the typed-capability gate landed, this forge is rejected at
+    ;; check time (:cap-arg-not-capability), so no receipt is ever emitted.
+    (let [source-path (temp-file "kotoba-cap-forged" ".kotoba"
+                                 (str "(ns demo-forged)\n"
+                                      "(defn main []\n"
+                                      "  (host-i64-roundtrip-with (i64 7) (i64 41)))\n"))
+          policy-path (temp-edn-file demo-policy)
+          result (launcher/dispatch ["run" source-path "--policy" policy-path "--json"])
+          runtime-result (get-in result [:kotoba.cli/data :kotoba.runtime/result])]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= [{:kotoba.runtime/problem :cap-arg-not-capability
+               :kotoba.runtime/fn "main"
+               :kotoba.runtime/op "host-i64-roundtrip-with"
+               :kotoba.runtime/arg "(i64 7)"}]
+             (:kotoba.runtime/problems runtime-result)))
+      (is (empty? (get-in result [:kotoba.cli/data :kotoba.host/receipts])))))
+  (testing "dynamically: an unissued handle presented at host-call time still fails closed"
+    ;; Defense in depth: even if a hostile front end bypassed the static
+    ;; gate, kotoba.cap-table/resolve-use rejects the unknown handle.
+    (let [table (cap-table/make-table)
+          recorded (atom [])
+          use-fn (get (host-providers/capability-passing-fns
+                       table demo-policy
+                       {:record! (fn [r] (swap! recorded conj r))
+                        :now "2026-07-02"})
+                      'host-i64-roundtrip-with)
+          thrown (try
+                   (use-fn 7 41)
+                   nil
+                   (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :unknown-cap-handle (:kotoba.host/denied thrown)))
+      (is (= 'host-i64-roundtrip-with (:kotoba.host/call thrown)))
+      (is (= :denied (:receipt/outcome (first @recorded))))
+      (is (= :unknown-cap-handle (:receipt/denied (first @recorded))))
+      (is (= 7 (:receipt/cap-handle (first @recorded)))))))
 
 (deftest cap-kind-mismatch-fails-closed
   (let [policy {:kotoba.policy/capabilities #{:ledger/append :clipboard/text}}

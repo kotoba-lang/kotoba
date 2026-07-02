@@ -377,32 +377,223 @@
      form)
     (vec (distinct @kinds))))
 
+;; ---------------------------------------------------------------------------
+;; Typed capability parameters (S4b)
+
+(defn cap-param-kind
+  "Capability kind declared on a parameter symbol through the canonical
+  `^{:cap <kind-kw>}` metadata form (e.g.
+  `(defn use-ledger [^{:cap :host/ledger-append} c ^:i64 code] ...)`),
+  or nil for an untyped parameter. This is the ONE metadata form: kind
+  keywords are themselves namespaced (`:host/ledger-append`), so a
+  `^:cap/<kind>` reader shorthand cannot spell them and is not accepted."
+  [sym]
+  (:cap (meta sym)))
+
+(declare function-defs symbol-key)
+
+(defn- cap-expr-kind
+  "Static capability kind of EXPR under CAP-ENV (local symbol -> kind), or
+  nil when EXPR is not statically known to carry a capability. Recognized
+  cap-typed expressions in this slice: the direct result of
+  `(cap-acquire <kind> ...)`, a `^{:cap <kind>}` typed parameter, and a
+  let-bound alias of either."
+  [cap-env expr]
+  (cond
+    (and (seq? expr) (= 'cap-acquire (first expr))) (second expr)
+    (symbol? expr) (get cap-env (symbol-key expr))
+    :else nil))
+
+(defn- cap-arg-problem
+  "Problem for one call-site argument position that requires a capability of
+  EXPECTED kind, or nil when ARG statically satisfies it."
+  [fn-name op cap-env expected arg]
+  (let [actual (cap-expr-kind cap-env arg)]
+    (cond
+      (nil? actual)
+      {:kotoba.runtime/problem :cap-arg-not-capability
+       :kotoba.runtime/fn (str fn-name)
+       :kotoba.runtime/op (str op)
+       :kotoba.runtime/arg (pr-str arg)}
+
+      (not= expected actual)
+      {:kotoba.runtime/problem :cap-kind-mismatch
+       :kotoba.runtime/fn (str fn-name)
+       :kotoba.runtime/op (str op)
+       :kotoba.runtime/expected expected
+       :kotoba.runtime/actual actual})))
+
+(defn- cap-use-problems
+  "Static typed-capability problems inside EXPR (one expression of FN-NAME's
+  body). CAP-ENV maps local symbols to capability kinds; FN-PARAM-KINDS maps
+  user fn name -> vector of its declared param cap kinds (nil entries for
+  untyped params), so the checks hold across the direct call graph."
+  [fn-name cap-env fn-param-kinds expr]
+  (letfn [(check-all [cap-env exprs]
+            (vec (mapcat #(check cap-env %) exprs)))
+          (check [cap-env expr]
+            (if-not (seq? expr)
+              []
+              (let [[op & args] expr]
+                (case op
+                  (quote ns defn) []
+                  def (check-all cap-env (rest args))
+                  (do if) (check-all cap-env args)
+                  let (let [[bindings & body] args]
+                        (loop [pairs (partition 2 bindings)
+                               cap-env cap-env
+                               problems []]
+                          (if-let [[binding value] (first pairs)]
+                            (recur (next pairs)
+                                   (if-let [kind (cap-expr-kind cap-env value)]
+                                     (assoc cap-env (symbol-key binding) kind)
+                                     (dissoc cap-env (symbol-key binding)))
+                                   (into problems (check cap-env value)))
+                            (into problems (check-all cap-env body)))))
+                  ;; call site
+                  (let [problems (check-all cap-env args)]
+                    (cond
+                      ;; `<op>-with` first argument must be cap-typed and of
+                      ;; the op's kind.
+                      (contains? with-op->op op)
+                      (if-let [problem (cap-arg-problem
+                                        fn-name op cap-env
+                                        (get op->kind (get with-op->op op))
+                                        (first args))]
+                        (conj problems problem)
+                        problems)
+
+                      ;; direct call to a user fn: cap-typed params require
+                      ;; cap-typed arguments of the same kind.
+                      (contains? fn-param-kinds op)
+                      (into problems
+                            (remove nil?)
+                            (map (fn [expected arg]
+                                   (when expected
+                                     (cap-arg-problem fn-name op cap-env
+                                                      expected arg)))
+                                 (get fn-param-kinds op)
+                                 args))
+
+                      :else problems))))))]
+    (check cap-env expr)))
+
+(defn cap-typed-problems
+  "Static S4b typed-capability-parameter checks, run at check/emit time next
+  to the effect gate:
+
+  - a `^{:cap <kind>}` param kind must be a known capability kind
+    (:unknown-capability-kind — kotoba.lang.capability-values/effect-for-kind
+    is the vocabulary);
+  - the first argument of every `<op>-with` use must be cap-typed — the
+    direct result of `(cap-acquire ...)`, a cap-typed param, or a let-bound
+    alias — never an untyped/forgeable integer (:cap-arg-not-capability);
+  - the cap-typed value's kind must match the op's kind, and a cap-typed
+    argument passed to a user fn must match the callee's declared param kind
+    (:cap-kind-mismatch), across the direct call graph."
+  [forms]
+  (let [defs (function-defs forms)
+        fn-param-kinds (into {}
+                             (map (fn [[fname f]]
+                                    [fname (mapv cap-param-kind (:params f))]))
+                             defs)
+        param-problems
+        (vec (for [[fname f] defs
+                   param (:params f)
+                   :let [kind (cap-param-kind param)]
+                   :when (and (some? kind)
+                              (not (contains? capability-values/effect-for-kind
+                                              kind)))]
+               {:kotoba.runtime/problem :unknown-capability-kind
+                :kotoba.runtime/fn (str fname)
+                :kotoba.runtime/kind (pr-str kind)}))
+        body-problems
+        (vec (mapcat
+              (fn [form]
+                (if-let [[fname f] (function-def form)]
+                  (let [cap-env (into {}
+                                      (keep (fn [param]
+                                              (when-let [kind (cap-param-kind param)]
+                                                [(symbol-key param) kind])))
+                                      (:params f))]
+                    (mapcat #(cap-use-problems fname cap-env fn-param-kinds %)
+                            (:body f)))
+                  (cap-use-problems 'top-level {} fn-param-kinds form)))
+              forms))]
+    (into param-problems body-problems)))
+
+(defn- direct-callees
+  "User fn names (from FN-NAMES) called anywhere inside BODY."
+  [fn-names body]
+  (let [found (atom #{})]
+    (doseq [form body]
+      (walk-forms
+       (fn [node]
+         (when (and (seq? node) (contains? fn-names (first node)))
+           (swap! found conj (first node))))
+       form))
+    @found))
+
+(defn fn-required-cap-kinds
+  "Map of user fn name -> set of capability kinds the fn requires: kinds its
+  body acquires (`cap-acquire`) or uses through a handle (`<op>-with`), kinds
+  of its `^{:cap <kind>}` typed params, plus — interprocedurally, closing a
+  fixpoint over direct calls — everything its callees require. A caller
+  passing its own cap param through to a callee therefore inherits the
+  requirement."
+  [forms]
+  (let [defs (function-defs forms)
+        names (set (map first defs))
+        own (into {}
+                  (map (fn [[fname f]]
+                         [fname (into (set (acquired-kinds (:body f)))
+                                      (keep cap-param-kind)
+                                      (:params f))]))
+                  defs)
+        callees (into {}
+                      (map (fn [[fname f]]
+                             [fname (direct-callees names (:body f))]))
+                      defs)]
+    (loop [required own]
+      (let [advanced (into {}
+                           (map (fn [[fname kinds]]
+                                  [fname (into kinds
+                                               (mapcat #(get required % #{}))
+                                               (get callees fname))]))
+                           required)]
+        (if (= advanced required)
+          required
+          (recur advanced))))))
+
 (defn cap-effect-problems
   "S4b effect/capability consistency: when a `defn` declares an :effects row
-  (metadata on the function name), every capability kind its body acquires
-  with `cap-acquire` or uses through a `<op>-with` handle must be covered by
-  the row (kotoba.lang.capability-values/effects-consistent?).
-  Under-declaration is rejected; functions without a declared row are not
-  checked by this slice."
+  (metadata on the function name), every capability kind it requires — body
+  `cap-acquire`/`<op>-with` kinds, `^{:cap <kind>}` typed param kinds, and,
+  through the fn-required-cap-kinds fixpoint over direct calls, everything
+  its callees require — must be covered by the row
+  (kotoba.lang.capability-values/effects-consistent?). Under-declaration is
+  rejected; functions without a declared row are not checked by this slice."
   [forms]
-  (vec
-   (for [form forms
-         :when (and (seq? form) (= 'defn (first form)))
-         :let [[_ fn-name] form
-               row (:effects (meta fn-name))]
-         :when (some? row)
-         :let [kinds (acquired-kinds (drop 2 form))
-               checked (capability-values/effects-consistent?
-                        row (map (fn [kind] {:cap/kind kind}) kinds))]
-         :when (not (:ok? checked))]
-     {:kotoba.runtime/problem :cap-effect-under-declared
-      :kotoba.runtime/fn (str fn-name)
-      :kotoba.runtime/missing (:missing checked)})))
+  (let [required (fn-required-cap-kinds forms)]
+    (vec
+     (for [form forms
+           :when (and (seq? form) (= 'defn (first form)))
+           :let [[_ fn-name] form
+                 row (:effects (meta fn-name))]
+           :when (some? row)
+           :let [kinds (get required fn-name)
+                 checked (capability-values/effects-consistent?
+                          row (map (fn [kind] {:cap/kind kind}) kinds))]
+           :when (not (:ok? checked))]
+       {:kotoba.runtime/problem :cap-effect-under-declared
+        :kotoba.runtime/fn (str fn-name)
+        :kotoba.runtime/missing (:missing checked)}))))
 
 (defn check
   ([safe-facts source-plan forms] (check safe-facts source-plan forms nil))
   ([safe-facts source-plan forms policy]
   (let [problems (vec (concat (source-problems safe-facts forms policy)
+                              (cap-typed-problems forms)
                               (cap-effect-problems forms)))
         ir (when (empty? problems)
              (compile-forms source-plan forms))]
@@ -1072,8 +1263,11 @@
   (symbol (name sym)))
 
 (defn annotated-wasm-type
+  "Wasm value type for a param symbol: `^:i64` params and `^{:cap <kind>}`
+  typed capability params (whose runtime representation is the opaque i64
+  handle) lower to :i64; everything else is :i32."
   [sym]
-  (if (:i64 (meta sym)) :i64 :i32))
+  (if (or (:i64 (meta sym)) (some? (cap-param-kind sym))) :i64 :i32))
 
 (defn function-result-type
   [[name _f]]
