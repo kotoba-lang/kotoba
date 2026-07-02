@@ -55,12 +55,35 @@
     :import {:module "kotoba" :field "pci_config" :capability "pci/config"
              :params [:i32 :i32] :result :i32}}])
 
-(deftest device-access-demos-deny-without-policy
-  (doseq [{:keys [demo]} device-access-demos]
+(def utility-cap-demos
+  "The remaining default kernel capabilities: log/write, clock/monotonic,
+  random/bytes, topic/publish, topic/subscribe (one representative demo,
+  topic-poll -- topic-take/topic-count share the same capability/shape and
+  are covered by the registration-completeness check below)."
+  [{:demo "src/demo_aiueos_log.kotoba" :policy "src/demo_aiueos_log_policy.edn"
+    :import {:module "kotoba" :field "log_write" :capability "log/write"
+             :params [:i32 :i32] :result :i32}}
+   {:demo "src/demo_aiueos_clock.kotoba" :policy "src/demo_aiueos_clock_policy.edn"
+    :import {:module "kotoba" :field "clock_monotonic" :capability "clock/monotonic"
+             :params [] :result :i64}}
+   {:demo "src/demo_aiueos_random.kotoba" :policy "src/demo_aiueos_random_policy.edn"
+    :import {:module "kotoba" :field "random_bytes" :capability "random/bytes"
+             :params [:i32 :i32] :result :i32}}
+   {:demo "src/demo_aiueos_topic_publish.kotoba" :policy "src/demo_aiueos_topic_publish_policy.edn"
+    :import {:module "kotoba" :field "topic_publish" :capability "topic/publish"
+             :params [:i32 :i64] :result :i32}}
+   {:demo "src/demo_aiueos_topic_poll.kotoba" :policy "src/demo_aiueos_topic_poll_policy.edn"
+    :import {:module "kotoba" :field "topic_poll" :capability "topic/subscribe"
+             :params [:i32] :result :i64}}])
+
+(def all-kernel-cap-demos (into device-access-demos utility-cap-demos))
+
+(deftest all-kernel-cap-demos-deny-without-policy
+  (doseq [{:keys [demo]} all-kernel-cap-demos]
     (is (denied-without-policy? demo) demo)))
 
-(deftest device-access-demos-compile-to-real-wasm-with-a-granting-policy
-  (doseq [{:keys [demo policy import]} device-access-demos]
+(deftest all-kernel-cap-demos-compile-to-real-wasm-with-a-granting-policy
+  (doseq [{:keys [demo policy import]} all-kernel-cap-demos]
     (is (wasm-emits-with-policy? demo policy import) demo)))
 
 (deftest all-nine-aiueos-kernel-capabilities-are-registered
