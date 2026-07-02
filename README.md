@@ -49,10 +49,10 @@ PDS/AppView handlers, and XRPC application surfaces live in
 `gftdcojp/app-aozora`. Hosting, placement, fleet, gateway, and runtime
 operations live in `kotoba-lang/murakumo`.
 
-The historical `crates/kotoba-kotodama` tree is migration-only. Its generic Rust
-config/inference crates may stay only when they are language/runtime substrate;
-domain cells, Python UDF pools, AT Protocol actors, and hosting code are being
-moved to their canonical owners.
+The historical `crates/kotoba-kotodama` tree (and the rest of `crates/`) has
+since been removed from this repository entirely (`604896171b`, 2026-07-01);
+domain cells, Python UDF pools, AT Protocol actors, and hosting code moved to
+their canonical owners per the boundary above.
 
 ## 📺 Explainers & Docs site
 
@@ -60,12 +60,12 @@ A static documentation site (landing page + **two interactive, auto-playing
 explainer videos** with Japanese narration) lives under [`docs/`](docs/) and is
 published via GitHub Pages:
 
-> **🌐 [com-junkawasaki.github.io/kotoba](https://com-junkawasaki.github.io/kotoba/)**
+> **🌐 [kotoba-lang.github.io/kotoba](https://kotoba-lang.github.io/kotoba/)**
 
 | explainer | what it covers |
 |---|---|
-| **Part 1 — [Datomic × IPFS × Prolly Tree](https://com-junkawasaki.github.io/kotoba/explainer/kotoba-datomic-ipfs-explainer.html)** | how a Datomic-style query runs over a Prolly-Tree index that is DAG-CBOR/IPLD content-addressed and pinned to IPFS — write → 4-index build → CID → CommitDag → query `scan_prefix` → result provenance CID |
-| **Part 2 — [Query / CACAO / Signal](https://com-junkawasaki.github.io/kotoba/explainer/kotoba-query-auth-signal-explainer.html)** | complex/large queries (BGP join, MaterializedView), multihop (property paths, Pregel BSP), federation (`SERVICE`), the transact write path, CACAO auth/authz (depth-2 delegation), and Signal E2E (X3DH → Double Ratchet) + t-of-N custody |
+| **Part 1 — [Datomic × IPFS × Prolly Tree](https://kotoba-lang.github.io/kotoba/explainer/kotoba-datomic-ipfs-explainer.html)** | how a Datomic-style query runs over a Prolly-Tree index that is DAG-CBOR/IPLD content-addressed and pinned to IPFS — write → 4-index build → CID → CommitDag → query `scan_prefix` → result provenance CID |
+| **Part 2 — [Query / CACAO / Signal](https://kotoba-lang.github.io/kotoba/explainer/kotoba-query-auth-signal-explainer.html)** | complex/large queries (BGP join, MaterializedView), multihop (property paths, Pregel BSP), federation (`SERVICE`), the transact write path, CACAO auth/authz (depth-2 delegation), and Signal E2E (X3DH → Double Ratchet) + t-of-N custody |
 
 > These are self-contained HTML (open the Pages links above, or open the files
 > in [`docs/explainer/`](docs/explainer/) directly in a browser). GitHub does not
@@ -127,50 +127,30 @@ bin/kotoba-clj deploy --manifest package-manifest.edn --target dev
 ```
 
 Side-effecting commands return EDN/JSON data for host adapters. They do not
-invent independent Rust behavior.
-
-### Legacy Rust adapter
-
-The Rust CLI remains available for existing server/database workflows while the
-host implementation is being retired:
-
-```bash
-cargo install --locked --path crates/kotoba-cli --bin kotoba
-```
+invent independent Rust behavior. There is no Rust code or `crates/` tree left
+in this repository (removed `604896171b`, 2026-07-01) — the CLJC launcher
+above is the only current install path.
 
 ## Quick start
 
-The full IPFS + CACAO + Datomic/Datalog stack, with SPARQL as an auxiliary
-query surface, runs as four single-shot commands:
+The CLI command surface is versioned and machine-readable in
+[`kotoba-lang/kotoba-lang`'s `lang/cli.edn`](https://github.com/kotoba-lang/kotoba-lang/blob/main/lang/cli.edn)
+(the semantic authority — see [Repository boundary](#repository-boundary)).
+Commands this repo's launcher currently wires up:
 
 ```bash
-# 1. One-time: generate Ed25519 + X25519 + DID, persist to macOS Keychain
-#    (or ~/.etzhayyim/kotoba.env on Linux/other, chmod 600).
-kotoba init
-
-# 2. Start the server. IPFS cold tier + CACAO Private-default are ON by
-#    default.  Add KOTOBA_PEERS="http://p1:5001 http://p2:5001" to fan-out
-#    across multi-peer DistributedBlockStore.
-kotoba serve &
-
-# 3. Smoke-test: ingest a sample entity and run all four SPARQL forms
-#    (SELECT / DESCRIBE / CONSTRUCT / ASK) through the direct-SPARQL endpoint.
-kotoba demo
-
-# 4. HTTP loadtest the running server.  `--cacao-seed <hex>` runs the bench
-#    through the full CACAO + Private-graph path with fresh nonces per request.
-kotoba bench --iters 1000 -c 16 'SELECT * WHERE { ?s <kg/claim/role> "admin" }'
+kotoba check --kind cli-contract --json     # validate the CLI/package/lock contract
+kotoba run path/to/entry.kotoba             # compile and run a Kotoba entry point
+kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
+kotoba wasm emit cell.kotoba --policy policy.edn -o cell.wasm    # capability-confined build, see Language below
+kotoba wasm run cell.kotoba --policy policy.edn                  # check + emit + execute
 ```
 
-Bare CLI features:
-
-```bash
-kotoba whoami                                    # print resolved config
-kotoba sparql 'ASK { ?s <kg/claim/role> "admin" }'
-kotoba sparql 'DESCRIBE <cid:abc...>' --cacao <b64>
-kotoba cypher 'MATCH (a)-[r]->(b) RETURN a, b'
-kotoba health                                    # ping /health
-```
+`db` / `git` / `rad` / `deploy` / `hinshitsu` are declared in the same
+contract for the distributed-graph, git-adapter, RAD sovereign-repo, and
+deploy/quality-gate surfaces; consult `lang/cli.edn` for their current tier
+and option shape rather than this README, since the contract is the
+versioned source of truth and this file is not.
 
 CACAO ecosystem helpers:
 
@@ -265,7 +245,7 @@ in [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/ad
 （および `ADR-kotoba-wasm.md`）で追跡しています。
 
 kotoba is not only a database — it ships its **own language profile**.
-[`kotoba-lang`](crates/kotoba-lang/) defines the source contract: `.kotoba` is
+[`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang) defines the source contract: `.kotoba` is
 the canonical Kotoba source extension, portable `.cljc` is for shared
 Clojure-family source, `.clj` / `.cljs` are compatibility inputs, and
 `#?(:kotoba ...)` selects Kotoba-specific code.
@@ -362,21 +342,36 @@ split, Rust-free self-hosting means moving authoritative language/admission
 semantics into confined Kotoba components slice by slice, while Rust remains
 the bootstrap/emitter/oracle for unfinished slices.
 
-## Defaults that just work
+## Current repositories (CLJC, post-migration)
 
-| Knob                       | Default                                                  | Override                       |
-|----------------------------|----------------------------------------------------------|--------------------------------|
-| Cold tier                  | `KuboBlockStore` against `KOTOBA_IPFS_ENDPOINT`          | `KOTOBA_IPFS=off`              |
-| IPFS endpoint              | `http://localhost:5001`                                  | `KOTOBA_IPFS_ENDPOINT=…`       |
-| Multi-peer federation      | none (single-node)                                        | `KOTOBA_PEERS="http://… http://…"` |
-| Default graph visibility   | `Private { owner_did = operator_did }` (CACAO required)  | `KOTOBA_DEFAULT_VISIBILITY=authenticated\|public\|private` |
-| Agent identity             | macOS Keychain → `~/.etzhayyim/kotoba.env` → env → ephemeral  | `kotoba init`                   |
+This repo (`kotoba-lang/kotoba`) is the launcher + host-adapter substrate. Its
+`deps.edn` and CI (`.github/workflows/ci.yml`) pull in the sibling repos that
+hold the rest of the stack as `:local/root`/git dependencies, not `crates/`
+subdirectories:
 
-`kotoba serve` boots with a clear startup probe: if `ipfs daemon` is not
-reachable on `KOTOBA_IPFS_ENDPOINT`, you get a single WARN line telling you
-exactly how to silence or fix it.
+| Repo | Role |
+|---|---|
+| `kotoba-lang/kotoba-lang` | the language/CLI semantic authority — `.kotoba` source contract, `lang/cli.edn` command contract, conformance fixtures |
+| `kotoba-lang/kotoba-core-contracts` | core CID/contract types shared across hosts |
+| `kotoba-lang/kotoba-selfhost-contracts` | self-hosting analyzer contract |
+| `kotoba-lang/cacao`, `kotoba-lang/ed25519`, `kotoba-lang/dag-cbor` | CACAO auth, signing, and content-addressing primitives |
 
-## Crates
+In this repo, `src/kotoba/` holds the host implementation: `launcher.clj`
+(dispatch), `wasm_exec.clj` (Wasm execution via Chicory), `git_adapter.cljc` /
+`rad_adapter.cljc` (git and RAD sovereign-repo adapters), `kgraph.clj`,
+`host_providers.clj`, `package_admission.clj`, `cap_table.clj`, `runtime.clj`.
+
+The database/runtime crates described below (`kotoba-core`, `kotoba-graph`,
+`kotoba-store`, `kotoba-runtime`, `kotoba-auth`, `kotoba-signal`, …) were a
+**Rust workspace removed from this repository** (`604896171b`, 2026-07-01).
+They're kept here as a design-vocabulary reference — the same names/roles
+recur throughout the Architecture, Query Surfaces, and Performance sections
+below — while the CLJC-native successors land per
+[ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
+None of the `cargo` commands or `crates/*` paths below are runnable in this
+repository today.
+
+## Crates (historical Rust design record)
 
 | Crate              | Role                                                                       |
 |--------------------|----------------------------------------------------------------------------|
@@ -399,8 +394,6 @@ exactly how to silence or fix it.
 | `kotoba-cli`       | `kotoba` binary (init, serve, demo, bench, sparql, …)                      |
 | `kotoba-guest`     | WASM guest SDK (WIT bindings for kotoba nodes)                             |
 | `kotoba-edn`       | SSoT EDN reader (Clojure/Datomic wire format) — the shared data/source reader |
-| `kotoba-lang`      | **the language profile**: `.kotoba` source contract, `#?(:kotoba ...)` reader target, fixtures, and conformance gates |
-| `kotoba-clj`       | Kotoba/EDN subset → WebAssembly compiler implementation, plus **safe Kotoba** (`compile_safe_kotoba`, legacy `compile_safe_clj`) — capability / subset / effect gates for confined, untrusted-safe modules |
 
 ## Properties
 
@@ -418,6 +411,13 @@ exactly how to silence or fix it.
 - **X-Road-style accountability** — ciphertext-only replication, purpose-declared + signed + receipted key release via t-of-N custodians, anchored tamper-evident audit log, slashable unreceipted releases. See [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md)
 
 ## Architecture
+
+> The design below (and the `Query Surfaces` and `Performance` sections that
+> follow) describes the pre-migration Rust implementation — `*.rs` file
+> references are historical pointers into the removed Rust workspace
+> (`604896171b`, 2026-07-01), not paths in this repository. The design itself
+> is still the target; the CLJC-native rebuild is tracked in
+> [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
 
 The canonical spine is one content-addressed chain — **Datom log → ProllyTree
 indexes → CommitDag → blocks** — with IPFS and B2 as export tiers, not the
@@ -492,7 +492,9 @@ Every form has a CACAO-authed variant — pass `cacaoB64` in the request body.
 ## Performance
 
 Measurements taken on M4 Mac, release build, `KOTOBA_IPFS=off`,
-`kotoba bench` against `kotoba serve`.
+`kotoba bench` against `kotoba serve` — **on the pre-migration Rust
+implementation** (see the Architecture disclaimer above). Not yet
+re-benchmarked on the CLJC rebuild.
 
 ### Ingest
 
@@ -532,37 +534,18 @@ Measurements taken on M4 Mac, release build, `KOTOBA_IPFS=off`,
 
 Trust-boundary throughput **12.8K QPS** at c=32, 100% replay-protected.
 
-## kotoba-shell release pipeline
+## kotoba-shell release pipeline (design, not yet shipped)
 
-`kotoba-shell` is the desktop/mobile app shell layer over safe-clj components
-and the aiueos shell surface. It generates target-specific app scaffolds and
-release evidence without requiring users to install global Node, wasmtime, or
-platform runtimes.
-
-```bash
-kotoba shell check examples/kotoba-shell-hello/app.kotoba.edn
-kotoba shell build examples/kotoba-shell-hello/app.kotoba.edn --target macos
-kotoba shell export examples/kotoba-shell-hello/app.kotoba.edn --target macos
-kotoba shell release-check --target macos target/kotoba-shell/release/macos/kotoba-shell-hello
-
-kotoba shell build examples/kotoba-shell-hello/app.kotoba.edn --target windows
-kotoba shell export examples/kotoba-shell-hello/app.kotoba.edn --target windows
-kotoba shell release-check --target windows target/kotoba-shell/release/windows/kotoba-shell-hello
-```
-
-macOS release gates generate Developer ID signing and notarization helpers.
-Windows release gates generate Authenticode signing and SmartScreen reputation
-evidence helpers. The aiueos runtime boundary is explicit: `core` builds verify
-and inspect manifests without `wasm-runtime`; `runner` builds include embedded
-Wasm execution for app launch without a global runtime install.
-
-Desktop exports also generate `aiueos-portable-plan.json`,
-`build-aiueos-core.bb`, and `build-aiueos-runner.bb`. Set `AIUEOS_DIR` when the
-aiueos checkout is not adjacent to the kotoba checkout.
+`kotoba-shell` — a desktop/mobile app shell layer over safe Kotoba components
+and the aiueos shell surface — is designed in
+[`docs/ADR-kotoba-shell-aiueos-safe-kotoba.md`](docs/ADR-kotoba-shell-aiueos-safe-kotoba.md).
+There is no `kotoba shell` subcommand wired up in this repo's launcher yet
+(current commands: see [Quick start](#quick-start)); treat the ADR as the
+design record, not a usable CLI.
 
 ## Documentation
 
-The published docs site — [**com-junkawasaki.github.io/kotoba**](https://com-junkawasaki.github.io/kotoba/)
+The published docs site — [**kotoba-lang.github.io/kotoba**](https://kotoba-lang.github.io/kotoba/)
 — is the entry point (overview, the two explainers, architecture, crates,
 security, and this index). It is the static site under [`docs/`](docs/), served
 by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
@@ -590,44 +573,18 @@ The cross-cutting design SSoT remains the parent-monorepo ADR (see [ADR](#adr) b
 
 ## Build
 
+This repo has no Rust build (see [Current repositories](#current-repositories-cljc-post-migration)
+above). CI (`.github/workflows/ci.yml`) runs two jobs:
+
 ```bash
+# CLJ launcher gates — checks out the deps.edn :local/root contract siblings, then:
 clojure -M:test
 bin/kotoba-clj check --kind cli-contract --json
+bin/kotoba-clj package verify --lock test/fixtures/package/positive-lock.edn \
+  --trust test/fixtures/package/trust.edn --json
+
+# Python SDK gates (sdk/kotoba-modal): pytest + wheel-contents check
 ```
-
-These are the default CI gates for the public CLI path.
-
-Legacy Rust compatibility gates are still available for backend migration work,
-but they are no longer the default release path:
-
-```bash
-cargo build --workspace
-cargo test --workspace
-cargo build --release -p kotoba-cli
-```
-
-The Rust gates run from the `Rust legacy compatibility` workflow on a manual or
-scheduled basis.
-
-Wallet actor/browser maturity gate:
-
-```bash
-cd crates/kotoba-wasm/web/cljs
-npm run test:wallet:all                 # Node + pure + ADR/package-lock/CI/export + browser ESM smoke
-```
-
-The same wallet gate runs in CI as `Wallet CLJS maturity gate`.
-
-## Coverage
-
-```bash
-./scripts/coverage.sh        # per-crate + total line/region coverage (lib tests)
-./scripts/coverage.sh html   # browsable report at target/llvm-cov/html/index.html
-./scripts/coverage.sh lcov   # lcov.info for CI / codecov upload
-```
-
-Requires `cargo install cargo-llvm-cov` and a rustup toolchain (the script pins
-to `rustup run stable` because Homebrew rust ships no `llvm-tools`).
 
 ## ADR
 
