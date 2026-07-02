@@ -149,7 +149,25 @@
    'keychain-write :host/keychain-write
    'fs-read :host/fs-read
    'fs-write :host/fs-write
-   'host-i64-roundtrip :host/ledger-append})
+   'host-i64-roundtrip :host/ledger-append
+   'kgraph-assert! :host/graph-assert
+   'kgraph-retract! :host/graph-retract
+   'kgraph-get-objects :host/graph-get-objects
+   'kgraph-query :host/graph-query
+   ;; aiueos default kernel capabilities (aiueos.policy/default-kernel-caps,
+   ;; ADR-2607022700) -- topic/subscribe backs three ops (poll/take/count),
+   ;; matching the retired Rust surface.rs registry.
+   'log-write :host/log-write
+   'clock-monotonic :host/clock-monotonic
+   'random-bytes :host/random-bytes
+   'topic-publish :host/topic-publish
+   'topic-poll :host/topic-subscribe
+   'topic-take :host/topic-subscribe
+   'topic-count :host/topic-subscribe
+   'pci-config :host/pci-config
+   'dma-map :host/dma-map
+   'irq-subscribe :host/irq-subscribe
+   'mmio-map :host/mmio-map})
 
 (def with-op->op
   "Capability-passing use variant (`<op>-with`, leading argument a capability

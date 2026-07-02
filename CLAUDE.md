@@ -1,5 +1,16 @@
 # etzhayyim-project-kotoba
 
+> **⚠ この CLAUDE.md の大半(crate 表・KQE/KSE/KVM 等の Rust コンポーネント一覧)は
+> 除去済みの旧 Rust 実装(`kotoba-core`/`kotoba-query`/`kotoba-vault`/... crate 群)
+> の歴史的記録であり、この repo の現行ツリーには存在しない(README.md 参照:
+> "Legacy Rust crates ... have been removed")。現行実装は JVM Clojure(`.clj`)の
+> `src/kotoba/{runtime,launcher,kgraph,wasm_exec}.clj` で、`kotoba wasm emit` が
+> 実行可能な WASM MVP バイナリを生成し `kotoba.wasm-exec`(com.dylibso.chicory)
+> が実際に実行する。旧称 **KQE(Kotoba Query Engine)は現行実装では `kgraph`**
+> に改称した(assert/retract という書き込みも含む EAVT グラフストアであり
+> "query" だけではないため)。詳細は `docs/ADR-kotoba-wasm-clj-execution.md`。
+> 以下の crate 表・KQE 記述は移行記録として保持する。**
+
 KOTOBA: Content-Addressed Distributed Datalog Database.
 
 SSoT: `90-docs/adr/2605240001-kotoba-cleanroom-architecture.md`
