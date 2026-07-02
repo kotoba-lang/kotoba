@@ -149,7 +149,11 @@
    'keychain-write :host/keychain-write
    'fs-read :host/fs-read
    'fs-write :host/fs-write
-   'host-i64-roundtrip :host/ledger-append})
+   'host-i64-roundtrip :host/ledger-append
+   'kgraph-assert! :host/graph-assert
+   'kgraph-retract! :host/graph-retract
+   'kgraph-get-objects :host/graph-get-objects
+   'kgraph-query :host/graph-query})
 
 (def with-op->op
   "Capability-passing use variant (`<op>-with`, leading argument a capability

@@ -28,7 +28,7 @@
     (is (= "kotoba.selfhost.safe-analyzer-facts.v0" (:schema seed)))
     (is (launcher/safe-analyzer-fact-classified? :non-executable-forms "defmacro"))
     (is (launcher/safe-analyzer-fact-classified? :numeric-result-ops "Math/sqrt"))
-    (is (launcher/safe-analyzer-fact-classified? :effect-ops "kqe-query"))
+    (is (launcher/safe-analyzer-fact-classified? :effect-ops "kgraph-query"))
     (is (launcher/safe-analyzer-fact-classified? :user-call-excluded-ops "llm-infer"))
     (is (not (launcher/safe-analyzer-fact-classified? :effect-ops "pure-helper")))))
 
@@ -544,6 +544,28 @@
     (is (false? (:kotoba.cli/ok? result)))
     (is (= :wasm/policy-not-readable (:kotoba.cli/code result)))
     (is (= "missing-policy.edn" (get-in result [:kotoba.cli/data :kotoba.policy/path])))))
+
+(deftest wasm-run-actually-executes-a-trivial-module
+  (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json"])]
+    (is (:kotoba.cli/ok? result))
+    (is (= :wasm/run-completed (:kotoba.cli/code result)))
+    (is (= 42 (get-in result [:kotoba.cli/data :kotoba.wasm/value])))
+    (is (zero? (get-in result [:kotoba.cli/data :kotoba.wasm/import-count])))))
+
+(deftest wasm-run-executes-kgraph-round-trip-end-to-end
+  (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba"
+                                   "--policy" "src/demo_kgraph_policy.edn"
+                                   "--json"])]
+    (is (:kotoba.cli/ok? result))
+    (is (= :wasm/run-completed (:kotoba.cli/code result)))
+    (is (pos? (get-in result [:kotoba.cli/data :kotoba.wasm/value]))
+        "kgraph_query wrote a real (positive) byte count via the real Chicory host function")
+    (is (= 2 (get-in result [:kotoba.cli/data :kotoba.wasm/import-count])))))
+
+(deftest wasm-run-requires-policy-for-host-capability-import
+  (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba" "--json"])]
+    (is (false? (:kotoba.cli/ok? result)))
+    (is (= :wasm/check-failed (:kotoba.cli/code result)))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.launcher-test)]
