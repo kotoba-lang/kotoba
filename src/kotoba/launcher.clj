@@ -10,6 +10,7 @@
             [clojure.string :as str]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
+            [kotoba.host-providers :as host-providers]
             [kotoba.package-admission :as package-admission]
             [kotoba.runtime :as runtime]
             [kotoba.selfhost.contracts :as selfhost]))
@@ -315,33 +316,72 @@
    :kotoba.launcher/authority-request (authority-request original-argv normalized-argv plan)
    :kotoba.runtime/result runtime-result})
 
+(defn guarded-run-result
+  "Capability-guarded `run` (issue #263): the static check admits the policy's
+  capabilities, and every host provider invocation is dispatched through
+  kotoba.lang.capability-host/guard-call with grants/local policy derived from
+  the policy EDN. The ordered receipt journal is attached to the result as
+  :kotoba.host/receipts. HANDLERS optionally overrides the provider handler
+  registry (kotoba.host-providers/default-handlers)."
+  ([safe-facts plan forms policy] (guarded-run-result safe-facts plan forms policy nil))
+  ([safe-facts plan forms policy handlers]
+   (let [{:keys [record! entries]} (host-providers/journal)
+         host-call (host-providers/host-call policy
+                                             (cond-> {:record! record!}
+                                               handlers (assoc :handlers handlers)))
+         ran (runtime/run safe-facts plan forms
+                          {:policy policy
+                           :host-call host-call
+                           :capability-query (host-providers/capability-query-fn policy)})]
+     (assoc ran :kotoba.host/receipts (entries)))))
+
 (defn runtime-result
-  "Run/check an existing source file through the CLJ-owned executable slice."
+  "Run/check an existing source file through the CLJ-owned executable slice.
+
+  When `--policy <path>` accompanies `run`/`check`, the policy EDN drives the
+  static capability check, and `run` additionally installs the capability
+  guard (see `guarded-run-result`). Without `--policy` the legacy ambient
+  behavior is unchanged (host-import ops are rejected as
+  :capability-not-granted and no receipts are emitted)."
   [command authority-result original-argv normalized-argv plan]
   (when (and (source-commands command)
              (source-file-readable? plan)
              (not (:kotoba.source/data? plan)))
-    (let [forms (runtime/read-file (:kotoba.source/path plan)
-                                   (:kotoba.source/reader-target plan))
-          safe-facts (safe-analyzer-fact-classification)]
-      (case command
-        "check"
-        (let [checked (runtime/check safe-facts plan forms)
-              ok? (:kotoba.runtime/ok? checked)]
-          {:kotoba.cli/ok? ok?
-           :kotoba.cli/code (if ok? :check/valid :check/invalid)
-           :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
-                                   (runtime-data original-argv normalized-argv plan checked))})
+    (let [policy-result (policy-result original-argv)
+          policy (:kotoba.policy/data policy-result)]
+      (if-not (:kotoba.policy/ok? policy-result)
+        {:kotoba.cli/ok? false
+         :kotoba.cli/code (if (= "run" command)
+                            :run/policy-not-readable
+                            :check/policy-not-readable)
+         :kotoba.cli/data policy-result}
+        (let [forms (runtime/read-file (:kotoba.source/path plan)
+                                       (:kotoba.source/reader-target plan))
+              safe-facts (safe-analyzer-fact-classification)]
+          (case command
+            "check"
+            (let [checked (runtime/check safe-facts plan forms policy)
+                  ok? (:kotoba.runtime/ok? checked)]
+              {:kotoba.cli/ok? ok?
+               :kotoba.cli/code (if ok? :check/valid :check/invalid)
+               :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
+                                       (runtime-data original-argv normalized-argv plan checked))})
 
-        "run"
-        (let [ran (runtime/run safe-facts plan forms)
-              ok? (:kotoba.runtime/ok? ran)]
-          {:kotoba.cli/ok? ok?
-           :kotoba.cli/code (if ok? :run/completed :run/failed)
-           :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
-                                   (runtime-data original-argv normalized-argv plan ran))})
+            "run"
+            (let [ran (if policy
+                        (guarded-run-result safe-facts plan forms policy)
+                        (runtime/run safe-facts plan forms))
+                  ok? (:kotoba.runtime/ok? ran)]
+              {:kotoba.cli/ok? ok?
+               :kotoba.cli/code (if ok? :run/completed :run/failed)
+               :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
+                                       (runtime-data original-argv normalized-argv plan
+                                                     (dissoc ran :kotoba.host/receipts))
+                                       (when policy
+                                         {:kotoba.host/receipts (:kotoba.host/receipts ran)
+                                          :kotoba.policy/path (:kotoba.policy/path policy-result)}))})
 
-        nil))))
+            nil))))))
 
 (defn wasm-emit-result*
   [argv]
