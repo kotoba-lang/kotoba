@@ -10,6 +10,7 @@ bin/kotoba-clj selfhost check --json
 bin/kotoba-clj run src/demo.kotoba --json
 bin/kotoba-clj run src/demo.cljc --json
 bin/kotoba-clj run src/demo.cljc --reader-target cljs --json
+bin/kotoba-clj run src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --json
 bin/kotoba-clj wasm emit src/demo.kotoba --output target/kotoba/demo.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo.wasm")).then(({instance})=>{if(instance.exports.main()!==42) process.exit(1)})'
 bin/kotoba-clj wasm emit src/demo_call.kotoba --output target/kotoba/demo_call.wasm --json
@@ -239,6 +240,36 @@ These gates verify that:
 - selfhost EDN seeds from `../kotoba-selfhost-contracts/resources/kotoba/selfhost/`
   are listable and checkable through CLJ launcher commands;
 - launcher resources are exercised through `bin/kotoba-clj` and the CLJ test gate.
+
+## Capability-guarded host calls
+
+The CLJ runtime slice dispatches host provider invocations through the
+capability intersection kernel from kotoba-lang/kotoba-lang (issue #263):
+
+```sh
+bin/kotoba-clj run src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --json
+```
+
+When `run` is given `--policy`, every capability-bearing host-import op
+(clipboard, HTTP fetch, keychain, filesystem, notify, ledger) is guarded at
+call time by `kotoba.lang.capability-host/guard-call`: the launcher derives
+CACAO-style grants and a local policy from the policy EDN
+(`kotoba.host-providers`, with optional
+`:kotoba.policy/capability-resources` scoping and
+`:kotoba.policy/capability-expires` expiry), a denied call never reaches the
+provider handler and fails the run closed with a `:host-call-denied` problem,
+and every attempted call — grant, denial, or handler error — leaves a receipt.
+The ordered receipt journal is attached to the run result as
+`:kotoba.host/receipts`; each grant receipt embeds the CONCRETE
+(post-intersection) capability, never the broader requested one.
+
+Without `--policy` the legacy behavior is unchanged: no guard is installed and
+host-import ops are statically rejected as `:capability-not-granted` (there is
+no ambient provider access to preserve, so enforcement when a policy is
+present is strictly additive). Provider handlers default to deterministic
+Rust-free stubs; concrete native providers (such as the `pbcopy`/`pbpaste`
+clipboard provider owned by `kotoba-lang/shell`) plug in through the
+`:handlers` registry of `kotoba.host-providers/host-call`.
 
 ## Package admission
 

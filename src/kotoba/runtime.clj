@@ -289,27 +289,63 @@
      :kotoba.runtime/problems problems
      :kotoba.runtime/ir ir})))
 
+(defn- guarded-host-fns
+  "Interpreter bindings routing every capability-bearing host-import op used
+  by FORMS through HOST-CALL (fn [op args] result)."
+  [forms host-call]
+  (into {}
+        (keep (fn [op]
+                (when (get-in host-imports [op :capability])
+                  [op (fn [& args] (host-call op (vec args)))])))
+        (required-host-imports forms)))
+
 (defn run
-  [safe-facts source-plan forms]
-  (let [{:kotoba.runtime/keys [ok? problems ir]} (check safe-facts source-plan forms)
-        fns (into {} (keep function-def forms))]
-    (if-not ok?
-      {:kotoba.runtime/ok? false
-       :kotoba.runtime/problems problems
-       :kotoba.runtime/ir ir}
-      (let [expressions (vec (remove #(and (seq? %) (#{'ns 'defn} (first %))) forms))
-            value (cond
-                    (contains? fns 'main)
-                    (call-fn (get fns 'main) [] fns)
+  "Run FORMS through the CLJ interpreter slice.
 
-                    (seq expressions)
-                    (eval-body expressions {} fns)
+  The optional OPTS map enables the capability-guarded host path (issue #263):
+  {:policy           <policy EDN, used for the static capability check>
+   :host-call        <fn [op args] -> result; every capability-bearing
+                      host-import op is dispatched through it>
+   :capability-query <fn [cap] -> boolean, bound as has-capability?>}
 
-                    :else
-                    nil)]
-        {:kotoba.runtime/ok? true
-         :kotoba.runtime/value value
-         :kotoba.runtime/ir ir}))))
+  Without OPTS behavior is unchanged: host-import ops are statically rejected
+  as :capability-not-granted. With a guard installed, a denied host call
+  (ex-info carrying :kotoba.host/denied) fails the run closed with a
+  :host-call-denied problem; the provider is never invoked."
+  ([safe-facts source-plan forms] (run safe-facts source-plan forms nil))
+  ([safe-facts source-plan forms {:keys [policy host-call capability-query]}]
+   (let [{:kotoba.runtime/keys [ok? problems ir]} (check safe-facts source-plan forms policy)
+         fns (into {} (keep function-def forms))
+         env-fns (cond-> fns
+                   host-call (merge (guarded-host-fns forms host-call))
+                   (and host-call capability-query)
+                   (assoc 'has-capability? capability-query))]
+     (if-not ok?
+       {:kotoba.runtime/ok? false
+        :kotoba.runtime/problems problems
+        :kotoba.runtime/ir ir}
+       (try
+         (let [expressions (vec (remove #(and (seq? %) (#{'ns 'defn} (first %))) forms))
+               value (cond
+                       (contains? fns 'main)
+                       (call-fn (get fns 'main) [] env-fns)
+
+                       (seq expressions)
+                       (eval-body expressions {} env-fns)
+
+                       :else
+                       nil)]
+           {:kotoba.runtime/ok? true
+            :kotoba.runtime/value value
+            :kotoba.runtime/ir ir})
+         (catch clojure.lang.ExceptionInfo e
+           (if (and host-call (:kotoba.host/denied (ex-data e)))
+             {:kotoba.runtime/ok? false
+              :kotoba.runtime/problems [{:kotoba.runtime/problem :host-call-denied
+                                         :kotoba.runtime/call (:kotoba.host/call (ex-data e))
+                                         :kotoba.runtime/denied (:kotoba.host/denied (ex-data e))}]
+              :kotoba.runtime/ir ir}
+             (throw e))))))))
 
 (defn wasm-artifact
   "Emit deterministic bytes for the current IR contract.
