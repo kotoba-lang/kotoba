@@ -102,6 +102,23 @@
    (into {} (for [[kind cap-name] (granted-kinds policy)]
               [kind (resource-scope policy cap-name)]))})
 
+(defn grants->policy
+  "Launcher policy EDN synthesized from externally supplied (CACAO chain)
+  grants — used when `run --cacao` is given WITHOUT `--policy`. The static
+  capability gate then admits exactly the contract capabilities whose host
+  kinds the chain grants, and the derived local policy allows :any for those
+  kinds (no `:kotoba.policy/capability-resources` narrowing): the local
+  policy remains the narrowing side, and absent an explicit `--policy` it
+  defaults to allowing whatever the chain grants. The grants themselves stay
+  the authorization side of the intersection."
+  [grants]
+  (let [kinds (into #{} (map :grant/kind) grants)]
+    {:kotoba.policy/capabilities
+     (into #{} (keep (fn [[op kind]]
+                       (when (contains? kinds kind)
+                         (op-capability op))))
+           op->kind)}))
+
 (def default-handlers
   "Deterministic Rust-free provider stubs, keyed by host-import op. Each
   handler is (fn [concrete-cap args] result). host-i64-roundtrip echoes its
@@ -138,10 +155,15 @@
   kotoba.lang.capability-host/guard-call with grants/policy derived from the
   launcher policy EDN; receipts flow to :record! (see `journal`). A denial
   throws ex-info carrying :kotoba.host/denied, :kotoba.host/call, and the
-  denial :kotoba.host/receipt — the provider handler is never invoked."
+  denial :kotoba.host/receipt — the provider handler is never invoked.
+
+  When OPTS carries :cacao-grants (verified CACAO delegation-chain grants,
+  see kotoba.lang.capability-cacao), those REPLACE the policy-derived grants
+  in the intersection; the local policy side still derives from POLICY, so an
+  explicit policy narrows the chain's resource set."
   ([policy] (host-call policy nil))
-  ([policy {:keys [record! now handlers]}]
-   (let [grants (policy-grants policy)
+  ([policy {:keys [record! now handlers cacao-grants]}]
+   (let [grants (or cacao-grants (policy-grants policy))
          allow (local-policy policy)
          now (or now (str (java.time.LocalDate/now)))
          handlers (or handlers default-handlers)]
@@ -235,11 +257,12 @@
   ex-info shape as a denied host call (:kotoba.host/denied, so the run fails
   closed with a :host-call-denied problem and :kotoba.runtime/call
   :cap/acquire). (<op>-with <handle> <args...>) resolves the handle through
-  `host-call-with` above."
-  [table policy {:keys [record! now] :as opts}]
+  `host-call-with` above. As with `host-call`, OPTS :cacao-grants replaces
+  the policy-derived grants at acquisition time."
+  [table policy {:keys [record! now cacao-grants] :as opts}]
   (let [now (or now (str (java.time.LocalDate/now)))
         opts (assoc opts :now now)
-        grants (policy-grants policy)
+        grants (or cacao-grants (policy-grants policy))
         allow (local-policy policy)
         call-with (host-call-with table opts)
         acquire (fn cap-acquire [kind resource]

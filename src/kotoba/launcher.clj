@@ -4,12 +4,14 @@
   This is intentionally small: command semantics live in `kotoba.cli` from
   kotoba-lang/kotoba-lang. Host-specific launchers call into that namespace and
   render the returned data."
-  (:require [clojure.data.json :as json]
+  (:require [cacao.core :as cacao-core]
+            [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [kotoba.cap-table :as cap-table]
+            [kotoba.lang.capability-cacao :as capability-cacao]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
             [kotoba.git-adapter :as git-adapter]
@@ -44,7 +46,8 @@
   #{"run" "check"})
 
 (def value-options
-  #{"--kind"
+  #{"--cacao"
+    "--kind"
     "--lock"
     "--manifest"
     "--output"
@@ -322,6 +325,52 @@
     {:kotoba.policy/ok? true
      :kotoba.policy/data nil}))
 
+(defn cacao-chain-data
+  "Chain vector from `--cacao` EDN: {:cacao/chain [\"b64\" ...]} or a plain
+  EDN vector of base64 strings."
+  [data]
+  (cond
+    (map? data) (:cacao/chain data)
+    (vector? data) data
+    :else nil))
+
+(defn cacao-result
+  "Load the `--cacao <file>` delegation chain, when the option is present."
+  [argv]
+  (if-let [path (option-value argv "--cacao")]
+    (try
+      {:kotoba.cacao/ok? true
+       :kotoba.cacao/path path
+       :kotoba.cacao/chain (cacao-chain-data
+                            (-> path io/file slurp edn/read-string))}
+      (catch Exception e
+        {:kotoba.cacao/ok? false
+         :kotoba.cacao/path path
+         :kotoba.cacao/error (.getMessage e)}))
+    {:kotoba.cacao/ok? true
+     :kotoba.cacao/chain nil}))
+
+(defn verified-cacao-chain
+  "Real crypto boundary: verify the delegation chain (cacao.core/verify-chain,
+  signatures + linkage + attenuation + expiry ordering + freshness at the
+  current instant) and map the VERIFIED result to capability grants
+  (kotoba.lang.capability-cacao/grants-from-chain — crypto-free).
+  Returns {:chain <verify-chain result> :grants [..] :skipped [..]
+           :problems <nil-or-problems>}."
+  [chain]
+  (let [verified (cacao-core/verify-chain chain
+                                          {:now (str (java.time.Instant/now))})
+        mapped (capability-cacao/grants-from-chain verified)]
+    {:chain verified
+     :grants (:grants mapped)
+     :skipped (:skipped mapped)
+     :problems (cond
+                 ;; grants-from-chain fails closed on an unverified chain and
+                 ;; already echoes the chain problems after :chain/not-verified
+                 (seq (:problems mapped)) (vec (:problems mapped))
+                 (not (:chain/valid? verified)) (vec (:chain/problems verified))
+                 :else nil)}))
+
 (defn contract-exports
   "Return common plus target-specific exports from a selfhost contract seed."
   ([seed] (contract-exports seed nil))
@@ -364,13 +413,19 @@
 
   The run also installs the S4b capability-passing surface: a per-run
   capability table (kotoba.cap-table) behind `cap-acquire` and the `<op>-with`
-  use variants, sharing the same receipt journal and provider handlers."
+  use variants, sharing the same receipt journal and provider handlers.
+
+  RUN-OPTS optionally carries :handlers (overriding
+  kotoba.host-providers/default-handlers) and :cacao-grants (verified CACAO
+  delegation-chain grants replacing the policy-derived grants; the local
+  policy side still comes from POLICY, which therefore narrows the chain)."
   ([safe-facts plan forms policy] (guarded-run-result safe-facts plan forms policy nil))
-  ([safe-facts plan forms policy handlers]
+  ([safe-facts plan forms policy {:keys [handlers cacao-grants]}]
    (let [{:keys [record! entries]} (host-providers/journal)
          now (str (java.time.LocalDate/now))
          opts (cond-> {:record! record! :now now}
-                handlers (assoc :handlers handlers))
+                handlers (assoc :handlers handlers)
+                cacao-grants (assoc :cacao-grants cacao-grants))
          host-call (host-providers/host-call policy opts)
          cap-table (cap-table/make-table)
          cap-fns (host-providers/capability-passing-fns cap-table policy opts)
@@ -388,7 +443,15 @@
   static capability check, and `run` additionally installs the capability
   guard (see `guarded-run-result`). Without `--policy` the legacy ambient
   behavior is unchanged (host-import ops are rejected as
-  :capability-not-granted and no receipts are emitted)."
+  :capability-not-granted and no receipts are emitted).
+
+  When `--cacao <file>` accompanies `run`, the file's delegation chain is
+  verified (cacao.core/verify-chain) and its grants replace the
+  policy-derived grants for the guarded run; an invalid/expired chain aborts
+  with :run/cacao-invalid before any execution. Without `--policy`, a policy
+  admitting the chain's capability kinds is synthesized
+  (kotoba.host-providers/grants->policy) so the local policy defaults to
+  allowing whatever the chain grants — an explicit `--policy` narrows it."
   [command authority-result original-argv normalized-argv plan]
   (when (and (source-commands command)
              (source-file-readable? plan)
@@ -414,18 +477,48 @@
                                        (runtime-data original-argv normalized-argv plan checked))})
 
             "run"
-            (let [ran (if policy
-                        (guarded-run-result safe-facts plan forms policy)
-                        (runtime/run safe-facts plan forms))
-                  ok? (:kotoba.runtime/ok? ran)]
-              {:kotoba.cli/ok? ok?
-               :kotoba.cli/code (if ok? :run/completed :run/failed)
-               :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
-                                       (runtime-data original-argv normalized-argv plan
-                                                     (dissoc ran :kotoba.host/receipts))
-                                       (when policy
-                                         {:kotoba.host/receipts (:kotoba.host/receipts ran)
-                                          :kotoba.policy/path (:kotoba.policy/path policy-result)}))})
+            (let [cacao-load (cacao-result original-argv)]
+              (cond
+                (not (:kotoba.cacao/ok? cacao-load))
+                {:kotoba.cli/ok? false
+                 :kotoba.cli/code :run/cacao-not-readable
+                 :kotoba.cli/data cacao-load}
+
+                :else
+                (let [cacao (when (:kotoba.cacao/path cacao-load)
+                              (verified-cacao-chain
+                               (:kotoba.cacao/chain cacao-load)))]
+                  (if (:problems cacao)
+                    ;; invalid/expired chain: the run does NOT proceed
+                    {:kotoba.cli/ok? false
+                     :kotoba.cli/code :run/cacao-invalid
+                     :kotoba.cli/data {:kotoba.cacao/path (:kotoba.cacao/path cacao-load)
+                                       :kotoba.cacao/problems (:problems cacao)}}
+                    (let [effective-policy
+                          (or policy
+                              (when cacao
+                                (host-providers/grants->policy (:grants cacao))))
+                          ran (if effective-policy
+                                (guarded-run-result safe-facts plan forms effective-policy
+                                                    (when cacao
+                                                      {:cacao-grants (:grants cacao)}))
+                                (runtime/run safe-facts plan forms))
+                          ok? (:kotoba.runtime/ok? ran)]
+                      {:kotoba.cli/ok? ok?
+                       :kotoba.cli/code (if ok? :run/completed :run/failed)
+                       :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
+                                               (runtime-data original-argv normalized-argv plan
+                                                             (dissoc ran :kotoba.host/receipts))
+                                               (when effective-policy
+                                                 {:kotoba.host/receipts (:kotoba.host/receipts ran)})
+                                               (when policy
+                                                 {:kotoba.policy/path (:kotoba.policy/path policy-result)})
+                                               (when cacao
+                                                 (let [chain (:chain cacao)]
+                                                   {:kotoba.cacao/path (:kotoba.cacao/path cacao-load)
+                                                    :kotoba.cacao/root-iss (:chain/root-iss chain)
+                                                    :kotoba.cacao/holder (:chain/holder chain)
+                                                    :kotoba.cacao/depth (:chain/depth chain)})))})))))
 
             nil))))))
 
