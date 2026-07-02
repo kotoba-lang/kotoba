@@ -7,10 +7,12 @@
   (:require [clojure.data.json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
             [clojure.string :as str]
             [kotoba.cap-table :as cap-table]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
+            [kotoba.git-adapter :as git-adapter]
             [kotoba.host-providers :as host-providers]
             [kotoba.package-admission :as package-admission]
             [kotoba.runtime :as runtime]
@@ -124,6 +126,22 @@
    :kotoba.launcher/reader-target-added? (not= original-argv normalized-argv)
    :kotoba.launcher/source-plan plan})
 
+(defn shell-process-port
+  "JVM process capability for host adapters (kotoba.git-adapter/IProcess)."
+  []
+  (reify git-adapter/IProcess
+    (-run [_ argv]
+      (apply shell/sh argv))))
+
+(defn adapter-result
+  "Execute host-adapter-backed commands (:git) from their CLJC-planned result.
+  Non-adapter commands pass through unchanged."
+  [command result]
+  (if (and (= "git" command)
+           (= :command/planned (:kotoba.cli/code result)))
+    (git-adapter/execute! (shell-process-port) result)
+    result))
+
 (defn dispatch
   "Dispatch argv through the CLJC authority and return a result map."
   [argv]
@@ -154,7 +172,7 @@
                   :kotoba.launcher/source-plan plan
                   :kotoba.launcher/authority-request
                   (authority-request argv normalized-argv plan))
-          result))))))
+          (adapter-result (command-name argv) result)))))))
 
 (defn resource-edn
   "Load an EDN resource by classpath path."
