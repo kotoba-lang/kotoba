@@ -13,13 +13,14 @@ Kotoba is two things in one system:
   decentralized AI agent systems, combining Datomic-style immutable datoms,
   Pregel BSP graph computation, an auxiliary SPARQL 1.1 executor over IPFS
   storage, native CACAO authentication, and WASM Component Model execution.
-- **A language** — `kotoba-lang` defines the source profile (`.kotoba`
-  canonical, portable `.cljc` with `#?(:kotoba ...)` for Kotoba-specific
-  branches), and `kotoba wasm` compiles that Kotoba/EDN subset directly to
-  **WebAssembly** (a compiler, not an interpreter). **safe Kotoba** adds a
-  *capability-confined* profile for running untrusted / AI-generated agents:
-  what a module can touch is whatever it was explicitly handed, and nothing
-  else. See [**Language**](#language--kotoba-lang--kotoba-wasm) below.
+- **A language** — [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang)
+  defines the source profile (`.kotoba` canonical, portable `.cljc` with
+  `#?(:kotoba ...)` for Kotoba-specific branches), and `kotoba wasm` compiles
+  that Kotoba/EDN subset directly to **WebAssembly** (a compiler, not an
+  interpreter). **safe Kotoba** adds a *capability-confined* profile for
+  running untrusted / AI-generated agents: what a module can touch is
+  whatever it was explicitly handed, and nothing else. See
+  [**Language**](#language--kotoba-lang--kotoba-wasm) below.
 
 ## Repository boundary
 
@@ -180,6 +181,69 @@ kotoba cacao-sign <seed> --graph <cid> \
 ```
 
 ## Language — kotoba-lang & kotoba wasm
+
+### `kotoba-lang/kotoba-lang` — the language contract
+
+The language itself is not defined in this repository. **[`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang)**
+("Kotoba language design, source profile, and conformance contract") is the
+semantic authority — see [Repository boundary](#repository-boundary) above.
+This repo hosts launchers and adapters that consume that contract; it does
+not define new command shape or language semantics of its own.
+
+- **Not a Clojure superset or dialect in the full sense — a Clojure-family
+  *profile/subset*** with its own compatibility contract. Canonical source
+  extension: `.kotoba`. Compatibility extensions: `.clj`, `.cljc` (portable,
+  shared Clojure-family source). **`.cljs` is retired as a dedicated source
+  extension** (profile v2) — ClojureScript-targeted behavior lives inside
+  `.cljc` via `#?(:cljs ...)`, not a separate file type. Reader-target
+  resolution order for `.cljc`: `:kotoba → :clj → :default`; namespace file
+  resolution priority: `.kotoba → .cljc → .clj`.
+- **The CLI/command contract is EDN, not code.** `lang/cli.edn`
+  (`:kotoba.cli.contract`, versioned M0–M3) and `lang/adapters.edn` (scopes
+  which repos may host adapters) define the command surface; `lang/profile.edn`
+  is the machine-readable profile spec. `src/kotoba/cli.cljc` validates the
+  contract and shapes argv as EDN — host launchers (like this repo's
+  `bin/kotoba-clj`) adapt to this contract; they don't define protocol
+  semantics of their own.
+- **Compilation target is WebAssembly.** The public compiler surface is
+  `kotoba -e` / `kotoba wasm ...`; `kotoba -e '(+ 1 2)'` is compile-and-run
+  sugar (wraps the expression as an exported `main`, compiles Kotoba → core
+  Wasm, runs it) — not a runtime `eval`.
+- **Safety model — "safe Kotoba."** Three formal soundness goals: **T1
+  Memory Safety**, **T2 Effect Soundness** (`Γ ⊢ e : T ! E`), **T3 Capability
+  Confinement** (a compile-time analog of CACAO delegation attenuation).
+  Capabilities are explicit, scoped, typed *values* (`GraphReadCap`,
+  `GraphWriteCap`, `InferCap`, `EgressCap`, `SecretReadCap`, `ClockCap`,
+  `RandomCap`) — never ambient strings a module can summon by name. Design
+  ranking from the language repo's own ADR: capability-sandboxed +
+  deny-by-default + reproducible builds (Kotoba's target) ranks above
+  Rust-style ownership/borrow Wasm, which ranks above "Clojure syntax + safe
+  subset + borrow checker," which ranks above linter-only Clojure/
+  ClojureScript.
+- **Conformance, not vibes.** `lang/conformance/`, `lang/capability-conformance/`,
+  and `lang/package-conformance/` hold positive/negative EDN fixtures run by
+  a manifest-driven conformance suite, tracked on an M0–M6 maturity scale
+  (`docs/lang/coverage.edn`), with its own versioning policy
+  (`docs/lang/versioning.md`) and CI gates (`docs/lang/gates.md`).
+- **Package/lock contract.** `lang/package.edn` — CID-pinned packages,
+  RID+signature authority, no capability grant without an explicit lockfile
+  + policy (`docs/adr/ADR-kotoba-package-cid-lock.md`). Wire protocol:
+  Transit JSON (`docs/adr/ADR-kotoba-transit-wire-protocol.md`).
+- **Where "authority" stops.** `kotoba-lang/kotoba-lang` owns the *semantic
+  contract* (what the language and CLI mean), not every implementation.
+  Capability *value-passing* (typed cap params, `cap-acquire`, i64 ABI
+  threading) is implemented in this sibling repo's CLJ runtime, not in
+  `kotoba-lang/kotoba-lang` itself — the contract repo defines the shape
+  (`docs/lang/capability-values.md`), hosts implement it.
+
+The rest of this section (below) walks through the **historical Rust
+implementation** of this same design (`kotoba-clj`, `policy.rs`/`subset.rs`/
+`effects.rs`). That Rust workspace was removed from this repository
+(`604896171b`, 2026-07-01) — the file paths below are a historical record
+(see git history), not current source. The CLJC-native successor is tracked
+in [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md)
+(database side) and lives entirely in `kotoba-lang/kotoba-lang` itself
+(language/compiler side).
 
 ## 言語性（Language-ness）
 
