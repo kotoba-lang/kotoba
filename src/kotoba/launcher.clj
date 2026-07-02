@@ -14,6 +14,7 @@
             [kotoba.cli :as cli]
             [kotoba.git-adapter :as git-adapter]
             [kotoba.host-providers :as host-providers]
+            [kotoba.rad-adapter :as rad-adapter]
             [kotoba.package-admission :as package-admission]
             [kotoba.runtime :as runtime]
             [kotoba.selfhost.contracts :as selfhost]))
@@ -126,6 +127,8 @@
    :kotoba.launcher/reader-target-added? (not= original-argv normalized-argv)
    :kotoba.launcher/source-plan plan})
 
+(declare dispatch)
+
 (defn shell-process-port
   "JVM process capability for host adapters (kotoba.git-adapter/IProcess)."
   []
@@ -133,13 +136,29 @@
     (-run [_ argv]
       (apply shell/sh argv))))
 
+(defn rad-host-port
+  "JVM host capabilities for the rad adapter: filesystem writes plus
+  in-process launcher re-dispatch (kotoba.rad-adapter/IRadHost)."
+  []
+  (reify rad-adapter/IRadHost
+    (-mkdirs [_ path]
+      (.mkdirs (io/file path)))
+    (-write-file [_ path content]
+      (let [f (io/file path)]
+        (some-> (.getParentFile f) .mkdirs)
+        (spit f content)))
+    (-dispatch [_ argv]
+      (dispatch argv))))
+
 (defn adapter-result
-  "Execute host-adapter-backed commands (:git) from their CLJC-planned result.
-  Non-adapter commands pass through unchanged."
+  "Execute host-adapter-backed commands (:git, :rad) from their CLJC-planned
+  result. Non-adapter commands pass through unchanged."
   [command result]
-  (if (and (= "git" command)
-           (= :command/planned (:kotoba.cli/code result)))
-    (git-adapter/execute! (shell-process-port) result)
+  (if (= :command/planned (:kotoba.cli/code result))
+    (case command
+      "git" (git-adapter/execute! (shell-process-port) result)
+      "rad" (rad-adapter/execute! (rad-host-port) result)
+      result)
     result))
 
 (defn dispatch
