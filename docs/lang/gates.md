@@ -240,6 +240,54 @@ These gates verify that:
   are listable and checkable through CLJ launcher commands;
 - launcher resources are exercised through `bin/kotoba-clj` and the CLJ test gate.
 
+## Package admission
+
+Safe execution rejects unsafe package inputs end-to-end (issue #262, security
+finding `F-001`). The launcher owns a package admission gate backed by the
+`kotoba.lang.package-contract` validation kernel from
+`kotoba-lang/kotoba-lang`:
+
+```sh
+bin/kotoba-clj package verify --lock kotoba.lock.edn --json
+bin/kotoba-clj package verify --lock kotoba.lock.edn \
+  --manifest package-manifest.edn \
+  --trust trust.edn \
+  --receipt target/kotoba/package-receipt.edn --json
+bin/kotoba-clj wasm emit src/demo.kotoba --package-lock kotoba.lock.edn --json
+```
+
+- `package verify --lock <kotoba.lock.edn>` validates every lock entry and
+  returns `:kotoba.cli/code` `package-verified` (exit 0) or `package-rejected`
+  (exit 1). The optional `--manifest <package-manifest.edn>` also validates the
+  package manifest (signatures, repo RID, CIDs) and supplies the declared
+  capabilities; `--trust <trust.edn>` supplies
+  `:declared-capabilities` / `:revoked-signers` / `:expired-signers` /
+  `:compromised-signers`. Without either source of declared capabilities, no
+  capability grant is admitted (strict default).
+- Rejection classes mirror the kotoba-lang package-conformance negatives:
+  version-only dependencies (`:package/missing-lock-field`), unsigned or
+  bad-signature manifests (`:package/signature-required`,
+  `:package/signature-alg-unsupported`), missing repo RID / manifest CID /
+  tree CID, revoked/expired/compromised signers
+  (`:package/signer-not-trusted`), capability grants exceeding the package
+  declaration (`:package/capability-exceeds-declaration`), and — added by the
+  admission layer in safe mode — local-path dependencies
+  (`:package/local-path-dependency`: any `:package/local-root` /
+  `:dep/local-root` key or path-looking `:dep/ref`/`:dep/url`).
+- Both accept and reject emit a package-verification receipt
+  (`:kotoba.package/receipt` with `:kotoba.package/verified?`,
+  `:kotoba.package/lock-path`, `:kotoba.package/checked-at`,
+  `:kotoba.package/problems`, and per-dependency `:kotoba.package/entries`
+  carrying `:package/id`, `:package/repo-rid`, `:package/manifest-cid`,
+  `:package/tree-cid`, `:package/result`). `--receipt <out.edn>` writes the
+  receipt EDN file used as release evidence.
+- The safe-build path takes an optional `--package-lock <path>` on
+  `wasm emit`: admission runs before the build, a rejected lock aborts the
+  build with `:wasm/package-rejected` and the receipt in the error payload,
+  and an admitted lock attaches the receipt to the build result. Without
+  `--package-lock` there are no package inputs to admit and behavior is
+  unchanged.
+
 Cargo/Rust gates are historical for this repository. Implementation-heavy
 compiler conformance belongs in `kotoba-lang/kotoba-lang` or another authority
 repo that owns the executable compiler/runtime.

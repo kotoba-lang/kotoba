@@ -10,6 +10,7 @@
             [clojure.string :as str]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
+            [kotoba.package-admission :as package-admission]
             [kotoba.runtime :as runtime]
             [kotoba.selfhost.contracts :as selfhost]))
 
@@ -32,19 +33,23 @@
 (defn command-name [argv]
   (first argv))
 
-(declare source-plan accepted-source? selfhost-result runtime-result wasm-result contract-exports)
+(declare source-plan accepted-source? selfhost-result runtime-result wasm-result package-result contract-exports)
 
 (def source-commands
   #{"run" "check"})
 
 (def value-options
   #{"--kind"
+    "--lock"
     "--manifest"
     "--output"
+    "--package-lock"
     "--policy"
     "--reader-target"
+    "--receipt"
     "--source-path"
     "--target"
+    "--trust"
     "--host-command"
     "--host-arg"
     "--provider-command"
@@ -124,6 +129,7 @@
     (if-let [launcher-result (case (command-name argv)
                                "selfhost" (selfhost-result argv)
                                "wasm" (wasm-result argv)
+                               "package" (package-result argv)
                                nil)]
       launcher-result
       (let [contract (-> "lang/cli.edn"
@@ -236,6 +242,33 @@
      :kotoba.cli/data {:kotoba.selfhost/command (second argv)
                        :kotoba.selfhost/commands ["list" "check"]}}))
 
+(defn admission-options
+  "Package-admission option paths carried by argv. `lock-option` names the
+  option holding the lock path (`--lock` for `package verify`,
+  `--package-lock` for safe builds)."
+  [argv lock-option]
+  {:lock-path (option-value argv lock-option)
+   :manifest-path (option-value argv "--manifest")
+   :trust-path (option-value argv "--trust")
+   :receipt-path (option-value argv "--receipt")})
+
+(defn package-verify-result
+  "Verify a package lock through the kotoba.lang.package-contract admission
+  gate and emit the package-verification receipt."
+  [argv]
+  (package-admission/cli-result (admission-options argv "--lock")))
+
+(defn package-result
+  "Handle launcher-owned package admission commands."
+  [argv]
+  (case (second argv)
+    "verify" (package-verify-result argv)
+    {:kotoba.cli/ok? false
+     :kotoba.cli/code :package/unknown-command
+     :kotoba.cli/data {:kotoba.package/command (second argv)
+                       :kotoba.package/commands ["verify"]
+                       :kotoba.package/usage package-admission/usage}}))
+
 (defn policy-result
   [argv]
   (if-let [path (option-value argv "--policy")]
@@ -310,7 +343,7 @@
 
         nil))))
 
-(defn wasm-emit-result
+(defn wasm-emit-result*
   [argv]
   (let [normalized-argv (normalize-source-argv (vec (cons "run" (rest argv))))
         plan (source-argv-plan normalized-argv)
@@ -389,6 +422,30 @@
                              :kotoba.wasm/artifact-kind :kotoba.runtime/edn-ir
                              :kotoba.wasm/binary? false
                              :kotoba.wasm/byte-count (when edn-bytes (alength edn-bytes))}})))))
+
+(defn wasm-emit-result
+  "Safe-build entry point for `wasm emit`. When `--package-lock <path>` is
+  provided, the package admission gate runs first and a rejected lock aborts
+  the build with the package-verification receipt in the error payload. When
+  no lock is provided there are no package inputs to admit and behavior is
+  unchanged."
+  [argv]
+  (let [admission (when (option-value argv "--package-lock")
+                    (package-admission/admit (admission-options argv "--package-lock")))]
+    (if (and admission (not (:kotoba.admission/ok? admission)))
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :wasm/package-rejected
+       :kotoba.cli/data (cond-> {:kotoba.package/admission-code (:kotoba.admission/code admission)}
+                          (:kotoba.admission/receipt admission)
+                          (assoc :kotoba.package/receipt (:kotoba.admission/receipt admission))
+
+                          (:kotoba.admission/error admission)
+                          (assoc :kotoba.package/error (:kotoba.admission/error admission)))}
+      (cond-> (wasm-emit-result* argv)
+        admission
+        (update :kotoba.cli/data
+                (fnil assoc {})
+                :kotoba.package/receipt (:kotoba.admission/receipt admission))))))
 
 (defn wasm-result
   "Handle launcher-owned Wasm-facing commands."
