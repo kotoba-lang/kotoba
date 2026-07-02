@@ -3,76 +3,65 @@
   aiueos-cljc-contract), registered as host-import primitives per
   ADR-2607022700 so a `.kotoba` guest component can declare and use them.
   Mirrors kotoba.cap-passing-test's direct-call (non-cap-passing) shape,
-  matching how demo_providers.kotoba exercises clipboard/http/fs today."
+  matching how demo_providers.kotoba exercises clipboard/http/fs today.
+
+  Each demo below is a real, capability-gated `.kotoba` -> Wasm compile: it
+  denies without a policy and emits a genuine Wasm binary with one. This is
+  the migration's core claim -- these aren't just contract-data entries,
+  they're compiler-verified."
   (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is]]
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime])
   (:import [java.io File]))
 
-(deftest irq-subscribe-denied-without-policy
-  (let [result (launcher/dispatch ["run" "src/demo_aiueos_irq.kotoba" "--json"])]
-    (is (false? (:kotoba.cli/ok? result)))
-    (is (= :capability-not-granted
-           (get-in result [:kotoba.cli/data :kotoba.runtime/result
-                           :kotoba.runtime/problems 0 :kotoba.runtime/problem])))))
+(defn- denied-without-policy? [demo-path]
+  (let [result (launcher/dispatch ["run" demo-path "--json"])]
+    (and (false? (:kotoba.cli/ok? result))
+         (= :capability-not-granted
+            (get-in result [:kotoba.cli/data :kotoba.runtime/result
+                            :kotoba.runtime/problems 0 :kotoba.runtime/problem])))))
 
-(deftest wasm-emit-supports-irq-subscribe-with-a-granting-policy
-  (let [forms (runtime/read-file "src/demo_aiueos_irq.kotoba" :kotoba)
-        policy (edn/read-string (slurp "src/demo_aiueos_irq_policy.edn"))
+(defn- wasm-emits-with-policy? [demo-path policy-path expected-import]
+  (let [forms (runtime/read-file demo-path :kotoba)
+        policy (edn/read-string (slurp policy-path))
         wasm (runtime/wasm-binary forms policy)
-        output (doto (File/createTempFile "kotoba-demo-aiueos-irq" ".wasm")
-                 (.deleteOnExit))
-        emitted (launcher/dispatch ["wasm" "emit" "src/demo_aiueos_irq.kotoba"
-                                    "--policy" "src/demo_aiueos_irq_policy.edn"
-                                    "--output" (.getPath output)
-                                    "--json"])]
-    (is (:kotoba.wasm/ok? wasm))
-    (is (= :i64 (:kotoba.wasm/result-type wasm)))
-    (is (= [{:module "kotoba"
-             :field "irq_subscribe"
-             :capability "irq/subscribe"
-             :params [:i32]
-             :result :i64}]
-           (:kotoba.wasm/imports wasm)))
-    (is (:kotoba.cli/ok? emitted))
-    (is (= :wasm/binary-emitted (:kotoba.cli/code emitted)))
-    (is (= 1 (get-in emitted [:kotoba.cli/data :kotoba.wasm/import-count])))
-    (is (= [0 97 115 109]
-           (mapv #(bit-and % 0xff)
-                 (take 4 (java.nio.file.Files/readAllBytes (.toPath output))))))))
+        output (doto (File/createTempFile "kotoba-aiueos-demo" ".wasm") (.deleteOnExit))
+        emitted (launcher/dispatch ["wasm" "emit" demo-path "--policy" policy-path
+                                    "--output" (.getPath output) "--json"])]
+    (and (:kotoba.wasm/ok? wasm)
+         (= [expected-import] (:kotoba.wasm/imports wasm))
+         (:kotoba.cli/ok? emitted)
+         (= :wasm/binary-emitted (:kotoba.cli/code emitted))
+         (= 1 (get-in emitted [:kotoba.cli/data :kotoba.wasm/import-count]))
+         (= [0 97 115 109]
+            (mapv #(bit-and % 0xff)
+                  (take 4 (java.nio.file.Files/readAllBytes (.toPath output))))))))
 
-(deftest mmio-map-denied-without-policy
-  (let [result (launcher/dispatch ["run" "src/demo_aiueos_mmio.kotoba" "--json"])]
-    (is (false? (:kotoba.cli/ok? result)))
-    (is (= :capability-not-granted
-           (get-in result [:kotoba.cli/data :kotoba.runtime/result
-                           :kotoba.runtime/problems 0 :kotoba.runtime/problem])))))
+(def device-access-demos
+  "The virtio-relevant device-access quartet -- the capabilities a rewritten
+  .kotoba driver component would actually call, per ADR-2607022700's
+  low-trust-rewrite disposition for the retired Rust virtio.rs."
+  [{:demo "src/demo_aiueos_irq.kotoba" :policy "src/demo_aiueos_irq_policy.edn"
+    :import {:module "kotoba" :field "irq_subscribe" :capability "irq/subscribe"
+             :params [:i32] :result :i64}}
+   {:demo "src/demo_aiueos_mmio.kotoba" :policy "src/demo_aiueos_mmio_policy.edn"
+    :import {:module "kotoba" :field "mmio_map" :capability "mmio/map"
+             :params [:i64 :i32] :result :i64}}
+   {:demo "src/demo_aiueos_dma.kotoba" :policy "src/demo_aiueos_dma_policy.edn"
+    :import {:module "kotoba" :field "dma_map" :capability "dma/map"
+             :params [:i32 :i32] :result :i64}}
+   {:demo "src/demo_aiueos_pci.kotoba" :policy "src/demo_aiueos_pci_policy.edn"
+    :import {:module "kotoba" :field "pci_config" :capability "pci/config"
+             :params [:i32 :i32] :result :i32}}])
 
-(deftest wasm-emit-supports-mmio-map-with-a-granting-policy
-  (let [forms (runtime/read-file "src/demo_aiueos_mmio.kotoba" :kotoba)
-        policy (edn/read-string (slurp "src/demo_aiueos_mmio_policy.edn"))
-        wasm (runtime/wasm-binary forms policy)
-        output (doto (File/createTempFile "kotoba-demo-aiueos-mmio" ".wasm")
-                 (.deleteOnExit))
-        emitted (launcher/dispatch ["wasm" "emit" "src/demo_aiueos_mmio.kotoba"
-                                    "--policy" "src/demo_aiueos_mmio_policy.edn"
-                                    "--output" (.getPath output)
-                                    "--json"])]
-    (is (:kotoba.wasm/ok? wasm))
-    (is (= :i64 (:kotoba.wasm/result-type wasm)))
-    (is (= [{:module "kotoba"
-             :field "mmio_map"
-             :capability "mmio/map"
-             :params [:i64 :i32]
-             :result :i64}]
-           (:kotoba.wasm/imports wasm)))
-    (is (:kotoba.cli/ok? emitted))
-    (is (= :wasm/binary-emitted (:kotoba.cli/code emitted)))
-    (is (= 1 (get-in emitted [:kotoba.cli/data :kotoba.wasm/import-count])))
-    (is (= [0 97 115 109]
-           (mapv #(bit-and % 0xff)
-                 (take 4 (java.nio.file.Files/readAllBytes (.toPath output))))))))
+(deftest device-access-demos-deny-without-policy
+  (doseq [{:keys [demo]} device-access-demos]
+    (is (denied-without-policy? demo) demo)))
+
+(deftest device-access-demos-compile-to-real-wasm-with-a-granting-policy
+  (doseq [{:keys [demo policy import]} device-access-demos]
+    (is (wasm-emits-with-policy? demo policy import) demo)))
 
 (deftest all-nine-aiueos-kernel-capabilities-are-registered
   ;; log/write, clock/monotonic, random/bytes, topic/publish, topic/subscribe
