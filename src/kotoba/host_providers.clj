@@ -31,24 +31,17 @@
   The default handlers are deterministic Rust-free stubs (the interpreter
   slice has no real memory ABI); concrete native providers (pbcopy/pbpaste,
   an HTTP client, ...) plug in by passing a :handlers map to `host-call`."
-  (:require [kotoba.core.contracts :as core-contracts]
+  (:require [kotoba.cap-table :as cap-table]
+            [kotoba.core.contracts :as core-contracts]
             [kotoba.lang.capability-host :as capability-host]
             [kotoba.lang.capability-values :as capability-values]
             [kotoba.runtime :as runtime]))
 
 (def op->kind
   "Host-import op (capability contract symbol) -> capability kind understood
-  by kotoba.lang.capability-values/effect-for-kind."
-  {'notify-show :host/notify
-   'clipboard-read :host/clipboard-read
-   'clipboard-write :host/clipboard-write
-   'clipboard-write-str :host/clipboard-write
-   'http-fetch :host/http
-   'keychain-read :host/keychain-read
-   'keychain-write :host/keychain-write
-   'fs-read :host/fs-read
-   'fs-write :host/fs-write
-   'host-i64-roundtrip :host/ledger-append})
+  by kotoba.lang.capability-values/effect-for-kind. Owned by kotoba.runtime
+  (the static capability gate needs it too); aliased here for provider code."
+  runtime/op->kind)
 
 (defn op-capability
   "Contract capability name (e.g. \"clipboard/text\") for a host-import op."
@@ -172,3 +165,98 @@
                              {:kotoba.host/denied (:kotoba.host/denied outcome)
                               :kotoba.host/call op
                               :kotoba.host/receipt (:kotoba.host/receipt outcome)})))))))))
+
+;; ---------------------------------------------------------------------------
+;; Capability-passing (S4b): cap-acquire + <op>-with use variants
+
+(defn- use-receipt
+  [concrete now call outcome handle extra]
+  (merge (assoc (capability-values/receipt concrete now call)
+                :receipt/outcome outcome
+                :receipt/cap-handle handle)
+         extra))
+
+(defn host-call-with
+  "Build the capability-passing host-call fn: (fn [base-op handle args] result).
+
+  HANDLE must have been issued by kotoba.cap-table/acquire! on TABLE. The
+  stored capability IS the intersected one, so no re-intersection happens at
+  use time; expiry is re-checked against :now, and the capability kind must
+  match the op (kotoba.cap-table/resolve-use). Provider handlers are looked
+  up by the BASE op — a `<op>-with` call reaches the same provider as `<op>`,
+  only the authorization path differs. Every use — grant, denial (unknown
+  handle, kind mismatch, expiry), or handler error — leaves a receipt
+  carrying :receipt/cap-handle; :receipt/call is the `<op>-with` surface.
+  A denial throws ex-info with :kotoba.host/denied (fail closed, the provider
+  handler is never invoked)."
+  [table {:keys [record! now handlers]}]
+  (let [now (or now (str (java.time.LocalDate/now)))
+        handlers (or handlers default-handlers)]
+    (fn guarded-host-call-with [op handle args]
+      (let [kind (get op->kind op)
+            handler (get handlers op)
+            with-op (get runtime/op->with-op op)]
+        (when-not (and kind handler with-op)
+          (throw (ex-info "host op has no capability guard"
+                          {:kotoba.host/op op})))
+        (let [call (keyword "kotoba.host" (str with-op))
+              resolved (cap-table/resolve-use table handle kind now)]
+          (if-not (:ok? resolved)
+            (let [receipt (use-receipt (cap-table/resolve-cap table handle)
+                                       now call :denied handle
+                                       {:receipt/denied (:denied resolved)})]
+              (when record! (record! receipt))
+              (throw (ex-info "capability handle rejected at host-call time"
+                              {:kotoba.host/denied (:denied resolved)
+                               :kotoba.host/call with-op
+                               :kotoba.host/receipt receipt})))
+            (let [concrete (:cap resolved)
+                  invoked (try
+                            {:value (handler concrete (vec args))}
+                            (catch Exception e
+                              {:error e}))]
+              (if (contains? invoked :error)
+                (let [e (:error invoked)
+                      receipt (use-receipt concrete now call :error handle
+                                           {:receipt/error (or (ex-message e) (str e))})]
+                  (when record! (record! receipt))
+                  (throw e))
+                (let [receipt (use-receipt concrete now call :ok handle nil)]
+                  (when record! (record! receipt))
+                  (:value invoked))))))))))
+
+(defn capability-passing-fns
+  "Interpreter bindings for the S4b capability-passing surface: 'cap-acquire
+  plus every '<op>-with use variant (kotoba.runtime/op->with-op). Handles are
+  per-run, issued and resolved against TABLE (kotoba.cap-table/make-table).
+
+  (cap-acquire <kind-kw> <resource>) intersects policy ∩ grants ∩ requested
+  ONCE and returns the handle; a denial at acquisition throws the same
+  ex-info shape as a denied host call (:kotoba.host/denied, so the run fails
+  closed with a :host-call-denied problem and :kotoba.runtime/call
+  :cap/acquire). (<op>-with <handle> <args...>) resolves the handle through
+  `host-call-with` above."
+  [table policy {:keys [record! now] :as opts}]
+  (let [now (or now (str (java.time.LocalDate/now)))
+        opts (assoc opts :now now)
+        grants (policy-grants policy)
+        allow (local-policy policy)
+        call-with (host-call-with table opts)
+        acquire (fn cap-acquire [kind resource]
+                  (let [outcome (cap-table/acquire! table {:kind kind
+                                                           :resource resource
+                                                           :grants grants
+                                                           :policy allow
+                                                           :now now
+                                                           :record! record!})]
+                    (if (:kotoba.host/ok? outcome)
+                      (:kotoba.host/result outcome)
+                      (throw (ex-info "capability acquisition denied"
+                                      {:kotoba.host/denied (:kotoba.host/denied outcome)
+                                       :kotoba.host/call :cap/acquire
+                                       :kotoba.host/receipt (:kotoba.host/receipt outcome)})))))]
+    (into {'cap-acquire acquire}
+          (map (fn [[base with-op]]
+                 [with-op (fn [handle & args]
+                            (call-with base handle (vec args)))]))
+          runtime/op->with-op)))

@@ -51,6 +51,22 @@ const fs = require('fs');
 const imports = { kotoba: { host_i64_roundtrip: (v) => v + 1n }};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_i64_host.wasm'), imports).then(({instance}) => { if (instance.exports.main() !== 42n) process.exit(1); });
 NODE
+bin/kotoba-clj run src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --json
+bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --output target/kotoba/demo_cap_passing.wasm --json
+node - <<'NODE'
+const fs = require('fs');
+let memory;
+const caps = new Map(); let next = 1n;
+const text = (ptr, len) => new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+const imports = { kotoba: {
+  cap_acquire: (kindId, resPtr, resLen) => {
+    if (kindId !== 201 || text(resPtr, resLen) !== 'ledger:main') return 0n;
+    const handle = next++; caps.set(handle, { kind: kindId, resource: text(resPtr, resLen) }); return handle;
+  },
+  host_i64_roundtrip_with: (cap, code) => caps.has(cap) ? code + 1n : 0n
+}};
+WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_cap_passing.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 42n) process.exit(1); });
+NODE
 bin/kotoba-clj wasm emit src/demo_indirect.kotoba --output target/kotoba/demo_indirect.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_indirect.wasm")).then(({instance})=>{if(instance.exports.main()!==42) process.exit(1)})'
 bin/kotoba-clj wasm emit src/demo_alloc.kotoba --output target/kotoba/demo_alloc.wasm --json
@@ -142,6 +158,11 @@ These gates verify that:
 - `^:i64` function params/results and `i64` locals are emitted for direct calls;
 - `i64 -> i64` host imports can be emitted and called by standard WebAssembly
   runtimes using BigInt host values;
+- capability-passing (S4b): `cap-acquire` + `host-i64-roundtrip-with` are
+  policy-gated, run against the per-run capability table in the interpreter,
+  and emit the `kotoba.cap_acquire(i32,i32,i32) -> i64` /
+  `kotoba.host_i64_roundtrip_with(i64,i64) -> i64` import shapes whose handle
+  argument a standard WebAssembly host resolves at call time;
 - `call-indirect` emits a function table, element segment, and `call_indirect`
   for the current `i32 -> i32` table slice;
 - `has-capability?` requires an explicit policy and emits a deterministic
@@ -270,6 +291,55 @@ present is strictly additive). Provider handlers default to deterministic
 Rust-free stubs; concrete native providers (such as the `pbcopy`/`pbpaste`
 clipboard provider owned by `kotoba-lang/shell`) plug in through the
 `:handlers` registry of `kotoba.host-providers/host-call`.
+
+### Capability-passing (S4b)
+
+Capability values also flow as first-class arguments (S4b slice,
+ADR-safe-capability-language "capability の値渡し"):
+
+```sh
+bin/kotoba-clj run src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --json
+bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --output target/kotoba/demo_cap_passing.wasm --json
+```
+
+- `(cap-acquire <kind-kw> <resource>)` (e.g.
+  `(cap-acquire :host/ledger-append "ledger:main")`) runs the guard-call
+  intersection — policy ∩ CACAO grants ∩ requested — ONCE at acquisition and
+  returns an opaque i64 capability handle (positive, first handle 1; 0 is
+  never issued). The CONCRETE (post-intersection) capability is stored in a
+  per-run capability table (`kotoba.cap-table`); a denial never issues a
+  handle and fails the run closed with the usual `:host-call-denied` problem
+  (`:kotoba.runtime/call :cap/acquire`).
+- Guarded host ops gain `<op>-with` use variants whose leading argument is a
+  cap handle: `(host-i64-roundtrip-with cap (i64 41))`,
+  `(clipboard-read-with cap ptr len)`, ... At host-call time the handle is
+  resolved back to the stored concrete capability — no re-intersection is
+  needed because the stored cap IS the intersected one — but expiry is
+  re-checked against the use-time clock and the capability kind must match
+  the op, so stale (`:expired`), forged (`:unknown-cap-handle`), and
+  mis-presented (`:cap-kind-mismatch`) handles all fail closed before the
+  provider handler runs.
+- Receipts are recorded on acquisition (`:receipt/call :cap/acquire`) AND on
+  each use (`:receipt/call :kotoba.host/<op>-with`), both carrying
+  `:receipt/cap-handle`, in the same `:kotoba.host/receipts` journal.
+- Effect/capability consistency: when a `defn` declares an `:effects` row
+  (metadata on the function name, e.g.
+  `(defn ^{:effects #{:host/ledger-append}} main [] ...)`), every capability
+  kind the body acquires or uses through a handle must be covered by the row
+  (`kotoba.lang.capability-values/effects-consistent?`); under-declaration is
+  rejected at check/emit time as `:cap-effect-under-declared`.
+- Wasm slice: ONE demonstration import shape is compiled end-to-end.
+  `cap-acquire` emits `kotoba.cap_acquire(kind_id: i32, res_ptr: i32,
+  res_len: i32) -> i64` (kind ids reuse the contract capability id for 1:1
+  capability↔kind mappings — `:host/ledger-append` → 201 — and literal
+  resource strings ride the existing data-segment pointer+length ABI), and
+  `host-i64-roundtrip-with` emits `kotoba.host_i64_roundtrip_with(cap: i64,
+  code: i64) -> i64`, threading the handle as a first-class i64 argument
+  through the compiled module. These two ops are a launcher-owned extension
+  of the host-import surface (`kotoba.runtime/cap-passing-imports`); the core
+  capability contract stays authoritative for the base ops, and the other
+  `<op>-with` variants remain interpreter-only in this slice (the host
+  binding that resolves handles is demonstrated by the node gate above).
 
 ## Package admission
 
