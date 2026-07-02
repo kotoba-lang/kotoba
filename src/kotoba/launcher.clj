@@ -19,7 +19,8 @@
             [kotoba.rad-adapter :as rad-adapter]
             [kotoba.package-admission :as package-admission]
             [kotoba.runtime :as runtime]
-            [kotoba.selfhost.contracts :as selfhost]))
+            [kotoba.selfhost.contracts :as selfhost]
+            [kotoba.wasm-exec :as wasm-exec]))
 
 (defn result->exit [result]
   (if (:kotoba.cli/ok? result) 0 1))
@@ -626,15 +627,86 @@
                 (fnil assoc {})
                 :kotoba.package/receipt (:kotoba.admission/receipt admission))))))
 
+(def ^:private kgraph-ops
+  #{'kgraph-assert! 'kgraph-retract! 'kgraph-get-objects 'kgraph-query})
+
+(defn wasm-run-result*
+  "`wasm run <source>`: check + emit (as `wasm emit` does), then actually
+  EXECUTE the module via kotoba.wasm-exec (com.dylibso.chicory) — the piece
+  `wasm emit` deliberately stops short of. kgraph-* host imports run for real
+  against a fresh per-invocation `kotoba.kgraph` store; every other declared
+  host import gets a trivial 0-returning stub (kotoba.wasm-exec/
+  stub-host-function), matching kotoba.host-providers/default-handlers'
+  convention, so a valid program never fails to link here for lack of a real
+  native provider."
+  [argv]
+  (let [normalized-argv (normalize-source-argv (vec (cons "run" (rest argv))))
+        plan (source-argv-plan normalized-argv)
+        policy-result (policy-result argv)
+        policy (:kotoba.policy/data policy-result)]
+    (cond
+      (not (:kotoba.policy/ok? policy-result))
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :wasm/policy-not-readable
+       :kotoba.cli/data policy-result}
+
+      (nil? plan)
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :wasm/missing-source
+       :kotoba.cli/data {:kotoba.wasm/usage "kotoba wasm run <source> [--policy <path>]"}}
+
+      (not (source-file-readable? plan))
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :wasm/source-not-readable
+       :kotoba.cli/data {:kotoba.source/path (:kotoba.source/path plan)}}
+
+      :else
+      (let [forms (runtime/read-file (:kotoba.source/path plan)
+                                     (:kotoba.source/reader-target plan))
+            checked (runtime/check (safe-analyzer-fact-classification) plan forms policy)
+            wasm (when (:kotoba.runtime/ok? checked) (runtime/wasm-binary forms policy))]
+        (cond
+          (not (:kotoba.runtime/ok? checked))
+          {:kotoba.cli/ok? false
+           :kotoba.cli/code :wasm/check-failed
+           :kotoba.cli/data {:kotoba.launcher/source-plan plan
+                             :kotoba.runtime/result checked}}
+
+          (not (:kotoba.wasm/ok? wasm))
+          {:kotoba.cli/ok? false
+           :kotoba.cli/code :wasm/binary-unsupported
+           :kotoba.cli/data {:kotoba.launcher/source-plan plan
+                             :kotoba.runtime/result checked
+                             :kotoba.wasm/problems (:kotoba.wasm/problems wasm)}}
+
+          :else
+          (let [ops (runtime/required-host-imports forms)
+                stub-fns (->> ops
+                              (remove kgraph-ops)
+                              (map runtime/host-imports)
+                              (map wasm-exec/stub-host-function))
+                instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
+                                                (concat (wasm-exec/kgraph-host-functions (atom []))
+                                                        stub-fns))
+                value (wasm-exec/call-main instance)]
+            {:kotoba.cli/ok? true
+             :kotoba.cli/code :wasm/run-completed
+             :kotoba.cli/data {:kotoba.launcher/source-plan plan
+                               :kotoba.wasm/value value
+                               :kotoba.wasm/result-type (:kotoba.wasm/result-type wasm)
+                               :kotoba.wasm/import-count (:kotoba.wasm/import-count wasm)
+                               :kotoba.wasm/imports (:kotoba.wasm/imports wasm)}}))))))
+
 (defn wasm-result
   "Handle launcher-owned Wasm-facing commands."
   [argv]
   (case (second argv)
     "emit" (wasm-emit-result argv)
+    "run" (wasm-run-result* argv)
     {:kotoba.cli/ok? false
      :kotoba.cli/code :wasm/unknown-command
      :kotoba.cli/data {:kotoba.wasm/command (second argv)
-                       :kotoba.wasm/commands ["emit"]}}))
+                       :kotoba.wasm/commands ["emit" "run"]}}))
 
 (defn -main [& argv]
   (let [result (dispatch argv)]

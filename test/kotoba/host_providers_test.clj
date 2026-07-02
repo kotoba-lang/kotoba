@@ -1,5 +1,6 @@
 (ns kotoba.host-providers-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.host-providers :as host-providers]
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime])
@@ -118,6 +119,22 @@
     (is (= 41 (host-call 'host-i64-roundtrip [41])))
     (is (= :host/ledger-append (:cap/kind @seen)))
     (is (= "ledger:main" (:cap/resource @seen)))))
+
+(deftest kgraph-handlers-real-eavt-round-trip
+  (testing "kgraph-handlers (kotoba.kgraph-backed, not a 0-returning stub) really stores and queries"
+    (let [store (atom [])
+          policy {:kotoba.policy/capabilities #{:graph/kotoba}}
+          host-call (host-providers/host-call policy {:handlers (host-providers/kgraph-handlers store)})]
+      (is (zero? (host-call 'kgraph-assert! ["[1 :name :aoi]"])))
+      (is (zero? (host-call 'kgraph-assert! ["[1 :age 7]"])))
+      (is (= 2 (count @store)))
+      (is (= [[:aoi]]
+             (edn/read-string
+              (host-call 'kgraph-query ["{:find [?v] :where [[1 :name ?v]]}"]))))
+      (is (= [[1 :name :aoi] [1 :age 7]]
+             (edn/read-string (host-call 'kgraph-get-objects ["1"]))))
+      (is (zero? (host-call 'kgraph-retract! ["[1 :age 7]"])))
+      (is (= 1 (count @store))))))
 
 (deftest guarded-run-binds-has-capability-query
   (let [result (launcher/dispatch ["run" "src/demo_cap.kotoba"

@@ -31,8 +31,10 @@
   The default handlers are deterministic Rust-free stubs (the interpreter
   slice has no real memory ABI); concrete native providers (pbcopy/pbpaste,
   an HTTP client, ...) plug in by passing a :handlers map to `host-call`."
-  (:require [kotoba.cap-table :as cap-table]
+  (:require [clojure.edn :as edn]
+            [kotoba.cap-table :as cap-table]
             [kotoba.core.contracts :as core-contracts]
+            [kotoba.kgraph :as kgraph]
             [kotoba.lang.capability-host :as capability-host]
             [kotoba.lang.capability-values :as capability-values]
             [kotoba.runtime :as runtime]))
@@ -123,8 +125,12 @@
   "Deterministic Rust-free provider stubs, keyed by host-import op. Each
   handler is (fn [concrete-cap args] result). host-i64-roundtrip echoes its
   argument (matching the interpreter builtin); the pointer-ABI providers
-  return 0 (the success status of the provider result ABI). Real native
-  providers replace these via the :handlers option of `host-call`."
+  return 0 (the success status of the provider result ABI) since the
+  interpreter has no real memory to read a ptr/len pair out of — `str-ptr`
+  always evaluates to 0 here (kotoba.runtime/builtin-fns). Real native
+  providers (or, for kgraph-*, `kgraph-handlers` below / kotoba.wasm-exec's
+  Chicory host functions for genuine WASM execution) replace these via the
+  :handlers option of `host-call`."
   {'notify-show (fn [_cap _args] 0)
    'clipboard-read (fn [_cap _args] 0)
    'clipboard-write (fn [_cap _args] 0)
@@ -134,7 +140,34 @@
    'keychain-write (fn [_cap _args] 0)
    'fs-read (fn [_cap _args] 0)
    'fs-write (fn [_cap _args] 0)
-   'host-i64-roundtrip (fn [_cap args] (first args))})
+   'host-i64-roundtrip (fn [_cap args] (first args))
+   'kgraph-assert! (fn [_cap _args] 0)
+   'kgraph-retract! (fn [_cap _args] 0)
+   'kgraph-get-objects (fn [_cap _args] 0)
+   'kgraph-query (fn [_cap _args] 0)})
+
+(defn kgraph-handlers
+  "Real (non-stub) interpreter-mode kgraph-* handlers backed by STORE (an
+  atom of `kotoba.kgraph` datoms; a fresh one per call when omitted). Unlike
+  the memory-ABI-oriented default stubs, these read their FIRST argument as a
+  literal EDN string directly (the interpreter has no linear memory to marshal
+  a ptr/len pair through, so callers pass the request/query EDN as a plain
+  string literal instead of `(str-ptr ...)`). Pass as `:handlers` to
+  `host-call`/`guarded-run-result` to exercise the real store from `run`
+  without going through kotoba.wasm-exec's WASM/Chicory path."
+  ([] (kgraph-handlers (atom [])))
+  ([store]
+   (merge default-handlers
+          {'kgraph-assert! (fn [_cap [datom-edn]]
+                             (swap! store kgraph/assert-datom (edn/read-string datom-edn))
+                             0)
+           'kgraph-retract! (fn [_cap [datom-edn]]
+                              (swap! store kgraph/retract-datom (edn/read-string datom-edn))
+                              0)
+           'kgraph-get-objects (fn [_cap [entity-edn]]
+                                 (pr-str (kgraph/get-objects @store (edn/read-string entity-edn))))
+           'kgraph-query (fn [_cap [query-edn]]
+                           (pr-str (kgraph/query @store (edn/read-string query-edn))))})))
 
 (defn journal
   "Append-only receipt recorder ({:record! fn :entries fn}) for a guarded run."
