@@ -144,7 +144,23 @@
    'kgraph-assert! (fn [_cap _args] 0)
    'kgraph-retract! (fn [_cap _args] 0)
    'kgraph-get-objects (fn [_cap _args] 0)
-   'kgraph-query (fn [_cap _args] 0)})
+   'kgraph-query (fn [_cap _args] 0)
+   ;; aiueos default kernel capabilities (ADR-2607022700) -- deterministic
+   ;; stubs like every other provider here; a native aiueos kototama adapter
+   ;; (wasmtime hosting, real MMIO/DMA/IRQ) plugs in via :handlers, never by
+   ;; editing these defaults. i64-result ops return 0 (a null/no-op
+   ;; sentinel, same convention as the ptr/len ABI's 0-status stubs above).
+   'log-write (fn [_cap _args] 0)
+   'clock-monotonic (fn [_cap _args] 0)
+   'random-bytes (fn [_cap _args] 0)
+   'topic-publish (fn [_cap _args] 0)
+   'topic-poll (fn [_cap _args] 0)
+   'topic-take (fn [_cap _args] 0)
+   'topic-count (fn [_cap _args] 0)
+   'pci-config (fn [_cap _args] 0)
+   'dma-map (fn [_cap _args] 0)
+   'irq-subscribe (fn [_cap _args] 0)
+   'mmio-map (fn [_cap _args] 0)})
 
 (defn kgraph-handlers
   "Real (non-stub) interpreter-mode kgraph-* handlers backed by STORE (an
