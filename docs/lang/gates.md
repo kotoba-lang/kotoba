@@ -341,6 +341,45 @@ bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passi
   `<op>-with` variants remain interpreter-only in this slice (the host
   binding that resolves handles is demonstrated by the node gate above).
 
+### CACAO delegation chains (`run --cacao`)
+
+The CACAO grant side of the intersection can come from a REAL verified
+delegation chain instead of the policy EDN:
+
+```sh
+bin/kotoba-clj run src/demo_i64_host.kotoba --cacao chain.edn --json
+bin/kotoba-clj run src/demo_i64_host.kotoba --cacao chain.edn --policy policy.edn --json
+```
+
+- `--cacao <file>` names an EDN file carrying `{:cacao/chain ["b64" ...]}`
+  (or a plain EDN vector of base64 CACAO strings), root link first. The
+  launcher verifies the chain with real crypto —
+  `cacao.core/verify-chain` from `kotoba-lang/cacao` checks every link's
+  Ed25519 signature, the `iss`/`aud` re-issuance linkage, resource
+  attenuation (child ⊆ parent, trailing-`*` wildcard), expiry ordering, and
+  freshness at the current instant — then maps the VERIFIED result to grants
+  through the crypto-free `kotoba.lang.capability-cacao/grants-from-chain`
+  (`kotoba://cap/<kind>/<resource>` URIs; unknown kinds are skipped, never
+  granted).
+- Those grants replace the policy-derived grants in the existing guarded run
+  (`policy ∩ grants ∩ requested`, receipts in `:kotoba.host/receipts` with
+  `"cacao:<root-iss>:<index>"` provenance). With `--policy`, the local policy
+  narrows the chain's resource set exactly as it narrows policy grants.
+  Without `--policy`, the local policy is synthesized to allow whatever the
+  chain grants (`kotoba.host-providers/grants->policy`) — the policy remains
+  the narrowing side, and omitting it means "no extra narrowing", never "more
+  authority than the chain".
+- An invalid, tampered, escalating, or expired chain aborts the run with
+  `:run/cacao-invalid` (the chain problems ride in
+  `:kotoba.cacao/problems`) BEFORE any execution; an unreadable chain file is
+  `:run/cacao-not-readable`. A successful run attaches
+  `:kotoba.cacao/root-iss`, `:kotoba.cacao/holder`, and
+  `:kotoba.cacao/depth` next to `:kotoba.host/receipts` in the result JSON.
+- The chain gate is exercised end-to-end by `clojure -M:test`
+  (`test/kotoba/cacao_run_test.clj` mints real 2-link chains in-process with
+  deterministic Ed25519 seeds — grant, escalation, tamper, expiry, and
+  policy-narrowing cases).
+
 ## Package admission
 
 Safe execution rejects unsafe package inputs end-to-end (issue #262, security

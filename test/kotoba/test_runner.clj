@@ -1,6 +1,7 @@
 (ns kotoba.test-runner
   "Aggregate test entry point for `clojure -M:test`."
   (:require [clojure.test :refer [run-tests]]
+            [kotoba.cacao-run-test]
             [kotoba.cap-passing-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
@@ -8,7 +9,8 @@
             [kotoba.package-admission-test]))
 
 (defn -main [& _]
-  (let [{:keys [fail error]} (run-tests 'kotoba.cap-passing-test
+  (let [{:keys [fail error]} (run-tests 'kotoba.cacao-run-test
+                                        'kotoba.cap-passing-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
                                         'kotoba.launcher-test
