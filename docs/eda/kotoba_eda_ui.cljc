@@ -1,17 +1,17 @@
-(ns kotoba.eda.ui
+(ns kotoba-eda-ui
   "Hiccup source for the kotoba EDA Flow Workbench page (docs/eda/index.html).
 
   This is the canonical, data-driven shape of the deployed page: every id and
   class the page's JS (resources/eda_app.js) touches via getElementById /
   querySelector is declared here, once, as hiccup data — not hand-typed HTML
   strings. `page` assembles the full document (head/style via
-  kotoba.eda.style + body markup below + the JS as a raw <script> block) and
+  kotoba-eda-style + body markup below + the JS as a raw <script> block) and
   is rendered to docs/eda/index.html by build.clj via kotoba.html/html5.
 
   Kept in sync with the ids/classes resources/eda_app.js queries — grep that
   file for `$(\"...\")` / `querySelectorAll` before renaming or removing any
   id/class declared below."
-  (:require [kotoba.eda.style :as style]))
+  (:require [kotoba-eda-style :as style]))
 
 (defn nav []
   [:nav
@@ -253,13 +253,18 @@
 (defn body [script-text]
   [:body
    (nav)
-   [:main (hero) (workspace)]
+   ;; #app is the reagent mount point (kotoba_eda_app.cljs): the SSR content
+   ;; below is the initial/no-JS-fallback paint, reagent's rdom/render
+   ;; replaces it on load. `id="eda-canvas"` inside (viewer-panel) is
+   ;; recreated by reagent with the same id — the kami-engine
+   ;; data-kami-engine="render-ir" contract survives the remount.
+   [:main#app (hero) (workspace)]
    [:script script-text]])
 
 (defn page
   "Full document hiccup for docs/eda/index.html. `script-text` is the
-  page's JS (resources/eda_app.js), embedded verbatim as a raw <script>
-  block — see the ns docstring for why the JS itself is not rewritten here."
+  compiled reagent app bundle (resources/eda_app.compiled.js, built from
+  kotoba_eda_app.cljs), embedded verbatim as a raw <script> block."
   [script-text]
   [:html {:lang "ja"}
    (head (style/page-css))

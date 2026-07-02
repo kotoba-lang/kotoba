@@ -1,6 +1,6 @@
-(ns kotoba.eda.style
+(ns kotoba-eda-style
   "kotoba EDA Flow Workbench page CSS, as css.core EDN rule data — the
-  page-authoring counterpart to kotoba.eda.ui's hiccup. Rendered to a CSS
+  page-authoring counterpart to kotoba-eda-ui's hiccup. Rendered to a CSS
   string via css.core/css (see kotoba-lang/css), the same EDN-to-CSS
   substrate liquid-glass-ui uses. This namespace owns exactly the ruleset
   that used to be the hand-typed <style> block in docs/eda/index.html —

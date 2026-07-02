@@ -1,21 +1,21 @@
-(ns kotoba.eda.selftest
-  "Asserts the CLJC-generated page still carries every id/class
-  resources/eda_app.js depends on, and that the JS + CSS made it through
-  unmodified. Not a cognitect-test-runner suite: kotoba_eda_ui.cljc /
-  kotoba_eda_style.cljc are flat-file `load-file`d (see kotoba_eda_build.clj
-  docstring for why — source.html serves them by flat filename), so they
-  aren't on a normal classpath a namespace-discovering test runner can find.
+(ns kotoba-eda-selftest
+  "Asserts the CLJC-generated page still carries every id/class the reagent
+  app (kotoba_eda_app.cljs, compiled to resources/main.js)
+  depends on, and that the compiled bundle + CSS made it through intact.
+  Not a cognitect-test-runner suite: kotoba_eda_ui.cljc / kotoba_eda_style.cljc
+  are flat single-segment namespaces (see kotoba_eda_build.clj docstring for
+  why — source.html serves them by flat filename), which plain `require`
+  resolves fine off this dir's `:paths [\".\"]` root.
 
   Run from this directory: clojure -M:test"
   (:require [clojure.test :refer [deftest is run-tests]]
             [clojure.string :as str]
-            [kotoba.html :as html]))
+            [kotoba.html :as html]
+            [kotoba-eda-style]
+            [kotoba-eda-ui :as ui]))
 
-(load-file "kotoba_eda_style.cljc")
-(load-file "kotoba_eda_ui.cljc")
-
-(def script (slurp "resources/eda_app.js"))
-(def doc (html/html5 (kotoba.eda.ui/page script)))
+(def script (slurp "resources/main.js"))
+(def doc (html/html5 (ui/page script)))
 
 ;; every $("...") / getElementById target the JS actually uses
 (def js-ids
@@ -52,6 +52,7 @@
   (is (str/starts-with? doc "<!DOCTYPE html>"))
   (is (str/includes? doc "<html lang=\"ja\">")))
 
-(let [{:keys [fail error]} (run-tests 'kotoba.eda.selftest)]
-  (when (or (pos? fail) (pos? error))
-    (System/exit 1)))
+(defn -main [& _args]
+  (let [{:keys [fail error]} (run-tests 'kotoba-eda-selftest)]
+    (when (or (pos? fail) (pos? error))
+      (System/exit 1))))
