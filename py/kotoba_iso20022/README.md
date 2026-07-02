@@ -281,4 +281,3 @@ full surface.
 - `40-engine/kotoba_kawase/` — kawase-yui Python facade (sibling)
 - `50-infra/warifu-gateway/iso8583-map.md` — sibling cleanroom (card-side ISO 8583)
 - `90-docs/adr/2605262130` + `2605312345` — kotoba Datom first-class state
-- `/CHARTER-RIDER.md` — §2(c) + §2(e) cleanroom basis

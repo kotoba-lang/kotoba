@@ -638,7 +638,4 @@ HTTP loadtest matrix, and operator-UX defaults.
 
 ## License
 
-Apache-2.0 with the **etzhayyim Charter Compliance Rider v2.0** — see
-[LICENSE](LICENSE), [NOTICE](NOTICE), and [CHARTER-RIDER.md](CHARTER-RIDER.md).
-Acceptance of the Apache License 2.0 constitutes acceptance of the Rider
-(Mission Charter ADR-2605192100; Rider ADR-2605192200 v2.0).
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
