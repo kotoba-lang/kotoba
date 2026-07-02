@@ -1,5 +1,13 @@
 # ADR — Kotoba to Wasm compiler path (`kotoba wasm`)
 
+> **⚠ 2026-07-02: この ADR は `Implementation crate: crates/kotoba-clj`(Rust)を
+> 前提に書かれているが、その crate は除去済み(`README.md`: "Legacy Rust crates
+> ... have been removed")。現行の JVM Clojure 実装(`kotoba.runtime`/
+> `kotoba.launcher`)が実際に WASM を emit・実行する経路は
+> [`ADR-kotoba-wasm-clj-execution.md`](ADR-kotoba-wasm-clj-execution.md) を参照。
+> 本 ADR は当時の設計判断(capability broker/aiueos/CID-addressed grants 等、
+> 現行実装より遥かに大きい構想)の歴史的記録として残す。**
+
 Status: **Accepted (steps 1–3 + 5 done; runs on kotoba-runtime. Only step 4 left)**
 Date: 2026-06-08 (steps 1–2), 2026-06-09 (steps 3 + 5, incl. live invoke)
 Implementation crate: `crates/kotoba-clj`

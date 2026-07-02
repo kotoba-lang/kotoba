@@ -8,7 +8,8 @@
 > 実行可能な WASM MVP バイナリを生成し `kotoba.wasm-exec`(com.dylibso.chicory)
 > が実際に実行する。旧称 **KQE(Kotoba Query Engine)は現行実装では `kgraph`**
 > に改称した(assert/retract という書き込みも含む EAVT グラフストアであり
-> "query" だけではないため)。以下の crate 表・KQE 記述は移行記録として保持する。**
+> "query" だけではないため)。詳細は `docs/ADR-kotoba-wasm-clj-execution.md`。
+> 以下の crate 表・KQE 記述は移行記録として保持する。**
 
 KOTOBA: Content-Addressed Distributed Datalog Database.
 
