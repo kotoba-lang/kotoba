@@ -7,6 +7,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [kotoba.core.contracts :as core-contracts]
+            [kotoba.lang.capability-values :as capability-values]
             [clojure.tools.reader :as reader]
             [clojure.tools.reader.reader-types :as reader-types]))
 
@@ -110,11 +111,63 @@
   [value]
   (core-contracts/capability-id capability-contract value))
 
+(def cap-passing-imports
+  "S4b capability-passing extension of the host-import surface, owned by this
+  launcher slice (the core capability contract stays authoritative for the
+  base ops). `cap-acquire` intersects policy ∩ grants ∩ requested ONCE at the
+  host boundary and returns an opaque i64 capability handle; the single
+  demonstration use shape `host-i64-roundtrip-with` threads that handle as a
+  first-class argument through compiled wasm and is resolved back to the
+  stored concrete capability at host-call time."
+  {'cap-acquire {:module "kotoba"
+                 :field "cap_acquire"
+                 :params [:i32 :i32 :i32]
+                 :result :i64}
+   'host-i64-roundtrip-with {:module "kotoba"
+                             :field "host_i64_roundtrip_with"
+                             :capability "ledger/append"
+                             :params [:i64 :i64]
+                             :result :i64}})
+
 (def host-imports
-  (core-contracts/host-imports capability-contract))
+  (merge (core-contracts/host-imports capability-contract)
+         cap-passing-imports))
 
 (def host-import-order
-  (core-contracts/host-import-order capability-contract))
+  (into (core-contracts/host-import-order capability-contract)
+        ['cap-acquire 'host-i64-roundtrip-with]))
+
+(def op->kind
+  "Host-import op (capability contract symbol) -> capability kind understood
+  by kotoba.lang.capability-values/effect-for-kind."
+  {'notify-show :host/notify
+   'clipboard-read :host/clipboard-read
+   'clipboard-write :host/clipboard-write
+   'clipboard-write-str :host/clipboard-write
+   'http-fetch :host/http
+   'keychain-read :host/keychain-read
+   'keychain-write :host/keychain-write
+   'fs-read :host/fs-read
+   'fs-write :host/fs-write
+   'host-i64-roundtrip :host/ledger-append})
+
+(def with-op->op
+  "Capability-passing use variant (`<op>-with`, leading argument a capability
+  handle from `cap-acquire`) -> base host-import op."
+  (into {} (map (fn [[op _]] [(symbol (str op "-with")) op])) op->kind))
+
+(def op->with-op
+  "Base host-import op -> its capability-passing `<op>-with` use variant."
+  (into {} (map (fn [[with-op op]] [op with-op])) with-op->op))
+
+(def kind->capability
+  "Capability kind -> contract capability name, derived from op->kind and the
+  host-import contract."
+  (into {}
+        (keep (fn [[op kind]]
+                (when-let [cap (get-in host-imports [op :capability])]
+                  [kind cap])))
+        op->kind))
 
 (defn policy-capabilities
   [policy]
@@ -131,6 +184,14 @@
              (cond
                (= 'has-capability? op)
                (swap! caps conj (second node))
+
+               (= 'cap-acquire op)
+               (when-let [cap (get kind->capability (second node))]
+                 (swap! caps conj cap))
+
+               (contains? with-op->op op)
+               (swap! caps conj (get-in host-imports
+                                        [(get with-op->op op) :capability]))
 
                (get-in host-imports [op :capability])
                (swap! caps conj (get-in host-imports [op :capability]))))))
@@ -164,6 +225,25 @@
              (denied head)
              (swap! problems conj {:kotoba.runtime/problem :denied-form
                                    :kotoba.runtime/form head})
+
+             (= "cap-acquire" head)
+             (let [kind (second node)
+                   cap-name (get kind->capability kind)]
+               (cond
+                 (nil? cap-name)
+                 (swap! problems conj {:kotoba.runtime/problem :unknown-capability-kind
+                                       :kotoba.runtime/kind (pr-str kind)})
+
+                 (not (contains? allowed-caps cap-name))
+                 (swap! problems conj {:kotoba.runtime/problem :capability-not-granted
+                                       :kotoba.runtime/capability cap-name})))
+
+             (contains? with-op->op (first node))
+             (let [cap-name (get-in host-imports
+                                    [(get with-op->op (first node)) :capability])]
+               (when-not (contains? allowed-caps cap-name)
+                 (swap! problems conj {:kotoba.runtime/problem :capability-not-granted
+                                       :kotoba.runtime/capability cap-name})))
 
              (contains? host-imports (first node))
              (let [op (first node)
@@ -279,10 +359,51 @@
      :kotoba.runtime/expression-count (count expressions)
      :kotoba.runtime/fn-count (count fns)}))
 
+(defn- acquired-kinds
+  "Capability kinds acquired (`cap-acquire`) or used through a capability
+  handle (`<op>-with`) anywhere inside FORM."
+  [form]
+  (let [kinds (atom [])]
+    (walk-forms
+     (fn [node]
+       (when (seq? node)
+         (let [op (first node)]
+           (cond
+             (= 'cap-acquire op)
+             (swap! kinds conj (second node))
+
+             (contains? with-op->op op)
+             (swap! kinds conj (get op->kind (get with-op->op op)))))))
+     form)
+    (vec (distinct @kinds))))
+
+(defn cap-effect-problems
+  "S4b effect/capability consistency: when a `defn` declares an :effects row
+  (metadata on the function name), every capability kind its body acquires
+  with `cap-acquire` or uses through a `<op>-with` handle must be covered by
+  the row (kotoba.lang.capability-values/effects-consistent?).
+  Under-declaration is rejected; functions without a declared row are not
+  checked by this slice."
+  [forms]
+  (vec
+   (for [form forms
+         :when (and (seq? form) (= 'defn (first form)))
+         :let [[_ fn-name] form
+               row (:effects (meta fn-name))]
+         :when (some? row)
+         :let [kinds (acquired-kinds (drop 2 form))
+               checked (capability-values/effects-consistent?
+                        row (map (fn [kind] {:cap/kind kind}) kinds))]
+         :when (not (:ok? checked))]
+     {:kotoba.runtime/problem :cap-effect-under-declared
+      :kotoba.runtime/fn (str fn-name)
+      :kotoba.runtime/missing (:missing checked)})))
+
 (defn check
   ([safe-facts source-plan forms] (check safe-facts source-plan forms nil))
   ([safe-facts source-plan forms policy]
-  (let [problems (vec (source-problems safe-facts forms policy))
+  (let [problems (vec (concat (source-problems safe-facts forms policy)
+                              (cap-effect-problems forms)))
         ir (when (empty? problems)
              (compile-forms source-plan forms))]
     {:kotoba.runtime/ok? (empty? problems)
@@ -295,7 +416,8 @@
   [forms host-call]
   (into {}
         (keep (fn [op]
-                (when (get-in host-imports [op :capability])
+                (when (and (get-in host-imports [op :capability])
+                           (not (contains? with-op->op op)))
                   [op (fn [& args] (host-call op (vec args)))])))
         (required-host-imports forms)))
 
@@ -306,18 +428,22 @@
   {:policy           <policy EDN, used for the static capability check>
    :host-call        <fn [op args] -> result; every capability-bearing
                       host-import op is dispatched through it>
-   :capability-query <fn [cap] -> boolean, bound as has-capability?>}
+   :capability-query <fn [cap] -> boolean, bound as has-capability?>
+   :host-fns         <map of extra interpreter bindings (symbol -> fn), used
+                      by the S4b capability-passing surface: cap-acquire and
+                      the <op>-with use variants>}
 
   Without OPTS behavior is unchanged: host-import ops are statically rejected
   as :capability-not-granted. With a guard installed, a denied host call
   (ex-info carrying :kotoba.host/denied) fails the run closed with a
   :host-call-denied problem; the provider is never invoked."
   ([safe-facts source-plan forms] (run safe-facts source-plan forms nil))
-  ([safe-facts source-plan forms {:keys [policy host-call capability-query]}]
+  ([safe-facts source-plan forms {:keys [policy host-call capability-query host-fns]}]
    (let [{:kotoba.runtime/keys [ok? problems ir]} (check safe-facts source-plan forms policy)
          fns (into {} (keep function-def forms))
          env-fns (cond-> fns
                    host-call (merge (guarded-host-fns forms host-call))
+                   host-fns (merge host-fns)
                    (and host-call capability-query)
                    (assoc 'has-capability? capability-query))]
      (if-not ok?
@@ -439,6 +565,22 @@
                            (+ (:offset entry) (:length entry)))
                          layout))
    16))
+
+(def wasm-cap-kind-ids
+  "Capability kind -> deterministic i32 id for the `cap_acquire` wasm import.
+  Only kinds whose contract capability maps to exactly one kind are exposed
+  (the id reuses the contract capability id, keeping the boundary 1:1);
+  many-kind capabilities (clipboard, keychain, fs) stay interpreter-only in
+  this slice."
+  (let [kinds-by-cap (reduce (fn [acc [kind cap]]
+                               (update acc cap (fnil conj #{}) kind))
+                             {}
+                             kind->capability)]
+    (into {}
+          (keep (fn [[kind cap]]
+                  (when (= 1 (count (get kinds-by-cap cap)))
+                    [kind (capability-id cap)])))
+          kind->capability)))
 
 (defn vec-bytes
   [items]
@@ -748,6 +890,31 @@
 
                     :else
                     {:bytes (bcat [0x41] (sleb32 (nth bytes idx)))}))
+        cap-acquire (let [[kind resource] args
+                          kind-id (get wasm-cap-kind-ids kind)
+                          entry (get (:memory fns) resource)]
+                      (cond
+                        (not= 2 (count args))
+                        {:problem {:kotoba.wasm/problem :arity
+                                   :kotoba.wasm/op "cap-acquire"
+                                   :kotoba.wasm/expected 2
+                                   :kotoba.wasm/actual (count args)}}
+
+                        (nil? kind-id)
+                        {:problem {:kotoba.wasm/problem :unsupported-capability-kind
+                                   :kotoba.wasm/op "cap-acquire"
+                                   :kotoba.wasm/kind (pr-str kind)}}
+
+                        (not (and (string? resource) entry))
+                        {:problem {:kotoba.wasm/problem :unsupported-cap-resource
+                                   :kotoba.wasm/op "cap-acquire"}}
+
+                        :else
+                        {:bytes (bcat [0x41] (sleb32 kind-id)
+                                      [0x41] (sleb32 (:offset entry))
+                                      [0x41] (sleb32 (:length entry))
+                                      [0x10] (uleb (get fns 'cap-acquire)))
+                         :result-type :i64}))
         has-capability? (let [cap (first args)]
                           (if-let [id (capability-id cap)]
                             {:bytes (bcat [0x41] (sleb32 id)

@@ -8,6 +8,7 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [kotoba.cap-table :as cap-table]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
             [kotoba.host-providers :as host-providers]
@@ -322,17 +323,25 @@
   kotoba.lang.capability-host/guard-call with grants/local policy derived from
   the policy EDN. The ordered receipt journal is attached to the result as
   :kotoba.host/receipts. HANDLERS optionally overrides the provider handler
-  registry (kotoba.host-providers/default-handlers)."
+  registry (kotoba.host-providers/default-handlers).
+
+  The run also installs the S4b capability-passing surface: a per-run
+  capability table (kotoba.cap-table) behind `cap-acquire` and the `<op>-with`
+  use variants, sharing the same receipt journal and provider handlers."
   ([safe-facts plan forms policy] (guarded-run-result safe-facts plan forms policy nil))
   ([safe-facts plan forms policy handlers]
    (let [{:keys [record! entries]} (host-providers/journal)
-         host-call (host-providers/host-call policy
-                                             (cond-> {:record! record!}
-                                               handlers (assoc :handlers handlers)))
+         now (str (java.time.LocalDate/now))
+         opts (cond-> {:record! record! :now now}
+                handlers (assoc :handlers handlers))
+         host-call (host-providers/host-call policy opts)
+         cap-table (cap-table/make-table)
+         cap-fns (host-providers/capability-passing-fns cap-table policy opts)
          ran (runtime/run safe-facts plan forms
                           {:policy policy
                            :host-call host-call
-                           :capability-query (host-providers/capability-query-fn policy)})]
+                           :capability-query (host-providers/capability-query-fn policy)
+                           :host-fns cap-fns})]
      (assoc ran :kotoba.host/receipts (entries)))))
 
 (defn runtime-result
