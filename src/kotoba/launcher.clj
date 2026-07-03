@@ -22,13 +22,19 @@
             [kotoba.selfhost.contracts :as selfhost]
             [kotoba.wasm-exec :as wasm-exec]))
 
-(defn result->exit [result]
+(defn result->exit
+  "Process exit code for a `:kotoba.cli/ok?` result map: 0 when ok, 1 otherwise."
+  [result]
   (if (:kotoba.cli/ok? result) 0 1))
 
-(defn json-requested? [argv]
+(defn json-requested?
+  "True when argv carries the `--json` flag."
+  [argv]
   (boolean (some #{"--json"} argv)))
 
 (defn render-result
+  "Render a CLI result map for stdout: JSON (namespace stripped from keys)
+  when `json-output?`, else `pr-str` EDN."
   ([result] (render-result result false))
   ([result json-output?]
    (if json-output?
@@ -38,7 +44,9 @@
                                         (str k))))
      (pr-str result))))
 
-(defn command-name [argv]
+(defn command-name
+  "The subcommand token — argv's first element."
+  [argv]
   (first argv))
 
 (declare source-plan accepted-source? selfhost-result runtime-result wasm-result package-result contract-exports)
@@ -66,17 +74,24 @@
     "-S"
     "-o"})
 
-(defn option-value [argv option]
+(defn option-value
+  "The token immediately following the first occurrence of `option` in argv,
+  or nil if `option` isn't present."
+  [argv option]
   (some (fn [[current next]]
           (when (= current option) next))
         (partition-all 2 1 argv)))
 
-(defn option-values [argv option]
+(defn option-values
+  "The tokens immediately following EVERY occurrence of `option` in argv."
+  [argv option]
   (keep (fn [[current next]]
           (when (= current option) next))
         (partition-all 2 1 argv)))
 
-(defn reader-target-option [argv]
+(defn reader-target-option
+  "The `--reader-target`/`--target` option value from argv, as a keyword."
+  [argv]
   (some-> (or (option-value argv "--reader-target")
               (option-value argv "--target"))
           keyword))
@@ -86,7 +101,11 @@
   [argv]
   (boolean (some #{"--reader-target" "--target"} argv)))
 
-(defn source-positionals [argv]
+(defn source-positionals
+  "Positional (non-option) tokens in argv, after the command name — value
+  options and the value that follows them are skipped, as are other tokens
+  starting with `-`."
+  [argv]
   (loop [tokens (rest argv)
          positionals []]
     (if-let [token (first tokens)]
@@ -101,7 +120,9 @@
         (recur (next tokens) (conj positionals token)))
       positionals)))
 
-(defn first-source-arg [argv]
+(defn first-source-arg
+  "The first positional argv token that names an accepted source, or nil."
+  [argv]
   (some #(when (accepted-source? %) %) (source-positionals argv)))
 
 (defn source-argv-plan
@@ -313,6 +334,9 @@
                        :kotoba.package/usage package-admission/usage}}))
 
 (defn policy-result
+  "Load and parse the `--policy <path>` EDN file, if the option is present.
+  Ok with nil data when the option is absent; ok? false with the exception
+  message when the file can't be read/parsed."
   [argv]
   (if-let [path (option-value argv "--policy")]
     (try
@@ -393,12 +417,16 @@
          (get (safe-analyzer-fact-classification) classification))))
 
 (defn source-file-readable?
+  "True when `plan`'s :kotoba.source/path names an existing, readable file."
   [plan]
   (let [file (io/file (:kotoba.source/path plan))]
     (and (.isFile file)
          (.canRead file))))
 
 (defn runtime-data
+  "Assemble the launcher's `:kotoba.cli/data` payload for a `run`/`check`
+  result: the source plan, the delegated-authority request metadata, and the
+  runtime result itself."
   [original-argv normalized-argv plan runtime-result]
   {:kotoba.launcher/source-plan plan
    :kotoba.launcher/authority-request (authority-request original-argv normalized-argv plan)
@@ -524,6 +552,12 @@
             nil))))))
 
 (defn wasm-emit-result*
+  "The unguarded `wasm emit` implementation (no package-admission gate — see
+  `wasm-emit-result` for the safe-build entry point that wraps this). Resolves
+  the source plan, checks it against policy, and either emits a WebAssembly
+  binary module (writing it to `--output`/`-o` when given) or falls back to
+  the EDN IR artifact byte-count when compilation isn't supported for the
+  source."
   [argv]
   (let [normalized-argv (normalize-source-argv (vec (cons "run" (rest argv))))
         plan (source-argv-plan normalized-argv)
