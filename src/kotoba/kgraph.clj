@@ -11,8 +11,15 @@
   keyword). This namespace is pure data manipulation over a datom vector; the
   mutable store (an atom) and the host boundaries (CLJ interpreter handlers in
   kotoba.host-providers, WASM host functions in kotoba.wasm-exec) live
-  elsewhere, so the same logic is exercised identically from both."
-  (:require [clojure.string :as str]))
+  elsewhere, so the same logic is exercised identically from both.
+
+  The `[e a v]` shape IS the canonical datom model, `datom.core` (datom-clj) —
+  the SAME representation the kotobase datom database uses (kotobase-engine's
+  entities->datoms / transact-tx). So the language's in-mem datom view and the
+  database's persistent datom view datafy entities identically. kotoba :
+  kotobase = Clojure : Datomic (ADR-2607032500)."
+  (:require [clojure.string :as str]
+            [datom.core :as dc]))
 
 (defn assert-datom
   "Append `datom` (`[e a v]`) to `datoms`. Idempotent-in-effect duplicates are
@@ -20,6 +27,19 @@
   set-like uniqueness can `retract-datom` first."
   [datoms datom]
   (conj (vec datoms) datom))
+
+(defn assert-entity
+  "Datafy a Datomic-style entity tx-map `{:.../id e :ns/a v …}` into `[e a v]`
+   datoms via the canonical datom model (`datom.core/eavt`) and append them all.
+   The language-side mirror of kotobase-engine's `entities->datoms`/`transact-tx`
+   — both datafy entities through the one shared model."
+  [datoms ent]
+  (into (vec datoms) (dc/eavt ent)))
+
+(defn assert-entities
+  "assert-entity over a seq of entity tx-maps (one flattened datom log)."
+  [datoms entities]
+  (into (vec datoms) (mapcat dc/eavt entities)))
 
 (defn retract-datom
   "Remove every occurrence of `datom` from `datoms`."
