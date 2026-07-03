@@ -5,7 +5,6 @@
   with an explicit reader target, checks a strict pure subset, emits deterministic
   EDN IR, and can run a zero-arity `main` function."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.lang.capability-values :as capability-values]
             [clojure.tools.reader :as reader]
@@ -45,14 +44,14 @@
    'str-len (fn [s] (count (.getBytes (str s) "UTF-8")))
    'bytes-len count
    'memory-pages (constantly 1)
-   'memory-grow (fn [pages] 1)
+   'memory-grow (fn [_pages] 1)
    'mem-byte-at (fn [_ptr _idx] 0)
    'mem-i32-at (fn [_ptr _offset] 0)
    'byte-store! (fn [_ptr _idx value] value)
    'i32-store! (fn [_ptr _offset value] value)
    'result-ok? (fn [value] (not (neg? value)))
    'result-err? neg?
-   'result-write! (fn [record-ptr value] record-ptr)
+   'result-write! (fn [record-ptr _value] record-ptr)
    'result-status (fn [_record-ptr] 0)
    'result-value (fn [_record-ptr] 0)
    'byte-at (fn [value idx]
@@ -842,8 +841,7 @@
                 :local-types local-types}))
 
         let (let [[bindings & body] args
-                  pairs (partition 2 bindings)
-                  base-local-count (count locals)]
+                  pairs (partition 2 bindings)]
               (loop [pairs pairs
                      locals locals
                      next-local (count locals)
@@ -1381,7 +1379,7 @@
 (defn wasm-binary
   "Compile integer functions to a WebAssembly MVP binary and export `main`."
   ([forms] (wasm-binary forms nil))
-  ([forms policy]
+  ([forms _policy]
   (let [defs (function-defs forms)
         indirect? (uses-call-indirect? forms)
         imports (required-host-imports forms)
