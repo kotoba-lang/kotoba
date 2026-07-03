@@ -84,15 +84,20 @@
           (recur (conj forms form)))))))
 
 (defn read-file
+  "Read every form from the file at path using a concrete CLJC reader target."
   [path reader-target]
   (read-forms (slurp (io/file path)) reader-target))
 
 (defn list-head
+  "The operator symbol of a list form (e.g. `+` in `(+ 1 2)`), or nil when
+  form isn't a seq."
   [form]
   (when (seq? form)
     (first form)))
 
 (defn walk-forms
+  "Depth-first walk: call f on form itself, then on every nested form/map
+  key+value/collection element."
   [f form]
   (f form)
   (cond
@@ -103,10 +108,14 @@
     (coll? form) (doseq [x form] (walk-forms f x))))
 
 (defn capability-name
+  "Human-readable name for a capability value (delegates to the shared
+  contract)."
   [value]
   (core-contracts/capability-name value))
 
 (defn capability-id
+  "Numeric capability id for a capability value under this launcher's
+  capability-contract, or nil if unknown."
   [value]
   (core-contracts/capability-id capability-contract value))
 
@@ -187,10 +196,15 @@
         op->kind))
 
 (defn policy-capabilities
+  "Set of capability names granted by policy (delegates to the shared
+  contract)."
   [policy]
   (core-contracts/policy-capabilities policy))
 
 (defn required-capabilities
+  "Capability names referenced anywhere in forms, via `has-capability?`,
+  `cap-acquire`, an `<op>-with` capability-passing use, or a direct
+  capability-bearing host-import call."
   [forms]
   (let [caps (atom [])]
     (doseq [form forms]
@@ -216,6 +230,8 @@
     (vec @caps)))
 
 (defn required-host-imports
+  "Host-import ops (symbols in host-imports) used anywhere in forms, in
+  canonical host-import-order."
   [forms]
   (let [imports (atom #{})]
     (doseq [form forms]
@@ -285,20 +301,29 @@
 (declare eval-form)
 
 (defn truthy?
+  "Kotoba truthiness: only nil and false are falsy, everything else
+  (including 0) is truthy."
   [value]
   (not (or (false? value) (nil? value))))
 
 (defn bind-params
+  "Zip a fn's params to call args into an env map. Throws ex-info on arity
+  mismatch."
   [params args]
   (when-not (= (count params) (count args))
     (throw (ex-info "arity mismatch" {:params params :args args})))
   (zipmap params args))
 
 (defn eval-body
+  "Evaluate forms in order under env/fns for side effects, returning the
+  value of the last form (or nil for an empty body)."
   [forms env fns]
   (reduce (fn [_ form] (eval-form form env fns)) nil forms))
 
 (defn call-fn
+  "Call f with args: a Kotoba fn value (`{:kind :kotoba.runtime/fn ...}`) is
+  interpreted, an ifn (builtin) is applied directly, anything else throws
+  ex-info \"not callable\"."
   [f args fns]
   (cond
     (and (map? f) (= :kotoba.runtime/fn (:kind f)))
@@ -311,6 +336,10 @@
     (throw (ex-info "not callable" {:callee f :args args}))))
 
 (defn eval-form
+  "Core tree-walking evaluator for one form under env (local bindings) and
+  fns (user-defined functions). Handles literals, symbol lookup
+  (env -> fns -> builtin-fns), and the special forms ns/quote/do/let/if/def
+  /defn; anything else is treated as a function call."
   [form env fns]
   (cond
     (symbol? form)
@@ -356,6 +385,8 @@
     (throw (ex-info "unsupported literal" {:form form}))))
 
 (defn function-def
+  "Parse a top-level `(defn name [params] body...)` form into
+  `[name {:kind :kotoba.runtime/fn ...}]`, or nil if form isn't a defn."
   [form]
   (when (and (seq? form) (= 'defn (first form)))
     (let [[_ name params & body] form]
@@ -607,6 +638,10 @@
         :kotoba.runtime/missing (:missing checked)}))))
 
 (defn check
+  "Run all static checks (safety/type problems, typed-capability problems,
+  effect/capability consistency) over forms and, if none fire, compile the
+  EDN IR. Returns `{:kotoba.runtime/ok? :kotoba.runtime/problems
+  :kotoba.runtime/ir}`."
   ([safe-facts source-plan forms] (check safe-facts source-plan forms nil))
   ([safe-facts source-plan forms policy]
   (let [problems (vec (concat (source-problems safe-facts forms policy)
@@ -716,14 +751,18 @@
         (recur shifted (conj out (bit-or byte 0x80)))))))
 
 (defn bcat
+  "Concatenate any number of byte sequences into one flat vector."
   [& parts]
   (vec (mapcat identity parts)))
 
 (defn utf8-bytes
+  "UTF-8 encode s into a vector of unsigned (0-255) byte values."
   [s]
   (mapv #(bit-and % 0xff) (.getBytes (str s) "UTF-8")))
 
 (defn literal-bytes
+  "Byte vector for a string or all-integer vector literal, or nil for
+  anything else (used to recognize memory-backed literals)."
   [value]
   (cond
     (string? value) (utf8-bytes value)
@@ -733,6 +772,8 @@
     :else nil))
 
 (defn collect-memory-literals
+  "Distinct string/byte-vector literals referenced anywhere in forms, in
+  first-seen order (candidates for static memory layout)."
   [forms]
   (let [literals (atom [])]
     (doseq [form forms]
@@ -746,6 +787,8 @@
     (vec (distinct @literals))))
 
 (defn memory-layout
+  "Assign each distinct memory literal in forms a static offset (starting at
+  1024) and length: `{literal {:offset :bytes :length}}`."
   [forms]
   (loop [literals (collect-memory-literals forms)
          offset 1024
@@ -760,6 +803,8 @@
       layout)))
 
 (defn align-to
+  "Round n up to the next multiple of alignment (n unchanged if already
+  aligned)."
   [n alignment]
   (let [rem (mod n alignment)]
     (if (zero? rem)
@@ -767,6 +812,8 @@
       (+ n (- alignment rem)))))
 
 (defn heap-base
+  "First 16-byte-aligned address after every static memory-layout entry (at
+  least 2048, leaving room below the layout for other reserved use)."
   [layout]
   (align-to
    (reduce max 2048 (map (fn [[_ entry]]
@@ -791,10 +838,14 @@
           kind->capability)))
 
 (defn vec-bytes
+  "Encode a WASM binary `vec(item)`: a uleb128 item count followed by the
+  items' bytes concatenated."
   [items]
   (bcat (uleb (count items)) (mapcat identity items)))
 
 (defn section
+  "Encode one WASM binary section: a 1-byte section id followed by a
+  uleb128-length-prefixed payload."
   [id payload]
   (bcat [id] (uleb (count payload)) payload))
 
@@ -803,6 +854,13 @@
          function-result-type symbol-key)
 
 (defn compile-wasm-expr
+  "Compile one Kotoba expression to a WASM instruction sequence. Returns
+  `{:bytes :local-count :local-types :result-type}` on success, or
+  `{:problem {:kotoba.wasm/problem ...}}` on failure (unknown local,
+  unsupported form/op, arity/type mismatch, etc.) — problems short-circuit
+  up through composite expressions. `locals` maps local symbol -> index/type
+  entry; `fns` carries the compile-time context (function indexes, memory
+  layout, declared result types)."
   ([form locals] (compile-wasm-expr form locals {}))
   ([form locals fns]
   (cond
@@ -1213,6 +1271,9 @@
                :kotoba.wasm/form (pr-str form)}})))
 
 (defn compile-wasm-fold
+  "Compile a variadic numeric/comparison op (e.g. `+`) by folding opcode
+  left-to-right over 2+ compiled args (a single arg just compiles through
+  unchanged). Requires at least one arg."
   ([opcode args locals] (compile-wasm-fold opcode args locals {}))
   ([opcode args locals fns]
   (cond
@@ -1241,6 +1302,9 @@
                  :local-types local-types)))))))
 
 (defn compile-wasm-fold-type
+  "Like compile-wasm-fold, but for typed ops (e.g. `i64+`): asserts every
+  arg's compiled result-type matches result-type (a :type-mismatch problem
+  otherwise) and tags the fold's own result-type accordingly."
   [opcode args locals fns result-type]
   (let [compiled (compile-wasm-fold opcode args locals fns)]
     (cond
@@ -1252,14 +1316,20 @@
       :else (assoc compiled :result-type result-type))))
 
 (defn main-function
+  "Parsed def-map for the `main` function in forms, or nil if forms declares
+  none."
   [forms]
   (get (into {} (keep function-def forms)) 'main))
 
 (defn function-defs
+  "All top-level `defn` forms parsed to `[name def-map]` pairs, in source
+  order."
   [forms]
   (vec (keep function-def forms)))
 
 (defn uses-call-indirect?
+  "True if `call-indirect` appears anywhere in forms (triggers emitting a
+  WASM table/element section)."
   [forms]
   (let [found? (atom false)]
     (doseq [form forms]
@@ -1275,6 +1345,8 @@
    :i64 0x7e})
 
 (defn symbol-key
+  "Normalize sym to an unqualified symbol (drop any namespace) for use as a
+  locals/params map key."
   [sym]
   (symbol (name sym)))
 
@@ -1286,26 +1358,38 @@
   (if (or (:i64 (meta sym)) (some? (cap-param-kind sym))) :i64 :i32))
 
 (defn function-result-type
+  "Declared WASM result type for a `[name def-map]` function entry: :i64 if
+  the fn name has `^:i64` metadata, else nil (void)."
   [[name _f]]
   (if (:i64 (meta name)) :i64 nil))
 
 (defn function-param-types
+  "WASM value types for a `[name def-map]` function entry's params, via
+  annotated-wasm-type."
   [[_name f]]
   (mapv annotated-wasm-type (:params f)))
 
 (defn compiled-result-type
+  "Result-type of a compile-wasm-expr result, defaulting to :i32 when
+  unset."
   [compiled]
   (or (:result-type compiled) :i32))
 
 (defn local-index
+  "Numeric locals-table index of entry: entries are either a bare index or a
+  `{:idx :type}` map."
   [entry]
   (if (map? entry) (:idx entry) entry))
 
 (defn local-type
+  "WASM value type of a locals-table entry, defaulting to :i32 for bare
+  (untyped) entries."
   [entry]
   (if (map? entry) (:type entry) :i32))
 
 (defn local-decls
+  "Encode the WASM local-declarations vector for a function body: types
+  grouped by consecutive run, each run as `(count type)`."
   [types]
   (if (seq types)
     (let [groups (partition-by identity types)]
@@ -1317,11 +1401,17 @@
     [0x00]))
 
 (defn merge-local-types
+  "Combine the :local-types (or a :i32-filled placeholder sized by
+  :local-count) of any number of compiled sub-expressions into one flat
+  vector, for tracking a function's scratch-local types across composed
+  compile-wasm-expr calls."
   [& compiled-values]
   (vec (mapcat #(or (:local-types %) (repeat (:local-count % 0) :i32))
                compiled-values)))
 
 (defn wasm-fn-type
+  "Encode one WASM function type entry: form byte 0x60, param types, and
+  either a 1-result-type or a 0-count result vec."
   [{:keys [params result]}]
   (bcat [0x60]
         (uleb (count params))
@@ -1334,6 +1424,8 @@
   [0x00 0x61 0x73 0x6d 0x01 0x00 0x00 0x00])
 
 (defn import-entry
+  "Encode one WASM import entry: length-prefixed module name, length-prefixed
+  field name, function-import kind byte (0x00), and the type index."
   [module field type-index]
   (let [module-bytes (utf8-bytes module)
         field-bytes (utf8-bytes field)]
@@ -1345,6 +1437,8 @@
           (uleb type-index))))
 
 (defn export-entry
+  "Encode one WASM export entry: length-prefixed name, export kind byte
+  (e.g. 0x00 func, 0x02 memory), and the exported item's index."
   [name kind index]
   (let [name-bytes (utf8-bytes name)]
     (bcat (uleb (count name-bytes))
@@ -1353,22 +1447,30 @@
           (uleb index))))
 
 (defn global-entry
+  "Encode one WASM mutable i32 global with the given constant initial
+  value."
   [initial-value]
   (bcat [0x7f 0x01 0x41]
         (sleb32 initial-value)
         [0x0b]))
 
 (defn table-entry
+  "Encode one WASM funcref table entry (for `call_indirect`) with the given
+  size."
   [size]
   [0x70 0x00 size])
 
 (defn element-segment
+  "Encode a WASM element segment that populates table index 0 (starting at
+  offset 0) with function-indexes, for `call_indirect` targets."
   [function-indexes]
   (bcat [0x00 0x41 0x00 0x0b]
         (uleb (count function-indexes))
         (mapcat uleb function-indexes)))
 
 (defn data-segment
+  "Encode a WASM active data segment: memory index 0, a constant i32
+  offset, and the byte payload."
   [offset bs]
   (bcat [0x00 0x41]
         (sleb32 offset)
