@@ -1,19 +1,22 @@
 # kotoba
 
-**A capability-safe language _and_ a content-addressed distributed Datalog database**
+**A capability-safe language — the _Clojure_ of the kotoba stack.**
 
 ```
-KOTOBA ≝ Datom[CID/T] × EAVT[KSE Topic] × Pregel[BSP] × Datalog[Δ]
-          × CACAO × AT Protocol × LLM/Weight × WASM/WIT × safe Kotoba[cap⊗effect]
+KOTOBA ≝ safe Kotoba[cap⊗effect] × Datom[e a v] (kgraph, in-mem)
+          × WASM/WIT × CACAO × AT Protocol × LLM/Weight
 ```
 
-Kotoba is two things in one system:
+**kotoba : kotobase = Clojure : Datomic** (ADR-2607032500). kotoba is the
+**language** — a capability-safe Lisp/EDN that compiles to WebAssembly, plus its
+in-memory **datom data model** (`kotoba.kgraph`, an EAVT `[e a v]` store). The
+**database** — the persistent, indexed, Datalog-queryable, content-addressed,
+time-versioned datom store built _on_ this model — is
+[**`kotoba-lang/kotobase`**](https://github.com/kotoba-lang/kotobase) (the
+"Datomic"): it depends on kotoba, never the reverse. Keep kotoba the language;
+the datom **database** lives in kotobase.
 
-- **A database** — a distributed, content-addressed knowledge graph for
-  decentralized AI agent systems, combining Datomic-style immutable datoms,
-  Pregel BSP graph computation, an auxiliary SPARQL 1.1 executor over IPFS
-  storage, native CACAO authentication, and WASM Component Model execution.
-- **A language** — [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang)
+- **The language** — [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang)
   defines the source profile (`.kotoba` canonical, portable `.cljc` with
   `#?(:kotoba ...)` for Kotoba-specific branches), and `kotoba wasm` compiles
   that Kotoba/EDN subset directly to **WebAssembly** (a compiler, not an
