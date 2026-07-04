@@ -1,7 +1,7 @@
 (ns kotoba.launcher-test
   (:require [clojure.data.json :as json]
             [clojure.edn :as edn]
-            [clojure.test :refer [deftest is run-tests]]
+            [clojure.test :refer [deftest is run-tests testing]]
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime]))
 
@@ -566,6 +566,39 @@
   (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba" "--json"])]
     (is (false? (:kotoba.cli/ok? result)))
     (is (= :wasm/check-failed (:kotoba.cli/code result)))))
+
+(deftest wasm-run-with-policy-surfaces-kgraph-receipts
+  (testing "`wasm run --policy` threads a journal into kotoba.wasm-exec/kgraph-host-functions
+            (mirroring the interpreter path's guarded-run-result), so the guarded kgraph-* calls
+            the module actually made are receipted and surfaced as :kotoba.host/receipts -- the
+            gap PR #279 deliberately left open (receipts were collectible via :record! but never
+            attached to the wasm-run-result* CLI result)"
+    (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba"
+                                     "--policy" "src/demo_kgraph_policy.edn"
+                                     "--json"])
+          receipts (get-in result [:kotoba.cli/data :kotoba.host/receipts])]
+      (is (:kotoba.cli/ok? result))
+      (is (= :wasm/run-completed (:kotoba.cli/code result)))
+      (is (= 2 (count receipts))
+          "one receipt per real kgraph-* call the module actually made (kgraph-assert! + kgraph-query)")
+      (is (= [:kotoba.wasm/kgraph-assert! :kotoba.wasm/kgraph-query]
+             (mapv :receipt/call receipts)))
+      (is (every? #(= :ok (:receipt/outcome %)) receipts)
+          "both calls were granted by the policy's :graph/kotoba capability")
+      (is (= [:host/graph-assert :host/graph-query]
+             (mapv #(get-in % [:receipt/cap :cap/kind]) receipts)))
+      (is (every? #(= ["policy:graph/kotoba"] (get-in % [:receipt/cap :cap/provenance]))
+                  receipts)))))
+
+(deftest wasm-run-without-policy-omits-receipts-key
+  (testing "no --policy means no meaningful guard was installed, so :kotoba.host/receipts is
+            absent entirely -- matching the interpreter run path's (when effective-policy ...)
+            convention (see kotoba.host-providers-test/legacy-no-policy-run-is-unchanged), not
+            merely an empty vector"
+    (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json"])]
+      (is (:kotoba.cli/ok? result))
+      (is (= :wasm/run-completed (:kotoba.cli/code result)))
+      (is (not (contains? (:kotoba.cli/data result) :kotoba.host/receipts))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.launcher-test)]

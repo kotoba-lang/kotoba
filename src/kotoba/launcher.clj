@@ -672,7 +672,16 @@
   host import gets a trivial 0-returning stub (kotoba.wasm-exec/
   stub-host-function), matching kotoba.host-providers/default-handlers'
   convention, so a valid program never fails to link here for lack of a real
-  native provider."
+  native provider.
+
+  Mirrors `guarded-run-result`/`runtime-result`'s interpreter-path receipt
+  surface: a `kotoba.host-providers/journal` is built and threaded into
+  `kotoba.wasm-exec/kgraph-host-functions` as :record!/:now, so every guarded
+  kgraph-* call — granted or denied — leaves a receipt; the ordered journal
+  is attached to the result as :kotoba.host/receipts, but ONLY when a policy
+  was actually supplied (same `(when policy ...)` convention as
+  `runtime-result`'s `(when effective-policy ...)`), since no policy means no
+  meaningful guard was installed."
   [argv]
   (let [normalized-argv (normalize-source-argv (vec (cons "run" (rest argv))))
         plan (source-argv-plan normalized-argv)
@@ -719,24 +728,34 @@
                               (remove kgraph-ops)
                               (map runtime/host-imports)
                               (map wasm-exec/stub-host-function))
+                {:keys [record! entries]} (host-providers/journal)
+                now (str (java.time.LocalDate/now))
                 ;; POLICY (already computed above for the static `check`
                 ;; gate) is threaded into `instantiate` too, so `has-capability?`
                 ;; and the kgraph-* effects are enforced at RUN time under the
                 ;; same policy that governed emission — closing the gap where
                 ;; the runtime executor previously granted every capability
                 ;; unconditionally regardless of `--policy` (ADR-2607050500).
+                ;; :record!/:now flow into every guard-kgraph-call dispatch so
+                ;; each attempted kgraph-* call (granted or denied) leaves a
+                ;; receipt in ENTRIES, exactly as the interpreter path's
+                ;; `guarded-run-result` does via kotoba.host-providers/host-call.
                 instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
-                                                (concat (wasm-exec/kgraph-host-functions (atom []) policy)
+                                                (concat (wasm-exec/kgraph-host-functions
+                                                         (atom []) policy
+                                                         {:record! record! :now now})
                                                         stub-fns)
                                                 policy)
                 value (wasm-exec/call-main instance)]
             {:kotoba.cli/ok? true
              :kotoba.cli/code :wasm/run-completed
-             :kotoba.cli/data {:kotoba.launcher/source-plan plan
-                               :kotoba.wasm/value value
-                               :kotoba.wasm/result-type (:kotoba.wasm/result-type wasm)
-                               :kotoba.wasm/import-count (:kotoba.wasm/import-count wasm)
-                               :kotoba.wasm/imports (:kotoba.wasm/imports wasm)}}))))))
+             :kotoba.cli/data (merge {:kotoba.launcher/source-plan plan
+                                      :kotoba.wasm/value value
+                                      :kotoba.wasm/result-type (:kotoba.wasm/result-type wasm)
+                                      :kotoba.wasm/import-count (:kotoba.wasm/import-count wasm)
+                                      :kotoba.wasm/imports (:kotoba.wasm/imports wasm)}
+                                     (when policy
+                                       {:kotoba.host/receipts (entries)}))}))))))
 
 (defn wasm-result
   "Handle launcher-owned Wasm-facing commands."
