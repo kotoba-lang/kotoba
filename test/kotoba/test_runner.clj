@@ -5,6 +5,7 @@
             [kotoba.cacao-run-test]
             [kotoba.cap-passing-test]
             [kotoba.cap-typed-test]
+            [kotoba.did-adapter-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
             [kotoba.kgraph-test]
@@ -18,6 +19,7 @@
                                         'kotoba.cacao-run-test
                                         'kotoba.cap-passing-test
                                         'kotoba.cap-typed-test
+                                        'kotoba.did-adapter-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
                                         'kotoba.kgraph-test
