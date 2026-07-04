@@ -600,6 +600,57 @@
       (is (= :wasm/run-completed (:kotoba.cli/code result)))
       (is (not (contains? (:kotoba.cli/data result) :kotoba.host/receipts))))))
 
+(deftest wasm-run-surfaces-capability-denial-instead-of-throwing
+  (testing "src/demo_kgraph_expired_policy.edn grants :graph/kotoba (so the static
+            `runtime/check` gate admits the module's kgraph-* imports, same as
+            src/demo_kgraph_policy.edn) but the grant's :kotoba.policy/capability-expires
+            is in the past, so kotoba.wasm-exec/guard-kgraph-call's RUNTIME guard denies
+            the module's first kgraph-assert! call as :expired. Before this fix that
+            denial's ex-info (thrown by guard-kgraph-call, propagated uncaught through
+            com.dylibso.chicory's call-main since Chicory does not wrap host-function
+            exceptions) escaped kotoba.launcher/dispatch entirely -- a `kotoba wasm run
+            --policy ...` invocation crashed with a raw stack trace instead of the clean
+            :kotoba.cli/ok? false result every other error path in this launcher returns.
+            This must now come back as :wasm/run-denied, mirroring kotoba.runtime/run's
+            interpreter-path handling of the exact same :kotoba.host/denied ex-data shape."
+    (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba"
+                                     "--policy" "src/demo_kgraph_expired_policy.edn"
+                                     "--json"])
+          receipts (get-in result [:kotoba.cli/data :kotoba.host/receipts])]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= :wasm/run-denied (:kotoba.cli/code result)))
+      (is (= :expired (get-in result [:kotoba.cli/data :kotoba.host/denied])))
+      (is (= 'kgraph-assert! (get-in result [:kotoba.cli/data :kotoba.host/call]))
+          "kgraph-assert! is the module's first host call, so it's the one the guard
+           denies before kgraph-query ever runs")
+      (is (= 1 (count receipts))
+          "the partial receipt journal collected before the denial is surfaced (not
+           dropped): one denial receipt for the attempted kgraph-assert!, since the throw
+           aborts execution before the module's kgraph-query call is ever reached")
+      (is (= :denied (:receipt/outcome (first receipts))))
+      (is (= :expired (:receipt/denied (first receipts)))))))
+
+(deftest wasm-run-does-not-swallow-unrelated-exceptions
+  (testing "the new capability-denial catch in wasm-run-result* must stay narrow: an
+            unrelated ExceptionInfo thrown mid-execution -- kotoba.wasm-exec/fuel-listener's
+            fuel-exhausted guard, via src/demo_fuel_exhausted_policy.edn's
+            :kotoba.policy/fuel 1 -- carries no :kotoba.host/denied key at all, so it must
+            still propagate out of kotoba.launcher/dispatch uncaught rather than being
+            mistaken for a capability denial and swallowed into a false :wasm/run-denied
+            result. A catch-too-broad here would hide real bugs."
+    (let [thrown (try
+                   (launcher/dispatch ["wasm" "run" "src/demo.kotoba"
+                                       "--policy" "src/demo_fuel_exhausted_policy.edn"
+                                       "--json"])
+                   ::not-thrown
+                   (catch clojure.lang.ExceptionInfo e e))]
+      (is (instance? clojure.lang.ExceptionInfo thrown)
+          "expected an uncaught ExceptionInfo, not a swallowed result")
+      (is (= :fuel-exhausted (:kotoba.wasm/problem (ex-data thrown))))
+      (is (nil? (:kotoba.host/denied (ex-data thrown)))
+          "this is NOT a capability denial, so wasm-run-result*'s catch must not have
+           intercepted it"))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.launcher-test)]
     (when (pos? (+ (or fail 0) (or error 0)))

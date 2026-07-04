@@ -681,7 +681,15 @@
   is attached to the result as :kotoba.host/receipts, but ONLY when a policy
   was actually supplied (same `(when policy ...)` convention as
   `runtime-result`'s `(when effective-policy ...)`), since no policy means no
-  meaningful guard was installed."
+  meaningful guard was installed.
+
+  A runtime capability denial (`kotoba.wasm-exec/guard-kgraph-call` throwing
+  ex-info with :kotoba.host/denied) is caught here and converted into a clean
+  `:wasm/run-denied` :kotoba.cli/ok? false result — mirroring
+  `kotoba.runtime/run`'s interpreter-path handling of the exact same ex-data
+  shape — instead of escaping as an uncaught exception. Any other
+  ExceptionInfo (e.g. `kotoba.wasm-exec/fuel-listener`'s fuel-exhausted guard)
+  is not a capability denial and is re-thrown unchanged."
   [argv]
   (let [normalized-argv (normalize-source-argv (vec (cons "run" (rest argv))))
         plan (source-argv-plan normalized-argv)
@@ -729,33 +737,56 @@
                               (map runtime/host-imports)
                               (map wasm-exec/stub-host-function))
                 {:keys [record! entries]} (host-providers/journal)
-                now (str (java.time.LocalDate/now))
-                ;; POLICY (already computed above for the static `check`
-                ;; gate) is threaded into `instantiate` too, so `has-capability?`
-                ;; and the kgraph-* effects are enforced at RUN time under the
-                ;; same policy that governed emission — closing the gap where
-                ;; the runtime executor previously granted every capability
-                ;; unconditionally regardless of `--policy` (ADR-2607050500).
-                ;; :record!/:now flow into every guard-kgraph-call dispatch so
-                ;; each attempted kgraph-* call (granted or denied) leaves a
-                ;; receipt in ENTRIES, exactly as the interpreter path's
-                ;; `guarded-run-result` does via kotoba.host-providers/host-call.
-                instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
-                                                (concat (wasm-exec/kgraph-host-functions
-                                                         (atom []) policy
-                                                         {:record! record! :now now})
-                                                        stub-fns)
-                                                policy)
-                value (wasm-exec/call-main instance)]
-            {:kotoba.cli/ok? true
-             :kotoba.cli/code :wasm/run-completed
-             :kotoba.cli/data (merge {:kotoba.launcher/source-plan plan
-                                      :kotoba.wasm/value value
-                                      :kotoba.wasm/result-type (:kotoba.wasm/result-type wasm)
-                                      :kotoba.wasm/import-count (:kotoba.wasm/import-count wasm)
-                                      :kotoba.wasm/imports (:kotoba.wasm/imports wasm)}
-                                     (when policy
-                                       {:kotoba.host/receipts (entries)}))}))))))
+                now (str (java.time.LocalDate/now))]
+            (try
+              ;; POLICY (already computed above for the static `check`
+              ;; gate) is threaded into `instantiate` too, so `has-capability?`
+              ;; and the kgraph-* effects are enforced at RUN time under the
+              ;; same policy that governed emission — closing the gap where
+              ;; the runtime executor previously granted every capability
+              ;; unconditionally regardless of `--policy` (ADR-2607050500).
+              ;; :record!/:now flow into every guard-kgraph-call dispatch so
+              ;; each attempted kgraph-* call (granted or denied) leaves a
+              ;; receipt in ENTRIES, exactly as the interpreter path's
+              ;; `guarded-run-result` does via kotoba.host-providers/host-call.
+              (let [instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
+                                                    (concat (wasm-exec/kgraph-host-functions
+                                                             (atom []) policy
+                                                             {:record! record! :now now})
+                                                            stub-fns)
+                                                    policy)
+                    value (wasm-exec/call-main instance)]
+                {:kotoba.cli/ok? true
+                 :kotoba.cli/code :wasm/run-completed
+                 :kotoba.cli/data (merge {:kotoba.launcher/source-plan plan
+                                          :kotoba.wasm/value value
+                                          :kotoba.wasm/result-type (:kotoba.wasm/result-type wasm)
+                                          :kotoba.wasm/import-count (:kotoba.wasm/import-count wasm)
+                                          :kotoba.wasm/imports (:kotoba.wasm/imports wasm)}
+                                         (when policy
+                                           {:kotoba.host/receipts (entries)}))})
+              ;; A denied kgraph-* call throws all the way up through
+              ;; Chicory's `call-main` uncaught (verified: Chicory does not
+              ;; wrap host-function exceptions, so `guard-kgraph-call`'s
+              ;; ex-info in kotoba.wasm-exec reaches here byte-for-byte).
+              ;; Mirror kotoba.runtime/run's interpreter-path handling (the
+              ;; `(catch clojure.lang.ExceptionInfo e (if (:kotoba.host/denied
+              ;; (ex-data e)) ... (throw e)))` pattern): a capability denial
+              ;; becomes a clean :kotoba.cli/ok? false result instead of an
+              ;; uncaught stack trace; any OTHER ExceptionInfo (e.g. the
+              ;; fuel-exhausted guard in kotoba.wasm-exec/fuel-listener) is
+              ;; not a capability denial and must propagate unchanged, not be
+              ;; swallowed by this catch.
+              (catch clojure.lang.ExceptionInfo e
+                (if-let [denied (:kotoba.host/denied (ex-data e))]
+                  {:kotoba.cli/ok? false
+                   :kotoba.cli/code :wasm/run-denied
+                   :kotoba.cli/data (merge {:kotoba.launcher/source-plan plan
+                                            :kotoba.host/denied denied
+                                            :kotoba.host/call (:kotoba.host/call (ex-data e))}
+                                           (when policy
+                                             {:kotoba.host/receipts (entries)}))}
+                  (throw e))))))))))
 
 (defn wasm-result
   "Handle launcher-owned Wasm-facing commands."
