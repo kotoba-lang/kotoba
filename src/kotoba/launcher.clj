@@ -719,9 +719,16 @@
                               (remove kgraph-ops)
                               (map runtime/host-imports)
                               (map wasm-exec/stub-host-function))
+                ;; POLICY (already computed above for the static `check`
+                ;; gate) is threaded into `instantiate` too, so `has-capability?`
+                ;; and the kgraph-* effects are enforced at RUN time under the
+                ;; same policy that governed emission — closing the gap where
+                ;; the runtime executor previously granted every capability
+                ;; unconditionally regardless of `--policy` (ADR-2607050500).
                 instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
-                                                (concat (wasm-exec/kgraph-host-functions (atom []))
-                                                        stub-fns))
+                                                (concat (wasm-exec/kgraph-host-functions (atom []) policy)
+                                                        stub-fns)
+                                                policy)
                 value (wasm-exec/call-main instance)]
             {:kotoba.cli/ok? true
              :kotoba.cli/code :wasm/run-completed
