@@ -637,16 +637,18 @@
                              :kotoba.wasm/binary? false
                              :kotoba.wasm/byte-count (when edn-bytes (alength edn-bytes))}})))))
 
-(defn wasm-emit-result
-  "Safe-build entry point for `wasm emit`. When `--package-lock <path>` is
-  provided, the package admission gate runs first and a rejected lock aborts
-  the build with the package-verification receipt in the error payload. When
-  no lock is provided there are no package inputs to admit and behavior is
-  unchanged."
-  [argv]
-  (let [admission (when (option-value argv "--package-lock")
-                    (package-admission/admit (admission-options argv "--package-lock")))]
-    (if (and admission (not (:kotoba.admission/ok? admission)))
+(defn- admission-gated
+  "Run the package admission gate over ARGV via LOCK-OPTION and, only if the
+  lock is admitted, call UNGUARDED-FN with ARGV, attaching the admission
+  receipt to its result. A missing or rejected lock short-circuits with the
+  receipt/error instead of calling UNGUARDED-FN at all — `--package-lock` is
+  mandatory, not opt-in (F-001: a caller could previously skip package
+  admission for both `wasm emit` and `wasm run` simply by omitting the
+  flag). Shared by `wasm-emit-result` and `wasm-run-result` so the two
+  safe-build entry points cannot drift apart on this gate."
+  [argv lock-option unguarded-fn]
+  (let [admission (package-admission/admit (admission-options argv lock-option))]
+    (if-not (:kotoba.admission/ok? admission)
       {:kotoba.cli/ok? false
        :kotoba.cli/code :wasm/package-rejected
        :kotoba.cli/data (cond-> {:kotoba.package/admission-code (:kotoba.admission/code admission)}
@@ -655,11 +657,18 @@
 
                           (:kotoba.admission/error admission)
                           (assoc :kotoba.package/error (:kotoba.admission/error admission)))}
-      (cond-> (wasm-emit-result* argv)
-        admission
-        (update :kotoba.cli/data
-                (fnil assoc {})
-                :kotoba.package/receipt (:kotoba.admission/receipt admission))))))
+      (update (unguarded-fn argv)
+              :kotoba.cli/data
+              (fnil assoc {})
+              :kotoba.package/receipt (:kotoba.admission/receipt admission)))))
+
+(defn wasm-emit-result
+  "Safe-build entry point for `wasm emit`. `--package-lock <path>` is
+  mandatory: the package admission gate always runs first, and a missing or
+  rejected lock aborts the build with the admission receipt/error in the
+  payload — there is no way to opt out (F-001)."
+  [argv]
+  (admission-gated argv "--package-lock" wasm-emit-result*))
 
 (def ^:private kgraph-ops
   #{'kgraph-assert! 'kgraph-retract! 'kgraph-get-objects 'kgraph-query})
@@ -788,12 +797,22 @@
                                              {:kotoba.host/receipts (entries)}))}
                   (throw e))))))))))
 
+(defn wasm-run-result
+  "Safe-build entry point for `wasm run`. Same mandatory package-admission
+  gate as `wasm-emit-result` (see `admission-gated`) — `wasm run` actually
+  executes the compiled module against real host capabilities, so it is at
+  least as sensitive to unverified package inputs as `wasm emit`, and must
+  not be reachable without admission (F-001: previously `wasm run` did not
+  consult package admission at all, regardless of `--package-lock`)."
+  [argv]
+  (admission-gated argv "--package-lock" wasm-run-result*))
+
 (defn wasm-result
   "Handle launcher-owned Wasm-facing commands."
   [argv]
   (case (second argv)
     "emit" (wasm-emit-result argv)
-    "run" (wasm-run-result* argv)
+    "run" (wasm-run-result argv)
     {:kotoba.cli/ok? false
      :kotoba.cli/code :wasm/unknown-command
      :kotoba.cli/data {:kotoba.wasm/command (second argv)

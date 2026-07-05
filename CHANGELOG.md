@@ -6,6 +6,13 @@ user-visible or architecturally significant changes.
 
 ## Unreleased
 
+- **Breaking**: `kotoba wasm emit` and `kotoba wasm run` now require
+  `--package-lock <path>` unconditionally — the package-admission gate always
+  runs first, and a missing or rejected lock aborts the build/run with the
+  admission receipt/error in the payload (`:wasm/package-rejected`). Closes
+  the F-001 gap where the flag was optional for `wasm emit` and entirely
+  absent for `wasm run` (a caller could skip package verification just by not
+  passing the flag). There is no opt-out.
 - Added `clj-kondo` lint (Clojars-based, no system install) and fixed the
   handful of warnings it surfaced (unused requires/bindings/params in
   `kotoba.runtime`), so CI now runs both tests and lint.

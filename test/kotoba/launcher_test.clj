@@ -5,6 +5,13 @@
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime]))
 
+;; `wasm emit`/`wasm run` require a mandatory package-admission gate (F-001);
+;; every dispatch call below that reaches those subcommands must supply an
+;; admitted lock, so all such tests share this one fixture pair (mirrors
+;; kotoba.package-admission-test's positive-lock/trust).
+(def positive-lock "test/fixtures/package/positive-lock.edn")
+(def trust "test/fixtures/package/trust.edn")
+
 (deftest delegates-check-to-cljc-authority
   (let [result (launcher/dispatch ["check" "--kind" "cli-contract" "--json"])]
     (is (:kotoba.cli/ok? result))
@@ -167,7 +174,7 @@
         output (doto (java.io.File/createTempFile "kotoba-demo" ".wasm")
                  (.deleteOnExit))
         result (launcher/dispatch ["wasm" "emit" "src/demo.kotoba" "--json"
-                                   "--output" (.getPath output)])]
+                                   "--output" (.getPath output) "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= [0 97 115 109 1 0 0 0]
            (mapv #(bit-and % 0xff) (take 8 (:kotoba.wasm/binary wasm)))))
@@ -190,7 +197,7 @@
         output (doto (java.io.File/createTempFile "kotoba-demo-call" ".wasm")
                  (.deleteOnExit))
         emit-result (launcher/dispatch ["wasm" "emit" "src/demo_call.kotoba" "--json"
-                                        "--output" (.getPath output)])]
+                                        "--output" (.getPath output) "--package-lock" positive-lock "--trust" trust])]
     (is (= 43 (get-in run-result [:kotoba.cli/data :kotoba.runtime/result
                                   :kotoba.runtime/value])))
     (is (:kotoba.wasm/ok? wasm))
@@ -203,7 +210,7 @@
 
 (deftest wasm-emit-requires-policy-for-host-capability-import
   (let [forms (runtime/read-file "src/demo_cap.kotoba" :kotoba)
-        denied (launcher/dispatch ["wasm" "emit" "src/demo_cap.kotoba" "--json"])
+        denied (launcher/dispatch ["wasm" "emit" "src/demo_cap.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])
         policy (edn/read-string (slurp "src/demo_policy.edn"))
         allowed-wasm (runtime/wasm-binary forms policy)
         output (doto (java.io.File/createTempFile "kotoba-demo-cap" ".wasm")
@@ -211,7 +218,7 @@
         allowed (launcher/dispatch ["wasm" "emit" "src/demo_cap.kotoba"
                                     "--policy" "src/demo_policy.edn"
                                     "--json"
-                                    "--output" (.getPath output)])]
+                                    "--output" (.getPath output) "--package-lock" positive-lock "--trust" trust])]
     (is (false? (:kotoba.cli/ok? denied)))
     (is (= :wasm/check-failed (:kotoba.cli/code denied)))
     (is (= :capability-not-granted
@@ -234,14 +241,14 @@
 (deftest wasm-emit-supports-notify-provider-import
   (let [forms (runtime/read-file "src/demo_notify.kotoba" :kotoba)
         policy (edn/read-string (slurp "src/demo_policy.edn"))
-        denied (launcher/dispatch ["wasm" "emit" "src/demo_notify.kotoba" "--json"])
+        denied (launcher/dispatch ["wasm" "emit" "src/demo_notify.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])
         wasm (runtime/wasm-binary forms policy)
         output (doto (java.io.File/createTempFile "kotoba-demo-notify" ".wasm")
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_notify.kotoba"
                                     "--policy" "src/demo_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (false? (:kotoba.cli/ok? denied)))
     (is (= :capability-not-granted
            (get-in denied [:kotoba.cli/data :kotoba.runtime/result
@@ -262,14 +269,14 @@
 (deftest wasm-emit-supports-core-provider-import-surface
   (let [forms (runtime/read-file "src/demo_providers.kotoba" :kotoba)
         policy (edn/read-string (slurp "src/demo_provider_policy.edn"))
-        denied (launcher/dispatch ["wasm" "emit" "src/demo_providers.kotoba" "--json"])
+        denied (launcher/dispatch ["wasm" "emit" "src/demo_providers.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])
         wasm (runtime/wasm-binary forms policy)
         output (doto (java.io.File/createTempFile "kotoba-demo-providers" ".wasm")
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_providers.kotoba"
                                     "--policy" "src/demo_provider_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (false? (:kotoba.cli/ok? denied)))
     (is (= :capability-not-granted
            (get-in denied [:kotoba.cli/data :kotoba.runtime/result
@@ -308,7 +315,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_memory.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (= 106 (get-in run-result [:kotoba.cli/data :kotoba.runtime/result
                                    :kotoba.runtime/value])))
     (is (:kotoba.wasm/ok? wasm))
@@ -327,7 +334,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_memory_write.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= 1 (:kotoba.wasm/data-segment-count wasm)))
     (is (:kotoba.cli/ok? emitted))
@@ -342,7 +349,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_alloc.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (integer? (:kotoba.wasm/heap-base wasm)))
     (is (:kotoba.cli/ok? emitted))
@@ -357,7 +364,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_alloc_checked.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (integer? (:kotoba.wasm/heap-base wasm)))
     (is (:kotoba.cli/ok? emitted))
@@ -371,7 +378,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_memory_grow.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= true (:kotoba.wasm/memory? wasm)))
     (is (:kotoba.cli/ok? emitted))
@@ -385,7 +392,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_i64.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= :i64 (:kotoba.wasm/result-type wasm)))
     (is (:kotoba.cli/ok? emitted))
@@ -400,7 +407,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_i64_params.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= :i64 (:kotoba.wasm/result-type wasm)))
     (is (:kotoba.cli/ok? emitted))
@@ -418,7 +425,7 @@
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_i64_host.kotoba"
                                     "--policy" "src/demo_i64_host_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= :i64 (:kotoba.wasm/result-type wasm)))
     (is (= [{:module "kotoba"
@@ -439,7 +446,7 @@
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_indirect.kotoba"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= :i32 (:kotoba.wasm/result-type wasm)))
     (is (:kotoba.cli/ok? emitted))
@@ -456,7 +463,7 @@
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_string_abi.kotoba"
                                     "--policy" "src/demo_provider_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= [{:module "kotoba"
              :field "clipboard_write_str"
@@ -479,7 +486,7 @@
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_provider_result.kotoba"
                                     "--policy" "src/demo_provider_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= [{:module "kotoba"
              :field "http_fetch"
@@ -501,7 +508,7 @@
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_result_record.kotoba"
                                     "--policy" "src/demo_provider_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= [{:module "kotoba"
              :field "http_fetch"
@@ -523,7 +530,7 @@
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_buffer_abi.kotoba"
                                     "--policy" "src/demo_provider_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= [{:module "kotoba"
              :field "clipboard_read"
@@ -540,13 +547,13 @@
 (deftest wasm-emit-reports-policy-read-errors
   (let [result (launcher/dispatch ["wasm" "emit" "src/demo_notify.kotoba"
                                    "--policy" "missing-policy.edn"
-                                   "--json"])]
+                                   "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (false? (:kotoba.cli/ok? result)))
     (is (= :wasm/policy-not-readable (:kotoba.cli/code result)))
     (is (= "missing-policy.edn" (get-in result [:kotoba.cli/data :kotoba.policy/path])))))
 
 (deftest wasm-run-actually-executes-a-trivial-module
-  (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json"])]
+  (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.cli/ok? result))
     (is (= :wasm/run-completed (:kotoba.cli/code result)))
     (is (= 42 (get-in result [:kotoba.cli/data :kotoba.wasm/value])))
@@ -555,7 +562,7 @@
 (deftest wasm-run-executes-kgraph-round-trip-end-to-end
   (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba"
                                    "--policy" "src/demo_kgraph_policy.edn"
-                                   "--json"])]
+                                   "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.cli/ok? result))
     (is (= :wasm/run-completed (:kotoba.cli/code result)))
     (is (pos? (get-in result [:kotoba.cli/data :kotoba.wasm/value]))
@@ -563,7 +570,7 @@
     (is (= 2 (get-in result [:kotoba.cli/data :kotoba.wasm/import-count])))))
 
 (deftest wasm-run-requires-policy-for-host-capability-import
-  (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba" "--json"])]
+  (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (false? (:kotoba.cli/ok? result)))
     (is (= :wasm/check-failed (:kotoba.cli/code result)))))
 
@@ -575,7 +582,7 @@
             attached to the wasm-run-result* CLI result)"
     (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba"
                                      "--policy" "src/demo_kgraph_policy.edn"
-                                     "--json"])
+                                     "--json" "--package-lock" positive-lock "--trust" trust])
           receipts (get-in result [:kotoba.cli/data :kotoba.host/receipts])]
       (is (:kotoba.cli/ok? result))
       (is (= :wasm/run-completed (:kotoba.cli/code result)))
@@ -595,7 +602,7 @@
             absent entirely -- matching the interpreter run path's (when effective-policy ...)
             convention (see kotoba.host-providers-test/legacy-no-policy-run-is-unchanged), not
             merely an empty vector"
-    (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json"])]
+    (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])]
       (is (:kotoba.cli/ok? result))
       (is (= :wasm/run-completed (:kotoba.cli/code result)))
       (is (not (contains? (:kotoba.cli/data result) :kotoba.host/receipts))))))
@@ -615,7 +622,7 @@
             interpreter-path handling of the exact same :kotoba.host/denied ex-data shape."
     (let [result (launcher/dispatch ["wasm" "run" "src/demo_kgraph.kotoba"
                                      "--policy" "src/demo_kgraph_expired_policy.edn"
-                                     "--json"])
+                                     "--json" "--package-lock" positive-lock "--trust" trust])
           receipts (get-in result [:kotoba.cli/data :kotoba.host/receipts])]
       (is (false? (:kotoba.cli/ok? result)))
       (is (= :wasm/run-denied (:kotoba.cli/code result)))
@@ -641,7 +648,7 @@
     (let [thrown (try
                    (launcher/dispatch ["wasm" "run" "src/demo.kotoba"
                                        "--policy" "src/demo_fuel_exhausted_policy.edn"
-                                       "--json"])
+                                       "--json" "--package-lock" positive-lock "--trust" trust])
                    ::not-thrown
                    (catch clojure.lang.ExceptionInfo e e))]
       (is (instance? clojure.lang.ExceptionInfo thrown)
@@ -650,6 +657,45 @@
       (is (nil? (:kotoba.host/denied (ex-data thrown)))
           "this is NOT a capability denial, so wasm-run-result*'s catch must not have
            intercepted it"))))
+
+;; F-001: `--package-lock` is mandatory for both `wasm emit` and `wasm run` --
+;; the two safe-build entry points must reject a missing lock instead of
+;; silently skipping package admission.
+
+(deftest wasm-emit-rejects-missing-package-lock
+  (let [result (launcher/dispatch ["wasm" "emit" "src/demo.kotoba" "--json"])]
+    (is (false? (:kotoba.cli/ok? result)))
+    (is (= :wasm/package-rejected (:kotoba.cli/code result)))
+    (is (= :package/missing-lock-option
+           (get-in result [:kotoba.cli/data :kotoba.package/admission-code])))))
+
+(deftest wasm-run-rejects-missing-package-lock
+  (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json"])]
+    (is (false? (:kotoba.cli/ok? result)))
+    (is (= :wasm/package-rejected (:kotoba.cli/code result)))
+    (is (= :package/missing-lock-option
+           (get-in result [:kotoba.cli/data :kotoba.package/admission-code])))))
+
+(deftest wasm-run-rejects-rejected-package-lock
+  (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json"
+                                   "--package-lock" "test/fixtures/package/version-only-lock.edn"])]
+    (is (false? (:kotoba.cli/ok? result)))
+    (is (= :wasm/package-rejected (:kotoba.cli/code result)))
+    (is (not= :package/missing-lock-option
+              (get-in result [:kotoba.cli/data :kotoba.package/admission-code]))
+        "a present-but-invalid lock must fail for a lock-content reason, not the missing-option code")))
+
+(deftest wasm-emit-and-run-proceed-with-admitted-package-lock
+  (let [emitted (launcher/dispatch ["wasm" "emit" "src/demo.kotoba" "--json"
+                                    "--package-lock" positive-lock "--trust" trust])
+        run (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json"
+                                "--package-lock" positive-lock "--trust" trust])]
+    (is (:kotoba.cli/ok? emitted))
+    (is (= :wasm/binary-emitted (:kotoba.cli/code emitted)))
+    (is (some? (get-in emitted [:kotoba.cli/data :kotoba.package/receipt])))
+    (is (:kotoba.cli/ok? run))
+    (is (= :wasm/run-completed (:kotoba.cli/code run)))
+    (is (some? (get-in run [:kotoba.cli/data :kotoba.package/receipt])))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.launcher-test)]

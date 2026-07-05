@@ -12,6 +12,11 @@
             [kotoba.runtime :as runtime])
   (:import [java.io File]))
 
+;; wasm emit/run require a mandatory package-admission gate (F-001);
+;; every dispatch call reaching those subcommands needs an admitted lock.
+(def positive-lock "test/fixtures/package/positive-lock.edn")
+(def trust "test/fixtures/package/trust.edn")
+
 (defn temp-file
   [prefix suffix content]
   (let [file (doto (File/createTempFile prefix suffix)
@@ -197,7 +202,7 @@
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_cap_threading.kotoba"
                                     "--policy" "src/demo_cap_threading_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.wasm/ok? wasm))
     (is (= :i64 (:kotoba.wasm/result-type wasm)))
     (is (= 3 (:kotoba.wasm/function-count wasm)))
@@ -268,7 +273,7 @@
           emitted (launcher/dispatch ["wasm" "emit" "src/demo_cap_threading.kotoba"
                                       "--policy" "src/demo_cap_threading_policy.edn"
                                       "--output" (.getPath output)
-                                      "--json"])]
+                                      "--json" "--package-lock" positive-lock "--trust" trust])]
       (is (:kotoba.cli/ok? emitted))
       (testing "two-level threading returns the expected value under the cap-map host"
         (is (= "42" (node-run-main (.getPath output)))))
@@ -280,7 +285,7 @@
               forged-path (temp-file "kotoba-cap-forged" ".kotoba" forged-source)
               rejected (launcher/dispatch ["wasm" "emit" forged-path
                                            "--policy" (temp-edn-file demo-policy)
-                                           "--json"])]
+                                           "--json" "--package-lock" positive-lock "--trust" trust])]
           (is (false? (:kotoba.cli/ok? rejected)))
           (is (= :wasm/check-failed (:kotoba.cli/code rejected)))
           (is (= :cap-arg-not-capability
