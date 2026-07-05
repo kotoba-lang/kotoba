@@ -11,6 +11,11 @@
             [kotoba.runtime :as runtime])
   (:import [java.io File]))
 
+;; wasm emit/run require a mandatory package-admission gate (F-001);
+;; every dispatch call reaching those subcommands needs an admitted lock.
+(def positive-lock "test/fixtures/package/positive-lock.edn")
+(def trust "test/fixtures/package/trust.edn")
+
 (defn temp-file
   [prefix suffix content]
   (let [file (doto (File/createTempFile prefix suffix)
@@ -228,14 +233,14 @@
 (deftest wasm-emit-supports-capability-passing-import-shape
   (let [forms (runtime/read-file "src/demo_cap_passing.kotoba" :kotoba)
         policy (edn/read-string (slurp "src/demo_cap_passing_policy.edn"))
-        denied (launcher/dispatch ["wasm" "emit" "src/demo_cap_passing.kotoba" "--json"])
+        denied (launcher/dispatch ["wasm" "emit" "src/demo_cap_passing.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])
         wasm (runtime/wasm-binary forms policy)
         output (doto (File/createTempFile "kotoba-demo-cap-passing" ".wasm")
                  (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" "src/demo_cap_passing.kotoba"
                                     "--policy" "src/demo_cap_passing_policy.edn"
                                     "--output" (.getPath output)
-                                    "--json"])]
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (false? (:kotoba.cli/ok? denied)))
     (is (= :capability-not-granted
            (get-in denied [:kotoba.cli/data :kotoba.runtime/result

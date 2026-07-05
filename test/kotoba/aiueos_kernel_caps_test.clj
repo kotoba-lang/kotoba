@@ -15,6 +15,11 @@
             [kotoba.runtime :as runtime])
   (:import [java.io File]))
 
+;; wasm emit/run require a mandatory package-admission gate (F-001);
+;; every dispatch call reaching those subcommands needs an admitted lock.
+(def positive-lock "test/fixtures/package/positive-lock.edn")
+(def trust "test/fixtures/package/trust.edn")
+
 (defn- denied-without-policy? [demo-path]
   (let [result (launcher/dispatch ["run" demo-path "--json"])]
     (and (false? (:kotoba.cli/ok? result))
@@ -28,7 +33,7 @@
         wasm (runtime/wasm-binary forms policy)
         output (doto (File/createTempFile "kotoba-aiueos-demo" ".wasm") (.deleteOnExit))
         emitted (launcher/dispatch ["wasm" "emit" demo-path "--policy" policy-path
-                                    "--output" (.getPath output) "--json"])]
+                                    "--output" (.getPath output) "--json" "--package-lock" positive-lock "--trust" trust])]
     (and (:kotoba.wasm/ok? wasm)
          (= [expected-import] (:kotoba.wasm/imports wasm))
          (:kotoba.cli/ok? emitted)

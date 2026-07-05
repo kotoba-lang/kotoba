@@ -145,9 +145,14 @@ Commands this repo's launcher currently wires up:
 kotoba check --kind cli-contract --json     # validate the CLI/package/lock contract
 kotoba run path/to/entry.kotoba             # compile and run a Kotoba entry point
 kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
-kotoba wasm emit cell.kotoba --policy policy.edn -o cell.wasm    # capability-confined build, see Language below
-kotoba wasm run cell.kotoba --policy policy.edn                  # check + emit + execute
+kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # capability-confined build, see Language below
+kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
 ```
+
+`--package-lock` is mandatory for both `wasm emit` and `wasm run`: the package
+admission gate always runs first, and a missing or rejected lock aborts the
+build/run with the admission receipt in the error payload — there is no way to
+opt out (F-001).
 
 `db` / `git` / `rad` / `deploy` / `hinshitsu` are declared in the same
 contract for the distributed-graph, git-adapter, RAD sovereign-repo, and
