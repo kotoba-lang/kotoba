@@ -6,6 +6,7 @@
             [kotoba.cap-passing-test]
             [kotoba.cap-typed-test]
             [kotoba.did-adapter-test]
+            [kotoba.doc-examples-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
             [kotoba.kgraph-test]
@@ -20,6 +21,7 @@
                                         'kotoba.cap-passing-test
                                         'kotoba.cap-typed-test
                                         'kotoba.did-adapter-test
+                                        'kotoba.doc-examples-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
                                         'kotoba.kgraph-test
