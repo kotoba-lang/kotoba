@@ -23,11 +23,14 @@
 
 (deftest scaffold-files-are-pure-data
   (let [files (rad-adapter/scaffold-files "/tmp/my-app" "app")]
-    (is (= #{"src/my_app.kotoba" "package.edn" "README.md"} (set (keys files))))
+    (is (= #{"src/my_app.kotoba" "package.edn" "kotoba.lock.edn" "README.md"} (set (keys files))))
     (is (.contains ^String (files "src/my_app.kotoba") "(ns my-app)"))
     (let [manifest (edn/read-string (files "package.edn"))]
       (is (= "my-app" (:kotoba.package/name manifest)))
-      (is (true? (:kotoba.package/draft? manifest))))))
+      (is (true? (:kotoba.package/draft? manifest))))
+    (let [lock (edn/read-string (files "kotoba.lock.edn"))]
+      (is (= 1 (:kotoba.lock/version lock)))
+      (is (= [] (:deps lock))))))
 
 (deftest plan-shapes-per-operation
   (let [new-plan (rad-adapter/plan {:positionals ["new"] :options {:project "/p/app"}})
@@ -35,13 +38,13 @@
         test-plan (rad-adapter/plan {:positionals ["test"] :options {:project "/p/app"}})
         export-plan (rad-adapter/plan {:positionals ["export"]
                                        :options {:project "/p/app" :o "/out/app.wasm"}})]
-    (is (= [:fs/mkdirs :fs/write :fs/write :fs/write]
+    (is (= [:fs/mkdirs :fs/write :fs/write :fs/write :fs/write]
            (mapv :kind (:steps new-plan))))
-    (is (= ["wasm" "emit" "/p/app/src/app.kotoba" "--output" "/p/app/target/app.wasm"]
+    (is (= ["wasm" "emit" "/p/app/src/app.kotoba" "--package-lock" "/p/app/kotoba.lock.edn" "--output" "/p/app/target/app.wasm"]
            (:argv (second (:steps build-plan)))))
     (is (= [["check" "/p/app/src/app.kotoba"]]
            (mapv :argv (:steps test-plan))))
-    (is (= ["wasm" "emit" "/p/app/src/app.kotoba" "--output" "/out/app.wasm"]
+    (is (= ["wasm" "emit" "/p/app/src/app.kotoba" "--package-lock" "/p/app/kotoba.lock.edn" "--output" "/out/app.wasm"]
            (:argv (second (:steps export-plan)))))))
 
 (deftest plan-rejects-bad-requests
