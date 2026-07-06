@@ -91,3 +91,11 @@ name reads as read-only, but the surface's own two write operations
 - No browser or Cloudflare Worker host for this JVM-defined ABI exists yet in
   this repository; `kotoba.wasm-exec` proves the contract is real and
   runnable, which is the prerequisite for such a host, not the host itself.
+- **Update (2026-07-06, ADR-2607061630 in `com-junkawasaki/root`)**: a
+  browser host now exists in a sibling repo — `kotoba-lang/kototama`'s
+  `web/` directory runs a zero-import `wasm emit` binary directly via the
+  browser's native `WebAssembly` API, wrapped as a `<kototama-wasm-run>`
+  WebComponent. It does not yet implement the `(module "kotoba")`
+  host-import ABI this file's `kotoba.wasm-exec` implements on the JVM
+  side — that remains open, host-import-bearing modules still only run
+  here via `kotoba wasm run`.
