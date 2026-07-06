@@ -59,6 +59,15 @@
 (defn default-output-path [project]
   (str project "/target/" (munge-name (project-name project)) ".wasm"))
 
+(defn lock-path
+  "Path to the scaffolded zero-dependency package lock every `:build`/
+  `:export` step passes to `wasm emit --package-lock` (F-001 made that
+  option mandatory with no opt-out; a freshly scaffolded app has no
+  dependencies to lock, so the scaffold itself provides the vacuous
+  `:deps []` lock kotoba-lang/kotoba-lang admits for that case)."
+  [project]
+  (str project "/kotoba.lock.edn"))
+
 (defn scaffold-files
   "Pure scaffold: relative path -> content for a new Kotoba package. The
   package.edn is a draft manifest — content pins (CIDs) and signatures are
@@ -78,6 +87,13 @@
           " ;; CIDs, and :kotoba.package/signatures are added by publish tooling\n"
           " ;; (see kotoba-lang/kotoba-lang lang/package.edn).\n"
           " :kotoba.package/draft? true}\n")
+
+     "kotoba.lock.edn"
+     (str "{:kotoba.lock/version 1\n"
+          " ;; No dependencies yet -- add :deps entries as this package takes\n"
+          " ;; on real ones. `wasm emit --package-lock` (F-001, mandatory) needs\n"
+          " ;; this file to exist even for a zero-dependency build.\n"
+          " :deps []}\n")
 
      "README.md"
      (str "# " name "\n\nScaffolded by `kotoba rad new`.\n\n"
@@ -124,7 +140,7 @@
            :steps [{:kind :fs/mkdirs :id :rad/target-dir
                     :path (or (re-find #".*(?=/)" out) ".")}
                    {:kind :dispatch :id :rad/wasm-emit
-                    :argv ["wasm" "emit" src "--output" out]}]})
+                    :argv ["wasm" "emit" src "--package-lock" (lock-path project) "--output" out]}]})
 
         :test
         {:operation op
@@ -143,7 +159,7 @@
            :steps [{:kind :fs/mkdirs :id :rad/output-dir
                     :path (or (re-find #".*(?=/)" output) ".")}
                    {:kind :dispatch :id :rad/wasm-emit
-                    :argv ["wasm" "emit" src "--output" output]}]})))))
+                    :argv ["wasm" "emit" src "--package-lock" (lock-path project) "--output" output]}]})))))
 
 (defn- run-step [host {:keys [kind id path content argv]}]
   (case kind
