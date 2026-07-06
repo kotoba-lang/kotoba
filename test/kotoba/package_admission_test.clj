@@ -1,6 +1,6 @@
 (ns kotoba.package-admission-test
   (:require [clojure.edn :as edn]
-            [clojure.test :refer [deftest is run-tests]]
+            [clojure.test :refer [deftest is run-tests testing]]
             [kotoba.launcher :as launcher]
             [kotoba.package-admission :as admission]))
 
@@ -9,6 +9,7 @@
 
 (def positive-lock (fixture "positive-lock.edn"))
 (def positive-manifest (fixture "positive-manifest.edn"))
+(def empty-deps-lock (fixture "empty-deps-lock.edn"))
 (def trust (fixture "trust.edn"))
 
 (defn verify-argv [& argv]
@@ -233,6 +234,20 @@
                                :kotoba.package/verified?])))
     (is (= :accepted (get-in result [:kotoba.cli/data :kotoba.package/receipt
                                      :kotoba.package/entries 0 :package/result])))))
+
+(deftest safe-build-proceeds-with-zero-dependency-package-lock
+  (testing "a genuinely dependency-free program can still be built under the
+            mandatory --package-lock gate (F-001) -- an empty :deps lock is
+            admitted, not rejected with lock-deps-required"
+    (let [result (launcher/dispatch ["wasm" "emit" "src/demo.kotoba"
+                                     "--package-lock" empty-deps-lock
+                                     "--json"])]
+      (is (true? (:kotoba.cli/ok? result)))
+      (is (= :wasm/binary-emitted (:kotoba.cli/code result)))
+      (is (true? (get-in result [:kotoba.cli/data :kotoba.package/receipt
+                                 :kotoba.package/verified?])))
+      (is (= [] (get-in result [:kotoba.cli/data :kotoba.package/receipt
+                                :kotoba.package/entries]))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.package-admission-test)]

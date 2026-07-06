@@ -21,7 +21,7 @@
   "Map kotoba.lang.package-contract (and admission-layer) messages to stable
   problem keywords surfaced in receipts."
   {"lock version 1 required" :package/lock-version-unsupported
-   "lock deps required" :package/lock-deps-required
+   "lock deps vector required" :package/lock-deps-required
    "missing required lock field" :package/missing-lock-field
    "cid required" :package/cid-required
    "signer required" :package/signer-required
@@ -112,8 +112,9 @@
   (or (when-not (= 1 (:kotoba.lock/version lock))
         (package-contract/invalid "lock version 1 required"
                                   {:value (:kotoba.lock/version lock)}))
-      (when-not (seq (:deps lock))
-        (package-contract/invalid "lock deps required" {}))))
+      (when-not (vector? (:deps lock))
+        (package-contract/invalid "lock deps vector required"
+                                  {:value (:deps lock)}))))
 
 (defn dep-error
   "First problem for a single lock entry: admission-layer safe-mode checks,
