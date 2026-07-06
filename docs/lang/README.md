@@ -127,24 +127,24 @@ scripts as CI evidence.
 The same launcher also exposes current host-facing checks:
 
 ```sh
-bin/kotoba-clj wasm emit src/demo.kotoba --output target/kotoba/demo.wasm --json
-bin/kotoba-clj wasm emit src/demo_call.kotoba --output target/kotoba/demo_call.wasm --json
-bin/kotoba-clj wasm emit src/demo_cap.kotoba --policy src/demo_policy.edn --output target/kotoba/demo_cap.wasm --json
-bin/kotoba-clj wasm emit src/demo_notify.kotoba --policy src/demo_policy.edn --output target/kotoba/demo_notify.wasm --json
-bin/kotoba-clj wasm emit src/demo_providers.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_providers.wasm --json
-bin/kotoba-clj wasm emit src/demo_memory.kotoba --output target/kotoba/demo_memory.wasm --json
-bin/kotoba-clj wasm emit src/demo_memory_write.kotoba --output target/kotoba/demo_memory_write.wasm --json
-bin/kotoba-clj wasm emit src/demo_memory_grow.kotoba --output target/kotoba/demo_memory_grow.wasm --json
-bin/kotoba-clj wasm emit src/demo_i64.kotoba --output target/kotoba/demo_i64.wasm --json
-bin/kotoba-clj wasm emit src/demo_i64_params.kotoba --output target/kotoba/demo_i64_params.wasm --json
-bin/kotoba-clj wasm emit src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --output target/kotoba/demo_i64_host.wasm --json
-bin/kotoba-clj wasm emit src/demo_indirect.kotoba --output target/kotoba/demo_indirect.wasm --json
-bin/kotoba-clj wasm emit src/demo_alloc.kotoba --output target/kotoba/demo_alloc.wasm --json
-bin/kotoba-clj wasm emit src/demo_alloc_checked.kotoba --output target/kotoba/demo_alloc_checked.wasm --json
-bin/kotoba-clj wasm emit src/demo_string_abi.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_string_abi.wasm --json
-bin/kotoba-clj wasm emit src/demo_buffer_abi.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_buffer_abi.wasm --json
-bin/kotoba-clj wasm emit src/demo_provider_result.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_provider_result.wasm --json
-bin/kotoba-clj wasm emit src/demo_result_record.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_result_record.wasm --json
+bin/kotoba-clj wasm emit src/demo.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo.wasm --json
+bin/kotoba-clj wasm emit src/demo_call.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_call.wasm --json
+bin/kotoba-clj wasm emit src/demo_cap.kotoba --policy src/demo_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_cap.wasm --json
+bin/kotoba-clj wasm emit src/demo_notify.kotoba --policy src/demo_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_notify.wasm --json
+bin/kotoba-clj wasm emit src/demo_providers.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_providers.wasm --json
+bin/kotoba-clj wasm emit src/demo_memory.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_memory.wasm --json
+bin/kotoba-clj wasm emit src/demo_memory_write.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_memory_write.wasm --json
+bin/kotoba-clj wasm emit src/demo_memory_grow.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_memory_grow.wasm --json
+bin/kotoba-clj wasm emit src/demo_i64.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_i64.wasm --json
+bin/kotoba-clj wasm emit src/demo_i64_params.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_i64_params.wasm --json
+bin/kotoba-clj wasm emit src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_i64_host.wasm --json
+bin/kotoba-clj wasm emit src/demo_indirect.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_indirect.wasm --json
+bin/kotoba-clj wasm emit src/demo_alloc.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_alloc.wasm --json
+bin/kotoba-clj wasm emit src/demo_alloc_checked.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_alloc_checked.wasm --json
+bin/kotoba-clj wasm emit src/demo_string_abi.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_string_abi.wasm --json
+bin/kotoba-clj wasm emit src/demo_buffer_abi.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_buffer_abi.wasm --json
+bin/kotoba-clj wasm emit src/demo_provider_result.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_provider_result.wasm --json
+bin/kotoba-clj wasm emit src/demo_result_record.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_result_record.wasm --json
 ../shell/bin/kotoba-shell adapter check --target ios --json
 ../shell/bin/kotoba-shell adapter check --target android --json
 ../shell/bin/kotoba-shell native-host check --target ios --json

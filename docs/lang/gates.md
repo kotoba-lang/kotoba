@@ -11,15 +11,15 @@ bin/kotoba-clj run src/demo.kotoba --json
 bin/kotoba-clj run src/demo.cljc --json
 bin/kotoba-clj run src/demo.cljc --reader-target cljs --json
 bin/kotoba-clj run src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --json
-bin/kotoba-clj wasm emit src/demo.kotoba --output target/kotoba/demo.wasm --json
+bin/kotoba-clj wasm emit src/demo.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo.wasm")).then(({instance})=>{if(instance.exports.main()!==42) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_call.kotoba --output target/kotoba/demo_call.wasm --json
+bin/kotoba-clj wasm emit src/demo_call.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_call.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_call.wasm")).then(({instance})=>{if(instance.exports.main()!==43) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_cap.kotoba --policy src/demo_policy.edn --output target/kotoba/demo_cap.wasm --json
+bin/kotoba-clj wasm emit src/demo_cap.kotoba --policy src/demo_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_cap.wasm --json
 node -e 'const fs=require("fs"); const imports={kotoba:{has_capability:(id)=>id===203?1:0}}; WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_cap.wasm"), imports).then(({instance})=>{if(instance.exports.main()!==7) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_notify.kotoba --policy src/demo_policy.edn --output target/kotoba/demo_notify.wasm --json
+bin/kotoba-clj wasm emit src/demo_notify.kotoba --policy src/demo_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_notify.wasm --json
 node -e 'const fs=require("fs"); const imports={kotoba:{notify_show:(code)=>code+1}}; WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_notify.wasm"), imports).then(({instance})=>{if(instance.exports.main()!==42) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_providers.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_providers.wasm --json
+bin/kotoba-clj wasm emit src/demo_providers.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_providers.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 let memory;
@@ -35,24 +35,24 @@ const imports = { kotoba: {
 }};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_providers.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 67) process.exit(1); });
 NODE
-bin/kotoba-clj wasm emit src/demo_memory.kotoba --output target/kotoba/demo_memory.wasm --json
+bin/kotoba-clj wasm emit src/demo_memory.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_memory.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_memory.wasm")).then(({instance})=>{if(instance.exports.main()!==106 || !(instance.exports.memory instanceof WebAssembly.Memory)) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_memory_write.kotoba --output target/kotoba/demo_memory_write.wasm --json
+bin/kotoba-clj wasm emit src/demo_memory_write.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_memory_write.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_memory_write.wasm")).then(({instance})=>{if(instance.exports.main()!==140) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_memory_grow.kotoba --output target/kotoba/demo_memory_grow.wasm --json
+bin/kotoba-clj wasm emit src/demo_memory_grow.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_memory_grow.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_memory_grow.wasm")).then(({instance})=>{if(instance.exports.main()!==3 || instance.exports.memory.buffer.byteLength!==131072) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_i64.kotoba --output target/kotoba/demo_i64.wasm --json
+bin/kotoba-clj wasm emit src/demo_i64.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_i64.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_i64.wasm")).then(({instance})=>{if(instance.exports.main()!==42n) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_i64_params.kotoba --output target/kotoba/demo_i64_params.wasm --json
+bin/kotoba-clj wasm emit src/demo_i64_params.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_i64_params.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_i64_params.wasm")).then(({instance})=>{if(instance.exports.main()!==42n) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --output target/kotoba/demo_i64_host.wasm --json
+bin/kotoba-clj wasm emit src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_i64_host.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 const imports = { kotoba: { host_i64_roundtrip: (v) => v + 1n }};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_i64_host.wasm'), imports).then(({instance}) => { if (instance.exports.main() !== 42n) process.exit(1); });
 NODE
 bin/kotoba-clj run src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --json
-bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --output target/kotoba/demo_cap_passing.wasm --json
+bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_cap_passing.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 let memory;
@@ -68,7 +68,7 @@ const imports = { kotoba: {
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_cap_passing.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 42n) process.exit(1); });
 NODE
 bin/kotoba-clj run src/demo_cap_threading.kotoba --policy src/demo_cap_threading_policy.edn --json
-bin/kotoba-clj wasm emit src/demo_cap_threading.kotoba --policy src/demo_cap_threading_policy.edn --output target/kotoba/demo_cap_threading.wasm --json
+bin/kotoba-clj wasm emit src/demo_cap_threading.kotoba --policy src/demo_cap_threading_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_cap_threading.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 let memory;
@@ -83,20 +83,20 @@ const imports = { kotoba: {
 }};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_cap_threading.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 42n) process.exit(1); });
 NODE
-bin/kotoba-clj wasm emit src/demo_indirect.kotoba --output target/kotoba/demo_indirect.wasm --json
+bin/kotoba-clj wasm emit src/demo_indirect.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_indirect.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_indirect.wasm")).then(({instance})=>{if(instance.exports.main()!==42) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_alloc.kotoba --output target/kotoba/demo_alloc.wasm --json
+bin/kotoba-clj wasm emit src/demo_alloc.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_alloc.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_alloc.wasm")).then(({instance})=>{if(instance.exports.main()!==162) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_alloc_checked.kotoba --output target/kotoba/demo_alloc_checked.wasm --json
+bin/kotoba-clj wasm emit src/demo_alloc_checked.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo_alloc_checked.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo_alloc_checked.wasm")).then(({instance})=>{if(instance.exports.main()!==1) process.exit(1)})'
-bin/kotoba-clj wasm emit src/demo_string_abi.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_string_abi.wasm --json
+bin/kotoba-clj wasm emit src/demo_string_abi.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_string_abi.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 let memory;
 const imports = { kotoba: { clipboard_write_str: (ptr, len) => new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len)).length }};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_string_abi.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 6) process.exit(1); });
 NODE
-bin/kotoba-clj wasm emit src/demo_buffer_abi.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_buffer_abi.wasm --json
+bin/kotoba-clj wasm emit src/demo_buffer_abi.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_buffer_abi.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 let memory;
@@ -107,13 +107,13 @@ const imports = { kotoba: { clipboard_read: (outPtr, outLen) => {
 }}};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_buffer_abi.wasm'), imports).then(({instance}) => { memory = instance.exports.memory; if (instance.exports.main() !== 201) process.exit(1); });
 NODE
-bin/kotoba-clj wasm emit src/demo_provider_result.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_provider_result.wasm --json
+bin/kotoba-clj wasm emit src/demo_provider_result.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_provider_result.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 const imports = { kotoba: { http_fetch: () => -7 }};
 WebAssembly.instantiate(fs.readFileSync('target/kotoba/demo_provider_result.wasm'), imports).then(({instance}) => { if (instance.exports.main() !== 7) process.exit(1); });
 NODE
-bin/kotoba-clj wasm emit src/demo_result_record.kotoba --policy src/demo_provider_policy.edn --output target/kotoba/demo_result_record.wasm --json
+bin/kotoba-clj wasm emit src/demo_result_record.kotoba --policy src/demo_provider_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_result_record.wasm --json
 node - <<'NODE'
 const fs = require('fs');
 const imports = { kotoba: { http_fetch: () => -7 }};
@@ -320,7 +320,7 @@ ADR-safe-capability-language "capability の値渡し"):
 
 ```sh
 bin/kotoba-clj run src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --json
-bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --output target/kotoba/demo_cap_passing.wasm --json
+bin/kotoba-clj wasm emit src/demo_cap_passing.kotoba --policy src/demo_cap_passing_policy.edn --package-lock kotoba.lock.edn --output target/kotoba/demo_cap_passing.wasm --json
 ```
 
 - `(cap-acquire <kind-kw> <resource>)` (e.g.
@@ -495,12 +495,16 @@ bin/kotoba-clj wasm emit src/demo.kotoba --package-lock kotoba.lock.edn --json
   carrying `:package/id`, `:package/repo-rid`, `:package/manifest-cid`,
   `:package/tree-cid`, `:package/result`). `--receipt <out.edn>` writes the
   receipt EDN file used as release evidence.
-- The safe-build path takes an optional `--package-lock <path>` on
-  `wasm emit`: admission runs before the build, a rejected lock aborts the
-  build with `:wasm/package-rejected` and the receipt in the error payload,
-  and an admitted lock attaches the receipt to the build result. Without
-  `--package-lock` there are no package inputs to admit and behavior is
-  unchanged.
+- `--package-lock <path>` is **mandatory** on `wasm emit`/`wasm run`, with no
+  way to opt out (F-001): admission runs before the build, a rejected or
+  missing lock aborts the build with `:wasm/package-rejected` and the
+  receipt (or `:package/missing-lock-option`, if the flag is absent
+  entirely) in the error payload, and an admitted lock attaches the receipt
+  to the build result. A genuinely dependency-free program still needs a
+  lock file — a `{:kotoba.lock/version 1 :deps []}` lock (as used by every
+  `wasm emit` example above) is admitted vacuously; `kotoba-lang/kotoba-lang`
+  requires `:deps` be present as a vector, not that it be non-empty
+  (kotoba-lang/kotoba-lang#11).
 
 Cargo/Rust gates are historical for this repository. Implementation-heavy
 compiler conformance belongs in `kotoba-lang/kotoba-lang` or another authority
