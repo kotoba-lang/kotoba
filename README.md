@@ -84,7 +84,7 @@ See [**Documentation**](#documentation) below for the full ADR / design index.
 
 ```bash
 # Tap the kotoba formula
-brew tap etzhayyim/kotoba          # one-time
+brew tap kotoba-lang/kotoba        # one-time
 brew install kotoba                # installs the CLJC/EDN-backed `kotoba` launcher
 ```
 
