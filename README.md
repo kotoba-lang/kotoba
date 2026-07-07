@@ -24,6 +24,15 @@ the datom **database** lives in kotobase.
   running untrusted / AI-generated agents: what a module can touch is
   whatever it was explicitly handed, and nothing else. See
   [**Language**](#language--kotoba-lang--kotoba-wasm) below.
+- **Clojure on Clojure** — the compiler and runtime that implement this
+  Clojure-shaped language are themselves written in Clojure/ClojureScript
+  (`.cljc`); the earlier Rust workspace has been fully removed (see
+  [Rust-free CLJ launcher](#rust-free-clj-launcher) below). Its
+  capability-safety design is *benchmarked against* Rust on an explicit
+  safety ladder, not modeled on it — see the "Safety model" bullet under
+  [Language — kotoba-lang & kotoba wasm](#language--kotoba-lang--kotoba-wasm)
+  below, or `kotoba-lang/docs/adr/ADR-safe-capability-language.md`, for what
+  that ladder actually claims.
 
 ## Repository boundary
 
