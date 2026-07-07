@@ -677,11 +677,18 @@
   "`wasm run <source>`: check + emit (as `wasm emit` does), then actually
   EXECUTE the module via kotoba.wasm-exec (com.dylibso.chicory) — the piece
   `wasm emit` deliberately stops short of. kgraph-* host imports run for real
-  against a fresh per-invocation `kotoba.kgraph` store; every other declared
-  host import gets a trivial 0-returning stub (kotoba.wasm-exec/
-  stub-host-function), matching kotoba.host-providers/default-handlers'
-  convention, so a valid program never fails to link here for lack of a real
-  native provider.
+  against a fresh per-invocation `kotoba.kgraph` store; the notify/
+  clipboard/http/keychain/fs/log/clock/random/topic-bus and actor-host
+  (gen-keypair/sign/verify/sha256-hex/http-post/log-read) surface runs for
+  real too, against a fresh per-invocation `kotoba.wasm-exec/
+  default-host-state` (`kotoba.wasm-exec/real-host-functions`) — real
+  in-memory clipboard/keychain/notification-log/append-log/topic queues, a
+  sandboxed real filesystem root, real HTTP, real Ed25519/SHA-256. Only the
+  device-access quartet (pci-config/dma-map/irq-subscribe/mmio-map) still
+  gets a trivial 0-returning stub (kotoba.wasm-exec/stub-host-function) —
+  permanently host/hypervisor-only, not a placeholder awaiting a real
+  implementation — so a valid program never fails to link here for lack of
+  a provider.
 
   Mirrors `guarded-run-result`/`runtime-result`'s interpreter-path receipt
   surface: a `kotoba.host-providers/journal` is built and threaded into
@@ -743,6 +750,7 @@
           (let [ops (runtime/required-host-imports forms)
                 stub-fns (->> ops
                               (remove kgraph-ops)
+                              (remove wasm-exec/real-op-ids)
                               (map runtime/host-imports)
                               (map wasm-exec/stub-host-function))
                 {:keys [record! entries]} (host-providers/journal)
@@ -750,18 +758,30 @@
             (try
               ;; POLICY (already computed above for the static `check`
               ;; gate) is threaded into `instantiate` too, so `has-capability?`
-              ;; and the kgraph-* effects are enforced at RUN time under the
-              ;; same policy that governed emission — closing the gap where
-              ;; the runtime executor previously granted every capability
-              ;; unconditionally regardless of `--policy` (ADR-2607050500).
-              ;; :record!/:now flow into every guard-kgraph-call dispatch so
-              ;; each attempted kgraph-* call (granted or denied) leaves a
-              ;; receipt in ENTRIES, exactly as the interpreter path's
-              ;; `guarded-run-result` does via kotoba.host-providers/host-call.
-              (let [instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
+              ;; and the kgraph-*/real-provider effects are enforced at RUN
+              ;; time under the same policy that governed emission — closing
+              ;; the gap where the runtime executor previously granted every
+              ;; capability unconditionally regardless of `--policy`
+              ;; (ADR-2607050500). :record!/:now flow into every
+              ;; guard-host-call dispatch so each attempted call (granted or
+              ;; denied) leaves a receipt in ENTRIES, exactly as the
+              ;; interpreter path's `guarded-run-result` does via
+              ;; kotoba.host-providers/host-call. `real-host-functions` now
+              ;; covers everything `stub-fns` used to fake except the
+              ;; device-access quartet (pci-config/dma-map/irq-subscribe/
+              ;; mmio-map, permanently host/hypervisor-only) — a genuine
+              ;; clipboard/keychain/filesystem/HTTP/crypto/topic-bus/log,
+              ;; not a 0-returning placeholder, backs every other declared
+              ;; import a guest calls.
+              (let [real-fns (when (some wasm-exec/real-op-ids ops)
+                               (wasm-exec/real-host-functions
+                                (wasm-exec/default-host-state) policy
+                                {:record! record! :now now}))
+                    instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
                                                     (concat (wasm-exec/kgraph-host-functions
                                                              (atom []) policy
                                                              {:record! record! :now now})
+                                                            real-fns
                                                             stub-fns)
                                                     policy)
                     value (wasm-exec/call-main instance)]

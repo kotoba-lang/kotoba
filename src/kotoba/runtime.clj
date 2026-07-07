@@ -175,7 +175,26 @@
    'pci-config :host/pci-config
    'dma-map :host/dma-map
    'irq-subscribe :host/irq-subscribe
-   'mmio-map :host/mmio-map})
+   'mmio-map :host/mmio-map
+   ;; kotoba-lang/kototama's actor:host ABI (kototama.contract/
+   ;; kototama.tender, ADR-2607062330/2607062400), mirrored into kotoba's
+   ;; own real host-provider surface (kotoba.wasm-exec/real-op-effects).
+   ;; None of these need a cap-passing <op>-with variant (no entry below in
+   ;; with-op->op/op->with-op) -- a plain guarded call is sufficient, same
+   ;; as kgraph-assert!/clipboard-write -- but the entry HERE is still
+   ;; required: kotoba.lang.capability-host/guard-call needs a capability
+   ;; kind to build a request from for ANY guarded call, cap-passing or
+   ;; not. (A first version of this registration omitted these entries on
+   ;; the mistaken assumption that only cap-passing needed op->kind --
+   ;; corrected once kotoba.wasm-exec's real, non-stub HostFunctions
+   ;; actually tried to guard-call them and were denied :malformed-
+   ;; requested every time, kotoba-lang/kotoba-lang#12.)
+   'gen-keypair :host/identity-keypair
+   'sign :host/identity-sign
+   'verify :host/identity-verify
+   'sha256-hex :host/hash-sha256
+   'http-post :host/http-post
+   'log-read :host/log-read})
 
 (def with-op->op
   "Capability-passing use variant (`<op>-with`, leading argument a capability
