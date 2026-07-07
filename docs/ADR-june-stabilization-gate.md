@@ -61,6 +61,8 @@ Those should be reconciled as part of the stabilization pass.
 
 - [ ] Stabilize kotoba / kotobase.net / etzhayyim.com (uptime, health, restart,
       cold-tier) — June.
-- [ ] Reconcile stale `etzhayyim/…` repo references in `README.md` to
-      `com-junkawasaki/kotoba`.
+- [x] Reconcile stale `etzhayyim/…` repo references in `README.md` to
+      `kotoba-lang/kotoba` (the canonical repo per this ADR's own header --
+      the original wording of this bullet, `com-junkawasaki/kotoba`, was
+      itself already stale by the time this was actioned; fixed 2026-07-07).
 - [ ] Re-open the July go-to-market plan (thread "T" first) once the gate is met.
