@@ -40,6 +40,46 @@
     (is (= :package-verified (:kotoba.cli/code result)))
     (is (true? (:kotoba.package/verified? (receipt result))))))
 
+;; ---------------------------------------------------------------------------
+;; Manifest integrity: a real CID mismatch, not just shape
+
+(deftest compute-manifest-cid-matches-the-fixtures-own-self-declared-cid
+  (testing "positive-manifest.edn's :manifest-cid genuinely IS its own content's real CID
+            (kotoba.package-admission/compute-manifest-cid, canonical DAG-CBOR + CIDv1) --
+            not just a CID-shaped placeholder that happens to pass the structural check"
+    (let [manifest (edn/read-string (slurp positive-manifest))]
+      (is (= (get-in manifest [:kotoba.package/source :manifest-cid])
+             (admission/compute-manifest-cid manifest))))))
+
+(deftest manifest-with-a-mismatched-cid-is-rejected-not-silently-accepted
+  (testing "a manifest edited without updating its pinned :manifest-cid (or a CID copied
+            from an unrelated package) is caught here -- kotoba.lang.package-contract/cid?'s
+            structural check alone (kotoba-lang/kotoba-lang#13) can't detect this: the
+            tampered value is still a perfectly well-formed CIDv1, just not THIS content's"
+    (let [manifest (edn/read-string (slurp positive-manifest))
+          tampered (assoc-in manifest [:kotoba.package/source :manifest-cid]
+                             (admission/compute-manifest-cid
+                              (assoc manifest :kotoba.package/version "9.9.9")))
+          error (admission/manifest-integrity-error tampered)]
+      (is (some? error))
+      (is (= "manifest cid does not match manifest content" (:message error)))
+      (is (not= (get-in tampered [:kotoba.package/source :manifest-cid])
+                (:computed (:data error)))
+          "the declared (tampered) CID and the real computed CID must differ")))
+  (testing "wired end to end through verify-lock: a rejected manifest fails the whole build,
+            not just the standalone helper function"
+    (let [manifest (edn/read-string (slurp positive-manifest))
+          tampered (assoc-in manifest [:kotoba.package/source :manifest-cid]
+                             (admission/compute-manifest-cid
+                              (assoc manifest :kotoba.package/version "9.9.9")))
+          lock (edn/read-string (slurp positive-lock))
+          r (admission/verify-lock {:lock lock :lock-path positive-lock
+                                    :manifest tampered :manifest-path positive-manifest
+                                    :trust {:declared-capabilities [:graph-read]}})]
+      (is (false? (:kotoba.package/verified? r)))
+      (is (= :package/manifest-cid-mismatch
+             (get-in r [:kotoba.package/problems 0 :kotoba.package/problem]))))))
+
 (deftest receipt-has-release-evidence-shape
   (let [result (verify-argv "--lock" positive-lock "--trust" trust)
         r (receipt result)
@@ -51,11 +91,11 @@
     (is (vector? (:kotoba.package/problems r)))
     (is (= 1 (count (:kotoba.package/entries r))))
     (is (= "kotoba-lang/json@0.1.0" (:package/id entry)))
-    (is (= "bafyrepojson111111111111111111111111111111111111111111111111"
+    (is (= "bafyreiarfykm5z7sphdaldk27xkdioykfxkyib7iyglqiteaszqlhoka5i"
            (:package/repo-rid entry)))
-    (is (= "bafymanifestjson111111111111111111111111111111111111111111"
+    (is (= "bafyreic7obercaz225ab3xc4nes5tijjhhl2cc4ws5xipozv4vexq5ucxm"
            (:package/manifest-cid entry)))
-    (is (= "bafytreejson111111111111111111111111111111111111111111111111"
+    (is (= "bafyreiawokfmkzvlt3yhwb5qd6widilkuvriucz6kxlrwb2o5whnpkjek4"
            (:package/tree-cid entry)))
     (is (= :accepted (:package/result entry)))))
 
@@ -159,10 +199,10 @@
 (deftest rejects-path-looking-refs-at-fn-level
   (let [dep {:dep/name "kotoba-lang/json"
              :dep/version "0.1.0"
-             :dep/repo-rid "bafyrepojson111111111111111111111111111111111111111111111111"
+             :dep/repo-rid "bafyreiarfykm5z7sphdaldk27xkdioykfxkyib7iyglqiteaszqlhoka5i"
              :dep/commit "0123456789abcdef0123456789abcdef01234567"
-             :dep/tree-cid "bafytreejson111111111111111111111111111111111111111111111111"
-             :dep/manifest-cid "bafymanifestjson111111111111111111111111111111111111111111"
+             :dep/tree-cid "bafyreiawokfmkzvlt3yhwb5qd6widilkuvriucz6kxlrwb2o5whnpkjek4"
+             :dep/manifest-cid "bafyreic7obercaz225ab3xc4nes5tijjhhl2cc4ws5xipozv4vexq5ucxm"
              :dep/signers ["did:key:z6Mkpkgjson"]
              :dep/capabilities []}
         verify (fn [d]

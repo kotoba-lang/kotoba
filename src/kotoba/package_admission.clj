@@ -6,12 +6,26 @@
   kotoba-lang/kotoba-lang, and layers launcher-owned safe-mode checks on top
   (local-path dependencies are never admitted). Every verification — accept or
   reject — emits a package-verification receipt; the receipt is the
-  release-evidence artifact required before a safe build may proceed."
-  (:require [clojure.edn :as edn]
+  release-evidence artifact required before a safe build may proceed.
+
+  `manifest-integrity-error` closes a real gap `kotoba.lang.package-contract/
+  cid?` alone doesn't (kotoba-lang/kotoba-lang#13 made `cid?` a genuine
+  CIDv1 structural check, but structural validity says nothing about
+  whether a CID actually matches the content it claims to pin): a
+  manifest's own self-declared `:manifest-cid` is recomputed from the
+  manifest's actual content (canonical DAG-CBOR + CIDv1, `cbor.core`/
+  `multiformats.core`) and compared against the declared value. A manifest
+  edited without updating its pinned CID -- or a manifest whose CID was
+  copied from a different package entirely -- is rejected here, where the
+  previous shape-only check would have silently accepted it as long as the
+  string merely looked CID-shaped."
+  (:require [cbor.core :as cbor]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [kotoba.lang.package-contract :as package-contract])
+            [kotoba.lang.package-contract :as package-contract]
+            [multiformats.core :as mf])
   (:import [java.time Instant]))
 
 (def local-path-message
@@ -41,6 +55,7 @@
    "signature did required" :package/signature-invalid
    "signature alg unsupported" :package/signature-alg-unsupported
    "signature bytes required" :package/signature-invalid
+   "manifest cid does not match manifest content" :package/manifest-cid-mismatch
    local-path-message :package/local-path-dependency})
 
 (defn problem-code
@@ -107,6 +122,37 @@
                   (:kotoba.package/capabilities manifest)
                   []))))
 
+(defn manifest-without-self-cid
+  "MANIFEST with its own self-declared :manifest-cid removed -- the content a
+  manifest's CID must be computed OVER, since including the CID field inside
+  the thing the CID hashes would make the value depend on itself (the same
+  reason a git commit's hash never covers its own hash, or an IPFS DAG
+  node's CID never covers its own CID field)."
+  [manifest]
+  (update manifest :kotoba.package/source dissoc :manifest-cid))
+
+(defn compute-manifest-cid
+  "The real CIDv1 (canonical DAG-CBOR + sha2-256, `cbor.core`/
+  `multiformats.core` -- the same CID shape `kotoba.lang.package-contract/
+  cid?` now structurally validates, kotoba-lang/kotoba-lang#13) of
+  MANIFEST's actual content, excluding its own self-declared :manifest-cid."
+  [manifest]
+  (mf/cidv1-dag-cbor (cbor/encode (manifest-without-self-cid manifest))))
+
+(defn manifest-integrity-error
+  "nil if MANIFEST's self-declared :manifest-cid matches what its content
+  actually hashes to; a package-contract-shaped error otherwise. Only
+  meaningful once the shape check (`package-contract/package-manifest-error`)
+  has already confirmed :manifest-cid is CID-shaped at all -- a missing or
+  malformed field is that check's problem to report, not this one's."
+  [manifest]
+  (let [declared (get-in manifest [:kotoba.package/source :manifest-cid])]
+    (when (package-contract/cid? declared)
+      (let [computed (compute-manifest-cid manifest)]
+        (when (not= declared computed)
+          (package-contract/invalid "manifest cid does not match manifest content"
+                                    {:declared declared :computed computed}))))))
+
 (defn lock-level-error
   [lock]
   (or (when-not (= 1 (:kotoba.lock/version lock))
@@ -148,6 +194,11 @@
   [{:keys [lock lock-path manifest manifest-path trust]}]
   (let [tc (trust-context trust manifest)
         manifest-error (when manifest (package-contract/package-manifest-error manifest))
+        ;; Only check integrity once the shape check passed -- a missing or
+        ;; malformed :manifest-cid is manifest-error's problem to report, not
+        ;; a mismatch (there is nothing valid to mismatch against yet).
+        integrity-error (when (and manifest (not manifest-error))
+                          (manifest-integrity-error manifest))
         lock-error (lock-level-error lock)
         dep-results (mapv (fn [dep] [dep (dep-error dep tc)]) (:deps lock))
         problems (vec (concat
@@ -155,6 +206,10 @@
                          [(->problem {:kotoba.package/input :manifest
                                       :kotoba.package/path manifest-path}
                                      manifest-error)])
+                       (when integrity-error
+                         [(->problem {:kotoba.package/input :manifest
+                                      :kotoba.package/path manifest-path}
+                                     integrity-error)])
                        (when lock-error
                          [(->problem {:kotoba.package/input :lock
                                       :kotoba.package/path lock-path}
