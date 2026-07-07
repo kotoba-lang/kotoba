@@ -34,6 +34,7 @@
   bounds execution against a runaway/looping guest instead of hanging or
   blowing the JVM stack uncontrolled."
   (:require [clojure.edn :as edn]
+            [ed25519.core :as ed]
             [kotoba.host-providers :as host-providers]
             [kotoba.kgraph :as kgraph]
             [kotoba.lang.capability-host :as capability-host]
@@ -42,12 +43,23 @@
   (:import (com.dylibso.chicory.runtime ExecutionListener HostFunction ImportFunction
                                         ImportValues Instance WasmFunctionHandle)
            (com.dylibso.chicory.wasm Parser)
-           (com.dylibso.chicory.wasm.types FunctionType ValType)))
+           (com.dylibso.chicory.wasm.types FunctionType ValType)
+           (java.net URI)
+           (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers HttpResponse$BodyHandlers)
+           (java.nio.file Files)
+           (java.security MessageDigest SecureRandom)))
 
 (defn- read-str
   "UTF-8 string at [ptr, ptr+len) in INSTANCE's exported linear memory."
   [instance ptr len]
   (.readString (.memory instance) (int ptr) (int len)))
+
+(defn- read-bytes
+  "Raw (not UTF-8-decoded) bytes at [ptr, ptr+len) in INSTANCE's exported
+  linear memory -- for providers whose payload isn't necessarily valid text
+  (clipboard/keychain/fs/log content, HTTP request/response bodies)."
+  [instance ptr len]
+  (.readBytes (.memory instance) (int ptr) (int len)))
 
 (defn- write-bytes!
   "Write BS into INSTANCE's memory at PTR (capacity CAP bytes); returns the
@@ -196,17 +208,21 @@
                  :params [ValType/I32 ValType/I32 ValType/I32 ValType/I32]
                  :result ValType/I32}})
 
-(defn- guard-kgraph-call
-  "Wrap EFFECT — one kgraph-* OP's raw (fn [instance args] -> long) body —
-  behind kotoba.lang.capability-host/guard-call, deriving CACAO-style grants
-  and a local policy from POLICY via kotoba.host-providers/policy-grants and
-  kotoba.host-providers/local-policy — the SAME derivation
+(defn- guard-host-call
+  "Wrap EFFECT — one host-import OP's raw (fn [instance args] -> long) body
+  — behind kotoba.lang.capability-host/guard-call, deriving CACAO-style
+  grants and a local policy from POLICY via kotoba.host-providers/policy-
+  grants and kotoba.host-providers/local-policy — the SAME derivation
   kotoba.host-providers/host-call uses for the CLJ-interpreter path, reused
   rather than reinvented. A denied call throws BEFORE EFFECT ever touches
-  STORE or guest memory (fail closed, matching host-providers/host-call's
-  contract); every attempt — granted, denied, or a handler error — is
-  receipted via RECORD! when supplied (OPTS may also carry :now, an ISO date
-  string defaulting to today)."
+  any real resource (memory, filesystem, network, ...) — fail closed,
+  matching host-providers/host-call's contract; every attempt — granted,
+  denied, or a handler error — is receipted via RECORD! when supplied
+  (OPTS may also carry :now, an ISO date string defaulting to today).
+  Generic across every guarded op this namespace wires (kgraph-*, and the
+  provider/kernel-capability/actor-host surface in `real-op-effects`), not
+  kgraph-specific despite the historical name this replaces
+  (`guard-kgraph-call`)."
   [op effect {:keys [policy record! now]}]
   (let [kind (get runtime/op->kind op)
         grants (host-providers/policy-grants policy)
@@ -223,7 +239,7 @@
                       :handler (fn [_concrete] (effect instance args))})]
         (if (:kotoba.host/ok? outcome)
           (:kotoba.host/result outcome)
-          (throw (ex-info "wasm kgraph host call denied by capability guard"
+          (throw (ex-info "wasm host call denied by capability guard"
                           {:kotoba.host/denied (:kotoba.host/denied outcome)
                            :kotoba.host/call op
                            :kotoba.host/receipt (:kotoba.host/receipt outcome)})))))))
@@ -244,11 +260,11 @@
   test, any caller not ready to supply a policy) are unaffected.
 
   2-/3-arg forms (GUARDED): every kgraph-* call is dispatched through
-  `guard-kgraph-call` — a real fail-closed per-call capability check derived
+  `guard-host-call` — a real fail-closed per-call capability check derived
   from POLICY, exactly mirroring kotoba.host-providers/host-call for the
   interpreter path. A denied call throws before STORE or guest memory is
   touched. OPTS (3-arg form) may carry :record!/:now, see
-  `guard-kgraph-call`."
+  `guard-host-call`."
   ([store]
    (mapv (fn [[op effect]]
            (let [{:keys [field params result]} (get kgraph-op-specs op)]
@@ -259,8 +275,244 @@
    (mapv (fn [[op effect]]
            (let [{:keys [field params result]} (get kgraph-op-specs op)]
              (host-fn field params result
-                      (guard-kgraph-call op effect (assoc opts :policy policy)))))
+                      (guard-host-call op effect (assoc opts :policy policy)))))
          (kgraph-effects store))))
+
+;; ---------------------------------------------------------------------------
+;; Real (non-stub) implementations for the provider (#263) and aiueos
+;; kernel-capability (ADR-2607022700) host imports `kotoba wasm run` used to
+;; wire as unconditional 0-returning stubs (kotoba.launcher/wasm-run-result*'s
+;; `stub-host-function` fallback). Only the device-access quartet
+;; (pci-config/dma-map/irq-subscribe/mmio-map) stays stubbed here on purpose
+;; — those need a privileged/hypervisor layer no JVM host process can honor,
+;; not merely "not yet built" (matching kototama.tender's own device-access
+;; scoping, ADR-2607022900).
+;;
+;; gen-keypair/sign/verify/sha256-hex/http-post/log-read reuse the exact
+;; algorithm choices `kototama.tender` already proved (ed25519.core, JDK
+;; MessageDigest/SecureRandom, java.net.http.HttpClient) — same operations,
+;; same wire shapes (both hosts import from module "kotoba" against the same
+;; kotoba-core-contracts entries) — but wired through THIS namespace's own
+;; guard-host-call/capability-host machinery, not kototama.contract's
+;; HostCaps (a second, incompatible capability model kotoba already declines
+;; to depend on, ADR-2607022700's semantic-authority-duplication rule).
+
+(defn default-host-state
+  "Fresh injectable state for every real (non-kgraph, non-device) provider
+  below: in-memory clipboard/keychain/notification-log/append-log/topic-bus
+  atoms, plus a sandboxed filesystem root (a fresh temp directory unless
+  FS-ROOT is supplied) that `fs-read`/`fs-write` are confined to — a guest
+  can never read or write outside it, however its path argument is spelled
+  (see `safe-path`). One state map is meant to live for one `kotoba wasm
+  run` invocation, mirroring kgraph's per-call fresh store."
+  ([] (default-host-state (Files/createTempDirectory "kotoba-wasm-fs" (into-array java.nio.file.attribute.FileAttribute []))))
+  ([fs-root]
+   {:clipboard (atom (byte-array 0))
+    :keychain (atom {})
+    :notifications (atom [])
+    :log (atom (byte-array 0))
+    :topics (atom {})
+    :fs-root (.toFile fs-root)}))
+
+(defn- safe-path
+  "REL resolved against ROOT and canonicalized; nil if the result would
+  escape ROOT (a `..`-traversal attempt, or an absolute path outside it) —
+  fs-read/fs-write treat that as a plain denial (-1), never touching the
+  real filesystem outside the sandbox."
+  ^java.io.File [^java.io.File root ^String rel]
+  (let [root-path (.toPath (.getCanonicalFile root))
+        candidate (.normalize (.resolve root-path rel))]
+    (when (.startsWith candidate root-path)
+      (.toFile candidate))))
+
+(defn real-op-effects
+  "op -> (fn [instance args] -> long) for the real provider surface, closed
+  over STATE (see `default-host-state`). Same (ptr,len)-in/(out-ptr,out-cap)
+  -out memory ABI convention `kgraph-effects` and `kototama.tender` both
+  use; `write-bytes!`'s -1-on-overflow convention doubles as this
+  namespace's \"recoverable failure\" signal (unknown keychain key, missing
+  file, malformed URL, ...) so a guest sees a value it can react to instead
+  of the whole `main` call dying on an uncaught Java exception."
+  [{:keys [clipboard keychain notifications log topics fs-root]}]
+  {'notify-show
+   (fn [_instance args]
+     (swap! notifications conj {:code (aget args 0) :at (System/currentTimeMillis)})
+     1)
+
+   'clipboard-read
+   (fn [instance args]
+     (write-bytes! instance (aget args 0) (aget args 1) @clipboard))
+   'clipboard-write
+   (fn [instance args]
+     (reset! clipboard (read-bytes instance (aget args 0) (aget args 1)))
+     0)
+   'clipboard-write-str
+   (fn [instance args]
+     (reset! clipboard (read-bytes instance (aget args 0) (aget args 1)))
+     0)
+
+   'http-fetch
+   (fn [instance args]
+     (try
+       (let [url (read-str instance (aget args 0) (aget args 1))
+             req (-> (HttpRequest/newBuilder (URI/create url)) .GET .build)
+             resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofByteArray))]
+         (write-bytes! instance (aget args 2) (aget args 3) (.body resp)))
+       (catch Exception _ -1)))
+
+   'keychain-read
+   (fn [instance args]
+     (let [k (read-str instance (aget args 0) (aget args 1))]
+       (if-let [v (get @keychain k)]
+         (write-bytes! instance (aget args 2) (aget args 3) v)
+         -1)))
+   'keychain-write
+   (fn [instance args]
+     (let [k (read-str instance (aget args 0) (aget args 1))
+           v (read-bytes instance (aget args 2) (aget args 3))]
+       (swap! keychain assoc k v)
+       0))
+
+   'fs-read
+   (fn [instance args]
+     (try
+       (let [path (read-str instance (aget args 0) (aget args 1))
+             file (safe-path fs-root path)]
+         (if (and file (.isFile file))
+           (write-bytes! instance (aget args 2) (aget args 3) (Files/readAllBytes (.toPath file)))
+           -1))
+       (catch Exception _ -1)))
+   'fs-write
+   (fn [instance args]
+     (try
+       (let [path (read-str instance (aget args 0) (aget args 1))
+             data (read-bytes instance (aget args 2) (aget args 3))
+             file (safe-path fs-root path)]
+         (if file
+           (do (.mkdirs (.getParentFile file))
+               (Files/write (.toPath file) ^bytes data (into-array java.nio.file.OpenOption []))
+               0)
+           -1))
+       (catch Exception _ -1)))
+
+   'log-write
+   (fn [instance args]
+     (let [bs (read-bytes instance (aget args 0) (aget args 1))]
+       (swap! log (fn [cur] (byte-array (concat cur bs))))
+       0))
+   'log-read
+   (fn [instance args]
+     (write-bytes! instance (aget args 0) (aget args 1) @log))
+
+   'clock-monotonic
+   (fn [_instance _args] (System/nanoTime))
+
+   'random-bytes
+   (fn [instance args]
+     (let [cap (aget args 1)
+           bs (byte-array cap)]
+       (.nextBytes (SecureRandom.) bs)
+       (write-bytes! instance (aget args 0) cap bs)))
+
+   ;; i64-payload pub/sub: a topic is an i32 id, a message is a raw i64 --
+   ;; no byte-buffer ABI here (matches the contract's :params [:i32 :i64]
+   ;; shape). 0 doubles as both "topic empty" and a legitimately published
+   ;; 0 value -- the same tradeoff the wire ABI already makes elsewhere
+   ;; (no separate ok?/empty? flag), documented rather than hidden.
+   'topic-publish
+   (fn [_instance args]
+     (swap! topics update (aget args 0) (fnil conj clojure.lang.PersistentQueue/EMPTY) (aget args 1))
+     0)
+   'topic-poll
+   (fn [_instance args]
+     (or (peek (get @topics (aget args 0))) 0))
+   'topic-take
+   (fn [_instance args]
+     (let [tid (aget args 0)
+           q (get @topics tid)]
+       (if (seq q)
+         (let [v (peek q)]
+           (swap! topics update tid pop)
+           v)
+         0)))
+   'topic-count
+   (fn [_instance args]
+     (count (get @topics (aget args 0))))
+
+   ;; gen-keypair/sign/verify/sha256-hex: a WASM host function is reachable
+   ;; directly from untrusted guest code with arbitrary (possibly malformed
+   ;; -- wrong-length, garbage) memory contents, and `ed25519.core`'s
+   ;; underlying `java.security.Signature`/`KeyFactory` calls are not
+   ;; guaranteed to fail gracefully on bad input (a malformed key/signature
+   ;; can throw rather than just returning false). Caught the same way
+   ;; http-fetch/http-post already are, so a guest passing garbage args
+   ;; gets a well-defined -1/0 instead of crashing the whole `wasm run`
+   ;; process on an uncaught exception.
+   'gen-keypair
+   (fn [instance args]
+     (try
+       (let [seed (byte-array 32)]
+         (.nextBytes (SecureRandom.) seed)
+         (write-bytes! instance (aget args 0) (aget args 1)
+                      (byte-array (concat seed (ed/pubkey-from-seed seed)))))
+       (catch Exception _ -1)))
+   'sign
+   (fn [instance args]
+     (try
+       (let [seed (read-bytes instance (aget args 0) 32)
+             msg (read-bytes instance (aget args 1) (aget args 2))]
+         (write-bytes! instance (aget args 3) (aget args 4) (ed/sign seed msg)))
+       (catch Exception _ -1)))
+   'verify
+   (fn [instance args]
+     (try
+       (let [pub (read-bytes instance (aget args 0) (aget args 1))
+             msg (read-bytes instance (aget args 2) (aget args 3))
+             sig (read-bytes instance (aget args 4) (aget args 5))]
+         (if (ed/verify pub msg sig) 1 0))
+       (catch Exception _ 0)))
+   'sha256-hex
+   (fn [instance args]
+     (try
+       (let [bs (read-bytes instance (aget args 0) (aget args 1))
+             digest (.digest (MessageDigest/getInstance "SHA-256") bs)
+             hex (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest))]
+         (write-bytes! instance (aget args 2) (aget args 3) (.getBytes hex "UTF-8")))
+       (catch Exception _ -1)))
+   'http-post
+   (fn [instance args]
+     (try
+       (let [url (read-str instance (aget args 0) (aget args 1))
+             body (read-bytes instance (aget args 2) (aget args 3))
+             req (-> (HttpRequest/newBuilder (URI/create url))
+                    (.POST (HttpRequest$BodyPublishers/ofByteArray body))
+                    .build)
+             resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofByteArray))]
+         (write-bytes! instance (aget args 4) (aget args 5) (.body resp)))
+       (catch Exception _ -1)))})
+
+(def real-op-ids
+  "Every op `real-op-effects` gives a genuine implementation to — everything
+  `kotoba.launcher`'s `wasm-run-result*` used to stub except kgraph-* (its
+  own real path already) and the device-access quartet (permanently
+  host/hypervisor-only, see the namespace-level note above). The map's key
+  set doesn't depend on its STATE argument, so NIL is enough here — no
+  temp directory needed just to enumerate op ids."
+  (set (keys (real-op-effects nil))))
+
+(defn real-host-functions
+  "HostFunctions for `real-op-ids`, guarded exactly like `kgraph-host-
+  functions`' 2-/3-arg forms (`guard-host-call`, fail-closed, receipted).
+  STATE is `default-host-state` (or a caller-supplied one, e.g. to inspect
+  :notifications/:clipboard/:log after a run). OPTS as `guard-host-call`
+  (:record!/:now)."
+  ([state policy] (real-host-functions state policy nil))
+  ([state policy opts]
+   (mapv (fn [[op effect]]
+           (let [{:keys [field params result]} (get runtime/host-imports op)]
+             (host-fn field (mapv valtype params) (valtype result)
+                      (guard-host-call op effect (assoc opts :policy policy)))))
+         (real-op-effects state))))
 
 (defn instantiate
   "Parse WASM-BYTES and build a Chicory Instance with EXTRA-HOST-FNS (a seq

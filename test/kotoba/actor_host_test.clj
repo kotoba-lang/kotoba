@@ -74,11 +74,19 @@
     (is (wasm-emits-with-policy? demo policy import) demo)))
 
 (deftest all-six-actor-host-imports-are-registered
-  ;; No op->kind entry expected or needed: these ops don't participate in
-  ;; the cap-acquire/<op>-with capability-passing extension (that's an
-  ;; aiueos-specific S4b feature) -- a plain :capability-gated host-imports
-  ;; entry is sufficient, same as kgraph-assert!/clipboard-write.
+  ;; op->kind IS required (corrected -- an earlier version of this test
+  ;; asserted the opposite): kotoba.lang.capability-host/guard-call needs a
+  ;; capability KIND to build a request from at RUN time, for a plain
+  ;; guarded call exactly as much as for the cap-acquire/<op>-with
+  ;; capability-passing extension (op->with-op/with-op->op are derived
+  ;; from EVERY op->kind entry uniformly -- there's no separate opt-in,
+  ;; so these 6 ops get a `<op>-with` variant automatically too, whether
+  ;; or not anything actually calls it). Missing op->kind entries here
+  ;; were only caught once kotoba.wasm-exec's real (non-stub) host
+  ;; functions actually ran these ops through guard-call for the first
+  ;; time -- this repo's own tests had only ever exercised the static
+  ;; compile-time capability gate against them, which never consults
+  ;; op->kind at all.
   (doseq [op '[gen-keypair sign verify sha256-hex http-post log-read]]
     (is (contains? runtime/host-imports op) (str op " missing from host-imports"))
-    (is (not (contains? runtime/op->kind op))
-        (str op " unexpectedly in op->kind -- does it need cap-passing after all?"))))
+    (is (contains? runtime/op->kind op) (str op " missing from op->kind"))))
