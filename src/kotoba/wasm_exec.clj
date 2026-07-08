@@ -541,20 +541,21 @@
 (defn call-main
   "Invoke an already-built Instance's 0-arity exported `main` and return its
   single result as a long -- Chicory's low-level `.apply` always returns the
-  raw i32/i64/f32/f64 value's bits packed into a `long[]` slot, regardless
-  of the WASM value's actual declared type; the caller decodes.
-  RESULT-TYPE (default :i64, matching this fn's original i32/i64-only
-  behavior) selects that decoding: :i32/:i64 return the raw long as-is
-  (correct for both -- i32 values already sit correctly in the low bits),
-  :f32 reinterprets the low 32 bits as an IEEE-754 float via
-  `Float/intBitsToFloat`, :f64 reinterprets all 64 bits via
-  `Double/longBitsToDouble`."
+  raw i32/i64/f32 value's bits packed into a `long[]` slot, regardless of
+  the WASM value's actual declared type; the caller decodes. RESULT-TYPE
+  (default :i64, matching this fn's original i32/i64-only behavior)
+  selects that decoding: :i32/:i64 return the raw long as-is (correct for
+  both -- i32 values already sit correctly in the low bits), :f32
+  reinterprets the low 32 bits as an IEEE-754 float via
+  `Float/intBitsToFloat`. No :f64 case -- `kotoba.runtime/wasm-valtypes`
+  has no :f64 entry and the compiler has no f64 literal/ops, so no real
+  compiled module can ever declare an f64 main result; a speculative
+  :f64 branch here would be untestable dead code, not real support."
   ([instance] (call-main instance :i64))
   ([instance result-type]
    (let [raw (aget ^longs (.apply (.export instance "main") (long-array 0)) 0)]
      (case result-type
        :f32 (Float/intBitsToFloat (unchecked-int raw))
-       :f64 (Double/longBitsToDouble raw)
        raw))))
 
 (defn run-main
