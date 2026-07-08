@@ -12,6 +12,8 @@
             [kotoba.host-providers-test]
             [kotoba.kgraph-test]
             [kotoba.launcher-test]
+            [kotoba.mesh-drama-profile-test]
+            [kotoba.mesh-node-test]
             [kotoba.package-admission-test]
             [kotoba.rad-adapter-test]
             [kotoba.real-host-providers-test]
@@ -29,6 +31,8 @@
                                         'kotoba.host-providers-test
                                         'kotoba.kgraph-test
                                         'kotoba.launcher-test
+                                        'kotoba.mesh-drama-profile-test
+                                        'kotoba.mesh-node-test
                                         'kotoba.package-admission-test
                                         'kotoba.rad-adapter-test
                                         'kotoba.real-host-providers-test
