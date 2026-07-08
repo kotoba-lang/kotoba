@@ -14,9 +14,13 @@
 (def ^:private server (atom nil))
 
 (defn- with-server [f]
-  (let [wasm (mesh-node/compile-route "src/mesh_drama_profile.kotoba"
-                                      "src/mesh_drama_profile_policy.edn")]
-    (reset! server (mesh-node/start! {"drama-profile" wasm} test-port)))
+  (let [drama-wasm (mesh-node/compile-route "src/mesh_drama_profile.kotoba"
+                                            "src/mesh_drama_profile_policy.edn")
+        no-answer-wasm (mesh-node/compile-route "src/mesh_no_answer.kotoba"
+                                                "src/mesh_drama_profile_policy.edn")]
+    (reset! server (mesh-node/start! {"drama-profile" drama-wasm
+                                      "no-answer" no-answer-wasm}
+                                     test-port)))
   (try (f) (finally (.stop ^com.sun.net.httpserver.HttpServer @server 0))))
 
 (use-fixtures :once with-server)
@@ -47,4 +51,40 @@
 
 (deftest unbound-route-answers-404-not-a-server-error
   (let [resp (http-post "/mesh/http/no-such-route")]
-    (is (= 404 (.statusCode resp)))))
+    (is (= 404 (.statusCode resp)))
+    (is (= "{:error :route-not-bound}" (.body resp)))))
+
+(deftest bound-route-with-nothing-to-answer-serves-204
+  (testing "dispatch returns nil when the guest never calls kgraph-query (an
+            assert-only guest has nothing to answer with, per dispatch's own
+            docstring) -- previously untested since mesh_drama_profile.kotoba
+            (the only fixture ever bound in this test file) always queries"
+    (let [resp (http-post "/mesh/http/no-answer")]
+      (is (= 204 (.statusCode resp)))
+      (is (= "" (.body resp))))))
+
+(deftest unmatched-method-or-path-falls-through-to-the-generic-404
+  (testing ":not-found is a DIFFERENT 404 than :route-not-bound above -- the
+            handler's final :else catch-all for anything that's neither
+            GET /health nor POST /mesh/http/*, e.g. a GET to any other
+            path. Previously untested; every existing test hit either the
+            GET /health branch or a POST /mesh/http/* branch."
+    (let [resp (http-get "/not-a-real-endpoint")]
+      (is (= 404 (.statusCode resp)))
+      (is (= "{:error :not-found}" (.body resp))))))
+
+(deftest compile-route-throws-when-the-guest-fails-to-compile
+  (testing "a route this node can't actually serve is a startup-time
+            configuration error, not a per-request one (compile-route's own
+            docstring) -- previously untested, only ever called with a
+            guest known to compile cleanly"
+    (let [err (try
+                (mesh-node/compile-route "src/mesh_bad_route.kotoba"
+                                         "src/mesh_drama_profile_policy.edn")
+                nil
+                (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? err))
+      (is (= "src/mesh_bad_route.kotoba" (:kotoba.mesh-node/source (ex-data err))))
+      (is (false? (get-in (ex-data err) [:kotoba.mesh-node/wasm :kotoba.wasm/ok?])))
+      (is (= :unsupported-op
+             (get-in (ex-data err) [:kotoba.mesh-node/wasm :kotoba.wasm/problems 0 :kotoba.wasm/problem]))))))
