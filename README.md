@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/header.png" alt="kotoba" width="480">
+</p>
+
 # kotoba
 
 **A capability-safe language — the _Clojure_ of the kotoba stack.**
