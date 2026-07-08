@@ -63,7 +63,7 @@
     (is (= :kotoba (launcher/source-kind contract "src/app.kotoba")))
     (is (= :clj (launcher/source-kind contract "src/app.clj")))
     (is (= :cljc (launcher/source-kind contract "src/app.cljc")))
-    (is (nil? (launcher/source-kind contract "src/app.cljs")))
+    (is (= :cljs (launcher/source-kind contract "src/app.cljs")))
     (is (= :edn (launcher/source-kind contract "policy.edn")))
     (is (nil? (launcher/source-kind contract "README.md")))))
 
@@ -160,6 +160,18 @@
     (is (= "kotoba.runtime.edn-ir.v0"
            (get-in kotoba-check [:kotoba.cli/data :kotoba.runtime/result
                                  :kotoba.runtime/ir :schema])))))
+
+(deftest dot-cljs-entry-file-runs-under-its-own-default-reader-target
+  (testing "a bare .cljs FILE (not a .cljc read under --reader-target cljs)
+            is accepted directly and defaults to the :cljs reader target
+            with no --reader-target flag needed"
+    (let [result (launcher/dispatch ["run" "src/demo.cljs" "--json"])]
+      (is (:kotoba.cli/ok? result))
+      (is (= :run/completed (:kotoba.cli/code result)))
+      (is (= :cljs (get-in result [:kotoba.cli/data :kotoba.launcher/source-plan
+                                   :kotoba.source/reader-target])))
+      (is (= 10 (get-in result [:kotoba.cli/data :kotoba.runtime/result
+                                :kotoba.runtime/value]))))))
 
 (deftest shell-command-is-owned-by-kotoba-shell
   (let [result (launcher/dispatch ["shell" "native-host" "check" "--target" "macos"])]

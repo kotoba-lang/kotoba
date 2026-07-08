@@ -227,8 +227,10 @@
     (-> resource slurp edn/read-string)))
 
 (defn source-contract
-  "Load the Kotoba source-kind contract. Dedicated .cljs source files are
-  retired from profile v2; the :cljs reader target stays reachable via .cljc."
+  "Load the Kotoba source-kind contract. `.cljs` is a compatibility source
+  extension (profile v3, kotoba-lang/kotoba-lang): a single-target format
+  like `.clj`, not the fully portable `.cljc`. The `:cljs` reader target is
+  also reachable via `.cljc`'s wider `:reader-targets`."
   []
   (core-contracts/source-contract))
 
