@@ -36,6 +36,42 @@
       (is (= :f32 (:kotoba.wasm/result-type wasm)))
       (is (== 4.0 (double (wasm-exec/run-main (:kotoba.wasm/binary wasm) [] nil :f32)))))))
 
+(deftest wasm-binary-executes-if-with-f32-and-i64-branches
+  (testing "`if` with f32/i64-typed branches -- previously a REAL bytecode bug, not
+            just a coverage gap: compile-wasm-expr's `if` hardcoded the WASM `if`
+            block's own result-type byte to i32 (0x7f) no matter what the branches
+            actually compiled to. Every prior if-using fixture only ever branched
+            on/to i32 values, so this silently emitted structurally invalid
+            bytecode (declares an i32 block, pushes an f32/i64 value) that a real
+            WASM validator -- Chicory here, but equally a browser's native
+            WebAssembly.instantiate -- rejects with a stack type mismatch. Fixed by
+            reading the block-type byte from the then-branch's actual
+            compiled-result-type via wasm-valtypes instead of hardcoding it."
+    (let [f32-forms (runtime/read-file "src/demo_f32_if.kotoba" :kotoba)
+          f32-wasm (runtime/wasm-binary f32-forms)
+          i64-forms (runtime/read-file "src/demo_i64_if.kotoba" :kotoba)
+          i64-wasm (runtime/wasm-binary i64-forms)]
+      (is (:kotoba.wasm/ok? f32-wasm))
+      (is (= :f32 (:kotoba.wasm/result-type f32-wasm)))
+      (is (== 4.0 (double (wasm-exec/run-main (:kotoba.wasm/binary f32-wasm) [] nil :f32)))
+          "the f32> test is true, so the then-branch (f32sqrt 16.0 = 4.0) really executes")
+      (is (:kotoba.wasm/ok? i64-wasm))
+      (is (= :i64 (:kotoba.wasm/result-type i64-wasm)))
+      (is (= 42 (long (wasm-exec/run-main (:kotoba.wasm/binary i64-wasm) [] nil :i64)))))))
+
+(deftest if-block-type-byte-matches-the-branches-declared-result-type
+  (testing "direct compiler-unit check of the emitted bytes' block-type byte
+            (the 2nd byte after the test expr's own bytes: 0x04 <blocktype>) --
+            0x7f=i32/0x7e=i64/0x7d=f32, matching kotoba.runtime/wasm-valtypes"
+    (let [i32-if (runtime/compile-wasm-expr (list 'if 1 1 2) {})
+          i64-if (runtime/compile-wasm-expr (list 'if 1 (list 'i64 1) (list 'i64 2)) {})
+          f32-if (runtime/compile-wasm-expr (list 'if 1 (list 'f32 1.0) (list 'f32 2.0)) {})]
+      ;; test-expr `1` compiles to a single-byte i32.const [0x41 0x01], so
+      ;; the `if` opcode + blocktype byte are bytes[2] and bytes[3].
+      (is (= [0x04 0x7f] (subvec (vec (:bytes i32-if)) 2 4)))
+      (is (= [0x04 0x7e] (subvec (vec (:bytes i64-if)) 2 4)))
+      (is (= [0x04 0x7d] (subvec (vec (:bytes f32-if)) 2 4))))))
+
 (deftest wasm-binary-executes-every-f32-comparison-and-neg
   (testing "f32=/f32</f32<=/f32>=/f32neg (previously zero coverage) all wired correctly, incl. a false-expected check (f32> 1.0 2.0)"
     (let [forms (runtime/read-file "src/demo_f32_ops.kotoba" :kotoba)

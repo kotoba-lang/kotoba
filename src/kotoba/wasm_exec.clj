@@ -74,7 +74,9 @@
 
 (defn host-fn
   "One (module \"kotoba\") host import: FIELD, param/result ValTypes, and a
-  Clojure fn [instance long-args] -> long (the single i32/i64 result;
+  Clojure fn [instance long-args] -> long (the single i32/i64/f32 result,
+  packed into Chicory's raw long[] return slot exactly like a real compiled
+  module's own f32 ops -- see kotoba.wasm-exec/call-main's header comment;
   this repo's host-import contract never returns more than one value)."
   [field params result f]
   (HostFunction. "kotoba" field
@@ -83,7 +85,19 @@
                    (apply [_ instance args]
                      (long-array [(f instance args)])))))
 
-(def ^:private valtype {:i32 ValType/I32 :i64 ValType/I64})
+(def ^:private valtype
+  "kotoba.runtime/wasm-valtypes' keyword vocabulary (:i32/:i64/:f32) -> the
+  matching Chicory ValType constant. Every host-import descriptor's :params/
+  :result (kotoba.runtime/host-imports, sourced from kotoba-core-contracts)
+  is drawn from that same 3-keyword vocabulary, so this map must stay in
+  sync with it -- an entry missing here (as :f32 once was, before any
+  capability actually used it) doesn't fail loudly at map-build time; it
+  silently returns nil into FunctionType/of's params/result list, which
+  only throws (a bare NullPointerException, no :kotoba.wasm/problem, deep
+  inside java.util.List/of) the first time some capability with that
+  valtype is actually stubbed via `kotoba wasm run` without an explicit
+  host-function override."
+  {:i32 ValType/I32 :i64 ValType/I64 :f32 ValType/F32})
 
 (defn stub-host-function
   "A trivial always-0 HostFunction for one host-import descriptor
@@ -91,7 +105,9 @@
   is always \"kotoba\" in this contract). For host imports a caller doesn't
   need real behavior for; mirrors kotoba.host-providers/default-handlers'
   stub convention on the WASM side, so `kotoba wasm run` never fails to link
-  a valid program just because it also happens to call e.g. notify-show."
+  a valid program just because it also happens to call e.g. notify-show.
+  The stub always returns integer 0 regardless of :result's valtype -- for
+  :f32 that decodes as 0.0f (a valid, harmless stub value), not a crash."
   [{:keys [field params result]}]
   (host-fn field (mapv valtype params) (valtype result) (fn [_instance _args] 0)))
 

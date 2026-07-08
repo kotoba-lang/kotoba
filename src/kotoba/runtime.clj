@@ -1101,7 +1101,7 @@
 
 (declare compile-wasm-fold compile-wasm-fold-type compiled-result-type local-index
          local-type merge-local-types local-decls function-param-types
-         function-result-type symbol-key)
+         function-result-type symbol-key wasm-valtypes)
 
 (defn compile-wasm-expr
   "Compile one Kotoba expression to a WASM instruction sequence. Returns
@@ -1185,7 +1185,7 @@
                (:problem then-compiled) then-compiled
                (:problem else-compiled) else-compiled
                :else {:bytes (bcat (:bytes test-compiled)
-                                   [0x04 0x7f]
+                                   [0x04 (wasm-valtypes (compiled-result-type then-compiled))]
                                    (:bytes then-compiled)
                                    [0x05]
                                    (:bytes else-compiled)
