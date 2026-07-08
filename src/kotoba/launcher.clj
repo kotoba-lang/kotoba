@@ -784,7 +784,7 @@
                                                             real-fns
                                                             stub-fns)
                                                     policy)
-                    value (wasm-exec/call-main instance)]
+                    value (wasm-exec/call-main instance (or (:kotoba.wasm/result-type wasm) :i64))]
                 {:kotoba.cli/ok? true
                  :kotoba.cli/code :wasm/run-completed
                  :kotoba.cli/data (merge {:kotoba.launcher/source-plan plan
