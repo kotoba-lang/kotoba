@@ -593,6 +593,30 @@
     (is (= :wasm/policy-not-readable (:kotoba.cli/code result)))
     (is (= "missing-policy.edn" (get-in result [:kotoba.cli/data :kotoba.policy/path])))))
 
+(deftest wasm-emit-and-run-report-missing-and-unreadable-source
+  (testing ":wasm/missing-source (no source positional at all) and
+            :wasm/source-not-readable (a path that isn't an existing,
+            readable file) -- reachable from the most everyday CLI typos
+            (`kotoba wasm emit` with no file, or a nonexistent path), yet
+            previously only their sibling :wasm/policy-not-readable had any
+            test coverage. Exercised via wasm-emit-result*/wasm-run-result*
+            directly (the pre-admission-gating fns) so this is isolated
+            from --package-lock plumbing entirely."
+    (let [emit-no-source (launcher/wasm-emit-result* ["wasm" "emit"])
+          emit-missing-file (launcher/wasm-emit-result* ["wasm" "emit" "nonexistent-file.kotoba"])
+          run-no-source (launcher/wasm-run-result* ["wasm" "run"])
+          run-missing-file (launcher/wasm-run-result* ["wasm" "run" "nonexistent-file.kotoba"])]
+      (is (false? (:kotoba.cli/ok? emit-no-source)))
+      (is (= :wasm/missing-source (:kotoba.cli/code emit-no-source)))
+      (is (false? (:kotoba.cli/ok? emit-missing-file)))
+      (is (= :wasm/source-not-readable (:kotoba.cli/code emit-missing-file)))
+      (is (= "nonexistent-file.kotoba" (get-in emit-missing-file [:kotoba.cli/data :kotoba.source/path])))
+      (is (false? (:kotoba.cli/ok? run-no-source)))
+      (is (= :wasm/missing-source (:kotoba.cli/code run-no-source)))
+      (is (false? (:kotoba.cli/ok? run-missing-file)))
+      (is (= :wasm/source-not-readable (:kotoba.cli/code run-missing-file)))
+      (is (= "nonexistent-file.kotoba" (get-in run-missing-file [:kotoba.cli/data :kotoba.source/path]))))))
+
 (deftest wasm-run-actually-executes-a-trivial-module
   (let [result (launcher/dispatch ["wasm" "run" "src/demo.kotoba" "--json" "--package-lock" positive-lock "--trust" trust])]
     (is (:kotoba.cli/ok? result))
