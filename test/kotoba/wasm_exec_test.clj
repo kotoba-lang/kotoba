@@ -96,6 +96,35 @@
       (is (nil? (:problem i64-two-args)))
       (is (= :i64 (:result-type i64-two-args))))))
 
+(deftest i64-and-f32-literals-reject-unsupported-values
+  (testing "(i64 ...)/(f32 ...) with a non-numeric-of-the-right-kind literal --
+            zero prior coverage of either :unsupported-i64-literal or
+            :unsupported-f32-literal, both genuinely reachable compile-time
+            rejections, not dead branches"
+    (let [f32-non-number (runtime/compile-wasm-expr (list 'f32 "oops") {})
+          i64-non-integer (runtime/compile-wasm-expr (list 'i64 "oops") {})
+          i64-float (runtime/compile-wasm-expr (list 'i64 1.5) {})]
+      (is (= :unsupported-f32-literal (get-in f32-non-number [:problem :kotoba.wasm/problem])))
+      (is (= :unsupported-i64-literal (get-in i64-non-integer [:problem :kotoba.wasm/problem])))
+      (is (= :unsupported-i64-literal (get-in i64-float [:problem :kotoba.wasm/problem]))
+          "i64's literal check is integer?, stricter than f32's number? -- a plain
+           float like 1.5 is rejected for i64 even though it's numeric, whereas the
+           same 1.5 is exactly the valid case f32's own literal check accepts"))))
+
+(deftest wasm-binary-rejects-a-module-with-no-main-or-a-parameterized-main
+  (testing ":missing-main/:main-arity -- wasm-binary's top-level acceptance gate for
+            the exported entrypoint, previously with zero direct test coverage of
+            either failure shape (only ever exercised indirectly by every OTHER
+            fixture happening to already declare a valid zero-arg main)"
+    (let [no-main (runtime/wasm-binary (list '(ns demo) (list 'defn 'helper [] 1)))
+          parameterized-main (runtime/wasm-binary (list '(ns demo) (list 'defn 'main ['x] 'x)))]
+      (is (false? (:kotoba.wasm/ok? no-main)))
+      (is (= [:missing-main] (map :kotoba.wasm/problem (:kotoba.wasm/problems no-main))))
+      (is (false? (:kotoba.wasm/ok? parameterized-main)))
+      (is (= :main-arity (-> parameterized-main :kotoba.wasm/problems first :kotoba.wasm/problem)))
+      (is (= 0 (-> parameterized-main :kotoba.wasm/problems first :kotoba.wasm/expected)))
+      (is (= 1 (-> parameterized-main :kotoba.wasm/problems first :kotoba.wasm/actual))))))
+
 (deftest wasm-binary-runs-kgraph-round-trip-through-real-host-functions
   (testing "compile -> emit -> Chicory-execute: kgraph-assert! really writes, kgraph-query really reads it back"
     (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)
