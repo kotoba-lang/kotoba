@@ -237,6 +237,42 @@
     (is (false? (:kotoba.cli/ok? unknown)))
     (is (= :package/unknown-command (:kotoba.cli/code unknown)))))
 
+(deftest reports-unreadable-manifest-and-trust
+  (testing ":package/manifest-not-readable and :package/trust-not-readable --
+            the same not-readable? shape as :package/lock-not-readable
+            (already tested above), just for the two OTHER optional input
+            files `admit` reads. Previously untested despite --manifest and
+            --trust being ordinary, documented CLI flags."
+    (let [bad-manifest (verify-argv "--lock" positive-lock
+                                    "--manifest" "missing-manifest.edn"
+                                    "--trust" trust "--json")
+          bad-trust (verify-argv "--lock" positive-lock
+                                 "--trust" "missing-trust.edn" "--json")]
+      (is (false? (:kotoba.cli/ok? bad-manifest)))
+      (is (= :package/manifest-not-readable (:kotoba.cli/code bad-manifest)))
+      (is (= "missing-manifest.edn"
+             (get-in bad-manifest [:kotoba.cli/data :kotoba.package/error :kotoba.package/path])))
+      (is (false? (:kotoba.cli/ok? bad-trust)))
+      (is (= :package/trust-not-readable (:kotoba.cli/code bad-trust)))
+      (is (= "missing-trust.edn"
+             (get-in bad-trust [:kotoba.cli/data :kotoba.package/error :kotoba.package/path]))))))
+
+(deftest lock-level-error-rejects-wrong-version-and-non-vector-deps
+  (testing "lock-level-error's two branches -- every existing lock fixture in
+            this repo happens to already declare a valid
+            {:kotoba.lock/version 1, :deps <vector>}, so neither branch was
+            ever exercised by any fixture-driven test."
+    (let [bad-version (admission/lock-level-error {:kotoba.lock/version 2 :deps []})
+          bad-deps (admission/lock-level-error {:kotoba.lock/version 1 :deps {}})
+          ok (admission/lock-level-error {:kotoba.lock/version 1 :deps []})]
+      (is (false? (:valid? bad-version)))
+      (is (= "lock version 1 required" (:message bad-version)))
+      (is (= 2 (get-in bad-version [:data :value])))
+      (is (false? (:valid? bad-deps)))
+      (is (= "lock deps vector required" (:message bad-deps)))
+      (is (= {} (get-in bad-deps [:data :value])))
+      (is (nil? ok) "a version-1, vector-deps lock has no lock-level error"))))
+
 ;; ---------------------------------------------------------------------------
 ;; Safe-build integration (`wasm emit --package-lock`)
 
