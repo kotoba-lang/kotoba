@@ -21,6 +21,21 @@
       (is (= (:kotoba.runtime/value interpreted)
              (wasm-exec/run-main (:kotoba.wasm/binary wasm) []))))))
 
+(deftest wasm-binary-executes-f32-arithmetic-and-comparison
+  (testing "f32 literal/f32+/f32> compile to a real, executable Chicory module: (1.5+2.5) > 3.0 -> 1"
+    (let [forms (runtime/read-file "src/demo_f32.kotoba" :kotoba)
+          wasm (runtime/wasm-binary forms)]
+      (is (:kotoba.wasm/ok? wasm))
+      (is (= 1 (long (wasm-exec/run-main (:kotoba.wasm/binary wasm) [])))))))
+
+(deftest wasm-binary-executes-f32-fn-params-and-result
+  (testing "f32-typed user fn params/results + f32sqrt: sqrt(8.0 * 2.0) = 4.0"
+    (let [forms (runtime/read-file "src/demo_f32_result.kotoba" :kotoba)
+          wasm (runtime/wasm-binary forms)]
+      (is (:kotoba.wasm/ok? wasm))
+      (is (= :f32 (:kotoba.wasm/result-type wasm)))
+      (is (== 4.0 (double (wasm-exec/run-main (:kotoba.wasm/binary wasm) [] nil :f32)))))))
+
 (deftest wasm-binary-runs-kgraph-round-trip-through-real-host-functions
   (testing "compile -> emit -> Chicory-execute: kgraph-assert! really writes, kgraph-query really reads it back"
     (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)

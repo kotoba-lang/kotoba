@@ -769,6 +769,17 @@
         (conj out byte)
         (recur shifted (conj out (bit-or byte 0x80)))))))
 
+(defn f32-le-bytes
+  "4 little-endian bytes for `n`'s IEEE-754 single-precision bit pattern
+  (WASM binary format §5.4.3 -- `f32.const`'s immediate is NOT LEB128, it's
+  4 raw bytes)."
+  [n]
+  (let [bits (Float/floatToIntBits (float n))]
+    [(bit-and bits 0xff)
+     (bit-and (bit-shift-right bits 8) 0xff)
+     (bit-and (bit-shift-right bits 16) 0xff)
+     (bit-and (bit-shift-right bits 24) 0xff)]))
+
 (defn bcat
   "Concatenate any number of byte sequences into one flat vector."
   [& parts]
@@ -995,6 +1006,49 @@
         i64+ (compile-wasm-fold-type 0x7c args locals fns :i64)
         i64- (compile-wasm-fold-type 0x7d args locals fns :i64)
         i64* (compile-wasm-fold-type 0x7e args locals fns :i64)
+        f32 (let [value (first args)]
+              (cond
+                (not= 1 (count args))
+                {:problem {:kotoba.wasm/problem :arity
+                           :kotoba.wasm/op "f32"
+                           :kotoba.wasm/expected 1
+                           :kotoba.wasm/actual (count args)}}
+
+                (number? value)
+                {:bytes (bcat [0x43] (f32-le-bytes value))
+                 :result-type :f32}
+
+                :else
+                {:problem {:kotoba.wasm/problem :unsupported-f32-literal
+                           :kotoba.wasm/form (pr-str value)}}))
+        f32+ (compile-wasm-fold-type 0x92 args locals fns :f32)
+        f32- (compile-wasm-fold-type 0x93 args locals fns :f32)
+        f32* (compile-wasm-fold-type 0x94 args locals fns :f32)
+        f32div (compile-wasm-fold-type 0x95 args locals fns :f32)
+        f32sqrt (let [[x] args
+                      compiled (compile-wasm-expr x locals fns)]
+                  (if (:problem compiled)
+                    compiled
+                    (assoc compiled
+                           :bytes (bcat (:bytes compiled) [0x91])
+                           :result-type :f32)))
+        f32neg (let [[x] args
+                     compiled (compile-wasm-expr x locals fns)]
+                 (if (:problem compiled)
+                   compiled
+                   (assoc compiled
+                          :bytes (bcat (:bytes compiled) [0x8c])
+                          :result-type :f32)))
+        ;; f32 comparisons take :f32 args but produce an :i32 boolean --
+        ;; compile-wasm-fold-type assumes homogeneous arg/result typing
+        ;; (right for f32+ etc., wrong here), so fold untyped and stamp the
+        ;; result-type after, matching plain `=`/`</`>`'s existing looser
+        ;; (unchecked-arg-type) convention above.
+        f32= (let [c (compile-wasm-fold 0x5b args locals fns)] (cond-> c (not (:problem c)) (assoc :result-type :i32)))
+        f32< (let [c (compile-wasm-fold 0x5d args locals fns)] (cond-> c (not (:problem c)) (assoc :result-type :i32)))
+        f32> (let [c (compile-wasm-fold 0x5e args locals fns)] (cond-> c (not (:problem c)) (assoc :result-type :i32)))
+        f32<= (let [c (compile-wasm-fold 0x5f args locals fns)] (cond-> c (not (:problem c)) (assoc :result-type :i32)))
+        f32>= (let [c (compile-wasm-fold 0x60 args locals fns)] (cond-> c (not (:problem c)) (assoc :result-type :i32)))
         call-indirect (let [[idx arg] args
                             idx-compiled (compile-wasm-expr idx locals fns)
                             arg-compiled (compile-wasm-expr arg locals fns)]
@@ -1361,7 +1415,8 @@
 
 (def wasm-valtypes
   {:i32 0x7f
-   :i64 0x7e})
+   :i64 0x7e
+   :f32 0x7d})
 
 (defn symbol-key
   "Normalize sym to an unqualified symbol (drop any namespace) for use as a
@@ -1372,15 +1427,22 @@
 (defn annotated-wasm-type
   "Wasm value type for a param symbol: `^:i64` params and `^{:cap <kind>}`
   typed capability params (whose runtime representation is the opaque i64
-  handle) lower to :i64; everything else is :i32."
+  handle) lower to :i64; `^:f32` params lower to :f32; everything else is
+  :i32."
   [sym]
-  (if (or (:i64 (meta sym)) (some? (cap-param-kind sym))) :i64 :i32))
+  (cond
+    (or (:i64 (meta sym)) (some? (cap-param-kind sym))) :i64
+    (:f32 (meta sym)) :f32
+    :else :i32))
 
 (defn function-result-type
   "Declared WASM result type for a `[name def-map]` function entry: :i64 if
-  the fn name has `^:i64` metadata, else nil (void)."
+  the fn name has `^:i64` metadata, :f32 if `^:f32`, else nil (void)."
   [[name _f]]
-  (if (:i64 (meta name)) :i64 nil))
+  (cond
+    (:i64 (meta name)) :i64
+    (:f32 (meta name)) :f32
+    :else nil))
 
 (defn function-param-types
   "WASM value types for a `[name def-map]` function entry's params, via

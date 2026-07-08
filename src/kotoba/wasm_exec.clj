@@ -540,17 +540,31 @@
 
 (defn call-main
   "Invoke an already-built Instance's 0-arity exported `main` and return its
-  single i32/i64 result as a long."
-  [instance]
-  (aget ^longs (.apply (.export instance "main") (long-array 0)) 0))
+  single result as a long -- Chicory's low-level `.apply` always returns the
+  raw i32/i64/f32/f64 value's bits packed into a `long[]` slot, regardless
+  of the WASM value's actual declared type; the caller decodes.
+  RESULT-TYPE (default :i64, matching this fn's original i32/i64-only
+  behavior) selects that decoding: :i32/:i64 return the raw long as-is
+  (correct for both -- i32 values already sit correctly in the low bits),
+  :f32 reinterprets the low 32 bits as an IEEE-754 float via
+  `Float/intBitsToFloat`, :f64 reinterprets all 64 bits via
+  `Double/longBitsToDouble`."
+  ([instance] (call-main instance :i64))
+  ([instance result-type]
+   (let [raw (aget ^longs (.apply (.export instance "main") (long-array 0)) 0)]
+     (case result-type
+       :f32 (Float/intBitsToFloat (unchecked-int raw))
+       :f64 (Double/longBitsToDouble raw)
+       raw))))
 
 (defn run-main
   "Instantiate WASM-BYTES with EXTRA-HOST-FNS under POLICY (see
   `instantiate`) and execute the exported 0-arity `main`, returning its
-  single i32/i64 result as a long."
-  ([wasm-bytes extra-host-fns] (run-main wasm-bytes extra-host-fns nil))
-  ([wasm-bytes extra-host-fns policy]
-   (call-main (instantiate wasm-bytes extra-host-fns policy))))
+  single result decoded per RESULT-TYPE (see `call-main`; default :i64)."
+  ([wasm-bytes extra-host-fns] (run-main wasm-bytes extra-host-fns nil :i64))
+  ([wasm-bytes extra-host-fns policy] (run-main wasm-bytes extra-host-fns policy :i64))
+  ([wasm-bytes extra-host-fns policy result-type]
+   (call-main (instantiate wasm-bytes extra-host-fns policy) result-type)))
 
 (defn read-memory-string
   "Read a UTF-8 string of LEN bytes at PTR out of INSTANCE's memory — for
