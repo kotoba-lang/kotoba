@@ -184,6 +184,10 @@ These gates verify that:
   interprocedural `:cap-effect-under-declared`), lower to i64 handle slots,
   and thread cap handles through user-defined function calls in compiled
   wasm (main -> outer -> inner -> host import, `demo_cap_threading`);
+- capability value affinity (narrow S2): a capability-typed local may be
+  consumed at most once along any single execution path through a function
+  body (deterministic drop, no implicit clone); reuse is statically rejected
+  as `:cap-value-reused`;
 - `call-indirect` emits a function table, element segment, and `call_indirect`
   for the current `i32 -> i32` table slice;
 - `has-capability?` requires an explicit policy and emits a deterministic
@@ -414,6 +418,51 @@ host binding (`test/kotoba/cap_typed_test.clj`).
 In the interpreter, cap-typed params are ordinary handle values;
 `kotoba.cap-table/resolve-use` re-checks kind + expiry at every host call
 regardless (static + dynamic).
+
+#### Capability value affinity — narrow S2 (deterministic drop, no implicit clone)
+
+`ADR-safe-capability-language.md`'s "borrow checker (S2)" line item is
+deliberately NOT a general Rust-style ownership/borrow/lifetime system over
+every value in the language: T1 Memory Safety is already achieved without
+one (raw memory ops denied, `byte-at`/`byte-append!` bounds-checked, the
+bump allocator never frees so use-after-free/double-free are structurally
+absent). What remains scoped to S2 is capability-typed values ONLY:
+
+```clojure
+(defn ^{:i64 true} f [^{:cap :host/ledger-append} c ^:i64 code]
+  (do (host-i64-roundtrip-with c code)
+      (host-i64-roundtrip-with c code)))   ; rejected: :cap-value-reused
+```
+
+`kotoba.runtime/cap-affine-problems` (run by `run`/`check`/`wasm emit`
+alongside `cap-typed-problems`) enforces: every capability-typed local — a
+`^{:cap <kind>}` param, the direct result of `(cap-acquire ...)`, or a
+let-bound alias of either — may be consumed (the leading argument of an
+`<op>-with` use, or an argument aligned with a callee's `^{:cap <kind>}`
+param) **at most once** along any single execution path through a function
+body. Being left unused is fine (deterministic drop — there is no linear
+must-use requirement); consuming the same binding a second time —
+sequentially, in only one branch and then again unconditionally, or once
+directly and once by handing it to a callee — is rejected as
+`:cap-value-reused`. `if` branches are mutually exclusive at runtime but
+checked independently from the same starting point and merged by union,
+since a downstream reuse must be caught regardless of which branch actually
+ran. The check is purely per function body: passing a capability into a
+callee's cap-typed param IS the caller's one consuming use of its own
+binding — what the callee does with the value it receives is the callee's
+own, separately checked, affine property.
+
+Known conservative limitation (false-negative only, never a false positive
+— same posture as the type-checker limitations in
+`ADR-safe-capability-language.md` §13(a)): tracking is per local binding
+name, not per underlying capability provenance, so `(let [alias c] ...)`
+followed by using both `alias` and `c` once each spends the same value
+twice without being caught. This does not weaken runtime confinement (T3):
+every `<op>-with` use, aliased or not, still re-resolves through
+`kotoba.cap-table/resolve-use` at the actual host call. See
+`kotoba.runtime/cap-affine-problems`'s docstring and
+`test/kotoba/cap_affine_test.clj` (positive/negative/documented-limitation
+cases).
 
 ### CACAO delegation chains (`run --cacao`)
 
