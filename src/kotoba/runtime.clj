@@ -1217,20 +1217,28 @@
         f32- (compile-wasm-fold-type 0x93 args locals fns :f32)
         f32* (compile-wasm-fold-type 0x94 args locals fns :f32)
         f32div (compile-wasm-fold-type 0x95 args locals fns :f32)
-        f32sqrt (let [[x] args
-                      compiled (compile-wasm-expr x locals fns)]
-                  (if (:problem compiled)
-                    compiled
-                    (assoc compiled
-                           :bytes (bcat (:bytes compiled) [0x91])
-                           :result-type :f32)))
-        f32neg (let [[x] args
-                     compiled (compile-wasm-expr x locals fns)]
-                 (if (:problem compiled)
-                   compiled
-                   (assoc compiled
-                          :bytes (bcat (:bytes compiled) [0x8c])
-                          :result-type :f32)))
+        f32sqrt (if (not= 1 (count args))
+                  {:problem {:kotoba.wasm/problem :arity
+                             :kotoba.wasm/op "f32sqrt"
+                             :kotoba.wasm/expected 1
+                             :kotoba.wasm/actual (count args)}}
+                  (let [compiled (compile-wasm-expr (first args) locals fns)]
+                    (if (:problem compiled)
+                      compiled
+                      (assoc compiled
+                             :bytes (bcat (:bytes compiled) [0x91])
+                             :result-type :f32))))
+        f32neg (if (not= 1 (count args))
+                 {:problem {:kotoba.wasm/problem :arity
+                            :kotoba.wasm/op "f32neg"
+                            :kotoba.wasm/expected 1
+                            :kotoba.wasm/actual (count args)}}
+                 (let [compiled (compile-wasm-expr (first args) locals fns)]
+                   (if (:problem compiled)
+                     compiled
+                     (assoc compiled
+                            :bytes (bcat (:bytes compiled) [0x8c])
+                            :result-type :f32))))
         ;; f32 comparisons take :f32 args but produce an :i32 boolean --
         ;; compile-wasm-fold-type assumes homogeneous arg/result typing
         ;; (right for f32+ etc., wrong here), so fold untyped and stamp the

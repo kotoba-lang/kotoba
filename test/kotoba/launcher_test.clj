@@ -397,6 +397,35 @@
     (is (= [0 97 115 109]
            (mapv #(bit-and % 0xff) (take 4 (java.nio.file.Files/readAllBytes (.toPath output))))))))
 
+(deftest wasm-emit-supports-f32-main-result
+  (let [forms (runtime/read-file "src/demo_f32_result.kotoba" :kotoba)
+        wasm (runtime/wasm-binary forms)
+        output (doto (java.io.File/createTempFile "kotoba-demo-f32-result" ".wasm")
+                 (.deleteOnExit))
+        emitted (launcher/dispatch ["wasm" "emit" "src/demo_f32_result.kotoba"
+                                    "--output" (.getPath output)
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
+    (is (:kotoba.wasm/ok? wasm))
+    (is (= :f32 (:kotoba.wasm/result-type wasm)))
+    (is (:kotoba.cli/ok? emitted))
+    (is (= :f32 (get-in emitted [:kotoba.cli/data :kotoba.wasm/result-type])))
+    (is (= [0 97 115 109]
+           (mapv #(bit-and % 0xff) (take 4 (java.nio.file.Files/readAllBytes (.toPath output))))))))
+
+(deftest wasm-emit-supports-f32-params-and-locals
+  (let [forms (runtime/read-file "src/demo_f32_ops.kotoba" :kotoba)
+        wasm (runtime/wasm-binary forms)
+        output (doto (java.io.File/createTempFile "kotoba-demo-f32-ops" ".wasm")
+                 (.deleteOnExit))
+        emitted (launcher/dispatch ["wasm" "emit" "src/demo_f32_ops.kotoba"
+                                    "--output" (.getPath output)
+                                    "--json" "--package-lock" positive-lock "--trust" trust])]
+    (is (:kotoba.wasm/ok? wasm))
+    (is (= :i32 (:kotoba.wasm/result-type wasm)))
+    (is (:kotoba.cli/ok? emitted))
+    (is (= [0 97 115 109]
+           (mapv #(bit-and % 0xff) (take 4 (java.nio.file.Files/readAllBytes (.toPath output))))))))
+
 (deftest wasm-emit-supports-i64-main-result
   (let [forms (runtime/read-file "src/demo_i64.kotoba" :kotoba)
         wasm (runtime/wasm-binary forms)

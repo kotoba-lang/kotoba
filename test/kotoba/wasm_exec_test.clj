@@ -36,6 +36,27 @@
       (is (= :f32 (:kotoba.wasm/result-type wasm)))
       (is (== 4.0 (double (wasm-exec/run-main (:kotoba.wasm/binary wasm) [] nil :f32)))))))
 
+(deftest wasm-binary-executes-every-f32-comparison-and-neg
+  (testing "f32=/f32</f32<=/f32>=/f32neg (previously zero coverage) all wired correctly, incl. a false-expected check (f32> 1.0 2.0)"
+    (let [forms (runtime/read-file "src/demo_f32_ops.kotoba" :kotoba)
+          wasm (runtime/wasm-binary forms)]
+      (is (:kotoba.wasm/ok? wasm))
+      (is (= 1 (long (wasm-exec/run-main (:kotoba.wasm/binary wasm) [])))
+          "1 means every true-expected comparison passed AND f32> correctly returned false for 1.0>2.0 (a -1 would mean that comparison is backwards, 0 would mean some other check failed)"))))
+
+(deftest f32sqrt-and-f32neg-reject-wrong-arity
+  (testing "f32sqrt/f32neg -- unlike (f32 ...) which already checked arity -- previously had no arity check at all: (f32sqrt) silently took nil as its argument (:unsupported-form, not :arity) and (f32sqrt a b) silently dropped the extra arg"
+    (let [locals {}
+          too-few (runtime/compile-wasm-expr '(f32sqrt) locals)
+          too-many (runtime/compile-wasm-expr (list 'f32sqrt '(f32 1.0) '(f32 2.0)) locals)
+          neg-too-few (runtime/compile-wasm-expr '(f32neg) locals)]
+      (is (= :arity (get-in too-few [:problem :kotoba.wasm/problem])))
+      (is (= "f32sqrt" (get-in too-few [:problem :kotoba.wasm/op])))
+      (is (= :arity (get-in too-many [:problem :kotoba.wasm/problem])))
+      (is (= 2 (get-in too-many [:problem :kotoba.wasm/actual])))
+      (is (= :arity (get-in neg-too-few [:problem :kotoba.wasm/problem])))
+      (is (= "f32neg" (get-in neg-too-few [:problem :kotoba.wasm/op]))))))
+
 (deftest wasm-binary-runs-kgraph-round-trip-through-real-host-functions
   (testing "compile -> emit -> Chicory-execute: kgraph-assert! really writes, kgraph-query really reads it back"
     (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)
