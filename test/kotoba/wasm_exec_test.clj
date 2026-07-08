@@ -57,6 +57,45 @@
       (is (= :arity (get-in neg-too-few [:problem :kotoba.wasm/problem])))
       (is (= "f32neg" (get-in neg-too-few [:problem :kotoba.wasm/op]))))))
 
+(deftest typed-fold-ops-reject-mixed-arg-types
+  (testing "compile-wasm-fold-type (backing f32+/f32-/f32*/f32div and i64+/i64-/i64*)
+            had zero direct test coverage of its :type-mismatch branch -- only ever
+            exercised via all-same-type happy-path .kotoba fixtures. Mixing a typed
+            literal with an untyped (defaults to :i32) literal, in either argument
+            position, must be rejected at compile time rather than silently emitting
+            a WASM module with a mismatched operand type Chicory would trap on."
+    (let [locals {}
+          f32-typed-then-untyped (runtime/compile-wasm-expr (list 'f32+ '(f32 1.0) 42) locals)
+          f32-untyped-then-typed (runtime/compile-wasm-expr (list 'f32+ 42 '(f32 1.0)) locals)
+          f32-single-untyped (runtime/compile-wasm-expr (list 'f32+ 42) locals)
+          i64-typed-then-untyped (runtime/compile-wasm-expr (list 'i64+ '(i64 1) 42) locals)
+          i64-untyped-then-typed (runtime/compile-wasm-expr (list 'i64+ 42 '(i64 1)) locals)]
+      (is (= :type-mismatch (get-in f32-typed-then-untyped [:problem :kotoba.wasm/problem])))
+      (is (= :f32 (get-in f32-typed-then-untyped [:problem :kotoba.wasm/expected])))
+      (is (= :type-mismatch (get-in f32-untyped-then-typed [:problem :kotoba.wasm/problem]))
+          "the mismatch must be caught regardless of which argument position is untyped")
+      (is (= :type-mismatch (get-in f32-single-untyped [:problem :kotoba.wasm/problem]))
+          "a single untyped arg to a typed fold op is still a mismatch, not a pass-through")
+      (is (= :type-mismatch (get-in i64-typed-then-untyped [:problem :kotoba.wasm/problem])))
+      (is (= :i64 (get-in i64-typed-then-untyped [:problem :kotoba.wasm/expected])))
+      (is (= :type-mismatch (get-in i64-untyped-then-typed [:problem :kotoba.wasm/problem]))))))
+
+(deftest typed-fold-ops-accept-consistent-types-and-tag-result-type
+  (testing "the non-mismatch path of compile-wasm-fold-type: same-type args compile
+            cleanly and the fold's own result is tagged with the declared type (not
+            left as whatever compile-wasm-fold's bare fold would produce)"
+    (let [locals {}
+          f32-two-args (runtime/compile-wasm-expr (list 'f32+ '(f32 1.0) '(f32 2.0)) locals)
+          f32-single-arg (runtime/compile-wasm-expr (list 'f32+ '(f32 1.0)) locals)
+          i64-two-args (runtime/compile-wasm-expr (list 'i64+ '(i64 1) '(i64 2)) locals)]
+      (is (nil? (:problem f32-two-args)))
+      (is (= :f32 (:result-type f32-two-args)))
+      (is (nil? (:problem f32-single-arg)))
+      (is (= :f32 (:result-type f32-single-arg))
+          "single-arg fold-type still gets the declared result-type tagged, not left untagged from the compile-wasm-fold pass-through")
+      (is (nil? (:problem i64-two-args)))
+      (is (= :i64 (:result-type i64-two-args))))))
+
 (deftest wasm-binary-runs-kgraph-round-trip-through-real-host-functions
   (testing "compile -> emit -> Chicory-execute: kgraph-assert! really writes, kgraph-query really reads it back"
     (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)
