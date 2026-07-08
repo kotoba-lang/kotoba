@@ -621,144 +621,169 @@
     (contains? fn-param-kinds op) (some? (nth (get fn-param-kinds op) idx nil))
     :else false))
 
+(defn- cap-expr-info
+  "[info' counter'] where info' is `{:kind :origin}` describing EXPR's
+  capability identity under CAP-ENV (local symbol -> `{:kind :origin}`), or
+  nil when EXPR is not statically known to carry a capability -- the same
+  two recognized shapes as `cap-expr-kind` (a direct `(cap-acquire ...)`
+  result, or a symbol reference), just carrying an ORIGIN id alongside the
+  kind. A direct `(cap-acquire ...)` result is assigned a FRESH origin
+  (COUNTER, then bumped) because each textual occurrence produces a
+  distinct value; a symbol reference reuses whatever `{:kind :origin}` its
+  binding already carries, so a `let`-bound alias shares its origin with
+  whatever it aliases rather than fabricating a new identity. This is what
+  lets the affine check in cap-affine-step catch `(let [alias c] ...)`
+  followed by using `alias` and `c` once each as a double-spend of the SAME
+  origin, not two independent bindings."
+  [cap-env counter expr]
+  (cond
+    (and (seq? expr) (= 'cap-acquire (first expr)))
+    [{:kind (second expr) :origin counter} (inc counter)]
+
+    (symbol? expr)
+    [(get cap-env (symbol-key expr)) counter]
+
+    :else
+    [nil counter]))
+
 (defn- affine-use
   "[problems' used'] after checking one already-evaluated argument ARG at a
   capability-consuming position of a call to OP, under CAP-ENV (local
-  symbol -> kind) and USED (local symbol key -> the op that first consumed
-  it, for every binding already consumed on every path reaching this call).
-  Only a bare symbol reference to a tracked binding can ever be reused -- an
-  inline `(cap-acquire ...)` expression produces a fresh value every time it
-  is textually evaluated, so it is never itself a reuse. Reusing an
-  already-consumed binding is the `:cap-value-reused` violation."
+  symbol -> `{:kind :origin}`) and USED (origin id -> the op that first
+  consumed it, for every capability VALUE already consumed on every path
+  reaching this call). Tracking is by ORIGIN, not by local binding name, so
+  a `let`-bound alias and whatever it aliases share the same origin and a
+  reuse through either name is caught. Only a bare symbol reference to a
+  tracked binding can ever be reused -- an inline `(cap-acquire ...)`
+  expression produces a fresh, never-referenceable-again value every time
+  it is textually evaluated, so it is never itself a reuse. Reusing an
+  already-consumed origin is the `:cap-value-reused` violation."
   [fn-name cap-env used op arg]
-  (if-let [key (and (symbol? arg) (contains? cap-env (symbol-key arg)) (symbol-key arg))]
-    (if-let [first-use (get used key)]
+  (if-let [{:keys [kind origin]} (and (symbol? arg) (get cap-env (symbol-key arg)))]
+    (if-let [first-use (get used origin)]
       [[{:kotoba.runtime/problem :cap-value-reused
          :kotoba.runtime/fn (str fn-name)
          :kotoba.runtime/op (str op)
-         :kotoba.runtime/binding (str key)
-         :kotoba.runtime/kind (get cap-env key)
+         :kotoba.runtime/binding (str arg)
+         :kotoba.runtime/kind kind
          :kotoba.runtime/first-use first-use}]
        used]
-      [[] (assoc used key (str op))])
+      [[] (assoc used origin (str op))])
     [[] used]))
 
 (defn- cap-affine-step
-  "[problems' used'] after walking EXPR (one form inside FN-NAME's body)
-  under CAP-ENV (local symbol -> capability kind, grows through `let`),
-  FN-PARAM-KINDS (user fn name -> declared param cap kinds), and USED (local
-  symbol key -> the op that consumed it, for every capability-typed binding
-  already consumed on every path reaching EXPR). Sequencing:
+  "[problems' used' counter'] after walking EXPR (one form inside FN-NAME's
+  body) under CAP-ENV (local symbol -> `{:kind :origin}`, grows through
+  `let`), FN-PARAM-KINDS (user fn name -> declared param cap kinds), USED
+  (origin id -> the op that consumed it, for every capability VALUE already
+  consumed on every path reaching EXPR), and COUNTER (the next fresh origin
+  id to assign to a `(cap-acquire ...)` occurrence). Sequencing:
 
-  - `do`/function-body/`def` values thread USED left-to-right (each form
-    sees everything the previous ones consumed);
-  - `let` evaluates each binding's value under the PRE-binding env/used (so
-    a value referencing a name this same let is about to shadow still sees
-    the outer binding), threads USED through the bindings and then the body
-    in order, and -- because names introduced or shadowed inside a `let` go
-    out of scope when it returns -- strips any key from the final USED that
-    was not already visible in the incoming CAP-ENV before returning. Without
-    this, two sibling `(let [c ...] ...)` blocks reusing the same local name
-    `c` for two DIFFERENT capability values would falsely flag the second
-    block's first use as a reuse of the first block's (already
-    out-of-scope) `c`;
-  - `if` evaluates its test under the incoming USED, then evaluates BOTH
-    branches independently from the SAME post-test USED (only one branch
-    ever runs at runtime) and continues with the UNION of what each branch
-    consumed -- a binding consumed in EITHER branch must be treated as
-    possibly-already-consumed by whatever follows, since a downstream reuse
-    on the branch actually taken would otherwise go undetected;
+  - `do`/function-body/`def` values thread USED and COUNTER left-to-right
+    (each form sees everything the previous ones consumed, and every
+    `cap-acquire` occurrence gets its own never-repeated origin);
+  - `let` evaluates each binding's value under the PRE-binding env/used/
+    counter (so a value referencing a name this same let is about to
+    shadow still sees the outer binding), assigns the new binding's
+    `{:kind :origin}` via cap-expr-info (fresh origin for a direct
+    `cap-acquire`, shared origin for an alias), and threads USED/COUNTER
+    through the bindings and then the body in order. USED is keyed by
+    origin, not by local name, so unlike CAP-ENV it never needs scope-exit
+    filtering: an origin created inside a let remains a globally unique
+    identifier for that one capability value for the rest of the function,
+    so two sibling `(let [c ...] ...)` blocks reusing the name `c` for two
+    DIFFERENT `cap-acquire` calls get two different origins automatically
+    and can never be confused, regardless of lexical scope;
+  - `if` evaluates its test under the incoming USED/COUNTER, then evaluates
+    BOTH branches independently from the same post-test USED (only one
+    branch ever runs at runtime) and continues with the UNION of what each
+    branch consumed -- a binding consumed in EITHER branch must be treated
+    as possibly-already-consumed by whatever follows, since a downstream
+    reuse on the branch actually taken would otherwise go undetected. The
+    else branch continues numbering origins from wherever the then branch
+    left COUNTER (an arbitrary but harmless ordering artifact -- origins
+    across the two branches never collide, and downstream code continues
+    from the higher of the two);
   - a capability-typed value reaching an `<op>-with` leading argument or a
     callee's `^{:cap <kind>}` parameter position is a consuming use
     (affine-use), checked AFTER recursing into the argument itself (so a
     reuse nested inside a complex argument expression is still caught)."
-  [fn-name cap-env fn-param-kinds used expr]
+  [fn-name cap-env fn-param-kinds used counter expr]
   (if-not (seq? expr)
-    [[] used]
+    [[] used counter]
     (let [[op & args] expr
-          step (fn [used e] (cap-affine-step fn-name cap-env fn-param-kinds used e))
-          step-seq (fn [used exprs]
-                     (reduce (fn [[problems used] e]
-                               (let [[p' used'] (step used e)]
-                                 [(into problems p') used']))
-                             [[] used] exprs))]
+          step (fn [used counter e] (cap-affine-step fn-name cap-env fn-param-kinds used counter e))
+          step-seq (fn [used counter exprs]
+                     (reduce (fn [[problems used counter] e]
+                               (let [[p' used' counter'] (step used counter e)]
+                                 [(into problems p') used' counter']))
+                             [[] used counter] exprs))]
       (case op
-        (quote ns defn) [[] used]
-        def (step-seq used (rest args))
-        do (step-seq used args)
+        (quote ns defn) [[] used counter]
+        def (step-seq used counter (rest args))
+        do (step-seq used counter args)
 
         let
-        (let [[bindings & body] args
-              outer-keys (set (keys cap-env))]
+        (let [[bindings & body] args]
           (loop [pairs (partition 2 bindings)
                  cap-env cap-env
                  used used
+                 counter counter
                  problems []]
             (if-let [[binding value] (first pairs)]
-              (let [[p' used'] (cap-affine-step fn-name cap-env fn-param-kinds used value)
+              (let [[p' used' counter'] (cap-affine-step fn-name cap-env fn-param-kinds used counter value)
                     bkey (symbol-key binding)
-                    cap-env' (if-let [kind (cap-expr-kind cap-env value)]
-                               (assoc cap-env bkey kind)
-                               (dissoc cap-env bkey))]
-                (recur (next pairs) cap-env' (dissoc used' bkey) (into problems p')))
-              (let [[p' used'] (reduce (fn [[problems used] e]
-                                          (let [[p'' used''] (cap-affine-step
-                                                               fn-name cap-env fn-param-kinds used e)]
-                                            [(into problems p'') used'']))
-                                        [problems used] body)]
-                [p' (select-keys used' outer-keys)]))))
+                    [info counter''] (cap-expr-info cap-env counter' value)
+                    cap-env' (if info (assoc cap-env bkey info) (dissoc cap-env bkey))]
+                (recur (next pairs) cap-env' used' counter'' (into problems p')))
+              (let [[p' used' counter']
+                    (reduce (fn [[problems used counter] e]
+                              (let [[p'' used'' counter'']
+                                    (cap-affine-step fn-name cap-env fn-param-kinds used counter e)]
+                                [(into problems p'') used'' counter'']))
+                            [[] used counter] body)]
+                [(into problems p') used' counter']))))
 
         if
         (let [[test then else] args
-              [tp tused] (step used test)
-              [thp thused] (cap-affine-step fn-name cap-env fn-param-kinds tused then)
-              [ep eused] (cap-affine-step fn-name cap-env fn-param-kinds tused else)]
-          [(-> tp (into thp) (into ep)) (merge thused eused)])
+              [tp tused tcounter] (step used counter test)
+              [thp thused thcounter] (cap-affine-step fn-name cap-env fn-param-kinds tused tcounter then)
+              [ep eused ecounter] (cap-affine-step fn-name cap-env fn-param-kinds tused thcounter else)]
+          [(-> tp (into thp) (into ep)) (merge thused eused) ecounter])
 
-        ;; call site: thread USED left-to-right through args (recursing into
-        ;; each for its own internal problems/uses first), then flag any
-        ;; capability-consuming position that reuses an already-used binding.
+        ;; call site: thread USED/COUNTER left-to-right through args
+        ;; (recursing into each for its own internal problems/uses first),
+        ;; then flag any capability-consuming position that reuses an
+        ;; already-used origin.
         (loop [remaining (map-indexed vector args)
                used used
+               counter counter
                problems []]
           (if-let [[idx arg] (first remaining)]
-            (let [[p' used'] (step used arg)
+            (let [[p' used' counter'] (step used counter arg)
                   [p'' used''] (if (cap-consuming-arg-index? fn-param-kinds op idx)
                                  (affine-use fn-name cap-env used' op arg)
                                  [[] used'])]
-              (recur (next remaining) used'' (-> problems (into p') (into p''))))
-            [problems used]))))))
+              (recur (next remaining) used'' counter' (-> problems (into p') (into p''))))
+            [problems used counter]))))))
 
 (defn cap-affine-problems
-  "Static capability-value affinity checks (narrow S2): every
-  capability-typed local -- a `^{:cap <kind>}` param, the direct result of
-  `(cap-acquire ...)`, or a let-bound alias of either -- may be consumed (the
-  leading argument of an `<op>-with` use, or an argument aligned with a
-  callee's `^{:cap <kind>}` param) AT MOST ONCE along any single execution
-  path through a function body (`:cap-value-reused` otherwise). Being left
+  "Static capability-value affinity checks (narrow S2): every capability
+  VALUE -- the result of a `^{:cap <kind>}` param binding or a
+  `(cap-acquire ...)` call, tracked by origin so every `let`-bound alias of
+  it shares the same identity -- may be consumed (the leading argument of
+  an `<op>-with` use, or an argument aligned with a callee's
+  `^{:cap <kind>}` param) AT MOST ONCE along any single execution path
+  through a function body (`:cap-value-reused` otherwise). Being left
   unused is fine -- deterministic drop, no linear must-use requirement.
 
   This is checked purely per function body: passing a capability into a
   callee's cap-typed param is itself the caller's one consuming use of its
   own binding; what the callee does with the value it receives is the
   callee's own, separately checked, affine property. Each top-level `defn`
-  (and each bare top-level form) is walked from a fresh, empty USED set, cap
-  environment seeded from `^{:cap <kind>}` params for `defn`.
-
-  Known conservative limitation (false-negative only, never a false
-  positive -- same posture as the other language-layer checkers, ADR-safe-
-  capability-language.md §13(a)): tracking is per LOCAL BINDING NAME, not
-  per underlying capability provenance. `(let [alias c] ...)` followed by
-  using both `alias` and `c` once each spends the same underlying value
-  twice without being caught, because the two names are tracked
-  independently. This does not weaken runtime confinement (T3): every
-  `<op>-with` use, aliased or not, still re-resolves through
-  `kotoba.cap-table/resolve-use` (kind + expiry re-checked, forged/expired
-  handles fail closed) at the actual host call, so an uncaught rename-alias
-  reuse is a static-discipline gap, not a confinement hole. Closing it needs
-  per-value provenance tracking (an origin id threaded alongside kind,
-  distinct from the local-binding-name keys used here) and is left as
-  follow-up rather than folded into this narrow slice."
+  (and each bare top-level form) is walked from a fresh, empty USED set and
+  a fresh origin counter starting at 0, with cap-env seeded from
+  `^{:cap <kind>}` params for `defn` (each param gets its own origin)."
   [forms]
   (let [defs (function-defs forms)
         fn-param-kinds (into {}
@@ -768,15 +793,18 @@
     (vec
      (mapcat
       (fn [form]
-        (let [[problems _used]
+        (let [[problems _used _counter]
               (if-let [[fname f] (function-def form)]
-                (let [cap-env (into {}
-                                    (keep (fn [param]
-                                            (when-let [kind (cap-param-kind param)]
-                                              [(symbol-key param) kind])))
-                                    (:params f))]
-                  (cap-affine-step fname cap-env fn-param-kinds {} (cons 'do (:body f))))
-                (cap-affine-step 'top-level {} fn-param-kinds {} form))]
+                (let [[cap-env counter]
+                      (reduce (fn [[cap-env counter] param]
+                                (if-let [kind (cap-param-kind param)]
+                                  [(assoc cap-env (symbol-key param) {:kind kind :origin counter})
+                                   (inc counter)]
+                                  [cap-env counter]))
+                              [{} 0]
+                              (:params f))]
+                  (cap-affine-step fname cap-env fn-param-kinds {} counter (cons 'do (:body f))))
+                (cap-affine-step 'top-level {} fn-param-kinds {} 0 form))]
           problems))
       forms))))
 

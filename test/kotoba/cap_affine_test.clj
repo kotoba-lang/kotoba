@@ -1,12 +1,14 @@
 (ns kotoba.cap-affine-test
   "Narrow S2 -- capability value affinity (deterministic drop, no implicit
   clone), scoped ONLY to capability-typed values (ADR-safe-capability-
-  language.md, §0/§13(c)): every `^{:cap <kind>}` param, `(cap-acquire ...)`
-  result, or let-bound alias may be consumed at most once along any single
-  execution path through a function body. This is a static discipline check
-  layered on top of the already-independent runtime confinement (T3) --
-  every `<op>-with` use, reused or not, still re-resolves through
-  `kotoba.cap-table/resolve-use` at the actual host call."
+  language.md, §0/§13(c)): every capability VALUE -- a `^{:cap <kind>}`
+  param, a `(cap-acquire ...)` result, or a let-bound alias of either,
+  tracked by origin so aliases share identity with whatever they alias --
+  may be consumed at most once along any single execution path through a
+  function body. This is a static discipline check layered on top of the
+  already-independent runtime confinement (T3) -- every `<op>-with` use,
+  reused or not, still re-resolves through `kotoba.cap-table/resolve-use`
+  at the actual host call."
   (:require [clojure.test :refer [deftest is testing]]
             [kotoba.launcher :as launcher])
   (:import [java.io File]))
@@ -135,24 +137,51 @@
       (is (= "inner" (:kotoba.runtime/first-use (first problems)))))))
 
 ;; ---------------------------------------------------------------------------
-;; Documented known limitation: per-name tracking, not per-value provenance.
+;; Provenance tracking: a let-bound alias shares its ORIGIN with whatever it
+;; aliases, so renaming can no longer dodge the affine check.
 
-(deftest renaming-through-a-let-alias-is-a-known-uncaught-evasion
-  (testing "tracked per LOCAL BINDING NAME -- `alias` and `c` are two
-            different names for the same underlying value here, so using
-            each once is not (yet) flagged as reusing the same capability.
-            This is a documented conservative false-negative
-            (kotoba.runtime/cap-affine-problems docstring); it does not
-            weaken runtime confinement (T3), since kotoba.cap-table/
-            resolve-use re-checks kind/expiry at every actual host call
-            regardless of how the language-level checker classified it."
+(deftest single-use-through-a-let-bound-alias-is-fine
+  (testing "using the alias exactly once (never touching the original name)
+            is deterministic drop, same as using the original name once"
     (is (empty? (reused-problems
-                 (str "(ns demo-alias-evasion)\n"
+                 (str "(ns demo-alias-single-use)\n"
                       "(defn ^{:i64 true} f [^{:cap :host/ledger-append} c]\n"
                       "  (let [alias c]\n"
-                      "    (do (host-i64-roundtrip-with alias (i64 1))\n"
-                      "        (host-i64-roundtrip-with c (i64 2)))))\n"
+                      "    (host-i64-roundtrip-with alias (i64 1))))\n"
                       "(defn main [] 0)\n"))))))
+
+(deftest renaming-through-a-let-alias-is-caught-as-a-reuse
+  (testing "`alias` and `c` are two different NAMES for the same underlying
+            capability VALUE -- tracking by origin (not by local binding
+            name) means using `alias` once and then `c` once is correctly
+            flagged as spending the same value twice, not as two
+            independent single uses"
+    (let [problems (reused-problems
+                    (str "(ns demo-alias-reused)\n"
+                         "(defn ^{:i64 true} f [^{:cap :host/ledger-append} c]\n"
+                         "  (let [alias c]\n"
+                         "    (do (host-i64-roundtrip-with alias (i64 1))\n"
+                         "        (host-i64-roundtrip-with c (i64 2)))))\n"
+                         "(defn main [] 0)\n"))]
+      (is (= 1 (count problems)))
+      (testing "the SECOND use site's own binding name is reported (`c`),
+                even though the FIRST consuming use happened through the
+                alias name -- both facts are visible in the problem map"
+        (is (= "c" (:kotoba.runtime/binding (first problems))))
+        (is (= "host-i64-roundtrip-with" (:kotoba.runtime/first-use (first problems))))))))
+
+(deftest transitive-alias-chain-shares-the-same-origin-as-the-original
+  (testing "alias2 aliases alias1 which aliases c -- all three names share
+            one origin, so using alias2 once and c once is still a reuse"
+    (let [problems (reused-problems
+                    (str "(ns demo-alias-chain)\n"
+                         "(defn ^{:i64 true} f [^{:cap :host/ledger-append} c]\n"
+                         "  (let [alias1 c\n"
+                         "        alias2 alias1]\n"
+                         "    (do (host-i64-roundtrip-with alias2 (i64 1))\n"
+                         "        (host-i64-roundtrip-with c (i64 2)))))\n"
+                         "(defn main [] 0)\n"))]
+      (is (= 1 (count problems))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Regression: the narrow affine check must not disturb the existing S4b
