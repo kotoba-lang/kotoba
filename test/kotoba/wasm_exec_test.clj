@@ -183,6 +183,29 @@
       (is (= :unsupported-cap-resource (get-in valid-kind-non-string-resource [:problem :kotoba.wasm/problem]))
           "a valid kind but a non-string resource -- same problem as an unbacked string, not a distinct error"))))
 
+(deftest unknown-op-symbols-and-non-expr-forms-are-rejected
+  (testing "compile-wasm-expr's two outermost catch-alls -- :unsupported-op (a
+            seq? form whose head symbol matches no builtin/host-import/user-fn)
+            and :unsupported-form (a form that's neither an integer, a symbol, nor
+            a seq at all, e.g. a bare float/keyword/nil/map literal) -- previously
+            had zero direct test coverage of either, despite being the first thing
+            a typo'd .kotoba program would actually hit"
+    (let [unknown-op (runtime/compile-wasm-expr (list 'totally-unknown-op 1 2) {})
+          bare-float (runtime/compile-wasm-expr 1.5 {})
+          bare-keyword (runtime/compile-wasm-expr :oops {})
+          bare-nil (runtime/compile-wasm-expr nil {})
+          bare-map (runtime/compile-wasm-expr {:a 1} {})]
+      (is (= :unsupported-op (get-in unknown-op [:problem :kotoba.wasm/problem])))
+      (is (= "totally-unknown-op" (get-in unknown-op [:problem :kotoba.wasm/op]))
+          "the op field is str'd, not the raw symbol")
+      (is (= :unsupported-form (get-in bare-float [:problem :kotoba.wasm/problem]))
+          "a bare float literal outside (f32 ...)/(i64 ...) isn't itself a valid form -- integer? literals compile to i32, but floats need an explicit f32 wrapper")
+      (is (= "1.5" (get-in bare-float [:problem :kotoba.wasm/form]))
+          "the form field is pr-str'd, not the raw value")
+      (is (= :unsupported-form (get-in bare-keyword [:problem :kotoba.wasm/problem])))
+      (is (= :unsupported-form (get-in bare-nil [:problem :kotoba.wasm/problem])))
+      (is (= :unsupported-form (get-in bare-map [:problem :kotoba.wasm/problem]))))))
+
 (deftest wasm-binary-runs-kgraph-round-trip-through-real-host-functions
   (testing "compile -> emit -> Chicory-execute: kgraph-assert! really writes, kgraph-query really reads it back"
     (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)
