@@ -4,6 +4,7 @@
             [kotoba.actor-host-test]
             [kotoba.aiueos-kernel-caps-test]
             [kotoba.cacao-run-test]
+            [kotoba.cap-affine-test]
             [kotoba.cap-passing-test]
             [kotoba.cap-typed-test]
             [kotoba.did-adapter-test]
@@ -23,6 +24,7 @@
   (let [{:keys [fail error]} (run-tests 'kotoba.actor-host-test
                                         'kotoba.aiueos-kernel-caps-test
                                         'kotoba.cacao-run-test
+                                        'kotoba.cap-affine-test
                                         'kotoba.cap-passing-test
                                         'kotoba.cap-typed-test
                                         'kotoba.did-adapter-test

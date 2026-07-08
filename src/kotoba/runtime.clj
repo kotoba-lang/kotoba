@@ -589,6 +589,197 @@
               forms))]
     (into param-problems body-problems)))
 
+;; ---------------------------------------------------------------------------
+;; Capability value affinity (narrow S2 -- ADR-safe-capability-language.md
+;; "borrow checker (S2, deterministic drop, no implicit clone)").
+;;
+;; This is NOT a general Rust-style ownership/borrow/lifetime system over
+;; every value in the language. T1 Memory Safety is already achieved without
+;; one (raw memory ops denied, byte-at/byte-append! bounds-checked, the bump
+;; allocator never frees so use-after-free/double-free are structurally
+;; absent, concurrency primitives are denied so data races are structurally
+;; absent). The ONLY thing scoped here is capability-typed values: a
+;; `^{:cap <kind>}` param, the direct result of `(cap-acquire ...)`, or a
+;; let-bound alias of either. "Deterministic drop" means an unused
+;; capability-typed binding is fine (no linear must-use requirement); "no
+;; implicit clone" means the SAME binding may be consumed at most once along
+;; any single execution path -- reusing it (two `<op>-with` calls, two
+;; callee arguments, or one of each) would let one capability grant silently
+;; back two independent live uses, which is exactly the kind of duplication
+;; capability-passing (S4b) must not allow.
+
+(defn- cap-consuming-arg-index?
+  "True when position IDX of a call to OP is a capability-consuming argument
+  position: the sole (index 0) leading handle argument of an `<op>-with`
+  use, or an argument aligned with one of the callee's `^{:cap <kind>}`
+  typed params (FN-PARAM-KINDS: user fn name -> vector of declared param cap
+  kinds, nil entries for untyped params -- the same map cap-typed-problems
+  builds)."
+  [fn-param-kinds op idx]
+  (cond
+    (contains? with-op->op op) (zero? idx)
+    (contains? fn-param-kinds op) (some? (nth (get fn-param-kinds op) idx nil))
+    :else false))
+
+(defn- affine-use
+  "[problems' used'] after checking one already-evaluated argument ARG at a
+  capability-consuming position of a call to OP, under CAP-ENV (local
+  symbol -> kind) and USED (local symbol key -> the op that first consumed
+  it, for every binding already consumed on every path reaching this call).
+  Only a bare symbol reference to a tracked binding can ever be reused -- an
+  inline `(cap-acquire ...)` expression produces a fresh value every time it
+  is textually evaluated, so it is never itself a reuse. Reusing an
+  already-consumed binding is the `:cap-value-reused` violation."
+  [fn-name cap-env used op arg]
+  (if-let [key (and (symbol? arg) (contains? cap-env (symbol-key arg)) (symbol-key arg))]
+    (if-let [first-use (get used key)]
+      [[{:kotoba.runtime/problem :cap-value-reused
+         :kotoba.runtime/fn (str fn-name)
+         :kotoba.runtime/op (str op)
+         :kotoba.runtime/binding (str key)
+         :kotoba.runtime/kind (get cap-env key)
+         :kotoba.runtime/first-use first-use}]
+       used]
+      [[] (assoc used key (str op))])
+    [[] used]))
+
+(defn- cap-affine-step
+  "[problems' used'] after walking EXPR (one form inside FN-NAME's body)
+  under CAP-ENV (local symbol -> capability kind, grows through `let`),
+  FN-PARAM-KINDS (user fn name -> declared param cap kinds), and USED (local
+  symbol key -> the op that consumed it, for every capability-typed binding
+  already consumed on every path reaching EXPR). Sequencing:
+
+  - `do`/function-body/`def` values thread USED left-to-right (each form
+    sees everything the previous ones consumed);
+  - `let` evaluates each binding's value under the PRE-binding env/used (so
+    a value referencing a name this same let is about to shadow still sees
+    the outer binding), threads USED through the bindings and then the body
+    in order, and -- because names introduced or shadowed inside a `let` go
+    out of scope when it returns -- strips any key from the final USED that
+    was not already visible in the incoming CAP-ENV before returning. Without
+    this, two sibling `(let [c ...] ...)` blocks reusing the same local name
+    `c` for two DIFFERENT capability values would falsely flag the second
+    block's first use as a reuse of the first block's (already
+    out-of-scope) `c`;
+  - `if` evaluates its test under the incoming USED, then evaluates BOTH
+    branches independently from the SAME post-test USED (only one branch
+    ever runs at runtime) and continues with the UNION of what each branch
+    consumed -- a binding consumed in EITHER branch must be treated as
+    possibly-already-consumed by whatever follows, since a downstream reuse
+    on the branch actually taken would otherwise go undetected;
+  - a capability-typed value reaching an `<op>-with` leading argument or a
+    callee's `^{:cap <kind>}` parameter position is a consuming use
+    (affine-use), checked AFTER recursing into the argument itself (so a
+    reuse nested inside a complex argument expression is still caught)."
+  [fn-name cap-env fn-param-kinds used expr]
+  (if-not (seq? expr)
+    [[] used]
+    (let [[op & args] expr
+          step (fn [used e] (cap-affine-step fn-name cap-env fn-param-kinds used e))
+          step-seq (fn [used exprs]
+                     (reduce (fn [[problems used] e]
+                               (let [[p' used'] (step used e)]
+                                 [(into problems p') used']))
+                             [[] used] exprs))]
+      (case op
+        (quote ns defn) [[] used]
+        def (step-seq used (rest args))
+        do (step-seq used args)
+
+        let
+        (let [[bindings & body] args
+              outer-keys (set (keys cap-env))]
+          (loop [pairs (partition 2 bindings)
+                 cap-env cap-env
+                 used used
+                 problems []]
+            (if-let [[binding value] (first pairs)]
+              (let [[p' used'] (cap-affine-step fn-name cap-env fn-param-kinds used value)
+                    bkey (symbol-key binding)
+                    cap-env' (if-let [kind (cap-expr-kind cap-env value)]
+                               (assoc cap-env bkey kind)
+                               (dissoc cap-env bkey))]
+                (recur (next pairs) cap-env' (dissoc used' bkey) (into problems p')))
+              (let [[p' used'] (reduce (fn [[problems used] e]
+                                          (let [[p'' used''] (cap-affine-step
+                                                               fn-name cap-env fn-param-kinds used e)]
+                                            [(into problems p'') used'']))
+                                        [problems used] body)]
+                [p' (select-keys used' outer-keys)]))))
+
+        if
+        (let [[test then else] args
+              [tp tused] (step used test)
+              [thp thused] (cap-affine-step fn-name cap-env fn-param-kinds tused then)
+              [ep eused] (cap-affine-step fn-name cap-env fn-param-kinds tused else)]
+          [(-> tp (into thp) (into ep)) (merge thused eused)])
+
+        ;; call site: thread USED left-to-right through args (recursing into
+        ;; each for its own internal problems/uses first), then flag any
+        ;; capability-consuming position that reuses an already-used binding.
+        (loop [remaining (map-indexed vector args)
+               used used
+               problems []]
+          (if-let [[idx arg] (first remaining)]
+            (let [[p' used'] (step used arg)
+                  [p'' used''] (if (cap-consuming-arg-index? fn-param-kinds op idx)
+                                 (affine-use fn-name cap-env used' op arg)
+                                 [[] used'])]
+              (recur (next remaining) used'' (-> problems (into p') (into p''))))
+            [problems used]))))))
+
+(defn cap-affine-problems
+  "Static capability-value affinity checks (narrow S2): every
+  capability-typed local -- a `^{:cap <kind>}` param, the direct result of
+  `(cap-acquire ...)`, or a let-bound alias of either -- may be consumed (the
+  leading argument of an `<op>-with` use, or an argument aligned with a
+  callee's `^{:cap <kind>}` param) AT MOST ONCE along any single execution
+  path through a function body (`:cap-value-reused` otherwise). Being left
+  unused is fine -- deterministic drop, no linear must-use requirement.
+
+  This is checked purely per function body: passing a capability into a
+  callee's cap-typed param is itself the caller's one consuming use of its
+  own binding; what the callee does with the value it receives is the
+  callee's own, separately checked, affine property. Each top-level `defn`
+  (and each bare top-level form) is walked from a fresh, empty USED set, cap
+  environment seeded from `^{:cap <kind>}` params for `defn`.
+
+  Known conservative limitation (false-negative only, never a false
+  positive -- same posture as the other language-layer checkers, ADR-safe-
+  capability-language.md §13(a)): tracking is per LOCAL BINDING NAME, not
+  per underlying capability provenance. `(let [alias c] ...)` followed by
+  using both `alias` and `c` once each spends the same underlying value
+  twice without being caught, because the two names are tracked
+  independently. This does not weaken runtime confinement (T3): every
+  `<op>-with` use, aliased or not, still re-resolves through
+  `kotoba.cap-table/resolve-use` (kind + expiry re-checked, forged/expired
+  handles fail closed) at the actual host call, so an uncaught rename-alias
+  reuse is a static-discipline gap, not a confinement hole. Closing it needs
+  per-value provenance tracking (an origin id threaded alongside kind,
+  distinct from the local-binding-name keys used here) and is left as
+  follow-up rather than folded into this narrow slice."
+  [forms]
+  (let [defs (function-defs forms)
+        fn-param-kinds (into {}
+                             (map (fn [[fname f]]
+                                    [fname (mapv cap-param-kind (:params f))]))
+                             defs)]
+    (vec
+     (mapcat
+      (fn [form]
+        (let [[problems _used]
+              (if-let [[fname f] (function-def form)]
+                (let [cap-env (into {}
+                                    (keep (fn [param]
+                                            (when-let [kind (cap-param-kind param)]
+                                              [(symbol-key param) kind])))
+                                    (:params f))]
+                  (cap-affine-step fname cap-env fn-param-kinds {} (cons 'do (:body f))))
+                (cap-affine-step 'top-level {} fn-param-kinds {} form))]
+          problems))
+      forms))))
+
 (defn- direct-callees
   "User fn names (from FN-NAMES) called anywhere inside BODY."
   [fn-names body]
@@ -658,13 +849,14 @@
 
 (defn check
   "Run all static checks (safety/type problems, typed-capability problems,
-  effect/capability consistency) over forms and, if none fire, compile the
-  EDN IR. Returns `{:kotoba.runtime/ok? :kotoba.runtime/problems
-  :kotoba.runtime/ir}`."
+  capability-value affinity, effect/capability consistency) over forms and,
+  if none fire, compile the EDN IR. Returns `{:kotoba.runtime/ok?
+  :kotoba.runtime/problems :kotoba.runtime/ir}`."
   ([safe-facts source-plan forms] (check safe-facts source-plan forms nil))
   ([safe-facts source-plan forms policy]
   (let [problems (vec (concat (source-problems safe-facts forms policy)
                               (cap-typed-problems forms)
+                              (cap-affine-problems forms)
                               (cap-effect-problems forms)))
         ir (when (empty? problems)
              (compile-forms source-plan forms))]
