@@ -125,6 +125,64 @@
       (is (= 0 (-> parameterized-main :kotoba.wasm/problems first :kotoba.wasm/expected)))
       (is (= 1 (-> parameterized-main :kotoba.wasm/problems first :kotoba.wasm/actual))))))
 
+(deftest byte-at-rejects-non-literal-args-non-integer-index-and-out-of-bounds-index
+  (testing "byte-at has three distinct problem branches -- all three previously had
+            zero direct test coverage, only the happy path was ever exercised
+            (transitively, via demo_alloc/demo_buffer_abi/demo_memory*.kotoba)"
+    (let [non-literal (runtime/compile-wasm-expr (list 'byte-at 'x 0) {})
+          non-integer-index (runtime/compile-wasm-expr (list 'byte-at "hi" 'x) {})
+          negative-index (runtime/compile-wasm-expr (list 'byte-at "hi" -1) {})
+          too-large-index (runtime/compile-wasm-expr (list 'byte-at "hi" 5) {})]
+      (is (= :unsupported-bytes-op (get-in non-literal [:problem :kotoba.wasm/problem])))
+      (is (= :unsupported-bytes-index (get-in non-integer-index [:problem :kotoba.wasm/problem])))
+      (is (= :bytes-index-out-of-bounds (get-in negative-index [:problem :kotoba.wasm/problem])))
+      (is (= -1 (get-in negative-index [:problem :kotoba.wasm/index])))
+      (is (= :bytes-index-out-of-bounds (get-in too-large-index [:problem :kotoba.wasm/problem])))
+      (is (= 5 (get-in too-large-index [:problem :kotoba.wasm/index])))
+      (is (= 2 (get-in too-large-index [:problem :kotoba.wasm/length]))
+          "\"hi\" is 2 UTF-8 bytes -- confirms the bound is the literal's actual byte length, not a hardcoded number"))))
+
+(deftest string-and-bytes-ptr-len-ops-reject-non-literals-and-missing-memory-entries
+  (testing "str-len/bytes-len (need a literal_bytes-recognizable value) and
+            str-ptr/bytes-ptr (additionally need a :memory entry for that literal)
+            -- all four previously had zero direct test coverage of their rejection
+            paths"
+    (let [str-len-non-literal (runtime/compile-wasm-expr (list 'str-len 'x) {})
+          bytes-len-non-literal (runtime/compile-wasm-expr (list 'bytes-len 'x) {})
+          str-ptr-no-memory (runtime/compile-wasm-expr (list 'str-ptr "hi") {} {})
+          bytes-ptr-no-memory (runtime/compile-wasm-expr (list 'bytes-ptr [1 2 3]) {} {})]
+      (is (= :unsupported-string-op (get-in str-len-non-literal [:problem :kotoba.wasm/problem])))
+      (is (= :unsupported-bytes-op (get-in bytes-len-non-literal [:problem :kotoba.wasm/problem])))
+      (is (= :unsupported-string-op (get-in str-ptr-no-memory [:problem :kotoba.wasm/problem]))
+          "str-ptr on a real string literal, but with no memory layout entry for it -- the resource just isn't backed, not a type error")
+      (is (= :unsupported-bytes-op (get-in bytes-ptr-no-memory [:problem :kotoba.wasm/problem]))))))
+
+(deftest unknown-local-symbol-is-rejected-at-compile-time
+  (testing ":unknown-local -- referencing a bare symbol that was never bound as a
+            local, previously with zero direct test coverage"
+    (let [result (runtime/compile-wasm-expr 'undeclared-var {})]
+      (is (= :unknown-local (get-in result [:problem :kotoba.wasm/problem])))
+      (is (= "undeclared-var" (get-in result [:problem :kotoba.wasm/symbol]))))))
+
+(deftest cap-acquire-rejects-unknown-kinds-and-unbacked-resources
+  (testing "cap-acquire's two non-arity problem branches -- :unsupported-capability-kind
+            (the kind keyword isn't in wasm-cap-kind-ids at all) and
+            :unsupported-cap-resource (the kind IS valid, but the resource is either
+            not a string literal or has no memory-layout entry) -- previously with
+            zero direct test coverage of either"
+    (let [bad-kind (runtime/compile-wasm-expr (list 'cap-acquire :bogus-kind "res") {} {})
+          valid-kind-missing-resource (runtime/compile-wasm-expr
+                                        (list 'cap-acquire :host/notify "missing-resource") {} {})
+          valid-kind-non-string-resource (runtime/compile-wasm-expr
+                                           (list 'cap-acquire :host/notify 42) {} {})]
+      (is (= :unsupported-capability-kind (get-in bad-kind [:problem :kotoba.wasm/problem])))
+      (is (= ":bogus-kind" (get-in bad-kind [:problem :kotoba.wasm/kind]))
+          "the kind field is pr-str'd, not the raw keyword")
+      (is (= :unsupported-cap-resource (get-in valid-kind-missing-resource [:problem :kotoba.wasm/problem]))
+          "a real, valid capability kind but a resource string with no matching memory-layout entry")
+      (is (= :unsupported-cap-resource (get-in valid-kind-non-string-resource [:problem :kotoba.wasm/problem]))
+          "a valid kind but a non-string resource -- same problem as an unbacked string, not a distinct error"))))
+
 (deftest wasm-binary-runs-kgraph-round-trip-through-real-host-functions
   (testing "compile -> emit -> Chicory-execute: kgraph-assert! really writes, kgraph-query really reads it back"
     (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)
