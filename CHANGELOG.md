@@ -6,6 +6,28 @@ user-visible or architecturally significant changes.
 
 ## Unreleased
 
+- Added `kotoba.runtime/cap-affine-problems` (narrow S2, deterministic drop
+  / no implicit clone): a capability-typed value — a `^{:cap <kind>}` param,
+  a `(cap-acquire ...)` result, or a let-bound alias of either — may be
+  consumed at most once along any single execution path through a function
+  body; reuse is rejected as `:cap-value-reused`. Deliberately scoped to
+  capability values only, not a general Rust-style ownership/borrow system
+  (T1 Memory Safety was already achieved without one). Documented
+  conservative limitation: tracking is per local binding name, not per
+  underlying value, so renaming through a `let`-alias and using both names
+  once each is an uncaught reuse — does not weaken runtime confinement,
+  since every `<op>-with` use still re-resolves through
+  `kotoba.cap-table/resolve-use` regardless of alias.
+- Reinstated `.cljs` as a directly-runnable source extension (bumped the
+  `kotoba-core-contracts` pin, which gained a `:cljs` source-kind mirroring
+  `.clj`'s single-target shape). `src/demo.cljs` proves a bare `.cljs` file
+  is accepted and defaults to the `:cljs` reader target with no
+  `--reader-target` flag needed.
+- Added `test/kotoba/cap_table_test.clj`: direct unit coverage of
+  `kotoba.cap-table` (handle sequencing across multiple acquisitions on the
+  same table, and `resolve-use`'s three denial branches called in
+  isolation) — previously only exercised indirectly through
+  `cap_passing_test.clj`'s end-to-end launcher tests.
 - **Breaking**: `kotoba wasm emit` and `kotoba wasm run` now require
   `--package-lock <path>` unconditionally — the package-admission gate always
   runs first, and a missing or rejected lock aborts the build/run with the
