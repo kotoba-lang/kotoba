@@ -167,6 +167,11 @@ admission gate always runs first, and a missing or rejected lock aborts the
 build/run with the admission receipt in the error payload — there is no way to
 opt out (F-001).
 
+Looking for things to run? [`docs/DEMONSTRATIONS.md`](docs/DEMONSTRATIONS.md)
+indexes every real program built with `.kotoba` so far — the mesh apps and 57
+capability demos under `src/`, the browser- and kototama-hosted tools, and the
+kami-lineage games — with the host that executes each one.
+
 `db` / `git` / `rad` / `deploy` / `hinshitsu` are declared in the same
 contract for the distributed-graph, git-adapter, RAD sovereign-repo, and
 deploy/quality-gate surfaces; consult `lang/cli.edn` for their current tier
@@ -440,6 +445,7 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | doc | topic |
 |---|---|
 | [`docs/index.html`](docs/index.html) | docs-site landing page (hub) |
+| [`docs/DEMONSTRATIONS.md`](docs/DEMONSTRATIONS.md) | **demonstrations** — index of real programs built with `.kotoba` (mesh apps, capability demos, browser/kototama-hosted tools, kami-lineage games) and the hosts that execute them |
 | [`docs/HISTORICAL-RUST-ARCHITECTURE.md`](docs/HISTORICAL-RUST-ARCHITECTURE.md) | pre-migration Rust crate table, architecture, query surfaces, and benchmarks (design-vocabulary reference) |
 | [`docs/paper/`](docs/paper/) | arXiv-style research paper (LaTeX source) — full system description |
 | [`docs/explainer/`](docs/explainer/) | the two interactive explainer videos |
