@@ -516,6 +516,22 @@
   temp directory needed just to enumerate op ids."
   (set (keys (real-op-effects nil))))
 
+(defn guarded-host-functions
+  "HostFunctions for EFFECTS (op symbol -> raw (fn [instance args] -> long)
+  body, each op a kotoba.runtime/host-imports key whose descriptor supplies
+  the wire shape), every one guarded exactly like `kgraph-host-functions`'
+  2-/3-arg forms (`guard-host-call`, fail-closed, receipted). The generic
+  effects->HostFunctions step `real-host-functions` always performed,
+  factored out so other real provider surfaces (e.g. kotoba.kami-host's
+  kami-* ECS ops) can reuse it instead of reimplementing the guard wiring."
+  ([effects policy] (guarded-host-functions effects policy nil))
+  ([effects policy opts]
+   (mapv (fn [[op effect]]
+           (let [{:keys [field params result]} (get runtime/host-imports op)]
+             (host-fn field (mapv valtype params) (valtype result)
+                      (guard-host-call op effect (assoc opts :policy policy)))))
+         effects)))
+
 (defn real-host-functions
   "HostFunctions for `real-op-ids`, guarded exactly like `kgraph-host-
   functions`' 2-/3-arg forms (`guard-host-call`, fail-closed, receipted).
@@ -524,11 +540,7 @@
   (:record!/:now)."
   ([state policy] (real-host-functions state policy nil))
   ([state policy opts]
-   (mapv (fn [[op effect]]
-           (let [{:keys [field params result]} (get runtime/host-imports op)]
-             (host-fn field (mapv valtype params) (valtype result)
-                      (guard-host-call op effect (assoc opts :policy policy)))))
-         (real-op-effects state))))
+   (guarded-host-functions (real-op-effects state) policy opts)))
 
 (defn instantiate
   "Parse WASM-BYTES and build a Chicory Instance with EXTRA-HOST-FNS (a seq
