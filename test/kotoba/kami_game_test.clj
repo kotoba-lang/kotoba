@@ -59,6 +59,16 @@
       (is (= rolls (roll b)) "same seed, same stream")
       (is (every? #(<= 0 % 3) rolls)))))
 
+(deftest kami-survivors-fixture-binary-is-in-sync
+  (testing "test/kotoba/fixtures/kami_survivors.wasm (the checked-in binary the
+            ClojureScript/nbb parity script and wasm-webcomponent's example
+            host) is byte-identical to a fresh emit of the source"
+    (let [{:keys [wasm]} (compiled-game)
+          fixture (java.nio.file.Files/readAllBytes
+                   (.toPath (java.io.File. "test/kotoba/fixtures/kami_survivors.wasm")))]
+      (is (java.util.Arrays/equals ^bytes fixture ^bytes (:kotoba.wasm/binary wasm))
+          "re-emit with: bin/kotoba-clj wasm emit src/kami_survivors.kotoba --policy src/kami_survivors_policy.edn --package-lock kotoba.lock.edn -o test/kotoba/fixtures/kami_survivors.wasm"))))
+
 (deftest kami-survivors-compiles-under-its-policy
   (let [{:keys [forms policy wasm]} (compiled-game)
         checked (runtime/check (launcher/safe-analyzer-fact-classification)
