@@ -194,7 +194,25 @@
    'verify :host/identity-verify
    'sha256-hex :host/hash-sha256
    'http-post :host/http-post
-   'log-read :host/log-read})
+   'log-read :host/log-read
+   ;; kami-* game-engine ECS surface (kotoba-core-contracts "kami/engine",
+   ;; one shared capability id 233 -> one kind for the family, mirroring
+   ;; topic-* mapping three ops to :host/topic-subscribe). The matching
+   ;; effect-for-kind entry landed in kotoba-lang at the same time, so
+   ;; guard-call can't reproduce the aiueos :unsupported-kind gap above.
+   'kami-tick-n :host/kami-engine
+   'kami-spawn :host/kami-engine
+   'kami-despawn :host/kami-engine
+   'kami-set-position! :host/kami-engine
+   'kami-set-velocity! :host/kami-engine
+   'kami-get-x :host/kami-engine
+   'kami-get-y :host/kami-engine
+   'kami-count-tagged :host/kami-engine
+   'kami-nearest-tagged :host/kami-engine
+   'kami-move-tagged-toward! :host/kami-engine
+   'kami-despawn-within! :host/kami-engine
+   'kami-axis :host/kami-engine
+   'kami-rand :host/kami-engine})
 
 (def with-op->op
   "Capability-passing use variant (`<op>-with`, leading argument a capability

@@ -168,9 +168,10 @@ build/run with the admission receipt in the error payload — there is no way to
 opt out (F-001).
 
 Looking for things to run? [`docs/DEMONSTRATIONS.md`](docs/DEMONSTRATIONS.md)
-indexes every real program built with `.kotoba` so far — the mesh apps and 57
-capability demos under `src/`, the browser- and kototama-hosted tools, and the
-kami-lineage games — with the host that executes each one.
+indexes every real program built with `.kotoba` so far — the mesh apps, the
+**kami-survivors game**, and the capability demos under `src/`, the browser-
+and kototama-hosted tools, and the kami-lineage games — with the host that
+executes each one.
 
 `db` / `git` / `rad` / `deploy` / `hinshitsu` are declared in the same
 contract for the distributed-graph, git-adapter, RAD sovereign-repo, and

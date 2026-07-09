@@ -38,9 +38,11 @@ The first *applications* — as opposed to capability demos — ported to
 
 ## Capability & ABI demos (this repo, `src/`)
 
-57 `.kotoba` programs (36 with a `*_policy.edn` capability policy alongside;
-the rest are pure-compute and need no capability grant). Each family proves
-one slice of the capability-confined execution model, and each is executed —
+58 `.kotoba` programs live under `src/`, 37 with a `*_policy.edn`
+capability policy alongside (the rest are pure-compute and need no
+capability grant; the 58th program is the **kami-survivors game**, listed
+under [Games](#games) below rather than here). Each family proves one
+slice of the capability-confined execution model, and each is executed —
 not just compiled — by the named test suite.
 
 | family | programs | what it demonstrates | executing tests |
@@ -62,18 +64,27 @@ not just compiled — by the named test suite.
 | [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang) | `examples/hello.kotoba`, `lang/conformance/entry_extensions/main.kotoba` | the language profile's own hello-world and conformance fixtures — the `.kotoba` entry-point contract every launcher must honor. |
 | [`kotoba-lang/lab`](https://github.com/kotoba-lang/lab) | `lab.kotoba` | a research-notebook site definition (replayable analysis runs, environment locks, CID artifacts) authored as `.kotoba` data — `.kotoba` as a declarative app-config surface rather than compiled logic. |
 
-## Games (kotoba-clj subset → WASM, kami lineage)
+## Games
 
-Playable game logic compiled by the same compiler family runs today, but is
-authored in the **kotoba-clj subset** (`.clj` files restricted to the proven
-compiler vocabulary — `defsystem`, `spawn-entity`, `set-velocity!`,
-`nearest-tagged`, `tick-n`, …), not in `.kotoba` files yet:
+### Authored directly in `.kotoba` (this repo)
+
+| game | source | running demonstration |
+|---|---|---|
+| **kami-survivors** (survivors-style: ghosts spawn on a ring, chase the player, a periodic nova burst clears the closest) | [`src/kami_survivors.kotoba`](../src/kami_survivors.kotoba) + [`src/kami_survivors_policy.edn`](../src/kami_survivors_policy.edn) (granting the one shared `:kami/engine` capability) | **The first game authored in a `.kotoba` file** — the "natural next demonstration" this page used to end on. Compiled by `kotoba wasm emit` against the `kami-*` host imports (kotoba-core-contracts `"kami/engine"`, id 233: the kami:engine vocabulary exposed through this repo's single `(module "kotoba")` ABI) and driven for 300 ticks on Chicory by [`src/kotoba/kami_host.clj`](../src/kotoba/kami_host.clj) — a host-owned ECS with fixed-step integration, tick counter, input axes, and seeded xorshift64 — in `test/kotoba/kami_game_test.clj`, which asserts exact pinned entity counts (the parity-by-counts method wasm-webcomponent's netsurvivors verification uses) and that the host-owned input axis really steers the player. Every op is capability-guarded: the same binary under a policy without `:kami/engine` is denied on its very first host call. |
+
+### Authored in the kotoba-clj subset (kami lineage)
+
+Game logic compiled by the same compiler family also runs today authored in
+the **kotoba-clj subset** (`.clj` files restricted to the proven compiler
+vocabulary — `defsystem`, `spawn-entity`, `set-velocity!`,
+`nearest-tagged`, `tick-n`, …):
 
 | game | source | running demonstration |
 |---|---|---|
 | **01-netsurvivors** (survivors-style: shiro-pico vs ghosts vs beat-sparks) | `gftdcojp/isekai-network` `games/01-netsurvivors/logic.clj` | compiled `.wasm` is checked into wasm-webcomponent's [`examples/kami-engine-host`](https://github.com/kotoba-lang/wasm-webcomponent/tree/main/examples/kami-engine-host) and ticks live in the browser via `kami-engine-host.js` (14 `kami:engine/*` host imports: scene / input / random / time) — a browser port of `kotoba-lang/kami-script-runtime-rs`. |
 | **8 genre base systems** (horror, puzzle, rhythm, single-player, sports, stealth, strategy, superhero) | [`kotoba-lang/kami-genre-base-systems`](https://github.com/kotoba-lang/kami-genre-base-systems) `games/<genre>/logic.clj` (+ `author.clj`, `scene.edn`) | one minimal, honest core-loop archetype per genre, each verified end-to-end through the kami-clj compiler and the `kami-script-runtime-rs` WASM host. |
 
-A game authored directly in a `.kotoba` file is the natural next
-demonstration once the `kami:engine/*` vocabulary is exposed through this
-repo's host-import registry the way `actor:host` and `kgraph-*` already are.
+The natural next step for **kami-survivors** is a browser port of
+`kotoba.kami-host`'s ECS in wasm-webcomponent (a hand-JS module in the
+`kgraph.js` / `actor-host.js` family), so the same compiled `.wasm` ticks
+on the browser's native engine the way netsurvivors already does.
