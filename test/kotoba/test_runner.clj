@@ -12,6 +12,7 @@
             [kotoba.doc-examples-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
+            [kotoba.kami-game-test]
             [kotoba.kgraph-test]
             [kotoba.launcher-test]
             [kotoba.mesh-drama-profile-test]
@@ -33,6 +34,7 @@
                                         'kotoba.doc-examples-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
+                                        'kotoba.kami-game-test
                                         'kotoba.kgraph-test
                                         'kotoba.launcher-test
                                         'kotoba.mesh-drama-profile-test
