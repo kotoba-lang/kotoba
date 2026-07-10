@@ -36,6 +36,21 @@
       (is (= :f32 (:kotoba.wasm/result-type wasm)))
       (is (== 4.0 (double (wasm-exec/run-main (:kotoba.wasm/binary wasm) [] nil :f32)))))))
 
+(deftest wasm-binary-executes-i32-bitwise-ops
+  (testing "bit-and/bit-or/bit-xor/bit-shift-left/bit-shift-right compile to real i32.and/or/xor/shl/shr_s: 2+7+5+16+4 = 34 (ADR-0011 follow-up)"
+    (let [forms (runtime/read-file "src/demo_bitops.kotoba" :kotoba)
+          wasm (runtime/wasm-binary forms)]
+      (is (:kotoba.wasm/ok? wasm))
+      (is (= 34 (long (wasm-exec/run-main (:kotoba.wasm/binary wasm) [])))))))
+
+(deftest wasm-binary-executes-i64-bitwise-ops
+  (testing "i64and/i64or/i64xor/i64shl/i64shr compile to real i64.and/or/xor/shl/shr_s: 2+7+5+16+4 = 34"
+    (let [forms (runtime/read-file "src/demo_i64_bitops.kotoba" :kotoba)
+          wasm (runtime/wasm-binary forms)]
+      (is (:kotoba.wasm/ok? wasm))
+      (is (= :i64 (:kotoba.wasm/result-type wasm)))
+      (is (= 34 (long (wasm-exec/run-main (:kotoba.wasm/binary wasm) [] nil :i64)))))))
+
 (deftest wasm-binary-executes-if-with-f32-and-i64-branches
   (testing "`if` with f32/i64-typed branches -- previously a REAL bytecode bug, not
             just a coverage gap: compile-wasm-expr's `if` hardcoded the WASM `if`
