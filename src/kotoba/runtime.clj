@@ -37,6 +37,18 @@
    'pos? pos?
    'neg? neg?
    'not not
+   'bit-and bit-and
+   'bit-or bit-or
+   'bit-xor bit-xor
+   'bit-shift-left bit-shift-left
+   'bit-shift-right bit-shift-right
+   'unsigned-bit-shift-right unsigned-bit-shift-right
+   'i64and bit-and
+   'i64or bit-or
+   'i64xor bit-xor
+   'i64shl bit-shift-left
+   'i64shr bit-shift-right
+   'i64ushr unsigned-bit-shift-right
    'alloc (constantly 0)
    'alloc-checked (constantly 0)
    'str-ptr (constantly 0)
@@ -1264,6 +1276,12 @@
         > (compile-wasm-fold 0x4a args locals fns)
         <= (compile-wasm-fold 0x4c args locals fns)
         >= (compile-wasm-fold 0x4e args locals fns)
+        bit-and (compile-wasm-fold 0x71 args locals fns)
+        bit-or (compile-wasm-fold 0x72 args locals fns)
+        bit-xor (compile-wasm-fold 0x73 args locals fns)
+        bit-shift-left (compile-wasm-fold 0x74 args locals fns)
+        bit-shift-right (compile-wasm-fold 0x75 args locals fns)
+        unsigned-bit-shift-right (compile-wasm-fold 0x76 args locals fns)
         i64 (let [value (first args)]
               (cond
                 (not= 1 (count args))
@@ -1282,6 +1300,12 @@
         i64+ (compile-wasm-fold-type 0x7c args locals fns :i64)
         i64- (compile-wasm-fold-type 0x7d args locals fns :i64)
         i64* (compile-wasm-fold-type 0x7e args locals fns :i64)
+        i64and (compile-wasm-fold-type 0x83 args locals fns :i64)
+        i64or (compile-wasm-fold-type 0x84 args locals fns :i64)
+        i64xor (compile-wasm-fold-type 0x85 args locals fns :i64)
+        i64shl (compile-wasm-fold-type 0x86 args locals fns :i64)
+        i64shr (compile-wasm-fold-type 0x87 args locals fns :i64)
+        i64ushr (compile-wasm-fold-type 0x88 args locals fns :i64)
         f32 (let [value (first args)]
               (cond
                 (not= 1 (count args))
