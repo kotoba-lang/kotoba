@@ -56,6 +56,7 @@
 
 (def value-options
   #{"--cacao"
+    "--engine"
     "--kind"
     "--lock"
     "--manifest"
@@ -467,13 +468,42 @@
                            :host-fns cap-fns})]
      (assoc ran :kotoba.host/receipts (entries)))))
 
+(defn- run-engine
+  "Execution engine for `kotoba run` (compat only).
+
+  Product split: kotoba = language (emit); kototama = runtime (run .wasm).
+
+  - `wasm`: same as `wasm run` — Chicory bootstrap in this repo (compat).
+    Prefer kototama `run guest.wasm` for real guests. Requires `--package-lock`.
+  - `interpret` (default): JVM tree-walk of forms — debug only, not the
+    language story. Kept so scripts without a package-lock keep working."
+  [argv]
+  (or (option-value argv "--engine") "interpret"))
+
+(defn- maybe-warn-compat-execute!
+  "One-line stderr note when language CLI executes a guest (compat path).
+  Silence with KOTOBA_SILENCE_RUNTIME_DEPRECATION=1 (CI)."
+  [kind]
+  (when-not (= "1" (System/getenv "KOTOBA_SILENCE_RUNTIME_DEPRECATION"))
+    (binding [*out* *err*]
+      (println
+       (str "kotoba: " kind " is compat bootstrap; "
+            "canonical .kotoba WASM runtime is kotoba-lang/kototama "
+            "(emit here, run there). Set KOTOBA_SILENCE_RUNTIME_DEPRECATION=1 to hush.")))))
+
+(declare wasm-run-result)
+
 (defn runtime-result
   "Run/check an existing source file through the CLJ-owned executable slice.
 
+  Language path is safe Kotoba → WASM AOT (`wasm emit` / `wasm run`, or
+  `run --engine wasm`). Plain `run` without `--engine wasm` is still the
+  JVM interpreter for backward compatibility (debug only).
+
   When `--policy <path>` accompanies `run`/`check`, the policy EDN drives the
-  static capability check, and `run` additionally installs the capability
-  guard (see `guarded-run-result`). Without `--policy` the legacy ambient
-  behavior is unchanged (host-import ops are rejected as
+  static capability check, and interpreter `run` additionally installs the
+  capability guard (see `guarded-run-result`). Without `--policy` the legacy
+  ambient behavior is unchanged (host-import ops are rejected as
   :capability-not-granted and no receipts are emitted).
 
   When `--cacao <file>` accompanies `run`, the file's delegation chain is
@@ -487,38 +517,42 @@
   (when (and (source-commands command)
              (source-file-readable? plan)
              (not (:kotoba.source/data? plan)))
-    (let [policy-result (policy-result original-argv)
-          policy (:kotoba.policy/data policy-result)]
-      (if-not (:kotoba.policy/ok? policy-result)
-        {:kotoba.cli/ok? false
-         :kotoba.cli/code (if (= "run" command)
-                            :run/policy-not-readable
-                            :check/policy-not-readable)
-         :kotoba.cli/data policy-result}
-        (let [forms (runtime/read-file (:kotoba.source/path plan)
-                                       (:kotoba.source/reader-target plan))
-              safe-facts (safe-analyzer-fact-classification)]
-          (case command
-            "check"
-            (let [checked (runtime/check safe-facts plan forms policy)
-                  ok? (:kotoba.runtime/ok? checked)]
-              {:kotoba.cli/ok? ok?
-               :kotoba.cli/code (if ok? :check/valid :check/invalid)
-               :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
-                                       (runtime-data original-argv normalized-argv plan checked))})
+    ;; Compat only: `run --engine wasm` → same as `wasm run` (prefer kototama).
+    (if (and (= "run" command)
+             (= "wasm" (run-engine original-argv)))
+      (wasm-run-result original-argv)
+      (let [policy-result (policy-result original-argv)
+            policy (:kotoba.policy/data policy-result)]
+        (if-not (:kotoba.policy/ok? policy-result)
+          {:kotoba.cli/ok? false
+           :kotoba.cli/code (if (= "run" command)
+                              :run/policy-not-readable
+                              :check/policy-not-readable)
+           :kotoba.cli/data policy-result}
+          (let [forms (runtime/read-file (:kotoba.source/path plan)
+                                         (:kotoba.source/reader-target plan))
+                safe-facts (safe-analyzer-fact-classification)]
+            (case command
+              "check"
+              (let [checked (runtime/check safe-facts plan forms policy)
+                    ok? (:kotoba.runtime/ok? checked)]
+                {:kotoba.cli/ok? ok?
+                 :kotoba.cli/code (if ok? :check/valid :check/invalid)
+                 :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
+                                         (runtime-data original-argv normalized-argv plan checked))})
 
-            "run"
-            (let [cacao-load (cacao-result original-argv)]
-              (cond
-                (not (:kotoba.cacao/ok? cacao-load))
-                {:kotoba.cli/ok? false
-                 :kotoba.cli/code :run/cacao-not-readable
-                 :kotoba.cli/data cacao-load}
+              "run"
+              (let [cacao-load (cacao-result original-argv)]
+                (cond
+                  (not (:kotoba.cacao/ok? cacao-load))
+                  {:kotoba.cli/ok? false
+                   :kotoba.cli/code :run/cacao-not-readable
+                   :kotoba.cli/data cacao-load}
 
-                :else
-                (let [cacao (when (:kotoba.cacao/path cacao-load)
-                              (verified-cacao-chain
-                               (:kotoba.cacao/chain cacao-load)))]
+                  :else
+                  (let [cacao (when (:kotoba.cacao/path cacao-load)
+                                (verified-cacao-chain
+                                 (:kotoba.cacao/chain cacao-load)))]
                   (if (:problems cacao)
                     ;; invalid/expired chain: the run does NOT proceed
                     {:kotoba.cli/ok? false
@@ -551,7 +585,7 @@
                                                     :kotoba.cacao/holder (:chain/holder chain)
                                                     :kotoba.cacao/depth (:chain/depth chain)})))})))))
 
-            nil))))))
+            nil)))))))
 
 (defn wasm-emit-result*
   "The unguarded `wasm emit` implementation (no package-admission gate — see
@@ -820,25 +854,32 @@
                   (throw e))))))))))
 
 (defn wasm-run-result
-  "Safe-build entry point for `wasm run`. Same mandatory package-admission
-  gate as `wasm-emit-result` (see `admission-gated`) — `wasm run` actually
-  executes the compiled module against real host capabilities, so it is at
-  least as sensitive to unverified package inputs as `wasm emit`, and must
-  not be reachable without admission (F-001: previously `wasm run` did not
-  consult package admission at all, regardless of `--package-lock`)."
+  "Compat: check + emit + Chicory execute in the *language* repo.
+  Canonical guest execution is kotoba-lang/kototama (`run guest.wasm`).
+  Same mandatory package-admission gate as `wasm-emit-result` (F-001)."
   [argv]
+  (maybe-warn-compat-execute! "wasm run")
   (admission-gated argv "--package-lock" wasm-run-result*))
 
 (defn wasm-result
-  "Handle launcher-owned Wasm-facing commands."
+  "Language CLI Wasm commands.
+
+  Primary (language):
+  - `wasm emit` / `safe-build` / `build` — safe Kotoba → WASM AOT only
+
+  Compat (prefer kototama for execute):
+  - `wasm run` — emit + Chicory bootstrap in this process
+
+  Product: kotoba = language; kototama = .kotoba WASM runtime."
   [argv]
   (case (second argv)
-    "emit" (wasm-emit-result argv)
+    ("emit" "safe-build" "build") (wasm-emit-result argv)
     "run" (wasm-run-result argv)
     {:kotoba.cli/ok? false
      :kotoba.cli/code :wasm/unknown-command
      :kotoba.cli/data {:kotoba.wasm/command (second argv)
-                       :kotoba.wasm/commands ["emit" "run"]}}))
+                       :kotoba.wasm/commands ["emit" "safe-build" "build" "run"]
+                       :kotoba.wasm/note "emit/safe-build/build = language AOT; run = compat (use kototama for runtime)"}}))
 
 (defn -main [& argv]
   (let [result (dispatch argv)]

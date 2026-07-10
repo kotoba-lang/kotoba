@@ -17,14 +17,25 @@ would create path-dependency churn without a stable contract.
 
 ## Decision
 
-Keep `kotoba-lang/kotoba` as the canonical substrate repository for now. It owns
-the language/runtime/database foundation:
+Keep `kotoba-lang/kotoba` as the canonical **language** substrate repository.
+Product vocabulary (ADR-2607022400, 2026-07-10 lock):
 
-- language profile, conformance, admission gates, and compiler implementation
-- `kotoba` CLI and integration paths such as `kotoba -e` and `kotoba wasm`
-- reusable database, storage, crypto, auth, Datalog, lattice, mesh, and Wasm
-  runtime crates
-- generic examples and fixtures that verify the substrate
+```text
+kotoba   = language   (profile, safe gates, AOT emit)
+kototama = runtime    (host/run emitted .wasm)  — separate repo
+```
+
+This repository owns the **language/compiler/database-view** foundation:
+
+- language profile consumers, conformance, admission gates, and AOT compiler
+- `kotoba` CLI language surface: `check`, `wasm emit` / `safe-build` / `build`
+- reusable language-side libraries (kgraph view, package admission, crypto
+  adapters used by the compiler/CLI)
+- generic examples and fixtures that verify **emit** (not a second tender)
+
+**Guest WASM execution is out of scope here** — that is `kotoba-lang/kototama`.
+Compat Chicory (`wasm run` / `wasm_exec`) may remain temporarily for tests;
+do not grow new tender/host features in this repo.
 
 Use the following extraction rules:
 

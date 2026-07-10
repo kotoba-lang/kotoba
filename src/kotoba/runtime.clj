@@ -1,12 +1,18 @@
 (ns kotoba.runtime
-  "Small CLJ-owned Kotoba execution core.
+  "Safe Kotoba execution / AOT core.
 
-  This is the first Rust-free executable slice: it reads Kotoba-family source
-  with an explicit reader target, checks a strict pure subset, emits deterministic
-  EDN IR, and can run a zero-arity `main` function."
+  Guest language path: safe Kotoba (Clojure/EDN subset) → WASM AOT via
+  `wasm-binary` (int-vector bytes + optional platform packing). This is a
+  compiler, not a full JVM Clojure runtime for guests.
+
+  Bootstrap host today is JVM Clojure (tools.reader, resource contracts).
+  Portable byte helpers live in `kotoba.wasm.bytes`; emit output always
+  includes `:kotoba.wasm/bytes` (unsigned 0–255 vector) so non-JVM hosts
+  can consume the same AOT artifact without re-encoding."
   (:require [clojure.java.io :as io]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.lang.capability-values :as capability-values]
+            [kotoba.wasm.bytes :as wasm-bytes]
             [clojure.tools.reader :as reader]
             [clojure.tools.reader.reader-types :as reader-types]))
 
@@ -41,7 +47,7 @@
    'alloc-checked (constantly 0)
    'str-ptr (constantly 0)
    'bytes-ptr (constantly 0)
-   'str-len (fn [s] (count (.getBytes (str s) "UTF-8")))
+   'str-len (fn [s] (count (wasm-bytes/utf8-bytes s)))
    'bytes-len count
    'memory-pages (constantly 1)
    'memory-grow (fn [_pages] 1)
@@ -56,7 +62,7 @@
    'result-value (fn [_record-ptr] 0)
    'byte-at (fn [value idx]
               (let [bytes (if (string? value)
-                            (mapv #(bit-and % 0xff) (.getBytes value "UTF-8"))
+                            (wasm-bytes/utf8-bytes value)
                             (vec value))]
                 (nth bytes idx)))
    'str str
@@ -980,7 +986,7 @@
   emitter can replace the payload while keeping the checked source contract.
   "
   [ir]
-  (.getBytes (pr-str ir) "UTF-8"))
+  (wasm-bytes/pack-bytes (wasm-bytes/utf8-bytes (pr-str ir))))
 
 (defn uleb
   "Unsigned LEB128 encoding."
@@ -1024,9 +1030,10 @@
   (vec (mapcat identity parts)))
 
 (defn utf8-bytes
-  "UTF-8 encode s into a vector of unsigned (0-255) byte values."
+  "UTF-8 encode s into a vector of unsigned (0-255) byte values.
+  Delegates to portable `kotoba.wasm.bytes` (JVM/nbb/cljs)."
   [s]
-  (mapv #(bit-and % 0xff) (.getBytes (str s) "UTF-8")))
+  (wasm-bytes/utf8-bytes s))
 
 (defn literal-bytes
   "Byte vector for a string or all-integer vector literal, or nil for
@@ -1924,8 +1931,14 @@
                                    element-section
                                    code-section
                                    data-section)]
+            ;; `:kotoba.wasm/bytes` is the portable AOT artifact (unsigned
+            ;; 0–255 vector). `:kotoba.wasm/binary` is the bootstrap-host
+            ;; packing (Java byte-array / Uint8Array) for Chicory or other
+            ;; hosts that need a platform buffer. Guests are defined by the
+            ;; byte vector; the host is replaceable.
             {:kotoba.wasm/ok? true
-             :kotoba.wasm/binary (byte-array (map unchecked-byte module-bytes))
+             :kotoba.wasm/bytes module-bytes
+             :kotoba.wasm/binary (wasm-bytes/pack-bytes module-bytes)
              :kotoba.wasm/byte-count (count module-bytes)
              :kotoba.wasm/export "main"
              :kotoba.wasm/result-type (compiled-result-type (some #(when (= 'main (:name %)) %) compiled-fns))

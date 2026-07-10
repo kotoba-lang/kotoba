@@ -4,7 +4,16 @@
 
 # kotoba
 
-**A capability-safe language — the _Clojure_ of the kotoba stack.**
+**Role: the language** — safe Kotoba (`.kotoba`) profile, admission gates, and
+**WASM AOT emit**. Not the guest execution runtime.
+
+```text
+kotoba   = language   (.kotoba → check → wasm emit → guest.wasm)
+kototama = runtime    (host & run that .wasm)   ← kotoba-lang/kototama
+aiueos   = OS / broker (decides grants; tender only enforces)
+```
+
+Stack vocabulary: [ADR-2607022400](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022400-kototama-unikernel-tender-runtime-vocabulary.md).
 
 ```
 KOTOBA ≝ safe Kotoba[cap⊗effect] × Datom[e a v] (kgraph, in-mem)
@@ -20,29 +29,30 @@ time-versioned datom store built _on_ this model — is
 "Datomic"): it depends on kotoba, never the reverse. Keep kotoba the language;
 the datom **database** lives in kotobase.
 
-- **The language** — [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang)
+- **Language + compiler** — [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang)
   defines the source profile (`.kotoba` canonical, portable `.cljc` with
-  `#?(:kotoba ...)` for Kotoba-specific branches), and `kotoba wasm` compiles
-  that Kotoba/EDN subset directly to **WebAssembly** (a compiler, not an
-  interpreter). **safe Kotoba** adds a *capability-confined* profile for
-  running untrusted / AI-generated agents: what a module can touch is
-  whatever it was explicitly handed, and nothing else. See
-  [**Language**](#language--kotoba-lang--kotoba-wasm) below.
-- **Clojure on Clojure** — the compiler and runtime that implement this
-  Clojure-shaped language are themselves written in Clojure/ClojureScript
-  (`.cljc`); the earlier Rust workspace has been fully removed (see
-  [Rust-free CLJ launcher](#rust-free-clj-launcher) below). Its
-  capability-safety design is *benchmarked against* Rust on an explicit
-  safety ladder, not modeled on it — see the "Safety model" bullet under
+  `#?(:kotoba ...)` for Kotoba-specific branches); this repo’s `kotoba wasm emit`
+  compiles that subset to **WebAssembly** (AOT compiler, not a guest runtime).
+  **safe Kotoba** is the capability-confined profile. **Execute guests with
+  [kototama](https://github.com/kotoba-lang/kototama)** — not this repo’s primary job.
+  See [**Language**](#language--kotoba-lang--kotoba-wasm) below.
+- **Clojure on Clojure** — the compiler that implements this Clojure-shaped
+  language is itself written in Clojure/ClojureScript (`.cljc`); the earlier
+  Rust workspace has been fully removed (see
+  [Rust-free CLJ launcher](#rust-free-clj-launcher) below). Guest **execution**
+  is **kototama**, not a second runtime in this repo. Capability-safety design
+  is *benchmarked against* Rust on an explicit safety ladder — see the "Safety
+  model" bullet under
   [Language — kotoba-lang & kotoba wasm](#language--kotoba-lang--kotoba-wasm)
-  below, or `kotoba-lang/docs/adr/ADR-safe-capability-language.md`, for what
-  that ladder actually claims.
+  or `kotoba-lang/docs/adr/ADR-safe-capability-language.md`.
 
 ## Repository boundary
 
-`kotoba-lang/kotoba` is the language and library substrate. Keep generic
-protocols, data structures, compilers, runtimes, storage, crypto, and reusable
-fixtures here. The split policy is recorded in
+`kotoba-lang/kotoba` is the **language** substrate: profile consumers, safe
+gates, AOT compiler, package admission, and reusable language-side libraries
+(datom view, crypto adapters used by the compiler/CLI). **Guest WASM execution
+belongs in `kotoba-lang/kototama`**, not here. Keep storage/crypto/fixtures that
+serve the language; do not grow a second tender. The split policy is recorded in
 [`docs/ADR-repository-boundaries.md`](docs/ADR-repository-boundaries.md).
 
 `kotoba-lang/kotoba-lang` owns the standalone language and public CLI contract.
@@ -149,23 +159,34 @@ above is the only current install path.
 
 ## Quick start
 
-The CLI command surface is versioned and machine-readable in
-[`kotoba-lang/kotoba-lang`'s `lang/cli.edn`](https://github.com/kotoba-lang/kotoba-lang/blob/main/lang/cli.edn)
-(the semantic authority — see [Repository boundary](#repository-boundary)).
-Commands this repo's launcher currently wires up:
+**Language (this repo):** `.kotoba` → check → **WASM AOT emit**.  
+**Runtime (sibling):** run the emitted `.wasm` with
+[`kotoba-lang/kototama`](https://github.com/kotoba-lang/kototama).
 
 ```bash
-kotoba check --kind cli-contract --json     # validate the CLI/package/lock contract
-kotoba run path/to/entry.kotoba             # compile and run a Kotoba entry point
-kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
-kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # capability-confined build, see Language below
-kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
+# ── LANGUAGE (kotoba) ──────────────────────────────────────────
+kotoba check cell.kotoba --json
+kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm
+kotoba wasm safe-build cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # alias of emit
+kotoba wasm build cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm         # alias of emit
+
+# ── RUNTIME (kototama) — canonical execute path ────────────────
+cd ../kototama   # or any checkout of kotoba-lang/kototama
+clojure -M:cli run cell.wasm --grant …
+# browser / Node: kototama/web + kotoba-lang/wasm-webcomponent
+
+# ── Compat / debug only (not the product execute story) ────────
+# kotoba wasm run …          # Chicory bootstrap in this repo; prefer kototama
+# kotoba run --engine wasm …
+# kotoba run …               # JVM tree-walk interpreter; debug only
+
+kotoba check --kind cli-contract --json
+kotoba package verify --lock lock.edn --trust trust.edn --json
 ```
 
-`--package-lock` is mandatory for both `wasm emit` and `wasm run`: the package
-admission gate always runs first, and a missing or rejected lock aborts the
-build/run with the admission receipt in the error payload — there is no way to
-opt out (F-001).
+`--package-lock` is mandatory for `wasm emit` / `safe-build` / `build` (and for
+compat `wasm run`): the package admission gate always runs first — no opt-out
+(F-001).
 
 Looking for things to run? [`docs/DEMONSTRATIONS.md`](docs/DEMONSTRATIONS.md)
 indexes every real program built with `.kotoba` so far — the mesh apps, the
@@ -274,77 +295,47 @@ in [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/ad
 kotoba is not only a database — it ships its **own language profile**.
 [`kotoba-lang/kotoba-lang`](https://github.com/kotoba-lang/kotoba-lang) defines the source contract: `.kotoba` is
 the canonical Kotoba source extension, portable `.cljc` is for shared
-Clojure-family source, `.clj` / `.cljs` are compatibility inputs, and
+Clojure-family source, `.clj` is a compatibility input, and
 `#?(:kotoba ...)` selects Kotoba-specific code.
-`kotoba wasm` compiles that profile's Kotoba/EDN subset directly to **real
-WebAssembly**: the Kotoba source *becomes* a WASM Component that runs on
-`kotoba-runtime` against the `kotoba:kais` host world (graph read/write,
-streams, LLM inference, CACAO). `.clj` / `.cljc` / `.cljs` remain compatibility
-inputs, but `.kotoba` is the canonical source extension. It is a compiler, not
-an embedded interpreter.
 
-The public CLI path is `kotoba wasm`: it exposes build, safe-build, safe-policy,
-and selfhost inspection over the same compiler APIs without making callers speak
-the implementation crate name. The language gate also pins that public surface:
-`kotoba -e`, `kotoba wasm build`, `safe-policy`, `selfhost-inspect`, and
-`safe-build` all default to the `kotoba` reader target, accept `-S` /
-`--source-path`, and keep `.kotoba` namespace sources ahead of `.clj`
-compatibility files. On top of the compiler, **safe Kotoba**
-(`compile_safe_kotoba`, legacy alias `compile_safe_clj`) is a *capability-confined*
-profile for running untrusted / AI-generated code. The thesis (see
-[`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md)):
-the strongest safety is not a "strong language" but **an execution environment
-where an attacker can do nothing it was not explicitly handed**. safe Kotoba
-enforces that with three deny-by-default gates, all at compile time:
+### Primary path: safe Kotoba → WASM AOT
+
+`kotoba wasm emit` / `safe-build` / `build` compile the **safe Kotoba**
+(Clojure/EDN subset + capability/subset/effect gates) **directly to a real
+WebAssembly MVP binary**. This is AOT, not an embedded JVM Clojure interpreter.
+`.kotoba` is the canonical guest language; JVM Clojure is only the bootstrap
+implementation of the compiler CLI today (portable emit core is moving to
+`.cljc` for nbb/browser-adjacent hosts).
+
+```bash
+# Language AOT surface (package-lock mandatory, F-001)
+kotoba wasm emit cell.kotoba --policy policy.edn --package-lock kotoba.lock.edn -o cell.wasm
+kotoba wasm safe-build cell.kotoba --policy policy.edn --package-lock kotoba.lock.edn -o cell.wasm
+```
+
+**Run** those bytes with **`kotoba-lang/kototama`** (`clojure -M:cli run cell.wasm`)
+or browser host (`kototama/web`, `wasm-webcomponent`).  
+`kotoba wasm run` remains Chicory **compat** only — not the product runtime.
+
+### Safe Kotoba gates
 
 | Gate | Guarantee | Theorem |
 |---|---|---|
-| **Capability** (`policy.rs`) | a module's wasm import section ⊆ the policy's grants — an ungranted host capability is *physically absent* from the emitted bytes, so the runtime can never bind it | **T3 — Capability Confinement** |
-| **Subset** (`subset.rs`) | no `eval`, no runtime `require`/`import`, no dynamic-var mutation (`set!`/`binding`), no reflection, no unrestricted `defmacro` — constructs the legacy path silently drops are rejected | no ambient code/effect |
-| **Effect** (`effects.rs`) | a function may not perform an effect outside its declared `{:effects …}` row — checked **interprocedurally** (a write cannot hide behind a helper; mutual recursion converges) | **T2 — Effect Soundness** |
+| **Capability** | a module's wasm import section ⊆ the policy's grants — ungranted host capability is *physically absent* from emitted bytes | **T3 — Capability Confinement** |
+| **Subset** | no `eval`, no runtime `require`/`import`, no dynamic-var mutation (`set!`/`binding`), no reflection, no unrestricted `defmacro` | no ambient code/effect |
+| **Effect** | a function may not perform an effect outside its declared effect row (interprocedural) | **T2 — Effect Soundness** |
 
-Capabilities are passed as **values**, never summoned by name: a module not
-handed write access to a graph cannot write it — the same attenuation CACAO
-enforces at run time, lifted into the type/compile layer. The policy is
-deny-by-default EDN (`crates/kotoba-clj/examples/safe-policy.edn`):
+See [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md).
+Policy is deny-by-default EDN (e.g. `src/demo_policy.edn` in this repo).
 
-```edn
-{:imports {:graph-read ["bafy…"] :graph-write ["bafy…"] :infer [] :auth false}
- :limits  {:memory-pages 4 :fuel 1000000 :max-output-bytes 65536}}
-```
+### Historical / not current CLI names
 
-Build a confined module from the CLI — and audit exactly what it can do:
-
-```bash
-kotoba -e '(+ 1 2)'                         # compile Kotoba -> Wasm -> run main
-kotoba wasm safe-build cell.kotoba --policy policy.edn -o cell.wasm
-# [wasm safe-build] cell.kotoba (10405 bytes)
-# [wasm safe-build] admission gate: selfhost/kotoba
-# [wasm safe-build] capability surface: kotoba:kais/kqe@0.1.0
-# [wasm safe-build] inferred effects: run={graph-write}
-```
-
-`--selfhost-gate` is retained only as a compatibility alias; safe-build and
-safe-policy are selfhost-first by default.
-
-To inspect the versioned analyzer request and selfhost summaries without
-compiling, use:
-
-```bash
-kotoba wasm selfhost-inspect cell.kotoba --policy policy.edn --request-hex --json
-# {
-#   "abi": "kotoba.selfhost.safe-analyzer.v1",
-#   "types": {"ok": true, "denials": []},
-#   "admission": {"effects": {"ok": true}, "policy": {"ok": true}},
-#   "functions": [{"name": "run", "effects": ["graph-write"]}]
-# }
-```
-
-Capabilities are scoped **per resource**: granting write to graph A does not
-permit graph B, and granting inference on model M does not permit model N — the
-compile-time twin of CACAO's `leaf.graph ⊆ root.graph` attenuation (T3 at
-instance granularity). `kotoba wasm safe-policy <cell>` runs the inverse of the
-gate, synthesizing the **minimal least-privilege policy** a cell needs.
+Rust-era docs still mention `kotoba -e`, `wasm safe-policy`, and
+`wasm selfhost-inspect`. Those verbs are **not** the live CLJ launcher surface
+(crates removed 2026-07-01). Live **language** verbs: `wasm emit`/`safe-build`/
+`build`, `check`, `selfhost list|check`. Guest **runtime**: kototama.  
+`wasm run` here is compat only. Self-hosting the analyzer as a `.kotoba` guest
+(executed on kototama) is a follow-up track.
 
 Audit/tooling APIs, usable standalone: `embedded_capability_ifaces(wasm)`
 (byte-level capability surface), `infer_effects(src)` (source-level transitive
