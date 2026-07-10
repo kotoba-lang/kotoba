@@ -1121,6 +1121,37 @@
          local-type merge-local-types local-decls function-param-types
          function-result-type symbol-key wasm-valtypes)
 
+(defn desugar-and
+  "Rewrite a Kotoba `(and a b c ...)` form into nested `let`/`if` so
+  compile-wasm-expr's EXISTING if/let lowering (0x21 local.set + 0x20
+  local.get, the [0x04 0x7f ... 0x05 ... 0x0b] if/else/end block) encodes the
+  short-circuit — no new WASM instruction pattern is introduced. Each
+  argument is compiled and evaluated at most once: `(and a b)` becomes
+  `(let [t a] (if t b t))`, i.e. bind a's value once, branch on it, and reuse
+  the bound value (not a re-evaluation of `a`) as the falsy result. Recurses
+  for 3+ args: `(and a b c)` => `(let [t a] (if t (and b c) t))`. `(and)` is
+  vacuously truthy (`1`, kotoba's i32 true); `(and a)` is just `a`."
+  [args]
+  (cond
+    (empty? args) 1
+    (empty? (rest args)) (first args)
+    :else (let [tmp (gensym "and-tmp__")]
+            (list 'let [tmp (first args)]
+                  (list 'if tmp (desugar-and (rest args)) tmp)))))
+
+(defn desugar-or
+  "Mirror of desugar-and for `(or a b c ...)`: `(or a b)` becomes
+  `(let [t a] (if t t b))` — bind a's value once, return it if truthy,
+  otherwise fall through to b. `(or)` is vacuously falsy (`0`); `(or a)` is
+  just `a`."
+  [args]
+  (cond
+    (empty? args) 0
+    (empty? (rest args)) (first args)
+    :else (let [tmp (gensym "or-tmp__")]
+            (list 'let [tmp (first args)]
+                  (list 'if tmp tmp (desugar-or (rest args)))))))
+
 (defn compile-wasm-expr
   "Compile one Kotoba expression to a WASM instruction sequence. Returns
   `{:bytes :local-count :local-types :result-type}` on success, or
@@ -1213,6 +1244,13 @@
                                         (:local-count else-compiled 0))
                       :local-types (merge-local-types test-compiled then-compiled else-compiled)
                       :result-type (compiled-result-type then-compiled)}))
+
+        and (compile-wasm-expr (desugar-and args) locals fns)
+
+        or (compile-wasm-expr (desugar-or args) locals fns)
+
+        when (let [[test & body] args]
+               (compile-wasm-expr (list 'if test (cons 'do body) 0) locals fns))
 
         + (compile-wasm-fold 0x6a args locals fns)
         - (compile-wasm-fold 0x6b args locals fns)
