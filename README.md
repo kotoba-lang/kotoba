@@ -46,6 +46,13 @@ the datom **database** lives in kotobase.
   [Language — kotoba-lang & kotoba wasm](#language--kotoba-lang--kotoba-wasm)
   or `kotoba-lang/docs/adr/ADR-safe-capability-language.md`.
 
+The admission gate also recognizes the M3 portable type contract. A public
+`defn` may carry `:signature` metadata; when the current
+`kotoba-lang/kotoba-lang` contract is available, `kotoba check` validates
+capability/effect consistency and region non-escape before compilation. An
+older language-contract pin rejects annotated source fail-closed rather than
+silently ignoring the annotation.
+
 ## Repository boundary
 
 `kotoba-lang/kotoba` is the **language** substrate: profile consumers, safe

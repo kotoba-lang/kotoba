@@ -20,6 +20,7 @@
             [kotoba.package-admission-test]
             [kotoba.rad-adapter-test]
             [kotoba.real-host-providers-test]
+            [kotoba.type-contract-adapter-test]
             [kotoba.wasm-exec-test]))
 
 (defn -main [& _]
@@ -42,6 +43,7 @@
                                         'kotoba.package-admission-test
                                         'kotoba.rad-adapter-test
                                         'kotoba.real-host-providers-test
+                                        'kotoba.type-contract-adapter-test
                                         'kotoba.wasm-exec-test)]
     (when (pos? (+ (or fail 0) (or error 0)))
       (System/exit 1))))

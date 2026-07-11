@@ -4,7 +4,7 @@
   Emit works on vectors of unsigned 0–255 integers so the same pure logic can
   run on JVM Clojure, nbb, or ClojureScript. Hosts that need a platform
   byte array (Chicory, Node Buffer, Uint8Array) convert at the edge."
-  (:require [clojure.string :as str]))
+  #?(:clj (:require [clojure.string :as str])))
 
 (defn utf8-bytes
   "UTF-8 encode s into a vector of unsigned (0–255) byte values."
@@ -20,8 +20,9 @@
   - :clj  → Java byte-array (signed bytes; bit-identical layout)
   - :cljs → js/Uint8Array"
   [unsigned-bytes]
-  #?(:clj  (byte-array (map unchecked-byte unsigned-bytes))
-     :cljs (js/Uint8Array. (clj->js unsigned-bytes))))
+  (let [bytes (vec unsigned-bytes)]
+    #?(:clj  (byte-array (map unchecked-byte bytes))
+       :cljs (js/Uint8Array. (clj->js bytes)))))
 
 (defn magic?
   "True when bs starts with the WASM magic number \\0asm."
@@ -33,13 +34,16 @@
             :else (vec bs))]
     (= [0 97 115 109] (vec (take 4 v)))))
 
-(defn hex-sha256
-  "Hex SHA-256 of unsigned byte vector. CLJ only (MessageDigest); cljs hosts
-  should pass precomputed digests or inject their own hash."
-  [unsigned-bytes]
-  #?(:clj
+#?(:clj
+   (defn hex-sha256
+     "Hex SHA-256 of unsigned byte vector. CLJ only (MessageDigest); cljs
+     hosts should pass precomputed digests or inject their own hash."
+     [unsigned-bytes]
      (let [md (java.security.MessageDigest/getInstance "SHA-256")
            digest (.digest md (byte-array (map unchecked-byte unsigned-bytes)))]
-       (str/join (map #(format "%02x" %) digest)))
-     :cljs
+       (str/join (map #(format "%02x" %) digest))))
+   :cljs
+   (defn hex-sha256
+     "CLJS hosts must use Web Crypto or inject a precomputed digest."
+     [_]
      (throw (js/Error. "kotoba.wasm.bytes/hex-sha256 is CLJ-only; use Web Crypto or inject"))))

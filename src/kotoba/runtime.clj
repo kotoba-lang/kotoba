@@ -897,7 +897,53 @@
            :when (not (:ok? checked))]
        {:kotoba.runtime/problem :cap-effect-under-declared
         :kotoba.runtime/fn (str fn-name)
-        :kotoba.runtime/missing (:missing checked)}))))
+       :kotoba.runtime/missing (:missing checked)}))))
+
+(defn- annotated-signature?
+  "True when FORM is a defn carrying the portable :signature metadata
+  contract. The runtime deliberately does not interpret the signature itself;
+  that authority belongs to kotoba-lang/kotoba-lang."
+  [form]
+  (and (seq? form)
+       (= 'defn (first form))
+       (some? (:signature (meta (second form))))))
+
+(defn- type-system-validator
+  "Resolve the M2 type-system validator lazily.
+
+  The released kotoba dependency pin may predate this language-contract
+  addition. Loading it lazily lets old, unannotated programs remain
+  compatible while ensuring an annotated program is never accepted merely
+  because a host has not upgraded its language contract."
+  []
+  (try
+    (requiring-resolve 'kotoba.lang.type-system/validate-forms)
+    (catch java.io.FileNotFoundException _ nil)))
+
+(defn type-contract-problems
+  "Bridge optional :signature annotations into the compiler admission gate.
+
+  With the current language contract available, delegate validation to its
+  CLJC authority. If an old pinned contract lacks that validator, reject the
+  annotation rather than silently compiling past its capability, region, or
+  task obligations. This is intentionally fail-closed during the package-pin
+  migration."
+  [forms]
+  (when (some annotated-signature? forms)
+    (if-let [validate-forms (type-system-validator)]
+      (let [{:keys [problems missing-effects]} (validate-forms forms)]
+        (vec
+         (concat
+          (map (fn [problem]
+                 {:kotoba.runtime/problem :type-contract-invalid
+                  :kotoba.runtime/detail problem})
+               problems)
+          (map (fn [effect]
+                 {:kotoba.runtime/problem :type-contract-missing-effect
+                  :kotoba.runtime/effect effect})
+               missing-effects))))
+      [{:kotoba.runtime/problem :type-contract-unavailable
+        :kotoba.runtime/required "kotoba.lang.type-system/validate-forms"}])))
 
 (defn check
   "Run all static checks (safety/type problems, typed-capability problems,
@@ -909,7 +955,8 @@
   (let [problems (vec (concat (source-problems safe-facts forms policy)
                               (cap-typed-problems forms)
                               (cap-affine-problems forms)
-                              (cap-effect-problems forms)))
+                              (cap-effect-problems forms)
+                              (type-contract-problems forms)))
         ir (when (empty? problems)
              (compile-forms source-plan forms))]
     {:kotoba.runtime/ok? (empty? problems)
