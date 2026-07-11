@@ -1105,6 +1105,35 @@
         :kotoba.runtime/fn (str fn-name)
         :kotoba.runtime/missing (:missing checked)}))))
 
+(defn- annotated-signature? [form]
+  (and (seq? form)
+       (= 'defn (first form))
+       (some? (:signature (meta (second form))))))
+
+(defn- type-system-validator []
+  (try
+    (requiring-resolve 'kotoba.lang.type-system/validate-forms)
+    (catch java.io.FileNotFoundException _ nil)))
+
+(defn type-contract-problems
+  "Fail closed for annotated signatures when the language validator is absent."
+  [forms]
+  (when (some annotated-signature? forms)
+    (if-let [validate-forms (type-system-validator)]
+      (let [{:keys [problems missing-effects]} (validate-forms forms)]
+        (vec
+         (concat
+          (map (fn [problem]
+                 {:kotoba.runtime/problem :type-contract-invalid
+                  :kotoba.runtime/detail problem})
+               problems)
+          (map (fn [effect]
+                 {:kotoba.runtime/problem :type-contract-missing-effect
+                  :kotoba.runtime/effect effect})
+               missing-effects))))
+      [{:kotoba.runtime/problem :type-contract-unavailable
+        :kotoba.runtime/required "kotoba.lang.type-system/validate-forms"}])))
+
 (declare wasm-binary)
 
 (defn check
@@ -1119,7 +1148,8 @@
         static-problems (vec (concat (source-problems safe-facts forms policy)
                                      (cap-typed-problems forms)
                                      (cap-affine-problems forms)
-                                     (cap-effect-problems forms)))
+                                     (cap-effect-problems forms)
+                                     (type-contract-problems forms)))
         ;; A defsystem source is an executable game module, not merely data.
         ;; Its safety check must prove that the selected Kotoba backend can
         ;; compile it; accepting an unknown operation here would be fail-open.

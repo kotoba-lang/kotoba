@@ -10,28 +10,30 @@
            [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
             HttpResponse$BodyHandlers]))
 
-(def ^:private test-port 18099)
 (def ^:private server (atom nil))
+(def ^:private test-port (atom nil))
 
 (defn- with-server [f]
   (let [drama-wasm (mesh-node/compile-route "src/mesh_drama_profile.kotoba"
                                             "src/mesh_drama_profile_policy.edn")
         no-answer-wasm (mesh-node/compile-route "src/mesh_no_answer.kotoba"
                                                 "src/mesh_drama_profile_policy.edn")]
-    (reset! server (mesh-node/start! {"drama-profile" drama-wasm
-                                      "no-answer" no-answer-wasm}
-                                     test-port)))
-  (try (f) (finally (.stop ^com.sun.net.httpserver.HttpServer @server 0))))
+  (let [started (mesh-node/start! {"drama-profile" drama-wasm
+                                    "no-answer" no-answer-wasm}
+                                   0)]
+    (reset! server started)
+    (reset! test-port (.getPort (.getAddress ^com.sun.net.httpserver.HttpServer started))))
+  (try (f) (finally (.stop ^com.sun.net.httpserver.HttpServer @server 0)))))
 
 (use-fixtures :once with-server)
 
 (defn- http-get [path]
-  (let [req (-> (HttpRequest/newBuilder (URI/create (str "http://localhost:" test-port path)))
+  (let [req (-> (HttpRequest/newBuilder (URI/create (str "http://localhost:" @test-port path)))
                 (.GET) (.build))]
     (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))))
 
 (defn- http-post [path]
-  (let [req (-> (HttpRequest/newBuilder (URI/create (str "http://localhost:" test-port path)))
+  (let [req (-> (HttpRequest/newBuilder (URI/create (str "http://localhost:" @test-port path)))
                 (.POST (HttpRequest$BodyPublishers/noBody)) (.build))]
     (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofString))))
 
