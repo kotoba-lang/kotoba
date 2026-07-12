@@ -387,8 +387,11 @@
 (defn eval-form
   "Core tree-walking evaluator for one form under env (local bindings) and
   fns (user-defined functions). Handles literals, symbol lookup
-  (env -> fns -> builtin-fns), and the special forms ns/quote/do/let/if/def
-  /defn; anything else is treated as a function call."
+  (env -> fns -> builtin-fns), and the special forms ns/quote/do/let/if
+  /when/and/or/def/defn; anything else is treated as a function call.
+  when/and/or use `truthy?` (nil/false falsy), mirroring `if` -- note the
+  known backend divergence: the WASM compiler's `if`/`when`/`and`/`or`
+  operate on i32 where 0 is falsy, while here integer 0 is truthy."
   [form env fns]
   (cond
     (symbol? form)
@@ -423,6 +426,24 @@
              (if (truthy? (eval-form test env fns))
                (eval-form then env fns)
                (eval-form else env fns)))
+        when (let [[test & body] args]
+               (when (truthy? (eval-form test env fns))
+                 (eval-body body env fns)))
+        and (loop [remaining args
+                   value true]
+              (if (seq remaining)
+                (let [v (eval-form (first remaining) env fns)]
+                  (if (truthy? v)
+                    (recur (next remaining) v)
+                    v))
+                value))
+        or (loop [remaining args]
+             (if (seq remaining)
+               (let [v (eval-form (first remaining) env fns)]
+                 (if (truthy? v)
+                   v
+                   (recur (next remaining))))
+               nil))
         def (let [[_name value] args]
               (eval-form value env fns))
         defn nil
@@ -1577,6 +1598,8 @@
                 compiled
                 {:bytes (bcat (:bytes compiled) [0x45])
                  :local-count (:local-count compiled 0)}))
+        pos? (compile-wasm-expr (list '> (first args) 0) locals fns)
+        neg? (compile-wasm-expr (list '< (first args) 0) locals fns)
         result-ok? (compile-wasm-expr (list '>= (first args) 0) locals fns)
         result-err? (compile-wasm-expr (list '< (first args) 0) locals fns)
         result-write! (let [[record-ptr value] args

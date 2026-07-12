@@ -371,3 +371,38 @@
       (is (not= ::did-not-trap trapped) "execution must not run to completion -- `spin` never returns")
       (is (= :fuel-exhausted (:kotoba.wasm/problem trapped)))
       (is (= 200 (:kotoba.wasm/fuel-limit trapped))))))
+
+(deftest wasm-binary-executes-bool-ops-parity-with-interpreter
+  (testing "pos?/neg?/and/or/when execute through Chicory and agree with the
+            interpreter (the fixture only branches on comparison results --
+            bare-integer-0 truthiness intentionally diverges between the two
+            backends, same caveat as `if`)"
+    (let [forms (runtime/read-file "src/demo_bool.kotoba" :kotoba)
+          interpreted (runtime/run (launcher/safe-analyzer-fact-classification)
+                                   (launcher/source-plan "src/demo_bool.kotoba")
+                                   forms)
+          wasm (runtime/wasm-binary forms)]
+      (is (:kotoba.wasm/ok? wasm))
+      (is (= 221 (long (wasm-exec/run-main (:kotoba.wasm/binary wasm) []))))
+      (is (= (long (:kotoba.runtime/value interpreted))
+             (long (wasm-exec/run-main (:kotoba.wasm/binary wasm) [])))))))
+
+(deftest wasm-binary-executes-pos?-neg?
+  (testing "pos?/neg? were the last interpreter numeric-predicate builtins
+            missing from the WASM compiler (both ADR-2607072530 and
+            ADR-2607072600 independently hit :unsupported-op on them) -- they
+            now desugar to i32 comparisons and execute"
+    (let [build (fn [body]
+                  (runtime/wasm-binary (list '(ns demo-posneg-inline)
+                                             (list 'defn 'main [] body))))
+          run1 (fn [body]
+                 (let [wasm (build body)]
+                   (is (:kotoba.wasm/ok? wasm) (pr-str body))
+                   (long (wasm-exec/run-main (:kotoba.wasm/binary wasm) []))))]
+      (is (= 1 (run1 '(pos? 5))))
+      (is (= 0 (run1 '(pos? 0))))
+      (is (= 0 (run1 '(pos? -5))))
+      (is (= 1 (run1 '(neg? -5))))
+      (is (= 0 (run1 '(neg? 0))))
+      (is (= 0 (run1 '(neg? 5))))
+      (is (= 3 (run1 '(if (and (pos? 2) (neg? -2)) 3 4)))))))
