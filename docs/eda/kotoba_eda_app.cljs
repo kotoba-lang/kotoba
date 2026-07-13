@@ -27,10 +27,24 @@
   differs. JSON downloads (datoms/packet/signoff-evidence-template) use
   `clj->js` + `JSON.stringify` and preserve the original's `namespace/name`
   key shape via a custom :keyword-fn so those payloads stay
-  structurally identical to before."
+  structurally identical to before.
+
+  Design system (kotoba-ui/docs/agent-guide.md): chrome comes from
+  kotoba-ui.core + appkit.core only — appkit/panel dense panes, kotoba-ui
+  buttons/badges/tab-bar/menu-select/slider/checkbox/progress-bar, HIG text
+  styles, `--hig-*` token app CSS (kotoba_eda_style.cljc, embedded by the
+  SSR page). Buttons carry `data-act` (the shitsuke portable-interaction
+  contract) dispatched by ONE delegated click handler (`dispatch-act!`) at
+  the reagent root, since the component hiccup is host-agnostic. Canvas
+  DRAWING colors are app-domain (wafer bins, macro layers, package art) and
+  exempt from the no-hex rule but centralized in `canvas-colors` below —
+  the accent is read live off the page's `--hig-color-tint` var so canvas
+  highlights follow the theme."
   (:require [reagent.core :as r]
             [reagent.dom :as rdom]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [kotoba-ui.core :as ui]
+            [appkit.core :as appkit]))
 
 ;; -- static reference data (kept as vectors of tuples, same shape as the
 ;;    original JS arrays, since the render fns below destructure them
@@ -647,17 +661,6 @@
   (swap! state update :approvals conj id)
   (transact! "eda.policy/approve" {:gate id :approver "human"}))
 
-(defn load-sample-signoff! []
-  (doseq [row (signoff-evidence-template)]
-    (let [evidence (normalize-evidence row)]
-      (swap! state update :signoff-evidence #(cons evidence %))
-      (swap! state update :runner-results
-             #(cons {:adapter (:type evidence) :tool (:tool evidence) :operation (:operation evidence)
-                      :status (:status evidence) :coverage (:coverage evidence) :output-cid (:output-cid evidence)}
-                     %))
-      (transact! "eda.signoff/evidence" evidence)))
-  (proposal! "Sample OpenSTA/OpenROAD/KLayout/Netgen/ngspice/ATE signoff evidence loaded. Release-ready still requires foundry-slot and human-signoff approvals." "info"))
-
 (defn signoff-evidence-template []
   [{:type "signoff/timing-pvt" :tool "sw/opensta" :operation "op/analyze-timing" :status "passed" :coverage 96
     :corners 4 :corner "ss_0p72v_125c" :pvt "ss/0.72V/125C" :slack-ns 0.041 :output-cid (edn-hash "opensta-pvt")}
@@ -672,7 +675,54 @@
    {:type "signoff/ate-pattern" :tool "sw/ate-adapter" :operation "op/ate" :status "passed" :coverage 97
     :vector-coverage 97 :output-cid (edn-hash "ate-pattern")}])
 
+(defn load-sample-signoff! []
+  (doseq [row (signoff-evidence-template)]
+    (let [evidence (normalize-evidence row)]
+      (swap! state update :signoff-evidence #(cons evidence %))
+      (swap! state update :runner-results
+             #(cons {:adapter (:type evidence) :tool (:tool evidence) :operation (:operation evidence)
+                      :status (:status evidence) :coverage (:coverage evidence) :output-cid (:output-cid evidence)}
+                     %))
+      (transact! "eda.signoff/evidence" evidence)))
+  (proposal! "Sample OpenSTA/OpenROAD/KLayout/Netgen/ngspice/ATE signoff evidence loaded. Release-ready still requires foundry-slot and human-signoff approvals." "info"))
+
 ;; -- canvas / render-IR -------------------------------------------------------
+;;
+;; Canvas DRAWING colors are app-domain artwork (macro layers, wafer bins,
+;; package substrate/bond art) — exempt from the page chrome's no-raw-hex
+;; rule but centralized in this ONE map instead of scattered through the
+;; draw fns. The artwork keeps its fixed light palette so wafer/layout
+;; renders identically (and stays ≥4.5:1 dark-ink-on-light-field) under
+;; both page appearances; the highlight color is read live off the page's
+;; `--hig-color-tint` var (getComputedStyle) so it follows the theme accent.
+
+(def canvas-colors
+  {:field "#e5eaf2"          ;; canvas background field
+   :sheet "#f8fafc"          ;; die sheet / flow background / wafer disc
+   :outline "#334155"        ;; die/wafer outline stroke
+   :edge "#0f172a"           ;; macro rect edge stroke
+   :ink "#172033"            ;; canvas title/label ink
+   :muted "#667085"          ;; canvas secondary ink
+   :label-on-tint "#ffffff"  ;; text over saturated fills
+   :grid-line "#cbd5e1"      ;; inactive stage box stroke
+   :stage-done "#dcfce7"     ;; flow view: completed stage fill
+   :stage-active "#dbeafe"   ;; flow view: active stage fill
+   :stage-idle "#ffffff"     ;; flow view: not-yet-reached stage fill
+   :die-pass "#16a34a"       ;; wafer bin pass
+   :die-fail "#dc2626"       ;; wafer bin fail
+   :pkg-substrate "#dbeafe"  ;; package substrate fill
+   :pkg-outline "#1d4ed8"    ;; package outline stroke
+   :pkg-bond "#b45309"       ;; bond wires
+   :macro-layers ["#2563eb" "#16825d" "#c2410c" "#0891b2" "#6d28d9" "#b45309"]})
+
+(defn accent-color
+  "The live theme accent (`--hig-color-tint`) for canvas highlights, falling
+  back to the first macro-layer blue when unset."
+  []
+  (let [v (some-> (js/getComputedStyle (.-documentElement js/document))
+                  (.getPropertyValue "--hig-color-tint")
+                  str/trim)]
+    (if (seq v) v (first (:macro-layers canvas-colors)))))
 
 (defn make-render-ir [s c sc]
   (let [dies (map-indexed
@@ -683,7 +733,7 @@
                  :y (+ 90 (* (quot i 3) 140))
                  :w (+ 140 (if (= ip "ml") 70 0))
                  :h (+ 80 (if (= ip "sram") 45 0))
-                 :color (nth ["#2563eb" "#16825d" "#c2410c" "#0891b2" "#6d28d9" "#b45309"] (mod i 6))})
+                 :color (nth (:macro-layers canvas-colors) (mod i 6))})
               (:ip c))]
     {:frame/n (:stage s) :frame/clear [0.97 0.98 0.99 1.0] :frame/kami-engine "render-ir-compatible"
      :eda/project (:target c) :eda/process (:process c) :eda/stage (first (nth stages (:stage s)))
@@ -706,10 +756,11 @@
   (.-fontFamily (js/getComputedStyle (.-body js/document))))
 
 (defn draw-layout! [ctx ir]
-  (let [canvas (.-canvas ctx)]
+  (let [canvas (.-canvas ctx)
+        {:keys [field sheet outline edge ink label-on-tint]} canvas-colors]
     (.clearRect ctx 0 0 (.-width canvas) (.-height canvas))
-    (set! (.-fillStyle ctx) "#e5eaf2") (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
-    (set! (.-fillStyle ctx) "#f8fafc") (set! (.-strokeStyle ctx) "#334155") (set! (.-lineWidth ctx) 2)
+    (set! (.-fillStyle ctx) field) (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
+    (set! (.-fillStyle ctx) sheet) (set! (.-strokeStyle ctx) outline) (set! (.-lineWidth ctx) 2)
     (.fillRect ctx 60 60 700 430) (.strokeRect ctx 60 60 700 430)
     (doseq [draw (:pass/draws (first (:frame/passes ir)))]
       (let [[x y w h] (:rect (:draw/instances draw))]
@@ -717,57 +768,60 @@
         (set! (.-globalAlpha ctx) 0.82)
         (.fillRect ctx x y w h)
         (set! (.-globalAlpha ctx) 1)
-        (set! (.-strokeStyle ctx) "#0f172a") (.strokeRect ctx x y w h)
-        (set! (.-fillStyle ctx) "#fff") (set! (.-font ctx) (str "18px " (font-family)))
+        (set! (.-strokeStyle ctx) edge) (.strokeRect ctx x y w h)
+        (set! (.-fillStyle ctx) label-on-tint) (set! (.-font ctx) (str "18px " (font-family)))
         (.fillText ctx (:label (:draw/instances draw)) (+ x 10) (+ y 28))))
-    (set! (.-fillStyle ctx) "#172033") (set! (.-font ctx) (str "24px " (font-family)))
+    (set! (.-fillStyle ctx) ink) (set! (.-font ctx) (str "24px " (font-family)))
     (.fillText ctx (str "GDS/OASIS layout view · " (:eda/process ir)) 60 535)))
 
 (defn draw-flow! [ctx s]
-  (let [canvas (.-canvas ctx)]
+  (let [canvas (.-canvas ctx)
+        {:keys [sheet stage-done stage-active stage-idle grid-line ink muted]} canvas-colors]
     (.clearRect ctx 0 0 (.-width canvas) (.-height canvas))
-    (set! (.-fillStyle ctx) "#f8fafc") (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
+    (set! (.-fillStyle ctx) sheet) (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
     (doseq [[i [id nm _]] (map-indexed vector stages)]
       (let [col (mod i 5) row (quot i 5) x (+ 55 (* col 200)) y (+ 70 (* row 155))
             stage (:stage s)]
-        (set! (.-fillStyle ctx) (cond (< i stage) "#dcfce7" (= i stage) "#dbeafe" :else "#fff"))
-        (set! (.-strokeStyle ctx) (if (= i stage) "#2563eb" "#cbd5e1"))
+        (set! (.-fillStyle ctx) (cond (< i stage) stage-done (= i stage) stage-active :else stage-idle))
+        (set! (.-strokeStyle ctx) (if (= i stage) (accent-color) grid-line))
         (set! (.-lineWidth ctx) (if (= i stage) 3 1))
         (.fillRect ctx x y 155 74) (.strokeRect ctx x y 155 74)
-        (set! (.-fillStyle ctx) "#172033") (set! (.-font ctx) (str "17px " (font-family)))
+        (set! (.-fillStyle ctx) ink) (set! (.-font ctx) (str "17px " (font-family)))
         (.fillText ctx nm (+ x 12) (+ y 32))
-        (set! (.-fillStyle ctx) "#667085") (set! (.-font ctx) (str "12px " (font-family)))
+        (set! (.-fillStyle ctx) muted) (set! (.-font ctx) (str "12px " (font-family)))
         (.fillText ctx id (+ x 12) (+ y 54))))))
 
 (defn draw-wafer! [ctx s]
   (let [canvas (.-canvas ctx)
+        {:keys [field sheet outline ink die-pass die-fail]} canvas-colors
         c (cfg s) sc (score c s)]
     (.clearRect ctx 0 0 (.-width canvas) (.-height canvas))
-    (set! (.-fillStyle ctx) "#eef2f7") (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
+    (set! (.-fillStyle ctx) field) (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
     (.beginPath ctx) (.arc ctx 360 310 230 0 (* js/Math.PI 2))
-    (set! (.-fillStyle ctx) "#f8fafc") (.fill ctx) (set! (.-strokeStyle ctx) "#334155") (.stroke ctx)
+    (set! (.-fillStyle ctx) sheet) (.fill ctx) (set! (.-strokeStyle ctx) outline) (.stroke ctx)
     (doseq [y (range -7 8) x (range -7 8)]
       (when (< (+ (* x x) (* y y)) 49)
         (let [pass (< (mod (+ (mod (+ (* x 13) (* y 17) (* (:stage s) 11)) 100) 100) 100) (:yield-pct sc))]
-          (set! (.-fillStyle ctx) (if pass "#16a34a" "#dc2626"))
+          (set! (.-fillStyle ctx) (if pass die-pass die-fail))
           (.fillRect ctx (- (+ 360 (* x 27)) 10) (- (+ 310 (* y 27)) 10) 20 20))))
-    (set! (.-fillStyle ctx) "#172033") (set! (.-font ctx) (str "26px " (font-family)))
+    (set! (.-fillStyle ctx) ink) (set! (.-font ctx) (str "26px " (font-family)))
     (.fillText ctx (str "Wafer sort yield " (.toFixed (:yield-pct sc) 1) "%") 650 210)
     (set! (.-font ctx) (str "16px " (font-family)))
     (.fillText ctx "Probe map and binning become :eda.manufacturing/probe datoms." 650 245)))
 
 (defn draw-package! [ctx]
-  (let [canvas (.-canvas ctx)]
+  (let [canvas (.-canvas ctx)
+        {:keys [sheet ink label-on-tint pkg-substrate pkg-outline pkg-bond]} canvas-colors]
     (.clearRect ctx 0 0 (.-width canvas) (.-height canvas))
-    (set! (.-fillStyle ctx) "#f8fafc") (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
-    (set! (.-fillStyle ctx) "#dbeafe") (set! (.-strokeStyle ctx) "#1d4ed8") (set! (.-lineWidth ctx) 3)
+    (set! (.-fillStyle ctx) sheet) (.fillRect ctx 0 0 (.-width canvas) (.-height canvas))
+    (set! (.-fillStyle ctx) pkg-substrate) (set! (.-strokeStyle ctx) pkg-outline) (set! (.-lineWidth ctx) 3)
     (.fillRect ctx 250 210 520 230) (.strokeRect ctx 250 210 520 230)
-    (set! (.-fillStyle ctx) "#172033") (.fillRect ctx 410 280 200 95)
-    (set! (.-fillStyle ctx) "#fff") (set! (.-font ctx) (str "22px " (font-family))) (.fillText ctx "DIE" 488 335)
-    (set! (.-strokeStyle ctx) "#b45309") (set! (.-lineWidth ctx) 2)
+    (set! (.-fillStyle ctx) ink) (.fillRect ctx 410 280 200 95)
+    (set! (.-fillStyle ctx) label-on-tint) (set! (.-font ctx) (str "22px " (font-family))) (.fillText ctx "DIE" 488 335)
+    (set! (.-strokeStyle ctx) pkg-bond) (set! (.-lineWidth ctx) 2)
     (doseq [i (range 18)]
       (.beginPath ctx) (.moveTo ctx (+ 420 (* i 10)) 280) (.lineTo ctx (+ 280 (* i 28)) 210) (.stroke ctx))
-    (set! (.-fillStyle ctx) "#172033") (set! (.-font ctx) (str "24px " (font-family)))
+    (set! (.-fillStyle ctx) ink) (set! (.-font ctx) (str "24px " (font-family)))
     (.fillText ctx "Package / assembly / thermal view" 250 500)))
 
 (defn draw! []
@@ -805,45 +859,54 @@
      :artifact-manifests (:artifacts s)}))
 
 ;; -- reactive views ------------------------------------------------------
+;;
+;; Chrome components come from kotoba-ui.core / appkit.core (agent-guide
+;; rule 1). `panel` is the appkit desktop pane (:thick surface, :flat
+;; elevation) with the child list as body.
+
+(defn panel [opts & children]
+  (appkit/panel (apply list children) opts))
+
+(defn- update-cfg! [k v]
+  (swap! state assoc k v)
+  (transact! "eda.project/update" (cfg @state)))
 
 (defn project-panel []
   (let [s @state c (cfg s)]
-    [:div.panel
-     [:h2 "Project"]
-     [:label "Target product"
-      [:select {:value (:target s)
-                :on-change (fn [e] (swap! state assoc :target (.. e -target -value))
-                             (transact! "eda.project/update" (cfg @state)))}
-       [:option {:value "sensor-asic"} "Sensor ASIC"]
-       [:option {:value "edge-accelerator"} "Edge AI Accelerator"]
-       [:option {:value "pmic"} "PMIC / BCD"]
-       [:option {:value "mixed-signal"} "Mixed-signal Controller"]]]
-     [:label "Process / PDK"
-      [:select {:value (:process s)
-                :on-change (fn [e] (swap! state assoc :process (.. e -target -value))
-                             (transact! "eda.project/update" (cfg @state)))}
-       [:option {:value "sky130"} "Sky130-like open PDK"]
-       [:option {:value "gf180"} "GF180-like mixed signal"]
-       [:option {:value "bcd180"} "180nm BCD"]
-       [:option {:value "cmos28"} "28nm CMOS"]]]
-     [:label "Die size " [:span#die-label (str (:die c) " mm²")]
-      [:input {:type "range" :min 4 :max 144 :value (:die s)
-               :on-change (fn [e] (swap! state assoc :die (js/Number (.. e -target -value)))
-                            (transact! "eda.project/update" (cfg @state)))}]]
-     [:label "Volume " [:span#volume-label (str (:volume c) "k units")]
-      [:input {:type "range" :min 1 :max 1000 :value (:volume s)
-               :on-change (fn [e] (swap! state assoc :volume (js/Number (.. e -target -value)))
-                            (transact! "eda.project/update" (cfg @state)))}]]
-     [:div.checks {:aria-label "IP blocks"}
-      (for [[ip label] [["cpu" "RISC-V"] ["sram" "SRAM"] ["analog" "Analog macro"]
-                         ["serdes" "SERDES"] ["ml" "ML array"] ["otp" "OTP"]]]
-        ^{:key ip}
-        [:label [:input {:type "checkbox" :checked (contains? (:ip s) ip)
-                          :on-change (fn [_]
-                                       (swap! state update :ip
-                                              (fn [xs] (if (contains? xs ip) (disj xs ip) (conj xs ip))))
-                                       (transact! "eda.project/update" (cfg @state)))}]
-         (str " " label)])]]))
+    (panel {}
+      [:h2.panel-title.hig-headline "Project"]
+      [:label.field "Target product"
+       (ui/menu-select [["sensor-asic" "Sensor ASIC"]
+                        ["edge-accelerator" "Edge AI Accelerator"]
+                        ["pmic" "PMIC / BCD"]
+                        ["mixed-signal" "Mixed-signal Controller"]]
+                       {:id "target" :value (:target s)
+                        :on-change (fn [e] (update-cfg! :target (.. e -target -value)))})]
+      [:label.field "Process / PDK"
+       (ui/menu-select [["sky130" "Sky130-like open PDK"]
+                        ["gf180" "GF180-like mixed signal"]
+                        ["bcd180" "180nm BCD"]
+                        ["cmos28" "28nm CMOS"]]
+                       {:id "process" :value (:process s)
+                        :on-change (fn [e] (update-cfg! :process (.. e -target -value)))})]
+      [:label.field "Die size " [:span#die-label (str (:die c) " mm²")]
+       (ui/slider {:id "die" :min 4 :max 144 :value (:die s)
+                   :on-input (fn [e] (update-cfg! :die (js/Number (.. e -target -value))))})]
+      [:label.field "Volume " [:span#volume-label (str (:volume c) "k units")]
+       (ui/slider {:id "volume" :min 1 :max 1000 :value (:volume s)
+                   :on-input (fn [e] (update-cfg! :volume (js/Number (.. e -target -value))))})]
+      [:div.checks {:aria-label "IP blocks"}
+       (for [[ip label] [["cpu" "RISC-V"] ["sram" "SRAM"] ["analog" "Analog macro"]
+                          ["serdes" "SERDES"] ["ml" "ML array"] ["otp" "OTP"]]]
+         ^{:key ip}
+         [:span
+          (ui/checkbox (str " " label)
+                       {:id (str "ip-" ip)
+                        :checked (contains? (:ip s) ip)
+                        :on-change (fn [_]
+                                     (swap! state update :ip
+                                            (fn [xs] (if (contains? xs ip) (disj xs ip) (conj xs ip))))
+                                     (transact! "eda.project/update" (cfg @state)))})])])))
 
 (defn stages-view []
   (let [s @state]
@@ -853,7 +916,7 @@
              fail? (and (:issue s) (= i (:stage s)) (>= i 6))]
          ^{:key id}
          [:div {:class (str klass (when fail? " fail"))}
-          [:b (str (inc i) ". " nm)] [:span desc] [:span.mono id]]))]))
+          [:b (str (inc i) ". " nm)] [:span desc] [:span [:code id]]]))]))
 
 (defn gates-view []
   (let [s @state]
@@ -863,7 +926,7 @@
          ^{:key id}
          [:div.gate
           [:div [:strong nm] [:span desc]]
-          [:button {:on-click #(approve-gate! id)} (if ok "approved" "approve")]]))]))
+          (ui/button (if ok "approved" "approve") {:act (str "gate/" id)})]))]))
 
 (defn log-row [k label small trailing]
   ^{:key k} [:div.log-row [:b label] [:small small] trailing])
@@ -919,7 +982,7 @@
     [:div#co-scores.score-list
      (for [[label value] [["Quality" (:quality co)] ["UIUX" (:uiux co)] ["Gates" (js/Math.round (* (:gate-coverage co) 100))]]]
        ^{:key label}
-       [:div.score-row [:b label] [:div.bar [:span {:style {:width (str value "%")}}]] [:span (str value "%")]])]))
+       [:div.score-row [:b label] (ui/progress-bar value) [:span (str value "%")]])]))
 
 (defn co-findings-view []
   (let [s @state co (or (:co s) (co-sientist-review s))]
@@ -935,7 +998,7 @@
 (defn maturity-use-view []
   (let [s @state m (or (:maturity s) (maturity-assessment s))]
     [:div#maturity-use
-     [:div.badges (for [x (:useable-for m)] ^{:key x} [:span.badge.ok x])]]))
+     [:div.badges (for [x (:useable-for m)] ^{:key x} [:span (ui/badge x {:class "ok"})])]]))
 
 (defn sim-matrix-view []
   (let [s @state m (or (:maturity s) (maturity-assessment s))]
@@ -988,168 +1051,205 @@
                         (set! (.. e -target -value) ""))}])
 
 (defn artifact-intake-panel []
-  [:div.panel
-   [:h2 "Artifact Intake"]
-   [:div.drop
-    [:label "Upload EDA files"
-     (file-input "artifact-files"
-                  ".v,.sv,.svh,.vhd,.vhdl,.sp,.spi,.cir,.ckt,.cdl,.sdc,.upf,.lib,.lef,.def,.gds,.gdsii,.oas,.oasis,.vcd,.fst,.sdf,.saif,.stil,.wgl,.rpt,.log,.drc,.lvs,.rule,.rules,.deck"
-                  true ingest-artifacts!)]]
-   (artifact-log-view)])
+  (panel {}
+    [:h2.panel-title.hig-headline "Artifact Intake"]
+    [:div.drop
+     [:label.field "Upload EDA files"
+      (file-input "artifact-files"
+                   ".v,.sv,.svh,.vhd,.vhdl,.sp,.spi,.cir,.ckt,.cdl,.sdc,.upf,.lib,.lef,.def,.gds,.gdsii,.oas,.oasis,.vcd,.fst,.sdf,.saif,.stil,.wgl,.rpt,.log,.drc,.lvs,.rule,.rules,.deck"
+                   true ingest-artifacts!)]]
+    (artifact-log-view)))
 
 (defn runner-adapter-panel []
-  [:div.panel
-   [:h2 "Runner Adapter"]
-   [:p "ブラウザは EDN job plan を作るだけです。実行は host/murakumo runner が policy gate 後に行います。"]
-   [:div.actions
-    [:button.wide {:on-click (fn [_]
-                                (let [plan (or (:runner-plan @state) (build-preview-runner-plan @state))]
-                                  (download-text! "kotoba-eda-runner-plan.edn" (str (pr-str plan) "\n") "application/edn")))}
-     "Download runner EDN"]
-    [:button.wide {:on-click (fn [_] (build-murakumo-payload!))} "Build murakumo payload"]
-    [:button.wide {:on-click (fn [_]
-                                (let [payload (or (:murakumo-payload @state) (build-murakumo-payload!))]
-                                  (download-text! "kotoba-eda-murakumo-submit.edn" (str (pr-str payload) "\n") "application/edn")))}
-     "Download murakumo EDN"]]
-   (runner-log-view) (murakumo-log-view)
-   [:div.drop {:style {:margin-top "10px"}}
-    [:label "Import runner result JSON" (file-input "runner-result-files" ".json" true import-runner-results!)]]
-   [:div.drop {:style {:margin-top "10px"}}
-    [:label "Import signoff evidence JSON" (file-input "signoff-evidence-files" ".json" true import-signoff-evidence!)]
-    [:div.actions {:style {:margin-top "8px"}}
-     [:button.wide {:on-click (fn [_] (load-sample-signoff!))} "Load sample signoff evidence"]
-     [:button.wide {:on-click (fn [_]
-                                 (download-text! "kotoba-eda-signoff-evidence-template.json"
-                                                  (str (->json (signoff-evidence-template) 2) "\n")
-                                                  "application/json"))}
-      "Download evidence template"]]]
-   [:div.source-links
-    [:a {:href "https://github.com/kotoba-lang/eda"} "Native CLJC engine repo"]
-    [:a {:href "https://kotoba-lang.github.io/eda/sample_flow.edn"} "Native EDN sample flow"]
-    [:a {:href "https://kotoba-lang.github.io/eda/oss_manifest.edn"} "OSS report manifest"]
-    [:a {:href "source.html?file=eda_runner_adapters.edn"} "Runner adapters EDN"]
-    [:a {:href "source.html?file=kotoba_eda_runner.cljc"} "Runner CLJC"]
-    [:a {:href "source.html?file=eda_signoff_evidence.edn"} "Signoff evidence EDN"]
-    [:a {:href "source.html?file=eda_murakumo_job.edn"} "Murakumo job EDN"]
-    [:a {:href "source.html?file=kotoba_eda_murakumo.cljc"} "Murakumo CLJC"]
-    [:a {:href "source.html?file=kotoba_eda_app.cljs"} "UI reagent app"]
-    [:a {:href "source.html?file=runner_host.clj"} "Host runner"]]])
+  (panel {}
+    [:h2.panel-title.hig-headline "Runner Adapter"]
+    [:p.panel-note "ブラウザは EDN job plan を作るだけです。実行は host/murakumo runner が policy gate 後に行います。"]
+    [:div.actions
+     (ui/button "Download runner EDN" {:act "download-runner-plan" :class "wide"})
+     (ui/button "Build murakumo payload" {:act "murakumo-submit" :class "wide"})
+     (ui/button "Download murakumo EDN" {:act "download-murakumo-payload" :class "wide"})]
+    (runner-log-view) (murakumo-log-view)
+    [:div.drop {:style {:margin-top "10px"}}
+     [:label.field "Import runner result JSON" (file-input "runner-result-files" ".json" true import-runner-results!)]]
+    [:div.drop {:style {:margin-top "10px"}}
+     [:label.field "Import signoff evidence JSON" (file-input "signoff-evidence-files" ".json" true import-signoff-evidence!)]
+     [:div.actions {:style {:margin-top "8px"}}
+      (ui/button "Load sample signoff evidence" {:act "load-sample-signoff" :class "wide"})
+      (ui/button "Download evidence template" {:act "download-signoff-template" :class "wide"})]]
+    [:div.source-links
+     [:a {:href "https://github.com/kotoba-lang/eda"} "Native CLJC engine repo"]
+     [:a {:href "https://kotoba-lang.github.io/eda/sample_flow.edn"} "Native EDN sample flow"]
+     [:a {:href "https://kotoba-lang.github.io/eda/oss_manifest.edn"} "OSS report manifest"]
+     [:a {:href "source.html?file=eda_runner_adapters.edn"} "Runner adapters EDN"]
+     [:a {:href "source.html?file=kotoba_eda_runner.cljc"} "Runner CLJC"]
+     [:a {:href "source.html?file=eda_signoff_evidence.edn"} "Signoff evidence EDN"]
+     [:a {:href "source.html?file=eda_murakumo_job.edn"} "Murakumo job EDN"]
+     [:a {:href "source.html?file=kotoba_eda_murakumo.cljc"} "Murakumo CLJC"]
+     [:a {:href "source.html?file=kotoba_eda_app.cljs"} "UI reagent app"]
+     [:a {:href "source.html?file=runner_host.clj"} "Host runner"]]))
 
 (defn policy-gates-panel []
-  [:div.panel [:h2 "Policy Gates"] (gates-view)])
+  (panel {} [:h2.panel-title.hig-headline "Policy Gates"] (gates-view)))
 
 (defn run-control-panel []
-  [:div.panel
-   [:h2 "Run Control"]
-   [:div.actions
-    [:button.primary.wide {:on-click (fn [_] (run-all!))} "Run full flow"]
-    [:button {:on-click (fn [_] (run-stage!))} "Advance stage"]
-    [:button.danger {:on-click (fn [_] (toggle-issue!))} "Inject issue"]
-    [:button {:on-click (fn [_] (download-text! "kotoba-eda-datoms.json" (str (->json (:datoms @state) 2) "\n") "application/json"))}
-     "Export datoms"]
-    [:button {:on-click (fn [_] (download-text! "kotoba-eda-manufacturing-packet.json" (str (->json (packet @state) 2) "\n") "application/json"))}
-     "Manufacturing packet"]
-    [:button.wide {:on-click (fn [_] (run-co-sientist-review!))} "Run co-sientist review"]
-    [:button.wide {:on-click (fn [_] (run-maturity-audit!))} "Run maturity audit"]
-    [:button.wide {:on-click (fn [_] (build-runner-plan!))} "Build runner plan"]]])
+  (panel {}
+    [:h2.panel-title.hig-headline "Run Control"]
+    [:div.actions
+     (ui/button "Run full flow" {:act "run-all" :class "primary wide"})
+     (ui/button "Advance stage" {:act "advance"})
+     (ui/button "Inject issue" {:act "inject" :class "danger"})
+     (ui/button "Export datoms" {:act "export-json"})
+     (ui/button "Manufacturing packet" {:act "download-packet"})
+     (ui/button "Run co-sientist review" {:act "co-review" :class "wide"})
+     (ui/button "Run maturity audit" {:act "maturity-audit" :class "wide"})
+     (ui/button "Build runner plan" {:act "runner-plan" :class "wide"})]))
 
 (defn viewer-panel []
   (let [s @state]
-    [:div.panel
-     [:h2 "kami-engine Viewer"]
-     [:div.canvas-wrap
-      [:div.canvas-tabs
-       (for [[view label] [["layout" "Layout"] ["flow" "Flow"] ["wafer" "Wafer"] ["package" "Package"]]]
-         ^{:key view}
-         [:button {:class (when (= (:view s) view) "active") :data-view view
-                   :on-click (fn [_] (swap! state assoc :view view) (draw!))}
-          label])]
-      [:canvas#eda-canvas {:width 1080 :height 630 :data-kami-engine "render-ir"}]]]))
+    (panel {}
+      [:h2.panel-title.hig-headline "kami-engine Viewer"]
+      [:div.canvas-wrap
+       (ui/tab-bar [["view/layout" "Layout"]
+                    ["view/flow" "Flow"]
+                    ["view/wafer" "Wafer"]
+                    ["view/package" "Package"]]
+                   (str "view/" (:view s))
+                   {:class "canvas-tabs"})
+       [:canvas#eda-canvas {:width 1080 :height 630 :data-kami-engine "render-ir"}]])))
 
 (defn manufacturing-readiness-panel []
-  (let [s @state m (or (:maturity s) (maturity-assessment s))]
-    [:div#manufacturing.panel
-     [:h2 "Manufacturing Readiness"]
-     [:p#mfg-summary (->json (:manufacturing (packet s)))]
-     (maturity-cards-view) (maturity-use-view)
-     [:table.matrix {:aria-label "Simulation matrix"}
-      [:thead [:tr [:th "Simulation"] [:th "Tool"] [:th "Status"] [:th "Coverage"]]]
-      (sim-matrix-view)]
-     (readiness-log-view)]))
+  (let [s @state]
+    (panel {:id "manufacturing"}
+      [:h2.panel-title.hig-headline "Manufacturing Readiness"]
+      [:p#mfg-summary.panel-note (->json (:manufacturing (packet s)))]
+      (maturity-cards-view) (maturity-use-view)
+      [:table.matrix {:aria-label "Simulation matrix"}
+       [:thead [:tr [:th "Simulation"] [:th "Tool"] [:th "Status"] [:th "Coverage"]]]
+       (sim-matrix-view)]
+      (readiness-log-view))))
 
 (defn coverage-panel []
-  [:div#coverage.panel
-   [:h2 "Coverage"]
-   [:p "Runner results, uploaded reports, and stage-model fallback are separated as " [:code ":eda.coverage/*"] " data."]
-   (coverage-cards-view)
-   [:table.matrix {:aria-label "Coverage matrix"}
-    [:thead [:tr [:th "Metric"] [:th "Source"] [:th "Status"] [:th "Score"]]]
-    (coverage-matrix-view)]
-   [:h3 "Signoff Evidence Gates"]
-   [:table.matrix {:aria-label "Signoff evidence matrix"}
-    [:thead [:tr [:th "Gate"] [:th "Tool"] [:th "Status"] [:th "Evidence"]]]
-    (signoff-evidence-matrix-view)]
-   (runner-result-log-view)
-   [:div.source-links
-    [:a {:href "source.html?file=eda_coverage_schema.edn"} "Coverage schema EDN"]
-    [:a {:href "source.html?file=eda_signoff_evidence.edn"} "Signoff evidence EDN"]]])
+  (panel {:id "coverage"}
+    [:h2.panel-title.hig-headline "Coverage"]
+    [:p.panel-note "Runner results, uploaded reports, and stage-model fallback are separated as " [:code ":eda.coverage/*"] " data."]
+    (coverage-cards-view)
+    [:table.matrix {:aria-label "Coverage matrix"}
+     [:thead [:tr [:th "Metric"] [:th "Source"] [:th "Status"] [:th "Score"]]]
+     (coverage-matrix-view)]
+    [:h3.hig-subheadline "Signoff Evidence Gates"]
+    [:table.matrix {:aria-label "Signoff evidence matrix"}
+     [:thead [:tr [:th "Gate"] [:th "Tool"] [:th "Status"] [:th "Evidence"]]]
+     (signoff-evidence-matrix-view)]
+    (runner-result-log-view)
+    [:div.source-links
+     [:a {:href "source.html?file=eda_coverage_schema.edn"} "Coverage schema EDN"]
+     [:a {:href "source.html?file=eda_signoff_evidence.edn"} "Signoff evidence EDN"]]))
 
 (defn formats-panel []
-  [:div#formats.panel
-   [:h2 "File Format Registry"]
-   [:p "EDA artifacts are CID-addressed files with EDN manifests. Each format maps to software adapters, operations, policy gates and EDN-centered converter pipelines."]
-   [:div.badges
-    [:span.badge.ok ".v .sv .vhd"] [:span.badge.ok ".sp .cdl .sdc .upf"] [:span.badge.ok ".lib .lef .def"]
-    [:span.badge.warn ".gds .oas"] [:span.badge.warn ".vcd .fst .sdf .saif"] [:span.badge.stop ".stil .wgl .deck"]]
-   [:div.log {:style {:margin-top "10px" :max-height "210px"}}
-    [:div.log-row [:b "RTL"] [:small ".v/.sv/.vhd -> EDN RTL graph -> Yosys/Surelog/slang/GHDL -> synth/sim/formal"]]
-    [:div.log-row [:b "Analog"] [:small ".sp/.cdl -> EDN netlist -> ngspice/Xyce/Netgen -> sim/LVS"]]
-    [:div.log-row [:b "Physical"] [:small ".lib/.lef/.def/.gds/.oas -> EDN physical model -> OpenROAD/KLayout/Magic/OpenSTA -> P&R/signoff/tapeout"]]
-    [:div.log-row [:b "Analysis"] [:small ".vcd/.fst/.sdf/.saif/.rpt -> EDN summaries/findings -> kami render-IR and LLM proposal input"]]
-    [:div.log-row [:b "Manufacturing"] [:small ".stil/.wgl + GDS/OASIS + reports -> EDN release packet -> ATE/foundry handoff gates"]]]
-   [:div.source-links
-    [:a {:href "source.html?file=eda_file_formats.edn"} "Canonical EDN registry"]
-    [:a {:href "source.html?file=kotoba_eda_formats.cljc"} "Pure CLJC query layer"]]])
+  (panel {:id "formats"}
+    [:h2.panel-title.hig-headline "File Format Registry"]
+    [:p.panel-note "EDA artifacts are CID-addressed files with EDN manifests. Each format maps to software adapters, operations, policy gates and EDN-centered converter pipelines."]
+    [:div.badges
+     (ui/badge ".v .sv .vhd" {:class "ok"})
+     (ui/badge ".sp .cdl .sdc .upf" {:class "ok"})
+     (ui/badge ".lib .lef .def" {:class "ok"})
+     (ui/badge ".gds .oas" {:class "warn"})
+     (ui/badge ".vcd .fst .sdf .saif" {:class "warn"})
+     (ui/badge ".stil .wgl .deck" {:class "stop"})]
+    [:div.log {:style {:margin-top "10px" :max-height "210px"}}
+     [:div.log-row [:b "RTL"] [:small ".v/.sv/.vhd -> EDN RTL graph -> Yosys/Surelog/slang/GHDL -> synth/sim/formal"]]
+     [:div.log-row [:b "Analog"] [:small ".sp/.cdl -> EDN netlist -> ngspice/Xyce/Netgen -> sim/LVS"]]
+     [:div.log-row [:b "Physical"] [:small ".lib/.lef/.def/.gds/.oas -> EDN physical model -> OpenROAD/KLayout/Magic/OpenSTA -> P&R/signoff/tapeout"]]
+     [:div.log-row [:b "Analysis"] [:small ".vcd/.fst/.sdf/.saif/.rpt -> EDN summaries/findings -> kami render-IR and LLM proposal input"]]
+     [:div.log-row [:b "Manufacturing"] [:small ".stil/.wgl + GDS/OASIS + reports -> EDN release packet -> ATE/foundry handoff gates"]]]
+    [:div.source-links
+     [:a {:href "source.html?file=eda_file_formats.edn"} "Canonical EDN registry"]
+     [:a {:href "source.html?file=kotoba_eda_formats.cljc"} "Pure CLJC query layer"]]))
 
-(defn proposal-panel [] [:div.panel [:h2 "LLM / murakumo Proposals"] (llm-log-view)])
-(defn co-sientist-panel [] [:div.panel [:h2 "Co-sientist Quality"] (co-scores-view) (co-findings-view)])
-(defn datom-panel [] [:div.panel [:h2 "Datom Log"] (datom-log-view)])
+(defn proposal-panel []
+  (panel {} [:h2.panel-title.hig-headline "LLM / murakumo Proposals"] (llm-log-view)))
+(defn co-sientist-panel []
+  (panel {} [:h2.panel-title.hig-headline "Co-sientist Quality"] (co-scores-view) (co-findings-view)))
+(defn datom-panel []
+  (panel {} [:h2.panel-title.hig-headline "Datom Log"] (datom-log-view)))
 (defn render-ir-panel []
   (let [s @state]
-    [:div.panel [:h2 "render-IR"] [:pre#render-ir (some-> (:render-ir s) (->json 2))]]))
+    (panel {} [:h2.panel-title.hig-headline "render-IR"]
+      [:pre#render-ir (some-> (:render-ir s) (->json 2))])))
 
 (defn hero []
   (let [s @state c (cfg s) sc (score c s)]
     [:section.hero {:aria-labelledby "title"}
-     [:div.panel
-      [:h1#title "kotoba EDA Flow Workbench"]
-      [:p "ブラウザ内で半導体の要求、設計、検証、サインオフ、製造引き渡しまでを一つの流れとして操作する実験版です。正本は "
-       [:code ".cljc"] " の純粋データモデルで、描画面は kami-engine の render-IR 形状に寄せています。"]
-      [:div.badges
-       [:span.badge.ok "CLJC workflow model"] [:span.badge.ok "kami render-IR"]
-       [:span.badge.warn "LLM proposals only"] [:span.badge.stop "Foundry upload requires gate"]]]
-     [:div.panel
-      [:h2 "Current Run"]
-      [:div.metrics
-       [:div.metric [:span "Stage"] [:b#metric-stage (second (nth stages (:stage s)))]]
-       [:div.metric [:span "Signoff"] [:b#metric-signoff (str (js/Math.round (* (:signoff sc) 100)) "%")]]
-       [:div.metric [:span "Yield"] [:b#metric-yield (str (.toFixed (:yield-pct sc) 1) "%")]]
-       [:div.metric [:span "Cost"] [:b#metric-cost (str "$" (:cost sc) "k")]]]
-      [:div.source-links
-       [:a {:href "source.html?file=kotoba_eda_core.cljc"} "CLJC model"]
-       [:a {:href "source.html?file=eda_file_formats.edn"} "EDA formats EDN"]
-       [:a {:href "source.html?file=kotoba_eda_formats.cljc"} "formats CLJC"]
-       [:a {:href "source.html?file=kami_render_ir.edn"} "render-IR sample"]
-       [:a {:href "../ADR-kotoba-eda-web-semiconductor-app.edn"} "ADR EDN"]]]]))
+     (panel {}
+       [:h1#title.hig-title1 "kotoba EDA Flow Workbench"]
+       [:p.panel-note "ブラウザ内で半導体の要求、設計、検証、サインオフ、製造引き渡しまでを一つの流れとして操作する実験版です。正本は "
+        [:code ".cljc"] " の純粋データモデルで、描画面は kami-engine の render-IR 形状に寄せています。"]
+       [:div.badges
+        (ui/badge "CLJC workflow model" {:class "ok"})
+        (ui/badge "kami render-IR" {:class "ok"})
+        (ui/badge "LLM proposals only" {:class "warn"})
+        (ui/badge "Foundry upload requires gate" {:class "stop"})])
+     (panel {}
+       [:h2.panel-title.hig-headline "Current Run"]
+       [:div.metrics
+        [:div.metric [:span "Stage"] [:b#metric-stage (second (nth stages (:stage s)))]]
+        [:div.metric [:span "Signoff"] [:b#metric-signoff (str (js/Math.round (* (:signoff sc) 100)) "%")]]
+        [:div.metric [:span "Yield"] [:b#metric-yield (str (.toFixed (:yield-pct sc) 1) "%")]]
+        [:div.metric [:span "Cost"] [:b#metric-cost (str "$" (:cost sc) "k")]]]
+       [:div.source-links
+        [:a {:href "source.html?file=kotoba_eda_core.cljc"} "CLJC model"]
+        [:a {:href "source.html?file=eda_file_formats.edn"} "EDA formats EDN"]
+        [:a {:href "source.html?file=kotoba_eda_formats.cljc"} "formats CLJC"]
+        [:a {:href "source.html?file=kami_render_ir.edn"} "render-IR sample"]
+        [:a {:href "../ADR-kotoba-eda-web-semiconductor-app.edn"} "ADR EDN"]])]))
 
 (defn workspace []
   [:section#flow.workspace
-   [:aside.stack (project-panel) (run-control-panel) (artifact-intake-panel) (runner-adapter-panel) (policy-gates-panel)]
-   [:section.stack (viewer-panel) (stages-view) (manufacturing-readiness-panel) (coverage-panel) (formats-panel)]
-   [:aside.stack (proposal-panel) (co-sientist-panel) (datom-panel) (render-ir-panel)]])
+   (ui/stack {:gap :3}
+     (project-panel) (run-control-panel) (artifact-intake-panel)
+     (runner-adapter-panel) (policy-gates-panel))
+   (ui/stack {:gap :3}
+     (viewer-panel) (stages-view) (manufacturing-readiness-panel)
+     (coverage-panel) (formats-panel))
+   (ui/stack {:gap :3 :class "col-right"}
+     (proposal-panel) (co-sientist-panel) (datom-panel) (render-ir-panel))])
+
+;; -- delegated act dispatch ------------------------------------------------
+;; kotoba-ui buttons/tab-bar emit `data-act` (the shitsuke portable
+;; interaction contract), not :on-click — ONE delegated click handler at the
+;; reagent root maps acts to the state-mutating actions above. Prefixed acts
+;; carry an argument: "gate/<id>" approves a policy gate, "view/<id>"
+;; switches the canvas view.
+
+(def act-handlers
+  {"run-all" run-all!
+   "advance" run-stage!
+   "inject" toggle-issue!
+   "export-json" (fn [] (download-text! "kotoba-eda-datoms.json" (str (->json (:datoms @state) 2) "\n") "application/json"))
+   "download-packet" (fn [] (download-text! "kotoba-eda-manufacturing-packet.json" (str (->json (packet @state) 2) "\n") "application/json"))
+   "co-review" run-co-sientist-review!
+   "maturity-audit" run-maturity-audit!
+   "runner-plan" build-runner-plan!
+   "download-runner-plan" (fn [] (let [plan (or (:runner-plan @state) (build-preview-runner-plan @state))]
+                                   (download-text! "kotoba-eda-runner-plan.edn" (str (pr-str plan) "\n") "application/edn")))
+   "murakumo-submit" build-murakumo-payload!
+   "download-murakumo-payload" (fn [] (let [payload (or (:murakumo-payload @state) (build-murakumo-payload!))]
+                                        (download-text! "kotoba-eda-murakumo-submit.edn" (str (pr-str payload) "\n") "application/edn")))
+   "load-sample-signoff" load-sample-signoff!
+   "download-signoff-template" (fn [] (download-text! "kotoba-eda-signoff-evidence-template.json"
+                                                       (str (->json (signoff-evidence-template) 2) "\n")
+                                                       "application/json"))})
+
+(defn dispatch-act! [e]
+  (when-let [el (some-> (.-target e) (.closest "[data-act]"))]
+    (let [act (.getAttribute el "data-act")]
+      (cond
+        (str/starts-with? act "view/") (do (swap! state assoc :view (subs act 5)) (draw!))
+        (str/starts-with? act "gate/") (approve-gate! (subs act 5))
+        :else (when-let [handler (get act-handlers act)] (handler))))))
 
 (defn root []
-  [:<> (hero) (workspace)])
+  [:div {:on-click dispatch-act!} (hero) (workspace)])
 
 ;; -- canvas redraw lifecycle ---------------------------------------------
 ;; Reagent re-renders `root` on every state change, but the canvas 2D
