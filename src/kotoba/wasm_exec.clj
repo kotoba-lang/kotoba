@@ -224,6 +224,40 @@
                  :params [ValType/I32 ValType/I32 ValType/I32 ValType/I32]
                  :result ValType/I32}})
 
+(def ^:dynamic *concrete-cap*
+  "The concrete (post-intersection) capability authorizing the host-import
+  call currently in flight, bound by `guard-host-call` around each granted
+  effect invocation. Lets an effect (e.g. fs-read/fs-write/http-fetch/
+  http-post/keychain-read/keychain-write in `real-op-effects`) enforce
+  `:cap/resource` scoping against the guest-supplied resource argument
+  (path/URL/key), which `guard-host-call` itself cannot do -- the requested
+  capability it builds is always the universal `(make-cap kind :any)` since
+  the guest's actual argument isn't known until AFTER the guard decision.
+  Bound via `binding` rather than threaded as an extra effect argument so
+  `guard-host-call`/`guarded-host-functions`' public
+  `(fn [instance args] -> long)` effect contract stays unchanged for other
+  callers (e.g. kotoba.kami-host's kami-* ECS ops)."
+  nil)
+
+(defn- resource-permitted?
+  "True when RESOURCE (a guest-supplied literal string -- a path, URL, or
+  keychain key) is inside CONCRETE's :cap/resource scope. `nil` CONCRETE
+  (no policy/guard installed at all) permits everything, matching every
+  other capability id's fail-open-when-unguarded convention elsewhere in
+  this namespace. Otherwise: kotoba.lang.capability-values models a
+  resource constraint as :any, a single resource string, or a set of
+  resource strings -- EXACT membership, not a prefix/pattern language -- so
+  a scoped grant like {:host/fs-read #{\"/only/this/dir/notes.txt\"}} covers
+  exactly that literal path/URL/key, nothing broader. Fails closed (denies)
+  on any other shape."
+  [concrete resource]
+  (let [scope (:cap/resource concrete)]
+    (boolean
+     (or (nil? concrete)
+         (= :any scope)
+         (= scope resource)
+         (and (set? scope) (contains? scope resource))))))
+
 (defn- guard-host-call
   "Wrap EFFECT — one host-import OP's raw (fn [instance args] -> long) body
   — behind kotoba.lang.capability-host/guard-call, deriving CACAO-style
@@ -238,7 +272,14 @@
   Generic across every guarded op this namespace wires (kgraph-*, and the
   provider/kernel-capability/actor-host surface in `real-op-effects`), not
   kgraph-specific despite the historical name this replaces
-  (`guard-kgraph-call`)."
+  (`guard-kgraph-call`).
+
+  Binds `*concrete-cap*` to the post-intersection capability around EFFECT
+  so a resource-sensitive effect (see `resource-permitted?`) can enforce
+  `:cap/resource` scoping against whatever resource argument it reads out
+  of guest memory -- the kind-level grant/deny decision above only ever
+  requested :any, since the guest's concrete argument isn't known yet at
+  that point."
   [op effect {:keys [policy record! now]}]
   (let [kind (get runtime/op->kind op)
         grants (host-providers/policy-grants policy)
@@ -252,7 +293,9 @@
                       :local-policy allow
                       :now now
                       :record! record!
-                      :handler (fn [_concrete] (effect instance args))})]
+                      :handler (fn [concrete]
+                                 (binding [*concrete-cap* concrete]
+                                   (effect instance args)))})]
         (if (:kotoba.host/ok? outcome)
           (:kotoba.host/result outcome)
           (throw (ex-info "wasm host call denied by capability guard"
@@ -370,45 +413,55 @@
    'http-fetch
    (fn [instance args]
      (try
-       (let [url (read-str instance (aget args 0) (aget args 1))
-             req (-> (HttpRequest/newBuilder (URI/create url)) .GET .build)
-             resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofByteArray))]
-         (write-bytes! instance (aget args 2) (aget args 3) (.body resp)))
+       (let [url (read-str instance (aget args 0) (aget args 1))]
+         (if-not (resource-permitted? *concrete-cap* url)
+           -1
+           (let [req (-> (HttpRequest/newBuilder (URI/create url)) .GET .build)
+                 resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofByteArray))]
+             (write-bytes! instance (aget args 2) (aget args 3) (.body resp)))))
        (catch Exception _ -1)))
 
    'keychain-read
    (fn [instance args]
      (let [k (read-str instance (aget args 0) (aget args 1))]
-       (if-let [v (get @keychain k)]
-         (write-bytes! instance (aget args 2) (aget args 3) v)
-         -1)))
+       (if-not (resource-permitted? *concrete-cap* k)
+         -1
+         (if-let [v (get @keychain k)]
+           (write-bytes! instance (aget args 2) (aget args 3) v)
+           -1))))
    'keychain-write
    (fn [instance args]
      (let [k (read-str instance (aget args 0) (aget args 1))
            v (read-bytes instance (aget args 2) (aget args 3))]
-       (swap! keychain assoc k v)
-       0))
+       (if-not (resource-permitted? *concrete-cap* k)
+         -1
+         (do (swap! keychain assoc k v)
+             0))))
 
    'fs-read
    (fn [instance args]
      (try
-       (let [path (read-str instance (aget args 0) (aget args 1))
-             file (safe-path fs-root path)]
-         (if (and file (.isFile file))
-           (write-bytes! instance (aget args 2) (aget args 3) (Files/readAllBytes (.toPath file)))
-           -1))
+       (let [path (read-str instance (aget args 0) (aget args 1))]
+         (if-not (resource-permitted? *concrete-cap* path)
+           -1
+           (let [file (safe-path fs-root path)]
+             (if (and file (.isFile file))
+               (write-bytes! instance (aget args 2) (aget args 3) (Files/readAllBytes (.toPath file)))
+               -1))))
        (catch Exception _ -1)))
    'fs-write
    (fn [instance args]
      (try
        (let [path (read-str instance (aget args 0) (aget args 1))
-             data (read-bytes instance (aget args 2) (aget args 3))
-             file (safe-path fs-root path)]
-         (if file
-           (do (.mkdirs (.getParentFile file))
-               (Files/write (.toPath file) ^bytes data (into-array java.nio.file.OpenOption []))
-               0)
-           -1))
+             data (read-bytes instance (aget args 2) (aget args 3))]
+         (if-not (resource-permitted? *concrete-cap* path)
+           -1
+           (let [file (safe-path fs-root path)]
+             (if file
+               (do (.mkdirs (.getParentFile file))
+                   (Files/write (.toPath file) ^bytes data (into-array java.nio.file.OpenOption []))
+                   0)
+               -1))))
        (catch Exception _ -1)))
 
    'log-write
@@ -499,12 +552,14 @@
    (fn [instance args]
      (try
        (let [url (read-str instance (aget args 0) (aget args 1))
-             body (read-bytes instance (aget args 2) (aget args 3))
-             req (-> (HttpRequest/newBuilder (URI/create url))
-                    (.POST (HttpRequest$BodyPublishers/ofByteArray body))
-                    .build)
-             resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofByteArray))]
-         (write-bytes! instance (aget args 4) (aget args 5) (.body resp)))
+             body (read-bytes instance (aget args 2) (aget args 3))]
+         (if-not (resource-permitted? *concrete-cap* url)
+           -1
+           (let [req (-> (HttpRequest/newBuilder (URI/create url))
+                        (.POST (HttpRequest$BodyPublishers/ofByteArray body))
+                        .build)
+                 resp (.send (HttpClient/newHttpClient) req (HttpResponse$BodyHandlers/ofByteArray))]
+             (write-bytes! instance (aget args 4) (aget args 5) (.body resp)))))
        (catch Exception _ -1)))})
 
 (def real-op-ids

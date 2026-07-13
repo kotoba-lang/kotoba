@@ -83,17 +83,25 @@
   (:special-forms capability-contract))
 
 (defn read-forms
-  "Read every form from source using a concrete CLJC reader target."
+  "Read every form from source using a concrete CLJC reader target.
+
+  Kotoba source is untrusted input (the whole point of the safe-subset
+  checker downstream), so the reader's eval-reader (`#=(...)`) and
+  record/type-literal construction syntax must stay disabled here —
+  `clojure.tools.reader/*read-eval*` defaults to true, which would let a
+  crafted `.kotoba` file execute arbitrary JVM code the instant it's read,
+  before the checker ever runs."
   [source reader-target]
   (let [rdr (reader-types/string-push-back-reader source)
         opts {:read-cond :allow
               :features #{reader-target}
               :eof ::eof}]
-    (loop [forms []]
-      (let [form (reader/read opts rdr)]
-        (if (= ::eof form)
-          forms
-          (recur (conj forms form)))))))
+    (binding [reader/*read-eval* false]
+      (loop [forms []]
+        (let [form (reader/read opts rdr)]
+          (if (= ::eof form)
+            forms
+            (recur (conj forms form))))))))
 
 (defn read-file
   "Read every form from the file at path using a concrete CLJC reader target."
