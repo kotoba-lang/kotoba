@@ -3,7 +3,8 @@
             [clojure.test :refer [deftest is run-tests testing]]
             [ed25519.core :as ed]
             [kotoba.launcher :as launcher]
-            [kotoba.package-admission :as admission])
+            [kotoba.package-admission :as admission]
+            [kotoba.lang.package-contract :as package-contract])
   (:import (java.security SecureRandom)
            (java.util Base64)))
 
@@ -103,6 +104,22 @@
       (is (false? (:kotoba.package/verified? r)))
       (is (= :package/manifest-cid-mismatch
              (get-in r [:kotoba.package/problems 0 :kotoba.package/problem]))))))
+
+(deftest forged-signature-maps-to-its-own-problem-code
+  (testing "a genuine crypto-verification failure (kotoba.lang.package-contract/
+            ed25519-signature-error's \"signature verification failed\") must map to
+            its own :package/signature-verification-failed code, not fall through to
+            the generic :package/invalid every OTHER unmapped message gets -- this
+            code path only became reachable once signature verification went from
+            shape-only to real (kotoba-lang PR #16), and problem-codes had no entry
+            for it yet"
+    (let [manifest (edn/read-string (slurp positive-manifest))
+          forged (update manifest :kotoba.package/signatures
+                         (fn [sigs] (mapv #(assoc % :sig "not-a-real-signature") sigs)))
+          error (package-contract/package-manifest-error forged)]
+      (is (some? error))
+      (is (= "signature verification failed" (:message error)))
+      (is (= :package/signature-verification-failed (admission/problem-code (:message error)))))))
 
 (deftest receipt-has-release-evidence-shape
   (let [result (verify-argv "--lock" positive-lock "--trust" trust)

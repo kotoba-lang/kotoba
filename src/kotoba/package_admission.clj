@@ -55,6 +55,7 @@
    "signature did required" :package/signature-invalid
    "signature alg unsupported" :package/signature-alg-unsupported
    "signature bytes required" :package/signature-invalid
+   "signature verification failed" :package/signature-verification-failed
    "manifest cid does not match manifest content" :package/manifest-cid-mismatch
    local-path-message :package/local-path-dependency})
 
@@ -140,7 +141,20 @@
   content breaks the cycle: the CID is a pure function of the manifest's
   substantive fields, computed once, then signed, and the signature can be
   attached/rotated/added afterward without ever changing what the CID
-  covers."
+  covers.
+
+  KNOWN LIMITATION (independent review of PR #305, 2607131600): since
+  :manifest-cid no longer covers :signatures, the CID cannot bind WHICH or
+  HOW MANY signers vouched for this content -- `signatures-error` verifies
+  every signature entry PRESENT is individually valid, but nothing requires
+  a minimum count, a quorum, or membership in an authorized-signer set,
+  so a manifest with one legitimate co-signer's entry silently removed (CID
+  untouched) still passes admission today. Not currently exploitable
+  because no policy in this codebase relies on that binding yet (this repo's
+  only signer-list logic, :dep/signers in LOCK entries, is unrelated -- it
+  gates dependencies against a revoked/expired/compromised denylist, not a
+  manifest's own signer set). An n-of-m or quorum signing policy, if ever
+  built, needs its own binding mechanism independent of :manifest-cid."
   [manifest]
   (-> manifest
       (update :kotoba.package/source dissoc :manifest-cid)
