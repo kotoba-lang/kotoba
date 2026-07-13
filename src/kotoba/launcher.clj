@@ -707,7 +707,26 @@
   `kotoba.runtime/run`'s interpreter-path handling of the exact same ex-data
   shape — instead of escaping as an uncaught exception. Any other
   ExceptionInfo (e.g. `kotoba.wasm-exec/fuel-listener`'s fuel-exhausted guard)
-  is not a capability denial and is re-thrown unchanged."
+  is not a capability denial and is re-thrown unchanged.
+
+  A required op that is NEITHER a kgraph-* op NOR covered by
+  `kotoba.wasm-exec/real-op-ids` normally falls through to
+  `kotoba.wasm-exec/stub-host-function` — a trivial always-0 stub, harmless
+  for e.g. the permanently-stubbed device-access quartet. But for the S4b
+  capability-passing surface (`cap-acquire` and every `<op>-with` variant,
+  see `kotoba.runtime/cap-passing-ops`) that stub is actively dangerous: it
+  silently discards the static affine-capability checker's guarantees and
+  returns a fabricated handle/value instead of ever failing, so a program
+  using `cap-acquire`/`host-i64-roundtrip-with` would appear to `wasm run`
+  successfully while actually running under wrong (always-0) semantics. If
+  any required op is a member of `kotoba.runtime/cap-passing-ops` and would
+  otherwise be stubbed, this refuses the run entirely
+  (`:wasm/cap-passing-unimplemented`) rather than linking the stub — loud
+  failure instead of silent wrong behavior. This is a detect-and-refuse
+  guard, not a real WASM implementation of capability-affine handles; the
+  interpreter path (`kotoba.runtime/run` via `guarded-run-result`) already
+  implements `cap-acquire`/`<op>-with` for real (`kotoba.host-providers/
+  capability-passing-fns`) and is unaffected."
   [argv]
   (let [normalized-argv (normalize-source-argv (vec (cons "run" (rest argv))))
         plan (source-argv-plan normalized-argv)
@@ -733,7 +752,12 @@
       (let [forms (runtime/read-file (:kotoba.source/path plan)
                                      (:kotoba.source/reader-target plan))
             checked (runtime/check (safe-analyzer-fact-classification) plan forms policy)
-            wasm (when (:kotoba.runtime/ok? checked) (runtime/wasm-binary forms policy))]
+            wasm (when (:kotoba.runtime/ok? checked) (runtime/wasm-binary forms policy))
+            ops (when (:kotoba.wasm/ok? wasm) (runtime/required-host-imports forms))
+            stubbed-ops (when ops
+                         (->> ops (remove kgraph-ops) (remove wasm-exec/real-op-ids)))
+            unimplemented-cap-ops (when stubbed-ops
+                                    (filterv runtime/cap-passing-ops stubbed-ops))]
         (cond
           (not (:kotoba.runtime/ok? checked))
           {:kotoba.cli/ok? false
@@ -748,11 +772,15 @@
                              :kotoba.runtime/result checked
                              :kotoba.wasm/problems (:kotoba.wasm/problems wasm)}}
 
+          (seq unimplemented-cap-ops)
+          {:kotoba.cli/ok? false
+           :kotoba.cli/code :wasm/cap-passing-unimplemented
+           :kotoba.cli/data {:kotoba.launcher/source-plan plan
+                             :kotoba.runtime/result checked
+                             :kotoba.wasm/ops (mapv str unimplemented-cap-ops)}}
+
           :else
-          (let [ops (runtime/required-host-imports forms)
-                stub-fns (->> ops
-                              (remove kgraph-ops)
-                              (remove wasm-exec/real-op-ids)
+          (let [stub-fns (->> stubbed-ops
                               (map runtime/host-imports)
                               (map wasm-exec/stub-host-function))
                 {:keys [record! entries]} (host-providers/journal)
