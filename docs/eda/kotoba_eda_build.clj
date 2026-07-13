@@ -1,9 +1,15 @@
 (ns kotoba-eda-build
-  "Regenerates docs/eda/index.html from kotoba_eda_ui.cljc + kotoba_eda_style.cljc
-  via kotoba.html/html5 + css.core, embedding the compiled reagent app bundle
-  (resources/main.js, built by `npx shadow-cljs release app` per
+  "Regenerates docs/eda/index.html from kotoba_eda_ui.cljc (kotoba-ui/appkit
+  hiccup + the ONE theme map) + kotoba_eda_style.cljc (small unlayered
+  --hig-* app CSS) via kotoba-ui.core/->page, embedding the compiled reagent
+  app bundle (resources/main.js, built by `npx shadow-cljs release app` per
   shadow-cljs.edn, from kotoba_eda_app.cljs — see that file's docstring) as
-  the page's <script>.
+  the page's <script>. The design-system theme CSS (HIG tokens light+dark,
+  glass material, shell layout — all inside @layer kotoba.hig/kotoba.glass)
+  is emitted inline by ->page from this same entrypoint, so theme + markup
+  regeneration stays atomic (the itonami cockpit pattern, adapted: this page
+  is a fully generated single file, so an inline <style> beats a separate
+  theme.css link).
 
   kotoba_eda_ui.cljc / kotoba_eda_style.cljc / kotoba_eda_app.cljs are
   deliberately kept flat in this directory (not under src/kotoba/eda/...)
@@ -15,12 +21,10 @@
   [\".\"]` classpath root without any directory nesting.
 
   Run from this directory: clojure -M:build"
-  (:require [kotoba.html :as html]
-            [kotoba-eda-style]
-            [kotoba-eda-ui :as ui]))
+  (:require [kotoba-eda-ui :as ui]))
 
 (defn -main [& _args]
   (let [script (slurp "resources/main.js")
-        doc (html/html5 (ui/page script))]
+        doc (str (ui/page-html script) "\n")]
     (spit "index.html" doc)
     (println "wrote index.html —" (count doc) "bytes")))
