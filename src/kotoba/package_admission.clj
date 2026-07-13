@@ -123,13 +123,28 @@
                   []))))
 
 (defn manifest-without-self-cid
-  "MANIFEST with its own self-declared :manifest-cid removed -- the content a
-  manifest's CID must be computed OVER, since including the CID field inside
-  the thing the CID hashes would make the value depend on itself (the same
-  reason a git commit's hash never covers its own hash, or an IPFS DAG
-  node's CID never covers its own CID field)."
+  "MANIFEST with its own self-declared :manifest-cid removed, AND its
+  :kotoba.package/signatures removed -- both are content a manifest's CID
+  must be computed OVER TOP OF, never included IN. :manifest-cid's exclusion
+  is the obvious case (the same reason a git commit's hash never covers its
+  own hash, or an IPFS DAG node's CID never covers its own CID field).
+  :signatures' exclusion is required for the SAME reason once
+  `kotoba.lang.package-contract/signatures-error` does real Ed25519
+  verification (kotoba-lang PR #16, 2607131500): a signer's :sig attests to
+  this manifest's :manifest-cid (`(signed-bytes manifest-cid)`), so if
+  :manifest-cid's own hash also covered :signatures, producing a
+  self-consistent manifest+signature pair would require solving a circular
+  fixed point (the signature depends on the CID, and -- had :signatures not
+  been excluded here -- the CID would depend on the signature) with no
+  general closed-form solution. Excluding :signatures from the hashed
+  content breaks the cycle: the CID is a pure function of the manifest's
+  substantive fields, computed once, then signed, and the signature can be
+  attached/rotated/added afterward without ever changing what the CID
+  covers."
   [manifest]
-  (update manifest :kotoba.package/source dissoc :manifest-cid))
+  (-> manifest
+      (update :kotoba.package/source dissoc :manifest-cid)
+      (dissoc :kotoba.package/signatures)))
 
 (defn compute-manifest-cid
   "The real CIDv1 (canonical DAG-CBOR + sha2-256, `cbor.core`/

@@ -1,8 +1,31 @@
 (ns kotoba.package-admission-test
   (:require [clojure.edn :as edn]
             [clojure.test :refer [deftest is run-tests testing]]
+            [ed25519.core :as ed]
             [kotoba.launcher :as launcher]
-            [kotoba.package-admission :as admission]))
+            [kotoba.package-admission :as admission])
+  (:import (java.security SecureRandom)
+           (java.util Base64)))
+
+(defn- b64 ^String [^bytes b] (.encodeToString (Base64/getEncoder) b))
+
+(defn- resign
+  "Real Ed25519 sign MANIFEST's own declared :manifest-cid with a fresh
+  keypair, replacing its :signatures. Used to isolate a single concern in a
+  tampered-fixture test (e.g. a bad :manifest-cid) from signature validity
+  now that kotoba.lang.package-contract/signatures-error does real
+  cryptographic verification (kotoba-lang PR #16, 2607131500) -- a tampered
+  manifest that keeps its ORIGINAL signature would also (correctly) fail
+  signature verification against the new, different declared :manifest-cid,
+  conflating two distinct failure modes in a test meant to isolate one."
+  [manifest]
+  (let [seed (byte-array 32)
+        _ (.nextBytes (SecureRandom.) seed)
+        did (ed/did-key-from-seed seed)
+        cid (get-in manifest [:kotoba.package/source :manifest-cid])
+        sig (b64 (ed/sign seed (.getBytes ^String cid "UTF-8")))]
+    (assoc manifest :kotoba.package/signatures
+           [{:did did :alg :ed25519 :sig sig}])))
 
 (defn fixture [name]
   (str "test/fixtures/package/" name))
@@ -69,9 +92,10 @@
   (testing "wired end to end through verify-lock: a rejected manifest fails the whole build,
             not just the standalone helper function"
     (let [manifest (edn/read-string (slurp positive-manifest))
-          tampered (assoc-in manifest [:kotoba.package/source :manifest-cid]
+          tampered (resign
+                    (assoc-in manifest [:kotoba.package/source :manifest-cid]
                              (admission/compute-manifest-cid
-                              (assoc manifest :kotoba.package/version "9.9.9")))
+                              (assoc manifest :kotoba.package/version "9.9.9"))))
           lock (edn/read-string (slurp positive-lock))
           r (admission/verify-lock {:lock lock :lock-path positive-lock
                                     :manifest tampered :manifest-path positive-manifest
