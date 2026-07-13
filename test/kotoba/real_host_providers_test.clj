@@ -10,6 +10,7 @@
   against a real local server, a real Ed25519 signature verified for real),
   not just that the call links and returns without throwing."
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [kotoba.runtime :as runtime]
             [kotoba.wasm-exec :as wasm-exec])
@@ -105,6 +106,35 @@
       (is (= 4 (run-main instance)) "fs-read wrote back \"data\"'s 4 bytes")
       (is (= "data" (slurp (str (:fs-root state) "/state.txt")))
           "the file genuinely exists on disk under the sandbox root, not just in an in-memory illusion"))))
+
+(deftest fs-resource-scope-denies-a-different-path-and-permits-the-exact-one
+  (testing "a policy scoping :host/fs-read (fs-write shares the same
+            capability, fs/app-data) to a path OTHER than the one
+            demo_real_fs.kotoba actually reads/writes (\"state.txt\") must
+            deny the operation -- capability-resources must actually
+            restrict which path is honored, not just narrow what appears
+            in a receipt while every path keeps working once the CAPABILITY
+            KIND is granted at all"
+    (let [forms (runtime/read-file "src/demo_real_fs.kotoba" :kotoba)
+          base-policy (edn/read-string (slurp "src/demo_real_fs_policy.edn"))
+          denying-policy (assoc base-policy :kotoba.policy/capability-resources
+                                {:fs/app-data #{"not-state.txt"}})
+          permitting-policy (assoc base-policy :kotoba.policy/capability-resources
+                                   {:fs/app-data #{"state.txt"}})
+          wasm (runtime/wasm-binary forms base-policy)
+          run! (fn [policy]
+                 (let [state (wasm-exec/default-host-state)
+                       instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
+                                                        (wasm-exec/real-host-functions state policy)
+                                                        policy)]
+                   {:result (run-main instance) :state state}))]
+      (let [{:keys [result state]} (run! denying-policy)]
+        (is (neg? result) "fs-write/fs-read on \"state.txt\" must be denied when only
+                            \"not-state.txt\" is in scope")
+        (is (not (.exists (io/file (:fs-root state) "state.txt")))
+            "the file must never have been written"))
+      (let [{:keys [result]} (run! permitting-policy)]
+        (is (= 4 result) "the exact path that IS in scope must still work")))))
 
 (deftest fs-path-traversal-is-denied-not-honored
   (testing "a `..`-escaping path never touches the real filesystem outside the sandbox"

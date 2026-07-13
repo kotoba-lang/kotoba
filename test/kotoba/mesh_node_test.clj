@@ -88,3 +88,25 @@
       (is (false? (get-in (ex-data err) [:kotoba.mesh-node/wasm :kotoba.wasm/ok?])))
       (is (= :unsupported-op
              (get-in (ex-data err) [:kotoba.mesh-node/wasm :kotoba.wasm/problems 0 :kotoba.wasm/problem]))))))
+
+(deftest compile-route-throws-when-the-static-checker-rejects-the-route
+  (testing "compile-route must run runtime/check BEFORE wasm-binary -- a
+            route using a host-import (kgraph-assert!) its own policy
+            doesn't grant must be rejected at the static-check stage, not
+            silently compiled and shipped (the bypass this test guards
+            against: wasm-binary's own POLICY argument is not itself a
+            guard, so a caller that skipped `check` got a working binary
+            for a program the policy never actually authorized). Reuses
+            mesh_drama_profile.kotoba (needs :graph/kotoba) against
+            demo_policy.edn (grants only :notify/show, not :graph/kotoba)."
+    (let [err (try
+                (mesh-node/compile-route "src/mesh_drama_profile.kotoba"
+                                         "src/demo_policy.edn")
+                nil
+                (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? err))
+      (is (= "src/mesh_drama_profile.kotoba" (:kotoba.mesh-node/source (ex-data err))))
+      (is (false? (get-in (ex-data err) [:kotoba.runtime/result :kotoba.runtime/ok?]))
+          "must be rejected by the static checker, not left to wasm-binary")
+      (is (some #(= :capability-not-granted (:kotoba.runtime/problem %))
+                (get-in (ex-data err) [:kotoba.runtime/result :kotoba.runtime/problems]))))))
