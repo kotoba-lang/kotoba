@@ -224,7 +224,22 @@
    'kami-move-tagged-toward! :host/kami-engine
    'kami-despawn-within! :host/kami-engine
    'kami-axis :host/kami-engine
-   'kami-rand :host/kami-engine})
+   'kami-rand :host/kami-engine
+   ;; ADR-2607140600 Phase 3a device-capability bridge (iPhone sensing for
+   ;; the indoor floorplan-lab): 4 read-only, no-network-egress ops backed
+   ;; by kotoba.sensing-host's deterministic stub (no real CoreMotion/
+   ;; CoreBluetooth/AVAudioEngine access -- that native shim is explicitly
+   ;; out of this ADR's scope). audio-play/audio-record share the ONE
+   ;; audio/io capability -> :host/audio-io, same convention as topic-poll/
+   ;; topic-take/topic-count sharing :host/topic-subscribe above. The
+   ;; matching effect-for-kind entries landed in kotoba-lang at the same
+   ;; time (kotoba-lang@9c3f1b7), so guard-call can't reproduce the aiueos
+   ;; :unsupported-kind gap documented above.
+   'motion-read :host/motion-read
+   'audio-play :host/audio-io
+   'audio-record :host/audio-io
+   'ble-scan :host/ble-scan
+   'wifi-info :host/wifi-info})
 
 (def with-op->op
   "Capability-passing use variant (`<op>-with`, leading argument a capability
