@@ -183,31 +183,90 @@
                           {:kotoba.wasm/problem :fuel-exhausted
                            :kotoba.wasm/fuel-limit limit})))))))
 
+(def ^:dynamic *concrete-cap*
+  "The concrete (post-intersection) capability authorizing the host-import
+  call currently in flight, bound by `guard-host-call` around each granted
+  effect invocation. Lets an effect (e.g. fs-read/fs-write/http-fetch/
+  http-post/keychain-read/keychain-write in `real-op-effects`, or
+  kgraph-assert!/kgraph-retract!/kgraph-get-objects/kgraph-query in
+  `kgraph-effects`) enforce `:cap/resource` scoping against the
+  guest-supplied resource argument (path/URL/key, or a kgraph entity id),
+  which `guard-host-call` itself cannot do -- the requested capability it
+  builds is always the universal `(make-cap kind :any)` since the guest's
+  actual argument isn't known until AFTER the guard decision. Bound via
+  `binding` rather than threaded as an extra effect argument so
+  `guard-host-call`/`guarded-host-functions`' public
+  `(fn [instance args] -> long)` effect contract stays unchanged for other
+  callers (e.g. kotoba.kami-host's kami-* ECS ops)."
+  nil)
+
+(defn- resource-permitted?
+  "True when RESOURCE (a guest-supplied literal string -- a path, URL,
+  keychain key, or `(pr-str entity-id)`) is inside CONCRETE's :cap/resource
+  scope. `nil` CONCRETE (no policy/guard installed at all, i.e. the
+  unguarded 1-arg `kgraph-host-functions` form) permits everything,
+  matching every other capability id's fail-open-when-unguarded convention
+  elsewhere in this namespace. Otherwise: kotoba.lang.capability-values
+  models a resource constraint as :any, a single resource string, or a set
+  of resource strings -- EXACT membership, not a prefix/pattern language --
+  so a scoped grant like {:host/fs-read #{\"/only/this/dir/notes.txt\"}}
+  covers exactly that literal path/URL/key/entity-id, nothing broader.
+  Fails closed (denies) on any other shape."
+  [concrete resource]
+  (let [scope (:cap/resource concrete)]
+    (boolean
+     (or (nil? concrete)
+         (= :any scope)
+         (= scope resource)
+         (and (set? scope) (contains? scope resource))))))
+
 (defn- kgraph-effects
   "Raw (uninstrumented) (fn [instance args] -> long) bodies for the four
   kgraph-* ops against STORE — factored out so both the unguarded and
-  guarded `kgraph-host-functions` forms share one implementation."
+  guarded `kgraph-host-functions` forms share one implementation.
+
+  kgraph-assert!/kgraph-retract!/kgraph-get-objects each act on ONE literal
+  entity id supplied directly by the guest (the datom's `e`, or
+  kgraph-get-objects' own argument), so `*concrete-cap*`'s :cap/resource
+  scope is checked against `(pr-str e)` -- an entity outside a scoped
+  grant's resource set is denied (-1) before the store is ever touched.
+  kgraph-query runs an arbitrary join over the WHOLE store and its :find
+  projection may not even include an entity var, so there is no sound way
+  to check an individual result against a per-entity resource scope; a
+  SCOPED grant (anything other than :any/unguarded) therefore denies
+  kgraph-query outright rather than silently returning unscoped results --
+  a scoped guest must use kgraph-get-objects (one entity at a time,
+  individually checked) instead of a free-form query."
   [store]
   {'kgraph-assert!
    (fn [instance args]
-     (swap! store kgraph/assert-datom
-            (edn/read-string (read-str instance (aget args 0) (aget args 1))))
-     0)
+     (let [datom (edn/read-string (read-str instance (aget args 0) (aget args 1)))]
+       (if-not (resource-permitted? *concrete-cap* (pr-str (first datom)))
+         -1
+         (do (swap! store kgraph/assert-datom datom)
+             0))))
    'kgraph-retract!
    (fn [instance args]
-     (swap! store kgraph/retract-datom
-            (edn/read-string (read-str instance (aget args 0) (aget args 1))))
-     0)
+     (let [datom (edn/read-string (read-str instance (aget args 0) (aget args 1)))]
+       (if-not (resource-permitted? *concrete-cap* (pr-str (first datom)))
+         -1
+         (do (swap! store kgraph/retract-datom datom)
+             0))))
    'kgraph-get-objects
    (fn [instance args]
-     (let [e (edn/read-string (read-str instance (aget args 0) (aget args 1)))
-           bs (.getBytes (pr-str (kgraph/get-objects @store e)) "UTF-8")]
-       (write-bytes! instance (aget args 2) (aget args 3) bs)))
+     (let [e (edn/read-string (read-str instance (aget args 0) (aget args 1)))]
+       (if-not (resource-permitted? *concrete-cap* (pr-str e))
+         -1
+         (let [bs (.getBytes (pr-str (kgraph/get-objects @store e)) "UTF-8")]
+           (write-bytes! instance (aget args 2) (aget args 3) bs)))))
    'kgraph-query
    (fn [instance args]
-     (let [q (edn/read-string (read-str instance (aget args 0) (aget args 1)))
-           bs (.getBytes (pr-str (kgraph/query @store q)) "UTF-8")]
-       (write-bytes! instance (aget args 2) (aget args 3) bs)))})
+     (let [scope (:cap/resource *concrete-cap*)]
+       (if-not (or (nil? *concrete-cap*) (= :any scope))
+         -1
+         (let [q (edn/read-string (read-str instance (aget args 0) (aget args 1)))
+               bs (.getBytes (pr-str (kgraph/query @store q)) "UTF-8")]
+           (write-bytes! instance (aget args 2) (aget args 3) bs)))))})
 
 (def ^:private kgraph-op-specs
   "op symbol -> the (module \"kotoba\") host-import wire shape for one
@@ -223,40 +282,6 @@
    'kgraph-query {:field "kgraph_query"
                  :params [ValType/I32 ValType/I32 ValType/I32 ValType/I32]
                  :result ValType/I32}})
-
-(def ^:dynamic *concrete-cap*
-  "The concrete (post-intersection) capability authorizing the host-import
-  call currently in flight, bound by `guard-host-call` around each granted
-  effect invocation. Lets an effect (e.g. fs-read/fs-write/http-fetch/
-  http-post/keychain-read/keychain-write in `real-op-effects`) enforce
-  `:cap/resource` scoping against the guest-supplied resource argument
-  (path/URL/key), which `guard-host-call` itself cannot do -- the requested
-  capability it builds is always the universal `(make-cap kind :any)` since
-  the guest's actual argument isn't known until AFTER the guard decision.
-  Bound via `binding` rather than threaded as an extra effect argument so
-  `guard-host-call`/`guarded-host-functions`' public
-  `(fn [instance args] -> long)` effect contract stays unchanged for other
-  callers (e.g. kotoba.kami-host's kami-* ECS ops)."
-  nil)
-
-(defn- resource-permitted?
-  "True when RESOURCE (a guest-supplied literal string -- a path, URL, or
-  keychain key) is inside CONCRETE's :cap/resource scope. `nil` CONCRETE
-  (no policy/guard installed at all) permits everything, matching every
-  other capability id's fail-open-when-unguarded convention elsewhere in
-  this namespace. Otherwise: kotoba.lang.capability-values models a
-  resource constraint as :any, a single resource string, or a set of
-  resource strings -- EXACT membership, not a prefix/pattern language -- so
-  a scoped grant like {:host/fs-read #{\"/only/this/dir/notes.txt\"}} covers
-  exactly that literal path/URL/key, nothing broader. Fails closed (denies)
-  on any other shape."
-  [concrete resource]
-  (let [scope (:cap/resource concrete)]
-    (boolean
-     (or (nil? concrete)
-         (= :any scope)
-         (= scope resource)
-         (and (set? scope) (contains? scope resource))))))
 
 (defn- guard-host-call
   "Wrap EFFECT — one host-import OP's raw (fn [instance args] -> long) body

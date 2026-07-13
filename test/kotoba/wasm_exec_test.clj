@@ -353,6 +353,52 @@
       (is (pos? (aget ^longs result 0)))
       (is (= [[1 :name "Aoi"]] @store)))))
 
+(deftest guarded-kgraph-host-functions-enforce-resource-scope
+  (testing "a policy scoping :graph/kotoba to an entity OTHER than the one
+            demo_kgraph.kotoba actually asserts/queries (entity 1) must
+            deny kgraph-assert!/kgraph-query -- resource scoping must have
+            real teeth, not just appear in a receipt (the gap this test
+            guards against: the kind-level grant alone used to be
+            sufficient regardless of which entity/URL/path/key the guest
+            actually named)"
+    (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)
+          policy (assoc (edn/read-string (slurp "src/demo_kgraph_policy.edn"))
+                        :kotoba.policy/capability-resources
+                        {:graph/kotoba #{"2"}})
+          wasm (runtime/wasm-binary forms policy)
+          store (atom [])
+          instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
+                                          (wasm-exec/kgraph-host-functions store policy)
+                                          policy)
+          result (.apply (.export instance "main") (long-array 0))]
+      (is (= [] @store)
+          "kgraph-assert! on entity 1 must be denied when only entity \"2\" is in scope")
+      (is (neg? (aget ^longs result 0))
+          "kgraph-query must also be denied outright once :graph/kotoba is resource-scoped
+           at all (a join query can't be soundly checked per-entity)"))))
+
+(deftest guarded-kgraph-host-functions-resource-scope-permits-the-exact-entity
+  (testing "scoping :graph/kotoba to the EXACT entity the guest uses (\"1\")
+            must still allow kgraph-assert! (the narrowing must not be
+            over-broad and deny everything)"
+    (let [forms (runtime/read-file "src/demo_kgraph.kotoba" :kotoba)
+          policy (assoc (edn/read-string (slurp "src/demo_kgraph_policy.edn"))
+                        :kotoba.policy/capability-resources
+                        {:graph/kotoba #{"1"}})
+          wasm (runtime/wasm-binary forms policy)
+          store (atom [])
+          instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
+                                          (wasm-exec/kgraph-host-functions store policy)
+                                          policy)
+          result (.apply (.export instance "main") (long-array 0))]
+      (is (= [[1 :name "Aoi"]] @store)
+          "kgraph-assert! on entity 1 must succeed when entity \"1\" is exactly in scope")
+      (is (neg? (aget ^longs result 0))
+          "kgraph-query is still denied outright once the grant is resource-scoped AT ALL --
+           by design, a join query can't be soundly checked against a single-entity scope (see
+           kgraph-effects' docstring), so even the entity that IS in scope can't use kgraph-query,
+           only kgraph-assert!/kgraph-retract!/kgraph-get-objects"))))
+
 (deftest fuel-limit-traps-a-genuinely-unbounded-guest
   (testing "a deliberately self-recursive, never-terminating guest (src/demo_loop_forever.kotoba:
             `spin` calls itself unconditionally, `main` calls `spin`, neither ever returns) is
