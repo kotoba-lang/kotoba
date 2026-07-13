@@ -230,6 +230,34 @@
            (get-in result [:kotoba.cli/data :kotoba.runtime/result
                            :kotoba.runtime/problems 0 :kotoba.runtime/problem])))))
 
+(deftest wasm-run-refuses-cap-passing-ops-it-cannot-really-implement
+  (testing "kotoba.wasm-exec has no real `cap_acquire`/`host_i64_roundtrip_with`
+            HostFunction implementation on the WASM/Chicory execution path
+            (unlike the interpreter path's `kotoba.host-providers/
+            capability-passing-fns`, exercised by the happy-path test above).
+            Before this fix, kotoba.launcher/wasm-run-result* silently linked
+            BOTH ops to the generic always-0 `kotoba.wasm-exec/
+            stub-host-function` fallback: `wasm run` on this exact program
+            (demo_cap_passing.kotoba: cap-acquire then host-i64-roundtrip-with
+            41) reported :wasm/run-completed with :kotoba.wasm/value 0 (the
+            stub's fixed return) instead of the interpreter path's real 41,
+            and zero receipts -- succeeding with silently WRONG semantics
+            instead of failing. `wasm run` must now refuse outright instead."
+    (let [result (launcher/dispatch ["wasm" "run" "src/demo_cap_passing.kotoba"
+                                     "--policy" "src/demo_cap_passing_policy.edn"
+                                     "--package-lock" positive-lock
+                                     "--trust" trust
+                                     "--json"])]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= :wasm/cap-passing-unimplemented (:kotoba.cli/code result)))
+      (is (= ["cap-acquire" "host-i64-roundtrip-with"]
+             (get-in result [:kotoba.cli/data :kotoba.wasm/ops]))
+          "both the acquire op and its <op>-with use variant are reported")
+      (is (not (contains? (:kotoba.cli/data result) :kotoba.wasm/value))
+          "must not silently succeed with a fabricated (always-0, wrong) value")
+      (is (not (contains? (:kotoba.cli/data result) :kotoba.host/receipts))
+          "no guard-host-call ever ran -- the refusal happens before linking"))))
+
 (deftest wasm-emit-supports-capability-passing-import-shape
   (let [forms (runtime/read-file "src/demo_cap_passing.kotoba" :kotoba)
         policy (edn/read-string (slurp "src/demo_cap_passing_policy.edn"))

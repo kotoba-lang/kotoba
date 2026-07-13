@@ -258,6 +258,30 @@
   "Base host-import op -> its capability-passing `<op>-with` use variant."
   (into {} (map (fn [[with-op op]] [op with-op])) with-op->op))
 
+(def cap-passing-ops
+  "Host-import ops that require a real capability-affine implementation on
+  EVERY execution path -- `cap-acquire` itself, plus every `<op>-with`
+  capability-passing use variant that's actually reachable as a compiled
+  host-import call. `with-op->op`/`op->with-op` mechanically derive an
+  `<op>-with` symbol for EVERY op registered in `op->kind` (most of which,
+  e.g. `kami-tick-n-with`, were never wired into `host-imports`/
+  `cap-passing-imports` and so can never appear in `required-host-imports`'
+  output for a real compiled program); intersecting `op->with-op`'s values
+  against `host-imports` narrows this down to the ops a guest can genuinely
+  require -- currently just `host-i64-roundtrip-with`, alongside
+  `cap-acquire`.
+
+  A host that links a program requiring one of these ops must either back it
+  with a real handle-aware implementation or refuse to run the program --
+  never silently substitute an inert always-0 stub in its place (see
+  kotoba.wasm-exec's `real-op-ids`, which intentionally excludes both
+  `cap-acquire` and `host-i64-roundtrip-with`, and kotoba.launcher's
+  `wasm-run-result*`, which uses this set to turn that gap into a loud
+  refusal instead of a silent wrong-value stub)."
+  (into #{'cap-acquire}
+        (filter host-imports)
+        (vals op->with-op)))
+
 (def kind->capability
   "Capability kind -> contract capability name, derived from op->kind and the
   host-import contract."
@@ -1027,7 +1051,32 @@
                                          :kotoba.runtime/call (:kotoba.host/call (ex-data e))
                                          :kotoba.runtime/denied (:kotoba.host/denied (ex-data e))}]
               :kotoba.runtime/ir ir}
-             (throw e))))))))
+             (throw e)))
+         ;; The interpreter (eval-form/eval-body/call-fn) is a plain
+         ;; tree-walker with no tail-call optimization and no step/fuel
+         ;; budget of its own (unlike the WASM path's `kotoba.wasm-exec/
+         ;; fuel-listener`, a real per-instruction cap): an unboundedly
+         ;; self-recursive `defn` (e.g. src/demo_loop_forever.kotoba's
+         ;; `spin`) grows the JVM call stack one frame per recursive call
+         ;; until the JVM throws `StackOverflowError` -- a `java.lang.Error`,
+         ;; NOT an `Exception`, so it is invisible to the
+         ;; `clojure.lang.ExceptionInfo` catch above and would otherwise
+         ;; propagate uncaught, crashing this `run` call (and, via
+         ;; kotoba.launcher's `-main`, the whole `kotoba run` process) with a
+         ;; raw Java stack trace instead of the clean
+         ;; `{:kotoba.runtime/ok? false ...}` shape every other failure mode
+         ;; here produces. Caught narrowly (StackOverflowError, not a
+         ;; blanket Throwable) so unrelated JVM-level failures (e.g.
+         ;; OutOfMemoryError, a genuine AssertionError bug) still surface
+         ;; instead of being silently reclassified as a clean interpreter
+         ;; result. This is deliberately just "catch and report cleanly" --
+         ;; NOT a step-count/instruction-budget fuel mechanism matching the
+         ;; WASM path's `fuel-listener`; that would be a larger feature and
+         ;; is out of scope here."
+         (catch StackOverflowError _e
+           {:kotoba.runtime/ok? false
+            :kotoba.runtime/problems [{:kotoba.runtime/problem :stack-overflow}]
+            :kotoba.runtime/ir ir}))))))
 
 (defn wasm-artifact
   "Emit deterministic bytes for the current IR contract.
