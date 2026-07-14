@@ -106,6 +106,16 @@ aiueos_isr_external_timer:
   pop %rax
   iretq
 
+.global aiueos_isr_virtio_rng
+.type aiueos_isr_virtio_rng,@function
+aiueos_isr_virtio_rng:
+  push %rax
+  incq aiueos_virtio_rng_irq_count(%rip)
+  mov aiueos_apic_mmio_base(%rip), %rax
+  movl $0, 0xb0(%rax)
+  pop %rax
+  iretq
+
 /* CPL0 bootstrap syscall gate; user-mode isolation is not claimed yet. */
 .global aiueos_isr_syscall
 .type aiueos_isr_syscall,@function

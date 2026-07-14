@@ -31,11 +31,13 @@ to acknowledge EOI before the smoke test can continue.
 
 The timer stub also preserves the complete x86-64 integer interrupt frame and
 passes its stack pointer to a minimal round-robin scheduler. Two kernel tasks
-run on separate 16 KiB stacks alongside the boot task. The QEMU gate proceeds
+run on separate 16 KiB stacks alongside the boot task. Each worker owns a
+distinct CR3 and increments only its private page; the timer switch restores
+the kernel CR3 before the boot task resumes. The QEMU gate proceeds
 only after all three contexts have been preempted and both worker tasks have
-resumed at least twice, producing `AIUEOS_SCHEDULER_OK`. This is kernel-task
-context-switch groundwork; scheduler-driven user address-space switching
-remains a later phase.
+resumed at least twice, producing `AIUEOS_SCHEDULER_OK` and
+`AIUEOS_SCHEDULER_CR3_OK`. Interrupt and kernel mappings remain shared and
+supervisor-only in every root.
 
 The Phase 3 bootstrap installs an `int 0x80` syscall gate that preserves the
 same integer context and returns through `iretq`. A tagged, generation-bearing
@@ -51,8 +53,8 @@ clones the low kernel page-table path, shares the kernel/MMIO branches, maps a
 different private user page, and leaves the other process's page non-present.
 The smoke switches CR3 sequentially, proves independent contents, and requires
 real non-present page faults for both cross-process reads before restoring the
-kernel CR3. Scheduler-driven CR3 switching, actual copy-in, and the
-`syscall`/`sysret` transport remain later work.
+kernel CR3. Actual copy-in and the `syscall`/`sysret` transport remain later
+work.
 
 The PCI path performs a bounded configuration-space scan and validates modern
 virtio vendor capabilities, including a cycle-limited capability chain, BAR
@@ -66,8 +68,11 @@ virtio-blk device. It reads the generation-stable capacity, rejects an empty or
 overflowing device, submits a three-descriptor `VIRTIO_BLK_T_IN` chain, and
 requires a 513-byte used completion, success status, and deterministic sector-0
 identity. The smoke disk is a separate read-only 1 MiB fixture, so neither the
-ESP nor a release image can be modified by this gate. These are polling
-split-virtqueue vertical slices; MSI-X,
+ESP nor a release image can be modified by this gate. The blk slice remains
+polling. The rng queue uses a bounded MSI-X
+capability walk, validates the complete table and PBA against probed BAR
+extents, maps their MMIO UC/NX, and requires vector-34 IRQ evidence before
+accepting the DMA completion.  MSI-X for the remaining transports,
 IOMMU isolation, indirect descriptors, and a reusable multi-request transport
 remain later Phase 4 work.
 
@@ -86,6 +91,13 @@ stable readback hash is required before `AIUEOS_FRAMEBUFFER_OK` is emitted.
 This is the native display capability boundary for the browser-owned desktop:
 the browser remains the workspace/focus/permission authority, while the kernel
 only admits validated surfaces and hardware input. Direct framebuffer mapping
+is not granted to the browser. The input boundary uses a versioned, sequenced
+envelope (`pointer`, `key`, or `text`); raw virtio DMA memory stays kernel-only
+and IME interpretation belongs to the browser desktop authority. The QEMU
+smoke configures a real modern `virtio-keyboard-pci` event queue, but its event
+is explicitly synthetic because headless HMP `sendkey` is routed to the legacy
+console rather than virtio-keyboard. Production builds do not enable that
+fallback and require a device-completed, length/type/value-validated event.
 into a user component, ambient display authority, and an invented browser
 runtime are intentionally excluded.
 

@@ -25,6 +25,7 @@ extern void aiueos_isr_invalid_opcode(void);
 extern void aiueos_isr_page_fault(void);
 extern void aiueos_isr_apic_timer(void);
 extern void aiueos_isr_external_timer(void);
+extern void aiueos_isr_virtio_rng(void);
 extern void aiueos_isr_syscall(void);
 extern void aiueos_probe_write_protect(void);
 extern void aiueos_probe_no_execute(void);
@@ -40,6 +41,7 @@ extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *b
 extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_pci_enumerate(void);
 extern int aiueos_object_store_ready(void);
+extern int aiueos_journal_ready(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
@@ -51,6 +53,7 @@ extern void aiueos_load_task_register(void);
 extern int aiueos_smp_start_application_processor(void);
 extern int aiueos_ioapic_route_legacy_timer(void);
 extern volatile uint64_t aiueos_external_timer_ticks;
+extern volatile uint64_t aiueos_virtio_rng_irq_count;
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -129,6 +132,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     set_idt_gate(14, aiueos_isr_page_fault);
     set_idt_gate(32, aiueos_isr_apic_timer);
     set_idt_gate(33, aiueos_isr_external_timer);
+    set_idt_gate(34, aiueos_isr_virtio_rng);
     set_idt_gate(128, aiueos_isr_syscall);
     idt[128].attributes = 0xee; /* present, DPL3, interrupt gate */
     const struct descriptor_pointer idtr = {
@@ -213,7 +217,12 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\n");
     serial_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\r\n");
-    if (pci_result != 3) {
+    if (aiueos_virtio_rng_irq_count != 1) {
+      serial_string("AIUEOS_VIRTIO_RNG_MSIX_FAIL irq-count\r\n"); qemu_exit(0x6f);
+    }
+    debug_string("AIUEOS_VIRTIO_RNG_MSIX_OK vector=34 irq=1 table-pba-bounded\n");
+    serial_string("AIUEOS_VIRTIO_RNG_MSIX_OK vector=34 irq=1 table-pba-bounded\r\n");
+    if ((pci_result & 3) != 3) {
       debug_string("AIUEOS_VIRTIO_BLK_FAIL capacity-or-read\n");
       serial_string("AIUEOS_VIRTIO_BLK_FAIL capacity-or-read\r\n");
       qemu_exit(0x71);
@@ -227,8 +236,26 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a\n");
     serial_string("AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a\r\n");
+    if (!aiueos_journal_ready()) {
+      debug_string("AIUEOS_JOURNAL_FAIL write-readback\n");
+      serial_string("AIUEOS_JOURNAL_FAIL write-readback\r\n");
+      qemu_exit(0x6f);
+    }
+    debug_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\n");
+    serial_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\r\n");
+    /* The input result bit is set only after a validated event has been copied
+       into the browser envelope; no second mutable readiness check is needed. */
+    if (!(pci_result & 4)) {
+      serial_string("AIUEOS_VIRTIO_INPUT_FAIL queue-or-envelope\r\n"); qemu_exit(0x6f);
+    }
+    debug_string("AIUEOS_VIRTIO_INPUT_OK modern-pci eventq configured synthetic-smoke\n");
+    serial_string("AIUEOS_VIRTIO_INPUT_OK modern-pci eventq configured synthetic-smoke\r\n");
+    debug_string("AIUEOS_DESKTOP_INPUT_OK envelope-v1 sequence=1 kind=key ime-neutral\n");
+    serial_string("AIUEOS_DESKTOP_INPUT_OK envelope-v1 sequence=1 kind=key ime-neutral\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
+    debug_string("AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return\n");
+    serial_string("AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return\r\n");
     if (!aiueos_ioapic_route_legacy_timer()) {
       debug_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\n");
       serial_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\r\n");

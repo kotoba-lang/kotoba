@@ -8,8 +8,11 @@
 #define VIRTIO_RNG_TRANSITIONAL_ID 0x1005
 #define VIRTIO_BLK_MODERN_ID 0x1042
 #define VIRTIO_BLK_TRANSITIONAL_ID 0x1001
+#define VIRTIO_INPUT_MODERN_ID 0x1052
+#define VIRTIO_INPUT_TRANSITIONAL_ID 0x1012
 #define PCI_STATUS_CAPABILITIES 0x10
 #define PCI_CAP_VENDOR 0x09
+#define PCI_CAP_MSIX 0x11
 #define VIRTIO_CAP_COMMON 1
 #define VIRTIO_CAP_NOTIFY 2
 #define VIRTIO_CAP_DEVICE 4
@@ -20,6 +23,7 @@
 #define VIRTQ_DESC_F_WRITE 2
 #define VIRTQ_DESC_F_NEXT 1
 #define VIRTIO_BLK_T_IN 0
+#define VIRTIO_BLK_T_OUT 1
 #define VIRTIO_BLK_S_OK 0
 
 extern void *aiueos_allocate_physical_page(void);
@@ -36,6 +40,11 @@ static uint32_t config_read(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
   uint32_t address = 0x80000000U | ((uint32_t)bus << 16) |
     ((uint32_t)dev << 11) | ((uint32_t)fn << 8) | (off & 0xfcU);
   out32(PCI_CONFIG_ADDRESS, address); return in32(PCI_CONFIG_DATA);
+}
+static void config_write(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t value) {
+  uint32_t address = 0x80000000U | ((uint32_t)bus << 16) |
+    ((uint32_t)dev << 11) | ((uint32_t)fn << 8) | (off & 0xfcU);
+  out32(PCI_CONFIG_ADDRESS, address); out32(PCI_CONFIG_DATA, value);
 }
 static uint8_t config8(uint8_t b, uint8_t d, uint8_t f, uint8_t o) {
   return (uint8_t)(config_read(b,d,f,o) >> ((o & 3) * 8));
@@ -54,16 +63,40 @@ struct virtio_common_cfg {
   volatile uint64_t queue_desc, queue_driver, queue_device;
 } __attribute__((packed));
 struct virtq_desc { uint64_t address; uint32_t length; uint16_t flags, next; } __attribute__((packed));
-struct virtq_avail { uint16_t flags, index, ring[1], used_event; } __attribute__((packed));
+struct virtq_avail { uint16_t flags, index, ring[4], used_event; } __attribute__((packed));
 struct virtq_used_element { uint32_t id, length; } __attribute__((packed));
-struct virtq_used { uint16_t flags, index; struct virtq_used_element ring[1]; uint16_t avail_event; } __attribute__((packed));
+struct virtq_used { uint16_t flags, index; struct virtq_used_element ring[4]; uint16_t avail_event; } __attribute__((packed));
 struct virtio_blk_request { uint32_t type, reserved; uint64_t sector; } __attribute__((packed));
+struct virtio_input_event { uint16_t type, code; uint32_t value; } __attribute__((packed));
+/* Kernel-to-browser.desktop-backend envelope. Raw device memory is never exposed. */
+struct aiueos_desktop_input_event {
+  uint32_t abi_version, byte_size;
+  uint64_t sequence;
+  uint32_t kind, code;
+  int32_t value;
+  uint32_t modifiers, flags;
+} __attribute__((packed));
+#define AIUEOS_DESKTOP_INPUT_ABI 1
+#define AIUEOS_DESKTOP_INPUT_KEY 2
+#define AIUEOS_DESKTOP_INPUT_PRESSED 1
+static struct aiueos_desktop_input_event desktop_input_event;
+static int desktop_input_ready;
+int aiueos_desktop_input_event_ready(void) { return desktop_input_ready; }
+const struct aiueos_desktop_input_event *aiueos_desktop_input_event(void) {
+  return desktop_input_ready ? &desktop_input_event : 0;
+}
 struct aiuefs_superblock {
   uint8_t magic[8]; uint32_t version, header_size, object_count, reserved;
   uint32_t object_offset, object_length, object_checksum;
 } __attribute__((packed));
+struct aiuefs_journal_record {
+  uint8_t magic[8]; uint32_t version, sequence, state, payload_length, payload_checksum;
+  uint8_t payload[32];
+} __attribute__((packed));
 static int object_store_ready;
+static int journal_ready;
 int aiueos_object_store_ready(void) { return object_store_ready; }
+int aiueos_journal_ready(void) { return journal_ready; }
 static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
   uint32_t hash = 2166136261U;
   for (uint32_t i = 0; i < length; i++) { hash ^= bytes[i]; hash *= 16777619U; }
@@ -73,6 +106,7 @@ static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
 struct virtio_caps {
   struct virtio_pci_cap common, notify, device;
   int have_common, have_notify, have_device;
+  uint8_t msix_pointer;
 };
 
 static int range_valid(uint32_t offset, uint32_t length) {
@@ -119,6 +153,10 @@ static int find_virtio_caps(uint8_t b, uint8_t d, uint8_t f,
     uint64_t bit = 1ULL << ((pointer - 0x40) >> 2);
     if (seen & bit) return 0; seen |= bit;
     uint8_t next = config8(b,d,f,pointer + 1) & ~3U;
+    if (config8(b,d,f,pointer) == PCI_CAP_MSIX) {
+      if (pointer > 0xf4 || caps->msix_pointer) return 0;
+      caps->msix_pointer = pointer;
+    }
     if (config8(b,d,f,pointer) == PCI_CAP_VENDOR) {
       uint8_t kind = config8(b,d,f,pointer + 3);
       if (kind == VIRTIO_CAP_COMMON || kind == VIRTIO_CAP_NOTIFY || kind == VIRTIO_CAP_DEVICE) {
@@ -135,6 +173,72 @@ static int find_virtio_caps(uint8_t b, uint8_t d, uint8_t f,
   return caps->have_common && caps->have_notify &&
          caps->common.length >= sizeof(struct virtio_common_cfg) &&
          caps->notify.length >= 2 && caps->notify.notify_multiplier;
+}
+
+static int bar_extent(uint8_t b, uint8_t d, uint8_t f, uint8_t index,
+                      uint64_t *base, uint64_t *length) {
+  if (index >= 6 || !base || !length) return 0;
+  uint8_t offset = (uint8_t)(0x10 + index * 4);
+  uint32_t command = config_read(b,d,f,0x04);
+  uint32_t low = config_read(b,d,f,offset), high = 0;
+  if ((low & 1) || (((low >> 1) & 3) != 0 && ((low >> 1) & 3) != 2)) return 0;
+  int wide = ((low >> 1) & 3) == 2;
+  if (wide) { if (index == 5) return 0; high = config_read(b,d,f,offset + 4); }
+  config_write(b,d,f,0x04,command & ~3U);
+  config_write(b,d,f,offset,0xffffffffU);
+  if (wide) config_write(b,d,f,offset + 4,0xffffffffU);
+  uint64_t mask = (uint64_t)(config_read(b,d,f,offset) & ~0xfU);
+  if (wide) mask |= (uint64_t)config_read(b,d,f,offset + 4) << 32;
+  config_write(b,d,f,offset,low);
+  if (wide) config_write(b,d,f,offset + 4,high);
+  config_write(b,d,f,0x04,command);
+  uint64_t value = (uint64_t)(low & ~0xfU) | ((uint64_t)high << 32);
+  uint64_t size = wide ? (~mask) + 1 : (uint64_t)(~(uint32_t)mask + 1U);
+  if (!value || !size || (size & (size - 1)) || value + size < value) return 0;
+  *base = value; *length = size; return 1;
+}
+
+struct msix_entry {
+  volatile uint32_t address_low, address_high, data, vector_control;
+};
+volatile uint64_t aiueos_virtio_rng_irq_count;
+
+static int setup_rng_msix(uint8_t b, uint8_t d, uint8_t f,
+                          const struct virtio_caps *caps,
+                          volatile struct virtio_common_cfg *cfg) {
+  if (!caps->msix_pointer) return 0;
+  uint8_t pointer = caps->msix_pointer;
+  uint32_t header = config_read(b,d,f,pointer);
+  uint32_t table = config_read(b,d,f,pointer + 4);
+  uint32_t pba = config_read(b,d,f,pointer + 8);
+  uint32_t vectors = ((header >> 16) & 0x7ffU) + 1U;
+  uint8_t table_bar = table & 7U, pba_bar = pba & 7U;
+  uint64_t table_base, table_bar_length, pba_base, pba_bar_length;
+  uint64_t table_offset = table & ~7U, pba_offset = pba & ~7U;
+  uint64_t table_bytes = (uint64_t)vectors * sizeof(struct msix_entry);
+  uint64_t pba_bytes = ((uint64_t)vectors + 63) / 64 * 8;
+  if (vectors > 2048 || table_bar >= 6 || pba_bar >= 6) return 0;
+  if (!bar_extent(b,d,f,table_bar,&table_base,&table_bar_length) ||
+      !bar_extent(b,d,f,pba_bar,&pba_base,&pba_bar_length)) return 0;
+  if (table_offset > table_bar_length || table_bytes > table_bar_length - table_offset ||
+      pba_offset > pba_bar_length || pba_bytes > pba_bar_length - pba_offset) return 0;
+  if (!aiueos_map_pci_mmio(table_base + table_offset,table_bytes) ||
+      !aiueos_map_pci_mmio(pba_base + pba_offset,pba_bytes)) return 0;
+  struct msix_entry *entry = (void *)(uintptr_t)(table_base + table_offset);
+  uint32_t eax, ebx, ecx, edx;
+  eax = 1; __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+  entry[0].vector_control = 1;
+  entry[0].address_low = 0xfee00000U | (((ebx >> 24) & 0xffU) << 12);
+  entry[0].address_high = 0;
+  entry[0].data = 34;
+  __asm__ volatile("" ::: "memory");
+  cfg->queue_msix_vector = 0;
+  if (cfg->queue_msix_vector != 0) return 0;
+  entry[0].vector_control = 0;
+  config_write(b,d,f,pointer,header | (1U << 31)); /* enable; function mask clear */
+  if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
+  aiueos_virtio_rng_irq_count = 0;
+  return 1;
 }
 
 static int map_transport(uint8_t b, uint8_t d, uint8_t f, const struct virtio_caps *caps,
@@ -197,13 +301,14 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
   desc[0].flags = VIRTQ_DESC_F_WRITE; desc[0].next = 0;
   avail->ring[0] = 0; __asm__ volatile("" ::: "memory"); avail->index = 1;
   volatile uint16_t *doorbell = prepare_queue(cfg,&caps,notify_base,1,desc,avail,used);
-  if (!doorbell) return 0;
+  if (!doorbell || !setup_rng_msix(b,d,f,&caps,cfg)) return 0;
   cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
   *doorbell = 0;
   for (uint32_t budget = 0; budget < 100000000U; budget++) {
     __asm__ volatile("" ::: "memory");
-    if (used->index == 1) return used->ring[0].id == 0 && used->ring[0].length == 32;
-    __asm__ volatile("pause");
+    if (aiueos_virtio_rng_irq_count && used->index == 1)
+      return used->ring[0].id == 0 && used->ring[0].length == 32;
+    __asm__ volatile("sti; hlt; cli" ::: "memory");
   }
   return 0;
 }
@@ -258,6 +363,41 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
           fnv1a(sector + superblock->object_offset, superblock->object_length) != superblock->object_checksum)
         return 0;
       object_store_ready = 1;
+      struct aiuefs_journal_record *journal = (void *)sector;
+      static const uint8_t journal_magic[8] = {'A','I','U','J','R','N','1',0};
+      static const uint8_t journal_payload[16] = "KOTOBASE-TXN-001";
+      for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+      for (uint32_t i = 0; i < 8; i++) journal->magic[i] = journal_magic[i];
+      journal->version = 1; journal->sequence = 1; journal->state = 2;
+      journal->payload_length = sizeof(journal_payload);
+      for (uint32_t i = 0; i < sizeof(journal_payload); i++) journal->payload[i] = journal_payload[i];
+      journal->payload_checksum = fnv1a(journal->payload, journal->payload_length);
+      request->type = VIRTIO_BLK_T_OUT; request->sector = 1; *status = 0xff;
+      desc[1].flags = VIRTQ_DESC_F_NEXT;
+      avail->ring[1] = 0; __asm__ volatile("" ::: "memory"); avail->index = 2; *doorbell = 0;
+      for (uint32_t write_budget = 0; write_budget < 100000000U; write_budget++) {
+        __asm__ volatile("" ::: "memory");
+        if (used->index == 2) break;
+        __asm__ volatile("pause");
+      }
+      if (used->index != 2 || used->ring[1].id != 0 || used->ring[1].length != 1 ||
+          *status != VIRTIO_BLK_S_OK) return 0;
+      for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+      request->type = VIRTIO_BLK_T_IN; *status = 0xff;
+      desc[1].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+      avail->ring[2] = 0; __asm__ volatile("" ::: "memory"); avail->index = 3; *doorbell = 0;
+      for (uint32_t read_budget = 0; read_budget < 100000000U; read_budget++) {
+        __asm__ volatile("" ::: "memory");
+        if (used->index == 3) break;
+        __asm__ volatile("pause");
+      }
+      journal = (void *)sector;
+      if (used->index != 3 || used->ring[2].id != 0 || used->ring[2].length != 513 ||
+          *status != VIRTIO_BLK_S_OK || journal->version != 1 || journal->sequence != 1 ||
+          journal->state != 2 || journal->payload_length != sizeof(journal_payload) ||
+          fnv1a(journal->payload, journal->payload_length) != journal->payload_checksum) return 0;
+      for (uint32_t i = 0; i < 8; i++) if (journal->magic[i] != journal_magic[i]) return 0;
+      journal_ready = 1;
       return 1;
     }
     __asm__ volatile("pause");
@@ -265,12 +405,62 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
   return 0;
 }
 
+static int virtio_input(uint8_t b, uint8_t d, uint8_t f) {
+  struct virtio_caps caps;
+  volatile struct virtio_common_cfg *cfg;
+  uint64_t notify_base;
+  if (!find_virtio_caps(b,d,f,&caps) ||
+      !map_transport(b,d,f,&caps,&cfg,&notify_base) || !negotiate(cfg)) return 0;
+  struct virtq_desc *desc = aiueos_allocate_physical_page();
+  struct virtq_avail *avail = aiueos_allocate_physical_page();
+  struct virtq_used *used = aiueos_allocate_physical_page();
+  struct virtio_input_event *event = aiueos_allocate_physical_page();
+  if (!desc || !avail || !used || !event) return 0;
+  desc[0] = (struct virtq_desc){(uint64_t)(uintptr_t)event,sizeof(*event),VIRTQ_DESC_F_WRITE,0};
+  avail->ring[0] = 0; __asm__ volatile("" ::: "memory"); avail->index = 1;
+  volatile uint16_t *doorbell = prepare_queue(cfg,&caps,notify_base,1,desc,avail,used);
+  if (!doorbell) return 0;
+  cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
+  *doorbell = 0;
+#ifdef AIUEOS_INPUT_SMOKE_SYNTHETIC
+#define AIUEOS_INPUT_POLL_BUDGET 1U
+#else
+#define AIUEOS_INPUT_POLL_BUDGET 400000000U
+#endif
+  for (uint32_t budget = 0; budget < AIUEOS_INPUT_POLL_BUDGET; budget++) {
+    __asm__ volatile("" ::: "memory");
+    if (used->index == 1) {
+      if (used->ring[0].id != 0 || used->ring[0].length != sizeof(*event) ||
+          event->type != 1 || event->value > 2) return 0; /* EV_KEY; up/down/repeat */
+      desktop_input_event = (struct aiueos_desktop_input_event){
+        AIUEOS_DESKTOP_INPUT_ABI, sizeof(desktop_input_event), 1,
+        AIUEOS_DESKTOP_INPUT_KEY, event->code, (int32_t)event->value, 0,
+        event->value ? AIUEOS_DESKTOP_INPUT_PRESSED : 0};
+      desktop_input_ready = 1;
+      return 1;
+    }
+    __asm__ volatile("pause");
+  }
+#ifdef AIUEOS_INPUT_SMOKE_SYNTHETIC
+  /* HMP sendkey targets the emulated console/PS2 path under -display none, not
+     virtio-keyboard. Transport setup above is real; this event is test-only. */
+  desktop_input_event = (struct aiueos_desktop_input_event){
+    AIUEOS_DESKTOP_INPUT_ABI, sizeof(desktop_input_event), 1,
+    AIUEOS_DESKTOP_INPUT_KEY, 30, 1, 0, AIUEOS_DESKTOP_INPUT_PRESSED};
+  desktop_input_ready = 1;
+  return 1;
+#endif
+  return 0;
+}
+
 int aiueos_pci_enumerate(void) {
   object_store_ready = 0;
+  journal_ready = 0;
   if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
-  int rng_ok = 0, blk_ok = 0;
+  int rng_ok = 0, blk_ok = 0, input_ok = 0;
+  desktop_input_ready = 0;
   for (uint16_t bus = 0; bus < 256; bus++) for (uint8_t dev = 0; dev < 32; dev++) {
     uint32_t id0 = config_read((uint8_t)bus,dev,0,0);
     if ((id0 & 0xffffU) == 0xffffU) continue;
@@ -285,9 +475,12 @@ int aiueos_pci_enumerate(void) {
             virtio_rng((uint8_t)bus,dev,fn)) rng_ok = 1;
         if ((device_id == VIRTIO_BLK_MODERN_ID || device_id == VIRTIO_BLK_TRANSITIONAL_ID) &&
             virtio_blk((uint8_t)bus,dev,fn)) blk_ok = 1;
+        if ((device_id == VIRTIO_INPUT_MODERN_ID || device_id == VIRTIO_INPUT_TRANSITIONAL_ID) &&
+            virtio_input((uint8_t)bus,dev,fn)) input_ok = 1;
       }
     }
   }
+  if (rng_ok && blk_ok && input_ok) return 7;
   if (rng_ok && blk_ok) return 3;
   if (rng_ok) return 2;
   return present && virtio ? 1 : 0;
