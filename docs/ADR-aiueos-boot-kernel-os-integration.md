@@ -1,0 +1,184 @@
+# ADR — aiueos boot, kernel, image, and OS integration
+
+- **Status**: Accepted; implementation staged
+- **Date**: 2026-07-14
+- **Owners**: `kotoba-lang/kotoba` (product integration),
+  `kotoba-lang/compiler` (code generation), `kotoba-lang/aiueos`
+  (capability/component semantics)
+- **Related implementation**: `kotoba-lang/aiueos#29`, the reviewed replacement
+  for PR #25
+
+## Context
+
+aiueos currently names both a capability-secure component contract and an
+intended machine OS. These are different maturity surfaces. PR #29 restores a
+Linux-hosted initramfs/PID-1/QEMU path, portable virtio-blk/console logic, and
+an experimental JVM FFM/VFIO provider. It is not a bare-metal kernel: Linux
+still owns firmware handoff, PCI/IOMMU, interrupts, paging, scheduling, and
+virtual memory. The VFIO provider is also not yet wired into aiueos's Wasm
+host-import quartet; those imports remain deterministic stubs.
+
+## Decision
+
+### Ownership
+
+`kotoba-lang/kotoba` owns the composition of the bootable product:
+
+- boot profiles and release graph;
+- firmware-to-kernel, kernel, syscall, and driver ABIs;
+- ISO/raw-disk/initramfs composition;
+- QEMU and real-machine evidence;
+- aiueos, Kotoba, kototama, browser, and kotobase integration.
+
+`kotoba-lang/compiler` owns genuinely freestanding targets:
+
+- `x86_64-aiueos-kernel`, then `aarch64-aiueos-kernel`;
+- `x86_64-aiueos-uefi`;
+- PE/COFF and ELF emission;
+- relocation, sections, entry point, stack, TLS, and no-host-runtime contracts.
+
+`kotoba-lang/aiueos` remains the authority for manifests, policy, admission,
+audit/run receipts, component boot graphs, portable virtio protocol logic, and
+the Linux-hosted development profile.
+
+### Profiles
+
+`hosted-linux` is Phase 0:
+
+```text
+firmware -> Linux -> initramfs -> JVM/aiueos PID 1
+                              -> Chicory/Kotoba components
+                              -> optional Linux VFIO provider
+```
+
+`bare-metal` is Phases 1–6:
+
+```text
+UEFI or BIOS/GRUB
+  -> aiueos loader and native kernel
+  -> ACPI/SMP/paging/APIC/IOMMU
+  -> scheduler/virtual memory/syscalls
+  -> PCI/MMIO/DMA/IRQ drivers
+  -> kototama/Kotoba components
+  -> browser shell + kotobase persistence
+```
+
+No hosted result satisfies a bare-metal release gate.
+
+### Required artifacts
+
+| Artifact | Purpose |
+|---|---|
+| `BOOTX64.EFI` | primary UEFI loader |
+| BIOS stage-1 sector | legacy boot test fixture |
+| GRUB/Multiboot2 configuration | compatibility boot path |
+| PE/COFF loader | UEFI-loadable compiler output |
+| bootable ISO | VM/distribution image |
+| GPT raw disk image | USB/QEMU/real-machine boot |
+| kernel image | native aiueos kernel |
+| `newc` initramfs/cpio | early components and recovery |
+
+Each artifact is reproducible, hashed, signed, and accompanied by a build
+receipt. A file-shaped placeholder does not count; successful QEMU boot is the
+minimum evidence.
+
+### Kernel scope
+
+The native kernel must implement:
+
+- firmware memory-map ingestion;
+- ACPI RSDP/XSDT/MADT and CPU discovery;
+- SMP application-processor startup;
+- page tables, W^X, isolation, and guard pages;
+- physical/virtual memory allocators;
+- APIC, timer, exceptions, and interrupt dispatch;
+- preemptive scheduler and address spaces;
+- capability-handle tables;
+- syscall entry/exit, validation, and copy-in/copy-out;
+- PCI enumeration and BAR validation;
+- MMIO, DMA, IOMMU, and IRQ providers;
+- serial console, panic/crash receipt, and deterministic QEMU shutdown.
+
+The first syscall ABI is capability-handle based. POSIX is an optional service,
+not the kernel authority.
+
+### Compiler and native-substrate rule
+
+Policy, service, driver-protocol, and application code expressible in Kotoba is
+compiled by `kotoba-lang/compiler`. A small assembly/native substrate is
+allowed temporarily for reset entry, CPU mode transition, page-table
+activation, interrupt stubs, and context switch.
+
+Every exception requires a named ABI, QEMU positive/negative tests, a compiler
+migration issue, and no ambient authority above the capability boundary.
+Hosted KEXE targets are not kernel targets. A target is freestanding only when
+it has no supervisor, libc, JVM, or host syscall dependency.
+
+### Driver, UI, and persistence split
+
+```text
+portable virtio planner
+  -> admitted driver service
+  -> kernel queue/MMIO/DMA/IRQ provider
+  -> device
+```
+
+VFIO remains a hosted conformance provider. Bare metal owns PCI, IOMMU, and
+interrupt setup.
+
+`kotoba-lang/browser` supplies shell/window/workspace state, input vocabulary,
+and retained draw operations. The native release additionally requires
+framebuffer/virtio-gpu scanout, compositor, virtio-input/USB HID, keyboard/IME,
+accessibility, and clipboard/file-picker permission brokers.
+
+`kotobase` is the datom persistence plane, not a block driver:
+
+```text
+virtio-blk/NVMe -> block service -> filesystem/object store
+                -> kotobase IStore -> browser/profile/system datoms
+```
+
+### Phases and exit gates
+
+| Phase | Deliverable | Exit gate |
+|---|---|---|
+| 0 | Linux PID-1/initramfs/QEMU/virtio/VFIO prototype | PR #29 merged; unit CI green; whole boot still unproven |
+| 1 | UEFI loader + serial kernel | OVMF boots `BOOTX64.EFI`, prints signed identity, exits QEMU |
+| 2 | paging, exceptions, ACPI, APIC, SMP | multi-core QEMU; malformed inputs fail safely |
+| 3 | scheduler, VM, syscall, capability handles | isolated tasks; W^X and invalid-handle tests |
+| 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | real QEMU queue completion; malformed descriptors rejected |
+| 5 | ISO/GPT/raw image, recovery, signed update | reproducible UEFI and GRUB boots |
+| 6 | browser shell, compositor, input, kotobase | desktop session persists and restores state |
+
+Contract M6 does not imply kernel/hardware M6. Every subsystem records maturity
+separately.
+
+## Security invariants
+
+- Firmware tables, descriptors, disk/package data, and binaries are hostile.
+- DMA is disabled until IOMMU isolation, except in a named QEMU-only profile.
+- Components receive revocable bounded handles, never physical addresses.
+- Executable mappings are not writable after admission.
+- Loader, kernel, policy, components, and filesystem identities are bound into
+  one boot receipt.
+- Secure Boot is not claimed until PE/COFF signing and key lifecycle are tested
+  on real firmware.
+
+## Consequences
+
+- aiueos PR #29 is supported but classified as Linux-hosted Phase 0.
+- The bootable product has one integration owner.
+- The compiler must gain freestanding targets before claiming a Kotoba-compiled
+  kernel.
+- Native bootstrap code is constrained and auditable rather than hidden.
+- Parity with macOS, Windows, or Linux is not claimed until Phase 6 passes on a
+  real-machine class as well as QEMU.
+
+## Initial non-goals
+
+- full POSIX/Linux ABI compatibility;
+- every x86 chipset or GPU;
+- BIOS as the primary production path;
+- Windows/macOS binary compatibility;
+- safety certification or hard real-time guarantees.
+
