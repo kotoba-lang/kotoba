@@ -8,6 +8,7 @@
             [kotoba.cap-passing-test]
             [kotoba.cap-table-test]
             [kotoba.cap-typed-test]
+            [kotoba.cljs-backend-test]
             [kotoba.did-adapter-test]
             [kotoba.doc-examples-test]
             [kotoba.git-adapter-test]
@@ -35,6 +36,7 @@
                                         'kotoba.cap-passing-test
                                         'kotoba.cap-table-test
                                         'kotoba.cap-typed-test
+                                        'kotoba.cljs-backend-test
                                         'kotoba.did-adapter-test
                                         'kotoba.doc-examples-test
                                         'kotoba.git-adapter-test
