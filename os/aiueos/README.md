@@ -34,8 +34,8 @@ passes its stack pointer to a minimal round-robin scheduler. Two kernel tasks
 run on separate 16 KiB stacks alongside the boot task. The QEMU gate proceeds
 only after all three contexts have been preempted and both worker tasks have
 resumed at least twice, producing `AIUEOS_SCHEDULER_OK`. This is kernel-task
-context-switch groundwork; user address spaces and ring 3 isolation remain a
-later phase.
+context-switch groundwork; scheduler-driven user address-space switching
+remains a later phase.
 
 The Phase 3 bootstrap installs an `int 0x80` syscall gate that preserves the
 same integer context and returns through `iretq`. A tagged, generation-bearing
@@ -46,8 +46,13 @@ for RX user text and RW+NX user data, leaves an unmapped guard page, and builds
 a loaded 64-bit TSS descriptor with a dedicated kernel-entry stack. A one-shot
 CPL3 task enters through `iretq`, exercises valid and rejected `int 0x80`
 requests, and exits back to the kernel through the TSS `rsp0` path. Per-process
-CR3 ownership, actual copy-in, and the `syscall`/`sysret` transport remain later
-work.
+address-space groundwork then constructs two distinct CR3 roots. Each root
+clones the low kernel page-table path, shares the kernel/MMIO branches, maps a
+different private user page, and leaves the other process's page non-present.
+The smoke switches CR3 sequentially, proves independent contents, and requires
+real non-present page faults for both cross-process reads before restoring the
+kernel CR3. Scheduler-driven CR3 switching, actual copy-in, and the
+`syscall`/`sysret` transport remain later work.
 
 The PCI path performs a bounded configuration-space scan and validates modern
 virtio vendor capabilities, including a cycle-limited capability chain, BAR

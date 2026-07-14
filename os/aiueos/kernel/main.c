@@ -43,6 +43,7 @@ extern int aiueos_syscall_self_test(void);
 extern int aiueos_process_initialize(void);
 extern void aiueos_process_enter(void);
 extern int aiueos_process_result(void);
+extern int aiueos_address_space_self_test(void);
 extern void aiueos_load_task_register(void);
 extern int aiueos_smp_start_application_processor(void);
 extern int aiueos_ioapic_route_legacy_timer(void);
@@ -256,6 +257,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_RING3_OK cpl3-int80 tss-rsp0 return-kernel\r\n");
     debug_string("AIUEOS_USER_SYSCALL_OK valid-log invalid-handle invalid-pointer\n");
     serial_string("AIUEOS_USER_SYSCALL_OK valid-log invalid-handle invalid-pointer\r\n");
+    if (!aiueos_address_space_self_test()) {
+      debug_string("AIUEOS_ADDRESS_SPACE_FAIL cr3-or-isolation\n");
+      serial_string("AIUEOS_ADDRESS_SPACE_FAIL cr3-or-isolation\r\n");
+      qemu_exit(0x76);
+    }
+    debug_string("AIUEOS_ADDRESS_SPACE_OK processes=2 distinct-cr3 private-pages cross-access-fault\n");
+    serial_string("AIUEOS_ADDRESS_SPACE_OK processes=2 distinct-cr3 private-pages cross-access-fault\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

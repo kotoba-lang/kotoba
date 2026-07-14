@@ -199,6 +199,10 @@ grep -F "AIUEOS_CAPABILITY_OK handle-v1 invalid-handle-denied" "$serial_log" >/d
 grep -F "AIUEOS_PROCESS_FOUNDATION_OK tss-descriptor user-wx guard-page" "$serial_log" >/dev/null || {
   echo "error: process isolation foundation evidence was not observed" >&2; exit 1;
 }
+grep -F "AIUEOS_ADDRESS_SPACE_OK processes=2 distinct-cr3 private-pages cross-access-fault" "$serial_log" >/dev/null || {
+  echo "error: per-process address-space isolation evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_RING3_OK cpl3-int80 tss-rsp0 return-kernel" "$serial_log" >/dev/null || {
   echo "error: CPL3 syscall and kernel-return evidence was not observed" >&2; exit 1;
 }
