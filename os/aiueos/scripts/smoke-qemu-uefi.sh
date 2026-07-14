@@ -41,6 +41,7 @@ fi
 }
 
 rm -f "$log" "$serial_log"
+if [ "${AIUEOS_PRESERVE_BLK_IMAGE:-0}" != 1 ] || [ ! -f "$blk_image" ]; then
 python3 - "$blk_image" <<'PY'
 import pathlib
 import struct
@@ -57,6 +58,7 @@ payload[:len(header)] = header
 payload[64:64 + len(obj)] = obj
 path.write_bytes(payload)
 PY
+fi
 if [ -n "${AIUEOS_DISK_IMAGE:-}" ]; then
   [ -f "$AIUEOS_DISK_IMAGE" ] || {
     echo "error: AIUEOS_DISK_IMAGE does not exist: $AIUEOS_DISK_IMAGE" >&2
