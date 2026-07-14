@@ -11,7 +11,10 @@ QEMU through the test-only debug-exit device. Its assembly entry switches to a
 private 64 KiB stack before entering C, and its first hardware driver
 initializes COM1 at 115200 baud. The kernel then installs its own GDT and IDT;
 the smoke gate executes `ud2` and requires the vector 6 handler to terminate
-QEMU. It does not use Linux, a JVM, GRUB, or a host initramfs in the guest.
+QEMU. Before that test the kernel replaces the firmware CR3 with its own
+four-level identity map, enables write-protect and NX, and maps text RX,
+rodata R+NX, and writable state RW+NX. It does not use Linux, a JVM, GRUB, or a
+host initramfs in the guest.
 
 ```sh
 ./os/aiueos/scripts/build-uefi.sh

@@ -64,6 +64,10 @@ grep -F "AIUEOS_DESCRIPTOR_TABLES_OK gdt-v1 idt-v1" "$serial_log" >/dev/null || 
   echo "error: kernel descriptor-table evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp" "$serial_log" >/dev/null || {
+  echo "error: kernel-owned paging evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_EXCEPTION_OK vector=6 invalid-opcode" "$serial_log" >/dev/null || {
   echo "error: kernel exception dispatch evidence was not observed" >&2
   exit 1

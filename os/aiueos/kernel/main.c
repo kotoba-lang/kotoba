@@ -19,6 +19,7 @@ struct __attribute__((packed)) descriptor_pointer {
 extern void aiueos_load_gdt(void);
 extern void aiueos_load_idt(const struct descriptor_pointer *pointer);
 extern void aiueos_isr_invalid_opcode(void);
+extern int aiueos_paging_initialize(void);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -101,6 +102,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     aiueos_load_idt(&idtr);
     debug_string("AIUEOS_DESCRIPTOR_TABLES_OK gdt-v1 idt-v1\n");
     serial_string("AIUEOS_DESCRIPTOR_TABLES_OK gdt-v1 idt-v1\r\n");
+    if (!aiueos_paging_initialize()) {
+      debug_string("AIUEOS_PAGING_FAIL ownership-or-wx\n");
+      serial_string("AIUEOS_PAGING_FAIL ownership-or-wx\r\n");
+      qemu_exit(0x7c);
+    }
+    debug_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\n");
+    serial_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\r\n");
     __asm__ volatile("ud2");
   }
   for (;;) __asm__ volatile("cli; hlt");
