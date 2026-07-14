@@ -143,7 +143,7 @@ virtio-blk/NVMe -> block service -> filesystem/object store
 | Phase | Deliverable | Exit gate |
 |---|---|---|
 | 0 | Linux PID-1/initramfs/QEMU/virtio/VFIO prototype | PR #29 merged; unit CI green; whole boot still unproven |
-| 1 | UEFI loader + serial kernel | OVMF boots `BOOTX64.EFI`, prints signed identity, exits QEMU |
+| 1 | UEFI loader + serial kernel | In progress: OVMF boots the Linux-independent `BOOTX64.EFI`, prints its contract identity, and exits QEMU; signed kernel handoff remains |
 | 2 | paging, exceptions, ACPI, APIC, SMP | multi-core QEMU; malformed inputs fail safely |
 | 3 | scheduler, VM, syscall, capability handles | isolated tasks; W^X and invalid-handle tests |
 | 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | real QEMU queue completion; malformed descriptors rejected |
@@ -174,6 +174,18 @@ separately.
 - Parity with macOS, Windows, or Linux is not claimed until Phase 6 passes on a
   real-machine class as well as QEMU.
 
+## Implementation record
+
+The first Phase 1 vertical slice lives in `os/aiueos`. It builds a real PE32+
+EFI application with a freestanding toolchain, boots it directly under OVMF,
+emits `AIUEOS_BOOT_OK` through firmware and the QEMU debug console, and uses a
+test-only I/O device for deterministic shutdown. The guest contains no Linux,
+libc, JVM, initramfs, or hosted supervisor.
+
+This evidence proves firmware entry and PE/COFF packaging only. It does not yet
+prove a separate kernel image, signature verification, memory-map handoff, or
+any Phase 2 kernel mechanism.
+
 ## Initial non-goals
 
 - full POSIX/Linux ABI compatibility;
@@ -181,4 +193,3 @@ separately.
 - BIOS as the primary production path;
 - Windows/macOS binary compatibility;
 - safety certification or hard real-time guarantees.
-
