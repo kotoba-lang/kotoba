@@ -23,6 +23,10 @@ validates both RSDP checksums, the XSDT and MADT checksums and lengths, and ever
 MADT subtable boundary. The QEMU gate starts two vCPUs and requires both to be
 reported as enabled by MADT; application processors are not started yet.
 
+The BSP enables its Local APIC, maps the MMIO page cache-disabled, installs a
+periodic timer on vector 32, enters `sti; hlt`, and requires the interrupt stub
+to acknowledge EOI before the smoke test can continue.
+
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh

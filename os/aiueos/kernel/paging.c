@@ -6,6 +6,8 @@
 #define PTE_PRESENT (1ULL << 0)
 #define PTE_WRITABLE (1ULL << 1)
 #define PTE_HUGE (1ULL << 7)
+#define PTE_WRITE_THROUGH (1ULL << 3)
+#define PTE_CACHE_DISABLE (1ULL << 4)
 #define PTE_NX (1ULL << 63)
 
 extern uint8_t aiueos_text_start[], aiueos_text_end[];
@@ -16,6 +18,7 @@ static uint64_t pml4[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t low_page_table[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t apic_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 
 static uint64_t read_cr0(void) {
   uint64_t value; __asm__ volatile("mov %%cr0, %0" : "=r"(value)); return value;
@@ -49,6 +52,7 @@ int aiueos_paging_initialize(void) {
 
   for (uint64_t i = 0; i < ENTRY_COUNT; i++) {
     pml4[i] = pdpt[i] = page_directory[i] = low_page_table[i] = 0;
+    apic_page_directory[i] = 0;
   }
   pml4[0] = (uint64_t)(uintptr_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
   pdpt[0] = (uint64_t)(uintptr_t)page_directory | PTE_PRESENT | PTE_WRITABLE;
@@ -56,6 +60,11 @@ int aiueos_paging_initialize(void) {
   for (uint64_t i = 1; i < ENTRY_COUNT; i++) {
     page_directory[i] = (i * 0x200000ULL) | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | PTE_NX;
   }
+  pdpt[3] = (uint64_t)(uintptr_t)apic_page_directory | PTE_PRESENT | PTE_WRITABLE;
+  const uint64_t apic_base = 0xfee00000ULL;
+  const uint64_t apic_pde = (apic_base >> 21) & 0x1ff;
+  apic_page_directory[apic_pde] = apic_base | PTE_PRESENT | PTE_WRITABLE |
+    PTE_HUGE | PTE_NX | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE;
   for (uint64_t i = 0; i < ENTRY_COUNT; i++) {
     uint64_t page = i * PAGE_SIZE;
     uint64_t flags = PTE_PRESENT | PTE_NX;
@@ -79,4 +88,3 @@ int aiueos_paging_initialize(void) {
          (low_page_table[data_index] & PTE_WRITABLE) && (low_page_table[data_index] & PTE_NX) &&
          ((uint64_t)(uintptr_t)aiueos_kernel_end < 0x200000ULL);
 }
-

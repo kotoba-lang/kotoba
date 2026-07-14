@@ -144,7 +144,7 @@ virtio-blk/NVMe -> block service -> filesystem/object store
 |---|---|---|
 | 0 | Linux PID-1/initramfs/QEMU/virtio/VFIO prototype | PR #29 merged; unit CI green; whole boot still unproven |
 | 1 | UEFI loader + serial kernel | In progress: OVMF hands off to a bounded ELF64 kernel with its own stack and COM1 serial output; signature verification remains |
-| 2 | paging, exceptions, ACPI, APIC, SMP | In progress: GDT/IDT, vectors 6/14, CR3/W^X, and bounded RSDP/XSDT/MADT discovery of 2 vCPUs pass; APIC setup and AP startup remain |
+| 2 | paging, exceptions, ACPI, APIC, SMP | In progress: GDT/IDT, CR3/W^X, ACPI discovery, and BSP Local APIC timer vector 32 pass; IOAPIC and AP startup remain |
 | 3 | scheduler, VM, syscall, capability handles | isolated tasks; W^X and invalid-handle tests |
 | 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | real QEMU queue completion; malformed descriptors rejected |
 | 5 | ISO/GPT/raw image, recovery, signed update | reproducible UEFI and GRUB boots |
@@ -204,6 +204,11 @@ validates legacy and extended RSDP checksums, then applies bounded signature,
 length, checksum, and subtable-walk checks to XSDT and MADT. The two-vCPU QEMU
 gate requires at least two enabled Local APIC/x2APIC processor records. This is
 discovery evidence, not SMP startup evidence.
+
+The BSP Local APIC slice maps the xAPIC MMIO window cache-disabled, enables the
+spurious vector, and programs a periodic timer on vector 32. The QEMU gate must
+wake from `sti; hlt`, enter the kernel interrupt stub, issue EOI, and continue.
+It does not yet route external interrupts or start application processors.
 
 ## Initial non-goals
 

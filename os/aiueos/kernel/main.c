@@ -21,12 +21,15 @@ extern void aiueos_load_gdt(void);
 extern void aiueos_load_idt(const struct descriptor_pointer *pointer);
 extern void aiueos_isr_invalid_opcode(void);
 extern void aiueos_isr_page_fault(void);
+extern void aiueos_isr_apic_timer(void);
 extern void aiueos_probe_write_protect(void);
 extern void aiueos_probe_no_execute(void);
 volatile uint64_t aiueos_page_fault_stage;
 volatile uint64_t aiueos_page_fault_error;
 extern int aiueos_paging_initialize(void);
 extern int aiueos_acpi_initialize(const void *rsdp);
+extern int aiueos_apic_timer_initialize(void);
+extern volatile uint64_t aiueos_apic_timer_ticks;
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -103,6 +106,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     aiueos_load_gdt();
     set_idt_gate(6, aiueos_isr_invalid_opcode);
     set_idt_gate(14, aiueos_isr_page_fault);
+    set_idt_gate(32, aiueos_isr_apic_timer);
     const struct descriptor_pointer idtr = {
       .limit = (uint16_t)(sizeof(idt) - 1),
       .base = (uint64_t)(uintptr_t)idt
@@ -124,6 +128,16 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\n");
     serial_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\r\n");
+    if (!aiueos_apic_timer_initialize()) {
+      debug_string("AIUEOS_APIC_FAIL initialization\n");
+      serial_string("AIUEOS_APIC_FAIL initialization\r\n");
+      qemu_exit(0x77);
+    }
+    __asm__ volatile("sti");
+    while (aiueos_apic_timer_ticks == 0) __asm__ volatile("hlt");
+    __asm__ volatile("cli");
+    debug_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\n");
+    serial_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

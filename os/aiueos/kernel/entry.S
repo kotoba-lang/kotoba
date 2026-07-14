@@ -50,6 +50,16 @@ aiueos_isr_invalid_opcode:
   hlt
   jmp 3b
 
+.global aiueos_isr_apic_timer
+.type aiueos_isr_apic_timer,@function
+aiueos_isr_apic_timer:
+  push %rax
+  incq aiueos_apic_timer_ticks(%rip)
+  mov aiueos_apic_mmio_base(%rip), %rax
+  movl $0, 0xb0(%rax)
+  pop %rax
+  iretq
+
 .global aiueos_page_fault_stage
 .global aiueos_page_fault_error
 .global aiueos_isr_page_fault

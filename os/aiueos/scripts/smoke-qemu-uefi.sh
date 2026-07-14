@@ -72,6 +72,10 @@ grep -F "AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2" "$serial_log" >/dev/null || {
   echo "error: validated ACPI CPU discovery evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_APIC_TIMER_OK vector=32 eoi-v1" "$serial_log" >/dev/null || {
+  echo "error: Local APIC timer interrupt evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_PAGE_FAULT_OK write-protect vector=14" "$serial_log" >/dev/null || {
   echo "error: write-protect page-fault evidence was not observed" >&2
   exit 1
