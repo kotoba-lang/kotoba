@@ -23,6 +23,7 @@ static uint64_t page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t low_page_table[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t apic_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t pci_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t framebuffer_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t pci_pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t pci_pdpt_index = UINT64_MAX;
 static uint64_t pci_pml4_index = UINT64_MAX;
@@ -75,6 +76,7 @@ int aiueos_paging_initialize(void) {
   for (uint64_t i = 0; i < ENTRY_COUNT; i++) {
     pml4[i] = pdpt[i] = page_directory[i] = low_page_table[i] = 0;
     apic_page_directory[i] = pci_page_directory[i] = pci_pdpt[i] = 0;
+    framebuffer_page_directory[i] = 0;
   }
   pml4[0] = (uint64_t)(uintptr_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
   pdpt[0] = (uint64_t)(uintptr_t)page_directory | PTE_PRESENT | PTE_WRITABLE;
@@ -161,6 +163,31 @@ uint64_t aiueos_address_space_enter(unsigned process) {
 void aiueos_address_space_leave(void) { write_cr3(kernel_cr3); }
 uint64_t aiueos_address_space_private_va(unsigned process) {
   return process == 0 ? PROCESS_PRIVATE_0 : process == 1 ? PROCESS_PRIVATE_1 : 0;
+}
+
+/* GOP memory is mapped supervisor-only, non-executable and uncached.  Its
+ * dedicated directory prevents a display capability from replacing RAM or
+ * PCI transport mappings. */
+int aiueos_map_framebuffer(uint64_t address, uint64_t length) {
+  if (!length || address < 0x40000000ULL || address >= 0xc0000000ULL ||
+      address + length < address || address + length > 0xc0000000ULL)
+    return 0;
+  uint64_t pdpt_index = address >> 30;
+  if (pdpt_index < 1 || pdpt_index > 2 ||
+      pdpt_index != ((address + length - 1) >> 30) || pdpt[pdpt_index])
+    return 0;
+  pdpt[pdpt_index] = (uint64_t)(uintptr_t)framebuffer_page_directory |
+    PTE_PRESENT | PTE_WRITABLE;
+  uint64_t first = address & ~0x1fffffULL;
+  uint64_t last = (address + length - 1) & ~0x1fffffULL;
+  for (uint64_t page = first;; page += 0x200000ULL) {
+    uint64_t index = (page >> 21) & 0x1ff;
+    framebuffer_page_directory[index] = page | PTE_PRESENT | PTE_WRITABLE |
+      PTE_HUGE | PTE_NX | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE;
+    if (page == last) break;
+  }
+  write_cr3(read_cr3());
+  return 1;
 }
 
 int aiueos_user_mapping_verify(void) {

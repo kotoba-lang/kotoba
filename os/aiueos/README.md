@@ -77,6 +77,18 @@ unconfigured VT-d unit makes PCI DMA fail closed. Only the QEMU bring-up profile
 may use unisolated DMA when DMAR is absent, and its serial evidence explicitly
 labels that exception `test-only-unisolated` rather than claiming isolation.
 
+The desktop transport bootstrap obtains the active UEFI GOP mode before
+`ExitBootServices` and hands only the aperture base/length, dimensions, stride,
+and RGB/BGR format to the kernel. The kernel independently validates every
+bound, maps the aperture supervisor-only RW+NX and uncached in a dedicated page
+directory, then presents a deterministic retained-rectangle test frame. A
+stable readback hash is required before `AIUEOS_FRAMEBUFFER_OK` is emitted.
+This is the native display capability boundary for the browser-owned desktop:
+the browser remains the workspace/focus/permission authority, while the kernel
+only admits validated surfaces and hardware input. Direct framebuffer mapping
+into a user component, ambient display authority, and an invented browser
+runtime are intentionally excluded.
+
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh

@@ -4,6 +4,8 @@ struct aiueos_boot_info {
   uint64_t magic, version;
   void *memory_map; uint64_t memory_map_size, descriptor_size, descriptor_version;
   void *acpi_rsdp;
+  uint64_t framebuffer_base, framebuffer_size;
+  uint32_t framebuffer_width, framebuffer_height, framebuffer_stride, framebuffer_format;
 };
 
 struct __attribute__((packed)) idt_entry {
@@ -29,6 +31,7 @@ extern void aiueos_probe_no_execute(void);
 volatile uint64_t aiueos_page_fault_stage;
 volatile uint64_t aiueos_page_fault_error;
 extern int aiueos_paging_initialize(void);
+extern int aiueos_framebuffer_initialize(const struct aiueos_boot_info *boot);
 extern int aiueos_acpi_initialize(const void *rsdp);
 extern int aiueos_dma_test_policy_allows_unisolated(void);
 extern int aiueos_apic_timer_initialize(void);
@@ -142,6 +145,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\n");
     serial_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\r\n");
+    if (!aiueos_framebuffer_initialize(boot)) {
+      debug_string("AIUEOS_FRAMEBUFFER_FAIL gop-contract\n");
+      serial_string("AIUEOS_FRAMEBUFFER_FAIL gop-contract\r\n");
+      qemu_exit(0x68);
+    }
+    debug_string("AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified\n");
+    serial_string("AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified\r\n");
     if (!aiueos_physical_allocator_initialize(boot)) {
       debug_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\n");
       serial_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\r\n");

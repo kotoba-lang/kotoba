@@ -121,6 +121,10 @@ grep -F "AIUEOS_LOADER_OK" "$log" >/dev/null || {
   echo "error: loader identity was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_GOP_HANDOFF_OK framebuffer-v1" "$log" >/dev/null || {
+  echo "error: loader did not hand off a validated GOP mode" >&2
+  exit 1
+}
 grep -F "AIUEOS_LOADER_INTEGRITY_OK sha256-v1" "$log" >/dev/null || {
   echo "error: kernel integrity evidence was not observed" >&2
   exit 1
@@ -140,6 +144,10 @@ grep -F "AIUEOS_DESCRIPTOR_TABLES_OK gdt-v1 idt-v1" "$serial_log" >/dev/null || 
 }
 grep -F "AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp" "$serial_log" >/dev/null || {
   echo "error: kernel-owned paging evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified" "$serial_log" >/dev/null || {
+  echo "error: kernel did not validate and render the GOP framebuffer" >&2
   exit 1
 }
 grep -F "AIUEOS_PHYSICAL_ALLOCATOR_OK pages=2 zeroed" "$serial_log" >/dev/null || {
