@@ -188,13 +188,20 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\n");
     serial_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\r\n");
-    if (pci_result != 2) {
+    if (pci_result < 2) {
       debug_string("AIUEOS_VIRTIO_FAIL rng-queue\n");
       serial_string("AIUEOS_VIRTIO_FAIL rng-queue\r\n");
       qemu_exit(0x73);
     }
     debug_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\n");
     serial_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\r\n");
+    if (pci_result != 3) {
+      debug_string("AIUEOS_VIRTIO_BLK_FAIL capacity-or-read\n");
+      serial_string("AIUEOS_VIRTIO_BLK_FAIL capacity-or-read\r\n");
+      qemu_exit(0x71);
+    }
+    debug_string("AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly\n");
+    serial_string("AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
     if (!aiueos_ioapic_route_legacy_timer()) {

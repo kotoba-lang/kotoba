@@ -6,6 +6,7 @@ aiueos="$repo/os/aiueos"
 out=${AIUEOS_OUT:-"$repo/build/aiueos"}
 log="$out/uefi-debug.log"
 serial_log="$out/kernel-serial.log"
+blk_image="$out/virtio-blk-smoke.img"
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
 
 "$aiueos/scripts/build-uefi.sh" >/dev/null
@@ -39,6 +40,15 @@ fi
 }
 
 rm -f "$log" "$serial_log"
+python3 - "$blk_image" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = bytearray(1024 * 1024)
+payload[:17] = b"AIUEOS-BLK-SMOKE\0"
+path.write_bytes(payload)
+PY
 if [ -n "${AIUEOS_DISK_IMAGE:-}" ]; then
   [ -f "$AIUEOS_DISK_IMAGE" ] || {
     echo "error: AIUEOS_DISK_IMAGE does not exist: $AIUEOS_DISK_IMAGE" >&2
@@ -58,6 +68,8 @@ set +e
   -chardev file,id=debug,path="$log" \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   -device virtio-rng-pci \
+  -drive if=none,id=aiueosblk,format=raw,readonly=on,file="$blk_image" \
+  -device virtio-blk-pci,drive=aiueosblk,disable-legacy=on \
   -display none -serial "file:$serial_log" -monitor none -no-reboot
 status=$?
 set -e
@@ -129,6 +141,11 @@ grep -F "AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4" "$serial_log" >/dev/null
 grep -F "AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32" "$serial_log" >/dev/null || {
   echo "error: modern virtio-rng DMA completion evidence was not observed" >&2
   test -f "$serial_log" && sed -n '1,120p' "$serial_log" >&2
+  exit 1
+}
+grep -F "AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly" "$serial_log" >/dev/null || {
+  echo "error: modern virtio-blk bounded read evidence was not observed" >&2
+  test -f "$serial_log" && sed -n '1,140p' "$serial_log" >&2
   exit 1
 }
 grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {
