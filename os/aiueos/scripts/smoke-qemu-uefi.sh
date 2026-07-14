@@ -41,8 +41,8 @@ set +e
 status=$?
 set -e
 
-# The kernel writes 0x20; isa-debug-exit maps it to (0x20 << 1) | 1 = 65.
-[ "$status" -eq 65 ] || {
+# The #UD handler writes 0x30; isa-debug-exit maps it to (0x30 << 1) | 1 = 97.
+[ "$status" -eq 97 ] || {
   echo "error: unexpected QEMU exit status $status" >&2
   test -f "$log" && sed -n '1,80p' "$log" >&2
   exit 1
@@ -58,6 +58,14 @@ grep -F "AIUEOS_KERNEL_OK memory-map-v1" "$log" >/dev/null || {
 grep -F "AIUEOS_SERIAL_OK stack-v1 memory-map-v1" "$serial_log" >/dev/null || {
   echo "error: kernel COM1 evidence was not observed" >&2
   test -f "$serial_log" && sed -n '1,80p' "$serial_log" >&2
+  exit 1
+}
+grep -F "AIUEOS_DESCRIPTOR_TABLES_OK gdt-v1 idt-v1" "$serial_log" >/dev/null || {
+  echo "error: kernel descriptor-table evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_EXCEPTION_OK vector=6 invalid-opcode" "$serial_log" >/dev/null || {
+  echo "error: kernel exception dispatch evidence was not observed" >&2
   exit 1
 }
 echo "AIUEOS_UEFI_SMOKE_OK"

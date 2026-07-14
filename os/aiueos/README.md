@@ -9,8 +9,9 @@ segments, captures the firmware memory map, exits UEFI boot services, and
 hands control to the kernel. The kernel validates the handoff and terminates
 QEMU through the test-only debug-exit device. Its assembly entry switches to a
 private 64 KiB stack before entering C, and its first hardware driver
-initializes COM1 at 115200 baud. It does not use Linux, a JVM, GRUB, or a host
-initramfs in the guest.
+initializes COM1 at 115200 baud. The kernel then installs its own GDT and IDT;
+the smoke gate executes `ud2` and requires the vector 6 handler to terminate
+QEMU. It does not use Linux, a JVM, GRUB, or a host initramfs in the guest.
 
 ```sh
 ./os/aiueos/scripts/build-uefi.sh

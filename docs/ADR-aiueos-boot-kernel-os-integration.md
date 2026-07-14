@@ -144,7 +144,7 @@ virtio-blk/NVMe -> block service -> filesystem/object store
 |---|---|---|
 | 0 | Linux PID-1/initramfs/QEMU/virtio/VFIO prototype | PR #29 merged; unit CI green; whole boot still unproven |
 | 1 | UEFI loader + serial kernel | In progress: OVMF hands off to a bounded ELF64 kernel with its own stack and COM1 serial output; signature verification remains |
-| 2 | paging, exceptions, ACPI, APIC, SMP | multi-core QEMU; malformed inputs fail safely |
+| 2 | paging, exceptions, ACPI, APIC, SMP | In progress: kernel-owned GDT/IDT and vector 6 dispatch pass; paging, ACPI, APIC, and SMP remain |
 | 3 | scheduler, VM, syscall, capability handles | isolated tasks; W^X and invalid-handle tests |
 | 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | real QEMU queue completion; malformed descriptors rejected |
 | 5 | ISO/GPT/raw image, recovery, signed update | reproducible UEFI and GRUB boots |
@@ -190,7 +190,10 @@ supervisor.
 This evidence proves firmware entry, PE/COFF packaging, a separate kernel
 image, memory-map handoff, post-boot-services kernel execution, an owned kernel
 stack, and COM1 output. It does not yet prove signature verification or any
-Phase 2 kernel mechanism.
+complete Phase 2 kernel mechanism. The first Phase 2 slice replaces the
+firmware GDT/IDT and proves exception dispatch by executing `ud2` and observing
+the kernel's vector 6 handler; other exception stubs, paging, ACPI, APIC, and
+SMP remain.
 
 ## Initial non-goals
 
