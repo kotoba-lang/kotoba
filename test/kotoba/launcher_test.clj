@@ -762,6 +762,96 @@
     (is (= :wasm/run-completed (:kotoba.cli/code run)))
     (is (some? (get-in run [:kotoba.cli/data :kotoba.package/receipt])))))
 
+;; ---- `cljs emit` (ADR-2607151500 addendum 6's ClojureScript backend, now
+;; wired to the CLI -- previously only reachable via kotoba.runtime/cljs-source
+;; directly from a test/REPL, not via `kotoba cljs emit` like `wasm emit`) ----
+
+(defn- eval-emitted-cljs-source
+  "Reads and evals every top-level form EXCEPT the emitted `(ns ...)` form
+  into a fresh throwaway JVM namespace -- mirrors cljs_backend_test.clj's
+  own eval-cljs-source convention (a real cljs host would instead `require`
+  the emitted namespace by name; this is a plain-JVM-Clojure stand-in,
+  legitimate here because nothing this backend ever emits is cljs-specific)."
+  [src]
+  (let [ns-sym (gensym "kotoba-launcher-cljs-emit-test-ns-")
+        forms (read-string (str "(" src ")"))
+        target-ns (create-ns ns-sym)]
+    (binding [*ns* target-ns]
+      (clojure.core/refer-clojure)
+      (doseq [form forms]
+        (when-not (and (seq? form) (= 'ns (first form)))
+          (eval form))))
+    target-ns))
+
+(deftest cljs-emit-compiles-and-the-emitted-source-actually-runs
+  (testing "the CLI path (cljs-emit-result*, pre-admission-gating) produces
+            the same source runtime/cljs-source would, and that source is
+            not just plausible-looking text -- it is eval'd here and
+            actually invoked, same real-execution-verification discipline
+            as cljs_backend_test.clj (not merely asserting :ok? true)."
+    (let [result (launcher/cljs-emit-result* ["cljs" "emit" "src/demo.kotoba"])
+          src (get-in result [:kotoba.cli/data :kotoba.cljs/source])]
+      (is (:kotoba.cli/ok? result))
+      (is (= :cljs/source-emitted (:kotoba.cli/code result)))
+      (is (= (runtime/cljs-source (runtime/read-file "src/demo.kotoba" :kotoba))
+             src))
+      (is (= 42 ((ns-resolve (eval-emitted-cljs-source src) 'main)))))))
+
+(deftest cljs-emit-writes-to-output-when-given
+  (let [output (doto (java.io.File/createTempFile "kotoba-demo-cljs" ".cljs")
+                 (.deleteOnExit))
+        result (launcher/cljs-emit-result* ["cljs" "emit" "src/demo.kotoba"
+                                            "--output" (.getPath output)])]
+    (is (:kotoba.cli/ok? result))
+    (is (= :cljs/source-emitted (:kotoba.cli/code result)))
+    (is (nil? (get-in result [:kotoba.cli/data :kotoba.cljs/source]))
+        "source is written to --output, not also duplicated inline")
+    (is (= 42 ((ns-resolve (eval-emitted-cljs-source (slurp output)) 'main))))))
+
+(deftest cljs-emit-reports-missing-and-unreadable-source
+  (let [no-source (launcher/cljs-emit-result* ["cljs" "emit"])
+        missing-file (launcher/cljs-emit-result* ["cljs" "emit" "nonexistent-file.kotoba"])]
+    (is (false? (:kotoba.cli/ok? no-source)))
+    (is (= :cljs/missing-source (:kotoba.cli/code no-source)))
+    (is (false? (:kotoba.cli/ok? missing-file)))
+    (is (= :cljs/source-not-readable (:kotoba.cli/code missing-file)))
+    (is (= "nonexistent-file.kotoba" (get-in missing-file [:kotoba.cli/data :kotoba.source/path])))))
+
+(deftest cljs-emit-rejects-a-safe-kotoba-op-this-backend-does-not-support
+  (testing "src/demo_i64.kotoba passes runtime/check unconditionally (i64 ops
+            need no capability grant, unlike src/demo_cap.kotoba's
+            has-capability? which fails :cljs/check-failed before ever
+            reaching cljs-source) -- so this exercises the OTHER failure
+            mode: check passes, cljs-source itself throws, and that throw is
+            caught as a clean :cljs/emit-unsupported result, not a crash."
+    (let [result (launcher/cljs-emit-result* ["cljs" "emit" "src/demo_i64.kotoba"])]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= :cljs/emit-unsupported (:kotoba.cli/code result)))
+      (is (= 'i64+ (get-in result [:kotoba.cli/data :kotoba.cljs/problem :kotoba.cljs/op]))))))
+
+(deftest cljs-result-reports-unknown-subcommand
+  (let [result (launcher/cljs-result ["cljs" "bogus"])]
+    (is (false? (:kotoba.cli/ok? result)))
+    (is (= :cljs/unknown-command (:kotoba.cli/code result)))
+    (is (= ["emit"] (get-in result [:kotoba.cli/data :kotoba.cljs/commands])))))
+
+(deftest cljs-emit-rejects-missing-package-lock
+  (let [result (launcher/dispatch ["cljs" "emit" "src/demo.kotoba" "--json"])]
+    (is (false? (:kotoba.cli/ok? result)))
+    (is (= :cljs/package-rejected (:kotoba.cli/code result))
+        "admission-gated now takes an explicit reject-code per caller (fixed here
+         alongside wiring the 3rd call site) rather than always reporting
+         :wasm/package-rejected regardless of which backend's emit was rejected")
+    (is (= :package/missing-lock-option
+           (get-in result [:kotoba.cli/data :kotoba.package/admission-code])))))
+
+(deftest cljs-emit-proceeds-with-admitted-package-lock
+  (let [result (launcher/dispatch ["cljs" "emit" "src/demo.kotoba" "--json"
+                                   "--package-lock" positive-lock "--trust" trust])]
+    (is (:kotoba.cli/ok? result))
+    (is (= :cljs/source-emitted (:kotoba.cli/code result)))
+    (is (some? (get-in result [:kotoba.cli/data :kotoba.package/receipt])))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.launcher-test)]
     (when (pos? (+ (or fail 0) (or error 0)))
