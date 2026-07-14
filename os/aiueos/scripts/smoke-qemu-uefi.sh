@@ -40,14 +40,18 @@ set +e
 status=$?
 set -e
 
-# isa-debug-exit maps value 0x10 to host status (0x10 << 1) | 1 = 33.
-[ "$status" -eq 33 ] || {
+# The kernel writes 0x20; isa-debug-exit maps it to (0x20 << 1) | 1 = 65.
+[ "$status" -eq 65 ] || {
   echo "error: unexpected QEMU exit status $status" >&2
   test -f "$log" && sed -n '1,80p' "$log" >&2
   exit 1
 }
-grep -F "AIUEOS_BOOT_OK x86_64-uefi boot-contract-v1" "$log" >/dev/null || {
-  echo "error: boot identity was not observed" >&2
+grep -F "AIUEOS_LOADER_OK" "$log" >/dev/null || {
+  echo "error: loader identity was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_KERNEL_OK memory-map-v1" "$log" >/dev/null || {
+  echo "error: kernel handoff was not observed" >&2
   exit 1
 }
 echo "AIUEOS_UEFI_SMOKE_OK"
