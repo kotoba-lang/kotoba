@@ -210,6 +210,11 @@ spurious vector, and programs a periodic timer on vector 32. The QEMU gate must
 wake from `sti; hlt`, enter the kernel interrupt stub, issue EOI, and continue.
 It does not yet route external interrupts or start application processors.
 
+The external-interrupt slice retains the MADT IOAPIC and IRQ0 source override,
+maps IOAPIC MMIO UC/NX, masks both legacy PICs, and routes the PIT through GSI
+to vector 33. The smoke gate must wake through that external IRQ and issue a
+Local APIC EOI. MSI/MSI-X routing remains separate.
+
 The first physical allocator consumes the variable-stride UEFI memory map and
 admits only Conventional Memory above the kernel image and below the current
 1 GiB bootstrap identity limit. Allocations are page-aligned and zeroed. This

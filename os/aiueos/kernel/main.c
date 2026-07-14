@@ -22,6 +22,7 @@ extern void aiueos_load_idt(const struct descriptor_pointer *pointer);
 extern void aiueos_isr_invalid_opcode(void);
 extern void aiueos_isr_page_fault(void);
 extern void aiueos_isr_apic_timer(void);
+extern void aiueos_isr_external_timer(void);
 extern void aiueos_isr_syscall(void);
 extern void aiueos_probe_write_protect(void);
 extern void aiueos_probe_no_execute(void);
@@ -38,6 +39,8 @@ extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
 extern int aiueos_smp_start_application_processor(void);
+extern int aiueos_ioapic_route_legacy_timer(void);
+extern volatile uint64_t aiueos_external_timer_ticks;
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -115,6 +118,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     set_idt_gate(6, aiueos_isr_invalid_opcode);
     set_idt_gate(14, aiueos_isr_page_fault);
     set_idt_gate(32, aiueos_isr_apic_timer);
+    set_idt_gate(33, aiueos_isr_external_timer);
     set_idt_gate(128, aiueos_isr_syscall);
     const struct descriptor_pointer idtr = {
       .limit = (uint16_t)(sizeof(idt) - 1),
@@ -188,6 +192,16 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
+    if (!aiueos_ioapic_route_legacy_timer()) {
+      debug_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\n");
+      serial_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\r\n");
+      qemu_exit(0x72);
+    }
+    __asm__ volatile("sti");
+    while (aiueos_external_timer_ticks == 0) __asm__ volatile("hlt");
+    __asm__ volatile("cli");
+    debug_string("AIUEOS_IOAPIC_OK pit-gsi vector=33 eoi-v1\n");
+    serial_string("AIUEOS_IOAPIC_OK pit-gsi vector=33 eoi-v1\r\n");
     if (!aiueos_syscall_self_test()) {
       debug_string("AIUEOS_SYSCALL_FAIL abi-capability-pointer\n");
       serial_string("AIUEOS_SYSCALL_FAIL abi-capability-pointer\r\n");

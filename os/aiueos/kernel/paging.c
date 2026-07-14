@@ -69,6 +69,10 @@ int aiueos_paging_initialize(void) {
   const uint64_t apic_pde = (apic_base >> 21) & 0x1ff;
   apic_page_directory[apic_pde] = apic_base | PTE_PRESENT | PTE_WRITABLE |
     PTE_HUGE | PTE_NX | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE;
+  const uint64_t ioapic_base = 0xfec00000ULL;
+  const uint64_t ioapic_pde = (ioapic_base >> 21) & 0x1ff;
+  apic_page_directory[ioapic_pde] = ioapic_base | PTE_PRESENT | PTE_WRITABLE |
+    PTE_HUGE | PTE_NX | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE;
   for (uint64_t i = 0; i < ENTRY_COUNT; i++) {
     uint64_t page = i * PAGE_SIZE;
     uint64_t flags = PTE_PRESENT | PTE_NX;

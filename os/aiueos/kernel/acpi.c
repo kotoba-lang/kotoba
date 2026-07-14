@@ -19,11 +19,17 @@ struct __attribute__((packed)) madt_header {
 
 static uint32_t discovered_apic_ids[256];
 static uint32_t discovered_cpu_count;
+static uint32_t discovered_ioapic_address;
+static uint32_t discovered_ioapic_gsi_base;
+static uint32_t discovered_timer_gsi;
 
 uint32_t aiueos_acpi_cpu_count(void) { return discovered_cpu_count; }
 uint32_t aiueos_acpi_apic_id(uint32_t index) {
   return index < discovered_cpu_count ? discovered_apic_ids[index] : 0xffffffffU;
 }
+uint32_t aiueos_acpi_ioapic_address(void) { return discovered_ioapic_address; }
+uint32_t aiueos_acpi_ioapic_gsi_base(void) { return discovered_ioapic_gsi_base; }
+uint32_t aiueos_acpi_timer_gsi(void) { return discovered_timer_gsi; }
 
 static int bytes_equal(const char *a, const char *b, uint64_t count) {
   while (count--) if (*a++ != *b++) return 0; return 1;
@@ -46,6 +52,9 @@ static int valid_sdt(const struct sdt_header *header) {
 
 int aiueos_acpi_initialize(const void *rsdp_pointer) {
   discovered_cpu_count = 0;
+  discovered_ioapic_address = 0;
+  discovered_ioapic_gsi_base = 0;
+  discovered_timer_gsi = 0;
   const struct rsdp_v2 *rsdp = rsdp_pointer;
   if (!bounded_address((uint64_t)(uintptr_t)rsdp, sizeof(*rsdp)) ||
       !bytes_equal(rsdp->signature, "RSD PTR ", 8) || rsdp->revision < 2 ||
@@ -91,8 +100,16 @@ int aiueos_acpi_initialize(const void *rsdp_pointer) {
           *(const uint32_t *)(const void *)(cursor + 4);
         enabled_cpus++;
       }
+    } else if (type == 1) {
+      if (length < 12 || discovered_ioapic_address) return 0;
+      discovered_ioapic_address = *(const uint32_t *)(const void *)(cursor + 4);
+      discovered_ioapic_gsi_base = *(const uint32_t *)(const void *)(cursor + 8);
+    } else if (type == 2) {
+      if (length < 10) return 0;
+      if (cursor[2] == 0 && cursor[3] == 0)
+        discovered_timer_gsi = *(const uint32_t *)(const void *)(cursor + 4);
     }
     cursor += length;
   }
-  return enabled_cpus >= 2;
+  return enabled_cpus >= 2 && discovered_ioapic_address == 0xfec00000U;
 }
