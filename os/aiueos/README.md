@@ -70,10 +70,11 @@ requires a 513-byte used completion, success status, and deterministic sector-0
 identity. The smoke disk is a separate writable 1 MiB fixture, so neither the
 ESP nor a release image can be modified by this gate. Sector 0 remains a
 bounded read-only `aiuefs-v1` object store. Sector 1 is a dedicated journal
-slot: boot first validates an existing committed record and adopts it without
+slot: boot first validates an existing committed record, including independent
+header and payload checksums, and adopts it without
 mutation, or writes and reads back sequence 1 when no valid record exists. The
 two-boot VM gate reuses the same medium and requires recovery evidence on boot
-two. This is one fixed transaction slot, not yet a general filesystem or
+two; a third boot gate corrupts the header and requires rejection. This is one fixed transaction slot, not yet a general filesystem or
 kotobase IStore. The blk slice remains polling. The rng queue uses a bounded MSI-X
 capability walk, validates the complete table and PBA against probed BAR
 extents, maps their MMIO UC/NX, and requires vector-34 IRQ evidence before

@@ -90,15 +90,17 @@ struct aiuefs_superblock {
   uint32_t object_offset, object_length, object_checksum;
 } __attribute__((packed));
 struct aiuefs_journal_record {
-  uint8_t magic[8]; uint32_t version, sequence, state, payload_length, payload_checksum;
+  uint8_t magic[8]; uint32_t version, sequence, state, payload_length, payload_checksum, header_checksum;
   uint8_t payload[32];
 } __attribute__((packed));
 static int object_store_ready;
 static int journal_ready;
 static int journal_recovered;
+static uint32_t journal_sequence;
 int aiueos_object_store_ready(void) { return object_store_ready; }
 int aiueos_journal_ready(void) { return journal_ready; }
 int aiueos_journal_recovered(void) { return journal_recovered; }
+uint32_t aiueos_journal_sequence(void) { return journal_sequence; }
 static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
   uint32_t hash = 2166136261U;
   for (uint32_t i = 0; i < length; i++) { hash ^= bytes[i]; hash *= 16777619U; }
@@ -107,8 +109,9 @@ static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
 
 static int journal_record_valid(const struct aiuefs_journal_record *journal) {
   static const uint8_t magic[8] = {'A','I','U','J','R','N','1',0};
-  if (journal->version != 1 || journal->sequence != 1 || journal->state != 2 ||
+  if (journal->version != 1 || !journal->sequence || journal->state != 2 ||
       journal->payload_length != 16 || journal->payload_length > sizeof(journal->payload) ||
+      fnv1a((const uint8_t *)journal, 28) != journal->header_checksum ||
       fnv1a(journal->payload, journal->payload_length) != journal->payload_checksum) return 0;
   for (uint32_t i = 0; i < sizeof(magic); i++) if (journal->magic[i] != magic[i]) return 0;
   return 1;
@@ -392,6 +395,7 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
       if (used->index != 2 || used->ring[1].id != 0 || used->ring[1].length != 513 ||
           *status != VIRTIO_BLK_S_OK) return 0;
       if (journal_record_valid(journal)) {
+        journal_sequence = journal->sequence;
         journal_recovered = 1;
         journal_ready = 1;
         return 1;
@@ -402,6 +406,7 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
       journal->payload_length = sizeof(journal_payload);
       for (uint32_t i = 0; i < sizeof(journal_payload); i++) journal->payload[i] = journal_payload[i];
       journal->payload_checksum = fnv1a(journal->payload, journal->payload_length);
+      journal->header_checksum = fnv1a((const uint8_t *)journal, 28);
       request->type = VIRTIO_BLK_T_OUT; request->sector = 1; *status = 0xff;
       desc[1].flags = VIRTQ_DESC_F_NEXT;
       avail->ring[2] = 0; __asm__ volatile("" ::: "memory"); avail->index = 3; *doorbell = 0;
@@ -425,6 +430,7 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
       if (used->index != 4 || used->ring[3].id != 0 || used->ring[3].length != 513 ||
           *status != VIRTIO_BLK_S_OK || !journal_record_valid(journal)) return 0;
       journal_ready = 1;
+      journal_sequence = 1;
       return 1;
     }
     __asm__ volatile("pause");
@@ -484,6 +490,7 @@ int aiueos_pci_enumerate(void) {
   object_store_ready = 0;
   journal_ready = 0;
   journal_recovered = 0;
+  journal_sequence = 0;
   if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
