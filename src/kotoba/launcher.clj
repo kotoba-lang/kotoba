@@ -50,7 +50,7 @@
   [argv]
   (first argv))
 
-(declare source-plan accepted-source? selfhost-result runtime-result wasm-result package-result contract-exports)
+(declare source-plan accepted-source? selfhost-result runtime-result wasm-result cljs-result package-result contract-exports)
 
 (def source-commands
   #{"run" "check"})
@@ -210,6 +210,7 @@
     (if-let [launcher-result (case (command-name argv)
                                "selfhost" (selfhost-result argv)
                                "wasm" (wasm-result argv)
+                               "cljs" (cljs-result argv)
                                "package" (package-result argv)
                                nil)]
       launcher-result
@@ -693,6 +694,81 @@
                              :kotoba.wasm/binary? false
                              :kotoba.wasm/byte-count (when edn-bytes (alength edn-bytes))}})))))
 
+(defn cljs-emit-result*
+  "The unguarded `cljs emit` implementation (no package-admission gate -- see
+  `cljs-emit-result` for the safe-build entry point that wraps this). Resolves
+  the source plan, runs it through the same static safe-kotoba-subset check
+  `wasm emit` uses, and -- only if that passes -- compiles the source to
+  plain ClojureScript text via `kotoba.runtime/cljs-source` (writing it to
+  `--output`/`-o` when given, else returning it inline).
+
+  A passing `runtime/check` does NOT guarantee `cljs-source` itself succeeds:
+  the general safe-kotoba-subset analyzer has no notion of this particular
+  backend's narrower op support (ADR-2607151500 addendum 6 -- i64/f32/
+  bitwise/string/memory/capability ops are valid safe-kotoba but rejected by
+  this backend specifically). `cljs-source` throwing on such a program (via
+  its own `cljs-reject!`) is caught here and turned into a clean
+  `:cljs/emit-unsupported` result instead of an uncaught stack trace,
+  mirroring `wasm-run-result*`'s handling of the distinct
+  `:kotoba.host/denied` capability-denial ex-data shape for a different kind
+  of expected, structured failure."
+  [argv]
+  (let [normalized-argv (normalize-source-argv (vec (cons "run" (rest argv))))
+        plan (source-argv-plan normalized-argv)
+        policy-result (policy-result argv)
+        policy (:kotoba.policy/data policy-result)
+        output (or (option-value argv "--output")
+                   (option-value argv "-o"))]
+    (cond
+      (not (:kotoba.policy/ok? policy-result))
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :cljs/policy-not-readable
+       :kotoba.cli/data policy-result}
+
+      (nil? plan)
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :cljs/missing-source
+       :kotoba.cli/data {:kotoba.cljs/usage "kotoba cljs emit <source> [--reader-target target] [--output path]"}}
+
+      (not (source-file-readable? plan))
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :cljs/source-not-readable
+       :kotoba.cli/data {:kotoba.source/path (:kotoba.source/path plan)}}
+
+      :else
+      (let [forms (runtime/read-file (:kotoba.source/path plan)
+                                     (:kotoba.source/reader-target plan))
+            checked (runtime/check (safe-analyzer-fact-classification) plan forms policy)]
+        (cond
+          (not (:kotoba.runtime/ok? checked))
+          {:kotoba.cli/ok? false
+           :kotoba.cli/code :cljs/check-failed
+           :kotoba.cli/data {:kotoba.launcher/source-plan plan
+                             :kotoba.runtime/result checked}}
+
+          :else
+          (try
+            (let [src (runtime/cljs-source forms)]
+              (when output
+                (let [file (io/file output)]
+                  (io/make-parents file)
+                  (spit file src)))
+              {:kotoba.cli/ok? true
+               :kotoba.cli/code :cljs/source-emitted
+               :kotoba.cli/data {:kotoba.launcher/source-plan plan
+                                 :kotoba.runtime/result checked
+                                 :kotoba.cljs/artifact-kind :clojurescript/source
+                                 :kotoba.cljs/source (when-not output src)
+                                 :kotoba.cljs/byte-length (count src)
+                                 :kotoba.cljs/output output}})
+            (catch clojure.lang.ExceptionInfo e
+              {:kotoba.cli/ok? false
+               :kotoba.cli/code :cljs/emit-unsupported
+               :kotoba.cli/data {:kotoba.launcher/source-plan plan
+                                 :kotoba.runtime/result checked
+                                 :kotoba.cljs/problem (ex-data e)
+                                 :kotoba.cljs/message (ex-message e)}})))))))
+
 (defn- admission-gated
   "Run the package admission gate over ARGV via LOCK-OPTION and, only if the
   lock is admitted, call UNGUARDED-FN with ARGV, attaching the admission
@@ -700,13 +776,16 @@
   receipt/error instead of calling UNGUARDED-FN at all — `--package-lock` is
   mandatory, not opt-in (F-001: a caller could previously skip package
   admission for both `wasm emit` and `wasm run` simply by omitting the
-  flag). Shared by `wasm-emit-result` and `wasm-run-result` so the two
-  safe-build entry points cannot drift apart on this gate."
-  [argv lock-option unguarded-fn]
+  flag). Shared by `wasm-emit-result`/`wasm-run-result`/`cljs-emit-result` so
+  none of the safe-build entry points can drift apart on this gate.
+  REJECT-CODE is caller-supplied (rather than a single hardcoded
+  `:wasm/package-rejected`) so a non-wasm caller's rejection is reported
+  under its own namespace instead of silently borrowing wasm's."
+  [argv lock-option reject-code unguarded-fn]
   (let [admission (package-admission/admit (admission-options argv lock-option))]
     (if-not (:kotoba.admission/ok? admission)
       {:kotoba.cli/ok? false
-       :kotoba.cli/code :wasm/package-rejected
+       :kotoba.cli/code reject-code
        :kotoba.cli/data (cond-> {:kotoba.package/admission-code (:kotoba.admission/code admission)}
                           (:kotoba.admission/receipt admission)
                           (assoc :kotoba.package/receipt (:kotoba.admission/receipt admission))
@@ -724,7 +803,15 @@
   rejected lock aborts the build with the admission receipt/error in the
   payload — there is no way to opt out (F-001)."
   [argv]
-  (admission-gated argv "--package-lock" wasm-emit-result*))
+  (admission-gated argv "--package-lock" :wasm/package-rejected wasm-emit-result*))
+
+(defn cljs-emit-result
+  "Safe-build entry point for `cljs emit`. Same `--package-lock`-mandatory
+  admission gate as `wasm-emit-result` (F-001) -- a new entry point must not
+  reopen the gap that fix closed by giving a caller an ungated path to
+  compile a source file just because it targets a different backend."
+  [argv]
+  (admission-gated argv "--package-lock" :cljs/package-rejected cljs-emit-result*))
 
 (def ^:private kgraph-ops
   #{'kgraph-assert! 'kgraph-retract! 'kgraph-get-objects 'kgraph-query})
@@ -909,7 +996,7 @@
   not be reachable without admission (F-001: previously `wasm run` did not
   consult package admission at all, regardless of `--package-lock`)."
   [argv]
-  (admission-gated argv "--package-lock" wasm-run-result*))
+  (admission-gated argv "--package-lock" :wasm/package-rejected wasm-run-result*))
 
 (defn wasm-result
   "Handle launcher-owned Wasm-facing commands."
@@ -921,6 +1008,21 @@
      :kotoba.cli/code :wasm/unknown-command
      :kotoba.cli/data {:kotoba.wasm/command (second argv)
                        :kotoba.wasm/commands ["emit" "run"]}}))
+
+(defn cljs-result
+  "Handle launcher-owned ClojureScript-facing commands. Only `emit` exists --
+  unlike `wasm run`, there is no `cljs run` here: this backend emits plain
+  ClojureScript source text meant to be required/evaluated by a host cljs
+  runtime (nbb, a browser bundle, Node), not executed in-process by this JVM
+  launcher (ADR-2607151500 addendum 6 -- no memory-based host ABI, no
+  Chicory-style in-process instantiation for this target)."
+  [argv]
+  (case (second argv)
+    "emit" (cljs-emit-result argv)
+    {:kotoba.cli/ok? false
+     :kotoba.cli/code :cljs/unknown-command
+     :kotoba.cli/data {:kotoba.cljs/command (second argv)
+                       :kotoba.cljs/commands ["emit"]}}))
 
 (defn -main [& argv]
   (let [result (dispatch argv)]

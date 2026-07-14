@@ -160,12 +160,24 @@ kotoba run path/to/entry.kotoba             # compile and run a Kotoba entry poi
 kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
 kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # capability-confined build, see Language below
 kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
+kotoba cljs emit cell.kotoba --package-lock lock.edn -o cell.cljs                      # ClojureScript source, see Language below
 ```
 
-`--package-lock` is mandatory for both `wasm emit` and `wasm run`: the package
-admission gate always runs first, and a missing or rejected lock aborts the
-build/run with the admission receipt in the error payload — there is no way to
-opt out (F-001).
+`--package-lock` is mandatory for `wasm emit`, `wasm run`, and `cljs emit`: the
+package admission gate always runs first, and a missing or rejected lock aborts
+the build/run with the admission receipt in the error payload — there is no way
+to opt out (F-001).
+
+`cljs emit` compiles a NARROW subset of `.kotoba` (arithmetic/comparison/
+boolean forms, `pair`, map `get`/`assoc` — the ops ADR-2607150000's
+narrow-slice governor ports actually use) to plain ClojureScript source text,
+not a WASM binary — a second execution target alongside `wasm`, added in
+ADR-2607151500 addendum 6. There is no `cljs run`: the emitted source is meant
+to be `require`d by a real cljs host (nbb, a browser bundle, Node), not
+executed in-process by this JVM launcher. i64/f32/bitwise/string/memory/
+capability ops are valid `.kotoba` (and pass the same `check` gate `wasm emit`
+uses) but are rejected by `cljs emit` specifically — see `kotoba.runtime/
+compile-cljs-expr`'s docstring for the exact scope.
 
 Looking for things to run? [`docs/DEMONSTRATIONS.md`](docs/DEMONSTRATIONS.md)
 indexes every real program built with `.kotoba` so far — the mesh apps, the
