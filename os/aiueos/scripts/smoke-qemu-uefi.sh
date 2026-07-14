@@ -9,6 +9,16 @@ serial_log="$out/kernel-serial.log"
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
 
 "$aiueos/scripts/build-uefi.sh" >/dev/null
+if [ "${AIUEOS_CORRUPT_KERNEL:-0}" = 1 ]; then
+  python3 - "$out/esp/EFI/AIUEOS/KERNEL.ELF" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+data = bytearray(path.read_bytes())
+data[-1] ^= 0x01
+path.write_bytes(data)
+PY
+fi
 command -v "$qemu" >/dev/null 2>&1 || {
   echo "error: qemu-system-x86_64 is required" >&2
   exit 1
@@ -52,6 +62,19 @@ set +e
 status=$?
 set -e
 
+if [ "${AIUEOS_CORRUPT_KERNEL:-0}" = 1 ]; then
+  [ "$status" -eq 255 ] || {
+    echo "error: corrupted kernel produced unexpected QEMU status $status" >&2
+    exit 1
+  }
+  grep -F "AIUEOS_LOADER_FAIL kernel-sha256" "$log" >/dev/null || {
+    echo "error: corrupted kernel was not rejected by loader" >&2
+    exit 1
+  }
+  echo "AIUEOS_KERNEL_INTEGRITY_REJECTION_OK"
+  exit 0
+fi
+
 # The #UD handler writes 0x30; isa-debug-exit maps it to (0x30 << 1) | 1 = 97.
 [ "$status" -eq 97 ] || {
   echo "error: unexpected QEMU exit status $status" >&2
@@ -60,6 +83,10 @@ set -e
 }
 grep -F "AIUEOS_LOADER_OK" "$log" >/dev/null || {
   echo "error: loader identity was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_LOADER_INTEGRITY_OK sha256-v1" "$log" >/dev/null || {
+  echo "error: kernel integrity evidence was not observed" >&2
   exit 1
 }
 grep -F "AIUEOS_KERNEL_OK memory-map-v1" "$log" >/dev/null || {

@@ -7,6 +7,8 @@ out=${AIUEOS_OUT:-"$repo/build/aiueos"}
 esp="$out/esp"
 efi="$esp/EFI/BOOT/BOOTX64.EFI"
 object="$out/uefi-main.obj"
+identity_source="$out/kernel-identity.c"
+identity_object="$out/kernel-identity.obj"
 kernel_dir="$esp/EFI/AIUEOS"
 kernel="$kernel_dir/KERNEL.ELF"
 kernel_object="$out/kernel-main.o"
@@ -73,11 +75,21 @@ zig ld.lld -nostdlib -static -z max-page-size=0x1000 \
   "$kernel_pci_object" "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_smp_object" "$kernel_trampoline_object" \
   "$kernel_ioapic_object"
+python3 - "$kernel" "$identity_source" <<'PY'
+import hashlib, pathlib, sys
+digest = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).digest()
+values = ",".join(f"0x{byte:02x}" for byte in digest)
+pathlib.Path(sys.argv[2]).write_text(
+    "#include <stdint.h>\nconst uint8_t aiueos_expected_kernel_sha256[32]={" + values + "};\n",
+    encoding="ascii")
+PY
+zig cc -target x86_64-windows-gnu -std=c11 -O2 -ffreestanding \
+  -c -o "$identity_object" "$identity_source"
 zig cc -target x86_64-windows-gnu -std=c11 -O2 \
   -ffreestanding -fshort-wchar -fno-stack-protector -mno-red-zone \
   -c -o "$object" "$aiueos/uefi/main.c"
 zig lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /timestamp:0 \
-  /fixed:no "/out:$efi" "$object"
+  /fixed:no "/out:$efi" "$object" "$identity_object"
 
 magic=$(dd if="$efi" bs=1 count=2 2>/dev/null)
 [ "$magic" = MZ ] || {
