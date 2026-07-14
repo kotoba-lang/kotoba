@@ -74,7 +74,7 @@ static int read_bar(uint8_t b, uint8_t d, uint8_t f, uint8_t index, uint64_t *ba
 static int parse_cap(uint8_t b, uint8_t d, uint8_t f, uint8_t pointer,
                      struct virtio_pci_cap *cap) {
   uint8_t cap_len = config8(b,d,f,pointer + 2);
-  if (cap_len < 16) return 0;
+  if (cap_len < 16 || (uint16_t)pointer + cap_len > 256) return 0;
   cap->bar = config8(b,d,f,pointer + 4);
   cap->offset = config_read(b,d,f,pointer + 8);
   cap->length = config_read(b,d,f,pointer + 12);
@@ -89,7 +89,8 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
   int have_common = 0, have_notify = 0;
   uint8_t pointer = config8(b,d,f,0x34) & ~3U;
   uint64_t seen = 0;
-  for (unsigned steps = 0; pointer && steps < 48; steps++) {
+  unsigned steps = 0;
+  for (; pointer && steps < 48; steps++) {
     if (pointer < 0x40 || pointer > 0xfc || (pointer & 3)) return 0;
     uint64_t bit = 1ULL << ((pointer - 0x40) >> 2);
     if (seen & bit) return 0; seen |= bit;
@@ -105,6 +106,7 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
     }
     pointer = next;
   }
+  if (pointer) return 0; /* Capability chain exceeded the bounded walk. */
   if (!have_common || !have_notify || common.length < sizeof(struct virtio_common_cfg) ||
       notify.length < 2 || !notify.notify_multiplier) return 0;
   uint64_t common_bar, notify_bar;
