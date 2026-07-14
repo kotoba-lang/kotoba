@@ -30,6 +30,8 @@ extern int aiueos_paging_initialize(void);
 extern int aiueos_acpi_initialize(const void *rsdp);
 extern int aiueos_apic_timer_initialize(void);
 extern volatile uint64_t aiueos_apic_timer_ticks;
+extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *boot);
+extern void *aiueos_allocate_physical_page(void);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -121,6 +123,22 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\n");
     serial_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\r\n");
+    if (!aiueos_physical_allocator_initialize(boot)) {
+      debug_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\n");
+      serial_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\r\n");
+      qemu_exit(0x76);
+    }
+    void *physical_page_a = aiueos_allocate_physical_page();
+    void *physical_page_b = aiueos_allocate_physical_page();
+    if (!physical_page_a || !physical_page_b || physical_page_a == physical_page_b ||
+        ((uintptr_t)physical_page_a & 4095) || ((uintptr_t)physical_page_b & 4095) ||
+        *(const uint64_t *)physical_page_a || *(const uint64_t *)physical_page_b) {
+      debug_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL allocation\n");
+      serial_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL allocation\r\n");
+      qemu_exit(0x75);
+    }
+    debug_string("AIUEOS_PHYSICAL_ALLOCATOR_OK pages=2 zeroed\n");
+    serial_string("AIUEOS_PHYSICAL_ALLOCATOR_OK pages=2 zeroed\r\n");
     if (!aiueos_acpi_initialize(boot->acpi_rsdp)) {
       debug_string("AIUEOS_ACPI_FAIL rsdp-xsdt-madt\n");
       serial_string("AIUEOS_ACPI_FAIL rsdp-xsdt-madt\r\n");

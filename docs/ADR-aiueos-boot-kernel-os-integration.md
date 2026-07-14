@@ -210,6 +210,12 @@ spurious vector, and programs a periodic timer on vector 32. The QEMU gate must
 wake from `sti; hlt`, enter the kernel interrupt stub, issue EOI, and continue.
 It does not yet route external interrupts or start application processors.
 
+The first physical allocator consumes the variable-stride UEFI memory map and
+admits only Conventional Memory above the kernel image and below the current
+1 GiB bootstrap identity limit. Allocations are page-aligned and zeroed. This
+bounded bump allocator establishes ownership evidence; reclamation, free lists,
+zones, and allocation above the bootstrap map remain.
+
 ## Initial non-goals
 
 - full POSIX/Linux ABI compatibility;

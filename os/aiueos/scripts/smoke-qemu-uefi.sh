@@ -68,6 +68,10 @@ grep -F "AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp" "$serial_log" >/dev/null || {
   echo "error: kernel-owned paging evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_PHYSICAL_ALLOCATOR_OK pages=2 zeroed" "$serial_log" >/dev/null || {
+  echo "error: physical page allocator evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2" "$serial_log" >/dev/null || {
   echo "error: validated ACPI CPU discovery evidence was not observed" >&2
   exit 1
