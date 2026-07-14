@@ -26,6 +26,11 @@ the language/runtime/database foundation:
   runtime crates
 - generic examples and fixtures that verify the substrate
 
+The bootable aiueos product is a deliberate integration responsibility: this
+repository owns firmware/kernel/image/release composition, while
+`kotoba-lang/aiueos` owns portable capability/component semantics. See
+`ADR-aiueos-boot-kernel-os-integration.md`.
+
 Use the following extraction rules:
 
 - `kotoba-lang/kotoba-lang`: reserve this repo for the language contract once a
