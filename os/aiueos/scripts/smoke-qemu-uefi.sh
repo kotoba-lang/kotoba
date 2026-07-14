@@ -31,7 +31,7 @@ fi
 rm -f "$log" "$serial_log"
 set +e
 "$qemu" \
-  -machine q35,accel=tcg -cpu max -m 128M -smp 1 \
+  -machine q35,accel=tcg -cpu max -m 128M -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive format=raw,file="fat:rw:$out/esp" \
   -device isa-debugcon,iobase=0xe9,chardev=debug \
@@ -66,6 +66,10 @@ grep -F "AIUEOS_DESCRIPTOR_TABLES_OK gdt-v1 idt-v1" "$serial_log" >/dev/null || 
 }
 grep -F "AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp" "$serial_log" >/dev/null || {
   echo "error: kernel-owned paging evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2" "$serial_log" >/dev/null || {
+  echo "error: validated ACPI CPU discovery evidence was not observed" >&2
   exit 1
 }
 grep -F "AIUEOS_PAGE_FAULT_OK write-protect vector=14" "$serial_log" >/dev/null || {

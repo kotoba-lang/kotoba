@@ -18,6 +18,11 @@ host initramfs in the guest. The smoke test writes to text and attempts to
 execute a byte in rodata; both must raise vector 14 with the expected x86 page
 fault error-code bits before execution can continue.
 
+The loader also selects the ACPI 2.0 configuration-table GUID. The kernel
+validates both RSDP checksums, the XSDT and MADT checksums and lengths, and every
+MADT subtable boundary. The QEMU gate starts two vCPUs and requires both to be
+reported as enabled by MADT; application processors are not started yet.
+
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh

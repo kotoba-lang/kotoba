@@ -54,6 +54,7 @@ struct efi_system_table {
   void *runtime_services; struct efi_boot_services *boot_services;
   uint64_t number_of_table_entries; void *configuration_table;
 };
+struct efi_configuration_table { struct efi_guid vendor_guid; void *vendor_table; };
 
 struct efi_loaded_image {
   uint32_t revision, padding; efi_handle parent_handle;
@@ -89,6 +90,7 @@ struct elf64_program_header {
 struct aiueos_boot_info {
   uint64_t magic, version;
   void *memory_map; uint64_t memory_map_size, descriptor_size, descriptor_version;
+  void *acpi_rsdp;
 };
 typedef void(SYSVABI *kernel_entry)(const struct aiueos_boot_info *);
 
@@ -96,6 +98,14 @@ static const struct efi_guid loaded_image_guid =
   {0x5b1b31a1, 0x9562, 0x11d2, {0x8e,0x3f,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
 static const struct efi_guid simple_fs_guid =
   {0x964e5b22, 0x6459, 0x11d2, {0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
+static const struct efi_guid acpi20_guid =
+  {0x8868e871, 0xe4f1, 0x11d3, {0xbc,0x22,0x00,0x80,0xc7,0x3c,0x88,0x81}};
+
+static int guid_equal(const struct efi_guid *a, const struct efi_guid *b) {
+  const uint8_t *x = (const uint8_t *)a, *y = (const uint8_t *)b;
+  for (uint64_t i = 0; i < sizeof(*a); i++) if (x[i] != y[i]) return 0;
+  return 1;
+}
 
 static void copy_bytes(void *to, const void *from, uint64_t size) {
   uint8_t *d = to; const uint8_t *s = from; while (size--) *d++ = *s++;
@@ -178,6 +188,15 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *system) {
   info.magic = 0x414955454f53424fULL; info.version = 1;
   info.memory_map = memory_map; info.memory_map_size = memory_map_size;
   info.descriptor_size = descriptor_size; info.descriptor_version = descriptor_version;
+  info.acpi_rsdp = 0;
+  struct efi_configuration_table *tables = system->configuration_table;
+  for (uint64_t i = 0; i < system->number_of_table_entries; i++) {
+    if (guid_equal(&tables[i].vendor_guid, &acpi20_guid)) {
+      info.acpi_rsdp = tables[i].vendor_table;
+      break;
+    }
+  }
+  if (!info.acpi_rsdp) return fail("AIUEOS_LOADER_FAIL acpi-rsdp");
 
   status = bs->exit_boot_services(image, map_key);
   if (status != EFI_SUCCESS) return fail("AIUEOS_LOADER_FAIL exit-boot-services");

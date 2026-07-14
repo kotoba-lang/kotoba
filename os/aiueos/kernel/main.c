@@ -3,6 +3,7 @@
 struct aiueos_boot_info {
   uint64_t magic, version;
   void *memory_map; uint64_t memory_map_size, descriptor_size, descriptor_version;
+  void *acpi_rsdp;
 };
 
 struct __attribute__((packed)) idt_entry {
@@ -25,6 +26,7 @@ extern void aiueos_probe_no_execute(void);
 volatile uint64_t aiueos_page_fault_stage;
 volatile uint64_t aiueos_page_fault_error;
 extern int aiueos_paging_initialize(void);
+extern int aiueos_acpi_initialize(const void *rsdp);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -115,6 +117,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\n");
     serial_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\r\n");
+    if (!aiueos_acpi_initialize(boot->acpi_rsdp)) {
+      debug_string("AIUEOS_ACPI_FAIL rsdp-xsdt-madt\n");
+      serial_string("AIUEOS_ACPI_FAIL rsdp-xsdt-madt\r\n");
+      qemu_exit(0x78);
+    }
+    debug_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\n");
+    serial_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||
