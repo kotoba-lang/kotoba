@@ -237,15 +237,18 @@
 (deftest unknown-op-symbols-and-non-expr-forms-are-rejected
   (testing "compile-wasm-expr's two outermost catch-alls -- :unsupported-op (a
             seq? form whose head symbol matches no builtin/host-import/user-fn)
-            and :unsupported-form (a form that's neither an integer, a symbol, nor
-            a seq at all, e.g. a bare float/keyword/nil/map literal) -- previously
-            had zero direct test coverage of either, despite being the first thing
-            a typo'd .kotoba program would actually hit"
+            and :unsupported-form (a form that's neither an integer, a keyword, a
+            map, a symbol, nor a seq at all, e.g. a bare float/nil literal) --
+            previously had zero direct test coverage of either, despite being the
+            first thing a typo'd .kotoba program would actually hit.
+
+            Bare keyword/map literals moved OUT of :unsupported-form as of
+            ADR-2607150000 -- they now compile (see kotoba.wasm-map-keyword-test)
+            -- so this test's coverage of them moved there; this test now only
+            asserts what's STILL unsupported at this catch-all."
     (let [unknown-op (runtime/compile-wasm-expr (list 'totally-unknown-op 1 2) {})
           bare-float (runtime/compile-wasm-expr 1.5 {})
-          bare-keyword (runtime/compile-wasm-expr :oops {})
-          bare-nil (runtime/compile-wasm-expr nil {})
-          bare-map (runtime/compile-wasm-expr {:a 1} {})]
+          bare-nil (runtime/compile-wasm-expr nil {})]
       (is (= :unsupported-op (get-in unknown-op [:problem :kotoba.wasm/problem])))
       (is (= "totally-unknown-op" (get-in unknown-op [:problem :kotoba.wasm/op]))
           "the op field is str'd, not the raw symbol")
@@ -253,9 +256,11 @@
           "a bare float literal outside (f32 ...)/(i64 ...) isn't itself a valid form -- integer? literals compile to i32, but floats need an explicit f32 wrapper")
       (is (= "1.5" (get-in bare-float [:problem :kotoba.wasm/form]))
           "the form field is pr-str'd, not the raw value")
-      (is (= :unsupported-form (get-in bare-keyword [:problem :kotoba.wasm/problem])))
       (is (= :unsupported-form (get-in bare-nil [:problem :kotoba.wasm/problem])))
-      (is (= :unsupported-form (get-in bare-map [:problem :kotoba.wasm/problem]))))))
+      (is (not (:problem (runtime/compile-wasm-expr :oops {})))
+          "a bare keyword literal now compiles (interned i32 constant, ADR-2607150000)")
+      (is (not (:problem (runtime/compile-wasm-expr {:a 1} {})))
+          "a bare map literal now compiles (desugars to a pair-chain, ADR-2607150000)"))))
 
 (deftest wasm-binary-runs-kgraph-round-trip-through-real-host-functions
   (testing "compile -> emit -> Chicory-execute: kgraph-assert! really writes, kgraph-query really reads it back"

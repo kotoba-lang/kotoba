@@ -1257,6 +1257,44 @@
             (list 'let [tmp (first args)]
                   (list 'if tmp tmp (desugar-or (rest args)))))))
 
+;; ADR-2607150000: keyword/map literal support, sharing the FNV-1a interning
+;; approach kotoba-lang/compiler uses for the same feature, but 32-bit here
+;; to match this repo's default :i32 numeric domain (compiler/'s is i64).
+(def max-get-unroll-depth
+  "Fixed unroll depth for the `get` special form's bounded pair-list scan
+  (see its case-dispatch docstring in compile-wasm-expr) -- a map literal
+  or assoc-chain deeper than this is not an admission error here (unlike
+  kotoba-lang/compiler's fuel-bounded recursive version); a `get` miss past
+  this depth just returns the default early. 32 comfortably covers the
+  small option-map-shaped literals this feature targets."
+  32)
+
+(defn- fnv1a-i32
+  "Deterministic 32-bit FNV-1a hash of S's UTF-8 bytes, used to intern
+  keyword literals as distinct i32 constants (ADR-2607150000) -- mirrors
+  kotoba-lang/compiler's 64-bit version, narrowed to i32 to match this
+  repo's default numeric domain. Not clojure.core/hash, for the same
+  reproducibility reason compiler/'s version documents. Collision
+  probability for one module's realistically small keyword vocabulary is
+  low but non-zero -- a known, documented limitation, not eliminated."
+  [^String s]
+  (let [bs (.getBytes s "UTF-8")
+        offset-basis (unchecked-int 0x811c9dc5)
+        prime (unchecked-int 0x01000193)]
+    (reduce (fn [h b] (unchecked-multiply-int (unchecked-int (bit-xor h (bit-and (int b) 0xff))) prime))
+            offset-basis bs)))
+
+(defn- keyword->i32 [kw] (fnv1a-i32 (str kw)))
+
+(defn desugar-map
+  "`{:k1 v1 :k2 v2}` -> `(pair (pair k1 v1) (pair (pair k2 v2) 0))`, reusing
+  the pair/pair-first/pair-second primitives above entirely (ADR-2607150000).
+  Entries sorted by `(pr-str k)` for deterministic codegen regardless of
+  Clojure's own map-literal iteration order (unspecified for >8 entries)."
+  [form]
+  (let [entries (sort-by (fn [[k _]] (pr-str k)) (seq form))]
+    (reduce (fn [tail [k v]] (list 'pair (list 'pair k v) tail)) 0 (reverse entries))))
+
 (defn compile-wasm-expr
   "Compile one Kotoba expression to a WASM instruction sequence. Returns
   `{:bytes :local-count :local-types :result-type}` on success, or
@@ -1271,6 +1309,16 @@
     (integer? form)
     {:bytes (bcat [0x41] (sleb32 form))
      :result-type :i32}
+
+    ;; ADR-2607150000: keyword literals intern to a deterministic i32
+    ;; constant; map literals desugar to a pair-chain (desugar-map above)
+    ;; and recompile through this same function.
+    (keyword? form)
+    {:bytes (bcat [0x41] (sleb32 (keyword->i32 form)))
+     :result-type :i32}
+
+    (map? form)
+    (compile-wasm-expr (desugar-map form) locals fns)
 
     (symbol? form)
     (if-let [entry (get locals (symbol-key form))]
@@ -1356,6 +1404,82 @@
 
         when (let [[test & body] args]
                (compile-wasm-expr (list 'if test (cons 'do body) 0) locals fns))
+
+        ;; ADR-2607150000: pair/pair-first/pair-second, keyword/map literals,
+        ;; and get/assoc, ported (in spirit) from kotoba-lang/compiler's
+        ;; version of the same feature -- but implemented here on top of
+        ;; this repo's OWN existing primitives (alloc/i32-store!/mem-i32-at)
+        ;; rather than a host import, since kotoba/ (unlike compiler/)
+        ;; already exposes raw linear memory to guest code directly. A pair
+        ;; is 8 bytes: left i32 @ offset 0, right i32 @ offset 4.
+        pair
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "pair"
+                     :kotoba.wasm/expected 2 :kotoba.wasm/actual (count args)}}
+          (let [[l r] args
+                ptr (gensym "pair-ptr__")]
+            (compile-wasm-expr
+             (list 'let [ptr (list 'alloc 8)]
+                   (list 'i32-store! ptr 0 l)
+                   (list 'i32-store! ptr 4 r)
+                   ptr)
+             locals fns)))
+
+        pair-first
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "pair-first"
+                     :kotoba.wasm/expected 1 :kotoba.wasm/actual (count args)}}
+          (compile-wasm-expr (list 'mem-i32-at (first args) 0) locals fns))
+
+        pair-second
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "pair-second"
+                     :kotoba.wasm/expected 1 :kotoba.wasm/actual (count args)}}
+          (compile-wasm-expr (list 'mem-i32-at (first args) 4) locals fns))
+
+        ;; get is a BOUNDED unroll (not a synthesized recursive helper like
+        ;; compiler/'s __kotoba_map_get) -- this repo's function-table has
+        ;; no single injection point analogous to compiler/'s `analyze`
+        ;; (function-defs is consumed from 4 separate call sites), so
+        ;; unrolling to a fixed depth avoids threading a new function
+        ;; through all of them. m/k/default are each bound ONCE via `let`
+        ;; so the unrolled body only re-references cheap local.gets, not
+        ;; re-evaluated subexpressions. A map deeper than
+        ;; max-get-unroll-depth silently returns default past that depth --
+        ;; documented limitation, not a trap (unlike compiler/'s fuel-bound
+        ;; recursive version).
+        get
+        (if (not (<= 2 (count args) 3))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "get"
+                     :kotoba.wasm/expected "2 or 3" :kotoba.wasm/actual (count args)}}
+          (let [[m k default-form] args
+                default (if (some? default-form) default-form 0)
+                m-sym (gensym "get-m__") k-sym (gensym "get-k__") d-sym (gensym "get-d__")
+                unroll (fn unroll [cur depth]
+                         (if (zero? depth)
+                           d-sym
+                           (list 'if (list '= cur 0)
+                                 d-sym
+                                 (list 'if (list '= (list 'pair-first (list 'pair-first cur)) k-sym)
+                                       (list 'pair-second (list 'pair-first cur))
+                                       (unroll (list 'pair-second cur) (dec depth))))))]
+            (compile-wasm-expr
+             (list 'let [m-sym m k-sym k d-sym default]
+                   (unroll m-sym max-get-unroll-depth))
+             locals fns)))
+
+        ;; assoc is a pure O(1) desugar (prepend + shadow, variadic k/v
+        ;; pairs) -- same as compiler/'s version, no unroll/recursion needed.
+        assoc
+        (if (not (and (>= (count args) 3) (odd? (count args))))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "assoc"
+                     :kotoba.wasm/expected "an odd count >= 3 (map, then key/value pairs)"
+                     :kotoba.wasm/actual (count args)}}
+          (let [[m & kvs] args]
+            (compile-wasm-expr
+             (reduce (fn [acc-map [k v]] (list 'pair (list 'pair k v) acc-map))
+                     m (partition 2 kvs))
+             locals fns)))
 
         + (compile-wasm-fold 0x6a args locals fns)
         - (compile-wasm-fold 0x6b args locals fns)
