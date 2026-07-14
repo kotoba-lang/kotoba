@@ -22,11 +22,13 @@ static uint64_t pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t low_page_table[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t apic_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t pci_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t framebuffer_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t pci_pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
-static uint64_t pci_pdpt_index = UINT64_MAX;
-static uint64_t pci_pml4_index = UINT64_MAX;
+#define PCI_PDPT_SLOTS 4
+#define PCI_DIRECTORY_SLOTS 8
+static uint64_t pci_pdpts[PCI_PDPT_SLOTS][ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t pci_directories[PCI_DIRECTORY_SLOTS][ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint16_t pci_pdpt_owner[PCI_PDPT_SLOTS];
+static uint32_t pci_directory_owner[PCI_DIRECTORY_SLOTS];
 
 /* Phase-3 address-space vertical slice.  Kernel/MMIO branches stay shared,
  * while each process owns the complete low-2MiB page-table path. */
@@ -75,8 +77,16 @@ int aiueos_paging_initialize(void) {
 
   for (uint64_t i = 0; i < ENTRY_COUNT; i++) {
     pml4[i] = pdpt[i] = page_directory[i] = low_page_table[i] = 0;
-    apic_page_directory[i] = pci_page_directory[i] = pci_pdpt[i] = 0;
+    apic_page_directory[i] = 0;
     framebuffer_page_directory[i] = 0;
+  }
+  for (uint64_t slot = 0; slot < PCI_PDPT_SLOTS; slot++) {
+    pci_pdpt_owner[slot] = UINT16_MAX;
+    for (uint64_t i = 0; i < ENTRY_COUNT; i++) pci_pdpts[slot][i] = 0;
+  }
+  for (uint64_t slot = 0; slot < PCI_DIRECTORY_SLOTS; slot++) {
+    pci_directory_owner[slot] = UINT32_MAX;
+    for (uint64_t i = 0; i < ENTRY_COUNT; i++) pci_directories[slot][i] = 0;
   }
   pml4[0] = (uint64_t)(uintptr_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
   pdpt[0] = (uint64_t)(uintptr_t)page_directory | PTE_PRESENT | PTE_WRITABLE;
@@ -222,32 +232,54 @@ int aiueos_paging_seal_ap_trampoline(void) {
 /* Map PCI MMIO in the already-owned top GiB using 2 MiB UC/NX pages.  Keep
  * the interface deliberately narrow: PCI must never turn an arbitrary BAR
  * into an executable or cached mapping. */
+static uint64_t *pci_resolve_pdpt(uint64_t pml4_index) {
+  if (pml4_index == 0) return pdpt;
+  for (uint64_t slot = 0; slot < PCI_PDPT_SLOTS; slot++) {
+    if (pci_pdpt_owner[slot] == pml4_index) return pci_pdpts[slot];
+  }
+  if (pml4[pml4_index]) return 0;
+  for (uint64_t slot = 0; slot < PCI_PDPT_SLOTS; slot++) {
+    if (pci_pdpt_owner[slot] == UINT16_MAX) {
+      pci_pdpt_owner[slot] = (uint16_t)pml4_index;
+      pml4[pml4_index] = (uint64_t)(uintptr_t)pci_pdpts[slot] | PTE_PRESENT | PTE_WRITABLE;
+      return pci_pdpts[slot];
+    }
+  }
+  return 0;
+}
+
+static uint64_t *pci_known_directory(uint64_t entry) {
+  uint64_t address = entry & 0x000ffffffffff000ULL;
+  if (address == (uint64_t)(uintptr_t)apic_page_directory) return apic_page_directory;
+  if (address == (uint64_t)(uintptr_t)framebuffer_page_directory) return framebuffer_page_directory;
+  for (uint64_t slot = 0; slot < PCI_DIRECTORY_SLOTS; slot++)
+    if (address == (uint64_t)(uintptr_t)pci_directories[slot]) return pci_directories[slot];
+  return 0;
+}
+
 int aiueos_map_pci_mmio(uint64_t address, uint64_t length) {
-  if (!length || address < 0xc0000000ULL || address >= 0x10000000000ULL ||
+  if (!length || address < 0x40000000ULL || address >= 0x10000000000ULL ||
       length > 0x40000000ULL || address + length < address ||
       address + length > 0x10000000000ULL ||
       (address >> 30) != ((address + length - 1) >> 30)) return 0;
   uint64_t pml4_index = address >> 39;
   uint64_t pdpt_index = (address >> 30) & 0x1ff;
-  uint64_t *directory;
-  if (pml4_index == 0 && pdpt_index == 3) directory = apic_page_directory;
+  uint64_t *target_pdpt = pci_resolve_pdpt(pml4_index);
+  if (!target_pdpt) return 0;
+  uint64_t *directory = 0;
+  if (target_pdpt[pdpt_index]) directory = pci_known_directory(target_pdpt[pdpt_index]);
   else {
-    if (pci_pdpt_index == UINT64_MAX) {
-      uint64_t *target_pdpt;
-      if (pml4_index == 0) target_pdpt = pdpt;
-      else {
-        if (pml4[pml4_index]) return 0;
-        pml4[pml4_index] = (uint64_t)(uintptr_t)pci_pdpt | PTE_PRESENT | PTE_WRITABLE;
-        target_pdpt = pci_pdpt;
+    uint32_t owner = (uint32_t)((pml4_index << 9) | pdpt_index);
+    for (uint64_t slot = 0; slot < PCI_DIRECTORY_SLOTS; slot++) {
+      if (pci_directory_owner[slot] == UINT32_MAX) {
+        pci_directory_owner[slot] = owner;
+        directory = pci_directories[slot];
+        target_pdpt[pdpt_index] = (uint64_t)(uintptr_t)directory | PTE_PRESENT | PTE_WRITABLE;
+        break;
       }
-      if (target_pdpt[pdpt_index]) return 0;
-      pci_pml4_index = pml4_index;
-      pci_pdpt_index = pdpt_index;
-      target_pdpt[pdpt_index] = (uint64_t)(uintptr_t)pci_page_directory | PTE_PRESENT | PTE_WRITABLE;
     }
-    if (pci_pml4_index != pml4_index || pci_pdpt_index != pdpt_index) return 0;
-    directory = pci_page_directory;
   }
+  if (!directory) return 0; /* Never traverse an unowned page-table pointer. */
   uint64_t first = address & ~0x1fffffULL;
   uint64_t last = (address + length - 1) & ~0x1fffffULL;
   for (uint64_t page = first;; page += 0x200000ULL) {

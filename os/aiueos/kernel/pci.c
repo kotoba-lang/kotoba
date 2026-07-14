@@ -10,6 +10,7 @@
 #define VIRTIO_BLK_TRANSITIONAL_ID 0x1001
 #define PCI_STATUS_CAPABILITIES 0x10
 #define PCI_CAP_VENDOR 0x09
+#define PCI_CAP_MSIX 0x11
 #define VIRTIO_CAP_COMMON 1
 #define VIRTIO_CAP_NOTIFY 2
 #define VIRTIO_CAP_DEVICE 4
@@ -37,6 +38,11 @@ static uint32_t config_read(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
   uint32_t address = 0x80000000U | ((uint32_t)bus << 16) |
     ((uint32_t)dev << 11) | ((uint32_t)fn << 8) | (off & 0xfcU);
   out32(PCI_CONFIG_ADDRESS, address); return in32(PCI_CONFIG_DATA);
+}
+static void config_write(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t value) {
+  uint32_t address = 0x80000000U | ((uint32_t)bus << 16) |
+    ((uint32_t)dev << 11) | ((uint32_t)fn << 8) | (off & 0xfcU);
+  out32(PCI_CONFIG_ADDRESS, address); out32(PCI_CONFIG_DATA, value);
 }
 static uint8_t config8(uint8_t b, uint8_t d, uint8_t f, uint8_t o) {
   return (uint8_t)(config_read(b,d,f,o) >> ((o & 3) * 8));
@@ -80,6 +86,7 @@ static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
 struct virtio_caps {
   struct virtio_pci_cap common, notify, device;
   int have_common, have_notify, have_device;
+  uint8_t msix_pointer;
 };
 
 static int range_valid(uint32_t offset, uint32_t length) {
@@ -126,6 +133,10 @@ static int find_virtio_caps(uint8_t b, uint8_t d, uint8_t f,
     uint64_t bit = 1ULL << ((pointer - 0x40) >> 2);
     if (seen & bit) return 0; seen |= bit;
     uint8_t next = config8(b,d,f,pointer + 1) & ~3U;
+    if (config8(b,d,f,pointer) == PCI_CAP_MSIX) {
+      if (pointer > 0xf4 || caps->msix_pointer) return 0;
+      caps->msix_pointer = pointer;
+    }
     if (config8(b,d,f,pointer) == PCI_CAP_VENDOR) {
       uint8_t kind = config8(b,d,f,pointer + 3);
       if (kind == VIRTIO_CAP_COMMON || kind == VIRTIO_CAP_NOTIFY || kind == VIRTIO_CAP_DEVICE) {
@@ -142,6 +153,72 @@ static int find_virtio_caps(uint8_t b, uint8_t d, uint8_t f,
   return caps->have_common && caps->have_notify &&
          caps->common.length >= sizeof(struct virtio_common_cfg) &&
          caps->notify.length >= 2 && caps->notify.notify_multiplier;
+}
+
+static int bar_extent(uint8_t b, uint8_t d, uint8_t f, uint8_t index,
+                      uint64_t *base, uint64_t *length) {
+  if (index >= 6 || !base || !length) return 0;
+  uint8_t offset = (uint8_t)(0x10 + index * 4);
+  uint32_t command = config_read(b,d,f,0x04);
+  uint32_t low = config_read(b,d,f,offset), high = 0;
+  if ((low & 1) || (((low >> 1) & 3) != 0 && ((low >> 1) & 3) != 2)) return 0;
+  int wide = ((low >> 1) & 3) == 2;
+  if (wide) { if (index == 5) return 0; high = config_read(b,d,f,offset + 4); }
+  config_write(b,d,f,0x04,command & ~3U);
+  config_write(b,d,f,offset,0xffffffffU);
+  if (wide) config_write(b,d,f,offset + 4,0xffffffffU);
+  uint64_t mask = (uint64_t)(config_read(b,d,f,offset) & ~0xfU);
+  if (wide) mask |= (uint64_t)config_read(b,d,f,offset + 4) << 32;
+  config_write(b,d,f,offset,low);
+  if (wide) config_write(b,d,f,offset + 4,high);
+  config_write(b,d,f,0x04,command);
+  uint64_t value = (uint64_t)(low & ~0xfU) | ((uint64_t)high << 32);
+  uint64_t size = wide ? (~mask) + 1 : (uint64_t)(~(uint32_t)mask + 1U);
+  if (!value || !size || (size & (size - 1)) || value + size < value) return 0;
+  *base = value; *length = size; return 1;
+}
+
+struct msix_entry {
+  volatile uint32_t address_low, address_high, data, vector_control;
+};
+volatile uint64_t aiueos_virtio_rng_irq_count;
+
+static int setup_rng_msix(uint8_t b, uint8_t d, uint8_t f,
+                          const struct virtio_caps *caps,
+                          volatile struct virtio_common_cfg *cfg) {
+  if (!caps->msix_pointer) return 0;
+  uint8_t pointer = caps->msix_pointer;
+  uint32_t header = config_read(b,d,f,pointer);
+  uint32_t table = config_read(b,d,f,pointer + 4);
+  uint32_t pba = config_read(b,d,f,pointer + 8);
+  uint32_t vectors = ((header >> 16) & 0x7ffU) + 1U;
+  uint8_t table_bar = table & 7U, pba_bar = pba & 7U;
+  uint64_t table_base, table_bar_length, pba_base, pba_bar_length;
+  uint64_t table_offset = table & ~7U, pba_offset = pba & ~7U;
+  uint64_t table_bytes = (uint64_t)vectors * sizeof(struct msix_entry);
+  uint64_t pba_bytes = ((uint64_t)vectors + 63) / 64 * 8;
+  if (vectors > 2048 || table_bar >= 6 || pba_bar >= 6) return 0;
+  if (!bar_extent(b,d,f,table_bar,&table_base,&table_bar_length) ||
+      !bar_extent(b,d,f,pba_bar,&pba_base,&pba_bar_length)) return 0;
+  if (table_offset > table_bar_length || table_bytes > table_bar_length - table_offset ||
+      pba_offset > pba_bar_length || pba_bytes > pba_bar_length - pba_offset) return 0;
+  if (!aiueos_map_pci_mmio(table_base + table_offset,table_bytes) ||
+      !aiueos_map_pci_mmio(pba_base + pba_offset,pba_bytes)) return 0;
+  struct msix_entry *entry = (void *)(uintptr_t)(table_base + table_offset);
+  uint32_t eax, ebx, ecx, edx;
+  eax = 1; __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+  entry[0].vector_control = 1;
+  entry[0].address_low = 0xfee00000U | (((ebx >> 24) & 0xffU) << 12);
+  entry[0].address_high = 0;
+  entry[0].data = 34;
+  __asm__ volatile("" ::: "memory");
+  cfg->queue_msix_vector = 0;
+  if (cfg->queue_msix_vector != 0) return 0;
+  entry[0].vector_control = 0;
+  config_write(b,d,f,pointer,header | (1U << 31)); /* enable; function mask clear */
+  if (!(config_read(b,d,f,pointer) & (1U << 31))) return 0;
+  aiueos_virtio_rng_irq_count = 0;
+  return 1;
 }
 
 static int map_transport(uint8_t b, uint8_t d, uint8_t f, const struct virtio_caps *caps,
@@ -204,13 +281,14 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
   desc[0].flags = VIRTQ_DESC_F_WRITE; desc[0].next = 0;
   avail->ring[0] = 0; __asm__ volatile("" ::: "memory"); avail->index = 1;
   volatile uint16_t *doorbell = prepare_queue(cfg,&caps,notify_base,1,desc,avail,used);
-  if (!doorbell) return 0;
+  if (!doorbell || !setup_rng_msix(b,d,f,&caps,cfg)) return 0;
   cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
   *doorbell = 0;
   for (uint32_t budget = 0; budget < 100000000U; budget++) {
     __asm__ volatile("" ::: "memory");
-    if (used->index == 1) return used->ring[0].id == 0 && used->ring[0].length == 32;
-    __asm__ volatile("pause");
+    if (aiueos_virtio_rng_irq_count && used->index == 1)
+      return used->ring[0].id == 0 && used->ring[0].length == 32;
+    __asm__ volatile("sti; hlt; cli" ::: "memory");
   }
   return 0;
 }

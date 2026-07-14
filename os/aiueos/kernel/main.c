@@ -25,6 +25,7 @@ extern void aiueos_isr_invalid_opcode(void);
 extern void aiueos_isr_page_fault(void);
 extern void aiueos_isr_apic_timer(void);
 extern void aiueos_isr_external_timer(void);
+extern void aiueos_isr_virtio_rng(void);
 extern void aiueos_isr_syscall(void);
 extern void aiueos_probe_write_protect(void);
 extern void aiueos_probe_no_execute(void);
@@ -52,6 +53,7 @@ extern void aiueos_load_task_register(void);
 extern int aiueos_smp_start_application_processor(void);
 extern int aiueos_ioapic_route_legacy_timer(void);
 extern volatile uint64_t aiueos_external_timer_ticks;
+extern volatile uint64_t aiueos_virtio_rng_irq_count;
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -130,6 +132,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     set_idt_gate(14, aiueos_isr_page_fault);
     set_idt_gate(32, aiueos_isr_apic_timer);
     set_idt_gate(33, aiueos_isr_external_timer);
+    set_idt_gate(34, aiueos_isr_virtio_rng);
     set_idt_gate(128, aiueos_isr_syscall);
     idt[128].attributes = 0xee; /* present, DPL3, interrupt gate */
     const struct descriptor_pointer idtr = {
@@ -214,6 +217,11 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\n");
     serial_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\r\n");
+    if (aiueos_virtio_rng_irq_count != 1) {
+      serial_string("AIUEOS_VIRTIO_RNG_MSIX_FAIL irq-count\r\n"); qemu_exit(0x6f);
+    }
+    debug_string("AIUEOS_VIRTIO_RNG_MSIX_OK vector=34 irq=1 table-pba-bounded\n");
+    serial_string("AIUEOS_VIRTIO_RNG_MSIX_OK vector=34 irq=1 table-pba-bounded\r\n");
     if (pci_result != 3) {
       debug_string("AIUEOS_VIRTIO_BLK_FAIL capacity-or-read\n");
       serial_string("AIUEOS_VIRTIO_BLK_FAIL capacity-or-read\r\n");

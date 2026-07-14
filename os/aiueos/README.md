@@ -68,8 +68,11 @@ virtio-blk device. It reads the generation-stable capacity, rejects an empty or
 overflowing device, submits a three-descriptor `VIRTIO_BLK_T_IN` chain, and
 requires a 513-byte used completion, success status, and deterministic sector-0
 identity. The smoke disk is a separate read-only 1 MiB fixture, so neither the
-ESP nor a release image can be modified by this gate. These are polling
-split-virtqueue vertical slices; MSI-X,
+ESP nor a release image can be modified by this gate. The blk slice remains
+polling. The rng queue uses a bounded MSI-X
+capability walk, validates the complete table and PBA against probed BAR
+extents, maps their MMIO UC/NX, and requires vector-34 IRQ evidence before
+accepting the DMA completion.  MSI-X for the remaining transports,
 IOMMU isolation, indirect descriptors, and a reusable multi-request transport
 remain later Phase 4 work.
 

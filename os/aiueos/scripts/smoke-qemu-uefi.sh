@@ -179,6 +179,11 @@ grep -F "AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32" 
   test -f "$serial_log" && sed -n '1,120p' "$serial_log" >&2
   exit 1
 }
+grep -F "AIUEOS_VIRTIO_RNG_MSIX_OK vector=34 irq=1 table-pba-bounded" "$serial_log" >/dev/null || {
+  echo "error: interrupt-driven virtio-rng MSI-X evidence was not observed" >&2
+  test -f "$serial_log" && sed -n '1,140p' "$serial_log" >&2
+  exit 1
+}
 grep -F "AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly" "$serial_log" >/dev/null || {
   echo "error: modern virtio-blk bounded read evidence was not observed" >&2
   test -f "$serial_log" && sed -n '1,140p' "$serial_log" >&2
