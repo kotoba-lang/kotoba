@@ -42,8 +42,11 @@ same integer context and returns through `iretq`. A tagged, generation-bearing
 capability handle is required by the log-write admission path. The QEMU gate
 proves that a stale generation, a non-canonical pointer, and a range crossing
 the bootstrap mapping are denied before dereference. This is explicitly a
-CPL0-only syscall contract; ring 3, per-process page tables, and actual copy-in
-remain later work.
+CPL0-only syscall contract. The process foundation reserves distinct U/S pages
+for RX user text and RW+NX user data, leaves an unmapped guard page, and builds
+a 64-bit TSS descriptor with a dedicated kernel-entry stack. Loading TR and
+entering ring 3 remain explicitly unclaimed because that transition still
+faults in the prototype; per-process page tables and actual copy-in also remain.
 
 The PCI path performs a bounded configuration-space scan and validates modern
 virtio vendor capabilities, including a cycle-limited capability chain, BAR

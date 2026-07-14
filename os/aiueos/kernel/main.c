@@ -38,6 +38,9 @@ extern int aiueos_pci_enumerate(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
+extern int aiueos_process_initialize(void);
+extern void aiueos_process_enter(void);
+extern int aiueos_process_result(void);
 extern int aiueos_smp_start_application_processor(void);
 extern int aiueos_ioapic_route_legacy_timer(void);
 extern volatile uint64_t aiueos_external_timer_ticks;
@@ -120,6 +123,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     set_idt_gate(32, aiueos_isr_apic_timer);
     set_idt_gate(33, aiueos_isr_external_timer);
     set_idt_gate(128, aiueos_isr_syscall);
+    idt[128].attributes = 0xee; /* present, DPL3, interrupt gate */
     const struct descriptor_pointer idtr = {
       .limit = (uint16_t)(sizeof(idt) - 1),
       .base = (uint64_t)(uintptr_t)idt
@@ -213,6 +217,12 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_CAPABILITY_OK handle-v1 invalid-handle-denied\r\n");
     debug_string("AIUEOS_COPYIN_OK noncanonical-and-unmapped-denied\n");
     serial_string("AIUEOS_COPYIN_OK noncanonical-and-unmapped-denied\r\n");
+    int process_init = aiueos_process_initialize();
+    if (process_init != 1) {
+      serial_string("AIUEOS_RING3_FAIL tss-or-mapping\r\n"); qemu_exit(0x72);
+    }
+    debug_string("AIUEOS_PROCESS_FOUNDATION_OK tss-descriptor user-wx guard-page\n");
+    serial_string("AIUEOS_PROCESS_FOUNDATION_OK tss-descriptor user-wx guard-page\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

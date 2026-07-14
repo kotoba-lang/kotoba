@@ -5,6 +5,8 @@
 .extern aiueos_exception_dispatch
 .extern aiueos_scheduler_on_timer
 .extern aiueos_syscall_dispatch
+.global aiueos_syscall_from_user
+.global aiueos_saved_kernel_rsp
 
 aiueos_kernel_entry:
   cli
@@ -124,6 +126,9 @@ aiueos_isr_syscall:
   push %r14
   push %r15
   mov %rsp, %r12
+  mov 128(%r12), %rax
+  and $3, %eax
+  mov %rax, aiueos_syscall_from_user(%rip)
   mov 112(%r12), %rdi
   mov 72(%r12), %rsi
   mov 80(%r12), %rdx
@@ -131,6 +136,13 @@ aiueos_isr_syscall:
   and $-16, %rsp
   call aiueos_syscall_dispatch
   mov %rax, 112(%r12)
+  cmpq $2, 112(%r12)
+  jne 8f
+  cmpq $3, aiueos_syscall_from_user(%rip)
+  jne 8f
+  mov aiueos_saved_kernel_rsp(%rip), %rsp
+  ret
+8:
   mov %r12, %rsp
   pop %r15
   pop %r14
@@ -204,16 +216,47 @@ aiueos_probe_no_execute:
 aiueos_nx_probe_resume:
   ret
 
-.section .rodata.gdt,"a",@progbits
+.section .data.gdt,"aw",@progbits
 .balign 8
+.global aiueos_gdt
 aiueos_gdt:
   .quad 0x0000000000000000
   .quad 0x00af9a000000ffff
   .quad 0x00cf92000000ffff
+  .quad 0x00affa000000ffff /* ring 3 64-bit code */
+  .quad 0x00cff2000000ffff /* ring 3 data */
+.global aiueos_gdt_tss
+aiueos_gdt_tss:
+  .quad 0
+  .quad 0
 aiueos_gdt_end:
 aiueos_gdt_pointer:
   .word aiueos_gdt_end - aiueos_gdt - 1
   .quad aiueos_gdt
+
+.global aiueos_load_task_register
+aiueos_load_task_register:
+  mov $0x28, %ax
+  ltr %ax
+  ret
+
+.global aiueos_enter_user
+aiueos_enter_user:
+  mov %rsp, aiueos_saved_kernel_rsp(%rip)
+  pushq $0x23
+  pushq %rsi
+  pushfq
+  pop %rax
+  or $0x200, %rax
+  push %rax
+  pushq $0x1b
+  push %rdi
+  iretq
+
+.section .bss.process,"aw",@nobits
+.balign 8
+aiueos_syscall_from_user: .skip 8
+aiueos_saved_kernel_rsp: .skip 8
 
 .section .rodata.nx-probe,"a",@progbits
 .global aiueos_nx_probe_target

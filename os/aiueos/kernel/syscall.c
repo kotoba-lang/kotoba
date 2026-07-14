@@ -23,13 +23,24 @@ static int readable_bootstrap_range(uint64_t pointer, uint64_t length) {
   return end < 0x40000000ULL;
 }
 
+extern uint8_t aiueos_user_data_start[], aiueos_user_data_end[];
+extern uint64_t aiueos_syscall_from_user;
+static int readable_user_range(uint64_t pointer, uint64_t length) {
+  uint64_t end;
+  return length && pointer >= (uint64_t)(uintptr_t)aiueos_user_data_start &&
+    !__builtin_add_overflow(pointer, length, &end) &&
+    end <= (uint64_t)(uintptr_t)aiueos_user_data_end;
+}
+
 uint64_t aiueos_syscall_dispatch(uint64_t number, uint64_t handle,
                                  uint64_t pointer, uint64_t length) {
   if (number == AIUEOS_SYSCALL_ABI) return AIUEOS_SYSCALL_ABI_V1;
+  if (number == 2) return 2; /* assembly consumes this completion token */
   if (number != AIUEOS_SYSCALL_LOG_WRITE) return AIUEOS_ERR_NO_SYSCALL;
   if (handle != log_handle || (handle & 0xffffULL) != AIUEOS_CAP_LOG_WRITE)
     return AIUEOS_ERR_BAD_HANDLE;
-  if (!readable_bootstrap_range(pointer, length)) return AIUEOS_ERR_BAD_POINTER;
+  if (aiueos_syscall_from_user ? !readable_user_range(pointer,length) :
+                 !readable_bootstrap_range(pointer,length)) return AIUEOS_ERR_BAD_POINTER;
   return length;
 }
 

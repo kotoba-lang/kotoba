@@ -5,6 +5,7 @@
 #define ENTRY_COUNT 512
 #define PTE_PRESENT (1ULL << 0)
 #define PTE_WRITABLE (1ULL << 1)
+#define PTE_USER (1ULL << 2)
 #define PTE_HUGE (1ULL << 7)
 #define PTE_WRITE_THROUGH (1ULL << 3)
 #define PTE_CACHE_DISABLE (1ULL << 4)
@@ -13,6 +14,8 @@
 extern uint8_t aiueos_text_start[], aiueos_text_end[];
 extern uint8_t aiueos_rodata_start[], aiueos_rodata_end[];
 extern uint8_t aiueos_data_start[], aiueos_kernel_end[];
+extern uint8_t aiueos_user_text_start[], aiueos_user_text_end[];
+extern uint8_t aiueos_user_data_start[], aiueos_user_data_end[];
 
 static uint64_t pml4[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
@@ -61,6 +64,7 @@ int aiueos_paging_initialize(void) {
   pml4[0] = (uint64_t)(uintptr_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
   pdpt[0] = (uint64_t)(uintptr_t)page_directory | PTE_PRESENT | PTE_WRITABLE;
   page_directory[0] = (uint64_t)(uintptr_t)low_page_table | PTE_PRESENT | PTE_WRITABLE;
+  pml4[0] |= PTE_USER; pdpt[0] |= PTE_USER; page_directory[0] |= PTE_USER;
   for (uint64_t i = 1; i < ENTRY_COUNT; i++) {
     page_directory[i] = (i * 0x200000ULL) | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | PTE_NX;
   }
@@ -79,8 +83,14 @@ int aiueos_paging_initialize(void) {
     if (!within(page, aiueos_text_start, aiueos_text_end) &&
         !within(page, aiueos_rodata_start, aiueos_rodata_end)) flags |= PTE_WRITABLE;
     if (within(page, aiueos_text_start, aiueos_text_end)) flags &= ~PTE_NX;
+    if (within(page, aiueos_user_text_start, aiueos_user_text_end))
+      flags = PTE_PRESENT | PTE_USER;
+    if (within(page, aiueos_user_data_start, aiueos_user_data_end))
+      flags = PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_NX;
+    if (page == (uint64_t)(uintptr_t)aiueos_user_data_end) flags = 0;
     low_page_table[i] = page | flags;
   }
+  low_page_table[(uint64_t)(uintptr_t)aiueos_user_data_end / PAGE_SIZE] = 0;
 
   write_msr(0xc0000080U, read_msr(0xc0000080U) | (1ULL << 11));
   write_cr0(read_cr0() | (1ULL << 16));
@@ -95,6 +105,20 @@ int aiueos_paging_initialize(void) {
          !(low_page_table[rodata_index] & PTE_WRITABLE) && (low_page_table[rodata_index] & PTE_NX) &&
          (low_page_table[data_index] & PTE_WRITABLE) && (low_page_table[data_index] & PTE_NX) &&
          ((uint64_t)(uintptr_t)aiueos_kernel_end < 0x200000ULL);
+}
+
+int aiueos_user_mapping_verify(void) {
+  uint64_t tx = (uint64_t)(uintptr_t)aiueos_user_text_start / PAGE_SIZE;
+  uint64_t rw = (uint64_t)(uintptr_t)aiueos_user_data_start / PAGE_SIZE;
+  uint64_t guard = (uint64_t)(uintptr_t)aiueos_user_data_end / PAGE_SIZE;
+  if (tx >= ENTRY_COUNT || rw >= ENTRY_COUNT || guard >= ENTRY_COUNT) return 0;
+  int result = 0;
+  if ((low_page_table[tx] & (PTE_PRESENT|PTE_USER|PTE_WRITABLE|PTE_NX)) ==
+      (PTE_PRESENT|PTE_USER)) result |= 1;
+  if ((low_page_table[rw] & (PTE_PRESENT|PTE_USER|PTE_WRITABLE|PTE_NX)) ==
+      (PTE_PRESENT|PTE_USER|PTE_WRITABLE|PTE_NX)) result |= 2;
+  if (!low_page_table[guard]) result |= 4;
+  return result;
 }
 
 int aiueos_paging_seal_ap_trampoline(void) {

@@ -120,6 +120,9 @@ grep -F "AIUEOS_CAPABILITY_OK handle-v1 invalid-handle-denied" "$serial_log" >/d
   echo "error: capability negative evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_PROCESS_FOUNDATION_OK tss-descriptor user-wx guard-page" "$serial_log" >/dev/null || {
+  echo "error: process isolation foundation evidence was not observed" >&2; exit 1;
+}
 grep -F "AIUEOS_COPYIN_OK noncanonical-and-unmapped-denied" "$serial_log" >/dev/null || {
   echo "error: invalid-pointer evidence was not observed" >&2
   exit 1
