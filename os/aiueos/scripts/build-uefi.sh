@@ -18,6 +18,8 @@ kernel_memory_object="$out/kernel-memory.o"
 kernel_pci_object="$out/kernel-pci.o"
 kernel_scheduler_object="$out/kernel-scheduler.o"
 kernel_syscall_object="$out/kernel-syscall.o"
+kernel_smp_object="$out/kernel-smp.o"
+kernel_trampoline_object="$out/kernel-ap-trampoline.o"
 
 command -v zig >/dev/null 2>&1 || {
   echo "error: Zig is required to build the freestanding UEFI application" >&2
@@ -51,11 +53,18 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_syscall_object" "$aiueos/kernel/syscall.c"
+  -c -o "$kernel_syscall_object" "$aiueos/kernel/syscall.c"
+zig cc -target x86_64-freestanding-none -std=c11 -O2 \
+  -ffreestanding -fno-stack-protector -mno-red-zone \
+  -c -o "$kernel_smp_object" "$aiueos/kernel/smp.c"
+zig cc -target x86_64-freestanding-none \
+  -c -o "$kernel_trampoline_object" "$aiueos/kernel/ap_trampoline.S"
 zig ld.lld -nostdlib -static -z max-page-size=0x1000 \
   -T "$aiueos/kernel/linker.ld" -o "$kernel" \
   "$kernel_entry_object" "$kernel_object" "$kernel_paging_object" \
   "$kernel_acpi_object" "$kernel_apic_object" "$kernel_memory_object" \
-  "$kernel_pci_object" "$kernel_scheduler_object" "$kernel_syscall_object"
+  "$kernel_pci_object" "$kernel_scheduler_object" "$kernel_syscall_object" \
+  "$kernel_smp_object" "$kernel_trampoline_object"
 zig cc -target x86_64-windows-gnu -std=c11 -O2 \
   -ffreestanding -fshort-wchar -fno-stack-protector -mno-red-zone \
   -c -o "$object" "$aiueos/uefi/main.c"

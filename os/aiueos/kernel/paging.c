@@ -88,3 +88,11 @@ int aiueos_paging_initialize(void) {
          (low_page_table[data_index] & PTE_WRITABLE) && (low_page_table[data_index] & PTE_NX) &&
          ((uint64_t)(uintptr_t)aiueos_kernel_end < 0x200000ULL);
 }
+
+int aiueos_paging_seal_ap_trampoline(void) {
+  const uint64_t index = 0x8000ULL / PAGE_SIZE;
+  if ((low_page_table[index] & PTE_PRESENT) == 0) return 0;
+  low_page_table[index] &= ~(PTE_WRITABLE | PTE_NX);
+  write_cr3(read_cr3());
+  return (low_page_table[index] & (PTE_WRITABLE | PTE_NX)) == 0;
+}

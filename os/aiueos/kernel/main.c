@@ -37,6 +37,7 @@ extern int aiueos_pci_enumerate(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
+extern int aiueos_smp_start_application_processor(void);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -157,6 +158,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
       serial_string("AIUEOS_APIC_FAIL initialization\r\n");
       qemu_exit(0x77);
     }
+    if (!aiueos_smp_start_application_processor()) {
+      debug_string("AIUEOS_SMP_FAIL ap-startup\n");
+      serial_string("AIUEOS_SMP_FAIL ap-startup\r\n");
+      qemu_exit(0x73);
+    }
+    debug_string("AIUEOS_SMP_OK cpus=2 init-sipi-v1\n");
+    serial_string("AIUEOS_SMP_OK cpus=2 init-sipi-v1 per-cpu-stack\r\n");
     aiueos_scheduler_initialize();
     __asm__ volatile("sti");
     while (!aiueos_scheduler_evidence_ready()) __asm__ volatile("hlt");

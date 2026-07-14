@@ -17,6 +17,14 @@ struct __attribute__((packed)) madt_header {
   struct sdt_header sdt; uint32_t local_apic_address, flags;
 };
 
+static uint32_t discovered_apic_ids[256];
+static uint32_t discovered_cpu_count;
+
+uint32_t aiueos_acpi_cpu_count(void) { return discovered_cpu_count; }
+uint32_t aiueos_acpi_apic_id(uint32_t index) {
+  return index < discovered_cpu_count ? discovered_apic_ids[index] : 0xffffffffU;
+}
+
 static int bytes_equal(const char *a, const char *b, uint64_t count) {
   while (count--) if (*a++ != *b++) return 0; return 1;
 }
@@ -37,6 +45,7 @@ static int valid_sdt(const struct sdt_header *header) {
 }
 
 int aiueos_acpi_initialize(const void *rsdp_pointer) {
+  discovered_cpu_count = 0;
   const struct rsdp_v2 *rsdp = rsdp_pointer;
   if (!bounded_address((uint64_t)(uintptr_t)rsdp, sizeof(*rsdp)) ||
       !bytes_equal(rsdp->signature, "RSD PTR ", 8) || rsdp->revision < 2 ||
@@ -70,14 +79,20 @@ int aiueos_acpi_initialize(const void *rsdp_pointer) {
     if (type == 0) {
       if (length < 8) return 0;
       uint32_t flags = *(const uint32_t *)(const void *)(cursor + 4);
-      if (flags & 3U) enabled_cpus++;
+      if ((flags & 3U) && discovered_cpu_count < 256) {
+        discovered_apic_ids[discovered_cpu_count++] = cursor[3];
+        enabled_cpus++;
+      }
     } else if (type == 9) {
       if (length < 16) return 0;
       uint32_t flags = *(const uint32_t *)(const void *)(cursor + 8);
-      if (flags & 3U) enabled_cpus++;
+      if ((flags & 3U) && discovered_cpu_count < 256) {
+        discovered_apic_ids[discovered_cpu_count++] =
+          *(const uint32_t *)(const void *)(cursor + 4);
+        enabled_cpus++;
+      }
     }
     cursor += length;
   }
   return enabled_cpus >= 2;
 }
-

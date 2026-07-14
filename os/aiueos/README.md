@@ -21,7 +21,9 @@ fault error-code bits before execution can continue.
 The loader also selects the ACPI 2.0 configuration-table GUID. The kernel
 validates both RSDP checksums, the XSDT and MADT checksums and lengths, and every
 MADT subtable boundary. The QEMU gate starts two vCPUs and requires both to be
-reported as enabled by MADT; application processors are not started yet.
+reported as enabled by MADT. The BSP then copies a real-mode trampoline below
+1 MiB, sends INIT plus two SIPIs to the second MADT APIC ID, and requires the AP
+to enter long mode on its own 64 KiB stack before the boot smoke may pass.
 
 The BSP enables its Local APIC, maps the MMIO page cache-disabled, installs a
 periodic timer on vector 32, enters `sti; hlt`, and requires the interrupt stub

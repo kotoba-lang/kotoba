@@ -91,6 +91,10 @@ grep -F "AIUEOS_APIC_TIMER_OK vector=32 eoi-v1" "$serial_log" >/dev/null || {
   echo "error: Local APIC timer interrupt evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_SMP_OK cpus=2 init-sipi-v1 per-cpu-stack" "$serial_log" >/dev/null || {
+  echo "error: BSP-to-AP INIT/SIPI evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4" "$serial_log" >/dev/null || {
   echo "error: bounded PCI/virtio discovery evidence was not observed" >&2
   exit 1
