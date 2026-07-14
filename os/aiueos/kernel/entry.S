@@ -3,6 +3,7 @@
 .type aiueos_kernel_entry,@function
 .extern aiueos_kernel_main
 .extern aiueos_exception_dispatch
+.extern aiueos_scheduler_on_timer
 
 aiueos_kernel_entry:
   cli
@@ -54,9 +55,41 @@ aiueos_isr_invalid_opcode:
 .type aiueos_isr_apic_timer,@function
 aiueos_isr_apic_timer:
   push %rax
+  push %rbx
+  push %rcx
+  push %rdx
+  push %rsi
+  push %rdi
+  push %rbp
+  push %r8
+  push %r9
+  push %r10
+  push %r11
+  push %r12
+  push %r13
+  push %r14
+  push %r15
   incq aiueos_apic_timer_ticks(%rip)
   mov aiueos_apic_mmio_base(%rip), %rax
   movl $0, 0xb0(%rax)
+  mov %rsp, %rdi
+  and $-16, %rsp
+  call aiueos_scheduler_on_timer
+  mov %rax, %rsp
+  pop %r15
+  pop %r14
+  pop %r13
+  pop %r12
+  pop %r11
+  pop %r10
+  pop %r9
+  pop %r8
+  pop %rbp
+  pop %rdi
+  pop %rsi
+  pop %rdx
+  pop %rcx
+  pop %rbx
   pop %rax
   iretq
 

@@ -33,6 +33,8 @@ extern volatile uint64_t aiueos_apic_timer_ticks;
 extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *boot);
 extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_pci_enumerate(void);
+extern void aiueos_scheduler_initialize(void);
+extern int aiueos_scheduler_evidence_ready(void);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -152,8 +154,9 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
       serial_string("AIUEOS_APIC_FAIL initialization\r\n");
       qemu_exit(0x77);
     }
+    aiueos_scheduler_initialize();
     __asm__ volatile("sti");
-    while (aiueos_apic_timer_ticks == 0) __asm__ volatile("hlt");
+    while (!aiueos_scheduler_evidence_ready()) __asm__ volatile("hlt");
     __asm__ volatile("cli");
     debug_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\n");
     serial_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\r\n");
@@ -164,6 +167,8 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\n");
     serial_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\r\n");
+    debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
+    serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

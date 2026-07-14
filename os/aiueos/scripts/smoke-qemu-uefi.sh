@@ -95,6 +95,10 @@ grep -F "AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4" "$serial_log" >/dev/null
   echo "error: bounded PCI/virtio discovery evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {
+  echo "error: preemptive round-robin scheduler evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_PAGE_FAULT_OK write-protect vector=14" "$serial_log" >/dev/null || {
   echo "error: write-protect page-fault evidence was not observed" >&2
   exit 1

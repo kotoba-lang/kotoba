@@ -27,6 +27,14 @@ The BSP enables its Local APIC, maps the MMIO page cache-disabled, installs a
 periodic timer on vector 32, enters `sti; hlt`, and requires the interrupt stub
 to acknowledge EOI before the smoke test can continue.
 
+The timer stub also preserves the complete x86-64 integer interrupt frame and
+passes its stack pointer to a minimal round-robin scheduler. Two kernel tasks
+run on separate 16 KiB stacks alongside the boot task. The QEMU gate proceeds
+only after all three contexts have been preempted and both worker tasks have
+resumed at least twice, producing `AIUEOS_SCHEDULER_OK`. This is kernel-task
+context-switch groundwork; user address spaces and ring 3 isolation remain a
+later phase.
+
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh
