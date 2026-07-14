@@ -7,8 +7,10 @@ The current Phase 1 slice builds a PE32+ `BOOTX64.EFI` and a separate ELF64
 `KERNEL.ELF`. OVMF starts the loader, which validates and places bounded ELF
 segments, captures the firmware memory map, exits UEFI boot services, and
 hands control to the kernel. The kernel validates the handoff and terminates
-QEMU through the test-only debug-exit device. It does not use Linux, a JVM,
-GRUB, or a host initramfs in the guest.
+QEMU through the test-only debug-exit device. Its assembly entry switches to a
+private 64 KiB stack before entering C, and its first hardware driver
+initializes COM1 at 115200 baud. It does not use Linux, a JVM, GRUB, or a host
+initramfs in the guest.
 
 ```sh
 ./os/aiueos/scripts/build-uefi.sh

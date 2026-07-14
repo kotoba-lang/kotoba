@@ -10,6 +10,7 @@ object="$out/uefi-main.obj"
 kernel_dir="$esp/EFI/AIUEOS"
 kernel="$kernel_dir/KERNEL.ELF"
 kernel_object="$out/kernel-main.o"
+kernel_entry_object="$out/kernel-entry.o"
 
 command -v zig >/dev/null 2>&1 || {
   echo "error: Zig is required to build the freestanding UEFI application" >&2
@@ -20,8 +21,10 @@ mkdir -p "$(dirname -- "$efi")" "$kernel_dir"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_object" "$aiueos/kernel/main.c"
+zig cc -target x86_64-freestanding-none \
+  -c -o "$kernel_entry_object" "$aiueos/kernel/entry.S"
 zig ld.lld -nostdlib -static -z max-page-size=0x1000 \
-  -T "$aiueos/kernel/linker.ld" -o "$kernel" "$kernel_object"
+  -T "$aiueos/kernel/linker.ld" -o "$kernel" "$kernel_entry_object" "$kernel_object"
 zig cc -target x86_64-windows-gnu -std=c11 -O2 \
   -ffreestanding -fshort-wchar -fno-stack-protector -mno-red-zone \
   -c -o "$object" "$aiueos/uefi/main.c"

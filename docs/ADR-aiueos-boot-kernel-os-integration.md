@@ -143,7 +143,7 @@ virtio-blk/NVMe -> block service -> filesystem/object store
 | Phase | Deliverable | Exit gate |
 |---|---|---|
 | 0 | Linux PID-1/initramfs/QEMU/virtio/VFIO prototype | PR #29 merged; unit CI green; whole boot still unproven |
-| 1 | UEFI loader + serial kernel | In progress: OVMF loads a bounded ELF64 kernel, transfers the UEFI memory map, exits boot services, and reaches kernel entry; signature verification and serial driver remain |
+| 1 | UEFI loader + serial kernel | In progress: OVMF hands off to a bounded ELF64 kernel with its own stack and COM1 serial output; signature verification remains |
 | 2 | paging, exceptions, ACPI, APIC, SMP | multi-core QEMU; malformed inputs fail safely |
 | 3 | scheduler, VM, syscall, capability handles | isolated tasks; W^X and invalid-handle tests |
 | 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | real QEMU queue completion; malformed descriptors rejected |
@@ -182,13 +182,15 @@ The loader reads the kernel from the ESP, validates bounded load segments and
 its executable entry, captures the UEFI memory map, exits boot services, and
 hands a versioned boot-info structure to the kernel. The kernel validates that
 handoff, emits `AIUEOS_KERNEL_OK`, and uses a test-only I/O device for
-deterministic shutdown. The guest contains no Linux, libc, JVM, initramfs, or
-hosted supervisor.
+deterministic shutdown. The assembly entry replaces the firmware stack with a
+private 64 KiB stack, while the kernel initializes COM1 and emits independent
+serial evidence. The guest contains no Linux, libc, JVM, initramfs, or hosted
+supervisor.
 
 This evidence proves firmware entry, PE/COFF packaging, a separate kernel
-image, memory-map handoff, and post-boot-services kernel execution. It does not
-yet prove signature verification, a serial driver, or any Phase 2 kernel
-mechanism.
+image, memory-map handoff, post-boot-services kernel execution, an owned kernel
+stack, and COM1 output. It does not yet prove signature verification or any
+Phase 2 kernel mechanism.
 
 ## Initial non-goals
 

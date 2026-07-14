@@ -5,6 +5,7 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 aiueos="$repo/os/aiueos"
 out=${AIUEOS_OUT:-"$repo/build/aiueos"}
 log="$out/uefi-debug.log"
+serial_log="$out/kernel-serial.log"
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
 
 "$aiueos/scripts/build-uefi.sh" >/dev/null
@@ -27,7 +28,7 @@ fi
   exit 1
 }
 
-rm -f "$log"
+rm -f "$log" "$serial_log"
 set +e
 "$qemu" \
   -machine q35,accel=tcg -cpu max -m 128M -smp 1 \
@@ -36,7 +37,7 @@ set +e
   -device isa-debugcon,iobase=0xe9,chardev=debug \
   -chardev file,id=debug,path="$log" \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-  -display none -serial none -monitor none -no-reboot
+  -display none -serial "file:$serial_log" -monitor none -no-reboot
 status=$?
 set -e
 
@@ -52,6 +53,11 @@ grep -F "AIUEOS_LOADER_OK" "$log" >/dev/null || {
 }
 grep -F "AIUEOS_KERNEL_OK memory-map-v1" "$log" >/dev/null || {
   echo "error: kernel handoff was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_SERIAL_OK stack-v1 memory-map-v1" "$serial_log" >/dev/null || {
+  echo "error: kernel COM1 evidence was not observed" >&2
+  test -f "$serial_log" && sed -n '1,80p' "$serial_log" >&2
   exit 1
 }
 echo "AIUEOS_UEFI_SMOKE_OK"
