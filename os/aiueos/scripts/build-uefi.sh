@@ -53,7 +53,6 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_syscall_object" "$aiueos/kernel/syscall.c"
-  -c -o "$kernel_syscall_object" "$aiueos/kernel/syscall.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_smp_object" "$aiueos/kernel/smp.c"
