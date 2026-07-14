@@ -19,6 +19,10 @@ static uint64_t pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t low_page_table[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
 static uint64_t apic_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t pci_page_directory[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t pci_pdpt[ENTRY_COUNT] __attribute__((aligned(PAGE_SIZE)));
+static uint64_t pci_pdpt_index = UINT64_MAX;
+static uint64_t pci_pml4_index = UINT64_MAX;
 
 static uint64_t read_cr0(void) {
   uint64_t value; __asm__ volatile("mov %%cr0, %0" : "=r"(value)); return value;
@@ -52,7 +56,7 @@ int aiueos_paging_initialize(void) {
 
   for (uint64_t i = 0; i < ENTRY_COUNT; i++) {
     pml4[i] = pdpt[i] = page_directory[i] = low_page_table[i] = 0;
-    apic_page_directory[i] = 0;
+    apic_page_directory[i] = pci_page_directory[i] = pci_pdpt[i] = 0;
   }
   pml4[0] = (uint64_t)(uintptr_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
   pdpt[0] = (uint64_t)(uintptr_t)page_directory | PTE_PRESENT | PTE_WRITABLE;
@@ -95,4 +99,48 @@ int aiueos_paging_seal_ap_trampoline(void) {
   low_page_table[index] &= ~(PTE_WRITABLE | PTE_NX);
   write_cr3(read_cr3());
   return (low_page_table[index] & (PTE_WRITABLE | PTE_NX)) == 0;
+}
+
+/* Map PCI MMIO in the already-owned top GiB using 2 MiB UC/NX pages.  Keep
+ * the interface deliberately narrow: PCI must never turn an arbitrary BAR
+ * into an executable or cached mapping. */
+int aiueos_map_pci_mmio(uint64_t address, uint64_t length) {
+  if (!length || address < 0xc0000000ULL || address >= 0x10000000000ULL ||
+      length > 0x40000000ULL || address + length < address ||
+      address + length > 0x10000000000ULL ||
+      (address >> 30) != ((address + length - 1) >> 30)) return 0;
+  uint64_t pml4_index = address >> 39;
+  uint64_t pdpt_index = (address >> 30) & 0x1ff;
+  uint64_t *directory;
+  if (pml4_index == 0 && pdpt_index == 3) directory = apic_page_directory;
+  else {
+    if (pci_pdpt_index == UINT64_MAX) {
+      uint64_t *target_pdpt;
+      if (pml4_index == 0) target_pdpt = pdpt;
+      else {
+        if (pml4[pml4_index]) return 0;
+        pml4[pml4_index] = (uint64_t)(uintptr_t)pci_pdpt | PTE_PRESENT | PTE_WRITABLE;
+        target_pdpt = pci_pdpt;
+      }
+      if (target_pdpt[pdpt_index]) return 0;
+      pci_pml4_index = pml4_index;
+      pci_pdpt_index = pdpt_index;
+      target_pdpt[pdpt_index] = (uint64_t)(uintptr_t)pci_page_directory | PTE_PRESENT | PTE_WRITABLE;
+    }
+    if (pci_pml4_index != pml4_index || pci_pdpt_index != pdpt_index) return 0;
+    directory = pci_page_directory;
+  }
+  uint64_t first = address & ~0x1fffffULL;
+  uint64_t last = (address + length - 1) & ~0x1fffffULL;
+  for (uint64_t page = first;; page += 0x200000ULL) {
+    uint64_t index = (page >> 21) & 0x1ff;
+    uint64_t prior = directory[index];
+    uint64_t wanted = page | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | PTE_NX |
+      PTE_WRITE_THROUGH | PTE_CACHE_DISABLE;
+    if (prior && (prior & 0x000fffffffe00000ULL) != page) return 0;
+    directory[index] = wanted;
+    __asm__ volatile("invlpg (%0)" : : "r"((void *)(uintptr_t)page) : "memory");
+    if (page == last) break;
+  }
+  return 1;
 }

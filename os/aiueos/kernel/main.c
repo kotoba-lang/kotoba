@@ -171,13 +171,21 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     __asm__ volatile("cli");
     debug_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\n");
     serial_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\r\n");
-    if (!aiueos_pci_enumerate()) {
+    int pci_result = aiueos_pci_enumerate();
+    if (!pci_result) {
       debug_string("AIUEOS_PCI_FAIL enumeration-or-virtio\n");
       serial_string("AIUEOS_PCI_FAIL enumeration-or-virtio\r\n");
       qemu_exit(0x74);
     }
     debug_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\n");
     serial_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\r\n");
+    if (pci_result != 2) {
+      debug_string("AIUEOS_VIRTIO_FAIL rng-queue\n");
+      serial_string("AIUEOS_VIRTIO_FAIL rng-queue\r\n");
+      qemu_exit(0x73);
+    }
+    debug_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\n");
+    serial_string("AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
     if (!aiueos_syscall_self_test()) {

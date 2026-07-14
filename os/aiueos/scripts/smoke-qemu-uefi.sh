@@ -99,6 +99,11 @@ grep -F "AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4" "$serial_log" >/dev/null
   echo "error: bounded PCI/virtio discovery evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32" "$serial_log" >/dev/null || {
+  echo "error: modern virtio-rng DMA completion evidence was not observed" >&2
+  test -f "$serial_log" && sed -n '1,120p' "$serial_log" >&2
+  exit 1
+}
 grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {
   echo "error: preemptive round-robin scheduler evidence was not observed" >&2
   exit 1

@@ -45,6 +45,17 @@ the bootstrap mapping are denied before dereference. This is explicitly a
 CPL0-only syscall contract; ring 3, per-process page tables, and actual copy-in
 remain later work.
 
+The PCI path performs a bounded configuration-space scan and validates modern
+virtio vendor capabilities, including a cycle-limited capability chain, BAR
+kind and width, and overflow-safe capability ranges. PCI MMIO is identity
+mapped UC/NX only after validation, including QEMU's 64-bit MMIO window above
+512 GiB. The virtio-rng smoke path negotiates `VIRTIO_F_VERSION_1`, allocates
+separate zeroed pages for the descriptor, available ring, used ring, and data
+buffer, submits one writable 32-byte request, and requires the device's used
+ring completion. This is a polling split-virtqueue vertical slice; MSI-X,
+IOMMU isolation, indirect descriptors, and a reusable multi-request transport
+remain later Phase 4 work.
+
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh
