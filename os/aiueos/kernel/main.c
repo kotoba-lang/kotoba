@@ -42,6 +42,7 @@ extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_pci_enumerate(void);
 extern int aiueos_object_store_ready(void);
 extern int aiueos_journal_ready(void);
+extern int aiueos_journal_recovered(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
@@ -243,6 +244,10 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\n");
     serial_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\r\n");
+    if (aiueos_journal_recovered()) {
+      debug_string("AIUEOS_JOURNAL_RECOVERY_OK sequence=1 committed no-overwrite\n");
+      serial_string("AIUEOS_JOURNAL_RECOVERY_OK sequence=1 committed no-overwrite\r\n");
+    }
     /* The input result bit is set only after a validated event has been copied
        into the browser envelope; no second mutable readiness check is needed. */
     if (!(pci_result & 4)) {

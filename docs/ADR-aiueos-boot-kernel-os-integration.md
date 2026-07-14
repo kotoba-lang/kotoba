@@ -226,11 +226,17 @@ scan and requires a QEMU virtio function with vendor ID `0x1af4`. It does not
 yet admit BARs, map device MMIO, allocate DMA, route MSI/MSI-X, or operate a
 virtqueue.
 
-The first storage slice interprets the separately attached read-only
-virtio-blk fixture as an `aiuefs-v1` object-store superblock. Header size,
-object count, offset, length, and checksum are validated within the 512-byte
-sector before an object is admitted. This is the block-service boundary below
-kotobase; it is not yet a writable filesystem, journal, or kotobase IStore.
+The first storage slice uses a separately attached writable virtio-blk fixture,
+isolated from the ESP and release disk. Sector 0 is an `aiuefs-v1` object-store
+superblock: header size, object count, offset, length, and checksum are bounded
+within one sector before an object is admitted. Sector 1 is a fixed journal
+slot. On boot the kernel reads and validates magic, version, sequence, committed
+state, payload length, and checksum before any mutation. A valid committed
+record is recovered without overwrite; otherwise sequence 1 is committed and
+read back. CI boots the same medium twice and requires recovery on boot two.
+This closes crash/reboot recovery for one bounded transaction record, but is
+not yet a multi-record journal, writable object allocator, filesystem, or
+kotobase IStore.
 
 ## Initial non-goals
 
