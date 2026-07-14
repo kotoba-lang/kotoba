@@ -234,13 +234,16 @@ aiueos_gdt_pointer:
   .word aiueos_gdt_end - aiueos_gdt - 1
   .quad aiueos_gdt
 
+.section .text,"ax",@progbits
 .global aiueos_load_task_register
+.type aiueos_load_task_register,@function
 aiueos_load_task_register:
   mov $0x28, %ax
   ltr %ax
   ret
 
 .global aiueos_enter_user
+.type aiueos_enter_user,@function
 aiueos_enter_user:
   mov %rsp, aiueos_saved_kernel_rsp(%rip)
   pushq $0x23

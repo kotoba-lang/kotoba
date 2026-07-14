@@ -41,6 +41,7 @@ extern int aiueos_syscall_self_test(void);
 extern int aiueos_process_initialize(void);
 extern void aiueos_process_enter(void);
 extern int aiueos_process_result(void);
+extern void aiueos_load_task_register(void);
 extern int aiueos_smp_start_application_processor(void);
 extern int aiueos_ioapic_route_legacy_timer(void);
 extern volatile uint64_t aiueos_external_timer_ticks;
@@ -223,6 +224,17 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PROCESS_FOUNDATION_OK tss-descriptor user-wx guard-page\n");
     serial_string("AIUEOS_PROCESS_FOUNDATION_OK tss-descriptor user-wx guard-page\r\n");
+    aiueos_load_task_register();
+    aiueos_process_enter();
+    if (!aiueos_process_result()) {
+      debug_string("AIUEOS_RING3_FAIL syscall-results\n");
+      serial_string("AIUEOS_RING3_FAIL syscall-results\r\n");
+      qemu_exit(0x71);
+    }
+    debug_string("AIUEOS_RING3_OK cpl3-int80 tss-rsp0 return-kernel\n");
+    serial_string("AIUEOS_RING3_OK cpl3-int80 tss-rsp0 return-kernel\r\n");
+    debug_string("AIUEOS_USER_SYSCALL_OK valid-log invalid-handle invalid-pointer\n");
+    serial_string("AIUEOS_USER_SYSCALL_OK valid-log invalid-handle invalid-pointer\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

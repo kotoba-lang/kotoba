@@ -17,6 +17,7 @@ extern uint8_t aiueos_kernel_stack_top[];
 extern void aiueos_load_task_register(void);
 extern void aiueos_enter_user(void (*entry)(void), void *stack);
 extern int aiueos_user_mapping_verify(void);
+extern uint64_t aiueos_syscall_from_user;
 static struct tss64 tss;
 static uint8_t syscall_stack[16384] __attribute__((aligned(4096)));
 
@@ -56,6 +57,7 @@ void aiueos_process_enter(void) {
   aiueos_enter_user(user_entry, user_stack + sizeof(user_stack));
 }
 int aiueos_process_result(void) {
-  return result.completed && result.abi==ABI_V1 && result.valid==5 &&
+  return aiueos_syscall_from_user == 3 && result.completed &&
+    result.abi==ABI_V1 && result.valid==5 &&
     result.bad_handle==BAD_HANDLE && result.bad_pointer==BAD_POINTER;
 }

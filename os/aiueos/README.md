@@ -41,12 +41,13 @@ The Phase 3 bootstrap installs an `int 0x80` syscall gate that preserves the
 same integer context and returns through `iretq`. A tagged, generation-bearing
 capability handle is required by the log-write admission path. The QEMU gate
 proves that a stale generation, a non-canonical pointer, and a range crossing
-the bootstrap mapping are denied before dereference. This is explicitly a
-CPL0-only syscall contract. The process foundation reserves distinct U/S pages
+the bootstrap mapping are denied before dereference. The process foundation reserves distinct U/S pages
 for RX user text and RW+NX user data, leaves an unmapped guard page, and builds
-a 64-bit TSS descriptor with a dedicated kernel-entry stack. Loading TR and
-entering ring 3 remain explicitly unclaimed because that transition still
-faults in the prototype; per-process page tables and actual copy-in also remain.
+a loaded 64-bit TSS descriptor with a dedicated kernel-entry stack. A one-shot
+CPL3 task enters through `iretq`, exercises valid and rejected `int 0x80`
+requests, and exits back to the kernel through the TSS `rsp0` path. Per-process
+CR3 ownership, actual copy-in, and the `syscall`/`sysret` transport remain later
+work.
 
 The PCI path performs a bounded configuration-space scan and validates modern
 virtio vendor capabilities, including a cycle-limited capability chain, BAR
