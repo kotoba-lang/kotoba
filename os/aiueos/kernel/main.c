@@ -22,6 +22,7 @@ extern void aiueos_load_idt(const struct descriptor_pointer *pointer);
 extern void aiueos_isr_invalid_opcode(void);
 extern void aiueos_isr_page_fault(void);
 extern void aiueos_isr_apic_timer(void);
+extern void aiueos_isr_syscall(void);
 extern void aiueos_probe_write_protect(void);
 extern void aiueos_probe_no_execute(void);
 volatile uint64_t aiueos_page_fault_stage;
@@ -35,6 +36,7 @@ extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_pci_enumerate(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
+extern int aiueos_syscall_self_test(void);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -112,6 +114,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     set_idt_gate(6, aiueos_isr_invalid_opcode);
     set_idt_gate(14, aiueos_isr_page_fault);
     set_idt_gate(32, aiueos_isr_apic_timer);
+    set_idt_gate(128, aiueos_isr_syscall);
     const struct descriptor_pointer idtr = {
       .limit = (uint16_t)(sizeof(idt) - 1),
       .base = (uint64_t)(uintptr_t)idt
@@ -169,6 +172,17 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
+    if (!aiueos_syscall_self_test()) {
+      debug_string("AIUEOS_SYSCALL_FAIL abi-capability-pointer\n");
+      serial_string("AIUEOS_SYSCALL_FAIL abi-capability-pointer\r\n");
+      qemu_exit(0x73);
+    }
+    debug_string("AIUEOS_SYSCALL_OK int80-cpl0 abi-v1\n");
+    serial_string("AIUEOS_SYSCALL_OK int80-cpl0 abi-v1\r\n");
+    debug_string("AIUEOS_CAPABILITY_OK handle-v1 invalid-handle-denied\n");
+    serial_string("AIUEOS_CAPABILITY_OK handle-v1 invalid-handle-denied\r\n");
+    debug_string("AIUEOS_COPYIN_OK noncanonical-and-unmapped-denied\n");
+    serial_string("AIUEOS_COPYIN_OK noncanonical-and-unmapped-denied\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

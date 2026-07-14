@@ -4,6 +4,7 @@
 .extern aiueos_kernel_main
 .extern aiueos_exception_dispatch
 .extern aiueos_scheduler_on_timer
+.extern aiueos_syscall_dispatch
 
 aiueos_kernel_entry:
   cli
@@ -76,6 +77,51 @@ aiueos_isr_apic_timer:
   and $-16, %rsp
   call aiueos_scheduler_on_timer
   mov %rax, %rsp
+  pop %r15
+  pop %r14
+  pop %r13
+  pop %r12
+  pop %r11
+  pop %r10
+  pop %r9
+  pop %r8
+  pop %rbp
+  pop %rdi
+  pop %rsi
+  pop %rdx
+  pop %rcx
+  pop %rbx
+  pop %rax
+  iretq
+
+/* CPL0 bootstrap syscall gate; user-mode isolation is not claimed yet. */
+.global aiueos_isr_syscall
+.type aiueos_isr_syscall,@function
+aiueos_isr_syscall:
+  push %rax
+  push %rbx
+  push %rcx
+  push %rdx
+  push %rsi
+  push %rdi
+  push %rbp
+  push %r8
+  push %r9
+  push %r10
+  push %r11
+  push %r12
+  push %r13
+  push %r14
+  push %r15
+  mov %rsp, %r12
+  mov 112(%r12), %rdi
+  mov 72(%r12), %rsi
+  mov 80(%r12), %rdx
+  mov 88(%r12), %rcx
+  and $-16, %rsp
+  call aiueos_syscall_dispatch
+  mov %rax, 112(%r12)
+  mov %r12, %rsp
   pop %r15
   pop %r14
   pop %r13

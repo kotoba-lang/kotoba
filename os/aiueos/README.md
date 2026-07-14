@@ -35,6 +35,14 @@ resumed at least twice, producing `AIUEOS_SCHEDULER_OK`. This is kernel-task
 context-switch groundwork; user address spaces and ring 3 isolation remain a
 later phase.
 
+The Phase 3 bootstrap installs an `int 0x80` syscall gate that preserves the
+same integer context and returns through `iretq`. A tagged, generation-bearing
+capability handle is required by the log-write admission path. The QEMU gate
+proves that a stale generation, a non-canonical pointer, and a range crossing
+the bootstrap mapping are denied before dereference. This is explicitly a
+CPL0-only syscall contract; ring 3, per-process page tables, and actual copy-in
+remain later work.
+
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh

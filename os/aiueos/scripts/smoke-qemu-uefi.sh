@@ -99,6 +99,18 @@ grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "
   echo "error: preemptive round-robin scheduler evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_SYSCALL_OK int80-cpl0 abi-v1" "$serial_log" >/dev/null || {
+  echo "error: CPL0 syscall evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_CAPABILITY_OK handle-v1 invalid-handle-denied" "$serial_log" >/dev/null || {
+  echo "error: capability negative evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_COPYIN_OK noncanonical-and-unmapped-denied" "$serial_log" >/dev/null || {
+  echo "error: invalid-pointer evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_PAGE_FAULT_OK write-protect vector=14" "$serial_log" >/dev/null || {
   echo "error: write-protect page-fault evidence was not observed" >&2
   exit 1
