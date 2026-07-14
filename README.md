@@ -249,8 +249,16 @@ implementation** of this same design (`kotoba-clj`, `policy.rs`/`subset.rs`/
 (`604896171b`, 2026-07-01) — the file paths below are a historical record
 (see git history), not current source. The CLJC-native successor is tracked
 in [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md)
-(database side) and lives entirely in `kotoba-lang/kotoba-lang` itself
-(language/compiler side).
+(database side) and, on the language/compiler side, lives in
+[`kotoba-lang/compiler`](https://github.com/kotoba-lang/compiler) — **not**
+`kotoba-lang/kotoba-lang`, which owns the source-extension/CLI/package
+*contract* only and does not itself implement compile-time admission gates.
+`kotoba-lang/compiler`'s `forbidden-heads`/`cap-call`/`infer-effects` in
+`src/kotoba/compiler/frontend.clj` are the CLJC counterparts of
+`subset.rs`/`policy.rs`/`effects.rs` below; that repo's admitted grammar is
+a stricter, capability/effect-gated KIR-level subset that has not yet been
+reconciled with this repo's friendlier surface grammar (documented above) —
+see `com-junkawasaki/root` ADR-2607141600 for the cross-repo analysis.
 
 ## 言語性（Language-ness）
 
