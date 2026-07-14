@@ -43,11 +43,18 @@ fi
 rm -f "$log" "$serial_log"
 python3 - "$blk_image" <<'PY'
 import pathlib
+import struct
 import sys
 
 path = pathlib.Path(sys.argv[1])
 payload = bytearray(1024 * 1024)
-payload[:17] = b"AIUEOS-BLK-SMOKE\0"
+obj = b"KOTOBASE-ROOT-V1"
+checksum = 2166136261
+for byte in obj:
+    checksum = ((checksum ^ byte) * 16777619) & 0xffffffff
+header = struct.pack("<8s7I", b"AIUEFS1\0", 1, 36, 1, 0, 64, len(obj), checksum)
+payload[:len(header)] = header
+payload[64:64 + len(obj)] = obj
 path.write_bytes(payload)
 PY
 if [ -n "${AIUEOS_DISK_IMAGE:-}" ]; then
@@ -167,6 +174,10 @@ grep -F "AIUEOS_VIRTIO_RNG_OK modern-pci caps-bounded dma=4pages completion=32" 
 grep -F "AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly" "$serial_log" >/dev/null || {
   echo "error: modern virtio-blk bounded read evidence was not observed" >&2
   test -f "$serial_log" && sed -n '1,140p' "$serial_log" >&2
+  exit 1
+}
+grep -F "AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a" "$serial_log" >/dev/null || {
+  echo "error: bounded read-only object-store evidence was not observed" >&2
   exit 1
 }
 grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {

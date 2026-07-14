@@ -58,6 +58,17 @@ struct virtq_avail { uint16_t flags, index, ring[1], used_event; } __attribute__
 struct virtq_used_element { uint32_t id, length; } __attribute__((packed));
 struct virtq_used { uint16_t flags, index; struct virtq_used_element ring[1]; uint16_t avail_event; } __attribute__((packed));
 struct virtio_blk_request { uint32_t type, reserved; uint64_t sector; } __attribute__((packed));
+struct aiuefs_superblock {
+  uint8_t magic[8]; uint32_t version, header_size, object_count, reserved;
+  uint32_t object_offset, object_length, object_checksum;
+} __attribute__((packed));
+static int object_store_ready;
+int aiueos_object_store_ready(void) { return object_store_ready; }
+static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
+  uint32_t hash = 2166136261U;
+  for (uint32_t i = 0; i < length; i++) { hash ^= bytes[i]; hash *= 16777619U; }
+  return hash;
+}
 
 struct virtio_caps {
   struct virtio_pci_cap common, notify, device;
@@ -198,7 +209,7 @@ static int virtio_rng(uint8_t b, uint8_t d, uint8_t f) {
 }
 
 static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
-  static const uint8_t expected[16] = "AIUEOS-BLK-SMOKE";
+  static const uint8_t magic[8] = {'A','I','U','E','F','S','1',0};
   struct virtio_caps caps;
   volatile struct virtio_common_cfg *cfg;
   uint64_t notify_base, device_bar;
@@ -238,7 +249,15 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
     if (used->index == 1) {
       if (used->ring[0].id != 0 || used->ring[0].length != 513 || *status != VIRTIO_BLK_S_OK)
         return 0;
-      for (unsigned i = 0; i < sizeof(expected); i++) if (sector[i] != expected[i]) return 0;
+      const struct aiuefs_superblock *superblock = (const void *)sector;
+      for (unsigned i = 0; i < sizeof(magic); i++) if (superblock->magic[i] != magic[i]) return 0;
+      if (superblock->version != 1 || superblock->header_size != sizeof(*superblock) ||
+          superblock->object_count != 1 || !superblock->object_length ||
+          superblock->object_offset < superblock->header_size ||
+          superblock->object_offset > 512 || superblock->object_length > 512 - superblock->object_offset ||
+          fnv1a(sector + superblock->object_offset, superblock->object_length) != superblock->object_checksum)
+        return 0;
+      object_store_ready = 1;
       return 1;
     }
     __asm__ volatile("pause");
@@ -247,6 +266,7 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
 }
 
 int aiueos_pci_enumerate(void) {
+  object_store_ready = 0;
   if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
