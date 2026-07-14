@@ -5,6 +5,10 @@
   with an explicit reader target, checks a strict pure subset, emits deterministic
   EDN IR, and can run a zero-arity `main` function."
   (:require [clojure.java.io :as io]
+            ;; aliased `cstr`, not `str` -- this file already uses the bare
+            ;; `clojure.core/str` function extensively; `:as str` would
+            ;; silently shadow every one of those call sites.
+            [clojure.string :as cstr]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.lang.capability-values :as capability-values]
             [clojure.tools.reader :as reader]
@@ -2218,3 +2222,228 @@
              :kotoba.wasm/heap-base heap-start
              :kotoba.wasm/data-segment-count (count layout)
              :kotoba.wasm/local-count (reduce max 0 (map #(:local-count % 0) compiled-fns))})))))))
+
+;; ---------------------------------------------------------------------------
+;; ADR-2607151500: ClojureScript backend -- a SECOND, genuinely separate
+;; execution target for `.kotoba`, alongside compile-wasm-expr/wasm-binary
+;; above. Covers ONLY the narrow-slice governor-style op set (int/keyword/
+;; map literals, let/if/do/and/or/when, pair/pair-first/pair-second, get/
+;; assoc, +/-/*/quot//rem/mod/comparisons, not/zero?/pos?/neg?/inc/dec,
+;; named function calls) -- explicitly NOT i64/f32 typed ops, bitwise ops,
+;; string ops, memory ops (alloc/i32-store!/mem-i32-at/byte-at/etc as raw
+;; user-facing ops), or capability ops (cap-acquire/has-capability?/
+;; call-indirect). kotoba-lang/compiler's own cljs backend (ADR-2607151500,
+;; src/kotoba/compiler/backend/cljs.clj) landed its map/keyword/get/assoc/
+;; loop-recur subset first and added cap-call support as a later, separate
+;; addendum; the same incremental, honestly-scoped discipline applies here.
+;;
+;; Unlike compile-wasm-expr, this needs NO `locals`/`fns` context threaded
+;; through recursive calls -- WASM locals need numeric INDICES (hence
+;; compile-wasm-expr's local-index bookkeeping), but cljs's own `let`/`defn`
+;; bind SYMBOLIC names directly, so lowering is a simple form -> form
+;; rewrite (mirroring kotoba-lang/compiler's backend/cljs.clj `lower-expr`,
+;; which has the same shape for the same reason).
+;;
+;; Two semantics kotoba's WASM output gets for free from the `if`/
+;; comparison WASM OPCODES THEMSELVES (0-is-false via the `if` instruction;
+;; i32.eq/i32.lt_s/etc. natively push 0 or 1) that plain cljs forms do NOT
+;; reproduce automatically -- both handled explicitly here, same as
+;; compiler/'s cljs backend:
+;;   - every `if` wraps its test: `(if (zero? test') else' then')`
+;;   - every comparison wraps its result: `(if (op ...) 1 0)`
+;;
+;; `pair`/`pair-first`/`pair-second`: this repo's WASM path encodes a pair
+;; as 8 raw bytes in linear memory (alloc + i32-store!/mem-i32-at) because
+;; that's the only heap kotoba/'s WASM target has. A cljs runtime already
+;; has real persistent data structures, so here a pair is just a plain
+;; 2-element vector + `nth` -- simpler, and `get`'s bounded unroll (reused
+;; verbatim below, since it's pure form construction that recurses through
+;; whichever `compile-*-expr` processes its result) inherits this for free.
+;;
+;; No memory-based host ABI: `kotoba wasm emit` requires a 0-arity `main`
+;; because a WASM module can only export a fixed-arity function and real
+;; inputs must be marshaled through linear memory -- neither restriction
+;; applies to a cljs target, so `defn`s here keep their own declared
+;; params and callers pass real arguments directly. This means EXISTING
+;; `.kotoba` sources written for the memory-ABI convention (e.g. the
+;; `mem-i32-at`-reading cloud-itonami governor ports) do NOT compile
+;; unchanged to this target -- a real, documented v1 scope limit, not
+;; silently patched over.
+
+(declare compile-cljs-expr)
+
+(def ^:private cljs-comparison-ops '#{= < > <= >=})
+(def ^:private cljs-dividing-ops '#{quot / rem mod})
+(def ^:private cljs-arith-ops (into cljs-dividing-ops '#{+ - *}))
+
+(defn- cljs-fold-binary
+  "Left-folds MAKE-BINARY (a fn [compiled-acc compiled-arg] -> compiled-form)
+  over ARGS' compiled forms -- mirrors `compile-wasm-fold`'s own algorithm
+  exactly: `(op a b c)` -> `((a op b) op c)`, a single arg passes through
+  unchanged, at least one arg is required. This matters beyond `+`/`*`
+  (associative, fold order is cosmetic): WASM's comparison opcodes ALSO go
+  through this SAME fold, so `(< 3 1 2)` compiles to `((3<1) < 2)` =
+  `(0 < 2)` = true -- NOT Clojure's native `<`'s true n-ary \"monotonic\"
+  chained-comparison semantics (which would say false, 3 is not < 1).
+  Replicating this exact fold, quirky as it is for 3+-arg comparisons, is
+  what makes this backend agree with kotoba/'s own WASM target rather than
+  silently adopting cljs's more intuitive but DIFFERENT native semantics."
+  [make-binary args]
+  (when (empty? args)
+    (throw (ex-info "numeric op requires at least one argument" {:kotoba.cljs/problem :arity})))
+  (if (= 1 (count args))
+    (compile-cljs-expr (first args))
+    (reduce (fn [acc-form arg] (make-binary acc-form (compile-cljs-expr arg)))
+            (compile-cljs-expr (first args))
+            (rest args))))
+
+(defn- cljs-checked-divide
+  "One fold step for quot//rem/mod: divisor is let-bound once (evaluated
+  exactly once, matching a WASM stack machine's own single-evaluation
+  property) and checked for zero before dividing -- WASM's i32.div_s/
+  i32.rem_s instructions themselves TRAP on a zero divisor; plain cljs
+  `quot`/`rem`/`mod`/`/` on JS numbers do NOT (silently produce Infinity/
+  NaN/an exception only on some paths), so this guard is what makes this
+  backend agree with kotoba/'s WASM target's trapping behavior instead of
+  silently diverging into IEEE-754 semantics -- the same fail-closed
+  reasoning kotoba-lang/compiler's cljs backend's own `kotoba$quot` guard
+  documents."
+  [op-name acc-form divisor-form]
+  (let [d-sym (gensym "div__")]
+    (list 'let [d-sym divisor-form]
+          (list 'if (list 'zero? d-sym)
+                (list 'throw (list 'ex-info "division-by-zero"
+                                   {:kotoba.cljs/trap :division-by-zero}))
+                (list op-name acc-form d-sym)))))
+(def ^:private cljs-unsupported-ops
+  "Explicitly rejected in this v1 scope -- i64/f32 typed ops, bitwise ops,
+  string ops, raw memory ops, and capability ops all need a cljs-side
+  design this pass does not attempt (see this section's own preface
+  comment). Failing loud and clear here beats silently falling through to
+  a named-function-call emission for an op that was never a user-defined
+  function."
+  '#{i64 i64+ i64- i64* i64and i64or i64xor i64shl i64shr i64ushr
+     f32 f32+ f32- f32* f32div f32sqrt
+     bit-and bit-or bit-xor bit-shift-left bit-shift-right unsigned-bit-shift-right
+     alloc i32-store! mem-i32-at mem-byte-at byte-store! byte-at
+     str-len str-ptr bytes-ptr bytes-len memory-pages memory-grow
+     cap-acquire has-capability? call-indirect
+     result-ok? result-err? result-write! result-status result-value})
+
+(defn- cljs-reject! [op form]
+  (throw (ex-info (str "op not supported by the cljs backend (ADR-2607151500 v1 scope): " op)
+                  {:kotoba.cljs/problem :unsupported-op :kotoba.cljs/op op :kotoba.cljs/form (pr-str form)})))
+
+(defn compile-cljs-expr
+  "Lowers one `.kotoba` expression to a plain ClojureScript s-expression --
+  the cljs-target sibling of `compile-wasm-expr` above, covering only the
+  narrow-slice governor-style subset (see this section's own preface
+  comment for the exact scope and the semantics it must bridge)."
+  [form]
+  (cond
+    (integer? form) form
+    (keyword? form) (keyword->i32 form)
+    (map? form) (compile-cljs-expr (desugar-map form))
+    (symbol? form) form
+    (seq? form)
+    (let [[op & args] form]
+      (case op
+        do (cons 'do (map compile-cljs-expr args))
+
+        let (let [[bindings & body] args]
+              (list* 'let (vec (mapcat (fn [[name value]] [name (compile-cljs-expr value)])
+                                        (partition 2 bindings)))
+                     (map compile-cljs-expr body)))
+
+        if (let [[test then else] args]
+             (list 'if (list 'zero? (compile-cljs-expr test))
+                   (compile-cljs-expr else) (compile-cljs-expr then)))
+
+        and (compile-cljs-expr (desugar-and args))
+        or (compile-cljs-expr (desugar-or args))
+        when (let [[test & body] args]
+               (compile-cljs-expr (list 'if test (cons 'do body) 0)))
+
+        pair (let [[l r] args] (list 'vector (compile-cljs-expr l) (compile-cljs-expr r)))
+        pair-first (list 'nth (compile-cljs-expr (first args)) 0)
+        pair-second (list 'nth (compile-cljs-expr (first args)) 1)
+
+        get
+        (if (not (<= 2 (count args) 3))
+          (cljs-reject! 'get form)
+          (let [[m k default-form] args
+                default (if (some? default-form) default-form 0)
+                m-sym (gensym "get-m__") k-sym (gensym "get-k__") d-sym (gensym "get-d__")
+                unroll (fn unroll [cur depth]
+                         (if (zero? depth)
+                           d-sym
+                           (list 'if (list '= cur 0)
+                                 d-sym
+                                 (list 'if (list '= (list 'pair-first (list 'pair-first cur)) k-sym)
+                                       (list 'pair-second (list 'pair-first cur))
+                                       (unroll (list 'pair-second cur) (dec depth))))))]
+            (compile-cljs-expr
+             (list 'let [m-sym m k-sym k d-sym default]
+                   (unroll m-sym max-get-unroll-depth)))))
+
+        assoc
+        (if (not (and (>= (count args) 3) (odd? (count args))))
+          (cljs-reject! 'assoc form)
+          (let [[m & kvs] args]
+            (compile-cljs-expr
+             (reduce (fn [acc-map [k v]] (list 'pair (list 'pair k v) acc-map))
+                     m (partition 2 kvs)))))
+
+        not (list 'if (list '= (compile-cljs-expr (first args)) 0) 1 0)
+        zero? (list 'if (list '= (compile-cljs-expr (first args)) 0) 1 0)
+        pos? (compile-cljs-expr (list '> (first args) 0))
+        neg? (compile-cljs-expr (list '< (first args) 0))
+        inc (compile-cljs-expr (list '+ (first args) 1))
+        dec (compile-cljs-expr (list '- (first args) 1))
+
+        (cond
+          (contains? cljs-unsupported-ops op) (cljs-reject! op form)
+
+          (contains? cljs-comparison-ops op)
+          (cljs-fold-binary (fn [acc-form arg-form] (list 'if (list op acc-form arg-form) 1 0))
+                            args)
+
+          (contains? cljs-dividing-ops op)
+          ;; `/` and `quot` are the SAME op here (integer division, matching
+          ;; compile-wasm-fold's own opcode aliasing); `rem`/`mod` likewise.
+          (let [op-name (case op (/ quot) 'quot (mod rem) 'rem)]
+            (cljs-fold-binary (fn [acc-form arg-form] (cljs-checked-divide op-name acc-form arg-form))
+                              args))
+
+          (contains? cljs-arith-ops op) ; the remaining ops: + - *
+          (cljs-fold-binary (fn [acc-form arg-form] (list op acc-form arg-form)) args)
+
+          :else (apply list op (map compile-cljs-expr args)))))
+    :else (cljs-reject! :literal form)))
+
+(defn cljs-source
+  "Compiles top-level `(defn name [params] body...)` forms to a plain
+  ClojureScript source string -- one `(ns ...)` form, a `(declare ...)` of
+  every function name (forward references between user-defined functions
+  are ordinary and expected here; unlike compile-wasm-expr's function-index
+  table this needs no bytes-level equivalent, just textual ordering safety
+  -- see kotoba-lang/compiler's own cljs backend, which found this exact
+  gap live via `nbb` for its `loop`-desugared helpers), then one `defn` per
+  function, callable directly by any cljs host that requires the emitted
+  namespace -- no memory-based ABI, callers pass real arguments (see this
+  section's own preface comment for why that's fine here, unlike the WASM
+  target)."
+  ([forms] (cljs-source forms 'kotoba.compiled.generated))
+  ([forms ns-name]
+   (let [defs (function-defs forms)]
+     (when (empty? defs)
+       (throw (ex-info "at least one defn is required" {:kotoba.cljs/problem :no-functions})))
+     (let [fn-forms (mapv (fn [[name {:keys [params body]}]]
+                            (list 'defn name (vec params)
+                                  (list* 'do (map compile-cljs-expr body))))
+                          defs)
+           fn-names (mapv first defs)
+           forms* (concat [(list 'ns ns-name)]
+                          [(list* 'declare fn-names)]
+                          fn-forms)]
+       (cstr/join "\n\n" (map pr-str forms*))))))
