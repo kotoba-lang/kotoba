@@ -135,6 +135,7 @@ int aiueos_address_spaces_initialize(void) {
       space->directory[i] = page_directory[i];
       space->low[i] = low_page_table[i];
     }
+    for (uint64_t i = 0; i < PAGE_SIZE; i++) process_private_pages[process][i] = 0;
     space->pml4[0] = (uint64_t)(uintptr_t)space->pdpt |
       PTE_PRESENT | PTE_WRITABLE | PTE_USER;
     space->pdpt[0] = (uint64_t)(uintptr_t)space->directory |
@@ -161,6 +162,12 @@ uint64_t aiueos_address_space_enter(unsigned process) {
 }
 
 void aiueos_address_space_leave(void) { write_cr3(kernel_cr3); }
+uint64_t aiueos_address_space_kernel_cr3(void) { return kernel_cr3; }
+uint64_t aiueos_address_space_cr3(unsigned process) {
+  return process < 2 ? (uint64_t)(uintptr_t)process_spaces[process].pml4 : 0;
+}
+uint64_t aiueos_address_space_current_cr3(void) { return read_cr3(); }
+void aiueos_address_space_switch(uint64_t cr3) { if (cr3) write_cr3(cr3); }
 uint64_t aiueos_address_space_private_va(unsigned process) {
   return process == 0 ? PROCESS_PRIVATE_0 : process == 1 ? PROCESS_PRIVATE_1 : 0;
 }

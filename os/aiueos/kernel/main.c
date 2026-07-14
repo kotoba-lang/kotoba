@@ -237,6 +237,8 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
+    debug_string("AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return\n");
+    serial_string("AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return\r\n");
     if (!aiueos_ioapic_route_legacy_timer()) {
       debug_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\n");
       serial_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\r\n");

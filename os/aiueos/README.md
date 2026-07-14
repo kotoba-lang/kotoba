@@ -31,11 +31,13 @@ to acknowledge EOI before the smoke test can continue.
 
 The timer stub also preserves the complete x86-64 integer interrupt frame and
 passes its stack pointer to a minimal round-robin scheduler. Two kernel tasks
-run on separate 16 KiB stacks alongside the boot task. The QEMU gate proceeds
+run on separate 16 KiB stacks alongside the boot task. Each worker owns a
+distinct CR3 and increments only its private page; the timer switch restores
+the kernel CR3 before the boot task resumes. The QEMU gate proceeds
 only after all three contexts have been preempted and both worker tasks have
-resumed at least twice, producing `AIUEOS_SCHEDULER_OK`. This is kernel-task
-context-switch groundwork; scheduler-driven user address-space switching
-remains a later phase.
+resumed at least twice, producing `AIUEOS_SCHEDULER_OK` and
+`AIUEOS_SCHEDULER_CR3_OK`. Interrupt and kernel mappings remain shared and
+supervisor-only in every root.
 
 The Phase 3 bootstrap installs an `int 0x80` syscall gate that preserves the
 same integer context and returns through `iretq`. A tagged, generation-bearing
@@ -51,8 +53,8 @@ clones the low kernel page-table path, shares the kernel/MMIO branches, maps a
 different private user page, and leaves the other process's page non-present.
 The smoke switches CR3 sequentially, proves independent contents, and requires
 real non-present page faults for both cross-process reads before restoring the
-kernel CR3. Scheduler-driven CR3 switching, actual copy-in, and the
-`syscall`/`sysret` transport remain later work.
+kernel CR3. Actual copy-in and the `syscall`/`sysret` transport remain later
+work.
 
 The PCI path performs a bounded configuration-space scan and validates modern
 virtio vendor capabilities, including a cycle-limited capability chain, BAR

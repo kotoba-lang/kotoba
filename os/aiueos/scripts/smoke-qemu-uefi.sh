@@ -196,6 +196,10 @@ grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "
   echo "error: preemptive round-robin scheduler evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return" "$serial_log" >/dev/null || {
+  echo "error: scheduler-driven address-space switching evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_IOAPIC_OK pit-gsi vector=33 eoi-v1" "$serial_log" >/dev/null || {
   echo "error: IOAPIC external timer IRQ evidence was not observed" >&2
   exit 1
