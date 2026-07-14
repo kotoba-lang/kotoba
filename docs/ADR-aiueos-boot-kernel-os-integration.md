@@ -233,7 +233,9 @@ within one sector before an object is admitted. Sector 1 is a fixed journal
 slot. On boot the kernel reads and validates magic, version, sequence, committed
 state, payload length, and checksum before any mutation. A valid committed
 record is recovered without overwrite; otherwise sequence 1 is committed and
-read back. CI boots the same medium twice and requires recovery on boot two.
+read back. Header and payload have independent checksums. CI boots the same
+medium twice, requires recovery on boot two, corrupts the committed header, and
+requires rejection plus reconstruction on boot three.
 This closes crash/reboot recovery for one bounded transaction record, but is
 not yet a multi-record journal, writable object allocator, filesystem, or
 kotobase IStore.
