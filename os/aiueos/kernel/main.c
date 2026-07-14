@@ -40,6 +40,7 @@ extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *b
 extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_pci_enumerate(void);
 extern int aiueos_object_store_ready(void);
+extern int aiueos_journal_ready(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
@@ -227,6 +228,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a\n");
     serial_string("AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a\r\n");
+    if (!aiueos_journal_ready()) {
+      debug_string("AIUEOS_JOURNAL_FAIL write-readback\n");
+      serial_string("AIUEOS_JOURNAL_FAIL write-readback\r\n");
+      qemu_exit(0x6f);
+    }
+    debug_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\n");
+    serial_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
     if (!aiueos_ioapic_route_legacy_timer()) {

@@ -80,7 +80,7 @@ if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then iommu_args="-device intel-iommu"; fi
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   $iommu_args \
   -device virtio-rng-pci \
-  -drive if=none,id=aiueosblk,format=raw,readonly=on,file="$blk_image" \
+  -drive if=none,id=aiueosblk,format=raw,file="$blk_image" \
   -device virtio-blk-pci,drive=aiueosblk,disable-legacy=on \
   -display none -serial "file:$serial_log" -monitor none -no-reboot
 status=$?
@@ -186,6 +186,10 @@ grep -F "AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly" "$se
 }
 grep -F "AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a" "$serial_log" >/dev/null || {
   echo "error: bounded read-only object-store evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_JOURNAL_OK sequence=1 committed write-readback" "$serial_log" >/dev/null || {
+  echo "error: journal write/readback evidence was not observed" >&2
   exit 1
 }
 grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {

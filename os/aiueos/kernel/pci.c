@@ -20,6 +20,7 @@
 #define VIRTQ_DESC_F_WRITE 2
 #define VIRTQ_DESC_F_NEXT 1
 #define VIRTIO_BLK_T_IN 0
+#define VIRTIO_BLK_T_OUT 1
 #define VIRTIO_BLK_S_OK 0
 
 extern void *aiueos_allocate_physical_page(void);
@@ -54,16 +55,22 @@ struct virtio_common_cfg {
   volatile uint64_t queue_desc, queue_driver, queue_device;
 } __attribute__((packed));
 struct virtq_desc { uint64_t address; uint32_t length; uint16_t flags, next; } __attribute__((packed));
-struct virtq_avail { uint16_t flags, index, ring[1], used_event; } __attribute__((packed));
+struct virtq_avail { uint16_t flags, index, ring[4], used_event; } __attribute__((packed));
 struct virtq_used_element { uint32_t id, length; } __attribute__((packed));
-struct virtq_used { uint16_t flags, index; struct virtq_used_element ring[1]; uint16_t avail_event; } __attribute__((packed));
+struct virtq_used { uint16_t flags, index; struct virtq_used_element ring[4]; uint16_t avail_event; } __attribute__((packed));
 struct virtio_blk_request { uint32_t type, reserved; uint64_t sector; } __attribute__((packed));
 struct aiuefs_superblock {
   uint8_t magic[8]; uint32_t version, header_size, object_count, reserved;
   uint32_t object_offset, object_length, object_checksum;
 } __attribute__((packed));
+struct aiuefs_journal_record {
+  uint8_t magic[8]; uint32_t version, sequence, state, payload_length, payload_checksum;
+  uint8_t payload[32];
+} __attribute__((packed));
 static int object_store_ready;
+static int journal_ready;
 int aiueos_object_store_ready(void) { return object_store_ready; }
+int aiueos_journal_ready(void) { return journal_ready; }
 static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
   uint32_t hash = 2166136261U;
   for (uint32_t i = 0; i < length; i++) { hash ^= bytes[i]; hash *= 16777619U; }
@@ -258,6 +265,41 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
           fnv1a(sector + superblock->object_offset, superblock->object_length) != superblock->object_checksum)
         return 0;
       object_store_ready = 1;
+      struct aiuefs_journal_record *journal = (void *)sector;
+      static const uint8_t journal_magic[8] = {'A','I','U','J','R','N','1',0};
+      static const uint8_t journal_payload[16] = "KOTOBASE-TXN-001";
+      for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+      for (uint32_t i = 0; i < 8; i++) journal->magic[i] = journal_magic[i];
+      journal->version = 1; journal->sequence = 1; journal->state = 2;
+      journal->payload_length = sizeof(journal_payload);
+      for (uint32_t i = 0; i < sizeof(journal_payload); i++) journal->payload[i] = journal_payload[i];
+      journal->payload_checksum = fnv1a(journal->payload, journal->payload_length);
+      request->type = VIRTIO_BLK_T_OUT; request->sector = 1; *status = 0xff;
+      desc[1].flags = VIRTQ_DESC_F_NEXT;
+      avail->ring[1] = 0; __asm__ volatile("" ::: "memory"); avail->index = 2; *doorbell = 0;
+      for (uint32_t write_budget = 0; write_budget < 100000000U; write_budget++) {
+        __asm__ volatile("" ::: "memory");
+        if (used->index == 2) break;
+        __asm__ volatile("pause");
+      }
+      if (used->index != 2 || used->ring[1].id != 0 || used->ring[1].length != 1 ||
+          *status != VIRTIO_BLK_S_OK) return 0;
+      for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+      request->type = VIRTIO_BLK_T_IN; *status = 0xff;
+      desc[1].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
+      avail->ring[2] = 0; __asm__ volatile("" ::: "memory"); avail->index = 3; *doorbell = 0;
+      for (uint32_t read_budget = 0; read_budget < 100000000U; read_budget++) {
+        __asm__ volatile("" ::: "memory");
+        if (used->index == 3) break;
+        __asm__ volatile("pause");
+      }
+      journal = (void *)sector;
+      if (used->index != 3 || used->ring[2].id != 0 || used->ring[2].length != 513 ||
+          *status != VIRTIO_BLK_S_OK || journal->version != 1 || journal->sequence != 1 ||
+          journal->state != 2 || journal->payload_length != sizeof(journal_payload) ||
+          fnv1a(journal->payload, journal->payload_length) != journal->payload_checksum) return 0;
+      for (uint32_t i = 0; i < 8; i++) if (journal->magic[i] != journal_magic[i]) return 0;
+      journal_ready = 1;
       return 1;
     }
     __asm__ volatile("pause");
@@ -267,6 +309,7 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
 
 int aiueos_pci_enumerate(void) {
   object_store_ready = 0;
+  journal_ready = 0;
   if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
