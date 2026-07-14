@@ -32,6 +32,7 @@ extern int aiueos_apic_timer_initialize(void);
 extern volatile uint64_t aiueos_apic_timer_ticks;
 extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *boot);
 extern void *aiueos_allocate_physical_page(void);
+extern int aiueos_pci_enumerate(void);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
 static inline void debug_byte(uint8_t value) {
@@ -156,6 +157,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     __asm__ volatile("cli");
     debug_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\n");
     serial_string("AIUEOS_APIC_TIMER_OK vector=32 eoi-v1\r\n");
+    if (!aiueos_pci_enumerate()) {
+      debug_string("AIUEOS_PCI_FAIL enumeration-or-virtio\n");
+      serial_string("AIUEOS_PCI_FAIL enumeration-or-virtio\r\n");
+      qemu_exit(0x74);
+    }
+    debug_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\n");
+    serial_string("AIUEOS_PCI_OK bounded-scan virtio-vendor=1af4\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

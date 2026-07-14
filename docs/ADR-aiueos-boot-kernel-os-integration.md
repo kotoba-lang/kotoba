@@ -216,6 +216,11 @@ admits only Conventional Memory above the kernel image and below the current
 bounded bump allocator establishes ownership evidence; reclamation, free lists,
 zones, and allocation above the bootstrap map remain.
 
+The Phase 4 discovery slice performs a bounded PCI configuration mechanism #1
+scan and requires a QEMU virtio function with vendor ID `0x1af4`. It does not
+yet admit BARs, map device MMIO, allocate DMA, route MSI/MSI-X, or operate a
+virtqueue.
+
 ## Initial non-goals
 
 - full POSIX/Linux ABI compatibility;
