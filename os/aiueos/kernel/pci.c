@@ -24,6 +24,7 @@
 
 extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_map_pci_mmio(uint64_t address, uint64_t length);
+extern int aiueos_dma_test_policy_allows_unisolated(void);
 
 static inline void out32(uint16_t port, uint32_t value) {
   __asm__ volatile("outl %0, %1" : : "a"(value), "Nd"(port));
@@ -246,6 +247,7 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
 }
 
 int aiueos_pci_enumerate(void) {
+  if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
   int rng_ok = 0, blk_ok = 0;

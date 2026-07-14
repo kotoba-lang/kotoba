@@ -66,6 +66,12 @@ split-virtqueue vertical slices; MSI-X,
 IOMMU isolation, indirect descriptors, and a reusable multi-request transport
 remain later Phase 4 work.
 
+ACPI DMAR discovery validates the complete table, bounded remapping structures,
+DRHD register bases, and variable-length device scopes. A detected but
+unconfigured VT-d unit makes PCI DMA fail closed. Only the QEMU bring-up profile
+may use unisolated DMA when DMAR is absent, and its serial evidence explicitly
+labels that exception `test-only-unisolated` rather than claiming isolation.
+
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh

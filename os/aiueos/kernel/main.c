@@ -30,6 +30,7 @@ volatile uint64_t aiueos_page_fault_stage;
 volatile uint64_t aiueos_page_fault_error;
 extern int aiueos_paging_initialize(void);
 extern int aiueos_acpi_initialize(const void *rsdp);
+extern int aiueos_dma_test_policy_allows_unisolated(void);
 extern int aiueos_apic_timer_initialize(void);
 extern volatile uint64_t aiueos_apic_timer_ticks;
 extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *boot);
@@ -162,6 +163,11 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\n");
     serial_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\r\n");
+    if (!aiueos_dma_test_policy_allows_unisolated()) {
+      serial_string("AIUEOS_DMA_POLICY_OK dmar=validated dma=denied-until-vtd-enabled\r\n");
+    } else {
+      serial_string("AIUEOS_DMA_POLICY_OK dmar=absent test-only-unisolated\r\n");
+    }
     if (!aiueos_apic_timer_initialize()) {
       debug_string("AIUEOS_APIC_FAIL initialization\n");
       serial_string("AIUEOS_APIC_FAIL initialization\r\n");

@@ -22,6 +22,7 @@ static uint32_t discovered_cpu_count;
 static uint32_t discovered_ioapic_address;
 static uint32_t discovered_ioapic_gsi_base;
 static uint32_t discovered_timer_gsi;
+static uint32_t discovered_dmar_drhd_count;
 
 uint32_t aiueos_acpi_cpu_count(void) { return discovered_cpu_count; }
 uint32_t aiueos_acpi_apic_id(uint32_t index) {
@@ -30,6 +31,10 @@ uint32_t aiueos_acpi_apic_id(uint32_t index) {
 uint32_t aiueos_acpi_ioapic_address(void) { return discovered_ioapic_address; }
 uint32_t aiueos_acpi_ioapic_gsi_base(void) { return discovered_ioapic_gsi_base; }
 uint32_t aiueos_acpi_timer_gsi(void) { return discovered_timer_gsi; }
+int aiueos_dma_test_policy_allows_unisolated(void) {
+  return discovered_dmar_drhd_count == 0;
+}
+uint32_t aiueos_acpi_dmar_drhd_count(void) { return discovered_dmar_drhd_count; }
 
 static int bytes_equal(const char *a, const char *b, uint64_t count) {
   while (count--) if (*a++ != *b++) return 0; return 1;
@@ -50,11 +55,47 @@ static int valid_sdt(const struct sdt_header *header) {
          bounded_address(address, header->length) && checksum_ok(header, header->length);
 }
 
+static int parse_dmar(const struct sdt_header *header) {
+  if (header->length < sizeof(*header) + 12) return 0;
+  const uint8_t *bytes = (const uint8_t *)header;
+  uint8_t width = bytes[sizeof(*header)];
+  if (width < 31 || width > 63) return 0;
+  const uint8_t *cursor = bytes + sizeof(*header) + 12;
+  const uint8_t *end = bytes + header->length;
+  uint32_t drhds = 0;
+  while (cursor < end) {
+    if ((uint64_t)(end - cursor) < 4) return 0;
+    uint16_t type = *(const uint16_t *)(const void *)cursor;
+    uint16_t length = *(const uint16_t *)(const void *)(cursor + 2);
+    if (length < 4 || (uint64_t)(end - cursor) < length) return 0;
+    if (type == 0) {
+      if (length < 16) return 0;
+      uint64_t base = *(const uint64_t *)(const void *)(cursor + 8);
+      /* The register base is data, not dereferenced during discovery. Keep it
+         page-aligned and within x86-64's architectural 52-bit physical range. */
+      if (!base || (base & 4095) || base >= (1ULL << 52)) return 0;
+      const uint8_t *scope = cursor + 16;
+      const uint8_t *scope_end = cursor + length;
+      while (scope < scope_end) {
+        if ((uint64_t)(scope_end - scope) < 6 || scope[1] < 6 ||
+            (uint64_t)(scope_end - scope) < scope[1] || ((scope[1] - 6) & 1)) return 0;
+        scope += scope[1];
+      }
+      drhds++;
+    }
+    cursor += length;
+  }
+  if (!drhds) return 0;
+  discovered_dmar_drhd_count = drhds;
+  return 1;
+}
+
 int aiueos_acpi_initialize(const void *rsdp_pointer) {
   discovered_cpu_count = 0;
   discovered_ioapic_address = 0;
   discovered_ioapic_gsi_base = 0;
   discovered_timer_gsi = 0;
+  discovered_dmar_drhd_count = 0;
   const struct rsdp_v2 *rsdp = rsdp_pointer;
   if (!bounded_address((uint64_t)(uintptr_t)rsdp, sizeof(*rsdp)) ||
       !bytes_equal(rsdp->signature, "RSD PTR ", 8) || rsdp->revision < 2 ||
@@ -67,16 +108,20 @@ int aiueos_acpi_initialize(const void *rsdp_pointer) {
   uint32_t entries = (xsdt->length - sizeof(*xsdt)) / 8;
   const uint64_t *addresses = (const void *)((const uint8_t *)xsdt + sizeof(*xsdt));
   const struct madt_header *madt = 0;
+  const struct sdt_header *dmar = 0;
   for (uint32_t i = 0; i < entries; i++) {
     const struct sdt_header *candidate = (const void *)(uintptr_t)addresses[i];
     if (!bounded_address(addresses[i], sizeof(*candidate))) return 0;
     if (bytes_equal(candidate->signature, "APIC", 4)) {
       if (!valid_sdt(candidate) || candidate->length < sizeof(struct madt_header)) return 0;
       madt = (const struct madt_header *)candidate;
-      break;
+    } else if (bytes_equal(candidate->signature, "DMAR", 4)) {
+      if (dmar || !valid_sdt(candidate)) return 0;
+      dmar = candidate;
     }
   }
   if (!madt) return 0;
+  if (dmar && !parse_dmar(dmar)) return 0;
 
   const uint8_t *cursor = (const uint8_t *)madt + sizeof(*madt);
   const uint8_t *end = (const uint8_t *)madt + madt->sdt.length;

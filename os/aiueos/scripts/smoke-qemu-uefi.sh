@@ -60,6 +60,9 @@ else
   boot_drive="format=raw,file=fat:rw:$out/esp"
 fi
 set +e
+iommu_args=
+if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then iommu_args="-device intel-iommu"; fi
+# shellcheck disable=SC2086 # intentional optional pair of QEMU arguments
 "$qemu" \
   -machine q35,accel=tcg -cpu max -m 128M -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -67,6 +70,7 @@ set +e
   -device isa-debugcon,iobase=0xe9,chardev=debug \
   -chardev file,id=debug,path="$log" \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+  $iommu_args \
   -device virtio-rng-pci \
   -drive if=none,id=aiueosblk,format=raw,readonly=on,file="$blk_image" \
   -device virtio-blk-pci,drive=aiueosblk,disable-legacy=on \
@@ -84,6 +88,18 @@ if [ "${AIUEOS_CORRUPT_KERNEL:-0}" = 1 ]; then
     exit 1
   }
   echo "AIUEOS_KERNEL_INTEGRITY_REJECTION_OK"
+  exit 0
+fi
+
+if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then
+  # PCI DMA is intentionally rejected before a virtqueue can be submitted.
+  [ "$status" -eq 233 ] || {
+    echo "error: fail-closed DMAR profile exited with status $status" >&2; exit 1;
+  }
+  grep -F "AIUEOS_DMA_POLICY_OK dmar=validated dma=denied-until-vtd-enabled" "$serial_log" >/dev/null || {
+    echo "error: validated DMAR fail-closed evidence was not observed" >&2; exit 1;
+  }
+  echo "AIUEOS_DMAR_FAIL_CLOSED_OK"
   exit 0
 fi
 
@@ -124,6 +140,10 @@ grep -F "AIUEOS_PHYSICAL_ALLOCATOR_OK pages=2 zeroed" "$serial_log" >/dev/null |
 }
 grep -F "AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2" "$serial_log" >/dev/null || {
   echo "error: validated ACPI CPU discovery evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_DMA_POLICY_OK dmar=absent test-only-unisolated" "$serial_log" >/dev/null || {
+  echo "error: explicit no-IOMMU test DMA policy evidence was not observed" >&2
   exit 1
 }
 grep -F "AIUEOS_APIC_TIMER_OK vector=32 eoi-v1" "$serial_log" >/dev/null || {
