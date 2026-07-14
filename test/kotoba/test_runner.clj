@@ -23,7 +23,8 @@
             [kotoba.runtime-test]
             [kotoba.sensing-host-test]
             [kotoba.wasm-and-or-when-test]
-            [kotoba.wasm-exec-test]))
+            [kotoba.wasm-exec-test]
+            [kotoba.wasm-map-keyword-test]))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'kotoba.actor-host-test
@@ -48,6 +49,7 @@
                                         'kotoba.runtime-test
                                         'kotoba.sensing-host-test
                                         'kotoba.wasm-and-or-when-test
-                                        'kotoba.wasm-exec-test)]
+                                        'kotoba.wasm-exec-test
+                                        'kotoba.wasm-map-keyword-test)]
     (when (pos? (+ (or fail 0) (or error 0)))
       (System/exit 1))))
