@@ -18,6 +18,12 @@ extern void aiueos_load_task_register(void);
 extern void aiueos_enter_user(void (*entry)(void), void *stack);
 extern int aiueos_user_mapping_verify(void);
 extern uint64_t aiueos_syscall_from_user;
+extern int aiueos_address_spaces_initialize(void);
+extern uint64_t aiueos_address_space_enter(unsigned process);
+extern void aiueos_address_space_leave(void);
+extern uint64_t aiueos_address_space_private_va(unsigned process);
+extern void aiueos_probe_cross_process(const void *address);
+extern volatile uint64_t aiueos_page_fault_stage, aiueos_page_fault_error;
 static struct tss64 tss;
 static uint8_t syscall_stack[16384] __attribute__((aligned(4096)));
 
@@ -60,4 +66,33 @@ int aiueos_process_result(void) {
   return aiueos_syscall_from_user == 3 && result.completed &&
     result.abi==ABI_V1 && result.valid==5 &&
     result.bad_handle==BAD_HANDLE && result.bad_pointer==BAD_POINTER;
+}
+
+int aiueos_address_space_self_test(void) {
+  if (!aiueos_address_spaces_initialize()) return 0;
+  uint64_t first = aiueos_address_space_private_va(0);
+  uint64_t second = aiueos_address_space_private_va(1);
+  uint64_t cr3_first = aiueos_address_space_enter(0);
+  *(volatile uint64_t *)(uintptr_t)first = 0x1111111111111111ULL;
+  aiueos_page_fault_stage = 3;
+  aiueos_probe_cross_process((const void *)(uintptr_t)second);
+  if (aiueos_page_fault_stage != 0x103 || (aiueos_page_fault_error & 1)) {
+    aiueos_address_space_leave(); return 0;
+  }
+  uint64_t cr3_second = aiueos_address_space_enter(1);
+  if (*(volatile uint64_t *)(uintptr_t)second != 0) {
+    aiueos_address_space_leave(); return 0;
+  }
+  *(volatile uint64_t *)(uintptr_t)second = 0x2222222222222222ULL;
+  aiueos_page_fault_stage = 3;
+  aiueos_probe_cross_process((const void *)(uintptr_t)first);
+  int isolated = aiueos_page_fault_stage == 0x103 &&
+    !(aiueos_page_fault_error & 1) && cr3_first != cr3_second;
+  if (isolated) {
+    aiueos_address_space_enter(0);
+    isolated = *(volatile uint64_t *)(uintptr_t)first ==
+      0x1111111111111111ULL;
+  }
+  aiueos_address_space_leave();
+  return isolated;
 }

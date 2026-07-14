@@ -91,6 +91,8 @@ struct aiueos_boot_info {
   uint64_t magic, version;
   void *memory_map; uint64_t memory_map_size, descriptor_size, descriptor_version;
   void *acpi_rsdp;
+  uint64_t framebuffer_base, framebuffer_size;
+  uint32_t framebuffer_width, framebuffer_height, framebuffer_stride, framebuffer_format;
 };
 typedef void(SYSVABI *kernel_entry)(const struct aiueos_boot_info *);
 extern const uint8_t aiueos_expected_kernel_sha256[32];
@@ -101,6 +103,20 @@ static const struct efi_guid simple_fs_guid =
   {0x964e5b22, 0x6459, 0x11d2, {0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b}};
 static const struct efi_guid acpi20_guid =
   {0x8868e871, 0xe4f1, 0x11d3, {0xbc,0x22,0x00,0x80,0xc7,0x3c,0x88,0x81}};
+static const struct efi_guid graphics_output_guid =
+  {0x9042a9de, 0x23dc, 0x4a38, {0x96,0xfb,0x7a,0xde,0xd0,0x80,0x51,0x6a}};
+
+struct efi_graphics_output_mode_info {
+  uint32_t version, horizontal_resolution, vertical_resolution, pixel_format;
+  uint32_t pixel_information[4], pixels_per_scan_line;
+};
+struct efi_graphics_output_mode {
+  uint32_t max_mode, mode; struct efi_graphics_output_mode_info *info;
+  uint64_t size_of_info, framebuffer_base, framebuffer_size;
+};
+struct efi_graphics_output_protocol {
+  void *query_mode, *set_mode, *blt; struct efi_graphics_output_mode *mode;
+};
 
 static int guid_equal(const struct efi_guid *a, const struct efi_guid *b) {
   const uint8_t *x = (const uint8_t *)a, *y = (const uint8_t *)b;
@@ -194,6 +210,7 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *system) {
   uint64_t memory_map_size, map_key, descriptor_size;
   uint32_t descriptor_version;
   struct aiueos_boot_info info;
+  struct efi_graphics_output_protocol *gop = 0;
 
   if (!system || !(bs = system->boot_services)) return fail("AIUEOS_LOADER_FAIL system-table");
   if (system->console_out && system->console_out->output_string)
@@ -266,6 +283,26 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *system) {
     }
   }
   if (!info.acpi_rsdp) return fail("AIUEOS_LOADER_FAIL acpi-rsdp");
+
+  if (bs->handle_protocol(system->console_out_handle, &graphics_output_guid,
+                          (void **)&gop) != EFI_SUCCESS || !gop || !gop->mode ||
+      !gop->mode->info || !gop->mode->framebuffer_base ||
+      !gop->mode->framebuffer_size)
+    return fail("AIUEOS_LOADER_FAIL gop");
+  struct efi_graphics_output_mode_info *gop_info = gop->mode->info;
+  if (!gop_info->horizontal_resolution || !gop_info->vertical_resolution ||
+      gop_info->pixels_per_scan_line < gop_info->horizontal_resolution ||
+      (gop_info->pixel_format != 0 && gop_info->pixel_format != 1) ||
+      (uint64_t)gop_info->pixels_per_scan_line * gop_info->vertical_resolution >
+        gop->mode->framebuffer_size / 4)
+    return fail("AIUEOS_LOADER_FAIL gop-mode");
+  info.framebuffer_base = gop->mode->framebuffer_base;
+  info.framebuffer_size = gop->mode->framebuffer_size;
+  info.framebuffer_width = gop_info->horizontal_resolution;
+  info.framebuffer_height = gop_info->vertical_resolution;
+  info.framebuffer_stride = gop_info->pixels_per_scan_line;
+  info.framebuffer_format = gop_info->pixel_format;
+  debug_string("AIUEOS_GOP_HANDOFF_OK framebuffer-v1\n");
 
   status = bs->exit_boot_services(image, map_key);
   if (status != EFI_SUCCESS) return fail("AIUEOS_LOADER_FAIL exit-boot-services");

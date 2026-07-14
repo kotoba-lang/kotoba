@@ -43,11 +43,18 @@ fi
 rm -f "$log" "$serial_log"
 python3 - "$blk_image" <<'PY'
 import pathlib
+import struct
 import sys
 
 path = pathlib.Path(sys.argv[1])
 payload = bytearray(1024 * 1024)
-payload[:17] = b"AIUEOS-BLK-SMOKE\0"
+obj = b"KOTOBASE-ROOT-V1"
+checksum = 2166136261
+for byte in obj:
+    checksum = ((checksum ^ byte) * 16777619) & 0xffffffff
+header = struct.pack("<8s7I", b"AIUEFS1\0", 1, 36, 1, 0, 64, len(obj), checksum)
+payload[:len(header)] = header
+payload[64:64 + len(obj)] = obj
 path.write_bytes(payload)
 PY
 if [ -n "${AIUEOS_DISK_IMAGE:-}" ]; then
@@ -114,6 +121,10 @@ grep -F "AIUEOS_LOADER_OK" "$log" >/dev/null || {
   echo "error: loader identity was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_GOP_HANDOFF_OK framebuffer-v1" "$log" >/dev/null || {
+  echo "error: loader did not hand off a validated GOP mode" >&2
+  exit 1
+}
 grep -F "AIUEOS_LOADER_INTEGRITY_OK sha256-v1" "$log" >/dev/null || {
   echo "error: kernel integrity evidence was not observed" >&2
   exit 1
@@ -133,6 +144,10 @@ grep -F "AIUEOS_DESCRIPTOR_TABLES_OK gdt-v1 idt-v1" "$serial_log" >/dev/null || 
 }
 grep -F "AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp" "$serial_log" >/dev/null || {
   echo "error: kernel-owned paging evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified" "$serial_log" >/dev/null || {
+  echo "error: kernel did not validate and render the GOP framebuffer" >&2
   exit 1
 }
 grep -F "AIUEOS_PHYSICAL_ALLOCATOR_OK pages=2 zeroed" "$serial_log" >/dev/null || {
@@ -169,6 +184,10 @@ grep -F "AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly" "$se
   test -f "$serial_log" && sed -n '1,140p' "$serial_log" >&2
   exit 1
 }
+grep -F "AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a" "$serial_log" >/dev/null || {
+  echo "error: bounded read-only object-store evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {
   echo "error: preemptive round-robin scheduler evidence was not observed" >&2
   exit 1
@@ -187,6 +206,10 @@ grep -F "AIUEOS_CAPABILITY_OK handle-v1 invalid-handle-denied" "$serial_log" >/d
 }
 grep -F "AIUEOS_PROCESS_FOUNDATION_OK tss-descriptor user-wx guard-page" "$serial_log" >/dev/null || {
   echo "error: process isolation foundation evidence was not observed" >&2; exit 1;
+}
+grep -F "AIUEOS_ADDRESS_SPACE_OK processes=2 distinct-cr3 private-pages cross-access-fault" "$serial_log" >/dev/null || {
+  echo "error: per-process address-space isolation evidence was not observed" >&2
+  exit 1
 }
 grep -F "AIUEOS_RING3_OK cpl3-int80 tss-rsp0 return-kernel" "$serial_log" >/dev/null || {
   echo "error: CPL3 syscall and kernel-return evidence was not observed" >&2; exit 1;

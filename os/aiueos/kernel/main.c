@@ -4,6 +4,8 @@ struct aiueos_boot_info {
   uint64_t magic, version;
   void *memory_map; uint64_t memory_map_size, descriptor_size, descriptor_version;
   void *acpi_rsdp;
+  uint64_t framebuffer_base, framebuffer_size;
+  uint32_t framebuffer_width, framebuffer_height, framebuffer_stride, framebuffer_format;
 };
 
 struct __attribute__((packed)) idt_entry {
@@ -29,6 +31,7 @@ extern void aiueos_probe_no_execute(void);
 volatile uint64_t aiueos_page_fault_stage;
 volatile uint64_t aiueos_page_fault_error;
 extern int aiueos_paging_initialize(void);
+extern int aiueos_framebuffer_initialize(const struct aiueos_boot_info *boot);
 extern int aiueos_acpi_initialize(const void *rsdp);
 extern int aiueos_dma_test_policy_allows_unisolated(void);
 extern int aiueos_apic_timer_initialize(void);
@@ -36,12 +39,14 @@ extern volatile uint64_t aiueos_apic_timer_ticks;
 extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *boot);
 extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_pci_enumerate(void);
+extern int aiueos_object_store_ready(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
 extern int aiueos_process_initialize(void);
 extern void aiueos_process_enter(void);
 extern int aiueos_process_result(void);
+extern int aiueos_address_space_self_test(void);
 extern void aiueos_load_task_register(void);
 extern int aiueos_smp_start_application_processor(void);
 extern int aiueos_ioapic_route_legacy_timer(void);
@@ -140,6 +145,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\n");
     serial_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\r\n");
+    if (!aiueos_framebuffer_initialize(boot)) {
+      debug_string("AIUEOS_FRAMEBUFFER_FAIL gop-contract\n");
+      serial_string("AIUEOS_FRAMEBUFFER_FAIL gop-contract\r\n");
+      qemu_exit(0x68);
+    }
+    debug_string("AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified\n");
+    serial_string("AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified\r\n");
     if (!aiueos_physical_allocator_initialize(boot)) {
       debug_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\n");
       serial_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\r\n");
@@ -208,6 +220,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly\n");
     serial_string("AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly\r\n");
+    if (!aiueos_object_store_ready()) {
+      debug_string("AIUEOS_OBJECT_STORE_FAIL superblock-or-object\n");
+      serial_string("AIUEOS_OBJECT_STORE_FAIL superblock-or-object\r\n");
+      qemu_exit(0x70);
+    }
+    debug_string("AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a\n");
+    serial_string("AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
     if (!aiueos_ioapic_route_legacy_timer()) {
@@ -248,6 +267,13 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_RING3_OK cpl3-int80 tss-rsp0 return-kernel\r\n");
     debug_string("AIUEOS_USER_SYSCALL_OK valid-log invalid-handle invalid-pointer\n");
     serial_string("AIUEOS_USER_SYSCALL_OK valid-log invalid-handle invalid-pointer\r\n");
+    if (!aiueos_address_space_self_test()) {
+      debug_string("AIUEOS_ADDRESS_SPACE_FAIL cr3-or-isolation\n");
+      serial_string("AIUEOS_ADDRESS_SPACE_FAIL cr3-or-isolation\r\n");
+      qemu_exit(0x76);
+    }
+    debug_string("AIUEOS_ADDRESS_SPACE_OK processes=2 distinct-cr3 private-pages cross-access-fault\n");
+    serial_string("AIUEOS_ADDRESS_SPACE_OK processes=2 distinct-cr3 private-pages cross-access-fault\r\n");
     aiueos_page_fault_stage = 1;
     aiueos_probe_write_protect();
     if (aiueos_page_fault_stage != 0x101 ||

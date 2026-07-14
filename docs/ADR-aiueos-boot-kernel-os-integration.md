@@ -226,6 +226,12 @@ scan and requires a QEMU virtio function with vendor ID `0x1af4`. It does not
 yet admit BARs, map device MMIO, allocate DMA, route MSI/MSI-X, or operate a
 virtqueue.
 
+The first storage slice interprets the separately attached read-only
+virtio-blk fixture as an `aiuefs-v1` object-store superblock. Header size,
+object count, offset, length, and checksum are validated within the 512-byte
+sector before an object is admitted. This is the block-service boundary below
+kotobase; it is not yet a writable filesystem, journal, or kotobase IStore.
+
 ## Initial non-goals
 
 - full POSIX/Linux ABI compatibility;

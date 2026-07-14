@@ -175,6 +175,8 @@ aiueos_isr_page_fault:
   je 4f
   cmp $2, %rax
   je 5f
+  cmp $3, %rax
+  je 9f
   mov $0xffff, %rax
   mov %rax, aiueos_page_fault_stage(%rip)
   jmp 6f
@@ -188,6 +190,12 @@ aiueos_isr_page_fault:
   lea aiueos_nx_probe_resume(%rip), %rax
   mov %rax, 16(%rsp)
   mov $0x102, %rax
+  mov %rax, aiueos_page_fault_stage(%rip)
+  jmp 7f
+9:
+  lea aiueos_cross_process_probe_resume(%rip), %rax
+  mov %rax, 16(%rsp)
+  mov $0x103, %rax
   mov %rax, aiueos_page_fault_stage(%rip)
 7:
   pop %rax
@@ -214,6 +222,14 @@ aiueos_probe_no_execute:
   jmp *%rax
 .global aiueos_nx_probe_resume
 aiueos_nx_probe_resume:
+  ret
+
+.global aiueos_probe_cross_process
+.type aiueos_probe_cross_process,@function
+aiueos_probe_cross_process:
+  mov (%rdi), %rax
+.global aiueos_cross_process_probe_resume
+aiueos_cross_process_probe_resume:
   ret
 
 .section .data.gdt,"aw",@progbits
