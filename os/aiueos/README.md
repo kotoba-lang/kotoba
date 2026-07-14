@@ -91,6 +91,13 @@ stable readback hash is required before `AIUEOS_FRAMEBUFFER_OK` is emitted.
 This is the native display capability boundary for the browser-owned desktop:
 the browser remains the workspace/focus/permission authority, while the kernel
 only admits validated surfaces and hardware input. Direct framebuffer mapping
+is not granted to the browser. The input boundary uses a versioned, sequenced
+envelope (`pointer`, `key`, or `text`); raw virtio DMA memory stays kernel-only
+and IME interpretation belongs to the browser desktop authority. The QEMU
+smoke configures a real modern `virtio-keyboard-pci` event queue, but its event
+is explicitly synthetic because headless HMP `sendkey` is routed to the legacy
+console rather than virtio-keyboard. Production builds do not enable that
+fallback and require a device-completed, length/type/value-validated event.
 into a user component, ambient display authority, and an invented browser
 runtime are intentionally excluded.
 

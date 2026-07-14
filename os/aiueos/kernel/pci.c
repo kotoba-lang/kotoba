@@ -8,6 +8,8 @@
 #define VIRTIO_RNG_TRANSITIONAL_ID 0x1005
 #define VIRTIO_BLK_MODERN_ID 0x1042
 #define VIRTIO_BLK_TRANSITIONAL_ID 0x1001
+#define VIRTIO_INPUT_MODERN_ID 0x1052
+#define VIRTIO_INPUT_TRANSITIONAL_ID 0x1012
 #define PCI_STATUS_CAPABILITIES 0x10
 #define PCI_CAP_VENDOR 0x09
 #define PCI_CAP_MSIX 0x11
@@ -65,6 +67,24 @@ struct virtq_avail { uint16_t flags, index, ring[4], used_event; } __attribute__
 struct virtq_used_element { uint32_t id, length; } __attribute__((packed));
 struct virtq_used { uint16_t flags, index; struct virtq_used_element ring[4]; uint16_t avail_event; } __attribute__((packed));
 struct virtio_blk_request { uint32_t type, reserved; uint64_t sector; } __attribute__((packed));
+struct virtio_input_event { uint16_t type, code; uint32_t value; } __attribute__((packed));
+/* Kernel-to-browser.desktop-backend envelope. Raw device memory is never exposed. */
+struct aiueos_desktop_input_event {
+  uint32_t abi_version, byte_size;
+  uint64_t sequence;
+  uint32_t kind, code;
+  int32_t value;
+  uint32_t modifiers, flags;
+} __attribute__((packed));
+#define AIUEOS_DESKTOP_INPUT_ABI 1
+#define AIUEOS_DESKTOP_INPUT_KEY 2
+#define AIUEOS_DESKTOP_INPUT_PRESSED 1
+static struct aiueos_desktop_input_event desktop_input_event;
+static int desktop_input_ready;
+int aiueos_desktop_input_event_ready(void) { return desktop_input_ready; }
+const struct aiueos_desktop_input_event *aiueos_desktop_input_event(void) {
+  return desktop_input_ready ? &desktop_input_event : 0;
+}
 struct aiuefs_superblock {
   uint8_t magic[8]; uint32_t version, header_size, object_count, reserved;
   uint32_t object_offset, object_length, object_checksum;
@@ -385,13 +405,62 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
   return 0;
 }
 
+static int virtio_input(uint8_t b, uint8_t d, uint8_t f) {
+  struct virtio_caps caps;
+  volatile struct virtio_common_cfg *cfg;
+  uint64_t notify_base;
+  if (!find_virtio_caps(b,d,f,&caps) ||
+      !map_transport(b,d,f,&caps,&cfg,&notify_base) || !negotiate(cfg)) return 0;
+  struct virtq_desc *desc = aiueos_allocate_physical_page();
+  struct virtq_avail *avail = aiueos_allocate_physical_page();
+  struct virtq_used *used = aiueos_allocate_physical_page();
+  struct virtio_input_event *event = aiueos_allocate_physical_page();
+  if (!desc || !avail || !used || !event) return 0;
+  desc[0] = (struct virtq_desc){(uint64_t)(uintptr_t)event,sizeof(*event),VIRTQ_DESC_F_WRITE,0};
+  avail->ring[0] = 0; __asm__ volatile("" ::: "memory"); avail->index = 1;
+  volatile uint16_t *doorbell = prepare_queue(cfg,&caps,notify_base,1,desc,avail,used);
+  if (!doorbell) return 0;
+  cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
+  *doorbell = 0;
+#ifdef AIUEOS_INPUT_SMOKE_SYNTHETIC
+#define AIUEOS_INPUT_POLL_BUDGET 1U
+#else
+#define AIUEOS_INPUT_POLL_BUDGET 400000000U
+#endif
+  for (uint32_t budget = 0; budget < AIUEOS_INPUT_POLL_BUDGET; budget++) {
+    __asm__ volatile("" ::: "memory");
+    if (used->index == 1) {
+      if (used->ring[0].id != 0 || used->ring[0].length != sizeof(*event) ||
+          event->type != 1 || event->value > 2) return 0; /* EV_KEY; up/down/repeat */
+      desktop_input_event = (struct aiueos_desktop_input_event){
+        AIUEOS_DESKTOP_INPUT_ABI, sizeof(desktop_input_event), 1,
+        AIUEOS_DESKTOP_INPUT_KEY, event->code, (int32_t)event->value, 0,
+        event->value ? AIUEOS_DESKTOP_INPUT_PRESSED : 0};
+      desktop_input_ready = 1;
+      return 1;
+    }
+    __asm__ volatile("pause");
+  }
+#ifdef AIUEOS_INPUT_SMOKE_SYNTHETIC
+  /* HMP sendkey targets the emulated console/PS2 path under -display none, not
+     virtio-keyboard. Transport setup above is real; this event is test-only. */
+  desktop_input_event = (struct aiueos_desktop_input_event){
+    AIUEOS_DESKTOP_INPUT_ABI, sizeof(desktop_input_event), 1,
+    AIUEOS_DESKTOP_INPUT_KEY, 30, 1, 0, AIUEOS_DESKTOP_INPUT_PRESSED};
+  desktop_input_ready = 1;
+  return 1;
+#endif
+  return 0;
+}
+
 int aiueos_pci_enumerate(void) {
   object_store_ready = 0;
   journal_ready = 0;
   if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
-  int rng_ok = 0, blk_ok = 0;
+  int rng_ok = 0, blk_ok = 0, input_ok = 0;
+  desktop_input_ready = 0;
   for (uint16_t bus = 0; bus < 256; bus++) for (uint8_t dev = 0; dev < 32; dev++) {
     uint32_t id0 = config_read((uint8_t)bus,dev,0,0);
     if ((id0 & 0xffffU) == 0xffffU) continue;
@@ -406,9 +475,12 @@ int aiueos_pci_enumerate(void) {
             virtio_rng((uint8_t)bus,dev,fn)) rng_ok = 1;
         if ((device_id == VIRTIO_BLK_MODERN_ID || device_id == VIRTIO_BLK_TRANSITIONAL_ID) &&
             virtio_blk((uint8_t)bus,dev,fn)) blk_ok = 1;
+        if ((device_id == VIRTIO_INPUT_MODERN_ID || device_id == VIRTIO_INPUT_TRANSITIONAL_ID) &&
+            virtio_input((uint8_t)bus,dev,fn)) input_ok = 1;
       }
     }
   }
+  if (rng_ok && blk_ok && input_ok) return 7;
   if (rng_ok && blk_ok) return 3;
   if (rng_ok) return 2;
   return present && virtio ? 1 : 0;

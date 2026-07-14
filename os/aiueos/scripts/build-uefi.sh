@@ -25,6 +25,10 @@ kernel_smp_object="$out/kernel-smp.o"
 kernel_trampoline_object="$out/kernel-ap-trampoline.o"
 kernel_ioapic_object="$out/kernel-ioapic.o"
 kernel_framebuffer_object="$out/kernel-framebuffer.o"
+input_smoke_cflags=
+if [ "${AIUEOS_INPUT_SMOKE_SYNTHETIC:-0}" = 1 ]; then
+  input_smoke_cflags=-DAIUEOS_INPUT_SMOKE_SYNTHETIC=1
+fi
 
 command -v zig >/dev/null 2>&1 || {
   echo "error: Zig is required to build the freestanding UEFI application" >&2
@@ -51,6 +55,7 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -c -o "$kernel_memory_object" "$aiueos/kernel/memory.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
+  $input_smoke_cflags \
   -c -o "$kernel_pci_object" "$aiueos/kernel/pci.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \

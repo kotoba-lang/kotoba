@@ -9,7 +9,7 @@ serial_log="$out/kernel-serial.log"
 blk_image="$out/virtio-blk-smoke.img"
 qemu=${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}
 
-"$aiueos/scripts/build-uefi.sh" >/dev/null
+AIUEOS_INPUT_SMOKE_SYNTHETIC=1 "$aiueos/scripts/build-uefi.sh" >/dev/null
 if [ "${AIUEOS_CORRUPT_KERNEL:-0}" = 1 ]; then
   python3 - "$out/esp/EFI/AIUEOS/KERNEL.ELF" <<'PY'
 from pathlib import Path
@@ -82,6 +82,7 @@ if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then iommu_args="-device intel-iommu"; fi
   -device virtio-rng-pci \
   -drive if=none,id=aiueosblk,format=raw,file="$blk_image" \
   -device virtio-blk-pci,drive=aiueosblk,disable-legacy=on \
+  -device virtio-keyboard-pci,disable-legacy=on \
   -display none -serial "file:$serial_log" -monitor none -no-reboot
 status=$?
 set -e
@@ -196,6 +197,12 @@ grep -F "AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a" "$serial_log
 grep -F "AIUEOS_JOURNAL_OK sequence=1 committed write-readback" "$serial_log" >/dev/null || {
   echo "error: journal write/readback evidence was not observed" >&2
   exit 1
+}
+grep -F "AIUEOS_VIRTIO_INPUT_OK modern-pci eventq configured synthetic-smoke" "$serial_log" >/dev/null || {
+  echo "error: modern virtio-input configuration/synthetic transport evidence was not observed" >&2; exit 1;
+}
+grep -F "AIUEOS_DESKTOP_INPUT_OK envelope-v1 sequence=1 kind=key ime-neutral" "$serial_log" >/dev/null || {
+  echo "error: validated browser desktop input envelope was not observed" >&2; exit 1;
 }
 grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {
   echo "error: preemptive round-robin scheduler evidence was not observed" >&2
