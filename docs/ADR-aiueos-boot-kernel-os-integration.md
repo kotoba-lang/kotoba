@@ -144,7 +144,7 @@ virtio-blk/NVMe -> block service -> filesystem/object store
 |---|---|---|
 | 0 | Linux PID-1/initramfs/QEMU/virtio/VFIO prototype | PR #29 merged; unit CI green; whole boot still unproven |
 | 1 | UEFI loader + serial kernel | In progress: OVMF hands off to a bounded ELF64 kernel with its own stack and COM1 serial output; signature verification remains |
-| 2 | paging, exceptions, ACPI, APIC, SMP | In progress: kernel-owned GDT/IDT, vector 6 dispatch, CR3, NX, WP, and section W^X pass; ACPI, APIC, SMP, and negative page-fault tests remain |
+| 2 | paging, exceptions, ACPI, APIC, SMP | In progress: kernel-owned GDT/IDT, vectors 6/14, CR3, NX, WP, and hardware W^X negative tests pass; ACPI, APIC, and SMP remain |
 | 3 | scheduler, VM, syscall, capability handles | isolated tasks; W^X and invalid-handle tests |
 | 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | real QEMU queue completion; malformed descriptors rejected |
 | 5 | ISO/GPT/raw image, recovery, signed update | reproducible UEFI and GRUB boots |
@@ -195,8 +195,9 @@ firmware GDT/IDT and proves exception dispatch by executing `ud2` and observing
 the kernel's vector 6 handler; other exception stubs, paging, ACPI, APIC, and
 SMP remain. The next slice installs a kernel-owned four-level bootstrap map,
 sets CR0.WP and EFER.NXE, and separates text (RX), rodata (R+NX), and mutable
-state (RW+NX). Hardware page-fault negative evidence is still required before
-the W^X gate is complete.
+state (RW+NX). Vector 14 recovery verifies both a forbidden text write and a
+forbidden instruction fetch from rodata, including the x86 error-code bits,
+before the vector 6 regression probe runs.
 
 ## Initial non-goals
 

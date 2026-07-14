@@ -14,7 +14,9 @@ the smoke gate executes `ud2` and requires the vector 6 handler to terminate
 QEMU. Before that test the kernel replaces the firmware CR3 with its own
 four-level identity map, enables write-protect and NX, and maps text RX,
 rodata R+NX, and writable state RW+NX. It does not use Linux, a JVM, GRUB, or a
-host initramfs in the guest.
+host initramfs in the guest. The smoke test writes to text and attempts to
+execute a byte in rodata; both must raise vector 14 with the expected x86 page
+fault error-code bits before execution can continue.
 
 ```sh
 ./os/aiueos/scripts/build-uefi.sh

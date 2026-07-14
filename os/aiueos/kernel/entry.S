@@ -50,6 +50,61 @@ aiueos_isr_invalid_opcode:
   hlt
   jmp 3b
 
+.global aiueos_page_fault_stage
+.global aiueos_page_fault_error
+.global aiueos_isr_page_fault
+.type aiueos_isr_page_fault,@function
+aiueos_isr_page_fault:
+  cli
+  push %rax
+  mov 8(%rsp), %rax
+  mov %rax, aiueos_page_fault_error(%rip)
+  mov aiueos_page_fault_stage(%rip), %rax
+  cmp $1, %rax
+  je 4f
+  cmp $2, %rax
+  je 5f
+  mov $0xffff, %rax
+  mov %rax, aiueos_page_fault_stage(%rip)
+  jmp 6f
+4:
+  lea aiueos_wp_probe_resume(%rip), %rax
+  mov %rax, 16(%rsp)
+  mov $0x101, %rax
+  mov %rax, aiueos_page_fault_stage(%rip)
+  jmp 7f
+5:
+  lea aiueos_nx_probe_resume(%rip), %rax
+  mov %rax, 16(%rsp)
+  mov $0x102, %rax
+  mov %rax, aiueos_page_fault_stage(%rip)
+7:
+  pop %rax
+  add $8, %rsp
+  iretq
+6:
+  pop %rax
+  mov $0x7b, %eax
+  outl %eax, $0xf4
+  jmp 3b
+
+.global aiueos_probe_write_protect
+.type aiueos_probe_write_protect,@function
+aiueos_probe_write_protect:
+  movb $0, aiueos_text_start(%rip)
+.global aiueos_wp_probe_resume
+aiueos_wp_probe_resume:
+  ret
+
+.global aiueos_probe_no_execute
+.type aiueos_probe_no_execute,@function
+aiueos_probe_no_execute:
+  lea aiueos_nx_probe_target(%rip), %rax
+  jmp *%rax
+.global aiueos_nx_probe_resume
+aiueos_nx_probe_resume:
+  ret
+
 .section .rodata.gdt,"a",@progbits
 .balign 8
 aiueos_gdt:
@@ -60,6 +115,11 @@ aiueos_gdt_end:
 aiueos_gdt_pointer:
   .word aiueos_gdt_end - aiueos_gdt - 1
   .quad aiueos_gdt
+
+.section .rodata.nx-probe,"a",@progbits
+.global aiueos_nx_probe_target
+aiueos_nx_probe_target:
+  .byte 0xc3
 
 .section .bss.stack,"aw",@nobits
 .balign 4096

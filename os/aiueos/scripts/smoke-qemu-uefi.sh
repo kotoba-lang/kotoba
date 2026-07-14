@@ -68,6 +68,14 @@ grep -F "AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp" "$serial_log" >/dev/null || {
   echo "error: kernel-owned paging evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_PAGE_FAULT_OK write-protect vector=14" "$serial_log" >/dev/null || {
+  echo "error: write-protect page-fault evidence was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_PAGE_FAULT_OK no-execute vector=14" "$serial_log" >/dev/null || {
+  echo "error: no-execute page-fault evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_EXCEPTION_OK vector=6 invalid-opcode" "$serial_log" >/dev/null || {
   echo "error: kernel exception dispatch evidence was not observed" >&2
   exit 1

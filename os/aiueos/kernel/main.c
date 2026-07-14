@@ -19,6 +19,11 @@ struct __attribute__((packed)) descriptor_pointer {
 extern void aiueos_load_gdt(void);
 extern void aiueos_load_idt(const struct descriptor_pointer *pointer);
 extern void aiueos_isr_invalid_opcode(void);
+extern void aiueos_isr_page_fault(void);
+extern void aiueos_probe_write_protect(void);
+extern void aiueos_probe_no_execute(void);
+volatile uint64_t aiueos_page_fault_stage;
+volatile uint64_t aiueos_page_fault_error;
 extern int aiueos_paging_initialize(void);
 static struct idt_entry idt[256] __attribute__((aligned(16)));
 
@@ -95,6 +100,7 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_SERIAL_OK stack-v1 memory-map-v1\r\n");
     aiueos_load_gdt();
     set_idt_gate(6, aiueos_isr_invalid_opcode);
+    set_idt_gate(14, aiueos_isr_page_fault);
     const struct descriptor_pointer idtr = {
       .limit = (uint16_t)(sizeof(idt) - 1),
       .base = (uint64_t)(uintptr_t)idt
@@ -109,6 +115,27 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\n");
     serial_string("AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp\r\n");
+    aiueos_page_fault_stage = 1;
+    aiueos_probe_write_protect();
+    if (aiueos_page_fault_stage != 0x101 ||
+        (aiueos_page_fault_error & 0x3) != 0x3) {
+      debug_string("AIUEOS_PAGE_FAULT_FAIL write-protect\n");
+      serial_string("AIUEOS_PAGE_FAULT_FAIL write-protect\r\n");
+      qemu_exit(0x7a);
+    }
+    debug_string("AIUEOS_PAGE_FAULT_OK write-protect vector=14\n");
+    serial_string("AIUEOS_PAGE_FAULT_OK write-protect vector=14\r\n");
+    aiueos_page_fault_stage = 2;
+    aiueos_probe_no_execute();
+    if (aiueos_page_fault_stage != 0x102 ||
+        (aiueos_page_fault_error & 0x11) != 0x11 ||
+        (aiueos_page_fault_error & 0x2) != 0) {
+      debug_string("AIUEOS_PAGE_FAULT_FAIL no-execute\n");
+      serial_string("AIUEOS_PAGE_FAULT_FAIL no-execute\r\n");
+      qemu_exit(0x79);
+    }
+    debug_string("AIUEOS_PAGE_FAULT_OK no-execute vector=14\n");
+    serial_string("AIUEOS_PAGE_FAULT_OK no-execute vector=14\r\n");
     __asm__ volatile("ud2");
   }
   for (;;) __asm__ volatile("cli; hlt");
