@@ -30,7 +30,18 @@ to acknowledge EOI before the smoke test can continue.
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
 ./os/aiueos/scripts/smoke-qemu-uefi.sh
+./os/aiueos/scripts/build-release-image.sh
+./os/aiueos/scripts/smoke-qemu-release-image.sh
 ```
+
+The release-image command creates a deterministic 64 MiB GPT raw disk image
+with a protective MBR and a FAT32 EFI System Partition. The ESP contains
+`EFI/BOOT/BOOTX64.EFI` and `EFI/AIUEOS/KERNEL.ELF`. It also emits a canonical
+JSON build receipt with the SHA-256 digest and byte size of the disk and both
+boot artifacts. Set `SOURCE_DATE_EPOCH` to record a release timestamp without
+making the disk image host-time-dependent. The image builder uses only Python's
+standard library; validation checks both GPT CRCs, the ESP layout, FAT chains,
+boot-image magic, and byte-for-byte embedded artifact contents.
 
 Requirements are Zig 0.14 or newer and `qemu-system-x86_64` with an edk2/OVMF
 firmware image. Override firmware discovery with `OVMF_CODE=/path/to/code.fd`.

@@ -50,7 +50,7 @@ zig ld.lld -nostdlib -static -z max-page-size=0x1000 \
 zig cc -target x86_64-windows-gnu -std=c11 -O2 \
   -ffreestanding -fshort-wchar -fno-stack-protector -mno-red-zone \
   -c -o "$object" "$aiueos/uefi/main.c"
-zig lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib \
+zig lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /timestamp:0 \
   /fixed:no "/out:$efi" "$object"
 
 magic=$(dd if="$efi" bs=1 count=2 2>/dev/null)

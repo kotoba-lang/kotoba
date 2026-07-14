@@ -29,11 +29,21 @@ fi
 }
 
 rm -f "$log" "$serial_log"
+if [ -n "${AIUEOS_DISK_IMAGE:-}" ]; then
+  [ -f "$AIUEOS_DISK_IMAGE" ] || {
+    echo "error: AIUEOS_DISK_IMAGE does not exist: $AIUEOS_DISK_IMAGE" >&2
+    exit 1
+  }
+  # OVMF may open the boot medium writable; snapshot keeps the release artifact immutable.
+  boot_drive="format=raw,snapshot=on,file=$AIUEOS_DISK_IMAGE"
+else
+  boot_drive="format=raw,file=fat:rw:$out/esp"
+fi
 set +e
 "$qemu" \
   -machine q35,accel=tcg -cpu max -m 128M -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-  -drive format=raw,file="fat:rw:$out/esp" \
+  -drive "$boot_drive" \
   -device isa-debugcon,iobase=0xe9,chardev=debug \
   -chardev file,id=debug,path="$log" \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
