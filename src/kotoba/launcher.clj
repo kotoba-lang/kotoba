@@ -19,6 +19,7 @@
             [kotoba.rad-adapter :as rad-adapter]
             [kotoba.package-admission :as package-admission]
             [kotoba.runtime :as runtime]
+            [kotoba.semantic-code :as semantic-code]
             [kotoba.selfhost.contracts :as selfhost]
             [kotoba.wasm-exec :as wasm-exec]))
 
@@ -186,6 +187,22 @@
       result)
     result))
 
+(defn read-cli-contract-resource
+  "Load the Datomic tx-data encoded CLI contract from the classpath and
+  reconstruct its namespaced entity map. Collection-valued attributes were
+  serialized with pr-str by the contract repository's datomizer."
+  [path]
+  (let [tx-data (-> path io/resource slurp edn/read-string)]
+    (into {}
+          (map (fn [[k v]]
+                 [k (if (string? v)
+                      (try
+                        (let [decoded (edn/read-string v)]
+                          (if (coll? decoded) decoded v))
+                        (catch Exception _ v))
+                      v)]))
+          (dissoc (first tx-data) :db/id))))
+
 (defn dispatch
   "Dispatch argv through the CLJC authority and return a result map."
   [argv]
@@ -196,10 +213,7 @@
                                "package" (package-result argv)
                                nil)]
       launcher-result
-      (let [contract (-> "lang/cli.edn"
-                         io/resource
-                         slurp
-                         edn/read-string)
+      (let [contract (read-cli-contract-resource "lang/cli.edn")
             normalized-argv (normalize-source-argv argv)
             result (cli/dispatch contract normalized-argv)
             plan (source-argv-plan normalized-argv)]
@@ -501,11 +515,51 @@
           (case command
             "check"
             (let [checked (runtime/check safe-facts plan forms policy)
-                  ok? (:kotoba.runtime/ok? checked)]
+                  semantic? (= "semantic-code" (option-value original-argv "--kind"))
+                  semantic-result
+                  (when (and semantic? (:kotoba.runtime/ok? checked))
+                    (try
+                      (let [source-text (slurp (io/file (:kotoba.source/path plan)))
+                            profile-text (slurp (io/resource "lang/profile.edn"))
+                            codebase
+                            (semantic-code/compile-definitions
+                             forms {:source-cid (semantic-code/source-cid source-text)
+                                    :profile-cid (semantic-code/source-cid profile-text)})]
+                        {:ok? true
+                         :codebase codebase
+                         :summary
+                         {:kotoba.semantic/schema (:schema codebase)
+                          :kotoba.semantic/source-cid (:source-cid codebase)
+                          :kotoba.semantic/profile-cid (:profile-cid codebase)
+                          :kotoba.semantic/hash-contract-cid
+                          (:hash-contract-cid codebase)
+                          :kotoba.semantic/definitions
+                          (into (sorted-map)
+                                (map (fn [[name {:keys [cid]}]] [(str name) cid]))
+                                (:definitions codebase))}})
+                      (catch clojure.lang.ExceptionInfo e
+                        {:ok? false
+                         :problem (ex-data e)
+                         :message (.getMessage e)})))
+                  checked (if (:ok? semantic-result)
+                            (update checked :kotoba.runtime/ir
+                                    semantic-code/attach-to-ir (:codebase semantic-result))
+                            checked)
+                  ok? (and (:kotoba.runtime/ok? checked)
+                           (not (false? (:ok? semantic-result))))]
               {:kotoba.cli/ok? ok?
-               :kotoba.cli/code (if ok? :check/valid :check/invalid)
-               :kotoba.cli/data (merge (:kotoba.cli/data authority-result)
-                                       (runtime-data original-argv normalized-argv plan checked))})
+               :kotoba.cli/code (cond
+                                  (and semantic? (not ok?)) :check/semantic-invalid
+                                  ok? :check/valid
+                                  :else :check/invalid)
+               :kotoba.cli/data
+               (merge (:kotoba.cli/data authority-result)
+                      (runtime-data original-argv normalized-argv plan checked)
+                      (when semantic?
+                        (if (:ok? semantic-result)
+                          (:summary semantic-result)
+                          {:kotoba.semantic/problem (:problem semantic-result)
+                           :kotoba.semantic/message (:message semantic-result)})))})
 
             "run"
             (let [cacao-load (cacao-result original-argv)]

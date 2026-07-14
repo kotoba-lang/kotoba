@@ -22,6 +22,7 @@
             [kotoba.real-host-providers-test]
             [kotoba.runtime-test]
             [kotoba.sensing-host-test]
+            [kotoba.semantic-code-test]
             [kotoba.wasm-and-or-when-test]
             [kotoba.wasm-exec-test]
             [kotoba.wasm-map-keyword-test]))
@@ -48,6 +49,7 @@
                                         'kotoba.real-host-providers-test
                                         'kotoba.runtime-test
                                         'kotoba.sensing-host-test
+                                        'kotoba.semantic-code-test
                                         'kotoba.wasm-and-or-when-test
                                         'kotoba.wasm-exec-test
                                         'kotoba.wasm-map-keyword-test)]
