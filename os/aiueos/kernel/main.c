@@ -44,6 +44,8 @@ extern int aiueos_object_store_ready(void);
 extern int aiueos_journal_ready(void);
 extern int aiueos_journal_recovered(void);
 extern uint32_t aiueos_journal_sequence(void);
+extern uint32_t aiueos_journal_recovered_sequence(void);
+extern uint32_t aiueos_journal_slot(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
@@ -243,12 +245,15 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
       serial_string("AIUEOS_JOURNAL_FAIL write-readback\r\n");
       qemu_exit(0x6f);
     }
-    debug_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\n");
-    serial_string("AIUEOS_JOURNAL_OK sequence=1 committed write-readback\r\n");
+    if (!aiueos_journal_sequence() || aiueos_journal_slot() < 1 || aiueos_journal_slot() > 2)
+      qemu_exit(0x6f);
+    debug_string("AIUEOS_JOURNAL_OK dual-slot committed append-readback\n");
+    serial_string("AIUEOS_JOURNAL_OK dual-slot committed append-readback\r\n");
     if (aiueos_journal_recovered()) {
-      if (aiueos_journal_sequence() != 1) qemu_exit(0x6f);
-      debug_string("AIUEOS_JOURNAL_RECOVERY_OK sequence=1 committed no-overwrite\n");
-      serial_string("AIUEOS_JOURNAL_RECOVERY_OK sequence=1 committed no-overwrite\r\n");
+      if (!aiueos_journal_recovered_sequence() ||
+          aiueos_journal_sequence() != aiueos_journal_recovered_sequence() + 1) qemu_exit(0x6f);
+      debug_string("AIUEOS_JOURNAL_RECOVERY_OK highest-valid selected alternate-slot-append\n");
+      serial_string("AIUEOS_JOURNAL_RECOVERY_OK highest-valid selected alternate-slot-append\r\n");
     }
     /* The input result bit is set only after a validated event has been copied
        into the browser envelope; no second mutable readiness check is needed. */

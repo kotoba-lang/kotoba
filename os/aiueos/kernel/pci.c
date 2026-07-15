@@ -97,10 +97,14 @@ static int object_store_ready;
 static int journal_ready;
 static int journal_recovered;
 static uint32_t journal_sequence;
+static uint32_t journal_recovered_sequence;
+static uint32_t journal_slot;
 int aiueos_object_store_ready(void) { return object_store_ready; }
 int aiueos_journal_ready(void) { return journal_ready; }
 int aiueos_journal_recovered(void) { return journal_recovered; }
 uint32_t aiueos_journal_sequence(void) { return journal_sequence; }
+uint32_t aiueos_journal_recovered_sequence(void) { return journal_recovered_sequence; }
+uint32_t aiueos_journal_slot(void) { return journal_slot; }
 static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
   uint32_t hash = 2166136261U;
   for (uint32_t i = 0; i < length; i++) { hash ^= bytes[i]; hash *= 16777619U; }
@@ -115,6 +119,30 @@ static int journal_record_valid(const struct aiuefs_journal_record *journal) {
       fnv1a(journal->payload, journal->payload_length) != journal->payload_checksum) return 0;
   for (uint32_t i = 0; i < sizeof(magic); i++) if (journal->magic[i] != magic[i]) return 0;
   return 1;
+}
+
+static int virtio_blk_sector_io(struct virtio_blk_request *request, uint8_t *sector,
+    uint8_t *status, struct virtq_desc *desc, struct virtq_avail *avail,
+    struct virtq_used *used, volatile uint16_t *doorbell, uint16_t *submitted,
+    uint32_t type, uint64_t disk_sector) {
+  uint16_t old = *submitted, target = old + 1;
+  request->type = type; request->reserved = 0; request->sector = disk_sector; *status = 0xff;
+  desc[1].flags = VIRTQ_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VIRTQ_DESC_F_WRITE : 0);
+  avail->ring[old & 3] = 0; __asm__ volatile("" ::: "memory");
+  avail->index = target; *doorbell = 0;
+  for (uint32_t budget = 0; budget < 100000000U; budget++) {
+    __asm__ volatile("" ::: "memory");
+    if (used->index == target) {
+      struct virtq_used_element *completion = &used->ring[old & 3];
+      uint32_t expected = type == VIRTIO_BLK_T_IN ? 513 : 1;
+      if (completion->id != 0 || completion->length != expected || *status != VIRTIO_BLK_S_OK)
+        return 0;
+      *submitted = target;
+      return 1;
+    }
+    __asm__ volatile("pause");
+  }
+  return 0;
 }
 
 struct virtio_caps {
@@ -377,60 +405,52 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
           fnv1a(sector + superblock->object_offset, superblock->object_length) != superblock->object_checksum)
         return 0;
       object_store_ready = 1;
+      struct aiuefs_journal_record slots[2];
       struct aiuefs_journal_record *journal = (void *)sector;
       static const uint8_t journal_magic[8] = {'A','I','U','J','R','N','1',0};
       static const uint8_t journal_payload[16] = "KOTOBASE-TXN-001";
-      /* Recovery is always attempted before mutation. A valid committed
-         record is authoritative and must survive subsequent boots unchanged. */
-      for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
-      request->type = VIRTIO_BLK_T_IN; request->sector = 1; *status = 0xff;
-      desc[1].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
-      avail->ring[1] = 0; __asm__ volatile("" ::: "memory"); avail->index = 2; *doorbell = 0;
-      for (uint32_t recovery_budget = 0; recovery_budget < 100000000U; recovery_budget++) {
-        __asm__ volatile("" ::: "memory");
-        if (used->index == 2) break;
-        __asm__ volatile("pause");
+      uint16_t submitted = 1;
+      int valid[2] = {0, 0}, selected = -1;
+      /* Validate both bounded slots before mutation and choose the greatest
+         committed sequence. The other slot remains the rollback record. */
+      for (uint32_t slot = 0; slot < 2; slot++) {
+        for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+        if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,
+                                  &submitted,VIRTIO_BLK_T_IN,slot + 1)) return 0;
+        journal = (void *)sector;
+        valid[slot] = journal_record_valid(journal);
+        if (valid[slot]) {
+          slots[slot] = *journal;
+          if (selected < 0 || slots[slot].sequence > slots[selected].sequence) selected = slot;
+        }
       }
-      journal = (void *)sector;
-      if (used->index != 2 || used->ring[1].id != 0 || used->ring[1].length != 513 ||
-          *status != VIRTIO_BLK_S_OK) return 0;
-      if (journal_record_valid(journal)) {
-        journal_sequence = journal->sequence;
+      uint32_t next_sequence = 1;
+      uint32_t target_slot = 0;
+      if (selected >= 0) {
         journal_recovered = 1;
-        journal_ready = 1;
-        return 1;
+        journal_recovered_sequence = slots[selected].sequence;
+        next_sequence = slots[selected].sequence + 1;
+        if (!next_sequence) return 0;
+        target_slot = (uint32_t)selected ^ 1U;
       }
       for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+      journal = (void *)sector;
       for (uint32_t i = 0; i < 8; i++) journal->magic[i] = journal_magic[i];
-      journal->version = 1; journal->sequence = 1; journal->state = 2;
+      journal->version = 1; journal->sequence = next_sequence; journal->state = 2;
       journal->payload_length = sizeof(journal_payload);
       for (uint32_t i = 0; i < sizeof(journal_payload); i++) journal->payload[i] = journal_payload[i];
       journal->payload_checksum = fnv1a(journal->payload, journal->payload_length);
       journal->header_checksum = fnv1a((const uint8_t *)journal, 28);
-      request->type = VIRTIO_BLK_T_OUT; request->sector = 1; *status = 0xff;
-      desc[1].flags = VIRTQ_DESC_F_NEXT;
-      avail->ring[2] = 0; __asm__ volatile("" ::: "memory"); avail->index = 3; *doorbell = 0;
-      for (uint32_t write_budget = 0; write_budget < 100000000U; write_budget++) {
-        __asm__ volatile("" ::: "memory");
-        if (used->index == 3) break;
-        __asm__ volatile("pause");
-      }
-      if (used->index != 3 || used->ring[2].id != 0 || used->ring[2].length != 1 ||
-          *status != VIRTIO_BLK_S_OK) return 0;
+      if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,
+                                &submitted,VIRTIO_BLK_T_OUT,target_slot + 1)) return 0;
       for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
-      request->type = VIRTIO_BLK_T_IN; *status = 0xff;
-      desc[1].flags = VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE;
-      avail->ring[3] = 0; __asm__ volatile("" ::: "memory"); avail->index = 4; *doorbell = 0;
-      for (uint32_t read_budget = 0; read_budget < 100000000U; read_budget++) {
-        __asm__ volatile("" ::: "memory");
-        if (used->index == 4) break;
-        __asm__ volatile("pause");
-      }
+      if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,
+                                &submitted,VIRTIO_BLK_T_IN,target_slot + 1)) return 0;
       journal = (void *)sector;
-      if (used->index != 4 || used->ring[3].id != 0 || used->ring[3].length != 513 ||
-          *status != VIRTIO_BLK_S_OK || !journal_record_valid(journal)) return 0;
+      if (!journal_record_valid(journal) || journal->sequence != next_sequence) return 0;
       journal_ready = 1;
-      journal_sequence = 1;
+      journal_sequence = next_sequence;
+      journal_slot = target_slot + 1;
       return 1;
     }
     __asm__ volatile("pause");
@@ -491,6 +511,8 @@ int aiueos_pci_enumerate(void) {
   journal_ready = 0;
   journal_recovered = 0;
   journal_sequence = 0;
+  journal_recovered_sequence = 0;
+  journal_slot = 0;
   if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
