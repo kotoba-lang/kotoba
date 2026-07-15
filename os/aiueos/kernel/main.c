@@ -33,6 +33,8 @@ volatile uint64_t aiueos_page_fault_stage;
 volatile uint64_t aiueos_page_fault_error;
 extern int aiueos_paging_initialize(void);
 extern int aiueos_framebuffer_initialize(const struct aiueos_boot_info *boot);
+extern int aiueos_desktop_surface_ready(void);
+extern int aiueos_desktop_surface_bind_scanout(uint32_t width, uint32_t height);
 extern int aiueos_acpi_initialize(const void *rsdp);
 extern int aiueos_dma_test_policy_allows_unisolated(void);
 extern int aiueos_vtd_initialize(void);
@@ -51,6 +53,8 @@ extern uint32_t aiueos_journal_recovered_sequence(void);
 extern uint32_t aiueos_journal_slot(void);
 extern int aiueos_object_transaction_replayed(void);
 extern uint32_t aiueos_object_transaction_sequence(void);
+extern uint32_t aiueos_gpu_scanout_width(void);
+extern uint32_t aiueos_gpu_scanout_height(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
 extern int aiueos_service_runtime_evidence_ready(void);
@@ -166,6 +170,9 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified\n");
     serial_string("AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified\r\n");
+    if (!aiueos_desktop_surface_ready()) qemu_exit(0x68);
+    debug_string("AIUEOS_DESKTOP_SURFACE_OK envelope-v1 opaque-handle full-damage hash-verified\n");
+    serial_string("AIUEOS_DESKTOP_SURFACE_OK envelope-v1 opaque-handle full-damage hash-verified\r\n");
     if (!aiueos_physical_allocator_initialize(boot)) {
       debug_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\n");
       serial_string("AIUEOS_PHYSICAL_ALLOCATOR_FAIL memory-map\r\n");
@@ -287,6 +294,14 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_VIRTIO_INPUT_OK modern-pci eventq configured synthetic-smoke\r\n");
     debug_string("AIUEOS_DESKTOP_INPUT_OK envelope-v1 sequence=1 kind=key ime-neutral\n");
     serial_string("AIUEOS_DESKTOP_INPUT_OK envelope-v1 sequence=1 kind=key ime-neutral\r\n");
+    if (!(pci_result & 8) || !aiueos_desktop_surface_bind_scanout(
+          aiueos_gpu_scanout_width(),aiueos_gpu_scanout_height())) {
+      serial_string("AIUEOS_VIRTIO_GPU_FAIL display-info-or-surface-binding\r\n"); qemu_exit(0x6f);
+    }
+    debug_string("AIUEOS_VIRTIO_GPU_OK modern-pci controlq display-info bounded\n");
+    serial_string("AIUEOS_VIRTIO_GPU_OK modern-pci controlq display-info bounded\r\n");
+    debug_string("AIUEOS_BROWSER_DESKTOP_TRANSPORT_OK surface-v1 gpu-scanout-bound input-v1\n");
+    serial_string("AIUEOS_BROWSER_DESKTOP_TRANSPORT_OK surface-v1 gpu-scanout-bound input-v1\r\n");
     debug_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\n");
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
     debug_string("AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return\n");

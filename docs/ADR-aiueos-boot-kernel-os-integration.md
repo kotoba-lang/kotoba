@@ -131,6 +131,19 @@ and retained draw operations. The native release additionally requires
 framebuffer/virtio-gpu scanout, compositor, virtio-input/USB HID, keyboard/IME,
 accessibility, and clipboard/file-picker permission brokers.
 
+The first native output transport slice is intentionally narrower. The kernel
+renders and hashes the actual OVMF GOP aperture, then emits a versioned surface
+descriptor containing an opaque kernel handle, generation, pixel metadata, and
+full-surface damage. Pixels cross the boundary only through a generation-checked,
+rectangle-bounded copy into caller-owned memory; the physical address remains
+hidden. A modern
+`virtio-vga` controlq `GET_DISPLAY_INFO` request must complete with a bounded,
+enabled scanout whose dimensions match that GOP surface. Together with the
+existing desktop input envelope this establishes the browser desktop transport
+ABI and real no-Linux QEMU device evidence. It does not yet create virtio-gpu
+2D resources, attach backing, transfer/flush frames, run a compositor, or boot
+the browser runtime.
+
 `kotobase` is the datom persistence plane, not a block driver:
 
 ```text

@@ -10,6 +10,37 @@ struct aiueos_boot_info {
 
 extern int aiueos_map_framebuffer(uint64_t address, uint64_t length);
 
+/* Browser desktop output ABI. surface_id is an opaque kernel-owned handle;
+   physical framebuffer addresses are intentionally absent from the contract. */
+struct aiueos_desktop_surface {
+  uint32_t abi_version, byte_size;
+  uint64_t surface_id, generation, content_hash;
+  uint32_t width, height, stride, pixel_format;
+  uint32_t damage_x, damage_y, damage_width, damage_height;
+} __attribute__((packed));
+static struct aiueos_desktop_surface desktop_surface;
+static int desktop_surface_ready;
+static volatile uint32_t *desktop_surface_pixels;
+int aiueos_desktop_surface_ready(void) { return desktop_surface_ready; }
+const struct aiueos_desktop_surface *aiueos_desktop_surface(void) {
+  return desktop_surface_ready ? &desktop_surface : 0;
+}
+int aiueos_desktop_surface_copy(uint64_t generation, uint32_t x, uint32_t y,
+    uint32_t width, uint32_t height, uint32_t *destination, uint64_t capacity) {
+  if (!desktop_surface_ready || !destination || generation != desktop_surface.generation ||
+      !width || !height || x >= desktop_surface.width || y >= desktop_surface.height ||
+      width > desktop_surface.width - x || height > desktop_surface.height - y ||
+      (uint64_t)width * height > capacity / sizeof(uint32_t)) return 0;
+  for (uint32_t row = 0; row < height; row++)
+    for (uint32_t column = 0; column < width; column++)
+      destination[(uint64_t)row * width + column] =
+        desktop_surface_pixels[(uint64_t)(y + row) * desktop_surface.stride + x + column];
+  return 1;
+}
+int aiueos_desktop_surface_bind_scanout(uint32_t width, uint32_t height) {
+  return desktop_surface_ready && desktop_surface.width == width && desktop_surface.height == height;
+}
+
 static uint32_t pixel(uint32_t rgb, uint32_t format) {
   if (format == 0) return rgb;
   return ((rgb & 0xffU) << 16) | (rgb & 0xff00U) | ((rgb >> 16) & 0xffU);
@@ -38,6 +69,7 @@ static uint64_t sample_hash(volatile uint32_t *fb, uint32_t width,
 }
 
 int aiueos_framebuffer_initialize(const struct aiueos_boot_info *boot) {
+  desktop_surface_ready = 0;
   if (!boot || !boot->framebuffer_base || !boot->framebuffer_size ||
       boot->framebuffer_width < 320 || boot->framebuffer_height < 200 ||
       boot->framebuffer_stride < boot->framebuffer_width ||
@@ -48,6 +80,7 @@ int aiueos_framebuffer_initialize(const struct aiueos_boot_info *boot) {
     return 0;
 
   volatile uint32_t *fb = (volatile uint32_t *)(uintptr_t)boot->framebuffer_base;
+  desktop_surface_pixels = fb;
   rectangle(fb, boot->framebuffer_stride, boot->framebuffer_format, 0, 0,
             boot->framebuffer_width, boot->framebuffer_height, 0x101827);
   uint32_t margin = boot->framebuffer_width / 16;
@@ -68,5 +101,11 @@ int aiueos_framebuffer_initialize(const struct aiueos_boot_info *boot) {
                                boot->framebuffer_height, boot->framebuffer_stride);
   uint64_t second = sample_hash(fb, boot->framebuffer_width,
                                 boot->framebuffer_height, boot->framebuffer_stride);
-  return first != 0 && first == second;
+  if (!first || first != second) return 0;
+  desktop_surface = (struct aiueos_desktop_surface){
+    1, sizeof(desktop_surface), 1, 1, first,
+    boot->framebuffer_width, boot->framebuffer_height, boot->framebuffer_stride,
+    boot->framebuffer_format, 0, 0, boot->framebuffer_width, boot->framebuffer_height};
+  desktop_surface_ready = 1;
+  return 1;
 }
