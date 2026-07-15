@@ -196,7 +196,7 @@ grep -F "AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a" "$serial_log
   echo "error: bounded read-only object-store evidence was not observed" >&2
   exit 1
 }
-grep -F "AIUEOS_JOURNAL_OK sequence=1 committed write-readback" "$serial_log" >/dev/null || {
+grep -F "AIUEOS_JOURNAL_OK dual-slot committed append-readback" "$serial_log" >/dev/null || {
   echo "error: journal write/readback evidence was not observed" >&2
   exit 1
 }

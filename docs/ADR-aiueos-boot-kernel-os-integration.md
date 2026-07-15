@@ -229,15 +229,15 @@ virtqueue.
 The first storage slice uses a separately attached writable virtio-blk fixture,
 isolated from the ESP and release disk. Sector 0 is an `aiuefs-v1` object-store
 superblock: header size, object count, offset, length, and checksum are bounded
-within one sector before an object is admitted. Sector 1 is a fixed journal
-slot. On boot the kernel reads and validates magic, version, sequence, committed
-state, payload length, and checksum before any mutation. A valid committed
-record is recovered without overwrite; otherwise sequence 1 is committed and
-read back. Header and payload have independent checksums. CI boots the same
-medium twice, requires recovery on boot two, corrupts the committed header, and
-requires rejection plus reconstruction on boot three.
-This closes crash/reboot recovery for one bounded transaction record, but is
-not yet a multi-record journal, writable object allocator, filesystem, or
+within one sector before an object is admitted. Sectors 1 and 2 are bounded
+journal slots. Before mutation, the kernel validates both slots' magic, version,
+nonzero sequence, committed state, payload bounds, and independent header and
+payload checksums. It selects the highest valid sequence and appends its
+successor to the alternate slot, preserving the selected commit until the new
+record has been written and read back. CI creates sequences 1 and 2, corrupts
+the latest slot, then requires fallback to sequence 1 and reconstruction of
+sequence 2. This closes a one-commit rollback window, but is not yet an
+unbounded multi-record journal, writable object allocator, filesystem, or
 kotobase IStore.
 
 ## Initial non-goals
