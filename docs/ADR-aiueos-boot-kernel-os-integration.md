@@ -232,13 +232,17 @@ superblock: header size, object count, offset, length, and checksum are bounded
 within one sector before an object is admitted. Sectors 1 and 2 are bounded
 journal slots. Before mutation, the kernel validates both slots' magic, version,
 nonzero sequence, committed state, payload bounds, and independent header and
-payload checksums. It selects the highest valid sequence and appends its
-successor to the alternate slot, preserving the selected commit until the new
-record has been written and read back. CI creates sequences 1 and 2, corrupts
-the latest slot, then requires fallback to sequence 1 and reconstruction of
-sequence 2. This closes a one-commit rollback window, but is not yet an
-unbounded multi-record journal, writable object allocator, filesystem, or
-kotobase IStore.
+payload checksums. Each payload describes one bounded sector-3 object mutation,
+including target, version, length, checksum, and 16 object bytes. It selects the
+highest valid sequence and replays that committed mutation idempotently before
+appending its successor to the alternate slot. The successor journal record is
+written and read back before the mutable object is written and read back, so a
+reset between those operations is recovered as redo rather than an unjournaled
+mutation. CI creates matching journal/object sequences 1 and 2, corrupts the
+latest slot, then requires fallback to sequence 1, redo, and reconstruction of
+sequence 2. This closes a one-commit rollback window and connects the journal
+to a writable object, but is not yet an unbounded multi-record journal, object
+allocator, filesystem, or kotobase IStore.
 
 ## Initial non-goals
 

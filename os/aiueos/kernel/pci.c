@@ -93,18 +93,30 @@ struct aiuefs_journal_record {
   uint8_t magic[8]; uint32_t version, sequence, state, payload_length, payload_checksum, header_checksum;
   uint8_t payload[32];
 } __attribute__((packed));
+struct aiuefs_object_transaction {
+  uint32_t target_sector, object_version, object_length, object_checksum;
+  uint8_t object[16];
+} __attribute__((packed));
+struct aiuefs_mutable_object {
+  uint8_t magic[8]; uint32_t version, sequence, object_length, object_checksum;
+  uint8_t object[16];
+} __attribute__((packed));
 static int object_store_ready;
 static int journal_ready;
 static int journal_recovered;
 static uint32_t journal_sequence;
 static uint32_t journal_recovered_sequence;
 static uint32_t journal_slot;
+static int object_transaction_replayed;
+static uint32_t object_transaction_sequence;
 int aiueos_object_store_ready(void) { return object_store_ready; }
 int aiueos_journal_ready(void) { return journal_ready; }
 int aiueos_journal_recovered(void) { return journal_recovered; }
 uint32_t aiueos_journal_sequence(void) { return journal_sequence; }
 uint32_t aiueos_journal_recovered_sequence(void) { return journal_recovered_sequence; }
 uint32_t aiueos_journal_slot(void) { return journal_slot; }
+int aiueos_object_transaction_replayed(void) { return object_transaction_replayed; }
+uint32_t aiueos_object_transaction_sequence(void) { return object_transaction_sequence; }
 static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
   uint32_t hash = 2166136261U;
   for (uint32_t i = 0; i < length; i++) { hash ^= bytes[i]; hash *= 16777619U; }
@@ -112,12 +124,32 @@ static uint32_t fnv1a(const uint8_t *bytes, uint32_t length) {
 }
 
 static int journal_record_valid(const struct aiuefs_journal_record *journal) {
-  static const uint8_t magic[8] = {'A','I','U','J','R','N','1',0};
-  if (journal->version != 1 || !journal->sequence || journal->state != 2 ||
-      journal->payload_length != 16 || journal->payload_length > sizeof(journal->payload) ||
+  static const uint8_t magic[8] = {'A','I','U','J','R','N','2',0};
+  if (journal->version != 2 || !journal->sequence || journal->state != 2 ||
+      journal->payload_length != sizeof(struct aiuefs_object_transaction) ||
+      journal->payload_length > sizeof(journal->payload) ||
       fnv1a((const uint8_t *)journal, 28) != journal->header_checksum ||
       fnv1a(journal->payload, journal->payload_length) != journal->payload_checksum) return 0;
   for (uint32_t i = 0; i < sizeof(magic); i++) if (journal->magic[i] != magic[i]) return 0;
+  return 1;
+}
+
+static int object_transaction_valid(const struct aiuefs_object_transaction *transaction) {
+  return transaction->target_sector == 3 && transaction->object_version == 1 &&
+    transaction->object_length == sizeof(transaction->object) &&
+    fnv1a(transaction->object, transaction->object_length) == transaction->object_checksum;
+}
+
+static int mutable_object_valid(const struct aiuefs_mutable_object *object, uint32_t sequence,
+    const struct aiuefs_object_transaction *transaction) {
+  static const uint8_t magic[8] = {'A','I','U','O','B','J','1',0};
+  for (uint32_t i = 0; i < sizeof(magic); i++) if (object->magic[i] != magic[i]) return 0;
+  if (object->version != transaction->object_version || object->sequence != sequence ||
+      object->object_length != transaction->object_length ||
+      object->object_checksum != transaction->object_checksum ||
+      fnv1a(object->object, object->object_length) != object->object_checksum) return 0;
+  for (uint32_t i = 0; i < object->object_length; i++)
+    if (object->object[i] != transaction->object[i]) return 0;
   return 1;
 }
 
@@ -143,6 +175,36 @@ static int virtio_blk_sector_io(struct virtio_blk_request *request, uint8_t *sec
     __asm__ volatile("pause");
   }
   return 0;
+}
+
+/* Redo a committed journal payload into its bounded object sector. The journal
+   is durable before this function is called, so a reset at either I/O boundary
+   is recovered by replaying the same idempotent payload on the next boot. */
+static int apply_object_transaction(struct virtio_blk_request *request, uint8_t *sector,
+    uint8_t *status, struct virtq_desc *desc, struct virtq_avail *avail,
+    struct virtq_used *used, volatile uint16_t *doorbell, uint16_t *submitted,
+    uint32_t sequence, const struct aiuefs_object_transaction *transaction,
+    int recovery) {
+  static const uint8_t magic[8] = {'A','I','U','O','B','J','1',0};
+  if (!object_transaction_valid(transaction)) return 0;
+  for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+  struct aiuefs_mutable_object *object = (void *)sector;
+  for (uint32_t i = 0; i < sizeof(magic); i++) object->magic[i] = magic[i];
+  object->version = transaction->object_version;
+  object->sequence = sequence;
+  object->object_length = transaction->object_length;
+  object->object_checksum = transaction->object_checksum;
+  for (uint32_t i = 0; i < transaction->object_length; i++) object->object[i] = transaction->object[i];
+  if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,submitted,
+                            VIRTIO_BLK_T_OUT,transaction->target_sector)) return 0;
+  for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
+  if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,submitted,
+                            VIRTIO_BLK_T_IN,transaction->target_sector)) return 0;
+  object = (void *)sector;
+  if (!mutable_object_valid(object,sequence,transaction)) return 0;
+  object_transaction_sequence = sequence;
+  if (recovery) object_transaction_replayed = 1;
+  return 1;
 }
 
 struct virtio_caps {
@@ -407,8 +469,7 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
       object_store_ready = 1;
       struct aiuefs_journal_record slots[2];
       struct aiuefs_journal_record *journal = (void *)sector;
-      static const uint8_t journal_magic[8] = {'A','I','U','J','R','N','1',0};
-      static const uint8_t journal_payload[16] = "KOTOBASE-TXN-001";
+      static const uint8_t journal_magic[8] = {'A','I','U','J','R','N','2',0};
       uint16_t submitted = 1;
       int valid[2] = {0, 0}, selected = -1;
       /* Validate both bounded slots before mutation and choose the greatest
@@ -429,16 +490,28 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
       if (selected >= 0) {
         journal_recovered = 1;
         journal_recovered_sequence = slots[selected].sequence;
+        const struct aiuefs_object_transaction *replay = (const void *)slots[selected].payload;
+        if (!apply_object_transaction(request,sector,status,desc,avail,used,doorbell,
+                                      &submitted,slots[selected].sequence,replay,1)) return 0;
         next_sequence = slots[selected].sequence + 1;
-        if (!next_sequence) return 0;
+        if (!next_sequence || next_sequence > 999) return 0;
         target_slot = (uint32_t)selected ^ 1U;
       }
       for (uint32_t i = 0; i < 512; i++) sector[i] = 0;
       journal = (void *)sector;
       for (uint32_t i = 0; i < 8; i++) journal->magic[i] = journal_magic[i];
-      journal->version = 1; journal->sequence = next_sequence; journal->state = 2;
-      journal->payload_length = sizeof(journal_payload);
-      for (uint32_t i = 0; i < sizeof(journal_payload); i++) journal->payload[i] = journal_payload[i];
+      journal->version = 2; journal->sequence = next_sequence; journal->state = 2;
+      journal->payload_length = sizeof(struct aiuefs_object_transaction);
+      struct aiuefs_object_transaction *transaction = (void *)journal->payload;
+      transaction->target_sector = 3;
+      transaction->object_version = 1;
+      transaction->object_length = sizeof(transaction->object);
+      static const uint8_t object_prefix[13] = "KOTOBASE-OBJ-";
+      for (uint32_t i = 0; i < sizeof(object_prefix); i++) transaction->object[i] = object_prefix[i];
+      transaction->object[13] = (uint8_t)('0' + (next_sequence / 100) % 10);
+      transaction->object[14] = (uint8_t)('0' + (next_sequence / 10) % 10);
+      transaction->object[15] = (uint8_t)('0' + next_sequence % 10);
+      transaction->object_checksum = fnv1a(transaction->object, transaction->object_length);
       journal->payload_checksum = fnv1a(journal->payload, journal->payload_length);
       journal->header_checksum = fnv1a((const uint8_t *)journal, 28);
       if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,
@@ -448,6 +521,10 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
                                 &submitted,VIRTIO_BLK_T_IN,target_slot + 1)) return 0;
       journal = (void *)sector;
       if (!journal_record_valid(journal) || journal->sequence != next_sequence) return 0;
+      transaction = (void *)journal->payload;
+      struct aiuefs_object_transaction committed_transaction = *transaction;
+      if (!apply_object_transaction(request,sector,status,desc,avail,used,doorbell,
+                                    &submitted,next_sequence,&committed_transaction,0)) return 0;
       journal_ready = 1;
       journal_sequence = next_sequence;
       journal_slot = target_slot + 1;
@@ -513,6 +590,8 @@ int aiueos_pci_enumerate(void) {
   journal_sequence = 0;
   journal_recovered_sequence = 0;
   journal_slot = 0;
+  object_transaction_replayed = 0;
+  object_transaction_sequence = 0;
   if (!aiueos_dma_test_policy_allows_unisolated()) return 0;
   if (!cap_selftest()) return 0;
   uint32_t present = 0, virtio = 0;
