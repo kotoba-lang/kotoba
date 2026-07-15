@@ -69,16 +69,18 @@ overflowing device, submits a three-descriptor `VIRTIO_BLK_T_IN` chain, and
 requires a 513-byte used completion, success status, and deterministic sector-0
 identity. The smoke disk is a separate writable 1 MiB fixture, so neither the
 ESP nor a release image can be modified by this gate. Sector 0 remains a
-bounded read-only `aiuefs-v1` object store. Sector 1 is a dedicated journal
-slot: boot first validates an existing committed record, including independent
-header and payload checksums, and adopts it without
-mutation. Sectors 1 and 2 form a dual-slot journal: boot validates both records,
+bounded read-only `aiuefs-v1` root. Sectors 1 and 2 form a dual-slot redo
+journal: boot validates both records,
 selects the highest valid committed sequence, then appends the next sequence to
 the alternate slot and verifies it by readback without destroying the prior
-commit. The VM gate creates sequences 1 and 2, corrupts the latest slot, and
-requires fallback to sequence 1 before sequence 2 is reconstructed. This is a
-bounded two-record rollback window, not yet a general filesystem or
-kotobase IStore. The blk slice remains polling. The rng queue uses a bounded MSI-X
+commit. Each payload is a bounded object transaction for sector 3. A committed
+payload is replayed idempotently before append; the new journal commit is made
+durable before its object mutation, and both writes require readback. The VM
+gate creates matching journal/object sequences 1 and 2, corrupts the latest
+slot, and requires fallback, redo, and reconstruction of sequence 2. This is a
+single-object transactional slice with a two-record rollback window, not yet a
+general allocator, filesystem, or kotobase IStore. The blk slice remains
+polling. The rng queue uses a bounded MSI-X
 capability walk, validates the complete table and PBA against probed BAR
 extents, maps their MMIO UC/NX, and requires vector-34 IRQ evidence before
 accepting the DMA completion.  MSI-X for the remaining transports,
