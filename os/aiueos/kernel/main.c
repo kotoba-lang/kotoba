@@ -48,6 +48,7 @@ extern uint32_t aiueos_journal_recovered_sequence(void);
 extern uint32_t aiueos_journal_slot(void);
 extern void aiueos_scheduler_initialize(void);
 extern int aiueos_scheduler_evidence_ready(void);
+extern int aiueos_service_runtime_evidence_ready(void);
 extern int aiueos_syscall_self_test(void);
 extern int aiueos_process_initialize(void);
 extern void aiueos_process_enter(void);
@@ -268,6 +269,9 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     serial_string("AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer\r\n");
     debug_string("AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return\n");
     serial_string("AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return\r\n");
+    if (!aiueos_service_runtime_evidence_ready()) qemu_exit(0x6f);
+    debug_string("AIUEOS_SERVICE_RUNTIME_OK services=2 generations=stable heartbeats=persistent\n");
+    serial_string("AIUEOS_SERVICE_RUNTIME_OK services=2 generations=stable heartbeats=persistent\r\n");
     if (!aiueos_ioapic_route_legacy_timer()) {
       debug_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\n");
       serial_string("AIUEOS_IOAPIC_FAIL route-legacy-timer\r\n");

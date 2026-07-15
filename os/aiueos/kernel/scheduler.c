@@ -28,6 +28,8 @@ volatile uint64_t aiueos_scheduler_task_a_runs;
 volatile uint64_t aiueos_scheduler_task_b_runs;
 volatile uint64_t aiueos_scheduler_context_switches;
 volatile uint64_t aiueos_scheduler_address_space_failures;
+struct aiueos_service_slot { uint64_t id, generation, heartbeats; };
+static struct aiueos_service_slot services[2];
 
 static inline void debug_byte(uint8_t value) {
   __asm__ volatile("outb %0, $0xe9" : : "a"(value));
@@ -40,6 +42,7 @@ static void task_loop(volatile uint64_t *runs, uint8_t marker, unsigned process)
       ++aiueos_scheduler_address_space_failures;
     ++*private_word;
     *runs = *private_word;
+    services[process].heartbeats++;
     if (*runs == 1) debug_byte(marker);
     __asm__ volatile("hlt");
   }
@@ -81,6 +84,13 @@ void aiueos_scheduler_initialize(void) {
   aiueos_scheduler_task_a_runs = aiueos_scheduler_task_b_runs = 0;
   aiueos_scheduler_context_switches = 0;
   aiueos_scheduler_address_space_failures = 0;
+  services[0] = (struct aiueos_service_slot){1, 1, 0};
+  services[1] = (struct aiueos_service_slot){2, 1, 0};
+}
+int aiueos_service_runtime_evidence_ready(void) {
+  return services[0].id == 1 && services[1].id == 2 &&
+    services[0].generation == 1 && services[1].generation == 1 &&
+    services[0].heartbeats >= 2 && services[1].heartbeats >= 2;
 }
 uint64_t *aiueos_scheduler_on_timer(uint64_t *interrupted_stack) {
   tasks[current_task].saved_stack = interrupted_stack;

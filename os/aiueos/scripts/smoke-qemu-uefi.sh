@@ -214,6 +214,10 @@ grep -F "AIUEOS_SCHEDULER_CR3_OK roots=3 private-pages=2 kernel-return" "$serial
   echo "error: scheduler-driven address-space switching evidence was not observed" >&2
   exit 1
 }
+grep -F "AIUEOS_SERVICE_RUNTIME_OK services=2 generations=stable heartbeats=persistent" "$serial_log" >/dev/null || {
+  echo "error: persistent service runtime evidence was not observed" >&2
+  exit 1
+}
 grep -F "AIUEOS_IOAPIC_OK pit-gsi vector=33 eoi-v1" "$serial_log" >/dev/null || {
   echo "error: IOAPIC external timer IRQ evidence was not observed" >&2
   exit 1
