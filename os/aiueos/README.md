@@ -84,12 +84,13 @@ polling. The rng queue uses a bounded MSI-X
 capability walk, validates the complete table and PBA against probed BAR
 extents, maps their MMIO UC/NX, and requires vector-34 IRQ evidence before
 accepting the DMA completion.  MSI-X for the remaining transports,
-IOMMU isolation, indirect descriptors, and a reusable multi-request transport
-remain later Phase 4 work.
+indirect descriptors and a reusable multi-request transport remain later Phase 4 work.
 
 ACPI DMAR discovery validates the complete table, bounded remapping structures,
-DRHD register bases, and variable-length device scopes. A detected but
-unconfigured VT-d unit makes PCI DMA fail closed. Only the QEMU bring-up profile
+DRHD register bases, and variable-length device scopes. The QEMU VT-d gate owns
+the selected segment-0 remapping unit, installs legacy root/context and four-level second-level
+tables, limits domain 1 to the first 128 MiB, invalidates caches, and requires
+hardware `GSTS.TES` before PCI DMA. Unsupported DMAR topologies fail closed. Only the QEMU bring-up profile
 may use unisolated DMA when DMAR is absent, and its serial evidence explicitly
 labels that exception `test-only-unisolated` rather than claiming isolation.
 

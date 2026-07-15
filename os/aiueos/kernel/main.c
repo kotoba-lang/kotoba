@@ -35,6 +35,9 @@ extern int aiueos_paging_initialize(void);
 extern int aiueos_framebuffer_initialize(const struct aiueos_boot_info *boot);
 extern int aiueos_acpi_initialize(const void *rsdp);
 extern int aiueos_dma_test_policy_allows_unisolated(void);
+extern int aiueos_vtd_initialize(void);
+extern int aiueos_vtd_translation_enabled(void);
+extern uint32_t aiueos_vtd_error(void);
 extern int aiueos_apic_timer_initialize(void);
 extern volatile uint64_t aiueos_apic_timer_ticks;
 extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *boot);
@@ -186,7 +189,18 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\n");
     serial_string("AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2\r\n");
-    if (!aiueos_dma_test_policy_allows_unisolated()) {
+    if (!aiueos_vtd_initialize()) {
+      if (aiueos_vtd_error() == 3) serial_string("AIUEOS_VTD_STAGE_FAIL srtp\r\n");
+      if (aiueos_vtd_error() == 4) serial_string("AIUEOS_VTD_STAGE_FAIL context-invalidate\r\n");
+      if (aiueos_vtd_error() == 6) serial_string("AIUEOS_VTD_STAGE_FAIL iotlb-invalidate\r\n");
+      if (aiueos_vtd_error() == 7) serial_string("AIUEOS_VTD_STAGE_FAIL translation-enable\r\n");
+      serial_string("AIUEOS_VTD_FAIL root-context-slpt\r\n");
+      qemu_exit(0x74);
+    }
+    if (aiueos_vtd_translation_enabled()) {
+      serial_string("AIUEOS_VTD_OK tes=1 root-context-slpt domain=1 aperture=128MiB\r\n");
+      serial_string("AIUEOS_DMA_POLICY_OK dmar=validated dma=vtd-isolated\r\n");
+    } else if (!aiueos_dma_test_policy_allows_unisolated()) {
       serial_string("AIUEOS_DMA_POLICY_OK dmar=validated dma=denied-until-vtd-enabled\r\n");
     } else {
       serial_string("AIUEOS_DMA_POLICY_OK dmar=absent test-only-unisolated\r\n");
