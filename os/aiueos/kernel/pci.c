@@ -32,6 +32,8 @@ extern void *aiueos_allocate_physical_page(void);
 extern int aiueos_map_pci_mmio(uint64_t address, uint64_t length);
 extern int aiueos_dma_test_policy_allows_unisolated(void);
 extern int aiueos_vtd_translation_enabled(void);
+extern int aiueos_vtd_program_msix(uint16_t source_id, uint16_t index, uint8_t vector,
+                                   uint32_t apic_id, uint32_t *address, uint32_t *data);
 
 static inline void out32(uint16_t port, uint32_t value) {
   __asm__ volatile("outl %0, %1" : : "a"(value), "Nd"(port));
@@ -390,10 +392,15 @@ static int setup_blk_msix(uint8_t b, uint8_t d, uint8_t f,
   struct msix_entry *entry = (void *)(uintptr_t)(table_base + table_offset);
   uint32_t eax = 1, ebx, ecx, edx;
   __asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
+  uint32_t destination = (ebx >> 24) & 0xffU;
+  uint32_t message_address = 0xfee00000U | (destination << 12), message_data = 35;
+  if (aiueos_vtd_translation_enabled() &&
+      !aiueos_vtd_program_msix(((uint16_t)b << 8) | ((uint16_t)d << 3) | f,
+                               1,35,destination,&message_address,&message_data)) return 0;
   entry[1].vector_control = 1;
-  entry[1].address_low = 0xfee00000U | (((ebx >> 24) & 0xffU) << 12);
+  entry[1].address_low = message_address;
   entry[1].address_high = 0;
-  entry[1].data = 35;
+  entry[1].data = message_data;
   __asm__ volatile("" ::: "memory");
   cfg->queue_msix_vector = 1;
   if (cfg->queue_msix_vector != 1) return 0;
@@ -512,8 +519,8 @@ static int virtio_blk(uint8_t b, uint8_t d, uint8_t f) {
   /* Split rings use a power-of-two queue; the request consumes three entries. */
   volatile uint16_t *doorbell = prepare_queue(cfg,&caps,notify_base,4,desc,avail,used);
   if (!doorbell) return 0;
-  blk_msix_active = !aiueos_vtd_translation_enabled();
-  if (blk_msix_active && !setup_blk_msix(b,d,f,&caps,cfg)) return 0;
+  blk_msix_active = 1;
+  if (!setup_blk_msix(b,d,f,&caps,cfg)) return 0;
   cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
   uint16_t submitted = 0;
   if (!virtio_blk_sector_io(request,sector,status,desc,avail,used,doorbell,

@@ -94,6 +94,12 @@ tables, limits domain 1 to the first 128 MiB, invalidates caches, and requires
 hardware `GSTS.TES` before PCI DMA. Unsupported DMAR topologies fail closed. Only the QEMU bring-up profile
 may use unisolated DMA when DMAR is absent, and its serial evidence explicitly
 labels that exception `test-only-unisolated` rather than claiming isolation.
+When QEMU advertises `ECAP.IR`, the kernel also owns a bounded 256-entry
+interrupt-remapping table. The blk IRTE validates the complete PCI requester
+ID, targets vector 35, and uses remappable-format MSI-X with zero data. IRTA
+pointer status and interrupt-remapping enable status are required while
+translation remains enabled; unsupported IR capability or topology fails
+closed in the DMAR profile.
 
 The desktop transport bootstrap obtains the active UEFI GOP mode before
 `ExitBootServices` and hands only the aperture base/length, dimensions, stride,

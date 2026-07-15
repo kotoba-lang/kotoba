@@ -257,13 +257,21 @@ sequence 2. This closes a one-commit rollback window and connects the journal
 to a writable object, but is not yet an unbounded multi-record journal, object
 allocator, filesystem, or kotobase IStore.
 
-The block request queue is assigned MSI-X table entry 0 and architectural
+The block request queue is assigned MSI-X table entry 1 and architectural
 vector 35 before `DRIVER_OK`. The kernel bounds the advertised vector count,
 table and PBA byte ranges against probed BAR extents, maps only those validated
 MMIO ranges, and rejects a queue vector assignment that the device does not
 retain. Every sector operation waits in `sti; hlt` and is accepted only when
 both a vector-35 IRQ and the matching used-ring element are observed. This is
 real QEMU device-interrupt evidence; it is not a synthetic smoke event.
+With VT-d active, the MSI-X entry uses remappable format rather than the
+compatibility APIC address. The kernel requires `ECAP.IR`, installs a 256-entry
+IR table through IRTA, and programs IRTE 1 with fixed physical delivery,
+vector 35, and full requester-ID source validation for the discovered blk BDF.
+It retains translation enable while issuing SIRTP/IRE and requires
+`GSTS.IRTPS`, `GSTS.IRES`, and `GSTS.TES` before accepting completion. QEMU CI
+enables `intel-iommu,intremap=on` explicitly; absence of the advertised
+capability or failure to retain either enable state is fail-closed.
 
 ## Initial non-goals
 

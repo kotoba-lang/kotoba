@@ -71,7 +71,7 @@ else
 fi
 set +e
 iommu_args=
-if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then iommu_args="-device intel-iommu"; fi
+if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then iommu_args="-device intel-iommu,intremap=on"; fi
 # shellcheck disable=SC2086 # intentional optional pair of QEMU arguments
 "$qemu" \
   -machine q35,accel=tcg -cpu max -m 128M -smp 2 \
@@ -193,12 +193,15 @@ grep -F "AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly" "$se
   test -f "$serial_log" && sed -n '1,140p' "$serial_log" >&2
   exit 1
 }
-if [ "${AIUEOS_TEST_DMAR:-0}" != 1 ]; then
 grep -F "AIUEOS_VIRTIO_BLK_MSIX_OK vector=35 irq-completions-bounded table-pba-bounded" "$serial_log" >/dev/null || {
   echo "error: interrupt-driven virtio-blk MSI-X completion evidence was not observed" >&2
   test -f "$serial_log" && sed -n '1,160p' "$serial_log" >&2
   exit 1
 }
+if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then
+  grep -F "AIUEOS_VTD_IR_OK irta=256 source-validated vector=35 remappable-msix" "$serial_log" >/dev/null || {
+    echo "error: VT-d interrupt-remapped MSI-X evidence was not observed" >&2; exit 1;
+  }
 fi
 grep -F "AIUEOS_OBJECT_STORE_OK aiuefs-v1 objects=1 checksum=fnv1a" "$serial_log" >/dev/null || {
   echo "error: bounded read-only object-store evidence was not observed" >&2
