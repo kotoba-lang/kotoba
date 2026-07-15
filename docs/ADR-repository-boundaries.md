@@ -1,7 +1,7 @@
 # ADR - Repository boundaries and extraction policy
 
 - **Status**: Accepted
-- **Date**: 2026-06-30
+- **Date**: 2026-07-15
 - **Related**: `ADR-kotoba-lang-profile.md`, `ADR-kotoba-wasm.md`, `ADR-kotodama-cljc-num-torch-inference.md`
 
 ## Context
@@ -17,21 +17,39 @@ would create path-dependency churn without a stable contract.
 
 ## Decision
 
-Keep `kotoba-lang/kotoba` as the canonical substrate repository for now. It owns
-the language/runtime/database foundation:
+Keep `kotoba-lang/kotoba` as the apex repository for the Kotoba language. It
+owns the language contract and the integration needed to evolve that contract:
 
 - language profile, conformance, admission gates, and compiler implementation
 - `kotoba` CLI and integration paths such as `kotoba -e` and `kotoba wasm`
-- reusable database, storage, crypto, auth, Datalog, lattice, mesh, and Wasm
-  runtime crates
+- the reference compiler/runtime while those implementations are co-versioned
+  with the language contract
 - generic examples and fixtures that verify the substrate
 
-The bootable aiueos product is a deliberate integration responsibility: this
-repository owns firmware/kernel/image/release composition, while
-`kotoba-lang/aiueos` owns portable capability/component semantics. See
-`ADR-aiueos-boot-kernel-os-integration.md`.
+The bootable aiueos product belongs to `kotoba-lang/aiueos`. Firmware, loader,
+kernel, drivers, images, hardware evidence, browser-desktop integration, and OS
+release policy must not remain owned by the language apex. The current
+`os/aiueos` tree is a migration source only and remains temporarily so its
+working CI is not destroyed before the destination commit is pinned and
+verified. See `ADR-aiueos-boot-kernel-os-integration.md`.
+
+Reusable libraries are independently versioned repositories in the
+`kotoba-lang` organization, not permanent subtrees of a growing monorepo. A
+west manifest composes their pinned revisions for development, integration,
+and releases. West is the checkout/composition authority; it does not transfer
+source ownership back to this repository or allow floating branch references
+in release manifests.
 
 Use the following extraction rules:
+
+- `kotoba-lang/aiueos`: owns the complete OS product, including all content
+  currently under `os/aiueos`. After the destination commit is pinned and
+  content-verified, this repository retains only freestanding language/compiler
+  contracts and cross-repository conformance fixtures.
+- repo-per-library: a reusable library with a stable public contract and an
+  independent release gate receives its own `kotoba-lang/<library>` repository.
+  Consumers use published identities or west-pinned revisions, never an
+  unversioned workspace-only path as a release dependency.
 
 - `kotoba-lang/kotoba-lang`: reserve this repo for the language contract once a
   second compiler/runtime, external package, or independent conformance suite
@@ -74,7 +92,7 @@ Use the following extraction rules:
 Before extracting code to another repository, all of these must be true:
 
 - The extracted unit has a stable public contract and versioning policy.
-- Its CI can run without relying on workspace-only path dependencies.
+- Its CI can run without relying on unpinned workspace-only path dependencies.
 - At least one external consumer or independent release cadence exists.
 - The destination repository has a named owner and release gate.
 - `kotoba-lang/kotoba` retains only a narrow compatibility fixture, adapter, or
@@ -83,16 +101,25 @@ Before extracting code to another repository, all of these must be true:
 ## Migration order
 
 1. Record ownership in docs and ADRs before moving files.
-2. Mirror or subtree `crates/kotoba-lang` plus `docs/lang` into
+2. Copy `os/aiueos` and its boot/release CI to `kotoba-lang/aiueos`, preserve
+   executable bits, and make the destination CI pass independently.
+3. Pin the accepted aiueos destination commit in the organization west
+   manifest. Run `scripts/finalize-aiueos-extraction.sh` against a checkout at
+   that exact commit; only then remove the duplicate source tree and its CI job.
+4. Retain in the language/compiler repositories the target triples, object
+   format and relocation contracts, freestanding ABI, entry-shim contract, and
+   positive/negative compiler fixtures. Do not retain a kernel or device model
+   as a compiler fixture.
+5. Mirror or subtree `crates/kotoba-lang` plus `docs/lang` into
    `kotoba-lang/kotoba-lang` only after an external language-profile consumer
    exists.
-3. Keep `kotodama-host`, `kotodama-mcp`, `kotodama-cells`, `kotodama-py`,
+6. Keep `kotodama-host`, `kotodama-mcp`, `kotodama-cells`, `kotodama-py`,
    `kotodama-holochain`, and `inference` as the canonical homes for extracted
    kotodama surfaces.
-4. Drain any remaining product/domain code by moving domain code to
+7. Drain any remaining product/domain code by moving domain code to
    `etzhayyim/com-etzhayyim-*`, AT Protocol app code to
    `gftdcojp/app-aozora`, and operational code to `kotoba-lang/murakumo`.
-5. Decide packaging for the public `kotoba` crate/CLI after the repository
+8. Decide packaging for the public `kotoba` crate/CLI after the repository
    boundaries are clean; do not create a separate CLI repository unless release
    cadence proves it necessary.
 
@@ -103,5 +130,7 @@ Before extracting code to another repository, all of these must be true:
   suite are still co-evolving in this workspace.
 - `kotoba-kotodama` is no longer a deep implementation subtree in `kotoba`; its
   major surfaces are separate repositories with redirect READMEs left behind.
-- The current repository remains the integration point until extracted surfaces
-  have independent tests and consumers.
+- The organization west workspace becomes the integration point. This
+  repository remains authoritative only for language/compiler surfaces.
+- During migration, `os/aiueos` remains duplicated solely to preserve a green
+  source gate. Its presence does not imply continuing ownership.
