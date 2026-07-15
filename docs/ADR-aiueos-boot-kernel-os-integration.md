@@ -242,6 +242,12 @@ kotobase IStore.
 
 ## Initial non-goals
 
+The first persistent service-runtime slice registers two stable service IDs and
+requires their generation and heartbeat state to survive repeated timer-driven
+preemption/address-space switches. Persistence currently means kernel lifetime,
+not reboot durability. IPC, supervision/restart, and durable registry replay
+remain explicit gaps.
+
 - full POSIX/Linux ABI compatibility;
 - every x86 chipset or GPU;
 - BIOS as the primary production path;
