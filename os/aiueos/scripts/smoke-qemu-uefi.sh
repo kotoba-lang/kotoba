@@ -85,6 +85,7 @@ if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then iommu_args="-device intel-iommu"; fi
   -drive if=none,id=aiueosblk,format=raw,file="$blk_image" \
   -device virtio-blk-pci,drive=aiueosblk,disable-legacy=on \
   -device virtio-keyboard-pci,disable-legacy=on \
+  -device virtio-vga,disable-legacy=on \
   -display none -serial "file:$serial_log" -monitor none -no-reboot
 status=$?
 set -e
@@ -139,6 +140,10 @@ grep -F "AIUEOS_PAGING_OK cr3-owned wx-v1 nx-wp" "$serial_log" >/dev/null || {
 }
 grep -F "AIUEOS_FRAMEBUFFER_OK gop-owned retained-rectangles hash-verified" "$serial_log" >/dev/null || {
   echo "error: kernel did not validate and render the GOP framebuffer" >&2
+  exit 1
+}
+grep -F "AIUEOS_DESKTOP_SURFACE_OK envelope-v1 opaque-handle full-damage hash-verified" "$serial_log" >/dev/null || {
+  echo "error: bounded desktop surface envelope was not observed" >&2
   exit 1
 }
 grep -F "AIUEOS_PHYSICAL_ALLOCATOR_OK pages=2 zeroed" "$serial_log" >/dev/null || {
@@ -205,6 +210,14 @@ grep -F "AIUEOS_VIRTIO_INPUT_OK modern-pci eventq configured synthetic-smoke" "$
 }
 grep -F "AIUEOS_DESKTOP_INPUT_OK envelope-v1 sequence=1 kind=key ime-neutral" "$serial_log" >/dev/null || {
   echo "error: validated browser desktop input envelope was not observed" >&2; exit 1;
+}
+grep -F "AIUEOS_VIRTIO_GPU_OK modern-pci controlq display-info bounded" "$serial_log" >/dev/null || {
+  echo "error: bounded virtio-gpu display-info completion was not observed" >&2
+  exit 1
+}
+grep -F "AIUEOS_BROWSER_DESKTOP_TRANSPORT_OK surface-v1 gpu-scanout-bound input-v1" "$serial_log" >/dev/null || {
+  echo "error: framebuffer/browser desktop transport binding was not observed" >&2
+  exit 1
 }
 grep -F "AIUEOS_SCHEDULER_OK tasks=2 policy=round-robin preemption=apic-timer" "$serial_log" >/dev/null || {
   echo "error: preemptive round-robin scheduler evidence was not observed" >&2

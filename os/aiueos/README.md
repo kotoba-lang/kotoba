@@ -100,6 +100,13 @@ and RGB/BGR format to the kernel. The kernel independently validates every
 bound, maps the aperture supervisor-only RW+NX and uncached in a dedicated page
 directory, then presents a deterministic retained-rectangle test frame. A
 stable readback hash is required before `AIUEOS_FRAMEBUFFER_OK` is emitted.
+The kernel packages that real GOP result as a versioned desktop-surface
+envelope with an opaque surface handle, generation, content hash, pixel
+metadata, and full-surface damage. A generation-checked, rectangle-bounded copy
+operation transfers pixels into caller-owned memory; no physical address is exposed. QEMU uses a
+modern `virtio-vga` device, submits `GET_DISPLAY_INFO` on its real controlq,
+validates the returned enabled scanout, and binds the envelope only when its
+dimensions match the GOP surface.
 This is the native display capability boundary for the browser-owned desktop:
 the browser remains the workspace/focus/permission authority, while the kernel
 only admits validated surfaces and hardware input. Direct framebuffer mapping
@@ -110,8 +117,9 @@ smoke configures a real modern `virtio-keyboard-pci` event queue, but its event
 is explicitly synthetic because headless HMP `sendkey` is routed to the legacy
 console rather than virtio-keyboard. Production builds do not enable that
 fallback and require a device-completed, length/type/value-validated event.
-into a user component, ambient display authority, and an invented browser
-runtime are intentionally excluded.
+Virtio 2D resource creation, backing attachment, transfer/flush, a compositor,
+mapping the surface into a user component, ambient display authority, and an
+invented browser runtime are intentionally excluded.
 
 ```sh
 ./os/aiueos/scripts/build-uefi.sh
