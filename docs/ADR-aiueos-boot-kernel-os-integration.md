@@ -2,9 +2,8 @@
 
 - **Status**: Accepted; implementation staged
 - **Date**: 2026-07-14
-- **Owners**: `kotoba-lang/kotoba` (product integration),
-  `kotoba-lang/compiler` (code generation), `kotoba-lang/aiueos`
-  (capability/component semantics)
+- **Owners**: `kotoba-lang/aiueos` (OS product), `kotoba-lang/compiler`
+  (code generation), `kotoba-lang/kotoba` (language contract)
 - **Related implementation**: `kotoba-lang/aiueos#29`, the reviewed replacement
   for PR #25
 
@@ -22,7 +21,7 @@ host-import quartet; those imports remain deterministic stubs.
 
 ### Ownership
 
-`kotoba-lang/kotoba` owns the composition of the bootable product:
+`kotoba-lang/aiueos` owns the composition of the bootable product:
 
 - boot profiles and release graph;
 - firmware-to-kernel, kernel, syscall, and driver ABIs;
@@ -37,9 +36,11 @@ host-import quartet; those imports remain deterministic stubs.
 - PE/COFF and ELF emission;
 - relocation, sections, entry point, stack, TLS, and no-host-runtime contracts.
 
-`kotoba-lang/aiueos` remains the authority for manifests, policy, admission,
-audit/run receipts, component boot graphs, portable virtio protocol logic, and
-the Linux-hosted development profile.
+It also remains the authority for manifests, policy, admission, audit/run
+receipts, component boot graphs, portable virtio protocol logic, and the
+Linux-hosted development profile. The `os/aiueos` implementation in this
+repository is a temporary migration source and must be removed only through the
+pin-and-verify gate in `docs/aiueos-extraction-contract.md`.
 
 ### Profiles
 
