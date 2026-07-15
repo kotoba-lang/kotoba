@@ -34,9 +34,10 @@ source_manifest=$(mktemp)
 destination_manifest=$(mktemp)
 trap 'rm -f "$source_manifest" "$destination_manifest"' EXIT HUP INT TERM
 
-git ls-files -s "$source_tree" | sed "s#\t$source_tree/#\t#" >"$source_manifest"
+git ls-files -s "$source_tree" | sed "s#\t$source_tree/#\t#" |
+  grep -v 'README.md$' >"$source_manifest"
 git -C "$destination" ls-files -s "$destination_subdir" |
-  sed "s#\t$destination_subdir/#\t#" >"$destination_manifest"
+  sed "s#\t$destination_subdir/#\t#" | grep -v 'README.md$' >"$destination_manifest"
 
 if ! cmp -s "$source_manifest" "$destination_manifest"; then
   echo "source and pinned destination differ (path, mode, or blob id)" >&2

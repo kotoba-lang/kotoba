@@ -11,8 +11,8 @@ The duplicate may be removed only when all of the following are true:
    object ID in the organization west manifest.
 2. A checkout at that exact commit contains the complete migrated source tree.
 3. File paths, bytes, and executable bits match this repository's
-   `os/aiueos` tree. Intentional destination-only changes happen in a later
-   commit, after extraction is complete.
+   `os/aiueos` tree. The destination-owned `os/aiueos/README.md` is the sole
+   exception because it records aiueos-local authority and commands.
 4. aiueos independently passes the direct UEFI, journal recovery, corrupt
    kernel rejection, GPT release image, and VT-d/interrupt-remapping gates.
 5. The destination CI, ADR, and release receipt no longer invoke files from a
