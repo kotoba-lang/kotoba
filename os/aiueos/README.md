@@ -79,8 +79,9 @@ durable before its object mutation, and both writes require readback. The VM
 gate creates matching journal/object sequences 1 and 2, corrupts the latest
 slot, and requires fallback, redo, and reconstruction of sequence 2. This is a
 single-object transactional slice with a two-record rollback window, not yet a
-general allocator, filesystem, or kotobase IStore. The blk slice remains
-polling. The rng queue uses a bounded MSI-X
+general allocator, filesystem, or kotobase IStore. The blk queue uses MSI-X
+vector 35 for synchronous sector completions and sleeps with interrupts
+enabled instead of polling. The rng queue uses a bounded MSI-X
 capability walk, validates the complete table and PBA against probed BAR
 extents, maps their MMIO UC/NX, and requires vector-34 IRQ evidence before
 accepting the DMA completion.  MSI-X for the remaining transports,
