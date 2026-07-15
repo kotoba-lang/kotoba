@@ -41,6 +41,7 @@ extern int aiueos_dma_test_policy_allows_unisolated(void);
 extern int aiueos_vtd_initialize(void);
 extern int aiueos_vtd_translation_enabled(void);
 extern uint32_t aiueos_vtd_error(void);
+extern int aiueos_vtd_interrupt_remapping_enabled(void);
 extern int aiueos_apic_timer_initialize(void);
 extern volatile uint64_t aiueos_apic_timer_ticks;
 extern int aiueos_physical_allocator_initialize(const struct aiueos_boot_info *boot);
@@ -204,6 +205,8 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
       if (aiueos_vtd_error() == 4) serial_string("AIUEOS_VTD_STAGE_FAIL context-invalidate\r\n");
       if (aiueos_vtd_error() == 6) serial_string("AIUEOS_VTD_STAGE_FAIL iotlb-invalidate\r\n");
       if (aiueos_vtd_error() == 7) serial_string("AIUEOS_VTD_STAGE_FAIL translation-enable\r\n");
+      if (aiueos_vtd_error() == 8) serial_string("AIUEOS_VTD_STAGE_FAIL interrupt-table-pointer\r\n");
+      if (aiueos_vtd_error() == 9) serial_string("AIUEOS_VTD_STAGE_FAIL interrupt-remapping-enable\r\n");
       serial_string("AIUEOS_VTD_FAIL root-context-slpt\r\n");
       qemu_exit(0x74);
     }
@@ -260,12 +263,14 @@ void aiueos_kernel_main(const struct aiueos_boot_info *boot) {
     }
     debug_string("AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly\n");
     serial_string("AIUEOS_VIRTIO_BLK_OK capacity-bounded sector=0 bytes=512 readonly\r\n");
-    if (!aiueos_vtd_translation_enabled() && aiueos_virtio_blk_irq_count < 5) {
+    if (aiueos_virtio_blk_irq_count < 5) {
       serial_string("AIUEOS_VIRTIO_BLK_MSIX_FAIL irq-count\r\n"); qemu_exit(0x6f);
     }
-    if (!aiueos_vtd_translation_enabled()) {
-      debug_string("AIUEOS_VIRTIO_BLK_MSIX_OK vector=35 irq-completions-bounded table-pba-bounded\n");
-      serial_string("AIUEOS_VIRTIO_BLK_MSIX_OK vector=35 irq-completions-bounded table-pba-bounded\r\n");
+    debug_string("AIUEOS_VIRTIO_BLK_MSIX_OK vector=35 irq-completions-bounded table-pba-bounded\n");
+    serial_string("AIUEOS_VIRTIO_BLK_MSIX_OK vector=35 irq-completions-bounded table-pba-bounded\r\n");
+    if (aiueos_vtd_translation_enabled()) {
+      if (!aiueos_vtd_interrupt_remapping_enabled()) qemu_exit(0x6f);
+      serial_string("AIUEOS_VTD_IR_OK irta=256 source-validated vector=35 remappable-msix\r\n");
     }
     if (!aiueos_object_store_ready()) {
       debug_string("AIUEOS_OBJECT_STORE_FAIL superblock-or-object\n");
