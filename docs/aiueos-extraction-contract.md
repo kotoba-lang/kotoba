@@ -1,7 +1,7 @@
 # aiueos extraction contract
 
-This document is the source-side gate for moving `os/aiueos` from
-`kotoba-lang/kotoba` to `kotoba-lang/aiueos`.
+This document records the completed source-side gate that moved `os/aiueos`
+from `kotoba-lang/kotoba` to `kotoba-lang/aiueos`.
 
 ## Destination acceptance
 
@@ -42,6 +42,10 @@ formats, browser desktop transport, QEMU machine configuration, and bootable
 images belong exclusively to aiueos after extraction.
 
 ## Source-side completion
+
+Completed against aiueos commit
+`489b1c1f0fe6d79f6daeef87a20c6606338bad5b`, with the same commit pinned by
+the organization west manifest.
 
 After the verifier succeeds, the extraction commit removes:
 

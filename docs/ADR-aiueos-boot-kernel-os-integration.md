@@ -38,9 +38,9 @@ host-import quartet; those imports remain deterministic stubs.
 
 It also remains the authority for manifests, policy, admission, audit/run
 receipts, component boot graphs, portable virtio protocol logic, and the
-Linux-hosted development profile. The `os/aiueos` implementation in this
-repository is a temporary migration source and must be removed only through the
-pin-and-verify gate in `docs/aiueos-extraction-contract.md`.
+Linux-hosted development profile. Native implementation and boot evidence now
+live exclusively in `kotoba-lang/aiueos`; the completed extraction is recorded
+by `docs/aiueos-extraction-contract.md`.
 
 ### Profiles
 
@@ -190,7 +190,7 @@ separately.
 
 ## Implementation record
 
-The Phase 1 vertical slice lives in `os/aiueos`. It builds a real PE32+ EFI
+The Phase 1 vertical slice lives in `kotoba-lang/aiueos/os/aiueos`. It builds a real PE32+ EFI
 application and a separate static ELF64 kernel with a freestanding toolchain.
 The loader reads the kernel from the ESP, validates bounded load segments and
 its executable entry, captures the UEFI memory map, exits boot services, and

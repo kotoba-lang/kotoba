@@ -28,10 +28,10 @@ owns the language contract and the integration needed to evolve that contract:
 
 The bootable aiueos product belongs to `kotoba-lang/aiueos`. Firmware, loader,
 kernel, drivers, images, hardware evidence, browser-desktop integration, and OS
-release policy must not remain owned by the language apex. The current
-`os/aiueos` tree is a migration source only and remains temporarily so its
-working CI is not destroyed before the destination commit is pinned and
-verified. See `ADR-aiueos-boot-kernel-os-integration.md`.
+release policy must not remain owned by the language apex. The native tree was
+content-verified against aiueos commit
+`489b1c1f0fe6d79f6daeef87a20c6606338bad5b`, pinned through west, and removed
+from this repository. See `ADR-aiueos-boot-kernel-os-integration.md`.
 
 Reusable libraries are independently versioned repositories in the
 `kotoba-lang` organization, not permanent subtrees of a growing monorepo. A
@@ -42,10 +42,9 @@ in release manifests.
 
 Use the following extraction rules:
 
-- `kotoba-lang/aiueos`: owns the complete OS product, including all content
-  currently under `os/aiueos`. After the destination commit is pinned and
-  content-verified, this repository retains only freestanding language/compiler
-  contracts and cross-repository conformance fixtures.
+- `kotoba-lang/aiueos`: owns the complete OS product. This repository retains
+  only freestanding language/compiler contracts and cross-repository
+  conformance fixtures.
 - repo-per-library: a reusable library with a stable public contract and an
   independent release gate receives its own `kotoba-lang/<library>` repository.
   Consumers use published identities or west-pinned revisions, never an
@@ -132,5 +131,5 @@ Before extracting code to another repository, all of these must be true:
   major surfaces are separate repositories with redirect READMEs left behind.
 - The organization west workspace becomes the integration point. This
   repository remains authoritative only for language/compiler surfaces.
-- During migration, `os/aiueos` remains duplicated solely to preserve a green
-  source gate. Its presence does not imply continuing ownership.
+- The aiueos extraction completed through a content-verification gate; OS
+  source and boot CI are no longer duplicated here.
