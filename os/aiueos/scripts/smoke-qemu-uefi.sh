@@ -102,18 +102,6 @@ if [ "${AIUEOS_CORRUPT_KERNEL:-0}" = 1 ]; then
   exit 0
 fi
 
-if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then
-  # PCI DMA is intentionally rejected before a virtqueue can be submitted.
-  [ "$status" -eq 233 ] || {
-    echo "error: fail-closed DMAR profile exited with status $status" >&2; exit 1;
-  }
-  grep -F "AIUEOS_DMA_POLICY_OK dmar=validated dma=denied-until-vtd-enabled" "$serial_log" >/dev/null || {
-    echo "error: validated DMAR fail-closed evidence was not observed" >&2; exit 1;
-  }
-  echo "AIUEOS_DMAR_FAIL_CLOSED_OK"
-  exit 0
-fi
-
 # The #UD handler writes 0x30; isa-debug-exit maps it to (0x30 << 1) | 1 = 97.
 [ "$status" -eq 97 ] || {
   echo "error: unexpected QEMU exit status $status" >&2
@@ -161,10 +149,18 @@ grep -F "AIUEOS_ACPI_OK rsdp-xsdt-madt cpu>=2" "$serial_log" >/dev/null || {
   echo "error: validated ACPI CPU discovery evidence was not observed" >&2
   exit 1
 }
-grep -F "AIUEOS_DMA_POLICY_OK dmar=absent test-only-unisolated" "$serial_log" >/dev/null || {
-  echo "error: explicit no-IOMMU test DMA policy evidence was not observed" >&2
-  exit 1
-}
+if [ "${AIUEOS_TEST_DMAR:-0}" = 1 ]; then
+  grep -F "AIUEOS_VTD_OK tes=1 root-context-slpt domain=1 aperture=128MiB" "$serial_log" >/dev/null || {
+    echo "error: VT-d translation-enable register evidence was not observed" >&2; exit 1;
+  }
+  grep -F "AIUEOS_DMA_POLICY_OK dmar=validated dma=vtd-isolated" "$serial_log" >/dev/null || {
+    echo "error: isolated VT-d DMA policy evidence was not observed" >&2; exit 1;
+  }
+else
+  grep -F "AIUEOS_DMA_POLICY_OK dmar=absent test-only-unisolated" "$serial_log" >/dev/null || {
+    echo "error: explicit no-IOMMU test DMA policy evidence was not observed" >&2; exit 1;
+  }
+fi
 grep -F "AIUEOS_APIC_TIMER_OK vector=32 eoi-v1" "$serial_log" >/dev/null || {
   echo "error: Local APIC timer interrupt evidence was not observed" >&2
   exit 1

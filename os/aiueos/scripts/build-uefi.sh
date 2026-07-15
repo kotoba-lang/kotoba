@@ -15,6 +15,7 @@ kernel_object="$out/kernel-main.o"
 kernel_entry_object="$out/kernel-entry.o"
 kernel_paging_object="$out/kernel-paging.o"
 kernel_acpi_object="$out/kernel-acpi.o"
+kernel_vtd_object="$out/kernel-vtd.o"
 kernel_apic_object="$out/kernel-apic.o"
 kernel_memory_object="$out/kernel-memory.o"
 kernel_pci_object="$out/kernel-pci.o"
@@ -49,6 +50,9 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -c -o "$kernel_acpi_object" "$aiueos/kernel/acpi.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
+  -c -o "$kernel_vtd_object" "$aiueos/kernel/vtd.c"
+zig cc -target x86_64-freestanding-none -std=c11 -O2 \
+  -ffreestanding -fno-stack-protector -mno-red-zone \
   -c -o "$kernel_apic_object" "$aiueos/kernel/apic.c"
 zig cc -target x86_64-freestanding-none -std=c11 -O2 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
@@ -80,7 +84,7 @@ zig cc -target x86_64-freestanding-none -std=c11 -O2 \
 zig ld.lld -nostdlib -static -z max-page-size=0x1000 \
   -T "$aiueos/kernel/linker.ld" -o "$kernel" \
   "$kernel_entry_object" "$kernel_object" "$kernel_paging_object" \
-  "$kernel_acpi_object" "$kernel_apic_object" "$kernel_memory_object" \
+  "$kernel_acpi_object" "$kernel_vtd_object" "$kernel_apic_object" "$kernel_memory_object" \
   "$kernel_pci_object" "$kernel_scheduler_object" "$kernel_syscall_object" \
   "$kernel_process_object" "$kernel_smp_object" "$kernel_trampoline_object" \
   "$kernel_ioapic_object" "$kernel_framebuffer_object"

@@ -146,7 +146,7 @@ virtio-blk/NVMe -> block service -> filesystem/object store
 | 1 | UEFI loader + serial kernel | In progress: OVMF hands off to a bounded ELF64 kernel with its own stack and COM1 serial output; signature verification remains |
 | 2 | paging, exceptions, ACPI, APIC, SMP | In progress: GDT/IDT, CR3/W^X, ACPI discovery, and BSP Local APIC timer vector 32 pass; IOAPIC and AP startup remain |
 | 3 | scheduler, VM, syscall, capability handles | isolated tasks; W^X and invalid-handle tests |
-| 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | real QEMU queue completion; malformed descriptors rejected |
+| 4 | PCI/MMIO/DMA/IOMMU/IRQ + virtio | In progress: QEMU intel-iommu root/context/second-level translation reaches `GSTS.TES`; domain 1 is bounded to 128 MiB and virtio queue completions pass through it; multi-segment/scoped DRHD and per-device domains remain |
 | 5 | ISO/GPT/raw image, recovery, signed update | reproducible UEFI and GRUB boots |
 | 6 | browser shell, compositor, input, kotobase | desktop session persists and restores state |
 

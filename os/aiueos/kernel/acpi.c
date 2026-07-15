@@ -23,6 +23,10 @@ static uint32_t discovered_ioapic_address;
 static uint32_t discovered_ioapic_gsi_base;
 static uint32_t discovered_timer_gsi;
 static uint32_t discovered_dmar_drhd_count;
+static uint64_t discovered_dmar_register_base;
+static uint16_t discovered_dmar_segment;
+static uint8_t discovered_dmar_include_all;
+static int vtd_translation_enabled;
 
 uint32_t aiueos_acpi_cpu_count(void) { return discovered_cpu_count; }
 uint32_t aiueos_acpi_apic_id(uint32_t index) {
@@ -32,9 +36,13 @@ uint32_t aiueos_acpi_ioapic_address(void) { return discovered_ioapic_address; }
 uint32_t aiueos_acpi_ioapic_gsi_base(void) { return discovered_ioapic_gsi_base; }
 uint32_t aiueos_acpi_timer_gsi(void) { return discovered_timer_gsi; }
 int aiueos_dma_test_policy_allows_unisolated(void) {
-  return discovered_dmar_drhd_count == 0;
+  return discovered_dmar_drhd_count == 0 || vtd_translation_enabled;
 }
 uint32_t aiueos_acpi_dmar_drhd_count(void) { return discovered_dmar_drhd_count; }
+uint64_t aiueos_acpi_dmar_register_base(void) { return discovered_dmar_register_base; }
+uint16_t aiueos_acpi_dmar_segment(void) { return discovered_dmar_segment; }
+int aiueos_acpi_dmar_include_all(void) { return discovered_dmar_include_all; }
+void aiueos_acpi_set_vtd_translation_enabled(int enabled) { vtd_translation_enabled = enabled; }
 
 static int bytes_equal(const char *a, const char *b, uint64_t count) {
   while (count--) if (*a++ != *b++) return 0; return 1;
@@ -71,9 +79,15 @@ static int parse_dmar(const struct sdt_header *header) {
     if (type == 0) {
       if (length < 16) return 0;
       uint64_t base = *(const uint64_t *)(const void *)(cursor + 8);
+      uint16_t segment = *(const uint16_t *)(const void *)(cursor + 6);
       /* The register base is data, not dereferenced during discovery. Keep it
          page-aligned and within x86-64's architectural 52-bit physical range. */
       if (!base || (base & 4095) || base >= (1ULL << 52)) return 0;
+      if (!discovered_dmar_register_base && segment == 0) {
+        discovered_dmar_include_all = cursor[4] & 1;
+        discovered_dmar_register_base = base;
+        discovered_dmar_segment = segment;
+      }
       const uint8_t *scope = cursor + 16;
       const uint8_t *scope_end = cursor + length;
       while (scope < scope_end) {
@@ -85,7 +99,7 @@ static int parse_dmar(const struct sdt_header *header) {
     }
     cursor += length;
   }
-  if (!drhds) return 0;
+  if (!drhds || !discovered_dmar_register_base) return 0;
   discovered_dmar_drhd_count = drhds;
   return 1;
 }
@@ -96,6 +110,10 @@ int aiueos_acpi_initialize(const void *rsdp_pointer) {
   discovered_ioapic_gsi_base = 0;
   discovered_timer_gsi = 0;
   discovered_dmar_drhd_count = 0;
+  discovered_dmar_register_base = 0;
+  discovered_dmar_segment = 0;
+  discovered_dmar_include_all = 0;
+  vtd_translation_enabled = 0;
   const struct rsdp_v2 *rsdp = rsdp_pointer;
   if (!bounded_address((uint64_t)(uintptr_t)rsdp, sizeof(*rsdp)) ||
       !bytes_equal(rsdp->signature, "RSD PTR ", 8) || rsdp->revision < 2 ||
