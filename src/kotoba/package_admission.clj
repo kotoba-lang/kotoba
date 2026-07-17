@@ -310,3 +310,29 @@
 
                         (:kotoba.admission/error admission)
                         (assoc :kotoba.package/error (:kotoba.admission/error admission)))}))
+
+(defn safe-release-ready?
+  "F-001 / F-007 partial: a safe release may proceed only when a package-
+  verification receipt exists and is verified. Returns
+  {:ok? bool :problems [...]}. Does not perform crypto re-verification —
+  callers pass the receipt produced by `admit`/`verify-lock`."
+  [receipt]
+  (cond
+    (nil? receipt)
+    {:ok? false
+     :problems [{:kotoba.package/problem :package/missing-receipt
+                 :kotoba.package/message "package verification receipt required for safe release"}]}
+
+    (not (map? receipt))
+    {:ok? false
+     :problems [{:kotoba.package/problem :package/invalid-receipt
+                 :kotoba.package/message "receipt must be a map"}]}
+
+    (not (true? (:kotoba.package/verified? receipt)))
+    {:ok? false
+     :problems (into [{:kotoba.package/problem :package/not-verified
+                       :kotoba.package/message "receipt is not verified"}]
+                     (:kotoba.package/problems receipt))}
+
+    :else
+    {:ok? true :problems []}))

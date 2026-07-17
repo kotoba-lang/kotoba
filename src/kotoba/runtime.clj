@@ -355,24 +355,32 @@
                    granted))))
 
 (defn source-problems
-  "Return safety/type problems for the current executable subset."
+  "Return safety/type problems for the current executable subset.
+
+  P0 (ADR-2607180900): always includes guest-grammar/strict-problems
+  (catalog forbidden heads + optional strict unknown-form rejection)."
   ([safe-facts forms] (source-problems safe-facts forms nil))
   ([safe-facts forms policy]
   (let [denied (set (remove #{"ns"} (:non-executable-forms safe-facts)))
         effect-ops (set (:effect-ops safe-facts))
         allowed-caps (policy-capabilities policy)
-        problems (atom [])]
+        grammar-problems (guest-grammar/strict-problems forms policy)
+        problems (atom (vec grammar-problems))]
     (doseq [form forms]
       (walk-forms
        (fn [node]
          (when-let [head (some-> node list-head str)]
            (cond
+             ;; Catalog already reported forbidden; skip duplicate.
              (denied head)
-             (swap! problems conj
-                    (guest-grammar/with-hint
-                      {:kotoba.runtime/problem :denied-form
-                       :kotoba.runtime/form head}
-                      head))
+             (when-not (some #(and (= :denied-form (:kotoba.runtime/problem %))
+                                   (= head (:kotoba.runtime/form %)))
+                             @problems)
+               (swap! problems conj
+                      (guest-grammar/with-hint
+                        {:kotoba.runtime/problem :denied-form
+                         :kotoba.runtime/form head}
+                        head)))
 
              (= "cap-acquire" head)
              (let [kind (second node)

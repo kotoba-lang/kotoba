@@ -32,6 +32,7 @@
   slice has no real memory ABI); concrete native providers (pbcopy/pbpaste,
   an HTTP client, ...) plug in by passing a :handlers map to `host-call`."
   (:require [clojure.edn :as edn]
+            [clojure.string :as str]
             [kotoba.cap-table :as cap-table]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.kgraph :as kgraph]
@@ -58,13 +59,28 @@
             v))
         m))
 
+(def network-cap-names
+  "Contract capability names that are network egress. When
+  `:kotoba.policy/http-require-allowlist` is true (recommended for safe
+  deployments), a missing `:kotoba.policy/capability-resources` entry for
+  these caps fails closed (empty resource set) instead of granting `:any`."
+  #{"http/fetch" "http/post"})
+
 (defn- resource-scope
-  "Grant resource set for CAP-NAME under POLICY; defaults to the universe."
+  "Grant resource set for CAP-NAME under POLICY. Defaults to the universe
+  (`#{:any}`) except for network caps under `:kotoba.policy/http-require-
+  allowlist`, which default to empty (deny all URLs until an allowlist is
+  declared)."
   [policy cap-name]
   (let [resources (named-lookup (:kotoba.policy/capability-resources policy)
                                 cap-name)]
     (cond
-      (nil? resources) #{:any}
+      (nil? resources)
+      (if (and (contains? network-cap-names cap-name)
+               (:kotoba.policy/http-require-allowlist policy))
+        #{}
+        #{:any})
+
       (= :any resources) #{:any}
       :else (set resources))))
 
@@ -98,11 +114,14 @@
 
 (defn local-policy
   "kotoba.lang.capability-values local policy derived from the launcher
-  policy EDN."
+  policy EDN. Propagates :kotoba.policy/forbid-wildcard (S4b least-privilege)
+  so intersect-grants can deny :any results."
   [policy]
-  {:policy/allow
-   (into {} (for [[kind cap-name] (granted-kinds policy)]
-              [kind (resource-scope policy cap-name)]))})
+  (cond-> {:policy/allow
+           (into {} (for [[kind cap-name] (granted-kinds policy)]
+                      [kind (resource-scope policy cap-name)]))}
+    (true? (get policy :kotoba.policy/forbid-wildcard))
+    (assoc :policy/forbid-wildcard true)))
 
 (defn grants->policy
   "Launcher policy EDN synthesized from externally supplied (CACAO chain)
@@ -198,6 +217,80 @@
     (fn [cap]
       (contains? caps (core-contracts/capability-name cap)))))
 
+(def network-ops
+  "Host-import ops whose first string arg is treated as a network resource
+  id (URL). Used to request a concrete resource instead of `:any` so
+  `:kotoba.policy/capability-resources` can constrain SSRF."
+  #{'http-fetch 'http-post})
+
+(def fs-ops
+  "Host-import ops whose first string arg is a path resource id."
+  #{'fs-read 'fs-write})
+
+(defn resource-from-args
+  "Concrete resource requested by OP from interpreter ARGS, or :any when
+  the op has no extractable resource or the arg is not a string."
+  [op args]
+  (let [arg0 (first args)]
+    (cond
+      (and (contains? network-ops op) (string? arg0)) arg0
+      (and (contains? fs-ops op) (string? arg0)) arg0
+      :else :any)))
+
+(defn resource-covers?
+  "Whether GRANTED (a set of resource strings, or :any / #{:any}) covers
+  REQUESTED. Network resources match by exact string or prefix (an allowlist
+  entry `http://host/` covers `http://host/path`). Non-network resources
+  match exactly."
+  [granted requested]
+  (cond
+    (or (= :any granted) (and (set? granted) (contains? granted :any))) true
+    (= :any requested) false
+    (not (string? requested)) false
+    (set? granted)
+    (boolean (some (fn [g]
+                     (and (string? g)
+                          (or (= g requested)
+                              (and (or (str/starts-with? g "http://")
+                                       (str/starts-with? g "https://")
+                                       (str/starts-with? g "file:"))
+                                   (str/starts-with? requested g)))))
+                   granted))
+    (string? granted) (resource-covers? #{granted} requested)
+    :else false))
+
+(defn request-resource
+  "Resource token to present to `intersect-grants` for OP/RESOURCE under
+  POLICY. Exact set intersection cannot express URL-prefix allowlists, so
+  when a policy resource entry is a prefix of the concrete URL we request
+  that entry (so the intersection succeeds) while the handler still sees the
+  original URL for the real HTTP call."
+  [policy op resource]
+  (if (= :any resource)
+    :any
+    (let [cap-name (op-capability op)
+          granted (named-lookup (:kotoba.policy/capability-resources policy)
+                                cap-name)]
+      (cond
+        (or (nil? granted) (= :any granted)) resource
+        (set? granted)
+        (or (->> granted
+                 (filter string?)
+                 (filter #(or (= % resource)
+                              (and (or (str/starts-with? % "http://")
+                                       (str/starts-with? % "https://")
+                                       (str/starts-with? % "file:"))
+                                   (str/starts-with? resource %))))
+                 (sort-by count >)
+                 first)
+            resource)
+        (string? granted)
+        (if (or (= granted resource)
+                (str/starts-with? resource granted))
+          granted
+          resource)
+        :else resource))))
+
 (defn host-call
   "Build the guarded host-call fn handed to kotoba.runtime/run:
   (fn [op args] result). Every invocation goes through
@@ -206,10 +299,11 @@
   throws ex-info carrying :kotoba.host/denied, :kotoba.host/call, and the
   denial :kotoba.host/receipt — the provider handler is never invoked.
 
-  When OPTS carries :cacao-grants (verified CACAO delegation-chain grants,
-  see kotoba.lang.capability-cacao), those REPLACE the policy-derived grants
-  in the intersection; the local policy side still derives from POLICY, so an
-  explicit policy narrows the chain's resource set."
+  Network/fs ops request the concrete URL/path from ARGS (not `:any`) so
+  `:kotoba.policy/capability-resources` can scope least privilege. When OPTS
+  carries :cacao-grants (verified CACAO delegation-chain grants, see
+  kotoba.lang.capability-cacao), those REPLACE the policy-derived grants in
+  the intersection; the local policy side still derives from POLICY."
   ([policy] (host-call policy nil))
   ([policy {:keys [record! now handlers cacao-grants]}]
    (let [grants (or cacao-grants (policy-grants policy))
@@ -218,18 +312,30 @@
          handlers (or handlers default-handlers)]
      (fn guarded-host-call [op args]
        (let [kind (get op->kind op)
-             handler (get handlers op)]
+             handler (get handlers op)
+             args (vec args)
+             resource (resource-from-args op args)
+             requested (request-resource policy op resource)]
          (when-not (and kind handler)
            (throw (ex-info "host op has no capability guard"
                            {:kotoba.host/op op})))
          (let [outcome (capability-host/guard-call
                         {:call (keyword "kotoba.host" (str op))
-                         :requested (capability-values/make-cap kind :any)
+                         :requested (capability-values/make-cap kind requested)
                          :cacao-grants grants
                          :local-policy allow
                          :now now
                          :record! record!
-                         :handler (fn [concrete] (handler concrete (vec args)))})]
+                         :handler (fn [concrete]
+                                    (let [granted (:cap/resource concrete)]
+                                      (when (and (string? resource)
+                                                 (not (resource-covers? granted resource)))
+                                        (throw (ex-info "host call denied by resource allowlist"
+                                                        {:kotoba.host/denied :resource-not-allowed
+                                                         :kotoba.host/call op
+                                                         :kotoba.host/resource resource
+                                                         :kotoba.host/granted granted})))
+                                      (handler concrete args)))})]
            (if (:kotoba.host/ok? outcome)
              (:kotoba.host/result outcome)
              (throw (ex-info "host call denied by capability guard"
@@ -271,7 +377,9 @@
           (throw (ex-info "host op has no capability guard"
                           {:kotoba.host/op op})))
         (let [call (keyword "kotoba.host" (str with-op))
-              resolved (cap-table/resolve-use table handle kind now)]
+              ;; consume-use!: handle is affine at runtime (S2 defense-in-depth).
+              ;; A second use of the same handle fails closed as unknown-cap-handle.
+              resolved (cap-table/consume-use! table handle kind now)]
           (if-not (:ok? resolved)
             (let [receipt (use-receipt (cap-table/resolve-cap table handle)
                                        now call :denied handle
