@@ -13,6 +13,7 @@ mkdir -p target/native
 native-image \
   --no-fallback \
   -H:+ReportExceptionStackTraces \
+  --features=clj_easy.graal_build_time.InitClojureClasses \
   '-H:IncludeResources=.*\.(clj|cljc|edn)$' \
   -jar target/kotoba-standalone.jar \
   target/native/kotoba
