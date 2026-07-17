@@ -331,6 +331,7 @@
   {:lock-path (option-value argv lock-option)
    :manifest-path (option-value argv "--manifest")
    :trust-path (option-value argv "--trust")
+   :key-register-path (option-value argv "--key-register")
    :receipt-path (option-value argv "--receipt")})
 
 (defn package-verify-result
@@ -353,13 +354,18 @@
 (defn policy-result
   "Load and parse the `--policy <path>` EDN file, if the option is present.
   Ok with nil data when the option is absent; ok? false with the exception
-  message when the file can't be read/parsed."
+  message when the file can't be read/parsed.
+
+  Loaded policies are passed through `host-providers/normalize-policy` so
+  safe defaults (network URL allowlist required) apply unless the file
+  explicitly opts out."
   [argv]
   (if-let [path (option-value argv "--policy")]
     (try
       {:kotoba.policy/ok? true
        :kotoba.policy/path path
-       :kotoba.policy/data (-> path io/file slurp edn/read-string)}
+       :kotoba.policy/data (host-providers/normalize-policy
+                            (-> path io/file slurp edn/read-string))}
       (catch Exception e
         {:kotoba.policy/ok? false
          :kotoba.policy/path path
