@@ -14,6 +14,7 @@ native-image \
   --no-fallback \
   -H:+ReportExceptionStackTraces \
   --features=clj_easy.graal_build_time.InitClojureClasses \
+  --initialize-at-build-time=com.dylibso.chicory \
   '-H:IncludeResources=.*\.(clj|cljc|edn)$' \
   -jar target/kotoba-standalone.jar \
   target/native/kotoba
