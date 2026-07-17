@@ -89,19 +89,19 @@ class WitWorld(wit_world.WitWorld):
 ```
 
 > This `WitWorld` wrapper is **not auto-generated**: `_build.build_component`
-> shells out to your `build-pywasm.bb` against the entry module as-is, so the
+> shells out to your `build-pywasm.cljs` against the entry module as-is, so the
 > entry module must already define this `run` export. Emitting the wrapper
 > automatically is a follow-up.
 
 ## Building the component (bundled toolchain)
 
 The py→wasm build is **bundled**: `wit/world.wit` (the `kotoba-node` world) and
-`scripts/build-pywasm.bb` ship with the package and drive `componentize-py`.
+`scripts/build-pywasm.cljs` ships with the package and drives `componentize-py`.
 
 ```bash
 pip install -e '.[build]'          # componentize-py
 COMPONENTIZE_PY=componentize-py \
-  scripts/build-pywasm.bb examples/guest_component.py -o generate.wasm
+  nbb scripts/build-pywasm.cljs examples/guest_component.py -o generate.wasm
 # → "Component built successfully"  (a real kotoba-node WASM component)
 ```
 
@@ -118,7 +118,7 @@ order:
 
 1. `@app.function(wasm=b"…")` / `@app.function(wasm_path="generate.wasm")` — a
    pre-built component (no build step at call time).
-2. otherwise build via the bundled `scripts/build-pywasm.bb` (used automatically
+2. otherwise build via the bundled `scripts/build-pywasm.cljs` (used automatically
    when `componentize-py` is resolvable), or an explicit
    `KOTOBA_PYWASM_BUILD` / `builder=`, invoked as `<script> <entry.py> -o
    <out.wasm>` and sent as `wasm_b64`.
@@ -164,7 +164,7 @@ python examples/infer_app.py "hello"   # uses .local()
   ↔ client decode), auth headers, the `ToolchainNotFound` gate, and the HTTP
   `llm` seam.
 - **Build verified** (with `pip install '.[build]'`): the bundled
-  `wit/` + `scripts/build-pywasm.bb` compile `examples/guest_component.py` to a
+  `wit/` + `scripts/build-pywasm.cljs` compile `examples/guest_component.py` to a
   real kotoba-node WASM component (`test_build_sample_component_compiles`).
 - **Still unverifiable here (no live node):** real on-node WASM *execution* and
   the `kotoba:kais/llm` WIT binding at runtime — they need a running

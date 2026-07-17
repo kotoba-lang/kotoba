@@ -98,8 +98,8 @@
 ;; Game state
 
 (defn fresh-state
-  "Fresh game state: tick counter, entity table (id -> {:tag :x :y :vx
-  :vy}, a sorted map so id-order iteration — and therefore nearest-tagged
+  "Fresh game state: tick counter, entity table (id -> {:tag :x :y :z :vx
+  :vy :vz}, a sorted map so id-order iteration — and therefore nearest-tagged
   tie-breaking — is deterministic), host-owned input axes, and the seeded
   xorshift64 rng word (SEED 0 is remapped to splitmix64's golden-gamma
   constant rather than rejected)."
@@ -121,7 +121,7 @@
   [state tag]
   (let [id (dec (swap! (:next-id state) inc))]
     (swap! (:entities state) assoc id
-           {:tag tag :x 0.0 :y 0.0 :vx 0.0 :vy 0.0})
+           {:tag tag :x 0.0 :y 0.0 :z 0.0 :vx 0.0 :vy 0.0 :vz 0.0})
     id))
 
 (defn despawn-entity!
@@ -146,11 +146,30 @@
     (do (swap! (:entities state) update id assoc :vx (double vx) :vy (double vy)) 0)
     -1))
 
+(defn set-position3!
+  "Place entity ID at (X,Y,Z); additive 3D ABI, 0 or -1 for unknown id."
+  [state id x y z]
+  (if (contains? @(:entities state) id)
+    (do (swap! (:entities state) update id assoc
+               :x (double x) :y (double y) :z (double z)) 0)
+    -1))
+
+(defn set-velocity3!
+  "Set entity ID velocity to (VX,VY,VZ); 0 or -1 for unknown id."
+  [state id vx vy vz]
+  (if (contains? @(:entities state) id)
+    (do (swap! (:entities state) update id assoc
+               :vx (double vx) :vy (double vy) :vz (double vz)) 0)
+    -1))
+
 (defn get-x [state id]
   (double (get-in @(:entities state) [id :x] 0.0)))
 
 (defn get-y [state id]
   (double (get-in @(:entities state) [id :y] 0.0)))
+
+(defn get-z [state id]
+  (double (get-in @(:entities state) [id :z] 0.0)))
 
 (defn count-tagged [state tag]
   (count (filter #(= tag (:tag %)) (vals @(:entities state)))))
@@ -244,7 +263,8 @@
                            (assoc m id
                                   (assoc e
                                          :x (+ (:x e) (* (:vx e) dt))
-                                         :y (+ (:y e) (* (:vy e) dt)))))
+                                         :y (+ (:y e) (* (:vy e) dt))
+                                         :z (+ (:z e) (* (:vz e) dt)))))
                          (sorted-map) es)))
      (swap! (:tick state) inc))
    nil))
@@ -272,6 +292,9 @@
             :kami_set_velocity (fn [id vx vy] (set-velocity! state id vx vy))
             :kami_get_x (fn [id] (get-x state id))
             :kami_get_y (fn [id] (get-y state id))
+            :kami_set_position3 (fn [id x y z] (set-position3! state id x y z))
+            :kami_set_velocity3 (fn [id vx vy vz] (set-velocity3! state id vx vy vz))
+            :kami_get_z (fn [id] (get-z state id))
             :kami_count_tagged (fn [ptr len] (count-tagged state (s ptr len)))
             :kami_nearest_tagged (fn [ptr len x y max-dist]
                                    (nearest-tagged state (s ptr len) x y max-dist))
@@ -325,6 +348,16 @@
         (fn [_instance ^longs args] (f32-ret (get-x state (aget args 0))))
         'kami-get-y
         (fn [_instance ^longs args] (f32-ret (get-y state (aget args 0))))
+        'kami-set-position3!
+        (fn [_instance ^longs args]
+          (long (set-position3! state (aget args 0) (f32-arg args 1)
+                                (f32-arg args 2) (f32-arg args 3))))
+        'kami-set-velocity3!
+        (fn [_instance ^longs args]
+          (long (set-velocity3! state (aget args 0) (f32-arg args 1)
+                                (f32-arg args 2) (f32-arg args 3))))
+        'kami-get-z
+        (fn [_instance ^longs args] (f32-ret (get-z state (aget args 0))))
         'kami-count-tagged
         (fn [instance ^longs args]
           (long (count-tagged state (read-str instance (aget args 0) (aget args 1)))))

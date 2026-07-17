@@ -25,6 +25,38 @@
     (is (= :command/planned (:kotoba.cli/code result)))
     (is (= :adapter-required (get-in result [:kotoba.cli/data :host-action])))))
 
+(deftest compile-web-uses-kotoba-script-from-checked-kir
+  (let [source (doto (java.io.File/createTempFile "kotoba-web" ".kotoba")
+                 (.deleteOnExit))
+        output (doto (java.io.File/createTempFile "kotoba-web" ".mjs")
+                 (.deleteOnExit))]
+    (spit source "(defn main [] (+ 40 2))")
+    (let [result (launcher/dispatch ["compile" (.getPath source) "--target" "web"
+                                     "--output" (.getPath output)])]
+      (is (:kotoba.cli/ok? result))
+      (is (= :compile/emitted (:kotoba.cli/code result)))
+      (is (= :kotoba-script (get-in result [:kotoba.cli/data :backend])))
+      (is (re-find #"kotoba-js-artifact/v1" (slurp (str (.getPath output) ".manifest.edn"))))
+      (is (re-find #"export" (slurp output))))))
+
+(deftest compile-cljc-selects-kotoba-reader-branch
+  (let [source (doto (java.io.File/createTempFile "kotoba-portable" ".cljc")
+                 (.deleteOnExit))
+        output (doto (java.io.File/createTempFile "kotoba-portable" ".mjs")
+                 (.deleteOnExit))]
+    (spit source "(defn main [] #?(:kotoba 42 :clj 1 :cljs 2))")
+    (is (:kotoba.cli/ok?
+         (launcher/dispatch ["compile" (.getPath source) "--target" "web"
+                             "--output" (.getPath output)])))
+    (is (re-find #"42" (slurp output)))))
+
+(deftest compile-does-not-claim-clojurescript-source
+  (let [source (doto (java.io.File/createTempFile "host-owned" ".cljs")
+                 (.deleteOnExit))]
+    (is (= :compile/not-kotoba-source
+           (:kotoba.cli/code
+            (launcher/dispatch ["compile" (.getPath source) "--target" "web"]))))))
+
 (deftest returns-nonzero-for-unknown-command
   (let [result (launcher/dispatch ["unknown"])]
     (is (false? (:kotoba.cli/ok? result)))

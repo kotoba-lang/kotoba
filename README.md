@@ -98,7 +98,7 @@ See [**Documentation**](#documentation) below for the full ADR / design index.
 ```bash
 # Tap the kotoba formula
 brew tap kotoba-lang/kotoba        # one-time
-brew install kotoba                # installs the CLJC/EDN-backed `kotoba` launcher
+brew install kotoba                # installs the native `kotoba` executable
 ```
 
 To track the upstream `main` branch instead of the latest tagged release,
@@ -122,10 +122,19 @@ cd kotoba
 bin/kotoba-clj check --kind cli-contract --json
 ```
 
+### Shell installer (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kotoba-lang/kotoba/main/install.sh | sh
+```
+
+The installer verifies the release archive checksum and installs a native
+executable. Neither a JVM nor Clojure CLI is required at runtime.
+
 ### npm / npx
 
-The npm package is also a CLJC/EDN-backed launcher. It requires a local
-`clojure` command on `PATH`.
+The npm launcher is a compatibility adapter. Native Homebrew and shell installs
+are the authoritative JVM-free distribution paths.
 
 ```bash
 npm install -g @kotoba-lang/kotoba
@@ -157,6 +166,8 @@ Commands this repo's launcher currently wires up:
 ```bash
 kotoba check --kind cli-contract --json     # validate the CLI/package/lock contract
 kotoba run path/to/entry.kotoba             # compile and run a Kotoba entry point
+kotoba compile app.kotoba --target web -o app.mjs # checked KIR → kotoba-script
+kotoba run path/to/entry.cljk                # CLJ Kotoba source
 kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
 kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # capability-confined build, see Language below
 kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
@@ -210,13 +221,11 @@ This repo hosts launchers and adapters that consume that contract; it does
 not define new command shape or language semantics of its own.
 
 - **Not a Clojure superset or dialect in the full sense — a Clojure-family
-  *profile/subset*** with its own compatibility contract. Canonical source
-  extension: `.kotoba`. Compatibility extensions: `.clj`, `.cljc` (portable,
-  shared Clojure-family source). **`.cljs` is retired as a dedicated source
-  extension** (profile v2) — ClojureScript-targeted behavior lives inside
-  `.cljc` via `#?(:cljs ...)`, not a separate file type. Reader-target
-  resolution order for `.cljc`: `:kotoba → :clj → :default`; namespace file
-  resolution priority: `.kotoba → .cljc → .clj`.
+  *profile/subset*** with its own compatibility contract. Primary source
+  extensions are `.kotoba`, `.cljk` (CLJ Kotoba), and portable `.cljc`.
+  `.clj` and `.cljs` retain their standard Clojure and ClojureScript meanings.
+  Web `.kotoba` is compiled through checked KIR and `kotoba-script`; it is not
+  delegated to ClojureScript.
 - **The CLI/command contract is EDN, not code.** `lang/cli.edn`
   (`:kotoba.cli.contract`, versioned M0–M3) and `lang/adapters.edn` (scopes
   which repos may host adapters) define the command surface; `lang/profile.edn`
@@ -224,8 +233,9 @@ not define new command shape or language semantics of its own.
   contract and shapes argv as EDN — host launchers (like this repo's
   `bin/kotoba-clj`) adapt to this contract; they don't define protocol
   semantics of their own.
-- **Compilation target is WebAssembly.** The public compiler surface is
-  `kotoba -e` / `kotoba wasm ...`; `kotoba -e '(+ 1 2)'` is compile-and-run
+- **Compilation targets are WebAssembly and restricted Web/JavaScript.** The
+  public compiler surface is `kotoba compile --target web|wasm` and
+  `kotoba wasm ...`; `kotoba -e '(+ 1 2)'` is compile-and-run
   sugar (wraps the expression as an exported `main`, compiles Kotoba → core
   Wasm, runs it) — not a runtime `eval`.
 - **Safety model — "safe Kotoba."** Three formal soundness goals: **T1

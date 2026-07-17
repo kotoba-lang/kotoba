@@ -51,6 +51,15 @@
       (is (= 0 (kami/count-tagged state "ghost")))
       (is (= -1 (kami/despawn-entity! state g))
           "already despawned -> -1")))
+  (testing "additive 3D position/velocity ABI preserves and integrates z"
+    (let [state (kami/fresh-state 7)
+          e (kami/spawn-entity! state "body")]
+      (is (= 0 (kami/set-position3! state e 1.0 2.0 3.0)))
+      (is (= 0 (kami/set-velocity3! state e 0.0 0.0 4.0)))
+      (kami/step! state 0.5)
+      (is (= 5.0 (kami/get-z state e)))
+      (is (= 1.0 (kami/get-x state e)))
+      (is (= 2.0 (kami/get-y state e)))))
   (testing "seeded rand is deterministic and in range"
     (let [a (kami/fresh-state 7)
           b (kami/fresh-state 7)
@@ -84,6 +93,38 @@
                 (runtime/source-problems (launcher/safe-analyzer-fact-classification)
                                          forms
                                          {:kotoba.policy/capabilities #{}}))))))
+
+(deftest kotoba-3d-surface-lowers-to-additive-kami-abi
+  (let [forms (runtime/read-forms
+               "(defn main [] (let [e (spawn-entity \"body\")
+                                    _p (set-position! e (f32 1.0) (f32 2.0) (f32 3.0))
+                                    _v (set-velocity! e (f32 0.0) (f32 0.0) (f32 4.0))]
+                                0))"
+               :kotoba)
+        lowered (pr-str (runtime/lower-language-forms forms))]
+    (is (re-find #"kami-set-position3!" lowered))
+    (is (re-find #"kami-set-velocity3!" lowered))
+    (is (not (re-find #"kami-set-position!.*3\.0" lowered))
+        "the z component is routed to the 3D ABI, never discarded into 2D")))
+
+(deftest kotoba-3d-abi-executes-through-wasm-host
+  (let [forms (runtime/read-forms
+               "(defn main [] (let [e (spawn-entity \"body\")
+                                    _p (set-position! e (f32 1.0) (f32 2.0) (f32 3.0))
+                                    _v (set-velocity! e (f32 0.0) (f32 0.0) (f32 4.0))]
+                                0))"
+               :kotoba)
+        policy {:kotoba.policy/capabilities #{:kami/engine}}
+        wasm (runtime/wasm-binary forms policy)
+        state (kami/fresh-state 7)
+        instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
+                                        (kami/kami-host-functions state policy)
+                                        policy)]
+    (is (:kotoba.wasm/ok? wasm))
+    (is (= 0 (wasm-exec/call-main instance)))
+    (is (= 3.0 (kami/get-z state 0)))
+    (kami/step! state 0.5)
+    (is (= 5.0 (kami/get-z state 0)))))
 
 (deftest kami-survivors-plays-deterministically-through-real-chicory
   (testing "300 ticks of the survivors loop on Chicory, exact pinned counts
