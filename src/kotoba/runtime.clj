@@ -9,6 +9,7 @@
             ;; `clojure.core/str` function extensively; `:as str` would
             ;; silently shadow every one of those call sites.
             [clojure.string :as cstr]
+            [clojure.walk :as walk]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.lang.capability-values :as capability-values]
             [clojure.tools.reader :as reader]
@@ -231,6 +232,9 @@
    'kami-set-velocity! :host/kami-engine
    'kami-get-x :host/kami-engine
    'kami-get-y :host/kami-engine
+   'kami-set-position3! :host/kami-engine
+   'kami-set-velocity3! :host/kami-engine
+   'kami-get-z :host/kami-engine
    'kami-count-tagged :host/kami-engine
    'kami-nearest-tagged :host/kami-engine
    'kami-move-tagged-toward! :host/kami-engine
@@ -568,10 +572,82 @@
              :params (vec params)
              :body (vec body)}])))
 
+(defn lower-language-forms
+  "Lower Kotoba-only surface forms into the compiler core. This pass is
+  shared by IR and Wasm so the two paths cannot silently diverge.
+  `(defsystem move [dt] ...)` has the stable ABI export `move-tick`."
+  [forms]
+  (let [constants (into {}
+                        (keep (fn [form]
+                                (when (and (seq? form) (= 'def (first form))
+                                           (= 3 (count form)))
+                                  [(second form) (nth form 2)])))
+                        forms)
+        string-args (fn [op s & args]
+                      (list* op (list 'str-ptr s) (list 'str-len s) args))
+        lower-cond (fn lower-cond [clauses]
+                     (if (empty? clauses)
+                       0
+                       (let [[test value & more] clauses]
+                         (if (= :else test)
+                           value
+                           (list 'if test value (lower-cond more))))))
+        lower-node
+        (fn [node]
+          (if-not (seq? node)
+            node
+            (let [[op & args] node]
+              (case op
+                defsystem (let [[name params & body] args]
+                            (list* 'defn (symbol (str name "-tick")) params body))
+                cond (lower-cond args)
+                not= (list 'not (list* '= args))
+                nearest-tagged (apply string-args 'kami-nearest-tagged args)
+                spawn-entity (apply string-args 'kami-spawn args)
+                count-tagged (apply string-args 'kami-count-tagged args)
+                axis (apply string-args 'kami-axis args)
+                play-sound (apply string-args 'audio-play args)
+                despawn-entity (list* 'kami-despawn args)
+                set-position! (case (count args)
+                                3 (list* 'kami-set-position! args)
+                                4 (list* 'kami-set-position3! args)
+                                node)
+                set-velocity! (case (count args)
+                                3 (list* 'kami-set-velocity! args)
+                                4 (list* 'kami-set-velocity3! args)
+                                node)
+                get-x (list* 'kami-get-x args)
+                get-y (list* 'kami-get-y args)
+                get-z (list* 'kami-get-z args)
+                tick-n (list 'kami-tick-n)
+                rand-int (list* 'kami-rand args)
+                ;; The current Kami host has a safe bulk operation instead of
+                ;; exposing an unbounded guest loop over host-owned entities.
+                doseq-entities
+                (let [[[entity tag] & body] args
+                      call (first body)]
+                  (if (and (= 1 (count body)) (seq? call)
+                           (= 'move-toward! (first call))
+                           (= entity (second call)))
+                    (let [[_ _ target speed] call]
+                      (string-args 'kami-move-tagged-toward! tag
+                                   (list 'kami-get-x target)
+                                   (list 'kami-get-y target)
+                                   speed))
+                    node))
+                node))))]
+    (->> forms
+         (remove #(and (seq? %) (= 'def (first %))))
+         (mapv (fn [form]
+                 (->> form
+                      (walk/postwalk-replace constants)
+                      (walk/postwalk lower-node)))))))
+
 (defn compile-forms
   "Compile checked forms to deterministic EDN IR."
   [source-plan forms]
-  (let [fns (into {} (keep function-def forms))
+  (let [forms (lower-language-forms forms)
+        fns (into {} (keep function-def forms))
         expressions (vec (remove #(and (seq? %) (#{'ns 'defn} (first %))) forms))]
     {:schema "kotoba.runtime.edn-ir.v0"
      :kotoba.runtime/source-plan source-plan
@@ -1029,6 +1105,8 @@
         :kotoba.runtime/fn (str fn-name)
         :kotoba.runtime/missing (:missing checked)}))))
 
+(declare wasm-binary)
+
 (defn check
   "Run all static checks (safety/type problems, typed-capability problems,
   capability-value affinity, effect/capability consistency) over forms and,
@@ -1036,10 +1114,25 @@
   :kotoba.runtime/problems :kotoba.runtime/ir}`."
   ([safe-facts source-plan forms] (check safe-facts source-plan forms nil))
   ([safe-facts source-plan forms policy]
-  (let [problems (vec (concat (source-problems safe-facts forms policy)
-                              (cap-typed-problems forms)
-                              (cap-affine-problems forms)
-                              (cap-effect-problems forms)))
+  (let [surface-forms forms
+        forms (lower-language-forms forms)
+        static-problems (vec (concat (source-problems safe-facts forms policy)
+                                     (cap-typed-problems forms)
+                                     (cap-affine-problems forms)
+                                     (cap-effect-problems forms)))
+        ;; A defsystem source is an executable game module, not merely data.
+        ;; Its safety check must prove that the selected Kotoba backend can
+        ;; compile it; accepting an unknown operation here would be fail-open.
+        backend (when (and (empty? static-problems)
+                           (some #(and (seq? %) (= 'defsystem (first %))) surface-forms))
+                  (wasm-binary forms policy))
+        backend-problems (when (and backend (not (:kotoba.wasm/ok? backend)))
+                           (mapv (fn [problem]
+                                   {:kotoba.runtime/problem :backend-unsupported
+                                    :kotoba.runtime/backend :wasm
+                                    :kotoba.runtime/cause problem})
+                                 (:kotoba.wasm/problems backend)))
+        problems (into static-problems backend-problems)
         ir (when (empty? problems)
              (compile-forms source-plan forms))]
     {:kotoba.runtime/ok? (empty? problems)
@@ -2143,10 +2236,13 @@
         bs))
 
 (defn wasm-binary
-  "Compile integer functions to a WebAssembly MVP binary and export `main`."
+  "Compile checked functions to WebAssembly. Every function is exported;
+  command programs require zero-arity `main`, while game modules may expose
+  `init` and/or `*-tick` systems instead."
   ([forms] (wasm-binary forms nil))
   ([forms _policy]
-  (let [defs (function-defs forms)
+  (let [forms (lower-language-forms forms)
+        defs (function-defs forms)
         indirect? (uses-call-indirect? forms)
         imports (required-host-imports forms)
         import-count (count imports)
@@ -2164,13 +2260,17 @@
                                :memory layout
                                :fn-result-types declared-fn-result-types
                                :indirect-type-index 0)
-        main (get (into {} defs) 'main)]
+        main (get (into {} defs) 'main)
+        module-entry? (some (fn [[name _]]
+                              (or (= name 'init)
+                                  (cstr/ends-with? (str name) "-tick")))
+                            defs)]
     (cond
-      (nil? main)
+      (and (nil? main) (not module-entry?))
       {:kotoba.wasm/ok? false
        :kotoba.wasm/problems [{:kotoba.wasm/problem :missing-main}]}
 
-      (seq (:params main))
+      (and main (seq (:params main)))
       {:kotoba.wasm/ok? false
        :kotoba.wasm/problems [{:kotoba.wasm/problem :main-arity
                                :kotoba.wasm/expected 0
@@ -2234,8 +2334,12 @@
                                 (section 4 (vec-bytes [(table-entry (count indirect-target-indexes))])))
                 memory-section (section 5 (vec-bytes [[0x00 0x01]]))
                 global-section (section 6 (vec-bytes [(global-entry heap-start)]))
-                export-section (section 7 (vec-bytes [(export-entry "main" 0x00 (get fn-indexes 'main))
-                                                       (export-entry "memory" 0x02 0)]))
+                export-names (mapv (comp str first) defs)
+                export-section (section 7 (vec-bytes (conj (mapv (fn [[name _]]
+                                                                    (export-entry (str name) 0x00
+                                                                                  (get fn-indexes name)))
+                                                                  defs)
+                                                             (export-entry "memory" 0x02 0))))
                 bodies (mapv (fn [compiled]
                                (let [decls (local-decls (merge-local-types compiled))
                                      body (bcat decls (:bytes compiled) [0x0b])]
@@ -2264,8 +2368,9 @@
             {:kotoba.wasm/ok? true
              :kotoba.wasm/binary (byte-array (map unchecked-byte module-bytes))
              :kotoba.wasm/byte-count (count module-bytes)
-             :kotoba.wasm/export "main"
-             :kotoba.wasm/result-type (compiled-result-type (some #(when (= 'main (:name %)) %) compiled-fns))
+             :kotoba.wasm/export (when main "main")
+             :kotoba.wasm/exports export-names
+             :kotoba.wasm/result-type (when main (compiled-result-type (some #(when (= 'main (:name %)) %) compiled-fns)))
              :kotoba.wasm/function-count (count compiled-fns)
              :kotoba.wasm/import-count import-count
              :kotoba.wasm/imports import-metadata

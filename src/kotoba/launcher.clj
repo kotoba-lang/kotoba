@@ -11,6 +11,7 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [kotoba.cap-table :as cap-table]
+            [kotoba.compiler.core :as compiler]
             [kotoba.lang.capability-cacao :as capability-cacao]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
@@ -50,10 +51,11 @@
   [argv]
   (first argv))
 
-(declare source-plan accepted-source? selfhost-result runtime-result wasm-result cljs-result package-result contract-exports)
+(declare source-plan source-extension accepted-source? selfhost-result runtime-result wasm-result cljs-result
+         compile-result package-result contract-exports)
 
 (def source-commands
-  #{"run" "check"})
+  #{"run" "check" "compile"})
 
 (def value-options
   #{"--cacao"
@@ -209,6 +211,7 @@
   (let [argv (vec argv)]
     (if-let [launcher-result (case (command-name argv)
                                "selfhost" (selfhost-result argv)
+                               "compile" (compile-result argv)
                                "wasm" (wasm-result argv)
                                "cljs" (cljs-result argv)
                                "package" (package-result argv)
@@ -232,6 +235,56 @@
                   :kotoba.launcher/authority-request
                   (authority-request argv normalized-argv plan))
           (adapter-result (command-name argv) result)))))))
+
+(defn- write-bytes! [path bytes]
+  (some-> (io/file path) .getParentFile .mkdirs)
+  (with-open [out (io/output-stream path)]
+    (.write out ^bytes bytes)))
+
+(defn compile-result
+  "Compile Kotoba-owned source through kotoba-lang/compiler. Web output is
+  restricted ESM emitted from checked KIR by kotoba-script; it never routes
+  through the legacy ClojureScript backend."
+  [argv]
+  (let [entry (first-source-arg argv)
+        extension (some-> entry source-extension)
+        target-name (or (option-value argv "--target") "wasm")
+        target (case target-name "web" :js-kotoba-v1 "wasm" :wasm32-kotoba-v1 nil)
+        output (or (option-value argv "--output")
+                   (option-value argv "-o")
+                   (when (and entry extension)
+                     (str (subs entry 0 (- (count entry) (count extension)))
+                          (if (= target-name "web") ".mjs" ".wasm"))))]
+    (cond
+      (nil? entry)
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/entry-required}
+
+      (not (#{".kotoba" ".cljk" ".cljc"} extension))
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/not-kotoba-source
+       :kotoba.cli/data {:entry entry :extension extension}}
+
+      (nil? target)
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/unsupported-target
+       :kotoba.cli/data {:target target-name :allowed ["web" "wasm"]}}
+
+      :else
+      (try
+        (let [compiled (compiler/compile-source (slurp entry) target)]
+          (if (= target :js-kotoba-v1)
+            (do
+              (some-> (io/file output) .getParentFile .mkdirs)
+              (spit output (:source compiled))
+              (spit (str output ".manifest.edn") (pr-str (:manifest compiled))))
+            (write-bytes! output (:bytes compiled)))
+          {:kotoba.cli/ok? true :kotoba.cli/code :compile/emitted
+           :kotoba.cli/data {:entry entry :output output :target target-name
+                             :backend (if (= target :js-kotoba-v1)
+                                        :kotoba-script :kotoba-wasm)
+                             :manifest (:manifest compiled)}})
+        (catch Exception error
+          {:kotoba.cli/ok? false :kotoba.cli/code :compile/failed
+           :kotoba.cli/message (ex-message error)
+           :kotoba.cli/data (select-keys (ex-data error) [:phase :reason :target])})))))
 
 (defn resource-edn
   "Load an EDN resource by classpath path."
