@@ -22,6 +22,7 @@
             [kotoba.rad-adapter-test]
             [kotoba.real-host-providers-test]
             [kotoba.runtime-test]
+            [kotoba.security-kaizen-test]
             [kotoba.sensing-host-test]
             [kotoba.semantic-code-test]
             [kotoba.wasm-and-or-when-test]
@@ -50,6 +51,7 @@
                                         'kotoba.rad-adapter-test
                                         'kotoba.real-host-providers-test
                                         'kotoba.runtime-test
+                                        'kotoba.security-kaizen-test
                                         'kotoba.sensing-host-test
                                         'kotoba.semantic-code-test
                                         'kotoba.wasm-and-or-when-test

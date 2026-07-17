@@ -23,7 +23,8 @@
           wasm (runtime/wasm-binary forms policy)
           store (atom [])
           instance (wasm-exec/instantiate (:kotoba.wasm/binary wasm)
-                                          (wasm-exec/kgraph-host-functions store))
+                                          (wasm-exec/kgraph-host-functions store policy)
+                                          policy)
           result (.apply (.export instance "main") (long-array 0))
           written (aget ^longs result 0)
           buf-ptr (:kotoba.wasm/heap-base wasm)]
