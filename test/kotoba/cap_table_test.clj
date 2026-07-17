@@ -90,3 +90,15 @@
     (testing "denied once NOW has advanced past the stored expiry"
       (is (= {:denied :expired}
              (cap-table/resolve-use table handle :host/ledger-append "2027-01-01"))))))
+
+(deftest consume-use-drops-handle-after-one-success
+  (testing "S2 runtime affinity: second use of the same handle fails closed"
+    (let [table (cap-table/make-table)
+          handle (:kotoba.host/result (acquire-ledger! table "ledger:main" "2026-07-08"))
+          first (cap-table/consume-use! table handle :host/ledger-append "2026-07-08")
+          second (cap-table/consume-use! table handle :host/ledger-append "2026-07-08")]
+      (is (true? (:ok? first)))
+      (is (= "ledger:main" (get-in first [:cap :cap/resource])))
+      (is (nil? (cap-table/resolve-cap table handle))
+          "successful consume removes the handle from the table")
+      (is (= {:denied :unknown-cap-handle} second)))))

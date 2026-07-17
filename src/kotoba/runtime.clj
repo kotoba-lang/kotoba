@@ -342,6 +342,47 @@
        form))
     (vec (filter @imports host-import-order))))
 
+(def ^:private network-resource-ops
+  "Ops whose first str-ptr argument is a URL subject to capability-resources."
+  #{'http-fetch 'http-post})
+
+(defn- str-ptr-literal
+  "When EXPR is `(str-ptr \"literal\")`, return the string; else nil."
+  [expr]
+  (when (and (seq? expr) (= 'str-ptr (first expr)) (string? (second expr)))
+    (second expr)))
+
+(defn- policy-resource-set
+  "Set of resource strings for CAP-NAME under POLICY, or nil when unconstrained."
+  [policy cap-name]
+  (let [m (:kotoba.policy/capability-resources policy)]
+    (when m
+      (let [raw (or (get m cap-name)
+                    (get m (keyword cap-name))
+                    (some (fn [[k v]]
+                            (when (= (capability-name k) cap-name) v))
+                          m))]
+        (cond
+          (nil? raw) nil
+          (= :any raw) #{:any}
+          (set? raw) raw
+          (string? raw) #{raw}
+          :else nil)))))
+
+(defn- resource-literal-allowed?
+  "Static check: literal URL RESOURCE is covered by GRANTED (set or :any)."
+  [granted resource]
+  (cond
+    (nil? granted) true
+    (or (= :any granted) (contains? granted :any)) true
+    (not (string? resource)) true
+    :else
+    (boolean (some (fn [g]
+                     (and (string? g)
+                          (or (= g resource)
+                              (.startsWith ^String resource g))))
+                   granted))))
+
 (defn source-problems
   "Return safety/type problems for the current executable subset."
   ([safe-facts forms] (source-problems safe-facts forms nil))
@@ -390,7 +431,18 @@
 
                  (not (contains? allowed-caps cap-name))
                  (swap! problems conj {:kotoba.runtime/problem :capability-not-granted
-                                       :kotoba.runtime/capability cap-name})))
+                                       :kotoba.runtime/capability cap-name})
+
+                 (and (contains? network-resource-ops op)
+                      (contains? allowed-caps cap-name))
+                 (when-let [url (str-ptr-literal (second node))]
+                   (let [granted (policy-resource-set policy cap-name)]
+                     (when (and granted
+                                (not (resource-literal-allowed? granted url)))
+                       (swap! problems conj
+                              {:kotoba.runtime/problem :resource-not-allowed
+                               :kotoba.runtime/capability cap-name
+                               :kotoba.runtime/resource url}))))))
 
              (effect-ops head)
              (swap! problems conj {:kotoba.runtime/problem :host-effect-requires-capability

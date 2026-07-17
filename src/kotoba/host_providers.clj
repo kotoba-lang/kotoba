@@ -58,13 +58,28 @@
             v))
         m))
 
+(def network-cap-names
+  "Contract capability names that are network egress. When
+  `:kotoba.policy/http-require-allowlist` is true, a missing
+  `:kotoba.policy/capability-resources` entry fails closed (empty set)
+  instead of granting `:any`."
+  #{"http/fetch" "http/post"})
+
 (defn- resource-scope
-  "Grant resource set for CAP-NAME under POLICY; defaults to the universe."
+  "Grant resource set for CAP-NAME under POLICY. Defaults to the universe
+  (`#{:any}`) except for network caps under `:kotoba.policy/http-require-
+  allowlist`, which default to empty (deny all URLs until an allowlist is
+  declared)."
   [policy cap-name]
   (let [resources (named-lookup (:kotoba.policy/capability-resources policy)
                                 cap-name)]
     (cond
-      (nil? resources) #{:any}
+      (nil? resources)
+      (if (and (contains? network-cap-names cap-name)
+               (:kotoba.policy/http-require-allowlist policy))
+        #{}
+        #{:any})
+
       (= :any resources) #{:any}
       :else (set resources))))
 
@@ -271,7 +286,8 @@
           (throw (ex-info "host op has no capability guard"
                           {:kotoba.host/op op})))
         (let [call (keyword "kotoba.host" (str with-op))
-              resolved (cap-table/resolve-use table handle kind now)]
+              ;; consume-use!: handle is affine at runtime (S2 defense-in-depth).
+              resolved (cap-table/consume-use! table handle kind now)]
           (if-not (:ok? resolved)
             (let [receipt (use-receipt (cap-table/resolve-cap table handle)
                                        now call :denied handle

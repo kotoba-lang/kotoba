@@ -203,22 +203,29 @@
 (defn- resource-permitted?
   "True when RESOURCE (a guest-supplied literal string -- a path, URL,
   keychain key, or `(pr-str entity-id)`) is inside CONCRETE's :cap/resource
-  scope. `nil` CONCRETE (no policy/guard installed at all, i.e. the
-  unguarded 1-arg `kgraph-host-functions` form) permits everything,
-  matching every other capability id's fail-open-when-unguarded convention
-  elsewhere in this namespace. Otherwise: kotoba.lang.capability-values
-  models a resource constraint as :any, a single resource string, or a set
-  of resource strings -- EXACT membership, not a prefix/pattern language --
-  so a scoped grant like {:host/fs-read #{\"/only/this/dir/notes.txt\"}}
-  covers exactly that literal path/URL/key/entity-id, nothing broader.
-  Fails closed (denies) on any other shape."
+  scope. `nil` CONCRETE (no policy/guard installed at all) permits
+  everything only for the explicit unguarded path. Otherwise: kotoba.lang
+  capability-values models a resource constraint as :any, a single resource
+  string, or a set of resource strings. Membership is exact, plus URL
+  prefix for http(s)/file allowlist entries (grant `http://h/` covers
+  `http://h/path`) — security kaizen 2026-07-17. Fails closed on other
+  shapes."
   [concrete resource]
-  (let [scope (:cap/resource concrete)]
+  (let [scope (:cap/resource concrete)
+        covers? (fn [g]
+                  (and (string? g) (string? resource)
+                       (or (= g resource)
+                           (and (or (.startsWith ^String g "http://")
+                                    (.startsWith ^String g "https://")
+                                    (.startsWith ^String g "file:"))
+                                (.startsWith ^String resource g)))))]
     (boolean
      (or (nil? concrete)
          (= :any scope)
-         (= scope resource)
-         (and (set? scope) (contains? scope resource))))))
+         (covers? scope)
+         (and (set? scope)
+              (or (contains? scope resource)
+                  (some covers? scope)))))))
 
 (defn- kgraph-effects
   "Raw (uninstrumented) (fn [instance args] -> long) bodies for the four
@@ -333,34 +340,32 @@
   datom vectors — shared across calls within one Instance, fresh per
   test/run unless the caller deliberately reuses it).
 
-  1-arg form (UNGUARDED, the pre-existing behavior): every call performs its
-  effect unconditionally, relying entirely on the static compile-time
-  capability gate (kotoba.runtime/check) having refused to emit this import
-  under a policy that didn't allow it. That gate is real, but it only holds
-  if the bytes reaching `instantiate` were actually produced by `check`
-  under the policy this run intends — nothing at THIS boundary verifies
-  that, so arbitrary/reused/tampered `.wasm` bytes get a free pass here.
-  Kept as the default so existing callers (this namespace's own round-trip
-  test, any caller not ready to supply a policy) are unaffected.
+  SAFE DEFAULT is GUARDED. The 1-arg form is equivalent to
+  `(kgraph-host-functions store {})` — empty policy, fail-closed: every
+  kgraph effect is denied at call time unless a real POLICY is supplied.
+  This closes the hole where 1-arg was unguarded and tampered `.wasm`
+  bytes could exercise host effects without a run-time policy
+  (security kaizen 2026-07-17).
 
-  2-/3-arg forms (GUARDED): every kgraph-* call is dispatched through
-  `guard-host-call` — a real fail-closed per-call capability check derived
-  from POLICY, exactly mirroring kotoba.host-providers/host-call for the
-  interpreter path. A denied call throws before STORE or guest memory is
-  touched. OPTS (3-arg form) may carry :record!/:now, see
-  `guard-host-call`."
+  Explicit unguarded (tests/migration only): pass
+  `{:kotoba.wasm/unguarded true}` as POLICY — not recommended for production.
+
+  2-/3-arg forms: every kgraph-* call is dispatched through
+  `guard-host-call`. OPTS (3-arg) may carry :record!/:now."
   ([store]
-   (mapv (fn [[op effect]]
-           (let [{:keys [field params result]} (get kgraph-op-specs op)]
-             (host-fn field params result effect)))
-         (kgraph-effects store)))
+   (kgraph-host-functions store {} nil))
   ([store policy] (kgraph-host-functions store policy nil))
   ([store policy opts]
-   (mapv (fn [[op effect]]
-           (let [{:keys [field params result]} (get kgraph-op-specs op)]
-             (host-fn field params result
-                      (guard-host-call op effect (assoc opts :policy policy)))))
-         (kgraph-effects store))))
+   (if (:kotoba.wasm/unguarded policy)
+     (mapv (fn [[op effect]]
+             (let [{:keys [field params result]} (get kgraph-op-specs op)]
+               (host-fn field params result effect)))
+           (kgraph-effects store))
+     (mapv (fn [[op effect]]
+             (let [{:keys [field params result]} (get kgraph-op-specs op)]
+               (host-fn field params result
+                        (guard-host-call op effect (assoc opts :policy policy)))))
+           (kgraph-effects store)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Real (non-stub) implementations for the provider (#263) and aiueos

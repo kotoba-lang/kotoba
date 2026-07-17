@@ -90,3 +90,16 @@
       (not= kind (:cap/kind cap)) {:denied :cap-kind-mismatch}
       (expired-at? (:cap/expires cap) now) {:denied :expired}
       :else {:ok? true :cap cap})))
+
+(defn consume-use!
+  "S2 runtime affinity: resolve HANDLE like `resolve-use`, then DROP it from
+  TABLE on success so the same handle cannot authorize a second host call.
+  Static affine checking is the primary gate for well-typed sources; this is
+  defense-in-depth against tampered wasm or forged handles. A denial leaves
+  the table unchanged."
+  [table handle kind now]
+  (let [resolved (resolve-use table handle kind now)]
+    (if (:ok? resolved)
+      (do (swap! table update :caps dissoc handle)
+          resolved)
+      resolved)))
