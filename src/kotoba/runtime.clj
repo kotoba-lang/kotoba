@@ -689,6 +689,26 @@
 
 (declare function-defs symbol-key)
 
+(defn- binding-symbol-keys
+  "All local symbol keys introduced by a symbol or destructuring binding.
+  Used only to shadow capability facts; collecting an extra symbol from a
+  destructuring default is conservative (it can forget a capability fact,
+  never invent one)."
+  [binding]
+  (->> (tree-seq coll? seq binding)
+       (filter symbol?)
+       (remove #{'&})
+       (map symbol-key)
+       set))
+
+(defn- shadow-cap-bindings [cap-env binding]
+  (reduce dissoc cap-env (binding-symbol-keys binding)))
+
+(defn- capability-destructuring-problem [fn-name binding]
+  {:kotoba.runtime/problem :capability-destructuring-forbidden
+   :kotoba.runtime/fn (str fn-name)
+   :kotoba.runtime/binding (pr-str binding)})
+
 (defn- cap-expr-kind
   "Static capability kind of EXPR under CAP-ENV (local symbol -> kind), or
   nil when EXPR is not statically known to carry a capability. Recognized
@@ -741,11 +761,17 @@
                                cap-env cap-env
                                problems []]
                           (if-let [[binding value] (first pairs)]
-                            (recur (next pairs)
-                                   (if-let [kind (cap-expr-kind cap-env value)]
-                                     (assoc cap-env (symbol-key binding) kind)
-                                     (dissoc cap-env (symbol-key binding)))
-                                   (into problems (check cap-env value)))
+                            (let [kind (cap-expr-kind cap-env value)
+                                  cap-env' (if (symbol? binding)
+                                             (if kind
+                                               (assoc cap-env (symbol-key binding) kind)
+                                               (dissoc cap-env (symbol-key binding)))
+                                             (shadow-cap-bindings cap-env binding))
+                                  problems' (cond-> (into problems (check cap-env value))
+                                              (and kind (not (symbol? binding)))
+                                              (conj (capability-destructuring-problem
+                                                     fn-name binding)))]
+                              (recur (next pairs) cap-env' problems'))
                             (into problems (check-all cap-env body)))))
                   ;; call site
                   (let [problems (check-all cap-env args)]
@@ -795,22 +821,26 @@
                                     [fname (mapv cap-param-kind (:params f))]))
                              defs)
         param-problems
-        (vec (for [[fname f] defs
-                   param (:params f)
-                   :let [kind (cap-param-kind param)]
-                   :when (and (some? kind)
-                              (not (contains? capability-values/effect-for-kind
-                                              kind)))]
-               {:kotoba.runtime/problem :unknown-capability-kind
-                :kotoba.runtime/fn (str fname)
-                :kotoba.runtime/kind (pr-str kind)}))
+        (vec (mapcat
+              (fn [[fname f]]
+                (keep (fn [param]
+                        (when-let [kind (cap-param-kind param)]
+                          (if-not (symbol? param)
+                            (capability-destructuring-problem fname param)
+                            (when-not (contains? capability-values/effect-for-kind kind)
+                              {:kotoba.runtime/problem :unknown-capability-kind
+                               :kotoba.runtime/fn (str fname)
+                               :kotoba.runtime/kind (pr-str kind)}))))
+                      (:params f)))
+              defs))
         body-problems
         (vec (mapcat
               (fn [form]
                 (if-let [[fname f] (function-def form)]
                   (let [cap-env (into {}
                                       (keep (fn [param]
-                                              (when-let [kind (cap-param-kind param)]
+                                              (when-let [kind (and (symbol? param)
+                                                                  (cap-param-kind param))]
                                                 [(symbol-key param) kind])))
                                       (:params f))]
                     (mapcat #(cap-use-problems fname cap-env fn-param-kinds %)
@@ -962,9 +992,12 @@
                  problems []]
             (if-let [[binding value] (first pairs)]
               (let [[p' used' counter'] (cap-affine-step fn-name cap-env fn-param-kinds used counter value)
-                    bkey (symbol-key binding)
                     [info counter''] (cap-expr-info cap-env counter' value)
-                    cap-env' (if info (assoc cap-env bkey info) (dissoc cap-env bkey))]
+                    cap-env' (if (symbol? binding)
+                               (if info
+                                 (assoc cap-env (symbol-key binding) info)
+                                 (dissoc cap-env (symbol-key binding)))
+                               (shadow-cap-bindings cap-env binding))]
                 (recur (next pairs) cap-env' used' counter'' (into problems p')))
               (let [[p' used' counter']
                     (reduce (fn [[problems used counter] e]
@@ -1026,8 +1059,9 @@
         (let [[problems _used _counter]
               (if-let [[fname f] (function-def form)]
                 (let [[cap-env counter]
-                      (reduce (fn [[cap-env counter] param]
-                                (if-let [kind (cap-param-kind param)]
+                              (reduce (fn [[cap-env counter] param]
+                                (if-let [kind (and (symbol? param)
+                                                   (cap-param-kind param))]
                                   [(assoc cap-env (symbol-key param) {:kind kind :origin counter})
                                    (inc counter)]
                                   [cap-env counter]))
