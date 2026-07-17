@@ -22,3 +22,6 @@ native-image \
 target/native/kotoba selfhost check --json >/dev/null
 target/native/kotoba compile src/demo.kotoba --target web \
   -o target/native/native-web-smoke.mjs --json >/dev/null
+target/native/kotoba compile test/fixtures/source/web-library.kotoba --target web \
+  -o target/native/native-web-library.mjs --json >/dev/null
+node scripts/test-native-web-library.mjs target/native/native-web-library.mjs
