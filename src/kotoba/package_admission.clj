@@ -108,20 +108,63 @@
 ;; ---------------------------------------------------------------------------
 ;; Verification
 
+(def blocked-key-statuses
+  "Key-register statuses that must not authorize NEW package artifacts.
+  Historical verification of past receipts may still use retired keys
+  elsewhere; admission of new locks only trusts :active (and optionally
+  :pre-active is also blocked)."
+  #{:revoked :expired :compromised :retired :pre-active})
+
+(defn key-register-blocked-signers
+  "From a key-register EDN map (`:keys` vector of key records), collect
+  signer/key ids whose `:key/status` is not safe for new artifacts.
+  Accepts either `:key/id` or `:key/signer` as the identity string."
+  [key-register]
+  (into #{}
+        (keep (fn [k]
+                (when (contains? blocked-key-statuses (:key/status k))
+                  (or (:key/signer k) (:key/id k)))))
+        (or (:keys key-register) [])))
+
+(defn merge-key-register-into-trust
+  "Fold KEY-REGISTER blocked signers into TRUST's :revoked-signers so the
+  existing package-contract lockfile kernel rejects them as
+  'signer not currently trusted' without a second code path."
+  [trust key-register]
+  (let [blocked (key-register-blocked-signers key-register)
+        trust (or trust {})]
+    (if (seq blocked)
+      (update trust :revoked-signers
+              (fn [xs] (into (set (or xs #{})) blocked)))
+      trust)))
+
 (defn trust-context
   "Build the trust context handed to the package-contract lockfile validator.
 
   `trust` is the optional trust EDN (`:declared-capabilities`,
-  `:revoked-signers`, `:expired-signers`, `:compromised-signers`). When the
-  trust EDN does not pin `:declared-capabilities`, the manifest's declared
+  `:revoked-signers`, `:expired-signers`, `:compromised-signers`, and
+  optional `:key-register` map or inline `:keys`). When the trust EDN does
+  not pin `:declared-capabilities`, the manifest's declared
   `:kotoba.package/capabilities` are used; with neither, no capability grant
-  is admitted (strict default)."
+  is admitted (strict default).
+
+  When trust carries `:key-register` (or is itself a key-register with
+  `:keys`), blocked statuses are merged into :revoked-signers (R-002)."
   [trust manifest]
-  (assoc (or trust {})
-         :declared-capabilities
-         (vec (or (:declared-capabilities trust)
-                  (:kotoba.package/capabilities manifest)
-                  []))))
+  (let [trust (or trust {})
+        key-reg (or (:key-register trust)
+                    (when (seq (:keys trust))
+                      trust))
+        trust (if key-reg
+                (merge-key-register-into-trust
+                 (dissoc trust :key-register :keys)
+                 key-reg)
+                trust)]
+    (assoc trust
+           :declared-capabilities
+           (vec (or (:declared-capabilities trust)
+                    (:kotoba.package/capabilities manifest)
+                    [])))))
 
 (defn manifest-without-self-cid
   "MANIFEST with its own self-declared :manifest-cid removed, AND its
@@ -276,7 +319,7 @@
     (spit file (with-out-str (pprint/pprint receipt)))))
 
 (def usage
-  "kotoba package verify --lock <kotoba.lock.edn> [--manifest <package-manifest.edn>] [--trust <trust.edn>] [--receipt <out.edn>] [--json]")
+  "kotoba package verify --lock <kotoba.lock.edn> [--manifest <package-manifest.edn>] [--trust <trust.edn>] [--key-register <key-register.edn>] [--receipt <out.edn>] [--json]")
 
 (defn not-readable
   [code path error]
@@ -291,15 +334,19 @@
    :kotoba.admission/code keyword
    :kotoba.admission/receipt receipt (when the inputs were readable)
    :kotoba.admission/receipt-path path (when a receipt file was written)
-   :kotoba.admission/error data (when the inputs were not readable)}"
-  [{:keys [lock-path manifest-path trust-path receipt-path]}]
+   :kotoba.admission/error data (when the inputs were not readable)}
+
+  Optional key-register-path folds non-active key statuses into trust
+  revoked-signers (R-002)."
+  [{:keys [lock-path manifest-path trust-path key-register-path receipt-path]}]
   (if-not lock-path
     {:kotoba.admission/ok? false
      :kotoba.admission/code :package/missing-lock-option
      :kotoba.admission/error {:kotoba.package/usage usage}}
     (let [lock (read-edn-file lock-path)
           manifest (some-> manifest-path read-edn-file)
-          trust (some-> trust-path read-edn-file)]
+          trust (some-> trust-path read-edn-file)
+          key-reg (some-> key-register-path read-edn-file)]
       (cond
         (not (:ok? lock))
         (not-readable :package/lock-not-readable lock-path lock)
@@ -310,12 +357,18 @@
         (and trust (not (:ok? trust)))
         (not-readable :package/trust-not-readable trust-path trust)
 
+        (and key-reg (not (:ok? key-reg)))
+        (not-readable :package/key-register-not-readable key-register-path key-reg)
+
         :else
-        (let [receipt (verify-lock {:lock (:value lock)
+        (let [trust-value (cond-> (or (:value trust) {})
+                            (:ok? key-reg)
+                            (assoc :key-register (:value key-reg)))
+              receipt (verify-lock {:lock (:value lock)
                                     :lock-path lock-path
                                     :manifest (:value manifest)
                                     :manifest-path manifest-path
-                                    :trust (:value trust)})
+                                    :trust trust-value})
               verified? (:kotoba.package/verified? receipt)]
           (when receipt-path
             (write-receipt! receipt-path receipt))

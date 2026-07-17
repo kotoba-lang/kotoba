@@ -59,24 +59,40 @@
         m))
 
 (def network-cap-names
-  "Contract capability names that are network egress. When
-  `:kotoba.policy/http-require-allowlist` is true, a missing
-  `:kotoba.policy/capability-resources` entry fails closed (empty set)
-  instead of granting `:any`."
+  "Contract capability names that are network egress. Safe default: a
+  missing `:kotoba.policy/capability-resources` entry fails closed
+  (empty set) unless the policy explicitly sets
+  `:kotoba.policy/http-require-allowlist false` (legacy opt-out)."
   #{"http/fetch" "http/post"})
 
+(defn http-require-allowlist?
+  "True when POLICY requires network resource allowlists (safe default).
+  Only an explicit `false` opts out."
+  [policy]
+  (not (false? (:kotoba.policy/http-require-allowlist policy))))
+
+(defn normalize-policy
+  "Apply safe-runtime defaults to a loaded policy map. Currently stamps
+  `:kotoba.policy/http-require-allowlist true` when the key is absent so
+  operators see the effective policy in receipts/debug."
+  [policy]
+  (cond
+    (nil? policy) nil
+    (contains? policy :kotoba.policy/http-require-allowlist) policy
+    :else (assoc policy :kotoba.policy/http-require-allowlist true)))
+
 (defn- resource-scope
-  "Grant resource set for CAP-NAME under POLICY. Defaults to the universe
-  (`#{:any}`) except for network caps under `:kotoba.policy/http-require-
-  allowlist`, which default to empty (deny all URLs until an allowlist is
-  declared)."
+  "Grant resource set for CAP-NAME under POLICY. Network caps default to
+  empty (deny all URLs) unless the operator opts out with
+  `:kotoba.policy/http-require-allowlist false` or supplies an explicit
+  `:kotoba.policy/capability-resources` allowlist."
   [policy cap-name]
   (let [resources (named-lookup (:kotoba.policy/capability-resources policy)
                                 cap-name)]
     (cond
       (nil? resources)
       (if (and (contains? network-cap-names cap-name)
-               (:kotoba.policy/http-require-allowlist policy))
+               (http-require-allowlist? policy))
         #{}
         #{:any})
 

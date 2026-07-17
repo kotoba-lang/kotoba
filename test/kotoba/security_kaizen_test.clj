@@ -8,6 +8,7 @@
             [kotoba.cap-table :as cap-table]
             [kotoba.host-providers :as host-providers]
             [kotoba.launcher :as launcher]
+            [kotoba.package-admission :as package-admission]
             [kotoba.runtime :as runtime]
             [kotoba.wasm-exec :as wasm-exec])
   (:import [java.io File]))
@@ -92,3 +93,30 @@
     (is (true? (:ok? (cap-table/consume-use! table handle :host/ledger-append "2026-07-17"))))
     (is (= {:denied :unknown-cap-handle}
            (cap-table/consume-use! table handle :host/ledger-append "2026-07-17")))))
+
+(deftest http-require-allowlist-is-default-on
+  (testing "normalize-policy stamps true when absent"
+    (is (true? (:kotoba.policy/http-require-allowlist
+                (host-providers/normalize-policy
+                 {:kotoba.policy/capabilities #{:http/fetch}})))))
+  (testing "network grant without resources is empty under default"
+    (let [policy (host-providers/normalize-policy
+                  {:kotoba.policy/capabilities #{:http/fetch}})
+          grants (host-providers/policy-grants policy)]
+      (is (= #{} (:grant/resources (first grants))))))
+  (testing "explicit false opts out to :any"
+    (let [policy {:kotoba.policy/capabilities #{:http/fetch}
+                  :kotoba.policy/http-require-allowlist false}
+          grants (host-providers/policy-grants policy)]
+      (is (= #{:any} (:grant/resources (first grants)))))))
+
+(deftest key-register-blocks-pre-active-and-revoked-signers
+  (let [reg {:register/type :kotoba.security/key-register
+             :keys [{:key/id "good" :key/status :active}
+                    {:key/id "bad-rev" :key/status :revoked}
+                    {:key/id "bad-pre" :key/status :pre-active}]}
+        blocked (package-admission/key-register-blocked-signers reg)
+        trust (package-admission/merge-key-register-into-trust {} reg)]
+    (is (= #{"bad-rev" "bad-pre"} blocked))
+    (is (contains? (set (:revoked-signers trust)) "bad-rev"))
+    (is (contains? (set (:revoked-signers trust)) "bad-pre"))))
