@@ -13,6 +13,7 @@ mkdir -p target/native
 native-image \
   --no-fallback \
   -H:+ReportExceptionStackTraces \
+  '-H:IncludeResources=.*\.(clj|cljc|edn)$' \
   -jar target/kotoba-standalone.jar \
   target/native/kotoba
 
