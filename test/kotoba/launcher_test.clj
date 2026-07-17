@@ -39,6 +39,22 @@
       (is (re-find #"kotoba-js-artifact/v1" (slurp (str (.getPath output) ".manifest.edn"))))
       (is (re-find #"export" (slurp output))))))
 
+(deftest compile-web-admits-only-explicit-entryless-library-boundary
+  (let [output (doto (java.io.File/createTempFile "kotoba-web-library" ".mjs")
+                 (.deleteOnExit))
+        source "test/fixtures/source/web-library.kotoba"
+        web (launcher/dispatch ["compile" source "--target" "web"
+                                "--output" (.getPath output)])
+        wasm (launcher/dispatch ["compile" source "--target" "wasm"])]
+    (is (:kotoba.cli/ok? web))
+    (is (= :kotoba-script (get-in web [:kotoba.cli/data :backend])))
+    (is (re-find #"entry:null" (slurp output)))
+    (is (re-find #"Object\.freeze\(\{'add1':k\$add1\}\)" (slurp output)))
+    (is (false? (:kotoba.cli/ok? wasm)))
+    (is (= :compile/failed (:kotoba.cli/code wasm)))
+    (is (re-find #"require the kotoba-script web target"
+                 (:kotoba.cli/message wasm)))))
+
 (deftest compile-cljc-selects-kotoba-reader-branch
   (let [source (doto (java.io.File/createTempFile "kotoba-portable" ".cljc")
                  (.deleteOnExit))
