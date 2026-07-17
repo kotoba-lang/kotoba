@@ -5,7 +5,10 @@
   with an explicit reader target, checks a strict pure subset, emits deterministic
   EDN IR, and can run a zero-arity `main` function."
   (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.walk :as walk]
             [kotoba.core.contracts :as core-contracts]
+            [kotoba.guest-grammar :as guest-grammar]
             [kotoba.lang.capability-values :as capability-values]
             [clojure.tools.reader :as reader]
             [clojure.tools.reader.reader-types :as reader-types]))
@@ -219,6 +222,9 @@
    'kami-set-velocity! :host/kami-engine
    'kami-get-x :host/kami-engine
    'kami-get-y :host/kami-engine
+   'kami-set-position3! :host/kami-engine
+   'kami-set-velocity3! :host/kami-engine
+   'kami-get-z :host/kami-engine
    'kami-count-tagged :host/kami-engine
    'kami-nearest-tagged :host/kami-engine
    'kami-move-tagged-toward! :host/kami-engine
@@ -306,6 +312,48 @@
        form))
     (vec (filter @imports host-import-order))))
 
+(def ^:private network-resource-ops
+  "Ops whose first str-ptr argument is a URL subject to capability-resources."
+  #{'http-fetch 'http-post})
+
+(defn- str-ptr-literal
+  "When EXPR is `(str-ptr \"literal\")`, return the string; else nil."
+  [expr]
+  (when (and (seq? expr) (= 'str-ptr (first expr)) (string? (second expr)))
+    (second expr)))
+
+(defn- policy-resource-set
+  "Set of resource strings for CAP-NAME under POLICY, or nil when the
+  policy does not constrain that capability (legacy :any)."
+  [policy cap-name]
+  (let [m (:kotoba.policy/capability-resources policy)]
+    (when m
+      (let [raw (or (get m cap-name)
+                    (get m (keyword cap-name))
+                    (some (fn [[k v]]
+                            (when (= (capability-name k) cap-name) v))
+                          m))]
+        (cond
+          (nil? raw) nil
+          (= :any raw) #{:any}
+          (set? raw) raw
+          (string? raw) #{raw}
+          :else nil)))))
+
+(defn- resource-literal-allowed?
+  "Static check: literal URL RESOURCE is covered by GRANTED (set or :any)."
+  [granted resource]
+  (cond
+    (nil? granted) true
+    (or (= :any granted) (contains? granted :any)) true
+    (not (string? resource)) true
+    :else
+    (boolean (some (fn [g]
+                     (and (string? g)
+                          (or (= g resource)
+                              (str/starts-with? resource g))))
+                   granted))))
+
 (defn source-problems
   "Return safety/type problems for the current executable subset."
   ([safe-facts forms] (source-problems safe-facts forms nil))
@@ -320,8 +368,11 @@
          (when-let [head (some-> node list-head str)]
            (cond
              (denied head)
-             (swap! problems conj {:kotoba.runtime/problem :denied-form
-                                   :kotoba.runtime/form head})
+             (swap! problems conj
+                    (guest-grammar/with-hint
+                      {:kotoba.runtime/problem :denied-form
+                       :kotoba.runtime/form head}
+                      head))
 
              (= "cap-acquire" head)
              (let [kind (second node)
@@ -354,7 +405,20 @@
 
                  (not (contains? allowed-caps cap-name))
                  (swap! problems conj {:kotoba.runtime/problem :capability-not-granted
-                                       :kotoba.runtime/capability cap-name})))
+                                       :kotoba.runtime/capability cap-name})
+
+                 ;; Static resource allowlist for literal URL host calls
+                 ;; (SSRF least-privilege at compile time when the URL is fixed).
+                 (and (contains? network-resource-ops op)
+                      (contains? allowed-caps cap-name))
+                 (when-let [url (str-ptr-literal (second node))]
+                   (let [granted (policy-resource-set policy cap-name)]
+                     (when (and granted
+                                (not (resource-literal-allowed? granted url)))
+                       (swap! problems conj
+                              {:kotoba.runtime/problem :resource-not-allowed
+                               :kotoba.runtime/capability cap-name
+                               :kotoba.runtime/resource url}))))))
 
              (effect-ops head)
              (swap! problems conj {:kotoba.runtime/problem :host-effect-requires-capability
@@ -480,10 +544,104 @@
              :params (vec params)
              :body (vec body)}])))
 
+(defn lower-language-forms
+  "Lower Kotoba-only surface forms into the compiler core. This pass is
+  shared by IR and Wasm so the two paths cannot silently diverge.
+  `(defsystem move [dt] ...)` has the stable ABI export `move-tick`.
+
+  ADR-2607180900 (L2): also lowers (1) multi-body `when` to `if`+`do`,
+  (2) bare string literals on string-head host ops to str-ptr/str-len —
+  desugar only, no ambient power."
+  [forms]
+  (let [constants (into {}
+                        (keep (fn [form]
+                                (when (and (seq? form) (= 'def (first form))
+                                           (= 3 (count form)))
+                                  [(second form) (nth form 2)])))
+                        forms)
+        string-head-ops (guest-grammar/string-head-host-ops)
+        string-args (fn [op s & args]
+                      (list* op (list 'str-ptr s) (list 'str-len s) args))
+        lower-cond (fn lower-cond [clauses]
+                     (if (empty? clauses)
+                       0
+                       (let [[test value & more] clauses]
+                         (if (= :else test)
+                           value
+                           (list 'if test value (lower-cond more))))))
+        lower-string-head
+        (fn [op args]
+          (if (and (contains? string-head-ops op)
+                   (seq args)
+                   (string? (first args)))
+            (list* op
+                   (list 'str-ptr (first args))
+                   (list 'str-len (first args))
+                   (rest args))
+            (list* op args)))
+        lower-node
+        (fn [node]
+          (if-not (seq? node)
+            node
+            (let [[op & args] node]
+              (case op
+                defsystem (let [[name params & body] args]
+                            (list* 'defn (symbol (str name "-tick")) params body))
+                cond (lower-cond args)
+                not= (list 'not (list* '= args))
+                ;; Multi-body when: (when t a b c) -> (if t (do a b c) 0)
+                when (let [[test & body] args]
+                       (cond
+                         (empty? body) (list 'if test 0 0)
+                         (= 1 (count body)) (list 'if test (first body) 0)
+                         :else (list 'if test (cons 'do body) 0)))
+                nearest-tagged (apply string-args 'kami-nearest-tagged args)
+                spawn-entity (apply string-args 'kami-spawn args)
+                count-tagged (apply string-args 'kami-count-tagged args)
+                axis (apply string-args 'kami-axis args)
+                play-sound (apply string-args 'audio-play args)
+                despawn-entity (list* 'kami-despawn args)
+                set-position! (case (count args)
+                                3 (list* 'kami-set-position! args)
+                                4 (list* 'kami-set-position3! args)
+                                node)
+                set-velocity! (case (count args)
+                                3 (list* 'kami-set-velocity! args)
+                                4 (list* 'kami-set-velocity3! args)
+                                node)
+                get-x (list* 'kami-get-x args)
+                get-y (list* 'kami-get-y args)
+                get-z (list* 'kami-get-z args)
+                tick-n (list 'kami-tick-n)
+                rand-int (list* 'kami-rand args)
+                ;; The current Kami host has a safe bulk operation instead of
+                ;; exposing an unbounded guest loop over host-owned entities.
+                doseq-entities
+                (let [[[entity tag] & body] args
+                      call (first body)]
+                  (if (and (= 1 (count body)) (seq? call)
+                           (= 'move-toward! (first call))
+                           (= entity (second call)))
+                    (let [[_ _ target speed] call]
+                      (string-args 'kami-move-tagged-toward! tag
+                                   (list 'kami-get-x target)
+                                   (list 'kami-get-y target)
+                                   speed))
+                    node))
+                ;; Default: string-head host ops accept bare string literals.
+                (lower-string-head op args)))))]
+    (->> forms
+         (remove #(and (seq? %) (= 'def (first %))))
+         (mapv (fn [form]
+                 (->> form
+                      (walk/postwalk-replace constants)
+                      (walk/postwalk lower-node)))))))
+
 (defn compile-forms
   "Compile checked forms to deterministic EDN IR."
   [source-plan forms]
-  (let [fns (into {} (keep function-def forms))
+  (let [forms (lower-language-forms forms)
+        fns (into {} (keep function-def forms))
         expressions (vec (remove #(and (seq? %) (#{'ns 'defn} (first %))) forms))]
     {:schema "kotoba.runtime.edn-ir.v0"
      :kotoba.runtime/source-plan source-plan
@@ -941,6 +1099,8 @@
         :kotoba.runtime/fn (str fn-name)
         :kotoba.runtime/missing (:missing checked)}))))
 
+(declare wasm-binary)
+
 (defn check
   "Run all static checks (safety/type problems, typed-capability problems,
   capability-value affinity, effect/capability consistency) over forms and,
@@ -948,10 +1108,25 @@
   :kotoba.runtime/problems :kotoba.runtime/ir}`."
   ([safe-facts source-plan forms] (check safe-facts source-plan forms nil))
   ([safe-facts source-plan forms policy]
-  (let [problems (vec (concat (source-problems safe-facts forms policy)
-                              (cap-typed-problems forms)
-                              (cap-affine-problems forms)
-                              (cap-effect-problems forms)))
+  (let [surface-forms forms
+        forms (lower-language-forms forms)
+        static-problems (vec (concat (source-problems safe-facts forms policy)
+                                     (cap-typed-problems forms)
+                                     (cap-affine-problems forms)
+                                     (cap-effect-problems forms)))
+        ;; A defsystem source is an executable game module, not merely data.
+        ;; Its safety check must prove that the selected Kotoba backend can
+        ;; compile it; accepting an unknown operation here would be fail-open.
+        backend (when (and (empty? static-problems)
+                           (some #(and (seq? %) (= 'defsystem (first %))) surface-forms))
+                  (wasm-binary forms policy))
+        backend-problems (when (and backend (not (:kotoba.wasm/ok? backend)))
+                           (mapv (fn [problem]
+                                   {:kotoba.runtime/problem :backend-unsupported
+                                    :kotoba.runtime/backend :wasm
+                                    :kotoba.runtime/cause problem})
+                                 (:kotoba.wasm/problems backend)))
+        problems (into static-problems backend-problems)
         ir (when (empty? problems)
              (compile-forms source-plan forms))]
     {:kotoba.runtime/ok? (empty? problems)
@@ -1682,8 +1857,10 @@
                  :local-count (count local-types)
                  :local-types local-types
                  :result-type (get-in fns [:fn-result-types op] :i32)}))
-            {:problem {:kotoba.wasm/problem :unsupported-op
-                       :kotoba.wasm/op (str op)}}))))
+            {:problem (guest-grammar/with-hint
+                        {:kotoba.wasm/problem :unsupported-op
+                         :kotoba.wasm/op (str op)}
+                        op)}))))
 
     :else
     {:problem {:kotoba.wasm/problem :unsupported-form
@@ -1906,10 +2083,13 @@
         bs))
 
 (defn wasm-binary
-  "Compile integer functions to a WebAssembly MVP binary and export `main`."
+  "Compile checked functions to WebAssembly. Every function is exported;
+  command programs require zero-arity `main`, while game modules may expose
+  `init` and/or `*-tick` systems instead."
   ([forms] (wasm-binary forms nil))
   ([forms _policy]
-  (let [defs (function-defs forms)
+  (let [forms (lower-language-forms forms)
+        defs (function-defs forms)
         indirect? (uses-call-indirect? forms)
         imports (required-host-imports forms)
         import-count (count imports)
@@ -1927,13 +2107,17 @@
                                :memory layout
                                :fn-result-types declared-fn-result-types
                                :indirect-type-index 0)
-        main (get (into {} defs) 'main)]
+        main (get (into {} defs) 'main)
+        module-entry? (some (fn [[name _]]
+                              (or (= name 'init)
+                                  (str/ends-with? (str name) "-tick")))
+                            defs)]
     (cond
-      (nil? main)
+      (and (nil? main) (not module-entry?))
       {:kotoba.wasm/ok? false
        :kotoba.wasm/problems [{:kotoba.wasm/problem :missing-main}]}
 
-      (seq (:params main))
+      (and main (seq (:params main)))
       {:kotoba.wasm/ok? false
        :kotoba.wasm/problems [{:kotoba.wasm/problem :main-arity
                                :kotoba.wasm/expected 0
@@ -1997,8 +2181,12 @@
                                 (section 4 (vec-bytes [(table-entry (count indirect-target-indexes))])))
                 memory-section (section 5 (vec-bytes [[0x00 0x01]]))
                 global-section (section 6 (vec-bytes [(global-entry heap-start)]))
-                export-section (section 7 (vec-bytes [(export-entry "main" 0x00 (get fn-indexes 'main))
-                                                       (export-entry "memory" 0x02 0)]))
+                export-names (mapv (comp str first) defs)
+                export-section (section 7 (vec-bytes (conj (mapv (fn [[name _]]
+                                                                    (export-entry (str name) 0x00
+                                                                                  (get fn-indexes name)))
+                                                                  defs)
+                                                             (export-entry "memory" 0x02 0))))
                 bodies (mapv (fn [compiled]
                                (let [decls (local-decls (merge-local-types compiled))
                                      body (bcat decls (:bytes compiled) [0x0b])]
@@ -2027,8 +2215,9 @@
             {:kotoba.wasm/ok? true
              :kotoba.wasm/binary (byte-array (map unchecked-byte module-bytes))
              :kotoba.wasm/byte-count (count module-bytes)
-             :kotoba.wasm/export "main"
-             :kotoba.wasm/result-type (compiled-result-type (some #(when (= 'main (:name %)) %) compiled-fns))
+             :kotoba.wasm/export (when main "main")
+             :kotoba.wasm/exports export-names
+             :kotoba.wasm/result-type (when main (compiled-result-type (some #(when (= 'main (:name %)) %) compiled-fns)))
              :kotoba.wasm/function-count (count compiled-fns)
              :kotoba.wasm/import-count import-count
              :kotoba.wasm/imports import-metadata

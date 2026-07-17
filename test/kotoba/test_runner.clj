@@ -10,6 +10,7 @@
             [kotoba.cap-typed-test]
             [kotoba.did-adapter-test]
             [kotoba.doc-examples-test]
+            [kotoba.guest-maturity-l2-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
             [kotoba.kami-game-test]
@@ -20,6 +21,7 @@
             [kotoba.package-admission-test]
             [kotoba.rad-adapter-test]
             [kotoba.real-host-providers-test]
+            [kotoba.security-kaizen-test]
             [kotoba.sensing-host-test]
             [kotoba.wasm-and-or-when-test]
             [kotoba.wasm-exec-test]))
@@ -34,6 +36,7 @@
                                         'kotoba.cap-typed-test
                                         'kotoba.did-adapter-test
                                         'kotoba.doc-examples-test
+                                        'kotoba.guest-maturity-l2-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
                                         'kotoba.kami-game-test
@@ -44,6 +47,7 @@
                                         'kotoba.package-admission-test
                                         'kotoba.rad-adapter-test
                                         'kotoba.real-host-providers-test
+                                        'kotoba.security-kaizen-test
                                         'kotoba.sensing-host-test
                                         'kotoba.wasm-and-or-when-test
                                         'kotoba.wasm-exec-test)]
