@@ -1,4 +1,7 @@
 #!/usr/bin/env nbb
+(ns build-pywasm
+  (:require [clojure.string :as str]))
+
 ;; --- nbb shims (auto, ADR-2607173000) ---------------------------------
 (def ^:private __fs (js/require "node:fs"))
 (def ^:private __path (js/require "node:path"))
@@ -26,9 +29,6 @@
 ;; Compile a kotoba_modal guest entry into a kotoba-node WASM component via
 ;; componentize-py, using the WIT vendored under this package's wit/ directory.
 
-(ns build-pywasm
-  (:require                         [clojure.string :as str]))
-
 (def usage "usage: build-pywasm.nbb <entry.py> -o <out.wasm>")
 
 (defn fail! [message code]
@@ -50,32 +50,33 @@
         (recur (rest remaining) arg out)))))
 
 (defn executable? [cmd]
-  (or (fs/which cmd)
-      (when (and (or (str/includes? cmd "/") (str/includes? cmd "\\"))
-                 (fs/exists? cmd))
-        cmd)))
+  (let [probe (.spawnSync __cp "sh" #js ["-c" "command -v \"$1\"" "sh" cmd]
+                          #js {:encoding "utf8"})]
+    (zero? (or (.-status probe) 1))))
 
 (defn env-command [name default-value]
-  (let [value (System/getenv name)]
+  (let [value (aget (.-env js/process) name)]
     (cond
       (nil? value) default-value
       (str/blank? value) (fail! (str name " resolved to an empty command") 2)
       :else (str/trim value))))
 
-(let [{:keys [entry out]} (parse-args *command-line-args*)
-      package-root (-> *file* fs/absolutize fs/parent fs/parent str)
-      wit-dir (str (fs/path package-root "wit"))
+(let [{:keys [entry out]} (parse-args (js->clj (.slice (.-argv js/process) 2)))
+      package-root (.dirname __path (.dirname __path (aget (.-argv js/process) 1)))
+      wit-dir (.join __path package-root "wit")
       componentize-py (env-command "COMPONENTIZE_PY" "componentize-py")]
   (when (str/blank? entry)
     (fail! usage 2))
-  (when-not (fs/regular-file? entry)
+  (when-not (and (.existsSync __fs entry) (.isFile (.statSync __fs entry)))
     (fail! (str "entry not found: " entry) 2))
   (when-not (executable? componentize-py)
     (fail! "componentize-py not found (set COMPONENTIZE_PY)" 127))
-  (let [entry-dir (-> entry fs/absolutize fs/parent str)
-        app (str/replace (fs/file-name entry) #"\.py$" "")
-        proc (process/process [componentize-py "-d" wit-dir "-w" "kotoba-node"
-                               "componentize" app "-p" entry-dir "-p" package-root
-                               "-o" out]
-                              {:out :inherit :err :inherit :in :inherit})]
-    (.exit js/process (:exit @proc))))
+  (let [absolute (.resolve __path entry)
+        entry-dir (.dirname __path absolute)
+        app (str/replace (.basename __path entry) #"\.py$" "")
+        proc (.spawnSync __cp componentize-py
+                         (clj->js ["-d" wit-dir "-w" "kotoba-node"
+                                   "componentize" app "-p" entry-dir "-p" package-root
+                                   "-o" out])
+                         #js {:stdio "inherit"})]
+    (.exit js/process (or (.-status proc) 1))))
