@@ -22,7 +22,8 @@
             [kotoba.runtime :as runtime]
             [kotoba.semantic-code :as semantic-code]
             [kotoba.selfhost.contracts :as selfhost]
-            [kotoba.wasm-exec :as wasm-exec]))
+            [kotoba.wasm-exec :as wasm-exec])
+  (:gen-class))
 
 (defn result->exit
   "Process exit code for a `:kotoba.cli/ok?` result map: 0 when ok, 1 otherwise."
