@@ -512,6 +512,7 @@ bin/kotoba-clj package verify --lock kotoba.lock.edn --json
 bin/kotoba-clj package verify --lock kotoba.lock.edn \
   --manifest package-manifest.edn \
   --trust trust.edn \
+  --key-register key-register.edn \
   --receipt target/kotoba/package-receipt.edn --json
 bin/kotoba-clj wasm emit src/demo.kotoba --package-lock kotoba.lock.edn --json
 ```
@@ -522,8 +523,12 @@ bin/kotoba-clj wasm emit src/demo.kotoba --package-lock kotoba.lock.edn --json
   package manifest (signatures, repo RID, CIDs) and supplies the declared
   capabilities; `--trust <trust.edn>` supplies
   `:declared-capabilities` / `:revoked-signers` / `:expired-signers` /
-  `:compromised-signers`. Without either source of declared capabilities, no
-  capability grant is admitted (strict default).
+  `:compromised-signers`. Optional `--key-register <key-register.edn>` folds
+  every non-`:active` key id (`:revoked`, `:expired`, `:compromised`,
+  `:retired`, `:pre-active`, …) into trust `:revoked-signers` so the same
+  package-contract kernel rejects them as `:package/signer-not-trusted`
+  (R-002; register lives in `kotoba-lang/security`). Without either source of
+  declared capabilities, no capability grant is admitted (strict default).
 - Rejection classes mirror the kotoba-lang package-conformance negatives:
   version-only dependencies (`:package/missing-lock-field`), unsigned or
   bad-signature manifests (`:package/signature-required`,

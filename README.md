@@ -169,6 +169,8 @@ kotoba run path/to/entry.kotoba             # compile and run a Kotoba entry poi
 kotoba compile app.kotoba --target web -o app.mjs # checked KIR → kotoba-script
 kotoba run path/to/entry.cljk                # CLJ Kotoba source
 kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
+kotoba package verify --lock lock.edn --trust trust.edn \
+  --key-register key-register.edn --json   # fold non-active key-register signers into trust
 kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # capability-confined build, see Language below
 kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
 kotoba cljs emit cell.kotoba --package-lock lock.edn -o cell.cljs                      # ClojureScript source, see Language below
