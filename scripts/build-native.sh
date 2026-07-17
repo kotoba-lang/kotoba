@@ -15,8 +15,10 @@ native-image \
   -H:+ReportExceptionStackTraces \
   --features=clj_easy.graal_build_time.InitClojureClasses \
   --initialize-at-build-time=com.dylibso.chicory \
-  '-H:IncludeResources=.*\.(clj|cljc|edn)$' \
+  '-H:IncludeResources=.*\.(clj|cljc|edn|properties)$' \
   -jar target/kotoba-standalone.jar \
   target/native/kotoba
 
 target/native/kotoba selfhost check --json >/dev/null
+target/native/kotoba compile src/demo.kotoba --target web \
+  -o target/native/native-web-smoke.mjs --json >/dev/null
