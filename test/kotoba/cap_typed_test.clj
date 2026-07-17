@@ -161,6 +161,28 @@
                :kotoba.runtime/kind ":host/nope"}]
              problems)))))
 
+(deftest destructuring-never-crashes-capability-analysis
+  (testing "ordinary vector/map destructuring carries no invented capability facts"
+    (let [forms (runtime/read-forms
+                 "(defn main []
+                    (let [[a b] [1 2]
+                          {:keys [x]} {:x 3}]
+                      (+ a b x)))"
+                 :kotoba)]
+      (is (empty? (runtime/cap-typed-problems forms)))
+      (is (empty? (runtime/cap-affine-problems forms)))))
+  (testing "a capability value cannot be split through destructuring"
+    (let [forms (runtime/read-forms
+                 "(defn main []
+                    (let [[c] (cap-acquire :host/ledger-append \"ledger:main\")]
+                      c))"
+                 :kotoba)]
+      (is (= [{:kotoba.runtime/problem :capability-destructuring-forbidden
+               :kotoba.runtime/fn "main"
+               :kotoba.runtime/binding "[c]"}]
+             (runtime/cap-typed-problems forms)))
+      (is (empty? (runtime/cap-affine-problems forms))))))
+
 (deftest effect-under-declaration-through-one-level-of-calls-rejected
   (testing "a caller's declared row must cover what its callee requires"
     (let [{:keys [ok? problems]}
