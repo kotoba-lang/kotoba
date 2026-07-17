@@ -25,3 +25,6 @@ target/native/kotoba compile src/demo.kotoba --target web \
 target/native/kotoba compile test/fixtures/source/web-library.kotoba --target web \
   -o target/native/native-web-library.mjs --json >/dev/null
 node scripts/test-native-web-library.mjs target/native/native-web-library.mjs
+target/native/kotoba compile test/fixtures/source/web-string-library.kotoba --target web \
+  -o target/native/native-web-string.mjs --json >/dev/null
+node scripts/test-native-web-string.mjs target/native/native-web-string.mjs

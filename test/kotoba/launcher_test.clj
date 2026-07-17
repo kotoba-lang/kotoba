@@ -55,6 +55,28 @@
     (is (re-find #"require the kotoba-script web target"
                  (:kotoba.cli/message wasm)))))
 
+(deftest compile-web-preserves-bounded-typed-strings
+  (let [output (doto (java.io.File/createTempFile "kotoba-web-string" ".mjs")
+                 (.deleteOnExit))
+        source "test/fixtures/source/web-string-library.kotoba"
+        web (launcher/dispatch ["compile" source "--target" "web"
+                                "--output" (.getPath output)])
+        wasm (launcher/dispatch ["compile" source "--target" "wasm"])
+        generated (slurp output)]
+    (is (:kotoba.cli/ok? web))
+    (is (= :kotoba-script (get-in web [:kotoba.cli/data :backend])))
+    (is (= :kotoba.value/typed-v1
+           (get-in web [:kotoba.cli/data :manifest :kotoba.artifact/value-profile])))
+    (is (= 65536
+           (get-in web [:kotoba.cli/data :manifest :kotoba.artifact/limits
+                        :string-value-bytes])))
+    (is (re-find #"valueProfile:'typed-v1'" generated))
+    (is (re-find #"こんにちは" generated))
+    (is (false? (:kotoba.cli/ok? wasm)))
+    (is (= :compile/failed (:kotoba.cli/code wasm)))
+    (is (re-find #"typed string values currently require"
+                 (:kotoba.cli/message wasm)))))
+
 (deftest compile-cljc-selects-kotoba-reader-branch
   (let [source (doto (java.io.File/createTempFile "kotoba-portable" ".cljc")
                  (.deleteOnExit))
