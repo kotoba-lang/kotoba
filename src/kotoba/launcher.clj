@@ -57,7 +57,7 @@
   (first argv))
 
 (declare source-plan source-extension accepted-source? selfhost-result runtime-result wasm-result cljs-result
-         compile-result package-result contract-exports)
+         compile-result project-check-result package-result contract-exports)
 
 (def source-commands
   #{"run" "check" "compile"})
@@ -217,6 +217,8 @@
   (let [argv (vec argv)]
     (if-let [launcher-result (case (command-name argv)
                                "selfhost" (selfhost-result argv)
+                               "check" (when (option-value argv "--project")
+                                         (project-check-result argv))
                                "compile" (compile-result argv)
                                "wasm" (wasm-result argv)
                                "cljs" (cljs-result argv)
@@ -409,6 +411,46 @@
                              :manifest (:manifest compiled)}})
         (catch Exception error
           {:kotoba.cli/ok? false :kotoba.cli/code :compile/failed
+           :kotoba.cli/message (ex-message error)
+           :kotoba.cli/data (select-keys (ex-data error)
+                                         [:phase :reason :target :module :dependency])})))))
+
+(defn project-check-result
+  "Check a closed Kotoba project through the exact compiler path used by
+  `compile --project`, but do not write an artifact."
+  [argv]
+  (let [project-path (option-value argv "--project")
+        entry (first-source-arg argv)
+        target-name (or (option-value argv "--target") "web")
+        target (case target-name "web" :js-kotoba-v1 "wasm" :wasm32-kotoba-v1 nil)]
+    (cond
+      entry
+      {:kotoba.cli/ok? false :kotoba.cli/code :check/ambiguous-input}
+
+      (not (str/ends-with? project-path ".edn"))
+      {:kotoba.cli/ok? false :kotoba.cli/code :check/invalid-project-manifest
+       :kotoba.cli/data {:project project-path}}
+
+      (nil? target)
+      {:kotoba.cli/ok? false :kotoba.cli/code :check/unsupported-target
+       :kotoba.cli/data {:target target-name :allowed ["web" "wasm"]}}
+
+      :else
+      (try
+        (let [project (project-input project-path)
+              compiled (compiler/compile-project (:sources project) (:root project) target)]
+          {:kotoba.cli/ok? true :kotoba.cli/code :check/project-valid
+           :kotoba.cli/data {:entry (:root project) :project project-path
+                             :target target-name
+                             :backend (if (= target :js-kotoba-v1)
+                                        :kotoba-script :kotoba-wasm)
+                             :project-digest (:project-digest compiled)
+                             :module-order (get-in compiled [:project :kotoba.module/order])
+                             :module-source-digests
+                             (get-in compiled [:project :kotoba.module/source-digests])
+                             :manifest (:manifest compiled)}})
+        (catch Exception error
+          {:kotoba.cli/ok? false :kotoba.cli/code :check/project-invalid
            :kotoba.cli/message (ex-message error)
            :kotoba.cli/data (select-keys (ex-data error)
                                          [:phase :reason :target :module :dependency])})))))
