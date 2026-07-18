@@ -23,6 +23,10 @@
             [kotoba.semantic-code :as semantic-code]
             [kotoba.selfhost.contracts :as selfhost]
             [kotoba.wasm-exec :as wasm-exec])
+  (:import [java.nio ByteBuffer]
+           [java.nio.charset CodingErrorAction StandardCharsets]
+           [java.nio.file Files LinkOption]
+           [java.nio.file.attribute BasicFileAttributes])
   (:gen-class))
 
 (defn result->exit
@@ -243,17 +247,85 @@
   (with-open [out (io/output-stream path)]
     (.write out ^bytes bytes)))
 
+(defn- reject-project-file! [message data]
+  (throw (ex-info message (assoc data :phase :project-manifest))))
+
+(defn- symlink-component? [^java.io.File base ^java.io.File candidate]
+  (loop [current candidate]
+    (cond
+      (nil? current) true
+      (= base current) false
+      (Files/isSymbolicLink (.toPath current)) true
+      :else (recur (.getParentFile current)))))
+
+(defn- file-attributes [^java.nio.file.Path path]
+  (Files/readAttributes path BasicFileAttributes
+                        (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])))
+
+(defn- same-file-snapshot? [^BasicFileAttributes before ^BasicFileAttributes after]
+  (and (= (.size before) (.size after))
+       (= (.lastModifiedTime before) (.lastModifiedTime after))
+       (let [before-key (.fileKey before)
+             after-key (.fileKey after)]
+         (or (and (nil? before-key) (nil? after-key))
+             (= before-key after-key)))))
+
+(defn- strict-utf8 [^bytes bytes data]
+  (try
+    (str (.decode (doto (.newDecoder StandardCharsets/UTF_8)
+                    (.onMalformedInput CodingErrorAction/REPORT)
+                    (.onUnmappableCharacter CodingErrorAction/REPORT))
+                  (ByteBuffer/wrap bytes)))
+    (catch java.nio.charset.CharacterCodingException _
+      (reject-project-file! "project file is not strict UTF-8" data))))
+
+(defn- read-stable-file [^java.io.File base-file relative max-bytes data]
+  (let [^java.nio.file.Path base-path (-> base-file .toPath .toAbsolutePath .normalize)
+        lexical-file (io/file base-file relative)
+        ^java.nio.file.Path lexical-path (-> lexical-file .toPath .toAbsolutePath .normalize)]
+    (when-not (.startsWith lexical-path base-path)
+      (reject-project-file! "project module path escapes its manifest root" data))
+    (when (symlink-component? base-file (.getAbsoluteFile lexical-file))
+      (reject-project-file! "project file path contains a symbolic link" data))
+    (let [canonical-before (.getCanonicalFile lexical-file)
+          ^java.nio.file.Path path (.toPath canonical-before)]
+      (when-not (and (.startsWith path (.toPath base-file))
+                     (Files/isRegularFile path
+                                          (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])))
+        (reject-project-file! "project module escapes its manifest root or is not a regular file" data))
+      (let [before (file-attributes path)]
+        (when (> (.size ^BasicFileAttributes before) max-bytes)
+          (reject-project-file! "project file exceeds byte limit"
+                                (assoc data :bytes (.size ^BasicFileAttributes before))))
+        (let [^bytes bytes (Files/readAllBytes path)
+              canonical-after (.getCanonicalFile lexical-file)
+              after (file-attributes (.toPath canonical-after))]
+          (when (or (> (alength bytes) max-bytes)
+                    (not= canonical-before canonical-after)
+                    (not (same-file-snapshot? before after))
+                    (symlink-component? base-file (.getAbsoluteFile lexical-file)))
+            (reject-project-file! "project file changed while being read" data))
+          (strict-utf8 bytes data))))))
+
 (defn- project-input [manifest-path]
   (let [manifest-file (io/file manifest-path)
-        manifest-text (slurp manifest-file)
-        _ (when (> (count manifest-text) (* 1024 1024))
-            (throw (ex-info "project manifest exceeds 1 MiB"
-                            {:phase :project-manifest})))
-        manifest (edn/read-string manifest-text)
+        manifest-absolute (.getAbsoluteFile manifest-file)
+        _ (when (Files/isSymbolicLink (.toPath manifest-absolute))
+            (reject-project-file! "project manifest must not be a symbolic link"
+                                  {:input :manifest}))
+        manifest-canonical (.getCanonicalFile manifest-file)
+        manifest-base (.getParentFile manifest-canonical)
+        manifest-text (read-stable-file manifest-base (.getName manifest-canonical)
+                                        (* 1024 1024) {:input :manifest})
+        manifest (edn/read-string
+                  {:readers {}
+                   :default (fn [tag _]
+                              (reject-project-file! "tagged project manifest value rejected"
+                                                    {:tag tag}))}
+                  manifest-text)
         root (:kotoba.project/root manifest)
         modules (:kotoba.project/modules manifest)
-        base-file (-> manifest-file .getCanonicalFile .getParentFile)
-        base (.toPath ^java.io.File base-file)
+        base-file manifest-base
         _ (when-not (and (simple-symbol? root) (map? modules)
                          (pos? (count modules)) (<= (count modules) 256))
             (throw (ex-info "invalid closed Kotoba project manifest"
@@ -266,13 +338,8 @@
                                     (not (.isAbsolute (io/file relative))))
                        (throw (ex-info "project modules require relative .kotoba paths"
                                        {:phase :project-manifest :module namespace})))
-                     (let [candidate (io/file base-file relative)
-                           real (-> candidate .getCanonicalFile .toPath)]
-                       (when-not (and (.startsWith real base)
-                                      (.isFile (.toFile real)))
-                         (throw (ex-info "project module escapes its manifest root or is not a file"
-                                         {:phase :project-manifest :module namespace})))
-                       [namespace (slurp (.toFile real))])))
+                     [namespace (read-stable-file base-file relative (* 1024 1024)
+                                                  {:input :module :module namespace})]))
               modules)]
     {:root root :sources sources :manifest (.getPath manifest-file)}))
 

@@ -1,6 +1,6 @@
 (ns kotoba.guest-maturity-l4-l6-test
   "ADR-2607180900 L4 (typed HIR) + L6 (signed modules / release evidence)."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [ed25519.core :as ed]
             [kotoba.lang.type-system :as types]
             [kotoba.package-admission :as package-admission]
