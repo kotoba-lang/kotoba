@@ -82,7 +82,8 @@ try {
   const projectOutput = join(work, "project-probe.mjs");
   writeFileSync(
     projectDependency,
-    "(ns release.probe.value (:export [answer]))\n(defn answer [] 42)\n",
+    "(ns release.probe.value \"bounded release project documentation\" (:export [answer]))\n" +
+      "(defn answer [] 42)\n",
   );
   writeFileSync(
     projectEntry,
