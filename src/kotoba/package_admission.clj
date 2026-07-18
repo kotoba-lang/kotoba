@@ -25,6 +25,7 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [kotoba.lang.package-contract :as package-contract]
+            [kotoba.lang.package-registry :as package-registry]
             [multiformats.core :as mf])
   (:import [java.time Instant]))
 
@@ -466,6 +467,28 @@
 
                         (:kotoba.admission/error admission)
                         (assoc :kotoba.package/error (:kotoba.admission/error admission)))}))
+
+(defn resolve-lock-with-registry
+  "Resolve version-only dependency requests through a package registry into
+  a full lock, then verify-lock (fail-closed). REGISTRY is parsed EDN;
+  REQUESTS is a vector of {:name :version :capabilities?}.
+
+  Returns the same shape as `admit` plus :kotoba.admission/lock when ok."
+  [{:keys [registry requests trust]}]
+  (let [resolved (package-registry/lock-from-requests registry requests)]
+    (if-not (:ok? resolved)
+      {:kotoba.admission/ok? false
+       :kotoba.admission/code :package/registry-resolve-failed
+       :kotoba.admission/error {:kotoba.package/problems (:problems resolved)}}
+      (let [receipt (verify-lock {:lock (:lock resolved)
+                                  :lock-path "<registry-resolved>"
+                                  :trust trust})]
+        {:kotoba.admission/ok? (:kotoba.package/verified? receipt)
+         :kotoba.admission/code (if (:kotoba.package/verified? receipt)
+                                  :package-verified
+                                  :package-rejected)
+         :kotoba.admission/receipt receipt
+         :kotoba.admission/lock (:lock resolved)}))))
 
 (defn safe-release-ready?
   "F-001 / F-007 partial + L3: a safe release may proceed only when a package-
