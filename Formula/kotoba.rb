@@ -1,32 +1,32 @@
 class Kotoba < Formula
   desc "Capability-safe Kotoba language compiler and CLI"
   homepage "https://github.com/kotoba-lang/kotoba"
-  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.25.tar.gz"
-  sha256 "480a3063de1ff9bfc068f5fc2b8f7a11873b7abb0f3c9683c2af7bc15d747e12"
+  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.26.tar.gz"
+  sha256 "942c3adc2420a00f154eb08bc988a69326e9eae9adf16893e92a1b2cd6ae60b1"
   license "Apache-2.0"
 
   bottle do
-    root_url "https://github.com/kotoba-lang/homebrew-kotoba/releases/download/kotoba-0.6.25"
+    root_url "https://github.com/kotoba-lang/homebrew-kotoba/releases/download/kotoba-0.6.26"
     rebuild 1
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "7612b1639eaa03e7c606fdd5d634190fccc733a709feca635d3a396c582b9612"
-    sha256 cellar: :any_skip_relocation, sequoia:       "d38eb2a47062fd72c9ad76a4485e51101f3d7bbf40b1fcd15f51b9d3884e028d"
-    sha256 cellar: :any_skip_relocation, x86_64_linux:  "f1e9c7766418275147b31caff2e6e32a8c50cc7b1211f5e559f5f81e0fe9c7c3"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "b3081c12ff606b14de543a5178d676112cb447206298ccfedf2f8bb15acac408"
+    sha256 cellar: :any_skip_relocation, sequoia:       "b29e055a450652ab4795021da7535b8bc531f2c9cd3c6bd88e09b6b8f187b2a4"
+    sha256 cellar: :any_skip_relocation, x86_64_linux:  "87932e53358d202af5ce5e4907acc63ae636039b188d09cc9e1f0f7f1250958a"
   end
 
   resource "binary" do
     on_macos do
       on_arm do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.25/kotoba-darwin-arm64.tar.gz"
-        sha256 "f1f14e5bfb32bf0eaff320b803fcaf9fd218fe061f87aacf4727958e5bcf4b98"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.26/kotoba-darwin-arm64.tar.gz"
+        sha256 "3d9eb436982229e0333f5f09e4ca371e2a80cf6d4abee170fa51ce83eda3bfa2"
       end
       on_intel do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.25/kotoba-darwin-amd64.tar.gz"
-        sha256 "34ba8d2645f9e1cee5114e272964095684bf5b63c39fdcae2b4fdfa150714667"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.26/kotoba-darwin-amd64.tar.gz"
+        sha256 "b192f279325a0a1dd7bbd4380410c445fbf9439a6b96902594d6ba76510fb312"
       end
     end
     on_linux do
-      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.25/kotoba-linux-amd64.tar.gz"
-      sha256 "c682a06aba5e183ea54341dea1fedf7362e3eae380568c4b640cc6e770e8ee32"
+      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.26/kotoba-linux-amd64.tar.gz"
+      sha256 "5596a1de5a0fb8c7ca1409d1c4ffdcbeaa1b3161d3cbb9d360ee1cb4bc76329c"
     end
   end
 
@@ -55,7 +55,7 @@ class Kotoba < Formula
 
     (testpath/"src/shared").mkpath
     (testpath/"src/shared/value.cljc").write <<~CLJC
-      (ns shared.value (:export [answer]))
+      (ns shared.value "bounded bottle project documentation" (:export [answer]))
       (defn answer [] 42)
     CLJC
     (testpath/"main.cljc").write <<~CLJC
