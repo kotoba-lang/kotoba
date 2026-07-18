@@ -66,6 +66,7 @@
     "--output"
     "--package-lock"
     "--policy"
+    "--project"
     "--reader-target"
     "--receipt"
     "--source-path"
@@ -242,25 +243,67 @@
   (with-open [out (io/output-stream path)]
     (.write out ^bytes bytes)))
 
+(defn- project-input [manifest-path]
+  (let [manifest-file (io/file manifest-path)
+        manifest-text (slurp manifest-file)
+        _ (when (> (count manifest-text) (* 1024 1024))
+            (throw (ex-info "project manifest exceeds 1 MiB"
+                            {:phase :project-manifest})))
+        manifest (edn/read-string manifest-text)
+        root (:kotoba.project/root manifest)
+        modules (:kotoba.project/modules manifest)
+        base (-> manifest-file .getCanonicalFile .getParentFile .toPath)
+        _ (when-not (and (simple-symbol? root) (map? modules)
+                         (pos? (count modules)) (<= (count modules) 256))
+            (throw (ex-info "invalid closed Kotoba project manifest"
+                            {:phase :project-manifest})))
+        sources
+        (into {}
+              (map (fn [[namespace relative]]
+                     (when-not (and (simple-symbol? namespace) (string? relative)
+                                    (str/ends-with? relative ".kotoba")
+                                    (not (.isAbsolute (io/file relative))))
+                       (throw (ex-info "project modules require relative .kotoba paths"
+                                       {:phase :project-manifest :module namespace})))
+                     (let [candidate (-> (.resolve base relative) .normalize)
+                           real (-> candidate .toFile .getCanonicalFile .toPath)]
+                       (when-not (and (.startsWith real base)
+                                      (.isFile (.toFile real)))
+                         (throw (ex-info "project module escapes its manifest root or is not a file"
+                                         {:phase :project-manifest :module namespace})))
+                       [namespace (slurp (.toFile real))])))
+              modules)]
+    {:root root :sources sources :manifest (.getPath manifest-file)}))
+
 (defn compile-result
   "Compile Kotoba-owned source through kotoba-lang/compiler. Web output is
   restricted ESM emitted from checked KIR by kotoba-script; it never routes
   through the legacy ClojureScript backend."
   [argv]
-  (let [entry (first-source-arg argv)
+  (let [project-path (option-value argv "--project")
+        entry (first-source-arg argv)
         extension (some-> entry source-extension)
         target-name (or (option-value argv "--target") "wasm")
         target (case target-name "web" :js-kotoba-v1 "wasm" :wasm32-kotoba-v1 nil)
         output (or (option-value argv "--output")
                    (option-value argv "-o")
-                   (when (and entry extension)
-                     (str (subs entry 0 (- (count entry) (count extension)))
-                          (if (= target-name "web") ".mjs" ".wasm"))))]
+                   (when (or entry project-path)
+                     (let [input (or entry project-path)
+                           suffix (if project-path ".edn" extension)]
+                       (str (subs input 0 (- (count input) (count suffix)))
+                            (if (= target-name "web") ".mjs" ".wasm")))))]
     (cond
-      (nil? entry)
+      (and entry project-path)
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/ambiguous-input}
+
+      (and (nil? entry) (nil? project-path))
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/entry-required}
 
-      (not (#{".kotoba" ".cljk" ".cljc"} extension))
+      (and project-path (not (str/ends-with? project-path ".edn")))
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/invalid-project-manifest
+       :kotoba.cli/data {:project project-path}}
+
+      (and entry (not (#{".kotoba" ".cljk" ".cljc"} extension)))
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/not-kotoba-source
        :kotoba.cli/data {:entry entry :extension extension}}
 
@@ -270,7 +313,10 @@
 
       :else
       (try
-        (let [compiled (compiler/compile-source (slurp entry) target)]
+        (let [project (when project-path (project-input project-path))
+              compiled (if project
+                         (compiler/compile-project (:sources project) (:root project) target)
+                         (compiler/compile-source (slurp entry) target))]
           (if (= target :js-kotoba-v1)
             (do
               (some-> (io/file output) .getParentFile .mkdirs)
@@ -278,14 +324,16 @@
               (spit (str output ".manifest.edn") (pr-str (:manifest compiled))))
             (write-bytes! output (:bytes compiled)))
           {:kotoba.cli/ok? true :kotoba.cli/code :compile/emitted
-           :kotoba.cli/data {:entry entry :output output :target target-name
+           :kotoba.cli/data {:entry (or entry (:root project))
+                             :project project-path :output output :target target-name
                              :backend (if (= target :js-kotoba-v1)
                                         :kotoba-script :kotoba-wasm)
                              :manifest (:manifest compiled)}})
         (catch Exception error
           {:kotoba.cli/ok? false :kotoba.cli/code :compile/failed
            :kotoba.cli/message (ex-message error)
-           :kotoba.cli/data (select-keys (ex-data error) [:phase :reason :target])})))))
+           :kotoba.cli/data (select-keys (ex-data error)
+                                         [:phase :reason :target :module :dependency])})))))
 
 (defn resource-edn
   "Load an EDN resource by classpath path."

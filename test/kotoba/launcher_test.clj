@@ -1,6 +1,7 @@
 (ns kotoba.launcher-test
   (:require [clojure.data.json :as json]
             [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is run-tests testing]]
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime]))
@@ -76,6 +77,51 @@
     (is (= :compile/failed (:kotoba.cli/code wasm)))
     (is (re-find #"typed string values currently require"
                  (:kotoba.cli/message wasm)))))
+
+(deftest compile-closed-multi-module-kotoba-project
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project" (make-array java.nio.file.attribute.FileAttribute 0)))
+        text (io/file directory "text.kotoba")
+        app (io/file directory "app.kotoba")
+        manifest (io/file directory "kotoba-project.edn")
+        output (io/file directory "app.mjs")]
+    (spit text "(ns example.text (:export [greet]))
+                (defn greet [name :string] :string
+                  (string-concat \"こんにちは、\" name))")
+    (spit app "(ns example.app
+                 (:require [example.text :as text])
+                 (:export [welcome]))
+               (defn welcome [name :string] :string (text/greet name))")
+    (spit manifest (pr-str {:kotoba.project/root 'example.app
+                            :kotoba.project/modules
+                            {'example.app "app.kotoba"
+                             'example.text "text.kotoba"}}))
+    (let [result (launcher/dispatch ["compile" "--project" (.getPath manifest)
+                                     "--target" "web" "--output" (.getPath output)])
+          generated (slurp output)
+          artifact-manifest (edn/read-string (slurp (str (.getPath output) ".manifest.edn")))]
+      (is (:kotoba.cli/ok? result))
+      (is (= :kotoba-script (get-in result [:kotoba.cli/data :backend])))
+      (is (= 'example.app (get-in result [:kotoba.cli/data :entry])))
+      (is (re-find #"こんにちは" generated))
+      (is (string? (:kotoba.artifact/module-graph-digest artifact-manifest)))
+      (is (= #{'example.app 'example.text}
+             (set (keys (:kotoba.artifact/module-source-digests artifact-manifest))))))))
+
+(deftest project-compile-rejects-path-escape-and-ambiguous-input
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-reject" (make-array java.nio.file.attribute.FileAttribute 0)))
+        manifest (io/file directory "bad.edn")]
+    (spit manifest (pr-str {:kotoba.project/root 'example.app
+                            :kotoba.project/modules {'example.app "../escape.kotoba"}}))
+    (let [escaped (launcher/dispatch ["compile" "--project" (.getPath manifest)
+                                      "--target" "web"])
+          ambiguous (launcher/dispatch ["compile" "test/fixtures/source/web-library.kotoba"
+                                        "--project" (.getPath manifest) "--target" "web"])]
+      (is (false? (:kotoba.cli/ok? escaped)))
+      (is (= :compile/failed (:kotoba.cli/code escaped)))
+      (is (= :project-manifest (get-in escaped [:kotoba.cli/data :phase])))
+      (is (= :compile/ambiguous-input (:kotoba.cli/code ambiguous))))))
 
 (deftest compile-cljc-selects-kotoba-reader-branch
   (let [source (doto (java.io.File/createTempFile "kotoba-portable" ".cljc")
