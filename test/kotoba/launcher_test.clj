@@ -70,8 +70,9 @@
   (let [directory (.toFile (java.nio.file.Files/createTempDirectory
                             "kotoba-cljc-source-path"
                             (make-array java.nio.file.attribute.FileAttribute 0)))
-        dependency (io/file directory "shared/value.cljc")
-        app (io/file directory "shared/app.cljc")
+        source-directory (io/file directory "src")
+        dependency (io/file source-directory "shared/value.cljc")
+        app (io/file directory "main.cljc")
         output (io/file directory "app.mjs")]
     (.mkdirs (.getParentFile dependency))
     (spit dependency
@@ -80,10 +81,10 @@
           "(ns shared.app (:require [shared.value :as value]) (:export [main]))
            (defn main [] (value/answer))")
     (let [result (launcher/dispatch
-                  ["compile" (.getPath app) "--source-path" (.getPath directory)
+                  ["compile" (.getPath app) "--source-path" (.getPath source-directory)
                    "--target" "web" "--output" (.getPath output)])]
       (is (:kotoba.cli/ok? result))
-      (is (= (.getPath directory)
+      (is (= (.getPath source-directory)
              (get-in result [:kotoba.cli/data :source-path])))
       (is (= #{'shared.app 'shared.value}
              (set (keys (get-in result [:kotoba.cli/data :manifest

@@ -76,7 +76,9 @@ try {
   const projectNamespace = join(projectRoot, "release", "probe");
   mkdirSync(projectNamespace, { recursive: true });
   const projectDependency = join(projectNamespace, "value.cljc");
-  const projectEntry = join(projectNamespace, "app.cljc");
+  // The explicitly selected root deliberately lives beside project-src/;
+  // namespace-discovered dependencies remain confined below projectRoot.
+  const projectEntry = join(work, "project-main.cljc");
   const projectOutput = join(work, "project-probe.mjs");
   writeFileSync(
     projectDependency,
