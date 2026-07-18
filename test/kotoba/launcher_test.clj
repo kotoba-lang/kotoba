@@ -110,6 +110,52 @@
       (is (= #{'example.app 'example.text}
              (set (keys (:kotoba.artifact/module-source-digests artifact-manifest))))))))
 
+(deftest check-closed-project-uses-compile-identity-without-writing-output
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-check" (make-array java.nio.file.attribute.FileAttribute 0)))
+        text (io/file directory "text.kotoba")
+        app (io/file directory "app.kotoba")
+        manifest (io/file directory "kotoba-project.edn")
+        implicit-output (io/file directory "kotoba-project.mjs")]
+    (spit text "(ns check.text (:export [answer])) (defn answer [] 42)")
+    (spit app "(ns check.app (:require [check.text :as text]) (:export [run]))
+               (defn run [] (text/answer))")
+    (spit manifest (pr-str {:kotoba.project/root 'check.app
+                            :kotoba.project/modules
+                            {'check.app "app.kotoba" 'check.text "text.kotoba"}}))
+    (let [checked (launcher/dispatch ["check" "--project" (.getPath manifest)
+                                      "--target" "web"])
+          compiled (launcher/dispatch ["compile" "--project" (.getPath manifest)
+                                       "--target" "web" "--output"
+                                       (.getPath (io/file directory "compiled.mjs"))])]
+      (is (:kotoba.cli/ok? checked))
+      (is (= :check/project-valid (:kotoba.cli/code checked)))
+      (is (= ['check.text 'check.app]
+             (get-in checked [:kotoba.cli/data :module-order])))
+      (is (= (get-in checked [:kotoba.cli/data :project-digest])
+             (get-in compiled [:kotoba.cli/data :manifest
+                               :kotoba.artifact/module-graph-digest])))
+      (is (= (get-in checked [:kotoba.cli/data :module-source-digests])
+             (get-in compiled [:kotoba.cli/data :manifest
+                               :kotoba.artifact/module-source-digests])))
+      (is (not (.exists implicit-output))))))
+
+(deftest check-and-compile-project-report-the-same-link-diagnostic
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-check-fail" (make-array java.nio.file.attribute.FileAttribute 0)))
+        app (io/file directory "app.kotoba")
+        manifest (io/file directory "kotoba-project.edn")]
+    (spit app "(ns check.app (:require [missing.dep :as dep]) (:export [run]))
+               (defn run [] (dep/run))")
+    (spit manifest (pr-str {:kotoba.project/root 'check.app
+                            :kotoba.project/modules {'check.app "app.kotoba"}}))
+    (let [checked (launcher/dispatch ["check" "--project" (.getPath manifest)])
+          compiled (launcher/dispatch ["compile" "--project" (.getPath manifest)])]
+      (is (= :check/project-invalid (:kotoba.cli/code checked)))
+      (is (= :compile/failed (:kotoba.cli/code compiled)))
+      (is (= (:kotoba.cli/message checked) (:kotoba.cli/message compiled)))
+      (is (= (:kotoba.cli/data checked) (:kotoba.cli/data compiled))))))
+
 (deftest project-compile-rejects-path-escape-and-ambiguous-input
   (let [directory (.toFile (java.nio.file.Files/createTempDirectory
                             "kotoba-project-reject" (make-array java.nio.file.attribute.FileAttribute 0)))
