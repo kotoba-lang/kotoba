@@ -324,6 +324,21 @@
     (is (false? (:kotoba.cli/ok? result)))
     (is (= 1 (launcher/result->exit result)))))
 
+(deftest process-boundary-runtime-rejection-is-structured-and-path-free
+  (let [source (doto (java.io.File/createTempFile "kotoba-forbidden-eval" ".kotoba")
+                 (.deleteOnExit))]
+    (spit source "(defn main [] (eval '(+ 40 2)))")
+    (let [result (launcher/safe-dispatch ["run" (.getPath source)])
+          rendered (launcher/render-result result true)]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= :runtime/rejected (:kotoba.cli/code result)))
+      (is (= {:format :kotoba.diagnostic/v1
+              :code :kotoba/runtime-rejected
+              :severity :error
+              :source (.getName source)}
+             (:kotoba.cli/diagnostic result)))
+      (is (not (re-find #"/var/|/tmp/|at kotoba|launcher.clj" rendered))))))
+
 (deftest loads-safe-analyzer-fact-seed-from-clj-resources
   (let [seed (launcher/safe-analyzer-fact-classification)]
     (is (= "kotoba.selfhost.safe-analyzer-facts.v0" (:schema seed)))
