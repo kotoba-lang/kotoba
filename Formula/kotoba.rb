@@ -1,32 +1,32 @@
 class Kotoba < Formula
   desc "Capability-safe Kotoba language compiler and CLI"
   homepage "https://github.com/kotoba-lang/kotoba"
-  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.27.tar.gz"
-  sha256 "77dab7775100a58d3e8299a2215fc5524607c35fea02d952c5e2227ac73fe803"
+  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.28.tar.gz"
+  sha256 "bf39efc9be56d29e608d46fdff46b36dd92b87e431392718de6474596047467d"
   license "Apache-2.0"
 
   bottle do
-    root_url "https://github.com/kotoba-lang/homebrew-kotoba/releases/download/kotoba-0.6.27"
+    root_url "https://github.com/kotoba-lang/homebrew-kotoba/releases/download/kotoba-0.6.28"
     rebuild 1
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "89217b55b9f20a01f0fab929f0fa138636c705c27c2f8f6c158ae6e9e77a7851"
-    sha256 cellar: :any_skip_relocation, sequoia:       "5fde5b6d21fd522284d4bcd055d063a6c53a1b40b2f8ac07888419cda078aa8a"
-    sha256 cellar: :any_skip_relocation, x86_64_linux:  "cf9514156138c845da143e1cc021cb34675517b6fe385cacc5d94ea0fe263b45"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "e2391c550bfc0f82bbc49ee332d980817480ad4b8c9d5418859421ca26143336"
+    sha256 cellar: :any_skip_relocation, sequoia:       "bfeb93ef8a148ec97b9936db0e304733343b7ba7c006cc342281aca5372fb7bd"
+    sha256 cellar: :any_skip_relocation, x86_64_linux:  "11084b4d0d6a19900ce554d1985fef7f837f1e96947fb1471bd1fd6ec3bc3531"
   end
 
   resource "binary" do
     on_macos do
       on_arm do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.27/kotoba-darwin-arm64.tar.gz"
-        sha256 "7768c0de0a770453282132811015fea68264bf84c3853505699164e4d6a9a086"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.28/kotoba-darwin-arm64.tar.gz"
+        sha256 "9e34cf3dbe3cdc8caca38247fc33c34f8fb3b37cf960baf8da0de815f501a092"
       end
       on_intel do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.27/kotoba-darwin-amd64.tar.gz"
-        sha256 "45e06484c4fb4183c9a9ba138ab1dbea2fec32544a77ecd225be04750e830b88"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.28/kotoba-darwin-amd64.tar.gz"
+        sha256 "d4ca17bbc3486918a03f6effe7aae30f3b4e7a9144a57dea9757022f136939ca"
       end
     end
     on_linux do
-      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.27/kotoba-linux-amd64.tar.gz"
-      sha256 "74091a517b8b5871cef723b675c9a34f786c3c1ee7e4c166bde1ead9668c95ef"
+      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.28/kotoba-linux-amd64.tar.gz"
+      sha256 "cc02e7887fd16bfd16dd249cfb3ebe52f866f97285dabb6059617cc2de56668a"
     end
   end
 
@@ -75,16 +75,36 @@ class Kotoba < Formula
 
     (testpath/"typed/fixture").mkpath
     (testpath/"typed/fixture/coverage.kotoba").write <<~KOTOBA
-      (ns fixture.coverage (:export [ready?]))
-      (defn ready? [covered [:set :keyword]] :bool
-        (typed-set-contains [:set :keyword] covered :ready))
+      (ns fixture.coverage (:export [none-report make-report choose-report]))
+      (defn none-report []
+        [:option [:record :fixture/report [[:value :i64]]]]
+        (option-none-of [:option [:record :fixture/report [[:value :i64]]]]))
+      (defn make-report [] [:record :fixture/report [[:value :i64]]]
+        (record [:record :fixture/report [[:value :i64]]] 42))
+      (defn choose-report
+        [left [:option [:record :fixture/report [[:value :i64]]]]
+         right [:option [:record :fixture/report [[:value :i64]]]]]
+        [:option [:record :fixture/report [[:value :i64]]]]
+        (match-option left [:option [:record :fixture/report [[:value :i64]]]]
+          (none right)
+          (some left-report
+            (match-option right [:option [:record :fixture/report [[:value :i64]]]]
+              (none left)
+              (some right-report right)))))
     KOTOBA
     (testpath/"typed/fixture/app.kotoba").write <<~KOTOBA
       (ns fixture.app
         (:require [fixture.coverage :as coverage])
         (:export [main]))
       (defn main [] :i64
-        (if (coverage/ready? (typed-set [:set :keyword] :ready)) 42 0))
+        (record-get [:record :fixture/report [[:value :i64]]]
+          (option-value-of [:option [:record :fixture/report [[:value :i64]]]]
+            (coverage/choose-report
+              (coverage/none-report)
+              (option-some-of [:option [:record :fixture/report [[:value :i64]]]]
+                (coverage/make-report)))
+            (coverage/make-report))
+          :value))
     KOTOBA
     web = shell_output(
       "#{bin}/kotoba compile #{testpath}/typed/fixture/app.kotoba " \
