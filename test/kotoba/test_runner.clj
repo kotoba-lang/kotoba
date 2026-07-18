@@ -13,6 +13,7 @@
             [kotoba.doc-examples-test]
             [kotoba.guest-maturity-l2-test]
             [kotoba.guest-maturity-p0-p1-test]
+            [kotoba.guest-maturity-l3-l5-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
             [kotoba.kami-game-test]
@@ -44,6 +45,9 @@
                                         'kotoba.cljs-backend-test
                                         'kotoba.did-adapter-test
                                         'kotoba.doc-examples-test
+                                        'kotoba.guest-maturity-l2-test
+                                        'kotoba.guest-maturity-p0-p1-test
+                                        'kotoba.guest-maturity-l3-l5-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
                                         'kotoba.kami-game-test
