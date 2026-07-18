@@ -34,6 +34,25 @@
   [result]
   (if (:kotoba.cli/ok? result) 0 1))
 
+(defn exception-chain
+  "Bounded, path-free exception identity for stable CLI diagnostics.
+
+  Native-image failures often surface only the message of a wrapper exception;
+  retaining the exception and cause classes lets release smoke identify a
+  missing runtime class without printing host stack traces or ambient paths."
+  [^Throwable error]
+  (loop [current error
+         remaining 8
+         result []]
+    (if (or (nil? current) (zero? remaining))
+      result
+      (recur (.getCause current)
+             (dec remaining)
+             (conj result
+                   (cond-> {:class (.getName (class current))}
+                     (some? (ex-message current))
+                     (assoc :message (ex-message current))))))))
+
 (defn json-requested?
   "True when argv carries the `--json` flag."
   [argv]
@@ -464,8 +483,10 @@
         (catch Exception error
           {:kotoba.cli/ok? false :kotoba.cli/code :compile/failed
            :kotoba.cli/message (ex-message error)
-           :kotoba.cli/data (select-keys (ex-data error)
-                                         [:phase :reason :target :module :dependency :problems])})))))
+           :kotoba.cli/data (assoc
+                             (select-keys (ex-data error)
+                                          [:phase :reason :target :module :dependency :problems])
+                             :exception-chain (exception-chain error))})))))
 
 (defn project-check-result
   "Check a closed Kotoba project through the exact compiler path used by
@@ -506,8 +527,10 @@
         (catch Exception error
           {:kotoba.cli/ok? false :kotoba.cli/code :check/project-invalid
            :kotoba.cli/message (ex-message error)
-           :kotoba.cli/data (select-keys (ex-data error)
-                                         [:phase :reason :target :module :dependency :problems])})))))
+           :kotoba.cli/data (assoc
+                             (select-keys (ex-data error)
+                                          [:phase :reason :target :module :dependency :problems])
+                             :exception-chain (exception-chain error))})))))
 
 (defn resource-edn
   "Load an EDN resource by classpath path."
