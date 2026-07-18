@@ -23,10 +23,10 @@
             [kotoba.semantic-code :as semantic-code]
             [kotoba.selfhost.contracts :as selfhost]
             [kotoba.wasm-exec :as wasm-exec])
-  (:import [java.nio ByteBuffer]
+  (:import [java.io ByteArrayOutputStream FileInputStream]
+           [java.nio ByteBuffer]
            [java.nio.charset CodingErrorAction StandardCharsets]
-           [java.nio.file Files LinkOption]
-           [java.nio.file.attribute BasicFileAttributes])
+           [java.nio.file Path])
   (:gen-class))
 
 (defn result->exit
@@ -255,20 +255,32 @@
     (cond
       (nil? current) true
       (= base current) false
-      (Files/isSymbolicLink (.toPath current)) true
+      (not= (.getAbsoluteFile current) (.getCanonicalFile current)) true
       :else (recur (.getParentFile current)))))
 
-(defn- file-attributes [^java.nio.file.Path path]
-  (Files/readAttributes path BasicFileAttributes
-                        (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])))
+(defn- symbolic-link-file? [^java.io.File file]
+  (let [absolute (.getAbsoluteFile file)
+        normalized (io/file (.getCanonicalFile (.getParentFile absolute))
+                            (.getName absolute))]
+    (not= (.getAbsoluteFile normalized) (.getCanonicalFile absolute))))
 
-(defn- same-file-snapshot? [^BasicFileAttributes before ^BasicFileAttributes after]
-  (and (= (.size before) (.size after))
-       (= (.lastModifiedTime before) (.lastModifiedTime after))
-       (let [before-key (.fileKey before)
-             after-key (.fileKey after)]
-         (or (and (nil? before-key) (nil? after-key))
-             (= before-key after-key)))))
+(defn- file-snapshot [^java.io.File file]
+  [(.getPath (.getCanonicalFile file)) (.length file) (.lastModified file)])
+
+(defn- read-bounded-bytes [^java.io.File file max-bytes data]
+  (with-open [input (FileInputStream. file)
+              output (ByteArrayOutputStream.)]
+    (let [buffer (byte-array 8192)]
+      (loop [total 0]
+        (let [read (.read input buffer)]
+          (if (neg? read)
+            (.toByteArray output)
+            (let [next-total (+ total read)]
+              (when (> next-total max-bytes)
+                (reject-project-file! "project file exceeds byte limit"
+                                      (assoc data :bytes next-total)))
+              (.write output buffer 0 read)
+              (recur next-total))))))))
 
 (defn- strict-utf8 [^bytes bytes data]
   (try
@@ -280,29 +292,27 @@
       (reject-project-file! "project file is not strict UTF-8" data))))
 
 (defn- read-stable-file [^java.io.File base-file relative max-bytes data]
-  (let [^java.nio.file.Path base-path (-> base-file .toPath .toAbsolutePath .normalize)
+  (let [^Path base-path (-> base-file .toPath .toAbsolutePath .normalize)
         lexical-file (io/file base-file relative)
-        ^java.nio.file.Path lexical-path (-> lexical-file .toPath .toAbsolutePath .normalize)]
+        ^Path lexical-path (-> lexical-file .toPath .toAbsolutePath .normalize)]
     (when-not (.startsWith lexical-path base-path)
       (reject-project-file! "project module path escapes its manifest root" data))
     (when (symlink-component? base-file (.getAbsoluteFile lexical-file))
       (reject-project-file! "project file path contains a symbolic link" data))
     (let [canonical-before (.getCanonicalFile lexical-file)
-          ^java.nio.file.Path path (.toPath canonical-before)]
+          ^Path path (.toPath canonical-before)]
       (when-not (and (.startsWith path (.toPath base-file))
-                     (Files/isRegularFile path
-                                          (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])))
+                     (.isFile canonical-before))
         (reject-project-file! "project module escapes its manifest root or is not a regular file" data))
-      (let [before (file-attributes path)]
-        (when (> (.size ^BasicFileAttributes before) max-bytes)
+      (let [before (file-snapshot canonical-before)]
+        (when (> (.length canonical-before) max-bytes)
           (reject-project-file! "project file exceeds byte limit"
-                                (assoc data :bytes (.size ^BasicFileAttributes before))))
-        (let [^bytes bytes (Files/readAllBytes path)
+                                (assoc data :bytes (.length canonical-before))))
+        (let [^bytes bytes (read-bounded-bytes canonical-before max-bytes data)
               canonical-after (.getCanonicalFile lexical-file)
-              after (file-attributes (.toPath canonical-after))]
-          (when (or (> (alength bytes) max-bytes)
-                    (not= canonical-before canonical-after)
-                    (not (same-file-snapshot? before after))
+              after (file-snapshot canonical-after)]
+          (when (or (not= canonical-before canonical-after)
+                    (not= before after)
                     (symlink-component? base-file (.getAbsoluteFile lexical-file)))
             (reject-project-file! "project file changed while being read" data))
           (strict-utf8 bytes data))))))
@@ -310,7 +320,7 @@
 (defn- project-input [manifest-path]
   (let [manifest-file (io/file manifest-path)
         manifest-absolute (.getAbsoluteFile manifest-file)
-        _ (when (Files/isSymbolicLink (.toPath manifest-absolute))
+        _ (when (symbolic-link-file? manifest-absolute)
             (reject-project-file! "project manifest must not be a symbolic link"
                                   {:input :manifest}))
         manifest-canonical (.getCanonicalFile manifest-file)
