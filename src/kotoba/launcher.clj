@@ -12,6 +12,7 @@
             [clojure.string :as str]
             [kotoba.cap-table :as cap-table]
             [kotoba.compiler.core :as compiler]
+            [kotoba.compiler.project-files :as project-files]
             [kotoba.lang.capability-cacao :as capability-cacao]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
@@ -446,6 +447,7 @@
   through the legacy ClojureScript backend."
   [argv]
   (let [project-path (option-value argv "--project")
+        source-root (option-value argv "--source-path")
         entry (first-source-arg argv)
         extension (some-> entry source-extension)
         target-name (or (option-value argv "--target") "wasm")
@@ -460,6 +462,9 @@
     (cond
       (and entry project-path)
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/ambiguous-input}
+
+      (and project-path source-root)
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/ambiguous-project-source}
 
       (and (nil? entry) (nil? project-path))
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/entry-required}
@@ -478,10 +483,13 @@
 
       :else
       (try
-        (let [project (when project-path (project-input project-path))
+        (let [manifest-project (when project-path (project-input project-path))
+              discovered-project (when source-root
+                                   (project-files/load-closed-graph entry source-root))
+              project (or manifest-project discovered-project)
               compiled (if project
                          (compiler/compile-project (:sources project) (:root project) target
-                                                   {} (:supply-chain project))
+                                                   {} (or (:supply-chain project) {}))
                          (compiler/compile-source (slurp entry) target))]
           (if (= target :js-kotoba-v1)
             (do
@@ -491,7 +499,8 @@
             (write-bytes! output (:bytes compiled)))
           {:kotoba.cli/ok? true :kotoba.cli/code :compile/emitted
            :kotoba.cli/data {:entry (or entry (:root project))
-                             :project project-path :output output :target target-name
+                             :project project-path :source-path source-root
+                             :output output :target target-name
                              :backend (if (= target :js-kotoba-v1)
                                         :kotoba-script :kotoba-wasm)
                              :manifest (:manifest compiled)
