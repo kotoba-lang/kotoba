@@ -1,24 +1,24 @@
 class Kotoba < Formula
   desc "Capability-safe Kotoba language compiler and CLI"
   homepage "https://github.com/kotoba-lang/kotoba"
-  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.1.tar.gz"
-  sha256 "bcb06b31fb01d015ccc7fc0c3085fdce26735fcfb7f30aa90f5c757bdd6a8138"
+  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.22.tar.gz"
+  sha256 "71bf92b90cd10c5bbaa990c992b769351810cc54d29107c1e4811b57f58c31e7"
   license "Apache-2.0"
 
   resource "binary" do
     on_macos do
       on_arm do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.1/kotoba-darwin-arm64.tar.gz"
-        sha256 "50c17d701f7a157ae065f5c104774acc80c0f229df45ed842da97ba7aeb4578b"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.22/kotoba-darwin-arm64.tar.gz"
+        sha256 "b985d1b81688a113daf134488d5d5904a791cd1f4a107ac9307aa6bd49b82582"
       end
       on_intel do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.1/kotoba-darwin-amd64.tar.gz"
-        sha256 "93491c872329be5607aae0a446a0bac30c7f6e58cb43e20ee60cd154bcc3651f"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.22/kotoba-darwin-amd64.tar.gz"
+        sha256 "1f5ca13d5981cf1b598460a584e093441ddd878280b18c15cda09595d7c94a91"
       end
     end
     on_linux do
-      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.1/kotoba-linux-amd64.tar.gz"
-      sha256 "08885fd9a6ba847b25cc6b85753298f6ba829fb2b7e016c9f137fc415ffa482d"
+      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.22/kotoba-linux-amd64.tar.gz"
+      sha256 "9d0280e0b8f44eaa0842b749bfa58ffa8d92465bc41d85080de69eaa3c8afdd2"
     end
   end
 
