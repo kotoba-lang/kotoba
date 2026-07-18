@@ -29,6 +29,6 @@ target/native/kotoba compile test/fixtures/source/web-string-library.kotoba --ta
   -o target/native/native-web-string.mjs --json >/dev/null
 node scripts/test-native-web-string.mjs target/native/native-web-string.mjs
 target/native/kotoba compile --project test/fixtures/project/kotoba-project.edn --target web \
-  -o target/native/native-web-project.mjs --json >/dev/null
+  -o target/native/native-web-project.mjs --json
 grep -q 'kotoba.artifact/module-graph-digest' target/native/native-web-project.mjs.manifest.edn
 node scripts/test-native-web-project.mjs target/native/native-web-project.mjs
