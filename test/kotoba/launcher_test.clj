@@ -101,7 +101,7 @@
     (is (re-find #"こんにちは" generated))
     (is (false? (:kotoba.cli/ok? wasm)))
     (is (= :compile/failed (:kotoba.cli/code wasm)))
-    (is (re-find #"typed string values currently require"
+    (is (re-find #"typed Wasm operation is not qualified"
                  (:kotoba.cli/message wasm)))))
 
 (deftest compile-closed-multi-module-kotoba-project
@@ -337,6 +337,11 @@
               :severity :error
               :source (.getName source)}
              (:kotoba.cli/diagnostic result)))
+      (let [wire (json/read-str rendered)]
+        (is (= "kotoba.diagnostic/v1"
+               (get-in wire ["kotoba.cli/diagnostic" "format"])))
+        (is (= "kotoba/runtime-rejected"
+               (get-in wire ["kotoba.cli/diagnostic" "code"]))))
       (is (not (re-find #"/var/|/tmp/|at kotoba|launcher.clj" rendered))))))
 
 (deftest loads-safe-analyzer-fact-seed-from-clj-resources

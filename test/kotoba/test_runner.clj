@@ -71,5 +71,4 @@
                                         'kotoba.wasm-and-or-when-test
                                         'kotoba.wasm-exec-test
                                         'kotoba.wasm-map-keyword-test)]
-    (when (pos? (+ (or fail 0) (or error 0)))
-      (System/exit 1))))
+    (System/exit (if (pos? (+ (or fail 0) (or error 0))) 1 0))))

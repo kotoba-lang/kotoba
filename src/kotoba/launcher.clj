@@ -70,10 +70,20 @@
   ([result] (render-result result false))
   ([result json-output?]
    (if json-output?
-     (json/write-str result :key-fn (fn [k]
+     (let [diagnostic-key :kotoba.cli/diagnostic
+           result (update result diagnostic-key
+                          (fn [diagnostic]
+                            (when diagnostic
+                              (into {}
+                                    (map (fn [[k v]]
+                                           [k (if (keyword? v)
+                                                (subs (str v) 1)
+                                                v)]))
+                                    diagnostic))))]
+       (json/write-str result :key-fn (fn [k]
                                       (if (keyword? k)
                                         (subs (str k) 1)
-                                        (str k))))
+                                        (str k)))))
      (pr-str result))))
 
 (defn command-name

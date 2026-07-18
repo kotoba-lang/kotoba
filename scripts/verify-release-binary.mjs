@@ -1,0 +1,71 @@
+#!/usr/bin/env node
+
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+
+const binary = resolve(process.argv[2] ?? "target/native/kotoba");
+const work = mkdtempSync(join(tmpdir(), "kotoba-release-"));
+
+function run(args, expectedStatus = 0) {
+  const result = spawnSync(binary, args, { encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== expectedStatus) {
+    throw new Error(
+      `${basename(binary)} ${args.join(" ")} exited ${result.status}\n${result.stdout}${result.stderr}`,
+    );
+  }
+  return `${result.stdout}${result.stderr}`;
+}
+
+try {
+  const binaryBytes = readFileSync(binary);
+  const magic = binaryBytes.subarray(0, 4).toString("hex");
+  const nativeMagic = new Set(["7f454c46", "feedfacf", "cffaedfe", "feedface", "cefaedfe"]);
+  if (!nativeMagic.has(magic) && binaryBytes.subarray(0, 2).toString("ascii") !== "MZ") {
+    throw new Error("release verifier requires a native executable, not a JVM or script launcher");
+  }
+
+  const extensionResults = {};
+  for (const extension of ["kotoba", "cljk", "cljc"]) {
+    const source = join(work, `portable.${extension}`);
+    writeFileSync(source, "(defn main [] (+ 40 2))\n");
+    const output = run(["run", source]);
+    if (!/(^|\D)42(\D|$)/.test(output)) {
+      throw new Error(`.${extension} did not evaluate the portable corpus to 42`);
+    }
+    extensionResults[extension] = "passed";
+  }
+
+  const forbidden = join(work, "forbidden-eval.kotoba");
+  writeFileSync(forbidden, "(defn main [] (eval '(+ 40 2)))\n");
+  const rejectionText = run(["run", forbidden, "--json"], 1).trim();
+  const rejection = JSON.parse(rejectionText);
+  const diagnostic = rejection["kotoba.cli/diagnostic"] ?? rejection.diagnostic;
+  if (diagnostic?.format !== "kotoba.diagnostic/v1" &&
+      diagnostic?.format !== ":kotoba.diagnostic/v1") {
+    throw new Error(`forbidden eval did not produce kotoba.diagnostic/v1: ${rejectionText}`);
+  }
+  if (rejectionText.includes(work)) {
+    throw new Error("structured rejection disclosed its absolute source path");
+  }
+
+  const binarySha256 = createHash("sha256").update(binaryBytes).digest("hex");
+  const evidence = {
+    schema: "kotoba.release-evidence/v1",
+    binary: basename(binary),
+    binarySha256,
+    runtime: "native-jvm-free",
+    sourceExtensions: extensionResults,
+    structuredRejection: "passed",
+  };
+  const evidenceDirectory = resolve("target/native");
+  mkdirSync(evidenceDirectory, { recursive: true });
+  const evidencePath = join(evidenceDirectory, "release-evidence.json");
+  writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(evidence)}\n`);
+} finally {
+  rmSync(work, { recursive: true, force: true });
+}
