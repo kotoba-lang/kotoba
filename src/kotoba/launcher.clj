@@ -503,6 +503,11 @@
                              :output output :target target-name
                              :backend (if (= target :js-kotoba-v1)
                                         :kotoba-script :kotoba-wasm)
+                             :value-profile (:value-profile compiled)
+                             :value-abi (:value-abi compiled)
+                             :wasm-features (:wasm-features compiled)
+                             :project-digest (:project-digest compiled)
+                             :compatibility (:compatibility compiled)
                              :manifest (:manifest compiled)
                              :package-receipt (:package-receipt project)}})
         (catch Exception error
