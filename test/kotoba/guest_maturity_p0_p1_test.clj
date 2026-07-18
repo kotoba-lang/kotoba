@@ -114,6 +114,7 @@
     (is (pos? (:total s)))
     (is (true? (:ok? s)) (str "ratio=" (:ratio s) " missing=" (:missing s)))
     (is (= :meets-threshold (:status r)))
+    (is (contains? #{:l5 :l5-partial} (:level r)))
     (is (some #(= :llm-infer (:import %)) (host-parity/matrix)))
     (is (some #(= :no (:browser %)) (host-parity/matrix))
         "honest gap: llm-infer browser absent")))

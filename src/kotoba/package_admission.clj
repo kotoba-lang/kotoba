@@ -57,6 +57,8 @@
    "signature bytes required" :package/signature-invalid
    "signature verification failed" :package/signature-verification-failed
    "manifest cid does not match manifest content" :package/manifest-cid-mismatch
+   "component cid required" :package/component-cid-required
+   "component cid does not match component content" :package/component-cid-mismatch
    local-path-message :package/local-path-dependency})
 
 (defn problem-code
@@ -236,10 +238,17 @@
 
 (defn dep-error
   "First problem for a single lock entry: admission-layer safe-mode checks,
-  then the package-contract lockfile kernel."
-  [dep trust]
-  (or (local-path-error dep)
-      (package-contract/lockfile-error {:kotoba.lock/version 1 :deps [dep]} trust)))
+  then the package-contract lockfile kernel.
+
+  OPTS may carry `:component-bytes` for L3 component-cid content integrity."
+  ([dep trust] (dep-error dep trust nil))
+  ([dep trust {:keys [component-bytes]}]
+   (or (local-path-error dep)
+       (package-contract/lockfile-error
+        {:kotoba.lock/version 1 :deps [dep]}
+        trust
+        (when component-bytes
+          {:component-bytes-by-dep {(:dep/name dep) component-bytes}})))))
 
 (defn ->problem
   [source error]
@@ -250,11 +259,15 @@
 
 (defn dep-entry
   [dep error]
-  {:package/id (str (:dep/name dep) "@" (:dep/version dep))
-   :package/repo-rid (:dep/repo-rid dep)
-   :package/manifest-cid (:dep/manifest-cid dep)
-   :package/tree-cid (:dep/tree-cid dep)
-   :package/result (if error :rejected :accepted)})
+  (cond-> {:package/id (str (:dep/name dep) "@" (:dep/version dep))
+           :package/repo-rid (:dep/repo-rid dep)
+           :package/manifest-cid (:dep/manifest-cid dep)
+           :package/tree-cid (:dep/tree-cid dep)
+           :package/result (if error :rejected :accepted)}
+    (:dep/kind dep) (assoc :package/kind (:dep/kind dep))
+    (package-contract/component-cid-of dep)
+    (assoc :package/component-cid (package-contract/component-cid-of dep)
+           :package/build (:dep/build dep))))
 
 (defn checked-at []
   (str (Instant/now)))
@@ -262,8 +275,11 @@
 (defn verify-lock
   "Verify a parsed lock (plus optional parsed manifest and trust EDN) and
   return the package-verification receipt. The receipt is emitted on both
-  accept and reject."
-  [{:keys [lock lock-path manifest manifest-path trust]}]
+  accept and reject.
+
+  OPTS may carry `:component-bytes-by-dep` {dep-name bytes} for L3 component
+  content integrity (CID guest packages)."
+  [{:keys [lock lock-path manifest manifest-path trust component-bytes-by-dep]}]
   (let [tc (trust-context trust manifest)
         manifest-error (when manifest (package-contract/package-manifest-error manifest))
         ;; Only check integrity once the shape check passed -- a missing or
@@ -272,7 +288,12 @@
         integrity-error (when (and manifest (not manifest-error))
                           (manifest-integrity-error manifest))
         lock-error (lock-level-error lock)
-        dep-results (mapv (fn [dep] [dep (dep-error dep tc)]) (:deps lock))
+        dep-results (mapv (fn [dep]
+                            [dep (dep-error dep tc
+                                            {:component-bytes
+                                             (get component-bytes-by-dep
+                                                  (:dep/name dep))})])
+                          (:deps lock))
         problems (vec (concat
                        (when manifest-error
                          [(->problem {:kotoba.package/input :manifest
@@ -298,6 +319,59 @@
      :kotoba.package/checked-at (checked-at)
      :kotoba.package/problems problems
      :kotoba.package/entries (mapv (fn [[dep error]] (dep-entry dep error)) dep-results)}))
+
+(defn compute-component-cid
+  "CIDv1-raw of COMPONENT-BYTES — the pin used for :dep/component-cid on
+  guest component packages (L3, ADR-2607180900)."
+  [component-bytes]
+  (mf/cidv1-raw component-bytes))
+
+(defn guest-package-dep
+  "Build a lock-entry map for a closed CID guest package (not ambient require).
+
+  Requires name/version/repo-rid/commit/tree-cid/manifest-cid/signers plus a
+  real component-cid over COMPONENT-BYTES. Kind defaults to :component.
+  Capabilities default to [] (deny-by-default)."
+  [{:keys [name version repo-rid commit tree-cid manifest-cid signers
+           component-bytes capabilities kind ref]
+    :or {capabilities [] kind :component ref "refs/heads/main"}}]
+  (let [component-cid (compute-component-cid component-bytes)]
+    {:dep/name name
+     :dep/version version
+     :dep/kind kind
+     :dep/repo-rid repo-rid
+     :dep/ref ref
+     :dep/commit commit
+     :dep/tree-cid tree-cid
+     :dep/manifest-cid manifest-cid
+     :dep/signers (vec signers)
+     :dep/capabilities (vec capabilities)
+     :dep/component-cid component-cid
+     :dep/build {:deterministic true
+                 :component-cid component-cid}}))
+
+(defn admit-guest-component
+  "L3: admit a single closed guest component package (CID-pinned, no require).
+  COMPONENT-BYTES are the built artifact (wasm / sealed graph payload).
+  Returns the same shape as `admit` over an in-memory lock."
+  [{:keys [name version repo-rid commit tree-cid manifest-cid signers
+           component-bytes capabilities trust]}]
+  (let [dep (guest-package-dep
+             {:name name :version version :repo-rid repo-rid :commit commit
+              :tree-cid tree-cid :manifest-cid manifest-cid :signers signers
+              :component-bytes component-bytes :capabilities capabilities})
+        lock {:kotoba.lock/version 1 :deps [dep]}
+        receipt (verify-lock
+                 {:lock lock
+                  :lock-path "<guest-component>"
+                  :trust trust
+                  :component-bytes-by-dep {name component-bytes}})]
+    {:kotoba.admission/ok? (:kotoba.package/verified? receipt)
+     :kotoba.admission/code (if (:kotoba.package/verified? receipt)
+                              :package-verified
+                              :package-rejected)
+     :kotoba.admission/receipt receipt
+     :kotoba.admission/dep dep}))
 
 ;; ---------------------------------------------------------------------------
 ;; File-level admission
@@ -394,25 +468,45 @@
                         (assoc :kotoba.package/error (:kotoba.admission/error admission)))}))
 
 (defn safe-release-ready?
-  "F-001 / F-007 partial: a safe release may proceed only when a package-
-  verification receipt exists and is verified."
-  [receipt]
-  (cond
-    (nil? receipt)
-    {:ok? false
-     :problems [{:kotoba.package/problem :package/missing-receipt
-                 :kotoba.package/message "package verification receipt required for safe release"}]}
+  "F-001 / F-007 partial + L3: a safe release may proceed only when a package-
+  verification receipt exists, is verified, and carries no reject entries.
+  Optional `:require-component-cid?` (default false) additionally demands
+  every accepted entry pin a component-cid (guest component packages)."
+  ([receipt] (safe-release-ready? receipt nil))
+  ([receipt {:keys [require-component-cid?] :or {require-component-cid? false}}]
+   (cond
+     (nil? receipt)
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/missing-receipt
+                  :kotoba.package/message "package verification receipt required for safe release"}]}
 
-    (not (map? receipt))
-    {:ok? false
-     :problems [{:kotoba.package/problem :package/invalid-receipt
-                 :kotoba.package/message "receipt must be a map"}]}
+     (not (map? receipt))
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/invalid-receipt
+                  :kotoba.package/message "receipt must be a map"}]}
 
-    (not (true? (:kotoba.package/verified? receipt)))
-    {:ok? false
-     :problems (into [{:kotoba.package/problem :package/not-verified
-                       :kotoba.package/message "receipt is not verified"}]
-                     (:kotoba.package/problems receipt))}
+     (not (true? (:kotoba.package/verified? receipt)))
+     {:ok? false
+      :problems (into [{:kotoba.package/problem :package/not-verified
+                        :kotoba.package/message "receipt is not verified"}]
+                      (:kotoba.package/problems receipt))}
 
-    :else
-    {:ok? true :problems []}))
+     (some #(= :rejected (:package/result %)) (:kotoba.package/entries receipt))
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/rejected-entry
+                  :kotoba.package/message "receipt contains rejected package entries"}]}
+
+     (and require-component-cid?
+          (let [entries (:kotoba.package/entries receipt)]
+            (or (empty? entries)
+                (some (fn [e]
+                        (not (package-contract/cid?
+                              (or (:package/component-cid e)
+                                  (get-in e [:package/build :component-cid])))))
+                      entries))))
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/component-cid-required
+                  :kotoba.package/message "safe release of component packages requires component-cid pins"}]}
+
+     :else
+     {:ok? true :problems []})))
