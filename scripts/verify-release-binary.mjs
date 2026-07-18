@@ -72,6 +72,47 @@ try {
     );
   }
 
+  const projectRoot = join(work, "project-src");
+  const projectNamespace = join(projectRoot, "release", "probe");
+  mkdirSync(projectNamespace, { recursive: true });
+  const projectDependency = join(projectNamespace, "value.cljc");
+  const projectEntry = join(projectNamespace, "app.cljc");
+  const projectOutput = join(work, "project-probe.mjs");
+  writeFileSync(
+    projectDependency,
+    "(ns release.probe.value (:export [answer]))\n(defn answer [] 42)\n",
+  );
+  writeFileSync(
+    projectEntry,
+    "(ns release.probe.app\n" +
+      "  (:require [release.probe.value :as value])\n" +
+      "  (:export [main]))\n" +
+      "(defn main [] (value/answer))\n",
+  );
+  run([
+    "compile",
+    projectEntry,
+    "--source-path",
+    projectRoot,
+    "--target",
+    "web",
+    "--output",
+    projectOutput,
+  ]);
+  const projectProbe = spawnSync(
+    "node",
+    [
+      "--input-type=module",
+      "-e",
+      `import(${JSON.stringify(pathToFileURL(projectOutput).href)}).then(m=>{if(m.instantiateKotoba({}).main()!==42n)process.exit(2)})`,
+    ],
+    { encoding: "utf8" },
+  );
+  if (projectProbe.error) throw projectProbe.error;
+  if (projectProbe.status !== 0) {
+    throw new Error(`closed .cljc project probe failed: ${projectProbe.stdout}${projectProbe.stderr}`);
+  }
+
   const forbidden = join(work, "forbidden-eval.kotoba");
   writeFileSync(forbidden, "(defn main [] (eval '(+ 40 2)))\n");
   const rejectionText = run(["run", forbidden, "--json"], 1).trim();
@@ -93,6 +134,7 @@ try {
     runtime: "native-jvm-free",
     sourceExtensions: extensionResults,
     syntaxAwareAuthorityNames: "passed",
+    closedCljcProjectSourcePath: "passed",
     structuredRejection: "passed",
   };
   const evidenceDirectory = resolve("target/native");
