@@ -129,11 +129,13 @@
 
 (defn local-policy
   "kotoba.lang.capability-values local policy derived from the launcher
-  policy EDN."
+  policy EDN. Propagates :kotoba.policy/forbid-wildcard (S4b least-privilege)."
   [policy]
-  {:policy/allow
-   (into {} (for [[kind cap-name] (granted-kinds policy)]
-              [kind (resource-scope policy cap-name)]))})
+  (cond-> {:policy/allow
+           (into {} (for [[kind cap-name] (granted-kinds policy)]
+                      [kind (resource-scope policy cap-name)]))}
+    (true? (get policy :kotoba.policy/forbid-wildcard))
+    (assoc :policy/forbid-wildcard true)))
 
 (defn grants->policy
   "Launcher policy EDN synthesized from externally supplied (CACAO chain)
