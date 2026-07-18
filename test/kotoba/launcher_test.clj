@@ -123,6 +123,58 @@
       (is (= :project-manifest (get-in escaped [:kotoba.cli/data :phase])))
       (is (= :compile/ambiguous-input (:kotoba.cli/code ambiguous))))))
 
+(deftest project-compile-rejects-non-utf8-module-bytes
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-utf8" (make-array java.nio.file.attribute.FileAttribute 0)))
+        source (io/file directory "app.kotoba")
+        manifest (io/file directory "kotoba-project.edn")]
+    (java.nio.file.Files/write (.toPath source)
+                               (byte-array [(unchecked-byte 0xc3) (unchecked-byte 0x28)])
+                               (make-array java.nio.file.OpenOption 0))
+    (spit manifest (pr-str {:kotoba.project/root 'example.app
+                            :kotoba.project/modules {'example.app "app.kotoba"}}))
+    (let [result (launcher/dispatch ["compile" "--project" (.getPath manifest)
+                                     "--target" "web"])]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= :compile/failed (:kotoba.cli/code result)))
+      (is (= :project-manifest (get-in result [:kotoba.cli/data :phase])))
+      (is (re-find #"strict UTF-8" (:kotoba.cli/message result))))))
+
+(deftest project-compile-rejects-tagged-manifest-values
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-tag" (make-array java.nio.file.attribute.FileAttribute 0)))
+        manifest (io/file directory "kotoba-project.edn")]
+    (spit manifest "{:kotoba.project/root #evil/value example.app :kotoba.project/modules {}}")
+    (let [result (launcher/dispatch ["compile" "--project" (.getPath manifest)
+                                     "--target" "web"])]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= :compile/failed (:kotoba.cli/code result)))
+      (is (= :project-manifest (get-in result [:kotoba.cli/data :phase])))
+      (is (re-find #"tagged project manifest" (:kotoba.cli/message result))))))
+
+(deftest project-compile-rejects-symbolic-link-module
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-symlink" (make-array java.nio.file.attribute.FileAttribute 0)))
+        target (io/file directory "real.kotoba")
+        link (io/file directory "app.kotoba")
+        manifest (io/file directory "kotoba-project.edn")]
+    (spit target "(ns example.app (:export [answer])) (defn answer [] 42)")
+    (spit manifest (pr-str {:kotoba.project/root 'example.app
+                            :kotoba.project/modules {'example.app "app.kotoba"}}))
+    (try
+      (java.nio.file.Files/createSymbolicLink
+       (.toPath link) (.toPath target) (make-array java.nio.file.attribute.FileAttribute 0))
+      (let [result (launcher/dispatch ["compile" "--project" (.getPath manifest)
+                                       "--target" "web"])]
+        (is (false? (:kotoba.cli/ok? result)))
+        (is (= :compile/failed (:kotoba.cli/code result)))
+        (is (= :project-manifest (get-in result [:kotoba.cli/data :phase])))
+        (is (re-find #"symbolic link" (:kotoba.cli/message result))))
+      (catch java.lang.UnsupportedOperationException _
+        (is true "symbolic links unsupported on this filesystem"))
+      (catch java.nio.file.FileSystemException _
+        (is true "symbolic links unavailable to this test process")))))
+
 (deftest compile-cljc-selects-kotoba-reader-branch
   (let [source (doto (java.io.File/createTempFile "kotoba-portable" ".cljc")
                  (.deleteOnExit))
