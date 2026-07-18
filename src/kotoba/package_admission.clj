@@ -25,6 +25,7 @@
             [clojure.pprint :as pprint]
             [clojure.set :as set]
             [clojure.string :as str]
+            [kotoba.compiler.artifact :as artifact]
             [kotoba.lang.package-contract :as package-contract]
             [kotoba.lang.package-registry :as package-registry]
             [multiformats.core :as mf])
@@ -409,7 +410,7 @@
            :kotoba.package/dependency-manifest-digests
            (into (sorted-map)
                  (map (fn [[name manifest]]
-                        [name (sha256-bytes (cbor/encode manifest))]))
+                        [name (artifact/sha256 manifest)]))
                  dependency-manifests))))
 
 (defn receipt-evidence
@@ -423,7 +424,11 @@
    :kotoba.package/problems (:kotoba.package/problems receipt)})
 
 (defn receipt-digest [receipt]
-  (sha256-bytes (cbor/encode (receipt-evidence receipt))))
+  ;; Use the compiler's already-native-verified canonical EDN hash here. DAG-
+  ;; CBOR remains authoritative for package CIDs, but receipt evidence is a
+  ;; distinct versioned schema and must not introduce a second runtime codec
+  ;; initialization path into the Graal launcher.
+  (artifact/sha256 (receipt-evidence receipt)))
 
 (defn compute-component-cid
   "CIDv1-raw of COMPONENT-BYTES — the pin used for :dep/component-cid on
