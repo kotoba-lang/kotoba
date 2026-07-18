@@ -76,7 +76,8 @@
         output (io/file directory "app.mjs")]
     (.mkdirs (.getParentFile dependency))
     (spit dependency
-          "(ns shared.value (:export [answer])) (defn answer [] 42)")
+          "(ns shared.value \"bounded project documentation\" (:export [answer]))
+           (defn answer [] 42)")
     (spit app
           "(ns shared.app (:require [shared.value :as value]) (:export [main]))
            (defn main [] (value/answer))")
