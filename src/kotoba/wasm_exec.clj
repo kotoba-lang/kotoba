@@ -14,6 +14,17 @@
   surface in its own runtime; this namespace is the JVM one, used here to
   prove — not just assert — that emitted modules run.
 
+  Not a duplicate of `kotoba-lang/kototama`'s `kototama.tender` (also
+  JVM/Chicory): that is a *separate* repo's production/compat runtime,
+  hosting already-emitted `.wasm` under capability grants `aiueos` decides
+  (per that repo's own README, its own JVM/Chicory tender is itself
+  'compat / CI, not primary' relative to native WASM AOT execution).
+  This namespace exists so `kotoba-lang/kotoba`'s own emit path (`kotoba.runtime`)
+  can prove its own output runs, in this repo's own test suite, without a
+  cross-repo test dependency on kototama. See
+  com-junkawasaki/root ADR-2607182200 for the full cross-repo dependency
+  graph and why these two are not considered the same thing to consolidate.
+
   Runtime capability enforcement (ADR-2607050500): `kotoba.runtime/check`
   only refuses to EMIT a host import a compile-time policy doesn't allow —
   it says nothing about what actually happens when the resulting bytes are
