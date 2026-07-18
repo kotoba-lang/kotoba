@@ -191,7 +191,11 @@ the filesystem or delegates module lookup to JavaScript:
 {:kotoba.project/root example.app
  :kotoba.project/modules
  {example.app "src/example/app.kotoba"
-  example.text "src/example/text.kotoba"}}
+  example.text "src/example/text.kotoba"}
+ :kotoba.project/package-lock "kotoba.lock.edn"
+ :kotoba.project/trust "kotoba.trust.edn"
+ :kotoba.project/dependency-manifests
+ {"kotoba-lang/text" "deps/text/package.edn"}}
 ```
 
 Module paths must be relative `.kotoba` files contained beneath the manifest
@@ -199,7 +203,15 @@ directory. Source namespaces use alias-only dependencies such as
 `(:require [example.text :as text])`. Missing/private imports, cycles, path
 escape, `:refer`, and undeclared runtime loading fail before KIR emission. The
 output manifest includes the exact SHA-256 of every reachable source and the
-canonical module-graph digest.
+canonical module-graph digest. Project check/compile additionally require a
+package lock and trust policy. Every locked dependency requires one signed,
+CID-valid manifest whose name, version, repository identity, commit, tree CID,
+manifest CID, capabilities, and exact signer set match its lock entry. Signers
+must be explicitly allowlisted by the trust policy. The package-lock, trust-
+policy, and deterministic verification-receipt SHA-256 identities are frozen
+into both generated ESM and its sidecar; partial supply-chain metadata cannot
+reach emission. A dependency-free project still declares an empty versioned
+lock, an explicit trust file, and an empty dependency-manifest map.
 
 `--package-lock` is mandatory for `wasm emit`, `wasm run`, and `cljs emit`: the
 package admission gate always runs first, and a missing or rejected lock aborts

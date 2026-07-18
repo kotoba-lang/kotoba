@@ -23,11 +23,19 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
+            [clojure.set :as set]
             [clojure.string :as str]
             [kotoba.lang.package-contract :as package-contract]
             [kotoba.lang.package-registry :as package-registry]
             [multiformats.core :as mf])
   (:import [java.time Instant]))
+
+(defn sha256-bytes [^bytes bytes]
+  (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-256") bytes)]
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest))))
+
+(defn sha256-text [text]
+  (sha256-bytes (.getBytes ^String text java.nio.charset.StandardCharsets/UTF_8)))
 
 (def local-path-message
   "local-path dependency not allowed in safe mode")
@@ -60,6 +68,10 @@
    "manifest cid does not match manifest content" :package/manifest-cid-mismatch
    "component cid required" :package/component-cid-required
    "component cid does not match component content" :package/component-cid-mismatch
+   "dependency manifest required" :package/dependency-manifest-required
+   "unexpected dependency manifest" :package/unexpected-dependency-manifest
+   "dependency manifest does not match lock entry" :package/dependency-manifest-mismatch
+   "dependency signer is not explicitly trusted" :package/signer-not-trusted
    local-path-message :package/local-path-dependency})
 
 (defn problem-code
@@ -320,6 +332,98 @@
      :kotoba.package/checked-at (checked-at)
      :kotoba.package/problems problems
      :kotoba.package/entries (mapv (fn [[dep error]] (dep-entry dep error)) dep-results)}))
+
+(defn- dependency-manifest-mismatch [dep manifest]
+  (let [manifest-signers (set (map :did (:kotoba.package/signatures manifest)))
+        expected {:name (:dep/name dep)
+                  :version (:dep/version dep)
+                  :repo-rid (:dep/repo-rid dep)
+                  :commit (:dep/commit dep)
+                  :tree-cid (:dep/tree-cid dep)
+                  :manifest-cid (:dep/manifest-cid dep)
+                  :capabilities (set (:dep/capabilities dep))
+                  :signers (set (:dep/signers dep))}
+        actual {:name (:kotoba.package/name manifest)
+                :version (:kotoba.package/version manifest)
+                :repo-rid (:kotoba.package/repo-rid manifest)
+                :commit (get-in manifest [:kotoba.package/source :git-commit])
+                :tree-cid (get-in manifest [:kotoba.package/source :tree-cid])
+                :manifest-cid (get-in manifest [:kotoba.package/source :manifest-cid])
+                :capabilities (set (:kotoba.package/capabilities manifest))
+                :signers manifest-signers}]
+    (when-not (= expected actual)
+      (package-contract/invalid "dependency manifest does not match lock entry"
+                                {:expected expected :actual actual}))))
+
+(defn verify-project-lock
+  "Strict closed-project package verification. Every lock dependency must have
+  exactly one cryptographically valid manifest, its identity/interface fields
+  must equal the lock entry, and every signer must be explicitly allowlisted by
+  the trust policy. Extra manifests fail closed."
+  [{:keys [lock lock-path trust dependency-manifests dependency-manifest-paths]}]
+  (let [base (verify-lock {:lock lock :lock-path lock-path :trust trust})
+        deps-by-name (into {} (map (juxt :dep/name identity)) (:deps lock))
+        manifest-names (set (keys dependency-manifests))
+        dep-names (set (keys deps-by-name))
+        trusted (set (:trusted-signers trust))
+        missing (sort (set/difference dep-names manifest-names))
+        extra (sort (set/difference manifest-names dep-names))
+        manifest-problems
+        (vec
+         (concat
+          (map (fn [name]
+                 (->problem {:kotoba.package/input :dependency-manifest
+                             :kotoba.package/dependency name}
+                            (package-contract/invalid "dependency manifest required"
+                                                      {:dependency name})))
+               missing)
+          (map (fn [name]
+                 (->problem {:kotoba.package/input :dependency-manifest
+                             :kotoba.package/dependency name}
+                            (package-contract/invalid "unexpected dependency manifest"
+                                                      {:dependency name})))
+               extra)
+          (keep
+           (fn [name]
+             (let [dep (get deps-by-name name)
+                   manifest (get dependency-manifests name)
+                   error (or (package-contract/package-manifest-error manifest)
+                             (manifest-integrity-error manifest)
+                             (dependency-manifest-mismatch dep manifest)
+                             (when-let [untrusted
+                                        (seq (set/difference
+                                              (set (:dep/signers dep)) trusted))]
+                               (package-contract/invalid
+                                "dependency signer is not explicitly trusted"
+                                {:dependency name :signers (vec (sort untrusted))})))]
+               (when error
+                 (->problem {:kotoba.package/input :dependency-manifest
+                             :kotoba.package/dependency name
+                             :kotoba.package/path (get dependency-manifest-paths name)}
+                            error))))
+           (sort (set/intersection dep-names manifest-names)))))
+        problems (into (:kotoba.package/problems base) manifest-problems)]
+    (assoc base
+           :kotoba.package/verified? (empty? problems)
+           :kotoba.package/problems problems
+           :kotoba.package/dependency-manifest-digests
+           (into (sorted-map)
+                 (map (fn [[name manifest]]
+                        [name (sha256-bytes (cbor/encode manifest))]))
+                 dependency-manifests))))
+
+(defn receipt-evidence
+  "Deterministic, path/time-free receipt value sealed into build identity."
+  [receipt]
+  {:kotoba.package/schema :kotoba.package/verification-evidence-v1
+   :kotoba.package/verified? (:kotoba.package/verified? receipt)
+   :kotoba.package/entries (vec (sort-by :package/id (:kotoba.package/entries receipt)))
+   :kotoba.package/dependency-manifest-digests
+   (:kotoba.package/dependency-manifest-digests receipt)
+   :kotoba.package/problems (:kotoba.package/problems receipt)})
+
+(defn receipt-digest [receipt]
+  (sha256-bytes (cbor/encode (receipt-evidence receipt))))
 
 (defn compute-component-cid
   "CIDv1-raw of COMPONENT-BYTES — the pin used for :dep/component-cid on

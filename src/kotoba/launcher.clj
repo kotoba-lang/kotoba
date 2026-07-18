@@ -337,11 +337,60 @@
                   manifest-text)
         root (:kotoba.project/root manifest)
         modules (:kotoba.project/modules manifest)
+        lock-relative (:kotoba.project/package-lock manifest)
+        trust-relative (:kotoba.project/trust manifest)
+        dependency-manifest-relatives (:kotoba.project/dependency-manifests manifest)
         base-file manifest-base
-        _ (when-not (and (simple-symbol? root) (map? modules)
+        _ (when-not (and (= #{:kotoba.project/root :kotoba.project/modules
+                              :kotoba.project/package-lock :kotoba.project/trust
+                              :kotoba.project/dependency-manifests}
+                            (set (keys manifest)))
+                         (simple-symbol? root) (map? modules)
                          (pos? (count modules)) (<= (count modules) 256))
             (throw (ex-info "invalid closed Kotoba project manifest"
                             {:phase :project-manifest})))
+        _ (when-not (and (string? lock-relative) (string? trust-relative)
+                         (map? dependency-manifest-relatives)
+                         (every? string? (keys dependency-manifest-relatives))
+                         (every? string? (vals dependency-manifest-relatives)))
+            (throw (ex-info "project package lock, trust, and dependency manifests are required"
+                            {:phase :project-manifest
+                             :reason :missing-supply-chain-input})))
+        read-edn (fn [relative input]
+                   (let [text (read-stable-file base-file relative (* 1024 1024)
+                                                {:input input})]
+                     {:text text
+                      :value (edn/read-string
+                              {:readers {}
+                               :default (fn [tag _]
+                                          (reject-project-file!
+                                           "tagged project supply-chain value rejected"
+                                           {:input input :tag tag}))}
+                              text)}))
+        lock-input (read-edn lock-relative :package-lock)
+        trust-input (read-edn trust-relative :trust-policy)
+        dependency-inputs
+        (into {}
+              (map (fn [[name relative]]
+                     [name (read-edn relative :dependency-manifest)]))
+              dependency-manifest-relatives)
+        package-receipt
+        (package-admission/verify-project-lock
+         {:lock (:value lock-input)
+          :lock-path lock-relative
+          :trust (:value trust-input)
+          :dependency-manifests
+          (into {} (map (fn [[name input]] [name (:value input)])) dependency-inputs)
+          :dependency-manifest-paths dependency-manifest-relatives})
+        _ (when-not (:kotoba.package/verified? package-receipt)
+            (throw (ex-info "closed project package admission rejected"
+                            {:phase :package-admission
+                             :reason :package-rejected
+                             :problems (:kotoba.package/problems package-receipt)})))
+        supply-chain
+        {:package-lock-digest (package-admission/sha256-text (:text lock-input))
+         :trust-policy-digest (package-admission/sha256-text (:text trust-input))
+         :package-receipt-digest (package-admission/receipt-digest package-receipt)}
         sources
         (into {}
               (map (fn [[namespace relative]]
@@ -353,7 +402,8 @@
                      [namespace (read-stable-file base-file relative (* 1024 1024)
                                                   {:input :module :module namespace})]))
               modules)]
-    {:root root :sources sources :manifest (.getPath manifest-file)}))
+    {:root root :sources sources :manifest (.getPath manifest-file)
+     :supply-chain supply-chain :package-receipt package-receipt}))
 
 (defn compile-result
   "Compile Kotoba-owned source through kotoba-lang/compiler. Web output is
@@ -395,7 +445,8 @@
       (try
         (let [project (when project-path (project-input project-path))
               compiled (if project
-                         (compiler/compile-project (:sources project) (:root project) target)
+                         (compiler/compile-project (:sources project) (:root project) target
+                                                   {} (:supply-chain project))
                          (compiler/compile-source (slurp entry) target))]
           (if (= target :js-kotoba-v1)
             (do
@@ -408,12 +459,13 @@
                              :project project-path :output output :target target-name
                              :backend (if (= target :js-kotoba-v1)
                                         :kotoba-script :kotoba-wasm)
-                             :manifest (:manifest compiled)}})
+                             :manifest (:manifest compiled)
+                             :package-receipt (:package-receipt project)}})
         (catch Exception error
           {:kotoba.cli/ok? false :kotoba.cli/code :compile/failed
            :kotoba.cli/message (ex-message error)
            :kotoba.cli/data (select-keys (ex-data error)
-                                         [:phase :reason :target :module :dependency])})))))
+                                         [:phase :reason :target :module :dependency :problems])})))))
 
 (defn project-check-result
   "Check a closed Kotoba project through the exact compiler path used by
@@ -438,7 +490,8 @@
       :else
       (try
         (let [project (project-input project-path)
-              compiled (compiler/compile-project (:sources project) (:root project) target)]
+              compiled (compiler/compile-project (:sources project) (:root project) target
+                                                  {} (:supply-chain project))]
           {:kotoba.cli/ok? true :kotoba.cli/code :check/project-valid
            :kotoba.cli/data {:entry (:root project) :project project-path
                              :target target-name
@@ -448,12 +501,13 @@
                              :module-order (get-in compiled [:project :kotoba.module/order])
                              :module-source-digests
                              (get-in compiled [:project :kotoba.module/source-digests])
-                             :manifest (:manifest compiled)}})
+                             :manifest (:manifest compiled)
+                             :package-receipt (:package-receipt project)}})
         (catch Exception error
           {:kotoba.cli/ok? false :kotoba.cli/code :check/project-invalid
            :kotoba.cli/message (ex-message error)
            :kotoba.cli/data (select-keys (ex-data error)
-                                         [:phase :reason :target :module :dependency])})))))
+                                         [:phase :reason :target :module :dependency :problems])})))))
 
 (defn resource-edn
   "Load an EDN resource by classpath path."
