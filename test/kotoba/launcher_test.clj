@@ -66,6 +66,30 @@
       (is (re-find #"kotoba-js-artifact/v1" (slurp (str (.getPath output) ".manifest.edn"))))
       (is (re-find #"export" (slurp output))))))
 
+(deftest compile-cljc-source-path-uses-the-closed-project-linker
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-cljc-source-path"
+                            (make-array java.nio.file.attribute.FileAttribute 0)))
+        dependency (io/file directory "shared/value.cljc")
+        app (io/file directory "shared/app.cljc")
+        output (io/file directory "app.mjs")]
+    (.mkdirs (.getParentFile dependency))
+    (spit dependency
+          "(ns shared.value (:export [answer])) (defn answer [] 42)")
+    (spit app
+          "(ns shared.app (:require [shared.value :as value]) (:export [main]))
+           (defn main [] (value/answer))")
+    (let [result (launcher/dispatch
+                  ["compile" (.getPath app) "--source-path" (.getPath directory)
+                   "--target" "web" "--output" (.getPath output)])]
+      (is (:kotoba.cli/ok? result))
+      (is (= (.getPath directory)
+             (get-in result [:kotoba.cli/data :source-path])))
+      (is (= #{'shared.app 'shared.value}
+             (set (keys (get-in result [:kotoba.cli/data :manifest
+                                        :kotoba.artifact/module-source-digests])))))
+      (is (re-find #"export" (slurp output))))))
+
 (deftest compile-web-allows-safe-identifiers-containing-ambient-names
   (let [source (doto (java.io.File/createTempFile "kotoba-window-name" ".kotoba")
                  (.deleteOnExit))
