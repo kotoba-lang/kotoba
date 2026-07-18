@@ -104,6 +104,8 @@
       (is (= :kotoba-script (get-in result [:kotoba.cli/data :backend])))
       (is (= 'example.app (get-in result [:kotoba.cli/data :entry])))
       (is (re-find #"こんにちは" generated))
+      (is (re-find #"moduleGraphDigest:\"[0-9a-f]{64}\"" generated))
+      (is (re-find #"moduleSourceDigests:Object.freeze" generated))
       (is (string? (:kotoba.artifact/module-graph-digest artifact-manifest)))
       (is (= #{'example.app 'example.text}
              (set (keys (:kotoba.artifact/module-source-digests artifact-manifest))))))))
