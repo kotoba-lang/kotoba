@@ -32,3 +32,10 @@ target/native/kotoba compile --project test/fixtures/project/kotoba-project.edn 
   -o target/native/native-web-project.mjs --json
 grep -q 'kotoba.artifact/module-graph-digest' target/native/native-web-project.mjs.manifest.edn
 node scripts/test-native-web-project.mjs target/native/native-web-project.mjs
+target/native/kotoba check --project test/fixtures/project-signed/kotoba-project.edn \
+  --target web --json >/dev/null
+target/native/kotoba compile --project test/fixtures/project-signed/kotoba-project.edn \
+  --target web -o target/native/native-web-signed-project.mjs --json
+grep -q 'kotoba.artifact/package-receipt-digest' \
+  target/native/native-web-signed-project.mjs.manifest.edn
+node scripts/test-native-web-project.mjs target/native/native-web-signed-project.mjs

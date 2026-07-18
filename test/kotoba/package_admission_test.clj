@@ -57,6 +57,30 @@
    :dep/signers (mapv :did (:kotoba.package/signatures manifest))
    :dep/capabilities (:kotoba.package/capabilities manifest)})
 
+(defn- reseal-and-sign [manifest]
+  (let [unsigned (dissoc manifest :kotoba.package/signatures)
+        resealed (assoc-in unsigned [:kotoba.package/source :manifest-cid]
+                           (admission/compute-manifest-cid unsigned))]
+    (resign resealed)))
+
+(defn- project-verification [manifests dep-overrides]
+  (let [deps (mapv (fn [manifest]
+                     (merge (manifest->dep manifest)
+                            (get dep-overrides (:kotoba.package/name manifest))))
+                   manifests)]
+    (admission/verify-project-lock
+     {:lock {:kotoba.lock/version 1 :deps deps}
+      :lock-path "kotoba.lock.edn"
+      :trust {:declared-capabilities [:graph-read :graph-write :network/admin]
+              :trusted-signers (set (mapcat :dep/signers deps))}
+      :dependency-manifests
+      (into {} (map (juxt :kotoba.package/name identity)) manifests)
+      :dependency-manifest-paths
+      (into {} (map (fn [manifest]
+                      [(:kotoba.package/name manifest)
+                       (str (:kotoba.package/name manifest) ".edn")]))
+            manifests)})))
+
 ;; ---------------------------------------------------------------------------
 ;; Positive admission
 
@@ -115,6 +139,106 @@
                         :kotoba.package/lock-path "/different/root/lock.edn")]
         (is (= (admission/receipt-digest verified)
                (admission/receipt-digest same)))))))
+
+(deftest closed-project-capabilities-are-lock-grants-bounded-by-signed-requests
+  (let [base (edn/read-string (slurp positive-manifest))
+        manifest (reseal-and-sign
+                  (assoc base :kotoba.package/capabilities
+                         [:graph-read :graph-write]))
+        name (:kotoba.package/name manifest)
+        narrowed (project-verification [manifest]
+                                       {name {:dep/capabilities [:graph-read]}})
+        excessive (project-verification [manifest]
+                                        {name {:dep/capabilities
+                                               [:graph-read :graph-write :network/admin]}})]
+    (is (true? (:kotoba.package/verified? narrowed))
+        "the lock may safely grant a strict subset of the signed request")
+    (is (= :package/capability-exceeds-manifest
+           (get-in excessive
+                   [:kotoba.package/problems 0 :kotoba.package/problem])))
+    (is (= {:dependency name
+            :grant [:graph-read :graph-write :network/admin]
+            :requested [:graph-read :graph-write]}
+           (get-in excessive
+                   [:kotoba.package/problems 0 :kotoba.package/data])))))
+
+(deftest closed-project-validates-signed-transitive-dependency-closure
+  (let [base (edn/read-string (slurp positive-manifest))
+        leaf (reseal-and-sign
+              (-> base
+                  (assoc :kotoba.package/name "kotoba-lang/leaf"
+                         :kotoba.package/version "2.0.0"
+                         :kotoba.package/capabilities [:graph-read]
+                         :kotoba.package/dependencies [])))
+        root (reseal-and-sign
+              (-> base
+                  (assoc :kotoba.package/name "kotoba-lang/root"
+                         :kotoba.package/version "1.0.0"
+                         :kotoba.package/capabilities []
+                         :kotoba.package/dependencies
+                         [{:dep/name "kotoba-lang/leaf"
+                           :dep/version "2.0.0"}])))
+        valid (project-verification [root leaf] {})]
+    (is (true? (:kotoba.package/verified? valid))
+        (pr-str (:kotoba.package/problems valid)))
+
+    (testing "an omitted transitive lock target fails closed"
+      (let [result (project-verification [root] {})]
+        (is (= :package/dependency-closure-mismatch
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/problem])))
+        (is (= :dependency-target-missing
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/data :reason])))))
+
+    (testing "a substituted target version fails closed"
+      (let [changed (reseal-and-sign
+                    (assoc leaf :kotoba.package/version "2.1.0"))
+            result (project-verification [root changed] {})]
+        (is (= :package/dependency-closure-mismatch
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/problem])))
+        (is (= :dependency-version-mismatch
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/data :reason])))))
+
+    (testing "duplicate lock identities cannot collapse in a name map"
+      (let [dep (manifest->dep root)
+            result (admission/verify-project-lock
+                    {:lock {:kotoba.lock/version 1 :deps [dep dep]}
+                     :lock-path "kotoba.lock.edn"
+                     :trust {:declared-capabilities []
+                             :trusted-signers (set (:dep/signers dep))}
+                     :dependency-manifests {"kotoba-lang/root" root}
+                     :dependency-manifest-paths
+                     {"kotoba-lang/root" "root.edn"}})]
+        (is (= :duplicate-lock-dependency
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/data :reason])))))
+
+    (testing "unknown dependency-coordinate fields cannot be silently erased"
+      (let [changed-root (reseal-and-sign
+                          (assoc root :kotoba.package/dependencies
+                                 [{:dep/name "kotoba-lang/leaf"
+                                   :dep/version "2.0.0"
+                                   :dep/ambient-path "../leaf"}]))
+            result (project-verification [changed-root leaf] {})]
+        (is (= :dependency-coordinate-invalid
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/data :reason])))))
+
+    (testing "a signed dependency cycle fails closed"
+      (let [cyclic-leaf (reseal-and-sign
+                         (assoc leaf :kotoba.package/dependencies
+                                [{:dep/name "kotoba-lang/root"
+                                  :dep/version "1.0.0"}]))
+            result (project-verification [root cyclic-leaf] {})]
+        (is (= :package/dependency-closure-mismatch
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/problem])))
+        (is (= :dependency-cycle
+               (get-in result
+                       [:kotoba.package/problems 0 :kotoba.package/data :reason])))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Manifest integrity: a real CID mismatch, not just shape

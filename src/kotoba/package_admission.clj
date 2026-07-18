@@ -72,6 +72,8 @@
    "dependency manifest required" :package/dependency-manifest-required
    "unexpected dependency manifest" :package/unexpected-dependency-manifest
    "dependency manifest does not match lock entry" :package/dependency-manifest-mismatch
+   "dependency capability grant exceeds signed request" :package/capability-exceeds-manifest
+   "dependency manifest closure does not match lock" :package/dependency-closure-mismatch
    "dependency signer is not explicitly trusted" :package/signer-not-trusted
    local-path-message :package/local-path-dependency})
 
@@ -342,7 +344,6 @@
                   :commit (:dep/commit dep)
                   :tree-cid (:dep/tree-cid dep)
                   :manifest-cid (:dep/manifest-cid dep)
-                  :capabilities (set (:dep/capabilities dep))
                   :signers (set (:dep/signers dep))}
         actual {:name (:kotoba.package/name manifest)
                 :version (:kotoba.package/version manifest)
@@ -350,19 +351,118 @@
                 :commit (get-in manifest [:kotoba.package/source :git-commit])
                 :tree-cid (get-in manifest [:kotoba.package/source :tree-cid])
                 :manifest-cid (get-in manifest [:kotoba.package/source :manifest-cid])
-                :capabilities (set (:kotoba.package/capabilities manifest))
                 :signers manifest-signers}]
     (when-not (= expected actual)
       (package-contract/invalid "dependency manifest does not match lock entry"
                                 {:expected expected :actual actual}))))
 
+(defn- dependency-capability-error [dep manifest]
+  (let [grant (set (:dep/capabilities dep))
+        requested (set (:kotoba.package/capabilities manifest))]
+    (when-not (set/subset? grant requested)
+      (package-contract/invalid
+       "dependency capability grant exceeds signed request"
+       {:dependency (:dep/name dep)
+        :grant (vec (sort grant))
+        :requested (vec (sort requested))}))))
+
+(defn- manifest-dependency-error [owner dependencies deps-by-name]
+  (cond
+    (not (vector? dependencies))
+    (package-contract/invalid
+     "dependency manifest closure does not match lock"
+     {:reason :dependencies-vector-required :dependency owner})
+
+    :else
+    (let [names (mapv :dep/name dependencies)]
+      (or
+       (when-let [invalid (first (remove #(and (map? %)
+                                               (set/subset?
+                                                (set (keys %))
+                                                #{:dep/name :dep/version :dep/kind})
+                                               (string? (:dep/name %))
+                                               (not (str/blank? (:dep/name %)))
+                                               (string? (:dep/version %))
+                                               (not (str/blank? (:dep/version %)))
+                                               (or (not (contains? % :dep/kind))
+                                                   (contains?
+                                                    package-contract/allowed-package-kinds
+                                                    (:dep/kind %))))
+                                        dependencies))]
+         (package-contract/invalid
+          "dependency manifest closure does not match lock"
+          {:reason :dependency-coordinate-invalid
+           :dependency owner :value invalid}))
+       (when-not (= (count names) (count (set names)))
+         (package-contract/invalid
+          "dependency manifest closure does not match lock"
+          {:reason :duplicate-dependency-edge :dependency owner :targets names}))
+       (when (some #{owner} names)
+         (package-contract/invalid
+          "dependency manifest closure does not match lock"
+          {:reason :self-dependency-edge :dependency owner}))
+       (some
+        (fn [coordinate]
+          (let [target (get deps-by-name (:dep/name coordinate))]
+            (cond
+              (nil? target)
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-target-missing
+                :dependency owner :target (:dep/name coordinate)})
+
+              (not= (:dep/version coordinate) (:dep/version target))
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-version-mismatch :dependency owner
+                :target (:dep/name coordinate)
+                :declared (:dep/version coordinate)
+                :locked (:dep/version target)})
+
+              (and (contains? coordinate :dep/kind)
+                   (not= (:dep/kind coordinate) (:dep/kind target)))
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-kind-mismatch :dependency owner
+                :target (:dep/name coordinate)
+                :declared (:dep/kind coordinate)
+                :locked (:dep/kind target)}))))
+        dependencies)))))
+
+(defn- dependency-cycle [dependency-manifests]
+  (let [edges (into {}
+                    (map (fn [[name manifest]]
+                           [name (mapv :dep/name
+                                       (:kotoba.package/dependencies manifest))]))
+                    dependency-manifests)]
+    (letfn [(visit [node visiting visited path]
+              (cond
+                (contains? visiting node)
+                (conj (vec (drop-while #(not= node %) path)) node)
+
+                (contains? visited node) nil
+
+                :else
+                (some #(visit % (conj visiting node) (conj visited node)
+                              (conj path node))
+                      (get edges node []))))]
+      (some #(visit % #{} #{} []) (sort (keys edges))))))
+
 (defn verify-project-lock
   "Strict closed-project package verification. Every lock dependency must have
   exactly one cryptographically valid manifest, its identity/interface fields
-  must equal the lock entry, and every signer must be explicitly allowlisted by
-  the trust policy. Extra manifests fail closed."
+  must equal the lock entry, the lock capability grant must be a subset of the
+  signed manifest request, and every signer must be explicitly allowlisted by
+  the trust policy. Signed direct dependency coordinates must resolve exactly
+  inside the lock with matching versions/kinds; duplicate identities, missing
+  targets, ambient coordinate fields, and cycles fail closed. Extra manifests
+  fail closed."
   [{:keys [lock lock-path trust dependency-manifests dependency-manifest-paths]}]
   (let [base (verify-lock {:lock lock :lock-path lock-path :trust trust})
+        lock-names (mapv :dep/name (:deps lock))
+        duplicate-lock-names (->> lock-names frequencies
+                                  (keep (fn [[name n]] (when (> n 1) name)))
+                                  sort vec)
         deps-by-name (into {} (map (juxt :dep/name identity)) (:deps lock))
         manifest-names (set (keys dependency-manifests))
         dep-names (set (keys deps-by-name))
@@ -372,6 +472,13 @@
         manifest-problems
         (vec
          (concat
+          (when (seq duplicate-lock-names)
+            [(->problem
+              {:kotoba.package/input :lock}
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :duplicate-lock-dependency
+                :dependencies duplicate-lock-names}))])
           (map (fn [name]
                  (->problem {:kotoba.package/input :dependency-manifest
                              :kotoba.package/dependency name}
@@ -391,6 +498,10 @@
                    error (or (package-contract/package-manifest-error manifest)
                              (manifest-integrity-error manifest)
                              (dependency-manifest-mismatch dep manifest)
+                             (dependency-capability-error dep manifest)
+                             (manifest-dependency-error
+                              name (:kotoba.package/dependencies manifest)
+                              deps-by-name)
                              (when-let [untrusted
                                         (seq (set/difference
                                               (set (:dep/signers dep)) trusted))]
@@ -402,7 +513,14 @@
                              :kotoba.package/dependency name
                              :kotoba.package/path (get dependency-manifest-paths name)}
                             error))))
-           (sort (set/intersection dep-names manifest-names)))))
+           (sort (set/intersection dep-names manifest-names)))
+          (when-let [cycle (and (= dep-names manifest-names)
+                                (dependency-cycle dependency-manifests))]
+            [(->problem
+              {:kotoba.package/input :dependency-manifest}
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-cycle :cycle cycle}))])))
         problems (into (:kotoba.package/problems base) manifest-problems)]
     (assoc base
            :kotoba.package/verified? (empty? problems)
