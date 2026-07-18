@@ -32,6 +32,7 @@
   slice has no real memory ABI); concrete native providers (pbcopy/pbpaste,
   an HTTP client, ...) plug in by passing a :handlers map to `host-call`."
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [kotoba.cap-table :as cap-table]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.kgraph :as kgraph]
@@ -154,16 +155,81 @@
                          (op-capability op))))
            op->kind)}))
 
+(defn- canonical-path
+  "Best-effort canonicalized (symlink/`..`-resolved) path string for S, used
+  ONLY for capability resource-scope comparison below -- the actual fs-read/
+  fs-write I/O always runs against the guest's ORIGINAL path string via
+  `io/file`, exactly like a native fs call would resolve it against the JVM
+  process's real cwd. Falls back to the raw string when canonicalization
+  itself throws (e.g. `fs-write`'s target parent directory doesn't exist
+  yet)."
+  [^String s]
+  (try (.getCanonicalPath (io/file s)) (catch Exception _ s)))
+
+(defn- fs-path-permitted?
+  "True when PATH (the guest-supplied literal fs-read/fs-write path
+  argument) is inside CONCRETE's :cap/resource scope.
+  kotoba.lang.capability-values/intersect-grants (run by guard-call, inside
+  `host-call` below) only ever requests the UNIVERSAL `:any` capability for
+  a host KIND -- the guest's actual path argument isn't known until AFTER
+  the guard decision runs, so a policy that scopes `:fs/app-data` to
+  specific paths (`:kotoba.policy/capability-resources`) would otherwise be
+  silently ignored once the capability kind is granted at all. This extra,
+  per-call check is what actually enforces that narrowing; it mirrors
+  kotoba.wasm-exec's `resource-permitted?` (identical policy vocabulary:
+  `:any`, a bare resource string, or a set of them) -- duplicated rather
+  than shared because kotoba.wasm-exec already requires this namespace, so
+  the reverse require would be circular. Comparison is on the canonicalized
+  path so a granted resource string can't be trivially defeated by a
+  `./`-prefixed or symlinked spelling of the same file."
+  [concrete path]
+  (let [scope (:cap/resource concrete)]
+    (boolean
+     (or (nil? concrete)
+         (= :any scope)
+         (let [target (canonical-path path)]
+           (cond
+             (string? scope) (= (canonical-path scope) target)
+             (set? scope) (some #(= (canonical-path %) target) scope)
+             :else false))))))
+
+(defn- fs-check-permitted!
+  "Throws (fail closed) when PATH is outside CONCRETE's granted resource
+  scope. Called from inside an already-GRANTED fs-read/fs-write handler
+  (guard-call's own kind-level grant check already ran and passed) -- this
+  is the finer per-path check `fs-path-permitted?` documents. Thrown from
+  inside the :handler fn passed to guard-call, so `capability-host/guard-call`
+  itself records the normal :error receipt and rethrows -- no separate
+  receipt shape to invent here."
+  [op concrete path]
+  (when-not (fs-path-permitted? concrete path)
+    (throw (ex-info (str op ": path outside granted capability resource scope")
+                     {:kotoba.host/denied :resource-not-permitted
+                      :kotoba.host/call op
+                      :kotoba.host/path path}))))
+
 (def default-handlers
-  "Deterministic Rust-free provider stubs, keyed by host-import op. Each
-  handler is (fn [concrete-cap args] result). host-i64-roundtrip echoes its
-  argument (matching the interpreter builtin); the pointer-ABI providers
-  return 0 (the success status of the provider result ABI) since the
-  interpreter has no real memory to read a ptr/len pair out of — `str-ptr`
-  always evaluates to 0 here (kotoba.runtime/builtin-fns). Real native
-  providers (or, for kgraph-*, `kgraph-handlers` below / kotoba.wasm-exec's
-  Chicory host functions for genuine WASM execution) replace these via the
-  :handlers option of `host-call`."
+  "Deterministic Rust-free provider stubs, keyed by host-import op, EXCEPT
+  fs-read/fs-write and clock-monotonic below, which are real (issue #263 v0.1
+  slice, ADR-2607182430 in the com-junkawasaki/root superproject): fs-read
+  really reads a file's bytes off disk (as a UTF-8 string) and fs-write
+  really writes one, both gated a second time by `fs-check-permitted!`
+  above; clock-monotonic is a real System/nanoTime read (no filesystem/
+  network surface to gate beyond the capability KIND itself). Each handler
+  is (fn [concrete-cap args] result); args here are plain literal Kotoba
+  values (a path string, file content), NOT the (ptr,len) WASM-ABI shape --
+  see `kgraph-handlers`' docstring for why the CLJ interpreter slice uses
+  this convention (it has no linear memory to marshal a ptr/len pair
+  through). host-i64-roundtrip echoes its argument (matching the
+  interpreter builtin); the remaining pointer-ABI providers return 0 (the
+  success status of the provider result ABI) since the interpreter has no
+  real memory to read a ptr/len pair out of — `str-ptr` always evaluates to
+  0 here (kotoba.runtime/builtin-fns). Real native providers for those (or,
+  for kgraph-*, `kgraph-handlers` below / kotoba.wasm-exec's Chicory host
+  functions for genuine WASM execution, which ALREADY has real fs-read/
+  fs-write/http-fetch/clipboard/keychain/etc. behind a sandboxed fs-root —
+  see kotoba.wasm-exec/real-op-effects, a separate execution path from this
+  interpreter slice) replace these via the :handlers option of `host-call`."
   {'notify-show (fn [_cap _args] 0)
    'clipboard-read (fn [_cap _args] 0)
    'clipboard-write (fn [_cap _args] 0)
@@ -171,8 +237,20 @@
    'http-fetch (fn [_cap _args] 0)
    'keychain-read (fn [_cap _args] 0)
    'keychain-write (fn [_cap _args] 0)
-   'fs-read (fn [_cap _args] 0)
-   'fs-write (fn [_cap _args] 0)
+   'fs-read (fn [concrete args]
+              (let [path (first args)]
+                (fs-check-permitted! 'fs-read concrete path)
+                (let [f (io/file path)]
+                  (when (.isFile f)
+                    (slurp f)))))
+   'fs-write (fn [concrete args]
+               (let [[path content] args]
+                 (fs-check-permitted! 'fs-write concrete path)
+                 (let [f (io/file path)]
+                   (when-let [parent (.getParentFile f)]
+                     (.mkdirs parent))
+                   (spit f (str content))
+                   (count (str content)))))
    'host-i64-roundtrip (fn [_cap args] (first args))
    'kgraph-assert! (fn [_cap _args] 0)
    'kgraph-retract! (fn [_cap _args] 0)
@@ -184,7 +262,7 @@
    ;; editing these defaults. i64-result ops return 0 (a null/no-op
    ;; sentinel, same convention as the ptr/len ABI's 0-status stubs above).
    'log-write (fn [_cap _args] 0)
-   'clock-monotonic (fn [_cap _args] 0)
+   'clock-monotonic (fn [_cap _args] (System/nanoTime))
    'random-bytes (fn [_cap _args] 0)
    'topic-publish (fn [_cap _args] 0)
    'topic-poll (fn [_cap _args] 0)
