@@ -50,6 +50,12 @@
              (dec remaining)
              (conj result
                    (cond-> {:class (.getName (class current))}
+                     (instance? ClassNotFoundException current)
+                     (assoc :frames
+                            (mapv (fn [^StackTraceElement frame]
+                                    {:class (.getClassName frame)
+                                     :method (.getMethodName frame)})
+                                  (take 12 (.getStackTrace current))))
                      (some? (ex-message current))
                      (assoc :message (ex-message current))))))))
 

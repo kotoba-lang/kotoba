@@ -15,13 +15,18 @@
 
 (deftest exception-chain-is-bounded-and-path-free
   (let [cause (ClassNotFoundException. "clojure.lang.RT")
-        wrapper (ex-info "project admission failed" {:path "/ambient/private"} cause)]
+        wrapper (ex-info "project admission failed" {:path "/ambient/private"} cause)
+        chain (launcher/exception-chain wrapper)]
     (is (= [{:class "clojure.lang.ExceptionInfo"
              :message "project admission failed"}
             {:class "java.lang.ClassNotFoundException"
              :message "clojure.lang.RT"}]
-           (launcher/exception-chain wrapper)))
-    (is (not (re-find #"ambient" (pr-str (launcher/exception-chain wrapper)))))))
+           (mapv #(select-keys % [:class :message]) chain)))
+    (is (nil? (:frames (first chain))))
+    (is (seq (:frames (second chain))))
+    (is (every? #(= #{:class :method} (set (keys %)))
+                (mapcat :frames chain)))
+    (is (not (re-find #"ambient|/|\\\\" (pr-str chain))))))
 
 (defn- write-closed-project! [manifest project]
   (let [directory (.getParentFile ^java.io.File manifest)]
