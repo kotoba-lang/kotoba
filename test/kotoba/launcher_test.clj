@@ -39,6 +39,31 @@
       (is (re-find #"kotoba-js-artifact/v1" (slurp (str (.getPath output) ".manifest.edn"))))
       (is (re-find #"export" (slurp output))))))
 
+(deftest compile-web-supports-an-explicit-portable-prelude
+  (let [prelude (doto (java.io.File/createTempFile "kotoba-prelude" ".kotoba")
+                  (.deleteOnExit))
+        source (doto (java.io.File/createTempFile "kotoba-prelude-entry" ".kotoba")
+                 (.deleteOnExit))
+        output (doto (java.io.File/createTempFile "kotoba-prelude" ".mjs")
+                 (.deleteOnExit))
+        _ (spit prelude "(defn from-prelude [x] (+ x 1))")
+        _ (spit source "(defn main [] (from-prelude 41))")
+        result (launcher/dispatch ["compile" (.getPath source)
+                                   "--prelude" (.getPath prelude)
+                                   "--target" "web" "--output" (.getPath output)])]
+    (is (:kotoba.cli/ok? result))
+    (is (= :compile/emitted (:kotoba.cli/code result)))
+    (is (= (.getPath prelude)
+           (get-in result [:kotoba.cli/data :prelude])))
+    (is (re-find #"from-prelude" (slurp output)))))
+
+(deftest compile-fails-closed-for-an-unreadable-prelude
+  (let [result (launcher/dispatch
+                ["compile" "test/fixtures/source/web-library.kotoba"
+                 "--prelude" "missing-prelude.kotoba" "--target" "web"])]
+    (is (false? (:kotoba.cli/ok? result)))
+    (is (= :compile/prelude-not-readable (:kotoba.cli/code result)))))
+
 (deftest compile-web-admits-only-explicit-entryless-library-boundary
   (let [output (doto (java.io.File/createTempFile "kotoba-web-library" ".mjs")
                  (.deleteOnExit))

@@ -2453,8 +2453,10 @@
   16)
 
 (def max-collection-unroll-depth
-  "Primary-backend bound for collection transforms. Kept below get's lookup
-  bound because transforms synthesize allocation/control-flow at every step."
+  "Primary-backend bound for the remaining multi-source static specialization.
+  Single-source transforms use fuel helpers; multi-source map retains this
+  legacy bound until its state can be represented without exponential static
+  expansion or exceeding the five-parameter ABI."
   8)
 
 (def max-vector-items

@@ -66,6 +66,7 @@
     "--output"
     "--package-lock"
     "--policy"
+    "--prelude"
     "--reader-target"
     "--receipt"
     "--source-path"
@@ -250,6 +251,7 @@
   through the legacy ClojureScript backend."
   [argv]
   (let [entry (first-source-arg argv)
+        prelude (option-value argv "--prelude")
         extension (some-> entry source-extension)
         target-name (or (option-value argv "--target") "wasm")
         target (case target-name "web" :js-kotoba-v1 "wasm" :wasm32-kotoba-v1 nil)
@@ -270,9 +272,15 @@
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/unsupported-target
        :kotoba.cli/data {:target target-name :allowed ["web" "wasm"]}}
 
+      (and prelude (not (.isFile (io/file prelude))))
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/prelude-not-readable
+       :kotoba.cli/data {:prelude prelude}}
+
       :else
       (try
-        (let [compiled (compiler/compile-source (slurp entry) target)]
+        (let [source (str (when prelude (str (slurp prelude) "\n"))
+                          (slurp entry))
+              compiled (compiler/compile-source source target)]
           (if (= target :js-kotoba-v1)
             (do
               (some-> (io/file output) .getParentFile .mkdirs)
@@ -280,7 +288,7 @@
               (spit (str output ".manifest.edn") (pr-str (:manifest compiled))))
             (write-bytes! output (:bytes compiled)))
           {:kotoba.cli/ok? true :kotoba.cli/code :compile/emitted
-           :kotoba.cli/data {:entry entry :output output :target target-name
+           :kotoba.cli/data {:entry entry :prelude prelude :output output :target target-name
                              :backend (if (= target :js-kotoba-v1)
                                         :kotoba-script :kotoba-wasm)
                              :manifest (:manifest compiled)}})
