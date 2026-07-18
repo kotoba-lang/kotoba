@@ -10,6 +10,7 @@
             ;; silently shadow every one of those call sites.
             [clojure.string :as cstr]
             [clojure.walk :as walk]
+            [kotoba.guest-grammar :as guest-grammar]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.lang.capability-values :as capability-values]
             [clojure.tools.reader :as reader]
@@ -388,21 +389,31 @@
                    granted))))
 
 (defn source-problems
-  "Return safety/type problems for the current executable subset."
+  "Return safety/type problems for the current executable subset.
+
+  P0 (ADR-2607180900): always includes guest-grammar/strict-problems
+  (catalog forbidden heads + optional strict unknown-form rejection)."
   ([safe-facts forms] (source-problems safe-facts forms nil))
   ([safe-facts forms policy]
   (let [denied (set (remove #{"ns"} (:non-executable-forms safe-facts)))
         effect-ops (set (:effect-ops safe-facts))
         allowed-caps (policy-capabilities policy)
-        problems (atom [])]
+        grammar-problems (guest-grammar/strict-problems forms policy)
+        problems (atom (vec grammar-problems))]
     (doseq [form forms]
       (walk-forms
        (fn [node]
          (when-let [head (some-> node list-head str)]
            (cond
              (denied head)
-             (swap! problems conj {:kotoba.runtime/problem :denied-form
-                                   :kotoba.runtime/form head})
+             (when-not (some #(and (= :denied-form (:kotoba.runtime/problem %))
+                                   (= head (:kotoba.runtime/form %)))
+                             @problems)
+               (swap! problems conj
+                      (guest-grammar/with-hint
+                        {:kotoba.runtime/problem :denied-form
+                         :kotoba.runtime/form head}
+                        head)))
 
              (= "cap-acquire" head)
              (let [kind (second node)
@@ -575,7 +586,10 @@
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
-  `(defsystem move [dt] ...)` has the stable ABI export `move-tick`."
+  `(defsystem move [dt] ...)` has the stable ABI export `move-tick`.
+
+  ADR-2607180900 (L2): multi-body `when` → `if`+`do`; bare string literals
+  on string-head host ops → str-ptr/str-len."
   [forms]
   (let [constants (into {}
                         (keep (fn [form]
@@ -583,6 +597,7 @@
                                            (= 3 (count form)))
                                   [(second form) (nth form 2)])))
                         forms)
+        string-head-ops (guest-grammar/string-head-host-ops)
         string-args (fn [op s & args]
                       (list* op (list 'str-ptr s) (list 'str-len s) args))
         lower-cond (fn lower-cond [clauses]
@@ -592,6 +607,16 @@
                          (if (= :else test)
                            value
                            (list 'if test value (lower-cond more))))))
+        lower-string-head
+        (fn [op args]
+          (if (and (contains? string-head-ops op)
+                   (seq args)
+                   (string? (first args)))
+            (list* op
+                   (list 'str-ptr (first args))
+                   (list 'str-len (first args))
+                   (rest args))
+            (list* op args)))
         lower-node
         (fn [node]
           (if-not (seq? node)
@@ -602,6 +627,11 @@
                             (list* 'defn (symbol (str name "-tick")) params body))
                 cond (lower-cond args)
                 not= (list 'not (list* '= args))
+                when (let [[test & body] args]
+                       (cond
+                         (empty? body) (list 'if test 0 0)
+                         (= 1 (count body)) (list 'if test (first body) 0)
+                         :else (list 'if test (cons 'do body) 0)))
                 nearest-tagged (apply string-args 'kami-nearest-tagged args)
                 spawn-entity (apply string-args 'kami-spawn args)
                 count-tagged (apply string-args 'kami-count-tagged args)
@@ -635,7 +665,8 @@
                                    (list 'kami-get-y target)
                                    speed))
                     node))
-                node))))]
+                ;; Default: string-head host ops accept bare string literals.
+                (lower-string-head op args)))))]
     (->> forms
          (remove #(and (seq? %) (= 'def (first %))))
          (mapv (fn [form]
@@ -2076,8 +2107,10 @@
                  :local-count (count local-types)
                  :local-types local-types
                  :result-type (get-in fns [:fn-result-types op] :i32)}))
-            {:problem {:kotoba.wasm/problem :unsupported-op
-                       :kotoba.wasm/op (str op)}}))))
+            {:problem (guest-grammar/with-hint
+                        {:kotoba.wasm/problem :unsupported-op
+                         :kotoba.wasm/op (str op)}
+                        op)}))))
 
     :else
     {:problem {:kotoba.wasm/problem :unsupported-form
