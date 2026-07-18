@@ -3,6 +3,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
@@ -39,6 +40,38 @@ try {
     extensionResults[extension] = "passed";
   }
 
+  const safeIdentifierSource = join(work, "safe-window-name.kotoba");
+  const safeIdentifierOutput = join(work, "safe-window-name.mjs");
+  writeFileSync(
+    safeIdentifierSource,
+    "(ns timing (:export [shot-hit]))\n" +
+      "(defn shot-hit [delta-present delta-ms window-ms]\n" +
+      "  (if delta-present (if (<= delta-ms window-ms) 1 0) 0))\n",
+  );
+  run([
+    "compile",
+    safeIdentifierSource,
+    "--target",
+    "web",
+    "--output",
+    safeIdentifierOutput,
+  ]);
+  const safeIdentifierProbe = spawnSync(
+    "node",
+    [
+      "--input-type=module",
+      "-e",
+      `import(${JSON.stringify(pathToFileURL(safeIdentifierOutput).href)}).then(m=>{const f=m.instantiateKotoba({})['shot-hit'];if(f(1n,150n,150n)!==1n||f(1n,151n,150n)!==0n||f(0n,0n,150n)!==0n)process.exit(2)})`,
+    ],
+    { encoding: "utf8" },
+  );
+  if (safeIdentifierProbe.error) throw safeIdentifierProbe.error;
+  if (safeIdentifierProbe.status !== 0) {
+    throw new Error(
+      `safe ambient-name identifier probe failed: ${safeIdentifierProbe.stdout}${safeIdentifierProbe.stderr}`,
+    );
+  }
+
   const forbidden = join(work, "forbidden-eval.kotoba");
   writeFileSync(forbidden, "(defn main [] (eval '(+ 40 2)))\n");
   const rejectionText = run(["run", forbidden, "--json"], 1).trim();
@@ -59,6 +92,7 @@ try {
     binarySha256,
     runtime: "native-jvm-free",
     sourceExtensions: extensionResults,
+    syntaxAwareAuthorityNames: "passed",
     structuredRejection: "passed",
   };
   const evidenceDirectory = resolve("target/native");

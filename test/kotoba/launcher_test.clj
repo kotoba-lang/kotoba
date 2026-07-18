@@ -66,6 +66,21 @@
       (is (re-find #"kotoba-js-artifact/v1" (slurp (str (.getPath output) ".manifest.edn"))))
       (is (re-find #"export" (slurp output))))))
 
+(deftest compile-web-allows-safe-identifiers-containing-ambient-names
+  (let [source (doto (java.io.File/createTempFile "kotoba-window-name" ".kotoba")
+                 (.deleteOnExit))
+        output (doto (java.io.File/createTempFile "kotoba-window-name" ".mjs")
+                 (.deleteOnExit))]
+    (spit source "(ns timing (:export [shot-hit]))
+                  (defn shot-hit [delta-present delta-ms window-ms]
+                    (if delta-present
+                      (if (<= delta-ms window-ms) 1 0)
+                      0))")
+    (let [result (launcher/dispatch ["compile" (.getPath source) "--target" "web"
+                                     "--output" (.getPath output)])]
+      (is (:kotoba.cli/ok? result))
+      (is (re-find #"k\$window\$002dms" (slurp output))))))
+
 (deftest compile-web-admits-only-explicit-entryless-library-boundary
   (let [output (doto (java.io.File/createTempFile "kotoba-web-library" ".mjs")
                  (.deleteOnExit))
