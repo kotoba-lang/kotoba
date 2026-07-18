@@ -9,8 +9,8 @@ assert.equal(generated.kotobaArtifact.valueProfile, "typed-v1");
 assert.match(generated.kotobaArtifact.moduleGraphDigest, /^[0-9a-f]{64}$/);
 assert.ok(Object.isFrozen(generated.kotobaArtifact.moduleSourceDigests));
 assert.deepEqual(Object.keys(generated.kotobaArtifact.moduleSourceDigests), [
-  "example.app",
-  "example.text",
+  "fixture.app",
+  "fixture.text",
 ]);
 for (const digest of Object.values(generated.kotobaArtifact.moduleSourceDigests)) {
   assert.match(digest, /^[0-9a-f]{64}$/);
