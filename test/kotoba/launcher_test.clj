@@ -92,6 +92,31 @@
                                         :kotoba.artifact/module-source-digests])))))
       (is (re-find #"export" (slurp output))))))
 
+(deftest typed-source-path-project-compiles-for-web-and-wasm
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-typed-project"
+                            (make-array java.nio.file.attribute.FileAttribute 0)))
+        entry "test/fixtures/typed-project/fixture/app.kotoba"
+        source-path "test/fixtures/typed-project"
+        web-output (io/file directory "app.mjs")
+        wasm-output (io/file directory "app.wasm")
+        web (launcher/dispatch ["compile" entry "--source-path" source-path
+                                "--target" "web" "--output" (.getPath web-output)])
+        wasm (launcher/dispatch ["compile" entry "--source-path" source-path
+                                 "--target" "wasm" "--output" (.getPath wasm-output)])]
+    (is (:kotoba.cli/ok? web))
+    (is (:kotoba.cli/ok? wasm))
+    (is (= :kotoba-script (get-in web [:kotoba.cli/data :backend])))
+    (is (= :kotoba-wasm (get-in wasm [:kotoba.cli/data :backend])))
+    (is (= :kotoba.value/typed-v1 (get-in web [:kotoba.cli/data :value-profile])))
+    (is (= :kotoba.value/typed-v1 (get-in wasm [:kotoba.cli/data :value-profile])))
+    (is (= :kotoba.typed/externref-v1 (get-in wasm [:kotoba.cli/data :value-abi])))
+    (is (= #{:reference-types} (get-in wasm [:kotoba.cli/data :wasm-features])))
+    (is (re-matches #"[0-9a-f]{64}" (get-in wasm [:kotoba.cli/data :project-digest])))
+    (is (= [0 97 115 109]
+           (mapv #(bit-and (int %) 0xff)
+                 (take 4 (java.nio.file.Files/readAllBytes (.toPath wasm-output))))))))
+
 (deftest compile-web-allows-safe-identifiers-containing-ambient-names
   (let [source (doto (java.io.File/createTempFile "kotoba-window-name" ".kotoba")
                  (.deleteOnExit))
