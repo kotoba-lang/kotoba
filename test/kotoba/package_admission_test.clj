@@ -46,6 +46,17 @@
 (defn receipt [result]
   (get-in result [:kotoba.cli/data :kotoba.package/receipt]))
 
+(defn- manifest->dep [manifest]
+  {:dep/name (:kotoba.package/name manifest)
+   :dep/version (:kotoba.package/version manifest)
+   :dep/repo-rid (:kotoba.package/repo-rid manifest)
+   :dep/ref "refs/tags/v0.1.0"
+   :dep/commit (get-in manifest [:kotoba.package/source :git-commit])
+   :dep/tree-cid (get-in manifest [:kotoba.package/source :tree-cid])
+   :dep/manifest-cid (get-in manifest [:kotoba.package/source :manifest-cid])
+   :dep/signers (mapv :did (:kotoba.package/signatures manifest))
+   :dep/capabilities (:kotoba.package/capabilities manifest)})
+
 ;; ---------------------------------------------------------------------------
 ;; Positive admission
 
@@ -63,6 +74,47 @@
     (is (true? (:kotoba.cli/ok? result)))
     (is (= :package-verified (:kotoba.cli/code result)))
     (is (true? (:kotoba.package/verified? (receipt result))))))
+
+(deftest closed-project-verification-binds-signed-manifest-lock-and-trust
+  (let [manifest (edn/read-string (slurp positive-manifest))
+        dep (manifest->dep manifest)
+        lock {:kotoba.lock/version 1 :deps [dep]}
+        trust {:declared-capabilities [:graph-read]
+               :trusted-signers (set (:dep/signers dep))}
+        opts {:lock lock :lock-path "kotoba.lock.edn" :trust trust
+              :dependency-manifests {(:dep/name dep) manifest}
+              :dependency-manifest-paths {(:dep/name dep) "json.package.edn"}}
+        verified (admission/verify-project-lock opts)]
+    (is (true? (:kotoba.package/verified? verified))
+        (pr-str (:kotoba.package/problems verified)))
+    (is (re-matches #"[0-9a-f]{64}" (admission/receipt-digest verified)))
+    (testing "missing and substituted dependency manifests fail closed"
+      (is (= :package/dependency-manifest-required
+             (get-in (admission/verify-project-lock
+                      (assoc opts :dependency-manifests {}))
+                     [:kotoba.package/problems 0 :kotoba.package/problem])))
+      (is (= :package/dependency-manifest-mismatch
+             (get-in (admission/verify-project-lock
+                      (assoc opts :dependency-manifests
+                             {(:dep/name dep)
+                              (let [changed (assoc manifest :kotoba.package/version "9.9.9")
+                                    resealed (assoc-in changed
+                                                       [:kotoba.package/source :manifest-cid]
+                                                       (admission/compute-manifest-cid changed))]
+                                (resign resealed))}))
+                     [:kotoba.package/problems 0 :kotoba.package/problem]))))
+    (testing "a valid signature is insufficient without explicit trust"
+      (is (= :package/signer-not-trusted
+             (get-in (admission/verify-project-lock
+                      (assoc opts :trust {:declared-capabilities [:graph-read]
+                                          :trusted-signers #{}}))
+                     [:kotoba.package/problems 0 :kotoba.package/problem]))))
+    (testing "receipt identity excludes clock and ambient paths"
+      (let [same (assoc verified
+                        :kotoba.package/checked-at "2099-01-01T00:00:00Z"
+                        :kotoba.package/lock-path "/different/root/lock.edn")]
+        (is (= (admission/receipt-digest verified)
+               (admission/receipt-digest same)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Manifest integrity: a real CID mismatch, not just shape

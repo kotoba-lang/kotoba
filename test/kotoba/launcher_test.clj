@@ -13,6 +13,17 @@
 (def positive-lock "test/fixtures/package/positive-lock.edn")
 (def trust "test/fixtures/package/trust.edn")
 
+(defn- write-closed-project! [manifest project]
+  (let [directory (.getParentFile ^java.io.File manifest)]
+    (spit (io/file directory "kotoba.lock.edn")
+          (pr-str {:kotoba.lock/version 1 :deps []}))
+    (spit (io/file directory "kotoba.trust.edn") (pr-str {}))
+    (spit manifest
+          (pr-str (merge project
+                         {:kotoba.project/package-lock "kotoba.lock.edn"
+                          :kotoba.project/trust "kotoba.trust.edn"
+                          :kotoba.project/dependency-manifests {}})))))
+
 (deftest delegates-check-to-cljc-authority
   (let [result (launcher/dispatch ["check" "--kind" "cli-contract" "--json"])]
     (is (:kotoba.cli/ok? result))
@@ -92,10 +103,10 @@
                  (:require [example.text :as text])
                  (:export [welcome]))
                (defn welcome [name :string] :string (text/greet name))")
-    (spit manifest (pr-str {:kotoba.project/root 'example.app
-                            :kotoba.project/modules
-                            {'example.app "app.kotoba"
-                             'example.text "text.kotoba"}}))
+    (write-closed-project! manifest {:kotoba.project/root 'example.app
+                                     :kotoba.project/modules
+                                     {'example.app "app.kotoba"
+                                      'example.text "text.kotoba"}})
     (let [result (launcher/dispatch ["compile" "--project" (.getPath manifest)
                                      "--target" "web" "--output" (.getPath output)])
           generated (slurp output)
@@ -106,7 +117,13 @@
       (is (re-find #"こんにちは" generated))
       (is (re-find #"moduleGraphDigest:\"[0-9a-f]{64}\"" generated))
       (is (re-find #"moduleSourceDigests:Object.freeze" generated))
+      (is (re-find #"packageLockDigest:\"[0-9a-f]{64}\"" generated))
+      (is (re-find #"trustPolicyDigest:\"[0-9a-f]{64}\"" generated))
+      (is (re-find #"packageReceiptDigest:\"[0-9a-f]{64}\"" generated))
       (is (string? (:kotoba.artifact/module-graph-digest artifact-manifest)))
+      (is (string? (:kotoba.artifact/package-lock-digest artifact-manifest)))
+      (is (string? (:kotoba.artifact/trust-policy-digest artifact-manifest)))
+      (is (string? (:kotoba.artifact/package-receipt-digest artifact-manifest)))
       (is (= #{'example.app 'example.text}
              (set (keys (:kotoba.artifact/module-source-digests artifact-manifest))))))))
 
@@ -120,9 +137,9 @@
     (spit text "(ns check.text (:export [answer])) (defn answer [] 42)")
     (spit app "(ns check.app (:require [check.text :as text]) (:export [run]))
                (defn run [] (text/answer))")
-    (spit manifest (pr-str {:kotoba.project/root 'check.app
-                            :kotoba.project/modules
-                            {'check.app "app.kotoba" 'check.text "text.kotoba"}}))
+    (write-closed-project! manifest {:kotoba.project/root 'check.app
+                                     :kotoba.project/modules
+                                     {'check.app "app.kotoba" 'check.text "text.kotoba"}})
     (let [checked (launcher/dispatch ["check" "--project" (.getPath manifest)
                                       "--target" "web"])
           compiled (launcher/dispatch ["compile" "--project" (.getPath manifest)
@@ -140,6 +157,52 @@
                                :kotoba.artifact/module-source-digests])))
       (is (not (.exists implicit-output))))))
 
+(deftest project-check-requires-explicit-supply-chain-closure
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-no-lock" (make-array java.nio.file.attribute.FileAttribute 0)))
+        source (io/file directory "app.kotoba")
+        manifest (io/file directory "kotoba-project.edn")]
+    (spit source "(ns unsafe.app (:export [answer])) (defn answer [] 42)")
+    (spit manifest (pr-str {:kotoba.project/root 'unsafe.app
+                            :kotoba.project/modules {'unsafe.app "app.kotoba"}}))
+    (let [result (launcher/dispatch ["check" "--project" (.getPath manifest)])]
+      (is (false? (:kotoba.cli/ok? result)))
+      (is (= :project-manifest (get-in result [:kotoba.cli/data :phase])))
+      (is (re-find #"invalid closed Kotoba project manifest"
+                   (:kotoba.cli/message result))))))
+
+(deftest trust-input-substitution-changes-sealed-artifact-identity
+  (let [directory (.toFile (java.nio.file.Files/createTempDirectory
+                            "kotoba-project-trust-seal" (make-array java.nio.file.attribute.FileAttribute 0)))
+        source (io/file directory "app.kotoba")
+        manifest (io/file directory "kotoba-project.edn")
+        first-output (io/file directory "first.mjs")
+        second-output (io/file directory "second.mjs")]
+    (spit source "(ns sealed.app (:export [answer])) (defn answer [] 42)")
+    (write-closed-project! manifest {:kotoba.project/root 'sealed.app
+                                     :kotoba.project/modules {'sealed.app "app.kotoba"}})
+    (let [first-result (launcher/dispatch
+                        ["compile" "--project" (.getPath manifest) "--target" "web"
+                         "--output" (.getPath first-output)])]
+      (spit (io/file directory "kotoba.trust.edn") "{ }\n")
+      (let [second-result (launcher/dispatch
+                           ["compile" "--project" (.getPath manifest) "--target" "web"
+                            "--output" (.getPath second-output)])]
+        (is (:kotoba.cli/ok? first-result))
+        (is (:kotoba.cli/ok? second-result))
+        (is (= (get-in first-result [:kotoba.cli/data :manifest
+                                     :kotoba.artifact/module-graph-digest])
+               (get-in second-result [:kotoba.cli/data :manifest
+                                      :kotoba.artifact/module-graph-digest])))
+        (is (not= (get-in first-result [:kotoba.cli/data :manifest
+                                        :kotoba.artifact/trust-policy-digest])
+                  (get-in second-result [:kotoba.cli/data :manifest
+                                         :kotoba.artifact/trust-policy-digest])))
+        (is (not= (get-in first-result [:kotoba.cli/data :manifest
+                                        :kotoba.artifact/output-digest])
+                  (get-in second-result [:kotoba.cli/data :manifest
+                                         :kotoba.artifact/output-digest])))))))
+
 (deftest check-and-compile-project-report-the-same-link-diagnostic
   (let [directory (.toFile (java.nio.file.Files/createTempDirectory
                             "kotoba-project-check-fail" (make-array java.nio.file.attribute.FileAttribute 0)))
@@ -147,8 +210,8 @@
         manifest (io/file directory "kotoba-project.edn")]
     (spit app "(ns check.app (:require [missing.dep :as dep]) (:export [run]))
                (defn run [] (dep/run))")
-    (spit manifest (pr-str {:kotoba.project/root 'check.app
-                            :kotoba.project/modules {'check.app "app.kotoba"}}))
+    (write-closed-project! manifest {:kotoba.project/root 'check.app
+                                     :kotoba.project/modules {'check.app "app.kotoba"}})
     (let [checked (launcher/dispatch ["check" "--project" (.getPath manifest)])
           compiled (launcher/dispatch ["compile" "--project" (.getPath manifest)])]
       (is (= :check/project-invalid (:kotoba.cli/code checked)))
@@ -160,8 +223,8 @@
   (let [directory (.toFile (java.nio.file.Files/createTempDirectory
                             "kotoba-project-reject" (make-array java.nio.file.attribute.FileAttribute 0)))
         manifest (io/file directory "bad.edn")]
-    (spit manifest (pr-str {:kotoba.project/root 'example.app
-                            :kotoba.project/modules {'example.app "../escape.kotoba"}}))
+    (write-closed-project! manifest {:kotoba.project/root 'example.app
+                                     :kotoba.project/modules {'example.app "../escape.kotoba"}})
     (let [escaped (launcher/dispatch ["compile" "--project" (.getPath manifest)
                                       "--target" "web"])
           ambiguous (launcher/dispatch ["compile" "test/fixtures/source/web-library.kotoba"
@@ -179,8 +242,8 @@
     (java.nio.file.Files/write (.toPath source)
                                (byte-array [(unchecked-byte 0xc3) (unchecked-byte 0x28)])
                                (make-array java.nio.file.OpenOption 0))
-    (spit manifest (pr-str {:kotoba.project/root 'example.app
-                            :kotoba.project/modules {'example.app "app.kotoba"}}))
+    (write-closed-project! manifest {:kotoba.project/root 'example.app
+                                     :kotoba.project/modules {'example.app "app.kotoba"}})
     (let [result (launcher/dispatch ["compile" "--project" (.getPath manifest)
                                      "--target" "web"])]
       (is (false? (:kotoba.cli/ok? result)))
@@ -207,8 +270,8 @@
         link (io/file directory "app.kotoba")
         manifest (io/file directory "kotoba-project.edn")]
     (spit target "(ns example.app (:export [answer])) (defn answer [] 42)")
-    (spit manifest (pr-str {:kotoba.project/root 'example.app
-                            :kotoba.project/modules {'example.app "app.kotoba"}}))
+    (write-closed-project! manifest {:kotoba.project/root 'example.app
+                                     :kotoba.project/modules {'example.app "app.kotoba"}})
     (try
       (java.nio.file.Files/createSymbolicLink
        (.toPath link) (.toPath target) (make-array java.nio.file.attribute.FileAttribute 0))
