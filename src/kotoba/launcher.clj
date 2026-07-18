@@ -1335,7 +1335,45 @@
      :kotoba.cli/data {:kotoba.cljs/command (second argv)
                        :kotoba.cljs/commands ["emit"]}}))
 
+(defn safe-dispatch
+  "Process-boundary dispatch. Language/runtime rejection is data; Java stack
+  traces and host paths never become the CLI protocol. Library callers may
+  continue using `dispatch` when they need exceptions for debugging."
+  [argv]
+  (try
+    (let [result (dispatch argv)]
+      (if (and (false? (:kotoba.cli/ok? result))
+               (= :run/failed (:kotoba.cli/code result)))
+        {:kotoba.cli/ok? false
+         :kotoba.cli/code :runtime/rejected
+         :kotoba.cli/diagnostic
+         {:format :kotoba.diagnostic/v1
+          :code :kotoba/runtime-rejected
+          :severity :error
+          :source (some-> (second argv) io/file .getName)}
+         :kotoba.cli/data
+         {:problems (get-in result [:kotoba.cli/data
+                                    :kotoba.runtime/result
+                                    :kotoba.runtime/problems])}}
+        result))
+    (catch clojure.lang.ExceptionInfo error
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :runtime/rejected
+       :kotoba.cli/diagnostic
+       {:format :kotoba.diagnostic/v1
+        :code :kotoba/runtime-rejected
+        :severity :error
+        :exception-class (.getName (class error))}})
+    (catch Exception error
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :runtime/internal-error
+       :kotoba.cli/diagnostic
+       {:format :kotoba.diagnostic/v1
+        :code :kotoba/internal-error
+        :severity :error
+        :exception-class (.getName (class error))}})))
+
 (defn -main [& argv]
-  (let [result (dispatch argv)]
+  (let [result (safe-dispatch argv)]
     (println (render-result result (json-requested? argv)))
     (System/exit (result->exit result))))
