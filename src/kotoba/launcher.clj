@@ -252,7 +252,8 @@
         manifest (edn/read-string manifest-text)
         root (:kotoba.project/root manifest)
         modules (:kotoba.project/modules manifest)
-        base (-> manifest-file .getCanonicalFile .getParentFile .toPath)
+        base-file (-> manifest-file .getCanonicalFile .getParentFile)
+        base (.toPath ^java.io.File base-file)
         _ (when-not (and (simple-symbol? root) (map? modules)
                          (pos? (count modules)) (<= (count modules) 256))
             (throw (ex-info "invalid closed Kotoba project manifest"
@@ -265,8 +266,8 @@
                                     (not (.isAbsolute (io/file relative))))
                        (throw (ex-info "project modules require relative .kotoba paths"
                                        {:phase :project-manifest :module namespace})))
-                     (let [candidate (-> (.resolve base relative) .normalize)
-                           real (-> candidate .toFile .getCanonicalFile .toPath)]
+                     (let [candidate (io/file base-file relative)
+                           real (-> candidate .getCanonicalFile .toPath)]
                        (when-not (and (.startsWith real base)
                                       (.isFile (.toFile real)))
                          (throw (ex-info "project module escapes its manifest root or is not a file"
