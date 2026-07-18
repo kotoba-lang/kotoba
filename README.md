@@ -174,6 +174,7 @@ Commands this repo's launcher currently wires up:
 kotoba check --kind cli-contract --json     # validate the CLI/package/lock contract
 kotoba run path/to/entry.kotoba             # compile and run a Kotoba entry point
 kotoba compile app.kotoba --target web -o app.mjs # checked KIR → kotoba-script
+kotoba compile --project kotoba-project.edn --target web -o app.mjs # closed multi-module build
 kotoba run path/to/entry.cljk                # CLJ Kotoba source
 kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
 kotoba package verify --lock lock.edn --trust trust.edn \
@@ -182,6 +183,23 @@ kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell
 kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
 kotoba cljs emit cell.kotoba --package-lock lock.edn -o cell.cljs                      # ClojureScript source, see Language below
 ```
+
+Multi-module projects use an explicit closed manifest; the compiler never scans
+the filesystem or delegates module lookup to JavaScript:
+
+```clojure
+{:kotoba.project/root example.app
+ :kotoba.project/modules
+ {example.app "src/example/app.kotoba"
+  example.text "src/example/text.kotoba"}}
+```
+
+Module paths must be relative `.kotoba` files contained beneath the manifest
+directory. Source namespaces use alias-only dependencies such as
+`(:require [example.text :as text])`. Missing/private imports, cycles, path
+escape, `:refer`, and undeclared runtime loading fail before KIR emission. The
+output manifest includes the exact SHA-256 of every reachable source and the
+canonical module-graph digest.
 
 `--package-lock` is mandatory for `wasm emit`, `wasm run`, and `cljs emit`: the
 package admission gate always runs first, and a missing or rejected lock aborts
