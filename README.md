@@ -418,17 +418,39 @@ gate, synthesizing the **minimal least-privilege policy** a cell needs.
 Audit/tooling APIs, usable standalone: `embedded_capability_ifaces(wasm)`
 (byte-level capability surface), `infer_effects(src)` (source-level transitive
 effects), `minimal_policy(src)` (least-privilege synthesis), `Policy::to_edn`.
-Self-hosting has started in slices under
-[`crates/kotoba-clj/selfhost/`](crates/kotoba-clj/selfhost/): the
-`safe_analyzer.kotoba` seed is written in Kotoba, compiles as safe Kotoba to a
-Wasm Component, has no embedded host capability imports, and is checked against
-the Rust analyzer for the covered effect/capability/policy surface. Rust callers
-can exercise that path through `kotoba_clj::selfhost::{Analyzer,
-infer_effects, minimal_policy, check_effect_declarations, check_policy,
-check_admission, unused_grants, compile_safe_kotoba}`. Status:
-capability (instance-level), subset, and effect (interprocedural) gates
-implemented and byte-verified (S0–S4) with safe-mode tests; typed HIR / borrow
-checker (T1) and wider self-hosting are tracked in the ADRs.
+
+**Self-hosting today is data-contract sharing, not a Kotoba-authored analyzer.**
+The old Rust `crates/kotoba-clj/selfhost/` implementation described in earlier
+revisions of this README no longer exists — the whole `crates/` Rust workspace
+was removed in `604896171b` (2026-07-01; see
+[`docs/ADR-kotoba-wasm-clj-execution.md`](docs/ADR-kotoba-wasm-clj-execution.md)).
+What self-hosting means in the current (post-Rust-removal) tree: a shared,
+versioned EDN admission contract,
+[`kotoba-lang/kotoba-selfhost-contracts`](https://github.com/kotoba-lang/kotoba-selfhost-contracts)
+(pinned in `deps.edn`), ships "seed" data such as `safe_analyzer_facts.edn` —
+the classification/effect/capability facts a safe-analyzer implementation
+must agree with. This launcher loads and validates those seeds through
+`kotoba.selfhost.contracts` (required from `src/kotoba/launcher.clj`) and
+exposes them over the CLI as `kotoba selfhost list` (bundled seed metadata)
+and `kotoba selfhost check` (validate the bundled seeds against the contract
+schema, without invoking any Rust crate — there is none left to invoke).
+`src/kotoba/mesh_node.clj` and the safe-build/safe-policy gate consult the
+same `safe_analyzer_facts` seed at runtime, so the JVM/Clojure implementation
+and the shared EDN facts stay in sync by construction.
+
+An analyzer literally **authored in and executing as Kotoba source** — the
+thing earlier revisions of this section described as already existing under
+`crates/kotoba-clj/selfhost/` — is not current fact in this repository. It
+remains a real, stated forward-looking goal: `kotoba-lang/compiler`'s own
+README says the bootstrap driving `kotoba -M ...` "currently uses Clojure
+internally, but that is not part of the compiler CLI contract and can be
+replaced by the self-hosted Kotoba driver without changing user commands"
+(compiler README, "After putting `bin/kotoba` on `PATH`..." section). Treat
+that as the target state, not the present one: capability (instance-level),
+subset, and effect (interprocedural) admission gates are implemented and
+tested against the JVM analyzer today; typed HIR / borrow checking (T1) and
+an actual Kotoba-authored self-hosted analyzer are tracked in the ADRs as
+future work, not shipped code.
 
 Current naming: `kotoba` is the language + database + semantic substrate,
 `kotoba wasm` / safe Kotoba is the executable language path that turns Kotoba
