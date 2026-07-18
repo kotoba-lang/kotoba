@@ -13,6 +13,16 @@
 (def positive-lock "test/fixtures/package/positive-lock.edn")
 (def trust "test/fixtures/package/trust.edn")
 
+(deftest exception-chain-is-bounded-and-path-free
+  (let [cause (ClassNotFoundException. "clojure.lang.RT")
+        wrapper (ex-info "project admission failed" {:path "/ambient/private"} cause)]
+    (is (= [{:class "clojure.lang.ExceptionInfo"
+             :message "project admission failed"}
+            {:class "java.lang.ClassNotFoundException"
+             :message "clojure.lang.RT"}]
+           (launcher/exception-chain wrapper)))
+    (is (not (re-find #"ambient" (pr-str (launcher/exception-chain wrapper)))))))
+
 (defn- write-closed-project! [manifest project]
   (let [directory (.getParentFile ^java.io.File manifest)]
     (spit (io/file directory "kotoba.lock.edn")
