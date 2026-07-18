@@ -1199,6 +1199,73 @@
       [{:kotoba.runtime/problem :type-contract-unavailable
         :kotoba.runtime/required "kotoba.lang.type-system/validate-forms"}])))
 
+(defn- type-system-fn [sym]
+  (try
+    (requiring-resolve sym)
+    (catch java.io.FileNotFoundException _ nil)
+    (catch Exception _ nil)))
+
+(def source-import-arities
+  "Guest-facing (pre-ABI) arities for host imports. The live host-imports
+  :params vector is the WASM ABI after string/ptr lowering and keyword
+  encoding — not the surface call shape authors write. L4 checks surface
+  arity from this map; ops absent here are not arity-checked (ABI-only)."
+  {'clipboard-read 2
+   'clipboard-write 2
+   'log-write 2
+   'log-read 2
+   'clock-monotonic 0
+   'cap-acquire 2
+   'sha256-hex 2
+   'http-post 4
+   'random-bytes 2
+   'gen-keypair 0})
+
+(defn- source-import-catalog
+  "Catalog shaped for type-system/validate-host-import-calls using surface arities."
+  []
+  (into {}
+        (keep (fn [[op n]]
+                (when-let [entry (get host-imports op)]
+                  [op (assoc entry :params (vec (repeat n :value)))]))
+              source-import-arities)))
+
+(defn import-arity-problems
+  "L4: check host-import surface arity against source-import-arities.
+  Opt-in via policy :kotoba.policy/check-import-arity or :typed-hir so existing
+  demos (ABI-shaped catalogs) are not false-positive rejected. Always
+  available for direct calls with explicit true policy."
+  ([forms] (import-arity-problems forms nil))
+  ([forms policy]
+   (let [enabled? (boolean (or (:kotoba.policy/check-import-arity policy)
+                               (:kotoba.policy/typed-hir policy)
+                               (:check-import-arity policy)
+                               (:typed-hir policy)))]
+     (if-not enabled?
+       []
+       (if-let [validate (type-system-fn 'kotoba.lang.type-system/validate-host-import-calls)]
+         (let [{:keys [problems]} (validate (source-import-catalog) forms)]
+           (mapv (fn [problem]
+                   {:kotoba.runtime/problem :import-arity-invalid
+                    :kotoba.runtime/detail problem})
+                 problems))
+         [])))))
+
+(defn require-signature-problems
+  "L4: when policy requests typed-HIR admission, public defn must carry
+  :signature metadata."
+  [forms policy]
+  (let [require? (boolean (or (:kotoba.policy/require-signatures policy)
+                              (:kotoba.policy/typed-hir policy)
+                              (:require-signatures policy)
+                              (:typed-hir policy)))]
+    (if-let [check (type-system-fn 'kotoba.lang.type-system/require-signatures-problems)]
+      (mapv (fn [problem]
+              {:kotoba.runtime/problem :signature-required
+               :kotoba.runtime/detail problem})
+            (check forms require?))
+      [])))
+
 (declare wasm-binary)
 
 (defn check
@@ -1214,7 +1281,9 @@
                                      (cap-typed-problems forms)
                                      (cap-affine-problems forms)
                                      (cap-effect-problems forms)
-                                     (type-contract-problems forms)))
+                                     (type-contract-problems forms)
+                                     (import-arity-problems forms policy)
+                                     (require-signature-problems forms policy)))
         ;; A defsystem source is an executable game module, not merely data.
         ;; Its safety check must prove that the selected Kotoba backend can
         ;; compile it; accepting an unknown operation here would be fail-open.
