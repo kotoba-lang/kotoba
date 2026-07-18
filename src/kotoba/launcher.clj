@@ -195,16 +195,18 @@
   reconstruct its namespaced entity map. Collection-valued attributes were
   serialized with pr-str by the contract repository's datomizer."
   [path]
-  (let [tx-data (-> path io/resource slurp edn/read-string)]
-    (into {}
-          (map (fn [[k v]]
-                 [k (if (string? v)
-                      (try
-                        (let [decoded (edn/read-string v)]
-                          (if (coll? decoded) decoded v))
-                        (catch Exception _ v))
-                      v)]))
-          (dissoc (first tx-data) :db/id))))
+  (let [document (-> path io/resource slurp edn/read-string)]
+    (if (map? document)
+      document
+      (into {}
+            (map (fn [[k v]]
+                   [k (if (string? v)
+                        (try
+                          (let [decoded (edn/read-string v)]
+                            (if (coll? decoded) decoded v))
+                          (catch Exception _ v))
+                        v)]))
+            (dissoc (first document) :db/id)))))
 
 (defn dispatch
   "Dispatch argv through the CLJC authority and return a result map."

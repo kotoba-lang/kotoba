@@ -5,6 +5,7 @@
   with an explicit reader target, checks a strict pure subset, emits deterministic
   EDN IR, and can run a zero-arity `main` function."
   (:require [clojure.java.io :as io]
+            [clojure.set :as set]
             ;; aliased `cstr`, not `str` -- this file already uses the bare
             ;; `clojure.core/str` function extensively; `:as str` would
             ;; silently shadow every one of those call sites.
@@ -572,16 +573,945 @@
     :else
     (throw (ex-info "unsupported literal" {:form form}))))
 
+(declare expand-let-bindings)
+
 (defn function-def
   "Parse a top-level `(defn name [params] body...)` form into
   `[name {:kind :kotoba.runtime/fn ...}]`, or nil if form isn't a defn."
   [form]
   (when (and (seq? form) (= 'defn (first form)))
-    (let [[_ name params & body] form]
+    (let [[_ name raw-params & raw-body] form
+          params (mapv (fn [index pattern]
+                         (if (symbol? pattern)
+                           pattern
+                           (symbol (str "__kotoba_param_" index))))
+                       (range) raw-params)
+          destructuring (vec (mapcat (fn [pattern param]
+                                       (when-not (symbol? pattern) [pattern param]))
+                                     raw-params params))
+          body (if (seq destructuring)
+                 [(list 'let destructuring (list* 'do raw-body))]
+                 raw-body)]
       [name {:kind :kotoba.runtime/fn
              :name name
-             :params (vec params)
+             :params params
              :body (vec body)}])))
+
+(defn- protocol-form->info [form]
+  (let [[_ protocol-name & methods] form]
+    (when-not (and (symbol? protocol-name) (seq methods)
+                   (every? #(and (seq? %) (= 2 (count %)) (symbol? (first %))
+                                 (vector? (second %)) (seq (second %))
+                                 (every? symbol? (second %))) methods)
+                   (= (count methods) (count (distinct (map first methods)))))
+      (throw (ex-info "defprotocol requires unique (method [this ...]) signatures"
+                      {:form form})))
+    {:name protocol-name
+     :methods (into {} (map (fn [[method-name params]] [method-name params]) methods))}))
+
+(defn- extension-implementations [protocols protocol-name type-name method-forms whole-form]
+  (let [protocol (get protocols protocol-name)]
+    (when-not (and protocol (symbol? type-name) (seq method-forms))
+      (throw (ex-info "protocol extension requires a declared protocol, type, and methods"
+                      {:form whole-form})))
+    (mapv (fn [[method-name params & body :as method-form]]
+            (when-not (and (= 1 (count body)) (vector? params)
+                           (every? symbol? params)
+                           (= (count params)
+                              (count (get-in protocol [:methods method-name]))))
+              (throw (ex-info "protocol method does not match its declaration"
+                              {:form method-form})))
+            {:protocol protocol-name :method method-name :record type-name
+             :params params :body (first body)})
+          method-forms)))
+
+(defn- record-form->info [protocols form]
+  (let [[_ record-name fields & extra] form]
+    (when-not (and (symbol? record-name) (vector? fields)
+                   (every? symbol? fields)
+                   (= (count fields) (count (distinct fields))))
+      (throw (ex-info "defrecord requires a name and unique symbol fields" {:form form})))
+    (let [groups (loop [remaining extra out []]
+                   (if (empty? remaining)
+                     out
+                     (let [protocol-name (first remaining)
+                           [methods tail] (split-with seq? (rest remaining))]
+                       (when-not (and (symbol? protocol-name) (seq methods))
+                         (throw (ex-info "defrecord protocol section requires methods"
+                                         {:form form})))
+                       (recur tail (conj out [protocol-name methods])))))
+          implementations (mapcat (fn [[protocol-name methods]]
+                                    (extension-implementations protocols protocol-name
+                                                               record-name methods form))
+                                  groups)
+          tag (keyword (name record-name))
+          record-map (into {:kotoba.record/type tag}
+                           (map (fn [field] [(keyword (name field)) field]) fields))]
+      {:name record-name
+       :defs [(list 'defn (symbol (str "->" record-name)) fields record-map)
+              (list 'defn (symbol (str "map->" record-name)) ['m]
+                    (list 'assoc 'm :kotoba.record/type tag))]
+       :implementations implementations})))
+
+(defn- protocol-dispatch-defs [protocols implementations]
+  (let [named (mapv #(assoc %1 :impl-name (symbol (str "__kotoba_protocol_impl_" %2)))
+                    implementations (range))
+        impl-defs (mapv (fn [{:keys [impl-name params body]}]
+                          (list 'defn impl-name params body)) named)]
+    (concat
+     impl-defs
+     (mapcat
+      (fn [[protocol-name {:keys [methods]}]]
+        (map (fn [[method-name params]]
+               (let [self (first params)
+                     matches #(and (= protocol-name (:protocol %))
+                                   (= method-name (:method %)))
+                     candidates (filter #(and (matches %) (not= 'default (:record %))) named)
+                     default-impl (first (filter #(and (matches %) (= 'default (:record %))) named))
+                     fallback (if default-impl
+                                (apply list (:impl-name default-impl) params)
+                                0)
+                     body (reduce (fn [otherwise {:keys [record impl-name]}]
+                                    (list 'if
+                                          (list '= (list 'get self :kotoba.record/type)
+                                                (keyword (name record)))
+                                          (apply list impl-name params)
+                                          otherwise))
+                                  fallback (reverse candidates))]
+                 (list 'defn method-name params body)))
+             (sort-by (comp str key) methods)))
+      (sort-by (comp str key) protocols)))))
+
+(defn- multi-arity-defn? [form]
+  (and (seq? form) (= 'defn (first form))
+       (not (vector? (nth form 2 nil)))))
+
+(defn- expand-multi-arity-defn [form]
+  (let [[_ function-name & clauses] form]
+    (when-not (and (symbol? function-name) (seq clauses)
+                   (every? #(and (seq? %) (vector? (first %))
+                                 (= 2 (count %))) clauses))
+      (throw (ex-info "multi-arity defn requires ([params] body) clauses" {:form form})))
+    (let [parsed (mapv (fn [[params body :as clause]]
+                         (let [amp-index (first (keep-indexed #(when (= '& %2) %1) params))]
+                           (if amp-index
+                             (do
+                               (when-not (and (= amp-index (- (count params) 2))
+                                              (every? symbol? (subvec params 0 amp-index))
+                                              (symbol? (peek params)))
+                                 (throw (ex-info "variadic clause requires [fixed ... & rest]"
+                                                 {:form clause})))
+                               {:kind :variadic :fixed (subvec params 0 amp-index)
+                                :rest-name (peek params) :body body :min-arity amp-index})
+                             (do
+                               (when-not (and (<= (count params) 5) (every? symbol? params))
+                                 (throw (ex-info "fixed clause exceeds the five-parameter ABI"
+                                                 {:form clause})))
+                               {:kind :fixed :params params :body body :arity (count params)}))))
+                       clauses)
+          fixed (filter #(= :fixed (:kind %)) parsed)
+          variadics (filter #(= :variadic (:kind %)) parsed)
+          fixed-by-arity (into {} (map (juxt :arity identity) fixed))
+          variadic (first variadics)]
+      (when (or (> (count variadics) 1)
+                (not= (count fixed) (count fixed-by-arity)))
+        (throw (ex-info "multi-arity defn requires unique fixed arities and one variadic clause"
+                        {:form form})))
+      (let [arities (sort (distinct (concat (keys fixed-by-arity)
+                                            (when variadic (range (:min-arity variadic) 6)))))
+            target (fn [arity]
+                     (if (and (= function-name 'main) (zero? arity))
+                       'main
+                       (symbol (str function-name "$arity" arity))))
+            defs (mapv (fn [arity]
+                         (if-let [{:keys [params body]} (get fixed-by-arity arity)]
+                           (list 'defn (target arity) params body)
+                           (let [{:keys [fixed rest-name body]} variadic
+                                 extras (mapv #(symbol (str "__kotoba_rest_arg_" %))
+                                              (range (- arity (count fixed))))]
+                             (list 'defn (target arity) (into (vec fixed) extras)
+                                   (list 'let
+                                         [rest-name
+                                          (reduce (fn [tail item] (list 'pair item tail))
+                                                  0 (reverse extras))]
+                                         body)))))
+                       arities)]
+        {:name function-name :dispatch (into {} (map (fn [a] [a (target a)]) arities))
+         :defs defs}))))
+
+(defn- rewrite-multi-arity-calls [dispatch form]
+  (cond
+    (seq? form)
+    (let [[op & args] form
+          args* (map #(rewrite-multi-arity-calls dispatch %) args)
+          callback-arity (case op
+                           map (when (seq (rest args)) (count (rest args)))
+                           filter 1
+                           reduce 2
+                           nil)
+          callback-name (first args*)
+          args* (cond
+                  (and (= op 'reduce) (= 2 (count args)) (symbol? callback-name)
+                       (get-in dispatch [callback-name 0])
+                       (get-in dispatch [callback-name 2]))
+                  (cons (list 'fn
+                              (list [] (list (get-in dispatch [callback-name 0])))
+                              (list '[acc value]
+                                    (list (get-in dispatch [callback-name 2]) 'acc 'value)))
+                        (rest args*))
+
+                  (and callback-arity (symbol? callback-name))
+                  (if-let [target (get-in dispatch [callback-name callback-arity])]
+                    (cons target (rest args*))
+                    args*)
+
+                  :else args*)]
+      (cond
+        (and (= op 'fn-ref) (= 1 (count args)) (get dispatch (first args)))
+        (cons 'fn
+              (map (fn [[arity target]]
+                     (let [params (mapv #(symbol (str "__kotoba_fn_ref_arg_" %))
+                                        (range arity))]
+                       (list params (apply list target params))))
+                   (sort-by key (get dispatch (first args)))))
+
+        (and (symbol? op) (get dispatch op))
+        (if-let [target (get-in dispatch [op (count args)])]
+          (apply list target args*)
+          (throw (ex-info "multi-arity call has no matching bounded arity" {:form form})))
+
+        :else (apply list op args*)))
+    (vector? form) (mapv #(rewrite-multi-arity-calls dispatch %) form)
+    (map? form) (into {} (map (fn [[k v]] [(rewrite-multi-arity-calls dispatch k)
+                                            (rewrite-multi-arity-calls dispatch v)]) form))
+    (set? form) (set (map #(rewrite-multi-arity-calls dispatch %) form))
+    :else form))
+
+(defn- expand-multi-arity-forms [forms]
+  (let [expansions (mapv expand-multi-arity-defn (filter multi-arity-defn? forms))
+        dispatch (into {} (map (juxt :name :dispatch) expansions))
+        forms* (concat (remove multi-arity-defn? forms) (mapcat :defs expansions))]
+    (mapv (partial rewrite-multi-arity-calls dispatch) forms*)))
+
+(defn- expand-record-protocol-forms [forms]
+  (let [protocol-infos (mapv protocol-form->info
+                             (filter #(and (seq? %) (#{'defprotocol 'definterface} (first %))) forms))
+        protocols (into {} (map (juxt :name identity) protocol-infos))
+        _ (when-not (= (count protocols) (count protocol-infos))
+            (throw (ex-info "duplicate protocol name" {:forms forms})))
+        record-infos (mapv (partial record-form->info protocols)
+                           (filter #(and (seq? %) (= 'defrecord (first %))) forms))
+        extend-type-impls
+        (mapcat (fn [[_ type-name protocol-name & methods :as form]]
+                  (extension-implementations protocols protocol-name type-name methods form))
+                (filter #(and (seq? %) (= 'extend-type (first %))) forms))
+        extend-protocol-impls
+        (mapcat (fn [[_ protocol-name & sections :as form]]
+                  (loop [remaining sections out []]
+                    (if (empty? remaining)
+                      out
+                      (let [type-name (first remaining)
+                            [methods tail] (split-with seq? (rest remaining))]
+                        (recur tail (into out (extension-implementations
+                                               protocols protocol-name type-name methods form)))))))
+                (filter #(and (seq? %) (= 'extend-protocol (first %))) forms))
+        implementations (vec (concat (mapcat :implementations record-infos)
+                                     extend-type-impls extend-protocol-impls))
+        identities (map (juxt :protocol :method :record) implementations)]
+    (when-not (= (count identities) (count (distinct identities)))
+      (throw (ex-info "duplicate protocol method implementation" {:forms forms})))
+    (concat
+     (remove #(and (seq? %)
+                   (#{'defrecord 'defprotocol 'definterface 'extend-type 'extend-protocol}
+                    (first %))) forms)
+     (mapcat :defs record-infos)
+     (protocol-dispatch-defs protocols implementations))))
+
+(defn- expand-lazy-forms [forms]
+  (let [defs (vec (keep function-def forms))
+        fn-names (set (map first defs))
+        direct-info
+        (into {}
+              (map (fn [[name f]]
+                     (let [calls (atom #{}) effects? (atom false)]
+                       (doseq [body (:body f)]
+                         (walk-forms
+                          (fn [node]
+                            (when (seq? node)
+                              (let [op (first node)]
+                                (when (contains? fn-names op) (swap! calls conj op))
+                                (when (contains? host-imports op) (reset! effects? true))))) body))
+                       [name {:calls @calls :direct-effect? @effects?}])) defs))
+        effectful (loop [known (set (keep (fn [[name {:keys [direct-effect?]}]]
+                                            (when direct-effect? name)) direct-info))]
+                    (let [next (into known
+                                     (keep (fn [[name {:keys [calls]}]]
+                                             (when (some known calls) name)) direct-info))]
+                      (if (= known next) known (recur next))))
+        effectful-expr? (fn [expr]
+                          (let [found? (atom false)]
+                            (walk-forms
+                             (fn [node]
+                               (when (and (seq? node)
+                                          (or (contains? host-imports (first node))
+                                              (contains? effectful (first node))))
+                                 (reset! found? true))) expr)
+                            @found?))
+        used (atom #{})
+        normalize-callback (fn [callback]
+                             (if (and (symbol? callback) (contains? fn-names callback))
+                               (list 'fn-ref callback)
+                               callback))
+        rewrite
+        (fn rewrite [form]
+          (cond
+            (vector? form) (mapv rewrite form)
+            (map? form) (into {} (map (fn [[k v]] [(rewrite k) (rewrite v)]) form))
+            (set? form) (set (map rewrite form))
+            (not (seq? form)) form
+            :else
+            (let [[op & args] form]
+              (case op
+                lazy-cons (do
+                            (when-not (= 2 (count args))
+                              (throw (ex-info "lazy-cons requires head and tail" {:form form})))
+                            (when (some effectful-expr? args)
+                              (throw (ex-info "lazy thunk must be transitively pure"
+                                              {:form form :kotoba.runtime/problem :effectful-lazy-thunk})))
+                            (list 'lazy-cons (rewrite (first args)) (rewrite (second args))))
+                lazy-map (let [arity (dec (count args))]
+                           (when-not (<= 1 arity 4)
+                             (throw (ex-info "lazy-map supports one to four sources" {:form form})))
+                           (swap! used conj (keyword (str "map" arity)))
+                           (apply list (symbol (str "__kotoba_lazy_map" arity))
+                                  (normalize-callback (rewrite (first args)))
+                                  (map rewrite (rest args))))
+                lazy-filter (do
+                              (when-not (= 2 (count args))
+                                (throw (ex-info "lazy-filter requires callback and source" {:form form})))
+                              (swap! used conj :filter)
+                              (list '__kotoba_lazy_filter
+                                    (normalize-callback (rewrite (first args)))
+                                    (rewrite (second args))))
+                take (do (swap! used conj :take) (list '__kotoba_lazy_take (rewrite (first args))
+                                                       (rewrite (second args))))
+                drop (do (swap! used conj :drop) (list '__kotoba_lazy_drop (rewrite (first args))
+                                                       (rewrite (second args))))
+                (apply list op (map rewrite args))))))
+        base (mapv rewrite forms)
+        map-helper
+        (fn [arity]
+          (let [name (symbol (str "__kotoba_lazy_map" arity))
+                sources (mapv #(symbol (str "source" %)) (range arity))
+                empty-test (reduce (fn [out source] (list 'or out (list 'lazy-empty? source)))
+                                   0 sources)
+                heads (map #(list 'lazy-first %) sources)
+                tails (map #(list 'lazy-rest %) sources)]
+            (list 'defn name (into ['callback] sources)
+                  (list 'if empty-test 0
+                        (list 'lazy-cons
+                              (apply list 'invoke 'callback heads)
+                              (apply list name 'callback tails))))))
+        helpers
+        (concat
+         (for [arity (range 1 5) :when (contains? @used (keyword (str "map" arity)))]
+           (map-helper arity))
+         (when (contains? @used :filter)
+           ['(defn __kotoba_lazy_filter [callback source]
+               (fn []
+                 (if (lazy-empty? source) 0
+                   (let [value (lazy-first source)
+                         tail (lazy-rest source)]
+                     (if (invoke callback value)
+                       (pair (fn [] value)
+                             (fn [] (__kotoba_lazy_filter callback tail)))
+                       (invoke (__kotoba_lazy_filter callback tail)))))))])
+         (when (contains? @used :take)
+           ['(defn __kotoba_lazy_take [n source]
+               (if (<= n 0) 0
+                 (if (lazy-empty? source) 0
+                   (pair (lazy-first source)
+                         (__kotoba_lazy_take (- n 1) (lazy-rest source))))))])
+         (when (contains? @used :drop)
+           ['(defn __kotoba_lazy_drop [n source]
+               (if (<= n 0) source
+                 (if (lazy-empty? source) 0
+                   (__kotoba_lazy_drop (- n 1) (lazy-rest source)))))]))]
+    (vec (concat base helpers))))
+
+(defn- expand-match-forms [forms]
+  (let [counter (volatile! 0)]
+    (letfn [(all-tests [tests]
+              (reduce (fn [out test] (list 'and out test)) 1 tests))
+            (pattern-plan [pattern value]
+              (cond
+                (= '_ pattern) {:test 1 :bindings []}
+                (symbol? pattern) {:test 1 :bindings [pattern value]}
+                (or (integer? pattern) (keyword? pattern) (string? pattern))
+                {:test (list '= value pattern) :bindings []}
+                (vector? pattern)
+                (let [amp (.indexOf pattern '&)
+                      positional (if (neg? amp) pattern (subvec pattern 0 amp))
+                      rest-pattern (when-not (neg? amp) (nth pattern (inc amp) nil))]
+                  (when (and (not (neg? amp))
+                             (or (not= amp (- (count pattern) 2))
+                                 (not (symbol? rest-pattern))))
+                    (throw (ex-info "match vector & requires one trailing symbol" {:pattern pattern})))
+                  (let [children (map-indexed
+                                  (fn [index child]
+                                    (pattern-plan child (list 'nth value index 0))) positional)
+                        length-test (if (neg? amp)
+                                      (list '= (list 'count value) (count positional))
+                                      (list '>= (list 'count value) (count positional)))]
+                    {:test (all-tests (cons length-test (map :test children)))
+                     :bindings (vec (concat (mapcat :bindings children)
+                                            (when rest-pattern
+                                              [rest-pattern
+                                               (reduce (fn [tail _] (list 'pop tail))
+                                                       value positional)])))}))
+                (map? pattern)
+                (let [children (mapv (fn [[key child]]
+                                       (when-not (keyword? key)
+                                         (throw (ex-info "match map keys must be keywords"
+                                                         {:pattern pattern})))
+                                       (let [entry (pattern-plan child (list 'get value key 0))]
+                                         (update entry :test
+                                                 #(list 'and
+                                                        (list 'contains-key? value key) %))))
+                                     (sort-by (comp str key) pattern))]
+                  {:test (all-tests (map :test children))
+                   :bindings (vec (mapcat :bindings children))})
+                :else (throw (ex-info "unsupported match pattern" {:pattern pattern}))))
+            (expand [form]
+              (cond
+                (vector? form) (mapv expand form)
+                (map? form) (into {} (map (fn [[k v]] [(expand k) (expand v)]) form))
+                (set? form) (set (map expand form))
+                (not (seq? form)) form
+                :else
+                (let [[op & args] form]
+                  (if (= op 'match)
+                    (let [[value & clauses] args]
+                      (when-not (and value (even? (count clauses)) (seq clauses))
+                        (throw (ex-info "match requires value and pattern/result pairs"
+                                        {:form form})))
+                      (let [temp (symbol (str "__kotoba_match_value_" (vswap! counter inc)))
+                            branch (reduce
+                                    (fn [otherwise [pattern result]]
+                                      (if (= :else pattern)
+                                        (expand result)
+                                        (let [{:keys [test bindings]} (pattern-plan pattern temp)]
+                                          (list 'if test
+                                                (if (seq bindings)
+                                                  (list 'let bindings (expand result))
+                                                  (expand result))
+                                                otherwise))))
+                                    0 (reverse (partition 2 clauses)))]
+                        (list 'let [temp (expand value)] branch)))
+                    (apply list op (map expand args))))))]
+      (mapv expand forms))))
+
+(def ^:private primary-collection-fuel 128)
+
+(defn- expand-fuel-collection-forms [forms]
+  (let [used (atom #{})
+        function-names (into #{} (keep #(when (and (seq? %) (= 'defn (first %)))
+                                          (second %)) forms))
+        callback-value (fn [callback]
+                         (if (and (symbol? callback) (contains? function-names callback))
+                           (list 'fn-ref callback)
+                           callback))]
+    (letfn [(rewrite [form]
+              (cond
+                (vector? form) (mapv rewrite form)
+                (map? form) (into {} (map (fn [[k v]] [(rewrite k) (rewrite v)]) form))
+                (set? form) (set (map rewrite form))
+                (not (seq? form)) form
+                :else
+                (let [[op & args] form]
+                  (case op
+                    count (do (swap! used conj :count)
+                              (list '__kotoba_fuel_count (rewrite (first args)) primary-collection-fuel))
+                    nth (do (swap! used conj :nth)
+                            (list '__kotoba_fuel_nth (rewrite (first args))
+                                  (rewrite (second args))
+                                  (if (= 3 (count args)) (rewrite (nth args 2)) 0)
+                                  primary-collection-fuel))
+                    map (if (= 2 (count args))
+                          (do (swap! used into #{:reverse :map})
+                              (list '__kotoba_fuel_map_loop
+                                    (callback-value (rewrite (first args)))
+                                    (rewrite (second args)) 0 primary-collection-fuel))
+                          ;; Multi-source map retains its existing static ABI
+                          ;; specialization until its source tuple gets a
+                          ;; dedicated tail-recursive representation.
+                          (apply list op (map rewrite args)))
+                    filter (do (swap! used into #{:filter :reverse})
+                               (list '__kotoba_fuel_filter_loop
+                                     (callback-value (rewrite (first args)))
+                                     (rewrite (second args)) 0 primary-collection-fuel))
+                    reduce (case (count args)
+                             2 (do (swap! used into #{:reduce-no-init :reduce})
+                                   (list '__kotoba_fuel_reduce_no_init
+                                         (callback-value (rewrite (first args)))
+                                         (rewrite (second args)) primary-collection-fuel))
+                             3 (do (swap! used conj :reduce)
+                                   (list '__kotoba_fuel_reduce
+                                         (callback-value (rewrite (first args)))
+                                         (rewrite (second args)) (rewrite (nth args 2))
+                                         primary-collection-fuel))
+                             (apply list op (map rewrite args)))
+                    keys (do (swap! used into #{:keys :reverse})
+                             (list '__kotoba_fuel_keys_loop (rewrite (first args)) 0 primary-collection-fuel))
+                    vals (do (swap! used into #{:vals :reverse})
+                             (list '__kotoba_fuel_vals_loop (rewrite (first args)) 0 primary-collection-fuel))
+                    dissoc (do (swap! used into #{:dissoc :reverse})
+                               (list '__kotoba_fuel_dissoc_loop (rewrite (first args))
+                                     (rewrite (second args)) 0 primary-collection-fuel))
+                    (apply list op (map rewrite args))))))]
+      (let [base (mapv rewrite forms)
+            helpers
+            (concat
+             (when (contains? @used :count)
+               ['(defn __kotoba_fuel_count [items fuel]
+                   (if (or (= fuel 0) (= items 0)) 0
+                     (+ 1 (__kotoba_fuel_count (pair-second items) (- fuel 1)))))] )
+             (when (contains? @used :nth)
+               ['(defn __kotoba_fuel_nth [items index default fuel]
+                   (if (or (= fuel 0) (= items 0) (< index 0)) default
+                     (if (= index 0) (pair-first items)
+                       (__kotoba_fuel_nth (pair-second items) (- index 1) default (- fuel 1)))))] )
+             (when (contains? @used :reverse)
+               ['(defn __kotoba_fuel_reverse [items out fuel]
+                   (if (or (= fuel 0) (= items 0)) out
+                     (__kotoba_fuel_reverse (pair-second items)
+                       (pair (pair-first items) out) (- fuel 1))))] )
+             (when (contains? @used :map)
+               ['(defn __kotoba_fuel_map_loop [callback items out fuel]
+                   (if (or (= fuel 0) (= items 0))
+                     (__kotoba_fuel_reverse out 0 128)
+                     (__kotoba_fuel_map_loop callback (pair-second items)
+                       (pair (invoke callback (pair-first items)) out) (- fuel 1))))] )
+             (when (contains? @used :filter)
+               ['(defn __kotoba_fuel_filter_loop [callback items out fuel]
+                   (if (or (= fuel 0) (= items 0))
+                     (__kotoba_fuel_reverse out 0 128)
+                     (let [value (pair-first items)]
+                       (__kotoba_fuel_filter_loop callback (pair-second items)
+                         (if (invoke callback value) (pair value out) out)
+                         (- fuel 1)))))] )
+             (when (contains? @used :reduce)
+               ['(defn __kotoba_fuel_reduce [callback acc items fuel]
+                   (if (or (= fuel 0) (= items 0)) acc
+                     (__kotoba_fuel_reduce callback
+                       (invoke callback acc (pair-first items))
+                       (pair-second items) (- fuel 1))))] )
+             (when (contains? @used :reduce-no-init)
+               ['(defn __kotoba_fuel_reduce_no_init [callback items fuel]
+                   (if (= items 0) (invoke callback)
+                     (__kotoba_fuel_reduce callback (pair-first items)
+                       (pair-second items) (- fuel 1))))] )
+             (when (contains? @used :keys)
+               ['(defn __kotoba_fuel_keys_loop [items out fuel]
+                   (if (or (= fuel 0) (= items 0)) (__kotoba_fuel_reverse out 0 128)
+                     (__kotoba_fuel_keys_loop (pair-second items)
+                       (pair (pair-first (pair-first items)) out) (- fuel 1))))] )
+             (when (contains? @used :vals)
+               ['(defn __kotoba_fuel_vals_loop [items out fuel]
+                   (if (or (= fuel 0) (= items 0)) (__kotoba_fuel_reverse out 0 128)
+                     (__kotoba_fuel_vals_loop (pair-second items)
+                       (pair (pair-second (pair-first items)) out) (- fuel 1))))] )
+             (when (contains? @used :dissoc)
+               ['(defn __kotoba_fuel_dissoc_loop [items key out fuel]
+                   (if (or (= fuel 0) (= items 0)) (__kotoba_fuel_reverse out 0 128)
+                     (let [entry (pair-first items)]
+                       (__kotoba_fuel_dissoc_loop (pair-second items) key
+                         (if (= (pair-first entry) key) out (pair entry out))
+                         (- fuel 1)))))] ))]
+        (vec (concat base helpers))))))
+
+(def ^:private pure-desugar-heads
+  '#{if do and or not = not= < > <= >= + - * quot rem mod
+     pair pair-first pair-second get assoc contains? contains-key? conj disj
+     count nth peek pop keys vals dissoc map filter reduce
+     lazy-cons lazy-first lazy-rest lazy-empty? lazy-map lazy-filter take drop
+     invoke apply fn-ref match})
+
+(defn- expand-pure-desugars [forms]
+  (let [definitions
+        (mapv (fn [[_ name params template :as form]]
+                (when-not (and (= 4 (count form)) (symbol? name) (vector? params)
+                               (<= (count params) 5) (every? symbol? params)
+                               (= (count params) (count (distinct params))))
+                  (throw (ex-info "defdesugar requires name, unique parameter vector, and template"
+                                  {:form form})))
+                [name {:params params :template template}])
+              (filter #(and (seq? %) (= 'defdesugar (first %))) forms))
+        registry (into {} definitions)
+        _ (when-not (= (count definitions) (count registry))
+            (throw (ex-info "duplicate defdesugar name" {:definitions definitions})))
+        allowed-heads (into pure-desugar-heads (keys registry))
+        validate-template
+        (fn validate-template [params node]
+          (cond
+            (symbol? node)
+            (when-not (contains? (set params) node)
+              (throw (ex-info "defdesugar template contains a free value symbol"
+                              {:symbol node})))
+            (seq? node)
+            (do
+              (when-not (contains? allowed-heads (first node))
+                (throw (ex-info "defdesugar template call head is not registered pure"
+                                {:head (first node)})))
+              (doseq [arg (rest node)] (validate-template params arg)))
+            (coll? node) (doseq [item node] (validate-template params item))
+            :else nil))
+        _ (doseq [[_ {:keys [params template]}] registry]
+            (validate-template params template))
+        counter (volatile! 0)
+        expansion-count (volatile! 0)]
+    (letfn [(expand [form depth]
+              (when (> depth 32)
+                (throw (ex-info "defdesugar expansion depth exceeded" {:form form})))
+              (cond
+                (vector? form) (mapv #(expand % depth) form)
+                (map? form) (into {} (map (fn [[k v]] [(expand k depth) (expand v depth)]) form))
+                (set? form) (set (map #(expand % depth) form))
+                (not (seq? form)) form
+                :else
+                (let [[op & args] form]
+                  (if-let [{:keys [params template]} (get registry op)]
+                    (do
+                      (when-not (= (count params) (count args))
+                        (throw (ex-info "defdesugar call arity mismatch" {:form form})))
+                      (when (> (vswap! expansion-count inc) 256)
+                        (throw (ex-info "defdesugar expansion count exceeded" {:form form})))
+                      (let [temps (mapv (fn [_]
+                                          (symbol (str "__kotoba_desugar_arg_"
+                                                       (vswap! counter inc)))) params)
+                            replacements (zipmap params temps)
+                            body (walk/postwalk-replace replacements template)]
+                        (list 'let (vec (mapcat vector temps
+                                                (map #(expand % depth) args)))
+                              (expand body (inc depth)))))
+                    (apply list op (map #(expand % depth) args))))))]
+      (mapv #(expand % 0)
+            (remove #(and (seq? %) (= 'defdesugar (first %))) forms)))))
+
+(defn- closure-dispatcher-name [arity]
+  (symbol (str "__kotoba_invoke$arity" arity)))
+
+(defn- pair-chain [items]
+  (reduce (fn [tail item] (list 'pair item tail)) 0 (reverse items)))
+
+(defn- pattern-symbols [pattern]
+  (cond
+    (symbol? pattern) (if (= '& pattern) #{} #{pattern})
+    (vector? pattern) (apply clojure.set/union #{} (map pattern-symbols pattern))
+    (map? pattern) (apply clojure.set/union #{}
+                          (map pattern-symbols
+                               (concat (vals (dissoc pattern :or))
+                                       (:keys pattern))))
+    :else #{}))
+
+(defn- captures-from [form outer-bound]
+  (letfn [(scan [node shadowed]
+            (cond
+              (symbol? node) (if (and (contains? outer-bound node)
+                                      (not (contains? shadowed node)))
+                               #{node} #{})
+              (or (vector? node) (set? node))
+              (apply clojure.set/union #{} (map #(scan % shadowed) node))
+              (map? node)
+              (apply clojure.set/union #{}
+                     (mapcat (fn [[k v]] [(scan k shadowed) (scan v shadowed)]) node))
+              (seq? node)
+              (let [[op & args] node]
+                (case op
+                  let (let [[bindings & body] args]
+                        (loop [pairs (partition 2 bindings) shadows shadowed found #{}]
+                          (if-let [[pattern value] (first pairs)]
+                            (recur (rest pairs)
+                                   (into shadows (pattern-symbols pattern))
+                                   (clojure.set/union found (scan value shadows)))
+                            (clojure.set/union found
+                                               (apply clojure.set/union #{}
+                                                      (map #(scan % shadows) body))))))
+                  fn (let [[params-or-clause & tail] args
+                           clauses (if (vector? params-or-clause)
+                                     [[params-or-clause (first tail)]]
+                                     (map (fn [clause] [(first clause) (second clause)])
+                                          (cons params-or-clause tail)))]
+                       (apply clojure.set/union #{}
+                              (map (fn [[params body]]
+                                     (scan body (into shadowed (pattern-symbols params))))
+                                   clauses)))
+                  (apply clojure.set/union #{} (map #(scan % shadowed) args))))
+              :else #{}))]
+    (scan form #{})))
+
+(defn- expand-closure-forms [forms]
+  (let [lambda-counter (volatile! 0)
+        lambdas (atom [])
+        loop-counter (volatile! 0)
+        loop-helpers (atom [])
+        uses-apply? (volatile! false)
+        function-arities (reduce (fn [out form]
+                                   (if-let [[name f] (function-def form)]
+                                     (update out name (fnil conj #{}) (count (:params f)))
+                                     out)) {} forms)]
+    (letfn [(parse-clauses [form]
+              (let [[_ params-or-clause & tail] form]
+                (if (vector? params-or-clause)
+                  (do
+                    (when-not (= 1 (count tail))
+                      (throw (ex-info "fn requires one body" {:form form})))
+                    [[params-or-clause (first tail)]])
+                  (mapv (fn [clause]
+                          (when-not (and (seq? clause) (vector? (first clause))
+                                         (= 2 (count clause)))
+                            (throw (ex-info "multi-arity fn requires ([params] body) clauses"
+                                            {:form clause})))
+                          [(first clause) (second clause)])
+                        (cons params-or-clause tail)))))
+            (normalize-clauses [form]
+              (let [parsed (mapv (fn [[params body :as clause]]
+                                   (let [amp (first (keep-indexed #(when (= '& %2) %1) params))]
+                                     (if amp
+                                       (do
+                                         (when-not (and (= amp (- (count params) 2)) (<= amp 4))
+                                           (throw (ex-info "variadic fn exceeds closure ABI" {:form clause})))
+                                         {:kind :variadic :fixed (subvec params 0 amp)
+                                          :rest-name (peek params) :body body :min amp})
+                                       {:kind :fixed :params params :body body
+                                        :arity (count params)})))
+                                 (parse-clauses form))
+                    fixed (filter #(= :fixed (:kind %)) parsed)
+                    variadic (first (filter #(= :variadic (:kind %)) parsed))
+                    by-arity (into {} (map (juxt :arity identity) fixed))
+                    arities (sort (distinct (concat (keys by-arity)
+                                                    (when variadic (range (:min variadic) 5)))))]
+                (when (or (> (count (filter #(= :variadic (:kind %)) parsed)) 1)
+                          (not= (count fixed) (count by-arity))
+                          (empty? arities) (some #(> % 4) arities))
+                  (throw (ex-info "fn requires unique arities zero through four" {:form form})))
+                (mapv (fn [arity]
+                        (if-let [{:keys [params body]} (get by-arity arity)]
+                          [params body]
+                          (let [{:keys [fixed rest-name body]} variadic
+                                extras (mapv #(symbol (str "__kotoba_lambda_rest_arg_" %))
+                                             (range (- arity (count fixed))))]
+                            [(into (vec fixed) extras)
+                             (list 'let [rest-name (pair-chain extras)] body)])))
+                      arities)))
+            (lift [form bound]
+              (let [clauses (normalize-clauses form)
+                    captures (vec (sort-by str
+                                           (apply clojure.set/union #{}
+                                                  (map (fn [[params body]]
+                                                         (captures-from body
+                                                                        (apply disj bound params)))
+                                                       clauses))))
+                    id (vswap! lambda-counter inc)]
+                (doseq [[params _] clauses]
+                  (when (> (+ (count captures) (count params)) 5)
+                    (throw (ex-info "fn captures plus parameters exceed ABI" {:form form}))))
+                (doseq [[params body] clauses]
+                  (let [arity (count params)
+                        helper (symbol (str "__kotoba_lambda_" id "_arity" arity))]
+                    (swap! lambdas conj {:id id :arity arity :captures captures
+                                         :helper helper :params (into captures params)
+                                         :body (transform body (into bound params))})))
+                (list 'pair id (pair-chain captures))))
+            (replace-recur [form helper loop-names captures]
+              (cond
+                (seq? form)
+                (let [[op & args] form]
+                  (if (= op 'recur)
+                    (do
+                      (when-not (= (count args) (count loop-names))
+                        (throw (ex-info "recur arity must match loop bindings" {:form form})))
+                      (apply list helper (concat args captures)))
+                    (apply list op (map #(replace-recur % helper loop-names captures) args))))
+                (vector? form) (mapv #(replace-recur % helper loop-names captures) form)
+                (map? form) (into {} (map (fn [[k v]] [(replace-recur k helper loop-names captures)
+                                                        (replace-recur v helper loop-names captures)]) form))
+                :else form))
+            (transform [form bound]
+              (cond
+                (vector? form) (mapv #(transform % bound) form)
+                (map? form) (into {} (map (fn [[k v]] [(transform k bound) (transform v bound)]) form))
+                (set? form) (set (map #(transform % bound) form))
+                (not (seq? form)) form
+                :else
+                (let [[op & args] form]
+                  (case op
+                    fn (lift form bound)
+                    fn-ref (let [target (first args)
+                                 arities (get function-arities target)]
+                             (when-not (and (= 1 (count args)) (seq arities)
+                                            (every? #(<= % 4) arities))
+                               (throw (ex-info "fn-ref requires a bounded top-level function"
+                                               {:form form})))
+                             (lift (cons 'fn
+                                         (map (fn [arity]
+                                                (let [params (mapv #(symbol (str "__kotoba_fn_ref_arg_" %))
+                                                                   (range arity))]
+                                                  (list params (apply list target params))))
+                                              (sort arities))) bound))
+                    invoke (do
+                             (when-not (<= 1 (count args) 5)
+                               (throw (ex-info "invoke requires closure plus zero to four args"
+                                               {:form form})))
+                             (apply list (closure-dispatcher-name (dec (count args)))
+                                    (map #(transform % bound) args)))
+                    apply (do
+                            (when-not (<= 2 (count args) 6)
+                              (throw (ex-info "apply requires closure, fixed args, and argument chain"
+                                              {:form form})))
+                            (vreset! uses-apply? true)
+                            (let [closure (transform (first args) bound)
+                                  call-args (rest args)
+                                  trailing (transform (last call-args) bound)
+                                  fixed (map #(transform % bound) (butlast call-args))]
+                              (list '__kotoba_closure_apply closure
+                                    (reduce (fn [tail value] (list 'pair value tail))
+                                            trailing (reverse fixed)))))
+                    lazy-cons (let [[head tail] args]
+                                (lift (list 'fn []
+                                            (list 'pair
+                                                  (list 'fn [] head)
+                                                  (list 'fn [] tail))) bound))
+                    lazy-first (let [source (transform (first args) bound)
+                                     cell (symbol "__kotoba_lazy_cell")]
+                                 (list 'let [cell (list (closure-dispatcher-name 0) source)]
+                                       (list 'if (list '= cell 0) 0
+                                             (list (closure-dispatcher-name 0)
+                                                   (list 'pair-first cell)))))
+                    lazy-rest (let [source (transform (first args) bound)
+                                    cell (symbol "__kotoba_lazy_cell")]
+                                (list 'let [cell (list (closure-dispatcher-name 0) source)]
+                                      (list 'if (list '= cell 0) 0
+                                            (list (closure-dispatcher-name 0)
+                                                  (list 'pair-second cell)))))
+                    lazy-empty? (let [source (transform (first args) bound)]
+                                  (list '= (list (closure-dispatcher-name 0) source) 0))
+                    loop (let [[bindings & body] args]
+                           (when-not (and (vector? bindings) (even? (count bindings))
+                                          (= 1 (count body))
+                                          (every? symbol? (take-nth 2 bindings)))
+                             (throw (ex-info "loop requires symbol/value pairs and one body"
+                                             {:form form})))
+                           (let [names (vec (take-nth 2 bindings))
+                                 inits (mapv #(transform % bound) (take-nth 2 (rest bindings)))
+                                 body* (transform (first body) (into bound names))
+                                 captures (vec (sort-by str
+                                                        (captures-from body*
+                                                                       (apply disj bound names))))
+                                 helper (symbol (str "__kotoba_loop_" (vswap! loop-counter inc)))
+                                 params (into names captures)]
+                             (when (> (count params) 5)
+                               (throw (ex-info "loop bindings plus captures exceed ABI"
+                                               {:form form})))
+                             (swap! loop-helpers conj
+                                    (list 'defn helper params
+                                          (replace-recur body* helper names captures)))
+                             (apply list helper (concat inits captures))))
+                    recur (apply list 'recur (map #(transform % bound) args))
+                    let (let [[bindings & body] args]
+                          (loop [pairs (partition 2 bindings) current bound out []]
+                            (if-let [[pattern value] (first pairs)]
+                              (recur (rest pairs) (into current (pattern-symbols pattern))
+                                     (into out [pattern (transform value current)]))
+                              (list* 'let (vec out) (mapv #(transform % current) body)))))
+                    map (let [callback (first args)
+                              sources (mapv #(transform % bound) (rest args))
+                              arity (count sources)]
+                          (cond
+                            (and (seq? callback) (= 'fn (first callback)))
+                            (list* 'map callback sources)
+                            (and (symbol? callback) (not (contains? bound callback)))
+                            (list* 'map callback sources)
+                            (symbol? callback)
+                            (list* 'map (list '__kotoba_closure_callback callback arity) sources)
+                            :else
+                            (let [temp (symbol "__kotoba_hof_closure")]
+                              (list 'let [temp (transform callback bound)]
+                                    (list* 'map
+                                           (list '__kotoba_closure_callback temp arity) sources)))))
+                    filter (let [callback (first args)
+                                 source (transform (second args) bound)]
+                             (cond
+                               (and (seq? callback) (= 'fn (first callback)))
+                               (list 'filter callback source)
+                               (and (symbol? callback) (not (contains? bound callback)))
+                               (list 'filter callback source)
+                               (symbol? callback)
+                               (list 'filter (list '__kotoba_closure_callback callback 1) source)
+                               :else
+                               (let [temp (symbol "__kotoba_hof_closure")]
+                                 (list 'let [temp (transform callback bound)]
+                                       (list 'filter
+                                             (list '__kotoba_closure_callback temp 1) source)))))
+                    reduce (let [callback (first args)
+                                 values (mapv #(transform % bound) (rest args))
+                                 no-init? (= 1 (count values))
+                                 marker (fn [closure]
+                                          (if no-init?
+                                            (list '__kotoba_closure_no_init_callback closure)
+                                            (list '__kotoba_closure_callback closure 2)))]
+                             (cond
+                               (and (seq? callback) (= 'fn (first callback)))
+                               (apply list 'reduce callback values)
+                               (and (symbol? callback) (not (contains? bound callback)))
+                               (apply list 'reduce callback values)
+                               (symbol? callback)
+                               (apply list 'reduce (marker callback) values)
+                               :else
+                               (let [temp (symbol "__kotoba_hof_closure")]
+                                 (list 'let [temp (transform callback bound)]
+                                       (apply list 'reduce (marker temp) values)))))
+                    (apply list op (map #(transform % bound) args))))))]
+      (let [base (mapv (fn [form]
+                         (if-let [[name f] (function-def form)]
+                           (list* 'defn name (:params f)
+                                  (mapv #(transform % (set (:params f))) (:body f)))
+                           form)) forms)
+            lambda-defs (mapv (fn [{:keys [helper params body]}]
+                                (list 'defn helper params body)) @lambdas)
+            dispatchers
+            (mapv (fn [arity]
+                    (let [closure (symbol (str "__kotoba_closure_" arity))
+                          args (mapv #(symbol (str "__kotoba_invoke_arg_" %)) (range arity))
+                          candidates (filter #(= arity (:arity %)) @lambdas)
+                          body (reduce
+                                (fn [fallback {:keys [id captures helper]}]
+                                  (let [chain (list 'pair-second closure)
+                                        values (map-indexed
+                                                (fn [index _]
+                                                  (list 'pair-first
+                                                        (nth (iterate #(list 'pair-second %) chain)
+                                                             index))) captures)]
+                                    (list 'if (list '= (list 'pair-first closure) id)
+                                          (apply list helper (concat values args)) fallback)))
+                                0 (reverse candidates))]
+                      (list 'defn (closure-dispatcher-name arity) (into [closure] args) body)))
+                  (if @uses-apply? (range 5) (sort (distinct (map :arity @lambdas)))))
+            apply-def
+            '(defn __kotoba_closure_apply [closure items]
+               (if (= items 0) (__kotoba_invoke$arity0 closure)
+                 (let [a0 (pair-first items) t1 (pair-second items)]
+                   (if (= t1 0) (__kotoba_invoke$arity1 closure a0)
+                     (let [a1 (pair-first t1) t2 (pair-second t1)]
+                       (if (= t2 0) (__kotoba_invoke$arity2 closure a0 a1)
+                         (let [a2 (pair-first t2) t3 (pair-second t2)]
+                           (if (= t3 0) (__kotoba_invoke$arity3 closure a0 a1 a2)
+                             (let [a3 (pair-first t3) t4 (pair-second t3)]
+                               (if (= t4 0) (__kotoba_invoke$arity4 closure a0 a1 a2 a3) 0))))))))))]
+        (vec (concat base @loop-helpers lambda-defs dispatchers
+                     (when @uses-apply? [apply-def])))))))
+
+(declare validate-portable-value-ids!)
 
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
@@ -591,7 +1521,11 @@
   ADR-2607180900 (L2): multi-body `when` → `if`+`do`; bare string literals
   on string-head host ops → str-ptr/str-len."
   [forms]
-  (let [constants (into {}
+  (validate-portable-value-ids! forms)
+  (let [forms (-> forms expand-pure-desugars expand-multi-arity-forms expand-record-protocol-forms
+                  expand-lazy-forms expand-match-forms expand-fuel-collection-forms
+                  expand-closure-forms)
+        constants (into {}
                         (keep (fn [form]
                                 (when (and (seq? form) (= 'def (first form))
                                            (= 3 (count form)))
@@ -1513,6 +2447,22 @@
   small option-map-shaped literals this feature targets."
   32)
 
+(def max-set-items
+  "Bound for eager set literals/operations. Set walks are compiler-unrolled,
+  so this is both the semantic collection bound and a code-size bound."
+  16)
+
+(def max-collection-unroll-depth
+  "Primary-backend bound for collection transforms. Kept below get's lookup
+  bound because transforms synthesize allocation/control-flow at every step."
+  8)
+
+(def max-vector-items
+  "Portable vector literal admission bound. Runtime collection walks use
+  fuel-carrying helpers, so this no longer needs to equal the legacy inline
+  unroll depth."
+  128)
+
 (defn- fnv1a-i32
   "Deterministic 32-bit FNV-1a hash of S's UTF-8 bytes, used to intern
   keyword literals as distinct i32 constants (ADR-2607150000) -- mirrors
@@ -1528,7 +2478,50 @@
     (reduce (fn [h b] (unchecked-multiply-int (unchecked-int (bit-xor h (bit-and (int b) 0xff))) prime))
             offset-basis bs)))
 
-(defn- keyword->i32 [kw] (fnv1a-i32 (str kw)))
+(def ^:private value-tag-mask (unchecked-int 0xf0000000))
+(def ^:private string-value-tag 0x50000000)
+(def ^:private keyword-value-tag 0x60000000)
+(def ^:private symbol-value-tag 0x70000000)
+
+(defn- tagged-hash [tag text bits]
+  (bit-or tag (bit-and (fnv1a-i32 text) (dec (bit-shift-left 1 bits)))))
+
+(defn- keyword->i32 [kw]
+  (tagged-hash keyword-value-tag (str kw) 28))
+
+(defn- string->i32 [s]
+  (let [length (count (utf8-bytes s))]
+    (when (> length 127)
+      (throw (ex-info "portable string literal exceeds 127 UTF-8 bytes"
+                      {:literal s :length length})))
+    (bit-or string-value-tag
+            (bit-shift-left length 21)
+            (bit-and (fnv1a-i32 s) 0x1fffff))))
+
+(defn- symbol-value->i32 [sym]
+  (tagged-hash symbol-value-tag (str sym) 28))
+
+(defn- validate-portable-value-ids! [forms]
+  (let [seen (atom {})]
+    (doseq [form forms]
+      (walk-forms
+       (fn [node]
+         (let [[kind source id]
+               (cond
+                 (string? node) [:string node (string->i32 node)]
+                 (keyword? node) [:keyword node (keyword->i32 node)]
+                 (and (seq? node) (= 'quote (first node))
+                      (= 2 (count node)) (symbol? (second node)))
+                 [:symbol (second node) (symbol-value->i32 (second node))]
+                 :else nil)]
+           (when id
+             (if-let [[other-kind other-source] (get @seen id)]
+               (when-not (= [kind source] [other-kind other-source])
+                 (throw (ex-info "portable value ID collision"
+                                 {:id id :left [other-kind other-source]
+                                  :right [kind source]})))
+               (swap! seen assoc id [kind source]))))) form))
+    true))
 
 (defn desugar-map
   "`{:k1 v1 :k2 v2}` -> `(pair (pair k1 v1) (pair (pair k2 v2) 0))`, reusing
@@ -1538,6 +2531,270 @@
   [form]
   (let [entries (sort-by (fn [[k _]] (pr-str k)) (seq form))]
     (reduce (fn [tail [k v]] (list 'pair (list 'pair k v) tail)) 0 (reverse entries))))
+
+(defn- desugar-vector [form]
+  (if (> (count form) max-vector-items)
+    ::vector-too-large
+    (reduce (fn [tail value] (list 'pair value tail)) 0 (reverse form))))
+
+(defn- bounded-set-without [set-expr value-expr]
+  (letfn [(step [cur depth]
+            (if (zero? depth)
+              0
+              (let [tmp (gensym "set-cur__")]
+                (list 'let [tmp cur]
+                      (list 'if (list '= tmp 0)
+                            0
+                            (let [tail (gensym "set-tail__")]
+                              (list 'let [tail (step (list 'pair-second tmp) (dec depth))]
+                                    (list 'if (list '= (list 'pair-first tmp) value-expr)
+                                          tail
+                                          (list 'pair (list 'pair-first tmp) tail)))))))))]
+    (step set-expr max-set-items)))
+
+(defn- bounded-set-contains [set-expr value-expr]
+  (letfn [(step [cur depth]
+            (if (zero? depth)
+              0
+              (list 'if (list '= cur 0)
+                    0
+                    (list 'if (list '= (list 'pair-first cur) value-expr)
+                          1
+                          (step (list 'pair-second cur) (dec depth))))))]
+    (step set-expr max-set-items)))
+
+(defn- set-conj-expr [set-expr value-expr]
+  (let [value (gensym "set-value__")]
+    (list 'let [value value-expr]
+          (list 'pair value (bounded-set-without set-expr value)))))
+
+(defn desugar-set
+  "Deterministically lower a bounded set literal to a unique pair-chain."
+  [form]
+  (if (> (count form) max-set-items)
+    ::set-too-large
+    (reduce set-conj-expr 0 (sort-by pr-str form))))
+
+(defn- bounded-coll-count [coll-expr]
+  (letfn [(step [cur depth acc]
+            (if (zero? depth)
+              acc
+              (let [tmp (gensym "count-cur__")]
+                (list 'let [tmp cur]
+                      (list 'if (list '= tmp 0) acc
+                            (step (list 'pair-second tmp) (dec depth) (list '+ acc 1)))))))]
+    (step coll-expr max-collection-unroll-depth 0)))
+
+(defn- bounded-coll-nth [coll-expr index-expr default-expr]
+  (letfn [(step [cur depth index]
+            (if (zero? depth)
+              default-expr
+              (let [tmp (gensym "nth-cur__") idx (gensym "nth-idx__")]
+                (list 'let [tmp cur idx index]
+                      (list 'if (list '= tmp 0) default-expr
+                            (list 'if (list '= idx 0) (list 'pair-first tmp)
+                                  (list 'if (list '< idx 0) default-expr
+                                        (step (list 'pair-second tmp) (dec depth)
+                                              (list '- idx 1)))))))))]
+    (step coll-expr max-collection-unroll-depth index-expr)))
+
+(defn- destructure-binding [pattern value-expr]
+  (letfn [(expand [p expr]
+            (cond
+              (symbol? p) [[p expr]]
+
+              (vector? p)
+              (let [amp-index (first (keep-indexed #(when (= '& %2) %1) p))
+                    positional (if amp-index (subvec p 0 amp-index) p)
+                    rest-part (when amp-index (subvec p amp-index))
+                    _ (when (and rest-part (not= 2 (count rest-part)))
+                        (throw (ex-info "vector destructuring & requires one rest pattern" {:pattern p})))
+                    temp (gensym "destructure-vector__")]
+                (into [[temp expr]]
+                      (concat
+                       (mapcat (fn [index child]
+                                 (expand child (bounded-coll-nth temp index 0)))
+                               (range) positional)
+                       (when rest-part
+                         (let [tail (nth (iterate #(list 'pair-second %) temp)
+                                         (count positional))]
+                           (expand (second rest-part) tail))))))
+
+              (map? p)
+              (let [keys-spec (:keys p)
+                    strs-spec (:strs p)
+                    syms-spec (:syms p)
+                    defaults (or (:or p) {})
+                    as-pattern (:as p)
+                    explicit (dissoc p :keys :strs :syms :or :as)
+                    _ (when-not (and (or (nil? keys-spec)
+                                         (and (vector? keys-spec) (every? symbol? keys-spec)))
+                                     (or (nil? strs-spec)
+                                         (and (vector? strs-spec) (every? symbol? strs-spec)))
+                                     (or (nil? syms-spec)
+                                         (and (vector? syms-spec) (every? symbol? syms-spec)))
+                                     (map? defaults)
+                                     (or (nil? as-pattern) (symbol? as-pattern))
+                                     (every? #(or (keyword? %) (string? %)
+                                                  (and (seq? %) (= 'quote (first %))
+                                                       (symbol? (second %))))
+                                             (keys explicit)))
+                        (throw (ex-info "invalid map destructuring pattern" {:pattern p})))
+                    temp (gensym "destructure-map__")]
+                (into [[temp expr]]
+                      (concat
+                       (mapcat (fn [name]
+                                 (expand name (list 'get temp (keyword name)
+                                                    (get defaults name 0))))
+                               keys-spec)
+                       (mapcat (fn [name]
+                                 (expand name (list 'get temp (clojure.core/name name)
+                                                    (get defaults name 0))))
+                               strs-spec)
+                       (mapcat (fn [name]
+                                 (expand name (list 'get temp (list 'quote name)
+                                                    (get defaults name 0))))
+                               syms-spec)
+                       (mapcat (fn [[key child]]
+                                 (expand child (list 'get temp key 0)))
+                               (sort-by (comp str key) explicit))
+                       (when as-pattern [[as-pattern temp]]))))
+
+              :else (throw (ex-info "unsupported destructuring pattern" {:pattern p}))))]
+    (expand pattern value-expr)))
+
+(defn- expand-let-bindings [bindings]
+  (if (and (vector? bindings) (even? (count bindings)))
+    (vec (mapcat identity
+                 (mapcat (fn [[pattern value]]
+                           (destructure-binding pattern value))
+                         (partition 2 bindings))))
+    bindings))
+
+(defn- fixed-inline-callback? [callback arity]
+  (and (seq? callback) (= 'fn (first callback))
+       (vector? (second callback))
+       (= arity (count (second callback)))
+       (= 3 (count callback))
+       (every? symbol? (second callback))
+       (= arity (count (distinct (second callback))))))
+
+(defn- callback-valid? [callback arity]
+  (or (symbol? callback)
+      (fixed-inline-callback? callback arity)
+      (and (seq? callback) (= '__kotoba_closure_callback (first callback))
+           (= 3 (count callback)) (= arity (nth callback 2)))))
+
+(defn- callback-call [callback args]
+  (cond
+    (symbol? callback) (apply list callback args)
+    (= '__kotoba_closure_callback (first callback))
+    (apply list (closure-dispatcher-name (nth callback 2)) (second callback) args)
+    :else (let [[_ params body] callback]
+            (list 'let (vec (mapcat vector params args)) body))))
+
+(defn- inline-no-init-reduce-info [callback]
+  (cond
+    (and (seq? callback) (= '__kotoba_closure_no_init_callback (first callback))
+         (= 2 (count callback)))
+    {:zero-body (list (closure-dispatcher-name 0) (second callback))
+     :binary (list '__kotoba_closure_callback (second callback) 2)}
+
+    (and (seq? callback) (= 'fn (first callback))
+         (not (vector? (second callback))))
+    (let [clauses (rest callback)
+          parsed (into {}
+                       (keep (fn [clause]
+                               (when (and (seq? clause) (= 2 (count clause))
+                                          (vector? (first clause))
+                                          (every? symbol? (first clause))
+                                          (= (count (first clause))
+                                             (count (distinct (first clause)))))
+                                 [(count (first clause)) clause])))
+                       clauses)]
+      (when (and (= (count parsed) (count clauses))
+                 (= #{0 2} (set (keys parsed))))
+        (let [[_ zero-body] (get parsed 0)
+              [binary-params binary-body] (get parsed 2)]
+          {:zero-body zero-body
+           :binary (list 'fn binary-params binary-body)})))
+
+    :else nil))
+
+(defn- bounded-eager-map [callback colls]
+  (letfn [(step [current depth]
+            (if (zero? depth)
+              0
+              (let [temps (mapv (fn [_] (gensym "map-coll__")) current)]
+                (list 'let (vec (mapcat vector temps current))
+                      (list 'if (apply list 'or (map #(list '= % 0) temps))
+                            0
+                            (list 'pair
+                                  (callback-call callback (map #(list 'pair-first %) temps))
+                                  (step (mapv #(list 'pair-second %) temps) (dec depth))))))))]
+    (step (vec colls) max-collection-unroll-depth)))
+
+(defn- bounded-eager-filter [callback coll]
+  (letfn [(step [current depth]
+            (if (zero? depth)
+              0
+              (let [temp (gensym "filter-coll__")]
+                (list 'let [temp current]
+                      (list 'if (list '= temp 0) 0
+                            (list 'if (callback-call callback [(list 'pair-first temp)])
+                                  (list 'pair (list 'pair-first temp)
+                                        (step (list 'pair-second temp) (dec depth)))
+                                  (step (list 'pair-second temp) (dec depth))))))))]
+    (step coll max-collection-unroll-depth)))
+
+(defn- bounded-eager-reduce [callback init coll]
+  (letfn [(step [acc current depth]
+            (if (zero? depth)
+              acc
+              (let [a (gensym "reduce-acc__") c (gensym "reduce-coll__")]
+                (list 'let [a acc c current]
+                      (list 'if (list '= c 0) a
+                            (step (callback-call callback [a (list 'pair-first c)])
+                                  (list 'pair-second c) (dec depth)))))))]
+    (step init coll max-collection-unroll-depth)))
+
+(defn- bounded-map-project [map-expr side]
+  (letfn [(step [cur depth]
+            (if (zero? depth)
+              0
+              (let [tmp (gensym "project-cur__")]
+                (list 'let [tmp cur]
+                      (list 'if (list '= tmp 0) 0
+                            (list 'pair
+                                  (list side (list 'pair-first tmp))
+                                  (step (list 'pair-second tmp) (dec depth))))))))]
+    (step map-expr max-collection-unroll-depth)))
+
+(defn- bounded-map-without [map-expr key-expr]
+  (letfn [(step [cur depth]
+            (if (zero? depth)
+              0
+              (let [tmp (gensym "map-cur__")]
+                (list 'let [tmp cur]
+                      (list 'if (list '= tmp 0) 0
+                            (let [tail (gensym "map-tail__")]
+                              (list 'let [tail (step (list 'pair-second tmp) (dec depth))]
+                                    (list 'if
+                                          (list '= (list 'pair-first (list 'pair-first tmp)) key-expr)
+                                          tail
+                                          (list 'pair (list 'pair-first tmp) tail)))))))))]
+    (step map-expr max-collection-unroll-depth)))
+
+(defn- bounded-map-contains-key [map-expr key-expr]
+  (letfn [(step [cur depth]
+            (if (zero? depth)
+              0
+              (list 'if (list '= cur 0) 0
+                    (list 'if
+                          (list '= (list 'pair-first (list 'pair-first cur)) key-expr)
+                          1
+                          (step (list 'pair-second cur) (dec depth))))))]
+    (step map-expr max-get-unroll-depth)))
 
 (defn compile-wasm-expr
   "Compile one Kotoba expression to a WASM instruction sequence. Returns
@@ -1561,8 +2818,28 @@
     {:bytes (bcat [0x41] (sleb32 (keyword->i32 form)))
      :result-type :i32}
 
+    (string? form)
+    {:bytes (bcat [0x41] (sleb32 (string->i32 form)))
+     :result-type :i32}
+
     (map? form)
     (compile-wasm-expr (desugar-map form) locals fns)
+
+    (vector? form)
+    (let [lowered (desugar-vector form)]
+      (if (= ::vector-too-large lowered)
+        {:problem {:kotoba.wasm/problem :admission-limit
+                   :kotoba.wasm/op "vector-literal"
+                   :kotoba.wasm/limit max-vector-items}}
+        (compile-wasm-expr lowered locals fns)))
+
+    (set? form)
+    (let [lowered (desugar-set form)]
+      (if (= ::set-too-large lowered)
+        {:problem {:kotoba.wasm/problem :admission-limit
+                   :kotoba.wasm/op "set-literal"
+                   :kotoba.wasm/limit max-set-items}}
+        (compile-wasm-expr lowered locals fns)))
 
     (symbol? form)
     (if-let [entry (get locals (symbol-key form))]
@@ -1574,6 +2851,12 @@
     (seq? form)
     (let [[op & args] form]
       (case op
+        quote (let [value (first args)]
+                (if (and (= 1 (count args)) (symbol? value))
+                  {:bytes (bcat [0x41] (sleb32 (symbol-value->i32 value)))
+                   :result-type :i32}
+                  {:problem {:kotoba.wasm/problem :unsupported-quote
+                             :kotoba.wasm/form (pr-str form)}}))
         do (loop [remaining args
                   out []
                   local-types []]
@@ -1594,7 +2877,8 @@
                 :local-count (count local-types)
                 :local-types local-types}))
 
-        let (let [[bindings & body] args
+        let (let [[raw-bindings & body] args
+                  bindings (expand-let-bindings raw-bindings)
                   pairs (partition 2 bindings)]
               (loop [pairs pairs
                      locals locals
@@ -1724,6 +3008,158 @@
              (reduce (fn [acc-map [k v]] (list 'pair (list 'pair k v) acc-map))
                      m (partition 2 kvs))
              locals fns)))
+
+        contains?
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "contains?"
+                     :kotoba.wasm/expected 2 :kotoba.wasm/actual (count args)}}
+          (let [[s v] args ss (gensym "set__") vv (gensym "value__")]
+            (compile-wasm-expr
+             (list 'let [ss s vv v] (bounded-set-contains ss vv)) locals fns)))
+
+        contains-key?
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "contains-key?"
+                     :kotoba.wasm/expected 2 :kotoba.wasm/actual (count args)}}
+          (let [[m k] args mm (gensym "map__") kk (gensym "key__")]
+            (compile-wasm-expr
+             (list 'let [mm m kk k] (bounded-map-contains-key mm kk)) locals fns)))
+
+        string?
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string?"}}
+          (compile-wasm-expr
+           (list '= (list 'bit-and (first args) value-tag-mask) string-value-tag)
+           locals fns))
+
+        symbol?
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "symbol?"}}
+          (compile-wasm-expr
+           (list '= (list 'bit-and (first args) value-tag-mask) symbol-value-tag)
+           locals fns))
+
+        keyword?
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "keyword?"}}
+          (compile-wasm-expr
+           (list '= (list 'bit-and (first args) value-tag-mask) keyword-value-tag)
+           locals fns))
+
+        string-length
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string-length"}}
+          (compile-wasm-expr
+           (list 'bit-and (list 'bit-shift-right (first args) 21) 127) locals fns))
+
+        string=
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string="}}
+          (compile-wasm-expr (list '= (first args) (second args)) locals fns))
+
+        conj
+        (if (< (count args) 2)
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "conj"
+                     :kotoba.wasm/expected "set plus one or more values"
+                     :kotoba.wasm/actual (count args)}}
+          (compile-wasm-expr (reduce set-conj-expr (first args) (rest args)) locals fns))
+
+        disj
+        (if (empty? args)
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "disj"
+                     :kotoba.wasm/expected "set plus zero or more values"
+                     :kotoba.wasm/actual 0}}
+          (compile-wasm-expr
+           (reduce (fn [s v]
+                     (let [vv (gensym "value__")]
+                       (list 'let [vv v] (bounded-set-without s vv))))
+                   (first args) (rest args)) locals fns))
+
+        map
+        (if (not (and (<= 2 (count args) 6)
+                      (callback-valid? (first args) (dec (count args)))))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "map"
+                     :kotoba.wasm/expected "named callback plus one to five collections"}}
+          (compile-wasm-expr (bounded-eager-map (first args) (rest args)) locals fns))
+
+        filter
+        (if (not (and (= 2 (count args)) (callback-valid? (first args) 1)))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "filter"
+                     :kotoba.wasm/expected "named unary callback plus collection"}}
+          (compile-wasm-expr (bounded-eager-filter (first args) (second args)) locals fns))
+
+        reduce
+        (case (count args)
+          3 (if (not (callback-valid? (first args) 2))
+              {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "reduce"
+                         :kotoba.wasm/expected "binary callback plus init and collection"}}
+              (compile-wasm-expr
+               (bounded-eager-reduce (first args) (second args) (nth args 2)) locals fns))
+          2 (if-let [{:keys [zero-body binary]} (inline-no-init-reduce-info (first args))]
+              (let [coll (gensym "reduce-no-init-coll__")]
+                (compile-wasm-expr
+                 (list 'let [coll (second args)]
+                       (list 'if (list '= coll 0)
+                             zero-body
+                             (bounded-eager-reduce binary (list 'pair-first coll)
+                                                   (list 'pair-second coll))))
+                 locals fns))
+              {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "reduce"
+                         :kotoba.wasm/expected "inline fn with [] and [acc value] clauses"}})
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "reduce"
+                     :kotoba.wasm/expected "callback+collection or callback+init+collection"}})
+
+        count
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "count"
+                     :kotoba.wasm/expected 1 :kotoba.wasm/actual (count args)}}
+          (let [coll (gensym "count-coll__")]
+            (compile-wasm-expr
+             (list 'let [coll (first args)] (bounded-coll-count coll)) locals fns)))
+
+        nth
+        (if (not (<= 2 (count args) 3))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "nth"
+                     :kotoba.wasm/expected "2 or 3" :kotoba.wasm/actual (count args)}}
+          (let [[c i d] args d (if (= 3 (count args)) d 0)
+                cc (gensym "nth-coll__") ii (gensym "nth-index__") dd (gensym "nth-default__")]
+            (compile-wasm-expr
+             (list 'let [cc c ii i dd d] (bounded-coll-nth cc ii dd)) locals fns)))
+
+        peek
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "peek"}}
+          (let [coll (gensym "peek-coll__")]
+            (compile-wasm-expr
+             (list 'let [coll (first args)]
+                   (list 'if (list '= coll 0) 0 (list 'pair-first coll))) locals fns)))
+
+        pop
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "pop"}}
+          (let [coll (gensym "pop-coll__")]
+            (compile-wasm-expr
+             (list 'let [coll (first args)]
+                   (list 'if (list '= coll 0) 0 (list 'pair-second coll))) locals fns)))
+
+        keys
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "keys"}}
+          (compile-wasm-expr (bounded-map-project (first args) 'pair-first) locals fns))
+
+        vals
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "vals"}}
+          (compile-wasm-expr (bounded-map-project (first args) 'pair-second) locals fns))
+
+        dissoc
+        (if (empty? args)
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "dissoc"}}
+          (compile-wasm-expr
+           (reduce (fn [m k]
+                     (let [kk (gensym "map-key__")]
+                       (list 'let [kk k] (bounded-map-without m kk))))
+                   (first args) (rest args)) locals fns))
 
         + (compile-wasm-fold 0x6a args locals fns)
         - (compile-wasm-fold 0x6b args locals fns)
@@ -2340,6 +3776,9 @@
   ([forms _policy]
   (let [forms (lower-language-forms forms)
         defs (function-defs forms)
+        unsupported-top-level (first
+                               (remove #(and (seq? %)
+                                             (#{'ns 'defn} (first %))) forms))
         indirect? (uses-call-indirect? forms)
         imports (required-host-imports forms)
         import-count (count imports)
@@ -2363,6 +3802,11 @@
                                   (cstr/ends-with? (str name) "-tick")))
                             defs)]
     (cond
+      unsupported-top-level
+      {:kotoba.wasm/ok? false
+       :kotoba.wasm/problems [{:kotoba.wasm/problem :unsupported-top-level-form
+                               :kotoba.wasm/form (pr-str unsupported-top-level)}]}
+
       (and (nil? main) (not module-entry?))
       {:kotoba.wasm/ok? false
        :kotoba.wasm/problems [{:kotoba.wasm/problem :missing-main}]}
@@ -2597,14 +4041,28 @@
   (cond
     (integer? form) form
     (keyword? form) (keyword->i32 form)
+    (string? form) (string->i32 form)
     (map? form) (compile-cljs-expr (desugar-map form))
+    (vector? form) (let [lowered (desugar-vector form)]
+                     (if (= ::vector-too-large lowered)
+                       (cljs-reject! 'vector-literal form)
+                       (compile-cljs-expr lowered)))
+    (set? form) (let [lowered (desugar-set form)]
+                  (if (= ::set-too-large lowered)
+                    (cljs-reject! 'set-literal form)
+                    (compile-cljs-expr lowered)))
     (symbol? form) form
     (seq? form)
     (let [[op & args] form]
       (case op
+        quote (let [value (first args)]
+                (if (and (= 1 (count args)) (symbol? value))
+                  (symbol-value->i32 value)
+                  (cljs-reject! 'quote form)))
         do (cons 'do (map compile-cljs-expr args))
 
-        let (let [[bindings & body] args]
+        let (let [[raw-bindings & body] args
+                  bindings (expand-let-bindings raw-bindings)]
               (list* 'let (vec (mapcat (fn [[name value]] [name (compile-cljs-expr value)])
                                         (partition 2 bindings)))
                      (map compile-cljs-expr body)))
@@ -2648,6 +4106,116 @@
              (reduce (fn [acc-map [k v]] (list 'pair (list 'pair k v) acc-map))
                      m (partition 2 kvs)))))
 
+        contains?
+        (if (not= 2 (count args))
+          (cljs-reject! 'contains? form)
+          (let [[s v] args ss (gensym "set__") vv (gensym "value__")]
+            (compile-cljs-expr
+             (list 'let [ss s vv v] (bounded-set-contains ss vv)))))
+
+        contains-key?
+        (if (not= 2 (count args))
+          (cljs-reject! 'contains-key? form)
+          (let [[m k] args mm (gensym "map__") kk (gensym "key__")]
+            (compile-cljs-expr
+             (list 'let [mm m kk k] (bounded-map-contains-key mm kk)))))
+
+        string? (if (= 1 (count args))
+                  (list 'if
+                        (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
+                              string-value-tag) 1 0)
+                  (cljs-reject! 'string? form))
+        symbol? (if (= 1 (count args))
+                  (list 'if
+                        (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
+                              symbol-value-tag) 1 0)
+                  (cljs-reject! 'symbol? form))
+        keyword? (if (= 1 (count args))
+                   (list 'if
+                         (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
+                               keyword-value-tag) 1 0)
+                   (cljs-reject! 'keyword? form))
+        string-length (if (= 1 (count args))
+                        (list 'bit-and
+                              (list 'bit-shift-right (compile-cljs-expr (first args)) 21) 127)
+                        (cljs-reject! 'string-length form))
+        string= (if (= 2 (count args))
+                  (list 'if (list '= (compile-cljs-expr (first args))
+                                  (compile-cljs-expr (second args))) 1 0)
+                  (cljs-reject! 'string= form))
+
+        conj
+        (if (< (count args) 2)
+          (cljs-reject! 'conj form)
+          (compile-cljs-expr (reduce set-conj-expr (first args) (rest args))))
+
+        disj
+        (if (empty? args)
+          (cljs-reject! 'disj form)
+          (compile-cljs-expr
+           (reduce (fn [s v]
+                     (let [vv (gensym "value__")]
+                       (list 'let [vv v] (bounded-set-without s vv))))
+                   (first args) (rest args))))
+
+        map
+        (if (not (and (<= 2 (count args) 6)
+                      (callback-valid? (first args) (dec (count args)))))
+          (cljs-reject! 'map form)
+          (compile-cljs-expr (bounded-eager-map (first args) (rest args))))
+
+        filter
+        (if (not (and (= 2 (count args)) (callback-valid? (first args) 1)))
+          (cljs-reject! 'filter form)
+          (compile-cljs-expr (bounded-eager-filter (first args) (second args))))
+
+        reduce
+        (case (count args)
+          3 (if (not (callback-valid? (first args) 2))
+              (cljs-reject! 'reduce form)
+              (compile-cljs-expr
+               (bounded-eager-reduce (first args) (second args) (nth args 2))))
+          2 (if-let [{:keys [zero-body binary]} (inline-no-init-reduce-info (first args))]
+              (let [coll (gensym "reduce-no-init-coll__")]
+                (compile-cljs-expr
+                 (list 'let [coll (second args)]
+                       (list 'if (list '= coll 0)
+                             zero-body
+                             (bounded-eager-reduce binary (list 'pair-first coll)
+                                                   (list 'pair-second coll))))))
+              (cljs-reject! 'reduce form))
+          (cljs-reject! 'reduce form))
+
+        count (if (not= 1 (count args)) (cljs-reject! 'count form)
+                  (let [coll (gensym "count-coll__")]
+                    (compile-cljs-expr
+                     (list 'let [coll (first args)] (bounded-coll-count coll)))))
+        nth (if (not (<= 2 (count args) 3)) (cljs-reject! 'nth form)
+                (let [[c i d] args d (if (= 3 (count args)) d 0)
+                      cc (gensym "nth-coll__") ii (gensym "nth-index__") dd (gensym "nth-default__")]
+                  (compile-cljs-expr
+                   (list 'let [cc c ii i dd d] (bounded-coll-nth cc ii dd)))))
+        peek (if (not= 1 (count args)) (cljs-reject! 'peek form)
+                 (let [coll (gensym "peek-coll__")]
+                   (compile-cljs-expr
+                    (list 'let [coll (first args)]
+                          (list 'if (list '= coll 0) 0 (list 'pair-first coll))))))
+        pop (if (not= 1 (count args)) (cljs-reject! 'pop form)
+                (let [coll (gensym "pop-coll__")]
+                  (compile-cljs-expr
+                   (list 'let [coll (first args)]
+                         (list 'if (list '= coll 0) 0 (list 'pair-second coll))))))
+        keys (if (not= 1 (count args)) (cljs-reject! 'keys form)
+                 (compile-cljs-expr (bounded-map-project (first args) 'pair-first)))
+        vals (if (not= 1 (count args)) (cljs-reject! 'vals form)
+                 (compile-cljs-expr (bounded-map-project (first args) 'pair-second)))
+        dissoc (if (empty? args) (cljs-reject! 'dissoc form)
+                   (compile-cljs-expr
+                    (reduce (fn [m k]
+                              (let [kk (gensym "map-key__")]
+                                (list 'let [kk k] (bounded-map-without m kk))))
+                            (first args) (rest args))))
+
         not (list 'if (list '= (compile-cljs-expr (first args)) 0) 1 0)
         zero? (list 'if (list '= (compile-cljs-expr (first args)) 0) 1 0)
         pos? (compile-cljs-expr (list '> (first args) 0))
@@ -2689,7 +4257,8 @@
   target)."
   ([forms] (cljs-source forms 'kotoba.compiled.generated))
   ([forms ns-name]
-   (let [defs (function-defs forms)]
+   (let [forms (lower-language-forms forms)
+         defs (function-defs forms)]
      (when (empty? defs)
        (throw (ex-info "at least one defn is required" {:kotoba.cljs/problem :no-functions})))
      (let [fn-forms (mapv (fn [[name {:keys [params body]}]]
