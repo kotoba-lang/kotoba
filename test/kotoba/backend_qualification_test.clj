@@ -26,6 +26,9 @@
 (def adversarial-path
   (authority-path "lang/qualification/q6-adversarial.edn"))
 (def q8-report-path "qualification/q8-report.edn")
+(def review-package-path "qualification/independent-review-package.edn")
+(def review-findings-path "qualification/independent-review-findings.edn")
+(def q9-pilot-path "qualification/q9-wave1-pilot.edn")
 
 (defn qualification []
   (edn/read-string (slurp qualification-path)))
@@ -35,6 +38,9 @@
 
 (defn q8-report []
   (edn/read-string (slurp (io/file q8-report-path))))
+
+(defn read-local-edn [path]
+  (edn/read-string (slurp (io/file path))))
 
 (defn evidence-paths [report]
   (concat (map #(get-in report [% :evidence]) [:q1 :q2 :q3 :q4 :q5 :q6])
@@ -69,6 +75,65 @@
     (doseq [path (evidence-paths report)]
       (testing (str "evidence exists: " path)
         (is (and (string? path) (.isFile (evidence-file path))))))))
+
+(deftest independent-review-package-fails-closed-until-external-evidence-exists
+  (let [report (q8-report)
+        package (read-local-edn review-package-path)
+        review (read-local-edn review-findings-path)
+        required-areas (set (map :id (:review-areas package)))
+        required-keys (get-in package [:required-output :required-finding-keys])
+        severities (get-in package [:required-output :severities])
+        dispositions (get-in package [:required-output :dispositions])
+        excluded-orgs (set (get-in package [:independence :reviewer-must-not-be-maintainer-of]))
+        reviewer (:reviewer review)
+        severe? #(contains? #{:critical :high} (:severity %))
+        unresolved? #(not= :fixed (:disposition %))
+        promotion-ready? (and (= :complete (:status review))
+                              (string? (:name reviewer))
+                              (not-empty (:name reviewer))
+                              (string? (:organization reviewer))
+                              (not-empty (:organization reviewer))
+                              (not (contains? excluded-orgs (:organization reviewer)))
+                              (true? (:independent-attestation reviewer))
+                              (= required-areas (:areas-covered review))
+                              (seq (:evidence review))
+                              (not-any? #(and (severe? %) (unresolved? %))
+                                        (:findings review))
+                              (every? #(.isFile (io/file %)) (:evidence review)))]
+    (is (= 1 (:kotoba.independent-review-package/version package)))
+    (is (= (:baseline-commit (:target package)) (:target-commit review)))
+    (is (= 5 (count required-areas)))
+    (doseq [finding (:findings review)]
+      (is (= required-keys (set (keys finding))))
+      (is (contains? required-areas (:area finding)))
+      (is (contains? severities (:severity finding)))
+      (is (contains? dispositions (:disposition finding)))
+      (is (= (:target-commit review) (:affected-commit finding))))
+    (is (= promotion-ready? (= :pass (:status report))))
+    (is (= promotion-ready? (= :pass (get-in report [:q8 :status]))))
+    (is (= promotion-ready? (get-in review [:promotion :q8-pass])))
+    (is (= promotion-ready? (get-in review [:promotion :cljc-oracle-retirement])))
+    (is (= promotion-ready? (get-in review [:promotion :q9-bulk-migration])))
+    (when-not promotion-ready?
+      (is (= :conditional-pass (:status report)))
+      (is (true? (get-in report [:scope :oracle-retained]))))))
+
+(deftest q9-wave1-pilot-is-reversible-and-cannot-self-promote
+  (let [pilot (read-local-edn q9-pilot-path)
+        paths (mapcat (fn [port]
+                        (keep port [:kotoba-source :cljc-oracle :denial-test]))
+                      (:ports pilot))]
+    (is (= :shadow-running (:status pilot)))
+    (is (= #{:independent-review :soak}
+           (get-in pilot [:promotion :blocked-by])))
+    (is (false? (get-in pilot [:promotion :wave-expansion])))
+    (is (false? (get-in pilot [:promotion :oracle-retirement])))
+    (is (true? (get-in pilot [:rollback :oracle-retained])))
+    (is (false? (get-in pilot [:rollback :data-migration-required])))
+    (is (= :pending (get-in pilot [:soak :status])))
+    (doseq [path paths]
+      (testing (str "pilot path exists: " path)
+        (is (.isFile (io/file path)))))))
 
 (defn kotoba-result [source]
   (let [forms (runtime/read-forms source :kotoba)
