@@ -1,32 +1,32 @@
 class Kotoba < Formula
   desc "Capability-safe Kotoba language compiler and CLI"
   homepage "https://github.com/kotoba-lang/kotoba"
-  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.28.tar.gz"
-  sha256 "bf39efc9be56d29e608d46fdff46b36dd92b87e431392718de6474596047467d"
+  url "https://github.com/kotoba-lang/kotoba/archive/refs/tags/v0.6.29.tar.gz"
+  sha256 "f3e21f81f6435ff540ff93036d6632e26424d7f7fb52ff157d8b6a30cfb57a10"
   license "Apache-2.0"
 
   bottle do
-    root_url "https://github.com/kotoba-lang/homebrew-kotoba/releases/download/kotoba-0.6.28"
+    root_url "https://github.com/kotoba-lang/homebrew-kotoba/releases/download/kotoba-0.6.29"
     rebuild 1
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "e2391c550bfc0f82bbc49ee332d980817480ad4b8c9d5418859421ca26143336"
-    sha256 cellar: :any_skip_relocation, sequoia:       "bfeb93ef8a148ec97b9936db0e304733343b7ba7c006cc342281aca5372fb7bd"
-    sha256 cellar: :any_skip_relocation, x86_64_linux:  "11084b4d0d6a19900ce554d1985fef7f837f1e96947fb1471bd1fd6ec3bc3531"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "6ce6056e61dc0f025c69db7c49e6a93711b5d0189d9b980a0dc61ff34869776b"
+    sha256 cellar: :any_skip_relocation, sequoia:       "758278ae6998cd44debb282fe1d91d5026c3519e5cc0c28833b9df29621211c9"
+    sha256 cellar: :any_skip_relocation, x86_64_linux:  "f50be4a03e9c127df193de22e7f1694960ad61190ecb57243ac97c432d1e5da3"
   end
 
   resource "binary" do
     on_macos do
       on_arm do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.28/kotoba-darwin-arm64.tar.gz"
-        sha256 "9e34cf3dbe3cdc8caca38247fc33c34f8fb3b37cf960baf8da0de815f501a092"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.29/kotoba-darwin-arm64.tar.gz"
+        sha256 "35835c5495388084b2987403d20cbccab2e5e02667a45db068e8a83e342c9b47"
       end
       on_intel do
-        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.28/kotoba-darwin-amd64.tar.gz"
-        sha256 "d4ca17bbc3486918a03f6effe7aae30f3b4e7a9144a57dea9757022f136939ca"
+        url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.29/kotoba-darwin-amd64.tar.gz"
+        sha256 "395a369c51dbecd54348256b77e6eef3d5e1c8fdb13d58eee42ffe2eeeb1d067"
       end
     end
     on_linux do
-      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.28/kotoba-linux-amd64.tar.gz"
-      sha256 "cc02e7887fd16bfd16dd249cfb3ebe52f866f97285dabb6059617cc2de56668a"
+      url "https://github.com/kotoba-lang/kotoba/releases/download/v0.6.29/kotoba-linux-amd64.tar.gz"
+      sha256 "287ddf7874d3e198a941f011b3bdc4a6032d6d15e191be83c686231163ccb508"
     end
   end
 
@@ -75,36 +75,93 @@ class Kotoba < Formula
 
     (testpath/"typed/fixture").mkpath
     (testpath/"typed/fixture/coverage.kotoba").write <<~KOTOBA
-      (ns fixture.coverage (:export [none-report make-report choose-report]))
+      (ns fixture.coverage
+        (:export [ready? make-report none-report choose-report covered-count map-score]))
+      (def label-map-type [:map :keyword :string])
+      (defn ready? [covered [:set :keyword]] :bool
+        (typed-set-contains [:set :keyword] covered :ready))
       (defn none-report []
-        [:option [:record :fixture/report [[:value :i64]]]]
-        (option-none-of [:option [:record :fixture/report [[:value :i64]]]]))
-      (defn make-report [] [:record :fixture/report [[:value :i64]]]
-        (record [:record :fixture/report [[:value :i64]]] 42))
+        [:option [:record :fixture/report
+                  [[:label :string] [:covered [:set :keyword]]]]]
+        (option-none-of
+          [:option [:record :fixture/report
+                    [[:label :string] [:covered [:set :keyword]]]]]))
+      (defn make-report []
+        [:record :fixture/report [[:label :string] [:covered [:set :keyword]]]]
+        (record
+          [:record :fixture/report [[:label :string] [:covered [:set :keyword]]]]
+          "qualified" (typed-set [:set :keyword] :ready :reviewed)))
       (defn choose-report
-        [left [:option [:record :fixture/report [[:value :i64]]]]
-         right [:option [:record :fixture/report [[:value :i64]]]]]
-        [:option [:record :fixture/report [[:value :i64]]]]
-        (match-option left [:option [:record :fixture/report [[:value :i64]]]]
+        [left [:option [:record :fixture/report
+                        [[:label :string] [:covered [:set :keyword]]]]]
+         right [:option [:record :fixture/report
+                         [[:label :string] [:covered [:set :keyword]]]]]]
+        [:option [:record :fixture/report
+                  [[:label :string] [:covered [:set :keyword]]]]]
+        (match-option left
+          [:option [:record :fixture/report
+                    [[:label :string] [:covered [:set :keyword]]]]]
           (none right)
           (some left-report
-            (match-option right [:option [:record :fixture/report [[:value :i64]]]]
+            (match-option right
+              [:option [:record :fixture/report
+                        [[:label :string] [:covered [:set :keyword]]]]]
               (none left)
               (some right-report right)))))
+      (defn covered-count
+        [report [:record :fixture/report
+                 [[:label :string] [:covered [:set :keyword]]]]]
+        :i64
+        (typed-set-count [:set :keyword]
+          (record-get
+            [:record :fixture/report [[:label :string] [:covered [:set :keyword]]]]
+            report :covered)))
+      (defn map-score [] :i64
+        (let [labels (typed-map-assoc label-map-type
+                       (typed-map-assoc label-map-type
+                         (typed-map-new label-map-type) :ready "yes")
+                       :reviewed "yes")
+              first-entry (option-value-of
+                            [:option [:vector [:keyword :string]]]
+                            (typed-map-entry-at label-map-type labels 0)
+                            (hetero-vector [:vector [:keyword :string]] :missing "no"))]
+          (if (= (typed-map-count label-map-type labels) 2)
+            (if (typed-map-contains label-map-type labels :ready)
+              (if (string=?
+                    (option-value-of [:option :string]
+                      (typed-map-get label-map-type labels :reviewed) "no")
+                    "yes")
+                (if (= (hetero-vector-count
+                         [:vector [:keyword :string]] first-entry) 2)
+                  2
+                  0)
+                0)
+              0)
+            0)))
     KOTOBA
     (testpath/"typed/fixture/app.kotoba").write <<~KOTOBA
       (ns fixture.app
         (:require [fixture.coverage :as coverage])
         (:export [main]))
       (defn main [] :i64
-        (record-get [:record :fixture/report [[:value :i64]]]
-          (option-value-of [:option [:record :fixture/report [[:value :i64]]]]
-            (coverage/choose-report
-              (coverage/none-report)
-              (option-some-of [:option [:record :fixture/report [[:value :i64]]]]
-                (coverage/make-report)))
-            (coverage/make-report))
-          :value))
+        (let [covered (typed-set [:set :keyword] :ready :reviewed)]
+          (if (coverage/ready? covered)
+            (if (string=? "Kotoba" "Kotoba")
+              (+ 38
+                (coverage/map-score)
+                (coverage/covered-count
+                  (option-value-of
+                    [:option [:record :fixture/report
+                              [[:label :string] [:covered [:set :keyword]]]]]
+                    (coverage/choose-report
+                      (coverage/none-report)
+                      (option-some-of
+                        [:option [:record :fixture/report
+                                  [[:label :string] [:covered [:set :keyword]]]]]
+                        (coverage/make-report)))
+                    (coverage/make-report))))
+              1)
+            0)))
     KOTOBA
     web = shell_output(
       "#{bin}/kotoba compile #{testpath}/typed/fixture/app.kotoba " \
