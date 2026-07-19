@@ -25,12 +25,50 @@
   (authority-path "lang/qualification/q3-backend-parity.edn"))
 (def adversarial-path
   (authority-path "lang/qualification/q6-adversarial.edn"))
+(def q8-report-path "qualification/q8-report.edn")
 
 (defn qualification []
   (edn/read-string (slurp qualification-path)))
 
 (defn adversarial []
   (edn/read-string (slurp adversarial-path)))
+
+(defn q8-report []
+  (edn/read-string (slurp (io/file q8-report-path))))
+
+(defn evidence-paths [report]
+  (concat (map #(get-in report [% :evidence]) [:q1 :q2 :q3 :q4 :q5 :q6])
+          (get-in report [:q7 :evidence])
+          (map #(get-in report [:q8 %])
+               [:pure-domain-port :cljc-oracle :capability-port :qualification-test])
+          (get-in report [:q8 :adversarial-verification])))
+
+(def evidence-roots
+  {"../kotoba-lang/" "KOTOBA_LANG_AUTHORITY_ROOT"
+   "../compiler/" "KOTOBA_COMPILER_EVIDENCE_ROOT"
+   "../kototama/" "KOTOTAMA_EVIDENCE_ROOT"})
+
+(defn evidence-file [path]
+  (or (some (fn [[prefix env-name]]
+              (when (.startsWith path prefix)
+                (some-> (System/getenv env-name)
+                        (io/file (subs path (count prefix))))))
+            evidence-roots)
+      (io/file path)))
+
+(deftest q8-report-is-machine-checkable-and-does-not-overclaim
+  (let [report (q8-report)]
+    (is (= 1 (:kotoba.qualification.report/version report)))
+    (is (= :conditional-pass (:status report)))
+    (is (= :conditional-pass (get-in report [:q8 :status])))
+    (is (= :open (get-in report [:q8 :independent-adversarial-review :status])))
+    (is (true? (get-in report [:scope :oracle-retained])))
+    (is (= :q9-wave-1-pilot (get-in report [:scope :authorized])))
+    (is (= :q9-bulk-migration-or-oracle-retirement
+           (get-in report [:scope :not-authorized])))
+    (doseq [path (evidence-paths report)]
+      (testing (str "evidence exists: " path)
+        (is (and (string? path) (.isFile (evidence-file path))))))))
 
 (defn kotoba-result [source]
   (let [forms (runtime/read-forms source :kotoba)
