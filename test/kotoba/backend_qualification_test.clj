@@ -38,7 +38,7 @@
   (try
     (f source)
     false
-    (catch Exception _ true)))
+    (catch Throwable _ true)))
 
 (deftest q3-positive-result-and-effect-parity
   (doseq [{:keys [id source result effects]} (:positive (qualification))]
