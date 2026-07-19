@@ -34,6 +34,7 @@
             [kotoba.sensing-host-test]
             [kotoba.semantic-code-test]
             [kotoba.type-contract-adapter-test]
+            [kotoba.transport-component-test]
             [kotoba.wasm-and-or-when-test]
             [kotoba.wasm-exec-test]
             [kotoba.wasm-map-keyword-test]))
@@ -72,6 +73,7 @@
                                         'kotoba.sensing-host-test
                                         'kotoba.semantic-code-test
                                         'kotoba.type-contract-adapter-test
+                                        'kotoba.transport-component-test
                                         'kotoba.wasm-and-or-when-test
                                         'kotoba.wasm-exec-test
                                         'kotoba.wasm-map-keyword-test)]

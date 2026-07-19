@@ -6,11 +6,17 @@
             [kotoba.wasm-exec :as wasm-exec]))
 
 (defn- authority-resource [relative]
-  (or (io/resource (str "lang/conformance/" relative))
+  (or (some-> (System/getenv "KOTOBA_LANG_AUTHORITY_ROOT")
+              (io/file "lang" "conformance" relative)
+              (#(when (.isFile %) %)))
+      (io/resource (str "lang/conformance/" relative))
       (throw (ex-info "language conformance resource is missing" {:relative relative}))))
 
 (defn- authority-language-resource [relative]
-  (or (io/resource (str "lang/" relative))
+  (or (some-> (System/getenv "KOTOBA_LANG_AUTHORITY_ROOT")
+              (io/file "lang" relative)
+              (#(when (.isFile %) %)))
+      (io/resource (str "lang/" relative))
       (throw (ex-info "language authority resource is missing" {:relative relative}))))
 
 (defn- compile-source [source]

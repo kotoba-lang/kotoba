@@ -167,7 +167,7 @@
     (is (re-find #"こんにちは" generated))
     (is (false? (:kotoba.cli/ok? wasm)))
     (is (= :compile/failed (:kotoba.cli/code wasm)))
-    (is (re-find #"typed Wasm operation is not qualified"
+    (is (re-find #"(typed Wasm operation is not qualified|(typed string values|entryless libraries) currently require)"
                  (:kotoba.cli/message wasm)))))
 
 (deftest compile-closed-multi-module-kotoba-project

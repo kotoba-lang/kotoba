@@ -10,7 +10,11 @@
             [kotoba.wasm-exec :as wasm-exec]))
 
 (defn authority-path [relative]
-  (or (some (fn [root]
+  (or (some-> (System/getenv "KOTOBA_LANG_AUTHORITY_ROOT")
+              (io/file relative)
+              (#(when (.isFile %) (.getPath %))))
+      (io/resource relative)
+      (some (fn [root]
               (let [path (io/file root relative)]
                 (when (.isFile path) (.getPath path))))
             ["../kotoba-lang" "../../kotoba-lang/kotoba-lang"])
@@ -23,10 +27,10 @@
   (authority-path "lang/qualification/q6-adversarial.edn"))
 
 (defn qualification []
-  (edn/read-string (slurp (io/file qualification-path))))
+  (edn/read-string (slurp qualification-path)))
 
 (defn adversarial []
-  (edn/read-string (slurp (io/file adversarial-path))))
+  (edn/read-string (slurp adversarial-path)))
 
 (defn kotoba-result [source]
   (let [forms (runtime/read-forms source :kotoba)
