@@ -662,6 +662,17 @@
          (.withUnsafeExecutionListener (fuel-listener (fuel-limit policy)))
          .build))))
 
+(defn call-export
+  "Invoke exported FUNCTION-NAME with integer ARGS and decode its single
+  result according to RESULT-TYPE."
+  ([instance function-name args] (call-export instance function-name args :i64))
+  ([instance function-name args result-type]
+   (let [raw (aget ^longs (.apply (.export instance (name function-name))
+                                  (long-array (map long args))) 0)]
+     (case result-type
+       :f32 (Float/intBitsToFloat (unchecked-int raw))
+       raw))))
+
 (defn call-main
   "Invoke an already-built Instance's 0-arity exported `main` and return its
   single result as a long -- Chicory's low-level `.apply` always returns the
@@ -677,10 +688,17 @@
   :f64 branch here would be untestable dead code, not real support."
   ([instance] (call-main instance :i64))
   ([instance result-type]
-   (let [raw (aget ^longs (.apply (.export instance "main") (long-array 0)) 0)]
-     (case result-type
-       :f32 (Float/intBitsToFloat (unchecked-int raw))
-       raw))))
+   (call-export instance "main" [] result-type)))
+
+(defn run-export
+  "Instantiate WASM-BYTES and invoke an exported function with integer ARGS."
+  ([wasm-bytes function-name args extra-host-fns]
+   (run-export wasm-bytes function-name args extra-host-fns nil :i64))
+  ([wasm-bytes function-name args extra-host-fns policy]
+   (run-export wasm-bytes function-name args extra-host-fns policy :i64))
+  ([wasm-bytes function-name args extra-host-fns policy result-type]
+   (call-export (instantiate wasm-bytes extra-host-fns policy)
+                function-name args result-type)))
 
 (defn run-main
   "Instantiate WASM-BYTES with EXTRA-HOST-FNS under POLICY (see

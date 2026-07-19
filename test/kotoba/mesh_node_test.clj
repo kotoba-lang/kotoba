@@ -75,11 +75,10 @@
       (is (= 404 (.statusCode resp)))
       (is (= "{:error :not-found}" (.body resp))))))
 
-(deftest compile-route-throws-when-the-guest-fails-to-compile
-  (testing "a route this node can't actually serve is a startup-time
-            configuration error, not a per-request one (compile-route's own
-            docstring) -- previously untested, only ever called with a
-            guest known to compile cleanly"
+(deftest compile-route-rejects-bad-guest-at-the-static-gate
+  (testing "strict grammar is the canonical first failure stage: an unknown
+            operation is rejected before Wasm compilation, preserving
+            compile-route's check-before-emit safety invariant"
     (let [err (try
                 (mesh-node/compile-route "src/mesh_bad_route.kotoba"
                                          "src/mesh_drama_profile_policy.edn")
@@ -87,9 +86,11 @@
                 (catch clojure.lang.ExceptionInfo e e))]
       (is (some? err))
       (is (= "src/mesh_bad_route.kotoba" (:kotoba.mesh-node/source (ex-data err))))
-      (is (false? (get-in (ex-data err) [:kotoba.mesh-node/wasm :kotoba.wasm/ok?])))
-      (is (= :unsupported-op
-             (get-in (ex-data err) [:kotoba.mesh-node/wasm :kotoba.wasm/problems 0 :kotoba.wasm/problem]))))))
+      (is (= "kotoba.mesh-node: safe-subset/capability check failed" (ex-message err)))
+      (is (= :unknown-form
+             (get-in (ex-data err)
+                     [:kotoba.runtime/result :kotoba.runtime/problems 0
+                      :kotoba.runtime/problem]))))))
 
 (deftest compile-route-throws-when-the-static-checker-rejects-the-route
   (testing "compile-route must run runtime/check BEFORE wasm-binary -- a

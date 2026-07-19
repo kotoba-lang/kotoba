@@ -126,7 +126,14 @@
   - When strict-grammar?: unknown call heads not in admitted-heads."
   [forms policy]
   (let [forbidden (forbidden-heads)
-        admitted (admitted-heads)
+        declared (into #{}
+                       (keep (fn [form]
+                               (when (and (seq? form)
+                                          (contains? '#{defn defsystem} (first form))
+                                          (symbol? (second form)))
+                                 (second form))))
+                       forms)
+        admitted (into (admitted-heads) declared)
         strict? (strict-grammar? policy)
         problems (atom [])]
     (doseq [form forms]

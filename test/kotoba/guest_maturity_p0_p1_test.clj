@@ -14,8 +14,8 @@
   (let [forms (runtime/read-forms "(ns t)\n(defn main [] (totally-unknown-op 1))" :kotoba)
         problems (guest-grammar/strict-problems forms {:kotoba.policy/strict-grammar true})
         unknown (first (filter #(= :unknown-form (:kotoba.runtime/problem %)) problems))]
-    (is (false? (guest-grammar/strict-grammar? nil))
-        "default is off so existing demos keep emitting")
+    (is (true? (guest-grammar/strict-grammar? nil))
+        "strict grammar defaults on for safe release execution")
     (is (true? (guest-grammar/strict-grammar? {:kotoba.policy/strict-grammar true})))
     (is unknown)
     (is (= "totally-unknown-op" (:kotoba.runtime/form unknown)))))
