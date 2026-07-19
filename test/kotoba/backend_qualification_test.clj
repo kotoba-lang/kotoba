@@ -109,9 +109,14 @@
       (is (contains? severities (:severity finding)))
       (is (contains? dispositions (:disposition finding)))
       (is (= (:target-commit review) (:affected-commit finding))))
-    (is (false? promotion-ready?))
-    (is (= :conditional-pass (:status report)))
-    (is (true? (get-in report [:scope :oracle-retained])))))
+    (is (= promotion-ready? (= :pass (:status report))))
+    (is (= promotion-ready? (= :pass (get-in report [:q8 :status]))))
+    (is (= promotion-ready? (get-in review [:promotion :q8-pass])))
+    (is (= promotion-ready? (get-in review [:promotion :cljc-oracle-retirement])))
+    (is (= promotion-ready? (get-in review [:promotion :q9-bulk-migration])))
+    (when-not promotion-ready?
+      (is (= :conditional-pass (:status report)))
+      (is (true? (get-in report [:scope :oracle-retained]))))))
 
 (deftest q9-wave1-pilot-is-reversible-and-cannot-self-promote
   (let [pilot (read-local-edn q9-pilot-path)
