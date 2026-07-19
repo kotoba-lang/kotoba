@@ -121,6 +121,26 @@
     (is (= :package/abac-denied
            (get-in rejected [:kotoba.package/problems 0 :kotoba.package/problem])))))
 
+(deftest production-package-admission-requires-real-hybrid-pqc
+  (let [lock (edn/read-string (slurp positive-lock))
+        trust-base (edn/read-string (slurp trust))
+        policy {:kotoba.security/crypto-policy-version 1
+                :mode :hybrid-required :hybrid-epoch-floor 1}
+        envelope {:envelope/provider {:provider/id :kagi
+                                      :provider/fips-validated false}
+                  :envelope/kem? true :envelope/hybrid? true
+                  :envelope/epoch 2
+                  :envelope/algorithms [:x25519 :ml-kem-768]}
+        verify (fn [e]
+                 (admission/verify-lock
+                  {:lock lock :lock-path positive-lock
+                   :trust (assoc trust-base :crypto/required? true
+                                 :crypto/policy policy :crypto/envelope e)}))]
+    (is (:kotoba.package/verified? (verify envelope)))
+    (is (= :package/hybrid-pqc-denied
+           (-> (verify (assoc envelope :envelope/algorithms [:x25519]))
+               :kotoba.package/problems first :kotoba.package/problem)))))
+
 (deftest positive-lock-with-manifest-declares-capabilities
   ;; With no trust file, declared capabilities come from the package manifest.
   (let [result (verify-argv "--lock" positive-lock "--manifest" positive-manifest)]

@@ -29,6 +29,7 @@
             [kotoba.lang.package-contract :as package-contract]
             [kotoba.lang.package-registry :as package-registry]
             [kotoba.security.abac :as abac]
+            [kotoba.security.crypto-policy :as crypto]
             [multiformats.core :as mf])
   (:import [java.time Instant]))
 
@@ -313,6 +314,10 @@
                    (merge {:id :package/admit :capabilities capabilities}
                           (:action supplied))))
         abac-result (abac/evaluate abac-attributes (:abac/policy trust))
+        crypto-required? (:crypto/required? trust)
+        crypto-result (when (or crypto-required? (:crypto/envelope trust))
+                        (crypto/check-production-envelope
+                         (:crypto/policy trust) (:crypto/envelope trust)))
         manifest-error (when manifest (package-contract/package-manifest-error manifest))
         ;; Only check integrity once the shape check passed -- a missing or
         ;; malformed :manifest-cid is manifest-error's problem to report, not
@@ -334,6 +339,11 @@
                            :kotoba.package/data
                            {:abac/policy-id (:abac/policy-id abac-result)
                             :abac/violations (:abac/violations abac-result)}}])
+                       (when (and crypto-required? (not (:valid? crypto-result)))
+                         [{:kotoba.package/input :admission-context
+                           :kotoba.package/problem :package/hybrid-pqc-denied
+                           :kotoba.package/message "hybrid PQC policy denies package admission"
+                           :kotoba.package/data {:crypto crypto-result}}])
                        (when manifest-error
                          [(->problem {:kotoba.package/input :manifest
                                       :kotoba.package/path manifest-path}
@@ -357,6 +367,7 @@
      :kotoba.package/manifest-path manifest-path
      :kotoba.package/checked-at (checked-at)
      :kotoba.package/abac abac-result
+     :kotoba.package/crypto crypto-result
      :kotoba.package/problems problems
      :kotoba.package/entries (mapv (fn [[dep error]] (dep-entry dep error)) dep-results)}))
 
