@@ -23,10 +23,20 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
+            [clojure.set :as set]
             [clojure.string :as str]
+            [kotoba.compiler.artifact :as artifact]
             [kotoba.lang.package-contract :as package-contract]
+            [kotoba.lang.package-registry :as package-registry]
             [multiformats.core :as mf])
   (:import [java.time Instant]))
+
+(defn sha256-bytes [^bytes bytes]
+  (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-256") bytes)]
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest))))
+
+(defn sha256-text [text]
+  (sha256-bytes (.getBytes ^String text java.nio.charset.StandardCharsets/UTF_8)))
 
 (def local-path-message
   "local-path dependency not allowed in safe mode")
@@ -57,6 +67,14 @@
    "signature bytes required" :package/signature-invalid
    "signature verification failed" :package/signature-verification-failed
    "manifest cid does not match manifest content" :package/manifest-cid-mismatch
+   "component cid required" :package/component-cid-required
+   "component cid does not match component content" :package/component-cid-mismatch
+   "dependency manifest required" :package/dependency-manifest-required
+   "unexpected dependency manifest" :package/unexpected-dependency-manifest
+   "dependency manifest does not match lock entry" :package/dependency-manifest-mismatch
+   "dependency capability grant exceeds signed request" :package/capability-exceeds-manifest
+   "dependency manifest closure does not match lock" :package/dependency-closure-mismatch
+   "dependency signer is not explicitly trusted" :package/signer-not-trusted
    local-path-message :package/local-path-dependency})
 
 (defn problem-code
@@ -236,10 +254,17 @@
 
 (defn dep-error
   "First problem for a single lock entry: admission-layer safe-mode checks,
-  then the package-contract lockfile kernel."
-  [dep trust]
-  (or (local-path-error dep)
-      (package-contract/lockfile-error {:kotoba.lock/version 1 :deps [dep]} trust)))
+  then the package-contract lockfile kernel.
+
+  OPTS may carry `:component-bytes` for L3 component-cid content integrity."
+  ([dep trust] (dep-error dep trust nil))
+  ([dep trust {:keys [component-bytes]}]
+   (or (local-path-error dep)
+       (package-contract/lockfile-error
+        {:kotoba.lock/version 1 :deps [dep]}
+        trust
+        (when component-bytes
+          {:component-bytes-by-dep {(:dep/name dep) component-bytes}})))))
 
 (defn ->problem
   [source error]
@@ -250,11 +275,15 @@
 
 (defn dep-entry
   [dep error]
-  {:package/id (str (:dep/name dep) "@" (:dep/version dep))
-   :package/repo-rid (:dep/repo-rid dep)
-   :package/manifest-cid (:dep/manifest-cid dep)
-   :package/tree-cid (:dep/tree-cid dep)
-   :package/result (if error :rejected :accepted)})
+  (cond-> {:package/id (str (:dep/name dep) "@" (:dep/version dep))
+           :package/repo-rid (:dep/repo-rid dep)
+           :package/manifest-cid (:dep/manifest-cid dep)
+           :package/tree-cid (:dep/tree-cid dep)
+           :package/result (if error :rejected :accepted)}
+    (:dep/kind dep) (assoc :package/kind (:dep/kind dep))
+    (package-contract/component-cid-of dep)
+    (assoc :package/component-cid (package-contract/component-cid-of dep)
+           :package/build (:dep/build dep))))
 
 (defn checked-at []
   (str (Instant/now)))
@@ -262,8 +291,11 @@
 (defn verify-lock
   "Verify a parsed lock (plus optional parsed manifest and trust EDN) and
   return the package-verification receipt. The receipt is emitted on both
-  accept and reject."
-  [{:keys [lock lock-path manifest manifest-path trust]}]
+  accept and reject.
+
+  OPTS may carry `:component-bytes-by-dep` {dep-name bytes} for L3 component
+  content integrity (CID guest packages)."
+  [{:keys [lock lock-path manifest manifest-path trust component-bytes-by-dep]}]
   (let [tc (trust-context trust manifest)
         manifest-error (when manifest (package-contract/package-manifest-error manifest))
         ;; Only check integrity once the shape check passed -- a missing or
@@ -272,7 +304,12 @@
         integrity-error (when (and manifest (not manifest-error))
                           (manifest-integrity-error manifest))
         lock-error (lock-level-error lock)
-        dep-results (mapv (fn [dep] [dep (dep-error dep tc)]) (:deps lock))
+        dep-results (mapv (fn [dep]
+                            [dep (dep-error dep tc
+                                            {:component-bytes
+                                             (get component-bytes-by-dep
+                                                  (:dep/name dep))})])
+                          (:deps lock))
         problems (vec (concat
                        (when manifest-error
                          [(->problem {:kotoba.package/input :manifest
@@ -298,6 +335,271 @@
      :kotoba.package/checked-at (checked-at)
      :kotoba.package/problems problems
      :kotoba.package/entries (mapv (fn [[dep error]] (dep-entry dep error)) dep-results)}))
+
+(defn- dependency-manifest-mismatch [dep manifest]
+  (let [manifest-signers (set (map :did (:kotoba.package/signatures manifest)))
+        expected {:name (:dep/name dep)
+                  :version (:dep/version dep)
+                  :repo-rid (:dep/repo-rid dep)
+                  :commit (:dep/commit dep)
+                  :tree-cid (:dep/tree-cid dep)
+                  :manifest-cid (:dep/manifest-cid dep)
+                  :signers (set (:dep/signers dep))}
+        actual {:name (:kotoba.package/name manifest)
+                :version (:kotoba.package/version manifest)
+                :repo-rid (:kotoba.package/repo-rid manifest)
+                :commit (get-in manifest [:kotoba.package/source :git-commit])
+                :tree-cid (get-in manifest [:kotoba.package/source :tree-cid])
+                :manifest-cid (get-in manifest [:kotoba.package/source :manifest-cid])
+                :signers manifest-signers}]
+    (when-not (= expected actual)
+      (package-contract/invalid "dependency manifest does not match lock entry"
+                                {:expected expected :actual actual}))))
+
+(defn- dependency-capability-error [dep manifest]
+  (let [grant (set (:dep/capabilities dep))
+        requested (set (:kotoba.package/capabilities manifest))]
+    (when-not (set/subset? grant requested)
+      (package-contract/invalid
+       "dependency capability grant exceeds signed request"
+       {:dependency (:dep/name dep)
+        :grant (vec (sort grant))
+        :requested (vec (sort requested))}))))
+
+(defn- manifest-dependency-error [owner dependencies deps-by-name]
+  (cond
+    (not (vector? dependencies))
+    (package-contract/invalid
+     "dependency manifest closure does not match lock"
+     {:reason :dependencies-vector-required :dependency owner})
+
+    :else
+    (let [names (mapv :dep/name dependencies)]
+      (or
+       (when-let [invalid (first (remove #(and (map? %)
+                                               (set/subset?
+                                                (set (keys %))
+                                                #{:dep/name :dep/version :dep/kind})
+                                               (string? (:dep/name %))
+                                               (not (str/blank? (:dep/name %)))
+                                               (string? (:dep/version %))
+                                               (not (str/blank? (:dep/version %)))
+                                               (or (not (contains? % :dep/kind))
+                                                   (contains?
+                                                    package-contract/allowed-package-kinds
+                                                    (:dep/kind %))))
+                                        dependencies))]
+         (package-contract/invalid
+          "dependency manifest closure does not match lock"
+          {:reason :dependency-coordinate-invalid
+           :dependency owner :value invalid}))
+       (when-not (= (count names) (count (set names)))
+         (package-contract/invalid
+          "dependency manifest closure does not match lock"
+          {:reason :duplicate-dependency-edge :dependency owner :targets names}))
+       (when (some #{owner} names)
+         (package-contract/invalid
+          "dependency manifest closure does not match lock"
+          {:reason :self-dependency-edge :dependency owner}))
+       (some
+        (fn [coordinate]
+          (let [target (get deps-by-name (:dep/name coordinate))]
+            (cond
+              (nil? target)
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-target-missing
+                :dependency owner :target (:dep/name coordinate)})
+
+              (not= (:dep/version coordinate) (:dep/version target))
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-version-mismatch :dependency owner
+                :target (:dep/name coordinate)
+                :declared (:dep/version coordinate)
+                :locked (:dep/version target)})
+
+              (and (contains? coordinate :dep/kind)
+                   (not= (:dep/kind coordinate) (:dep/kind target)))
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-kind-mismatch :dependency owner
+                :target (:dep/name coordinate)
+                :declared (:dep/kind coordinate)
+                :locked (:dep/kind target)}))))
+        dependencies)))))
+
+(defn- dependency-cycle [dependency-manifests]
+  (let [edges (into {}
+                    (map (fn [[name manifest]]
+                           [name (mapv :dep/name
+                                       (:kotoba.package/dependencies manifest))]))
+                    dependency-manifests)]
+    (letfn [(visit [node visiting visited path]
+              (cond
+                (contains? visiting node)
+                (conj (vec (drop-while #(not= node %) path)) node)
+
+                (contains? visited node) nil
+
+                :else
+                (some #(visit % (conj visiting node) (conj visited node)
+                              (conj path node))
+                      (get edges node []))))]
+      (some #(visit % #{} #{} []) (sort (keys edges))))))
+
+(defn verify-project-lock
+  "Strict closed-project package verification. Every lock dependency must have
+  exactly one cryptographically valid manifest, its identity/interface fields
+  must equal the lock entry, the lock capability grant must be a subset of the
+  signed manifest request, and every signer must be explicitly allowlisted by
+  the trust policy. Signed direct dependency coordinates must resolve exactly
+  inside the lock with matching versions/kinds; duplicate identities, missing
+  targets, ambient coordinate fields, and cycles fail closed. Extra manifests
+  fail closed."
+  [{:keys [lock lock-path trust dependency-manifests dependency-manifest-paths]}]
+  (let [base (verify-lock {:lock lock :lock-path lock-path :trust trust})
+        lock-names (mapv :dep/name (:deps lock))
+        duplicate-lock-names (->> lock-names frequencies
+                                  (keep (fn [[name n]] (when (> n 1) name)))
+                                  sort vec)
+        deps-by-name (into {} (map (juxt :dep/name identity)) (:deps lock))
+        manifest-names (set (keys dependency-manifests))
+        dep-names (set (keys deps-by-name))
+        trusted (set (:trusted-signers trust))
+        missing (sort (set/difference dep-names manifest-names))
+        extra (sort (set/difference manifest-names dep-names))
+        manifest-problems
+        (vec
+         (concat
+          (when (seq duplicate-lock-names)
+            [(->problem
+              {:kotoba.package/input :lock}
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :duplicate-lock-dependency
+                :dependencies duplicate-lock-names}))])
+          (map (fn [name]
+                 (->problem {:kotoba.package/input :dependency-manifest
+                             :kotoba.package/dependency name}
+                            (package-contract/invalid "dependency manifest required"
+                                                      {:dependency name})))
+               missing)
+          (map (fn [name]
+                 (->problem {:kotoba.package/input :dependency-manifest
+                             :kotoba.package/dependency name}
+                            (package-contract/invalid "unexpected dependency manifest"
+                                                      {:dependency name})))
+               extra)
+          (keep
+           (fn [name]
+             (let [dep (get deps-by-name name)
+                   manifest (get dependency-manifests name)
+                   error (or (package-contract/package-manifest-error manifest)
+                             (manifest-integrity-error manifest)
+                             (dependency-manifest-mismatch dep manifest)
+                             (dependency-capability-error dep manifest)
+                             (manifest-dependency-error
+                              name (:kotoba.package/dependencies manifest)
+                              deps-by-name)
+                             (when-let [untrusted
+                                        (seq (set/difference
+                                              (set (:dep/signers dep)) trusted))]
+                               (package-contract/invalid
+                                "dependency signer is not explicitly trusted"
+                                {:dependency name :signers (vec (sort untrusted))})))]
+               (when error
+                 (->problem {:kotoba.package/input :dependency-manifest
+                             :kotoba.package/dependency name
+                             :kotoba.package/path (get dependency-manifest-paths name)}
+                            error))))
+           (sort (set/intersection dep-names manifest-names)))
+          (when-let [cycle (and (= dep-names manifest-names)
+                                (dependency-cycle dependency-manifests))]
+            [(->problem
+              {:kotoba.package/input :dependency-manifest}
+              (package-contract/invalid
+               "dependency manifest closure does not match lock"
+               {:reason :dependency-cycle :cycle cycle}))])))
+        problems (into (:kotoba.package/problems base) manifest-problems)]
+    (assoc base
+           :kotoba.package/verified? (empty? problems)
+           :kotoba.package/problems problems
+           :kotoba.package/dependency-manifest-digests
+           (into (sorted-map)
+                 (map (fn [[name manifest]]
+                        [name (artifact/sha256 manifest)]))
+                 dependency-manifests))))
+
+(defn receipt-evidence
+  "Deterministic, path/time-free receipt value sealed into build identity."
+  [receipt]
+  {:kotoba.package/schema :kotoba.package/verification-evidence-v1
+   :kotoba.package/verified? (:kotoba.package/verified? receipt)
+   :kotoba.package/entries (vec (sort-by :package/id (:kotoba.package/entries receipt)))
+   :kotoba.package/dependency-manifest-digests
+   (:kotoba.package/dependency-manifest-digests receipt)
+   :kotoba.package/problems (:kotoba.package/problems receipt)})
+
+(defn receipt-digest [receipt]
+  ;; Use the compiler's already-native-verified canonical EDN hash here. DAG-
+  ;; CBOR remains authoritative for package CIDs, but receipt evidence is a
+  ;; distinct versioned schema and must not introduce a second runtime codec
+  ;; initialization path into the Graal launcher.
+  (artifact/sha256 (receipt-evidence receipt)))
+
+(defn compute-component-cid
+  "CIDv1-raw of COMPONENT-BYTES — the pin used for :dep/component-cid on
+  guest component packages (L3, ADR-2607180900)."
+  [component-bytes]
+  (mf/cidv1-raw component-bytes))
+
+(defn guest-package-dep
+  "Build a lock-entry map for a closed CID guest package (not ambient require).
+
+  Requires name/version/repo-rid/commit/tree-cid/manifest-cid/signers plus a
+  real component-cid over COMPONENT-BYTES. Kind defaults to :component.
+  Capabilities default to [] (deny-by-default)."
+  [{:keys [name version repo-rid commit tree-cid manifest-cid signers
+           component-bytes capabilities kind ref]
+    :or {capabilities [] kind :component ref "refs/heads/main"}}]
+  (let [component-cid (compute-component-cid component-bytes)]
+    {:dep/name name
+     :dep/version version
+     :dep/kind kind
+     :dep/repo-rid repo-rid
+     :dep/ref ref
+     :dep/commit commit
+     :dep/tree-cid tree-cid
+     :dep/manifest-cid manifest-cid
+     :dep/signers (vec signers)
+     :dep/capabilities (vec capabilities)
+     :dep/component-cid component-cid
+     :dep/build {:deterministic true
+                 :component-cid component-cid}}))
+
+(defn admit-guest-component
+  "L3: admit a single closed guest component package (CID-pinned, no require).
+  COMPONENT-BYTES are the built artifact (wasm / sealed graph payload).
+  Returns the same shape as `admit` over an in-memory lock."
+  [{:keys [name version repo-rid commit tree-cid manifest-cid signers
+           component-bytes capabilities trust]}]
+  (let [dep (guest-package-dep
+             {:name name :version version :repo-rid repo-rid :commit commit
+              :tree-cid tree-cid :manifest-cid manifest-cid :signers signers
+              :component-bytes component-bytes :capabilities capabilities})
+        lock {:kotoba.lock/version 1 :deps [dep]}
+        receipt (verify-lock
+                 {:lock lock
+                  :lock-path "<guest-component>"
+                  :trust trust
+                  :component-bytes-by-dep {name component-bytes}})]
+    {:kotoba.admission/ok? (:kotoba.package/verified? receipt)
+     :kotoba.admission/code (if (:kotoba.package/verified? receipt)
+                              :package-verified
+                              :package-rejected)
+     :kotoba.admission/receipt receipt
+     :kotoba.admission/dep dep}))
 
 ;; ---------------------------------------------------------------------------
 ;; File-level admission
@@ -393,26 +695,68 @@
                         (:kotoba.admission/error admission)
                         (assoc :kotoba.package/error (:kotoba.admission/error admission)))}))
 
+(defn resolve-lock-with-registry
+  "Resolve version-only dependency requests through a package registry into
+  a full lock, then verify-lock (fail-closed). REGISTRY is parsed EDN;
+  REQUESTS is a vector of {:name :version :capabilities?}.
+
+  Returns the same shape as `admit` plus :kotoba.admission/lock when ok."
+  [{:keys [registry requests trust]}]
+  (let [resolved (package-registry/lock-from-requests registry requests)]
+    (if-not (:ok? resolved)
+      {:kotoba.admission/ok? false
+       :kotoba.admission/code :package/registry-resolve-failed
+       :kotoba.admission/error {:kotoba.package/problems (:problems resolved)}}
+      (let [receipt (verify-lock {:lock (:lock resolved)
+                                  :lock-path "<registry-resolved>"
+                                  :trust trust})]
+        {:kotoba.admission/ok? (:kotoba.package/verified? receipt)
+         :kotoba.admission/code (if (:kotoba.package/verified? receipt)
+                                  :package-verified
+                                  :package-rejected)
+         :kotoba.admission/receipt receipt
+         :kotoba.admission/lock (:lock resolved)}))))
+
 (defn safe-release-ready?
-  "F-001 / F-007 partial: a safe release may proceed only when a package-
-  verification receipt exists and is verified."
-  [receipt]
-  (cond
-    (nil? receipt)
-    {:ok? false
-     :problems [{:kotoba.package/problem :package/missing-receipt
-                 :kotoba.package/message "package verification receipt required for safe release"}]}
+  "F-001 / F-007 partial + L3: a safe release may proceed only when a package-
+  verification receipt exists, is verified, and carries no reject entries.
+  Optional `:require-component-cid?` (default false) additionally demands
+  every accepted entry pin a component-cid (guest component packages)."
+  ([receipt] (safe-release-ready? receipt nil))
+  ([receipt {:keys [require-component-cid?] :or {require-component-cid? false}}]
+   (cond
+     (nil? receipt)
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/missing-receipt
+                  :kotoba.package/message "package verification receipt required for safe release"}]}
 
-    (not (map? receipt))
-    {:ok? false
-     :problems [{:kotoba.package/problem :package/invalid-receipt
-                 :kotoba.package/message "receipt must be a map"}]}
+     (not (map? receipt))
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/invalid-receipt
+                  :kotoba.package/message "receipt must be a map"}]}
 
-    (not (true? (:kotoba.package/verified? receipt)))
-    {:ok? false
-     :problems (into [{:kotoba.package/problem :package/not-verified
-                       :kotoba.package/message "receipt is not verified"}]
-                     (:kotoba.package/problems receipt))}
+     (not (true? (:kotoba.package/verified? receipt)))
+     {:ok? false
+      :problems (into [{:kotoba.package/problem :package/not-verified
+                        :kotoba.package/message "receipt is not verified"}]
+                      (:kotoba.package/problems receipt))}
 
-    :else
-    {:ok? true :problems []}))
+     (some #(= :rejected (:package/result %)) (:kotoba.package/entries receipt))
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/rejected-entry
+                  :kotoba.package/message "receipt contains rejected package entries"}]}
+
+     (and require-component-cid?
+          (let [entries (:kotoba.package/entries receipt)]
+            (or (empty? entries)
+                (some (fn [e]
+                        (not (package-contract/cid?
+                              (or (:package/component-cid e)
+                                  (get-in e [:package/build :component-cid])))))
+                      entries))))
+     {:ok? false
+      :problems [{:kotoba.package/problem :package/component-cid-required
+                  :kotoba.package/message "safe release of component packages requires component-cid pins"}]}
+
+     :else
+     {:ok? true :problems []})))

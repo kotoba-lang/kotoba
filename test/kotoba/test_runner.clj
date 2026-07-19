@@ -14,6 +14,8 @@
             [kotoba.doc-examples-test]
             [kotoba.guest-maturity-l2-test]
             [kotoba.guest-maturity-p0-p1-test]
+            [kotoba.guest-maturity-l3-l5-test]
+            [kotoba.guest-maturity-l4-l6-test]
             [kotoba.git-adapter-test]
             [kotoba.host-providers-test]
             [kotoba.kami-game-test]
@@ -23,6 +25,7 @@
             [kotoba.mesh-drama-profile-test]
             [kotoba.mesh-node-test]
             [kotoba.package-admission-test]
+            [kotoba.package-registry-test]
             [kotoba.package-key-revoke-e2e-test]
             [kotoba.rad-adapter-test]
             [kotoba.real-host-providers-test]
@@ -47,6 +50,10 @@
                                         'kotoba.cljs-backend-test
                                         'kotoba.did-adapter-test
                                         'kotoba.doc-examples-test
+                                        'kotoba.guest-maturity-l2-test
+                                        'kotoba.guest-maturity-p0-p1-test
+                                        'kotoba.guest-maturity-l3-l5-test
+                                        'kotoba.guest-maturity-l4-l6-test
                                         'kotoba.git-adapter-test
                                         'kotoba.host-providers-test
                                         'kotoba.kami-game-test
@@ -56,6 +63,7 @@
                                         'kotoba.mesh-drama-profile-test
                                         'kotoba.mesh-node-test
                                         'kotoba.package-admission-test
+                                        'kotoba.package-registry-test
                                         'kotoba.package-key-revoke-e2e-test
                                         'kotoba.rad-adapter-test
                                         'kotoba.real-host-providers-test
@@ -67,5 +75,4 @@
                                         'kotoba.wasm-and-or-when-test
                                         'kotoba.wasm-exec-test
                                         'kotoba.wasm-map-keyword-test)]
-    (when (pos? (+ (or fail 0) (or error 0)))
-      (System/exit 1))))
+    (System/exit (if (pos? (+ (or fail 0) (or error 0))) 1 0))))

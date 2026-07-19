@@ -13,6 +13,15 @@
     (spit file (pr-str content))
     (.getPath file)))
 
+(defn temp-fs-target
+  "A path for a file that does NOT yet exist (fs-write must create it), under
+  a fresh temp directory so tests never touch the repo tree."
+  []
+  (let [dir (.toFile (java.nio.file.Files/createTempDirectory
+                      "kotoba-host-providers-fs"
+                      (into-array java.nio.file.attribute.FileAttribute [])))]
+    (.getPath (File. ^File dir "target.txt"))))
+
 (deftest policy-derives-grants-and-local-policy-per-host-kind
   (let [policy {:kotoba.policy/capabilities #{:clipboard/text :ledger/append}
                 :kotoba.policy/capability-resources {:clipboard/text #{"clipboard:system"}}
@@ -176,3 +185,80 @@
         ran (runtime/run (launcher/safe-analyzer-fact-classification) plan forms)]
     (is (true? (:kotoba.runtime/ok? ran)))
     (is (= 42 (:kotoba.runtime/value ran)))))
+
+;; ---------------------------------------------------------------------------
+;; kbb v0.1 real fs-read/fs-write handlers (ADR-2607182430 in
+;; com-junkawasaki/root): default-handlers' fs-read/fs-write are no longer
+;; 0-returning stubs -- these prove they perform genuine filesystem I/O
+;; through `host-providers/host-call` (the CLJ interpreter slice's own path,
+;; distinct from kotoba.wasm-exec's already-real WASM/Chicory fs-read/
+;; fs-write covered by real_host_providers_test.clj).
+
+(deftest fs-write-then-fs-read-round-trip-through-default-handlers-for-real
+  (testing "fs-write really writes to disk; fs-read really reads the same bytes back
+            -- not the old 0-returning stub"
+    (let [target (temp-fs-target)
+          policy {:kotoba.policy/capabilities #{:fs/app-data}}
+          host-call (host-providers/host-call policy)]
+      (is (not (.exists (File. ^String target))) "file must not pre-exist")
+      (is (= 10 (host-call 'fs-write [target "hello kbb!"]))
+          "fs-write returns the real byte count written")
+      (is (.isFile (File. ^String target)) "the file genuinely exists on disk")
+      (is (= "hello kbb!" (slurp target))
+          "the bytes on disk are exactly what fs-write was asked to write")
+      (is (= "hello kbb!" (host-call 'fs-read [target]))
+          "fs-read reads back the real file content, not a stub 0"))))
+
+(deftest fs-read-of-a-missing-file-is-a-clean-nil-not-a-crash
+  (testing "reading a path that doesn't exist returns nil (a clean miss), not an exception"
+    (let [target (temp-fs-target)
+          policy {:kotoba.policy/capabilities #{:fs/app-data}}
+          host-call (host-providers/host-call policy)]
+      (is (not (.exists (File. ^String target))))
+      (is (nil? (host-call 'fs-read [target]))))))
+
+(deftest fs-capability-not-granted-denies-before-ever-touching-the-real-filesystem
+  (testing "guard-call's own kind-level denial (capability absent from policy) still fails
+            closed for the REAL fs-write/fs-read handlers -- the handler (and therefore the
+            real filesystem) is never reached, exactly like the pre-existing stub-era guarantee"
+    (let [target (temp-fs-target)
+          policy {:kotoba.policy/capabilities #{}}
+          host-call (host-providers/host-call policy)
+          thrown-write (try (host-call 'fs-write [target "should never land"])
+                            nil
+                            (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :empty-intersection (:kotoba.host/denied thrown-write)))
+      (is (= 'fs-write (:kotoba.host/call thrown-write)))
+      (is (not (.exists (File. ^String target)))
+          "the real handler must never have run -- no file was created")
+      (let [thrown-read (try (host-call 'fs-read [target])
+                             nil
+                             (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= :empty-intersection (:kotoba.host/denied thrown-read)))
+        (is (= 'fs-read (:kotoba.host/call thrown-read)))))))
+
+(deftest fs-resource-scope-denies-a-path-outside-the-granted-set-even-though-the-kind-is-granted
+  (testing "the CAPABILITY KIND being granted (:fs/app-data) is not enough on its own --
+            a policy narrowing :kotoba.policy/capability-resources to specific path(s) must
+            still deny a DIFFERENT path, exactly mirroring kotoba.wasm-exec's
+            fs-resource-scope-denies-a-different-path-and-permits-the-exact-one"
+    (let [allowed (temp-fs-target)
+          other (temp-fs-target)
+          policy {:kotoba.policy/capabilities #{:fs/app-data}
+                  :kotoba.policy/capability-resources {:fs/app-data #{allowed}}}
+          host-call (host-providers/host-call policy)
+          thrown (try (host-call 'fs-write [other "must not land"])
+                     nil
+                     (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :resource-not-permitted (:kotoba.host/denied thrown)))
+      (is (not (.exists (File. ^String other)))
+          "the out-of-scope path must never have been written")
+      (is (= 5 (host-call 'fs-write [allowed "match"]))
+          "the exact granted path still works")
+      (is (= "match" (host-call 'fs-read [allowed]))))))
+
+(deftest clock-monotonic-returns-a-real-timestamp-not-a-0-stub
+  (testing "clock-monotonic is a real System/nanoTime read"
+    (let [policy {:kotoba.policy/capabilities #{:clock/monotonic}}
+          host-call (host-providers/host-call policy)]
+      (is (pos? (host-call 'clock-monotonic []))))))

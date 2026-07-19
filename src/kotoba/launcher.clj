@@ -12,6 +12,7 @@
             [clojure.string :as str]
             [kotoba.cap-table :as cap-table]
             [kotoba.compiler.core :as compiler]
+            [kotoba.compiler.project-files :as project-files]
             [kotoba.lang.capability-cacao :as capability-cacao]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.cli :as cli]
@@ -23,12 +24,41 @@
             [kotoba.semantic-code :as semantic-code]
             [kotoba.selfhost.contracts :as selfhost]
             [kotoba.wasm-exec :as wasm-exec])
+  (:import [java.io ByteArrayOutputStream FileInputStream]
+           [java.nio ByteBuffer]
+           [java.nio.charset CodingErrorAction StandardCharsets]
+           [java.nio.file Path])
   (:gen-class))
 
 (defn result->exit
   "Process exit code for a `:kotoba.cli/ok?` result map: 0 when ok, 1 otherwise."
   [result]
   (if (:kotoba.cli/ok? result) 0 1))
+
+(defn exception-chain
+  "Bounded, path-free exception identity for stable CLI diagnostics.
+
+  Native-image failures often surface only the message of a wrapper exception;
+  retaining the exception and cause classes lets release smoke identify a
+  missing runtime class without printing host stack traces or ambient paths."
+  [^Throwable error]
+  (loop [current error
+         remaining 8
+         result []]
+    (if (or (nil? current) (zero? remaining))
+      result
+      (recur (.getCause current)
+             (dec remaining)
+             (conj result
+                   (cond-> {:class (.getName (class current))}
+                     (instance? ClassNotFoundException current)
+                     (assoc :frames
+                            (mapv (fn [^StackTraceElement frame]
+                                    {:class (.getClassName frame)
+                                     :method (.getMethodName frame)})
+                                  (take 12 (.getStackTrace current))))
+                     (some? (ex-message current))
+                     (assoc :message (ex-message current))))))))
 
 (defn json-requested?
   "True when argv carries the `--json` flag."
@@ -41,10 +71,20 @@
   ([result] (render-result result false))
   ([result json-output?]
    (if json-output?
-     (json/write-str result :key-fn (fn [k]
+     (let [diagnostic-key :kotoba.cli/diagnostic
+           result (update result diagnostic-key
+                          (fn [diagnostic]
+                            (when diagnostic
+                              (into {}
+                                    (map (fn [[k v]]
+                                           [k (if (keyword? v)
+                                                (subs (str v) 1)
+                                                v)]))
+                                    diagnostic))))]
+       (json/write-str result :key-fn (fn [k]
                                       (if (keyword? k)
                                         (subs (str k) 1)
-                                        (str k))))
+                                        (str k)))))
      (pr-str result))))
 
 (defn command-name
@@ -53,7 +93,7 @@
   (first argv))
 
 (declare source-plan source-extension accepted-source? selfhost-result runtime-result wasm-result cljs-result
-         compile-result package-result contract-exports)
+         compile-result project-check-result package-result contract-exports)
 
 (def source-commands
   #{"run" "check" "compile"})
@@ -66,7 +106,7 @@
     "--output"
     "--package-lock"
     "--policy"
-    "--prelude"
+    "--project"
     "--reader-target"
     "--receipt"
     "--source-path"
@@ -196,18 +236,16 @@
   reconstruct its namespaced entity map. Collection-valued attributes were
   serialized with pr-str by the contract repository's datomizer."
   [path]
-  (let [document (-> path io/resource slurp edn/read-string)]
-    (if (map? document)
-      document
-      (into {}
-            (map (fn [[k v]]
-                   [k (if (string? v)
-                        (try
-                          (let [decoded (edn/read-string v)]
-                            (if (coll? decoded) decoded v))
-                          (catch Exception _ v))
-                        v)]))
-            (dissoc (first document) :db/id)))))
+  (let [tx-data (-> path io/resource slurp edn/read-string)]
+    (into {}
+          (map (fn [[k v]]
+                 [k (if (string? v)
+                      (try
+                        (let [decoded (edn/read-string v)]
+                          (if (coll? decoded) decoded v))
+                        (catch Exception _ v))
+                      v)]))
+          (dissoc (first tx-data) :db/id))))
 
 (defn dispatch
   "Dispatch argv through the CLJC authority and return a result map."
@@ -215,6 +253,8 @@
   (let [argv (vec argv)]
     (if-let [launcher-result (case (command-name argv)
                                "selfhost" (selfhost-result argv)
+                               "check" (when (option-value argv "--project")
+                                         (project-check-result argv))
                                "compile" (compile-result argv)
                                "wasm" (wasm-result argv)
                                "cljs" (cljs-result argv)
@@ -245,26 +285,195 @@
   (with-open [out (io/output-stream path)]
     (.write out ^bytes bytes)))
 
+(defn- reject-project-file! [message data]
+  (throw (ex-info message (assoc data :phase :project-manifest))))
+
+(defn- symlink-component? [^java.io.File base ^java.io.File candidate]
+  (loop [current candidate]
+    (cond
+      (nil? current) true
+      (= base current) false
+      (not= (.getAbsoluteFile current) (.getCanonicalFile current)) true
+      :else (recur (.getParentFile current)))))
+
+(defn- symbolic-link-file? [^java.io.File file]
+  (let [absolute (.getAbsoluteFile file)
+        normalized (io/file (.getCanonicalFile (.getParentFile absolute))
+                            (.getName absolute))]
+    (not= (.getAbsoluteFile normalized) (.getCanonicalFile absolute))))
+
+(defn- file-snapshot [^java.io.File file]
+  [(.getPath (.getCanonicalFile file)) (.length file) (.lastModified file)])
+
+(defn- read-bounded-bytes [^java.io.File file max-bytes data]
+  (with-open [input (FileInputStream. file)
+              output (ByteArrayOutputStream.)]
+    (let [buffer (byte-array 8192)]
+      (loop [total 0]
+        (let [read (.read input buffer)]
+          (if (neg? read)
+            (.toByteArray output)
+            (let [next-total (+ total read)]
+              (when (> next-total max-bytes)
+                (reject-project-file! "project file exceeds byte limit"
+                                      (assoc data :bytes next-total)))
+              (.write output buffer 0 read)
+              (recur next-total))))))))
+
+(defn- strict-utf8 [^bytes bytes data]
+  (try
+    (str (.decode (doto (.newDecoder StandardCharsets/UTF_8)
+                    (.onMalformedInput CodingErrorAction/REPORT)
+                    (.onUnmappableCharacter CodingErrorAction/REPORT))
+                  (ByteBuffer/wrap bytes)))
+    (catch java.nio.charset.CharacterCodingException _
+      (reject-project-file! "project file is not strict UTF-8" data))))
+
+(defn- read-stable-file [^java.io.File base-file relative max-bytes data]
+  (let [^Path base-path (-> base-file .toPath .toAbsolutePath .normalize)
+        lexical-file (io/file base-file relative)
+        ^Path lexical-path (-> lexical-file .toPath .toAbsolutePath .normalize)]
+    (when-not (.startsWith lexical-path base-path)
+      (reject-project-file! "project module path escapes its manifest root" data))
+    (when (symlink-component? base-file (.getAbsoluteFile lexical-file))
+      (reject-project-file! "project file path contains a symbolic link" data))
+    (let [canonical-before (.getCanonicalFile lexical-file)
+          ^Path path (.toPath canonical-before)]
+      (when-not (and (.startsWith path (.toPath base-file))
+                     (.isFile canonical-before))
+        (reject-project-file! "project module escapes its manifest root or is not a regular file" data))
+      (let [before (file-snapshot canonical-before)]
+        (when (> (.length canonical-before) max-bytes)
+          (reject-project-file! "project file exceeds byte limit"
+                                (assoc data :bytes (.length canonical-before))))
+        (let [^bytes bytes (read-bounded-bytes canonical-before max-bytes data)
+              canonical-after (.getCanonicalFile lexical-file)
+              after (file-snapshot canonical-after)]
+          (when (or (not= canonical-before canonical-after)
+                    (not= before after)
+                    (symlink-component? base-file (.getAbsoluteFile lexical-file)))
+            (reject-project-file! "project file changed while being read" data))
+          (strict-utf8 bytes data))))))
+
+(defn- project-input [manifest-path]
+  (let [manifest-file (io/file manifest-path)
+        manifest-absolute (.getAbsoluteFile manifest-file)
+        _ (when (symbolic-link-file? manifest-absolute)
+            (reject-project-file! "project manifest must not be a symbolic link"
+                                  {:input :manifest}))
+        manifest-canonical (.getCanonicalFile manifest-file)
+        manifest-base (.getParentFile manifest-canonical)
+        manifest-text (read-stable-file manifest-base (.getName manifest-canonical)
+                                        (* 1024 1024) {:input :manifest})
+        manifest (edn/read-string
+                  {:readers {}
+                   :default (fn [tag _]
+                              (reject-project-file! "tagged project manifest value rejected"
+                                                    {:tag tag}))}
+                  manifest-text)
+        root (:kotoba.project/root manifest)
+        modules (:kotoba.project/modules manifest)
+        lock-relative (:kotoba.project/package-lock manifest)
+        trust-relative (:kotoba.project/trust manifest)
+        dependency-manifest-relatives (:kotoba.project/dependency-manifests manifest)
+        base-file manifest-base
+        _ (when-not (and (= #{:kotoba.project/root :kotoba.project/modules
+                              :kotoba.project/package-lock :kotoba.project/trust
+                              :kotoba.project/dependency-manifests}
+                            (set (keys manifest)))
+                         (simple-symbol? root) (map? modules)
+                         (pos? (count modules)) (<= (count modules) 256))
+            (throw (ex-info "invalid closed Kotoba project manifest"
+                            {:phase :project-manifest})))
+        _ (when-not (and (string? lock-relative) (string? trust-relative)
+                         (map? dependency-manifest-relatives)
+                         (every? string? (keys dependency-manifest-relatives))
+                         (every? string? (vals dependency-manifest-relatives)))
+            (throw (ex-info "project package lock, trust, and dependency manifests are required"
+                            {:phase :project-manifest
+                             :reason :missing-supply-chain-input})))
+        read-edn (fn [relative input]
+                   (let [text (read-stable-file base-file relative (* 1024 1024)
+                                                {:input input})]
+                     {:text text
+                      :value (edn/read-string
+                              {:readers {}
+                               :default (fn [tag _]
+                                          (reject-project-file!
+                                           "tagged project supply-chain value rejected"
+                                           {:input input :tag tag}))}
+                              text)}))
+        lock-input (read-edn lock-relative :package-lock)
+        trust-input (read-edn trust-relative :trust-policy)
+        dependency-inputs
+        (into {}
+              (map (fn [[name relative]]
+                     [name (read-edn relative :dependency-manifest)]))
+              dependency-manifest-relatives)
+        package-receipt
+        (package-admission/verify-project-lock
+         {:lock (:value lock-input)
+          :lock-path lock-relative
+          :trust (:value trust-input)
+          :dependency-manifests
+          (into {} (map (fn [[name input]] [name (:value input)])) dependency-inputs)
+          :dependency-manifest-paths dependency-manifest-relatives})
+        _ (when-not (:kotoba.package/verified? package-receipt)
+            (throw (ex-info "closed project package admission rejected"
+                            {:phase :package-admission
+                             :reason :package-rejected
+                             :problems (:kotoba.package/problems package-receipt)})))
+        supply-chain
+        {:package-lock-digest (package-admission/sha256-text (:text lock-input))
+         :trust-policy-digest (package-admission/sha256-text (:text trust-input))
+         :package-receipt-digest (package-admission/receipt-digest package-receipt)}
+        sources
+        (into {}
+              (map (fn [[namespace relative]]
+                     (when-not (and (simple-symbol? namespace) (string? relative)
+                                    (str/ends-with? relative ".kotoba")
+                                    (not (.isAbsolute (io/file relative))))
+                       (throw (ex-info "project modules require relative .kotoba paths"
+                                       {:phase :project-manifest :module namespace})))
+                     [namespace (read-stable-file base-file relative (* 1024 1024)
+                                                  {:input :module :module namespace})]))
+              modules)]
+    {:root root :sources sources :manifest (.getPath manifest-file)
+     :supply-chain supply-chain :package-receipt package-receipt}))
+
 (defn compile-result
   "Compile Kotoba-owned source through kotoba-lang/compiler. Web output is
   restricted ESM emitted from checked KIR by kotoba-script; it never routes
   through the legacy ClojureScript backend."
   [argv]
-  (let [entry (first-source-arg argv)
-        prelude (option-value argv "--prelude")
+  (let [project-path (option-value argv "--project")
+        source-root (option-value argv "--source-path")
+        entry (first-source-arg argv)
         extension (some-> entry source-extension)
         target-name (or (option-value argv "--target") "wasm")
         target (case target-name "web" :js-kotoba-v1 "wasm" :wasm32-kotoba-v1 nil)
         output (or (option-value argv "--output")
                    (option-value argv "-o")
-                   (when (and entry extension)
-                     (str (subs entry 0 (- (count entry) (count extension)))
-                          (if (= target-name "web") ".mjs" ".wasm"))))]
+                   (when (or entry project-path)
+                     (let [input (or entry project-path)
+                           suffix (if project-path ".edn" extension)]
+                       (str (subs input 0 (- (count input) (count suffix)))
+                            (if (= target-name "web") ".mjs" ".wasm")))))]
     (cond
-      (nil? entry)
+      (and entry project-path)
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/ambiguous-input}
+
+      (and project-path source-root)
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/ambiguous-project-source}
+
+      (and (nil? entry) (nil? project-path))
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/entry-required}
 
-      (not (#{".kotoba" ".cljk" ".cljc"} extension))
+      (and project-path (not (str/ends-with? project-path ".edn")))
+      {:kotoba.cli/ok? false :kotoba.cli/code :compile/invalid-project-manifest
+       :kotoba.cli/data {:project project-path}}
+
+      (and entry (not (#{".kotoba" ".cljk" ".cljc"} extension)))
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/not-kotoba-source
        :kotoba.cli/data {:entry entry :extension extension}}
 
@@ -272,15 +481,16 @@
       {:kotoba.cli/ok? false :kotoba.cli/code :compile/unsupported-target
        :kotoba.cli/data {:target target-name :allowed ["web" "wasm"]}}
 
-      (and prelude (not (.isFile (io/file prelude))))
-      {:kotoba.cli/ok? false :kotoba.cli/code :compile/prelude-not-readable
-       :kotoba.cli/data {:prelude prelude}}
-
       :else
       (try
-        (let [source (str (when prelude (str (slurp prelude) "\n"))
-                          (slurp entry))
-              compiled (compiler/compile-source source target)]
+        (let [manifest-project (when project-path (project-input project-path))
+              discovered-project (when source-root
+                                   (project-files/load-closed-graph entry source-root))
+              project (or manifest-project discovered-project)
+              compiled (if project
+                         (compiler/compile-project (:sources project) (:root project) target
+                                                   {} (or (:supply-chain project) {}))
+                         (compiler/compile-source (slurp entry) target))]
           (if (= target :js-kotoba-v1)
             (do
               (some-> (io/file output) .getParentFile .mkdirs)
@@ -288,14 +498,69 @@
               (spit (str output ".manifest.edn") (pr-str (:manifest compiled))))
             (write-bytes! output (:bytes compiled)))
           {:kotoba.cli/ok? true :kotoba.cli/code :compile/emitted
-           :kotoba.cli/data {:entry entry :prelude prelude :output output :target target-name
+           :kotoba.cli/data {:entry (or entry (:root project))
+                             :project project-path :source-path source-root
+                             :output output :target target-name
                              :backend (if (= target :js-kotoba-v1)
                                         :kotoba-script :kotoba-wasm)
-                             :manifest (:manifest compiled)}})
+                             :value-profile (:value-profile compiled)
+                             :value-abi (:value-abi compiled)
+                             :wasm-features (:wasm-features compiled)
+                             :project-digest (:project-digest compiled)
+                             :compatibility (:compatibility compiled)
+                             :manifest (:manifest compiled)
+                             :package-receipt (:package-receipt project)}})
         (catch Exception error
           {:kotoba.cli/ok? false :kotoba.cli/code :compile/failed
            :kotoba.cli/message (ex-message error)
-           :kotoba.cli/data (select-keys (ex-data error) [:phase :reason :target])})))))
+           :kotoba.cli/data (assoc
+                             (select-keys (ex-data error)
+                                          [:phase :reason :target :module :dependency :problems])
+                             :exception-chain (exception-chain error))})))))
+
+(defn project-check-result
+  "Check a closed Kotoba project through the exact compiler path used by
+  `compile --project`, but do not write an artifact."
+  [argv]
+  (let [project-path (option-value argv "--project")
+        entry (first-source-arg argv)
+        target-name (or (option-value argv "--target") "web")
+        target (case target-name "web" :js-kotoba-v1 "wasm" :wasm32-kotoba-v1 nil)]
+    (cond
+      entry
+      {:kotoba.cli/ok? false :kotoba.cli/code :check/ambiguous-input}
+
+      (not (str/ends-with? project-path ".edn"))
+      {:kotoba.cli/ok? false :kotoba.cli/code :check/invalid-project-manifest
+       :kotoba.cli/data {:project project-path}}
+
+      (nil? target)
+      {:kotoba.cli/ok? false :kotoba.cli/code :check/unsupported-target
+       :kotoba.cli/data {:target target-name :allowed ["web" "wasm"]}}
+
+      :else
+      (try
+        (let [project (project-input project-path)
+              compiled (compiler/compile-project (:sources project) (:root project) target
+                                                  {} (:supply-chain project))]
+          {:kotoba.cli/ok? true :kotoba.cli/code :check/project-valid
+           :kotoba.cli/data {:entry (:root project) :project project-path
+                             :target target-name
+                             :backend (if (= target :js-kotoba-v1)
+                                        :kotoba-script :kotoba-wasm)
+                             :project-digest (:project-digest compiled)
+                             :module-order (get-in compiled [:project :kotoba.module/order])
+                             :module-source-digests
+                             (get-in compiled [:project :kotoba.module/source-digests])
+                             :manifest (:manifest compiled)
+                             :package-receipt (:package-receipt project)}})
+        (catch Exception error
+          {:kotoba.cli/ok? false :kotoba.cli/code :check/project-invalid
+           :kotoba.cli/message (ex-message error)
+           :kotoba.cli/data (assoc
+                             (select-keys (ex-data error)
+                                          [:phase :reason :target :module :dependency :problems])
+                             :exception-chain (exception-chain error))})))))
 
 (defn resource-edn
   "Load an EDN resource by classpath path."
@@ -1094,7 +1359,45 @@
      :kotoba.cli/data {:kotoba.cljs/command (second argv)
                        :kotoba.cljs/commands ["emit"]}}))
 
+(defn safe-dispatch
+  "Process-boundary dispatch. Language/runtime rejection is data; Java stack
+  traces and host paths never become the CLI protocol. Library callers may
+  continue using `dispatch` when they need exceptions for debugging."
+  [argv]
+  (try
+    (let [result (dispatch argv)]
+      (if (and (false? (:kotoba.cli/ok? result))
+               (= :run/failed (:kotoba.cli/code result)))
+        {:kotoba.cli/ok? false
+         :kotoba.cli/code :runtime/rejected
+         :kotoba.cli/diagnostic
+         {:format :kotoba.diagnostic/v1
+          :code :kotoba/runtime-rejected
+          :severity :error
+          :source (some-> (second argv) io/file .getName)}
+         :kotoba.cli/data
+         {:problems (get-in result [:kotoba.cli/data
+                                    :kotoba.runtime/result
+                                    :kotoba.runtime/problems])}}
+        result))
+    (catch clojure.lang.ExceptionInfo error
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :runtime/rejected
+       :kotoba.cli/diagnostic
+       {:format :kotoba.diagnostic/v1
+        :code :kotoba/runtime-rejected
+        :severity :error
+        :exception-class (.getName (class error))}})
+    (catch Exception error
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :runtime/internal-error
+       :kotoba.cli/diagnostic
+       {:format :kotoba.diagnostic/v1
+        :code :kotoba/internal-error
+        :severity :error
+        :exception-class (.getName (class error))}})))
+
 (defn -main [& argv]
-  (let [result (dispatch argv)]
+  (let [result (safe-dispatch argv)]
     (println (render-result result (json-requested? argv)))
     (System/exit (result->exit result))))
