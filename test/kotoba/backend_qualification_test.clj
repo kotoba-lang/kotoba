@@ -9,10 +9,18 @@
             [kotoba.runtime :as runtime]
             [kotoba.wasm-exec :as wasm-exec]))
 
+(defn authority-path [relative]
+  (or (some (fn [root]
+              (let [path (io/file root relative)]
+                (when (.isFile path) (.getPath path))))
+            ["../kotoba-lang" "../../kotoba-lang/kotoba-lang"])
+      (throw (ex-info "kotoba-lang qualification authority not found"
+                      {:relative relative}))))
+
 (def qualification-path
-  "../kotoba-lang/lang/qualification/q3-backend-parity.edn")
+  (authority-path "lang/qualification/q3-backend-parity.edn"))
 (def adversarial-path
-  "../kotoba-lang/lang/qualification/q6-adversarial.edn")
+  (authority-path "lang/qualification/q6-adversarial.edn"))
 
 (defn qualification []
   (edn/read-string (slurp (io/file qualification-path))))
