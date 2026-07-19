@@ -2568,6 +2568,18 @@
   small option-map-shaped literals this feature targets."
   32)
 
+(def max-set-items
+  "Bound for eager set literals/operations and their compiler-unrolled walks."
+  16)
+
+(def max-collection-unroll-depth
+  "Bound for multi-source static collection specialization."
+  8)
+
+(def max-vector-items
+  "Portable vector literal admission bound; runtime walks use fuel helpers."
+  128)
+
 (defn- fnv1a-i32
   "Deterministic 32-bit FNV-1a hash of S's UTF-8 bytes, used to intern
   keyword literals as distinct i32 constants (ADR-2607150000) -- mirrors
