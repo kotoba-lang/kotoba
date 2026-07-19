@@ -5,6 +5,7 @@
   with an explicit reader target, checks a strict pure subset, emits deterministic
   EDN IR, and can run a zero-arity `main` function."
   (:require [clojure.java.io :as io]
+            [clojure.set :as set]
             ;; aliased `cstr`, not `str` -- this file already uses the bare
             ;; `clojure.core/str` function extensively; `:as str` would
             ;; silently shadow every one of those call sites.
@@ -1241,8 +1242,8 @@
 (defn- pattern-symbols [pattern]
   (cond
     (symbol? pattern) (if (= '& pattern) #{} #{pattern})
-    (vector? pattern) (apply clojure.set/union #{} (map pattern-symbols pattern))
-    (map? pattern) (apply clojure.set/union #{}
+    (vector? pattern) (apply set/union #{} (map pattern-symbols pattern))
+    (map? pattern) (apply set/union #{}
                           (map pattern-symbols
                                (concat (vals (dissoc pattern :or))
                                        (:keys pattern))))
@@ -1255,9 +1256,9 @@
                                       (not (contains? shadowed node)))
                                #{node} #{})
               (or (vector? node) (set? node))
-              (apply clojure.set/union #{} (map #(scan % shadowed) node))
+              (apply set/union #{} (map #(scan % shadowed) node))
               (map? node)
-              (apply clojure.set/union #{}
+              (apply set/union #{}
                      (mapcat (fn [[k v]] [(scan k shadowed) (scan v shadowed)]) node))
               (seq? node)
               (let [[op & args] node]
