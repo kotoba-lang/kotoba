@@ -2595,7 +2595,49 @@
     (reduce (fn [h b] (unchecked-multiply-int (unchecked-int (bit-xor h (bit-and (int b) 0xff))) prime))
             offset-basis bs)))
 
-(defn- keyword->i32 [kw] (fnv1a-i32 (str kw)))
+(def ^:private string-value-tag 0x50000000)
+(def ^:private keyword-value-tag 0x60000000)
+(def ^:private symbol-value-tag 0x70000000)
+
+(defn- tagged-hash [tag text bits]
+  (bit-or tag (bit-and (fnv1a-i32 text) (dec (bit-shift-left 1 bits)))))
+
+(defn- keyword->i32 [kw]
+  (tagged-hash keyword-value-tag (str kw) 28))
+
+(defn- string->i32 [s]
+  (let [length (count (utf8-bytes s))]
+    (when (> length 127)
+      (throw (ex-info "portable string literal exceeds 127 UTF-8 bytes"
+                      {:literal s :length length})))
+    (bit-or string-value-tag
+            (bit-shift-left length 21)
+            (bit-and (fnv1a-i32 s) 0x1fffff))))
+
+(defn- symbol-value->i32 [sym]
+  (tagged-hash symbol-value-tag (str sym) 28))
+
+(defn- validate-portable-value-ids! [forms]
+  (let [seen (atom {})]
+    (doseq [form forms]
+      (walk-forms
+       (fn [node]
+         (let [[kind source id]
+               (cond
+                 (string? node) [:string node (string->i32 node)]
+                 (keyword? node) [:keyword node (keyword->i32 node)]
+                 (and (seq? node) (= 'quote (first node))
+                      (= 2 (count node)) (symbol? (second node)))
+                 [:symbol (second node) (symbol-value->i32 (second node))]
+                 :else nil)]
+           (when id
+             (if-let [[other-kind other-source] (get @seen id)]
+               (when-not (= [kind source] [other-kind other-source])
+                 (throw (ex-info "portable value ID collision"
+                                 {:id id :left [other-kind other-source]
+                                  :right [kind source]})))
+               (swap! seen assoc id [kind source]))))) form))
+    true))
 
 (defn desugar-map
   "`{:k1 v1 :k2 v2}` -> `(pair (pair k1 v1) (pair (pair k2 v2) 0))`, reusing
