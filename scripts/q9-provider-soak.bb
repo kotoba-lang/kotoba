@@ -7,10 +7,17 @@
 
 (def evidence-path "qualification/q9-provider-soak.edn")
 (def artifact-paths
-  ["providers/http_transport.kotoba"
+  ["qualification/q9-provider-pilot.edn"
+   "providers/http_transport.kotoba"
+   "providers/http_consumer.kotoba"
    "providers/db_transport.kotoba"
    "providers/pg_scram.kotoba"
-   "test/kotoba/transport_component_test.clj"])
+   "providers/pg_pool_consumer.kotoba"
+   "providers/transport_policy.edn"
+   "test/kotoba/transport_component_test.clj"
+   "test/kotoba/real_host_providers_test.clj"
+   ".github/workflows/provider-soak.yml"
+   "scripts/q9-provider-soak.bb"])
 
 (defn sha256 [path]
   (let [digest (.digest (MessageDigest/getInstance "SHA-256")
