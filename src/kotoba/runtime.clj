@@ -3910,6 +3910,106 @@
         (sleb32 initial-value)
         [0x0b]))
 
+;; ---------------------------------------------------------------------------
+;; Embedded fuel: a module-private, monotonic call-count trap baked directly
+;; into the compiled `.wasm` bytes, so a self-recursive guest is bounded by
+;; the ENGINE itself (`unreachable` -> a real trap), not by whatever host
+;; happens to run it. Ported from kotoba-lang/compiler's `backend/wasm.cljc`
+;; `function-body` charge prologue (same instruction shape, verified there
+;; against three independent engines -- Node's native WebAssembly, standalone
+;; `wasmtime`, and, transitively, JVM/Chicory), NOT invented fresh here.
+;;
+;; This closes a real gap `kotoba.wasm-exec/fuel-listener` (a Chicory
+;; `ExecutionListener`, see wasm_exec.clj) does NOT: that listener is a
+;; HOST-provided instrumentation hook that only exists when a `.wasm` binary
+;; happens to run through Chicory on the JVM (`kotoba run`). The exact same
+;; bytes, loaded by a browser's or Node's own native WebAssembly engine
+;; (kotoba-lang/wasm-webcomponent's actor-host.js / kotoba-wasm-element.js,
+;; no Chicory involved at all), previously had NO fuel protection
+;; whatsoever -- only the JVM path was ever covered.
+;;
+;; Two design differences from the compiler.cljc port, both required by
+;; things this file's `wasm-binary` docstring already documents as
+;; supported that compiler.cljc's simpler single-shot `main()` model does
+;; not need to consider:
+;;
+;;   1. Budget size: compiler.cljc uses 256 (deliberately tiny -- "low
+;;      enough to trap before the host call stack becomes the limiting
+;;      resource"). This file already has its OWN existing, tested,
+;;      independent 256-scale budget for a DIFFERENT purpose
+;;      (`primary-collection-fuel` = 128, capping built-in collection
+;;      recursion specifically) -- a single legitimate `map`/`filter`/
+;;      `reduce` call over an ordinary-sized collection can already cost
+;;      close to 128 real function calls on its own, so reusing
+;;      compiler.cljc's 256 here would trap ordinary, already-working
+;;      collection-processing programs, not just runaway ones. Uses
+;;      5,000,000 instead -- the SAME order-of-magnitude default
+;;      `kototama.tender`'s (JVM/Chicory) `default-fuel-limit` and this
+;;      file's own `kotoba.wasm-exec/fuel-listener` already use
+;;      elsewhere in this ecosystem, on the same "generous for legitimate
+;;      small guests, still trips a genuinely unbounded loop in a
+;;      fraction of a second" reasoning -- proven safe at that scale
+;;      already, not a fresh guess.
+;;   2. Reset points: compiler.cljc's fuel is a strict, non-replenishable
+;;      whole-INSTANCE-lifetime budget (never reset after the module's
+;;      globals are initialized) -- correct for its single-shot "compile,
+;;      instantiate, call main() once" usage model, where a fresh
+;;      Instance is created per invocation anyway. This file's
+;;      `wasm-binary` docstring explicitly ALSO supports a second,
+;;      long-running usage model: "game modules may expose `init` and/or
+;;      `*-tick` systems instead" (see `module-entry?` above) -- a single
+;;      Instance whose `*-tick` export the host calls repeatedly, once per
+;;      frame, indefinitely. A non-replenishable lifetime budget would
+;;      eventually and INCORRECTLY trap such a guest purely for running
+;;      long enough, with no runaway behavior at all. So fuel is instead
+;;      RESET TO FULL at the entry of `main`, `init`, and any `*-tick`
+;;      export specifically (`fuel-reset-entry?` below, reusing this
+;;      file's own existing `module-entry?` naming convention rather than
+;;      inventing a new one) -- bounding "everything one host-invoked call
+;;      does, including however deep its internal recursion goes" without
+;;      accumulating fatigue across separate, legitimate, repeated calls.
+;;      Every OTHER function (internal, non-entry helpers -- e.g.
+;;      `demo_loop_forever.kotoba`'s self-recursive `spin`, which is not
+;;      named `main`/`init`/`*-tick`) only decrements, never resets, so
+;;      unbounded internal recursion still traps within its enclosing
+;;      call exactly as intended.
+(def wasm-fuel-global-index
+  "Global index 1 -- index 0 is always `heap-start` (see `global-section`
+  below); fuel is declared second so existing `alloc`/`alloc-checked`
+  bump-pointer codegen's hardcoded `global.{get,set} 0` bytes (heap-pointer
+  access, unrelated to fuel) stay correct unchanged."
+  1)
+
+(def wasm-fuel-initial
+  "See the fuel design comment above for why this is 5,000,000, not
+  compiler.cljc's 256."
+  5000000)
+
+(defn fuel-reset-entry?
+  "true iff DEF-NAME (a symbol) should get a FRESH fuel budget on entry
+  rather than draw down the module's shared running total -- the set of
+  functions a HOST can call directly (`main`, `init`, any `*-tick`
+  export), matching `wasm-binary`'s own `module-entry?` predicate above."
+  [def-name]
+  (or (= def-name 'main)
+      (= def-name 'init)
+      (cstr/ends-with? (str def-name) "-tick")))
+
+(def fuel-charge
+  "Every function entry, reset or not, consumes exactly one unit from the
+  fuel global: `if (fuel == 0) unreachable; fuel -= 1`. i32 equivalent of
+  compiler.cljc's i64 charge sequence (opcodes: global.get, i32.eqz, if,
+  unreachable, end, global.get, i32.const 1, i32.sub, global.set)."
+  [0x23 wasm-fuel-global-index 0x45 0x04 0x40 0x00 0x0b
+   0x23 wasm-fuel-global-index 0x41 1 0x6b 0x24 wasm-fuel-global-index])
+
+(def fuel-reset-and-charge
+  "`fuel-reset-entry?` functions get this instead of `fuel-charge`: set the
+  fuel global back to `wasm-fuel-initial`, THEN charge one unit for this
+  entry itself (same per-entry accounting every other function uses)."
+  (bcat [0x41] (sleb32 wasm-fuel-initial) [0x24 wasm-fuel-global-index]
+        fuel-charge))
+
 (defn table-entry
   "Encode one WASM funcref table entry (for `call_indirect`) with the given
   size."
@@ -4040,7 +4140,8 @@
                 table-section (when indirect?
                                 (section 4 (vec-bytes [(table-entry (count indirect-target-indexes))])))
                 memory-section (section 5 (vec-bytes [[0x00 0x01]]))
-                global-section (section 6 (vec-bytes [(global-entry heap-start)]))
+                global-section (section 6 (vec-bytes [(global-entry heap-start)
+                                                      (global-entry wasm-fuel-initial)]))
                 export-names (mapv (comp str first) defs)
                 export-section (section 7 (vec-bytes (conj (mapv (fn [[name _]]
                                                                     (export-entry (str name) 0x00
@@ -4049,7 +4150,10 @@
                                                              (export-entry "memory" 0x02 0))))
                 bodies (mapv (fn [compiled]
                                (let [decls (local-decls (merge-local-types compiled))
-                                     body (bcat decls (:bytes compiled) [0x0b])]
+                                     charge (if (fuel-reset-entry? (:name compiled))
+                                              fuel-reset-and-charge
+                                              fuel-charge)
+                                     body (bcat decls charge (:bytes compiled) [0x0b])]
                                  (bcat (uleb (count body)) body)))
                              compiled-fns)
                 code-section (section 10 (vec-bytes bodies))
