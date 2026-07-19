@@ -29,6 +29,8 @@
 (def review-package-path "qualification/independent-review-package.edn")
 (def review-findings-path "qualification/independent-review-findings.edn")
 (def q9-pilot-path "qualification/q9-wave1-pilot.edn")
+(def q9-provider-pilot-path "qualification/q9-provider-pilot.edn")
+(def q9-provider-soak-path "qualification/q9-provider-soak.edn")
 
 (defn qualification []
   (edn/read-string (slurp qualification-path)))
@@ -133,6 +135,30 @@
     (is (= :pending (get-in pilot [:soak :status])))
     (doseq [path paths]
       (testing (str "pilot path exists: " path)
+        (is (.isFile (io/file path)))))))
+
+(deftest q9-provider-pilot-is-provider-bearing-and-fails-closed-before-soak
+  (let [pilot (read-local-edn q9-provider-pilot-path)
+        soak (read-local-edn q9-provider-soak-path)
+        components (:components pilot)
+        component-paths (mapcat (fn [component]
+                                  (keep component [:provider-source :auth-source
+                                                   :consumer-source :policy
+                                                   :real-loopback-oracle]))
+                                components)]
+    (is (= #{:http :postgresql} (set (map :id components))))
+    (is (true? (get-in pilot [:shadow :http-oracle-retained])))
+    (is (true? (get-in pilot [:shadow :postgres-wire-oracle-retained])))
+    (is (= #{:independent-review :provider-soak :live-postgresql-profile}
+           (get-in pilot [:promotion :blocked-by])))
+    (is (false? (get-in pilot [:promotion :bulk-migration])))
+    (is (false? (get-in pilot [:promotion :oracle-retirement])))
+    (is (= :pending (:status soak)))
+    (is (empty? (:runs soak)))
+    (doseq [path (concat component-paths
+                         [(get-in pilot [:soak :collector])
+                          (get-in pilot [:soak :workflow])])]
+      (testing (str "provider pilot path exists: " path)
         (is (.isFile (io/file path)))))))
 
 (defn kotoba-result [source]
