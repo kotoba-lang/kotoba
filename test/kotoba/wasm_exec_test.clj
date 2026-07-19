@@ -21,6 +21,13 @@
       (is (= (:kotoba.runtime/value interpreted)
              (wasm-exec/run-main (:kotoba.wasm/binary wasm) []))))))
 
+(deftest run-export-invokes-parameterized-language-functions
+  (let [forms (runtime/read-forms
+               "(defn add [a b] (+ a b)) (defn main [] 0)" :kotoba)
+        wasm (runtime/wasm-binary forms)]
+    (is (:kotoba.wasm/ok? wasm))
+    (is (= 9 (wasm-exec/run-export (:kotoba.wasm/binary wasm) "add" [4 5] [])))))
+
 (deftest wasm-binary-executes-f32-arithmetic-and-comparison
   (testing "f32 literal/f32+/f32> compile to a real, executable Chicory module: (1.5+2.5) > 3.0 -> 1"
     (let [forms (runtime/read-file "src/demo_f32.kotoba" :kotoba)

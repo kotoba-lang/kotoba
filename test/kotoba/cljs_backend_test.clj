@@ -149,6 +149,83 @@
   (is (= 5 (run "(defn main [] (get (assoc {:a 1} :a 5) :a))"))
       "assoc on an existing key shadows the old value"))
 
+(deftest named-higher-order-collection-operations-run-in-cljs-backend
+  (is (= 10 (run "(defn add [a b] (+ a b))
+                   (defn main [] (nth (map add [1 2] [7 8]) 1 0))")))
+  (is (= 4 (run "(defn above-two [x] (> x 2))
+                  (defn main [] (pair-first (filter above-two [1 4 2])))")))
+  (is (= 10 (run "(defn add [a b] (+ a b))
+                   (defn main [] (reduce add 4 [1 2 3]))"))))
+
+(deftest inline-higher-order-callbacks-capture-in-cljs-backend
+  (is (= 7 (run "(defn main []
+                   (let [n 3] (pair-first (map (fn [x] (+ x n)) [4]))))")))
+  (is (= 16 (run "(defn main []
+                    (let [scale 2]
+                      (reduce (fn [acc x] (+ acc (* scale x))) 4 [1 2 3])))"))))
+
+(deftest no-init-reduce-zero-and-binary-clauses-run-in-cljs-backend
+  (is (= 6 (run "(defn main []
+                   (reduce (fn ([] 40) ([acc x] (+ acc x))) [1 2 3]))")))
+  (is (= 40 (run "(defn main []
+                    (reduce (fn ([] 40) ([acc x] (+ acc x))) []))"))))
+
+(deftest nested-let-destructuring-runs-in-cljs-backend
+  (is (= 11 (run "(defn main []
+                    (let [[a [b c] & rest] [1 [2 3] 4 5]]
+                      (+ (+ a b) (+ c (nth rest 1 0)))))")))
+  (is (= 12 (run "(defn main []
+                    (let [{:keys [a] :or {a 7} :b [x y]} {:b [2 3]}]
+                      (+ a (+ x y))))"))))
+
+(deftest function-parameter-destructuring-runs-in-cljs-backend
+  (is (= 6 (run "(defn sum [[a b] {:keys [c]}] (+ a (+ b c)))
+                  (defn main [] (sum [1 2] {:c 3}))"))))
+
+(deftest record-constructors-run-in-cljs-backend
+  (is (= 7 (run "(defrecord Point [x y])
+                  (defn main [] (get (->Point 3 7) :y))")))
+  (is (= 5 (run "(defrecord Point [x y])
+                  (defn main [] (get (map->Point {:x 5 :y 6}) :x))"))))
+
+(deftest record-protocol-static-dispatch-runs-in-cljs-backend
+  (is (= 7 (run "(defprotocol Value (value [this]))
+                  (defrecord Box [x] Value (value [this] (get this :x)))
+                  (defn main [] (value (->Box 7)))")))
+  (is (= 9 (run "(defprotocol Value (value [this]))
+                  (defrecord Box [x])
+                  (extend-type Box Value (value [this] (get this :x)))
+                  (defn main [] (value (->Box 9)))"))))
+
+(deftest named-multi-arity-and-variadic-functions-run-in-cljs-backend
+  (is (= 12 (run "(defn choose ([x] x) ([x y] (+ x y)))
+                   (defn main [] (+ (choose 3) (choose 4 5)))")))
+  (is (= 7 (run "(defn tally ([x] x) ([x & more] (+ x (count more))))
+                  (defn main [] (tally 5 8 9))")))
+  (is (= 40 (run "(defn add ([] 40) ([a b] (+ a b)))
+                   (defn main [] (reduce add []))"))))
+
+(deftest first-class-closures-invoke-and-apply-run-in-cljs-backend
+  (is (= 7 (run "(defn main []
+                   (let [n 3 f (fn [x] (+ x n))]
+                     (invoke f 4)))")))
+  (is (= 12 (run "(defn make [n] (fn [x] (+ x n)))
+                    (defn main [] (invoke (make 5) 7))")))
+  (is (= 11 (run "(defn add [a b] (+ a b))
+                    (defn main [] (invoke (fn-ref add) 3 8))")))
+  (is (= 6 (run "(defn main []
+                   (apply (fn [a b c] (+ a (+ b c))) 1 [2 3]))"))))
+
+(deftest pure-call-by-name-lazy-sequences-run-in-cljs-backend
+  (is (= 6 (run "(defn nums [n] (lazy-cons n (nums (+ n 1))))
+                  (defn main [] (nth (take 4 (nums 3)) 3 0))")))
+  (is (= 6 (run "(defn nums [n] (lazy-cons n (nums (+ n 1))))
+                  (defn main []
+                    (nth (take 3 (lazy-map (fn [x] (* x 2)) (nums 1))) 2 0))")))
+  (is (= 5 (run "(defn nums [n] (lazy-cons n (nums (+ n 1))))
+                  (defn main []
+                    (nth (take 2 (lazy-filter (fn [x] (> x 3)) (nums 1))) 1 0))"))))
+
 ;; ───────────────────────── unsupported ops (v1 scope) ─────────────────────────
 
 (deftest unsupported-ops-are-rejected-at-compile-time-not-silently-stubbed

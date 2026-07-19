@@ -621,15 +621,28 @@
     :else
     (throw (ex-info "unsupported literal" {:form form}))))
 
+(declare expand-let-bindings)
+
 (defn function-def
   "Parse a top-level `(defn name [params] body...)` form into
   `[name {:kind :kotoba.runtime/fn ...}]`, or nil if form isn't a defn."
   [form]
   (when (and (seq? form) (= 'defn (first form)))
-    (let [[_ name params & body] form]
+    (let [[_ name raw-params & raw-body] form
+          params (mapv (fn [index pattern]
+                         (if (symbol? pattern)
+                           pattern
+                           (symbol (str "__kotoba_param_" index))))
+                       (range) raw-params)
+          destructuring (vec (mapcat (fn [pattern param]
+                                       (when-not (symbol? pattern) [pattern param]))
+                                     raw-params params))
+          body (if (seq destructuring)
+                 [(list 'let destructuring (list* 'do raw-body))]
+                 raw-body)]
       [name {:kind :kotoba.runtime/fn
              :name name
-             :params (vec params)
+             :params params
              :body (vec body)}])))
 
 (defn- protocol-form->info [form]
@@ -2570,15 +2583,21 @@
   32)
 
 (def max-set-items
-  "Bound for eager set literals/operations and their compiler-unrolled walks."
+  "Bound for eager set literals/operations. Set walks are compiler-unrolled,
+  so this is both the semantic collection bound and a code-size bound."
   16)
 
 (def max-collection-unroll-depth
-  "Bound for multi-source static collection specialization."
+  "Primary-backend bound for the remaining multi-source static specialization.
+  Single-source transforms use fuel helpers; multi-source map retains this
+  legacy bound until its state can be represented without exponential static
+  expansion or exceeding the five-parameter ABI."
   8)
 
 (def max-vector-items
-  "Portable vector literal admission bound; runtime walks use fuel helpers."
+  "Portable vector literal admission bound. Runtime collection walks use
+  fuel-carrying helpers, so this no longer needs to equal the legacy inline
+  unroll depth."
   128)
 
 (defn- fnv1a-i32
@@ -2596,6 +2615,7 @@
     (reduce (fn [h b] (unchecked-multiply-int (unchecked-int (bit-xor h (bit-and (int b) 0xff))) prime))
             offset-basis bs)))
 
+(def ^:private value-tag-mask (unchecked-int 0xf0000000))
 (def ^:private string-value-tag 0x50000000)
 (def ^:private keyword-value-tag 0x60000000)
 (def ^:private symbol-value-tag 0x70000000)
@@ -2948,8 +2968,28 @@
     {:bytes (bcat [0x41] (sleb32 (keyword->i32 form)))
      :result-type :i32}
 
+    (string? form)
+    {:bytes (bcat [0x41] (sleb32 (string->i32 form)))
+     :result-type :i32}
+
     (map? form)
     (compile-wasm-expr (desugar-map form) locals fns)
+
+    (vector? form)
+    (let [lowered (desugar-vector form)]
+      (if (= ::vector-too-large lowered)
+        {:problem {:kotoba.wasm/problem :admission-limit
+                   :kotoba.wasm/op "vector-literal"
+                   :kotoba.wasm/limit max-vector-items}}
+        (compile-wasm-expr lowered locals fns)))
+
+    (set? form)
+    (let [lowered (desugar-set form)]
+      (if (= ::set-too-large lowered)
+        {:problem {:kotoba.wasm/problem :admission-limit
+                   :kotoba.wasm/op "set-literal"
+                   :kotoba.wasm/limit max-set-items}}
+        (compile-wasm-expr lowered locals fns)))
 
     (symbol? form)
     (if-let [entry (get locals (symbol-key form))]
@@ -2961,6 +3001,12 @@
     (seq? form)
     (let [[op & args] form]
       (case op
+        quote (let [value (first args)]
+                (if (and (= 1 (count args)) (symbol? value))
+                  {:bytes (bcat [0x41] (sleb32 (symbol-value->i32 value)))
+                   :result-type :i32}
+                  {:problem {:kotoba.wasm/problem :unsupported-quote
+                             :kotoba.wasm/form (pr-str form)}}))
         do (loop [remaining args
                   out []
                   local-types []]
@@ -2981,7 +3027,8 @@
                 :local-count (count local-types)
                 :local-types local-types}))
 
-        let (let [[bindings & body] args
+        let (let [[raw-bindings & body] args
+                  bindings (expand-let-bindings raw-bindings)
                   pairs (partition 2 bindings)]
               (loop [pairs pairs
                      locals locals
@@ -3127,6 +3174,158 @@
              (reduce (fn [acc-map [k v]] (list 'pair (list 'pair k v) acc-map))
                      m (partition 2 kvs))
              locals fns)))
+
+        contains?
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "contains?"
+                     :kotoba.wasm/expected 2 :kotoba.wasm/actual (count args)}}
+          (let [[s v] args ss (gensym "set__") vv (gensym "value__")]
+            (compile-wasm-expr
+             (list 'let [ss s vv v] (bounded-set-contains ss vv)) locals fns)))
+
+        contains-key?
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "contains-key?"
+                     :kotoba.wasm/expected 2 :kotoba.wasm/actual (count args)}}
+          (let [[m k] args mm (gensym "map__") kk (gensym "key__")]
+            (compile-wasm-expr
+             (list 'let [mm m kk k] (bounded-map-contains-key mm kk)) locals fns)))
+
+        string?
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string?"}}
+          (compile-wasm-expr
+           (list '= (list 'bit-and (first args) value-tag-mask) string-value-tag)
+           locals fns))
+
+        symbol?
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "symbol?"}}
+          (compile-wasm-expr
+           (list '= (list 'bit-and (first args) value-tag-mask) symbol-value-tag)
+           locals fns))
+
+        keyword?
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "keyword?"}}
+          (compile-wasm-expr
+           (list '= (list 'bit-and (first args) value-tag-mask) keyword-value-tag)
+           locals fns))
+
+        string-length
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string-length"}}
+          (compile-wasm-expr
+           (list 'bit-and (list 'bit-shift-right (first args) 21) 127) locals fns))
+
+        string=
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string="}}
+          (compile-wasm-expr (list '= (first args) (second args)) locals fns))
+
+        conj
+        (if (< (count args) 2)
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "conj"
+                     :kotoba.wasm/expected "set plus one or more values"
+                     :kotoba.wasm/actual (count args)}}
+          (compile-wasm-expr (reduce set-conj-expr (first args) (rest args)) locals fns))
+
+        disj
+        (if (empty? args)
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "disj"
+                     :kotoba.wasm/expected "set plus zero or more values"
+                     :kotoba.wasm/actual 0}}
+          (compile-wasm-expr
+           (reduce (fn [s v]
+                     (let [vv (gensym "value__")]
+                       (list 'let [vv v] (bounded-set-without s vv))))
+                   (first args) (rest args)) locals fns))
+
+        map
+        (if (not (and (<= 2 (count args) 6)
+                      (callback-valid? (first args) (dec (count args)))))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "map"
+                     :kotoba.wasm/expected "named callback plus one to five collections"}}
+          (compile-wasm-expr (bounded-eager-map (first args) (rest args)) locals fns))
+
+        filter
+        (if (not (and (= 2 (count args)) (callback-valid? (first args) 1)))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "filter"
+                     :kotoba.wasm/expected "named unary callback plus collection"}}
+          (compile-wasm-expr (bounded-eager-filter (first args) (second args)) locals fns))
+
+        reduce
+        (case (count args)
+          3 (if (not (callback-valid? (first args) 2))
+              {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "reduce"
+                         :kotoba.wasm/expected "binary callback plus init and collection"}}
+              (compile-wasm-expr
+               (bounded-eager-reduce (first args) (second args) (nth args 2)) locals fns))
+          2 (if-let [{:keys [zero-body binary]} (inline-no-init-reduce-info (first args))]
+              (let [coll (gensym "reduce-no-init-coll__")]
+                (compile-wasm-expr
+                 (list 'let [coll (second args)]
+                       (list 'if (list '= coll 0)
+                             zero-body
+                             (bounded-eager-reduce binary (list 'pair-first coll)
+                                                   (list 'pair-second coll))))
+                 locals fns))
+              {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "reduce"
+                         :kotoba.wasm/expected "inline fn with [] and [acc value] clauses"}})
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "reduce"
+                     :kotoba.wasm/expected "callback+collection or callback+init+collection"}})
+
+        count
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "count"
+                     :kotoba.wasm/expected 1 :kotoba.wasm/actual (count args)}}
+          (let [coll (gensym "count-coll__")]
+            (compile-wasm-expr
+             (list 'let [coll (first args)] (bounded-coll-count coll)) locals fns)))
+
+        nth
+        (if (not (<= 2 (count args) 3))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "nth"
+                     :kotoba.wasm/expected "2 or 3" :kotoba.wasm/actual (count args)}}
+          (let [[c i d] args d (if (= 3 (count args)) d 0)
+                cc (gensym "nth-coll__") ii (gensym "nth-index__") dd (gensym "nth-default__")]
+            (compile-wasm-expr
+             (list 'let [cc c ii i dd d] (bounded-coll-nth cc ii dd)) locals fns)))
+
+        peek
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "peek"}}
+          (let [coll (gensym "peek-coll__")]
+            (compile-wasm-expr
+             (list 'let [coll (first args)]
+                   (list 'if (list '= coll 0) 0 (list 'pair-first coll))) locals fns)))
+
+        pop
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "pop"}}
+          (let [coll (gensym "pop-coll__")]
+            (compile-wasm-expr
+             (list 'let [coll (first args)]
+                   (list 'if (list '= coll 0) 0 (list 'pair-second coll))) locals fns)))
+
+        keys
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "keys"}}
+          (compile-wasm-expr (bounded-map-project (first args) 'pair-first) locals fns))
+
+        vals
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "vals"}}
+          (compile-wasm-expr (bounded-map-project (first args) 'pair-second) locals fns))
+
+        dissoc
+        (if (empty? args)
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "dissoc"}}
+          (compile-wasm-expr
+           (reduce (fn [m k]
+                     (let [kk (gensym "map-key__")]
+                       (list 'let [kk k] (bounded-map-without m kk))))
+                   (first args) (rest args)) locals fns))
 
         + (compile-wasm-fold 0x6a args locals fns)
         - (compile-wasm-fold 0x6b args locals fns)
@@ -3743,6 +3942,9 @@
   ([forms _policy]
   (let [forms (lower-language-forms forms)
         defs (function-defs forms)
+        unsupported-top-level (first
+                               (remove #(and (seq? %)
+                                             (#{'ns 'defn} (first %))) forms))
         indirect? (uses-call-indirect? forms)
         imports (required-host-imports forms)
         import-count (count imports)
@@ -3766,6 +3968,11 @@
                                   (cstr/ends-with? (str name) "-tick")))
                             defs)]
     (cond
+      unsupported-top-level
+      {:kotoba.wasm/ok? false
+       :kotoba.wasm/problems [{:kotoba.wasm/problem :unsupported-top-level-form
+                               :kotoba.wasm/form (pr-str unsupported-top-level)}]}
+
       (and (nil? main) (not module-entry?))
       {:kotoba.wasm/ok? false
        :kotoba.wasm/problems [{:kotoba.wasm/problem :missing-main}]}
@@ -4000,14 +4207,28 @@
   (cond
     (integer? form) form
     (keyword? form) (keyword->i32 form)
+    (string? form) (string->i32 form)
     (map? form) (compile-cljs-expr (desugar-map form))
+    (vector? form) (let [lowered (desugar-vector form)]
+                     (if (= ::vector-too-large lowered)
+                       (cljs-reject! 'vector-literal form)
+                       (compile-cljs-expr lowered)))
+    (set? form) (let [lowered (desugar-set form)]
+                  (if (= ::set-too-large lowered)
+                    (cljs-reject! 'set-literal form)
+                    (compile-cljs-expr lowered)))
     (symbol? form) form
     (seq? form)
     (let [[op & args] form]
       (case op
+        quote (let [value (first args)]
+                (if (and (= 1 (count args)) (symbol? value))
+                  (symbol-value->i32 value)
+                  (cljs-reject! 'quote form)))
         do (cons 'do (map compile-cljs-expr args))
 
-        let (let [[bindings & body] args]
+        let (let [[raw-bindings & body] args
+                  bindings (expand-let-bindings raw-bindings)]
               (list* 'let (vec (mapcat (fn [[name value]] [name (compile-cljs-expr value)])
                                         (partition 2 bindings)))
                      (map compile-cljs-expr body)))
@@ -4051,6 +4272,116 @@
              (reduce (fn [acc-map [k v]] (list 'pair (list 'pair k v) acc-map))
                      m (partition 2 kvs)))))
 
+        contains?
+        (if (not= 2 (count args))
+          (cljs-reject! 'contains? form)
+          (let [[s v] args ss (gensym "set__") vv (gensym "value__")]
+            (compile-cljs-expr
+             (list 'let [ss s vv v] (bounded-set-contains ss vv)))))
+
+        contains-key?
+        (if (not= 2 (count args))
+          (cljs-reject! 'contains-key? form)
+          (let [[m k] args mm (gensym "map__") kk (gensym "key__")]
+            (compile-cljs-expr
+             (list 'let [mm m kk k] (bounded-map-contains-key mm kk)))))
+
+        string? (if (= 1 (count args))
+                  (list 'if
+                        (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
+                              string-value-tag) 1 0)
+                  (cljs-reject! 'string? form))
+        symbol? (if (= 1 (count args))
+                  (list 'if
+                        (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
+                              symbol-value-tag) 1 0)
+                  (cljs-reject! 'symbol? form))
+        keyword? (if (= 1 (count args))
+                   (list 'if
+                         (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
+                               keyword-value-tag) 1 0)
+                   (cljs-reject! 'keyword? form))
+        string-length (if (= 1 (count args))
+                        (list 'bit-and
+                              (list 'bit-shift-right (compile-cljs-expr (first args)) 21) 127)
+                        (cljs-reject! 'string-length form))
+        string= (if (= 2 (count args))
+                  (list 'if (list '= (compile-cljs-expr (first args))
+                                  (compile-cljs-expr (second args))) 1 0)
+                  (cljs-reject! 'string= form))
+
+        conj
+        (if (< (count args) 2)
+          (cljs-reject! 'conj form)
+          (compile-cljs-expr (reduce set-conj-expr (first args) (rest args))))
+
+        disj
+        (if (empty? args)
+          (cljs-reject! 'disj form)
+          (compile-cljs-expr
+           (reduce (fn [s v]
+                     (let [vv (gensym "value__")]
+                       (list 'let [vv v] (bounded-set-without s vv))))
+                   (first args) (rest args))))
+
+        map
+        (if (not (and (<= 2 (count args) 6)
+                      (callback-valid? (first args) (dec (count args)))))
+          (cljs-reject! 'map form)
+          (compile-cljs-expr (bounded-eager-map (first args) (rest args))))
+
+        filter
+        (if (not (and (= 2 (count args)) (callback-valid? (first args) 1)))
+          (cljs-reject! 'filter form)
+          (compile-cljs-expr (bounded-eager-filter (first args) (second args))))
+
+        reduce
+        (case (count args)
+          3 (if (not (callback-valid? (first args) 2))
+              (cljs-reject! 'reduce form)
+              (compile-cljs-expr
+               (bounded-eager-reduce (first args) (second args) (nth args 2))))
+          2 (if-let [{:keys [zero-body binary]} (inline-no-init-reduce-info (first args))]
+              (let [coll (gensym "reduce-no-init-coll__")]
+                (compile-cljs-expr
+                 (list 'let [coll (second args)]
+                       (list 'if (list '= coll 0)
+                             zero-body
+                             (bounded-eager-reduce binary (list 'pair-first coll)
+                                                   (list 'pair-second coll))))))
+              (cljs-reject! 'reduce form))
+          (cljs-reject! 'reduce form))
+
+        count (if (not= 1 (count args)) (cljs-reject! 'count form)
+                  (let [coll (gensym "count-coll__")]
+                    (compile-cljs-expr
+                     (list 'let [coll (first args)] (bounded-coll-count coll)))))
+        nth (if (not (<= 2 (count args) 3)) (cljs-reject! 'nth form)
+                (let [[c i d] args d (if (= 3 (count args)) d 0)
+                      cc (gensym "nth-coll__") ii (gensym "nth-index__") dd (gensym "nth-default__")]
+                  (compile-cljs-expr
+                   (list 'let [cc c ii i dd d] (bounded-coll-nth cc ii dd)))))
+        peek (if (not= 1 (count args)) (cljs-reject! 'peek form)
+                 (let [coll (gensym "peek-coll__")]
+                   (compile-cljs-expr
+                    (list 'let [coll (first args)]
+                          (list 'if (list '= coll 0) 0 (list 'pair-first coll))))))
+        pop (if (not= 1 (count args)) (cljs-reject! 'pop form)
+                (let [coll (gensym "pop-coll__")]
+                  (compile-cljs-expr
+                   (list 'let [coll (first args)]
+                         (list 'if (list '= coll 0) 0 (list 'pair-second coll))))))
+        keys (if (not= 1 (count args)) (cljs-reject! 'keys form)
+                 (compile-cljs-expr (bounded-map-project (first args) 'pair-first)))
+        vals (if (not= 1 (count args)) (cljs-reject! 'vals form)
+                 (compile-cljs-expr (bounded-map-project (first args) 'pair-second)))
+        dissoc (if (empty? args) (cljs-reject! 'dissoc form)
+                   (compile-cljs-expr
+                    (reduce (fn [m k]
+                              (let [kk (gensym "map-key__")]
+                                (list 'let [kk k] (bounded-map-without m kk))))
+                            (first args) (rest args))))
+
         not (list 'if (list '= (compile-cljs-expr (first args)) 0) 1 0)
         zero? (list 'if (list '= (compile-cljs-expr (first args)) 0) 1 0)
         pos? (compile-cljs-expr (list '> (first args) 0))
@@ -4092,7 +4423,8 @@
   target)."
   ([forms] (cljs-source forms 'kotoba.compiled.generated))
   ([forms ns-name]
-   (let [defs (function-defs forms)]
+   (let [forms (lower-language-forms forms)
+         defs (function-defs forms)]
      (when (empty? defs)
        (throw (ex-info "at least one defn is required" {:kotoba.cljs/problem :no-functions})))
      (let [fn-forms (mapv (fn [[name {:keys [params body]}]]
