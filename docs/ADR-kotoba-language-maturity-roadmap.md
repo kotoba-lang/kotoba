@@ -3,6 +3,34 @@
 - Status: informational (prioritized roadmap, not a single binary decision)
 - Date: 2026-07-13
 
+## 2026-07-20 implementation correction
+
+This document originally described the direct `kotoba.runtime` emitter as if
+it were the whole language. That is no longer accurate. The canonical
+`kotoba-lang/compiler` frontend now provides typed f32/f64/string, Result,
+Option, Variant, heterogeneous vector, typed set/map, and nominal record
+values across its checked KIR and qualified backends. The direct runtime and
+the compiler are separate implementations and their coverage must be reported
+separately.
+
+In particular:
+
+- non-integer entry/results are **partially implemented**, not wholly absent:
+  the direct runtime has an evidenced f32 `main`, while the compiler supports
+  typed f64/string and structured exported results on its qualified Web ABI;
+- UI, state, filesystem, network, GPU, and LLM effects already have explicit
+  capability contracts; remaining work is typed request/result schemas and
+  provider conformance, not admitting ambient mutation;
+- generic recursive schemas remain absent. Existing structured descriptors
+  are recursively validated only to fixed depth/node budgets; this is not the
+  same as admitting an unbounded self-referential type;
+- nested destructuring remains partial in the compiler (flat vectors and
+  `{:keys [...]}`), despite an over-broad guest-grammar catalog entry;
+- bounded decimal text parsing is implemented as
+  `decimal-f64-parse : string -> [:option :f64]` and
+  `decimal-f64x3-parse`. These replace host `Double/parseDouble` for guest
+  decisions without exceptions, NaN/infinity, or implicit `0.0` fallback.
+
 ## Context
 
 A maturity assessment (2026-07-13) found `kotoba wasm emit`/`kotoba.wasm-exec`
@@ -73,14 +101,14 @@ existing boolean-context call sites, but that should be confirmed by reading
 the actual `compile-wasm-expr` `if`-emission code before committing to the
 direction).
 
-### 4. `non-integer` `main` support
+### 4. Complete non-integer `main` parity
 
-`docs/lang/coverage.edn` lists `:non-integer-main-not-yet-supported` as an
-explicit negative. Scope/cost not assessed here — worth a short spike to
-determine whether this is a small `wasm-valtypes` extension or requires
-deeper changes to the result-decoding ABI (`kotoba.wasm-exec/call-main`
-already special-cases `:f32` vs `:i32`/`:i64` decoding, so the pattern for
-adding another result type exists, but confirm before scoping).
+The original blanket negative is stale: direct runtime tests evidence f32
+`main`, and the compiler has broader typed export results. Remaining work is
+parity: direct-runtime f64 decoding and a versioned structured-result ABI for
+hosts that do not consume the compiler's Web typed-value contract. Coverage
+must name those exact gaps instead of saying every non-integer result is
+unsupported.
 
 ### 5. `wasm-policy` readability
 

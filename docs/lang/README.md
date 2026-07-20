@@ -1,5 +1,18 @@
 # Kotoba Language Profile
 
+## Bounded decimal values
+
+Application guests parse decimal text with `decimal-f64-parse`, whose type is
+`string -> [:option :f64]`, or `decimal-f64x3-parse` for a fixed three-value
+tuple. Parsing is bounded and locale-independent; malformed input, non-finite
+results, and overflow produce `none`. Guest code handles that result with
+`match-option` rather than host exceptions or an implicit numeric fallback.
+
+This is the `.kotoba` replacement for the string branch of CLJC helpers built
+on `Double/parseDouble`/`js/parseFloat`. A polymorphic `as-float` that also
+coerces numbers, booleans, and strings is deliberately not implicit: decode
+such external input into a closed typed Variant first, then match each case.
+
 Kotoba source is a Kotoba/EDN subset with a capability-safe profile for
 untrusted or AI-generated code. `.kotoba` is the canonical Kotoba-only source
 extension; portable `.cljc` is for shared Clojure-family source where
