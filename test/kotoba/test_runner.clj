@@ -36,6 +36,7 @@
             [kotoba.type-contract-adapter-test]
             [kotoba.transport-component-test]
             [kotoba.wasm-and-or-when-test]
+            [kotoba.wasm-case-test]
             [kotoba.wasm-exec-test]
             [kotoba.wasm-map-keyword-test]))
 
@@ -75,6 +76,7 @@
                                         'kotoba.type-contract-adapter-test
                                         'kotoba.transport-component-test
                                         'kotoba.wasm-and-or-when-test
+                                        'kotoba.wasm-case-test
                                         'kotoba.wasm-exec-test
                                         'kotoba.wasm-map-keyword-test)]
     (System/exit (if (pos? (+ (or fail 0) (or error 0))) 1 0))))

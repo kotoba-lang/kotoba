@@ -1608,6 +1608,52 @@
                          (if (= :else test)
                            value
                            (list 'if test value (lower-cond more))))))
+        ;; `case` was simply never registered here -- an implementation gap,
+        ;; not an intentional exclusion (unlike e.g. regex or Java/JS
+        ;; interop, which are denied by the guest-grammar catalog itself).
+        ;; Desugars to nested if/= exactly like `cond` above: the dispatch
+        ;; value is bound once via `let` (single evaluation, matching real
+        ;; Clojure `case` semantics) and each clause becomes an `if`
+        ;; testing `(= e test)`. A list in test position
+        ;; (`(case e (1 2 3) result ...)`) means "match any of these
+        ;; constants" -- built from a plain `(or (= e t1) (= e t2) ...)`
+        ;; rather than hand-rolled nested ifs, since `or` is already an
+        ;; op `compile-wasm-expr` desugars on its own (see its `'or` case
+        ;; branch below) -- no new machinery needed. An odd clause count
+        ;; means the trailing form is the default; an even count means
+        ;; there is no default, and an unmatched value is a genuine
+        ;; runtime failure. This subset has no `throw`/exception mechanism
+        ;; for guest code (see :forbidden-heads), so instead of inventing
+        ;; one just for `case`, we reuse the same native-WASM-trap idiom
+        ;; this codebase already relies on for division-by-zero
+        ;; (`compile-wasm-fold`'s i32.div_s/i32.rem_s are emitted
+        ;; unguarded and trap in the engine itself) -- `(quot 1 0)` traps
+        ;; identically and needs no new opcode or host import.
+        lower-case (fn lower-case [expr clauses]
+                     (let [e-sym (gensym "case-e__")
+                           has-default? (odd? (count clauses))
+                           default (if has-default?
+                                     (last clauses)
+                                     (list 'quot 1 0))
+                           pairs (partition 2 (if has-default? (butlast clauses) clauses))
+                           test-form (fn [test]
+                                       ;; `seq?`, not `list?`: by the time this
+                                       ;; runs, `postwalk` has already visited
+                                       ;; this clause's test position itself
+                                       ;; (bottom-up), and the generic
+                                       ;; `lower-string-head` default branch
+                                       ;; rebuilds unrecognized call forms via
+                                       ;; `list*` -- a `Cons`, not a
+                                       ;; `PersistentList` -- so `list?` alone
+                                       ;; would miss it here.
+                                       (if (seq? test)
+                                         (cons 'or (map (fn [t] (list '= e-sym t)) test))
+                                         (list '= e-sym test)))]
+                       (list 'let [e-sym expr]
+                             (reduce (fn [acc [test result]]
+                                       (list 'if (test-form test) result acc))
+                                     default
+                                     (reverse pairs)))))
         lower-string-head
         (fn [op args]
           (if (and (contains? string-head-ops op)
@@ -1627,6 +1673,7 @@
                 defsystem (let [[name params & body] args]
                             (list* 'defn (symbol (str name "-tick")) params body))
                 cond (lower-cond args)
+                case (let [[expr & clauses] args] (lower-case expr clauses))
                 not= (list 'not (list* '= args))
                 when (let [[test & body] args]
                        (cond
