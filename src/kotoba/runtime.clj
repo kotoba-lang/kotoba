@@ -1688,6 +1688,28 @@
                                        (list 'if (test-form test) result acc))
                                      default
                                      (reverse pairs)))))
+        lower-binding-if
+        (fn [op args]
+          (let [[binding & bodies] args
+                when? (= 'when-let op)]
+            (when-not (and (vector? binding) (= 2 (count binding)))
+              (throw (ex-info (if when?
+                                "when-let requires one binding pair"
+                                "if-let requires one binding pair")
+                              {:phase :lowering :form op :binding binding})))
+            (when (if when? (empty? bodies) (not (<= 1 (count bodies) 2)))
+              (throw (ex-info (if when?
+                                "when-let requires at least one body expression"
+                                "if-let requires then and optional else expressions")
+                              {:phase :lowering :form op :body-count (count bodies)})))
+            (let [[pattern value] binding
+                  tmp (gensym "binding-if__")
+                  then-form (if when?
+                              (if (= 1 (count bodies)) (first bodies) (cons 'do bodies))
+                              (first bodies))
+                  else-form (if when? 0 (if (= 2 (count bodies)) (second bodies) 0))]
+              (list 'let [tmp value]
+                    (list 'if tmp (list 'let [pattern tmp] then-form) else-form)))))
         lower-string-head
         (fn [op args]
           (if (and (contains? string-head-ops op)
@@ -1708,6 +1730,8 @@
                             (list* 'defn (symbol (str name "-tick")) params body))
                 cond (lower-cond args)
                 case (let [[expr & clauses] args] (lower-case expr clauses))
+                if-let (lower-binding-if op args)
+                when-let (lower-binding-if op args)
                 not= (list 'not (list* '= args))
                 when (let [[test & body] args]
                        (cond
