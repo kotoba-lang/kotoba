@@ -1579,6 +1579,38 @@
                  (into pending (map #(vector % (inc depth))) children)
                  pending))))))
 
+(defn- lower-threading-form
+  "Lower one `->` or `->>` form without evaluating any source expression.
+  Threading must run before the general bottom-up sugar pass: a step such as
+  `(when enabled?)` is call syntax *inside* the threading form and must not be
+  lowered as a standalone `when` before the threaded value is inserted."
+  [form]
+  (loop [current form]
+    (if-not (and (seq? current) (#{'-> '->>} (first current)))
+      current
+      (let [[op initial & steps] current
+            insert (if (= '-> op)
+                     (fn [value step]
+                       (cond
+                         (symbol? step) (list step value)
+                         (and (seq? step) (seq step))
+                         (list* (first step) value (rest step))
+                         :else
+                         (throw (ex-info "threading step must be a symbol or non-empty list"
+                                         {:phase :lowering :form op :step step}))))
+                     (fn [value step]
+                       (cond
+                         (symbol? step) (list step value)
+                         (and (seq? step) (seq step))
+                         (apply list (first step) (concat (rest step) [value]))
+                         :else
+                         (throw (ex-info "threading step must be a symbol or non-empty list"
+                                         {:phase :lowering :form op :step step})))))]
+        ;; The expansion itself can expose another threading form at the
+        ;; root, e.g. `(-> x (->> (f)))`; finish that root before walking its
+        ;; children.
+        (recur (reduce insert initial steps))))))
+
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
@@ -1589,9 +1621,11 @@
   [forms]
   (check-form-depth! forms)
   (validate-portable-value-ids! forms)
-  (let [forms (-> forms expand-pure-desugars expand-multi-arity-forms expand-record-protocol-forms
-                  expand-lazy-forms expand-match-forms expand-fuel-collection-forms
-                  expand-closure-forms)
+  (let [forms (->> (-> forms expand-pure-desugars expand-multi-arity-forms
+                        expand-record-protocol-forms expand-lazy-forms
+                        expand-match-forms expand-fuel-collection-forms
+                        expand-closure-forms)
+                   (mapv #(walk/prewalk lower-threading-form %)))
         constants (into {}
                         (keep (fn [form]
                                 (when (and (seq? form) (= 'def (first form))
