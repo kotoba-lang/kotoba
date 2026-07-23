@@ -2207,13 +2207,11 @@
               (when-not (= 2 (count args))
                 (throw (ex-info "string-concat requires exactly two arguments"
                                 {:phase :lowering :form form})))
-              (when-not (every? string? args)
-                (throw (ex-info "primary runtime string-concat currently requires literal operands"
-                                {:phase :lowering :form form
-                                 :reason :dynamic-string-storage-unavailable})))
-              (let [result (apply str args)]
-                (string->i32 result)
-                result))
+              (if (every? string? args)
+                (let [result (apply str args)]
+                  (string->i32 result)
+                  result)
+                form))
 
             string-substring
             (do
@@ -2221,13 +2219,11 @@
                 (throw (ex-info "string-substring requires a string, start, and end"
                                 {:phase :lowering :form form})))
               (let [[s start end] args]
-                (when-not (string? s)
-                  (throw (ex-info "primary runtime string-substring currently requires a literal string"
-                                  {:phase :lowering :form form
-                                   :reason :dynamic-string-storage-unavailable})))
-                (let [result (portable-string-substring s start end form)]
-                  (string->i32 result)
-                  result)))))
+                (if (and (string? s) (integer? start) (integer? end))
+                  (let [result (portable-string-substring s start end form)]
+                    (string->i32 result)
+                    result)
+                  form)))))
         lower-node
         (fn [node]
           (if-not (seq? node)
@@ -3264,6 +3260,7 @@
             offset-basis bs)))
 
 (def ^:private value-tag-mask (unchecked-int 0xf0000000))
+(def ^:private dynamic-string-value-tag 0x40000000)
 (def ^:private string-value-tag 0x50000000)
 (def ^:private keyword-value-tag 0x60000000)
 (def ^:private symbol-value-tag 0x70000000)
@@ -3284,20 +3281,90 @@
             (bit-and (fnv1a-i32 s) 0x1fffff))))
 
 (defn- portable-string-substring
-  "Return a literal substring using Unicode code-point indexes. This runs
-  during lowering, before strings become tagged i32 identities."
+  "Return a literal substring using UTF-8 byte indexes. Indexes must land on
+  code-point boundaries. This runs before strings become tagged identities."
   [^String s start end form]
   (when-not (and (integer? start) (integer? end))
     (throw (ex-info "string-substring indexes must be integer literals"
                     {:phase :lowering :form form})))
-  (let [length (.codePointCount s 0 (.length s))]
+  (let [bytes (utf8-bytes s)
+        length (count bytes)]
     (when-not (<= 0 start end length)
       (throw (ex-info "string-substring indexes are out of bounds"
                       {:phase :lowering :form form
                        :start start :end end :length length})))
-    (.substring s
-                (.offsetByCodePoints s 0 (int start))
-                (.offsetByCodePoints s 0 (int end)))))
+    (let [selected (subvec bytes start end)
+          result (String. (byte-array (map unchecked-byte selected)) "UTF-8")]
+      (when-not (= selected (utf8-bytes result))
+        (throw (ex-info "string-substring indexes must land on UTF-8 code-point boundaries"
+                        {:phase :lowering :form form :start start :end end})))
+      result)))
+
+(defn- dynamic-string-ptr [value]
+  (list 'bit-and value 0x0fffffff))
+
+(defn- string-length-expr [value]
+  (list 'if
+        (list '= (list 'bit-and value value-tag-mask) string-value-tag)
+        (list 'bit-and (list 'bit-shift-right value 21) 127)
+        (list 'mem-i32-at (dynamic-string-ptr value) 0)))
+
+(defn- string-id-expr [value]
+  (list 'if
+        (list '= (list 'bit-and value value-tag-mask) string-value-tag)
+        value
+        (list 'mem-i32-at (dynamic-string-ptr value) 4)))
+
+(defn- string-data-ptr-expr [value memory]
+  (reduce (fn [fallback [literal {:keys [offset]}]]
+            (if (string? literal)
+              (list 'if (list '= value (string->i32 literal)) offset fallback)
+              fallback))
+          (list '+ (dynamic-string-ptr value) 8)
+          (reverse (seq memory))))
+
+(defn- bounded-dynamic-string-expr
+  "Build a heap string descriptor from LENGTH and BYTE-AT.  The descriptor is
+  [byte-length, canonical tagged FNV id, UTF-8 bytes...]."
+  [length byte-at]
+  (let [len (gensym "string_len__")
+        ptr (gensym "string_ptr__")
+        hash-name (gensym "string_hash__")
+        hash-steps
+        (letfn [(step [idx current]
+                  (if (= idx 127)
+                    (list 'do
+                          (list 'i32-store! ptr 4
+                                (list 'bit-or string-value-tag
+                                      (list 'bit-shift-left len 21)
+                                      (list 'bit-and current 0x1fffff)))
+                          (list 'bit-or dynamic-string-value-tag ptr))
+                    (let [next-hash (gensym "string_hash__")]
+                      (list 'let
+                            [next-hash
+                             (list 'if (list '< idx len)
+                                   (list '*
+                                         (list 'bit-xor current (byte-at idx))
+                                         0x01000193)
+                                   current)]
+                            (step (inc idx) next-hash)))))]
+          (step 0 hash-name))
+        stores (mapv (fn [idx]
+                       (list 'if (list '< idx len)
+                             (list 'byte-store! ptr (+ 8 idx) (byte-at idx))
+                             0))
+                     (range 127))]
+    (list 'let [len length]
+          (list 'if (list 'or (list '< len 0) (list '> len 127))
+                (list 'quot 1 0)
+                (list 'let [ptr (list 'alloc-checked (list '+ len 8))]
+                      (list 'if (list '= ptr -1)
+                            (list 'quot 1 0)
+                            (list* 'do
+                                   (list 'i32-store! ptr 0 len)
+                                   (concat stores
+                                           [(list 'let [hash-name (unchecked-int 0x811c9dc5)]
+                                                  hash-steps)]))))))))
 
 (defn- symbol-value->i32 [sym]
   (tagged-hash symbol-value-tag (str sym) 28))
@@ -3863,7 +3930,9 @@
         (if (not= 1 (count args))
           {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string?"}}
           (compile-wasm-expr
-           (list '= (list 'bit-and (first args) value-tag-mask) string-value-tag)
+           (list 'or
+                 (list '= (list 'bit-and (first args) value-tag-mask) string-value-tag)
+                 (list '= (list 'bit-and (first args) value-tag-mask) dynamic-string-value-tag))
            locals fns))
 
         symbol?
@@ -3883,13 +3952,83 @@
         string-length
         (if (not= 1 (count args))
           {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string-length"}}
-          (compile-wasm-expr
-           (list 'bit-and (list 'bit-shift-right (first args) 21) 127) locals fns))
+          (compile-wasm-expr (string-length-expr (first args)) locals fns))
 
         string=
         (if (not= 2 (count args))
           {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string="}}
-          (compile-wasm-expr (list '= (first args) (second args)) locals fns))
+          (let [[left right] args
+                l (gensym "string_left__")
+                r (gensym "string_right__")]
+            (compile-wasm-expr
+             (list 'let [l left r right]
+                   (list '= (string-id-expr l) (string-id-expr r)))
+             locals fns)))
+
+        string-concat
+        (if (not= 2 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string-concat"}}
+          (let [[left right] args
+                l (gensym "string_left__")
+                r (gensym "string_right__")
+                llen (gensym "string_left_len__")
+                rlen (gensym "string_right_len__")
+                byte-at (fn [idx]
+                          (list 'if (list '< idx llen)
+                                (list 'mem-byte-at
+                                      (string-data-ptr-expr l (:memory fns))
+                                      idx)
+                                (list 'mem-byte-at
+                                      (string-data-ptr-expr r (:memory fns))
+                                      (list '- idx llen))))]
+            (compile-wasm-expr
+             (list 'let [l left
+                         r right
+                         llen (string-length-expr l)
+                         rlen (string-length-expr r)]
+                   (bounded-dynamic-string-expr (list '+ llen rlen) byte-at))
+             locals fns)))
+
+        string-substring
+        (if (not= 3 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "string-substring"}}
+          (let [[source start end] args
+                s (gensym "string_source__")
+                from (gensym "string_from__")
+                to (gensym "string_to__")
+                slen (gensym "string_source_len__")
+                data-ptr (string-data-ptr-expr s (:memory fns))
+                continuation? (fn [idx]
+                                (list 'and
+                                      (list '> idx 0)
+                                      (list 'and
+                                            (list '< idx slen)
+                                            (list '=
+                                                  (list 'bit-and
+                                                        (list 'mem-byte-at data-ptr idx)
+                                                        0xc0)
+                                                  0x80))))
+                byte-at (fn [idx]
+                          (list 'mem-byte-at
+                                data-ptr
+                                (list '+ from idx)))]
+            (compile-wasm-expr
+             (list 'let [s source
+                         from start
+                         to end
+                         slen (string-length-expr s)]
+                   (list 'if
+                         (list 'or (list '< from 0)
+                               (list 'or
+                                     (list '< to from)
+                                     (list 'or
+                                           (list '> to slen)
+                                           (list 'or
+                                                 (continuation? from)
+                                                 (continuation? to)))))
+                         (list 'quot 1 0)
+                         (bounded-dynamic-string-expr (list '- to from) byte-at)))
+             locals fns)))
 
         conj
         (if (< (count args) 2)
