@@ -67,3 +67,16 @@
                      "(defn main [] (string-length (join \""
                      (apply str (repeat 127 "a"))
                      "\" \"b\")))")))))
+
+(deftest dynamic-symbol-construction-shares-quoted-symbol-identity
+  (is (= 1
+         (emit-and-run
+          "(ns dynamic.symbol)
+           (defn make-symbol [left right]
+             (symbol (string-concat left right)))
+           (defn main []
+             (= (make-symbol \"koto\" \"ba\") 'kotoba))")))
+  (is (= 1
+         (emit-and-run
+          "(ns dynamic.symbol-predicate)
+           (defn main [] (symbol? (symbol \"kotoba\")))"))))
