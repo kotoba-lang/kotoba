@@ -36,6 +36,7 @@
             [kotoba.type-contract-adapter-test]
             [kotoba.transport-component-test]
             [kotoba.wasm-and-or-when-test]
+            [kotoba.wasm-assert-test]
             [kotoba.wasm-case-test]
             [kotoba.wasm-condp-test]
             [kotoba.wasm-doseq-test]
@@ -82,6 +83,7 @@
                                         'kotoba.type-contract-adapter-test
                                         'kotoba.transport-component-test
                                         'kotoba.wasm-and-or-when-test
+                                        'kotoba.wasm-assert-test
                                         'kotoba.wasm-case-test
                                         'kotoba.wasm-condp-test
                                         'kotoba.wasm-doseq-test
