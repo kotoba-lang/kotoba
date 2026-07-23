@@ -1678,6 +1678,34 @@
                           (list* 'do (concat body [(list 'recur (list '+ index 1))]))
                           0)))))))
 
+(defn- lower-doseq-form
+  "Lower the bounded single-binding `doseq` profile by statically unrolling
+  an admitted vector literal. The vector is still constructed once before
+  any body runs, preserving source evaluation order."
+  [form]
+  (if-not (and (seq? form) (= 'doseq (first form)))
+    form
+    (let [[_ binding & body] form]
+      (when-not (and (vector? binding) (= 2 (count binding))
+                     (symbol? (first binding)) (nil? (namespace (first binding))))
+        (throw
+         (ex-info
+          "doseq requires one [unqualified-symbol collection] binding; modifiers and multiple bindings are not supported"
+          {:phase :lowering :form form})))
+      (let [[item collection] binding]
+        (when-not (vector? collection)
+          (throw (ex-info "doseq collection must be a bounded vector literal"
+                          {:phase :lowering :form form})))
+        (let [values (gensym "doseq-values__")
+              iterations
+              (map-indexed
+               (fn [index _]
+                 (list 'let [item (list 'nth values index)]
+                       (list* 'do (concat body [0]))))
+               collection)]
+          (list 'let [values collection]
+                (list* 'do (concat iterations [0]))))))))
+
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
@@ -1688,7 +1716,10 @@
   [forms]
   (check-form-depth! forms)
   (validate-portable-value-ids! forms)
-  (let [forms (mapv #(walk/prewalk lower-dotimes-form %) forms)
+  (let [forms (mapv #(walk/prewalk
+                      lower-doseq-form
+                      (walk/prewalk lower-dotimes-form %))
+                    forms)
         forms (-> forms expand-pure-desugars expand-multi-arity-forms
                   expand-record-protocol-forms expand-lazy-forms
                   expand-match-forms expand-fuel-collection-forms
