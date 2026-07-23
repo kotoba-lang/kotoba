@@ -71,6 +71,14 @@
                (string-substring value start end))
              (defn main [] (slice \"a😀\" 2 5))"))))
 
+(deftest dynamic-symbol-construction
+  (is (= 'kotoba
+         (run "(defn make-symbol [left right]
+                 (symbol (string-concat left right)))
+               (defn main [] (make-symbol \"koto\" \"ba\"))")))
+  (is (= 1 (run "(defn main [] (symbol? (symbol \"kotoba\")))")))
+  (is (= 1 (run "(defn main [] (= (symbol \"kotoba\") 'kotoba))"))))
+
 (deftest named-function-calls-across-multiple-defns
   (is (= 7 (run "(defn addpair [a b] (+ a b)) (defn main [] (addpair 3 4))"))))
 

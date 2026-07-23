@@ -2263,6 +2263,13 @@
                                :else (list 'if (list 'not test) (cons 'do body) 0))))
                 string-concat (lower-portable-string op args node)
                 string-substring (lower-portable-string op args node)
+                symbol (do
+                         (when-not (= 1 (count args))
+                           (throw (ex-info "symbol requires exactly one string"
+                                           {:phase :lowering :form node})))
+                         (if (string? (first args))
+                           (list 'quote (clojure.core/symbol (first args)))
+                           node))
                 as-> (let [[initial name & steps] args]
                        (when-not (and (<= 2 (count args)) (symbol? name)
                                       (nil? (namespace name)))
@@ -3366,6 +3373,32 @@
                                            [(list 'let [hash-name (unchecked-int 0x811c9dc5)]
                                                   hash-steps)]))))))))
 
+(defn- dynamic-symbol-expr [string-value memory]
+  (let [value (gensym "symbol_string__")
+        len (gensym "symbol_len__")
+        data (gensym "symbol_data__")
+        initial (gensym "symbol_hash__")
+        hash-body
+        (letfn [(step [idx current]
+                  (if (= idx 127)
+                    (list 'bit-or symbol-value-tag
+                          (list 'bit-and current 0x0fffffff))
+                    (let [next-hash (gensym "symbol_hash__")]
+                      (list 'let
+                            [next-hash
+                             (list 'if (list '< idx len)
+                                   (list '* (list 'bit-xor current
+                                                 (list 'mem-byte-at data idx))
+                                         0x01000193)
+                                   current)]
+                            (step (inc idx) next-hash)))))]
+          (step 0 initial))]
+    (list 'let [value string-value
+                len (string-length-expr value)
+                data (string-data-ptr-expr value memory)
+                initial (unchecked-int 0x811c9dc5)]
+          hash-body)))
+
 (defn- symbol-value->i32 [sym]
   (tagged-hash symbol-value-tag (str sym) 28))
 
@@ -3940,6 +3973,13 @@
           {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "symbol?"}}
           (compile-wasm-expr
            (list '= (list 'bit-and (first args) value-tag-mask) symbol-value-tag)
+           locals fns))
+
+        symbol
+        (if (not= 1 (count args))
+          {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "symbol"}}
+          (compile-wasm-expr
+           (dynamic-symbol-expr (first args) (:memory fns))
            locals fns))
 
         keyword?
@@ -5134,7 +5174,7 @@
       (case op
         quote (let [value (first args)]
                 (if (and (= 1 (count args)) (symbol? value))
-                  (symbol-value->i32 value)
+                  (list 'quote value)
                   (cljs-reject! 'quote form)))
         do (cons 'do (map compile-cljs-expr args))
 
@@ -5202,10 +5242,13 @@
                                   (compile-cljs-expr (first args))) 1 0)
                   (cljs-reject! 'string? form))
         symbol? (if (= 1 (count args))
-                  (list 'if
-                        (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
-                              symbol-value-tag) 1 0)
+                  (list 'if (list 'clojure.core/symbol?
+                                  (compile-cljs-expr (first args))) 1 0)
                   (cljs-reject! 'symbol? form))
+        symbol (if (= 1 (count args))
+                 (list 'clojure.core/symbol
+                       (compile-cljs-expr (first args)))
+                 (cljs-reject! 'symbol form))
         keyword? (if (= 1 (count args))
                    (list 'if
                          (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
