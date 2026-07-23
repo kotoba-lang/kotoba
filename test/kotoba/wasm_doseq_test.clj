@@ -35,11 +35,10 @@
                   "(doseq [x [1] y [2]] (+ x y))"
                   "(doseq [:x [1]] 0)"
                   "(doseq [qualified/x [1]] 0)"
-                  "(doseq [x [1] :when x] x)"]]
+                  "(doseq [x [1] :while x] x)"]]
     (testing source
-      (is (thrown-with-msg?
+      (is (thrown?
            clojure.lang.ExceptionInfo
-           #"doseq requires one \[unqualified-symbol collection\] binding; modifiers and multiple bindings are not supported"
            (runtime/lower-language-forms
            (runtime/read-forms (str "(ns bad) (defn main [] " source ")")
                                 :kotoba)))))))
@@ -54,3 +53,13 @@
                 "(let [xs (if 1 [1 2 3] [])]
                    (doseq [x xs]
                      (if (= x 3) (quot 1 0) 0)))"))))
+
+(deftest doseq-supports-ordered-let-and-when-modifiers
+  (is (= 0
+         (emit-and-run
+          "(doseq [x [1 2 3] :let [y (+ x 10)] :when (= y 99)]
+             (quot 1 0))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x [1 2 3] :let [y (+ x 10)] :when (= y 12)]
+                   (quot 1 0))"))))

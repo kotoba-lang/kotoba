@@ -1686,20 +1686,61 @@
   (if-not (and (seq? form) (= 'doseq (first form)))
     form
     (let [[_ binding & body] form]
-      (when-not (and (vector? binding) (= 2 (count binding))
+      (when-not (and (vector? binding) (<= 2 (count binding))
                      (symbol? (first binding)) (nil? (namespace (first binding))))
         (throw
          (ex-info
-          "doseq requires one [unqualified-symbol collection] binding; modifiers and multiple bindings are not supported"
+          "doseq requires one [unqualified-symbol collection] binding with optional :let/:when modifiers"
           {:phase :lowering :form form})))
-      (let [[item collection] binding
+      (let [[item collection & modifier-forms] binding]
+        (when (odd? (count modifier-forms))
+          (throw (ex-info "doseq modifiers require keyword/value pairs"
+                          {:phase :lowering :form form})))
+        (let [modifiers
+              (mapv
+               (fn [[modifier value]]
+                 (case modifier
+                   :let
+                   (do
+                     (when-not (and (vector? value) (even? (count value))
+                                    (every? #(and (symbol? %)
+                                                  (nil? (namespace %)))
+                                            (take-nth 2 value))
+                                    (= (count (take-nth 2 value))
+                                       (count (distinct (take-nth 2 value)))))
+                       (throw
+                        (ex-info
+                         "doseq :let requires unique unqualified symbol/value bindings"
+                         {:phase :lowering :form form})))
+                     [:let value])
+
+                   :when [:when value]
+
+                   :while
+                   (throw
+                    (ex-info "doseq :while is not supported by this portable profile"
+                             {:phase :lowering :form form}))
+
+                   (throw
+                    (ex-info
+                     "doseq supports only :let and :when modifiers; multiple collection bindings are not supported"
+                     {:phase :lowering :form form}))))
+               (partition 2 modifier-forms))
+              iteration-body
+              (reduce
+               (fn [inner [modifier value]]
+                 (case modifier
+                   :let (list 'let value inner)
+                   :when (list 'if value inner 0)))
+               (list* 'do (concat body [0]))
+               (reverse modifiers))
             values (gensym "doseq-values__")
             length (gensym "doseq-length__")
             iterations
             (map (fn [index]
                    (list 'if (list '< index length)
                          (list 'let [item (list 'nth values index)]
-                               (list* 'do (concat body [0])))
+                               iteration-body)
                          0))
                  (range 128))
             blocks (map #(list* 'do (concat % [0]))
@@ -1707,7 +1748,7 @@
             unrolled (list* 'do (concat blocks [0]))]
         (list 'let [values collection]
               (list 'let [length (list 'count values)]
-                    unrolled))))))
+                    unrolled)))))))
 
 (defn- closed-multimethod-literal? [value]
   (or (integer? value) (keyword? value) (boolean? value) (string? value)))
