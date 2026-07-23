@@ -1659,6 +1659,25 @@
        initial
        (partition 2 clauses)))))
 
+(defn- lower-dotimes-form
+  "Lower `dotimes` before loop/closure expansion so its synthesized loop is
+  handled by the same deterministic, fuel-trapped path as a source loop."
+  [form]
+  (if-not (and (seq? form) (= 'dotimes (first form)))
+    form
+    (let [[_ binding & body] form]
+      (when-not (and (vector? binding) (= 2 (count binding))
+                     (symbol? (first binding)) (nil? (namespace (first binding))))
+        (throw (ex-info "dotimes requires [unqualified-symbol count]"
+                        {:phase :lowering :form form})))
+      (let [[index count-form] binding
+            limit (gensym "dotimes-limit__")]
+        (list 'let [limit count-form]
+              (list 'loop [index 0]
+                    (list 'if (list '< index limit)
+                          (list* 'do (concat body [(list 'recur (list '+ index 1))]))
+                          0)))))))
+
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
@@ -1669,14 +1688,16 @@
   [forms]
   (check-form-depth! forms)
   (validate-portable-value-ids! forms)
-  (let [forms (->> (-> forms expand-pure-desugars expand-multi-arity-forms
-                        expand-record-protocol-forms expand-lazy-forms
-                        expand-match-forms expand-fuel-collection-forms
-                        expand-closure-forms)
-                   (mapv #(->> %
-                               (walk/prewalk lower-threading-form)
-                               (walk/prewalk lower-some-threading-form)
-                               (walk/prewalk lower-cond-threading-form))))
+  (let [forms (mapv #(walk/prewalk lower-dotimes-form %) forms)
+        forms (-> forms expand-pure-desugars expand-multi-arity-forms
+                  expand-record-protocol-forms expand-lazy-forms
+                  expand-match-forms expand-fuel-collection-forms
+                  expand-closure-forms)
+        forms (mapv #(->> %
+                          (walk/prewalk lower-threading-form)
+                          (walk/prewalk lower-some-threading-form)
+                          (walk/prewalk lower-cond-threading-form))
+                    forms)
         constants (into {}
                         (keep (fn [form]
                                 (when (and (seq? form) (= 'def (first form))
