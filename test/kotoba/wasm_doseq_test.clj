@@ -44,10 +44,13 @@
            (runtime/read-forms (str "(ns bad) (defn main [] " source ")")
                                 :kotoba)))))))
 
-(deftest doseq-rejects-dynamic-collections
-  (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo #"doseq collection must be a bounded vector literal"
-       (runtime/lower-language-forms
-        (runtime/read-forms
-         "(ns bad) (defn main [] (let [xs [1 2]] (doseq [x xs] x)))"
-         :kotoba)))))
+(deftest doseq-admits-dynamic-bounded-vector-expressions
+  (is (= 0
+         (emit-and-run
+          "(let [xs (if 1 [1 2 3] [])]
+             (doseq [x xs] (+ x 1)))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(let [xs (if 1 [1 2 3] [])]
+                   (doseq [x xs]
+                     (if (= x 3) (quot 1 0) 0)))"))))
