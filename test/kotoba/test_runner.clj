@@ -45,6 +45,7 @@
             [kotoba.wasm-some-sugar-test]
             [kotoba.wasm-exec-test]
             [kotoba.wasm-map-keyword-test]
+            [kotoba.wasm-multimethod-test]
             [kotoba.wasm-threading-test]))
 
 (defn -main [& _]
@@ -92,5 +93,6 @@
                                         'kotoba.wasm-some-sugar-test
                                         'kotoba.wasm-exec-test
                                         'kotoba.wasm-map-keyword-test
+                                        'kotoba.wasm-multimethod-test
                                         'kotoba.wasm-threading-test)]
     (System/exit (if (pos? (+ (or fail 0) (or error 0))) 1 0))))

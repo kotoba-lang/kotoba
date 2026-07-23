@@ -1706,6 +1706,92 @@
           (list 'let [values collection]
                 (list* 'do (concat iterations [0]))))))))
 
+(defn- closed-multimethod-literal? [value]
+  (or (integer? value) (keyword? value) (boolean? value) (string? value)))
+
+(defn- expand-closed-multimethod-forms [forms]
+  (let [declarations (filter #(and (seq? %) (= 'defmulti (first %))) forms)
+        methods (filter #(and (seq? %) (= 'defmethod (first %))) forms)
+        declaration-names (mapv second declarations)]
+    (when-not (= (count declaration-names) (count (distinct declaration-names)))
+      (throw (ex-info "duplicate defmulti declaration" {:forms declarations})))
+    (let [declarations-by-name
+          (into {}
+                (map (fn [form]
+                       (let [[_ name dispatch & extra] form]
+                         (when-not (and (symbol? name) (nil? (namespace name))
+                                        (symbol? dispatch) (nil? (namespace dispatch))
+                                        (empty? extra))
+                           (throw
+                            (ex-info
+                             "defmulti requires an unqualified name and one unqualified dispatch function symbol"
+                             {:form form})))
+                         [name {:form form :dispatch dispatch}]))
+                     declarations))
+          methods-by-name (group-by second methods)]
+      (doseq [form methods]
+        (let [[_ name dispatch-value params & body] form]
+          (when-not (contains? declarations-by-name name)
+            (throw (ex-info "defmethod requires a matching defmulti declaration"
+                            {:form form})))
+          (when-not (closed-multimethod-literal? dispatch-value)
+            (throw (ex-info "defmethod dispatch value must be a bounded literal or :default"
+                            {:form form})))
+          (when-not (and (vector? params) (<= (count params) 5)
+                         (every? #(and (symbol? %) (nil? (namespace %))) params)
+                         (= (count params) (count (distinct params))))
+            (throw
+             (ex-info
+              "defmethod parameters must be a unique vector of unqualified symbols within the ABI arity"
+              {:form form})))
+          (when (empty? body)
+            (throw (ex-info "defmethod requires at least one body expression"
+                            {:form form})))))
+      (let [expanded
+            (into {}
+                  (map
+                   (fn [[name {:keys [dispatch form]}]]
+                     (let [method-forms (get methods-by-name name)]
+                       (when (empty? method-forms)
+                         (throw (ex-info "defmulti requires at least one closed-world defmethod"
+                                         {:form form})))
+                       (let [params (nth (first method-forms) 3)]
+                         (doseq [method method-forms]
+                           (when-not (= params (nth method 3))
+                             (throw (ex-info "all defmethods must use the same parameter vector"
+                                             {:form method}))))
+                         (let [values (mapv #(nth % 2) method-forms)]
+                           (when-not (= (count values) (count (distinct values)))
+                             (throw (ex-info "duplicate defmethod dispatch value"
+                                             {:forms method-forms}))))
+                         (let [default-method (first (filter #(= :default (nth % 2))
+                                                             method-forms))
+                               ordinary (remove #(= :default (nth % 2)) method-forms)
+                               body-form (fn [method]
+                                           (let [body (drop 4 method)]
+                                             (if (= 1 (count body))
+                                               (first body)
+                                               (list* 'do body))))
+                               clauses (mapcat (fn [method]
+                                                 [(nth method 2) (body-form method)])
+                                               ordinary)
+                               clauses (cond-> (vec clauses)
+                                         default-method (conj (body-form default-method)))]
+                           [name (list 'defn name params
+                                       (list* 'case (list* dispatch params) clauses))]))))
+                   declarations-by-name))]
+        (into [] (remove nil?)
+              (map (fn [form]
+                     (cond
+                       (and (seq? form) (= 'defmulti (first form)))
+                       (get expanded (second form))
+
+                       (and (seq? form) (= 'defmethod (first form)))
+                       nil
+
+                       :else form))
+                   forms))))))
+
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
@@ -1716,7 +1802,8 @@
   [forms]
   (check-form-depth! forms)
   (validate-portable-value-ids! forms)
-  (let [forms (mapv #(walk/prewalk
+  (let [forms (expand-closed-multimethod-forms forms)
+        forms (mapv #(walk/prewalk
                       lower-doseq-form
                       (walk/prewalk lower-dotimes-form %))
                     forms)
