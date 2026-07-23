@@ -1716,36 +1716,43 @@
 
                    :when [:when value]
 
-                   :while
-                   (throw
-                    (ex-info "doseq :while is not supported by this portable profile"
-                             {:phase :lowering :form form}))
+                   :while [:while value]
 
                    (throw
                     (ex-info
-                     "doseq supports only :let and :when modifiers; multiple collection bindings are not supported"
+                     "doseq supports only :let, :when, and :while modifiers; multiple collection bindings are not supported"
                      {:phase :lowering :form form}))))
                (partition 2 modifier-forms))
-              iteration-body
+              iteration-signal
               (reduce
                (fn [inner [modifier value]]
                  (case modifier
                    :let (list 'let value inner)
-                   :when (list 'if value inner 0)))
-               (list* 'do (concat body [0]))
+                   :when (list 'if value inner 1)
+                   :while (list 'if value inner 0)))
+               (list* 'do (concat body [1]))
                (reverse modifiers))
             values (gensym "doseq-values__")
             length (gensym "doseq-length__")
-            iterations
-            (map (fn [index]
-                   (list 'if (list '< index length)
-                         (list 'let [item (list 'nth values index)]
-                               iteration-body)
-                         0))
-                 (range 128))
-            blocks (map #(list* 'do (concat % [0]))
-                        (partition-all 16 iterations))
-            unrolled (list* 'do (concat blocks [0]))]
+            block-signal
+            (fn [indices]
+              (reduce
+               (fn [continuation index]
+                 (list 'if (list '< index length)
+                       (list 'if
+                             (list 'let [item (list 'nth values index)]
+                                   iteration-signal)
+                             continuation
+                             0)
+                       1))
+               1
+               (reverse indices)))
+            blocks (map block-signal (partition-all 16 (range 128)))
+            unrolled
+            (reduce (fn [continuation block]
+                      (list 'if block continuation 0))
+                    0
+                    (reverse blocks))]
         (list 'let [values collection]
               (list 'let [length (list 'count values)]
                     unrolled)))))))
