@@ -2054,6 +2054,8 @@
                        :else form))
                    forms))))))
 
+(declare string->i32 portable-string-substring)
+
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
@@ -2197,6 +2199,35 @@
                    (list 'str-len (first args))
                    (rest args))
             (list* op args)))
+        lower-portable-string
+        (fn [op args form]
+          (case op
+            string-concat
+            (do
+              (when-not (= 2 (count args))
+                (throw (ex-info "string-concat requires exactly two arguments"
+                                {:phase :lowering :form form})))
+              (when-not (every? string? args)
+                (throw (ex-info "primary runtime string-concat currently requires literal operands"
+                                {:phase :lowering :form form
+                                 :reason :dynamic-string-storage-unavailable})))
+              (let [result (apply str args)]
+                (string->i32 result)
+                result))
+
+            string-substring
+            (do
+              (when-not (= 3 (count args))
+                (throw (ex-info "string-substring requires a string, start, and end"
+                                {:phase :lowering :form form})))
+              (let [[s start end] args]
+                (when-not (string? s)
+                  (throw (ex-info "primary runtime string-substring currently requires a literal string"
+                                  {:phase :lowering :form form
+                                   :reason :dynamic-string-storage-unavailable})))
+                (let [result (portable-string-substring s start end form)]
+                  (string->i32 result)
+                  result)))))
         lower-node
         (fn [node]
           (if-not (seq? node)
@@ -2234,6 +2265,8 @@
                                (empty? body) (list 'if (list 'not test) 0 0)
                                (= 1 (count body)) (list 'if (list 'not test) (first body) 0)
                                :else (list 'if (list 'not test) (cons 'do body) 0))))
+                string-concat (lower-portable-string op args node)
+                string-substring (lower-portable-string op args node)
                 as-> (let [[initial name & steps] args]
                        (when-not (and (<= 2 (count args)) (symbol? name)
                                       (nil? (namespace name)))
@@ -3249,6 +3282,22 @@
     (bit-or string-value-tag
             (bit-shift-left length 21)
             (bit-and (fnv1a-i32 s) 0x1fffff))))
+
+(defn- portable-string-substring
+  "Return a literal substring using Unicode code-point indexes. This runs
+  during lowering, before strings become tagged i32 identities."
+  [^String s start end form]
+  (when-not (and (integer? start) (integer? end))
+    (throw (ex-info "string-substring indexes must be integer literals"
+                    {:phase :lowering :form form})))
+  (let [length (.codePointCount s 0 (.length s))]
+    (when-not (<= 0 start end length)
+      (throw (ex-info "string-substring indexes are out of bounds"
+                      {:phase :lowering :form form
+                       :start start :end end :length length})))
+    (.substring s
+                (.offsetByCodePoints s 0 (int start))
+                (.offsetByCodePoints s 0 (int end)))))
 
 (defn- symbol-value->i32 [sym]
   (tagged-hash symbol-value-tag (str sym) 28))
