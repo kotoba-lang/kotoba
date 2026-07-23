@@ -1714,6 +1714,30 @@
                          (if (= :else test)
                            value
                            (list 'if test value (lower-cond more))))))
+        lower-condp
+        (fn [args form]
+          (when (< (count args) 2)
+            (throw (ex-info "condp requires a predicate and dispatch expression"
+                            {:phase :lowering :form form})))
+          (let [[predicate dispatch & clauses] args]
+            (when-not (and (symbol? predicate) (nil? (namespace predicate)))
+              (throw (ex-info "condp predicate must be an unqualified function symbol"
+                              {:phase :lowering :form form :predicate predicate})))
+            (when (some #{:>>} clauses)
+              (throw (ex-info "condp :>> clauses are not supported by this portable profile"
+                              {:phase :lowering :form form})))
+            (let [has-default? (odd? (count clauses))
+                  default (if has-default? (last clauses) (list 'quot 1 0))
+                  pairs (partition 2 (if has-default? (butlast clauses) clauses))
+                  dispatch-sym (gensym "condp__")]
+              (list 'let [dispatch-sym dispatch]
+                    (reduce (fn [fallback [test result]]
+                              (list 'if
+                                    (list predicate test dispatch-sym)
+                                    result
+                                    fallback))
+                            default
+                            (reverse pairs))))))
         ;; `case` was simply never registered here -- an implementation gap,
         ;; not an intentional exclusion (unlike e.g. regex or Java/JS
         ;; interop, which are denied by the guest-grammar catalog itself).
@@ -1801,6 +1825,7 @@
                 defsystem (let [[name params & body] args]
                             (list* 'defn (symbol (str name "-tick")) params body))
                 cond (lower-cond args)
+                condp (lower-condp args node)
                 case (let [[expr & clauses] args] (lower-case expr clauses))
                 if-let (lower-binding-if op args)
                 when-let (lower-binding-if op args)
