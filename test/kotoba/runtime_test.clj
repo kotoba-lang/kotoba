@@ -20,6 +20,28 @@
       (is (thrown-with-msg? Exception #"read-eval"
                             (runtime/read-forms payload :clj))))))
 
+(deftest read-forms-bounds-nesting-before-the-host-reader
+  (testing "deep source is rejected as a reader admission error, not a host
+            StackOverflowError"
+    (let [source (str (apply str (repeat 513 "["))
+                      (apply str (repeat 513 "]")))]
+      (try
+        (runtime/read-forms source :clj)
+        (is false "deep source must be rejected")
+        (catch clojure.lang.ExceptionInfo ex
+          (is (= {:phase :reader
+                  :depth 513
+                  :limit 512
+                  :kotoba.reader/problem :max-depth}
+                 (ex-data ex)))))))
+  (testing "reader-looking delimiters in lexical literals and comments do not
+            consume the nesting budget"
+    (let [delimiters (apply str (repeat 600 "("))]
+      (is (= [delimiters \(]
+             (runtime/read-forms
+              (str "\"" delimiters "\" ; " delimiters "\n\\(")
+              :clj))))))
+
 (deftest read-file-rejects-the-eval-reader-and-never-touches-the-filesystem
   (testing "the same rejection holds through read-file, and — the actual
             exploit shape — a side-effecting payload never runs (no file

@@ -89,6 +89,64 @@
 (def special-forms
   (:special-forms capability-contract))
 
+(def ^:private max-reader-depth 512)
+
+(defn- check-source-reader-depth!
+  "Bound delimiter nesting before tools.reader builds a recursive object graph.
+
+  This lexical pass deliberately leaves syntax validation to tools.reader; it
+  only tracks delimiters which are outside strings, comments, and character
+  literals.  Running it first prevents hostile source from reaching the host
+  reader's stack limit."
+  [source]
+  (loop [idx 0
+         depth 0
+         in-string? false
+         escaped? false
+         in-comment? false]
+    (when (< idx (count source))
+      (let [ch (.charAt ^String source idx)]
+        (cond
+          in-comment?
+          (recur (inc idx) depth false false (not (or (= ch \newline)
+                                                      (= ch \return))))
+
+          in-string?
+          (cond
+            escaped? (recur (inc idx) depth true false false)
+            (= ch \\) (recur (inc idx) depth true true false)
+            (= ch \") (recur (inc idx) depth false false false)
+            :else (recur (inc idx) depth true false false))
+
+          (= ch \;)
+          (recur (inc idx) depth false false true)
+
+          (= ch \")
+          (recur (inc idx) depth true false false)
+
+          ;; A reader character literal starts with backslash.  Skipping its
+          ;; first character is enough here: named literals contain no reader
+          ;; delimiters, while escaped delimiter literals are exactly two
+          ;; characters.
+          (= ch \\)
+          (recur (min (+ idx 2) (count source)) depth false false false)
+
+          (#{\( \[ \{} ch)
+          (let [next-depth (inc depth)]
+            (when (> next-depth max-reader-depth)
+              (throw (ex-info "reader nesting exceeds admission limit"
+                              {:phase :reader
+                               :depth next-depth
+                               :limit max-reader-depth
+                               :kotoba.reader/problem :max-depth})))
+            (recur (inc idx) next-depth false false false))
+
+          (#{\) \] \}} ch)
+          (recur (inc idx) (max 0 (dec depth)) false false false)
+
+          :else
+          (recur (inc idx) depth false false false))))))
+
 (defn read-forms
   "Read every form from source using a concrete CLJC reader target.
 
@@ -99,6 +157,7 @@
   crafted `.kotoba` file execute arbitrary JVM code the instant it's read,
   before the checker ever runs."
   [source reader-target]
+  (check-source-reader-depth! source)
   (let [rdr (reader-types/string-push-back-reader source)
         opts {:read-cond :allow
               :features #{reader-target}
