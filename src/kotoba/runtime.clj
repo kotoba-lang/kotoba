@@ -1062,6 +1062,29 @@
 
 (def ^:private primary-collection-fuel 128)
 
+(defn- primary-multi-map-helper [arity]
+  (let [name (symbol (str "__kotoba_fuel_map" arity "_loop"))
+        callback 'callback
+        sources 'sources
+        out 'out
+        fuel 'fuel
+        source-at (fn [idx]
+                    (nth (iterate #(list 'pair-second %) sources) idx))
+        current (mapv #(list 'pair-first (source-at %)) (range arity))
+        heads (mapv #(list 'pair-first %) current)
+        tails (mapv #(list 'pair-second %) current)
+        pair-list (fn [items] (reduce #(list 'pair %2 %1) 0 (reverse items)))
+        stopped (apply list 'or
+                       (list '= fuel 0)
+                       (map #(list '= % 0) current))]
+    (list 'defn name [callback sources out fuel]
+          (list 'if stopped
+                (list '__kotoba_fuel_reverse out 0 primary-collection-fuel)
+                (list name callback
+                      (pair-list tails)
+                      (list 'pair (apply list 'invoke callback heads) out)
+                      (list '- fuel 1))))))
+
 (defn- expand-fuel-collection-forms [forms]
   (let [used (atom #{})
         function-names (into #{} (keep #(when (and (seq? %) (= 'defn (first %)))
@@ -1091,10 +1114,15 @@
                               (list '__kotoba_fuel_map_loop
                                     (callback-value (rewrite (first args)))
                                     (rewrite (second args)) 0 primary-collection-fuel))
-                          ;; Multi-source map retains its existing static ABI
-                          ;; specialization until its source tuple gets a
-                          ;; dedicated tail-recursive representation.
-                          (apply list op (map rewrite args)))
+                          (let [arity (dec (count args))]
+                            (if (<= 2 arity 5)
+                              (do (swap! used into #{:reverse [:multi-map arity]})
+                                  (list (symbol (str "__kotoba_fuel_map" arity "_loop"))
+                                        (callback-value (rewrite (first args)))
+                                        (reduce #(list 'pair %2 %1) 0
+                                                (reverse (map rewrite (rest args))))
+                                        0 primary-collection-fuel))
+                              (apply list op (map rewrite args)))))
                     filter (do (swap! used into #{:filter :reverse})
                                (list '__kotoba_fuel_filter_loop
                                      (callback-value (rewrite (first args)))
@@ -1141,6 +1169,10 @@
                      (__kotoba_fuel_reverse out 0 128)
                      (__kotoba_fuel_map_loop callback (pair-second items)
                        (pair (invoke callback (pair-first items)) out) (- fuel 1))))] )
+             (map primary-multi-map-helper
+                  (keep (fn [arity]
+                          (when (contains? @used [:multi-map arity]) arity))
+                        (range 2 6)))
              (when (contains? @used :filter)
                ['(defn __kotoba_fuel_filter_loop [callback items out fuel]
                    (if (or (= fuel 0) (= items 0))

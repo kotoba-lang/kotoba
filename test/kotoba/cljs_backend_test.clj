@@ -187,6 +187,14 @@
   (is (= 10 (run "(defn add [a b] (+ a b))
                    (defn main [] (reduce add 4 [1 2 3]))"))))
 
+(deftest multi-source-map-uses-fuel-helper-beyond-legacy-eight-items
+  (let [left (pr-str (vec (range 20)))
+        right (pr-str (vec (range 20 40)))]
+    (is (= 58
+           (run (str "(defn add [a b] (+ a b))"
+                     "(defn main [] (nth (map add "
+                     left " " right ") 19 0))"))))))
+
 (deftest inline-higher-order-callbacks-capture-in-cljs-backend
   (is (= 7 (run "(defn main []
                    (let [n 3] (pair-first (map (fn [x] (+ x n)) [4]))))")))
