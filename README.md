@@ -179,6 +179,8 @@ kotoba run path/to/entry.cljk                # CLJ Kotoba source
 kotoba package verify --lock lock.edn --trust trust.edn --json   # package admission gate
 kotoba package verify --lock lock.edn --trust trust.edn \
   --key-register key-register.edn --json   # fold non-active key-register signers into trust
+kotoba package resolve --registry-cid bafkrei... --requests requests.edn \
+  --trust trust.edn --lock-output kotoba.lock.edn # CID-verified network registry → admitted lock
 kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # capability-confined build, see Language below
 kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
 kotoba cljs emit cell.kotoba --package-lock lock.edn -o cell.cljs                      # ClojureScript source, see Language below

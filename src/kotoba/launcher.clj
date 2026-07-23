@@ -669,15 +669,38 @@
   [argv]
   (package-admission/cli-result (admission-options argv "--lock")))
 
+(defn package-resolve-result
+  "Resolve name+version requests through a CID-addressed network registry."
+  [argv]
+  (let [timeout-text (option-value argv "--timeout-ms")
+        timeout-ms (when timeout-text
+                     (try (Long/parseLong timeout-text)
+                          (catch NumberFormatException _ ::invalid)))]
+    (if (or (= ::invalid timeout-ms)
+            (and timeout-ms (not (pos? timeout-ms))))
+      {:kotoba.cli/ok? false
+       :kotoba.cli/code :package/timeout-invalid
+       :kotoba.cli/data {:kotoba.package/timeout-ms timeout-text}}
+      (package-admission/resolution-cli-result
+       (package-admission/resolve-network-cli
+        {:registry-cid (option-value argv "--registry-cid")
+         :requests-path (option-value argv "--requests")
+         :trust-path (option-value argv "--trust")
+         :gateway-base (option-value argv "--gateway")
+         :timeout-ms timeout-ms
+         :lock-output (option-value argv "--lock-output")
+         :receipt-path (option-value argv "--receipt")})))))
+
 (defn package-result
   "Handle launcher-owned package admission commands."
   [argv]
   (case (second argv)
     "verify" (package-verify-result argv)
+    "resolve" (package-resolve-result argv)
     {:kotoba.cli/ok? false
      :kotoba.cli/code :package/unknown-command
      :kotoba.cli/data {:kotoba.package/command (second argv)
-                       :kotoba.package/commands ["verify"]
+                       :kotoba.package/commands ["verify" "resolve"]
                        :kotoba.package/usage package-admission/usage}}))
 
 (defn policy-result

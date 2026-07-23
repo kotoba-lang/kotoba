@@ -28,6 +28,7 @@
             [kotoba.compiler.artifact :as artifact]
             [kotoba.lang.package-contract :as package-contract]
             [kotoba.lang.package-registry :as package-registry]
+            [kotoba.lang.package-registry-network :as package-registry-network]
             [kotoba.security.abac :as abac]
             [kotoba.security.crypto-policy :as crypto]
             [multiformats.core :as mf])
@@ -656,7 +657,8 @@
     (spit file (with-out-str (pprint/pprint receipt)))))
 
 (def usage
-  "kotoba package verify --lock <kotoba.lock.edn> [--manifest <package-manifest.edn>] [--trust <trust.edn>] [--key-register <key-register.edn>] [--receipt <out.edn>] [--json]")
+  (str "kotoba package verify --lock <kotoba.lock.edn> [--manifest <package-manifest.edn>] [--trust <trust.edn>] [--key-register <key-register.edn>] [--receipt <out.edn>] [--json]\n"
+       "kotoba package resolve --registry-cid <cid> --requests <requests.edn> [--trust <trust.edn>] [--gateway <url>] [--timeout-ms <ms>] [--lock-output <kotoba.lock.edn>] [--receipt <out.edn>] [--json]"))
 
 (defn not-readable
   [code path error]
@@ -730,6 +732,23 @@
                         (:kotoba.admission/error admission)
                         (assoc :kotoba.package/error (:kotoba.admission/error admission)))}))
 
+(defn resolution-cli-result
+  "Wrap an already-resolved network admission result as a launcher result."
+  [admission]
+  {:kotoba.cli/ok? (:kotoba.admission/ok? admission)
+   :kotoba.cli/code (:kotoba.admission/code admission)
+   :kotoba.cli/data (cond-> {}
+                      (:kotoba.admission/lock admission)
+                      (assoc :kotoba.package/lock (:kotoba.admission/lock admission))
+                      (:kotoba.admission/lock-path admission)
+                      (assoc :kotoba.package/lock-path (:kotoba.admission/lock-path admission))
+                      (:kotoba.admission/receipt admission)
+                      (assoc :kotoba.package/receipt (:kotoba.admission/receipt admission))
+                      (:kotoba.admission/receipt-path admission)
+                      (assoc :kotoba.package/receipt-path (:kotoba.admission/receipt-path admission))
+                      (:kotoba.admission/error admission)
+                      (assoc :kotoba.package/error (:kotoba.admission/error admission)))})
+
 (defn resolve-lock-with-registry
   "Resolve version-only dependency requests through a package registry into
   a full lock, then verify-lock (fail-closed). REGISTRY is parsed EDN;
@@ -751,6 +770,78 @@
                                   :package-rejected)
          :kotoba.admission/receipt receipt
          :kotoba.admission/lock (:lock resolved)}))))
+
+(defn resolve-lock-with-network
+  "Fetch a CID-addressed registry snapshot through the authority network
+  adapter, resolve REQUESTS, and run the resulting lock through the same
+  fail-closed admission gate as a local lock. The registry bytes are accepted
+  only after the adapter verifies their CID."
+  [{:keys [registry-cid requests trust gateway-base timeout-ms]}]
+  (if-not (package-contract/cid? registry-cid)
+    {:kotoba.admission/ok? false
+     :kotoba.admission/code :package/registry-cid-invalid
+     :kotoba.admission/error {:kotoba.package/registry-cid registry-cid}}
+    (let [fetch-opts (cond-> {}
+                       gateway-base (assoc :gateway-base gateway-base)
+                       timeout-ms (assoc :timeout-ms timeout-ms))
+          resolved (package-registry-network/lock-from-requests-network
+                    registry-cid requests fetch-opts)]
+      (if-not (:ok? resolved)
+        {:kotoba.admission/ok? false
+         :kotoba.admission/code :package/registry-resolve-failed
+         :kotoba.admission/error {:kotoba.package/problems (:problems resolved)}}
+        (let [receipt (verify-lock {:lock (:lock resolved)
+                                    :lock-path "<network-registry-resolved>"
+                                    :trust trust})]
+          {:kotoba.admission/ok? (:kotoba.package/verified? receipt)
+           :kotoba.admission/code (if (:kotoba.package/verified? receipt)
+                                    :package-verified
+                                    :package-rejected)
+           :kotoba.admission/receipt receipt
+           :kotoba.admission/lock (:lock resolved)})))))
+
+(defn resolve-network-cli
+  "Read CLI-owned request/trust inputs, resolve them through a CID-addressed
+  registry, and optionally write the verified lock and receipt."
+  [{:keys [registry-cid requests-path trust-path gateway-base timeout-ms
+           lock-output receipt-path]}]
+  (cond
+    (nil? registry-cid)
+    {:kotoba.admission/ok? false
+     :kotoba.admission/code :package/missing-registry-cid
+     :kotoba.admission/error {:kotoba.package/usage usage}}
+
+    (nil? requests-path)
+    {:kotoba.admission/ok? false
+     :kotoba.admission/code :package/missing-requests-option
+     :kotoba.admission/error {:kotoba.package/usage usage}}
+
+    :else
+    (let [requests-input (read-edn-file requests-path)
+          trust-input (some-> trust-path read-edn-file)]
+      (cond
+        (not (:ok? requests-input))
+        (not-readable :package/requests-not-readable requests-path requests-input)
+
+        (and trust-input (not (:ok? trust-input)))
+        (not-readable :package/trust-not-readable trust-path trust-input)
+
+        :else
+        (let [result (resolve-lock-with-network
+                      {:registry-cid registry-cid
+                       :requests (:value requests-input)
+                       :trust (:value trust-input)
+                       :gateway-base gateway-base
+                       :timeout-ms timeout-ms})]
+          (when (and (:kotoba.admission/ok? result) lock-output)
+            (write-receipt! lock-output (:kotoba.admission/lock result)))
+          (when (and (:kotoba.admission/receipt result) receipt-path)
+            (write-receipt! receipt-path (:kotoba.admission/receipt result)))
+          (cond-> result
+            (and (:kotoba.admission/ok? result) lock-output)
+            (assoc :kotoba.admission/lock-path lock-output)
+            (and (:kotoba.admission/receipt result) receipt-path)
+            (assoc :kotoba.admission/receipt-path receipt-path)))))))
 
 (defn safe-release-ready?
   "F-001 / F-007 partial + L3: a safe release may proceed only when a package-
