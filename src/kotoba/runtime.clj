@@ -1857,6 +1857,13 @@
                             (list* 'defn (symbol (str name "-tick")) params body))
                 cond (lower-cond args)
                 condp (lower-condp args node)
+                assert (do
+                         (when-not (= 1 (count args))
+                           (throw
+                            (ex-info
+                             "assert requires exactly one condition; messages are not supported"
+                             {:phase :lowering :form node})))
+                         (list 'if (first args) 0 (list 'quot 1 0)))
                 case (let [[expr & clauses] args] (lower-case expr clauses))
                 if-let (lower-binding-if op args)
                 when-let (lower-binding-if op args)
