@@ -49,6 +49,28 @@
 (deftest basic-arithmetic
   (is (= 3 (run "(defn main [] (+ 1 2))"))))
 
+(deftest dynamic-string-construction-and-substring
+  (is (= "ことば"
+         (run "(defn join [left right] (string-concat left right))
+               (defn main [] (join \"こと\" \"ば\"))")))
+  (is (= "😀語"
+         (run "(defn slice [value start end]
+                 (string-substring value start end))
+               (defn main []
+                 (slice (string-concat \"a😀\" \"語z\") 1 8))")))
+  (is (= 8
+         (run "(defn main []
+                 (string-length (string-concat \"😀\" \"語x\")))")))
+  (is (= 1
+         (run "(defn main []
+                 (string= (string-concat \"a\" \"b\") \"ab\"))")))
+  (is (= 1 (run "(defn main [] (string? (string-concat \"a\" \"b\")))")))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"splits a UTF-8 code point"
+       (run "(defn slice [value start end]
+               (string-substring value start end))
+             (defn main [] (slice \"a😀\" 2 5))"))))
+
 (deftest named-function-calls-across-multiple-defns
   (is (= 7 (run "(defn addpair [a b] (+ a b)) (defn main [] (addpair 3 4))"))))
 

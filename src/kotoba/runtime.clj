@@ -5118,7 +5118,7 @@
   (cond
     (integer? form) form
     (keyword? form) (keyword->i32 form)
-    (string? form) (string->i32 form)
+    (string? form) form
     (map? form) (compile-cljs-expr (desugar-map form))
     (vector? form) (let [lowered (desugar-vector form)]
                      (if (= ::vector-too-large lowered)
@@ -5198,9 +5198,8 @@
              (list 'let [mm m kk k] (bounded-map-contains-key mm kk)))))
 
         string? (if (= 1 (count args))
-                  (list 'if
-                        (list '= (list 'bit-and (compile-cljs-expr (first args)) value-tag-mask)
-                              string-value-tag) 1 0)
+                  (list 'if (list 'clojure.core/string?
+                                  (compile-cljs-expr (first args))) 1 0)
                   (cljs-reject! 'string? form))
         symbol? (if (= 1 (count args))
                   (list 'if
@@ -5213,13 +5212,26 @@
                                keyword-value-tag) 1 0)
                    (cljs-reject! 'keyword? form))
         string-length (if (= 1 (count args))
-                        (list 'bit-and
-                              (list 'bit-shift-right (compile-cljs-expr (first args)) 21) 127)
+                        (list 'kotoba$string-byte-length
+                              (compile-cljs-expr (first args)))
                         (cljs-reject! 'string-length form))
         string= (if (= 2 (count args))
                   (list 'if (list '= (compile-cljs-expr (first args))
                                   (compile-cljs-expr (second args))) 1 0)
                   (cljs-reject! 'string= form))
+        string-concat
+        (if (= 2 (count args))
+          (list 'kotoba$string-checked
+                (list 'str (compile-cljs-expr (first args))
+                      (compile-cljs-expr (second args))))
+          (cljs-reject! 'string-concat form))
+        string-substring
+        (if (= 3 (count args))
+          (list 'kotoba$string-substring
+                (compile-cljs-expr (first args))
+                (compile-cljs-expr (second args))
+                (compile-cljs-expr (nth args 2)))
+          (cljs-reject! 'string-substring form))
 
         conj
         (if (< (count args) 2)
@@ -5343,7 +5355,52 @@
                                   (list* 'do (map compile-cljs-expr body))))
                           defs)
            fn-names (mapv first defs)
+           string-runtime
+           '[(defn kotoba$string-byte-length [text]
+               (loop [index 0 total 0]
+                 (if (= index (count text))
+                   total
+                   (let [unit (subs text index (inc index))]
+                     (cond
+                       (<= (compare unit "\u007f") 0) (recur (inc index) (inc total))
+                       (<= (compare unit "\u07ff") 0) (recur (inc index) (+ total 2))
+                       (and (<= (compare "\ud800" unit) 0)
+                            (<= (compare unit "\udbff") 0))
+                       (recur (+ index 2) (+ total 4))
+                       :else (recur (inc index) (+ total 3)))))))
+             (defn kotoba$string-checked [text]
+               (if (> (kotoba$string-byte-length text) 127)
+                 (throw (ex-info "portable string exceeds 127 UTF-8 bytes"
+                                 {:kotoba.cljs/trap :string-too-large}))
+                 text))
+             (defn kotoba$string-substring [text start end]
+               (let [length (kotoba$string-byte-length text)]
+                 (if-not (and (integer? start) (integer? end)
+                              (<= 0 start end length))
+                   (throw (ex-info "string-substring indexes are out of bounds"
+                                   {:kotoba.cljs/trap :string-substring-bounds}))
+                   (loop [index 0 byte-index 0 boundaries {0 0}]
+                     (if (= index (count text))
+                       (let [from (get boundaries start)
+                             to (get boundaries end)]
+                         (if (and (some? from) (some? to))
+                           (subs text from to)
+                           (throw
+                            (ex-info "string-substring splits a UTF-8 code point"
+                                     {:kotoba.cljs/trap :string-substring-boundary}))))
+                       (let [unit (subs text index (inc index))
+                             [units bytes]
+                             (cond
+                               (<= (compare unit "\u007f") 0) [1 1]
+                               (<= (compare unit "\u07ff") 0) [1 2]
+                               (and (<= (compare "\ud800" unit) 0)
+                                    (<= (compare unit "\udbff") 0)) [2 4]
+                               :else [1 3])]
+                         (recur (+ index units) (+ byte-index bytes)
+                                (assoc boundaries (+ byte-index bytes)
+                                       (+ index units)))))))))]
            forms* (concat [(list 'ns ns-name)]
+                          string-runtime
                           [(list* 'declare fn-names)]
                           fn-forms)]
        (cstr/join "\n\n" (map pr-str forms*))))))
