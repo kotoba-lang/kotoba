@@ -1635,6 +1635,30 @@
                   (list 'if-some [tmp value] (insert tmp step) 0)))
               initial steps))))
 
+(defn- lower-cond-threading-form
+  "Lower `cond->`/`cond->>` before the bottom-up sugar pass so a conditional
+  step remains call syntax until the threaded value has been inserted."
+  [form]
+  (if-not (and (seq? form) (#{'cond-> 'cond->>} (first form)))
+    form
+    (let [[op initial & clauses] form
+          last? (= 'cond->> op)]
+      (when (or (< (count form) 2) (odd? (count clauses)))
+        (throw (ex-info (str op " requires an initial value followed by test/form pairs")
+                        {:phase :lowering :form form})))
+      (reduce
+       (fn [value [test step]]
+         (when-not (and (seq? step) (symbol? (first step)))
+           (throw (ex-info (str op " update must be a non-empty call form")
+                           {:phase :lowering :form op :step step})))
+         (let [tmp (gensym "cond-thread__")
+               threaded (if last?
+                          (apply list (first step) (concat (rest step) [tmp]))
+                          (list* (first step) tmp (rest step)))]
+           (list 'let [tmp value] (list 'if test threaded tmp))))
+       initial
+       (partition 2 clauses)))))
+
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
@@ -1651,7 +1675,8 @@
                         expand-closure-forms)
                    (mapv #(->> %
                                (walk/prewalk lower-threading-form)
-                               (walk/prewalk lower-some-threading-form))))
+                               (walk/prewalk lower-some-threading-form)
+                               (walk/prewalk lower-cond-threading-form))))
         constants (into {}
                         (keep (fn [form]
                                 (when (and (seq? form) (= 'def (first form))
@@ -1760,6 +1785,28 @@
                 when-let (lower-binding-if op args)
                 if-some (lower-binding-if 'if-let args)
                 when-some (lower-binding-if 'when-let args)
+                if-not (do
+                         (when-not (<= 2 (count args) 3)
+                           (throw (ex-info "if-not requires then and optional else expressions"
+                                           {:phase :lowering :form node})))
+                         (let [[test then else] args]
+                           (list 'if (list 'not test) then (if (= 3 (count args)) else 0))))
+                when-not (do
+                           (when (empty? args)
+                             (throw (ex-info "when-not requires a test expression"
+                                             {:phase :lowering :form node})))
+                           (let [[test & body] args]
+                             (cond
+                               (empty? body) (list 'if (list 'not test) 0 0)
+                               (= 1 (count body)) (list 'if (list 'not test) (first body) 0)
+                               :else (list 'if (list 'not test) (cons 'do body) 0))))
+                as-> (let [[initial name & steps] args]
+                       (when-not (and (<= 2 (count args)) (symbol? name)
+                                      (nil? (namespace name)))
+                         (throw (ex-info "as-> requires an initial value, an unqualified binding symbol, and optional forms"
+                                         {:phase :lowering :form node})))
+                       (reduce (fn [value step] (list 'let [name value] step))
+                               initial steps))
                 not= (list 'not (list* '= args))
                 when (let [[test & body] args]
                        (cond

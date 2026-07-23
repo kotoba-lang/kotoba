@@ -38,3 +38,14 @@
                    (runtime/lower-language-forms
                     (runtime/read-forms
                      (str "(ns bad) (defn main [] " source ")") :kotoba)))))))
+
+(deftest negative-conditionals-lower-and-short-circuit
+  (is (= 7 (emit-and-run "(if-not 0 7 (quot 1 0))")))
+  (is (= 0 (emit-and-run "(if-not 1 (quot 1 0))")))
+  (is (= 9 (emit-and-run "(when-not 0 (+ 1 2) (+ 4 5))")))
+  (is (= 0 (emit-and-run "(when-not 1 (quot 1 0))")))
+  (doseq [source ["(if-not 1)" "(if-not 1 2 3 4)" "(when-not)"]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (runtime/lower-language-forms
+                  (runtime/read-forms
+                   (str "(ns bad) (defn main [] " source ")") :kotoba))))))

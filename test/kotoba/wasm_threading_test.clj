@@ -41,3 +41,19 @@
        #"threading step must be a symbol or non-empty list"
        (runtime/lower-language-forms
         (runtime/read-forms "(ns bad) (defn main [] (-> 1 [inc]))" :kotoba)))))
+
+(deftest conditional-thread-last-lowers-and-executes
+  (is (= 7 (emit-and-run "(cond->> 3 1 (- 10) 0 (quot 0))")))
+  (is (= 3 (emit-and-run "(cond->> 3 0 (quot 0))")))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"cond->> update must be a non-empty call form"
+       (runtime/lower-language-forms
+        (runtime/read-forms "(ns bad) (defn main [] (cond->> 1 1 :bad))" :kotoba)))))
+
+(deftest named-threading-lowers-and-executes
+  (is (= 42 (emit-and-run "(as-> 5 x (+ x 2) (* x 6))")))
+  (is (= 5 (emit-and-run "(as-> 5 x)")))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"as-> requires an initial value"
+       (runtime/lower-language-forms
+        (runtime/read-forms "(ns bad) (defn main [] (as-> 1 :x))" :kotoba)))))
