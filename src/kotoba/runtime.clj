@@ -1686,76 +1686,101 @@
   (if-not (and (seq? form) (= 'doseq (first form)))
     form
     (let [[_ binding & body] form]
-      (when-not (and (vector? binding) (<= 2 (count binding))
-                     (symbol? (first binding)) (nil? (namespace (first binding))))
-        (throw
-         (ex-info
-          "doseq requires one [unqualified-symbol collection] binding with optional :let/:when modifiers"
-          {:phase :lowering :form form})))
-      (let [[item collection & modifier-forms] binding]
-        (when (odd? (count modifier-forms))
-          (throw (ex-info "doseq modifiers require keyword/value pairs"
-                          {:phase :lowering :form form})))
-        (let [modifiers
-              (mapv
-               (fn [[modifier value]]
-                 (case modifier
-                   :let
-                   (do
-                     (when-not (and (vector? value) (even? (count value))
-                                    (every? #(and (symbol? %)
-                                                  (nil? (namespace %)))
-                                            (take-nth 2 value))
-                                    (= (count (take-nth 2 value))
-                                       (count (distinct (take-nth 2 value)))))
-                       (throw
-                        (ex-info
-                         "doseq :let requires unique unqualified symbol/value bindings"
-                         {:phase :lowering :form form})))
-                     [:let value])
+      (when-not (vector? binding)
+        (throw (ex-info "doseq requires a binding vector"
+                        {:phase :lowering :form form})))
+      (letfn [(valid-item? [item]
+                (and (symbol? item) (nil? (namespace item))))
+              (reject [message]
+                (throw (ex-info message {:phase :lowering :form form})))
+              (parse-modifier [modifier modifier-value]
+                (case modifier
+                  :let
+                  (do
+                    (when-not (and (vector? modifier-value)
+                                   (even? (count modifier-value))
+                                   (every? valid-item? (take-nth 2 modifier-value))
+                                   (= (count (take-nth 2 modifier-value))
+                                      (count (distinct (take-nth 2 modifier-value)))))
+                      (reject "doseq :let requires unique unqualified symbol/value bindings"))
+                    [:let modifier-value])
+                  :when [:when modifier-value]
+                  :while [:while modifier-value]
+                  (reject "doseq supports only :let, :when, and :while modifiers")))
+              (parse-groups []
+                (loop [tokens (seq binding) groups [] current nil]
+                  (cond
+                    (nil? tokens)
+                    (cond-> groups current (conj current))
 
-                   :when [:when value]
+                    (nil? current)
+                    (let [item (first tokens)
+                          collection (second tokens)]
+                      (when-not (and (valid-item? item) (next tokens))
+                        (reject "doseq requires [unqualified-symbol collection] binding pairs"))
+                      (recur (nnext tokens) groups
+                             {:item item :collection collection :modifiers []}))
 
-                   :while [:while value]
+                    (keyword? (first tokens))
+                    (do
+                      (when-not (next tokens)
+                        (reject "doseq modifiers require keyword/value pairs"))
+                      (recur (nnext tokens) groups
+                             (update current :modifiers conj
+                                     (parse-modifier (first tokens) (second tokens)))))
 
-                   (throw
-                    (ex-info
-                     "doseq supports only :let, :when, and :while modifiers; multiple collection bindings are not supported"
-                     {:phase :lowering :form form}))))
-               (partition 2 modifier-forms))
-              iteration-signal
-              (reduce
-               (fn [inner [modifier value]]
-                 (case modifier
-                   :let (list 'let value inner)
-                   :when (list 'if value inner 1)
-                   :while (list 'if value inner 0)))
-               (list* 'do (concat body [1]))
-               (reverse modifiers))
-            values (gensym "doseq-values__")
-            length (gensym "doseq-length__")
-            block-signal
-            (fn [indices]
-              (reduce
-               (fn [continuation index]
-                 (list 'if (list '< index length)
-                       (list 'if
-                             (list 'let [item (list 'nth values index)]
-                                   iteration-signal)
-                             continuation
-                             0)
-                       1))
-               1
-               (reverse indices)))
-            blocks (map block-signal (partition-all 16 (range 128)))
-            unrolled
-            (reduce (fn [continuation block]
-                      (list 'if block continuation 0))
-                    0
-                    (reverse blocks))]
-        (list 'let [values collection]
-              (list 'let [length (list 'count values)]
-                    unrolled)))))))
+                    (valid-item? (first tokens))
+                    (recur tokens (conj groups current) nil)
+
+                    :else
+                    (reject "doseq requires binding pairs separated only by :let/:when/:while modifiers"))))
+              (lower-group [{:keys [item collection modifiers]} group-body limit]
+                (let [iteration-signal
+                      (reduce
+                       (fn [inner [modifier modifier-value]]
+                         (case modifier
+                           :let (list 'let modifier-value inner)
+                           :when (list 'if modifier-value inner 1)
+                           :while (list 'if modifier-value inner 0)))
+                       (list* 'do (concat group-body [1]))
+                       (reverse modifiers))
+                      values (gensym "doseq-values__")
+                      length (gensym "doseq-length__")
+                      block-signal
+                      (fn [indices]
+                        (reduce
+                         (fn [continuation index]
+                           (list 'if (list '< index length)
+                                 (list 'if
+                                       (list 'let [item (list 'nth values index)]
+                                             iteration-signal)
+                                       continuation
+                                       0)
+                                 1))
+                         1
+                         (reverse indices)))
+                      blocks (map block-signal (partition-all 16 (range limit)))
+                      unrolled
+                      (reduce (fn [continuation block]
+                                (list 'if block continuation 0))
+                              0
+                              (reverse blocks))
+                      bounded
+                      (if (< limit 128)
+                        (list 'if (list '< limit length) (list 'quot 1 0) unrolled)
+                        unrolled)]
+                  (list 'let [values collection]
+                        (list 'let [length (list 'count values)]
+                              bounded))))]
+        (let [groups (parse-groups)
+              group-count (count groups)]
+          (when-not (<= 1 group-count 2)
+            (reject "doseq supports one binding, or two bindings capped at 16 items each"))
+          (let [limit (if (= 1 group-count) 128 16)]
+            (reduce (fn [inner group]
+                      (lower-group group [inner] limit))
+                    (list* 'do (concat body [0]))
+                    (reverse groups))))))))
 
 (defn- closed-multimethod-literal? [value]
   (or (integer? value) (keyword? value) (boolean? value) (string? value)))
