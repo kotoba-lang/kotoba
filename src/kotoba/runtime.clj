@@ -1679,9 +1679,9 @@
                           0)))))))
 
 (defn- lower-doseq-form
-  "Lower the bounded single-binding `doseq` profile by statically unrolling
-  an admitted vector literal. The vector is still constructed once before
-  any body runs, preserving source evaluation order."
+  "Lower the bounded single-binding `doseq` profile to at most 128 guarded
+  vector accesses. Collection and length are each evaluated once; no typed
+  value crosses a recursive-helper ABI boundary."
   [form]
   (if-not (and (seq? form) (= 'doseq (first form)))
     form
@@ -1692,19 +1692,22 @@
          (ex-info
           "doseq requires one [unqualified-symbol collection] binding; modifiers and multiple bindings are not supported"
           {:phase :lowering :form form})))
-      (let [[item collection] binding]
-        (when-not (vector? collection)
-          (throw (ex-info "doseq collection must be a bounded vector literal"
-                          {:phase :lowering :form form})))
-        (let [values (gensym "doseq-values__")
-              iterations
-              (map-indexed
-               (fn [index _]
-                 (list 'let [item (list 'nth values index)]
-                       (list* 'do (concat body [0]))))
-               collection)]
-          (list 'let [values collection]
-                (list* 'do (concat iterations [0]))))))))
+      (let [[item collection] binding
+            values (gensym "doseq-values__")
+            length (gensym "doseq-length__")
+            iterations
+            (map (fn [index]
+                   (list 'if (list '< index length)
+                         (list 'let [item (list 'nth values index)]
+                               (list* 'do (concat body [0])))
+                         0))
+                 (range 128))
+            blocks (map #(list* 'do (concat % [0]))
+                        (partition-all 16 iterations))
+            unrolled (list* 'do (concat blocks [0]))]
+        (list 'let [values collection]
+              (list 'let [length (list 'count values)]
+                    unrolled))))))
 
 (defn- closed-multimethod-literal? [value]
   (or (integer? value) (keyword? value) (boolean? value) (string? value)))
