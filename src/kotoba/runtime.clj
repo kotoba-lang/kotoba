@@ -1955,11 +1955,12 @@
                                 bounded)))))]
         (let [groups (parse-groups)
               group-count (count groups)]
-          (when-not (<= 1 group-count 3)
-            (reject "doseq supports at most three collection bindings"))
+          (when-not (<= 1 group-count 4)
+            (reject "doseq supports at most four collection bindings"))
           (reduce (fn [inner group]
                     (lower-group group [inner]
                                  (cond
+                                   (= 4 group-count) 2
                                    (= 3 group-count) 4
                                    (= 2 group-count) 16
                                    (:pair-sequence? group) 32
