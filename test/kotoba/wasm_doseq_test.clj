@@ -1,5 +1,6 @@
 (ns kotoba.wasm-doseq-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [kotoba.runtime :as runtime]
             [kotoba.wasm-exec :as wasm-exec]))
 
@@ -79,3 +80,10 @@
                (emit-and-run
                 "(doseq [x [1 2 3] :while (< x 3)]
                    (if (= x 2) (quot 1 0) 0))"))))
+
+(deftest doseq-runs-at-the-128-item-vector-bound
+  (let [items (str/join " " (range 1 129))]
+    (is (= 0
+           (emit-and-run
+            (str "(doseq [x [" items "] :while (< x 65)]"
+                 "  (if (= x 65) (quot 1 0) 0))"))))))

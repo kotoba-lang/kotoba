@@ -3514,11 +3514,15 @@
           {:problem {:kotoba.wasm/problem :arity :kotoba.wasm/op "pair"
                      :kotoba.wasm/expected 2 :kotoba.wasm/actual (count args)}}
           (let [[l r] args
+                left (gensym "pair-left__")
+                right (gensym "pair-right__")
                 ptr (gensym "pair-ptr__")]
             (compile-wasm-expr
-             (list 'let [ptr (list 'alloc 8)]
-                   (list 'i32-store! ptr 0 l)
-                   (list 'i32-store! ptr 4 r)
+             (list 'let [left l
+                         right r
+                         ptr (list 'alloc 8)]
+                   (list 'i32-store! ptr 0 left)
+                   (list 'i32-store! ptr 4 right)
                    ptr)
              locals fns)))
 
