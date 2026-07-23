@@ -1611,6 +1611,30 @@
         ;; children.
         (recur (reduce insert initial steps))))))
 
+(defn- lower-some-threading-form
+  "Lower `some->`/`some->>` to nested `if-some` forms.  The primary i64
+  runtime represents absence as 0, so this is the documented nil/falsy
+  approximation; the typed compiler uses explicit Option values."
+  [form]
+  (if-not (and (seq? form) (#{'some-> 'some->>} (first form)))
+    form
+    (let [[op initial & steps] form
+          last? (= 'some->> op)
+          insert (fn [value step]
+                   (cond
+                     (symbol? step) (list step value)
+                     (and (seq? step) (seq step))
+                     (if last?
+                       (apply list (first step) (concat (rest step) [value]))
+                       (list* (first step) value (rest step)))
+                     :else
+                     (throw (ex-info "some-threading step must be a symbol or non-empty list"
+                                     {:phase :lowering :form op :step step}))))]
+      (reduce (fn [value step]
+                (let [tmp (gensym "some-thread__")]
+                  (list 'if-some [tmp value] (insert tmp step) 0)))
+              initial steps))))
+
 (defn lower-language-forms
   "Lower Kotoba-only surface forms into the compiler core. This pass is
   shared by IR and Wasm so the two paths cannot silently diverge.
@@ -1625,7 +1649,9 @@
                         expand-record-protocol-forms expand-lazy-forms
                         expand-match-forms expand-fuel-collection-forms
                         expand-closure-forms)
-                   (mapv #(walk/prewalk lower-threading-form %)))
+                   (mapv #(->> %
+                               (walk/prewalk lower-threading-form)
+                               (walk/prewalk lower-some-threading-form))))
         constants (into {}
                         (keep (fn [form]
                                 (when (and (seq? form) (= 'def (first form))
@@ -1732,6 +1758,8 @@
                 case (let [[expr & clauses] args] (lower-case expr clauses))
                 if-let (lower-binding-if op args)
                 when-let (lower-binding-if op args)
+                if-some (lower-binding-if 'if-let args)
+                when-some (lower-binding-if 'when-let args)
                 not= (list 'not (list* '= args))
                 when (let [[test & body] args]
                        (cond
