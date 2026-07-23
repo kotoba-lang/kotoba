@@ -112,3 +112,27 @@
                 "(doseq [x [1]
                          y [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17]]
                    0)"))))
+
+(deftest doseq-supports-explicit-pair-sequence-expressions
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x (list 1 2 3)]
+                   (if (= x 3) (quot 1 0) 0))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x (rest (list 0 1 2 3))]
+                   (if (= x 3) (quot 1 0) 0))")))
+  (is (= 0
+         (emit-and-run
+          "(doseq [x (cons 1 (list 2 3)) :while (< x 3)]
+             (if (= x 3) (quot 1 0) 0))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x (list 1 2) y [x]]
+                   (if (= x 2)
+                     (if (= y 2) (quot 1 0) 0)
+                     0))")))
+  (let [tail (str/join " " (range 1 33))]
+    (is (thrown? Exception
+                 (emit-and-run
+                  (str "(doseq [x (cons 0 (list " tail "))] 0)"))))))
