@@ -35,7 +35,7 @@
   (doseq [source ["(doseq [x] x)"
                   "(doseq [:x [1]] 0)"
                   "(doseq [qualified/x [1]] 0)"
-                  "(doseq [x [1] y [2] z [3]] (+ x y z))"]]
+                  "(doseq [w [0] x [1] y [2] z [3]] (+ w x y z))"]]
     (testing source
       (is (thrown?
            clojure.lang.ExceptionInfo
@@ -136,3 +136,23 @@
     (is (thrown? Exception
                  (emit-and-run
                   (str "(doseq [x (cons 0 (list " tail "))] 0)"))))))
+
+(deftest doseq-supports-three-bounded-cartesian-bindings
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x [1 2] y [3 4] z [5 6]]
+                   (if (= x 2)
+                     (if (= y 4)
+                       (if (= z 6) (quot 1 0) 0)
+                       0)
+                     0))")))
+  (is (= 0
+         (emit-and-run
+          "(doseq [x [1 2]
+                   y [1 2]
+                   z [1 2 3] :while (< z 2)]
+             (if (= z 2) (quot 1 0) 0))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x [1] y [1] z [1 2 3 4 5]]
+                   0)"))))
