@@ -38,6 +38,7 @@
             [kotoba.wasm-and-or-when-test]
             [kotoba.wasm-case-test]
             [kotoba.wasm-condp-test]
+            [kotoba.wasm-doseq-test]
             [kotoba.wasm-binding-conditionals-test]
             [kotoba.wasm-dotimes-test]
             [kotoba.wasm-some-sugar-test]
@@ -83,6 +84,7 @@
                                         'kotoba.wasm-and-or-when-test
                                         'kotoba.wasm-case-test
                                         'kotoba.wasm-condp-test
+                                        'kotoba.wasm-doseq-test
                                         'kotoba.wasm-binding-conditionals-test
                                         'kotoba.wasm-dotimes-test
                                         'kotoba.wasm-some-sugar-test
