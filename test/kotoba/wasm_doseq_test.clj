@@ -34,8 +34,7 @@
   (doseq [source ["(doseq [x] x)"
                   "(doseq [x [1] y [2]] (+ x y))"
                   "(doseq [:x [1]] 0)"
-                  "(doseq [qualified/x [1]] 0)"
-                  "(doseq [x [1] :while x] x)"]]
+                  "(doseq [qualified/x [1]] 0)"]]
     (testing source
       (is (thrown?
            clojure.lang.ExceptionInfo
@@ -63,3 +62,20 @@
                (emit-and-run
                 "(doseq [x [1 2 3] :let [y (+ x 10)] :when (= y 12)]
                    (quot 1 0))"))))
+
+(deftest doseq-while-stops-all-later-iterations
+  (is (= 0
+         (emit-and-run
+          "(doseq [x [1 2 3] :while (< x 2)]
+             (if (= x 2) (quot 1 0) 0))")))
+  (is (= 0
+         (emit-and-run
+          "(doseq [x [1 2 3]
+                   :let [y (+ x 10)]
+                   :while (< y 12)
+                   :when (= x 99)]
+             (quot 1 0))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x [1 2 3] :while (< x 3)]
+                   (if (= x 2) (quot 1 0) 0))"))))
