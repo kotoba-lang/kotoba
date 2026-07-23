@@ -156,3 +156,25 @@
                (emit-and-run
                 "(doseq [x [1] y [1] z [1 2 3 4 5]]
                    0)"))))
+
+(deftest doseq-resolves-let-bound-pair-sequence-symbols
+  (is (thrown? Exception
+               (emit-and-run
+                "(let [xs (list 1 2 3)
+                       alias xs]
+                   (doseq [x alias]
+                     (if (= x 3) (quot 1 0) 0)))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(doseq [x [1 2]
+                         :let [ys (list x (+ x 10))]
+                         y ys]
+                   (if (= x 2)
+                     (if (= y 12) (quot 1 0) 0)
+                     0))")))
+  (is (thrown? Exception
+               (emit-and-run
+                "(let [xs (list 99)]
+                   (let [xs [1 2]]
+                     (doseq [x xs]
+                       (if (= x 2) (quot 1 0) 0))))"))))
