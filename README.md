@@ -93,8 +93,16 @@ published via GitHub Pages:
 > These are self-contained HTML (open the Pages links above, or open the files
 > in [`docs/explainer/`](docs/explainer/) directly in a browser). GitHub does not
 > render the interactive HTML inline in this README. Every claim is grounded in
-> the actual source (`prolly.rs`, `arrangement.rs`, `cacao.rs`, `delegation.rs`,
-> `x3dh.rs`, `ratchet.rs`, `shares.rs`).
+> the source of the **pre-migration Rust distributed database**
+> (`prolly.rs`, `arrangement.rs`, `cacao.rs`, `delegation.rs`, `x3dh.rs`,
+> `ratchet.rs`, `shares.rs`) — that Rust workspace was removed from this
+> repository (`604896171b`, 2026-07-01; see [Repository boundary](#repository-boundary)
+> above) and the design it documents now lives on as
+> [`kotoba-lang/kotobase`](https://github.com/kotoba-lang/kotobase), the
+> persistent Datom database. Treat these two videos as an architecture
+> explainer for that design (still an accurate map of the Datomic/IPFS/CACAO/
+> Signal model kotobase implements), not as a tour of this repository's
+> current source tree.
 
 See [**Documentation**](#documentation) below for the full ADR / design index.
 
@@ -306,14 +314,16 @@ not define new command shape or language semantics of its own.
   (`docs/lang/versioning.md`) and CI gates (`docs/lang/gates.md`).
 - **Package/lock contract.** `lang/package.edn` — CID-pinned packages,
   RID+signature authority, no capability grant without an explicit lockfile
-  + policy (`docs/adr/ADR-kotoba-package-cid-lock.md`). Wire protocol:
-  Transit JSON (`docs/adr/ADR-kotoba-transit-wire-protocol.md`).
+  + policy (this repo's [`docs/ADR-kotoba-package-cid-lock.md`](docs/ADR-kotoba-package-cid-lock.md)).
+  Wire protocol: Transit JSON (`ADR-kotoba-transit-wire-protocol.md` in the
+  `kotoba-lang/kotoba-lang` sibling repo).
 - **Where "authority" stops.** `kotoba-lang/kotoba-lang` owns the *semantic
   contract* (what the language and CLI mean), not every implementation.
   Capability *value-passing* (typed cap params, `cap-acquire`, i64 ABI
   threading) is implemented in this sibling repo's CLJ runtime, not in
   `kotoba-lang/kotoba-lang` itself — the contract repo defines the shape
-  (`docs/lang/capability-values.md`), hosts implement it.
+  (`docs/lang/capability-values.md` in `kotoba-lang/kotoba-lang`), hosts
+  implement it.
 
 The rest of this section (below) walks through the **historical Rust
 implementation** of this same design (`kotoba-clj`, `policy.rs`/`subset.rs`/
@@ -362,6 +372,18 @@ WebAssembly**: the Kotoba source *becomes* a WASM Component that runs on
 streams, LLM inference, CACAO). `.clj` / `.cljc` / `.cljs` remain compatibility
 inputs, but `.kotoba` is the canonical source extension. It is a compiler, not
 an embedded interpreter.
+
+> **Historical Rust CLI walkthrough below.** The rest of this subsection
+> (`kotoba wasm build`/`safe-build`/`safe-policy`/`selfhost-inspect`, the
+> `policy.rs`/`subset.rs`/`effects.rs` gate table, and the `{:imports …
+> :limits …}` policy EDN shape) documents the removed Rust `crates/kotoba-clj`
+> implementation (`604896171b`, 2026-07-01) as a design record — none of
+> those subcommands are wired up in this repo's current launcher. The live
+> CLI surface is `kotoba wasm emit` / `kotoba wasm run` (see
+> [Quick start](#quick-start) above), and the live capability-policy EDN
+> shape is `{:kotoba.policy/capabilities #{…}}` (e.g.
+> [`src/demo_kgraph_policy.edn`](src/demo_kgraph_policy.edn)), not the
+> `:imports`/`:limits` shape shown below.
 
 The public CLI path is `kotoba wasm`: it exposes build, safe-build, safe-policy,
 and selfhost inspection over the same compiler APIs without making callers speak
@@ -551,14 +573,33 @@ subdirectories:
 | Repo | Role |
 |---|---|
 | `kotoba-lang/kotoba-lang` | the language/CLI semantic authority — `.kotoba` source contract, `lang/cli.edn` command contract, conformance fixtures |
+| `kotoba-lang/compiler` | canonical `.kotoba` frontend/KIR and the restricted kotoba-script backend |
 | `kotoba-lang/kotoba-core-contracts` | core CID/contract types shared across hosts |
 | `kotoba-lang/kotoba-selfhost-contracts` | self-hosting analyzer contract |
-| `kotoba-lang/cacao`, `kotoba-lang/ed25519`, `kotoba-lang/dag-cbor` | CACAO auth, signing, and content-addressing primitives |
+| `kotoba-lang/datom` | canonical datom model (`[e a v]` / entity↔EAVT) shared by `kotoba.kgraph` (this repo's in-memory view) and kotobase's persistent store — the concrete substrate behind **kotoba : kotobase = Clojure : Datomic** (ADR-2607032500) |
+| `kotoba-lang/org-chainagnostic-cacao` | CACAO delegation-chain verification |
+| `kotoba-lang/ed25519`, `kotoba-lang/org-ietf-ed25519` | Ed25519 sign/verify |
+| `kotoba-lang/dag-cbor`, `kotoba-lang/org-ietf-cbor` | DAG-CBOR encoding + CIDv1 |
+| `kotoba-lang/io-multiformats` | multiformats/multibase codecs |
+| `kotoba-lang/org-w3-did` | `did:key` / `did:web` document construction and local resolution |
+| `kotoba-lang/security` | shared security tooling consumed by this repo's package-admission and grade-A gates |
 
-In this repo, `src/kotoba/` holds the host implementation: `launcher.clj`
+In this repo, `src/kotoba/` holds the host implementation. Core: `launcher.clj`
 (dispatch), `wasm_exec.clj` (Wasm execution via Chicory), `git_adapter.cljc` /
 `rad_adapter.cljc` (git and RAD sovereign-repo adapters), `kgraph.clj`,
-`host_providers.clj`, `package_admission.clj`, `cap_table.clj`, `runtime.clj`.
+`host_providers.clj`, `package_admission.clj`, `cap_table.clj`, `runtime.clj`,
+`did_adapter.cljc`, `mesh_node.clj`, `kami_host.cljc`, `sensing_host.cljc`,
+`kagi_boundary.cljc`, `guest_grammar.clj`. Security/assurance ("Grade A")
+surface: `grade_a.clj`, `threat_model.clj`, `supply_chain.clj`,
+`key_hierarchy.clj`, `control_adoption.clj`, `vulnerability_response.clj`,
+`crypto_qualification.clj`, `release_evidence.clj`, `sealed_egress.clj`,
+`cold_tier_admission.clj`, `anchor_relayer.clj`, `origin_assertion.clj`,
+`signed_module.clj` — see [Documentation](#documentation) below
+(`SECURITY.md`, `docs/THREAT-MODEL.md`,
+`docs/ADR-grade-a-security-assurance-program.md`). Content-addressed-codebase
+surface (ADR-kotoba-content-addressed-codebase-gap.md): `semantic_code.cljc`,
+`semantic_codebase.clj`, `bounded_cbor.clj`, `compositional_negative.clj`,
+`host_parity.clj`.
 
 The database/runtime crates described below (`kotoba-core`, `kotoba-graph`,
 `kotoba-store`, `kotoba-runtime`, `kotoba-auth`, `kotoba-signal`, …) were a
@@ -625,16 +666,21 @@ by [`.github/workflows/pages.yml`](.github/workflows/pages.yml).
 | [`docs/SECURITY-ARCHITECTURE.md`](docs/SECURITY-ARCHITECTURE.md) | X-Road-style accountability, R0–R3 custody, threat model |
 | [`docs/ADR-001-five-axis-distributed-redesign.md`](docs/ADR-001-five-axis-distributed-redesign.md) | five-axis distributed redesign |
 | [`docs/ADR-sealed-cold-tier.md`](docs/ADR-sealed-cold-tier.md) | encrypted cold tier + t-of-N custody |
-| [`docs/ADR-clojure-wasm.md`](docs/ADR-clojure-wasm.md) | Clojure/EDN-subset → WebAssembly compiler (the language) |
-| [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe-clj** — capability-confined language design (capability/subset/effect gates, T2/T3) |
+| [`docs/ADR-kotoba-wasm-clj-execution.md`](docs/ADR-kotoba-wasm-clj-execution.md) | **current** — `kotoba wasm` actually executes on the JVM Clojure runtime (`kotoba.runtime`/`kotoba.wasm-exec`), `kgraph` store |
+| [`docs/ADR-kotoba-wasm.md`](docs/ADR-kotoba-wasm.md) | Clojure/EDN-subset → WebAssembly compiler path design (historical Rust `crates/kotoba-clj` implementation, since removed — see the ADR's own banner) |
+| [`docs/ADR-safe-capability-language.md`](docs/ADR-safe-capability-language.md) | **safe-clj** — capability-confined language design (capability/subset/effect gates, T2/T3); gates (S0–S4) described are the historical Rust implementation, see [Language](#language--kotoba-lang--kotoba-wasm) above for what's live today |
 | [`docs/ADR-kotoba-shell-aiueos-safety-clj.md`](docs/ADR-kotoba-shell-aiueos-safety-clj.md) | kotoba-shell, aiueos runner integration, and release security gates |
 | [`docs/lang/README.md`](docs/lang/README.md) | language profile (`.kotoba`/reader target), conformance fixtures, and gates |
 | [`docs/ADR-browser-cid-query-vs-p2p.md`](docs/ADR-browser-cid-query-vs-p2p.md) | browser execution boundary |
 | [`docs/ADR-wallet-actor-cljs.md`](docs/ADR-wallet-actor-cljs.md) | CLJS wallet actor and Ethereum library surface |
-| [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC |
-| [`docs/ADR-kotoba-word.md`](docs/ADR-kotoba-word.md) | word/root registry + capability boundary |
+| [`docs/ADR-turn-relay.md`](docs/ADR-turn-relay.md) | pure-Rust TURN relay for WebRTC (historical design record — the `kotoba-turn` crate was part of the removed Rust workspace) |
+| [`docs/ADR-kotoba-word.md`](docs/ADR-kotoba-word.md) | word/root registry + capability boundary (`kotoba.lock.edn`/`kotoba.words.json` at repo root are the live artifacts; the Rust closure-extraction implementation described predates the workspace removal) |
 | [`docs/ADR-research-paper-arxiv.md`](docs/ADR-research-paper-arxiv.md) | arXiv paper as a grounded, derived artifact |
 | [`docs/WASI-HTTP-EGRESS-XRPC-INGRESS.md`](docs/WASI-HTTP-EGRESS-XRPC-INGRESS.md) | I/O boundary (egress/ingress) |
+| [`SECURITY.md`](SECURITY.md) | vulnerability reporting policy |
+| [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) | Kotoba stack end-to-end threat model (Grade A candidate profile) |
+| [`docs/ADR-grade-a-security-assurance-program.md`](docs/ADR-grade-a-security-assurance-program.md) | Grade A security assurance program across `kotoba`/`kototama`/`aiueos`/`kotoba-lang`/`kotobase` |
+| [`docs/ADR-kotoba-content-addressed-codebase-gap.md`](docs/ADR-kotoba-content-addressed-codebase-gap.md) | content-addressed codebase (Unison-like) — implemented slice and remaining gaps |
 
 The cross-cutting design SSoT remains the parent-monorepo ADR (see [ADR](#adr) below).
 
