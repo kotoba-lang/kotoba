@@ -192,7 +192,17 @@ kotoba package resolve --registry-cid bafkrei... --requests requests.edn \
 kotoba wasm emit cell.kotoba --policy policy.edn --package-lock lock.edn -o cell.wasm  # capability-confined build, see Language below
 kotoba wasm run cell.kotoba --policy policy.edn --package-lock lock.edn                # check + emit + execute
 kotoba cljs emit cell.kotoba --package-lock lock.edn -o cell.cljs                      # ClojureScript source, see Language below
+kotoba codebase init --store dir                                       # C5 content-addressed codebase store
+kotoba codebase import src.kotoba --store dir --namespace ns           # import semantic blocks (git remains authoring)
+kotoba codebase inspect <cid> --store dir                              # inspect one semantic block
+kotoba codebase resolve --store dir --namespace ns <name>              # resolve a name to its current CID
+kotoba codebase merge --store dir --namespace ns --base <cid> --left <cid> --right <cid>  # three-way merge
 ```
+
+`codebase` persists semantic blocks only (see
+[`docs/ADR-kotoba-content-addressed-codebase-gap.md`](docs/ADR-kotoba-content-addressed-codebase-gap.md));
+source Git remains the authoring workflow, and no network synchronization is
+implied.
 
 Multi-module projects use an explicit closed manifest; the compiler never scans
 the filesystem or delegates module lookup to JavaScript:
@@ -259,14 +269,6 @@ contract for the distributed-graph, git-adapter, RAD sovereign-repo, and
 deploy/quality-gate surfaces; consult `lang/cli.edn` for their current tier
 and option shape rather than this README, since the contract is the
 versioned source of truth and this file is not.
-
-CACAO ecosystem helpers:
-
-```bash
-kotoba did-derive <32-byte-hex-seed>             # → did:key:z…
-kotoba cacao-sign <seed> --graph <cid> \
-    --capability datom:read [--private] [--aud <did>]
-```
 
 ## Language — kotoba-lang & kotoba wasm
 
@@ -627,14 +629,29 @@ tracked in [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90
 
 ## Properties
 
+Properties of **this repository** (`kotoba-lang/kotoba`) as it stands today —
+each one exercised directly above in [Quick start](#quick-start):
+
+- **Capability-safe language** — `kotoba wasm` compiles Kotoba/EDN → WASM; **safe Kotoba** confines untrusted/AI-generated modules by deny-by-default capability, subset, and (interprocedural) effect gates — capability confinement (T3) and effect soundness (T2)
+- **WASM runtime** — `kotoba wasm emit`/`run` execute real Wasm on the JVM (Chicory), with capability-gated host imports (e.g. graph read/write) reported back as per-call receipts
+- **In-memory EAVT datom store** — `kotoba.kgraph` is a pure in-memory `(E,A,V)` graph store backing those host imports; single-index, not persisted, and not the 5-index/Prolly-Tree/content-addressed store described in [Crates, architecture & performance](#crates-architecture--performance-historical-rust-design-record) below (that's kotobase's design)
+- **Content-addressed codebase (C5)** — `kotoba codebase init/import/inspect/resolve/merge` persists semantic blocks by CID; source Git remains the authoring workflow
+- **CID-pinned package/lock admission** — `kotoba package verify`/`resolve` gate every dependency on a signed, CID-verified manifest before it can reach compilation
+- **CACAO-native authz** — a `--cacao` delegation-chain option is wired through the launcher (`cacao.core`, `kotoba.lang.capability-cacao`) for host commands that accept one
+- **`did:key` / `did:web`** — local DID document construction and resolution (`did_adapter.cljc`, ADR-2607050100)
+
+Properties of the **persistent, distributed Datom database** — this is
+[`kotoba-lang/kotobase`](https://github.com/kotoba-lang/kotobase)'s identity,
+not this repository's; the bullets below describe that design (largely as
+implemented in the removed Rust workspace, being rebuilt CLJC-native per
+[ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md)):
+
 - **Content-addressed** — IPFS-compatible CIDv1 sha2-256 over raw / dag-pb / dag-cbor blocks
 - **Immutable datoms** — Datomic-style 5-tuple `(E,A,V,T,Added)` with retract tombstones
 - **5-index arrangement** — EAVT / AEVT / AVET / VAET / TEA for O(1)–O(log n) access
 - **Prolly Tree storage** — deterministic, hash-consistent B-tree over blocks
 - **Distributed Pregel** — BSP graph computation across nodes via libp2p
 - **AT Protocol native** — Datom projection backed by commit DAG and JetStream
-- **WASM runtime** — arbitrary graph logic as Component Model guests
-- **Capability-safe language** — `kotoba wasm` compiles Kotoba/EDN → WASM; **safe Kotoba** confines untrusted/AI-generated modules by deny-by-default capability, subset, and (interprocedural) effect gates — capability confinement (T3) and effect soundness (T2)
 - **E2E encryption** — Signal Protocol + CACAO auth for consent-gated data
 - **Datomic/Datalog primary, SPARQL auxiliary** — the distributed Datom DB is the source of truth; SPARQL 1.1 reads the same projection for RDF-compatible query and federation
 - **CACAO-native authz** — depth-2 delegation chains, multi-graph grants, anti-replay nonce
@@ -690,14 +707,28 @@ This repo has no Rust build (see [Current repositories](#current-repositories-cl
 above). CI (`.github/workflows/ci.yml`) runs two jobs:
 
 ```bash
-# CLJ launcher gates — checks out the deps.edn :local/root contract siblings, then:
+# CLJ launcher gates — checks out pinned kotoba-lang/kotoba-lang, kotoba-lang/compiler,
+# and kotoba-lang/kototama refs as qualification evidence, plus the cacao/ed25519/
+# dag-cbor/kotoba-core-contracts/kotoba-selfhost-contracts sibling repos, then:
+clojure -M -m kotoba.security.adoption   # shared security-adoption check (kotoba-lang/security)
 clojure -M:test
+clojure -M:lint                          # clj-kondo
 bin/kotoba-clj check --kind cli-contract --json
 bin/kotoba-clj package verify --lock test/fixtures/package/positive-lock.edn \
   --trust test/fixtures/package/trust.edn --json
+# negative case: a version-only lock must be rejected, not silently admitted
+bin/kotoba-clj package verify --lock test/fixtures/package/version-only-lock.edn --json && exit 1
 
 # Python SDK gates (sdk/kotoba-modal): pytest + wheel-contents check
 ```
+
+The security/assurance surface ([Documentation](#documentation) below —
+`SECURITY.md`, `docs/THREAT-MODEL.md`,
+`docs/ADR-grade-a-security-assurance-program.md`) is exercised separately via
+`deps.edn` aliases, not the default CI job: `:grade-a-check`/`:grade-a-attest`,
+`:crypto-check`, `:threat-model-check`, `:supply-chain-check`,
+`:key-hierarchy-check`, `:control-adoption-check`,
+`:vulnerability-response-check` (e.g. `clojure -M:crypto-check`).
 
 ## ADR
 
