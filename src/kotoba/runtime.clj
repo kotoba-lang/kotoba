@@ -3102,15 +3102,14 @@
    (let [{:kotoba.runtime/keys [ok? problems ir]} (check safe-facts source-plan forms policy)
          fns (into {} (keep function-def forms))
          step-budget (when (some? step-limit)
-                       (do
-                         (when-not (and (integer? step-limit)
-                                        (pos? step-limit))
-                           (throw (ex-info "interpreter step limit must be positive"
-                                           {:kotoba.runtime/problem
-                                            :invalid-interpreter-step-limit
-                                            :kotoba.runtime/step-limit
-                                            step-limit})))
-                         {:limit step-limit :used (atom 0)}))
+                       (when-not (and (integer? step-limit)
+                                      (pos? step-limit))
+                         (throw (ex-info "interpreter step limit must be positive"
+                                         {:kotoba.runtime/problem
+                                          :invalid-interpreter-step-limit
+                                          :kotoba.runtime/step-limit
+                                          step-limit})))
+                       {:limit step-limit :used (atom 0)})
          env-fns (cond-> fns
                    host-call (merge (guarded-host-fns forms host-call))
                    host-fns (merge host-fns)
