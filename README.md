@@ -45,6 +45,18 @@ capability/effect consistency and region non-escape before compilation. An
 older language-contract pin rejects annotated source fail-closed rather than
 silently ignoring the annotation.
 
+## Stack topology
+
+The canonical dependency topology of the stack (compiler at the foundation;
+`kotoba` → compiler; `kototama` → `aiueos` ("decides ⊣ enforces") ; `kotobase`
+→ `kotoba`, never the reverse; `aiueos` dependency-minimal, consuming compiler
+*artifacts*), plus this repo's assigned cleanup items (finishing the
+language-authority migration to `kotoba-lang/kotoba-lang`, and the
+`kototama`/`kotodama` · `kotobase*`/`kotoba-client` naming convergence), is
+recorded in
+[`docs/ADR-stack-topology-and-design-cleanup.md`](docs/ADR-stack-topology-and-design-cleanup.md)
+(root authority: `com-junkawasaki/root` ADR-2607241100).
+
 ## Repository boundary
 
 `kotoba-lang/kotoba` is the language and library substrate. Keep generic
