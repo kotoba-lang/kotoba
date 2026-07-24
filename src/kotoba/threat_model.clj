@@ -16,6 +16,14 @@
 (defn read-model []
   (edn/read-string (slurp model-path)))
 
+(defn evidence-present?
+  "A control can point to locally checked evidence or an immutable external
+  evidence URL owned by another scoped product. CI checks out this repository
+  alone, so it must not mistake a cross-repository URL for a missing file."
+  [evidence]
+  (or (.isFile (io/file evidence))
+      (boolean (re-matches #"https://github\.com/[^/]+/[^/]+/blob/[0-9a-f]{40}/.+" evidence))))
+
 (defn validation-errors [model]
   (let [assets (set (map :id (:assets model)))
         boundaries (set (map :id (:trust-boundaries model)))
@@ -45,7 +53,7 @@
           :controls (set/difference used-controls controls)}])
       (for [[id control] (:controls model)
             :when (and (not= :gap (:status control))
-                       (not (.isFile (io/file (:evidence control))))) ]
+                       (not (evidence-present? (:evidence control)))) ]
         {:code :threat-model/missing-evidence :control id
          :path (:evidence control)})
       (for [risk (:residual-risks model)
