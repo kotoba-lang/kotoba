@@ -98,11 +98,16 @@ can be admitted in source and still have no kit, hence no qualification row.
    the west tooling). Each would need a catalog entry with a wire id, a kit
    file with a typed request/result schema, and providers in both hosts.
 2. **`:fs/transact` (wire 19) and `:git/run` (wire 22) are in the catalog with
-   wire ids and `:source-status :friendly-qualified`, but have no kit file and
-   no provider in either host.** Every script that writes a file or drives git
-   is blocked on these. They need a kit (`:qualification` rows for
-   `:jit`/`:native-aot`) and provider implementations in `bin/kbb_js.cljs`
-   and `tools/kexe_loader.c`.
+   wire ids and `:source-status :friendly-qualified`.** Measured update
+   2026-09-07: `:git/run` has a js-backend provider AND stdout capture
+   (`lib/kbb/git.kotoba`, wire 22, landed 1ef80b7d4 — stdout / stdout-line-count,
+   256 KiB cap), and `:fs/app-data` (35) gained a write form on the js backend
+   (78458db1b, WRITE_SEP contract). Every script that writes a file or drives a
+   FIXED git invocation is no longer blocked on the js host. Remaining: the
+   native loader still hosts only read+env (browse/env/proc providers are
+   stubs, task 5), no kit files exist yet (`:qualification` rows for
+   `:jit`/`:native-aot`), and the dynamic-argv design tension for per-repo
+   fan-out tooling is tracked in kotoba-lang/kotoba#597.
 3. **`:proc/exec` answers an exit STATUS, never stdout.** `checkout-holds`'s
    five per-path counts are line counts of `git status --porcelain` output, so
    they are not portable today; that is why the port answers the verdict and
