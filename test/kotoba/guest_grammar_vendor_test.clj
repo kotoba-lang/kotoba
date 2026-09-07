@@ -53,13 +53,13 @@
   with the three pins and the ci.yml authority checkout. Change it only as part
   of a resync wave, in all four repositories, and resync both copies this
   repository ships in the same commit."
-  "a1b444230a3ec6b835545b422f79a9c6fc581dc2588d035ae739bc0eb89d08bb")
+  "e333abac09386fc059331fd81fe4cce685e757a6bd4507edfc28cee67b3afc97")
 
 (def recorded-kernel-head-count
   "Kernel heads `:admitted-builtins` names in the copies on this classpath,
   equal to what kotoba-lang main names -- the gap is closed, so there is one
   count, not two."
-  115)
+  116)
 
 (def ^:private resource-path "kotoba/lang/guest-grammar.edn")
 
