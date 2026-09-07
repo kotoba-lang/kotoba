@@ -66,7 +66,22 @@
     :policy "examples/kbb/edn_value_read_policy.edn"
     :args ["--backend" "js" "--fuel" "400000"]
     :expect 6272
-    :origin "kbb.edn — entry-count 6, :count 42, :pins present, :missing absent, well-formed"}])
+    :origin "kbb.edn — entry-count 6, :count 42, :pins present, :missing absent, well-formed"}
+   ;; :git/run (wire 22) had a wire id in the catalog and nothing behind it
+   ;; on any JVM-free backend. One script exercises it plus the shipped
+   ;; wire-35 write form, so the write is confirmed by reading the bytes
+   ;; back through the SAME provider that made them (the write form answers
+   ;; the content written; kbb.fs/write-ok? is the byte-exact check). The
+   ;; answer packs five readings: ls-files lines 1 -> 100000, ls-files exit
+   ;; 0 -> 0, cat-file exit 128 -> 12800, 15 bytes written, 15 read back,
+   ;; round-trip equal -> 7. 100000+0+12800+15+15+7 = 112837.
+   {:name "git_status_report/js"
+    :script "examples/kbb/git_status_report.kotoba"
+    :policy "examples/kbb/git_status_report_policy.edn"
+    :args ["--backend" "js" "--fuel" "400000"]
+    :expect 112837
+    :origin "kbb.git + the wire-35 write — ls-files 1 line exit 0, cat-file exit 128, 15 bytes written and read back equal"}])
+
 
 ;; A surface no JVM-free backend hosts must be REFUSED by name with the
 ;; distinct code, never routed to the JVM behind the caller's back.
@@ -101,7 +116,38 @@
     :args ["--backend" "js" "--fuel" "400000"]
     :exit 1 :code ":kbb-js/guest-failed"
     :says "path outside the granted :fs/app-data scope"
-    :why "granted, but scoped to another directory -- a grant is not a key to the filesystem"}])
+    :why "granted, but scoped to another directory -- a grant is not a key to the filesystem"}
+   ;; :git/run refusals, each a distinct reason so the run cannot pass by
+   ;; accident. A capability that cannot refuse is a security hole; the
+   ;; refusal REASONS must not blur into each other either.
+   {:name "git_status ungranted -> refuse at admission"
+    :script "examples/kbb/git_status_report.kotoba"
+    :policy "examples/kbb/git_status_report_ungranted_policy.edn"
+    :args ["--backend" "js" "--fuel" "400000"]
+    :exit 1 :code ":kbb-js/compile-failed"
+    :says "capability policy denies required effects"
+    :why "wire 22 withheld; refused before a git process starts or a byte is written"}
+   {:name "git_status write outside scope -> refuse at the provider"
+    :script "examples/kbb/git_status_report.kotoba"
+    :policy "examples/kbb/git_status_report_write_outside_policy.edn"
+    :args ["--backend" "js" "--fuel" "400000"]
+    :exit 1 :code ":kbb-js/guest-failed"
+    :says "path outside the granted :fs/app-data scope"
+    :why "the wire-35 write form resolves the target's PARENT and refuses -- a write scope is the boundary even when :git/run was granted"}
+   {:name "git_status git cwd outside scope -> refuse"
+    :script "examples/kbb/git_status_report.kotoba"
+    :policy "examples/kbb/git_status_report_git_outside_policy.edn"
+    :args ["--backend" "js" "--fuel" "400000"]
+    :exit 1 :code ":kbb-js/guest-failed"
+    :says "invocation cwd outside the granted :git/run scope"
+    :why "a policy table must not reach a repository the grant did not name"}
+   {:name "git_status index outside table -> refuse"
+    :script "examples/kbb/git_status_report.kotoba"
+    :policy "examples/kbb/git_status_report_short_table_policy.edn"
+    :args ["--backend" "js" "--fuel" "400000"]
+    :exit 1 :code ":kbb-js/guest-failed"
+    :says "grant index outside the policy's git invocation table"
+    :why "the index is the only git byte the guest supplies; out of range must refuse, not clamp"}])
 
 (defn- stub-dir! []
   (let [d (fs/mkdtempSync (path/join (os/tmpdir) "kbb-nojvm-"))]

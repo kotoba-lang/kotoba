@@ -13,11 +13,11 @@
 ;;           DISTRIBUTION artifact.
 ;;   js      bin/kbb_js.cljs: amu compile --target js --jvm-free -> restricted
 ;;           ESM instantiated in this Node process. Hosts :fs/app-data,
-;;           :env/read, :fs/browse and :proc/exec (wire 35/33/34/20).
+;;           :env/read, :fs/browse, :proc/exec and :git/run (wire 35/33/34/20/22).
 ;;
 ;; Dispatch, with `--backend` absent (the default, :auto):
 ;;   caps subset of {:fs/app-data}                        -> native
-;;   caps subset of the js host's four                    -> js
+;;   caps subset of the js host's five                    -> js
 ;;   anything else                                        -> REFUSE, exit 3
 ;;
 ;; NO SILENT FALLBACK (ADR-2609051100). A surface no JVM-free backend hosts
@@ -44,7 +44,7 @@
 ;; Wire ids come from kotoba-lang capability-catalog.edn; the js host's table
 ;; is bin/kbb_js.cljs `wire-ids`, the native loader's is kexe_loader.c.
 (def native-hosted #{:fs/app-data})
-(def js-hosted #{:fs/app-data :env/read :fs/browse :proc/exec})
+(def js-hosted #{:fs/app-data :env/read :fs/browse :proc/exec :git/run})
 (def interpreter-only #{:data/json :data/edn :http/fetch})
 
 (def exit-unsupported-surface 3)
