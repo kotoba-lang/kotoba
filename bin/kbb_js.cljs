@@ -8,12 +8,13 @@
 ;; What it does, in order, and what it refuses:
 ;;   1. reads the SAME deny-by-default policy shape kbb v1 takes
 ;;      (:kotoba.policy/capabilities, /forbid-wildcard true, /capability-
-;;      resources, /proc-exec-invocations). Wildcards, unscoped grants and
-;;      capabilities this host does not provide are refused before anything
-;;      runs. :data/json, :data/edn and :http/fetch are refused by NAME with
-;;      the reason: they have no compiler wire id, so no compiled guest can
-;;      call them -- the interpreter backend hosts them, and saying so is
-;;      the point (silent fallback is forbidden, ADR-2609051100).
+;;      resources, /proc-exec-invocations, /git-invocations). Wildcards,
+;;      unscoped grants and capabilities this host does not provide are
+;;      refused before anything runs. :data/json, :data/edn and :http/fetch
+;;      are refused by NAME with the reason: they have no compiler wire id,
+;;      so no compiled guest can call them -- the interpreter backend hosts
+;;      them, and saying so is the point (silent fallback is forbidden,
+;;      ADR-2609051100).
 ;;   2. compiles the script with `amu compile --target js --jvm-free`
 ;;      (kotoba.compiler.nbb.js-cli), giving the compiler a policy that
 ;;      allows exactly the granted capabilities' wire ids. amu is found at
@@ -21,12 +22,14 @@
 ;;      node_modules/nbb is a refusal that names the fix, not a fallback.
 ;;   3. instantiates the emitted restricted ESM with grants keyed by wire id:
 ;;        35 :fs/app-data   read one file inside the realpath'd scope, or
-;;                         write one: request "<path>WRITE_SEP<content>"
-;;                         (same token the native loader takes, amu 6cca3852);
-;;                         the result is the content written back
+;;                          write one: request "<path>WRITE_SEP<content>"
+;;                          (same token the native loader takes, amu 6cca3852);
+;;                          the result is the content written back
 ;;        33 :env/read      one granted NAME; unset answers "" (loader parity)
 ;;        34 :fs/browse     sorted entry names of one scoped directory, "\n"-joined
 ;;        20 :proc/exec     one policy invocation by grant index; exit status
+;;        22 :git/run       one policy git invocation by grant index;
+;;                          answer "<exit>\n<stdout>"
 ;;      Every provider re-checks scope on every call and records a receipt.
 ;;      A refusal inside a provider throws, the guest traps, the run fails.
 ;;   4. calls the exported `main` and prints the kbb v1 receipt shape
@@ -54,6 +57,7 @@
 (def version 1)
 (def max-policy-bytes 65536)
 (def max-file-bytes 65536)          ; the artifact's string-value-bytes limit
+(def max-stdout-bytes 262144)        ; :git/run stdout cap (git-run-v1 kit)
 ;; The write form of wire 35 is "<path>WRITE_SEP<content>". An ASCII token,
 ;; not a control character: Kotoba source cannot emit one and has no
 ;; char-to-string builtin, so the guest builds the request with
@@ -61,9 +65,11 @@
 ;; tools/kexe_loader.c fs_app_data_write_provider); a second occurrence
 ;; anywhere in the request is refused fail-closed there and here.
 (def write-token "WRITE_SEP")
-(def wire-ids {:fs/app-data 35 :env/read 33 :fs/browse 34 :proc/exec 20})
+(def wire-ids {:fs/app-data 35 :env/read 33 :fs/browse 34 :proc/exec 20
+               :git/run 22})
 (def compile-names {:fs/app-data :fs/app-data :env/read :env/read
-                    :fs/browse :fs/browse :proc/exec :process/spawn})
+                    :fs/browse :fs/browse :proc/exec :process/spawn
+                    :git/run :git/run})
 (def interpreter-only #{:data/json :data/edn :http/fetch})
 (def hosted (set (keys wire-ids)))
 
@@ -128,13 +134,24 @@
 (defn- scope-strings? [v] (or (string? v) (and (set? v) (seq v) (every? string? v))))
 (defn- scope-set [v] (if (string? v) #{v} (set v)))
 
+;; A :git/run annotation row and a :proc/exec row share the shape that
+;; makes a policy table reviewable -- no guest bytes in the command line --
+;; but git is the sharper tool, so the shape is checked MORE strictly:
+;; the row's argv[0] must be exactly `git`, so a table cannot smuggle a
+;; different program through a grant name that says git.
+(defn- git-row? [i]
+  (and (map? i) (vector? (:argv i)) (seq (:argv i))
+       (every? string? (:argv i)) (= "git" (first (:argv i)))
+       (string? (:cwd i))))
+
 (defn- policy-problem [policy]
   (let [caps (or (:kotoba.policy/capabilities policy) #{})
         resources (:kotoba.policy/capability-resources policy)
         not-compilable (seq (sort (filter interpreter-only caps)))
         unsupported (seq (sort (remove (into hosted interpreter-only) caps)))
         needs-scope (fn [cap problem] (when (and (contains? caps cap) (not (scope-strings? (get resources cap)))) {:problem problem}))
-        invocations (:kotoba.policy/proc-exec-invocations policy)]
+        invocations (:kotoba.policy/proc-exec-invocations policy)
+        git-invocations (:kotoba.policy/git-invocations policy)]
     (cond
       (not (set? caps)) {:problem :kbb/capabilities-not-set}
       (not (true? (:kotoba.policy/forbid-wildcard policy))) {:problem :kbb/forbid-wildcard-required}
@@ -147,6 +164,7 @@
       (needs-scope :env/read :kbb/env-resource-scope-required) (needs-scope :env/read :kbb/env-resource-scope-required)
       (needs-scope :fs/browse :kbb/fs-browse-resource-scope-required) (needs-scope :fs/browse :kbb/fs-browse-resource-scope-required)
       (needs-scope :proc/exec :kbb/proc-resource-scope-required) (needs-scope :proc/exec :kbb/proc-resource-scope-required)
+      (needs-scope :git/run :kbb/git-resource-scope-required) (needs-scope :git/run :kbb/git-resource-scope-required)
       (and (contains? caps :proc/exec)
            (not (and (vector? invocations) (seq invocations)
                      (every? (fn [i] (and (map? i) (string? (:command i)) (not (str/includes? (:command i) "/"))
@@ -154,6 +172,10 @@
                                           (= (:command i) (first (:argv i)))))
                              invocations))))
       {:problem :kbb/proc-invocations-required}
+      (and (contains? caps :git/run)
+           (not (and (vector? git-invocations) (seq git-invocations)
+                     (every? git-row? git-invocations))))
+      {:problem :kbb/git-invocations-required}
       :else nil)))
 
 ;; ---------------------------------------------------------------- amu
@@ -324,7 +346,9 @@
         browse-dirs (set (keep realpath-or-nil (scope-set (get resources :fs/browse))))
         env-names (scope-set (get resources :env/read))
         proc-commands (scope-set (get resources :proc/exec))
-        invocations (vec (:kotoba.policy/proc-exec-invocations policy))]
+        invocations (vec (:kotoba.policy/proc-exec-invocations policy))
+        git-roots (set (keep realpath-or-nil (scope-set (get resources :git/run))))
+        git-invocations (vec (:kotoba.policy/git-invocations policy))]
     (cond-> {}
       (contains? caps :fs/app-data)
       (assoc 35 (fn [request _types]
@@ -379,7 +403,41 @@
                       (record! {:capability :proc/exec :request idx-text :outcome :ok :exit (.-status r)
                                 :stdout-bytes (.byteLength js/Buffer (str (.-stdout r)) "utf8")
                                 :elapsed-ms elapsed})
-                      (js/BigInt (or (.-status r) -1)))))))))
+                      (js/BigInt (or (.-status r) -1))))))
+      (contains? caps :git/run)
+      (assoc 22 (fn [request _types]
+                  (let [idx-text (str request)
+                        idx (when (re-matches #"[0-9]+" idx-text) (js/parseInt idx-text 10))
+                        inv (when idx (get git-invocations idx))
+                        cwd (some-> inv :cwd realpath-or-nil)]
+                    (when-not inv
+                      (record! {:capability :git/run :request idx-text :outcome :denied})
+                      (deny! :git/run "grant index outside the policy's git invocation table" {:index idx-text}))
+                    (when-not (and cwd (within? cwd git-roots #{}))
+                      (record! {:capability :git/run :request idx-text :outcome :denied
+                                :reason "invocation cwd outside the granted :git/run scope"})
+                      (deny! :git/run "invocation cwd outside the granted :git/run scope" {:index idx-text :cwd (:cwd inv)}))
+                    (let [timeout (* 1000 (or (:timeout-seconds inv) 30))
+                          started (.now js/Date)
+                          r (cp/spawnSync "git" (clj->js (vec (rest (:argv inv))))
+                                          #js {:encoding "utf8" :timeout timeout :shell false :cwd cwd
+                                               :stdio #js ["ignore" "pipe" "pipe"] :maxBuffer (* 8 1024 1024)})
+                          elapsed (- (.now js/Date) started)
+                          out (str (.-stdout r))]
+                      (when (.-error r)
+                        (record! {:capability :git/run :request idx-text :outcome :failed :error (.-message (.-error r))
+                                  :timeout-ms timeout :elapsed-ms elapsed})
+                        (deny! :git/run (str "invocation failed: " (.-message (.-error r))) {:index idx-text}))
+                      (when (> (.byteLength js/Buffer out "utf8") max-stdout-bytes)
+                        (record! {:capability :git/run :request idx-text :outcome :denied
+                                  :reason "stdout exceeds the transport limit"
+                                  :bytes (.byteLength js/Buffer out "utf8") :limit max-stdout-bytes})
+                        (deny! :git/run (str "stdout exceeds the transport limit (" (.byteLength js/Buffer out "utf8")
+                                             " > " max-stdout-bytes " bytes)") {:index idx-text}))
+                      (record! {:capability :git/run :request idx-text :outcome :ok :exit (.-status r)
+                                :argv (:argv inv) :stdout-bytes (.byteLength js/Buffer out "utf8")
+                                :elapsed-ms elapsed})
+                      (str (or (.-status r) -1) "\n" out))))))))
 
 ;; ---------------------------------------------------------------- run
 (defn- guest-value [v]

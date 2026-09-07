@@ -58,7 +58,7 @@ not just compiled — by the named test suite.
 `bin/kbb` runs one `.kotoba` script under an explicit deny-by-default policy
 on a **JVM-free** backend: `--backend native` (amu `kexe_loader`, wire 35
 only) or `--backend js` (`bin/kbb_js.cljs`: `amu compile --target js
---jvm-free` + Node `instantiateKotoba`; wire ids 35/33/34/20). Scripts are
+--jvm-free` + Node `instantiateKotoba`; wire ids 35/33/34/20/22). Scripts are
 written against the `lib/kbb/` library through the project route
 (`--source-path lib`) and never spell a wire id. Every script answers ONE
 i64, so a packed number is the parity evidence between hosts and against the
@@ -90,6 +90,7 @@ backend or refuses by name with exit 3.)
 | [`examples/kbb/edn_depth_scan.kotoba`](../examples/kbb/edn_depth_scan.kotoba) | superproject `scripts/docs-edn-depth-profile.cljs` ported: end depth of an EDN document honouring escapes, char literals and `;` comments, summed over two fixtures. `:fs/app-data` only, so it runs on **both** JVM-free backends. | **3** on native AND js (nbb original prints end depth `0` + `3`) | `scripts/verify-kbb-ports.cljs`; commit `91c12dc64` |
 | [`examples/kbb/store_adoption_scan.kotoba`](../examples/kbb/store_adoption_scan.kotoba) | superproject `scripts/langchain-store-adoption-scan.cljs` ported: buckets `store.cljc` files as adopted / hand-rolled / other, packed `adopted*100 + hand-rolled*10 + other`. Scans ONE flat directory because `:fs/browse` answers names with no is-directory (a stated capability gap). | **121** (nbb original: adopted 1, hand-rolled 2, other 1) | `scripts/verify-kbb-ports.cljs`; commit `91c12dc64` |
 | [`examples/kbb/checkout_holds_probe.kotoba`](../examples/kbb/checkout_holds_probe.kotoba) | superproject `scripts/checkout-holds.cljs` ported — the NO_GIT arm (a directory without `.git` must be answered from a listing, not a git call), packed `verdict*100 + git-exit*10 + home?`. The five per-path counts are NOT ported: `:proc/exec` answers an exit status, never stdout. | **201** (nbb original exits 2, `git --version` exits 0, `HOME` set) | `scripts/verify-kbb-ports.cljs`; commit `91c12dc64` |
+| [`examples/kbb/git_status_report.kotoba`](../examples/kbb/git_status_report.kotoba) | the capability that had a wire id in the catalog and nothing behind it — `kbb.git` (:git/run, wire 22) runs ONE allowlisted git invocation by grant INDEX and answers `<exit>\n<stdout>`; the write half rides the shipped wire-35 WRITE_SEP form (`kbb.fs/write-file`), and the read-back through the same provider proves the bytes reached the disk. | **112837** = `100000` (ls-files 1 line) `+ 0` (exit 0) `+ 12800` (cat-file exit 128 — a non-zero git exit is information) `+ 15` (15 bytes written) `+ 15` (15 bytes read back) `+ 7` (round-trip equal); not granted → `:kbb-js/compile-failed`; cwd outside the `:git/run` scope or index outside the table → refused at the provider | `scripts/verify-kbb-ports.cljs` |
 
 ### Probes (`examples/kbb/probe_*.kotoba`)
 
