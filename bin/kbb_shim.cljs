@@ -8,17 +8,21 @@
 ;; capability surfaces. Routing between them is the whole job:
 ;;
 ;;   native  amu compile --target <isa> --jvm-free -> KEXE -> the measured
-;;           kexe_loader. Hosts :fs/app-data (wire 35) only; the wire-34/33/20
-;;           providers are still stubs (ADR-2609051100 task 5). This is the
-;;           DISTRIBUTION artifact.
+;;           kexe_loader. Hosts :fs/app-data (wire 35: read, write and the
+;;           RANGE_SEP ranged read) and :fs/browse (wire 34); the wire-33/20
+;;           providers are still stubs on this backend (ADR-2609051100 task
+;;           5). `--fuel` reaches the loader as KEXE_FUEL (default 512). This
+;;           is the DISTRIBUTION artifact.
 ;;   js      bin/kbb_js.cljs: amu compile --target js --jvm-free -> restricted
 ;;           ESM instantiated in this Node process. Hosts :fs/app-data,
 ;;           :env/read, :fs/browse, :proc/exec and :git/run (wire 35/33/34/20/22).
 ;;
 ;; Dispatch, with `--backend` absent (the default, :auto):
 ;;   caps subset of {:fs/app-data}                        -> native
-;;   caps subset of the js host's five                    -> js
+;;   caps subset of the js host's five                    -> js (this is
+;;           where :fs/browse scripts go for now: see `native-auto`)
 ;;   anything else                                        -> REFUSE, exit 3
+;; An explicit --backend native admits {:fs/app-data :fs/browse}.
 ;;
 ;; NO SILENT FALLBACK (ADR-2609051100). A surface no JVM-free backend hosts
 ;; is refused BY NAME with a distinct exit code (3, neither 0 nor 1) that
@@ -43,7 +47,23 @@
 
 ;; Wire ids come from kotoba-lang capability-catalog.edn; the js host's table
 ;; is bin/kbb_js.cljs `wire-ids`, the native loader's is kexe_loader.c.
-(def native-hosted #{:fs/app-data})
+;; native-hosted grew from #{:fs/app-data} on 2026-09-07 when the loader gained
+;; its wire-34 provider (amu tools/kexe_loader.c fs_browse_provider). The
+;; loader wire id of each native-hosted capability, for the allow list and
+;; the KEXE_CAP_RESOURCES_<id> scope the shim hands over.
+(def native-wire-ids {:fs/app-data 35 :fs/browse 34})
+(def native-hosted (set (keys native-wire-ids)))
+;; What :auto may ROUTE to native is narrower than what the loader hosts:
+;; lib/kbb/browse.kotoba walks its listing with string-index-of, which the
+;; native backend does not lower (measured 2026-09-07, amu f57e8142 pins:
+;; `aggregate ABI rejected: call-abi-not-admitted`; string-split-count is
+;; refused too), so a script that requires kbb.browse cannot COMPILE for
+;; native today even though the loader would host the call. :auto therefore
+;; keeps sending :fs/browse scripts to the js host, which runs them; an
+;; explicit `--backend native` is honoured and surfaces the compiler's own
+;; refusal by name (exit 1), never rerouted. Widen this set to native-hosted
+;; when kbb.browse compiles natively -- kbb_shim_test measures both.
+(def native-auto #{:fs/app-data})
 (def js-hosted #{:fs/app-data :env/read :fs/browse :proc/exec :git/run})
 (def interpreter-only #{:data/json :data/edn :http/fetch})
 
@@ -164,25 +184,32 @@
         bin))))
 
 (defn- run-native! [{:keys [script policy source-paths fuel]} amu isa]
-  ;; The loader's fuel is a compile-time constant in kexe_loader.c
-  ;; (`:fuel {:initial 512 ...}` in every report it prints), not a policy
-  ;; budget: measured 2026-09-06, a guest that runs past it dies with
-  ;; SIGTRAP whatever `--fuel` says. Accepting the flag here would be a
-  ;; knob that does nothing, so it is refused by name.
-  (when fuel
-    (die :kbb-shim/fuel-not-adjustable-on-native
-         "the native loader's fuel is fixed in kexe_loader.c; --fuel only applies to --backend js"
+  ;; `--fuel` is a budget the loader ENFORCES, not one it decides: it reaches
+  ;; kexe_loader.c as KEXE_FUEL (a positive decimal; absent = the loader's 512)
+  ;; and the report's `:fuel {:initial N ...}` echoes what was in force. Until
+  ;; 2026-09-07 the loader's fuel was a compile-time constant and this shim
+  ;; refused the flag by name; a malformed value is still refused by name here
+  ;; rather than handed to the loader to reject as exit 2.
+  (when (and fuel (not (re-matches #"[1-9][0-9]*" fuel)))
+    (die :kbb-shim/fuel-invalid
+         "--fuel must be a positive decimal integer"
          {:requested fuel :backend :native}))
-  (let [scope (set (keep realpath-or-nil (get (:kotoba.policy/capability-resources policy)
-                                              :fs/app-data #{})))
+  (let [caps (set (:kotoba.policy/capabilities policy))
+        resources (:kotoba.policy/capability-resources policy)
+        scope-of (fn [cap] (set (keep realpath-or-nil (get resources cap #{}))))
+        scopes (into {} (map (fn [cap] [cap (scope-of cap)]) caps))
         tmp (.mkdtempSync fs (.join path (.tmpdir os) "kbb-native-"))]
-    (when (empty? scope)
-      (die :kbb-shim/no-scope ":fs/app-data granted but no resource scope resolves" {:policy policy}))
-    (let [{:keys [source rewrites]} (absolutize-script script scope tmp)
+    (doseq [[cap scope] scopes]
+      (when (empty? scope)
+        (die :kbb-shim/no-scope (str (pr-str cap) " granted but no resource scope resolves")
+             {:policy policy :capability cap})))
+    (let [scope (reduce into #{} (vals scopes))
+          {:keys [source rewrites]} (absolutize-script script scope tmp)
+          wire-ids (sort (map native-wire-ids caps))
           policy-file (.join path tmp "compile-policy.edn")
           kexe (.join path tmp "guest.kexe")
           bin (.join path tmp "guest.bin")
-          _ (.writeFileSync fs policy-file (pr-str {:allow #{[:cap/call 35]}}))
+          _ (.writeFileSync fs policy-file (pr-str {:allow (set (map (fn [id] [:cap/call id]) wire-ids))}))
           amu-bin (.join path amu "bin" "amu")
           compile (node-run (.-execPath js/process)
                             (into [amu-bin "compile" source "--target" isa "--jvm-free"
@@ -196,8 +223,22 @@
               (die :kbb-shim/extract-failed (:stderr extract) {:status (:status extract)}))
           report (edn/read-string (:stdout extract))
           loader (build-loader amu)
-          r (node-run loader [bin (str (get report :offset 0)) (str (get report :arity 0)) isa "35"]
-                      {:env-extra {"KEXE_CAP_RESOURCES_35" (str/join ":" (sort scope))}})]
+          ;; One KEXE_CAP_RESOURCES_<wire id> per granted capability: the
+          ;; policy's entries as absolute LITERALS plus their realpaths, sorted
+          ;; and colon-joined. The loader grants both spellings of an entry
+          ;; (literal and resolved) so a guest may name a file by either; a
+          ;; shim that handed over only the realpath (as this one did until
+          ;; 2026-09-07) made "/var/folders/.../f" trap SIGILL while
+          ;; "/private/var/folders/.../f" read -- the js host resolved both.
+          env-extra (cond-> (into {} (map (fn [[cap dirs]]
+                                            (let [literals (map #(.resolve path %) (get resources cap #{}))]
+                                              [(str "KEXE_CAP_RESOURCES_" (native-wire-ids cap))
+                                               (str/join ":" (sort (distinct (concat literals dirs))))]))
+                                          scopes))
+                      fuel (assoc "KEXE_FUEL" fuel))
+          r (node-run loader [bin (str (get report :offset 0)) (str (get report :arity 0)) isa
+                              (str/join "," wire-ids)]
+                      {:env-extra env-extra})]
       (when (not= 0 (:status r))
         (die :kbb-shim/loader-failed (:stderr r) {:status (:status r) :rewrites rewrites}))
       (emit! {:kotoba.cli/ok? true
@@ -208,6 +249,8 @@
                                 :kotoba.kbb/backend :native
                                 :kotoba.kbb/target (str isa "-kotoba-v1")
                                 :kotoba.kbb/scope (vec (sort scope))
+                                :kotoba.kbb/scopes (into {} (map (fn [[cap dirs]] [cap (vec (sort dirs))]) scopes))
+                                :kotoba.kbb/fuel (if fuel (js/Number fuel) 512)
                                 :kotoba.kbb/path-rewrites rewrites}}
              0))))
 
@@ -278,7 +321,7 @@
                   (refuse-surface! caps :native))
 
         (cond
-          (every? native-hosted caps) (run-native! opts (amu-home) (host-isa))
+          (every? native-auto caps) (run-native! opts (amu-home) (host-isa))
           (every? js-hosted caps) (run-js! opts)
           :else (refuse-surface! caps :auto))))))
 
