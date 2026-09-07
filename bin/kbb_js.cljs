@@ -20,7 +20,10 @@
 ;;      $AMU_HOME or the deps.edn pin under ~/.gitlibs; a checkout without
 ;;      node_modules/nbb is a refusal that names the fix, not a fallback.
 ;;   3. instantiates the emitted restricted ESM with grants keyed by wire id:
-;;        35 :fs/app-data   read one file inside the realpath'd scope
+;;        35 :fs/app-data   read one file inside the realpath'd scope, or
+;;                         write one: request "<path>WRITE_SEP<content>"
+;;                         (same token the native loader takes, amu 6cca3852);
+;;                         the result is the content written back
 ;;        33 :env/read      one granted NAME; unset answers "" (loader parity)
 ;;        34 :fs/browse     sorted entry names of one scoped directory, "\n"-joined
 ;;        20 :proc/exec     one policy invocation by grant index; exit status
@@ -51,6 +54,13 @@
 (def version 1)
 (def max-policy-bytes 65536)
 (def max-file-bytes 65536)          ; the artifact's string-value-bytes limit
+;; The write form of wire 35 is "<path>WRITE_SEP<content>". An ASCII token,
+;; not a control character: Kotoba source cannot emit one and has no
+;; char-to-string builtin, so the guest builds the request with
+;; string-concat. Same token as the native loader (amu 6cca3852,
+;; tools/kexe_loader.c fs_app_data_write_provider); a second occurrence
+;; anywhere in the request is refused fail-closed there and here.
+(def write-token "WRITE_SEP")
 (def wire-ids {:fs/app-data 35 :env/read 33 :fs/browse 34 :proc/exec 20})
 (def compile-names {:fs/app-data :fs/app-data :env/read :env/read
                     :fs/browse :fs/browse :proc/exec :process/spawn})
@@ -194,6 +204,112 @@
   (or (contains? scope-files resolved)
       (some (fn [d] (or (= d resolved) (str/starts-with? resolved (str d (.-sep path))))) scope-dirs)))
 
+(defn- fs-read!
+  "Wire 35, read form: request = path -> file content. Unchanged from the
+  read-only host (its receipts carry no :op key so existing measurements
+  still match)."
+  [p fs-dirs fs-files record!]
+  (let [abs (.resolve path p)
+        resolved (realpath-or-nil abs)]
+    (when-not (and resolved (within? resolved fs-dirs fs-files))
+      (record! {:capability :fs/app-data :request p :outcome :denied})
+      (deny! :fs/app-data "path outside the granted :fs/app-data scope" {:path p}))
+    ;; Every refusal below records a :denied receipt BEFORE it
+    ;; throws (measured 2026-09-06: the directory and
+    ;; over-limit refusals threw without one, so the receipt
+    ;; list of a denied run was empty -- indistinguishable
+    ;; from a run that never reached the provider).
+    (let [fd (try (.openSync fs resolved (bit-or (.-O_RDONLY (.-constants fs)) (or (.-O_NOFOLLOW (.-constants fs)) 0)))
+                  (catch :default e
+                    (record! {:capability :fs/app-data :request p :outcome :denied :reason (.-message e)})
+                    (deny! :fs/app-data (str "cannot open: " (.-message e)) {:path p})))]
+      (try
+        (let [st (.fstatSync fs fd)]
+          (when-not (.isFile st)
+            (record! {:capability :fs/app-data :request p :outcome :denied :reason "not a regular file"})
+            (deny! :fs/app-data "not a regular file" {:path p}))
+          (when (> (.-size st) max-file-bytes)
+            (record! {:capability :fs/app-data :request p :outcome :denied :reason "file exceeds the guest string limit"
+                      :bytes (.-size st) :limit max-file-bytes})
+            (deny! :fs/app-data (str "file exceeds the guest string limit (" (.-size st) " > " max-file-bytes " bytes)")
+                   {:path p :bytes (.-size st) :limit max-file-bytes}))
+          (let [buf (.readFileSync fs fd "utf8")]
+            (record! {:capability :fs/app-data :request p :outcome :ok :bytes (.-size st)})
+            buf))
+        (finally (.closeSync fs fd))))))
+
+(defn- fs-write!
+  "Wire 35, write form: request = \"<path>WRITE_SEP<content>\" -> the content
+  written back (the native loader returns `intern_utf8(content)` so the
+  guest verifies with string-byte-length / string=?; mirrored exactly).
+
+  Refusals, each with a :denied receipt first, in the order the loader
+  checks them: a second WRITE_SEP anywhere after the first; an empty path;
+  content over max-file-bytes (the read form's limit -- the loader has no
+  separate write cap, but a file this host cannot read back is not a
+  round-trip; measured 2026-09-07: a compiled guest cannot reach this
+  branch, because the whole request is ONE guest string and the artifact
+  refuses it as `string-too-large` at 65537 bytes, so the effective content
+  ceiling is 65536 - 9 - byte-length(path) and the check here is the
+  belt for a caller that is not a compiled guest); a target whose parent
+  directory does not exist (the loader's open(2) fails there: it does not
+  create parents, so neither does this);
+  a target outside the realpath'd scope (a NEW file is judged by its
+  realpath'd parent, an EXISTING one by its own realpath); a directory; a
+  symlink (O_NOFOLLOW at the loader -- here an lstat refusal, because the
+  write goes through a temp file + rename and rename would replace the link
+  rather than follow it, which is a different thing from what the loader
+  does). The write itself is atomic: temp file in the same directory
+  (O_CREAT|O_EXCL, 0644), fsync, rename over the target."
+  [req fs-dirs fs-files record!]
+  (let [sep (.indexOf req write-token)
+        p (subs req 0 sep)
+        content (subs req (+ sep (count write-token)))
+        bytes (.byteLength js/Buffer content "utf8")
+        refuse! (fn [why data]
+                  (record! (merge {:capability :fs/app-data :op :write :request p :outcome :denied :reason why} data))
+                  (deny! :fs/app-data why (assoc data :path p)))]
+    (when (str/includes? content write-token)
+      (refuse! "content contains the WRITE_SEP token" {}))
+    (when (str/blank? p)
+      (refuse! "empty path" {}))
+    (when (> bytes max-file-bytes)
+      (refuse! "content exceeds the guest string limit" {:bytes bytes :limit max-file-bytes}))
+    (let [abs (.resolve path p)
+          parent (realpath-or-nil (.dirname path abs))
+          _ (when-not parent
+              ;; scope first, as the loader does: a missing parent OUTSIDE
+              ;; the grant is refused as out-of-scope, and the reason
+              ;; string does not say whether that directory exists
+              (if (within? abs fs-dirs fs-files)
+                (refuse! "parent directory does not exist" {})
+                (refuse! "path outside the granted :fs/app-data scope" {})))
+          candidate (.join path parent (.basename path abs))
+          lst (try (.lstatSync fs candidate) (catch :default _ nil))]
+      (when (and lst (.isSymbolicLink lst))
+        (refuse! "refusing to write through a symlink" {}))
+      (when-not (within? candidate fs-dirs fs-files)
+        (refuse! "path outside the granted :fs/app-data scope" {}))
+      (when (and lst (.isDirectory lst))
+        (refuse! "not a regular file" {}))
+      (when (and lst (not (.isFile lst)))
+        (refuse! "not a regular file" {}))
+      (let [tmp (.join path parent (str "." (.basename path abs) ".kbb-" (.toString (.randomBytes crypto 6) "hex") ".tmp"))
+            c (.-constants fs)
+            fd (try (.openSync fs tmp (bit-or (.-O_WRONLY c) (.-O_CREAT c) (.-O_EXCL c) (or (.-O_NOFOLLOW c) 0)) 0x1a4)
+                    (catch :default e (refuse! (str "cannot create: " (.-message e)) {})))]
+        (try
+          (.writeFileSync fs fd content "utf8")
+          (.fsyncSync fs fd)
+          (.closeSync fs fd)
+          (.renameSync fs tmp candidate)
+          (catch :default e
+            (try (.closeSync fs fd) (catch :default _ nil))
+            (try (.unlinkSync fs tmp) (catch :default _ nil))
+            (refuse! (str "cannot write: " (.-message e)) {})))
+        (record! {:capability :fs/app-data :op :write :request p :outcome :ok :bytes bytes})
+        content))))
+
 (defn- make-providers
   "Grants keyed by wire id, closed over the policy. Scope entries are
   realpath'd ONCE, here, before the guest runs; a scope entry that does not
@@ -212,35 +328,10 @@
     (cond-> {}
       (contains? caps :fs/app-data)
       (assoc 35 (fn [request _types]
-                  (let [p (str request)
-                        abs (.resolve path p)
-                        resolved (realpath-or-nil abs)]
-                    (when-not (and resolved (within? resolved fs-dirs fs-files))
-                      (record! {:capability :fs/app-data :request p :outcome :denied})
-                      (deny! :fs/app-data "path outside the granted :fs/app-data scope" {:path p}))
-                    ;; Every refusal below records a :denied receipt BEFORE it
-                    ;; throws (measured 2026-09-06: the directory and
-                    ;; over-limit refusals threw without one, so the receipt
-                    ;; list of a denied run was empty -- indistinguishable
-                    ;; from a run that never reached the provider).
-                    (let [fd (try (.openSync fs resolved (bit-or (.-O_RDONLY (.-constants fs)) (or (.-O_NOFOLLOW (.-constants fs)) 0)))
-                                  (catch :default e
-                                    (record! {:capability :fs/app-data :request p :outcome :denied :reason (.-message e)})
-                                    (deny! :fs/app-data (str "cannot open: " (.-message e)) {:path p})))]
-                      (try
-                        (let [st (.fstatSync fs fd)]
-                          (when-not (.isFile st)
-                            (record! {:capability :fs/app-data :request p :outcome :denied :reason "not a regular file"})
-                            (deny! :fs/app-data "not a regular file" {:path p}))
-                          (when (> (.-size st) max-file-bytes)
-                            (record! {:capability :fs/app-data :request p :outcome :denied :reason "file exceeds the guest string limit"
-                                      :bytes (.-size st) :limit max-file-bytes})
-                            (deny! :fs/app-data (str "file exceeds the guest string limit (" (.-size st) " > " max-file-bytes " bytes)")
-                                   {:path p :bytes (.-size st) :limit max-file-bytes}))
-                          (let [buf (.readFileSync fs fd "utf8")]
-                            (record! {:capability :fs/app-data :request p :outcome :ok :bytes (.-size st)})
-                            buf))
-                        (finally (.closeSync fs fd)))))))
+                  (let [req (str request)]
+                    (if (str/includes? req write-token)
+                      (fs-write! req fs-dirs fs-files record!)
+                      (fs-read! req fs-dirs fs-files record!)))))
       (contains? caps :env/read)
       (assoc 33 (fn [request _types]
                   (let [n (str request)]

@@ -1,0 +1,228 @@
+(ns kotoba.kbb-js-write-test
+  "The WRITE form of wire 35 (:fs/app-data) on kbb --backend js
+  (bin/kbb_js.cljs), mirroring the native loader's provider (amu 6cca3852,
+  tools/kexe_loader.c fs_app_data_write_provider): request
+  \"<path>WRITE_SEP<content>\", result = the content written back.
+
+  Measured here: the round trip (examples/kbb/fs_roundtrip.kotoba writes
+  20 bytes into the .gitkeep'd scope directory, reads them back, answers
+  20; the receipt sequence is write :ok then read :ok; the bytes on disk
+  are exactly the content); a new file and a truncating rewrite through
+  examples/kbb/probe_fs_write_via_env.kotoba (path and content arrive via
+  two granted env names, because a guest has no argv); and the refusals,
+  each leaving the three marks kbb-js-providers-test defines -- exit 1,
+  :kbb-js/guest-failed naming :fs/app-data, a LAST receipt with :outcome
+  :denied: a path outside the scope, a second WRITE_SEP in the content, a
+  directory target, a missing parent directory (the loader's open(2)
+  fails; no parent is created), a symlink (O_NOFOLLOW at the loader).
+
+  The size limit is measured for what it IS, not what the provider says:
+  the request is one guest string, so the artifact refuses
+  path + 9 + content > 65536 bytes as `string-too-large` BEFORE the
+  provider runs -- exit 1, :kbb-js/guest-failed, no :fs/app-data receipt at
+  all. The largest content that fits (65536 - 9 - byte-length(path)) is
+  written and answered in full.
+
+  Needs `nbb` on PATH and an amu checkout with node_modules (AMU_HOME, or
+  the deps.edn pin under ~/.gitlibs); otherwise SKIPPED, and it says so."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]])
+  (:import [java.nio.file Files Paths]
+           [java.nio.file.attribute FileAttribute]))
+
+(def ^:private home (System/getProperty "user.dir"))
+
+(defn- nbb-available? []
+  (try (zero? (:exit (shell/sh "nbb" "--version"))) (catch Exception _ false)))
+
+(defn- amu-available? []
+  (let [amu-home (or (System/getenv "AMU_HOME")
+                     (let [sha (second (re-find #"kotoba-lang/amu\s*\{[^}]*:git/sha\s+\"([0-9a-f]{40})\""
+                                                (slurp (io/file home "deps.edn"))))]
+                       (when sha (str (System/getProperty "user.home") "/.gitlibs/libs/io.github.kotoba-lang/amu/" sha))))]
+    (and amu-home (.exists (io/file amu-home "node_modules" "nbb" "cli.js")))))
+
+(def ^:private ready? (delay (and (nbb-available?) (amu-available?))))
+
+(defmacro when-ready [& body]
+  `(if @ready?
+     (do ~@body)
+     (println "SKIPPED kotoba.kbb-js-write-test: nbb or an amu checkout with node_modules is not available (set AMU_HOME)")))
+
+(defn- kbb-js
+  "Runs bin/kbb_js.cljs with `extra-env` merged over the process env and
+  KBB_HOME = this checkout; returns the printed receipt plus :exit."
+  [extra-env & argv]
+  (let [env (-> (into {} (System/getenv)) (merge extra-env) (assoc "KBB_HOME" home))
+        {:keys [exit out err]} (apply shell/sh "nbb" "bin/kbb_js.cljs" (concat argv [:env env]))
+        receipt (try (edn/read-string (last (remove str/blank? (str/split-lines out))))
+                     (catch Exception _ nil))]
+    (when-not (map? receipt)
+      (throw (ex-info "kbb_js printed no receipt" {:exit exit :out out :err err})))
+    (assoc receipt :exit exit)))
+
+(defn- receipts [r] (get-in r [:kotoba.cli/data :kotoba.kbb/receipts]))
+(defn- fs-receipts [r] (filterv #(= :fs/app-data (:capability %)) (receipts r)))
+
+(defn- refused!
+  "The three marks every provider refusal leaves (same as
+  kbb-js-providers-test). Returns the last receipt so the caller pins the
+  reason."
+  [r cap]
+  (is (not (:kotoba.cli/ok? r)) (pr-str r))
+  (is (= 1 (:exit r)))
+  (is (= :kbb-js/guest-failed (:kotoba.cli/code r)))
+  (is (= cap (get-in r [:kotoba.cli/data :kotoba.kbb/capability])) (pr-str r))
+  (is (str/starts-with? (:kotoba.cli/message r) (str (subs (str cap) 1) ": ")) (:kotoba.cli/message r))
+  (let [last-receipt (last (receipts r))]
+    (is (= cap (:capability last-receipt)) (pr-str (receipts r)))
+    (is (= :denied (:outcome last-receipt)) (pr-str (receipts r)))
+    last-receipt))
+
+(defn- temp-dir []
+  ;; realpath'd, so the paths the probe receives are the ones the host's
+  ;; receipts echo (macOS puts temp dirs under /var -> /private/var)
+  (str (.toRealPath (Files/createTempDirectory "kbb-js-write" (make-array FileAttribute 0))
+                    (make-array java.nio.file.LinkOption 0))))
+
+(defn- delete-tree! [dir]
+  (doseq [^java.io.File f (reverse (file-seq (io/file dir)))]
+    (.delete f)))
+
+(defn- write-policy! [dir]
+  (let [f (io/file dir "policy.edn")]
+    (spit f (pr-str {:kotoba.policy/capabilities #{:env/read :fs/app-data}
+                     :kotoba.policy/forbid-wildcard true
+                     :kotoba.policy/capability-resources
+                     {:env/read #{"KBB_PROBE_PATH" "KBB_PROBE_CONTENT"}
+                      :fs/app-data #{(.getPath (io/file dir "scope"))}}}))
+    (.getPath f)))
+
+(defn- write-receipt [p outcome & [extra]]
+  (merge {:capability :fs/app-data :op :write :request p :outcome outcome} extra))
+
+;; ---------------------------------------------------------------- round trip
+
+(deftest fs-roundtrip-writes-then-reads-back
+  (when-ready
+   (let [out (io/file home "test/fixtures/kbb_js_write/out/report.txt")
+         p "test/fixtures/kbb_js_write/out/report.txt"]
+     (try
+       (.delete out)
+       (let [r (kbb-js {} "examples/kbb/fs_roundtrip.kotoba" "--policy" "examples/kbb/fs_roundtrip_policy.edn" "--source-path" "lib")]
+         (is (:kotoba.cli/ok? r) (pr-str r))
+         (is (zero? (:exit r)))
+         (is (= 20 (get-in r [:kotoba.cli/data :kotoba.kbb/result])))
+         (is (= [35] (get-in r [:kotoba.cli/data :kotoba.kbb/required-capabilities])))
+         (testing "the receipt sequence is the write (:op :write) then the read (no :op, as before this slice)"
+           (is (= [(write-receipt p :ok {:bytes 20})
+                   {:capability :fs/app-data :request p :outcome :ok :bytes 20}]
+                  (receipts r))))
+         (testing "the bytes on disk are exactly the content the guest sent"
+           (is (.exists out))
+           (is (= "kbb write roundtrip\n" (slurp out)))
+           (is (= 20 (.length out)))))
+       (finally (.delete out))))))
+
+;; ---------------------------------------------------------------- the write form through the probe
+
+(deftest fs-write-creates-and-truncates-inside-the-scope
+  (when-ready
+   (let [tmp (temp-dir)
+         scope (io/file tmp "scope")]
+     (try
+       (.mkdirs scope)
+       (let [policy (write-policy! tmp)
+             run (fn [p content] (kbb-js {"KBB_PROBE_PATH" p "KBB_PROBE_CONTENT" content}
+                                         "examples/kbb/probe_fs_write_via_env.kotoba" "--policy" policy "--source-path" "lib"))
+             new-file (io/file scope "new.txt")
+             existing (io/file scope "existing.txt")]
+         (testing "a new file inside the scope: the result is the content written back (3 bytes), and the file holds it"
+           (let [r (run (.getPath new-file) "abc")]
+             (is (:kotoba.cli/ok? r) (pr-str r))
+             (is (zero? (:exit r)))
+             (is (= 3 (get-in r [:kotoba.cli/data :kotoba.kbb/result])))
+             (is (= [(write-receipt (.getPath new-file) :ok {:bytes 3})] (fs-receipts r)))
+             (is (= "abc" (slurp new-file)))))
+         (testing "an existing longer file is truncated to the new content (O_TRUNC at the loader; rename-over here)"
+           (spit existing "old content, longer than the new one\n")
+           (let [r (run (.getPath existing) "short")]
+             (is (:kotoba.cli/ok? r) (pr-str r))
+             (is (= 5 (get-in r [:kotoba.cli/data :kotoba.kbb/result])))
+             (is (= "short" (slurp existing)))))
+         (testing "the largest content that fits the 65536-byte request string is written whole; one byte more is refused by the artifact before the provider"
+           (let [p (.getPath (io/file scope "cap.txt"))
+                 fit (- 65536 9 (count (.getBytes p "UTF-8")))
+                 r-fit (run p (apply str (repeat fit "a")))
+                 r-over (run p (apply str (repeat (inc fit) "a")))]
+             (is (:kotoba.cli/ok? r-fit) (pr-str (dissoc r-fit :kotoba.cli/data)))
+             (is (= fit (get-in r-fit [:kotoba.cli/data :kotoba.kbb/result])))
+             (is (= fit (.length (io/file p))))
+             (println "measured: fs/app-data write fits" fit "bytes of content for a" (count (.getBytes p "UTF-8")) "byte path")
+             (is (not (:kotoba.cli/ok? r-over)))
+             (is (= 1 (:exit r-over)))
+             (is (= :kbb-js/guest-failed (:kotoba.cli/code r-over)))
+             (is (= "string-too-large" (:kotoba.cli/message r-over)) (:kotoba.cli/message r-over))
+             (is (nil? (get-in r-over [:kotoba.cli/data :kotoba.kbb/capability])))
+             (is (= [] (fs-receipts r-over)) "the provider was never reached")
+             (is (= fit (.length (io/file p))) "the earlier content is untouched")))
+         (testing "no temp file is left in the scope directory"
+           (is (empty? (filter #(str/ends-with? % ".tmp") (.list scope))) (pr-str (vec (.list scope))))))
+       (finally (delete-tree! tmp))))))
+
+;; ---------------------------------------------------------------- refusals
+
+(deftest fs-write-refusals
+  (when-ready
+   (let [tmp (temp-dir)
+         scope (io/file tmp "scope")
+         sub (io/file scope "sub")
+         link (io/file scope "link")
+         outside (io/file tmp "outside")
+         target (io/file outside "target.txt")]
+     (try
+       (.mkdirs sub)
+       (.mkdirs outside)
+       (spit target "x")
+       (Files/createSymbolicLink (Paths/get (.getPath link) (make-array String 0))
+                                 (Paths/get "../outside/target.txt" (make-array String 0))
+                                 (make-array FileAttribute 0))
+       (let [policy (write-policy! tmp)
+             run (fn [p content] (kbb-js {"KBB_PROBE_PATH" p "KBB_PROBE_CONTENT" content}
+                                         "examples/kbb/probe_fs_write_via_env.kotoba" "--policy" policy "--source-path" "lib"))
+             denied (fn [r] (get-in r [:kotoba.cli/data :kotoba.kbb/denied]))]
+         (testing "a path outside the scope (existing parent) is denied, nothing is created"
+           (let [p (.getPath (io/file outside "x.txt"))
+                 r (run p "abc")]
+             (is (= (write-receipt p :denied {:reason "path outside the granted :fs/app-data scope"}) (refused! r :fs/app-data)))
+             (is (= "path outside the granted :fs/app-data scope" (denied r)))
+             (is (not (.exists (io/file p))))))
+         (testing "a path outside the scope whose parent does not exist is denied as out-of-scope (the reason does not say whether that directory exists)"
+           (let [p (.getPath (io/file outside "nope" "x.txt"))
+                 r (run p "abc")]
+             (is (= (write-receipt p :denied {:reason "path outside the granted :fs/app-data scope"}) (refused! r :fs/app-data)))))
+         (testing "content containing a second WRITE_SEP is denied fail-closed"
+           (let [p (.getPath (io/file scope "tok.txt"))
+                 r (run p "aWRITE_SEPb")]
+             (is (= (write-receipt p :denied {:reason "content contains the WRITE_SEP token"}) (refused! r :fs/app-data)))
+             (is (= "content contains the WRITE_SEP token" (denied r)))
+             (is (not (.exists (io/file p))))))
+         (testing "a directory inside the scope is denied: not a regular file"
+           (let [r (run (.getPath sub) "abc")]
+             (is (= (write-receipt (.getPath sub) :denied {:reason "not a regular file"}) (refused! r :fs/app-data)))
+             (is (.isDirectory sub))))
+         (testing "a missing parent directory inside the scope is denied; no parent is created (the loader's open(2) fails the same way)"
+           (let [p (.getPath (io/file scope "nope" "x.txt"))
+                 r (run p "abc")]
+             (is (= (write-receipt p :denied {:reason "parent directory does not exist"}) (refused! r :fs/app-data)))
+             (is (not (.exists (io/file scope "nope"))))))
+         (testing "a symlink inside the scope is denied (O_NOFOLLOW at the loader); its target outside is untouched"
+           (let [r (run (.getPath link) "abc")]
+             (is (= (write-receipt (.getPath link) :denied {:reason "refusing to write through a symlink"}) (refused! r :fs/app-data)))
+             (is (= "x" (slurp target)))))
+         (testing "no temp file is left behind by any refusal"
+           (is (empty? (filter #(str/ends-with? % ".tmp") (.list scope))) (pr-str (vec (.list scope))))))
+       (finally (delete-tree! tmp))))))

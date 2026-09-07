@@ -738,11 +738,20 @@ names of one scoped directory, `"\n"`-joined), `20 :proc/exec` (one policy
 invocation by grant index; exit status). `:data/json`, `:data/edn` and
 `:http/fetch` have no compiler wire id, so the host refuses them by name and
 points at the interpreter backend — never a silent fallback. Every refusal is
-a receipt with `:outcome :denied`.
+a receipt with `:outcome :denied`. (EDN *values* need no capability at all:
+`kbb.edn` parses the bytes `kbb.fs` reads — `examples/kbb/edn_value_read.kotoba`
+→ 6272 on the JVM-free route.)
 
 `lib/kbb/` is the library scripts write against — `kbb.fs/read-file`,
-`kbb.env/read`, `kbb.browse/entries`, `kbb.proc/exec` and friends — so a script
-never spells a `typed-cap-call` or a wire id. It is consumed through the
+`kbb.fs/write-file`, `kbb.env/read`, `kbb.browse/entries`, `kbb.proc/exec` and
+friends — so a script never spells a `typed-cap-call` or a wire id. Wire 35
+now writes as well as reads: the request `"<path>WRITE_SEP<content>"` (an
+ASCII token, because Kotoba source cannot emit a control character) is the
+form the native loader takes too (amu `6cca3852`), a second `WRITE_SEP` in
+the request is refused, and the result is the content written back, so
+`kbb.fs/write-ok?` is a `string=?` against what was sent
+(`examples/kbb/fs_roundtrip.kotoba` → 20; refusals measured in
+`test/kotoba/kbb_js_write_test.clj`). It is consumed through the
 project route (`--source-path lib`) and compiles on the js and native
 backends alike; `kbb.browse` and `kbb.proc` run on js today because the native
 loader's wire-34/20 providers are still stubs (ADR-2609051100 task 5). amu is
@@ -752,11 +761,14 @@ and a checkout without `node_modules/nbb` is a named refusal.
 when `nbb` or amu is missing. `examples/kbb/no_bb_scan.kotoba` is the first
 gate script ported to the compile route (ADR-2607181900 item ②): the test
 measures it and the interpreter twin `src/no_bb_scan.kotoba` in one place
-(both 3). `kbb.str` (`starts-with?` / `ends-with?` / `line-count` / `nth-line` /
+(both 3); `examples/kbb/shebang_scan.kotoba` is the second (the interpreter's
+`[1 2 2]` packed as 122). `kbb.str` (`starts-with?` / `ends-with?` / `line-count` / `nth-line` /
 `count-matches`, all byte-addressed, no capability) is what the ported scans
 walk their listings with; `examples/kbb/env_scan.kotoba` takes its directory
 from `KBB_SCAN_DIR` through `kbb.env` and is measured in
 `test/kotoba/kbb_lib_test.clj` (dirty_dir 3, clean_dir 0, unset → browse denied).
+Every `examples/kbb/*.kotoba` script and probe, with its measured answer and
+the test that asserts it, is indexed in `docs/DEMONSTRATIONS.md` § kbb.
 
 `cljs emit` currently compiles a NARROW backend slice of `.kotoba` (arithmetic/comparison/
 boolean forms, `pair`, map `get`/`assoc` — the ops ADR-2607150000's
