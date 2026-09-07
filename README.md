@@ -741,8 +741,15 @@ points at the interpreter backend — never a silent fallback. Every refusal is
 a receipt with `:outcome :denied`.
 
 `lib/kbb/` is the library scripts write against — `kbb.fs/read-file`,
-`kbb.env/read`, `kbb.browse/entries`, `kbb.proc/exec` and friends — so a script
-never spells a `typed-cap-call` or a wire id. It is consumed through the
+`kbb.fs/write-file`, `kbb.env/read`, `kbb.browse/entries`, `kbb.proc/exec` and
+friends — so a script never spells a `typed-cap-call` or a wire id. Wire 35
+now writes as well as reads: the request `"<path>WRITE_SEP<content>"` (an
+ASCII token, because Kotoba source cannot emit a control character) is the
+form the native loader takes too (amu `6cca3852`), a second `WRITE_SEP` in
+the request is refused, and the result is the content written back, so
+`kbb.fs/write-ok?` is a `string=?` against what was sent
+(`examples/kbb/fs_roundtrip.kotoba` → 20; refusals measured in
+`test/kotoba/kbb_js_write_test.clj`). It is consumed through the
 project route (`--source-path lib`) and compiles on the js and native
 backends alike; `kbb.browse` and `kbb.proc` run on js today because the native
 loader's wire-34/20 providers are still stubs (ADR-2609051100 task 5). amu is
