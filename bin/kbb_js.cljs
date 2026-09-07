@@ -449,9 +449,12 @@
                     (when-not (.isDirectory (.statSync fs resolved))
                       (record! {:capability :fs/browse :request d :outcome :denied :reason "not a directory"})
                       (deny! :fs/browse "not a directory" {:dir d}))
-                    (let [names (vec (sort (js->clj (.readdirSync fs resolved))))]
-                      (record! {:capability :fs/browse :request d :outcome :ok :entries (count names)})
-                      (str/join "\n" names)))))
+(let [ents (map (fn [e] [(.-name e) (.isDirectory e)])
+                                     (.readdirSync fs resolved #js {:withFileTypes true}))
+                          ents (sort-by first ents)
+                          lines (vec (map (fn [[n d?]] (str n "\t" (if d? "1" "0"))) ents))]
+                      (record! {:capability :fs/browse :request d :outcome :ok :entries (count lines)})
+                      (str/join "\n" lines)))))
       (contains? caps :proc/exec)
       (assoc 20 (fn [request _types]
                   (let [idx-text (str request)

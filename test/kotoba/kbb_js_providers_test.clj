@@ -138,6 +138,31 @@
              (is (= "directory outside the granted :fs/browse scope" (get-in r [:kotoba.cli/data :kotoba.kbb/denied]))))))
        (finally (delete-tree! tmp))))))
 
+(deftest fs-browse-is-dir-flag
+  (when-ready
+   (let [tmp (temp-dir)
+         scoped (io/file tmp "scoped")]
+     (try
+       (.mkdirs scoped)
+       (.mkdirs (io/file scoped "sub"))
+       (spit (io/file scoped "a.txt") "a")
+       (spit (io/file scoped "b.txt") "b")
+       (spit (io/file scoped "sub" "x.txt") "x")
+       (let [policy (write-policy! tmp {:kotoba.policy/capabilities #{:env/read :fs/browse}
+                                        :kotoba.policy/forbid-wildcard true
+                                        :kotoba.policy/capability-resources {:env/read #{"KBB_PROBE_DIR"}
+                                                                             :fs/browse #{(.getPath scoped)}}})
+             r (kbb-js {"KBB_PROBE_DIR" (.getPath scoped)}
+                       "examples/kbb/probe_browse_kind_via_env.kotoba"
+                       "--policy" policy "--source-path" "lib")]
+         (testing "the host answers the wire with the is-directory flag: entry-count 3, subdirs = the one subdirectory (3 bytes), per-line accessors parse a directory line and a file line"
+           (is (:kotoba.cli/ok? r) (pr-str r))
+           (is (zero? (:exit r)) (str (:out r) (:err r)))
+           (is (= 1 (get-in r [:kotoba.cli/data :kotoba.kbb/result])) (pr-str r))
+           (is (= {:capability :fs/browse :request (.getPath scoped) :outcome :ok :entries 3}
+                  (last (receipts r))))))
+       (finally (delete-tree! tmp))))))
+
 ;; ---------------------------------------------------------------- :fs/app-data (35)
 
 (deftest fs-app-data-boundary
