@@ -12,7 +12,6 @@
   round-trip of stdout through wire 20 -- if the host ever discards stdout
   again, examples/kbb/proc_stdout.kotoba answers 0 and this test goes red."
   (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
