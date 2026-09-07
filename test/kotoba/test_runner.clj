@@ -24,6 +24,7 @@
             [kotoba.llm-infer-host-test]
             [kotoba.kbb-js-providers-test]
             [kotoba.kbb-js-write-test]
+            [kotoba.kbb-js-range-test]
             [kotoba.kbb-js-cli-test]
             [kotoba.kbb-lib-test]
             [kotoba.key-hierarchy-test]
@@ -127,6 +128,7 @@
                                         'kotoba.llm-infer-host-test
                                         'kotoba.kbb-js-providers-test
                                         'kotoba.kbb-js-write-test
+                                        'kotoba.kbb-js-range-test
                                         'kotoba.kbb-js-cli-test
                                         'kotoba.kbb-lib-test
                                         'kotoba.key-hierarchy-test

@@ -6,7 +6,9 @@
   kexe_loader. A green run here is evidence the JVM-free kbb path works
   (cold start far below JVM kotoba.kbb)."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.java.io :as io]
             [clojure.java.shell :as shell]
+            [clojure.string :as str]
             [clojure.edn :as edn]))
 
 (def ^:private nbb-exe (or (System/getenv "NBB") "nbb"))
@@ -72,3 +74,164 @@
             (is (= 1 (:exit r)))
             (is (= :kbb-js/guest-failed (:kotoba.cli/code (edn/read-string (:out r))))))
           (finally (.delete tmp)))))))
+
+
+;; ---------------------------------------------------------------------------
+;; The native loader's kbb host contract (amu ADR-0343, 2026-09-07): --fuel
+;; reaches the loader as KEXE_FUEL, :fs/browse (wire 34) is hosted, and the
+;; wire-35 RANGE_SEP form reads a bounded window. The shim resolves amu the
+;; way `amu-home` does (AMU_HOME, else the deps.edn pin under ~/.gitlibs);
+;; when THAT loader predates the contract the native tests below print
+;; SKIPPED by name rather than failing on a pin nobody advanced -- and the
+;; marker they look for is the feature itself in the loader source.
+
+(defn- amu-home []
+  (or (System/getenv "AMU_HOME")
+      (when-let [sha (second (re-find #"kotoba-lang/amu\s*\{[^}]*:git/sha\s+\"([0-9a-f]{40})\""
+                                      (slurp (io/file "deps.edn"))))]
+        (str (System/getProperty "user.home") "/.gitlibs/libs/io.github.kotoba-lang/amu/" sha))))
+
+(defn- loader-has? [marker]
+  (let [f (io/file (amu-home) "tools" "kexe_loader.c")]
+    (and (.exists f) (str/includes? (slurp f) marker))))
+
+(defn- skip! [marker]
+  (println (str "SKIPPED kotoba.kbb-shim-test native contract: the amu loader at " (amu-home)
+                " has no " marker "; advance the deps.edn amu pin (or point AMU_HOME at one that has it)")))
+
+(defn- receipt [r] (edn/read-string (:out r)))
+
+(defn- temp-dir []
+  (str (java.nio.file.Files/createTempDirectory "kbb-shim-native" (make-array java.nio.file.attribute.FileAttribute 0))))
+
+(defn- delete-tree! [dir]
+  (doseq [^java.io.File f (reverse (file-seq (io/file dir)))] (.delete f)))
+
+(defn- fs-policy! [dir]
+  (let [f (io/file dir "policy.edn")]
+    (spit f (pr-str {:kotoba.policy/capabilities #{:fs/app-data} :kotoba.policy/forbid-wildcard true
+                     :kotoba.policy/capability-resources {:fs/app-data #{dir}}}))
+    (.getPath f)))
+
+(deftest native-fuel-is-a-budget-the-shim-passes-through
+  (when (shim-enabled?)
+    (testing "--fuel 12abc is refused by the shim by name, before any compile"
+      (let [r (run-shim "src/demo_kbb_fs_read_native.kotoba" "--policy" "src/demo_kbb_fs_read_native_policy.edn"
+                        "--backend" "native" "--fuel" "12abc")]
+        (is (= 1 (:exit r)))
+        (is (= :kbb-shim/fuel-invalid (:kotoba.cli/code (receipt r))) (:out r))))
+    (if-not (loader-has? "KEXE_FUEL")
+      (skip! "KEXE_FUEL")
+      (let [tmp (temp-dir)
+            data (io/file tmp "walk.txt")
+            script (io/file tmp "nl_count.kotoba")
+            policy (fs-policy! tmp)]
+        (try
+          ;; 1,800 bytes, 37 newlines: more steps than the default 512 fuel,
+          ;; fewer than the 4096-handle pair arena the walk spends two per byte.
+          (spit data (subs (apply str (repeat 40 (str (apply str (repeat 47 \x)) "\n"))) 0 1800))
+          (spit script (str "(ns probe.nl-count (:require [kbb.fs :as fs]) (:export [main]))\n"
+                            "(defn count-nl [s :string i :i64 n :i64 acc :i64] :i64\n"
+                            "  (if (>= i n) acc (count-nl s (+ i 1) n (if (string=? (string-substring s i (+ i 1)) \"\\n\") (+ acc 1) acc))))\n"
+                            "(defn main [] :i64 (let [c (fs/read-file \"" (.getPath data) "\")] (count-nl c 0 (string-byte-length c) 0)))\n"))
+          (testing "without --fuel the loader's 512 default still traps (SIGTRAP)"
+            (let [r (run-shim (.getPath script) "--policy" policy "--source-path" "lib" "--backend" "native")]
+              (is (= 1 (:exit r)))
+              (is (= :kbb-shim/loader-failed (:kotoba.cli/code (receipt r))) (:out r))
+              (is (str/includes? (:kotoba.cli/message (receipt r)) ":signal :SIGTRAP") (:out r))))
+          (testing "--fuel 100000000 reaches the loader: the walk completes and the receipt names the budget"
+            (let [r (run-shim (.getPath script) "--policy" policy "--source-path" "lib" "--backend" "native" "--fuel" "100000000")
+                  m (receipt r)]
+              (is (zero? (:exit r)) (str "exit=" (:exit r) " out=" (:out r) " err=" (:err r)))
+              (is (= 37 (get-in m [:kotoba.cli/data :kotoba.kbb/result])))
+              (is (= 100000000 (get-in m [:kotoba.cli/data :kotoba.kbb/fuel])))))
+          (testing "the js backend answers the same 37 for the same walk"
+            (let [r (run-shim (.getPath script) "--policy" policy "--source-path" "lib" "--backend" "js" "--fuel" "100000000")]
+              (is (zero? (:exit r)) (:out r))
+              (is (= 37 (get-in (receipt r) [:kotoba.cli/data :kotoba.kbb/result])))))
+          (finally (delete-tree! tmp)))))))
+
+(deftest native-hosts-fs-browse-and-auto-still-routes-it-to-js
+  (when (shim-enabled?)
+    (let [tmp (temp-dir)
+          dir (io/file tmp "listing")
+          policy (io/file tmp "browse_policy.edn")
+          via-lib (io/file tmp "browse_count.kotoba")
+          via-wire (io/file tmp "browse_bytes.kotoba")]
+      (try
+        (.mkdirs dir)
+        (doseq [n ["b" "a" ".h"]] (spit (io/file dir n) n))
+        (spit policy (pr-str {:kotoba.policy/capabilities #{:fs/browse} :kotoba.policy/forbid-wildcard true
+                              :kotoba.policy/capability-resources {:fs/browse #{(.getPath dir)}}}))
+        (spit via-lib (str "(ns probe.browse-count (:require [kbb.browse :as browse]) (:export [main]))\n"
+                           "(defn main [] :i64 (browse/entry-count \"" (.getPath dir) "\"))\n"))
+        (spit via-wire (str "(ns probe.browse-bytes (:export [main]))\n"
+                            "(defn main [] :i64 (string-byte-length (typed-cap-call :fs/browse :string :string \"" (.getPath dir) "\")))\n"))
+        (testing ":auto routes a :fs/browse script to the js host, which runs it (3 entries)"
+          (let [r (run-shim (.getPath via-lib) "--policy" (.getPath policy) "--source-path" "lib")
+                m (receipt r)]
+            (is (zero? (:exit r)) (:out r))
+            (is (= :js (get-in m [:kotoba.cli/data :kotoba.kbb/backend])))
+            (is (= 3 (get-in m [:kotoba.cli/data :kotoba.kbb/result])))))
+        (testing "an explicit --backend native is admitted by the shim and surfaces the native compiler's refusal of kbb.browse by name (string-index-of is not lowered natively; when this goes red, widen native-auto)"
+          (let [r (run-shim (.getPath via-lib) "--policy" (.getPath policy) "--source-path" "lib" "--backend" "native")
+                m (receipt r)]
+            (is (= 1 (:exit r)))
+            (is (= :kbb-shim/compile-failed (:kotoba.cli/code m)) (:out r))
+            (is (str/includes? (:kotoba.cli/message m) "call-abi-not-admitted") (:out r))))
+        (if-not (loader-has? "fs_browse_provider")
+          (skip! "fs_browse_provider (wire 34)")
+          (testing "the loader's wire-34 provider answers the listing the js host answers: \".h\\na\\nb\" = 6 bytes"
+            (let [native (run-shim (.getPath via-wire) "--policy" (.getPath policy) "--backend" "native")
+                  js (run-shim (.getPath via-wire) "--policy" (.getPath policy) "--backend" "js")]
+              (is (zero? (:exit native)) (str (:out native) (:err native)))
+              (is (zero? (:exit js)) (:out js))
+              (is (= 6 (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/result])))
+              (is (= 6 (get-in (receipt js) [:kotoba.cli/data :kotoba.kbb/result])))
+              (is (= {:fs/browse [(str (.toRealPath (.toPath dir) (make-array java.nio.file.LinkOption 0)))]}
+                     (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/scopes]))))))
+        (finally (delete-tree! tmp))))))
+
+(deftest native-range-read-matches-js-and-the-file
+  (when (shim-enabled?)
+    (if-not (loader-has? "RANGE_SEP")
+      (skip! "RANGE_SEP (wire-35 range form)")
+      (let [tmp (temp-dir)
+            big (io/file tmp "big.txt")
+            out (io/file tmp "out.bin")
+            policy (fs-policy! tmp)
+            pattern "0123456789abcdef\n"
+            ascii (fn [n] (subs (apply str (repeat (inc (quot n (count pattern))) pattern)) 0 n))
+            bytes (.getBytes (str (ascii 5000) "─" (ascii (- 70000 5003))) java.nio.charset.StandardCharsets/UTF_8)
+            script! (fn [off len]
+                      (let [f (io/file tmp (str "range_" off "_" len ".kotoba"))]
+                        (spit f (str "(ns probe.range-copy (:require [kbb.fs :as fs]) (:export [main]))\n"
+                                     "(defn main [] :i64 (fs/write-bytes-count \"" (.getPath out) "\" (fs/read-range \"" (.getPath big) "\" " off " " len ")))\n"))
+                        (.getPath f)))
+            slice (fn [off len] (java.util.Arrays/copyOfRange ^bytes bytes (int off) (int (+ off len))))]
+        (try
+          (io/copy bytes big)
+          (doseq [[off len] [[0 4096] [66000 4000]]
+                  backend ["native" "js"]]
+            (testing (str "[" off ", +" len ") on " backend " is byte-identical to the file")
+              (.delete out)
+              (let [r (run-shim (script! off len) "--policy" policy "--source-path" "lib" "--backend" backend)]
+                (is (zero? (:exit r)) (str backend " exit=" (:exit r) " out=" (:out r) " err=" (:err r)))
+                (is (= len (get-in (receipt r) [:kotoba.cli/data :kotoba.kbb/result])))
+                (is (java.util.Arrays/equals ^bytes (slice off len)
+                                             ^bytes (java.nio.file.Files/readAllBytes (.toPath out)))))))
+          (testing "a window cutting U+2500 traps on native (SIGILL) and is refused by name on js"
+            (let [native (run-shim (script! 5001 4) "--policy" policy "--source-path" "lib" "--backend" "native")
+                  js (run-shim (script! 5001 4) "--policy" policy "--source-path" "lib" "--backend" "js")]
+              (is (= 1 (:exit native)))
+              (is (str/includes? (:kotoba.cli/message (receipt native)) ":signal :SIGILL") (:out native))
+              (is (= 1 (:exit js)))
+              (is (= "range does not fall on UTF-8 code-point boundaries"
+                     (get-in (receipt js) [:kotoba.cli/data :kotoba.kbb/denied])) (:out js))))
+          (testing "a window past EOF traps on native and is refused by name on js"
+            (let [native (run-shim (script! 69500 1000) "--policy" policy "--source-path" "lib" "--backend" "native")
+                  js (run-shim (script! 69500 1000) "--policy" policy "--source-path" "lib" "--backend" "js")]
+              (is (str/includes? (:kotoba.cli/message (receipt native)) ":signal :SIGILL") (:out native))
+              (is (= "range [69500, 70500) lies outside the file (70000 bytes)"
+                     (get-in (receipt js) [:kotoba.cli/data :kotoba.kbb/denied])) (:out js))))
+          (finally (delete-tree! tmp)))))))

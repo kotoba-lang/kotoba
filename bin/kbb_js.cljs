@@ -24,7 +24,11 @@
 ;;        35 :fs/app-data   read one file inside the realpath'd scope, or
 ;;                          write one: request "<path>WRITE_SEP<content>"
 ;;                          (same token the native loader takes, amu 6cca3852);
-;;                          the result is the content written back
+;;                          the result is the content written back; or read
+;;                          one bounded window of a file larger than a guest
+;;                          string: request "<path>RANGE_SEP<offset>:<length>"
+;;                          -> exactly those bytes (same token and bounds as
+;;                          the loader's fs_app_data_range_read_provider)
 ;;        33 :env/read      one granted NAME; unset answers "" (loader parity)
 ;;        34 :fs/browse     sorted entry names of one scoped directory, "\n"-joined
 ;;        20 :proc/exec     one policy invocation by grant index; exit status
@@ -65,6 +69,14 @@
 ;; tools/kexe_loader.c fs_app_data_write_provider); a second occurrence
 ;; anywhere in the request is refused fail-closed there and here.
 (def write-token "WRITE_SEP")
+;; The range form of wire 35 is "<path>RANGE_SEP<offset>:<length>": exactly
+;; `length` bytes from byte `offset`, refused (not shortened) when the window
+;; leaves the file, when `length` exceeds the guest string limit, or when the
+;; bytes do not decode as UTF-8 -- a window that cuts a code point is a
+;; request for bytes no guest string may hold. WRITE_SEP is tested first, so
+;; written content may itself contain RANGE_SEP. Same token, bounds and order
+;; as the native loader (amu tools/kexe_loader.c, 2026-09-07).
+(def range-token "RANGE_SEP")
 (def wire-ids {:fs/app-data 35 :env/read 33 :fs/browse 34 :proc/exec 20
                :git/run 22})
 (def compile-names {:fs/app-data :fs/app-data :env/read :env/read
@@ -260,6 +272,66 @@
             buf))
         (finally (.closeSync fs fd))))))
 
+(defn- fs-read-range!
+  "Wire 35, range form: request = \"<path>RANGE_SEP<offset>:<length>\" ->
+  exactly `length` bytes of the file from byte `offset`, decoded as UTF-8.
+  Mirrors the native loader's fs_app_data_range_read_provider check for
+  check: one token occurrence, a decimal offset and length, the window inside
+  the file (no short read is ever answered), length within the guest string
+  limit, and the bytes must decode as UTF-8. Every refusal records a :denied
+  receipt (with :op :read-range) before it throws."
+  [req fs-dirs fs-files record!]
+  (let [first-idx (str/index-of req range-token)
+        p (subs req 0 first-idx)
+        spec (subs req (+ first-idx (count range-token)))
+        refuse! (fn [why data]
+                  (record! (merge {:capability :fs/app-data :op :read-range :request p :outcome :denied :reason why} data))
+                  (deny! :fs/app-data why (merge {:path p} data)))
+        [_ off-text len-text] (re-matches #"([0-9]{1,20}):([0-9]{1,20})" spec)]
+    (when (str/includes? spec range-token)
+      (refuse! "request contains the RANGE_SEP token twice" {}))
+    (when (str/blank? p)
+      (refuse! "empty path" {}))
+    (when-not off-text
+      (refuse! "range spec must be <offset>:<length> in decimal" {:spec spec}))
+    (let [off (js/Number off-text)
+          len (js/Number len-text)]
+      (when-not (and (js/Number.isSafeInteger off) (js/Number.isSafeInteger len))
+        (refuse! "range spec exceeds the safe integer range" {:spec spec}))
+      (when (> len max-file-bytes)
+        (refuse! "range length exceeds the guest string limit" {:length len :limit max-file-bytes}))
+      (let [abs (.resolve path p)
+            resolved (realpath-or-nil abs)]
+        (when-not (and resolved (within? resolved fs-dirs fs-files))
+          (refuse! "path outside the granted :fs/app-data scope" {}))
+        (let [fd (try (.openSync fs resolved (bit-or (.-O_RDONLY (.-constants fs)) (or (.-O_NOFOLLOW (.-constants fs)) 0)))
+                      (catch :default e (refuse! (str "cannot open: " (.-message e)) {})))]
+          (try
+            (let [st (.fstatSync fs fd)
+                  size (.-size st)]
+              (when-not (.isFile st)
+                (refuse! "not a regular file" {}))
+              (when (or (> off size) (> len (- size off)))
+                (refuse! (str "range [" off ", " (+ off len) ") lies outside the file (" size " bytes)")
+                         {:offset off :length len :bytes size}))
+              (let [buf (js/Buffer.alloc len)]
+                (loop [got 0]
+                  (when (< got len)
+                    (let [n (.readSync fs fd buf got (- len got) (+ off got))]
+                      (when (zero? n)
+                        (refuse! "file shrank during the read" {:offset off :length len}))
+                      (recur (+ got n)))))
+                ;; fatal: a cut code point is refused; ignoreBOM: the bytes are
+                ;; answered as they are, a leading U+FEFF included (the loader
+                ;; interns bytes and never strips one).
+                (let [text (try (.decode (js/TextDecoder. "utf-8" #js {:fatal true :ignoreBOM true}) buf)
+                                (catch :default _
+                                  (refuse! "range does not fall on UTF-8 code-point boundaries"
+                                           {:offset off :length len})))]
+                  (record! {:capability :fs/app-data :op :read-range :request p :offset off :length len :outcome :ok :bytes len})
+                  text)))
+            (finally (.closeSync fs fd))))))))
+
 (defn- fs-write!
   "Wire 35, write form: request = \"<path>WRITE_SEP<content>\" -> the content
   written back (the native loader returns `intern_utf8(content)` so the
@@ -353,9 +425,10 @@
       (contains? caps :fs/app-data)
       (assoc 35 (fn [request _types]
                   (let [req (str request)]
-                    (if (str/includes? req write-token)
-                      (fs-write! req fs-dirs fs-files record!)
-                      (fs-read! req fs-dirs fs-files record!)))))
+                    (cond
+                      (str/includes? req write-token) (fs-write! req fs-dirs fs-files record!)
+                      (str/includes? req range-token) (fs-read-range! req fs-dirs fs-files record!)
+                      :else (fs-read! req fs-dirs fs-files record!)))))
       (contains? caps :env/read)
       (assoc 33 (fn [request _types]
                   (let [n (str request)]
