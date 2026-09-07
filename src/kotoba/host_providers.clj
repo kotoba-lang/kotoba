@@ -492,18 +492,14 @@
                  (let [url (str (first args))]
                    (http-check-permitted! concrete url)
                    (try
-                     (let [req (-> (java.net.http.HttpRequest/newBuilder
-                                    (java.net.URI/create url))
-                                   (.timeout java.time.Duration/ofSeconds 30)
-                                   (.GET)
-                                   (.build))
-                           resp (.send (java.net.http.HttpClient/newHttpClient)
-                                       req
-                                       (java.net.http.HttpResponse$BodyHandlers/ofString))]
-                       (if (<= 200 (.statusCode resp) 299)
-                         (.body resp)
-                         -1))
-                     (catch Exception _ -1))))
+                   ;; delegated to kotoba.net.jvm-host (the workspace's single
+                   ;; java.net.http site)
+                   (let [resp ((jvm-host/http-transport {:timeout-seconds 30})
+                               {:url url :method :get})]
+                     (if (<= 200 (:status resp) 299)
+                       (:body resp)
+                       -1))
+                   (catch Exception _ -1))))
    'keychain-read (fn [_cap _args] 0)
    'keychain-write (fn [_cap _args] 0)
    'fs-read (fn [concrete args]
