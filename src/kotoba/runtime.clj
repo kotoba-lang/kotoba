@@ -443,6 +443,11 @@
    ;; listing narrowed to the granted directory TREE (see the fs-browse
    ;; handler in kotoba.host-providers for the per-call narrowing).
    'fs-browse :host/fs-browse
+   ;; fs/browse-dir (capability id 261, kotoba-core-contracts 2ff3f736):
+   ;; directory listing WITH an is-dir flag per entry, for the
+   ;; kotoba-lang/find recursive tree-walk. Same narrowing as fs-browse
+   ;; (granted directory TREE); the handler in kotoba.host-providers.
+   'fs-browse-dir :host/fs-browse-dir
    ;; data/json (capability id 246, kotoba-core-contracts): JSON wire-format
    ;; ops. One kind for the family (same convention as topic-* ->
    ;; :host/topic-subscribe). The interpreter slice passes plain values, not

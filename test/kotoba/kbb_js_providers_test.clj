@@ -138,6 +138,37 @@
              (is (= "directory outside the granted :fs/browse scope" (get-in r [:kotoba.cli/data :kotoba.kbb/denied]))))))
        (finally (delete-tree! tmp))))))
 
+;; ---------------------------------------------------------------- :fs/browse-dir (261)
+
+(deftest fs-browse-dir-boundary
+  (when-ready
+   (let [tmp (temp-dir)
+         scoped (io/file tmp "scoped")
+         sub (io/file scoped "subdir")
+         outside (io/file tmp "outside")]
+     (try
+       (.mkdirs scoped)
+       (.mkdirs sub)
+       (.mkdirs outside)
+       ;; 3 files + 1 subdir in scoped
+       (doseq [n ["e.cljs" "a.clj" "b.cljc"]] (spit (io/file scoped n) n))
+       (let [policy (write-policy! tmp {:kotoba.policy/capabilities #{:env/read :fs/browse-dir}
+                                        :kotoba.policy/forbid-wildcard true
+                                        :kotoba.policy/capability-resources {:env/read #{"KBB_PROBE_DIR"}
+                                                                             :fs/browse-dir #{(.getPath scoped)}}})
+             run (fn [dir] (kbb-js {"KBB_PROBE_DIR" dir} "examples/kbb/probe_browse_dir_via_env.kotoba" "--policy" policy "--source-path" "lib"))]
+         (testing "a scoped directory: result counts exactly the 1 subdirectory (3 files + 1 dir, flags 0/0/0/1)"
+           (let [r (run (.getPath scoped))]
+             (is (:kotoba.cli/ok? r) (pr-str r))
+             (is (= 1 (get-in r [:kotoba.cli/data :kotoba.kbb/result])) (pr-str r))
+             (is (= {:capability :fs/browse-dir :request (.getPath scoped) :outcome :ok :entries 4}
+                    (last (receipts r))))))
+         (testing "a FILE inside the scope is denied: not a directory"
+           (let [f (.getPath (io/file scoped "a.cljs"))
+                 r (run f)]
+             (is (= {:capability :fs/browse-dir :request f :outcome :denied :reason "not a directory"} (refused! r :fs/browse-dir))))))
+       (finally (delete-tree! tmp))))))
+
 ;; ---------------------------------------------------------------- :fs/app-data (35)
 
 (deftest fs-app-data-boundary

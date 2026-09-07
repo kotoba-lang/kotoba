@@ -65,10 +65,10 @@
 ;; tools/kexe_loader.c fs_app_data_write_provider); a second occurrence
 ;; anywhere in the request is refused fail-closed there and here.
 (def write-token "WRITE_SEP")
-(def wire-ids {:fs/app-data 35 :env/read 33 :fs/browse 34 :proc/exec 20
+(def wire-ids {:fs/app-data 35 :env/read 33 :fs/browse 34 :fs/browse-dir 261 :proc/exec 20
                :git/run 22})
 (def compile-names {:fs/app-data :fs/app-data :env/read :env/read
-                    :fs/browse :fs/browse :proc/exec :process/spawn
+                    :fs/browse :fs/browse :fs/browse-dir :fs/browse-dir :proc/exec :process/spawn
                     :git/run :git/run})
 (def interpreter-only #{:data/json :data/edn :http/fetch})
 (def hosted (set (keys wire-ids)))
@@ -163,6 +163,7 @@
       (needs-scope :fs/app-data :kbb/fs-resource-scope-required) (needs-scope :fs/app-data :kbb/fs-resource-scope-required)
       (needs-scope :env/read :kbb/env-resource-scope-required) (needs-scope :env/read :kbb/env-resource-scope-required)
       (needs-scope :fs/browse :kbb/fs-browse-resource-scope-required) (needs-scope :fs/browse :kbb/fs-browse-resource-scope-required)
+      (needs-scope :fs/browse-dir :kbb/fs-browse-dir-resource-scope-required) (needs-scope :fs/browse-dir :kbb/fs-browse-dir-resource-scope-required)
       (needs-scope :proc/exec :kbb/proc-resource-scope-required) (needs-scope :proc/exec :kbb/proc-resource-scope-required)
       (needs-scope :git/run :kbb/git-resource-scope-required) (needs-scope :git/run :kbb/git-resource-scope-required)
       (and (contains? caps :proc/exec)
@@ -343,7 +344,9 @@
         fs-scope (keep realpath-or-nil (scope-set (get resources :fs/app-data)))
         fs-files (set (filter #(try (.isFile (.statSync fs %)) (catch :default _ false)) fs-scope))
         fs-dirs (set (filter #(try (.isDirectory (.statSync fs %)) (catch :default _ false)) fs-scope))
-        browse-dirs (set (keep realpath-or-nil (scope-set (get resources :fs/browse))))
+        browse-dirs (set (keep realpath-or-nil
+                                  (concat (scope-set (get resources :fs/browse))
+                                          (scope-set (get resources :fs/browse-dir)))))
         env-names (scope-set (get resources :env/read))
         proc-commands (scope-set (get resources :proc/exec))
         invocations (vec (:kotoba.policy/proc-exec-invocations policy))
@@ -378,6 +381,24 @@
                     (let [names (vec (sort (js->clj (.readdirSync fs resolved))))]
                       (record! {:capability :fs/browse :request d :outcome :ok :entries (count names)})
                       (str/join "\n" names)))))
+      (contains? caps :fs/browse-dir)
+      (assoc 261 (fn [request _types]
+                  (let [d (str request)
+                        resolved (realpath-or-nil (.resolve path d))]
+                    (when-not (and resolved (within? resolved browse-dirs #{}))
+                      (record! {:capability :fs/browse-dir :request d :outcome :denied})
+                      (deny! :fs/browse-dir "directory outside the granted :fs/browse-dir scope" {:dir d}))
+                    (when-not (.isDirectory (.statSync fs resolved))
+                      (record! {:capability :fs/browse-dir :request d :outcome :denied :reason "not a directory"})
+                      (deny! :fs/browse-dir "not a directory" {:dir d}))
+                    (let [names (vec (sort (js->clj (.readdirSync fs resolved))))
+                          lines (vec (map (fn [nm]
+                                           (let [p (.resolve path resolved nm)
+                                                 isdir (try (.isDirectory (.statSync fs p)) (catch :default _ false))]
+                                             (str nm "\t" (if isdir 1 0))))
+                                                 names))]
+                      (record! {:capability :fs/browse-dir :request d :outcome :ok :entries (count names)})
+                      (str/join "\n" lines)))))
       (contains? caps :proc/exec)
       (assoc 20 (fn [request _types]
                   (let [idx-text (str request)

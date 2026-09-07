@@ -627,6 +627,26 @@
                   (let [f (io/file dir)]
                     (when (.isDirectory f)
                       (vec (.list f))))))
+   ;; kotoba-lang/find (capability id 261, "fs/browse-dir") — directory
+   ;; listing WITH an is-dir flag per entry, so a guest can walk a tree
+   ;; recursively. Same narrowing as fs-browse (fs-browse-check-permitted!:
+   ;; granted directory TREE, prefix boundary on a path separator), so a
+   ;; grant of fs/browse-dir cannot be escaped via a sibling dir or "..".
+   ;; Returns a "\n"-joined string where each line is "<name>\t<0|1>"
+   ;; (0 = file, 1 = directory) — flowed through the interpreter slice's
+   ;; plain-string result convention exactly like env-read, so the js/wasm
+   ;; backends carry it via the shared string ABI and the guest splits it.
+   ;; A granted-but-missing directory returns nil (absent, like fs-browse).
+   'fs-browse-dir (fn [concrete args]
+                    (let [dir (first args)]
+                      (fs-browse-check-permitted! concrete dir)
+                      (let [f (io/file dir)]
+                        (when (.isDirectory f)
+                          (let [names (.list f)]
+                            (cstr/join "\n"
+                              (map (fn [nm]
+                                     (str nm "\t" (if (.isDirectory (io/file dir nm)) 1 0)))
+                                   names)))))))
    'topic-publish (fn [_cap _args] 0)
    'topic-poll (fn [_cap _args] 0)
    'topic-take (fn [_cap _args] 0)
