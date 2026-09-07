@@ -40,6 +40,7 @@
             [kotoba.kgraph :as kgraph]
             [kotoba.lang.capability-host :as capability-host]
             [kotoba.lang.capability-values :as capability-values]
+            [kotoba.net.jvm-host :as jvm-host]
             [kotoba.security.information-flow :as flow]
             [kotoba.runtime :as runtime]))
 
