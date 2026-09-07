@@ -738,7 +738,9 @@ names of one scoped directory, `"\n"`-joined), `20 :proc/exec` (one policy
 invocation by grant index; exit status). `:data/json`, `:data/edn` and
 `:http/fetch` have no compiler wire id, so the host refuses them by name and
 points at the interpreter backend — never a silent fallback. Every refusal is
-a receipt with `:outcome :denied`.
+a receipt with `:outcome :denied`. (EDN *values* need no capability at all:
+`kbb.edn` parses the bytes `kbb.fs` reads — `examples/kbb/edn_value_read.kotoba`
+→ 6272 on the JVM-free route.)
 
 `lib/kbb/` is the library scripts write against — `kbb.fs/read-file`,
 `kbb.fs/write-file`, `kbb.env/read`, `kbb.browse/entries`, `kbb.proc/exec` and
@@ -759,11 +761,14 @@ and a checkout without `node_modules/nbb` is a named refusal.
 when `nbb` or amu is missing. `examples/kbb/no_bb_scan.kotoba` is the first
 gate script ported to the compile route (ADR-2607181900 item ②): the test
 measures it and the interpreter twin `src/no_bb_scan.kotoba` in one place
-(both 3). `kbb.str` (`starts-with?` / `ends-with?` / `line-count` / `nth-line` /
+(both 3); `examples/kbb/shebang_scan.kotoba` is the second (the interpreter's
+`[1 2 2]` packed as 122). `kbb.str` (`starts-with?` / `ends-with?` / `line-count` / `nth-line` /
 `count-matches`, all byte-addressed, no capability) is what the ported scans
 walk their listings with; `examples/kbb/env_scan.kotoba` takes its directory
 from `KBB_SCAN_DIR` through `kbb.env` and is measured in
 `test/kotoba/kbb_lib_test.clj` (dirty_dir 3, clean_dir 0, unset → browse denied).
+Every `examples/kbb/*.kotoba` script and probe, with its measured answer and
+the test that asserts it, is indexed in `docs/DEMONSTRATIONS.md` § kbb.
 
 `cljs emit` currently compiles a NARROW backend slice of `.kotoba` (arithmetic/comparison/
 boolean forms, `pair`, map `get`/`assoc` — the ops ADR-2607150000's

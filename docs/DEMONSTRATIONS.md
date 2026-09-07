@@ -53,6 +53,77 @@ not just compiled — by the named test suite.
 | **`actor:host` ABI** (`demo_actor_host_*`) | `sha256`, `sign`, `verify`, `keypair`, `http_post`, `log_read` | the kototama `actor:host` vocabulary (crypto / http / log — ADR-2607062330) called from `.kotoba`: hashing, Ed25519 keypair/sign/verify, HTTP POST, append-only log reads | `actor_host_test.clj` |
 | **aiueOS kernel caps** (`demo_aiueos_*`) | `clock`, `random`, `log`, `irq`, `dma`, `mmio`, `pci`, `topic_publish`, `topic_poll` | OS-kernel-level capability surface (interrupts, DMA, MMIO, PCI, …) confined behind the same policy mechanism | `aiueos_kernel_caps_test.clj` |
 
+## kbb — operational scripts on the JVM-free hosts (`examples/kbb/`, `lib/kbb/`)
+
+`bin/kbb` runs one `.kotoba` script under an explicit deny-by-default policy
+on a **JVM-free** backend: `--backend native` (amu `kexe_loader`, wire 35
+only) or `--backend js` (`bin/kbb_js.cljs`: `amu compile --target js
+--jvm-free` + Node `instantiateKotoba`; wire ids 35/33/34/20). Scripts are
+written against the `lib/kbb/` library through the project route
+(`--source-path lib`) and never spell a wire id. Every script answers ONE
+i64, so a packed number is the parity evidence between hosts and against the
+nbb original it ports (ADR-2607181900; `docs/ADR-kbb-js-backend-oracle.md`,
+`docs/ADR-kbb-jvm-free-front-door.md`).
+
+Run one:
+
+```bash
+bin/kbb examples/kbb/fs_report.kotoba --policy examples/kbb/fs_report_policy.edn --backend js --source-path lib
+nbb bin/kbb_js.cljs examples/kbb/fs_report.kotoba --policy examples/kbb/fs_report_policy.edn --source-path lib --json
+```
+
+(`bin/kbb <script> --policy <p> [--backend native|js|interpreter] [--source-path <dir>]... [--fuel <n>] [--json]`
+is the shim's usage line; with `--backend` absent it routes to a JVM-free
+backend or refuses by name with exit 3.)
+
+### Scripts
+
+| program | what it demonstrates | measured answer | executed by |
+|---|---|---|---|
+| [`examples/kbb/fs_report.kotoba`](../examples/kbb/fs_report.kotoba) | the `demo_kbb_fs_report` pattern written against the library: read one policy-scoped file through `kbb.fs`, answer its byte count. Compiles on js and native through `--source-path lib`. | **84** | `kbb_js_test.clj` |
+| [`examples/kbb/env_browse_proc.kotoba`](../examples/kbb/env_browse_proc.kotoba) | the three non-fs modules in one script: entry count of one directory (`kbb.browse`), whether `HOME` is set (`kbb.env`), exit status of the policy's invocation 0 (`kbb.proc`, `echo`). | `entries * 1000 + (HOME set? 100 : 0) + exit`; the test recomputes `entries` from the fixture dir at run time and asserts required capabilities `[20 33 34]` | `kbb_js_test.clj` |
+| [`examples/kbb/no_bb_scan.kotoba`](../examples/kbb/no_bb_scan.kotoba) | **gate item ② first port**: the interpreter gate script `src/no_bb_scan.kotoba` (verify-no-babashka residue scan — name ends `.bb`, name is `bb.edn`, content starts `#!/usr/bin/env bb`) on the compile route; listing walked with `kbb.str/line-count` + `nth-line`. | **3** — same as the interpreter twin, asserted together | `kbb_js_test.clj` |
+| [`examples/kbb/shebang_scan.kotoba`](../examples/kbb/shebang_scan.kotoba) | second gate port: `src/shebang_scan.kotoba`'s per-file class (bb-shebang / other-shebang / no-shebang), the interpreter's 3-vector packed as `bb*100 + other*10 + none`. | **122** (↔ `[1 2 2]`) | `kbb_js_test.clj` |
+| [`examples/kbb/env_scan.kotoba`](../examples/kbb/env_scan.kotoba) | third gate port: no_bb_scan's three checks over ONE directory named by the env var `KBB_SCAN_DIR` read through `kbb.env` — four library modules in one script (env + browse + fs + str). | **3** for `dirty_dir`, **0** for `clean_dir`; unset → `kbb.env/read` answers `""`, the `""` directory is outside the `:fs/browse` scope, host denies → `:kbb-js/guest-failed` with a `:denied` receipt | `kbb_lib_test.clj` |
+| [`examples/kbb/fs_roundtrip.kotoba`](../examples/kbb/fs_roundtrip.kotoba) | the wire-35 WRITE form: write one policy-scoped file through `kbb.fs/write-ok?`, read it back through `kbb.fs/read-bytes-count`, answer the length read back (−1 if the host did not hand back exactly what was written). Scope `test/fixtures/kbb_js_write/out`. | **20** | `kbb_js_write_test.clj` |
+| [`examples/kbb/edn_value_read.kotoba`](../examples/kbb/edn_value_read.kotoba) | reading VALUES out of a real EDN file with **no `:data/edn` capability** — bytes via `:fs/app-data`, parsing is computation in `kbb.edn` (a `}` inside a string, a `{` inside a comment and `\{` / `\;` char literals must not move the entry count). | **6272** = `6000` (6 entries) `+ 42` (`:count`) `+ 200` (`:pins` present) `+ 0` (`:missing` absent) `+ 30` (well-formed); not granted → `:kotoba/admission-denied`; granted but out of scope → `:denied` receipt | `scripts/verify-kbb-ports.cljs`; commit `de0880da2` |
+| [`examples/kbb/edn_depth_scan.kotoba`](../examples/kbb/edn_depth_scan.kotoba) | superproject `scripts/docs-edn-depth-profile.cljs` ported: end depth of an EDN document honouring escapes, char literals and `;` comments, summed over two fixtures. `:fs/app-data` only, so it runs on **both** JVM-free backends. | **3** on native AND js (nbb original prints end depth `0` + `3`) | `scripts/verify-kbb-ports.cljs`; commit `91c12dc64` |
+| [`examples/kbb/store_adoption_scan.kotoba`](../examples/kbb/store_adoption_scan.kotoba) | superproject `scripts/langchain-store-adoption-scan.cljs` ported: buckets `store.cljc` files as adopted / hand-rolled / other, packed `adopted*100 + hand-rolled*10 + other`. Scans ONE flat directory because `:fs/browse` answers names with no is-directory (a stated capability gap). | **121** (nbb original: adopted 1, hand-rolled 2, other 1) | `scripts/verify-kbb-ports.cljs`; commit `91c12dc64` |
+| [`examples/kbb/checkout_holds_probe.kotoba`](../examples/kbb/checkout_holds_probe.kotoba) | superproject `scripts/checkout-holds.cljs` ported — the NO_GIT arm (a directory without `.git` must be answered from a listing, not a git call), packed `verdict*100 + git-exit*10 + home?`. The five per-path counts are NOT ported: `:proc/exec` answers an exit status, never stdout. | **201** (nbb original exits 2, `git --version` exits 0, `HOME` set) | `scripts/verify-kbb-ports.cljs`; commit `91c12dc64` |
+
+### Probes (`examples/kbb/probe_*.kotoba`)
+
+Each probe measures one host rule from outside; a guest has no argv, so the
+value under test arrives through a granted env name the test sets at run time.
+
+| probe | rule measured | measured answer | executed by |
+|---|---|---|---|
+| `probe_fuel` | does `kbb --fuel N` reach the compiled module? Self-recursive countdown, empty capability set. | **100** under the host default (amu's 512); under `--fuel 8` the guest traps `fuel-exhausted`. Countdown is 100 not 200 because kotoba-kir's `lower` oracle executes an effect-free entry once at compile time under its own budget (200 failed there as `:kotoba/lowering-failed "fuel-exhausted"`, measured 2026-09-06 on amu ffd9adfa) | `kbb_js_cli_test.clj` |
+| `probe_str` | `kbb.str` with NO capability; eight checks, one bit each. | **255** (all eight hold; a zero bit names the failing check) | `kbb_lib_test.clj` |
+| `probe_str_oracle` | a PURE module reaching `kbb.str/nth-line` **does not compile** on the amu pin: `ir/lower` constant-folds `main` through the KIR reference interpreter, which has no `string-index-of` case. | refused with `unknown-function`, asserted by its literal so the test goes red the day the interpreter learns the op (would answer 1) | `kbb_lib_test.clj` |
+| `probe_env_unset` | `:env/read` of a granted-but-unset name | `""` → `present?` false → **0** | `kbb_js_providers_test.clj` |
+| `probe_env_equals` | `:env/read` of a name containing `=`, even when the policy grants that exact string | host refuses (`:denied`) | `kbb_js_providers_test.clj` |
+| `probe_env_outside` | `:env/read` of a name the policy does not grant | refused before `getenv` runs; `main` never returns | `kbb_js_providers_test.clj` |
+| `probe_fs_via_env` | `:fs/app-data` READ of a path from `KBB_PROBE_PATH` | byte count, or `:denied` for over-limit (65537 bytes → receipt `:bytes 65537 :limit 65536`), a directory, a symlink escaping the scope | `kbb_js_providers_test.clj` |
+| `probe_fs_write_via_env` | `:fs/app-data` WRITE of `KBB_PROBE_CONTENT` to `KBB_PROBE_PATH` | bytes written back, or `:denied` for outside-scope, a second `WRITE_SEP`, over 65536 bytes, a directory, a missing parent, a symlink | `kbb_js_write_test.clj` |
+| `probe_browse_via_env` | `:fs/browse` of a directory from `KBB_PROBE_DIR` | entry count (5-entry temp dir → 5), or `:denied` for a file or a directory outside the scope | `kbb_js_providers_test.clj` |
+| `probe_proc_via_env` | `:proc/exec` by grant index from `KBB_PROBE_INDEX` | exit status, or `:denied` for index out of range / command outside the scope set; `sleep 5` under `:timeout-seconds 1` → `:failed` `ETIMEDOUT` | `kbb_js_providers_test.clj` |
+
+### Library (`lib/kbb/`)
+
+One module per capability; each owns its wire id and typed request/result
+shape once, so a script never spells a `typed-cap-call`. Backend column is
+what each module's own header states.
+
+| module | wraps | wire id | runs today on |
+|---|---|---|---|
+| [`kbb.fs`](../lib/kbb/fs.kotoba) | `:fs/app-data` — `read-file` / `read-bytes-count`, and the WRITE form `write-file` / `write-ok?` / `write-bytes-count` (request `<path>WRITE_SEP<content>`, result = content written back; a second `WRITE_SEP` is refused; path + 9 + content must fit the 65536-byte string limit) | 35 | js (`kbb_js_write_test.clj`) and native (amu `kexe_loader.c` `fs_app_data_write_provider`, commit 6cca3852 — per that commit, not run here) |
+| [`kbb.env`](../lib/kbb/env.kotoba) | `:env/read` — `read` / `present?`; host narrows by NAME against the policy scope; a granted unset name answers `""` (same contract as the native loader's `env_read_provider`); a name outside the scope is refused before `getenv` | 33 | js (the shim routes only `{:fs/app-data}` surfaces to native — commit 91c12dc64) |
+| [`kbb.browse`](../lib/kbb/browse.kotoba) | `:fs/browse` — `entries` (sorted names of one directory, `"\n"`-joined) / `entry-count` | 34 | js; the native loader's wire-34 provider is still the identity stub (ADR-2609051100 task 5) |
+| [`kbb.proc`](../lib/kbb/proc.kotoba) | `:process/spawn` — `exec` / `ok?`: ONE allowlisted invocation by grant INDEX (argv, cwd, timeout are policy literals; result is the exit status) | 20 | js; the native loader's wire-20 provider is still pending (ADR-2609051100 task 5) |
+| [`kbb.str`](../lib/kbb/str.kotoba) | byte-addressed string helpers — `starts-with?` / `ends-with?` / `line-count` / `nth-line` / `count-matches` — no capability | — (pure) | js runs every export; `amu check lib/kbb/str.kotoba --jvm-free` answers `:ok true` with all five exports. Limit: a PURE module reaching `nth-line` fails to compile (`unknown-function`, see `probe_str_oracle`) |
+| [`kbb.edn`](../lib/kbb/edn.kotoba) | reading the STRUCTURE of an EDN document — `entry-count` / `value-of` (source text) / `value-i64` / `has-key?` / `well-formed?` — no capability (parsing is computation, not authority; bytes come from `kbb.fs`) | — (pure) | native and js (asks for nothing the native loader does not already provide) |
+
 ## Cross-repo demonstrations
 
 `.kotoba`-built artifacts hosted outside this repo:
