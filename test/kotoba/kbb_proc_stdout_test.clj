@@ -1,0 +1,70 @@
+(ns kotoba.kbb-proc-stdout-test
+  "Regression test for kbb.proc reading stdout (jvm-retire, superproject
+  ADR-2609070200 priority 1: :proc/exec wire 20). The :proc/exec capability
+  used to answer only an exit STATUS; the stdout a process wrote was captured
+  and discarded. The host now answers \"<exit>\\n<stdout>\" (the same wire
+  shape :git/run used) and kbb.proc decodes it once.
+
+  This test deliberately does NOT require kotoba.kbb (the interpreter
+  backend / host-providers): it drives bin/kbb_js.cljs as an nbb subprocess
+  the way a user runs it, so it stays runnable and green on a tree where the
+  JVM interpreter's own compile is broken. The assertion is the byte-exact
+  round-trip of stdout through wire 20 -- if the host ever discards stdout
+  again, examples/kbb/proc_stdout.kotoba answers 0 and this test goes red."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]))
+
+(def ^:private home (System/getProperty "user.dir"))
+
+(defn- nbb-available? []
+  (try (zero? (:exit (shell/sh "nbb" "--version"))) (catch Exception _ false)))
+
+;; The example's expected stdout is the measured `echo hello-from-proc`
+;; output: 15 chars + trailing newline = 16 bytes ("hello-from-proc\n").
+(def ^:private expected-stdout-bytes 16)
+
+(deftest proc-exp-answers-exit-and-stdout
+  (if-not (nbb-available?)
+    (println "SKIPPED kotoba.kbb-proc-stdout-test: nbb is not on PATH")
+    (testing "examples/kbb/proc_stdout.kotoba round-trips stdout through wire 20"
+      (let [{:keys [exit out]} (shell/sh "nbb" "bin/kbb_js.cljs"
+                                   "examples/kbb/proc_stdout.kotoba"
+                                   "--policy" "examples/kbb/proc_stdout_policy.edn"
+                                   "--source-path" "lib"
+                                   :env (assoc (into {} (System/getenv)) "KBB_HOME" home))]
+        (is (zero? exit) (str "kbb_js exit " exit))
+        ;; The receipt is the last EDN line.
+        (let [receipt (try (edn/read-string (last (remove str/blank? (str/split-lines out))))
+                           (catch Exception _ nil))]
+          (is (map? receipt) (str "no receipt in output:\n" out))
+          (is (:kotoba.cli/ok? receipt) (pr-str receipt))
+          (is (= 1 (get-in receipt [:kotoba.cli/data :kotoba.kbb/result]))
+              (str "proc_stdout should answer 1; receipt:\n" (pr-str receipt)))
+          ;; The receipt also carries :elapsed-ms; select just the shape that
+          ;; matters so the assertion does not pin timing.
+          (is (= {:capability :proc/exec :request "0" :outcome :ok
+                   :exit 0 :stdout-bytes expected-stdout-bytes}
+                 (select-keys (first (get-in receipt [:kotoba.cli/data :kotoba.kbb/receipts]))
+                              [:capability :request :outcome :exit :stdout-bytes]))
+              "wire-20 receipt must carry exit 0 and the 16 stdout bytes"))))))
+
+(deftest proc-exp-keeps-exec-numeric
+  (if-not (nbb-available?)
+    (println "SKIPPED kotoba.kbb-proc-stdout-test: nbb is not on PATH")
+    (testing "examples/kbb/env_browse_proc.kotoba still answers through the numeric exec"
+      (let [{:keys [exit out]} (shell/sh "nbb" "bin/kbb_js.cljs"
+                                   "examples/kbb/env_browse_proc.kotoba"
+                                   "--policy" "examples/kbb/env_browse_proc_policy.edn"
+                                   "--source-path" "lib"
+                                   :env (assoc (into {} (System/getenv)) "KBB_HOME" home))]
+        (is (zero? exit) (str "kbb_js exit " exit))
+        (let [receipt (try (edn/read-string (last (remove str/blank? (str/split-lines out))))
+                           (catch Exception _ nil))]
+          (is (map? receipt) (str "no receipt in output:\n" out))
+          ;; clean_dir has 2 entries, HOME is set, invocation 0 exits 0:
+          ;;   2*1000 + 1*100 + 0 = 2100
+          (is (= 2100 (get-in receipt [:kotoba.cli/data :kotoba.kbb/result]))
+              (pr-str receipt)))))))

@@ -31,7 +31,8 @@
 ;;                          the loader's fs_app_data_range_read_provider)
 ;;        33 :env/read      one granted NAME; unset answers "" (loader parity)
 ;;        34 :fs/browse     sorted entry names of one scoped directory, "\n"-joined
-;;        20 :proc/exec     one policy invocation by grant index; exit status
+;;        20 :proc/exec     one policy invocation by grant index;
+;;                          answer "<exit>\n<stdout>" (same shape as :git/run)
 ;;        22 :git/run       one policy git invocation by grant index;
 ;;                          answer "<exit>\n<stdout>"
 ;;      Every provider re-checks scope on every call and records a receipt.
@@ -61,7 +62,7 @@
 (def version 1)
 (def max-policy-bytes 65536)
 (def max-file-bytes 65536)          ; the artifact's string-value-bytes limit
-(def max-stdout-bytes 262144)        ; :git/run stdout cap (git-run-v1 kit)
+(def max-stdout-bytes 262144)        ; :git/run / :proc/exec stdout cap
 ;; The write form of wire 35 is "<path>WRITE_SEP<content>". An ASCII token,
 ;; not a control character: Kotoba source cannot emit one and has no
 ;; char-to-string builtin, so the guest builds the request with
@@ -473,10 +474,20 @@
                         (record! {:capability :proc/exec :request idx-text :outcome :failed :error (.-message (.-error r))
                                   :timeout-ms timeout :elapsed-ms elapsed})
                         (deny! :proc/exec (str "invocation failed: " (.-message (.-error r))) {:index idx-text}))
-                      (record! {:capability :proc/exec :request idx-text :outcome :ok :exit (.-status r)
-                                :stdout-bytes (.byteLength js/Buffer (str (.-stdout r)) "utf8")
-                                :elapsed-ms elapsed})
-                      (js/BigInt (or (.-status r) -1))))))
+                      (let [out (str (.-stdout r))]
+                        (when (> (.byteLength js/Buffer out "utf8") max-stdout-bytes)
+                          (record! {:capability :proc/exec :request idx-text :outcome :denied
+                                    :reason "stdout exceeds the transport limit"
+                                    :bytes (.byteLength js/Buffer out "utf8") :limit max-stdout-bytes})
+                          (deny! :proc/exec (str "stdout exceeds the transport limit ("
+                                                 (.byteLength js/Buffer out "utf8") " > " max-stdout-bytes " bytes)")
+                                 {:index idx-text}))
+                        (record! {:capability :proc/exec :request idx-text :outcome :ok :exit (.-status r)
+                                  :stdout-bytes (.byteLength js/Buffer out "utf8")
+                                  :elapsed-ms elapsed})
+                        ;; "<exit>\n<stdout>", the same wire shape :git/run answers;
+                        ;; the split is decoded once, in lib/kbb/proc.kotoba.
+                        (str (or (.-status r) -1) "\n" out))))))
       (contains? caps :git/run)
       (assoc 22 (fn [request _types]
                   (let [idx-text (str request)
