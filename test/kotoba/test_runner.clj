@@ -27,6 +27,7 @@
             [kotoba.kbb-js-range-test]
             [kotoba.kbb-js-cli-test]
             [kotoba.kbb-lib-test]
+            [kotoba.kbb-proc-stdout-test]
             [kotoba.key-hierarchy-test]
             [kotoba.origin-assertion-test]
             [kotoba.sealed-egress-test]
@@ -131,6 +132,7 @@
                                         'kotoba.kbb-js-range-test
                                         'kotoba.kbb-js-cli-test
                                         'kotoba.kbb-lib-test
+                                        'kotoba.kbb-proc-stdout-test
                                         'kotoba.key-hierarchy-test
                                         'kotoba.origin-assertion-test
                                         'kotoba.sealed-egress-test
