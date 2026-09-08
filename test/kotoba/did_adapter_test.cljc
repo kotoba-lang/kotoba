@@ -1,5 +1,6 @@
 (ns kotoba.did-adapter-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require #?(:clj [clojure.test :refer [deftest is]]
+               :cljs [cljs.test :refer [deftest is] :include-macros true])
             [did.core :as did]
             [kotoba.did-adapter :as adapter]))
 

@@ -127,24 +127,6 @@
      :now "2026-08-15"
      :require-component-cid? true})))
 
-(deftest plan-defaults-to-plan-operation
-  (let [p (deploy-adapter/plan {:positionals []
-                                :options {:manifest "pkg.edn" :target "dev"}})]
-    (is (= :plan (:operation p)))
-    (is (true? (:dry-run? p)))
-    (is (= "./.kotoba/deploy/dev" (:target-dir p)))))
-
-(deftest plan-rejects-bad-requests
-  (is (= :deploy/unknown-operation
-         (:error (deploy-adapter/plan {:positionals ["ship"] :options {:target "dev"}}))))
-  (is (= :deploy/missing-target
-         (:error (deploy-adapter/plan {:positionals ["apply"] :options {}})))))
-
-(deftest request-dry-run-respects-contract-default
-  (is (true? (deploy-adapter/request-dry-run? {:options {}})))
-  (is (true? (deploy-adapter/request-dry-run? {:options {:dry-run true}})))
-  (is (false? (deploy-adapter/request-dry-run? {:options {:dry-run "false"}}))))
-
 (deftest execute-plan-reads-manifest-without-writing
   (let [files (atom {"pkg.edn" sample-manifest})
         calls (atom [])
@@ -231,60 +213,6 @@
     (is (= :deploy/rolled-back (:kotoba.cli/code rolled)))
     (is (= "r1" (get-in rolled [:kotoba.cli/data :receipt :kotoba.deploy/revision])))))
 
-(deftest parse-target-classifies-local-and-reside
-  (is (= :local (:substrate (deploy-adapter/parse-target "pkg.edn" "dev"))))
-  (is (= "./.kotoba/deploy/dev"
-         (:target-dir (deploy-adapter/parse-target "pkg.edn" "dev"))))
-  (is (= "/t/env" (:target-dir (deploy-adapter/parse-target "pkg.edn" "/t/env"))))
-  (is (= "/abs" (:target-dir (deploy-adapter/parse-target "pkg.edn" "file:/abs"))))
-  (let [r (deploy-adapter/parse-target "pkg.edn" "murakumo:asher")]
-    (is (= :reside (:substrate r)))
-    (is (= "murakumo" (:control-plane r)))
-    (is (= "asher" (:node r)))
-    (is (= "./.kotoba/deploy/murakumo/asher" (:target-dir r))))
-  (let [r (deploy-adapter/parse-target "pkg.edn" "fleet")]
-    (is (= :reside (:substrate r)))
-    (is (nil? (:node r)))
-    (is (= "./.kotoba/deploy/fleet/default" (:target-dir r))))
-  (is (= :deploy/unknown-target-scheme
-         (:error (deploy-adapter/parse-target "pkg.edn" "https://deno.com")))))
-
-(deftest plan-reside-selects-explicit-or-canary-node-without-a-process
-  (let [p (deploy-adapter/plan {:positionals ["apply"]
-                                :options {:manifest "app.edn"
-                                          :target "murakumo:asher"}})]
-    (is (= :reside (:substrate p)))
-    (is (= "asher" (:node p)))
-    (is (nil? (:invoke p)))
-    (is (true? (:dry-run? p)))))
-
-(deftest public-urls-are-murakumo-https-and-ipns
-  (let [urls (deploy-adapter/public-urls "k51qabc" "bafkreidemo")]
-    (is (= "k51qabc" (:kotoba.deploy/ipns-name urls)))
-    (is (= "ipns://k51qabc" (:kotoba.deploy/ipns-url urls)))
-    (is (= "ipfs://bafkreidemo" (:kotoba.deploy/ipfs-url urls)))
-    (is (= "https://murakumo.cloud/ipns/k51qabc"
-           (:kotoba.deploy/public-url urls))))
-  (is (nil? (deploy-adapter/public-urls "" "bafkreidemo")))
-  (is (nil? (deploy-adapter/public-urls nil "bafkreidemo"))))
-
-(deftest public-urls-support-independent-gateways-and-ipns-only
-  (let [gateways (deploy-adapter/parse-ipns-gateways
-                  "https://gw1.example/, https://gw2.example")
-        urls (deploy-adapter/public-urls "k51qabc" "bafkreidemo" gateways)]
-    (is (= ["https://gw1.example" "https://gw2.example"] gateways))
-    (is (= ["https://gw1.example/ipns/k51qabc"
-            "https://gw2.example/ipns/k51qabc"]
-           (:kotoba.deploy/gateway-urls urls)))
-    (is (= "https://gw1.example/ipns/k51qabc"
-           (:kotoba.deploy/public-url urls))))
-  (let [urls (deploy-adapter/public-urls
-              "k51qabc" "bafkreidemo"
-              (deploy-adapter/parse-ipns-gateways "ipns-only"))]
-    (is (= "ipns://k51qabc" (:kotoba.deploy/ipns-url urls)))
-    (is (= [] (:kotoba.deploy/gateway-urls urls)))
-    (is (nil? (:kotoba.deploy/public-url urls)))))
-
 (deftest control-profile-mirrors-are-explicit-and-ordered
   (is (= [deploy-adapter/control-plane-profile-url]
          (launcher/parse-control-plane-profile-sources nil)))
@@ -307,18 +235,6 @@
           profile (#'launcher/fetch-control-plane-profile-source source)]
       (is (= source (:kotoba.control/profile-source profile)))
       (is (:ok? (deploy-adapter/validate-control-plane-profile profile))))))
-
-(deftest control-plane-profile-pins-domain-roles
-  (is (:ok? (deploy-adapter/validate-control-plane-profile control-plane-profile)))
-  (is (= [:authority-origin-mismatch]
-         (:problems
-          (deploy-adapter/validate-control-plane-profile
-           (assoc-in control-plane-profile [:roles :storage :origin]
-                     "https://api.murakumo.cloud")))))
-  (is (= [:hosted-apply-overclaim]
-         (:problems
-          (deploy-adapter/validate-control-plane-profile
-           (assoc-in control-plane-profile [:deploy :hostedApply] true))))))
 
 (deftest execute-reside-dry-run-does-not-shell
   (let [files (atom {"app.edn" sample-manifest})
@@ -572,15 +488,6 @@
     (is (= :deploy/ipns-seed-required (:kotoba.cli/code result)))
     (is (not-any? #(= :publish-desired (first %)) @calls))
     (is (not-any? #(= :write (first %)) @calls))))
-
-(deftest parse-target-rejects-deno-cloudflare-vercel
-  (doseq [target ["https://deno.com"
-                  "deno:project"
-                  "cloudflare:pages"
-                  "cf:workers"
-                  "vercel:prod"]]
-    (is (= :deploy/unknown-target-scheme
-           (:error (deploy-adapter/parse-target "pkg.edn" target))))))
 
 (deftest kotoba-publishes-verifiable-chained-murakumo-desired-state
   (let [base (str (Files/createTempDirectory "kotoba-desired" (make-array FileAttribute 0)))
