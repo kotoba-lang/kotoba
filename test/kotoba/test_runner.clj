@@ -34,6 +34,7 @@
             [kotoba.semantic-codebase-test]
             [kotoba.test-runner-completeness-test]
             [kotoba.kagi-boundary-test]
+            [kotoba.kagi-boundary-portable-test]
             [kotoba.hybrid-envelope-test]
             [kotoba.package-admission-test]
             [kotoba.package-install-test]
@@ -59,11 +60,14 @@
             [kotoba.guest-maturity-l3-l5-test]
             [kotoba.guest-maturity-l4-l6-test]
             [kotoba.git-adapter-test]
+            [kotoba.git-adapter-portable-test]
             [kotoba.graph-adapter-test]
             [kotoba.deploy-adapter-test]
+            [kotoba.deploy-adapter-portable-test]
             [kotoba.host-providers-test]
             [kotoba.host-write-window-test]
             [kotoba.kami-game-test]
+            [kotoba.kami-host-portable-test]
             [kotoba.kgraph-test]
             [kotoba.codebase-cli-test]
             [kotoba.codebase-compile-test]
@@ -79,6 +83,7 @@
             [kotoba.package-registry-test]
             [kotoba.package-key-revoke-e2e-test]
             [kotoba.rad-adapter-test]
+            [kotoba.rad-adapter-portable-test]
             [kotoba.raw-memory-test]
             [kotoba.real-host-providers-test]
             [kotoba.reproducible-emit-test]
@@ -88,6 +93,7 @@
             [kotoba.security-kaizen-test]
             [kotoba.security-boundary-fuzz-test]
             [kotoba.sensing-host-test]
+            [kotoba.sensing-host-portable-test]
             [kotoba.semantic-code-integration-test]
             [kotoba.type-contract-adapter-test]
             [kotoba.transport-component-test]
@@ -139,6 +145,7 @@
                                         'kotoba.semantic-codebase-test
                                         'kotoba.test-runner-completeness-test
                                         'kotoba.kagi-boundary-test
+                                        'kotoba.kagi-boundary-portable-test
                                         'kotoba.hybrid-envelope-test
                                         'kotoba.package-admission-test
                                         'kotoba.package-install-test
@@ -164,11 +171,14 @@
                                         'kotoba.guest-maturity-l3-l5-test
                                         'kotoba.guest-maturity-l4-l6-test
                                         'kotoba.git-adapter-test
+                                        'kotoba.git-adapter-portable-test
                                         'kotoba.graph-adapter-test
                                         'kotoba.deploy-adapter-test
+                                        'kotoba.deploy-adapter-portable-test
                                         'kotoba.host-providers-test
                                         'kotoba.host-write-window-test
                                         'kotoba.kami-game-test
+                                        'kotoba.kami-host-portable-test
                                         'kotoba.kgraph-test
                                         'kotoba.codebase-cli-test
                                         'kotoba.codebase-compile-test
@@ -184,6 +194,7 @@
                                         'kotoba.package-registry-test
                                         'kotoba.package-key-revoke-e2e-test
                                         'kotoba.rad-adapter-test
+                                        'kotoba.rad-adapter-portable-test
                                         'kotoba.raw-memory-test
                                         'kotoba.real-host-providers-test
                                         'kotoba.reproducible-emit-test
@@ -193,6 +204,7 @@
                                         'kotoba.security-kaizen-test
                                         'kotoba.security-boundary-fuzz-test
                                         'kotoba.sensing-host-test
+                                        'kotoba.sensing-host-portable-test
                                         'kotoba.semantic-code-integration-test
                                         'kotoba.type-contract-adapter-test
                                         'kotoba.transport-component-test

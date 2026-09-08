@@ -1,15 +1,9 @@
 (ns kotoba.kagi-boundary-test
+  "The JVM-only half: real-op-effects is Chicory wiring (kotoba.wasm-exec),
+  not a kagi-boundary concern. The boundary's own portable coverage lives in
+  kotoba.kagi-boundary-portable-test (.cljc), registered on both hosts."
   (:require [clojure.test :refer [deftest is]]
-            [kotoba.kagi-boundary :as boundary]
             [kotoba.wasm-exec :as wasm-exec]))
-
-(deftest kotoba-persists-only-kagi-references
-  (let [r (boundary/reference-record {:ref "kagi://personal/github"
-                                      :category :login :purpose :deploy :key-epoch 4})]
-    (is (= "kagi://personal/github" (:kotoba.secret/ref r)))
-    (is (= r (boundary/assert-reference-only! r)))
-    (is (thrown? Exception
-                 (boundary/assert-reference-only! (assoc r :plaintext "leak"))))))
 
 (deftest wasm-raw-private-key-effects-are-disabled-by-default
   (let [secure (wasm-exec/real-op-effects nil)]
