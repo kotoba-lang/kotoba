@@ -38,7 +38,7 @@
 ;; surface | the interpreter's own code when --backend interpreter is asked.
 (ns kbb-shim
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 (def fs (js/require "fs"))
 (def path (js/require "path"))
@@ -185,7 +185,7 @@
       {:status (.-status res) :stdout (or (.-stdout res) "") :stderr (or (.-stderr res) "")})))
 
 (defn- host-isa []
-  (if (contains? #{"arm64" "aarch64"} (str/lower-case (.arch os))) "aarch64" "x86_64"))
+  (if (contains? #{"arm64" "aarch64"} (str/lower (.arch os))) "aarch64" "x86_64"))
 
 ;; ------------------------------------------------------------------ native
 (defn- realpath-or-nil [p] (try (.realpathSync fs p) (catch :default _ nil)))

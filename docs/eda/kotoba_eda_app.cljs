@@ -42,7 +42,7 @@
   highlights follow the theme."
   (:require [reagent.core :as r]
             [reagent.dom :as rdom]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba-ui.core :as ui]
             [appkit.core :as appkit]))
 
@@ -182,7 +182,7 @@
 
 (defn extension [path]
   (let [i (.lastIndexOf path ".")]
-    (if (>= i 0) (str/lower-case (.slice path i)) "")))
+    (if (>= i 0) (str/lower (.slice path i)) "")))
 
 (defn format-for-file [name]
   (let [ext (extension name)
@@ -197,7 +197,7 @@
 (defn parse-artifact [name text bytes]
   (let [fmt (format-for-file name)
         fmt-id (:id fmt)
-        lower (str/lower-case text)
+        lower (str/lower text)
         base {:format fmt-id :kind (:kind fmt) :bytes bytes}
         [summary findings]
         (cond

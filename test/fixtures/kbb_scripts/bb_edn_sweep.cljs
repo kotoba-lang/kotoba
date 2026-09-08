@@ -3,7 +3,7 @@
 ;; ADR-2607181900): same five per-class violation counts over the same
 ;; fixture directory. Prints one EDN vector.
 (require '["fs" :as fs]
-         '[clojure.string :as str])
+         '[kotoba.lang.text :as str])
 (let [dir "test/fixtures/kbb_scripts/bb_sweep"
       names (vec (fs/readdirSync dir))
       counts (reduce

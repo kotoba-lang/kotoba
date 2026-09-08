@@ -1,6 +1,6 @@
 #!/usr/bin/env nbb
 (ns build-pywasm
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; --- nbb shims (auto, ADR-2607173000) ---------------------------------
 (def ^:private __fs (js/require "node:fs"))

@@ -8,7 +8,7 @@
 ;;   nbb edn-datomize.cljs adr-dir <dir>
 ;;   nbb edn-datomize.cljs adr-file <path>
 (require '[clojure.edn :as edn]
-         '[clojure.string :as str])
+         '[kotoba.lang.text :as str])
 
 (def fs (js/require "node:fs"))
 (def path (js/require "node:path"))

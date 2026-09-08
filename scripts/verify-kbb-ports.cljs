@@ -19,7 +19,7 @@
             ["node:fs" :as fs]
             ["node:os" :as os]
             ["node:path" :as path]
-            [clojure.string :as str]))
+            [kotoba.lang.text :as str]))
 
 ;; argv under nbb is [node, nbb_main.js, this script, ...], so index 2 is this file.
 (def repo (or (.-KBB_HOME js/process.env)
