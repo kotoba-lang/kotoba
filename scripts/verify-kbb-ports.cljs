@@ -67,6 +67,51 @@
     :args ["--backend" "js" "--fuel" "400000"]
     :expect 6272
     :origin "kbb.edn — entry-count 6, :count 42, :pins present, :missing absent, well-formed"}
+   ;; The delimiter-balance pass of the superproject's
+   ;; scripts/docs-edn-locate-break.cljs. Two things make it worth a case:
+   ;;
+   ;;   - it is the first ported script that takes its INPUT PATH from
+   ;;     :env/read (wire 33) rather than a literal, which is what an
+   ;;     operational script does. The loader has hosted wire 33 all along;
+   ;;     the shim could not reach it until an env NAME stopped being run
+   ;;     through realpath (2026-09-08).
+   ;;   - it self-recurses once per code point. These fixtures are far too
+   ;;     small to reach the JS stack limit, so the js case here asserts
+   ;;     BACKEND AGREEMENT and nothing about tail calls; the depth claim is
+   ;;     kotoba-script's, tested at 200,000 iterations in its own
+   ;;     JVM-free suite (test/nbb/parity.cljs).
+   ;;
+   ;; Both answers come from running the nbb original on the same fixtures,
+   ;; not from reading the guest: balanced -> 0, and a `}` closing a `[` on
+   ;; line 3 -> line*10 + 2 (mismatch) = 32. The balanced fixture carries a
+   ;; `}` inside a string and a `;` inside a string, so a scanner that did
+   ;; not track string state would answer something else.
+   ;; The env value is ABSOLUTE. The native loader refuses a relative request
+   ;; outright (kexe_loader.c), and the shim's path rewriting reaches literals
+   ;; in the SCRIPT, not values that arrive through :env/read -- so a relative
+   ;; spelling here would pass on js and be refused on native, which is the
+   ;; kind of difference a gate exists to not have.
+   {:name "edn_balance_scan/native (balanced)"
+    :script "examples/kbb/edn_balance_scan.kotoba"
+    :policy "examples/kbb/edn_balance_scan_policy.edn"
+    :args ["--fuel" "400000"]
+    :env {"KBB_EDN_FILE" (path/join repo "test/fixtures/kbb_gate_scripts/edn_balance/balanced.edn")}
+    :expect 0
+    :origin "scripts/docs-edn-locate-break.cljs balance -> nil (clean)"}
+   {:name "edn_balance_scan/native (mismatch on line 3)"
+    :script "examples/kbb/edn_balance_scan.kotoba"
+    :policy "examples/kbb/edn_balance_scan_policy.edn"
+    :args ["--fuel" "400000"]
+    :env {"KBB_EDN_FILE" (path/join repo "test/fixtures/kbb_gate_scripts/edn_balance/surplus.edn")}
+    :expect 32
+    :origin "same balance pass -> {:kind :mismatch :line 3}"}
+   {:name "edn_balance_scan/js (mismatch on line 3)"
+    :script "examples/kbb/edn_balance_scan.kotoba"
+    :policy "examples/kbb/edn_balance_scan_policy.edn"
+    :args ["--backend" "js" "--fuel" "400000"]
+    :env {"KBB_EDN_FILE" (path/join repo "test/fixtures/kbb_gate_scripts/edn_balance/surplus.edn")}
+    :expect 32
+    :origin "same script, second host -- two backends must agree"}
    ;; :git/run (wire 22) had a wire id in the catalog and nothing behind it
    ;; on any JVM-free backend. One script exercises it plus the shipped
    ;; wire-35 write form, so the write is confirmed by reading the bytes
@@ -91,11 +136,18 @@
     :policy "src/demo_kbb_data_json_policy.edn"
     :args []
     :exit 3 :code ":kbb/no-jvm-free-backend"}
-   {:name "explicit native on a browse surface -> refuse"
+   ;; An EXPLICIT --backend native is honoured, not rerouted: the shim admits
+   ;; it and the native compiler's own refusal of kbb.browse comes back by
+   ;; name (exit 1). This case read exit 3 :kbb/no-jvm-free-backend until
+   ;; 2026-09-08, which was the routing answer from before :fs/browse became
+   ;; native-hosted (2026-09-07); the gate has been red ever since, and a gate
+   ;; that cannot go green is one nobody can act on. The contract asserted
+   ;; here is the one kotoba.kbb-shim-test already asserts.
+   {:name "explicit native on a browse surface -> the compiler refuses, by name"
     :script "examples/kbb/store_adoption_scan.kotoba"
     :policy "examples/kbb/store_adoption_scan_policy.edn"
     :args ["--backend" "native"]
-    :exit 3 :code ":kbb/no-jvm-free-backend"}])
+    :exit 1 :code ":kbb-shim/compile-failed"}])
 
 ;; A capability that cannot refuse is a security hole, so every capability
 ;; the gate exercises is run three ways: granted (the cases above), NOT
@@ -157,10 +209,14 @@
         (fs/chmodSync f 0755)))
     d))
 
-(defn- run [stub cmd args]
+(defn- run [stub cmd args & [extra-env]]
   (let [env (js/Object.assign (js-obj) (.-env js/process))]
     (aset env "PATH" (str stub ":" (aget env "PATH")))
     (aset env "JAVA_HOME" "/nonexistent")
+    ;; A case may name the variables its guest is granted. They are part of
+    ;; the case, not of whoever ran the gate: a case that only passes because
+    ;; the operator happened to export something is not a gate.
+    (doseq [[k v] extra-env] (aset env k v))
     (let [r (cp/spawnSync cmd (clj->js args)
                           #js {:encoding "utf8" :cwd repo :env env :maxBuffer (* 32 1024 1024)})]
       {:status (.-status r) :out (str (.-stdout r))
@@ -175,9 +231,10 @@
       (.exit js/process 2))
     (let [results
           (concat
-           (for [{:keys [name script policy args expect origin]} cases]
+           (for [{:keys [name script policy args expect origin env]} cases]
              (let [r (run stub (path/join repo "bin" "kbb")
-                          (into [script "--policy" policy "--source-path" "lib"] args))
+                          (into [script "--policy" policy "--source-path" "lib"] args)
+                          env)
                    got (some-> (re-find #"(?::kotoba\.kbb/result|:result) (-?\d+)" (:out r)) second js/parseInt)
                    escaped? (str/includes? (str (:out r) (:err r)) "JVM ESCAPE")]
                (when verbose? (println (str "  " name " -> " (str/trim (:out r)))))
