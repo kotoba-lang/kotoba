@@ -51,7 +51,15 @@
 ;; its wire-34 provider (amu tools/kexe_loader.c fs_browse_provider). The
 ;; loader wire id of each native-hosted capability, for the allow list and
 ;; the KEXE_CAP_RESOURCES_<id> scope the shim hands over.
-(def native-wire-ids {:fs/app-data 35 :fs/browse 34})
+(def native-wire-ids {:fs/app-data 35 :fs/browse 34 :env/read 33})
+;; Capabilities whose policy scope entries are NAMES, not filesystem paths.
+;; Every other native capability scopes a directory tree, and the shim resolves
+;; each entry with realpath before handing it over; doing that to "KBB_EDN_FILE"
+;; answers nil, which the empty-scope refusal below then reads as "granted but
+;; nothing resolves". So an :env/read grant could not reach the native loader
+;; even though the loader has hosted wire 33 all along (kexe_loader.c
+;; env_read_provider).
+(def ^:private name-scoped-capabilities #{:env/read})
 (def native-hosted (set (keys native-wire-ids)))
 ;; What :auto may ROUTE to native is narrower than what the loader hosts:
 ;; lib/kbb/browse.kotoba walks its listing with string-index-of, which the
@@ -63,7 +71,17 @@
 ;; explicit `--backend native` is honoured and surfaces the compiler's own
 ;; refusal by name (exit 1), never rerouted. Widen this set to native-hosted
 ;; when kbb.browse compiles natively -- kbb_shim_test measures both.
-(def native-auto #{:fs/app-data})
+;;
+;; :env/read joined on 2026-09-08. lib/kbb/env.kotoba is a plain typed-cap-call
+;; with no string search in it, so it compiles for native; the loader has hosted
+;; wire 33 all along. Routing it here is not a convenience -- it is the only way
+;; a scanning guest finishes at all, because the js host does not eliminate tail
+;; calls and a self-recursive walk dies at roughly 1,600 frames. Measured that
+;; day on the same guest and the same 15,532-byte document: js raised the
+;; engine's stack-overflow RangeError, native answered. What native buys is
+;; bounded elsewhere -- the whole document has to fit the 65,536-byte string
+;; pool (measured: 65,398 bytes ran, 65,998 trapped SIGILL).
+(def native-auto #{:fs/app-data :env/read})
 (def js-hosted #{:fs/app-data :env/read :fs/browse :proc/exec :git/run})
 (def interpreter-only #{:data/json :data/edn :http/fetch})
 
@@ -222,14 +240,20 @@
          {:requested fuel :backend :native}))
   (let [caps (set (:kotoba.policy/capabilities policy))
         resources (:kotoba.policy/capability-resources policy)
-        scope-of (fn [cap] (set (keep realpath-or-nil (get resources cap #{}))))
+        scope-of (fn [cap]
+                   (if (name-scoped-capabilities cap)
+                     (set (get resources cap #{}))
+                     (set (keep realpath-or-nil (get resources cap #{})))))
         scopes (into {} (map (fn [cap] [cap (scope-of cap)]) caps))
         tmp (.mkdtempSync fs (.join path (.tmpdir os) "kbb-native-"))]
     (doseq [[cap scope] scopes]
       (when (empty? scope)
         (die :kbb-shim/no-scope (str (pr-str cap) " granted but no resource scope resolves")
              {:policy policy :capability cap})))
-    (let [scope (reduce into #{} (vals scopes))
+    ;; Only PATH scopes take part in rewriting the script's relative paths; an
+    ;; env name in that set would make "KBB_EDN_FILE" look like a directory the
+    ;; guest may name.
+    (let [scope (reduce into #{} (map val (remove (comp name-scoped-capabilities key) scopes)))
           {:keys [source rewrites]} (absolutize-script script scope tmp)
           wire-ids (sort (map native-wire-ids caps))
           policy-file (.join path tmp "compile-policy.edn")
@@ -257,7 +281,9 @@
           ;; 2026-09-07) made "/var/folders/.../f" trap SIGILL while
           ;; "/private/var/folders/.../f" read -- the js host resolved both.
           env-extra (cond-> (into {} (map (fn [[cap dirs]]
-                                            (let [literals (map #(.resolve path %) (get resources cap #{}))]
+                                            (let [literals (if (name-scoped-capabilities cap)
+                                                             (get resources cap #{})
+                                                             (map #(.resolve path %) (get resources cap #{})))]
                                               [(str "KEXE_CAP_RESOURCES_" (native-wire-ids cap))
                                                (str/join ":" (sort (distinct (concat literals dirs))))]))
                                           scopes))
