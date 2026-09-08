@@ -53,7 +53,7 @@
   with the three pins and the ci.yml authority checkout. Change it only as part
   of a resync wave, in all four repositories, and resync both copies this
   repository ships in the same commit."
-  "ee7ea37c7ea88c52ee8869af4d485e91a0b11bb153682ad717c86c055270b6b5")
+  "515bbc7de84a3340ef3b250e4ee411739d3acebf32ba31450540f146768bb841")
 
 (def recorded-kernel-head-count
   "Kernel heads `:admitted-builtins` names in the copies on this classpath,
