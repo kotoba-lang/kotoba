@@ -235,3 +235,49 @@
               (is (= "range [69500, 70500) lies outside the file (70000 bytes)"
                      (get-in (receipt js) [:kotoba.cli/data :kotoba.kbb/denied])) (:out js))))
           (finally (delete-tree! tmp)))))))
+
+;; ── caller-relative paths ────────────────────────────────────────────────
+;;
+;; `bin/kbb_shim.cljs` chdirs to the kotoba repo root on startup, for a real
+;; reason it states. The cost it did not state: every relative path the CALLER
+;; wrote was then resolved there instead of in their own directory, so
+;; `kbb script.kotoba --policy policy.edn` run from a user's project answered
+;; ENOENT for a policy sitting right next to the script.
+;;
+;; Every other test in this file runs the shim with cwd = repo root, where the
+;; two resolutions agree, so none of them can see this. This one runs it from
+;; somewhere else. Measured 2026-09-08 before the fix: ENOENT on the policy.
+;;
+;; SCOPE: this covers the three CALLER-supplied paths (script, --policy,
+;; --source-path). Resource paths INSIDE a policy are still resolved against
+;; the repo root -- they feed the granted scope, and moving that base is a
+;; security-relevant change, not a path-handling one. The fixture below spells
+;; its resource absolutely for that reason.
+
+(deftest caller-relative-paths-resolve-against-the-invocation-directory
+  (when (shim-enabled?)
+    (let [tmp (java.nio.file.Files/createTempDirectory
+               "kbb-caller-cwd" (make-array java.nio.file.attribute.FileAttribute 0))
+          dir (.toFile tmp)
+          data (io/file dir "data.txt")
+          script (io/file dir "count.kotoba")
+          policy (io/file dir "policy.edn")]
+      (try
+        (spit data "hello-native-kotoba\n")            ; 20 bytes
+        (spit script (str "(ns count)\n\n(defn main []\n"
+                          "  (let [content (typed-cap-call :fs/app-data :string :string\n"
+                          "                                \"" (.getCanonicalPath data) "\")]\n"
+                          "    (string-byte-length content)))\n"))
+        (spit policy (str "{:kotoba.policy/capabilities #{:fs/app-data}\n"
+                          " :kotoba.policy/forbid-wildcard true\n"
+                          " :kotoba.policy/capability-resources\n"
+                          " {:fs/app-data #{\"" (.getCanonicalPath data) "\"}}}\n"))
+        (testing "a script and policy named relatively, from the caller's own directory"
+          (let [{:keys [exit out err]}
+                (shell/sh nbb-exe (.getCanonicalPath (io/file shim))
+                          "count.kotoba" "--policy" "policy.edn" "--backend" "native"
+                          :dir dir)]
+            (is (zero? exit) (str "exit=" exit " out=" out " err=" err))
+            (is (= 20 (get-in (edn/read-string out)
+                              [:kotoba.cli/data :kotoba.kbb/result])))))
+        (finally (delete-tree! dir))))))
