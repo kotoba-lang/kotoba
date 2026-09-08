@@ -262,8 +262,17 @@
                                                (str/join ":" (sort (distinct (concat literals dirs))))]))
                                           scopes))
                       fuel (assoc "KEXE_FUEL" fuel))
+          ;; The loader's allow argument is a CSV of wire ids OR the sentinel
+          ;; "-" for "grant nothing" (kexe_loader.c parse_allow). An EMPTY
+          ;; string is neither: parse_allow falls through its digit loop and
+          ;; returns -1, so main returns 2 before the guest is mapped, with
+          ;; nothing on stderr. A capability-free policy therefore reached the
+          ;; loader as "" and every pure script failed as :kbb-shim/loader-
+          ;; failed {:status 2} -- the one shape no test covered, because each
+          ;; native case here grants :fs/app-data. Send the sentinel.
+          allow-csv (if (seq wire-ids) (str/join "," wire-ids) "-")
           r (node-run loader [bin (str (get report :offset 0)) (str (get report :arity 0)) isa
-                              (str/join "," wire-ids)]
+                              allow-csv]
                       {:env-extra env-extra})]
       (when (not= 0 (:status r))
         (die :kbb-shim/loader-failed (:stderr r) {:status (:status r) :rewrites rewrites}))

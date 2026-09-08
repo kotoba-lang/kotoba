@@ -287,3 +287,39 @@
             (is (= 20 (get-in (edn/read-string out)
                               [:kotoba.cli/data :kotoba.kbb/result])))))
         (finally (delete-tree! dir))))))
+
+;; A capability-free script -- the simplest thing anyone writes first, and the
+;; one shape none of the cases above covered: every native test here grants
+;; :fs/app-data, so `wire-ids` was never empty and the loader never saw the
+;; argument the shim actually sends for "grant nothing".
+;;
+;; kexe_loader.c's parse_allow takes a CSV of wire ids or the sentinel "-".
+;; The empty string is neither: the digit loop never runs and it returns -1,
+;; so main returns 2 having printed nothing. Measured 2026-09-08 at 944e2502:
+;; `kbb probe.kotoba --policy <empty caps>` -> exit 1,
+;; :kbb-shim/loader-failed {:status 2} with an empty :message, on native AND
+;; on :auto (an empty capability set satisfies `every?`, so :auto routes
+;; native). The js backend answered 42 throughout -- which is why this was
+;; invisible to anyone who reached for --backend js when native "did not work".
+(deftest a-capability-free-script-runs-on-native-and-on-auto
+  (when (shim-enabled?)
+    (let [tmp (temp-dir)
+          script (io/file tmp "pure.kotoba")
+          policy (io/file tmp "policy.edn")]
+      (try
+        (spit script "(ns pure (:export [main]))\n(defn main [] :i64 (+ 40 2))\n")
+        (spit policy (pr-str {:kotoba.policy/capabilities #{}
+                              :kotoba.policy/forbid-wildcard true
+                              :kotoba.policy/capability-resources {}}))
+        (doseq [backend ["native" "js"]]
+          (testing (str "an empty capability set is a grant of nothing, not a malformed grant (--backend " backend ")")
+            (let [r (run-shim (.getPath script) "--policy" (.getPath policy) "--backend" backend)]
+              (is (zero? (:exit r)) (str "exit=" (:exit r) " out=" (:out r) " err=" (:err r)))
+              (is (= 42 (get-in (receipt r) [:kotoba.cli/data :kotoba.kbb/result])) (:out r)))))
+        (testing ":auto routes an empty capability set to native and answers the same 42"
+          (let [r (run-shim (.getPath script) "--policy" (.getPath policy))
+                m (receipt r)]
+            (is (zero? (:exit r)) (str "exit=" (:exit r) " out=" (:out r) " err=" (:err r)))
+            (is (= :native (get-in m [:kotoba.cli/data :kotoba.kbb/backend])) (:out r))
+            (is (= 42 (get-in m [:kotoba.cli/data :kotoba.kbb/result])) (:out r))))
+        (finally (delete-tree! tmp))))))
