@@ -1,7 +1,7 @@
 (ns kotoba.deploy-adapter-test
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is use-fixtures]]
             [kotoba.cli :as cli]
             [kotoba.deploy-adapter :as deploy-adapter]

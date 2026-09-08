@@ -7,7 +7,7 @@
   bootstrap host for this first slice; no JavaScript or nbb runtime is loaded."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.kbb-native :as kbb-native]
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime])

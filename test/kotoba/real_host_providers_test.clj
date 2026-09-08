@@ -11,7 +11,7 @@
   not just that the call links and returns without throwing."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [kotoba.runtime :as runtime]
             [kotoba.wasm-exec :as wasm-exec])

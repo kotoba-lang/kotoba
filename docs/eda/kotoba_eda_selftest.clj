@@ -10,7 +10,7 @@
 
   Run from this directory: clojure -M:test"
   (:require [clojure.test :refer [deftest is run-tests]]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba-eda-style]
             [kotoba-eda-ui :as ui]))
 

@@ -1,7 +1,7 @@
 (ns kotoba.kagi-boundary
   "Reference-only boundary to kagi/kagitaba. Kotoba facts and capabilities must
   never carry secret values. Resolution belongs to an injected kagi runtime adapter."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [kotoba.security.information-flow :as flow]))
 
 (def allowed-schemes #{"kagi" "keychain" "pkcs11" "passkey"})

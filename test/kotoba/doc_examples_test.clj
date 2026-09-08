@@ -9,7 +9,7 @@
   mandatory flag, a renamed option, ...) fails CI immediately instead of
   waiting for a human to notice the docs no longer work."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.launcher :as launcher]))
 

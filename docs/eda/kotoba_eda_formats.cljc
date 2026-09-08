@@ -5,7 +5,7 @@
   ddl, statechart and vllm: file formats are described as EDN data, while CLJC
   provides pure query/normalization functions. Parsers and external tools are
   host-injected adapters, not hidden side effects."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (def empty-registry
   {:schema 1
@@ -52,12 +52,12 @@
   (let [name (last (str/split (str path) #"/"))
         i (.lastIndexOf name ".")]
     (when (pos? i)
-      (str/lower-case (subs name i)))))
+      (str/lower (subs name i)))))
 
 (defn by-extension
   [registry ext-or-path]
   (let [ext (if (str/starts-with? (str ext-or-path) ".")
-              (str/lower-case (str ext-or-path))
+              (str/lower (str ext-or-path))
               (extension ext-or-path))]
     (filter #(some #{ext} (:eda.format/extensions %)) (formats registry))))
 

@@ -6,7 +6,7 @@
   definition, and none of them is what the definition IS."
   (:require [cbor.core :as cbor]
             [json.data-json :as json]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.codebase-ipns]
             [kotoba.codebase-routing :as routing]

@@ -1,7 +1,7 @@
 (ns kotoba.operator-identity-test
   "Shared local operator seed: generate once, never echo, env overrides file."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [ed25519.core :as ed]
             [kotoba.launcher :as launcher]

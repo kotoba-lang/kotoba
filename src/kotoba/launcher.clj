@@ -9,7 +9,7 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.cap-table :as cap-table]
             [kotoba.compiler.core :as compiler]
             [kotoba.compiler.project-files :as project-files]

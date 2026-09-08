@@ -6,7 +6,7 @@
   result for `git` and turns it into process steps. Planning and output
   parsing are pure; execution happens only through an injected process
   port, so the core makes no direct host calls."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defprotocol IProcess
   "Host-supplied process capability. `-run` takes a full argv vector and

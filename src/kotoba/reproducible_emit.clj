@@ -31,7 +31,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.launcher :as launcher])
   (:import [java.security MessageDigest]))
 

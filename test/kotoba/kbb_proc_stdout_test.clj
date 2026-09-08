@@ -13,7 +13,7 @@
   again, examples/kbb/proc_stdout.kotoba answers 0 and this test goes red."
   (:require [clojure.edn :as edn]
             [clojure.java.shell :as shell]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]))
 
 (def ^:private home (System/getProperty "user.dir"))

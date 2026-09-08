@@ -29,7 +29,7 @@
 
   Planning is pure; filesystem, env, process, and IPNS happen only through
   an injected host port."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             #?(:clj [clojure.edn :as edn])))
 
 (defprotocol IDeployHost
@@ -195,7 +195,7 @@
   [raw]
   (cond
     (or (nil? raw) (str/blank? raw)) [(str "https://" murakumo-public-host)]
-    (= "ipns-only" (str/lower-case (str/trim raw))) []
+    (= "ipns-only" (str/lower (str/trim raw))) []
     :else (->> (str/split raw #",")
                (map str/trim)
                (remove str/blank?)

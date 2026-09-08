@@ -42,7 +42,7 @@
   frontend admits 114, so 111 heads the compiler admits were reported here as
   `:unknown-form`. It names 115 now."
   (:require [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.grammar :as guest-grammar]))
 

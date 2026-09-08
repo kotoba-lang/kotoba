@@ -3,7 +3,7 @@
   contract registration (capability id 259), the real index-addressed
   proc-exec host provider, and kbb's policy admission of :proc/exec."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.core.contracts :as core-contracts]
             [kotoba.host-providers :as host-providers]

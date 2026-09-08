@@ -13,7 +13,7 @@
   The parent directory `kotoba/` is created at 0700. Existing files are not
   overwritten unless the caller passes `:force?`."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [ed25519.core :as ed25519]
             [kotoba.codebase-ipns :as codebase-ipns])
   (:import [java.nio.charset StandardCharsets]

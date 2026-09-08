@@ -3,7 +3,7 @@
 
   This namespace does not perform network I/O. Browser/UI code, a service, or a
   murakumo host adapter can turn the returned map into HTTP/XRPC/SSE calls."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn ready-adapters
   [runner-plan]

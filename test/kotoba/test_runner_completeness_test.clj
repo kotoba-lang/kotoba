@@ -12,7 +12,7 @@
   outside the gate rather than failing in it, which is the harder case to
   notice."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is]]))
 
 (defn- ns-symbol [^java.io.File f]
