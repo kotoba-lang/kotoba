@@ -181,13 +181,19 @@
             (is (str/includes? (:kotoba.cli/message m) "call-abi-not-admitted") (:out r))))
         (if-not (loader-has? "fs_browse_provider")
           (skip! "fs_browse_provider (wire 34)")
-          (testing "the loader's wire-34 provider answers the listing the js host answers: \".h\\na\\nb\" = 6 bytes"
+          ;; Measured 2026-09-08 through this shim on both hosts: the js host
+          ;; answers the NAME<TAB>D wire (".h\t0\na\t0\nb\t0" = 12 bytes for the
+          ;; three-file fixture; kotoba b7ab6bee2), the native loader at this
+          ;; file's deps.edn amu pin answers names only (".h\na\nb" = 6 bytes).
+          ;; The native D-flag widening is jvm-retire item 1/2 work; when the
+          ;; loader answers the js bytes, the native assertion flips to 12.
+          (testing "each JVM-free host answers its measured wire-34 listing: js = 12 bytes (NAME<TAB>D), native = 6 bytes (names-only, the open D-flag gap)"
             (let [native (run-shim (.getPath via-wire) "--policy" (.getPath policy) "--backend" "native")
                   js (run-shim (.getPath via-wire) "--policy" (.getPath policy) "--backend" "js")]
               (is (zero? (:exit native)) (str (:out native) (:err native)))
               (is (zero? (:exit js)) (:out js))
-              (is (= 6 (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/result])))
-              (is (= 6 (get-in (receipt js) [:kotoba.cli/data :kotoba.kbb/result])))
+              (is (= 6 (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/result])) (:out native))
+              (is (= 12 (get-in (receipt js) [:kotoba.cli/data :kotoba.kbb/result])) (:out js))
               (is (= {:fs/browse [(str (.toRealPath (.toPath dir) (make-array java.nio.file.LinkOption 0)))]}
                      (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/scopes]))))))
         (finally (delete-tree! tmp))))))
