@@ -324,57 +324,9 @@
             (is (= 42 (get-in m [:kotoba.cli/data :kotoba.kbb/result])) (:out r))))
         (finally (delete-tree! tmp))))))
 
-;; :env/read on the native backend.
-;;
-;; The loader has hosted wire 33 since before this shim existed (kexe_loader.c
-;; env_read_provider), but the shim could not reach it. Two reasons, both fixed
-;; on 2026-09-08: `native-wire-ids` did not carry :env/read, and the scope
-;; resolver ran realpath over EVERY granted resource -- which answers nil for a
-;; variable NAME, so the empty-scope refusal read a correct grant as "granted
-;; but nothing resolves".
-;;
-;; This is not a convenience. The js host does not eliminate tail calls, so a
-;; guest that walks a document one code point at a time dies at roughly 1,600
-;; frames; native optimises tail self-recursion and finishes. Measured that day
-;; on one 15,532-byte document: js raised the engine's stack-overflow
-;; RangeError, native answered.
-(defn- run-shim-with-env
-  [env-pairs & args]
-  (let [{:keys [exit out err]}
-        (apply shell/sh (concat [nbb-exe shim] (map str args)
-                                [:env (merge (into {} (System/getenv)) env-pairs)]))]
-    {:exit exit :out out :err err}))
-
-(deftest env-read-runs-on-native-and-is-scoped-by-name
-  (when (shim-enabled?)
-    (if-not (loader-has? "env_read_provider")
-      (skip! "env_read_provider")
-      (let [tmp (temp-dir)
-            data (io/file tmp "named.txt")
-            script (io/file tmp "byte_count.kotoba")
-            policy (io/file tmp "policy.edn")]
-        (try
-          (spit data "hello-from-an-env-named-file\n")   ; 29 bytes
-          (spit script (str "(ns probe.env-native (:require [kbb.fs :as fs] [kbb.env :as env]) (:export [main]))\n"
-                            "(defn main [] :i64 (string-byte-length (fs/read-file (env/read \"KBB_SHIM_TEST_FILE\"))))\n"))
-          (spit policy (pr-str {:kotoba.policy/capabilities #{:fs/app-data :env/read}
-                                :kotoba.policy/forbid-wildcard true
-                                :kotoba.policy/capability-resources
-                                {:fs/app-data #{tmp}
-                                 :env/read #{"KBB_SHIM_TEST_FILE"}}}))
-          (doseq [backend ["native" "auto"]]
-            (testing (str "a granted env NAME is a scope, not a path (" backend ")")
-              (let [r (apply run-shim-with-env
-                             {"KBB_SHIM_TEST_FILE" (.getCanonicalPath data)}
-                             (cond-> [(.getPath script) "--policy" (.getPath policy)
-                                      "--source-path" "lib"]
-                               (= backend "native") (conj "--backend" "native")))
-                    m (receipt r)]
-                (is (zero? (:exit r)) (str "exit=" (:exit r) " out=" (:out r) " err=" (:err r)))
-                (is (= :native (get-in m [:kotoba.cli/data :kotoba.kbb/backend])) (:out r))
-                (is (= 29 (get-in m [:kotoba.cli/data :kotoba.kbb/result])) (:out r))
-                ;; the receipt shows the NAME, which is what the loader is handed
-                (is (= ["KBB_SHIM_TEST_FILE"]
-                       (get-in m [:kotoba.cli/data :kotoba.kbb/scopes :env/read]))
-                    (:out r)))))
-          (finally (delete-tree! tmp)))))))
+;; :env/read on the native backend is asserted WITHOUT a JVM, in
+;; scripts/verify-kbb-ports.cljs (the edn_balance_scan cases): that runner
+;; already stubs clojure/java/clj to exit 127, so a green there says the guest
+;; compiled, both hosts answered the same number, and nothing started a JVM.
+;; Adding it here instead would have put new assertions on a `clojure -M:test`
+;; site the workspace is retiring (ADR-2609070200).
