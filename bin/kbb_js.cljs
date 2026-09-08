@@ -52,7 +52,7 @@
 ;; leaves a :denied receipt) are measured by test/kotoba/kbb_js_providers_test.clj.
 (ns kbb-js
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             ["node:child_process" :as cp]
             ["node:crypto" :as crypto]
             ["node:fs" :as fs]

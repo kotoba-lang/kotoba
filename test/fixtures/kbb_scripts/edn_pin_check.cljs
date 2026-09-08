@@ -5,7 +5,7 @@
 ;; the integer count (the kbb guest counts the same via bounded substring
 ;; scans because the guest surface has no regex).
 (require '["fs" :as fs]
-         '[clojure.string :as str])
+         '[kotoba.lang.text :as str])
 (let [path "test/fixtures/kbb_scripts/deps_sample.edn"]
   (if-not (try (fs/existsSync path) (catch js/Error _ false))
     (println -1)
