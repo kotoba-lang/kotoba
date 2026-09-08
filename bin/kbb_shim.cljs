@@ -69,6 +69,32 @@
 
 (def exit-unsupported-surface 3)
 
+;; Where bin/kbb was invoked from, captured BEFORE the chdir below.
+;;
+;; The chdir is deliberate and its reason is real, but it has a cost the
+;; comment did not name: every relative path the CALLER wrote -- the script,
+;; `--policy`, `--source-path` -- was then resolved against the kotoba repo
+;; root instead of their own directory. Measured 2026-09-08: an identical
+;; policy.edn sitting next to the script answered `ENOENT`, and the same name
+;; placed in KBB_HOME resolved from an unrelated working directory. That is
+;; the difference between a tool you run inside this repository and one you
+;; run in your own project.
+(def invocation-cwd (.cwd js/process))
+
+(defn- caller-path
+  "Resolve a caller-supplied path against the directory kbb was invoked from.
+
+  Absolute paths pass through. Relative ones that exist relative to the
+  invocation resolve there; anything else is left alone so the kbb-home
+  fallback below still finds paths written relative to this repository, which
+  is how every in-repo caller and the test suite spell them."
+  [p]
+  (when p
+    (if (.isAbsolute path p)
+      p
+      (let [from-caller (.resolve path invocation-cwd p)]
+        (if (.existsSync fs from-caller) from-caller p)))))
+
 ;; Normalize cwd to the kotoba repo root (parent of bin/) so relative guest
 ;; paths, the amu resolution and the interpreter delegate share one working
 ;; directory regardless of where bin/kbb was invoked from.
@@ -117,11 +143,11 @@
             value (when (and (seq more) (not (str/starts-with? (first more) "--"))) (first more))]
         (case t
           "--json" (recur more (assoc parsed :json? true))
-          "--policy" (if value (recur (next more) (assoc parsed :policy value))
+          "--policy" (if value (recur (next more) (assoc parsed :policy (caller-path value)))
                          (assoc parsed :problem :kbb/missing-option-value :option t))
           "--fuel" (if value (recur (next more) (assoc parsed :fuel value))
                        (assoc parsed :problem :kbb/missing-option-value :option t))
-          "--source-path" (if value (recur (next more) (update parsed :source-paths conj value))
+          "--source-path" (if value (recur (next more) (update parsed :source-paths conj (caller-path value)))
                               (assoc parsed :problem :kbb/missing-option-value :option t))
           "--backend" (if (contains? #{"native" "js" "interpreter"} value)
                         (recur (next more) (assoc parsed :backend (keyword value)))
@@ -129,7 +155,7 @@
           (cond
             (str/starts-with? t "-") (assoc parsed :problem :kbb/unsupported-option :option t)
             (:script parsed) (assoc parsed :problem :kbb/script-arguments-unsupported :argument t)
-            :else (recur more (assoc parsed :script t))))))))
+            :else (recur more (assoc parsed :script (caller-path t)))))))))
 
 ;; ------------------------------------------------------------------ child
 (defn- node-run [cmd args & [opts]]
