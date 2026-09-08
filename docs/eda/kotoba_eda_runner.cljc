@@ -4,7 +4,7 @@
   The browser and CLJC layer only build plans. A host runner may execute the
   whitelisted commands after resolving CIDs into a workspace and checking
   policy/license gates."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn adapters [registry] (:adapters registry))
 

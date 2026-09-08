@@ -9,7 +9,7 @@
   Rust tree; these tests are the first ones that hold the CURRENT
   implementation to it."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime]

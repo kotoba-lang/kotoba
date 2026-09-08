@@ -33,7 +33,7 @@
   an HTTP client, ...) plug in by passing a :handlers map to `host-call`."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as cstr]
+            [kotoba.lang.text :as cstr]
             [json.core :as json]
             [kotoba.cap-table :as cap-table]
             [kotoba.core.contracts :as core-contracts]
@@ -294,8 +294,8 @@
      (or (nil? concrete)
          (= :any scope)
          (cond
-           (string? scope) (clojure.string/starts-with? url scope)
-           (set? scope) (some #(clojure.string/starts-with? url %) scope)
+           (string? scope) (cstr/starts-with? url scope)
+           (set? scope) (some #(cstr/starts-with? url %) scope)
            :else false)))))
 
 (defn- http-check-permitted!

@@ -12,7 +12,7 @@
 
   Planning is pure; filesystem writes and launcher dispatch happen only
   through an injected host port, so the core makes no direct host calls."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defprotocol IRadHost
   "Host-supplied capabilities for rad workflows."

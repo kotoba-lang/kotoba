@@ -1,12 +1,12 @@
 (ns kotoba.resource-scope
   "Structural resource-scope matching shared by static and runtime gates."
-  (:require [clojure.string :as str])
+  (:require [kotoba.lang.text :as str])
   (:import (java.net URI)))
 
 (defn- effective-port [^URI uri]
   (let [port (.getPort uri)]
     (if (neg? port)
-      (case (some-> (.getScheme uri) str/lower-case)
+      (case (some-> (.getScheme uri) str/lower)
         "http" 80
         "https" 443
         -1)
@@ -24,8 +24,8 @@
   (try
     (let [^URI g (URI/create grant)
           ^URI r (URI/create resource)
-          gs (some-> (.getScheme g) str/lower-case)
-          rs (some-> (.getScheme r) str/lower-case)
+          gs (some-> (.getScheme g) str/lower)
+          rs (some-> (.getScheme r) str/lower)
           gp (normalized-path g)
           rp (normalized-path r)]
       (boolean
@@ -35,8 +35,8 @@
             (nil? (.getFragment g)) (nil? (.getFragment r))
             (nil? (.getQuery g))
             (some? (.getHost g)) (some? (.getHost r))
-            (= (str/lower-case (.getHost g))
-               (str/lower-case (.getHost r)))
+            (= (str/lower (.getHost g))
+               (str/lower (.getHost r)))
             (= (effective-port g) (effective-port r))
             (or (= gp rp)
                 (if (str/ends-with? gp "/")

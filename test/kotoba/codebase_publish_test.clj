@@ -6,7 +6,7 @@
   closure and a signed head, and must refuse both a hostile host and a second
   key."
   (:require [cbor.core :as cbor]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [ed25519.core :as ed]
             [kotoba.codebase-publish :as publish]
@@ -658,7 +658,7 @@
                         {:endpoint url :write-token test-write-token})
       (let [listing (get-text (str url "/browse/demo"))]
         (is (= 200 (:status listing)))
-        (is (clojure.string/includes? (:body listing) "quadruple"))
+        (is (str/includes? (:body listing) "quadruple"))
         (testing "names link to CIDs, so following one navigates the real graph"
           (is (re-find #"/def/bafyrei[a-z0-9]+\?ns=demo" (:body listing))))))))
 
@@ -672,14 +672,14 @@
       (let [bindings (:bindings (store/namespace-view host (store/head host "demo")))
             page (get-text (str url "/def/" (get bindings "quadruple") "?ns=demo"))]
         (is (= 200 (:status page)))
-        (is (clojure.string/includes? (:body page) "(defn quadruple [a] (double (double a)))"))
-        (is (clojure.string/includes? (:body page) "depends on"))
-        (is (clojure.string/includes? (:body page) (get bindings "double"))))
+        (is (str/includes? (:body page) "(defn quadruple [a] (double (double a)))"))
+        (is (str/includes? (:body page) "depends on"))
+        (is (str/includes? (:body page) (get bindings "double"))))
       (testing "and a definition browsed without a namespace still renders, by hash"
         (let [bindings (:bindings (store/namespace-view host (store/head host "demo")))
               page (get-text (str url "/def/" (get bindings "double")))]
           (is (= 200 (:status page)))
-          (is (clojure.string/includes? (:body page) (get bindings "double"))))))))
+          (is (str/includes? (:body page) (get bindings "double"))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Announcement

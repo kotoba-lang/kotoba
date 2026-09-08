@@ -6,7 +6,7 @@
   (main -> outer -> inner -> host import)."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.launcher :as launcher]
             [kotoba.runtime :as runtime])

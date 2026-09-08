@@ -22,7 +22,7 @@
     Compiling again costs time; handing back bytes emitted by a different
     compiler is a wrong answer."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.codebase.semantic-code :as semantic]
             [kotoba.codebase.store :as store]
             [kotoba.codebase.typed-eval :as typed-eval]

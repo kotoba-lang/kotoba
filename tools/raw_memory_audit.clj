@@ -9,7 +9,7 @@
     clojure -M:raw-memory-audit            ; report only
     clojure -M:raw-memory-audit --declare  ; report and rewrite"
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.runtime :as runtime]))
 
 (defn- kotoba-files

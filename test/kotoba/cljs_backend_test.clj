@@ -15,7 +15,7 @@
   is valid, semantically identical Clojure AND ClojureScript. Real nbb
   execution of the exact same generated sources was independently
   verified by hand before this commit; see ADR-2607151500."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is]]
             [kotoba.runtime :as runtime]))
 
@@ -275,8 +275,8 @@
   ;; documented and undocumented forms produce identical expansion output
   (let [documented (compile-cljs "(ns t) (defn f \"doc\" ([x] x) ([x y] (+ x y)))\n                                  (defn main [] (f 1))")
         plain (compile-cljs "(ns t) (defn f ([x] x) ([x y] (+ x y)))\n                             (defn main [] (f 1))")]
-    (is (= (clojure.string/replace documented "t " "")
-           (clojure.string/replace plain "t " "")))))
+    (is (= (str/replace documented "t " "")
+           (str/replace plain "t " "")))))
 
 (deftest first-class-closures-invoke-and-apply-run-in-cljs-backend
   (is (= 7 (run "(defn main []

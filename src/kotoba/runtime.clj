@@ -9,7 +9,7 @@
             ;; aliased `cstr`, not `str` -- this file already uses the bare
             ;; `clojure.core/str` function extensively; `:as str` would
             ;; silently shadow every one of those call sites.
-            [clojure.string :as cstr]
+            [kotoba.lang.text :as cstr]
             [clojure.walk :as walk]
             [ipld.value :as value-codec]
             [kotoba.grammar :as guest-grammar]

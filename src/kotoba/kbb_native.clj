@@ -21,7 +21,7 @@
   Scripts whose capability surface is not proc-exec are refused closed: this
   slice hosts nothing else."
   (:require [clojure.java.io :as io]
-            [clojure.string :as cstr]
+            [kotoba.lang.text :as cstr]
             [clojure.walk :as walk]
             [kotoba.compiler.core :as compiler]
             [kotoba.artifact.runtime-identity :as runtime-identity]
@@ -64,7 +64,7 @@
 (defn- host-target
   "The compile target matching the running JVM's architecture."
   []
-  (let [arch (cstr/lower-case (str (System/getProperty "os.arch")))]
+  (let [arch (cstr/lower (str (System/getProperty "os.arch")))]
     (if (contains? #{"aarch64" "arm64"} arch)
       :aarch64-kotoba-v1
       :x86_64-kotoba-v1)))

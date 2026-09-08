@@ -8,7 +8,7 @@
   (:require [json.data-json :as json]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.security.information-flow :as information-flow])
   (:import [java.awt Desktop Desktop$Action]
            [java.net URI]

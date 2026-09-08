@@ -27,7 +27,7 @@
   there, and this namespace deliberately reports an empty provider set rather
   than implying otherwise."
   (:require [json.data-json :as json]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.codebase.fetch :as fetch])
   (:import [java.io ByteArrayOutputStream]
            [java.net URI]

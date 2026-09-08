@@ -1,5 +1,5 @@
 (ns kotoba.wasm-doseq-test
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.runtime :as runtime]
             [kotoba.wasm-exec :as wasm-exec]))

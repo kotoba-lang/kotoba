@@ -25,7 +25,7 @@
   (:require [cbor.core :as cbor]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.codebase-routing :as routing]
             [kotoba.codebase.fetch :as fetch]
             [kotoba.codebase.names :as names]
@@ -627,8 +627,8 @@
 
 (defn- require-secure-write-endpoint! [endpoint]
   (let [uri (try (URI/create endpoint) (catch Exception _ nil))
-        scheme (some-> uri .getScheme str/lower-case)
-        host (some-> uri .getHost str/lower-case)]
+        scheme (some-> uri .getScheme str/lower)
+        host (some-> uri .getHost str/lower)]
     (when-not (or (and (= "https" scheme) host)
                   (and (= "http" scheme) (loopback-http-host? host)))
       (fail! :publish/insecure-write-endpoint

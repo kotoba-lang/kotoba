@@ -6,7 +6,7 @@
   The oracle keeps the handle table, the receipts and the acquisition-time
   intersection. Only the use-time gate crossed over, and the corpus below is
   every way it can answer plus the boundaries between them."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.cap-table :as cap-table]
             [kotoba.compiler.core :as compiler]

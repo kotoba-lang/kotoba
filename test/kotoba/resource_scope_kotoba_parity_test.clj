@@ -11,7 +11,7 @@
   Corpus-bounded by construction: this proves agreement on the pairs below,
   not over all strings. The boundary cases that motivated the port -- a
   grant covering a longer, different name -- are pinned individually."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.test :refer [deftest is testing]]
             [kotoba.compiler.core :as compiler]
             [kotoba.kir :as ir]

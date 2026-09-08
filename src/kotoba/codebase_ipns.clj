@@ -31,7 +31,7 @@
   sequence and the predecessor link that make a rollback detectable. Two
   signatures over two different claims, both checked."
   (:require [cbor.core :as cbor]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [ed25519.core :as ed]
             [ipns.core :as ipns-core]
             [ipns.head :as registry-head]

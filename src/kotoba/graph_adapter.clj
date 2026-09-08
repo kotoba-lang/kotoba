@@ -20,7 +20,7 @@
   Planning is pure; load/save and file reads happen only through an injected
   host port."
   (:require [clojure.edn :as edn]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.walk :as walk]
             [datom.core :as dc]
             [kotoba.kgraph :as kgraph]))

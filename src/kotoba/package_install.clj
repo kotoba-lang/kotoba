@@ -9,7 +9,7 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotoba.codebase-routing :as routing]
             [kotoba.codebase.fetch :as fetch]
             [kotoba.codebase.publication :as publication]
@@ -88,8 +88,8 @@
   (try
     (let [uri (.normalize (URI/create endpoint))
           path (str/replace (or (.getPath uri) "") #"/+$" "")]
-      [(some-> (.getScheme uri) str/lower-case)
-       (some-> (.getHost uri) str/lower-case)
+      [(some-> (.getScheme uri) str/lower)
+       (some-> (.getHost uri) str/lower)
        (.getPort uri) path])
     (catch Exception _ [:invalid endpoint])))
 
