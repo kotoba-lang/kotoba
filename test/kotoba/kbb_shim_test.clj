@@ -183,16 +183,18 @@
           (skip! "fs_browse_provider (wire 34)")
           ;; Measured 2026-09-08 through this shim on both hosts: the js host
           ;; answers the NAME<TAB>D wire (".h\t0\na\t0\nb\t0" = 12 bytes for the
-          ;; three-file fixture; kotoba b7ab6bee2), the native loader at this
-          ;; file's deps.edn amu pin answers names only (".h\na\nb" = 6 bytes).
-          ;; The native D-flag widening is jvm-retire item 1/2 work; when the
-          ;; loader answers the js bytes, the native assertion flips to 12.
-          (testing "each JVM-free host answers its measured wire-34 listing: js = 12 bytes (NAME<TAB>D), native = 6 bytes (names-only, the open D-flag gap)"
+          ;; three-file fixture; kotoba b7ab6bee2). The native loader at the
+          ;; pre-widening amu pin answered names only (".h\na\nb" = 6 bytes);
+          ;; amu a681d3f2 (loader 9942820b) widened it to the same NAME<TAB>D bytes, so both
+          ;; hosts must answer 12 for the same three-file fixture. A native
+          ;; answer of 6 (or anything but 12) is a regression to the names-only
+          ;; wire and a silent is-directory loss.
+          (testing "each JVM-free host answers its measured wire-34 listing: js = 12 bytes (NAME<TAB>D), native = 12 bytes (same wire, amu a681d3f2+)"
             (let [native (run-shim (.getPath via-wire) "--policy" (.getPath policy) "--backend" "native")
                   js (run-shim (.getPath via-wire) "--policy" (.getPath policy) "--backend" "js")]
               (is (zero? (:exit native)) (str (:out native) (:err native)))
               (is (zero? (:exit js)) (:out js))
-              (is (= 6 (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/result])) (:out native))
+              (is (= 12 (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/result])) (:out native))
               (is (= 12 (get-in (receipt js) [:kotoba.cli/data :kotoba.kbb/result])) (:out js))
               (is (= {:fs/browse [(str (.toRealPath (.toPath dir) (make-array java.nio.file.LinkOption 0)))]}
                      (get-in (receipt native) [:kotoba.cli/data :kotoba.kbb/scopes]))))))
