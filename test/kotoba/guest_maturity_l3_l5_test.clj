@@ -97,22 +97,25 @@
     (is (= :meets-threshold (:status report)))))
 
 (deftest l5-missing-host-is-capability-absence
-  (testing "browser lacks llm-infer — guard fails closed before provider"
-    (let [g (host-parity/guard-host-import :llm-infer :browser)]
+  (testing "browser lacks scram-sha256 - guard fails closed before provider"
+    (let [g (host-parity/guard-host-import :scram-sha256 :browser)]
       (is (false? (:kotoba.host/ok? g)))
       (is (= :host-absent (:kotoba.host/denied g)))
       (is (= :capability-absent (:status g)))))
-  (testing "same import is available on jvm"
+  (testing "browser coop-or-inject (llm-infer) counts as available, not absent"
+    (let [g (host-parity/guard-host-import :llm-infer :browser)]
+      (is (true? (:kotoba.host/ok? g)))))
+  (testing "llm-infer is available on jvm"
     (let [g (host-parity/guard-host-import :llm-infer :jvm)]
       (is (true? (:kotoba.host/ok? g)))))
   (testing "compose: host-absent short-circuits guard-call style handlers"
-    (let [host-gate (host-parity/guard-host-import :llm-infer :browser)
+    (let [host-gate (host-parity/guard-host-import :scram-sha256 :browser)
           ;; only if host were available would we reach capability intersection
           final (if (false? (:kotoba.host/ok? host-gate))
                   host-gate
                   (capability-host/guard-call
-                   {:call :llm-infer
-                    :requested (capability-values/make-cap :infer "bafymodel")
+                   {:call :scram-sha256
+                    :requested (capability-values/make-cap :hash-scram-sha256 "any-resource")
                     :cacao-grants []
                     :local-policy {:policy/allow {}}
                     :now "2026-07-18"
