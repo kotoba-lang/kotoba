@@ -1,0 +1,749 @@
+(ns kotoba.lang.bounded-regex
+  (:export [regex-piece-budget regex-valid?
+            regex-contains regex-match regex-find-index regex-match-end
+            regex-count main]))
+
+;; Sovereign bounded REGEX kernel, in the same subset as
+;; kotoba.lang.bounded-text. Until this module existed, `kotoba.lang.text`
+;; reached for the HOST's #"..." for every regex operation, so no `.kotoba`
+;; guest could match a pattern at all.
+;;
+;; ## Why this is allowed to exist
+;;
+;; The absence of regex was NOT a security decision. ADR-2608650000 records
+;; the classification: regex is `:not-yet-implemented`, and it appears in
+;; neither `:forbidden-heads` nor `lang/surface-status.edn`. The one place the
+;; word does appear, `lang/value-codec.edn`'s `:rejected-closed`, says a
+;; COMPILED PATTERN cannot be transferred as a value -- a canonical encoding
+;; decision about values, not a ban on the operation. This module respects it:
+;; a pattern here is a `:string` argument, never a value of a regex type, so
+;; nothing new has to become encodable.
+;;
+;; `lang/compat.edn` also records that a `#"..."` literal in guest source is a
+;; READER rejection, so nothing in this subset can be reached by writing one.
+;;
+;; ## What IS a real constraint, and how it is met structurally
+;;
+;; `resource-bounds` is one of the shielding axes (adr-2608301500). The hazard
+;; in regex is not the notation, it is BACKTRACKING: a backtracking engine
+;; turns `(a+)+$` into exponential work on an input the caller chose, which is
+;; a denial of service written in the pattern language. So this kernel has no
+;; backtracking matcher, and it is not written in a style where one could be
+;; added by accident.
+;;
+;; The subset is group-free, so every branch is a LINEAR chain of pieces and
+;; its Glushkov automaton is a chain of states. The state set is a bitmask in
+;; one i64, and one input code point advances the WHOLE set in a single
+;; forward walk of the pattern. Cost is O(n * m) with m <= 60 pieces -- a
+;; bound the machine has by CONSTRUCTION, not by a fuel counter bolted on
+;; afterwards. There is no backtracking stack and no input that makes the
+;; scan re-enter. `regex-find-index` is the one function that pays O(n^2 * m),
+;; because a leftmost START needs a per-start answer and this kernel has
+;; nowhere to keep one start offset per live state; it says so at its own
+;; definition, and `regex-contains` is the linear answer to the question grep
+;; actually asks.
+;;
+;; ## The subset, exactly
+;;
+;;   pattern := branch ('|' branch)*        alternation, top level only
+;;   branch  := '^'? piece* '$'?
+;;   piece   := atom ('*' | '+' | '?')?
+;;   atom    := '.' | '[' class ']' | '\' escape | literal-code-point
+;;   class   := '^'? item*                  ']' first is literal, a-z ranges
+;;   escape  := d D w W s S n t r, or any other character, taken literally
+;;
+;; Everything else is REFUSED, never guessed. `(` `)` `{` `}` are refused
+;; rather than read as literals, because a caller who writes `(ab)+` or
+;; `a{2,3}` means the group and the repetition, and matching the punctuation
+;; instead would answer a question nobody asked. `^` and `$` away from their
+;; anchor positions are refused for the same reason. A refusal is the error
+;; arm of `[:result :i64 :string]`, distinct from every successful answer, so
+;; "outside the subset" can never be read as "no match" (root CLAUDE.md, the
+;; eight questions, #1 and #4).
+;;
+;; ## Character classes are ASCII, and say so
+;;
+;; \d is [0-9], \w is [0-9A-Za-z_], \s is the six ASCII spaces that
+;; bounded_text's `ws?` names. A host engine may answer for Unicode digits;
+;; this kernel names its class rather than differing silently, which is the
+;; same trade bounded_text made for `trim` and `fold-case`.
+;;
+;; ## Two divergences, both named rather than discovered later
+;;
+;;   * `[]]` matches a `]`. The first `]` inside a bracket expression is a
+;;     LITERAL, which is what POSIX says and what grep and Python do
+;;     (`printf 'a]b' | grep -c '[]]'` answers 1, measured 2026-09-08).
+;;     JavaScript's RegExp disagrees -- it reads `[]` as an empty class that
+;;     matches nothing -- so a parity run against the host RegExp reports this
+;;     as a mismatch. It is the host that is the outlier here, and the
+;;     divergence is asserted in scripts/verify-bounded-regex.cljs rather than
+;;     skipped, so it cannot rot into an accident.
+;;   * Alternation is leftmost-LONGEST, not leftmost-first. `a|ab` against
+;;     "ab" matches the whole of "ab" here and just "a" in a backtracking
+;;     engine. Longest is what a machine without backtracking naturally
+;;     computes, and it is what POSIX specifies; a caller who needs the
+;;     ordered-alternative rule does not have it in this kernel.
+;;
+;; ## Measured cost, and where it is NOT
+;;
+;; The automaton is O(n * m). What the kotoba-script (web) backend actually
+;; delivers is quadratic in n, because `string-code-point-at` at a byte offset
+;; appears to cost O(offset) there: measured 2026-09-08, `regex-contains` with
+;; a ONE-piece pattern takes 7.5 / 14 / 41 / 144 / 550 ms at n = 500 / 1000 /
+;; 2000 / 4000 / 8000, and the five-piece pattern costs almost the same, so
+;; the growth is in the text access rather than in the pattern walk. The
+;; CONTROL that places it outside this module: bounded_text's own
+;; `index-of-text`, which predates this file, draws the same curve (7.3 / 23 /
+;; 60 / 249 / 881 ms). This is the same defect class amu's co-scientist found
+;; and fixed in the NATIVE loader on 2026-08-31 -- `checked_string_code_point_at`
+;; revalidating the whole string on every access, O(n^2), which took the
+;; strings domain from 10.77x to 2.17x against its gcc twin. The web backend
+;; still has the shape. Nothing in this module can fix it, and no rewrite here
+;; should be attempted on the strength of a profile that points at this file.
+
+;; ## Four measured backend facts shaped this code (2026-09-08, amu 9092ee34)
+;;
+;;   * A function may take at most FIVE parameters (`:kotoba.error/
+;;     max-parameters`), and a `loop`'s bindings plus its captured outer
+;;     variables must also total at most five (`:kotoba.error/
+;;     loop-parameter-ceiling`). That is why a branch is carried as its own
+;;     SUBSTRING rather than as (pattern, start, end): one string parameter
+;;     instead of three. It is also why every walk here is a self-recursive
+;;     `defn-` -- self tail calls compile to loops, so this costs no stack.
+;;   * `bit-and` / `bit-or` compile on wasm32 but NOT on the kotoba-script
+;;     (web) backend: `unsupported KIR operation`. So the bitmask is built and
+;;     read with `+`, `-`, `*` and `quot` only, and this module compiles on
+;;     both. That is an implementation gap in one backend, not a language
+;;     decision; when it closes, the arithmetic can become bit operations with
+;;     no change to any signature.
+;;   * `i64-shift-left` requires an integer LITERAL shift count in [0,63], so
+;;     `(i64-shift-left 1 k)` for a loop variable is rejected outright. The
+;;     place value is carried through the walk and doubled instead, which is
+;;     what the walk wanted anyway.
+;;   * `quot` is admitted; `rem` is not.
+;;
+;; The budget is 60 pieces per branch so the highest place value is 2^60 and
+;; the doubling never approaches the i64 sign bit.
+
+(defn regex-piece-budget [] :i64 60)
+
+;; --- code point walking ----------------------------------------------------
+;; string-code-point-at and string-substring take BYTE offsets and TRAP on a
+;; non-boundary offset, so every scan advances by the decoded width, and the
+;; width comes from the CODE POINT rather than the leading byte (bounded_text
+;; records the same trap: U+00F6 is code point 246 but two bytes).
+
+(defn- cp-width [ch :i64] :i64
+  (if (< ch 128)
+    1
+    (if (< ch 2048)
+      2
+      (if (< ch 65536) 3 4))))
+
+(defn- next-index [s :string i :i64] :i64
+  (+ i (cp-width (string-code-point-at s i))))
+
+;; --- character classes -----------------------------------------------------
+
+(defn- digit? [c :i64] :bool
+  (if (< c 48) false (if (> c 57) false true)))
+
+(defn- space? [c :i64] :bool
+  (if (= c 32)
+    true
+    (if (= c 9)
+      true
+      (if (= c 10)
+        true
+        (if (= c 13)
+          true
+          (if (= c 12)
+            true
+            (if (= c 11) true false)))))))
+
+(defn- word? [c :i64] :bool
+  (if (digit? c)
+    true
+    (if (= c 95)
+      true
+      (if (< c 65)
+        false
+        (if (<= c 90)
+          true
+          (if (< c 97) false (if (<= c 122) true false)))))))
+
+;; --- pattern shape ---------------------------------------------------------
+
+(defn- class-end [b :string i :i64 e :i64] :i64
+  ;; i addresses '['. Answers the offset just past the closing ']', or -1 when
+  ;; the class is unterminated inside [i,e). A ']' immediately after '[' or
+  ;; '[^' is a literal ']', which is what `first` tracks.
+  (let [a1 (+ i 1)
+        a2 (if (< a1 e)
+             (if (= (string-code-point-at b a1) 94) (+ a1 1) a1)
+             a1)]
+    (loop [j a2 first 1]
+      (if (>= j e)
+        -1
+        (let [ch (string-code-point-at b j)]
+          (if (= ch 92)
+            (if (>= (+ j 1) e) -1 (recur (next-index b (+ j 1)) 0))
+            (if (= ch 93)
+              (if (= first 1) (recur (next-index b j) 0) (+ j 1))
+              (recur (next-index b j) 0))))))))
+
+(defn- atom-end [b :string i :i64 e :i64] :i64
+  ;; Offset just past the atom starting at i, or -1 when what is there is not
+  ;; an atom of this subset. Refusing is the point: '(' is not a literal
+  ;; parenthesis here, it is a construct this kernel does not implement.
+  (let [ch (string-code-point-at b i)]
+    (if (= ch 92)
+      (if (>= (+ i 1) e) -1 (next-index b (+ i 1)))
+      (if (= ch 91)
+        (class-end b i e)
+        (if (= ch 40)
+          -1
+          (if (= ch 41)
+            -1
+            (if (= ch 123)
+              -1
+              (if (= ch 125)
+                -1
+                (if (= ch 93)
+                  -1
+                  (if (= ch 42)
+                    -1
+                    (if (= ch 43)
+                      -1
+                      (if (= ch 63)
+                        -1
+                        (if (= ch 124)
+                          -1
+                          (if (= ch 94)
+                            -1
+                            (if (= ch 36) -1 (next-index b i))))))))))))))))
+
+(defn- quant-at [b :string j :i64 e :i64] :i64
+  ;; The quantifier code point at j, or 0 when there is none.
+  (if (>= j e)
+    0
+    (let [ch (string-code-point-at b j)]
+      (if (= ch 42) 42 (if (= ch 43) 43 (if (= ch 63) 63 0))))))
+
+(defn- repeatable [q :i64] :i64
+  (if (= q 42) 1 (if (= q 43) 1 0)))
+
+(defn- optional [q :i64] :i64
+  (if (= q 42) 1 (if (= q 63) 1 0)))
+
+;; --- matching one atom against one code point ------------------------------
+
+(defn- esc-matches? [b :string ei :i64 c :i64] :bool
+  ;; ei addresses the code point AFTER the backslash.
+  (let [k (string-code-point-at b ei)]
+    (if (= k 100)
+      (digit? c)
+      (if (= k 68)
+        (if (digit? c) false true)
+        (if (= k 119)
+          (word? c)
+          (if (= k 87)
+            (if (word? c) false true)
+            (if (= k 115)
+              (space? c)
+              (if (= k 83)
+                (if (space? c) false true)
+                (if (= k 110)
+                  (if (= c 10) true false)
+                  (if (= k 116)
+                    (if (= c 9) true false)
+                    (if (= k 114)
+                      (if (= c 13) true false)
+                      (if (= c k) true false))))))))))))
+
+(defn- class-hit [b :string e :i64 c :i64 j :i64] :i64
+  ;; 1 when code point c is one of the class items in [j,e). Self-recursive
+  ;; rather than a loop for the arity ceiling.
+  (if (>= j e)
+    0
+    (let [ch (string-code-point-at b j)]
+      (if (= ch 92)
+        (if (esc-matches? b (+ j 1) c)
+          1
+          (class-hit b e c (next-index b (+ j 1))))
+        (let [nx (next-index b j)]
+          (if (< nx e)
+            (if (= (string-code-point-at b nx) 45)
+              (let [r2 (+ nx 1)]
+                (if (< r2 e)
+                  (let [hi (string-code-point-at b r2)]
+                    (if (>= c ch)
+                      (if (<= c hi) 1 (class-hit b e c (next-index b r2)))
+                      (class-hit b e c (next-index b r2))))
+                  (if (= c ch) 1 (class-hit b e c nx))))
+              (if (= c ch) 1 (class-hit b e c nx)))
+            (if (= c ch) 1 (class-hit b e c nx))))))))
+
+(defn- class-matches? [b :string i :i64 aend :i64 c :i64] :bool
+  ;; i addresses '[', aend is just past ']'.
+  (let [n1 (+ i 1)
+        neg (if (= (string-code-point-at b n1) 94) 1 0)
+        hit (class-hit b (- aend 1) c (+ n1 neg))]
+    (if (= neg 1)
+      (if (= hit 1) false true)
+      (if (= hit 1) true false))))
+
+(defn- atom-matches? [b :string i :i64 aend :i64 c :i64] :bool
+  (let [ch (string-code-point-at b i)]
+    (if (= ch 46)
+      ;; '.' is any code point except newline, as in every grep.
+      (if (= c 10) false true)
+      (if (= ch 92)
+        (esc-matches? b (+ i 1) c)
+        (if (= ch 91)
+          (class-matches? b i aend c)
+          (if (= c ch) true false))))))
+
+;; --- branch shape ----------------------------------------------------------
+;; A BRANCH BODY is carried as its own string from here down: the drivers cut
+;; it out of the pattern once with string-substring, anchors already stripped.
+
+(defn- branch-limit [p :string s :i64 plen :i64] :i64
+  ;; End offset of the branch starting at s: the next TOP LEVEL '|', which is
+  ;; neither escaped nor inside a class.
+  (loop [j s]
+    (if (>= j plen)
+      plen
+      (let [ch (string-code-point-at p j)]
+        (if (= ch 92)
+          (if (>= (+ j 1) plen) plen (recur (next-index p (+ j 1))))
+          (if (= ch 91)
+            (let [ce (class-end p j plen)]
+              (if (< ce 0) plen (recur ce)))
+            (if (= ch 124) j (recur (next-index p j)))))))))
+
+(defn- dollar-at [b :string e :i64 i :i64] :i64
+  ;; 1 when the piece walk over [0,e) reaches a bare '$' occupying the last
+  ;; byte. The walk is how the '$' is FOUND, rather than indexing e-1
+  ;; directly: `string-code-point-at` traps on a non-boundary offset, and
+  ;; e-1 is a continuation byte whenever the branch ends in a multi-byte
+  ;; character (measured 2026-09-08 -- `é+` trapped here with
+  ;; "string code-point offset splits a UTF-8 code point"). A piece start is
+  ;; always a boundary, so reading at `i` is safe.
+  (if (>= i e)
+    0
+    (let [aend (atom-end b i e)]
+      (if (< aend 0)
+        (if (= i (- e 1))
+          (if (= (string-code-point-at b i) 36) 1 0)
+          0)
+        (if (> aend e)
+          0
+          (let [q (quant-at b aend e)]
+            (dollar-at b e (if (= q 0) aend (+ aend 1)))))))))
+
+(defn- pieces-step [b :string e :i64 i :i64 n :i64] :i64
+  (if (>= i e)
+    (if (> n 60) -1 n)
+    (let [aend (atom-end b i e)]
+      (if (< aend 0)
+        -1
+        (if (> aend e)
+          -1
+          (let [q (quant-at b aend e)]
+            (pieces-step b e (if (= q 0) aend (+ aend 1)) (+ n 1))))))))
+
+(defn- pieces [b :string] :i64
+  ;; Number of pieces in the branch body, or -1 when it is outside the subset
+  ;; or over budget.
+  (pieces-step b (string-byte-length b) 0 0))
+
+(defn- astart [p :string s :i64 be :i64] :i64
+  (if (>= s be) 0 (if (= (string-code-point-at p s) 94) 1 0)))
+
+(defn- aend-flag [p :string bs :i64 be :i64] :i64
+  ;; 1 when the branch body ends with a BARE '$' piece. `\$` answers 0,
+  ;; because the piece walk consumes the backslash escape and never reaches
+  ;; the '$' as a piece of its own.
+  (let [raw (string-substring p bs be)]
+    (dollar-at raw (string-byte-length raw) 0)))
+
+;; --- the automaton ---------------------------------------------------------
+;; Bit k of the state means "pieces 0..k-1 are consumed, the machine sits
+;; before piece k". Bit m is the accept state, and because bits above m are
+;; never set, "accept" is exactly `state >= 2^m`.
+
+(defn- pow2 [k :i64] :i64
+  (loop [n k b 1]
+    (if (<= n 0) b (recur (- n 1) (* b 2)))))
+
+(defn- init-step [b :string i :i64 pend :i64] :i64
+  ;; Returns the bits for positions i-onwards, this position at bit 0. The
+  ;; combination happens on the way back out, which is what keeps the
+  ;; parameter list inside the ABI ceiling.
+  (if (>= i (string-byte-length b))
+    pend
+    (let [aend (atom-end b i (string-byte-length b))
+          q (quant-at b aend (string-byte-length b))]
+      (+ pend
+         (* 2 (init-step b
+                         (if (= q 0) aend (+ aend 1))
+                         (if (= pend 1) (optional q) 0)))))))
+
+(defn- init-state [b :string] :i64
+  ;; Bit 0, closed under the epsilon edges '*' and '?' pieces provide.
+  (init-step b 0 1))
+
+(defn- adv-step [b :string c :i64 i :i64 sr :i64 pend :i64] :i64
+  ;; One input code point moves the WHOLE state set forward in one walk.
+  ;; `sr` is the unread half of the incoming state, so its low bit is the
+  ;; current position's bit; `pend` is this position's bit in the state being
+  ;; built. Epsilon edges only ever go k -> k+1, so this single ascending pass
+  ;; closes them.
+  (if (>= i (string-byte-length b))
+    pend
+    (let [aend (atom-end b i (string-byte-length b))
+          q (quant-at b aend (string-byte-length b))
+          sk (- sr (* (quot sr 2) 2))
+          matched (if (= sk 1)
+                    (if (atom-matches? b i aend c) 1 0)
+                    0)
+          here (if (= pend 1)
+                 1
+                 (if (= matched 1) (repeatable q) 0))
+          nb (if (= matched 1)
+               1
+               (if (= here 1) (optional q) 0))]
+      (+ here
+         (* 2 (adv-step b c
+                        (if (= q 0) aend (+ aend 1))
+                        (quot sr 2)
+                        nb))))))
+
+(defn- advance [b :string st :i64 c :i64 inject :i64] :i64
+  ;; `inject` set means a fresh match may also begin here, which is how an
+  ;; unanchored search stays a single pass instead of restarting.
+  (adv-step b c 0 st inject))
+
+;; --- scans -----------------------------------------------------------------
+
+(defn- first-scan [b :string text :string acc :i64 pos :i64 st :i64] :i64
+  ;; 1 when the anchored machine accepts anywhere from here.
+  (if (>= st acc)
+    1
+    (if (>= pos (string-byte-length text))
+      0
+      (if (= st 0)
+        0
+        (first-scan b text acc
+                    (next-index text pos)
+                    (advance b st (string-code-point-at text pos) 0))))))
+
+(defn- full-scan [b :string text :string acc :i64 pos :i64 st :i64] :i64
+  ;; 1 when a path accepts exactly at the end of the text.
+  (if (>= pos (string-byte-length text))
+    (if (>= st acc) 1 0)
+    (if (= st 0)
+      0
+      (full-scan b text acc
+                 (next-index text pos)
+                 (advance b st (string-code-point-at text pos) 0)))))
+
+(defn- long-scan [b :string text :string acc :i64 pos :i64 st :i64] :i64
+  ;; The LONGEST accept offset from here, or -1. This one combines on the way
+  ;; back, so its depth is the number of steps until the machine dies or the
+  ;; text ends -- for most patterns the machine dies within a few code points
+  ;; of the match.
+  (let [cur (if (>= st acc) pos -1)]
+    (if (>= pos (string-byte-length text))
+      cur
+      (if (= st 0)
+        cur
+        (let [rest (long-scan b text acc
+                              (next-index text pos)
+                              (advance b st
+                                       (string-code-point-at text pos) 0))]
+          (if (>= rest 0) rest cur))))))
+
+(defn- hit-scan [b :string text :string acc :i64 pos :i64 st :i64] :i64
+  ;; Unanchored containment in ONE pass: the start state is re-injected at
+  ;; every position, so no input makes this restart. O(n * m).
+  (if (>= st acc)
+    1
+    (if (>= pos (string-byte-length text))
+      0
+      (hit-scan b text acc
+                (next-index text pos)
+                (advance b st (string-code-point-at text pos) 1)))))
+
+(defn- hit-end-scan [b :string text :string acc :i64 pos :i64 st :i64] :i64
+  ;; The same, for a branch carrying '$': only an accept at the end counts.
+  (if (>= pos (string-byte-length text))
+    (if (>= st acc) 1 0)
+    (hit-end-scan b text acc
+                  (next-index text pos)
+                  (advance b st (string-code-point-at text pos) 1))))
+
+;; --- one branch ------------------------------------------------------------
+
+(defn- b-any-at [b :string text :string from :i64 need :i64] :i64
+  ;; 1 when a match starts exactly at `from`.
+  (let [acc (pow2 (pieces b))
+        st (init-state b)]
+    (if (= need 1)
+      (full-scan b text acc from st)
+      (first-scan b text acc from st))))
+
+(defn- b-hit [b :string text :string anchored :i64 need :i64] :i64
+  (let [acc (pow2 (pieces b))
+        st (init-state b)]
+    (if (= anchored 1)
+      (if (= need 1)
+        (full-scan b text acc 0 st)
+        (first-scan b text acc 0 st))
+      (if (= need 1)
+        (hit-end-scan b text acc 0 st)
+        (hit-scan b text acc 0 st)))))
+
+(defn- b-long [b :string text :string from :i64 need :i64] :i64
+  ;; Offset just past the longest match anchored at `from`, or -1.
+  (let [acc (pow2 (pieces b))
+        st (init-state b)]
+    (if (= need 1)
+      (if (= (full-scan b text acc from st) 1) (string-byte-length text) -1)
+      (long-scan b text acc from st))))
+
+(defn- find-scan [b :string text :string need :i64 pos :i64] :i64
+  (if (= (b-any-at b text pos need) 1)
+    pos
+    (if (>= pos (string-byte-length text))
+      -1
+      (find-scan b text need (next-index text pos)))))
+
+(defn- b-find [b :string text :string from :i64 anchored :i64 need :i64] :i64
+  ;; Leftmost start at or after `from`, or -1. O(n^2 * m): a leftmost START
+  ;; needs a per-start answer and this kernel has nowhere to keep one start
+  ;; offset per live state. Callers that only need "is there a match" must use
+  ;; regex-contains, which is O(n * m).
+  (if (= anchored 1)
+    (if (= from 0)
+      (if (= (b-any-at b text 0 need) 1) 0 -1)
+      -1)
+    (find-scan b text need from)))
+
+;; --- whole-pattern drivers -------------------------------------------------
+;; Each walks the top-level branches. Every branch is validated even after an
+;; answer is known, so an alternation whose LATER arm is outside the subset is
+;; refused rather than answered from its earlier arm.
+
+(defn- validate-step [p :string plen :i64 s :i64] :i64
+  (let [be (branch-limit p s plen)
+        a0 (astart p s be)
+        a1 (aend-flag p (+ s a0) be)]
+    (if (< (pieces (string-substring p (+ s a0) (- be a1))) 0)
+      0
+      (if (>= be plen) 1 (validate-step p plen (+ be 1))))))
+
+(defn- raw-validate [p :string] :i64
+  (validate-step p (string-byte-length p) 0))
+
+(defn- contains-step [p :string plen :i64 text :string s :i64 hit :i64] :i64
+  (let [be (branch-limit p s plen)
+        a0 (astart p s be)
+        a1 (aend-flag p (+ s a0) be)
+        b (string-substring p (+ s a0) (- be a1))]
+    (if (< (pieces b) 0)
+      -2
+      (let [h (if (= hit 1) 1 (b-hit b text a0 a1))]
+        (if (>= be plen) h (contains-step p plen text (+ be 1) h))))))
+
+(defn- raw-contains [p :string text :string] :i64
+  (contains-step p (string-byte-length p) text 0 0))
+
+(defn- full-step [p :string plen :i64 text :string s :i64 hit :i64] :i64
+  (let [be (branch-limit p s plen)
+        a0 (astart p s be)
+        a1 (aend-flag p (+ s a0) be)
+        b (string-substring p (+ s a0) (- be a1))]
+    (if (< (pieces b) 0)
+      -2
+      (let [h (if (= hit 1) 1 (b-hit b text 1 1))]
+        (if (>= be plen) h (full-step p plen text (+ be 1) h))))))
+
+(defn- raw-full [p :string text :string] :i64
+  ;; The WHOLE input must be the match: anchored at both ends whatever the
+  ;; branch itself says.
+  (full-step p (string-byte-length p) text 0 0))
+
+(defn- findfrom-step [p :string text :string from :i64 s :i64 best :i64] :i64
+  (let [plen (string-byte-length p)
+        be (branch-limit p s plen)
+        a0 (astart p s be)
+        a1 (aend-flag p (+ s a0) be)
+        b (string-substring p (+ s a0) (- be a1))]
+    (if (< (pieces b) 0)
+      -2
+      (let [f (b-find b text from a0 a1)
+            b2 (if (< f 0)
+                 best
+                 (if (< best 0) f (if (< f best) f best)))]
+        (if (>= be plen) b2 (findfrom-step p text from (+ be 1) b2))))))
+
+(defn- find-from [p :string text :string from :i64] :i64
+  (findfrom-step p text from 0 -1))
+
+(defn- endat-step [p :string text :string at :i64 s :i64 best :i64] :i64
+  (let [plen (string-byte-length p)
+        be (branch-limit p s plen)
+        a0 (astart p s be)
+        a1 (aend-flag p (+ s a0) be)
+        b (string-substring p (+ s a0) (- be a1))]
+    (if (< (pieces b) 0)
+      -2
+      (let [e (if (= a0 1)
+                (if (= at 0) (b-long b text 0 a1) -1)
+                (b-long b text at a1))
+            b2 (if (> e best) e best)]
+        (if (>= be plen) b2 (endat-step p text at (+ be 1) b2))))))
+
+(defn- end-at [p :string text :string at :i64] :i64
+  (endat-step p text at 0 -1))
+
+(defn- count-step [p :string text :string pos :i64 n :i64] :i64
+  (if (> pos (string-byte-length text))
+    n
+    (let [st (find-from p text pos)]
+      (if (< st 0)
+        n
+        (let [e (end-at p text st)]
+          (if (< e 0)
+            n
+            (if (> e st)
+              (count-step p text e (+ n 1))
+              (if (>= st (string-byte-length text))
+                (+ n 1)
+                (count-step p text (next-index text st) (+ n 1))))))))))
+
+(defn- raw-count [p :string text :string] :i64
+  ;; Non-overlapping leftmost-longest matches. An empty match advances one
+  ;; code point so the scan cannot stall on `a*`.
+  (if (= (raw-validate p) 0)
+    -2
+    (count-step p text 0 0)))
+
+;; --- public surface --------------------------------------------------------
+;; Every answer that can fail carries [:result :i64 :string]: a pattern this
+;; kernel does not implement is an ERROR ARM, never a 0 that reads like "no
+;; match". regex-valid? is total and needs no error channel.
+
+(defn regex-valid? [pattern :string] :bool
+  (if (= (raw-validate pattern) 1) true false))
+
+(defn regex-contains [pattern :string text :string] [:result :i64 :string]
+  ;; 1 when some substring of text matches, else 0. O(n * m), one pass.
+  (let [r (raw-contains pattern text)]
+    (if (= r -2)
+      (result-err-of [:result :i64 :string]
+                     "pattern is outside the bounded regex subset")
+      (result-ok-of [:result :i64 :string] r))))
+
+(defn regex-match [pattern :string text :string] [:result :i64 :string]
+  ;; 1 when the WHOLE text matches, else 0.
+  (let [r (raw-full pattern text)]
+    (if (= r -2)
+      (result-err-of [:result :i64 :string]
+                     "pattern is outside the bounded regex subset")
+      (result-ok-of [:result :i64 :string] r))))
+
+(defn regex-find-index [pattern :string text :string] [:result :i64 :string]
+  ;; Byte offset where the leftmost match starts, or -1 when there is none --
+  ;; the -1 contract index-of-text already uses in this repo.
+  (let [r (find-from pattern text 0)]
+    (if (= r -2)
+      (result-err-of [:result :i64 :string]
+                     "pattern is outside the bounded regex subset")
+      (result-ok-of [:result :i64 :string] r))))
+
+(defn regex-match-end [pattern :string text :string start :i64] [:result :i64 :string]
+  ;; Byte offset just past the LONGEST match anchored at `start`, or -1.
+  (let [r (end-at pattern text start)]
+    (if (= r -2)
+      (result-err-of [:result :i64 :string]
+                     "pattern is outside the bounded regex subset")
+      (result-ok-of [:result :i64 :string] r))))
+
+(defn regex-count [pattern :string text :string] [:result :i64 :string]
+  ;; Non-overlapping match count.
+  (let [r (raw-count pattern text)]
+    (if (= r -2)
+      (result-err-of [:result :i64 :string]
+                     "pattern is outside the bounded regex subset")
+      (result-ok-of [:result :i64 :string] r))))
+
+;; --- self check ------------------------------------------------------------
+;; Answers FAILURES * 1000 + CHECKS RUN, so a build that ran no checks answers
+;; 0 and is visibly different from a build that ran them all and passed (root
+;; CLAUDE.md: a boolean self-check cannot tell one regression apart from a
+;; broken build). All 47 passing is 47.
+
+(defn- chk [got :i64 want :i64] :i64
+  (if (= got want) 0 1))
+
+(defn main [] :i64
+  (let [lit (+ (+ (chk (raw-contains "abc" "xxabcxx") 1)
+                  (chk (raw-contains "abc" "xxabxx") 0))
+               (+ (chk (raw-contains "a.c" "zabcz") 1)
+                  (chk (raw-contains "a.c" "za\ncz") 0)))
+        qnt (+ (+ (chk (raw-contains "ab*c" "ac") 1)
+                  (chk (raw-contains "ab*c" "abbbc") 1))
+               (+ (chk (raw-contains "ab+c" "ac") 0)
+                  (chk (raw-contains "ab?c" "abc") 1)))
+        anc (+ (+ (chk (raw-contains "^abc" "abcd") 1)
+                  (chk (raw-contains "^abc" "xabcd") 0))
+               (+ (chk (raw-contains "abc$" "xxabc") 1)
+                  (chk (raw-contains "abc$" "xxabcx") 0)))
+        cls (+ (+ (chk (raw-contains "[a-c]x" "zbx") 1)
+                  (chk (raw-contains "[a-c]x" "zdx") 0))
+               (+ (chk (raw-contains "[^a-c]x" "zdx") 1)
+                  (chk (raw-contains "[]]" "a]b") 1)))
+        esc (+ (+ (chk (raw-contains "\\d+" "ab123") 1)
+                  (chk (raw-contains "\\d+" "abc") 0))
+               (+ (chk (raw-contains "\\w+" "..a_1..") 1)
+                  (chk (raw-contains "a\\.c" "abc") 0)))
+        alt (+ (+ (chk (raw-contains "cat|dog" "hotdog") 1)
+                  (chk (raw-contains "cat|dog" "hotbird") 0))
+               (+ (chk (raw-contains "^cat|dog$" "dog") 1)
+                  (chk (raw-contains "^cat|dog$" "dogs") 0)))
+        ful (+ (+ (chk (raw-full "a+" "aaa") 1)
+                  (chk (raw-full "a+" "aaab") 0))
+               (+ (chk (raw-full "a|ab" "ab") 1)
+                  (chk (raw-full "" "") 1)))
+        fnd (+ (+ (chk (find-from "b+" "aabbb" 0) 2)
+                  (chk (find-from "z" "aabbb" 0) -1))
+               (+ (chk (find-from "b" "aabbb" 3) 3)
+                  (chk (find-from "^a" "aab" 0) 0)))
+        lng (+ (+ (chk (end-at "ab*" "abbbc" 0) 4)
+                  (chk (end-at "ab*" "xbbb" 0) -1))
+               (+ (chk (end-at "a|ab" "abc" 0) 2)
+                  (chk (end-at "" "abc" 1) 1)))
+        cnt (+ (+ (chk (raw-count "ab" "ababab") 3)
+                  (chk (raw-count "a*" "aa") 2))
+               (+ (chk (raw-count "\\d+" "a1b22c333") 3)
+                  (chk (raw-count "z" "aaa") 0)))
+        rja (+ (+ (chk (raw-contains "(ab)+" "abab") -2)
+                  (chk (raw-contains "a{2,3}" "aaa") -2))
+               (+ (chk (raw-contains "[abc" "b") -2)
+                  (chk (raw-contains "*a" "a") -2)))
+        rjb (+ (+ (chk (raw-contains "a|(b)" "a") -2)
+                  (chk (raw-contains "a$b" "ab") -2))
+               (+ (chk (raw-validate "a\\") 0)
+                  (chk (raw-validate "[a-c]|\\d+|^x$") 1)))
+        uni (+ (+ (chk (raw-contains "é+" "caféé!") 1)
+                  (chk (find-from "é" "café" 0) 3))
+               (+ (chk (raw-contains "^$" "") 1)
+                  (chk (raw-full "a?b?" "") 1)))]
+    (+ (* (+ (+ (+ (+ (+ lit qnt) (+ anc cls)) (+ esc alt))
+                (+ (+ ful fnd) (+ lng cnt)))
+             (+ (+ rja rjb) uni))
+          1000)
+       47)))
