@@ -24,6 +24,13 @@
   #{"deps.edn" "nbb.edn" "bb.edn" "shadow-cljs.edn" "figwheel-main.edn"
     "lein-project.edn" "data_readers.edn" "config.edn.template"})
 
+(def source-ext [".clj" ".cljs" ".cljc"])
+
+(defn- source-path? [p] (some #(str/ends-with? p %) source-ext))
+
+(defn- source-target [p]
+  (str (subs p 0 (str/last-index-of p ".")) ".kotoba"))
+
 (def skip-dirs #{".git" "node_modules" ".nbb" ".cpcache" "target" ".shadow-cljs"
                  ".projection-cache" "dist" "build" ".datalad"})
 
@@ -31,7 +38,8 @@
   (let [st (try (fs/statSync root) (catch :default _ nil))]
     (cond
       (nil? st) out
-      (.isFile st) (if (str/ends-with? root ".edn") (conj out root) out)
+      (.isFile st) (if (or (str/ends-with? root ".edn") (source-path? root))
+                     (conj out root) out)
       (.isDirectory st)
       (if (contains? skip-dirs (path/basename root))
         out
@@ -65,11 +73,49 @@
    agent's in-flight work in this workspace; renaming them is destructive and
    invisible to review, so --tracked-only exists and the wave uses it."
   [root]
-  (let [out (.toString (cp/execSync "git ls-files -z -- '*.edn'"
+  (let [out (.toString (cp/execSync "git ls-files -z -- '*.edn' '*.clj' '*.cljs' '*.cljc'"
                                     #js {:cwd root :maxBuffer 268435456}))]
     (set (remove empty? (str/split out #"\u0000")))))
 
 (def dirty-paths (delay (dirty-set (js/process.cwd))))
+
+(defn- ns-of
+  "The namespace a source file declares, or nil."
+  [txt]
+  (try
+    (let [forms (r/forms (r/read-cst txt :source))]
+      (some (fn [n]
+              (when (and (= :coll (:t n)) (= :list (:kind n)))
+                (let [fs (r/forms (:children n))]
+                  (when (and (= "ns" (some-> (first fs) :v str))
+                             (= :atom (:t (second fs))))
+                    (str (:v (second fs)))))))
+            forms))
+    (catch :default _ nil)))
+
+(defn- clojure-consumers
+  "Files still loaded by a Clojure runtime that name this namespace.
+
+   Renaming a source file to .kotoba does not move its consumers, and the
+   runtimes are not interchangeable: amu resolves .kotoba, nbb does not.
+   Measured 2026-09-10 in this workspace -- kotoba-lang/datalog was renamed
+   (commit d3c1caf, `Rename src to .kotoba`) while three nbb scripts still
+   required datalog.core, and the datom query face has been dead since:
+   `Could not find namespace: datalog.core`. Nothing reported it, because a
+   rename does not fail."
+  [root ns-name self]
+  (when ns-name
+    (let [out (atom [])]
+      ((fn walk [d]
+         (doseq [e (fs/readdirSync d #js {:withFileTypes true})]
+           (let [n (.-name e) pth (path/join d n)]
+             (cond
+               (.isDirectory e) (when-not (contains? skip-dirs n) (walk pth))
+               (and (source-path? n) (not= (path/resolve pth) (path/resolve self)))
+               (let [txt (try (fs/readFileSync pth "utf8") (catch :default _ ""))]
+                 (when (str/includes? txt ns-name) (swap! out conj pth)))))))
+       root)
+      @out)))
 
 (defn- annex-pointer? [txt] (str/starts-with? txt "/annex/objects"))
 
@@ -88,6 +134,28 @@
 
       (contains? @dirty-paths (path/relative (js/process.cwd) (path/resolve p)))
       {:status :refused :reason :uncommitted-changes}
+
+      (source-path? p)
+      ;; A program, not a document. The data rewrite is meaning-preserving for
+      ;; data and NOT for code: {:a 1} in source would become (map (:a 1)), an
+      ;; application of `map`. 415 files in this tree contain a map literal
+      ;; inside code. So source is RENAMED and never rewritten -- Kotoba source
+      ;; is already Clojure-shaped, which is the whole reason the rename is the
+      ;; conversion.
+      (let [txt (fs/readFileSync p "utf8")]
+        (cond
+          (fs/existsSync (source-target p))
+          {:status :refused :reason :target-exists}
+
+          (nil? (try (r/read-cst txt :source) (catch :default _ nil)))
+          {:status :refused :reason :unparseable-source}
+
+          :else
+          (let [consumers (clojure-consumers (js/process.cwd) (ns-of txt) p)]
+            (if (seq consumers)
+              {:status :refused :reason :still-required-by-clojure-runtime
+               :detail (str/join ", " (take 3 consumers))}
+              {:status :ok :rename-only true}))))
 
       :else
       (let [txt (fs/readFileSync p "utf8")]
@@ -130,8 +198,10 @@
       (let [{:keys [status reason text]} (classify p)]
         (if (= status :ok)
           (if apply?
-            (do (fs/writeFileSync (target-path p) text)
-                (fs/unlinkSync p)
+            (do (if (source-path? p)
+                  (fs/renameSync p (source-target p))
+                  (do (fs/writeFileSync (target-path p) text)
+                      (fs/unlinkSync p)))
                 (swap! tally update :converted inc))
             (swap! tally update :would-convert inc))
           (swap! refusals update reason (fnil inc 0)))))

@@ -28,11 +28,28 @@
   #?(:clj  (Double/parseDouble t)
      :cljs (js/parseFloat t)))
 
+(def ^:dynamic *surface*
+  "Which surface is being read.
+
+   :data   -- a document. EDN's rules apply, and everything outside them is
+              refused, because a data file that needs a reader extension is
+              telling you something.
+   :source -- a program. The full Clojure reader surface is legal here, so the
+              reader stays faithful and `edn->adl` does the refusing instead.
+              Refusing source constructs at read time would mean the source
+              path could not read the very files it exists to move."
+  :data)
+
 (def ^:private ws-chars #{\space \tab \newline \return \, (char 12) (char 11)})
 
 (defn- ws? [c] (contains? ws-chars c))
 
-(def ^:private delim-chars #{\( \) \[ \] \{ \} \" \; \^ \` \~ \@ \'})
+;; `'` is deliberately NOT here. It dispatches a quote only in FIRST position,
+;; which read-form checks before it ever scans a token; inside a token it is an
+;; ordinary symbol character, and Clojure source is full of `state'`. Treating
+;; it as a terminator ended the symbol early and made the rest of the form read
+;; as unbalanced -- 52 files in this tree.
+(def ^:private delim-chars #{\( \) \[ \] \{ \} \" \; \^ \` \~ \@})
 
 (defn- terminator? [c] (or (nil? c) (ws? c) (contains? delim-chars c)))
 
@@ -76,6 +93,18 @@
             (err j "unsupported escape in string" {:escape (str e)})))
         :else (recur (inc j) (conj buf c))))))
 
+(defn- read-regex
+  "#\"...\" -- scanned raw. Regex escapes are not string escapes (\\d is legal
+   here and illegal there), so this keeps the source text and does not decode."
+  [^String s i]
+  (loop [j (+ i 2)]
+    (let [c (at s j)]
+      (cond
+        (nil? c) (err i "unterminated regex literal")
+        (= c \\) (recur (+ j 2))
+        (= c \") [{:t :regex :s (subs s i (inc j))} (inc j)]
+        :else (recur (inc j))))))
+
 (defn- read-char-literal
   "Reads a \\c / \\newline / \\uXXXX literal starting at the backslash."
   [^String s i]
@@ -110,7 +139,8 @@
     (str/starts-with? tok ":")
     (let [body (subs tok 1)]
       (when (empty? body) (err i "empty keyword"))
-      (when (str/starts-with? body ":") (err i "auto-resolved keyword is not data" {:token tok}))
+      (when (and (str/starts-with? body ":") (= *surface* :data))
+        (err i "auto-resolved keyword is not data" {:token tok}))
       [:keyword (keyword body)])
 
     (re-matches int-re tok) [:int (parse-int-radix tok 10)]
@@ -119,6 +149,13 @@
     ;; 0xFA and friends: Clojure's reader accepts these and this workspace has
     ;; them (MIDI status bytes). The atom keeps its original :s, so the written
     ;; form stays hex; only the decoded value is decimal.
+    ;; Clojure reads a leading zero as octal: #js {:mode 0600} is 384, not 600.
+    (re-matches #"^[+-]?0[0-7]+$" tok)
+    [:int (let [neg? (str/starts-with? tok "-")
+                digits (subs tok (if (re-matches #"^[+-].*" tok) 2 1))
+                m (parse-int-radix digits 8)]
+            (if neg? (- m) m))]
+
     (re-matches #"^[+-]?0[xX][0-9a-fA-F]+$" tok)
     [:int (let [neg? (str/starts-with? tok "-")
                 digits (subs tok (if (re-matches #"^[+-].*" tok) 3 2))
@@ -143,6 +180,11 @@
     (re-matches #"^[a-zA-Z*+!_?$%&=<>.-][a-zA-Z0-9*+!_?$%&=<>.#'-]*(/[a-zA-Z*+!_?$%&=<>.-][a-zA-Z0-9*+!_?$%&=<>.#'-]*)?$" tok)
     [:symbol (symbol tok)]
 
+    ;; Source symbols are wider than EDN's (-> , some->> , clojure.core//).
+    ;; The strict form above stays the rule for data, where it is what stops a
+    ;; git-annex pointer from parsing as a symbol and converting cleanly.
+    (= *surface* :source) [:symbol (symbol tok)]
+
     :else (err i "not a valid EDN token" {:token tok})))
 
 (defn- read-token [^String s i]
@@ -154,9 +196,9 @@
 
 ;; ---------------------------------------------------------------- forms
 
-(declare read-form)
+(declare read-form read-prefixed read-cst*)
 
-(def ^:private closers {:list \) :vector \] :map \} :set \}})
+(def ^:private closers {:list \) :vector \] :map \} :set \} :fn-literal \)})
 
 (defn- read-coll [^String s i kind open-len]
   (let [close (get closers kind)]
@@ -169,6 +211,15 @@
                                         {:kind kind :found (str c)})
           :else (let [[node nj] (read-form s j)]
                   (recur nj (conj kids node))))))))
+
+(defn- read-prefixed
+  "A prefix macro and the one form it applies to, keeping any trivia between."
+  [^String s i prefix]
+  (loop [j (+ i (count prefix)) trivia []]
+    (let [[node nj] (read-form s j)]
+      (if (contains? #{:ws :comment} (:t node))
+        (recur nj (conj trivia node))
+        [{:t :macro :prefix prefix :children (conj trivia node)} nj]))))
 
 (defn- read-form
   "Reads one node (which may be trivia) at i. Returns [node next-index]."
@@ -193,7 +244,25 @@
       (= c \#)
       (let [d (at s (inc i))]
         (cond
+          ;; ##Inf / ##-Inf / ##NaN -- Clojure's symbolic values.
+          (= d \#)
+          (let [end (loop [k (+ i 2)]
+                      (if (and (< k (count s)) (not (terminator? (at s k)))) (recur (inc k)) k))
+                name* (subs s (+ i 2) end)
+                v (case name*
+                    "Inf" #?(:clj Double/POSITIVE_INFINITY :cljs js/Infinity)
+                    "-Inf" #?(:clj Double/NEGATIVE_INFINITY :cljs (- js/Infinity))
+                    "NaN" #?(:clj Double/NaN :cljs js/NaN)
+                    (err i "unknown symbolic value" {:token (str "##" name*)}))]
+            [{:t :atom :kind :float :v v :s (subs s i end)} end])
+
           (= d \{) (read-coll s i :set 2)
+          (= d \() (read-coll s i :fn-literal 2)
+          (= d \") (read-regex s i)
+          (= d \') (read-prefixed s i "#'")
+          (= d \?) (if (= \@ (at s (+ i 2)))
+                     (read-prefixed s i "#?@")
+                     (read-prefixed s i "#?"))
           (= d \_) (let [[node nj] (read-form s (+ i 2))]
                      [{:t :discard :children [node]} nj])
           ;; #:ns{...} -- a namespaced map. Without this branch it reads as a
@@ -224,7 +293,7 @@
                     ;; to a host array, which has no Kotoba ADL spelling; turning
                     ;; it into (tag "js" ...) would hand every downstream reader a
                     ;; Form where it expects an array. Refuse and say so.
-                    (when (= "js" (subs s (inc i) e))
+                    (when (and (= "js" (subs s (inc i) e)) (= *surface* :data))
                       (err i "#js is a ClojureScript reader extension, not EDN"
                            {:token "#js"})))
                 end (loop [k (inc i)]
@@ -249,7 +318,15 @@
               [{:t :meta :children (vec (concat m trivia [node]))} nj]))))
 
       (contains? #{\) \] \}} c) (err i "unbalanced closing delimiter" {:found (str c)})
-      (contains? #{\' \` \~ \@} c) (err i "reader macro is not data" {:found (str c)})
+
+      ;; Reader macros. These are SOURCE, never data -- edn->adl refuses them.
+      ;; The reader accepts them so a .clj/.cljs/.cljc file can be parsed and
+      ;; checked before it is renamed; refusing here would mean the source path
+      ;; could not read the very files it exists to move.
+      (contains? #{\' \` \@} c) (read-prefixed s i (str c))
+      (= c \~) (if (= \@ (at s (inc i)))
+                 (read-prefixed s i "~@")
+                 (read-prefixed s i "~"))
 
       :else (read-token s i))))
 
@@ -257,8 +334,14 @@
 
 (defn read-cst
   "Reads the whole of s into a vector of top-level CST nodes (including trivia).
-   Throws ex-info on anything it cannot classify."
-  [^String s]
+   Throws ex-info on anything it cannot classify.
+
+   surface is :data (default, EDN rules) or :source (full Clojure reader)."
+  ([^String s] (read-cst s :data))
+  ([^String s surface]
+   (binding [*surface* surface] (read-cst* s))))
+
+(defn- read-cst* [^String s]
   (loop [i 0 acc []]
     (if (>= i (count s))
       acc
@@ -283,9 +366,13 @@
                 (case (:t n)
                   (:ws :comment) (:s n)
                   :atom (:s n)
-                  :coll (str (case (:kind n) :list "(" :vector "[" :map "{" :set "#{")
+                  :coll (str (case (:kind n)
+                               :list "(" :vector "[" :map "{" :set "#{" :fn-literal "#(")
                              (print-cst (:children n))
-                             (case (:kind n) :list ")" :vector "]" (:map :set) "}"))
+                             (case (:kind n)
+                               (:list :fn-literal) ")" :vector "]" (:map :set) "}"))
+                  :regex (:s n)
+                  :macro (str (:prefix n) (print-cst (:children n)))
                   :nsmap (str "#:" (:ns n) (print-cst (:children n)))
                   :tagged (str "#" (:tag n) (print-cst (:children n)))
                   :discard (str "#_" (print-cst (:children n)))

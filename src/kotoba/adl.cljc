@@ -108,13 +108,16 @@
   (case (:t n)
     (:ws :comment) (:s n)
     :atom (:s n)
-    :coll (let [tag (if (= :map (:kind n)) "map" (get coll-tag (:kind n)))
+    :coll (do
+            (when (= :fn-literal (:kind n))
+              (err "function literal is not data" {}))
+            (let [tag (if (= :map (:kind n)) "map" (get coll-tag (:kind n)))
                 inner (if (= :map (:kind n))
                         (map-children->adl (:children n))
                         (children->adl (:children n)))]
             (if (str/blank? inner)
               (str "(" tag inner ")")
-              (str "(" tag " " inner ")")))
+              (str "(" tag " " inner ")"))))
     :tagged (let [t (:tag n)
                   raw (children->adl (:children n))
                   ;; the trivia between #tag and its value already carries a
@@ -128,6 +131,11 @@
     :nsmap (let [mapnode (first (filter #(= :coll (:t %)) (:children n)))
                  inner (map-children->adl (:children mapnode) (:ns n))]
              (if (str/blank? inner) "(map)" (str "(map " inner ")")))
+    ;; Source constructs are not data. The reader accepts them so the source
+    ;; path can read a program before renaming it; converting one into a
+    ;; document would be inventing a meaning it does not have.
+    :macro (err "reader macro is not data" {:prefix (:prefix n)})
+    :regex (err "regex literal is not data" {:literal (:s n)})
     :discard (str "#_" (children->adl (:children n)))
     :meta (str "(with-meta " (children->adl (:children n)) ")")
     (err "unknown CST node" {:node (pr-str n)})))
