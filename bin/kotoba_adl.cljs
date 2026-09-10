@@ -162,8 +162,24 @@
 (def filename-index
   (delay (index-by @reference-corpus #"[A-Za-z0-9_.-]+\.clj[sc]?")))
 
+(defn- dotted-prefixes
+  "a.b.c -> #{a.b.c a.b}. The substring scan this index replaced matched a
+   namespace inside a longer one -- looking for `gftd.score` found it in
+   `gftd.score.core` -- and a token index does not. Measured 2026-09-10: that
+   difference alone moved 13 files from refused to convertible, which is the
+   wrong direction for a guard to drift."
+  [tok]
+  (let [parts (str/split tok #"\.")]
+    (set (for [n (range 2 (inc (count parts)))]
+           (str/join "." (take n parts))))))
+
 (def ns-index
-  (delay (index-by @code-corpus #"[a-z][a-zA-Z0-9.*+!_?<>=-]*\.[a-zA-Z0-9.*+!_?<>=-]+")))
+  (delay (let [raw (index-by @code-corpus #"[a-z][a-zA-Z0-9.*+!_?<>=-]*\.[a-zA-Z0-9.*+!_?<>=-]+")
+               m (atom {})]
+           (doseq [[tok files] raw
+                   pre (dotted-prefixes tok)]
+             (swap! m update pre (fnil into []) files))
+           (into {} (map (fn [[k v]] [k (vec (distinct v))]) @m)))))
 
 (defn- path-invokers
   "Files naming this source file by its filename.
