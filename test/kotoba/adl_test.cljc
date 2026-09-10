@@ -87,3 +87,27 @@
 (defn run []
   #?(:cljs (run-tests 'kotoba.adl-test)
      :clj (run-tests 'kotoba.adl-test)))
+
+;; ---------------------------------------------------------------- source
+
+(deftest source-surface-is-legal-source-only
+  (testing "what :source accepts, :data refuses -- and names why"
+    (doseq [s (:kotoba.adl/source-only spec)]
+      (is (= s (r/print-cst (r/read-cst s :source))) (str ":source must read " (pr-str s)))
+      (is (thrown? #?(:clj Exception :cljs :default) (adl/edn->adl s))
+          (str ":data must refuse " (pr-str s))))))
+
+(deftest source-shapes-that-were-read-wrong
+  (testing "the reader bugs this corpus found, kept fixed"
+    (doseq [{:keys [src kind value]} (:kotoba.adl/source-vectors spec)]
+      (let [n (first (r/forms (r/read-cst src :source)))]
+        (is (= src (r/print-cst (r/read-cst src :source))))
+        (when kind (is (= kind (:kind n)) (str src " should be " kind)))
+        (when value (is (= value (:v n)) (str src " should be " value)))))))
+
+(deftest source-is-never-rewritten
+  (testing "the data rewrite would change what code MEANS, so it must refuse code"
+    ;; {:a 1} as a literal in source would become (map (:a 1)) -- a call.
+    (is (= "(map (:a 1))" (adl/edn->adl "{:a 1}")))
+    ;; and a source construct in a data file is refused rather than converted
+    (is (thrown? #?(:clj Exception :cljs :default) (adl/edn->adl "(defn f [] #(inc %))")))))
