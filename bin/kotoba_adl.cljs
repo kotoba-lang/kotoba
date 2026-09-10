@@ -336,6 +336,71 @@
                       (or (= r self*) (contains? *convert-set* r)))
                    hits)))))
 
+(defn- code-outside-strings
+  "TXT with string literals and line comments blanked out, so a scan for
+   dispatch tags cannot be fooled by one quoted inside a docstring. Character
+   literals are left alone deliberately -- \\\" is a character, not a string
+   opener, and treating it as one silently swallows the rest of the file."
+  [txt]
+  (let [n (count txt)]
+    (loop [i 0 out [] state :code]
+      (if (>= i n)
+        (apply str out)
+        (let [c (nth txt i)
+              c2 (when (< (inc i) n) (nth txt (inc i)))]
+          (case state
+            :code (cond
+                    (and (= c \\) c2) (recur (+ i 2) (conj out \space \space) :code)
+                    ;; A regex literal opens with #" and its body is scanned as
+                    ;; a string. Measured 2026-09-10: without this arm the `"`
+                    ;; was taken as an ordinary string opener and blanked, so
+                    ;; the `#"` the scanner is looking for never survived into
+                    ;; the sanitized text and every regex was ADMITTED. The
+                    ;; marker is emitted so the body can still be blanked.
+                    (and (= c \#) (= c2 \"))
+                    (recur (+ i 2) (into out (seq "#REGEX")) :string)
+                    (= c \") (recur (inc i) (conj out \space) :string)
+                    (= c \;) (recur (inc i) (conj out \space) :comment)
+                    :else (recur (inc i) (conj out c) :code))
+            :string (cond
+                      (and (= c \\) c2) (recur (+ i 2) (conj out \space \space) :string)
+                      (= c \") (recur (inc i) (conj out \space) :code)
+                      :else (recur (inc i) (conj out \space) :string))
+            :comment (if (= c \newline)
+                       (recur (inc i) (conj out c) :code)
+                       (recur (inc i) (conj out \space) :comment))))))))
+
+(def ^:private unsupported-dispatch
+  "Dispatch forms amu's SOURCE reader refuses. Measured 2026-09-10 by bisecting
+   real files down to the offending line, not by reading a grammar."
+  [["#REGEX" :regex-literal] ["#js" :js-literal] ["#inst" :inst-literal]
+   ["#uuid" :uuid-literal] ["#object" :object-literal]])
+
+(defn- source-inadmissible
+  "Why amu's source reader will refuse this file, or nil.
+
+   The converter's own reader is NOT this check. Measured 2026-09-10:
+   `kotoba.adl.reader/read-cst` ACCEPTS all four shapes below, so
+   :unparseable-source never fires for them and the file is renamed into a
+   state where `amu check` answers `source reader rejected input` -- with NO
+   span in six of seven cases, which is an error a reader cannot act on.
+
+   Refusing here is conservative: the cost of a false refusal is a file that
+   did not move, and the cost of a false admission is a file that moved and
+   stopped being readable. Those are not symmetric."
+  [txt]
+  (let [code (code-outside-strings txt)
+        first-line (first (remove str/blank? (str/split-lines txt)))]
+    (cond
+      (str/starts-with? txt "#!")
+      :executable-script
+      (and first-line (str/starts-with? (str/trim first-line) "//"))
+      :not-clojure-source
+      :else
+      (when-let [hit (first (filter (fn [[lit _]] (str/includes? code lit))
+                                    unsupported-dispatch))]
+        (second hit)))))
+
 (defn- annex-pointer? [txt] (str/starts-with? txt "/annex/objects"))
 
 (defn- classify
@@ -368,6 +433,11 @@
 
           (nil? (try (r/read-cst txt :source) (catch :default _ nil)))
           {:status :refused :reason :unparseable-source}
+
+          ;; Our reader is more permissive than the compiler's. Refusing with
+          ;; the specific construct beats renaming into a spanless failure.
+          (some? (source-inadmissible txt))
+          {:status :refused :reason (source-inadmissible txt)}
 
           (build-consumes? p)
           {:status :refused :reason :compiled-by-build-config}
@@ -445,10 +515,22 @@
         ;; terminates; the bound is belt-and-braces and is REPORTED rather than
         ;; hidden, because a run that stopped early is not the same answer as a
         ;; run that settled.
+        ;; The reason a file is refused must be the reason it FIRST dropped out,
+        ;; not the reason it fails once everything else has dropped too.
+        ;; Measured 2026-09-10: without this, a file refused in iteration 1 for
+        ;; its own reason was reported as `compiled-by-build-config`, because by
+        ;; the final pass the converting set was empty and the build guard
+        ;; refuses every file against an empty set. The cascade reason is true
+        ;; and useless -- it points at the consequence, not the cause.
+        first-reason (atom {})
         [settled iters converged?]
         (loop [s (set (map #(path/resolve %) files)) i 0]
           (let [ok (set (for [p files
-                              :when (= :ok (:status (binding [*convert-set* s] (classify p))))]
+                              :let [c (binding [*convert-set* s] (classify p))]
+                              :when (do (when (and (not= :ok (:status c))
+                                                   (not (contains? @first-reason (path/resolve p))))
+                                          (swap! first-reason assoc (path/resolve p) (:reason c)))
+                                        (= :ok (:status c)))]
                           (path/resolve p)))]
             (cond
               (= ok s) [ok i true]
@@ -460,7 +542,8 @@
       (println "REFUSED\tfixpoint did not settle in 8 iterations -- not reporting a pass")
       (.exit js/process 2))
     (doseq [p files]
-      (let [{:keys [status reason text]} (binding [*convert-set* settled] (classify p))]
+      (let [{:keys [status text]} (binding [*convert-set* settled] (classify p))
+            reason (get @first-reason (path/resolve p))]
         (if (= status :ok)
           (if apply?
             (do (if (source-path? p)
