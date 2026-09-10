@@ -207,8 +207,17 @@
    rename does not fail."
   [ns-name self]
   (when ns-name
-    (let [self* (path/resolve self)]
-      (vec (remove #(= (path/resolve %) self*) (get @ns-index ns-name []))))))
+    (let [self* (path/resolve self)
+          hits (if (str/includes? ns-name ".")
+                 (get @ns-index ns-name [])
+                 ;; A single-segment namespace -- (ns gate) -- has no dot, and
+                 ;; the dotted-token index cannot hold it at all. Measured
+                 ;; 2026-09-10: that absence alone left 13 files reported as
+                 ;; convertible that the scan had refused. These are a minority,
+                 ;; so they get the scan; the index carries the rest.
+                 (keep (fn [[pth txt]] (when (str/includes? txt ns-name) pth))
+                       @code-corpus))]
+      (vec (remove #(= (path/resolve %) self*) hits)))))
 
 (defn- annex-pointer? [txt] (str/starts-with? txt "/annex/objects"))
 
