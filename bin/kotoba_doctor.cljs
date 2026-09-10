@@ -1,0 +1,223 @@
+#!/usr/bin/env nbb
+(ns kotoba-doctor
+  "`kotoba doctor` -- drive a converted tree to admission, and name what is left.
+
+   The owner's Q9 procedure is rename FIRST and fix afterwards with the
+   toolchain. `kotoba adl convert` does the renaming half. Until now nothing
+   did the other half: measured 2026-09-10, `kotoba` had exactly one
+   subcommand (`adl`) and `amu` had no doctor, so a renamed tree had a
+   diagnosis available one file at a time and no repair at all. That is the
+   gap the 20-repository rename fell into -- the files moved, `amu check`
+   could say why each one failed, and nobody could act on nineteen answers.
+
+     DIAGNOSE  run `amu check` over every .kotoba under the given paths and
+               group the failures by the code and message amu itself returns.
+               The tally IS the work list.
+
+     FIX       apply the repairs that are mechanical, then RE-RUN amu. An edit
+               nobody re-checked is not a fix (CLAUDE.md's eighth question),
+               and a repair whose class did not move is undone.
+
+   Runs on nbb, so it does not start a JVM. The repairs themselves are
+   portable `.cljc` in `kotoba.doctor`; only the parts that walk directories
+   and run a subprocess are here.
+
+   Exit codes: 0 clean, 1 findings, 2 refused (could not measure).
+
+   The distinction between 1 and 2 is the point. A run that could not start
+   amu, or could not read what amu said, must not return what a clean run
+   returns -- that is the shape this workspace has been bitten by repeatedly."
+  (:require [kotoba.doctor :as doc]
+            [clojure.string :as str]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["child_process" :as cp]))
+
+(def skip-dirs #{".git" "node_modules" ".nbb" ".cpcache" "target" ".shadow-cljs"
+                 ".projection-cache" "dist" "build" ".datalad"})
+
+(defn- walk-kotoba [root out]
+  (let [st (try (fs/statSync root) (catch :default _ nil))]
+    (cond
+      (nil? st) out
+      (.isFile st) (if (str/ends-with? root ".kotoba") (conj out root) out)
+      (.isDirectory st)
+      (if (contains? skip-dirs (path/basename root))
+        out
+        (reduce (fn [acc e] (walk-kotoba (path/join root e) acc))
+                out (sort (fs/readdirSync root))))
+      :else out)))
+
+(defn- resolve-amu
+  "The amu executable, or nil.
+
+   Never guessed from a sibling path. amu is a separate west project and its
+   checkout location is not this repository's to assume; a hardcoded
+   ../amu/bin/amu is a path that works on the machine it was written on. The
+   caller supplies it, or the environment does, or the run refuses -- the only
+   honest third option, because a doctor that cannot run amu has not found a
+   healthy tree, it has failed to look."
+  [explicit]
+  (let [cand (or explicit (some-> js/process.env.AMU))]
+    (cond
+      (and cand (fs/existsSync cand)) (path/resolve cand)
+      cand nil
+      :else (try (str/trim (.toString (cp/execSync "command -v amu"
+                                                   #js {:stdio #js ["ignore" "pipe" "ignore"]})))
+                 (catch :default _ nil)))))
+
+(defn- amu-check
+  "Ask amu about one file. Three outcomes, deliberately three rather than two:
+
+     {:ok? true}                                  amu admitted it
+     {:ok? false :code .. :message .. :source ..}  amu refused it, and said why
+     {:measured? false :detail ..}                 we could not get an answer
+
+   The third is not a failure of the file. Folding it into the second would
+   put a tooling problem into the work list as if it were a defect in the
+   source; folding it into the first would report a pass for a file nothing
+   looked at."
+  [amu file source-path]
+  (let [args (cond-> ["check" file "--jvm-free"]
+               source-path (into ["--source-path" source-path]))
+        res (try (cp/spawnSync amu (clj->js args)
+                               #js {:encoding "utf8" :timeout 180000 :maxBuffer 33554432})
+                 (catch :default e {::spawn-error (ex-message e)}))]
+    (cond
+      (and (map? res) (::spawn-error res))
+      {:measured? false :detail (::spawn-error res)}
+
+      (.-error res)
+      {:measured? false :detail (str (.-message (.-error res)))}
+
+      ;; A killed process has no exit status at all. nil is not 0 -- but it is
+      ;; also not a refusal amu authored, so it must not be reported as one.
+      (nil? (.-status res))
+      {:measured? false :detail (str "no exit status (signal " (.-signal res) ")")}
+
+      (zero? (.-status res)) {:ok? true}
+
+      :else
+      (let [out (str (.-stdout res) (.-stderr res))
+            code (second (re-find #":code\s+(:[A-Za-z0-9/._-]+)" out))
+            msg (second (re-find #":message\s+\"((?:[^\"\\]|\\.)*)\"" out))
+            src (second (re-find #":source\s+\"([^\"]*)\"" out))]
+        (if (and (nil? code) (nil? msg))
+          ;; amu refused and we could not read WHY. Reporting this as a
+          ;; nameless finding would seat it in the tally next to findings that
+          ;; carry a cause; it is a measurement failure and is counted as one.
+          {:measured? false
+           :detail (str "exit " (.-status res) ", no :code or :message in output")}
+          {:ok? false :code (or code ":kotoba/unnamed") :message (or msg "") :source src})))))
+
+(defn- run [paths {:keys [amu source-path fix?]}]
+  (let [files (reduce (fn [acc p] (walk-kotoba p acc)) [] paths)
+        amu-bin (resolve-amu amu)]
+    (when (zero? (count files))
+      (println "REFUSED\tscanned 0 files -- not reporting a pass")
+      (.exit js/process 2))
+    (when (nil? amu-bin)
+      (println "REFUSED\tno amu executable (pass --amu <path> or set $AMU)")
+      (.exit js/process 2))
+    (println (str "AMU\t" amu-bin))
+    (println (str "SCANNED\t" (count files)
+                  (if source-path (str "\tproject mode, --source-path " source-path)
+                      "\tsingle-file mode (pass --source-path for a project)")))
+    (let [before (mapv (fn [f] [f (amu-check amu-bin f source-path)]) files)
+          failing (filterv (fn [[_ r]] (false? (:ok? r))) before)
+          fixed (atom []) skipped (atom [])]
+      ;; Three phases, in this order for a measured reason.
+      ;;
+      ;; Phase 1 applies EVERY repair before any of them is re-checked. Doing
+      ;; it file-by-file made a repair look inert whenever the module it
+      ;; requires had not been reached yet -- the sorted walk visits
+      ;; datalog/index.kotoba before datom/source.kotoba, so index was
+      ;; repaired, re-checked against an unrepaired dependency, and reverted.
+      ;; Measured 2026-09-10: that ordering alone cost three of fourteen.
+      ;;
+      ;; Phase 2 asks amu about each repaired file and undoes the ones whose
+      ;; own class did not move. That is what keeps phase 1 from being an
+      ;; edit-and-hope.
+      ;;
+      ;; Phase 3 re-measures EVERY file. The counts below are that measurement
+      ;; and not a deduction from phases 1 and 2: a repair kept in phase 2 can
+      ;; be invalidated by a revert that happened after it, and the only
+      ;; honest way to report the tree's state is to look at the tree.
+      (when fix?
+        (let [edited (atom {})]
+          (doseq [[f res] failing]
+            (when-let [repair (get doc/repairs (:message res))]
+              (let [txt (fs/readFileSync f "utf8")]
+                (if-not (doc/fidelity-ok? txt)
+                  (swap! skipped conj [f :cst-round-trip-not-byte-identical])
+                  (let [out (repair txt)]
+                    (if (:skip out)
+                      (swap! skipped conj [f (:skip out)])
+                      (do (fs/writeFileSync f (:text out))
+                          (swap! edited assoc f {:original txt :names (:names out) :before res}))))))))
+          (doseq [[f {:keys [original names before]}] @edited]
+            (let [after (amu-check amu-bin f source-path)]
+              (cond
+                (false? (:measured? after))
+                (do (fs/writeFileSync f original)
+                    (swap! skipped conj [f :repair-unverifiable]))
+
+                (doc/repair-progressed? before after (path/basename f))
+                (swap! fixed conj [f names after])
+
+                :else
+                (do (fs/writeFileSync f original)
+                    (swap! skipped conj [f :repair-did-not-change-the-class]))))))
+        (println (str "REPAIRED\t" (count @fixed) "\tclass removed, verified by re-running amu"))
+        (doseq [[f names after] (sort-by first @fixed)]
+          (println (str "  + " f "\t(:export [" (str/join " " names) "])"
+                        (if (true? (:ok? after))
+                          "\t-> admitted"
+                          (str "\t-> next: " (:code after) " " (:message after))))))
+        (doseq [[f why] (sort-by first @skipped)]
+          (println (str "  - " f "\t" (name why)))))
+      ;; Phase 3. Everything below is read off THIS measurement.
+      (let [final (if fix? (mapv (fn [f] [f (amu-check amu-bin f source-path)]) files) before)
+            unmeasured (filterv (fn [[_ r]] (false? (:measured? r))) final)
+            admitted (count (filterv (fn [[_ r]] (true? (:ok? r))) final))
+            by-class (reduce (fn [m [_ r]]
+                               (if (or (true? (:ok? r)) (false? (:measured? r)))
+                                 m
+                                 (update m [(:code r) (:message r)] (fnil inc 0))))
+                             {} final)]
+        (println (str "ADMITTED\t" admitted "/" (count files)
+                      (when fix? "\t(re-measured after the repairs)")))
+        (doseq [[[code msg] n] (sort-by (comp - val) by-class)]
+          (println (str "FINDING\t" n "\t" code "\t" msg)))
+        (when (seq unmeasured)
+          (println (str "UNMEASURED\t" (count unmeasured)
+                        "\tamu gave no readable answer -- NOT counted as clean"))
+          (doseq [[f r] (take 5 unmeasured)]
+            (println (str "  ? " f "\t" (:detail r)))))
+        (cond
+          (seq unmeasured) 2
+          (< admitted (count files)) 1
+          :else 0)))))
+
+(defn -main [& args]
+  (let [[cmd & rest*] args
+        opt (fn [flag] (second (drop-while #(not= flag %) rest*)))
+        flags #{"--fix"}
+        valued #{"--amu" "--source-path"}
+        paths (loop [xs (vec rest*) out []]
+                (if (empty? xs) out
+                    (let [x (first xs)]
+                      (cond (contains? valued x) (recur (vec (drop 2 xs)) out)
+                            (contains? flags x) (recur (vec (rest xs)) out)
+                            (str/starts-with? x "--") (recur (vec (rest xs)) out)
+                            :else (recur (vec (rest xs)) (conj out x))))))]
+    (js/process.exit
+     (case cmd
+       "doctor" (run (if (seq paths) paths ["."])
+                     {:amu (opt "--amu")
+                      :source-path (opt "--source-path")
+                      :fix? (boolean (some #{"--fix"} rest*))})
+       (do (println "usage: kotoba doctor <paths...> [--source-path <dir>] [--fix] [--amu <path>]")
+           2)))))
+
+(apply -main *command-line-args*)
