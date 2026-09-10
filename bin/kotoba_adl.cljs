@@ -79,6 +79,47 @@
 
 (def dirty-paths (delay (dirty-set (js/process.cwd))))
 
+(def ^:private project-files ["deps.edn" "nbb.edn" "bb.edn" "shadow-cljs.edn"])
+
+(defn- declared-source-paths
+  "Source paths a Clojure project file declares, as absolute directories."
+  [root]
+  (->> project-files
+       (mapcat (fn [pf]
+                 (let [f (path/join root pf)]
+                   (when (fs/existsSync f)
+                     (let [txt (try (fs/readFileSync f "utf8") (catch :default _ ""))]
+                       ;; :paths / :source-paths string vectors, read as text --
+                       ;; enough to know which directories the build compiles.
+                       (->> (re-seq #"\"([^\"]{1,120})\"" txt)
+                            (map second)
+                            (filter #(and (not (str/includes? % " "))
+                                          (fs/existsSync (path/join root %))
+                                          (.isDirectory (fs/statSync (path/join root %)))))))))))
+       (map #(path/resolve root %))
+       distinct
+       vec))
+
+(defn- build-consumes?
+  "True when a build config compiles this file BY EXTENSION.
+
+   The third way a consumer names a file, and the one neither other guard sees.
+   shadow-cljs compiles src/**/*.cljs; nbb and the clojure CLI resolve a
+   namespace from :paths by extension. None of them names the file, so renaming
+   it to .kotoba makes it invisible to the build and nothing reports an error --
+   which is exactly how kotoba-lang/datalog took the datom query face down.
+
+   This is why Q9 treats source migration as a whole-component build change and
+   not a rename: the file cannot move until its BUILD moves."
+  [p]
+  (let [abs (path/resolve p)]
+    (loop [d (path/dirname abs)]
+      (cond
+        (or (= d "/") (str/blank? d)) false
+        (some #(fs/existsSync (path/join d %)) project-files)
+        (boolean (some #(str/starts-with? abs (str % path/sep)) (declared-source-paths d)))
+        :else (recur (path/dirname d))))))
+
 (defn- ns-of
   "The namespace a source file declares, or nil."
   [txt]
@@ -166,7 +207,10 @@
     @m))
 
 (def filename-index
-  (delay (index-by @reference-corpus #"[A-Za-z0-9_.-]+\.clj[sc]?")))
+  ;; .edn belongs here too. Without it the index held only Clojure filenames,
+  ;; so the name guard could never fire for a document -- and a guard that
+  ;; cannot fire reports exactly what a guard with nothing to find reports.
+  (delay (index-by @reference-corpus #"[A-Za-z0-9_.-]+\.(?:clj[sc]?|cljc|edn|kotoba)")))
 
 (defn- dotted-prefixes
   "a.b.c -> #{a.b.c a.b}. The substring scan this index replaced matched a
@@ -277,6 +321,9 @@
           (nil? (try (r/read-cst txt :source) (catch :default _ nil)))
           {:status :refused :reason :unparseable-source}
 
+          (build-consumes? p)
+          {:status :refused :reason :compiled-by-build-config}
+
           :else
           (let [consumers (clojure-consumers (ns-of txt) p)
                 invokers (path-invokers p)]
@@ -297,6 +344,15 @@
 
           (fs/existsSync (str (subs p 0 (- (count p) 4)) ".kotoba"))
           {:status :refused :reason :target-exists}
+
+          ;; A document is read by name too, and until now only SOURCE was
+          ;; guarded against that. A child repo's README.edn is read by the
+          ;; superproject (scripts/repo-search.cljs reads READMEs); converting
+          ;; it would break that with nothing reporting an error -- the same
+          ;; shape as every other failure this design is built around.
+          (seq (path-invokers p))
+          {:status :refused :reason :referenced-by-name
+           :detail (str/join ", " (take 3 (path-invokers p)))}
 
           :else
           (let [adl (try (adl/edn->adl txt)
