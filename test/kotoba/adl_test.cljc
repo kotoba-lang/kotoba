@@ -1,0 +1,89 @@
+(ns kotoba.adl-test
+  "Executes lang/adl.kotoba. The spec is the fixture: a conformance vector that
+   nothing runs is a claim, not a test.
+
+   Runs JVM-free under nbb:
+     nbb --classpath src:test -e \"(require '[kotoba.adl-test])(kotoba.adl-test/run)\""
+  (:require [clojure.test :refer [deftest is testing run-tests]]
+            [clojure.edn :as edn]
+            [kotoba.adl :as adl]
+            [kotoba.adl.reader :as r]
+            #?(:cljs ["fs" :as fs])))
+
+(defn- slurp* [p]
+  #?(:clj (slurp p)
+     :cljs (fs/readFileSync p "utf8")))
+
+(def spec (adl/read-string (slurp* "lang/adl.kotoba")))
+
+(deftest spec-is-loadable
+  (testing "the authority file parses, and its values have the types it claims"
+    (is (= 1 (:kotoba.adl/version spec)))
+    (is (number? (:kotoba.adl/version spec)))
+    ;; type, not just value: EDN happily returns a list where a string was meant
+    (is (every? string? (:kotoba.adl/well-known-tags spec)))
+    (is (every? string? (:kotoba.adl/tool-owned-filenames spec)))
+    (is (= 9 (count (:kotoba.adl/ipld-kinds spec))))
+    (is (= 4 (count (:kotoba.adl/planes spec))))))
+
+(deftest conformance-vectors-encode
+  (testing "every vector in the spec encodes to exactly the spelling it states"
+    (doseq [{:keys [edn adl]} (:kotoba.adl/vectors spec)]
+      (is (= adl (adl/edn->adl edn)) (str "encoding " (pr-str edn))))))
+
+(deftest conformance-vectors-decode
+  (testing "and decodes back to the same value clojure.edn reads"
+    (doseq [{:keys [edn adl]} (:kotoba.adl/vectors spec)]
+      (is (= (edn/read-string edn) (adl/read-string adl)) (str "decoding " (pr-str adl))))))
+
+(defn- refusal-reason [s]
+  (try (do (r/read-cst s) ::accepted)
+       (catch #?(:clj Exception :cljs :default) e (ex-message e))))
+
+(deftest refusals-name-their-reason
+  (testing "the reader refuses, AND refuses for the reason it names"
+    (doseq [{:keys [input reason]} (:kotoba.adl/refusals spec)]
+      (let [got (refusal-reason input)]
+        (is (not= ::accepted got) (str "should refuse " (pr-str input)))
+        (is (and (string? got) (re-find (re-pattern reason) got))
+            (str (pr-str input) " refused as " (pr-str got) ", expected reason " (pr-str reason)))))))
+
+(deftest reader-is-byte-faithful
+  (testing "print-cst . read-cst is the identity, so a transform can be checked against it"
+    (doseq [s ["{:a 1}" ";; note\n{:a 1} ;; tail\n" "#:n{:a 1}" "[1 ,2]" "#{1}" "\"a\\nb\""
+               "{:a ;; why\n 1}" "#_ignored {:a 1}" "0xFA" "[]"]]
+      (is (= s (r/print-cst (r/read-cst s))) (str "fidelity for " (pr-str s))))))
+
+(deftest type-preserving-round-trip
+  (testing "a vector does not become a list, which plain = would not catch"
+    (is (vector? (adl/read-string "(vector 1 2)")))
+    (is (seq? (adl/read-string "(list 1 2)")))
+    (is (set? (adl/read-string "(set 1 2)")))
+    (is (map? (adl/read-string "(map (:a 1))")))
+    (is (keyword? (ffirst (adl/read-string "(map (:a 1))"))))
+    (is (string? (ffirst (adl/read-string "(map (\"a\" 1))"))))
+    ;; the distinction the whole design turns on
+    (is (not= (adl/read-string "(map (:a 1))") (adl/read-string "(map (\"a\" 1))")))))
+
+(deftest maps-refuse-ambiguity
+  (testing "duplicate keys and odd entries are refused rather than silently merged"
+    (is (thrown? #?(:clj Exception :cljs :default) (adl/read-string "(map (:a 1) (:a 2))")))
+    (is (thrown? #?(:clj Exception :cljs :default) (adl/edn->adl "{:a 1 :b}")))))
+
+(deftest canonical-projection
+  (testing "canonical yields only IPLD kinds"
+    (is (= {"a" 1} (adl/canonical {"a" 1})))
+    (is (= ["map" [["kw" "a"] 1]] (adl/canonical {:a 1})))
+    (is (= ["kw" "ns/n"] (adl/canonical :ns/n)))
+    (is (= ["set" 1 2] (adl/canonical #{1 2})))
+    (is (= [1 2] (adl/canonical [1 2])))
+    (testing "a map that mixes key kinds keeps them distinct, in canonical order"
+      ;; entries sort by the canonical key, so the string key precedes the
+      ;; keyword's ("kw" ...) form. The order is fixed, which is the point:
+      ;; the same value must produce the same bytes, hence the same CID.
+      (is (= ["map" ["a" 2] [["kw" "a"] 1]] (adl/canonical {:a 1 "a" 2})))
+      (is (= (adl/canonical {:a 1 "a" 2}) (adl/canonical {"a" 2 :a 1}))))))
+
+(defn run []
+  #?(:cljs (run-tests 'kotoba.adl-test)
+     :clj (run-tests 'kotoba.adl-test)))
