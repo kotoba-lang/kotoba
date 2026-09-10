@@ -119,7 +119,12 @@
      root)
     @out))
 
-(def code-corpus (delay (code-index (js/process.cwd))))
+(def extra-code-roots (atom []))
+
+(defn- scan-roots [] (cons (js/process.cwd) @extra-code-roots))
+
+(def code-corpus
+  (delay (vec (mapcat code-index (scan-roots)))))
 
 (def ^:private reference-ext
   [".edn" ".json" ".yml" ".yaml" ".toml" ".plist" ".sh" ".md" ".mjs" ".cjs" ".js"])
@@ -139,7 +144,8 @@
      root)
     @out))
 
-(def reference-corpus (delay (reference-index (js/process.cwd))))
+(def reference-corpus
+  (delay (vec (mapcat reference-index (scan-roots)))))
 
 (defn- index-by
   "Inverts a corpus into token -> the files naming it.
@@ -195,6 +201,26 @@
         self* (path/resolve p)]
     (vec (remove #(= (path/resolve %) self*) (get @filename-index base [])))))
 
+(def needed-bare-names
+  "Single-segment namespace names among the candidates of THIS run.
+
+   A bare name cannot live in the dotted-token index, and scanning the corpus
+   once per such candidate is what made a superproject run take ten minutes.
+   Collecting the names first turns it back into one filtered pass."
+  (atom #{}))
+
+(def bare-index
+  (delay
+    (let [needed @needed-bare-names
+          m (atom {})]
+      (when (seq needed)
+        (doseq [[pth txt] @code-corpus]
+          (doseq [tok (set (map #(if (string? %) % (first %))
+                                (re-seq #"[a-zA-Z][a-zA-Z0-9*+!_?<>=-]*" txt)))]
+            (when (contains? needed tok)
+              (swap! m update tok (fnil conj []) pth)))))
+      @m)))
+
 (defn- clojure-consumers
   "Files still loaded by a Clojure runtime that name this namespace.
 
@@ -215,8 +241,7 @@
                  ;; 2026-09-10: that absence alone left 13 files reported as
                  ;; convertible that the scan had refused. These are a minority,
                  ;; so they get the scan; the index carries the rest.
-                 (keep (fn [[pth txt]] (when (str/includes? txt ns-name) pth))
-                       @code-corpus))]
+                 (get @bare-index ns-name []))]
       (vec (remove #(= (path/resolve %) self*) hits)))))
 
 (defn- annex-pointer? [txt] (str/starts-with? txt "/annex/objects"))
@@ -296,9 +321,19 @@
           keep (vec (filter #(contains? tracked (path/relative (js/process.cwd) (path/resolve %))) files))]
       [keep (- (count files) (count keep))])))
 
+(defn- collect-bare-names! [files]
+  (reset! needed-bare-names
+          (into #{}
+                (keep (fn [p]
+                        (when (and (source-path? p) (fs/existsSync p))
+                          (let [n (ns-of (fs/readFileSync p "utf8"))]
+                            (when (and n (not (str/includes? n "."))) n))))
+                      files))))
+
 (defn- run-convert [paths apply? tracked-only?]
   (let [all (reduce (fn [acc p] (walk-edn p acc)) [] paths)
         [files untracked] (filter-tracked all tracked-only?)
+        _ (collect-bare-names! files)
         tally (atom {:converted 0 :would-convert 0})
         refusals (atom {})]
     (doseq [p files]
@@ -318,6 +353,9 @@
                     " Clojure-runtime files"
                     (when (realized? reference-corpus)
                       (str " + " (count @reference-corpus) " reference files"))
+                    " across " (count (scan-roots)) " root(s)"
+                    (when (empty? @extra-code-roots)
+                      "; NOT walked: anything outside this repo (pass --code)")
                     "; NOT walked: orgs/ (west children)")))
     (when (pos? untracked)
       (println (str "SKIPPED-UNTRACKED\t" untracked "\t(--tracked-only: not ours to rename)")))
@@ -333,6 +371,7 @@
 
 (defn- run-verify [paths]
   (let [files (reduce (fn [acc p] (walk-edn p acc)) [] paths)
+        _ (collect-bare-names! files)
         ok (atom 0) refusals (atom {})]
     (doseq [p files]
       (let [{:keys [status reason]} (classify p)]
@@ -348,7 +387,12 @@
 (defn -main [& args]
   (let [[cmd & rest*] args
         apply? (boolean (some #{"--apply"} rest*))
-        paths (vec (remove #(str/starts-with? % "--") rest*))]
+        code-roots (->> (map vector rest* (rest rest*))
+                        (keep (fn [[a b]] (when (= a "--code") b)))
+                        vec)
+        flag-values (set code-roots)
+        paths (vec (remove #(or (str/starts-with? % "--") (contains? flag-values %)) rest*))]
+    (reset! extra-code-roots code-roots)
     (js/process.exit
      (case cmd
        "encode" (do (println (adl/edn->adl (fs/readFileSync (first paths) "utf8"))) 0)
