@@ -93,6 +93,92 @@
             forms))
     (catch :default _ nil)))
 
+(def ^:private consumer-skip
+  "Directories the consumer index does not walk by default. `orgs` is the west
+   checkout of thousands of child repos; walking it per run is not feasible.
+   It is REPORTED rather than skipped quietly -- a consumer scan that silently
+   covered less than you thought is the same shape as the rename that started
+   all this."
+  (conj skip-dirs "orgs"))
+
+(defn- code-index
+  "Every Clojure-runtime source file under root, read once.
+
+   Built once per run rather than per candidate: the guard asks the same
+   question of the same corpus for every file, and walking the tree per file
+   turned a superproject run into minutes."
+  [root]
+  (let [out (atom [])]
+    ((fn walk [d]
+       (doseq [e (fs/readdirSync d #js {:withFileTypes true})]
+         (let [n (.-name e) pth (path/join d n)]
+           (cond
+             (.isDirectory e) (when-not (contains? consumer-skip n) (walk pth))
+             (source-path? n)
+             (swap! out conj [pth (try (fs/readFileSync pth "utf8") (catch :default _ ""))])))))
+     root)
+    @out))
+
+(def code-corpus (delay (code-index (js/process.cwd))))
+
+(def ^:private reference-ext
+  [".edn" ".json" ".yml" ".yaml" ".toml" ".plist" ".sh" ".md" ".mjs" ".cjs" ".js"])
+
+(defn- reference-index
+  "Files that could name a source file BY PATH rather than require it as a
+   namespace: gate tables, plists, package scripts, runbooks."
+  [root]
+  (let [out (atom [])]
+    ((fn walk [d]
+       (doseq [e (fs/readdirSync d #js {:withFileTypes true})]
+         (let [n (.-name e) pth (path/join d n)]
+           (cond
+             (.isDirectory e) (when-not (contains? consumer-skip n) (walk pth))
+             (some #(str/ends-with? n %) reference-ext)
+             (swap! out conj [pth (try (fs/readFileSync pth "utf8") (catch :default _ ""))])))))
+     root)
+    @out))
+
+(def reference-corpus (delay (reference-index (js/process.cwd))))
+
+(defn- index-by
+  "Inverts a corpus into token -> the files naming it.
+
+   The direct form -- for each candidate, scan every file -- is
+   O(candidates x corpus) and took minutes on this superproject. Each corpus is
+   scanned once here instead, and the guard becomes a lookup."
+  [corpus re]
+  (let [m (atom {})]
+    (doseq [[pth txt] corpus]
+      ;; re-seq yields a STRING when the pattern has no capture group and a
+      ;; vector when it has one. `first` on the string form silently yields a
+      ;; character, every lookup misses, and the guard reports everything as
+      ;; safe -- which is how this returned WOULD-CONVERT 74 for files it had
+      ;; just refused.
+      (doseq [tok (set (map #(if (string? %) % (first %)) (re-seq re txt)))]
+        (swap! m update tok (fnil conj []) pth)))
+    @m))
+
+(def filename-index
+  (delay (index-by @reference-corpus #"[A-Za-z0-9_.-]+\.clj[sc]?")))
+
+(def ns-index
+  (delay (index-by @code-corpus #"[a-z][a-zA-Z0-9.*+!_?<>=-]*\.[a-zA-Z0-9.*+!_?<>=-]+")))
+
+(defn- path-invokers
+  "Files naming this source file by its filename.
+
+   A namespace guard is not enough. A fleet gate is never required as a
+   namespace -- scripts/fleet-ci/tick.cljs reads gates.edn and runs
+   `gates/<file>.cljs` by path, under nbb, which cannot load .kotoba. Renaming
+   one would leave gates.edn pointing at a file that no longer exists, and a
+   rename does not fail. Measured 2026-09-10: 68 of the 75 gate scripts passed
+   the namespace guard and would have been converted."
+  [p]
+  (let [base (path/basename p)
+        self* (path/resolve p)]
+    (vec (remove #(= (path/resolve %) self*) (get @filename-index base [])))))
+
 (defn- clojure-consumers
   "Files still loaded by a Clojure runtime that name this namespace.
 
@@ -103,19 +189,10 @@
    required datalog.core, and the datom query face has been dead since:
    `Could not find namespace: datalog.core`. Nothing reported it, because a
    rename does not fail."
-  [root ns-name self]
+  [ns-name self]
   (when ns-name
-    (let [out (atom [])]
-      ((fn walk [d]
-         (doseq [e (fs/readdirSync d #js {:withFileTypes true})]
-           (let [n (.-name e) pth (path/join d n)]
-             (cond
-               (.isDirectory e) (when-not (contains? skip-dirs n) (walk pth))
-               (and (source-path? n) (not= (path/resolve pth) (path/resolve self)))
-               (let [txt (try (fs/readFileSync pth "utf8") (catch :default _ ""))]
-                 (when (str/includes? txt ns-name) (swap! out conj pth)))))))
-       root)
-      @out)))
+    (let [self* (path/resolve self)]
+      (vec (remove #(= (path/resolve %) self*) (get @ns-index ns-name []))))))
 
 (defn- annex-pointer? [txt] (str/starts-with? txt "/annex/objects"))
 
@@ -151,11 +228,16 @@
           {:status :refused :reason :unparseable-source}
 
           :else
-          (let [consumers (clojure-consumers (js/process.cwd) (ns-of txt) p)]
-            (if (seq consumers)
+          (let [consumers (clojure-consumers (ns-of txt) p)
+                invokers (path-invokers p)]
+            (cond
+              (seq consumers)
               {:status :refused :reason :still-required-by-clojure-runtime
                :detail (str/join ", " (take 3 consumers))}
-              {:status :ok :rename-only true}))))
+              (seq invokers)
+              {:status :refused :reason :invoked-by-path
+               :detail (str/join ", " (take 3 invokers))}
+              :else {:status :ok :rename-only true}))))
 
       :else
       (let [txt (fs/readFileSync p "utf8")]
@@ -206,6 +288,12 @@
             (swap! tally update :would-convert inc))
           (swap! refusals update reason (fnil inc 0)))))
     (println (str "SCANNED\t" (count files)))
+    (when (realized? code-corpus)
+      (println (str "CONSUMER-SCAN\t" (count @code-corpus)
+                    " Clojure-runtime files"
+                    (when (realized? reference-corpus)
+                      (str " + " (count @reference-corpus) " reference files"))
+                    "; NOT walked: orgs/ (west children)")))
     (when (pos? untracked)
       (println (str "SKIPPED-UNTRACKED\t" untracked "\t(--tracked-only: not ours to rename)")))
     (println (str (if apply? "CONVERTED\t" "WOULD-CONVERT\t")
