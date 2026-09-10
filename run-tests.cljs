@@ -36,7 +36,8 @@
             [kotoba.kami-host-portable-test]
             [kotoba.rad-adapter-portable-test]
             [kotoba.sensing-host-portable-test]
-            [kotoba.deploy-adapter-portable-test]))
+            [kotoba.deploy-adapter-portable-test]
+            [kotoba.doctor-test]))
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (println (str "\nnbb: " (:test m) " tests, " (:pass m) " passed, "
@@ -50,4 +51,5 @@
              'kotoba.kami-host-portable-test
              'kotoba.rad-adapter-portable-test
              'kotoba.sensing-host-portable-test
-             'kotoba.deploy-adapter-portable-test)
+             'kotoba.deploy-adapter-portable-test
+             'kotoba.doctor-test)
