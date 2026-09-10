@@ -81,6 +81,22 @@
 
 (def ^:private project-files ["deps.edn" "nbb.edn" "bb.edn" "shadow-cljs.edn"])
 
+;; The set of paths this pass is converting, as resolved absolutes.
+;;
+;; Both consumer guards below used to ask "does a consumer exist?" when the
+;; question they are FOR is "will a Clojure consumer REMAIN?". Converting a
+;; whole source root file-by-file, every file blocks every other: A requires B
+;; so B is refused, and A is refused for its own requirer, so a tree that is
+;; entirely self-consistent converts nothing. Measured 2026-09-10 across eight
+;; real target repositories: 56 scanned, 0 convertible.
+;;
+;; Set-awareness does not weaken either guard. A consumer that is itself
+;; converting in this pass is not a Clojure consumer afterwards, and a source
+;; root that converts ENTIRELY leaves no Clojure namespace for a build to
+;; resolve by extension. What still refuses -- and must -- is a PARTIAL
+;; conversion of a source root, and any consumer outside the set.
+(def ^:dynamic *convert-set* #{})
+
 (defn- declared-source-paths
   "Source paths a Clojure project file declares, as absolute directories."
   [root]
@@ -100,6 +116,22 @@
        distinct
        vec))
 
+(defn- walk-source
+  "Every Clojure source file under DIR. Separate from walk-edn because the
+   build guard asks about source only -- an .edn under the root is not resolved
+   by extension from :paths."
+  [root out]
+  (let [st (try (fs/statSync root) (catch :default _ nil))]
+    (cond
+      (nil? st) out
+      (.isFile st) (if (source-path? root) (conj out root) out)
+      (.isDirectory st)
+      (if (contains? skip-dirs (path/basename root))
+        out
+        (reduce (fn [acc e] (walk-source (path/join root e) acc))
+                out (sort (fs/readdirSync root))))
+      :else out)))
+
 (defn- build-consumes?
   "True when a build config compiles this file BY EXTENSION.
 
@@ -117,7 +149,19 @@
       (cond
         (or (= d "/") (str/blank? d)) false
         (some #(fs/existsSync (path/join d %)) project-files)
-        (boolean (some #(str/starts-with? abs (str % path/sep)) (declared-source-paths d)))
+        (let [owning (first (filter #(str/starts-with? abs (str % path/sep))
+                                    (declared-source-paths d)))]
+          (if (nil? owning)
+            false
+            ;; The hazard is a file going invisible to a build that still
+            ;; expects it. If the WHOLE declared source root is converting,
+            ;; no Clojure namespace remains under it for any runtime to
+            ;; resolve by extension, and a consumer that still needs one is
+            ;; caught by the external-consumer guard rather than this one.
+            ;; A PARTIAL conversion is still refused, which is the case the
+            ;; kotoba-lang/datalog incident actually was.
+            (boolean (some (fn [f] (not (contains? *convert-set* (path/resolve f))))
+                           (walk-source owning [])))))
         :else (recur (path/dirname d))))))
 
 (defn- ns-of
@@ -286,7 +330,11 @@
                  ;; convertible that the scan had refused. These are a minority,
                  ;; so they get the scan; the index carries the rest.
                  (get @bare-index ns-name []))]
-      (vec (remove #(= (path/resolve %) self*) hits)))))
+      ;; A consumer inside this pass stops being a Clojure consumer when the
+      ;; pass lands, so it is not evidence against converting this file.
+      (vec (remove #(let [r (path/resolve %)]
+                      (or (= r self*) (contains? *convert-set* r)))
+                   hits)))))
 
 (defn- annex-pointer? [txt] (str/starts-with? txt "/annex/objects"))
 
@@ -390,10 +438,29 @@
   (let [all (reduce (fn [acc p] (walk-edn p acc)) [] paths)
         [files untracked] (filter-tracked all tracked-only?)
         _ (collect-bare-names! files)
+        ;; Whether a file may convert depends on which OTHER files convert, so
+        ;; the answer is a fixpoint rather than a single pass. Start optimistic
+        ;; -- assume everything requested converts -- classify, drop whatever
+        ;; was refused, and repeat. The set only ever shrinks, so this
+        ;; terminates; the bound is belt-and-braces and is REPORTED rather than
+        ;; hidden, because a run that stopped early is not the same answer as a
+        ;; run that settled.
+        [settled iters converged?]
+        (loop [s (set (map #(path/resolve %) files)) i 0]
+          (let [ok (set (for [p files
+                              :when (= :ok (:status (binding [*convert-set* s] (classify p))))]
+                          (path/resolve p)))]
+            (cond
+              (= ok s) [ok i true]
+              (>= i 8) [ok i false]
+              :else (recur ok (inc i)))))
         tally (atom {:converted 0 :would-convert 0})
         refusals (atom {})]
+    (when-not converged?
+      (println "REFUSED\tfixpoint did not settle in 8 iterations -- not reporting a pass")
+      (.exit js/process 2))
     (doseq [p files]
-      (let [{:keys [status reason text]} (classify p)]
+      (let [{:keys [status reason text]} (binding [*convert-set* settled] (classify p))]
         (if (= status :ok)
           (if apply?
             (do (if (source-path? p)
@@ -404,6 +471,7 @@
             (swap! tally update :would-convert inc))
           (swap! refusals update reason (fnil inc 0)))))
     (println (str "SCANNED\t" (count files)))
+    (println (str "FIXPOINT\t" iters " iteration(s) to settle, " (count settled) " in the converting set"))
     (when (realized? code-corpus)
       (println (str "CONSUMER-SCAN\t" (count @code-corpus)
                     " Clojure-runtime files"
