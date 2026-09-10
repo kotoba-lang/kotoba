@@ -40,6 +40,26 @@
                 (sort (fs/readdirSync root))))
       :else out)))
 
+(defn- dirty-set
+  "Paths with uncommitted changes, per git.
+
+   Converting one of these renames a file out from under an edit that is not in
+   any commit. Measured 2026-09-10: wave 1 hit exactly this. A bot had appended
+   one record to a metrics document; the rename landed upstream, the local edit
+   then blocked the merge, and the record survived only because it was archived
+   by hand first. --tracked-only guards files git does not know about; it says
+   nothing about files git knows about and whose content has moved on."
+  [root]
+  (let [out (.toString (cp/execSync "git status --porcelain -z --"
+                                    #js {:cwd root :maxBuffer 268435456}))]
+    (->> (str/split out #"\u0000")
+         (remove empty?)
+         ;; porcelain -z: "XY <path>", and a rename adds a second NUL-separated
+         ;; path which we do not need -- an entry without a status prefix is
+         ;; that trailing path and is dropped by the length guard below.
+         (keep (fn [e] (when (> (count e) 3) (subs e 3))))
+         set)))
+
 (defn- tracked-set
   "The set of git-tracked paths under root. Untracked files are another
    agent's in-flight work in this workspace; renaming them is destructive and
@@ -48,6 +68,8 @@
   (let [out (.toString (cp/execSync "git ls-files -z -- '*.edn'"
                                     #js {:cwd root :maxBuffer 268435456}))]
     (set (remove empty? (str/split out #"\u0000")))))
+
+(def dirty-paths (delay (dirty-set (js/process.cwd))))
 
 (defn- annex-pointer? [txt] (str/starts-with? txt "/annex/objects"))
 
@@ -63,6 +85,9 @@
 
       (not (fs/existsSync p))
       {:status :refused :reason :absent-from-worktree}
+
+      (contains? @dirty-paths (path/relative (js/process.cwd) (path/resolve p)))
+      {:status :refused :reason :uncommitted-changes}
 
       :else
       (let [txt (fs/readFileSync p "utf8")]
