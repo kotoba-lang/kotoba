@@ -16,7 +16,7 @@ the JS route itself needed a JDK (`kotoba-script` was `.clj`).
 
 ## Decision
 
-1. `bin/kbb_js.cljs` (nbb) hosts `.kotoba` + kbb-v1 policy through
+1. `bin/kbb_js.cljk` (nbb) hosts `.kotoba` + kbb-v1 policy through
    `amu compile --target js --jvm-free` and Node `instantiateKotoba(grants)`.
    Grants are built from the policy, keyed by compiler wire id (35/33/34/20),
    re-check scope on every call, and journal receipts. Capabilities without a
@@ -31,11 +31,11 @@ the JS route itself needed a JDK (`kotoba-script` was `.clj`).
    The full index is `docs/DEMONSTRATIONS.md` § kbb.
 3. Parity is the acceptance: `demo_kbb_fs_read_native.kotoba` answers 84 on
    `--backend js` and on `--backend native` (kbb_native_test) for the same
-   policy. `test/kotoba/kbb_js_test.clj` measures the js side; a missing `nbb`
+   policy. `test/kotoba/kbb_js_test.cljk` measures the js side; a missing `nbb`
    or amu runtime SKIPS with a printed line, never a silent green.
 4. This is not the shipped artifact. `--backend native` remains the
    distribution form; the shim that routes `bin/kbb` is a separate,
-   concurrent slice (`bin/kbb_shim.cljs`) and is free to add `--backend js`
+   concurrent slice (`bin/kbb_shim.cljk`) and is free to add `--backend js`
    delegation to this file.
 
 ## Measured (2026-09-06)
@@ -61,7 +61,7 @@ Read from the merge commits on `main` (`git log --format=%B <sha>`); test
 counts are quoted as the commit bodies state them.
 
 - Provider-boundary tests (`c5393d04`, branch commit `79f1542d`): one group
-  per provider of `bin/kbb_js.cljs`, asserting every refusal leaves exit 1,
+  per provider of `bin/kbb_js.cljk`, asserting every refusal leaves exit 1,
   `:kbb-js/guest-failed`, `:kotoba.kbb/capability` naming the provider and a
   LAST receipt with `:outcome :denied`. Probes
   `examples/kbb/probe_{fs,browse,proc}_via_env.kotoba` and the three env
@@ -69,7 +69,7 @@ counts are quoted as the commit bodies state them.
   / not-a-directory threw without a receipt). Body states:
   `kotoba.kbb-js-providers-test  Ran 4 tests containing 97 assertions. 0 failures, 0 errors.`
   and `kotoba.kbb-js-test            Ran 5 tests containing 33 assertions. 0 failures, 0 errors.`
-- CLI surface tests for `bin/kbb_js.cljs` (`d3251c1d`): `--fuel` reaches the
+- CLI surface tests for `bin/kbb_js.cljk` (`d3251c1d`): `--fuel` reaches the
   compiled module (`probe_fuel` → 100 by default, `fuel-exhausted` under
   `--fuel 8`), `--json`, argument refusals, two `--source-path`. Body states:
   `Ran 4 tests containing 54 assertions, 0 failures`.
@@ -88,7 +88,7 @@ counts are quoted as the commit bodies state them.
   `examples/kbb/fs_roundtrip.kotoba` → 20. Body states:
   `Ran 12 tests containing 213 assertions. 0 failures, 0 errors (kbb-js-write / kbb-js / kbb-js-providers).`
 - Shim delegation (`39aab807`, dated 2026-09-06; branch commit `e43b4d68`):
-  `bin/kbb --backend js` hands argv to `bin/kbb_js.cljs` with `KBB_HOME`
+  `bin/kbb --backend js` hands argv to `bin/kbb_js.cljk` with `KBB_HOME`
   derived from the shim's own location; delegation answers 84 with
   `:backend :js`, `--source-path` / `--json` pass through (`no_bb_scan` → 3),
   a js-host refusal keeps exit 1. The merge commit states no test count; the

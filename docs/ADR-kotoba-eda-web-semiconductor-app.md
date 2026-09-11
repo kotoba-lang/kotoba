@@ -255,10 +255,10 @@ EDA は「計算コスト」だけでなく「知財流出」と「sign-off 誤�
 ### P0a: docs-hosted executable workbench
 
 - `docs/eda/index.html` を説明ページから flow workbench に変更済み。
-- `docs/eda/kotoba_eda_core.cljc` が工程、policy gate、datom、manufacturing packet、
+- `docs/eda/kotoba_eda_core.cljk` が工程、policy gate、datom、manufacturing packet、
   kami render-IR の正本モデルを持つ。
 - `docs/eda/eda_file_formats.edn` が EDA でよく使うファイル形式を registry として定義し、
-  `docs/eda/kotoba_eda_formats.cljc` が拡張子、工程、policy、manifest 生成を純関数で扱う。
+  `docs/eda/kotoba_eda_formats.cljk` が拡張子、工程、policy、manifest 生成を純関数で扱う。
 - registry は `:software`、`:operations`、`:converter-pipelines` も持つ。
   変換は file-to-file 直結ではなく、`external file -> typed EDN -> tool/render/report output` の
   EDN hub 方式にする。
@@ -274,15 +274,15 @@ EDA は「計算コスト」だけでなく「知財流出」と「sign-off 誤�
   `:eda.artifact/ingest`、`:eda.parser/summary`、`:eda.report/finding` datom を作る。
   これにより `upload -> parse -> datom -> maturity` の一周は GitHub Pages 上で実行できる。
   実 Verilator/Yosys/OpenROAD/KLayout/ngspice 実行は次段の host/murakumo runner adapter に接続する。
-- `docs/eda/eda_runner_adapters.edn` と `docs/eda/kotoba_eda_runner.cljc` は
+- `docs/eda/eda_runner_adapters.edn` と `docs/eda/kotoba_eda_runner.cljk` は
   artifact manifest から Verilator/Yosys/OpenSTA/OpenROAD/KLayout/Netgen/ngspice の EDN job plan を
-  生成する。`docs/eda/runner_host.clj` は host 側 dry-run/execution skeleton。
-- `docs/eda/eda_murakumo_job.edn` と `docs/eda/kotoba_eda_murakumo.cljc` は runner job plan を
+  生成する。`docs/eda/runner_host.cljk` は host 側 dry-run/execution skeleton。
+- `docs/eda/eda_murakumo_job.edn` と `docs/eda/kotoba_eda_murakumo.cljk` は runner job plan を
   murakumo submit payload に変換する。UI は dry-run payload と SSE events path を生成し、
   実行は host/murakumo 側の policy approval 後に限定する。
 - runner plan / murakumo payload の download は EDN に統一する。
   `runner_host.clj` は `kotoba-eda-runner-plan.edn` をそのまま dry-run 実行できる。
-- `docs/eda/kotoba_eda_ui.cljc` は Hiccup component と shadow-css 風 style data の正本。
+- `docs/eda/kotoba_eda_ui.cljk` は Hiccup component と shadow-css 風 style data の正本。
   現在の GitHub Pages HTML はこの UI spec に合わせた静的配信版として扱う。
 - `docs/eda/eda_coverage_schema.edn` と `:eda.coverage/*` は stage-model coverage と
   runner-result coverage を分離する。runner result import 後は coverage/maturity が実行結果を優先する。

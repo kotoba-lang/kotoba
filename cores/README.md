@@ -18,8 +18,8 @@ Clojure never loads it.
 
 | core | oracle it was extracted from | host seam | parity test |
 |---|---|---|---|
-| `resource_scope_core.cljk` | `src/kotoba/resource_scope.clj` | `resource-scope/parts` | `test/kotoba/resource_scope_kotoba_parity_test.clj` |
-| `cap_use_core.cljk` | `src/kotoba/cap_table.clj` | `cap-table/decide-use` | `test/kotoba/cap_use_kotoba_parity_test.clj` |
+| `resource_scope_core.cljk` | `src/kotoba/resource_scope.cljk` | `resource-scope/parts` | `test/kotoba/resource_scope_kotoba_parity_test.cljk` |
+| `cap_use_core.cljk` | `src/kotoba/cap_table.cljk` | `cap-table/decide-use` | `test/kotoba/cap_use_kotoba_parity_test.cljk` |
 
 **The `.clj` is still what runs.** Q9's rollback policy retains the oracle
 until soak, so no call site selects a core yet. The parity tests are the only

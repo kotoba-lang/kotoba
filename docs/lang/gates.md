@@ -8,8 +8,8 @@ bin/kotoba-clj check --kind cli-contract --json
 bin/kotoba-clj selfhost list --json
 bin/kotoba-clj selfhost check --json
 bin/kotoba-clj run src/demo.kotoba --json
-bin/kotoba-clj run src/demo.cljc --json
-bin/kotoba-clj run src/demo.cljc --reader-target cljs --json
+bin/kotoba-clj run src/demo.cljc.cljk --json
+bin/kotoba-clj run src/demo.cljc.cljk --reader-target cljs --json
 bin/kotoba-clj run src/demo_i64_host.kotoba --policy src/demo_i64_host_policy.edn --json
 bin/kotoba-clj wasm emit src/demo.kotoba --package-lock kotoba.lock.edn --output target/kotoba/demo.wasm --json
 node -e 'const fs=require("fs"); WebAssembly.instantiate(fs.readFileSync("target/kotoba/demo.wasm")).then(({instance})=>{if(instance.exports.main()!==42) process.exit(1)})'
@@ -417,7 +417,7 @@ param — returning `42` in the interpreter (receipts show the SAME handle at
 acquire and use) and `42n` under the node cap-map host; a forged handle
 constant in a variant module is rejected statically by the launcher and,
 when emitted by a checker-bypassing front end, still fails closed at the
-host binding (`test/kotoba/cap_typed_test.clj`).
+host binding (`test/kotoba/cap_typed_test.cljk`).
 
 In the interpreter, cap-typed params are ordinary handle values;
 `kotoba.cap-table/resolve-use` re-checks kind + expiry at every host call
@@ -463,7 +463,7 @@ aliases, so `(let [alias c] ...)` followed by using `alias` once and `c`
 once is correctly caught as spending the same value twice, including
 through a chain of aliases (`alias2` aliasing `alias1` aliasing `c`). See
 `kotoba.runtime/cap-affine-problems`'s docstring and
-`test/kotoba/cap_affine_test.clj` (positive/negative/alias-chain cases).
+`test/kotoba/cap_affine_test.cljk` (positive/negative/alias-chain cases).
 
 ### CACAO delegation chains (`run --cacao`)
 
@@ -500,7 +500,7 @@ bin/kotoba-clj run src/demo_i64_host.kotoba --cacao chain.edn --policy policy.ed
   `:kotoba.cacao/root-iss`, `:kotoba.cacao/holder`, and
   `:kotoba.cacao/depth` next to `:kotoba.host/receipts` in the result JSON.
 - The chain gate is exercised end-to-end by `clojure -M:test`
-  (`test/kotoba/cacao_run_test.clj` mints real 2-link chains in-process with
+  (`test/kotoba/cacao_run_test.cljk` mints real 2-link chains in-process with
   deterministic Ed25519 seeds — grant, escalation, tamper, expiry, and
   policy-narrowing cases).
 

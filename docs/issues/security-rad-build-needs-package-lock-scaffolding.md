@@ -50,5 +50,5 @@ some other way to skip admission if this isn't fixed promptly.
 
 - `kotoba-lang/security/docs/architecture-review-2026-07-01.md` finding `F-001`
 - `docs/issues/security-package-verification-admission-gate.md`
-- `src/kotoba/rad_adapter.cljc` (`build` step)
-- `test/kotoba/rad_adapter_test.clj` (`launcher-executes-rad-lifecycle-end-to-end`)
+- `src/kotoba/rad_adapter.cljk` (`build` step)
+- `test/kotoba/rad_adapter_test.cljk` (`launcher-executes-rad-lifecycle-end-to-end`)

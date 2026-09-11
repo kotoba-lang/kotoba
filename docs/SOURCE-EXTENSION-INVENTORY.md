@@ -7,7 +7,7 @@ Kotoba targets.
 ## Canonical Kotoba source
 
 - `src/*.kotoba`: capability-checked programs compiled by the Kotoba/Kototama
-  compiler. `src/demo.kotoba` replaces the former production `src/demo.cljc`.
+  compiler. `src/demo.kotoba` replaces the former production `src/demo.cljc.cljk`.
 - Web builds read `.kotoba` with the `:cljs` target.
 
 ## Intentionally shared CLJC
@@ -19,7 +19,7 @@ Kotoba targets.
   Kotoba Wasm subset.
 - `docs/eda/*.cljc`: shared CLJ documentation build and browser application
   model.
-- `test/fixtures/source/demo_shared.cljc`: conformance evidence for all three
+- `test/fixtures/source/demo_shared.cljk`: conformance evidence for all three
   reader targets; it is not production source.
 
 Do not rename these shared namespaces mechanically. A `.cljc` file moves to

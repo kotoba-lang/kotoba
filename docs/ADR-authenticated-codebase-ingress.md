@@ -78,14 +78,14 @@ not NIST or DoDAF certification.
 
 ## Evidence
 
-`test/kotoba/codebase_publish_test.clj` proves that missing/wrong authority is
+`test/kotoba/codebase_publish_test.cljk` proves that missing/wrong authority is
 rejected before persistence, plaintext non-loopback transport is rejected,
 tokenless nodes are read-only, quota exhaustion returns 507 before storage,
 restart and two concurrent listeners share the durable balance, corrupt state
 fails closed, duplicate CIDs are charged once, wrong-CID bytes are still
 refused, and public browse/follow reads remain available. IPNS endpoint hosting
 exercises the same authority in
-`test/kotoba/codebase_ipns_test.clj`.
+`test/kotoba/codebase_ipns_test.cljk`.
 
 The same suite proves per-principal byte isolation across restart, durable
 per-principal mutation rate enforcement for both block and head paths, window
