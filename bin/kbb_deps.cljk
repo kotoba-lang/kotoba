@@ -1,0 +1,267 @@
+#!/usr/bin/env nbb
+;; bin/kbb_deps.cljk — the tools.deps-shaped door of kbb (ADR-2609112000).
+;;
+;; `bin/kbb` execs this on the kbb ENGINE (kotoba-lang/org-babashka-nbb: SCI on
+;; Node with `.cljk` classpath resolution) whenever argv looks like a Clojure
+;; CLI invocation rather than a `.kotoba` guest:
+;;
+;;   kbb -M:dev:test [args]      kbb -A:dev -m ns      kbb -X:fmt :k v
+;;   kbb -Sdeps '{…}' -M …       kbb -Spath            kbb -Saliases
+;;   kbb -m ns | -e expr | -i file | <script.cljk> [args]
+;;
+;; The owner decision of 2026-09-11 rewrote every `clojure -M:<alias>`,
+;; `clj -M`, `bb <task>` and `nbb <script>` in the workspace to `kbb …`
+;; textually. This file is what makes those strings name something that RUNS:
+;; it reads the repository's `deps.edn` exactly as tools.deps would for the
+;; classpath-and-main-opts subset, and hands the result to the engine. It is
+;; NOT tools.deps: there is no Maven or git resolution here (the engine reads
+;; `nbb.edn` `:deps` itself), no JVM, no `-Stree`. What it cannot answer it
+;; refuses BY NAME with exit 64, never by running something else.
+;;
+;; Resolution, in tools.deps order:
+;;   classpath  = :paths (default ["src"]) ∪ every alias's :extra-paths
+;;                ∪ the :paths of every :local/root dependency (recursively),
+;;                an alias's :paths REPLACING the root :paths when present.
+;;   main opts  = concatenation of the aliases' :main-opts, then the trailing
+;;                command-line args (exactly `clojure -M:alias args`).
+;;   -X/-T      = the alias's :exec-fn called with :exec-args merged with the
+;;                trailing `:k v` pairs.
+;;   test alias = when the main ns is a JVM test runner (cognitect.test-runner,
+;;                kaocha.runner, eftest) or the exec-fn is its API, kbb runs
+;;                its own: every `*_test.cljk` under the alias's test dirs is
+;;                required and `cljs.test/run-tests` decides the exit code.
+;;                Those runners do not exist on this engine; this is the
+;;                one substitution, and it is named on stderr when it happens.
+;;
+;; Deps that are not :local/root are listed on stderr once (they are not on
+;; the classpath) so a later `Could not find namespace` has its cause printed
+;; ABOVE it rather than being a mystery.
+;;
+;; Exit codes: the child's | 64 usage / unsupported flag / unknown alias
+;; | 66 no deps.edn where one was needed.
+(ns kbb-deps
+  (:require [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(def fs (js/require "fs"))
+(def path (js/require "path"))
+(def os (js/require "os"))
+(def cp (js/require "child_process"))
+
+(defn- die! [code & msg]
+  (binding [*print-fn* *print-err-fn*] (apply println "kbb:" msg))
+  (.exit js/process code))
+
+(defn- warn! [& msg] (binding [*print-fn* *print-err-fn*] (apply println "kbb:" msg)))
+
+(def engine
+  (or (.-KBB_ENGINE (.-env js/process))
+      (die! 3 "KBB_ENGINE is not set; run through bin/kbb.")))
+
+(defn- read-edn-file [f]
+  (when (.existsSync fs f)
+    (try (edn/read-string {:default (fn [_ v] v)} (.readFileSync fs f "utf8"))
+         (catch :default e (die! 65 (str f " does not read as EDN: " (.-message e)))))))
+
+;; ---- argv --------------------------------------------------------------
+
+(defn- alias-kws
+  "\"-M:dev:test\" -> [:dev :test]; \"-M\" -> []."
+  [tok]
+  (->> (str/split (subs tok 2) #":") (remove str/blank?) (map keyword) vec))
+
+(defn parse-argv
+  "tools.deps flag grammar, the subset kbb answers. Returns
+  {:mode :main|:exec|:script|:path|:aliases :aliases [...] :sdeps {...}
+   :classpath str|nil :args [...]}."
+  [argv]
+  (loop [[a & more :as all] argv acc {:mode nil :aliases [] :args []}]
+    (cond
+      (nil? a) acc
+      (:mode acc) (assoc acc :args (vec all))
+      (= a "-Sdeps") (recur (rest more) (assoc acc :sdeps (try (edn/read-string (first more))
+                                                                 (catch :default e (die! 64 "-Sdeps is not EDN:" (.-message e))))))
+      (= a "-Spath") (assoc acc :mode :path :args (vec more))
+      (= a "-Saliases") (assoc acc :mode :aliases)
+      (contains? #{"-Sforce" "-Srepro" "-Sverbose" "-Strace"} a) (recur more acc)
+      (= a "-Sthreads") (recur (rest more) acc)
+      (contains? #{"-Stree" "-Sdescribe" "-Spom" "-Scp"} a)
+      (die! 64 a "is a tools.deps operation with no kbb equivalent (kbb resolves :paths and :local/root only; no Maven, no git).")
+      (str/starts-with? a "-J") (recur more acc)
+      (or (str/starts-with? a "-M") (str/starts-with? a "-A"))
+      (recur more (-> acc (assoc :mode :main) (update :aliases into (alias-kws a))))
+      (or (str/starts-with? a "-X") (str/starts-with? a "-T"))
+      (recur more (-> acc (assoc :mode :exec :tool? (str/starts-with? a "-T")) (update :aliases into (alias-kws a))))
+      (contains? #{"-cp" "--classpath"} a) (recur (rest more) (assoc acc :classpath (first more)))
+      (contains? #{"-m" "--main" "-e" "-i" "-r"} a) (assoc acc :mode :main :args (vec all))
+      (= a "-f") (assoc acc :mode :script :args (vec more))
+      (= a "-h") (assoc acc :mode :help)
+      (= a "--help") (assoc acc :mode :help)
+      (str/starts-with? a "-") (die! 64 "unknown flag" a)
+      :else (assoc acc :mode :script :args (vec all)))))
+
+;; ---- deps.edn ----------------------------------------------------------
+
+(defn- merge-sdeps [deps sdeps]
+  (cond-> deps
+    (:paths sdeps) (assoc :paths (:paths sdeps))
+    (:deps sdeps) (update :deps merge (:deps sdeps))
+    (:aliases sdeps) (update :aliases (fn [a] (merge-with merge a (:aliases sdeps))))))
+
+(defn- local-root-paths
+  "Classpath contribution of :local/root deps, recursively, relative to cwd.
+  `seen` is an atom {:dirs #{…} :missing [lib …]}."
+  [deps-map base seen]
+  (reduce (fn [acc [lib coord]]
+            (if-let [root (:local/root coord)]
+              (let [dir (.resolve path base root)]
+                (if (contains? (:dirs @seen) dir) acc
+                    (do (swap! seen update :dirs conj dir)
+                        (let [d (read-edn-file (.join path dir "deps.edn"))
+                              ps (or (:paths d) ["src"])]
+                          (into (into acc (map #(.relative path (.cwd js/process) (.join path dir %)) ps))
+                                (local-root-paths (:deps d) dir seen))))))
+              (do (swap! seen update :missing conj lib) acc)))
+          [] deps-map))
+
+(defn resolve-classpath
+  "[classpath-vector missing-libs]"
+  [deps aliases]
+  (let [alias-maps (map #(get-in deps [:aliases %]) aliases)
+        root-paths (or (some :paths (reverse alias-maps)) (:paths deps) ["src"])
+        extra (mapcat :extra-paths alias-maps)
+        seen (atom {:dirs #{} :missing []})
+        dep-maps (cons (:deps deps) (map #(merge (:extra-deps %) (:deps %) (:replace-deps %)) alias-maps))
+        locals (vec (mapcat #(local-root-paths % (.cwd js/process) seen) dep-maps))]
+    [(vec (distinct (concat root-paths extra locals)))
+     (vec (distinct (:missing @seen)))]))
+
+(defn- unknown-aliases [deps aliases]
+  (remove #(contains? (:aliases deps) %) aliases))
+
+;; ---- test runner substitution -----------------------------------------
+
+(def jvm-test-runners
+  #{"cognitect.test-runner" "kaocha.runner" "eftest.runner" "lambdaisland.kaocha"
+    "clojure.test.runner" "circleci.test"})
+
+(def jvm-test-exec-fns
+  #{"cognitect.test-runner.api/test" "kaocha.runner/exec-fn" "kaocha.runner/run"})
+
+(defn- ns-of-file [dir f]
+  (-> (.relative path dir f)
+      (str/replace #"\.(cljk|cljc|cljs|clj)$" "")
+      (str/replace "/" ".")
+      (str/replace "_" "-")))
+
+(defn- test-files [dir]
+  (let [out (atom [])]
+    (letfn [(walk [d]
+              (doseq [e (.readdirSync fs d #js {:withFileTypes true})]
+                (let [p (.join path d (.-name e))]
+                  (cond (.isDirectory e) (when-not (contains? #{"node_modules" ".git" "target"} (.-name e)) (walk p))
+                        (re-find #"_test\.(cljk|cljc|cljs|clj)$" (.-name e)) (swap! out conj p)))))]
+      (when (.existsSync fs dir) (walk dir)))
+    @out))
+
+(defn- test-runner-source
+  "A script that requires every test ns and lets cljs.test decide the exit."
+  [nses]
+  (str "(ns kbb-test-run (:require [cljs.test]))\n"
+       "(defmethod cljs.test/report [:cljs.test/default :end-run-tests] [m]\n"
+       "  (println (str \"kbb test: \" (:test m) \" test(s), \" (:pass m) \" pass, \" (:fail m) \" fail, \" (:error m) \" error\"))\n"
+       "  (.exit js/process (if (cljs.test/successful? m) 0 1)))\n"
+       (str/join "\n" (map #(str "(require '" % ")") nses)) "\n"
+       (if (seq nses)
+         (str "(cljs.test/run-tests " (str/join " " (map #(str "'" %) nses)) ")\n")
+         "(println \"kbb test: 0 test namespace(s) found\") (.exit js/process 1)\n")))
+
+(defn- test-run-plan
+  "Given the alias maps, the test dirs and -n / -d options, the namespaces to run."
+  [alias-maps args]
+  (let [opts (loop [[a & more] args m {:dirs [] :nses []}]
+               (cond (nil? a) m
+                     (= a "-d") (recur (rest more) (update m :dirs conj (first more)))
+                     (= a "-n") (recur (rest more) (update m :nses conj (first more)))
+                     :else (recur more m)))
+        dirs (or (seq (:dirs opts))
+                 (seq (filter #(.existsSync fs %) (mapcat :extra-paths alias-maps)))
+                 ["test"])
+        nses (or (seq (:nses opts))
+                 (for [d dirs f (test-files d)] (ns-of-file d f)))]
+    {:dirs dirs :nses (vec (distinct nses))}))
+
+;; ---- run ---------------------------------------------------------------
+
+(defn- exec-engine!
+  "Runs the engine and exits with its status. `config?` points the engine at
+  the project's nbb.edn explicitly: the engine finds nbb.edn by walking UP
+  FROM THE SCRIPT PATH, so a runner written to the temp dir would otherwise
+  see none of the project's :deps (measured 2026-09-11)."
+  [classpath engine-args & [{:keys [config?]}]]
+  (let [nbb-edn (.join path (.cwd js/process) "nbb.edn")
+        r (.spawnSync cp "node" (clj->js (concat [engine]
+                                                 (when (seq classpath) ["--classpath" (str/join ":" classpath)])
+                                                 (when (and config? (.existsSync fs nbb-edn)) ["--config" nbb-edn])
+                                                 engine-args))
+                      #js {:stdio "inherit"})]
+    (.exit js/process (or (.-status r) 1))))
+
+(defn- run-test-substitute! [classpath alias-maps args]
+  (let [{:keys [dirs nses]} (test-run-plan alias-maps args)
+        tmp (.join path (.tmpdir os) (str "kbb-test-" (.-pid js/process) ".cljk"))]
+    (warn! "test runner substitution: running" (count nses) "namespace(s) under" (pr-str dirs) "with cljs.test (the JVM runner named by the alias does not exist on this engine)")
+    (.writeFileSync fs tmp (test-runner-source nses))
+    (exec-engine! (vec (distinct (concat classpath dirs))) [tmp] {:config? true})))
+
+(defn -main [argv]
+  (let [{:keys [mode aliases sdeps classpath args tool?]} (parse-argv argv)
+        cwd (.cwd js/process)
+        deps-file (.join path cwd "deps.edn")
+        deps (merge-sdeps (or (read-edn-file deps-file) {}) sdeps)]
+    (when (= mode :help)
+      (println "kbb -M[:alias…] [args] | -X[:alias] [:k v…] | -Spath | -Saliases | -Sdeps '{…}' | -m ns | -e expr | <script.cljk> [args]")
+      (.exit js/process 0))
+    (when (and (seq aliases) (not (.existsSync fs deps-file)) (nil? sdeps))
+      (die! 66 "no deps.edn in" cwd "— aliases" (pr-str aliases) "cannot be resolved here."))
+    (when-let [u (seq (unknown-aliases deps aliases))]
+      (die! 64 "alias" (pr-str (vec u)) "is not declared in" deps-file
+            (str "(declared: " (pr-str (vec (keys (:aliases deps)))) ")")))
+    (let [alias-maps (map #(get-in deps [:aliases %]) aliases)
+          [cp-vec missing] (if classpath [(str/split classpath #":") []] (resolve-classpath deps aliases))]
+      (when-let [missing (seq (remove (set (keys (:deps (read-edn-file (.join path cwd "nbb.edn"))))) missing))]
+        (warn! (count missing) "dep(s) are not :local/root and are NOT on the classpath (kbb resolves no Maven/git coordinates; declare them in nbb.edn for the engine):" (str/join ", " (map str missing))))
+      (case mode
+        :path (do (println (str/join ":" cp-vec)) (.exit js/process 0))
+        :aliases (do (doseq [[k v] (sort-by key (:aliases deps))]
+                       (println (name k) (cond (:main-opts v) (str "-M " (str/join " " (:main-opts v)))
+                                               (:exec-fn v) (str "-X " (:exec-fn v))
+                                               :else "(paths/deps only)")))
+                     (.exit js/process 0))
+        :script (exec-engine! cp-vec args)
+        :exec (let [exec-fn (some :exec-fn (reverse alias-maps))
+                    exec-args (apply merge (map :exec-args alias-maps))
+                    kv (apply hash-map (map edn/read-string args))]
+                (when-not exec-fn (die! 64 "-X/-T: no :exec-fn in aliases" (pr-str aliases)))
+                (if (contains? jvm-test-exec-fns (str exec-fn))
+                  (run-test-substitute! cp-vec alias-maps (mapcat (fn [[k v]] (case k :dirs (mapcat #(vector "-d" (str %)) v) :nses (mapcat #(vector "-n" (str %)) v) [])) (merge exec-args kv)))
+                  (let [ns-sym (symbol (namespace exec-fn))
+                        form (str "(require '" ns-sym ") (" exec-fn " " (pr-str (merge exec-args kv)) ")")]
+                    (exec-engine! cp-vec ["-e" form]))))
+        :main (let [main-opts (vec (concat (mapcat :main-opts alias-maps) args))
+                    [flag v & rest-opts] main-opts]
+                (cond
+                  (and (contains? #{"-m" "--main"} flag) (contains? jvm-test-runners v))
+                  (run-test-substitute! cp-vec alias-maps rest-opts)
+
+                  (empty? main-opts)
+                  (if (seq aliases)
+                    (die! 64 "aliases" (pr-str aliases) "declare no :main-opts; nothing to run (this is a classpath-only alias — pass -m <ns> or a script).")
+                    (exec-engine! cp-vec []))
+
+                  (= flag "-i") (exec-engine! cp-vec (into [v] rest-opts))
+                  (= flag "-r") (exec-engine! cp-vec [])
+                  :else (exec-engine! cp-vec main-opts)))
+        (die! 64 "nothing to run; see kbb --help")))))
+
+(-main (vec *command-line-args*))
