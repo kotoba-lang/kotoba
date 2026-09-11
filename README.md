@@ -718,7 +718,7 @@ consumers move.
 
 #### `kbb --backend js` — the JVM-free JS host, and the kbb library
 
-`bin/kbb_js.cljs` runs the same `.kotoba` + policy through the compiler's
+`bin/kbb_js.cljk` runs the same `.kotoba` + policy through the compiler's
 JS route and Node instead of the JVM interpreter (superproject
 ADR-2609062200; `amu compile --target js --jvm-free`, amu ADR 0340). Cold
 start is sub-second where `bin/kbb` is ~10 s, and it is the second oracle
@@ -727,8 +727,8 @@ on both (demo_kbb_fs_read_native → 84).
 
 ```bash
 bin/kbb src/demo_kbb_fs_read_native.kotoba --policy src/demo_kbb_fs_read_native_policy.edn --backend js   # via the v2 shim
-nbb bin/kbb_js.cljs src/demo_kbb_fs_read_native.kotoba   --policy src/demo_kbb_fs_read_native_policy.edn --json
-nbb bin/kbb_js.cljs examples/kbb/fs_report.kotoba   --policy examples/kbb/fs_report_policy.edn --source-path lib
+nbb bin/kbb_js.cljk src/demo_kbb_fs_read_native.kotoba   --policy src/demo_kbb_fs_read_native_policy.edn --json
+nbb bin/kbb_js.cljk examples/kbb/fs_report.kotoba   --policy examples/kbb/fs_report_policy.edn --source-path lib
 ```
 
 Providers are keyed by compiler wire id and re-check the policy scope on every
@@ -751,13 +751,13 @@ form the native loader takes too (amu `6cca3852`), a second `WRITE_SEP` in
 the request is refused, and the result is the content written back, so
 `kbb.fs/write-ok?` is a `string=?` against what was sent
 (`examples/kbb/fs_roundtrip.kotoba` → 20; refusals measured in
-`test/kotoba/kbb_js_write_test.clj`). It is consumed through the
+`test/kotoba/kbb_js_write_test.cljk`). It is consumed through the
 project route (`--source-path lib`) and compiles on the js and native
 backends alike; `kbb.browse` and `kbb.proc` run on js today because the native
 loader's wire-34/20 providers are still stubs (ADR-2609051100 task 5). amu is
 located through `$AMU_HOME` or this repo's `deps.edn` pin under `~/.gitlibs`,
 and a checkout without `node_modules/nbb` is a named refusal.
-`test/kotoba/kbb_js_test.clj` drives the host as a process and SKIPS visibly
+`test/kotoba/kbb_js_test.cljk` drives the host as a process and SKIPS visibly
 when `nbb` or amu is missing. `examples/kbb/no_bb_scan.kotoba` is the first
 gate script ported to the compile route (ADR-2607181900 item ②): the test
 measures it and the interpreter twin `src/no_bb_scan.kotoba` in one place
@@ -766,7 +766,7 @@ measures it and the interpreter twin `src/no_bb_scan.kotoba` in one place
 `count-matches`, all byte-addressed, no capability) is what the ported scans
 walk their listings with; `examples/kbb/env_scan.kotoba` takes its directory
 from `KBB_SCAN_DIR` through `kbb.env` and is measured in
-`test/kotoba/kbb_lib_test.clj` (dirty_dir 3, clean_dir 0, unset → browse denied).
+`test/kotoba/kbb_lib_test.cljk` (dirty_dir 3, clean_dir 0, unset → browse denied).
 Every `examples/kbb/*.kotoba` script and probe, with its measured answer and
 the test that asserts it, is indexed in `docs/DEMONSTRATIONS.md` § kbb.
 
@@ -1050,7 +1050,7 @@ versioned EDN admission contract,
 (pinned in `deps.edn`), ships "seed" data such as `safe_analyzer_facts.edn` —
 the classification/effect/capability facts a safe-analyzer implementation
 must agree with. This launcher loads and validates those seeds through
-`kotoba.selfhost.contracts` (required from `src/kotoba/launcher.clj`) and
+`kotoba.selfhost.contracts` (required from `src/kotoba/launcher.cljk`) and
 exposes them over the CLI as `kotoba selfhost list` (bundled seed metadata)
 and `kotoba selfhost check` (validate the bundled seeds against the contract
 schema, without invoking any Rust crate — there is none left to invoke).

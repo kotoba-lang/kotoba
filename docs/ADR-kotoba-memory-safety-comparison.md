@@ -162,19 +162,19 @@ with caller-proven slice provenance. Address-producing operations such as
 
 ## Evidence
 
-- `src/kotoba/runtime.clj`: `raw-memory-ops`, `raw-memory-problems`,
+- `src/kotoba/runtime.cljk`: `raw-memory-ops`, `raw-memory-problems`,
   `raw-memory-extent-problems`, admission wiring, Wasm memory maximum, bump
   allocation and checked allocation.
-- `src/kotoba/wasm_exec.clj`: `writable-output-window` and `write-bytes!`.
-- `test/kotoba/raw_memory_test.clj`: deny-by-default, explicit allow/forbid,
+- `src/kotoba/wasm_exec.cljk`: `writable-output-window` and `write-bytes!`.
+- `test/kotoba/raw_memory_test.cljk`: deny-by-default, explicit allow/forbid,
   caller provenance, forged/oversized/read-only slice refusal, private export
   boundary and dynamic Wasm trap tests.
-- `test/kotoba/host_write_window_test.clj`: data-segment, negative, overflow and
+- `test/kotoba/host_write_window_test.cljk`: data-segment, negative, overflow and
   out-of-linear-memory refusal tests.
-- `test/kotoba/real_host_providers_test.clj`: real Wasm and real provider
+- `test/kotoba/real_host_providers_test.cljk`: real Wasm and real provider
   refusal for cross-allocation, interior, unallocated and forged-header output
   windows, plus exact and smaller legitimate capacities.
-- `test/kotoba/cap_affine_test.clj`: narrow affine capability-value checks.
+- `test/kotoba/cap_affine_test.cljk`: narrow affine capability-value checks.
 - `docs/lang/gates.md`: current executable gate inventory.
 
 The 2026-08-15 isolated current-main worktree run executed 624 tests and 8,917

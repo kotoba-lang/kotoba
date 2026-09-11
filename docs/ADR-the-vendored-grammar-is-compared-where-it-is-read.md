@@ -10,7 +10,7 @@
 
 ## This repository is the one that reads the set
 
-`kotoba.grammar/admitted-heads` — `vendor/grammar/src/kotoba/grammar.clj` —
+`kotoba.grammar/admitted-heads` — `vendor/grammar/src/kotoba/grammar.cljk` —
 unions kotoba-lang's `lang/guest-grammar.edn` `:admitted-builtins` into the
 known-head set that `strict-problems` checks a guest program against. A head
 missing from the vendored copy is reported as `:unknown-form`, even when the
@@ -92,7 +92,7 @@ backend has not qualified" a real statement rather than an excuse:
 
 | | primary wasm | compile route |
 |---|---|---|
-| entry point | `kotoba.runtime/wasm-binary` (`src/kotoba/runtime.clj`) | `kotoba.compiler.core/compile-source`, target `:wasm32-kotoba-v1` |
+| entry point | `kotoba.runtime/wasm-binary` (`src/kotoba/runtime.cljk`) | `kotoba.compiler.core/compile-source`, target `:wasm32-kotoba-v1` |
 | CLI | `kotoba wasm emit` → `kotoba.launcher/wasm-emit-result` | `amu compile --target wasm32` |
 | frontend | its own form walker | amu + kotoba-sema elaboration |
 
@@ -117,7 +117,7 @@ refusal — deliberately a stronger test than the one it replaces.
 uses.** All nine carry `:class :compiler-run`, whose declared backends are
 `:required #{:kir}` and `:optional #{:js-kotoba-v1 :wasm32-kotoba-v1}` — the
 authority does not require a wasm backend to run them. `primary-wasm-pending` in
-`test/kotoba/language_conformance_test.clj` makes that checkable here, against
+`test/kotoba/language_conformance_test.cljk` makes that checkable here, against
 the emitter this namespace drives, naming the operation each case is refused on.
 
 It is not a skip list. Each entry must **actually refuse, with exactly the
@@ -143,7 +143,7 @@ grammar bytes; all of them are upstream work this repository has not consumed.
 
 ## What the test file asserts now
 
-`test/kotoba/guest_grammar_vendor_test.clj`, rewritten from a gap baseline into
+`test/kotoba/guest_grammar_vendor_test.cljk`, rewritten from a gap baseline into
 a pin:
 
 - **two digests, because the gap did not reach zero** — `classpath-grammar-sha256`

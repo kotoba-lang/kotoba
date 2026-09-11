@@ -93,10 +93,10 @@ user-visible or architecturally significant changes.
   `kotoba.cap-table/resolve-use` regardless of alias.
 - Reinstated `.cljs` as a directly-runnable source extension (bumped the
   `kotoba-core-contracts` pin, which gained a `:cljs` source-kind mirroring
-  `.clj`'s single-target shape). `src/demo.cljs` proves a bare `.cljs` file
+  `.clj`'s single-target shape). `src/demo.cljs.cljk` proves a bare `.cljs` file
   is accepted and defaults to the `:cljs` reader target with no
   `--reader-target` flag needed.
-- Added `test/kotoba/cap_table_test.clj`: direct unit coverage of
+- Added `test/kotoba/cap_table_test.cljk`: direct unit coverage of
   `kotoba.cap-table` (handle sequencing across multiple acquisitions on the
   same table, and `resolve-use`'s three denial branches called in
   isolation) — previously only exercised indirectly through

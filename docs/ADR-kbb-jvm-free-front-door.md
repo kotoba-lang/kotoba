@@ -14,10 +14,10 @@ the shim only knew one backend. Measured 2026-09-06 on `origin/main`
 * the default route admitted a capability surface only when it was a subset of
   `{:fs/app-data}`; **anything else was refused with a message pointing at
   `--backend interpreter`, i.e. the JVM** — including surfaces the JVM-free
-  `bin/kbb_js.cljs` host runs today (`:fs/browse`, `:env/read`, `:proc/exec`).
+  `bin/kbb_js.cljk` host runs today (`:fs/browse`, `:env/read`, `:proc/exec`).
   The two gate scripts already landed on the compile route
   (`examples/kbb/no_bb_scan.kotoba`, `shebang_scan.kotoba`) could not be run
-  through `bin/kbb` at all; they had to be invoked as `nbb bin/kbb_js.cljs`.
+  through `bin/kbb` at all; they had to be invoked as `nbb bin/kbb_js.cljk`.
 * the shim dropped `--source-path`, so every script built on the `lib/kbb`
   library — the whole point of the library — failed on the native route with
   `:kotoba.error/namespace-require-needs-project`.
@@ -75,7 +75,7 @@ below. Checked in both directions: scanning the fixture and this repository
 gives kbb `201` and nbb exit 2; scanning only this repository gives kbb `1`
 (verdict 0) and nbb reports no `no-git` line.
 
-The gate is `scripts/verify-kbb-ports.cljs` (nbb, JVM-free). It builds the
+The gate is `scripts/verify-kbb-ports.cljk` (nbb, JVM-free). It builds the
 stubs itself and **checks the control first**: if `clojure -e` does not exit
 127 under the stub PATH the stub is not discriminating, so it prints `REFUSED`
 and exits **2** rather than reporting a pass nobody measured.
@@ -92,7 +92,7 @@ can be admitted in source and still have no kit, hence no qualification row.
 1. **`:data/edn`, `:data/json`, `:http/fetch` are absent from the catalog
    entirely.** No entry, therefore no wire id, therefore no compiled guest can
    call them on any backend; they exist only as interpreter builtins in
-   `kotoba.kbb`. `bin/kbb_js.cljs` already refuses them by name for exactly
+   `kotoba.kbb`. `bin/kbb_js.cljk` already refuses them by name for exactly
    this reason. **This is the single largest blocker**: most workspace scripts
    read EDN (`docs-edn-parse-report`, `docs-edn-only`, `consumability-audit`,
    the west tooling). Each would need a catalog entry with a wire id, a kit
@@ -123,7 +123,7 @@ can be admitted in source and still have no kit, hence no qualification row.
    such ceiling but caps a single file read at 64 KiB.
 6. **The whole fs/env/browse/proc surface kbb uses has no kit file at all**, so
    none of it appears in any `:qualification` table. It is implemented ad hoc
-   in `bin/kbb_js.cljs` and `tools/kexe_loader.c`. Until those kits exist,
+   in `bin/kbb_js.cljk` and `tools/kexe_loader.c`. Until those kits exist,
    "does backend X host this?" has no machine-readable answer and this shim's
    `native-hosted` / `js-hosted` sets are the only place the question is
    written down — which is a duplication waiting to drift.

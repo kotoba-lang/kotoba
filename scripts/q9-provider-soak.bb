@@ -14,8 +14,8 @@
    "providers/pg_scram.kotoba"
    "providers/pg_pool_consumer.kotoba"
    "providers/transport_policy.edn"
-   "test/kotoba/transport_component_test.clj"
-   "test/kotoba/real_host_providers_test.clj"
+   "test/kotoba/transport_component_test.cljk"
+   "test/kotoba/real_host_providers_test.cljk"
    ".github/workflows/provider-soak.yml"
    "scripts/q9-provider-soak.bb"])
 

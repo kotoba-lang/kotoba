@@ -45,8 +45,8 @@ aiueos policy.
 
 ## Tests
 
-- `test/kotoba/security_kaizen_test.clj`
-- `test/kotoba/cap_table_test.clj` (`consume-use-drops-handle-after-one-success`)
+- `test/kotoba/security_kaizen_test.cljk`
+- `test/kotoba/cap_table_test.cljk` (`consume-use-drops-handle-after-one-success`)
 
 ## Non-claims
 
