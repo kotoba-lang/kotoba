@@ -716,6 +716,35 @@ kbb. Process, git, named-secret, and deploy capabilities must be added one
 vertical slice at a time with real providers and denial tests before their nbb
 consumers move.
 
+#### `kbb --backend sci` — Clojure-shaped `.cljk` on the kbb engine (2026-09-11)
+
+The driver behind `bin/kbb` is no longer `nbb` from PATH. It is the **kbb
+engine**, `kotoba-lang/org-babashka-nbb`: nbb 1.4.208 with one patch, a
+classpath resolver that finds `.cljk` (and the rename's `foo.cljs.cljk` /
+`foo.cljc.cljk` / `foo.clj.cljk` spellings). Since the workspace rename
+(root ADR-2609111500) stock nbb cannot even load `bin/kbb_shim.cljk` — its
+requires are `.cljk` — so the engine is what makes every route above run.
+
+The engine also gives the operational surface that predates amu admission
+(PreToolUse hooks, fleet gates, launchd bots — Clojure-shaped `.cljk` with
+`cheshire` / `babashka.process` shims) a kbb entry point:
+
+```bash
+bin/kbb --backend sci [--classpath <cp>] <script.cljk> [args...]
+```
+
+`--backend sci` must lead the argv; `bin/kbb` hands the script to the engine
+directly and the shim never sees it (the shim refuses a trailing
+`--backend sci` by name). Engine resolution is `$KBB_ENGINE` (path to the
+engine's `cli.js`) then the west sibling `../org-babashka-nbb/cli.js`; there
+is no fallback to `nbb` on PATH — exit 3 names both paths tried. Root's
+`.claude/settings.json` hooks run this way.
+
+This is not a Kotoba backend: the guest is Clojure evaluated by SCI, with no
+capability gate and no receipt. It is the bridge that keeps the nbb-era
+surface running while each piece is migrated as a whole component onto the
+gated backends above.
+
 #### `kbb --backend js` — the JVM-free JS host, and the kbb library
 
 `bin/kbb_js.cljk` runs the same `.kotoba` + policy through the compiler's
@@ -727,8 +756,8 @@ on both (demo_kbb_fs_read_native → 84).
 
 ```bash
 bin/kbb src/demo_kbb_fs_read_native.kotoba --policy src/demo_kbb_fs_read_native_policy.edn --backend js   # via the v2 shim
-nbb bin/kbb_js.cljk src/demo_kbb_fs_read_native.kotoba   --policy src/demo_kbb_fs_read_native_policy.edn --json
-nbb bin/kbb_js.cljk examples/kbb/fs_report.kotoba   --policy examples/kbb/fs_report_policy.edn --source-path lib
+bin/kbb src/demo_kbb_fs_read_native.kotoba --backend js --policy src/demo_kbb_fs_read_native_policy.edn --json
+bin/kbb examples/kbb/fs_report.kotoba --backend js --policy examples/kbb/fs_report_policy.edn --source-path lib
 ```
 
 Providers are keyed by compiler wire id and re-check the policy scope on every

@@ -69,7 +69,7 @@ Run one:
 
 ```bash
 bin/kbb examples/kbb/fs_report.kotoba --policy examples/kbb/fs_report_policy.edn --backend js --source-path lib
-nbb bin/kbb_js.cljk examples/kbb/fs_report.kotoba --policy examples/kbb/fs_report_policy.edn --source-path lib --json
+bin/kbb examples/kbb/fs_report.kotoba --backend js --policy examples/kbb/fs_report_policy.edn --source-path lib --json
 ```
 
 (`bin/kbb <script> --policy <p> [--backend native|js|interpreter] [--source-path <dir>]... [--fuel <n>] [--json]`
