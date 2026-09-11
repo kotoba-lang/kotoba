@@ -12,7 +12,7 @@ test -z "$(git status --porcelain --untracked-files=no)" || {
 
 TEST_LOG=$(mktemp "${TMPDIR:-/tmp}/kotoba-release-tests.XXXXXX")
 trap 'rm -f "$TEST_LOG"' EXIT
-clojure -M:test > "$TEST_LOG"
+kbb -M:test > "$TEST_LOG"
 cat "$TEST_LOG"
 scripts/build-native.sh
 mkdir -p target/release-evidence target/release-package
@@ -34,7 +34,7 @@ cp target/native/release-evidence.json \
 tar -C target/release-package -czf "target/kotoba-$PLATFORM.tar.gz" kotoba LICENSE README.md
 (cd target && shasum -a 256 "kotoba-$PLATFORM.tar.gz" > "kotoba-$PLATFORM.tar.gz.sha256")
 
-clojure -M -m kotoba.release-build \
+kbb -M -m kotoba.release-build \
   "$VERSION" "$PLATFORM" "target/kotoba-$PLATFORM.tar.gz" \
   "target/release-evidence/kotoba-$PLATFORM.json" \
   target/release-evidence/tests.txt "$POLICY_PATH" \

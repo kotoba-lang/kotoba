@@ -17,7 +17,7 @@ the shim only knew one backend. Measured 2026-09-06 on `origin/main`
   `bin/kbb_js.cljk` host runs today (`:fs/browse`, `:env/read`, `:proc/exec`).
   The two gate scripts already landed on the compile route
   (`examples/kbb/no_bb_scan.kotoba`, `shebang_scan.kotoba`) could not be run
-  through `bin/kbb` at all; they had to be invoked as `nbb bin/kbb_js.cljk`.
+  through `bin/kbb` at all; they had to be invoked as `kbb --backend sci bin/kbb_js.cljk`.
 * the shim dropped `--source-path`, so every script built on the `lib/kbb`
   library — the whole point of the library — failed on the native route with
   `:kotoba.error/namespace-require-needs-project`.
@@ -36,7 +36,7 @@ anything neither can host **by name, with a distinct exit code**.
 | absent (`:auto`) | native when caps ⊆ `{:fs/app-data}`, else js when caps ⊆ the js host's four, else refuse | — |
 | `native` | amu `--target <isa> --jvm-free` → KEXE → kexe_loader | `:fs/app-data` (35) |
 | `js` | amu `--target js --jvm-free` → restricted ESM in this Node process | `:fs/app-data` 35, `:env/read` 33, `:fs/browse` 34, `:proc/exec` 20 |
-| `interpreter` | `clojure -M -m kotoba.kbb` | the JVM builtins, **only when asked for by name** |
+| `interpreter` | `kbb -M -m kotoba.kbb` | the JVM builtins, **only when asked for by name** |
 
 Exit codes: `0` ok, `1` the run failed, **`3` no JVM-free backend hosts this
 surface**, and the interpreter's own code when it is asked for. `3` exists so

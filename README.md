@@ -272,12 +272,12 @@ Profile-bound releases are built from a clean commit without GitHub Actions:
 ```bash
 scripts/package-native-release.sh 0.7.3 darwin-arm64 ../kotoba-lang/lang/version-policy.edn
 kagi get kotoba-language-release-ed25519 --compartment personal |
-  clojure -M:release-tag sign \
+  kbb -M:release-tag sign \
     --policy ../kotoba-lang/lang/version-policy.edn \
     --trust ../kotoba-lang/lang/release-trust.edn \
     --envelope target/release-evidence/unsigned-envelope.edn \
     > target/release-evidence/kotoba-v0.7.3-envelope.edn
-clojure -M:release-tag verify \
+kbb -M:release-tag verify \
   --policy ../kotoba-lang/lang/version-policy.edn \
   --trust ../kotoba-lang/lang/release-trust.edn \
   --envelope target/release-evidence/kotoba-v0.7.3-envelope.edn
@@ -706,7 +706,7 @@ kbb -M:test              # deps.edn :test alias -> classpath + main opts on the 
 kbb -M:dev:run a b       # alias chain, trailing args appended (tools.deps order)
 kbb -X:fmt :dir '"src"'  # :exec-fn with :exec-args merged
 kbb -Spath               # :paths + :extra-paths + :local/root paths (recursive)
-kbb -Saliases            # what deps.edn declares (the `bb tasks` replacement)
+kbb -Saliases            # what deps.edn declares (the `kbb -Saliases` replacement)
 kbb -m ns | -e '…' | script.cljk args | #!/usr/bin/env kbb
 ```
 

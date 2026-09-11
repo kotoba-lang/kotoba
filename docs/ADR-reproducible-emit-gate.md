@@ -85,11 +85,11 @@ that is how a gate ends up locking in a baseline nobody reviewed.
 ### Usage
 
 ```sh
-clojure -M:reproducible-emit            # verify
-clojure -M:reproducible-emit regenerate # rewrite after an intended change
+kbb -M:reproducible-emit            # verify
+kbb -M:reproducible-emit regenerate # rewrite after an intended change
 ```
 
-The gate runs in CI through the existing `clojure -M:test` step, not a new
+The gate runs in CI through the existing `kbb -M:test` step, not a new
 workflow step: `kotoba.reproducible-emit-test` is registered in
 `kotoba.test-runner`, which `kotoba.test-runner-completeness-test` requires of
 every test namespace on disk. A separate workflow step would have been a second

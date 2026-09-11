@@ -267,8 +267,8 @@ The verifier must recompute the grade from this bundle. A handwritten badge is
 not evidence.
 
 The live gap registry is `qualification/grade-a-program.edn`.
-`clojure -M:grade-a-check` verifies that no gap or hard gate disappeared and
-that a `:pass` has complete evidence. `clojure -M:grade-a-attest` additionally
+`kbb -M:grade-a-check` verifies that no gap or hard gate disappeared and
+that a `:pass` has complete evidence. `kbb -M:grade-a-attest` additionally
 fails until every entry is `:pass`. As of 2026-07-23, K-01 is closed by the
 clean 336-test / 1,696-assertion Kotoba run; every remaining item intentionally
 blocks attestation.

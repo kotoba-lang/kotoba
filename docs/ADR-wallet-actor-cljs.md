@@ -363,7 +363,7 @@ Covered R0 invariants:
 - Balance sync projection: **R0.11 landed for host sync materialization into observed facts**; RPC polling implementation remains host-owned.
 - Pure provider dispatcher for `eth_accounts`, `eth_chainId`, `wallet_switchEthereumChain`, `wallet_addEthereumChain`, `wallet_watchAsset`, `eth_call`, `eth_estimateGas`, `eth_sendTransaction`: **R0.1 landed**.
 - `:evm-rpc-fn` host injection: represented as `:evm-rpc/*` effects; runtime runner **R0.20 landed** for `eth_call` and `eth_estimateGas`.
-- bb tests for pure actor projections: **R0 landed**.
+- kbb -M:tests for pure actor projections: **R0 landed**.
 - Browser/CLJS ESM export wrappers and export map: **R0.3 landed historically**;
   current browser packaging is host-adapter owned.
 - Stateful EIP-1193 provider object wrapper and browser ESM gates landed in the

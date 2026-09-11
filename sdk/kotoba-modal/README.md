@@ -101,7 +101,7 @@ The py→wasm build is **bundled**: `wit/world.wit` (the `kotoba-node` world) an
 ```bash
 pip install -e '.[build]'          # componentize-py
 COMPONENTIZE_PY=componentize-py \
-  nbb scripts/build-pywasm.cljs examples/guest_component.py -o generate.wasm
+  kbb --backend sci scripts/build-pywasm.cljk examples/guest_component.py -o generate.wasm
 # → "Component built successfully"  (a real kotoba-node WASM component)
 ```
 

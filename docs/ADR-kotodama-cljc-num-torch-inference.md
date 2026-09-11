@@ -116,13 +116,13 @@ next maturity step.
 `verify/maturity.edn` is the machine-readable coverage gate for this ADR. It
 tracks required CLJC/Rust/num/torch/WebGPU/gemma4 checks and keeps known gaps
 explicit until real browser WebGPU token generation lands on `num`.
-`clojure -M:verify-maturity-run` executes the required non-model gates, while
-`clojure -M:verify-maturity-run --include-local-model` also runs `gemma4:e4b`.
-`clojure -M:verify-gguf` verifies the local GGUF artifact metadata, tensor
+`kbb -M:verify-maturity-run` executes the required non-model gates, while
+`kbb -M:verify-maturity-run --include-local-model` also runs `gemma4:e4b`.
+`kbb -M:verify-gguf` verifies the local GGUF artifact metadata, tensor
 directory, tensor byte windows, F32 payload samples, Q4_K attention/MLP
 dequantization samples, and Q6_K attention/token embedding dequantization
 samples for `gemma4:e4b`, including the RoPE dimension/frequency metadata.
-`clojure -M:verify-gemma-num` verifies that the same decoded quantized blocks
+`kbb -M:verify-gemma-num` verifies that the same decoded quantized blocks
 can be uploaded into num-clj tensors, that the BOS token embedding row can be
 looked up from the real GGUF tensor, that `blk.0.attn_norm.weight` can be
 applied as Gemma RMSNorm, and that partial Q/K/V projections for
@@ -132,16 +132,16 @@ including a full-width head0-only output projection, can be evaluated on the
 num CPU backend. It also verifies output RMSNorm, tied-embedding candidate and
 full-vocabulary logits, greedy/top-k sampling, FFN RMSNorm, partial gated MLP projection,
 SiLU gated activation, and partial FFN down projection on the same real GGUF
-weights. `KOTODAMA_VERIFY_FULL_MLP=1 clojure -M:verify-gemma-num` additionally
+weights. `KOTODAMA_VERIFY_FULL_MLP=1 kbb -M:verify-gemma-num` additionally
 verifies the fixed standalone full blk.0 MLP contract and the composed blk.0
 block output contract on the same real GGUF weights.
-`KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 clojure -M:verify-gemma-num`
+`KOTODAMA_VERIFY_FULL_MLP=1 KOTODAMA_VERIFY_FULL_LAYERS=2 kbb -M:verify-gemma-num`
 skips that legacy standalone full MLP output generation, verifies the reusable
 block composer across `blk.0 -> blk.1`, and checks the same real two-block
 contract through `torch/run` over indexed `:gemma4-block` layers and through
 `core/forward` over the `IModelRuntime` port, including the session forward
 cache hit on a repeated call.
-`clojure -M:verify-torch-num` is the minimal proof that a torch-clj graph can be
+`kbb -M:verify-torch-num` is the minimal proof that a torch-clj graph can be
 executed through a host backend that lowers layers to num-clj tensor ops; it
 now also runs a two-layer `:gemma4-block` graph through a custom num-backed host
 runner to prove the graph-level handoff for block composition.

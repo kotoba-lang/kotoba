@@ -292,7 +292,7 @@ EDA は「計算コスト」だけでなく「知財流出」と「sign-off 誤�
 - `kotoba-lang/eda` を native `.cljc` library repo として作成した。Apache-2.0 を既定 license とし、
   browser-use など upstream 由来 repo/port は upstream license と NOTICE を維持する。
 - `kotoba-lang/eda` は Hiccup + shadow-css data (`kotoba.eda.site`) を docs page の正本にし、
-  `clojure -M:site` で GitHub Pages HTML を生成する。
+  `kbb -M:site` で GitHub Pages HTML を生成する。
 - `kotoba-lang/eda` は OpenSTA/OpenROAD/KLayout/Magic/Netgen/ngspice/OpenLane report を
   `:eda.signoff/*` evidence EDN に正規化する OSS report normalizer を持つ。
 - 現在の成熟度は **alpha evidence pipeline**。CLJC native kernel は prototype、

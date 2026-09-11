@@ -1,2 +1,2 @@
-#!/usr/bin/env bb
+#!/usr/bin/env kbb
 (println "bb")
