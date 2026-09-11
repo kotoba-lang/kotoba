@@ -52,8 +52,14 @@
   authority 2026-09-05 at kbb slice 2 (env-read + fs-browse string heads, 9d701ea...; prior #550 811e3d5e); NOTE: sema bf01d4a8 (kbb slice 3) vendors the same 9d701ea copy, so the classpath now carries ONE digest (kotoba-lang PR #553 ships this repo's two copies; the sema gap is tracked separately), in one commit
   with the three pins and the ci.yml authority checkout. Change it only as part
   of a resync wave, in all four repositories, and resync both copies this
-  repository ships in the same commit."
-  "515bbc7de84a3340ef3b250e4ee411739d3acebf32ba31450540f146768bb841")
+  repository ships in the same commit.
+
+  Advanced 2026-09-11 to `10ff0062` for module type parameters (root ADR
+  adr-2609113100; authority kotoba-lang 9c2bb949): `:core-form-shapes` gains
+  `:ns` and `:require-spec` and `:admission-limits` gains
+  `:max-template-parameters 8`. No head admitted or withdrawn; the previous
+  digest was `515bbc7d`."
+  "10ff0062271d3a557deab865510c948125a84aba7d760298bcaf345cd0370a6b")
 
 (def recorded-kernel-head-count
   "Kernel heads `:admitted-builtins` names in the copies on this classpath,
