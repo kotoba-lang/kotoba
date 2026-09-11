@@ -692,6 +692,34 @@ package admission gate always runs first, and a missing or rejected lock aborts
 the build/run with the admission receipt in the error payload — there is no way
 to opt out (F-001).
 
+### `kbb -M:<alias>` — the Clojure-CLI-shaped door (ADR-2609112000)
+
+On 2026-09-11 every `clojure -M:<alias>`, `clj -M`, `bb <task>` and
+`nbb <script>` in the workspace was rewritten to `kbb …`. `bin/kbb` answers
+that shape through `bin/kbb_deps.cljk`, on the same JVM-free engine
+(kotoba-lang/org-babashka-nbb) that hosts `--backend sci`:
+
+```bash
+kbb -M:test              # deps.edn :test alias -> classpath + main opts on the engine
+kbb -M:dev:run a b       # alias chain, trailing args appended (tools.deps order)
+kbb -X:fmt :dir '"src"'  # :exec-fn with :exec-args merged
+kbb -Spath               # :paths + :extra-paths + :local/root paths (recursive)
+kbb -Saliases            # what deps.edn declares (the `bb tasks` replacement)
+kbb -m ns | -e '…' | script.cljk args | #!/usr/bin/env kbb
+```
+
+What it resolves is the tools.deps subset a Node engine can honour: `:paths`,
+`:extra-paths`, `:local/root` deps (recursively), `:main-opts`, `:exec-fn` /
+`:exec-args`, `-Sdeps` merging. It resolves **no** Maven or git coordinate
+(the engine reads `nbb.edn` `:deps` itself) and refuses `-Stree` / `-Sdescribe`
+by name (exit 64). An alias that names a JVM test runner
+(`cognitect.test-runner`, `kaocha.runner`, `eftest`) is run by kbb's own
+`cljs.test` walk over `*_test.cljk` in the alias's test dirs — the one
+substitution, announced on stderr each time. Exit codes: the child's; 64 usage
+/ unknown alias / unsupported flag; 66 no `deps.edn`. Test:
+`test/kotoba/kbb_deps_test.cljk` (both directions, including the
+classpath-only-alias boundary).
+
 ### `kbb` — deny-by-default Kotoba scripts
 
 `bin/kbb` is the first executable replacement slice for nbb-hosted operational
