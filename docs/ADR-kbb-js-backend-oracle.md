@@ -6,7 +6,7 @@
 
 ## Context
 
-`bin/kbb` is a `clojure -M -m kotoba.kbb` bootstrap (~10 s cold). ADR-2609051100
+`bin/kbb` is a `kbb -M -m kotoba.kbb` bootstrap (~10 s cold). ADR-2609051100
 chose the native KEXE + `kexe_loader` as the JVM-free distribution artifact and
 rejected "kbb を nbb で書き直すだけ" as the *final* form, because a JS-engine
 guest is not the Node/browser-independent artifact ADR-2607198300 requires.

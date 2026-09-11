@@ -75,7 +75,7 @@ name reads as read-only, but the surface's own two write operations
   read the query result back out of guest linear memory) and confirms it
   matches what was asserted. `kotoba.launcher-test` repeats the same round
   trip through the actual CLI (`kotoba wasm run ... --json`). Manually:
-  `clojure -M -m kotoba.launcher wasm run src/demo_kgraph.kotoba --policy
+  `kbb -M -m kotoba.launcher wasm run src/demo_kgraph.kotoba --policy
   src/demo_kgraph_policy.edn --json` → `"kotoba.wasm/value":9` (the real byte
   count `kgraph_query` wrote back).
 - `kotoba.kgraph`'s store is in-memory and per-invocation (no persistence,

@@ -3,7 +3,7 @@
 Current launcher gates are CLJ/EDN-first:
 
 ```sh
-clojure -M:test
+kbb -M:test
 bin/kotoba-clj check --kind cli-contract --json
 bin/kotoba-clj selfhost list --json
 bin/kotoba-clj selfhost check --json
@@ -499,7 +499,7 @@ bin/kotoba-clj run src/demo_i64_host.kotoba --cacao chain.edn --policy policy.ed
   `:run/cacao-not-readable`. A successful run attaches
   `:kotoba.cacao/root-iss`, `:kotoba.cacao/holder`, and
   `:kotoba.cacao/depth` next to `:kotoba.host/receipts` in the result JSON.
-- The chain gate is exercised end-to-end by `clojure -M:test`
+- The chain gate is exercised end-to-end by `kbb -M:test`
   (`test/kotoba/cacao_run_test.cljk` mints real 2-link chains in-process with
   deterministic Ed25519 seeds — grant, escalation, tamper, expiry, and
   policy-narrowing cases).
