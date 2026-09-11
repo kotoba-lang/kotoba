@@ -696,8 +696,8 @@ to opt out (F-001).
 
 On 2026-09-11 every `clojure -M…`, `clj -M…`, `bb <task>` and
 `nbb <script>` invocation in the workspace was rewritten to `kbb …`
-(adr-2609112000; the rewriter leaves a file whole when it carries the literal
-`kbb-cutover: keep`). `bin/kbb` answers
+(adr-2609112000; the rewriter leaves a file whole when it carries its keep
+marker — see com-junkawasaki/root `scripts/kbb-cutover.cljk`). `bin/kbb` answers
 that shape through `bin/kbb_deps.cljk`, on the same JVM-free engine
 (kotoba-lang/org-babashka-nbb) that hosts `--backend sci`:
 
