@@ -710,6 +710,15 @@ kbb -Saliases            # what deps.edn declares (the `kbb -Saliases` replaceme
 kbb -m ns | -e '…' | script.cljk args | #!/usr/bin/env kbb
 ```
 
+A `#!/usr/bin/env kbb` launcher usually has no extension (`bin/itonami`,
+`bin/misogi`), so `bin/kbb` routes on its first line: a regular file whose
+first line is a shebang is a Clojure-shaped script and takes this door; a
+`.kotoba` file takes the guest shim whatever its first line says. The
+launcher's project is the nearest `deps.edn` above the script's real path,
+not the caller's cwd -- `itonami status` typed in `$HOME` resolves the CLI
+repository's `:paths`. (Until 2026-09-15 both were wrong: an extension-less
+launcher fell through to the shim and answered `:kbb/policy-required`.)
+
 What it resolves is the tools.deps subset a Node engine can honour: `:paths`,
 `:extra-paths`, `:local/root` deps (recursively), `:main-opts`, `:exec-fn` /
 `:exec-args`, `-Sdeps` merging. It resolves **no** Maven or git coordinate
