@@ -720,10 +720,22 @@ repository's `:paths`. (Until 2026-09-15 both were wrong: an extension-less
 launcher fell through to the shim and answered `:kbb/policy-required`.)
 
 What it resolves is the tools.deps subset a Node engine can honour: `:paths`,
-`:extra-paths`, `:local/root` deps (recursively), `:main-opts`, `:exec-fn` /
-`:exec-args`, `-Sdeps` merging. It resolves **no** Maven or git coordinate
-(the engine reads `nbb.edn` `:deps` itself) and refuses `-Stree` / `-Sdescribe`
-by name (exit 64). An alias that names a JVM test runner
+`:extra-paths`, `:local/root` and `:git/sha` deps (recursively), `:main-opts`,
+`:exec-fn` / `:exec-args`, `-Sdeps` merging. Git coordinates resolve into the
+tools.deps cache (`~/.gitlibs`, or `$GITLIBS`), so JVM and kbb runs share
+checkouts and a warm cache works offline; one that cannot be resolved is named
+on stderr with its reason. It resolves **no** Maven coordinate and refuses
+`-Stree` / `-Sdescribe` by name (exit 64).
+
+The kotoba stdlib — `kotoba-lang/{text, edn, spec, coll, test, io, fs, process,
+bytes, json, http}` — is on every classpath **implicitly**, appended after the
+project's own entries from the west sibling checkouts next to this repo, the
+way `clojure.string` needs no declaration on the host. A project that declares
+one of them keeps its own pin. `KBB_NO_STDLIB=1` turns it off,
+`KBB_STDLIB_ROOT` points at another sibling root, `KBB_DEPS_VERBOSE=1` prints
+the pins a first-wins resolution ignored. (Until 2026-09-23 a repository with
+no project file had nowhere to declare `kotoba.lang.text`, and a `deps.edn`
+git coordinate was invisible here.) An alias that names a JVM test runner
 (`cognitect.test-runner`, `kaocha.runner`, `eftest`) is run by kbb's own
 `cljs.test` walk over `*_test.cljk` in the alias's test dirs — the one
 substitution, announced on stderr each time. Exit codes: the child's; 64 usage
