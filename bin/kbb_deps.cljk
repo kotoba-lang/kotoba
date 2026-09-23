@@ -17,13 +17,15 @@
 ;; textually. This file is what makes those strings name something that RUNS:
 ;; it reads the repository's `deps.edn` exactly as tools.deps would for the
 ;; classpath-and-main-opts subset, and hands the result to the engine. It is
-;; NOT tools.deps: there is no Maven or git resolution here (the engine reads
-;; `nbb.edn` `:deps` itself), no JVM, no `-Stree`. What it cannot answer it
+;; NOT tools.deps: :git/sha coordinates resolve into the tools.deps ~/.gitlibs
+;; cache, but there is no Maven resolution, no JVM, no `-Stree`. The kotoba
+;; stdlib is on every classpath implicitly (see `stdlib-deps`). What it cannot answer it
 ;; refuses BY NAME with exit 64, never by running something else.
 ;;
 ;; Resolution, in tools.deps order:
 ;;   classpath  = :paths (default ["src"]) ∪ every alias's :extra-paths
-;;                ∪ the :paths of every :local/root dependency (recursively),
+;;                ∪ the :paths of every :local/root and :git/sha dependency
+;;                (recursively) ∪ the implicit kotoba stdlib, last,
 ;;                an alias's :paths REPLACING the root :paths when present.
 ;;   main opts  = concatenation of the aliases' :main-opts, then the trailing
 ;;                command-line args (exactly `clojure -M:alias args`).
@@ -36,7 +38,7 @@
 ;;                Those runners do not exist on this engine; this is the
 ;;                one substitution, and it is named on stderr when it happens.
 ;;
-;; Deps that are not :local/root are listed on stderr once (they are not on
+;; Maven deps, and git deps that could not be resolved, are listed on stderr once (they are not on
 ;; the classpath) so a later `Could not find namespace` has its cause printed
 ;; ABOVE it rather than being a mystery.
 ;;
@@ -89,7 +91,7 @@
       (contains? #{"-Sforce" "-Srepro" "-Sverbose" "-Strace"} a) (recur more acc)
       (= a "-Sthreads") (recur (rest more) acc)
       (contains? #{"-Stree" "-Sdescribe" "-Spom" "-Scp"} a)
-      (die! 64 a "is a tools.deps operation with no kbb equivalent (kbb resolves :paths and :local/root only; no Maven, no git).")
+      (die! 64 a "is a tools.deps operation with no kbb equivalent (kbb resolves :paths, :local/root and :git/sha; no Maven).")
       (str/starts-with? a "-J") (recur more acc)
       (or (str/starts-with? a "-M") (str/starts-with? a "-A"))
       (recur more (-> acc (assoc :mode :main) (update :aliases into (alias-kws a))))
@@ -126,21 +128,166 @@
             (= d (.dirname path d)) nil
             :else (recur (.dirname path d))))))
 
-(defn- local-root-paths
-  "Classpath contribution of :local/root deps, recursively, relative to cwd.
-  `seen` is an atom {:dirs #{…} :missing [lib …]}."
+;; ---- git coordinates ---------------------------------------------------
+;;
+;; A `:git/sha` coordinate is resolved the way tools.deps resolves it, into the
+;; SAME cache tools.deps uses, so a JVM run and a kbb run of one repository
+;; share checkouts instead of fetching twice:
+;;
+;;   ~/.gitlibs/_repos/<https|ssh>/<host>/<org>/<repo>   mirror clone
+;;   ~/.gitlibs/libs/<group>/<artifact>/<full-sha>       detached worktree
+;;
+;; ($GITLIBS overrides the root, as it does for tools.deps.) An existing
+;; `libs/…/<sha>` directory is used without touching git or the network, so a
+;; warm cache works offline. A coordinate that cannot be resolved (no sha, no
+;; derivable url, clone/fetch failed, sha not in the repository) is reported
+;; with its reason on stderr and left off the classpath -- never silently.
+;;
+;; Until 2026-09-23 this door resolved :local/root only and told every repo to
+;; declare git deps in nbb.edn, where the engine resolves them by shelling out
+;; to babashka. Measured that day: kotoba-lang/shinkansen's suite was green
+;; (174 tests) and went red with `Could not find namespace: kotoba.lang.text`
+;; after its deps.edn gained the kotoba-lang/text coordinate -- the
+;; declaration was correct and this door could not see it.
+
+(def gitlibs (or (.-GITLIBS (.-env js/process)) (.join path (.homedir os) ".gitlibs")))
+
+(defn- git [& args]
+  (let [r (.spawnSync cp "git" (clj->js args) #js {:encoding "utf8"})]
+    {:exit (.-status r) :out (str/trim (or (.-stdout r) "")) :err (str/trim (or (.-stderr r) ""))}))
+
+(defn- git-url
+  "The coordinate's :git/url, or the one tools.deps infers from an
+  io.github / com.github / io.gitlab / com.gitlab lib name."
+  [lib coord]
+  (or (:git/url coord)
+      (let [g (namespace lib) a (name lib)]
+        (some (fn [[prefix host]]
+                (when (and g (str/starts-with? g prefix))
+                  (str "https://" host "/" (subs g (count prefix)) "/" a ".git")))
+              [["io.github." "github.com"] ["com.github." "github.com"]
+               ["io.gitlab." "gitlab.com"] ["com.gitlab." "gitlab.com"]]))))
+
+(defn- mirror-dir
+  "tools.deps' _repos path for a url: https://h/o/r(.git) and git@h:o/r(.git)."
+  [url]
+  (let [u (str/replace url #"\.git$" "")]
+    (if-let [[_ host p] (re-find #"^git@([^:]+):(.+)$" u)]
+      (.join path gitlibs "_repos" "ssh" host p)
+      (if-let [[_ proto more] (re-find #"^([a-z]+)://(.+)$" u)]
+        (.join path gitlibs "_repos" proto more)
+        (.join path gitlibs "_repos" "file" (str/replace u #"^/" ""))))))
+
+(defn- full-sha [repo sha]
+  (let [r (git "--git-dir" repo "rev-parse" "--verify" "--quiet" (str sha "^{commit}"))]
+    (when (and (zero? (:exit r)) (re-find #"^[0-9a-f]{40}$" (:out r))) (:out r))))
+
+(defn- git-lib-dir
+  "{:dir d} for a git coordinate, or {:error reason}."
+  [lib coord]
+  (let [sha (:git/sha coord)
+        url (git-url lib coord)
+        libs-dir (fn [s] (.join path gitlibs "libs" (or (namespace lib) (name lib)) (name lib) s))
+        sub (fn [d] (if-let [r (:deps/root coord)] (.join path d r) d))]
+    (cond
+      (not (string? sha)) {:error "no :git/sha"}
+      (and (= 40 (count sha)) (.existsSync fs (libs-dir sha))) {:dir (sub (libs-dir sha))}
+      (nil? url) {:error "no :git/url, and the lib name implies none"}
+      :else
+      (let [repo (mirror-dir url)
+            cloned (or (.existsSync fs repo)
+                       (do (.mkdirSync fs (.dirname path repo) #js {:recursive true})
+                           (zero? (:exit (git "clone" "--quiet" "--mirror" url repo)))))
+            full (when cloned (or (full-sha repo sha)
+                                  (do (git "--git-dir" repo "fetch" "--quiet" "origin")
+                                      (full-sha repo sha))))]
+        (cond
+          (not cloned) {:error (str "could not clone " url)}
+          (nil? full) {:error (str "sha " sha " is not in " url)}
+          :else
+          (let [d (libs-dir full)]
+            (when-not (.existsSync fs d)
+              (.mkdirSync fs (.dirname path d) #js {:recursive true})
+              (git "--git-dir" repo "worktree" "add" "--force" "--detach" d full))
+            (if (.existsSync fs d)
+              {:dir (sub d)}
+              {:error (str "could not check out " full " of " url)})))))))
+
+(defn- dep-paths
+  "Classpath contribution of :local/root and :git/sha deps, recursively,
+  relative to cwd. The first coordinate seen for a lib wins (the project's own
+  deps.edn is read first, so its pins win over transitive ones); a later,
+  different coordinate for the same lib is recorded under :conflicts
+  (printed with KBB_DEPS_VERBOSE=1), not merged. Maven coordinates are
+  collected as :missing -- the engine cannot load a jar.
+  `seen` is an atom {:dirs #{} :libs {} :missing [] :errors [] :conflicts []}."
   [deps-map base seen]
   (reduce (fn [acc [lib coord]]
-            (if-let [root (:local/root coord)]
-              (let [dir (.resolve path base root)]
-                (if (contains? (:dirs @seen) dir) acc
+            (let [prior (get-in @seen [:libs lib])]
+              (cond
+                (and prior (not= prior coord)) (do (swap! seen update :conflicts conj [lib prior coord]) acc)
+                prior acc
+                :else
+                (let [_ (swap! seen assoc-in [:libs lib] coord)
+                      {:keys [dir error]} (cond
+                                            (:local/root coord) {:dir (.resolve path base (:local/root coord))}
+                                            (:git/sha coord) (git-lib-dir lib coord)
+                                            :else nil)]
+                  (cond
+                    error (do (swap! seen update :errors conj [lib error]) acc)
+                    (nil? dir) (do (swap! seen update :missing conj lib) acc)
+                    (contains? (:dirs @seen) dir) acc
+                    :else
                     (do (swap! seen update :dirs conj dir)
                         (let [d (read-edn-file (.join path dir "deps.edn"))
                               ps (or (:paths d) ["src"])]
                           (into (into acc (map #(.relative path (.cwd js/process) (.join path dir %)) ps))
-                                (local-root-paths (:deps d) dir seen))))))
-              (do (swap! seen update :missing conj lib) acc)))
+                                (dep-paths (:deps d) dir seen)))))))))
           [] deps-map))
+
+;; ---- the kotoba standard library, on every classpath -------------------
+;;
+;; `clojure.string` needs no declaration: it is part of the host. Its
+;; replacement `kotoba.lang.text` did, so every repository that moved off
+;; clojure.* had to name a coordinate, and a repository with no project file
+;; at all (run as bare `kbb run_tests.cljk`) had nowhere to name it. Measured
+;; 2026-09-23: 249 of 381 repositories still requiring clojure.string were
+;; refused by the migration for exactly that reason. The stdlib is therefore
+;; IMPLICIT, the way the host's own namespaces are: each repository below is
+;; appended to the END of the classpath from the west sibling checkout next to
+;; this kbb (orgs/kotoba-lang/<repo>, the same place the engine is found), with
+;; its own deps resolved as above. A project that declares one of them itself
+;; keeps its own pin -- the implicit entry is skipped for that lib -- and
+;; anything the project puts on the classpath is found first.
+;;
+;; KBB_NO_STDLIB=1 turns it off; KBB_STDLIB_ROOT points at another directory
+;; holding the same sibling layout. A sibling that is not checked out is named
+;; on stderr, never skipped silently.
+
+(def stdlib-repos
+  "orgs/kotoba-lang/<repo> for the namespaces the stdlib router (ADR-2609040930)
+  routes clojure.* / java.* to."
+  ;; dependency order: a lib is listed before the stdlib libs that depend on it,
+  ;; so its sibling checkout -- not an older transitive pin -- is what resolves
+  ["text" "edn" "spec" "coll" "test" "io" "fs" "process" "bytes" "json" "http"])
+
+(def stdlib-root
+  (or (.-KBB_STDLIB_ROOT (.-env js/process))
+      (.resolve path (.dirname path (.realpathSync fs *file*)) ".." "..")))
+
+(defn- stdlib-deps
+  "The implicit deps, as ordered [lib coord] pairs (a map would lose the
+  order above), minus libs the project already resolved."
+  [seen]
+  (when-not (= "1" (.-KBB_NO_STDLIB (.-env js/process)))
+    (vec (keep (fn [r]
+                 (let [lib (symbol "io.github.kotoba-lang" r)
+                       dir (.join path stdlib-root r)]
+                   (cond
+                     (contains? (:libs @seen) lib) nil
+                     (.existsSync fs dir) [lib {:local/root dir}]
+                     :else (do (swap! seen update :errors conj [lib (str "stdlib sibling not checked out at " dir)]) nil))))
+               stdlib-repos))))
 
 (defn resolve-classpath
   "[classpath-vector missing-libs]. Every entry is relative to cwd (what the
@@ -153,11 +300,22 @@
          alias-maps (map #(get-in deps [:aliases %]) aliases)
          root-paths (or (some :paths (reverse alias-maps)) (:paths deps) ["src"])
          extra (mapcat :extra-paths alias-maps)
-         seen (atom {:dirs #{} :missing []})
+         seen (atom {:dirs #{} :libs {} :missing [] :errors []})
          dep-maps (cons (:deps deps) (map #(merge (:extra-deps %) (:deps %) (:replace-deps %)) alias-maps))
-         locals (vec (mapcat #(local-root-paths % project seen) dep-maps))]
+         locals (vec (mapcat #(dep-paths % project seen) dep-maps))
+         project-missing (:missing @seen)
+         stdlib (dep-paths (stdlib-deps seen) project seen)
+         ;; the stdlib's own Maven coordinates (http-kit behind kotoba.http's
+         ;; :clj branch) are not the project's missing deps
+         _ (swap! seen assoc :missing project-missing)]
+     (doseq [[lib why] (distinct (:errors @seen))]
+       (warn! (str lib) "is NOT on the classpath:" why))
+     (when (= "1" (.-KBB_DEPS_VERBOSE (.-env js/process)))
+       (doseq [[lib kept ignored] (:conflicts @seen)]
+         (warn! (str lib) "kept" (pr-str kept) "ignored" (pr-str ignored))))
      [(vec (distinct (concat (map #(.relative path cwd (.join path project %)) (concat root-paths extra))
-                             locals)))
+                             locals
+                             stdlib)))
       (vec (distinct (:missing @seen)))])))
 
 (defn- unknown-aliases [deps aliases]
@@ -260,7 +418,7 @@
       (when-let [missing (seq (remove (into #{'org.clojure/clojure 'org.clojure/clojurescript}
                                             (keys (:deps (read-edn-file (.join path project "nbb.edn")))))
                                       missing))]
-        (warn! (count missing) "dep(s) are not :local/root and are NOT on the classpath (kbb resolves no Maven/git coordinates; declare them in nbb.edn for the engine):" (str/join ", " (map str missing))))
+        (warn! (count missing) "dep(s) are not :local/root and are NOT on the classpath (kbb resolves :local/root and :git/sha coordinates, not Maven; a jar cannot load on this engine):" (str/join ", " (map str missing))))
       (case mode
         :path (do (println (str/join ":" cp-vec)) (.exit js/process 0))
         :aliases (do (doseq [[k v] (sort-by key (:aliases deps))]

@@ -27,9 +27,14 @@
   (or (some? (.-KBB_ENGINE (.-env js/process)))
       (.existsSync fs (.resolve path "../org-babashka-nbb/cli.js"))))
 
-(defn- run-kbb [cwd & args]
-  (let [r (.spawnSync cp kbb (clj->js args) #js {:cwd cwd :encoding "utf8"})]
+(defn- run-kbb-env
+  "run-kbb with `extra` merged over the inherited environment."
+  [extra cwd & args]
+  (let [env (js/Object.assign #js {} (.-env js/process) (clj->js extra))
+        r (.spawnSync cp kbb (clj->js args) #js {:cwd cwd :encoding "utf8" :env env})]
     {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn- run-kbb [cwd & args] (apply run-kbb-env {} cwd args))
 
 (defn- write! [dir rel content]
   (let [f (.join path dir rel)]
@@ -53,8 +58,10 @@
   (if-not (engine-present?)
     (println "SKIPPED kotoba.kbb-deps-test: engine not present (set KBB_ENGINE)")
     (let [dir (fixture!)]
+      ;; KBB_NO_STDLIB: this case pins the project's own contribution exactly;
+      ;; the implicit stdlib (appended last) has its own deftest below.
       (testing "-Spath: root :paths plus :local/root paths, no JVM"
-        (let [r (run-kbb dir "-Spath")]
+        (let [r (run-kbb-env {"KBB_NO_STDLIB" "1"} dir "-Spath")]
           (is (zero? (:exit r)) (:err r))
           (is (= "src:sib/src" (str/trim (:out r))))))
       (testing "-M:run with trailing args reaches -main through the local/root dep"
@@ -127,3 +134,72 @@
         (let [r (run-kbb dir (.join path dir "bin/plain"))]
           (is (str/includes? (:out r) ":kbb/policy-required") (str (:out r) (:err r)))))
       (.rmSync fs dir #js {:recursive true :force true}))))
+
+(defn- sh! [cwd & args]
+  (let [r (.spawnSync cp (first args) (clj->js (rest args)) #js {:cwd cwd :encoding "utf8"})]
+    (str/trim (or (.-stdout r) ""))))
+
+;; :git/sha coordinates (2026-09-23). Until then this door resolved
+;; :local/root only; kotoba-lang/shinkansen's suite was green and went red
+;; with `Could not find namespace: kotoba.lang.text` the moment its deps.edn
+;; declared the kotoba-lang/text coordinate. The fixture is a local file://
+;; repository and GITLIBS points into the temp dir, so nothing here touches
+;; the network or the caller's ~/.gitlibs.
+(deftest kbb-deps-git-coordinates
+  (if-not (engine-present?)
+    (println "SKIPPED kotoba.kbb-deps-test/git: engine not present (set KBB_ENGINE)")
+    (let [dir (.mkdtempSync fs (.join path (.tmpdir os) "kbb-git-"))
+          lib (.join path dir "gitlib")
+          gitlibs (.join path dir "gitlibs")
+          env {"GITLIBS" gitlibs "KBB_NO_STDLIB" "1"}
+          proj (.join path dir "proj")]
+      (write! lib "deps.edn" "{:paths [\"src\"]}\n")
+      (write! lib "src/gl/core.cljk" "(ns gl.core)\n(defn hello [] :from-git)\n")
+      (sh! lib "git" "init" "-q")
+      (sh! lib "git" "add" "-A")
+      (sh! lib "git" "-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "gl")
+      (let [sha (sh! lib "git" "rev-parse" "HEAD")
+            deps (fn [s] (str "{:paths [\"src\"] :deps {gl/gl {:git/url \"file://" lib "\" :git/sha \"" s "\"}}"
+                              " :aliases {:run {:main-opts [\"-m\" \"fx.main\"]}}}\n"))]
+        (write! proj "deps.edn" (deps sha))
+        (write! proj "src/fx/main.cljk" "(ns fx.main (:require [gl.core :as g]))\n(defn -main [& _] (println \"got\" (g/hello)))\n")
+        (testing "a :git/sha dep is cloned into GITLIBS and its :paths reach the engine"
+          (let [r (run-kbb-env env proj "-M:run")]
+            (is (zero? (:exit r)) (str (:out r) (:err r)))
+            (is (str/includes? (:out r) "got :from-git"))
+            (is (.existsSync fs (.join path gitlibs "libs" "gl" "gl" sha "src")))))
+        (testing "warm cache: the source repository is gone and the dep still resolves (no git, no network)"
+          (.rmSync fs lib #js {:recursive true :force true})
+          (.rmSync fs (.join path gitlibs "_repos") #js {:recursive true :force true})
+          (let [r (run-kbb-env env proj "-M:run")]
+            (is (zero? (:exit r)) (str (:out r) (:err r)))
+            (is (str/includes? (:out r) "got :from-git"))))
+        (testing "an unresolvable sha is named on stderr with its reason, not silently dropped"
+          (write! proj "deps.edn" (deps "0000000000000000000000000000000000000000"))
+          (let [r (run-kbb-env env proj "-M:run")]
+            (is (= 1 (:exit r)))
+            (is (str/includes? (:err r) "gl/gl is NOT on the classpath") (:err r)))))
+      (.rmSync fs dir #js {:recursive true :force true}))))
+
+;; The implicit kotoba stdlib (2026-09-23): kotoba.lang.text resolves with no
+;; project file at all -- the case of every bare `kbb run_tests.cljk` repo --
+;; and KBB_NO_STDLIB=1 turns exactly that off.
+(deftest kbb-deps-implicit-stdlib
+  (let [stdlib-root (or (.-KBB_STDLIB_ROOT (.-env js/process)) (.resolve path ".."))]
+    (if-not (and (engine-present?) (.existsSync fs (.join path stdlib-root "text" "src")))
+      (println "SKIPPED kotoba.kbb-deps-test/stdlib: engine or the kotoba-lang/text sibling checkout not present")
+      (let [dir (.mkdtempSync fs (.join path (.tmpdir os) "kbb-stdlib-"))]
+        (write! dir "probe.cljk" "(ns probe (:require [kotoba.lang.text :as t]))\n(println \"upper\" (t/upper \"a\"))\n")
+        (testing "no deps.edn, no nbb.edn: kotoba.lang.text is on the classpath"
+          (let [r (run-kbb dir "probe.cljk")]
+            (is (zero? (:exit r)) (str (:out r) (:err r)))
+            (is (str/includes? (:out r) "upper A"))))
+        (testing "KBB_NO_STDLIB=1: the same script cannot find it"
+          (let [r (run-kbb-env {"KBB_NO_STDLIB" "1"} dir "probe.cljk")]
+            (is (= 1 (:exit r)))
+            (is (str/includes? (str (:out r) (:err r)) "Could not find namespace: kotoba.lang.text"))))
+        (testing "the stdlib comes AFTER the project's own paths"
+          (let [cpv (str/split (str/trim (:out (run-kbb dir "-Spath"))) #":")]
+            (is (= "src" (first cpv)))
+            (is (some #(str/ends-with? % "text/src") cpv))))
+        (.rmSync fs dir #js {:recursive true :force true})))))
