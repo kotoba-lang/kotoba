@@ -27,6 +27,9 @@
 ;;                ∪ the :paths of every :local/root and :git/sha dependency
 ;;                (recursively) ∪ the implicit kotoba stdlib, last,
 ;;                an alias's :paths REPLACING the root :paths when present.
+;;   versions   = one coordinate per lib, chosen as tools.deps chooses it:
+;;                top-level deps win, otherwise the NEWEST (the descendant
+;;                sha); see "version selection" below.
 ;;   main opts  = concatenation of the aliases' :main-opts, then the trailing
 ;;                command-line args (exactly `clojure -M:alias args`).
 ;;   -X/-T      = the alias's :exec-fn called with :exec-args merged with the
@@ -43,6 +46,8 @@
 ;; ABOVE it rather than being a mystery.
 ;;
 ;; Exit codes: the child's | 64 usage / unsupported flag / unknown alias
+;; | 65 a deps.edn that does not read, or two versions of a lib with no
+;; ancestor relationship (tools.deps refuses the same graph)
 ;; | 66 no deps.edn where one was needed.
 (ns kbb-deps
   (:require [clojure.edn :as edn]
@@ -81,13 +86,17 @@
   {:mode :main|:exec|:script|:path|:aliases :aliases [...] :sdeps {...}
    :classpath str|nil :args [...]}."
   [argv]
-  (loop [[a & more :as all] argv acc {:mode nil :aliases [] :args []}]
+  ;; -Spath is a flag like the other -S options: `kbb -Spath -M:test` prints
+  ;; the :test classpath, as `clojure -Spath -M:test` does. Until 2026-09-24
+  ;; it ended parsing, so the aliases after it were silently dropped (the
+  ;; amu measurement of that day printed the alias-less classpath).
+  (let [r (loop [[a & more :as all] argv acc {:mode nil :aliases [] :args []}]
     (cond
       (nil? a) acc
       (:mode acc) (assoc acc :args (vec all))
       (= a "-Sdeps") (recur (rest more) (assoc acc :sdeps (try (edn/read-string (first more))
                                                                  (catch :default e (die! 64 "-Sdeps is not EDN:" (.-message e))))))
-      (= a "-Spath") (assoc acc :mode :path :args (vec more))
+      (= a "-Spath") (recur more (assoc acc :spath? true))
       (= a "-Saliases") (assoc acc :mode :aliases)
       (contains? #{"-Sforce" "-Srepro" "-Sverbose" "-Strace"} a) (recur more acc)
       (= a "-Sthreads") (recur (rest more) acc)
@@ -104,7 +113,8 @@
       (= a "-h") (assoc acc :mode :help)
       (= a "--help") (assoc acc :mode :help)
       (str/starts-with? a "-") (die! 64 "unknown flag" a)
-      :else (assoc acc :mode :script :args (vec all)))))
+      :else (assoc acc :mode :script :args (vec all))))]
+    (if (:spath? r) (assoc r :mode :path) r)))
 
 ;; ---- deps.edn ----------------------------------------------------------
 
@@ -194,8 +204,27 @@
   [coord]
   (or (:git/sha coord) (:sha coord)))
 
+(defn- mirror-with!
+  "The mirror clone of url holding every sha in shas (full or abbreviated),
+  cloned / fetched once when needed: {:repo r :fulls [full…]} or {:error reason}."
+  [url shas]
+  (let [repo (mirror-dir url)
+        cloned (or (.existsSync fs repo)
+                   (do (.mkdirSync fs (.dirname path repo) #js {:recursive true})
+                       (zero? (:exit (git "clone" "--quiet" "--mirror" url repo)))))
+        fulls (fn [] (mapv #(full-sha repo %) shas))
+        fs1 (when cloned (fulls))
+        fs2 (if (and cloned (some nil? fs1))
+              (do (git "--git-dir" repo "fetch" "--quiet" "origin") (fulls))
+              fs1)]
+    (cond
+      (not cloned) {:error (str "could not clone " url)}
+      (some nil? fs2) {:error (str "sha " (first (keep (fn [[s f]] (when-not f s)) (map vector shas fs2)))
+                                   " is not in " url)}
+      :else {:repo repo :fulls fs2})))
+
 (defn- git-lib-dir
-  "{:dir d} for a git coordinate, or {:error reason}."
+  "{:dir d :sha full-sha} for a git coordinate, or {:error reason}."
   [lib coord]
   (let [sha (coord-sha coord)
         url (git-url lib coord)
@@ -203,26 +232,20 @@
         sub (fn [d] (if-let [r (:deps/root coord)] (.join path d r) d))]
     (cond
       (not (string? sha)) {:error "no :git/sha"}
-      (and (= 40 (count sha)) (.existsSync fs (libs-dir sha))) {:dir (sub (libs-dir sha))}
+      (and (= 40 (count sha)) (.existsSync fs (libs-dir sha))) {:dir (sub (libs-dir sha)) :sha sha}
       (nil? url) {:error "no :git/url, and the lib name implies none"}
       :else
-      (let [repo (mirror-dir url)
-            cloned (or (.existsSync fs repo)
-                       (do (.mkdirSync fs (.dirname path repo) #js {:recursive true})
-                           (zero? (:exit (git "clone" "--quiet" "--mirror" url repo)))))
-            full (when cloned (or (full-sha repo sha)
-                                  (do (git "--git-dir" repo "fetch" "--quiet" "origin")
-                                      (full-sha repo sha))))]
+      (let [{:keys [repo fulls error]} (mirror-with! url [sha])
+            full (first fulls)]
         (cond
-          (not cloned) {:error (str "could not clone " url)}
-          (nil? full) {:error (str "sha " sha " is not in " url)}
+          error {:error error}
           :else
           (let [d (libs-dir full)]
             (when-not (.existsSync fs d)
               (.mkdirSync fs (.dirname path d) #js {:recursive true})
               (git "--git-dir" repo "worktree" "add" "--force" "--detach" d full))
             (if (.existsSync fs d)
-              {:dir (sub d)}
+              {:dir (sub d) :sha full}
               {:error (str "could not check out " full " of " url)})))))))
 
 ;; ---- :local/root coordinates -------------------------------------------
@@ -280,37 +303,267 @@
       :else {:error (str ":local/root " (pr-str (:local/root coord)) " does not exist (" d ")"
                          (if (seq sibs) (str " and no west sibling at " (str/join " or " sibs)) ", and no west sibling is implied"))})))
 
+;; ---- version selection: newest wins, as in tools.deps ------------------
+;;
+;; Until 2026-09-24 the FIRST coordinate this door met for a lib won, depth
+;; first, and every later one was dropped (KBB_DEPS_VERBOSE=1 listed them).
+;; tools.deps does not do that, and the two disagreed where it hurts: measured
+;; that day, amu's `kbb -Spath -M:test` put osaho a54916bc (met first, deep in
+;; a transitive subtree; it lacks kotoba.kir.alpha-normalization) on the
+;; classpath and dropped the 85ed11be amu itself declares.
+;;
+;; The expansion below is tools.deps' `expand-deps` / `include-coord?`
+;; (clojure/tools.deps src/main/clojure/clojure/tools/deps.clj), breadth first:
+;;   - a top-level dep (the project's :deps merged with the aliases'
+;;     :extra-deps / :deps / :replace-deps, a later alias winning, as
+;;     tools.deps merges them) is selected and every transitive coordinate
+;;     of that lib is omitted (:use-top);
+;;   - a transitive lib takes the NEWER of two coordinates. For :git/sha that
+;;     is the descendant: `git merge-base --is-ancestor` in the ~/.gitlibs
+;;     mirror (extensions/git.clj `compare-versions`, via tools.gitlibs
+;;     `descendant`). When neither sha is an ancestor of the other tools.deps
+;;     throws "No known ancestor relationship between git versions for <lib>";
+;;     so does this door (exit 65, both shas and urls named) -- the fix is
+;;     the one tools.deps asks for: pin the lib at top level;
+;;   - switching a lib to a newer version deselects the children only the old
+;;     version brought in, and a lib whose parent path is no longer selected
+;;     is not considered (`deselect-orphans`, `parent-missing?`);
+;;   - :override-deps replaces a lib's coordinate wherever it appears.
+;; Where kbb differs, on purpose (tools.deps would throw "Unable to compare
+;; versions" for mixed coordinate types):
+;;   - a :local/root is a working copy and dominates any :git/sha or Maven
+;;     coordinate of the same lib; two DIFFERENT :local/root directories are
+;;     ambiguous (tools.deps' local.clj throws there too) and exit 65;
+;;   - a :git/sha dominates a Maven coordinate (a jar cannot load here);
+;;   - a coordinate that cannot be resolved never displaces one that was.
+;; Ancestry answers are facts about two immutable commits, so they are cached
+;; in $GITLIBS/_kbb/ancestry/<sha>-<sha> (the warm path is an existsSync, no
+;; git spawn). KBB_DEPS_VERBOSE=1 prints every choice: "<lib> kept <coord>
+;; ignored <coord> (<reason>)".
+;;
+;; The classpath ORDER is unchanged: the project's paths, then each selected
+;; lib depth first in declaration order, then the implicit stdlib.
+
+(defn- ident
+  "The identity of a coordinate, cheap: no checkout. {:lib :coord :type :id
+  :url [:sha] [:dir] [:error]}. A 40-character :git/sha is its own identity;
+  an abbreviated one is resolved (and checked out) the way it always was."
+  [lib coord base seen]
+  (let [sha (coord-sha coord)]
+    (cond
+      (:local/root coord)
+      (let [{:keys [dir error]} (local-root-dir lib coord base seen)]
+        {:lib lib :coord coord :type :local :id (if dir [:local dir] [:error (pr-str coord)]) :dir dir :error error})
+
+      (string? sha)
+      (let [url (git-url lib coord)
+            r (when-not (= 40 (count sha)) (git-lib-dir lib coord))
+            full (if (= 40 (count sha)) sha (:sha r))]
+        (cond-> {:lib lib :coord coord :type :git :url url :sha full
+                 :id (if full [:git full (:deps/root coord)] [:error (pr-str coord)])}
+          (:dir r) (assoc :dir (:dir r))
+          (:error r) (assoc :error (:error r))))
+
+      (:mvn/version coord) {:lib lib :coord coord :type :mvn :id [:mvn (:mvn/version coord)]}
+      :else {:lib lib :coord coord :type :other :id [:other (pr-str coord)]})))
+
+(defn- realize!
+  "The node with its checkout, :paths and :children ([lib coord] in declaration
+  order, relative to its own directory), memoized by identity."
+  [node seen]
+  (or (get-in @seen [:realized (:id node)])
+      (let [{:keys [dir error]} (cond
+                                  (or (:dir node) (:error node)) node
+                                  (= :git (:type node)) (git-lib-dir (:lib node) (:coord node))
+                                  :else nil)
+            d (when dir (read-edn-file (.join path dir "deps.edn")))
+            n (cond-> (assoc node :dir dir :error error)
+                dir (assoc :paths (or (:paths d) ["src"]) :children (vec (:deps d))))]
+        (swap! seen assoc-in [:realized (:id node)] n)
+        n)))
+
+(def ^:private ancestry-dir (.join path gitlibs "_kbb" "ancestry"))
+
+(defn- descendant
+  "Which of shas a, b (full) descends from the other in url's repository:
+  a | b | :none (neither), or {:error reason} when it could not be measured."
+  [url a b]
+  (let [cache (.join path ancestry-dir (str/join "-" (sort [a b])))]
+    (if (.existsSync fs cache)
+      (let [v (str/trim (.readFileSync fs cache "utf8"))] (if (= v "none") :none v))
+      (let [{:keys [repo error]} (mirror-with! url [a b])
+            anc? (fn [x y] (:exit (git "--git-dir" repo "merge-base" "--is-ancestor" x y)))]
+        (if error
+          {:error error}
+          (let [ab (anc? a b)
+                ba (when (= 1 ab) (anc? b a))
+                v (cond (zero? ab) b
+                        (and (= 1 ab) (zero? ba)) a
+                        (and (= 1 ab) (= 1 ba)) :none
+                        :else nil)]
+            (if (nil? v)
+              {:error (str "git merge-base --is-ancestor failed in " repo)}
+              (do (.mkdirSync fs ancestry-dir #js {:recursive true})
+                  (.writeFileSync fs cache (if (= v :none) "none" v))
+                  v))))))))
+
+(defn- compare-nodes
+  "Is `new` newer than `old` (the selected one)? :newer | :older | :same |
+  {:ambiguous msg} | {:unmeasured msg}. See the rules above."
+  [lib new old]
+  (let [tn (:type new) to (:type old)]
+    (cond
+      (= (:id new) (:id old)) :same
+      (:error new) :older
+      (:error old) :newer
+      (and (= :git tn) (= :git to))
+      (if (= (:sha new) (:sha old))
+        :same
+        (let [urls (distinct (remove nil? [(:url old) (:url new)]))
+              answers (map #(descendant % (:sha new) (:sha old)) urls)
+              answer (cond (empty? urls) {:error "no :git/url to compare in"}
+                           (some map? answers) (first (filter map? answers))
+                           (apply = answers) (first answers)
+                           :else :none)]
+          (cond
+            (map? answer) {:unmeasured (str "cannot compare git versions of " lib ": " (:error answer))}
+            (= answer :none)
+            {:ambiguous (str "No known ancestor relationship between git versions for " lib "\n"
+                             "  " (:url old) " at " (:sha old) "\n"
+                             "  " (:url new) " at " (:sha new))}
+            (= answer (:sha new)) :newer
+            :else :older)))
+      (and (= :local tn) (= :local to))
+      {:ambiguous (str "No known ancestor relationship between local versions for " lib ": "
+                       (:dir old) " and " (:dir new))}
+      (= :local tn) :newer
+      (= :local to) :older
+      (and (= :git tn) (= :mvn to)) :newer
+      :else :older)))
+
+(defn- parent-missing?
+  "tools.deps `parent-missing?`: is any lib on this parent path no longer
+  selected by the path it was reached through?"
+  [vmap parent-path]
+  (loop [p parent-path more nil]
+    (if (seq p)
+      (let [lib (peek p)
+            check (pop p)
+            {:keys [paths select]} (get vmap lib)
+            to-selected (get paths select)]
+        (if (contains? to-selected check)
+          (recur check (concat more (remove #(= % check) to-selected)))
+          (if (seq more) (recur (first more) (rest more)) true)))
+      false)))
+
+(defn- deselect-orphans
+  "tools.deps `deselect-orphans`: deselect every lib whose selected version is
+  reached only through the omitted paths."
+  [vmap omitted]
+  (reduce-kv (fn [ret lib {:keys [select paths]}]
+               (let [lib-paths (get paths select)]
+                 (if (and select (every? (fn [p] (some #(= (seq %) (seq (take (count %) p))) omitted)) lib-paths))
+                   (update ret lib dissoc :select)
+                   ret)))
+             vmap vmap))
+
+(defn- add-version [vmap node parents]
+  (-> vmap
+      (assoc-in [(:lib node) :versions (:id node)] node)
+      (update-in [(:lib node) :paths (:id node)] (fnil conj #{}) parents)))
+
+(defn- selected [vmap lib] (get-in vmap [lib :versions (get-in vmap [lib :select])]))
+
+(defn- expand!
+  "tools.deps' breadth-first expansion. tops: [[lib coord base]…], all
+  top-level. Returns the version map {lib {:select id :versions {id node}
+  :paths {id #{parent-path}} :top bool}}; choices go to (:conflicts @seen),
+  ambiguities to (:ambiguous @seen)."
+  [tops overrides seen]
+  (loop [q (mapv (fn [[lib coord base]] [[] lib coord base]) tops)
+         i 0
+         vmap {}]
+    (if (>= i (count q))
+      vmap
+      (let [[parents lib coord base] (nth q i)
+            coord (get overrides lib coord)
+            k [lib coord base]
+            node (or (get-in @seen [:idents k])
+                     (let [nd (ident lib coord base seen)] (swap! seen assoc-in [:idents k] nd) nd))
+            sel (selected vmap lib)
+            conflict! (fn [kept ignored why]
+                        (swap! seen update :conflicts (fnil conj []) [lib (:coord kept) (:coord ignored) why]))
+            [include vmap']
+            (cond
+              (empty? parents)
+              [true (-> vmap (add-version node parents) (update lib assoc :select (:id node) :top true))]
+
+              (get-in vmap [lib :top])
+              (do (when (and sel (not= (:id sel) (:id node))) (conflict! sel node "top-level"))
+                  [false vmap])
+
+              (parent-missing? vmap parents) [false vmap]
+
+              (nil? sel)
+              [true (-> vmap (add-version node parents) (update lib assoc :select (:id node)))]
+
+              (= (:id sel) (:id node)) [false (add-version vmap node parents)]
+
+              :else
+              (let [c (compare-nodes lib node sel)]
+                (cond
+                  (= c :newer)
+                  (do (conflict! node sel "newer")
+                      [true (-> vmap
+                                (add-version node parents)
+                                (deselect-orphans (set (map #(conj % lib) (get-in vmap [lib :paths (:id sel)]))))
+                                (update lib assoc :select (:id node)))])
+                  (= c :same) [false vmap]
+                  (:ambiguous c) (do (swap! seen update :ambiguous (fnil conj []) (:ambiguous c)) [false vmap])
+                  (:unmeasured c) (do (swap! seen update :unmeasured (fnil conj []) [lib (:unmeasured c)])
+                                      (conflict! sel node "kept: newer-ness could not be measured")
+                                      [false vmap])
+                  :else (do (conflict! sel node "older") [false vmap]))))
+            q' (if include
+                 (let [n (realize! node seen)]
+                   (into q (map (fn [[l c]] [(conj parents lib) l c (:dir n)]) (:children n))))
+                 q)]
+        (recur q' (inc i) vmap')))))
+
 (defn- dep-paths
-  "Classpath contribution of :local/root and :git/sha deps, recursively,
-  relative to cwd. The first coordinate seen for a lib wins (the project's own
-  deps.edn is read first, so its pins win over transitive ones); a later,
-  different coordinate for the same lib is recorded under :conflicts
-  (printed with KBB_DEPS_VERBOSE=1), not merged. Maven coordinates are
-  collected as :missing -- the engine cannot load a jar.
-  `seen` is an atom {:dirs #{} :libs {} :missing [] :errors [] :conflicts []}."
-  [deps-map base seen]
-  (reduce (fn [acc [lib coord]]
-            (let [prior (get-in @seen [:libs lib])]
-              (cond
-                (and prior (not= prior coord)) (do (swap! seen update :conflicts conj [lib prior coord]) acc)
-                prior acc
-                :else
-                (let [_ (swap! seen assoc-in [:libs lib] coord)
-                      {:keys [dir error]} (cond
-                                            (:local/root coord) (local-root-dir lib coord base seen)
-                                            (coord-sha coord) (git-lib-dir lib coord)
-                                            :else nil)]
+  "Classpath contribution of the selected libs, relative to cwd, depth first
+  from `tops` in order (each [lib coord base]). Records on `seen`:
+  :dirs/:order (checkout directories, in order), :missing (Maven and other
+  unloadable coordinates, [lib phase]), :errors ([lib reason], for selected
+  coordinates that did not resolve). `phases` tags each top so the caller can
+  tell the project's missing deps from the stdlib's."
+  [vmap tops phases seen]
+  (let [visited (atom #{})
+        acc (atom [])]
+    (letfn [(visit [lib phase]
+              (when-let [sel (and (not (contains? @visited lib)) (selected vmap lib))]
+                (swap! visited conj lib)
+                (let [n (realize! sel seen)]
                   (cond
-                    error (do (swap! seen update :errors conj [lib error]) acc)
-                    (nil? dir) (do (swap! seen update :missing conj lib) acc)
-                    (contains? (:dirs @seen) dir) acc
+                    (:error n) (swap! seen update :errors conj [lib (:error n)])
+                    (nil? (:dir n)) (swap! seen update :missing conj [lib phase])
+                    (contains? (:dirs @seen) (:dir n)) nil
                     :else
-                    (do (swap! seen #(-> % (update :dirs conj dir) (update :order (fnil conj []) dir)))
-                        (let [d (read-edn-file (.join path dir "deps.edn"))
-                              ps (or (:paths d) ["src"])]
-                          (into (into acc (map #(.relative path (.cwd js/process) (.join path dir %)) ps))
-                                (dep-paths (:deps d) dir seen)))))))))
-          [] deps-map))
+                    (do (swap! seen #(-> % (update :dirs conj (:dir n)) (update :order (fnil conj []) (:dir n))))
+                        (swap! acc into (map #(.relative path (.cwd js/process) (.join path (:dir n) %)) (:paths n)))
+                        (doseq [[l _] (:children n)] (visit l phase)))))))]
+      (doseq [[[lib] phase] (map vector tops phases)] (visit lib phase))
+      @acc)))
+
+(defn- ordered-merge
+  "Merge [lib coord] maps left to right, a later coordinate replacing an
+  earlier one in place (the order of first appearance is kept)."
+  [maps]
+  (reduce (fn [acc [lib coord]]
+            (if-let [i (first (keep-indexed (fn [i [l]] (when (= l lib) i)) acc))]
+              (assoc acc i [lib coord])
+              (conj acc [lib coord])))
+          [] (apply concat maps)))
 
 ;; ---- the kotoba standard library, on every classpath -------------------
 ;;
@@ -323,9 +576,11 @@
 ;; IMPLICIT, the way the host's own namespaces are: each repository below is
 ;; appended to the END of the classpath from the west sibling checkout next to
 ;; this kbb (orgs/kotoba-lang/<repo>, the same place the engine is found), with
-;; its own deps resolved as above. A project that declares one of them itself
-;; keeps its own pin -- the implicit entry is skipped for that lib -- and
-;; anything the project puts on the classpath is found first.
+;; its own deps resolved as above. The stdlib libs are TOP-level deps of the
+;; expansion (see `stdlib-deps`): a sibling beats any transitive coordinate
+;; of the same lib, a project that declares one of them itself keeps its own
+;; pin -- the implicit entry is skipped for that lib -- and anything the
+;; project puts on the classpath is found first.
 ;;
 ;; KBB_NO_STDLIB=1 turns it off; KBB_STDLIB_ROOT points at another directory
 ;; holding the same sibling layout. A sibling that is not checked out is named
@@ -334,8 +589,8 @@
 (def stdlib-repos
   "orgs/kotoba-lang/<repo> for the namespaces the stdlib router (ADR-2609040930)
   routes clojure.* / java.* to."
-  ;; dependency order: a lib is listed before the stdlib libs that depend on it,
-  ;; so its sibling checkout -- not an older transitive pin -- is what resolves
+  ;; dependency order: a lib is listed before the stdlib libs that depend on it
+  ;; (the classpath order of the tail; which VERSION resolves is `stdlib-deps`)
   ["text" "edn" "spec" "coll" "test" "io" "fs" "process" "bytes" "json" "http" "pprint"])
 
 (def stdlib-root
@@ -344,17 +599,25 @@
 
 (defn- stdlib-deps
   "The implicit deps, as ordered [lib coord] pairs (a map would lose the
-  order above), minus libs the project already resolved."
-  [seen]
+  order above), minus libs the project names at TOP level (`project-tops`,
+  a set of libs). They join the expansion as top-level deps themselves, so a
+  stdlib sibling wins over any TRANSITIVE coordinate of the same lib (tools.deps'
+  :use-top) -- decided 2026-09-24: the sibling is the west-pinned working copy
+  every other stdlib namespace was checked out against, and a stale transitive
+  pin of kotoba-lang/text must not replace it. A project that wants another
+  version pins it in its own :deps, and that pin wins."
+  [project-tops seen]
   (when-not (= "1" (.-KBB_NO_STDLIB (.-env js/process)))
     (vec (keep (fn [r]
                  (let [lib (symbol "io.github.kotoba-lang" r)
                        dir (.join path stdlib-root r)]
                    (cond
-                     (contains? (:libs @seen) lib) nil
+                     (contains? project-tops lib) nil
                      (.existsSync fs dir) [lib {:local/root dir}]
                      :else (do (swap! seen update :errors conj [lib (str "stdlib sibling not checked out at " dir)]) nil))))
                stdlib-repos))))
+
+(defn- new-seen [] (atom {:dirs #{} :missing [] :errors [] :conflicts [] :ambiguous [] :unmeasured []}))
 
 ;; ---- the other two doors: `kbb --classpath cp` and `kbb --backend sci` ----
 ;;
@@ -376,14 +639,18 @@
 ;;   5 the resolution problems, '; '-joined (bin/kbb prints them every run)
 
 (defn- stdlib-classpath
-  "[absolute-entries errors] for the implicit stdlib alone, minus libs `seen`
-  already resolved."
-  ([] (stdlib-classpath (atom {:dirs #{} :libs {} :missing [] :errors []})))
-  ([seen]
-   (let [before (count (:errors @seen))
-         entries (dep-paths (stdlib-deps seen) stdlib-root seen)]
-     [(vec (distinct (map #(.resolve path %) entries)))
-      (vec (distinct (drop before (:errors @seen))))])))
+  "[absolute-entries errors] for the implicit stdlib alone. An ambiguity
+  inside the stdlib's own closure is an error line here, not an exit: this
+  answer is cached for hundreds of hooks, which keep the version met first."
+  []
+  (let [seen (new-seen)
+        tops (mapv (fn [[l c]] [l c stdlib-root]) (stdlib-deps #{} seen))
+        vmap (expand! tops {} seen)
+        entries (dep-paths vmap tops (repeat :stdlib) seen)]
+    [(vec (distinct (map #(.resolve path %) entries)))
+     (vec (distinct (concat (:errors @seen)
+                            (map (fn [m] ['stdlib m]) (:ambiguous @seen))
+                            (:unmeasured @seen))))]))
 
 (defn- print-stdlib-path!
   "The `--stdlib-path` answer described above."
@@ -395,7 +662,7 @@
     (println (str/join ":" entries))
     (println (str/join " " present))
     (println (str/join " " absent))
-    (println (str/join "; " (map (fn [[lib why]] (str lib " is NOT on the classpath: " why)) errors)))
+    (println (str/join "; " (map (fn [[lib why]] (str lib " is NOT on the classpath: " (str/replace (str why) #"\n\s*" " "))) errors)))
     (.exit js/process 0)))
 
 (defn resolve-classpath
@@ -412,25 +679,31 @@
          alias-maps (map #(get-in deps [:aliases %]) aliases)
          root-paths (or (some :paths (reverse alias-maps)) (:paths deps) ["src"])
          extra (mapcat :extra-paths alias-maps)
-         seen (atom {:dirs #{} :libs {} :missing [] :errors []})
-         dep-maps (cons (:deps deps) (map #(merge (:extra-deps %) (:deps %) (:replace-deps %)) alias-maps))
-         locals (vec (mapcat #(dep-paths % project seen) dep-maps))
-         project-missing (:missing @seen)
-         stdlib (dep-paths (stdlib-deps seen) project seen)
-         ;; the stdlib's own Maven coordinates (http-kit behind kotoba.http's
-         ;; :clj branch) are not the project's missing deps
-         _ (swap! seen assoc :missing project-missing)]
+         seen (new-seen)
+         project-tops (ordered-merge (cons (:deps deps) (map #(merge (:extra-deps %) (:deps %) (:replace-deps %)) alias-maps)))
+         overrides (apply merge (map :override-deps alias-maps))
+         std (stdlib-deps (set (map first project-tops)) seen)
+         tops (vec (concat (map (fn [[l c]] [l c project]) project-tops)
+                           (map (fn [[l c]] [l c stdlib-root]) std)))
+         vmap (expand! tops overrides seen)
+         entries (dep-paths vmap tops (concat (repeat (count project-tops) :project) (repeat :stdlib)) seen)]
      (doseq [[lib why] (distinct (:errors @seen))]
        (warn! (str lib) "is NOT on the classpath:" why))
      (doseq [[lib declared sib] (distinct (:substituted @seen))]
        (warn! (str lib) ":local/root" (pr-str declared) "does not exist here; using the west sibling checkout" sib))
+     (doseq [[_ why] (distinct (:unmeasured @seen))]
+       (warn! why))
      (when (= "1" (.-KBB_DEPS_VERBOSE (.-env js/process)))
-       (doseq [[lib kept ignored] (:conflicts @seen)]
-         (warn! (str lib) "kept" (pr-str kept) "ignored" (pr-str ignored))))
+       (doseq [[lib kept ignored why] (distinct (:conflicts @seen))]
+         (warn! (str lib) "kept" (pr-str kept) "ignored" (pr-str ignored) (str "(" why ")"))))
+     (when-let [amb (seq (distinct (:ambiguous @seen)))]
+       (doseq [m amb] (warn! m))
+       (die! 65 (count amb) "lib(s) have versions with no ancestor relationship; tools.deps refuses the same graph. Pin each at top level in deps.edn."))
      [(vec (distinct (concat (map #(.relative path cwd (.join path project %)) (concat root-paths extra))
-                             locals
-                             stdlib)))
-      (vec (distinct (:missing @seen)))
+                             entries)))
+      ;; the stdlib's own Maven coordinates (http-kit behind kotoba.http's
+      ;; :clj branch) are not the project's missing deps
+      (vec (distinct (keep (fn [[lib phase]] (when (= phase :project) lib)) (:missing @seen))))
       (vec (distinct (cons (.resolve path project) (map #(.resolve path %) (:order @seen)))))])))
 
 ;; ---- npm modules of the classpath roots ---------------------------------
