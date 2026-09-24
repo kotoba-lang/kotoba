@@ -728,7 +728,7 @@ on stderr with its reason. It resolves **no** Maven coordinate and refuses
 `-Stree` / `-Sdescribe` by name (exit 64).
 
 The kotoba stdlib — `kotoba-lang/{text, edn, spec, coll, test, io, fs, process,
-bytes, json, http}` — is on every classpath **implicitly**, appended after the
+bytes, json, http, pprint}` — is on every classpath **implicitly**, appended after the
 project's own entries from the west sibling checkouts next to this repo, the
 way `clojure.string` needs no declaration on the host. A project that declares
 one of them keeps its own pin. `KBB_NO_STDLIB=1` turns it off,
