@@ -64,6 +64,10 @@
         (let [r (run-kbb-env {"KBB_NO_STDLIB" "1"} dir "-Spath")]
           (is (zero? (:exit r)) (:err r))
           (is (= "src:sib/src" (str/trim (:out r))))))
+      (testing "-Spath -M:test: the aliases after -Spath are applied (before 2026-09-24 they were dropped)"
+        (let [r (run-kbb-env {"KBB_NO_STDLIB" "1"} dir "-Spath" "-M:test")]
+          (is (zero? (:exit r)) (:err r))
+          (is (= "src:test:sib/src" (str/trim (:out r))))))
       (testing "-M:run with trailing args reaches -main through the local/root dep"
         (let [r (run-kbb dir "-M:run" "a" "b")]
           (is (zero? (:exit r)) (:err r))
@@ -428,4 +432,129 @@
               (is (= 1 (:exit r)))
               (is (str/includes? (:err r) (str "npm: install FAILED in " p3)) (:err r))
               (is (str/includes? (out+err r) "Cannot find module 'kbb-tiny/x.js'") (out+err r))))))
+      (.rmSync fs dir #js {:recursive true :force true}))))
+
+;; Version selection (2026-09-24): newest wins, as in tools.deps. Until then
+;; the FIRST coordinate met (depth first) won -- measured on amu, whose
+;; `kbb -Spath -M:test` carried a stale transitive osaho (a54916bc) instead of
+;; the 85ed11be amu declares at top level. The fixture is one local git
+;; repository gl with history
+;;     old --- new           (new descends from old)
+;;       \--- side           (a branch: neither side nor new is an ancestor)
+;; `old` also depends on o/o, which `new` dropped. Two local sibling libs a/a
+;; and b/b name gl at different shas; a/a is declared first, so the old door
+;; met a's coordinate first.
+(deftest kbb-deps-newest-wins
+  (if-not (engine-present?)
+    (println "SKIPPED kotoba.kbb-deps-test/newest-wins: engine not present (set KBB_ENGINE)")
+    (let [dir (.realpathSync fs (.mkdtempSync fs (.join path (.tmpdir os) "kbb-newest-")))
+          lib (.join path dir "gl")
+          gitlibs (.join path dir "gitlibs")
+          env {"GITLIBS" gitlibs "KBB_NO_STDLIB" "1" "KBB_DEPS_VERBOSE" "1"}
+          commit! (fn [v deps]
+                    (write! lib "deps.edn" (str "{:paths [\"src\"] :deps " deps "}\n"))
+                    (write! lib "src/gl/core.cljk" (str "(ns gl.core)\n(def v " v ")\n"))
+                    (sh! lib "git" "add" "-A")
+                    (sh! lib "git" "-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" (str v))
+                    (sh! lib "git" "rev-parse" "HEAD"))
+          _ (write! dir "o/src/o/core.cljk" "(ns o.core)\n")
+          _ (sh! (do (.mkdirSync fs lib #js {:recursive true}) lib) "git" "init" "-q")
+          old (commit! ":old" (str "{o/o {:local/root \"" dir "/o\"}}"))
+          new (commit! ":new" "{}")
+          _ (sh! lib "git" "checkout" "-q" "-b" "side" old)
+          side (commit! ":side" "{}")
+          gl (fn [s] (str "gl/gl {:git/url \"file://" lib "\" :git/sha \"" s "\"}"))
+          project! (fn [nm deps a-sha b-sha]
+                     (let [p (.join path dir nm)]
+                       (write! p "a/deps.edn" (str "{:deps {" (gl a-sha) "}}\n"))
+                       (write! p "b/deps.edn" (str "{:deps {" (gl b-sha) "}}\n"))
+                       (write! p "deps.edn" (str "{:deps " deps " :aliases {:run {:main-opts [\"-m\" \"fx.main\"]}}}\n"))
+                       (write! p "src/fx/main.cljk" "(ns fx.main (:require [gl.core :as g]))\n(defn -main [& _] (println \"gl\" g/v))\n")
+                       p))
+          ab "{a/a {:local/root \"a\"} b/b {:local/root \"b\"}}"
+          out+err (fn [r] (str (:out r) (:err r)))]
+      (testing "transitive: the descendant wins over the coordinate met first, and says why"
+        (let [p (project! "p1" ab old new)
+              r (run-kbb-env env p "-M:run")
+              cpr (run-kbb-env env p "-Spath")]
+          ;; before: "gl :old" and gl/<old>/src on the classpath
+          (is (zero? (:exit r)) (out+err r))
+          (is (str/includes? (:out r) "gl :new") (out+err r))
+          (is (str/includes? (:out cpr) (str "gl/gl/" new "/src")) (:out cpr))
+          (is (not (str/includes? (:out cpr) old)) (:out cpr))
+          (is (str/includes? (:err r) (str "gl/gl kept #:git{:url \"file://" lib "\", :sha \"" new "\"}")) (:err r))
+          (is (str/includes? (:err r) "(newer)") (:err r))
+          (testing "and the old version's own dependency (o/o) left with it"
+            (is (not (str/includes? (:out cpr) "o/src")) (:out cpr)))))
+      (testing "boundary: the same order reversed (new met first) keeps new, the old one is 'older'"
+        (let [p (project! "p2" ab new old)
+              r (run-kbb-env env p "-M:run")]
+          (is (zero? (:exit r)) (out+err r))
+          (is (str/includes? (:out r) "gl :new") (out+err r))
+          (is (str/includes? (:err r) "(older)") (:err r))))
+      (testing "a top-level pin wins over a NEWER transitive one (tools.deps :use-top)"
+        ;; before: a/a's subtree was walked first and its gl@new replaced the pin
+        (let [p (project! "p3" (str "{a/a {:local/root \"a\"} " (gl old) "}") new new)
+              r (run-kbb-env env p "-M:run")]
+          (is (zero? (:exit r)) (out+err r))
+          (is (str/includes? (:out r) "gl :old") (out+err r))
+          (is (str/includes? (:err r) "(top-level)") (:err r))))
+      (testing "warm: mirror and source gone, the ancestry answer is cached -- same choice, no git"
+        (let [p (.join path dir "p1")]
+          (.renameSync fs lib (str lib ".gone"))
+          (.renameSync fs (.join path gitlibs "_repos") (.join path dir "repos.gone"))
+          (let [r (run-kbb-env env p "-M:run")]
+            (is (zero? (:exit r)) (out+err r))
+            (is (str/includes? (:out r) "gl :new") (out+err r)))
+          (.renameSync fs (str lib ".gone") lib)
+          (.renameSync fs (.join path dir "repos.gone") (.join path gitlibs "_repos"))))
+      (testing "divergent shas (neither an ancestor): refused as tools.deps refuses, exit 65, both named"
+        ;; before: exit 0 running whichever was met first
+        (let [p (project! "p4" ab side new)
+              r (run-kbb-env env p "-M:run")]
+          (is (= 65 (:exit r)) (out+err r))
+          (is (str/includes? (:err r) "No known ancestor relationship between git versions for gl/gl") (:err r))
+          (is (str/includes? (:err r) side) (:err r))
+          (is (str/includes? (:err r) new) (:err r))))
+      (testing "divergent, but pinned at top level: the pin decides, exit 0"
+        (let [p (project! "p5" (str "{a/a {:local/root \"a\"} b/b {:local/root \"b\"} " (gl side) "}") side new)
+              r (run-kbb-env env p "-M:run")]
+          (is (zero? (:exit r)) (out+err r))
+          (is (str/includes? (:out r) "gl :side") (out+err r))))
+      (.rmSync fs dir #js {:recursive true :force true}))))
+
+;; The implicit stdlib against a transitive git pin of the same lib
+;; (2026-09-24). The stdlib siblings join the expansion as TOP-level deps, so a
+;; transitive :git/sha of io.github.kotoba-lang/text cannot replace the west
+;; sibling; a pin in the project's own :deps still wins over the sibling.
+;; Before: the transitive git text was met first and the sibling was skipped.
+(deftest kbb-deps-stdlib-over-transitive
+  (if-not (engine-present?)
+    (println "SKIPPED kotoba.kbb-deps-test/stdlib-over-transitive: engine not present (set KBB_ENGINE)")
+    (let [dir (.realpathSync fs (.mkdtempSync fs (.join path (.tmpdir os) "kbb-stdtr-")))
+          root (.join path dir "orgs" "kotoba-lang")
+          textgit (.join path dir "textgit")
+          env {"GITLIBS" (.join path dir "gitlibs") "KBB_STDLIB_ROOT" root}
+          out+err (fn [r] (str (:out r) (:err r)))]
+      (write! root "text/src/kotoba/lang/text.cljk" "(ns kotoba.lang.text)\n(def who :sibling)\n")
+      (write! textgit "src/kotoba/lang/text.cljk" "(ns kotoba.lang.text)\n(def who :transitive-git)\n")
+      (write! textgit "deps.edn" "{:paths [\"src\"]}\n")
+      (sh! textgit "git" "init" "-q")
+      (sh! textgit "git" "add" "-A")
+      (sh! textgit "git" "-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "t")
+      (let [sha (sh! textgit "git" "rev-parse" "HEAD")
+            coord (str "io.github.kotoba-lang/text {:git/url \"file://" textgit "\" :git/sha \"" sha "\"}")
+            p (.join path dir "proj")]
+        (write! p "a/deps.edn" (str "{:deps {" coord "}}\n"))
+        (write! p "probe.cljk" "(ns probe (:require [kotoba.lang.text :as t]))\n(println \"text\" t/who)\n")
+        (testing "transitive git pin vs stdlib sibling -> the sibling"
+          (write! p "deps.edn" "{:deps {a/a {:local/root \"a\"}}}\n")
+          (let [r (run-kbb-env env p "probe.cljk")]
+            (is (zero? (:exit r)) (out+err r))
+            (is (str/includes? (:out r) "text :sibling") (out+err r))))
+        (testing "the project's own top-level pin -> the pin"
+          (write! p "deps.edn" (str "{:deps {a/a {:local/root \"a\"} " coord "}}\n"))
+          (let [r (run-kbb-env env p "probe.cljk")]
+            (is (zero? (:exit r)) (out+err r))
+            (is (str/includes? (:out r) "text :transitive-git") (out+err r)))))
       (.rmSync fs dir #js {:recursive true :force true}))))
