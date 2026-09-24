@@ -749,7 +749,17 @@ problems are printed on every run, cached or not). An alias that names a JVM tes
 `cljs.test` walk over `*_test.cljk` in the alias's test dirs — the one
 substitution, announced on stderr each time. Each test file is required by the
 name its `(ns …)` form declares (a file with none falls back to the
-path-derived name, said on stderr). Exit codes: the child's; 64 usage
+path-derived name, said on stderr). npm modules a classpath root needs (a
+`package.json` declaring `"dependencies"`, as kotoba-lang/io-multiformats
+declares `@noble/hashes`) are installed before the engine starts — a
+`~/.gitlibs/libs/<lib>/<sha>` checkout once, remembered by
+`node_modules/.kbb-npm-installed` (warm runs never spawn npm); the project, a
+`:local/root` or a west sibling only when its `node_modules` is absent — with
+`npm ci` where the directory has a lockfile, else `npm install
+--no-package-lock`, both `--omit=dev --no-audit --no-fund --ignore-scripts`;
+a failure is printed with its reason and the run continues. Every root's
+`node_modules` then goes on `NODE_PATH` (after the caller's), which is how the
+temp-dir test runner reaches them. `KBB_NO_NPM=1` turns both off. Exit codes: the child's; 64 usage
 / unknown alias / unsupported flag; 66 no `deps.edn`. Test:
 `test/kotoba/kbb_deps_test.cljk` (both directions, including the
 classpath-only-alias boundary).

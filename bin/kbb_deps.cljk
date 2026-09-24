@@ -294,7 +294,7 @@
                     (nil? dir) (do (swap! seen update :missing conj lib) acc)
                     (contains? (:dirs @seen) dir) acc
                     :else
-                    (do (swap! seen update :dirs conj dir)
+                    (do (swap! seen #(-> % (update :dirs conj dir) (update :order (fnil conj []) dir)))
                         (let [d (read-edn-file (.join path dir "deps.edn"))
                               ps (or (:paths d) ["src"])]
                           (into (into acc (map #(.relative path (.cwd js/process) (.join path dir %)) ps))
@@ -388,7 +388,10 @@
     (.exit js/process 0)))
 
 (defn resolve-classpath
-  "[classpath-vector missing-libs]. Every entry is relative to cwd (what the
+  "[classpath-vector missing-libs root-dirs]. root-dirs is every directory a
+  classpath root came from -- the project, then each :local/root / :git/sha /
+  stdlib dependency in resolution order (see `npm-node-path!`). Every
+  classpath entry is relative to cwd (what the
   engine's --classpath takes); `project` is the directory deps.edn's own
   relative paths are relative to -- cwd for the CLI-shaped doors, the
   script's project for a launcher (see `project-dir-of-script`)."
@@ -416,7 +419,91 @@
      [(vec (distinct (concat (map #(.relative path cwd (.join path project %)) (concat root-paths extra))
                              locals
                              stdlib)))
-      (vec (distinct (:missing @seen)))])))
+      (vec (distinct (:missing @seen)))
+      (vec (distinct (cons (.resolve path project) (map #(.resolve path %) (:order @seen)))))])))
+
+;; ---- npm modules of the classpath roots ---------------------------------
+;;
+;; A .cljk namespace may `(:require ["@noble/hashes/sha2.js" …])`, and the
+;; repository that holds it declares that module in its own package.json
+;; (kotoba-lang/io-multiformats declares @noble/hashes). Until 2026-09-24
+;; nothing installed a DEPENDENCY's npm modules -- a :git/sha dep lands in
+;; ~/.gitlibs/libs/<lib>/<sha> with no node_modules -- and the engine resolves
+;; a module name upward from the file it was started on, which for the test
+;; substitution is a runner in the temp dir, so not even the project's own
+;; node_modules was found. Measured that day: 77 of the suites the clojure.test
+;; codemod refused as red-before died with `Cannot find module '@noble/…'` in
+;; a fresh clone.
+;;
+;; So, before the engine starts, every classpath root directory whose
+;; package.json declares "dependencies" gets its node_modules:
+;;   ~/.gitlibs/libs/<lib>/<sha>  immutable: installed once, remembered by
+;;                                node_modules/.kbb-npm-installed (the warm
+;;                                path is an existsSync, never an npm spawn)
+;;   anything else (the project,  installed only when node_modules is ABSENT;
+;;   :local/root, west siblings)  a present one is the owner's and is used as is
+;; with `npm ci` when the directory has its own lockfile (ci never rewrites
+;; it), else `npm install --no-package-lock` (no lockfile is created), both
+;; --omit=dev --no-audit --no-fund --ignore-scripts. An npm failure is printed
+;; with its reason and the run continues -- the module error, if any, follows
+;; with its cause printed above it. Every root's existing node_modules is then
+;; put on NODE_PATH (after any NODE_PATH the caller set), which the engine's
+;; CommonJS fallback resolver honours whatever file it was started on.
+;; KBB_NO_NPM=1 turns off both the install and the NODE_PATH entries.
+
+(def npm-marker ".kbb-npm-installed")
+
+(defn- npm-dependencies
+  "The \"dependencies\" map of dir/package.json, or nil."
+  [dir]
+  (let [pj (.join path dir "package.json")]
+    (when (.existsSync fs pj)
+      (try (let [d (.-dependencies (js/JSON.parse (.readFileSync fs pj "utf8")))]
+             (when (and d (pos? (.-length (js/Object.keys d)))) d))
+           (catch :default e
+             (warn! "npm:" pj "is not readable JSON:" (.-message e) "-- not installing its modules")
+             nil)))))
+
+(defn- gitlib-dir? [dir]
+  (str/starts-with? dir (str (.resolve path gitlibs "libs") "/")))
+
+(defn- npm! [dir args]
+  (let [t0 (js/Date.now)
+        r (.spawnSync cp "npm" (clj->js args) #js {:cwd dir :encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"]})]
+    {:ok? (zero? (.-status r))
+     :ms (- (js/Date.now) t0)
+     :why (or (some-> (.-error r) .-message)
+              (let [lines (remove str/blank? (str/split (str (.-stderr r)) #"\n"))]
+                (str/join " | " (take-last 3 lines))))}))
+
+(defn- npm-install!
+  "Installs dir's npm dependencies if this door owns doing so (see above)."
+  [dir]
+  (when-let [ds (npm-dependencies dir)]
+    (let [nm (.join path dir "node_modules")
+          marker (.join path nm npm-marker)
+          immutable? (gitlib-dir? dir)]
+      (when (if immutable? (not (.existsSync fs marker)) (not (.existsSync fs nm)))
+        (let [flags ["--omit=dev" "--no-audit" "--no-fund" "--ignore-scripts"]
+              lock? (some #(.existsSync fs (.join path dir %)) ["package-lock.json" "npm-shrinkwrap.json"])
+              r (or (when lock?
+                      (let [r (npm! dir (into ["ci"] flags))]
+                        (when (:ok? r) r)))
+                    (npm! dir (into ["install" "--no-package-lock"] flags)))]
+          (if (:ok? r)
+            (do (when immutable? (.writeFileSync fs marker (str (js/JSON.stringify ds) "\n")))
+                (warn! "npm: installed" (.-length (js/Object.keys ds)) "dependenc(ies) of" dir "in" (str (:ms r) " ms")))
+            (warn! "npm: install FAILED in" dir (str "(" (:why r) ");") "continuing without its modules")))))))
+
+(defn npm-node-path!
+  "The NODE_PATH for the engine: the caller's, then every root's node_modules,
+  after installing what `npm-install!` owns. nil when KBB_NO_NPM=1."
+  [roots]
+  (when-not (= "1" (.-KBB_NO_NPM (.-env js/process)))
+    (doseq [d roots] (npm-install! d))
+    (let [ours (filter #(.existsSync fs %) (map #(.join path % "node_modules") roots))
+          theirs (remove str/blank? (str/split (or (.-NODE_PATH (.-env js/process)) "") #":"))]
+      (when (seq ours) (str/join ":" (distinct (concat theirs ours)))))))
 
 (defn- unknown-aliases [deps aliases]
   (remove #(contains? (:aliases deps) %) aliases))
@@ -504,12 +591,13 @@
   the project's nbb.edn explicitly: the engine finds nbb.edn by walking UP
   FROM THE SCRIPT PATH, so a runner written to the temp dir would otherwise
   see none of the project's :deps (measured 2026-09-11)."
-  [classpath engine-args & [{:keys [config? tail]}]]
+  [classpath engine-args & [{:keys [config? tail node-path]}]]
   (let [nbb-edn (.join path (.cwd js/process) "nbb.edn")
         env (doto (js/Object.assign #js {} (.-env js/process) #js {:KBB_CLASSPATH_TAIL (str/join ":" tail)})
               ;; bin/kbb's hand-over to THIS process; not the script's to inherit
               (js-delete "KBB_STDLIB_PRECOMPUTED")
               (js-delete "KBB_STDLIB_CLASSPATH"))
+        _ (when node-path (aset env "NODE_PATH" node-path))
         r (.spawnSync cp "node" (clj->js (concat [engine]
                                                  (when (seq classpath) ["--classpath" (str/join ":" classpath)])
                                                  (when (and config? (.existsSync fs nbb-edn)) ["--config" nbb-edn])
@@ -517,12 +605,14 @@
                       #js {:stdio "inherit" :env env})]
     (.exit js/process (or (.-status r) 1))))
 
-(defn- run-test-substitute! [classpath alias-maps args]
+(defn- run-test-substitute!
+  "`exec!` is -main's engine launcher (it carries the stdlib tail and NODE_PATH)."
+  [exec! classpath alias-maps args]
   (let [{:keys [dirs nses]} (test-run-plan alias-maps args)
         tmp (.join path (.tmpdir os) (str "kbb-test-" (.-pid js/process) ".cljk"))]
     (warn! "test runner substitution: running" (count nses) "namespace(s) under" (pr-str dirs) "with cljs.test (the JVM runner named by the alias does not exist on this engine)")
     (.writeFileSync fs tmp (test-runner-source nses))
-    (exec-engine! (vec (distinct (concat classpath dirs))) [tmp] {:config? true})))
+    (exec! (vec (distinct (concat classpath dirs))) [tmp] {:config? true})))
 
 (defn -main [argv]
   (when (= "--stdlib-path" (first argv)) (print-stdlib-path!))
@@ -540,7 +630,7 @@
       (die! 64 "alias" (pr-str (vec u)) "is not declared in" deps-file
             (str "(declared: " (pr-str (vec (keys (:aliases deps)))) ")")))
     (let [alias-maps (map #(get-in deps [:aliases %]) aliases)
-          [cp-vec missing] (if classpath [(str/split classpath #":") []] (resolve-classpath deps aliases project))
+          [cp-vec missing roots] (if classpath [(str/split classpath #":") [] [(.resolve path project)]] (resolve-classpath deps aliases project))
           ;; -cp: the caller's classpath verbatim, the stdlib after it (see
           ;; `stdlib-classpath`); the deps.edn door already carries it in cp-vec
           ;; bin/kbb hands over its cached answer (already warned about) as
@@ -551,7 +641,7 @@
                    (let [[entries errors] (stdlib-classpath)]
                      (doseq [[lib why] errors] (warn! (str lib) "is NOT on the classpath:" why))
                      entries)))
-          exec-engine! (fn [cpv args & [opts]] (exec-engine! cpv args (assoc opts :tail tail)))]
+          exec-engine! (fn [cpv args & [opts]] (exec-engine! cpv args (assoc opts :tail tail :node-path (npm-node-path! roots))))]
       ;; org.clojure/clojure and clojurescript are the engine itself, not a
       ;; coordinate it could be missing; naming them warned on every run of
       ;; every launcher whose deps.edn pins Clojure for the linter.
@@ -572,7 +662,7 @@
                     kv (apply hash-map (map edn/read-string args))]
                 (when-not exec-fn (die! 64 "-X/-T: no :exec-fn in aliases" (pr-str aliases)))
                 (if (contains? jvm-test-exec-fns (str exec-fn))
-                  (run-test-substitute! cp-vec alias-maps (mapcat (fn [[k v]] (case k :dirs (mapcat #(vector "-d" (str %)) v) :nses (mapcat #(vector "-n" (str %)) v) [])) (merge exec-args kv)))
+                  (run-test-substitute! exec-engine! cp-vec alias-maps (mapcat (fn [[k v]] (case k :dirs (mapcat #(vector "-d" (str %)) v) :nses (mapcat #(vector "-n" (str %)) v) [])) (merge exec-args kv)))
                   (let [ns-sym (symbol (namespace exec-fn))
                         form (str "(require '" ns-sym ") (" exec-fn " " (pr-str (merge exec-args kv)) ")")]
                     (exec-engine! cp-vec ["-e" form]))))
@@ -580,7 +670,7 @@
                     [flag v & rest-opts] main-opts]
                 (cond
                   (and (contains? #{"-m" "--main"} flag) (contains? jvm-test-runners v))
-                  (run-test-substitute! cp-vec alias-maps rest-opts)
+                  (run-test-substitute! exec-engine! cp-vec alias-maps rest-opts)
 
                   (empty? main-opts)
                   (if (seq aliases)

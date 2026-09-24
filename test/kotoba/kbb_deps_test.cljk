@@ -333,3 +333,87 @@
               (is (str/includes? (:err r2) "stdlib sibling not checked out"))
               (is (= partial (first (str/split (.readFileSync fs cache "utf8") #"\n")))))))
         (.rmSync fs dir #js {:recursive true :force true})))))
+
+;; npm modules of the classpath roots (2026-09-24). A dependency whose own
+;; package.json declares an npm module (kotoba-lang/io-multiformats declares
+;; @noble/hashes) left `Cannot find module '@noble/…'` in every fresh clone:
+;; nothing installed a dep directory's node_modules, and the test runner lives
+;; in the temp dir, so the engine's upward node_modules walk never reached it.
+;; The fixture is the same shape, offline: a :git/sha dep whose .cljk requires
+;; "kbb-tiny/x.js" (an ESM package with an exports map, like @noble/*),
+;; declared as a file: dependency in the dep's package.json. A fake `npm` first
+;; on PATH records any spawn -- that is how "the warm path never runs npm" is
+;; measured rather than assumed.
+(deftest kbb-deps-npm-modules
+  (if-not (and (engine-present?) (zero? (.-status (.spawnSync cp "npm" #js ["--version"]))))
+    (println "SKIPPED kotoba.kbb-deps-test/npm: engine or npm not present")
+    (let [dir (.realpathSync fs (.mkdtempSync fs (.join path (.tmpdir os) "kbb-npm-")))
+          tiny (.join path dir "tiny")
+          lib (.join path dir "gitlib")
+          gitlibs (.join path dir "gitlibs")
+          proj (.join path dir "proj")
+          fakebin (.join path dir "fakebin")
+          spawned (.join path dir "npm-was-spawned")
+          env {"GITLIBS" gitlibs "KBB_NO_STDLIB" "1"}
+          fake-env (assoc env "PATH" (str fakebin ":" (.-PATH (.-env js/process))))
+          out+err (fn [r] (str (:out r) (:err r)))
+          test-deps "{:aliases {:test {:extra-paths [\"test\"] :main-opts [\"-m\" \"cognitect.test-runner\"]}}}\n"
+          own-test (fn [n] (str "(ns " n ".own-test (:require [cljs.test :refer [deftest is]] [\"kbb-tiny/x.js\" :as t]))\n(deftest own (is (= \"tiny-ok\" (t/hi))))\n"))]
+      (write! tiny "package.json" "{\"name\":\"kbb-tiny\",\"version\":\"1.0.0\",\"type\":\"module\",\"exports\":{\"./x.js\":\"./x.js\"}}\n")
+      (write! tiny "x.js" "export const hi = () => \"tiny-ok\";\n")
+      (write! fakebin "npm" (str "#!/bin/sh\ntouch " spawned "\nexit 1\n"))
+      (.chmodSync fs (.join path fakebin "npm") 493)
+      (write! lib "deps.edn" "{:paths [\"src\"]}\n")
+      (write! lib "package.json" (str "{\"name\":\"gl\",\"private\":true,\"dependencies\":{\"kbb-tiny\":\"file:" tiny "\"}}\n"))
+      (write! lib "src/gl/core.cljk" "(ns gl.core (:require [\"kbb-tiny/x.js\" :as t]))\n(defn hello [] (t/hi))\n")
+      (sh! lib "git" "init" "-q")
+      (sh! lib "git" "add" "-A")
+      (sh! lib "git" "-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "gl")
+      (let [sha (sh! lib "git" "rev-parse" "HEAD")
+            libdir (.join path gitlibs "libs" "gl" "gl" sha)
+            marker (.join path libdir "node_modules" ".kbb-npm-installed")]
+        (write! proj "deps.edn" (str "{:deps {gl/gl {:git/url \"file://" lib "\" :git/sha \"" sha "\"}}\n"
+                                     " :aliases {:test {:extra-paths [\"test\"] :main-opts [\"-m\" \"cognitect.test-runner\"]}}}\n"))
+        (write! proj "test/fx/npm_test.cljk" "(ns fx.npm-test (:require [cljs.test :refer [deftest is]] [gl.core :as g]))\n(deftest tiny (is (= \"tiny-ok\" (g/hello))))\n")
+        (testing "KBB_NO_NPM=1 (the behaviour before): the dep's module is not found, for that reason"
+          (let [r (run-kbb-env (assoc env "KBB_NO_NPM" "1") proj "-M:test")]
+            (is (= 1 (:exit r)) (out+err r))
+            (is (str/includes? (out+err r) "Cannot find module 'kbb-tiny/x.js'") (out+err r))
+            (is (not (.existsSync fs (.join path libdir "node_modules"))))))
+        (testing "cold: the gitlib's modules are installed once, marked, and reach the engine on NODE_PATH"
+          (let [r (run-kbb-env env proj "-M:test")]
+            (is (zero? (:exit r)) (out+err r))
+            (is (str/includes? (:out r) "1 pass, 0 fail, 0 error") (:out r))
+            (is (str/includes? (:err r) (str "npm: installed 1 dependenc(ies) of " libdir)) (:err r))
+            (is (.existsSync fs marker))
+            (is (not (.existsSync fs (.join path libdir "package-lock.json"))) "no lockfile is created")))
+        (testing "warm: green again and npm is never spawned (a failing fake npm is first on PATH)"
+          (let [r (run-kbb-env fake-env proj "-M:test")]
+            (is (zero? (:exit r)) (out+err r))
+            (is (not (.existsSync fs spawned)) "npm was spawned on the warm path")
+            (is (not (str/includes? (:err r) "npm:")) (:err r))))
+        (testing "KBB_NO_NPM=1 with the modules installed: they are not on NODE_PATH, so it fails again"
+          (let [r (run-kbb-env (assoc env "KBB_NO_NPM" "1") proj "-M:test")]
+            (is (= 1 (:exit r)))
+            (is (str/includes? (out+err r) "Cannot find module 'kbb-tiny/x.js'") (out+err r))))
+        (testing "the project's own package.json: installed when node_modules is absent, left alone when present"
+          (let [p2 (.join path dir "proj2")]
+            (write! p2 "deps.edn" test-deps)
+            (write! p2 "package.json" (str "{\"name\":\"p2\",\"private\":true,\"dependencies\":{\"kbb-tiny\":\"file:" tiny "\"}}\n"))
+            (write! p2 "test/p2/own_test.cljk" (own-test "p2"))
+            (let [r (run-kbb-env env p2 "-M:test")]
+              (is (zero? (:exit r)) (out+err r))
+              (is (not (.existsSync fs (.join path p2 "package-lock.json"))) "no lockfile is created"))
+            (let [r (run-kbb-env fake-env p2 "-M:test")]
+              (is (zero? (:exit r)) (out+err r))
+              (is (not (.existsSync fs spawned)) "npm was spawned for a project whose node_modules exists"))))
+        (testing "npm failure: the reason is printed and the run continues to the module error"
+          (let [p3 (.join path dir "proj3")]
+            (write! p3 "deps.edn" test-deps)
+            (write! p3 "package.json" (str "{\"name\":\"p3\",\"private\":true,\"dependencies\":{\"kbb-tiny\":\"file:" dir "/no-such-pkg.tgz\"}}\n"))
+            (write! p3 "test/p3/own_test.cljk" (own-test "p3"))
+            (let [r (run-kbb-env env p3 "-M:test")]
+              (is (= 1 (:exit r)))
+              (is (str/includes? (:err r) (str "npm: install FAILED in " p3)) (:err r))
+              (is (str/includes? (out+err r) "Cannot find module 'kbb-tiny/x.js'") (out+err r))))))
+      (.rmSync fs dir #js {:recursive true :force true}))))
