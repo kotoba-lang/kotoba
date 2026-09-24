@@ -735,10 +735,21 @@ one of them keeps its own pin. `KBB_NO_STDLIB=1` turns it off,
 `KBB_STDLIB_ROOT` points at another sibling root, `KBB_DEPS_VERBOSE=1` prints
 the pins a first-wins resolution ignored. (Until 2026-09-23 a repository with
 no project file had nowhere to declare `kotoba.lang.text`, and a `deps.edn`
-git coordinate was invisible here.) An alias that names a JVM test runner
+git coordinate was invisible here.) The same stdlib reaches the two doors that
+read no `deps.edn` — `kbb --backend sci [--classpath cp] script` and
+`kbb --classpath cp script` — handed to the engine as `KBB_CLASSPATH_TAIL`, which
+the engine appends after `--classpath`, the cwd default and `nbb.edn`, and does
+not pass on to processes the script spawns. Those doors do not resolve it per
+run: `bin/kbb` caches the answer of `kbb_deps.cljk --stdlib-path` in
+`${XDG_CACHE_HOME:-~/.cache}/kbb/stdlib-classpath` and checks it with shell
+builtins only (recomputed when the stdlib root differs, when `kbb_deps.cljk` or a
+stdlib `deps.edn` is newer, or when an absent sibling appears; resolution
+problems are printed on every run, cached or not). An alias that names a JVM test runner
 (`cognitect.test-runner`, `kaocha.runner`, `eftest`) is run by kbb's own
 `cljs.test` walk over `*_test.cljk` in the alias's test dirs — the one
-substitution, announced on stderr each time. Exit codes: the child's; 64 usage
+substitution, announced on stderr each time. Each test file is required by the
+name its `(ns …)` form declares (a file with none falls back to the
+path-derived name, said on stderr). Exit codes: the child's; 64 usage
 / unknown alias / unsupported flag; 66 no `deps.edn`. Test:
 `test/kotoba/kbb_deps_test.cljk` (both directions, including the
 classpath-only-alias boundary).
