@@ -46,6 +46,7 @@
 ;; | 66 no deps.edn where one was needed.
 (ns kbb-deps
   (:require [clojure.edn :as edn]
+            [edamame.core :as edamame]
             [kotoba.lang.text :as str]))
 
 (def fs (js/require "fs"))
@@ -234,8 +235,10 @@
 
 (def workspace-orgs
   "orgs/ of the west checkout this kbb lives in (KBB_STDLIB_ROOT's parent when set)."
-  (.dirname path (or (.-KBB_STDLIB_ROOT (.-env js/process))
-                     (.resolve path (.dirname path (.realpathSync fs *file*)) ".." ".."))))
+  ;; resolved: bin/kbb hands over KBB_STDLIB_ROOT as "<kbb home>/..", and the
+  ;; dirname of an unnormalised path is not its parent
+  (.dirname path (.resolve path (or (.-KBB_STDLIB_ROOT (.-env js/process))
+                                    (.resolve path (.dirname path (.realpathSync fs *file*)) ".." "..")))))
 
 (defn west-siblings
   "Candidate west sibling directories for a :local/root, in order:
@@ -325,8 +328,8 @@
   ["text" "edn" "spec" "coll" "test" "io" "fs" "process" "bytes" "json" "http"])
 
 (def stdlib-root
-  (or (.-KBB_STDLIB_ROOT (.-env js/process))
-      (.resolve path (.dirname path (.realpathSync fs *file*)) ".." "..")))
+  (.resolve path (or (.-KBB_STDLIB_ROOT (.-env js/process))
+                     (.resolve path (.dirname path (.realpathSync fs *file*)) ".." ".."))))
 
 (defn- stdlib-deps
   "The implicit deps, as ordered [lib coord] pairs (a map would lose the
@@ -341,6 +344,48 @@
                      (.existsSync fs dir) [lib {:local/root dir}]
                      :else (do (swap! seen update :errors conj [lib (str "stdlib sibling not checked out at " dir)]) nil))))
                stdlib-repos))))
+
+;; ---- the other two doors: `kbb --classpath cp` and `kbb --backend sci` ----
+;;
+;; Until 2026-09-24 the stdlib reached only the deps.edn door: `kbb --classpath
+;; cp script` (the -cp branch below) took the caller's classpath verbatim, and
+;; `kbb --backend sci [--classpath cp] script` -- bin/kbb execs the engine
+;; directly, hundreds of root hooks use it -- never came through this file.
+;; Both now get the same implicit stdlib, AFTER everything the caller names:
+;; it is handed to the engine as KBB_CLASSPATH_TAIL, which the engine appends
+;; after --classpath, the cwd default and nbb.edn (org-babashka-nbb api.cljs).
+;;
+;; The sci door must stay cheap, so bin/kbb does not resolve it per run: it
+;; asks `kbb_deps.cljk --stdlib-path` once and caches the answer (see bin/kbb
+;; `stdlib_tail`). That answer is five lines:
+;;   1 the KBB_STDLIB_ROOT it was computed for, verbatim
+;;   2 the absolute classpath entries, ':'-joined
+;;   3 the stdlib repositories that were present
+;;   4 the stdlib repositories that were absent
+;;   5 the resolution problems, '; '-joined (bin/kbb prints them every run)
+
+(defn- stdlib-classpath
+  "[absolute-entries errors] for the implicit stdlib alone, minus libs `seen`
+  already resolved."
+  ([] (stdlib-classpath (atom {:dirs #{} :libs {} :missing [] :errors []})))
+  ([seen]
+   (let [before (count (:errors @seen))
+         entries (dep-paths (stdlib-deps seen) stdlib-root seen)]
+     [(vec (distinct (map #(.resolve path %) entries)))
+      (vec (distinct (drop before (:errors @seen))))])))
+
+(defn- print-stdlib-path!
+  "The `--stdlib-path` answer described above."
+  []
+  (let [[entries errors] (stdlib-classpath)
+        present (filter #(.existsSync fs (.join path stdlib-root %)) stdlib-repos)
+        absent (remove (set present) stdlib-repos)]
+    (println (or (.-KBB_STDLIB_ROOT (.-env js/process)) stdlib-root))
+    (println (str/join ":" entries))
+    (println (str/join " " present))
+    (println (str/join " " absent))
+    (println (str/join "; " (map (fn [[lib why]] (str lib " is NOT on the classpath: " why)) errors)))
+    (.exit js/process 0)))
 
 (defn resolve-classpath
   "[classpath-vector missing-libs]. Every entry is relative to cwd (what the
@@ -385,11 +430,35 @@
 (def jvm-test-exec-fns
   #{"cognitect.test-runner.api/test" "kaocha.runner/exec-fn" "kaocha.runner/run"})
 
+;; The namespace a test file is required as is the one its `(ns …)` form
+;; DECLARES. Until 2026-09-24 it was derived from the path (dirs -> dots,
+;; `_` -> `-`), which is only the munge convention, not a law: a file at
+;; test/ntp_time/main_test.cljk declaring `(ns ntp_time.main-test …)` (several
+;; com-* repositories) was required as ntp-time.main-test; the engine found the
+;; same file by munging, loaded it, and the run died with
+;; "No namespace: ntp-time.main-test found". The path is now only the
+;; fallback for a file with no readable ns form, and that is named on stderr.
+
+(defn declared-ns
+  "The symbol a file's first form `(ns <sym> …)` declares, or nil when the
+  file does not read or does not start with an ns form."
+  [f]
+  (try
+    (let [src (str/replace (.readFileSync fs f "utf8") #"^#![^\n]*" "")
+          form (edamame/parse-string src {:all true :read-cond :allow :features #{:cljs}
+                                          :auto-resolve (fn [a] (if (= :current a) 'user a))})]
+      (when (and (seq? form) (= 'ns (first form)) (symbol? (second form)))
+        (second form)))
+    (catch :default _ nil)))
+
 (defn- ns-of-file [dir f]
-  (-> (.relative path dir f)
-      (str/replace #"\.(cljk|cljc|cljs|clj)$" "")
-      (str/replace "/" ".")
-      (str/replace "_" "-")))
+  (or (declared-ns f)
+      (let [derived (-> (.relative path dir f)
+                        (str/replace #"\.(cljk|cljc|cljs|clj)$" "")
+                        (str/replace "/" ".")
+                        (str/replace "_" "-"))]
+        (warn! f "has no readable (ns …) form; requiring it as" derived "(derived from its path)")
+        derived)))
 
 (defn- test-files [dir]
   (let [out (atom [])]
@@ -435,13 +504,17 @@
   the project's nbb.edn explicitly: the engine finds nbb.edn by walking UP
   FROM THE SCRIPT PATH, so a runner written to the temp dir would otherwise
   see none of the project's :deps (measured 2026-09-11)."
-  [classpath engine-args & [{:keys [config?]}]]
+  [classpath engine-args & [{:keys [config? tail]}]]
   (let [nbb-edn (.join path (.cwd js/process) "nbb.edn")
+        env (doto (js/Object.assign #js {} (.-env js/process) #js {:KBB_CLASSPATH_TAIL (str/join ":" tail)})
+              ;; bin/kbb's hand-over to THIS process; not the script's to inherit
+              (js-delete "KBB_STDLIB_PRECOMPUTED")
+              (js-delete "KBB_STDLIB_CLASSPATH"))
         r (.spawnSync cp "node" (clj->js (concat [engine]
                                                  (when (seq classpath) ["--classpath" (str/join ":" classpath)])
                                                  (when (and config? (.existsSync fs nbb-edn)) ["--config" nbb-edn])
                                                  engine-args))
-                      #js {:stdio "inherit"})]
+                      #js {:stdio "inherit" :env env})]
     (.exit js/process (or (.-status r) 1))))
 
 (defn- run-test-substitute! [classpath alias-maps args]
@@ -452,6 +525,7 @@
     (exec-engine! (vec (distinct (concat classpath dirs))) [tmp] {:config? true})))
 
 (defn -main [argv]
+  (when (= "--stdlib-path" (first argv)) (print-stdlib-path!))
   (let [{:keys [mode aliases sdeps classpath args tool?]} (parse-argv argv)
         cwd (.cwd js/process)
         project (or (when (= mode :script) (project-dir-of-script (first args))) cwd)
@@ -466,7 +540,18 @@
       (die! 64 "alias" (pr-str (vec u)) "is not declared in" deps-file
             (str "(declared: " (pr-str (vec (keys (:aliases deps)))) ")")))
     (let [alias-maps (map #(get-in deps [:aliases %]) aliases)
-          [cp-vec missing] (if classpath [(str/split classpath #":") []] (resolve-classpath deps aliases project))]
+          [cp-vec missing] (if classpath [(str/split classpath #":") []] (resolve-classpath deps aliases project))
+          ;; -cp: the caller's classpath verbatim, the stdlib after it (see
+          ;; `stdlib-classpath`); the deps.edn door already carries it in cp-vec
+          ;; bin/kbb hands over its cached answer (already warned about) as
+          ;; KBB_STDLIB_CLASSPATH; resolved here only when called some other way
+          tail (when classpath
+                 (if (= "1" (.-KBB_STDLIB_PRECOMPUTED (.-env js/process)))
+                   (vec (remove str/blank? (str/split (or (.-KBB_STDLIB_CLASSPATH (.-env js/process)) "") #":")))
+                   (let [[entries errors] (stdlib-classpath)]
+                     (doseq [[lib why] errors] (warn! (str lib) "is NOT on the classpath:" why))
+                     entries)))
+          exec-engine! (fn [cpv args & [opts]] (exec-engine! cpv args (assoc opts :tail tail)))]
       ;; org.clojure/clojure and clojurescript are the engine itself, not a
       ;; coordinate it could be missing; naming them warned on every run of
       ;; every launcher whose deps.edn pins Clojure for the linter.
