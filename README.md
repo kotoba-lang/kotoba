@@ -835,8 +835,12 @@ bin/kbb examples/kbb/fs_report.kotoba --backend js --policy examples/kbb/fs_repo
 Providers are keyed by compiler wire id and re-check the policy scope on every
 call: `35 :fs/app-data` (read one file inside the realpath'd scope), `33
 :env/read` (a granted name; unset answers `""`), `34 :fs/browse` (sorted entry
-names of one scoped directory, `"\n"`-joined), `20 :proc/exec` (one policy
-invocation by grant index; exit status). `:data/json`, `:data/edn` and
+names of one scoped directory, `"\n"`-joined), `20 :proc/exec` (`:process/spawn`:
+`"<program>[ARG_SEP<arg>]..."` under `:kotoba.policy/spawn {:programs [...]
+:path-lookup bool :env [...]}`, answering `"<exit>\n<stdout>"` -- the ONE
+wire-20 grammar every host answers, kotoba-lang `lang/capability-catalog.edn`
+`:process/spawn`; the index-into-an-invocation-table grammar is retired and
+its policy key refused by name). `:data/json`, `:data/edn` and
 `:http/fetch` have no compiler wire id, so the host refuses them by name and
 points at the interpreter backend — never a silent fallback. Every refusal is
 a receipt with `:outcome :denied`. (EDN *values* need no capability at all:
@@ -854,8 +858,10 @@ the request is refused, and the result is the content written back, so
 (`examples/kbb/fs_roundtrip.kotoba` → 20; refusals measured in
 `test/kotoba/kbb_js_write_test.cljk`). It is consumed through the
 project route (`--source-path lib`) and compiles on the js and native
-backends alike; `kbb.browse` and `kbb.proc` run on js today because the native
-loader's wire-34/20 providers are still stubs (ADR-2609051100 task 5). amu is
+backends alike; `kbb.browse` runs on js today (see `native-auto` in
+`bin/kbb_shim.cljk`). The native loader answers wire 20 since 2026-09-25 (amu
+`tools/kexe_loader.c`, the same compiled decisions as the Linux static ELF);
+this shim still routes `:proc/exec` to the js host. amu is
 located through `$AMU_HOME` or this repo's `deps.edn` pin under `~/.gitlibs`,
 and a checkout without `node_modules/nbb` is a named refusal.
 `test/kotoba/kbb_js_test.cljk` drives the host as a process and SKIPS visibly
