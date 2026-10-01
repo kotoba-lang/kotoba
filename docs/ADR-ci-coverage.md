@@ -1,5 +1,8 @@
 # ADR — CI + coverage measurement for the kotoba workspace
 
+> **Superseded / historical (2026-10-01): Rust dependency removed.** The Rust workspace (`crates/*`, `cargo` gates, `.rs` files) this document describes no longer exists in this repository, and nothing here may be used to reintroduce a Rust build, toolchain or host adapter. The Kotoba CLI is Kotoba (`.cljk`/`.kotoba`) launched through `bin/kotoba` on the nbb-hosted `kbb` engine; see README.md and [`rust-crate-migration.md`](rust-crate-migration.md). Commands and paths below are kept as design history only.
+
+
 Status: **Accepted — implemented (PR #104 coverage, PR #105 CI)**
 Context: until 2026-06-11 the ~2,100-test workspace suite was only ever run by
 hand at ~150 commits/week, and no measured coverage number existed (estimates

@@ -1,5 +1,8 @@
 # ADR — Pure-Rust TURN relay for real-media calls (`kotoba-turn`)
 
+> **Superseded / historical (2026-10-01): Rust dependency removed.** The Rust workspace (`crates/*`, `cargo` gates, `.rs` files) this document describes no longer exists in this repository, and nothing here may be used to reintroduce a Rust build, toolchain or host adapter. The Kotoba CLI is Kotoba (`.cljk`/`.kotoba`) launched through `bin/kotoba` on the nbb-hosted `kbb` engine; see README.md and [`rust-crate-migration.md`](rust-crate-migration.md). Commands and paths below are kept as design history only.
+
+
 Status: **Accepted — socket-free core implemented; listener shell pending**
 Context: 1:1 real-media WebRTC calling shipped as `@etzhayyim/kami-engine-sdk/call`
 (browser owns the media plane; `kotoba-rt` relays SDP/ICE). STUN alone is not

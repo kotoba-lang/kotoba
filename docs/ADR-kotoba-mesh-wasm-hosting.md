@@ -1,5 +1,8 @@
 # ADR — KOTOBA Mesh: WASM ベース分散 hosting / network
 
+> **Superseded / historical (2026-10-01): Rust dependency removed.** The Rust workspace (`crates/*`, `cargo` gates, `.rs` files) this document describes no longer exists in this repository, and nothing here may be used to reintroduce a Rust build, toolchain or host adapter. The Kotoba CLI is Kotoba (`.cljk`/`.kotoba`) launched through `bin/kotoba` on the nbb-hosted `kbb` engine; see README.md and [`rust-crate-migration.md`](rust-crate-migration.md). Commands and paths below are kept as design history only.
+
+
 > Status: Draft (設計提案) ／ Date: 2026-06-22 ／ Scope: kotoba superproject
 >
 > wasmCloud (lattice + capability provider + wadm) と Fermyon Spin / SpinKube

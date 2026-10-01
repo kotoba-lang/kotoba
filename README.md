@@ -173,13 +173,20 @@ fixtures here. The split policy is recorded in
 [`docs/ADR-repository-boundaries.md`](docs/ADR-repository-boundaries.md).
 
 `kotoba-lang/kotoba-lang` owns the standalone language and public CLI contract.
-This repository keeps host implementations, integration tests, and legacy Rust
-adapters while they are migrated to consume the CLJC/EDN authority there.
+This repository keeps host implementations and integration tests that consume
+the CLJC/EDN authority there.
 
-The Rust `kotoba` crate/CLI is an integration adapter over multiple workspace
-crates. It is no longer the semantic authority for the public CLI. New command
-shape belongs in `kotoba-lang/kotoba-lang`, and host launchers should delegate
-to that CLJC contract.
+**There is no Rust in the Kotoba CLI.** `bin/kotoba` is a Kotoba launcher: the
+`adl` and `doctor` commands run directly on the nbb-hosted `kbb` engine
+(`kbb --backend sci`), and every other command is dispatched through
+`bin/kotoba-clj` to `kotoba.launcher` (`.cljk`). `kotoba.launcher` still uses
+JVM interop (HTTP client, BouncyCastle, Chicory, Closure Compiler), so it does
+not yet load on the nbb engine; that remaining gap is JVM, not Rust, and is
+being closed by porting those slices to Kotoba. No Rust
+toolchain, crate, `cargo` build, Rust host adapter or Rust parity target is
+needed to build, test, run or release anything in this repository. New command
+shape belongs in `kotoba-lang/kotoba-lang`, and host launchers delegate to that
+CLJC contract.
 
 `kami-engine` is the strongest future split candidate when the Kami host,
 rendering/devtool SDK, templates, and golden UI verification can build without
@@ -379,7 +386,7 @@ Operator of the public host: 運営元 [awai.network](https://awai.network),
 営業 Ryo Awai.
 
 Side-effecting commands return EDN/JSON data for host adapters. They do not
-invent independent Rust behavior. There is no Rust code or `crates/` tree left
+invent independent host behavior. There is no Rust code or `crates/` tree left
 in this repository (removed `604896171b`, 2026-07-01) — the CLJC launcher
 above is the only current install path.
 
@@ -1182,10 +1189,10 @@ future work, not shipped code.
 Current naming: `kotoba` is the language + database + semantic substrate,
 `kotoba wasm` / safe Kotoba is the executable language path that turns Kotoba
 into Wasm, and `aiueos` is the OS/component supervisor and capability broker.
-`kotoba-clj` remains the implementation crate for that compiler path. In that
-split, Rust-free self-hosting means moving authoritative language/admission
-semantics into confined Kotoba components slice by slice, while Rust remains
-the bootstrap/emitter/oracle for unfinished slices.
+`bin/kotoba-clj` is the Kotoba (`.cljk`) launcher for that compiler path; no
+Rust crate remains in it and Rust is not a bootstrap, emitter or oracle.
+Self-hosting means moving authoritative language/admission semantics into
+confined Kotoba components slice by slice.
 
 The first HTTP/DB provider slices now live in `providers/*.kotoba`. They import
 only the bounded `transport-connect`, `tls-open`, `tls-server-end-point`,

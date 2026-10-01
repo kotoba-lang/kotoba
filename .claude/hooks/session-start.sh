@@ -1,12 +1,11 @@
 #!/bin/bash
 # SessionStart hook — etzhayyim/kotoba
 #
-# Bootstraps the Rust + IPFS toolchain so a Claude Code on the web session can
-# build, test, and run kotoba (incl. the real-Kubo IPFS cold-tier E2E path)
+# Bootstraps the wasm-tools + IPFS toolchain so a Claude Code on the web session can
+# build, test, and run kotoba (Kotoba/nbb CLI; no Rust toolchain is required) (incl. the real-Kubo IPFS cold-tier E2E path)
 # WITHOUT any secrets touching the cloud container.
 #
 # What it installs (all idempotent, all from public sources — no credentials):
-#   - rustup wasm32-unknown-unknown target   (kotoba-store-web / WASM runtime)
 #   - wasm-tools                              (validate WASM components)
 #   - kubo (ipfs)                             (KuboBlockStore cold tier, CID, CAR)
 #   - an OFFLINE ipfs repo                    (--only-hash / dag export, no daemon)
@@ -34,19 +33,7 @@ ARCH="$(uname -m)"
 
 log() { echo "session-start: $*"; }
 
-# ── 1. Rust wasm32 target ────────────────────────────────────────────────────
-if command -v rustup >/dev/null 2>&1; then
-  if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
-    log "adding rust target wasm32-unknown-unknown"
-    rustup target add wasm32-unknown-unknown
-  else
-    log "wasm32-unknown-unknown target already present"
-  fi
-else
-  log "WARN: rustup not found — WASM builds will be unavailable"
-fi
-
-# ── 2. wasm-tools (validate WASM components) ──────────────────────────────────
+# ── 1. wasm-tools (validate WASM components) ──────────────────────────────────
 if ! command -v wasm-tools >/dev/null 2>&1; then
   log "installing wasm-tools ${WASM_TOOLS_VER}"
   tmp="$(mktemp -d)"
@@ -61,7 +48,7 @@ else
   log "wasm-tools already present: $(wasm-tools --version)"
 fi
 
-# ── 3. kubo / ipfs (KuboBlockStore cold tier + deterministic CID/CAR) ────────
+# ── 2. kubo / ipfs (KuboBlockStore cold tier + deterministic CID/CAR) ────────
 if ! command -v ipfs >/dev/null 2>&1; then
   log "installing kubo ${KUBO_VER}"
   tmp="$(mktemp -d)"
@@ -76,7 +63,7 @@ else
   log "kubo already present: $(ipfs --version)"
 fi
 
-# ── 4. Offline IPFS repo (no daemon, no network, no peers) ───────────────────
+# ── 3. Offline IPFS repo (no daemon, no network, no peers) ───────────────────
 export IPFS_PATH="${IPFS_PATH:-$HOME/.ipfs}"
 if command -v ipfs >/dev/null 2>&1 && [ ! -f "$IPFS_PATH/config" ]; then
   log "initializing offline ipfs repo at $IPFS_PATH"
@@ -86,4 +73,4 @@ if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export IPFS_PATH=\"$IPFS_PATH\"" >> "$CLAUDE_ENV_FILE"
 fi
 
-log "toolchain ready — cargo test + WASM + real-Kubo IPFS path enabled (deploy is operator/CI-driven)"
+log "toolchain ready — Kotoba/nbb CLI + WASM validation + real-Kubo IPFS path enabled (deploy is operator/CI-driven)"
