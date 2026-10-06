@@ -24,3 +24,6 @@ chmod +x "$runtime/nbb"
   echo "KBB_ENGINE=$runtime/org-babashka-nbb/cli.js"
   echo "NBB=$runtime/nbb"
 } >> "${GITHUB_ENV:?}"
+
+# Subprocess tests probe nbb and kbb by name; expose the exact prepared hosts.
+printf "%s\n%s\n" "$runtime" "$PWD/bin" >> "${GITHUB_PATH:?}"
